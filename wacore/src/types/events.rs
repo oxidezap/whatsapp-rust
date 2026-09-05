@@ -376,18 +376,76 @@ pub trait EventHandler: crate::sync_marker::MaybeSendSync {
 /// ```
 pub struct ChannelEventHandler {
     tx: async_channel::Sender<Arc<Event>>,
+    enqueued: AtomicU64,
+    dropped_full: AtomicU64,
+    closed: AtomicU64,
+}
+
+/// Delivery results observed by a [`ChannelEventHandler`].
+///
+/// This is an approximate concurrent snapshot of `try_send` outcomes. The
+/// channel can make an enqueued event visible before its counter increment is
+/// observed, and the fields are read independently. It does not confirm that
+/// a receiver has processed any event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ChannelEventStats {
+    /// Events accepted by the channel. This is enqueue acceptance, not
+    /// confirmation that a receiver has processed the event.
+    pub enqueued: u64,
+    /// Events rejected because a bounded channel had no capacity.
+    pub dropped_full: u64,
+    /// Events rejected because the receiver was closed.
+    pub closed: u64,
 }
 
 impl ChannelEventHandler {
     pub fn new() -> (Arc<Self>, async_channel::Receiver<Arc<Event>>) {
         let (tx, rx) = async_channel::unbounded();
-        (Arc::new(Self { tx }), rx)
+        (Arc::new(Self::from_sender(tx)), rx)
+    }
+
+    /// Create a channel-backed handler with a bounded mailbox. A zero capacity
+    /// request is clamped to one because dispatch must retain one event without
+    /// introducing a rendezvous that could wait. Dispatch stays synchronous
+    /// and never waits; overload is reported by [`Self::stats`].
+    pub fn with_capacity(capacity: usize) -> (Arc<Self>, async_channel::Receiver<Arc<Event>>) {
+        let (tx, rx) = async_channel::bounded(capacity.max(1));
+        (Arc::new(Self::from_sender(tx)), rx)
+    }
+
+    fn from_sender(tx: async_channel::Sender<Arc<Event>>) -> Self {
+        Self {
+            tx,
+            enqueued: AtomicU64::new(0),
+            dropped_full: AtomicU64::new(0),
+            closed: AtomicU64::new(0),
+        }
+    }
+
+    /// Snapshot delivery outcomes without touching the channel.
+    pub fn stats(&self) -> ChannelEventStats {
+        ChannelEventStats {
+            enqueued: self.enqueued.load(Ordering::Relaxed),
+            dropped_full: self.dropped_full.load(Ordering::Relaxed),
+            closed: self.closed.load(Ordering::Relaxed),
+        }
     }
 }
 
 impl EventHandler for ChannelEventHandler {
     fn handle_event(&self, event: Arc<Event>) {
-        let _ = self.tx.try_send(event);
+        match self.tx.try_send(event) {
+            Ok(()) => {
+                self.enqueued.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(async_channel::TrySendError::Full(_)) => {
+                self.dropped_full.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(async_channel::TrySendError::Closed(_)) => {
+                self.closed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -3347,5 +3405,87 @@ mod tests {
 
         bus.dispatch(Event::Connected(Connected::builder().build()));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn channel_handler_reports_delivery_and_closed_receiver_separately() {
+        let (handler, receiver) = ChannelEventHandler::new();
+        handler.handle_event(Arc::new(Event::Connected(Connected::builder().build())));
+        assert_eq!(
+            handler.stats(),
+            ChannelEventStats {
+                enqueued: 1,
+                dropped_full: 0,
+                closed: 0,
+            }
+        );
+        drop(receiver);
+        handler.handle_event(Arc::new(Event::Connected(Connected::builder().build())));
+        assert_eq!(handler.stats().closed, 1);
+        assert_eq!(handler.stats().dropped_full, 0);
+    }
+
+    #[test]
+    fn bounded_channel_handler_reports_overload_without_waiting() {
+        let (handler, receiver) = ChannelEventHandler::with_capacity(1);
+        let event = |code: &str| {
+            Arc::new(Event::PairingCode(
+                PairingCode::builder()
+                    .code(code.to_string())
+                    .timeout(std::time::Duration::from_secs(1))
+                    .build(),
+            ))
+        };
+        handler.handle_event(event("first"));
+        handler.handle_event(event("dropped"));
+        assert_eq!(handler.stats().enqueued, 1);
+        assert_eq!(handler.stats().dropped_full, 1);
+        assert_eq!(handler.stats().closed, 0);
+        assert!(matches!(
+            &*receiver.try_recv().expect("first event remains queued"),
+            Event::PairingCode(code) if code.code == "first"
+        ));
+        handler.handle_event(event("recovered"));
+        assert!(matches!(
+            &*receiver.try_recv().expect("queue accepts after drain"),
+            Event::PairingCode(code) if code.code == "recovered"
+        ));
+    }
+
+    #[test]
+    fn a_full_channel_does_not_block_other_subscribers_or_future_dispatches() {
+        use std::sync::atomic::AtomicUsize;
+
+        let bus = CoreEventBus::new();
+        let (channel, receiver) = ChannelEventHandler::with_capacity(1);
+        let seen = Arc::new(AtomicUsize::new(0));
+        struct Counter(Arc<AtomicUsize>);
+        impl EventHandler for Counter {
+            fn handle_event(&self, _: Arc<Event>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let channel_subscription = bus.subscribe_handler(channel.clone());
+        let _counter_subscription = bus.subscribe_handler(Arc::new(Counter(Arc::clone(&seen))));
+        let event = || {
+            Event::PairingCode(
+                PairingCode::builder()
+                    .code("code".to_string())
+                    .timeout(std::time::Duration::from_secs(1))
+                    .build(),
+            )
+        };
+        bus.dispatch(event());
+        bus.dispatch(event());
+        assert_eq!(seen.load(Ordering::Relaxed), 2);
+        assert_eq!(channel.stats().dropped_full, 1);
+        drop(channel_subscription);
+        bus.dispatch(event());
+        assert_eq!(seen.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            receiver.len(),
+            1,
+            "the removed subscription receives no future event"
+        );
     }
 }
