@@ -160,6 +160,9 @@ A rodada de revisão reforçou as fronteiras que tornam a derivação reproduzí
   de stack incompletos, patches sobrepostos são erros e todos os sinks de marker
   registram seus hits. O check dos auditores C também compara o manifesto de
   proveniência inteiro com os arquivos empacotados.
+- O host recusa `EM_ASM` desconhecido, descreve corretamente o preopen WASI e
+  preserva largura/sinal dos inteiros registrados pelo embind. A inspeção
+  estática também recusa exports com índices fora do espaço de funções.
 
 Os pins finais usados pelo tooling são `unwasm`
 `8f798470e9f8c22a9ef40780eee302894fe7bdce` e `whatspec`

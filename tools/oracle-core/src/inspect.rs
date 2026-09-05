@@ -249,7 +249,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed> {
                         // import; both carry a type index.
                         TypeRef::Func(index) | TypeRef::FuncExact(index) => {
                             func_types.push(index);
-                            EntryKind::Func(signature_of(&signatures, index))
+                            EntryKind::Func(signature_of(&signatures, index)?)
                         }
                         TypeRef::Memory(ty) => {
                             memories.push((ty.initial, ty.maximum, ty.shared));
@@ -315,12 +315,15 @@ fn parse(bytes: &[u8]) -> Result<Parsed> {
                     let export = export.context("reading export")?;
                     let index = export.index as usize;
                     let kind = match export.kind {
-                        wasmparser::ExternalKind::Func => EntryKind::Func(
-                            func_types
-                                .get(index)
-                                .map(|ty| signature_of(&signatures, *ty))
-                                .unwrap_or_else(|| "?".to_owned()),
-                        ),
+                        wasmparser::ExternalKind::Func => {
+                            let type_index = func_types.get(index).with_context(|| {
+                                format!(
+                                    "function export {:?} references missing function index {index}",
+                                    export.name
+                                )
+                            })?;
+                            EntryKind::Func(signature_of(&signatures, *type_index)?)
+                        }
                         // `memories` and `tables` are already in index-space
                         // order, so the export's own index is the lookup.
                         wasmparser::ExternalKind::Memory => match memories.get(index) {
@@ -388,11 +391,11 @@ fn note_requirement(requires: &mut Vec<Requirement>, requirement: Requirement) {
     }
 }
 
-fn signature_of(signatures: &[String], index: u32) -> String {
+fn signature_of(signatures: &[String], index: u32) -> Result<String> {
     signatures
         .get(index as usize)
         .cloned()
-        .unwrap_or_else(|| "?".to_owned())
+        .with_context(|| format!("missing function type index {index}"))
 }
 
 fn format_composite(composite: &wasmparser::CompositeType) -> String {
@@ -567,5 +570,19 @@ mod tests {
                 shared: false
             }
         );
+    }
+
+    #[test]
+    fn an_export_cannot_reference_a_missing_function() {
+        let mut exports = ExportSection::new();
+        exports.export("missing", ExportKind::Func, 7);
+        let mut module = Module::new();
+        module.section(&exports);
+
+        let error = match parse(&module.finish()) {
+            Ok(_) => panic!("invalid function export was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("function index 7"), "{error:#}");
     }
 }

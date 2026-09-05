@@ -125,6 +125,7 @@ pub struct EmbindClass {
 pub struct EmbindRegistry {
     /// Type id to type name, from the primitive and class registrations.
     pub types: BTreeMap<u32, String>,
+    integer_types: BTreeMap<u32, IntegerType>,
     /// Free functions, in registration order.
     pub functions: Vec<EmbindFunction>,
     /// Classes, by type id.
@@ -137,6 +138,12 @@ pub struct EmbindRegistry {
     orphan_methods: Vec<EmbindMethod>,
     orphan_constructors: Vec<EmbindConstructor>,
     orphan_properties: Vec<EmbindProperty>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IntegerType {
+    pub bytes: u32,
+    pub signed: bool,
 }
 
 impl EmbindRegistry {
@@ -153,6 +160,10 @@ impl EmbindRegistry {
             .get(&id)
             .cloned()
             .unwrap_or_else(|| format!("type#{id}"))
+    }
+
+    pub(crate) fn integer_type(&self, id: u32) -> Option<IntegerType> {
+        self.integer_types.get(&id).copied()
     }
 
     /// Renders a signature the way a C++ declaration reads.
@@ -254,7 +265,10 @@ fn read_type_ids(state: &HostState, ptr: u32, count: u32) -> Vec<u32> {
 #[derive(Debug, Clone, Copy)]
 enum Layout {
     /// A named type: the id is argument 0 and the name is at `name_at`.
-    Type { name_at: usize },
+    Type {
+        name_at: usize,
+    },
+    Integer,
     /// A free function.
     Function,
     /// A class declaration.
@@ -283,8 +297,6 @@ fn layout_of(name: &str) -> Option<Layout> {
         // (type, name, ...)
         "_embind_register_void"
         | "_embind_register_bool"
-        | "_embind_register_integer"
-        | "_embind_register_bigint"
         | "_embind_register_float"
         | "_embind_register_std_string"
         | "_embind_register_emval"
@@ -293,6 +305,8 @@ fn layout_of(name: &str) -> Option<Layout> {
         | "_embind_register_value_array"
         | "_embind_register_smart_ptr"
         | "_embind_register_user_type" => Layout::Type { name_at: 1 },
+
+        "_embind_register_integer" | "_embind_register_bigint" => Layout::Integer,
 
         // (type, <something>, name, ...)
         "_embind_register_std_wstring" | "_embind_register_memory_view" => {
@@ -321,6 +335,24 @@ fn arg(args: &[Val], index: usize) -> Option<u32> {
     }
 }
 
+fn signed_arg(args: &[Val], index: usize) -> Option<i64> {
+    match args.get(index)? {
+        Val::I32(value) => Some(i64::from(*value)),
+        Val::I64(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn integer_minimum(args: &[Val]) -> Option<i64> {
+    if args.len() >= 7 {
+        let low = u64::from(arg(args, 3)?);
+        let high = u64::from(arg(args, 4)?);
+        Some(((high << 32) | low) as i64)
+    } else {
+        signed_arg(args, 3)
+    }
+}
+
 /// Applies one registration to the registry.
 fn apply(caller: &mut Caller<'_, HostState>, layout: Layout, args: &[Val]) {
     match layout {
@@ -331,6 +363,31 @@ fn apply(caller: &mut Caller<'_, HostState>, layout: Layout, args: &[Val]) {
             let name = caller.data().read_cstr(name_ptr).unwrap_or_default();
             if !name.is_empty() {
                 caller.data_mut().embind.types.insert(id, name);
+            }
+        }
+
+        Layout::Integer => {
+            // (type, name, size, min, max). The minimum carries signedness;
+            // size decides whether the ABI value travels as i32 or i64.
+            let (Some(id), Some(name_ptr), Some(bytes), Some(minimum)) = (
+                arg(args, 0),
+                arg(args, 1),
+                arg(args, 2),
+                integer_minimum(args),
+            ) else {
+                return;
+            };
+            let name = caller.data().read_cstr(name_ptr).unwrap_or_default();
+            if !name.is_empty() {
+                let state = caller.data_mut();
+                state.embind.types.insert(id, name);
+                state.embind.integer_types.insert(
+                    id,
+                    IntegerType {
+                        bytes,
+                        signed: minimum < 0,
+                    },
+                );
             }
         }
 
@@ -512,4 +569,44 @@ pub fn define(
     }
 
     Ok(defined)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legalized_bigint_bounds_preserve_signedness() {
+        let signed = [
+            Val::I32(1),
+            Val::I32(2),
+            Val::I32(8),
+            Val::I32(0),
+            Val::I32(i32::MIN),
+            Val::I32(-1),
+            Val::I32(i32::MAX),
+        ];
+        assert_eq!(integer_minimum(&signed), Some(i64::MIN));
+
+        let unsigned = [
+            Val::I32(1),
+            Val::I32(2),
+            Val::I32(8),
+            Val::I32(0),
+            Val::I32(0),
+            Val::I32(-1),
+            Val::I32(-1),
+        ];
+        assert_eq!(integer_minimum(&unsigned), Some(0));
+        assert_eq!(
+            integer_minimum(&[
+                Val::I32(1),
+                Val::I32(2),
+                Val::I32(8),
+                Val::I64(i64::MIN),
+                Val::I64(i64::MAX),
+            ]),
+            Some(i64::MIN)
+        );
+    }
 }

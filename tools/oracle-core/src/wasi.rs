@@ -364,13 +364,17 @@ fn fd_filestat_get(caller: &mut Caller<'_, HostState>, fd: u32, out: u32) -> i32
             .get(&open.path)
             .map(|file| file.len() as u64)
             .unwrap_or(0),
-        None if fd <= FD_STDERR => 0,
+        None if fd <= FD_ROOT => 0,
         None => return EBADF,
     };
 
     let mut buffer = [0u8; 64];
-    // filetype at offset 16: 4 = regular file, 2 = character device.
-    buffer[16] = if fd <= FD_STDERR { 2 } else { 4 };
+    // filetype at offset 16: 4 = regular file, 3 = directory, 2 = character device.
+    buffer[16] = match fd {
+        FD_STDIN | FD_STDOUT | FD_STDERR => 2,
+        FD_ROOT => 3,
+        _ => 4,
+    };
     buffer[32..40].copy_from_slice(&size.to_le_bytes());
 
     match caller.data().write(out, &buffer) {

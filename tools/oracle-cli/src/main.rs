@@ -715,6 +715,11 @@ fn parse_arg(raw: &str, type_name: &str) -> Result<Value> {
                 .with_context(|| format!("`{raw}` is not a number"))?,
         ),
         "std::string" => Value::Str(raw.to_owned()),
+        "unsigned char" | "unsigned short" | "unsigned int" | "unsigned long" | "uint64_t"
+        | "unsigned long long" => Value::UInt(
+            raw.parse()
+                .with_context(|| format!("`{raw}` is not an unsigned integer"))?,
+        ),
         _ => match raw.parse::<i64>() {
             Ok(value) => Value::Int(value),
             Err(_) => Value::Str(raw.to_owned()),
@@ -1202,6 +1207,11 @@ mod tests {
         assert_eq!(parse_arg("true", "bool").unwrap(), Value::Bool(true));
         assert_eq!(parse_arg("0", "bool").unwrap(), Value::Bool(false));
         assert_eq!(parse_arg("-1.5", "double").unwrap(), Value::Double(-1.5));
+        assert_eq!(
+            parse_arg("18446744073709551615", "uint64_t").unwrap(),
+            Value::UInt(u64::MAX)
+        );
+        assert!(parse_arg("-1", "unsigned int").is_err());
 
         for (raw, type_name) in [("yse", "bool"), ("1.0e", "double"), ("", "float")] {
             let error = parse_arg(raw, type_name).unwrap_err().to_string();

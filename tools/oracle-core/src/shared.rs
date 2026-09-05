@@ -155,6 +155,7 @@ pub struct SharedHost {
     /// Export name of the guest's function table, when it is not the
     /// conventional `__indirect_function_table`.
     pub table_export: std::sync::OnceLock<String>,
+    pub(crate) module_data_sha256: std::sync::OnceLock<String>,
     /// Threads that have been told to check their mailbox and have not yet.
     ///
     /// Emscripten wakes a thread by posting it a `checkMailbox` message; there
@@ -256,6 +257,7 @@ impl Default for SharedHost {
             idle_lock: Mutex::new(()),
             invoke_imports: std::sync::OnceLock::new(),
             table_export: std::sync::OnceLock::new(),
+            module_data_sha256: std::sync::OnceLock::new(),
             exports: std::sync::OnceLock::new(),
             watch: std::sync::OnceLock::new(),
             last_size: AtomicUsize::new(0),

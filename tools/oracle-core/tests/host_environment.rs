@@ -324,6 +324,8 @@ mod wasi_fixture {
     pub const TIMESTAMP: u32 = 32;
     /// Where `path_open` writes the descriptor it allocated.
     pub const OPENED_FD: u32 = 48;
+    /// Where `fd_filestat_get` writes its result.
+    pub const FILESTAT: u32 = 256;
     /// Where the test writes the path for `path_open` to read.
     pub const PATH: u32 = 128;
 
@@ -365,6 +367,7 @@ mod wasi_fixture {
             ("path_open", 2),
             ("fd_read", 3),
             ("fd_close", 5),
+            ("fd_filestat_get", 6),
         ] {
             imports.import("wasi_snapshot_preview1", name, EntityType::Function(ty));
         }
@@ -379,7 +382,7 @@ mod wasi_fixture {
         });
 
         let mut functions = FunctionSection::new();
-        for ty in [4, 5, 6, 5, 5] {
+        for ty in [4, 5, 6, 5, 5, 5] {
             functions.function(ty);
         }
 
@@ -455,13 +458,29 @@ mod wasi_fixture {
         close.instructions().local_get(0).call(4).end();
         code.function(&close);
 
+        let mut filestat = Function::new([]);
+        filestat
+            .instructions()
+            .local_get(0)
+            .i32_const(FILESTAT as i32)
+            .call(5)
+            .end();
+        code.function(&filestat);
+
         let mut exports = ExportSection::new();
         exports.export("memory", ExportKind::Memory, 0);
-        for (index, name) in ["do_pread", "do_clock", "do_open", "do_read", "do_close"]
-            .into_iter()
-            .enumerate()
+        for (index, name) in [
+            "do_pread",
+            "do_clock",
+            "do_open",
+            "do_read",
+            "do_close",
+            "do_filestat",
+        ]
+        .into_iter()
+        .enumerate()
         {
-            exports.export(name, ExportKind::Func, 5 + index as u32);
+            exports.export(name, ExportKind::Func, 6 + index as u32);
         }
 
         let mut module = Module::new();
@@ -591,6 +610,22 @@ fn fd_close_rejects_reserved_unknown_and_already_closed_descriptors() {
     for reserved in [0, 1, 2, 3] {
         assert_eq!(close(&mut runtime, reserved), 8);
     }
+}
+
+#[test]
+fn fd_filestat_reports_the_preopened_root_as_a_directory() {
+    let mut runtime = Runtime::instantiate(&wasi_fixture::module()).expect("instantiate");
+    let result = runtime
+        .call("do_filestat", &[wasmtime::Val::I32(3)])
+        .expect("fd_filestat_get");
+    assert_eq!(errno_of(&result), 0);
+    assert_eq!(
+        runtime
+            .state()
+            .read(wasi_fixture::FILESTAT + 16, 1)
+            .expect("file type"),
+        [3]
+    );
 }
 
 #[test]

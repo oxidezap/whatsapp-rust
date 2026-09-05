@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+use sha2::{Digest, Sha256};
 use wasmtime::error::Context as _;
 use wasmtime::{Extern, Func, Instance, Linker, Module, Ref, Store, Table, Val};
 
@@ -130,6 +131,9 @@ fn exported_memory_name(module: &Module) -> Option<String> {
 /// through its table needs neither.
 fn record_module_facts(store: &Store<HostState>, module: &Module, bytes: &[u8]) {
     let shared = &store.data().shared;
+    if let Some(data_hash) = module_data_sha256(bytes) {
+        shared.module_data_sha256.set(data_hash).ok();
+    }
 
     // Every export name, so a failed lookup can name the near misses instead of
     // reporting only what it wanted. See `exports.rs`.
@@ -155,6 +159,17 @@ fn record_module_facts(store: &Store<HostState>, module: &Module, bytes: &[u8]) 
         .map(|(_, import)| import.name().to_owned())
         .collect();
     shared.invoke_imports.set(names).ok();
+}
+
+fn module_data_sha256(bytes: &[u8]) -> Option<String> {
+    let mut data_hash = Sha256::new();
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        let payload = payload.ok()?;
+        if let wasmparser::Payload::DataSection(reader) = payload {
+            data_hash.update(&bytes[reader.range()]);
+        }
+    }
+    Some(hex::encode(data_hash.finalize()))
 }
 
 impl Runtime {
@@ -547,6 +562,10 @@ impl Runtime {
 
     pub(crate) fn type_name(&self, id: u32) -> String {
         self.store.data().embind.type_name(id)
+    }
+
+    pub(crate) fn integer_type(&self, id: u32) -> Option<crate::embind::IntegerType> {
+        self.store.data().embind.integer_type(id)
     }
 
     pub(crate) fn export(&mut self, name: &str) -> Option<Extern> {

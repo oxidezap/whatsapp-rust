@@ -280,6 +280,13 @@ hang or a wrong answer, not because a spec said to implement it:
 | `__cxa_*` → 0 | every `try`/`catch` broke, turning recoverable errors into opaque traps |
 | a memory window read once | WASI wrote arguments into a stale window and reported success, so every media tool behaved as if invoked with no arguments — and exited 71 from inside its own panic handler |
 
+`EM_ASM` is handled by source text when the module embeds it. Three stripped
+selectors needed by the pinned VOPRF and VoIP captures are keyed by the hash of
+their data section and index; every other missing, unreadable or unknown
+snippet traps. The data fingerprint survives instrumentation, which rewrites
+only code, while keeping a selector address from one capture from acquiring
+meaning in another module that happens to use the same number.
+
 With those implemented, `initVoipStack` returns, `handleIncomingSignalingOffer`
 completes without raising, and a genuine C++ error arrives readable:
 `std::invalid_argument: stoull: no conversion`.

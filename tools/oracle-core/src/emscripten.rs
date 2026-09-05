@@ -545,15 +545,15 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
     linker.func_wrap(
         "env",
         "emscripten_asm_const_int",
-        |mut caller: Caller<'_, HostState>, code: i32, _sig: i32, _args: i32| -> i32 {
+        |mut caller: Caller<'_, HostState>, code: i32, _sig: i32, _args: i32| {
             answer_asm_const(&mut caller, "emscripten_asm_const_int", code)
         },
     )?;
     linker.func_wrap(
         "env",
         "emscripten_asm_const_double",
-        |mut caller: Caller<'_, HostState>, code: i32, _sig: i32, _args: i32| -> f64 {
-            answer_asm_const(&mut caller, "emscripten_asm_const_double", code) as f64
+        |mut caller: Caller<'_, HostState>, code: i32, _sig: i32, _args: i32| {
+            answer_asm_const(&mut caller, "emscripten_asm_const_double", code).map(f64::from)
         },
     )?;
 
@@ -796,30 +796,63 @@ fn read_sized(caller: &Caller<'_, HostState>, ptr: u32, len: u32) -> String {
 ///
 /// Shared by both variants so the two differ only where they have to: in the
 /// return type the module declared.
-fn answer_asm_const(caller: &mut Caller<'_, HostState>, symbol: &str, code: i32) -> i32 {
+fn answer_asm_const(
+    caller: &mut Caller<'_, HostState>,
+    symbol: &str,
+    code: i32,
+) -> Result<i32, wasmtime::Error> {
     crate::state::sync_memory(caller);
     let state = caller.data();
-    let snippet = state.read_cstr(code as u32).unwrap_or_default();
     state.record("env", symbol, vec![code as i64]);
+    let snippet = state
+        .read_cstr(code as u32)
+        .map_err(|error| wasmtime::Error::msg(format!("read EM_ASM index {code}: {error}")))?;
+    if snippet.is_empty() {
+        return answer_em_asm_index(
+            state.shared.module_data_sha256.get().map(String::as_str),
+            code,
+        )
+        .ok_or_else(|| {
+            wasmtime::Error::msg(format!(
+                "unsupported EM_ASM index {code} with no embedded source"
+            ))
+        });
+    }
     answer_em_asm(&snippet)
+}
+
+fn answer_em_asm_index(module_sha256: Option<&str>, code: i32) -> Option<i32> {
+    match (module_sha256?, code) {
+        // COs9e0Kj0ic func 107 calls this once per requested byte. Its locked
+        // oracle behavior is a deterministic nonzero byte.
+        ("d463cda148dae98e98b9a811276a5c0b95edea64ffba768820704e0eb15599c7", 50_356) => Some(1),
+        // COs9e0Kj0ic sodiumInit uses this as hardware concurrency.
+        ("d463cda148dae98e98b9a811276a5c0b95edea64ffba768820704e0eb15599c7", 50_392) => Some(1),
+        // JgwtTQVeWPm and S_ivh1PriOA use the same zero-argument f64 callback
+        // shape at different data addresses during VoIP stack startup; the
+        // locked startup result is truthy.
+        ("4e37a0a11ba95731bb91ec264fa7718fe130c5dc1638e4ac936062cf2f4257ca", 1_324_292) => Some(1),
+        ("2a3d2e9d83b6de3aa2895ce73a2168228b6872ad988232d9c9d7a3e41b50413d", 1_336_996) => Some(1),
+        _ => None,
+    }
 }
 
 /// What to answer an EM_ASM snippet.
 ///
 /// The snippets these modules use are environment probes — "is there a crypto
-/// API", "how many cores" — and the only wrong answer is one that makes the
-/// caller retry. Anything unrecognised gets a truthy answer for that reason,
-/// and is logged so an unhandled snippet is visible rather than silent.
-fn answer_em_asm(snippet: &str) -> i32 {
+/// API", "how many cores". Anything else is unsupported.
+fn answer_em_asm(snippet: &str) -> Result<i32, wasmtime::Error> {
     // A capability check: claiming the feature exists stops the polling.
     if snippet.contains("crypto") || snippet.contains("getRandomValues") {
-        return 1;
+        return Ok(1);
     }
     if snippet.contains("navigator") || snippet.contains("hardwareConcurrency") {
-        return 1;
+        return Ok(1);
     }
-    // Default truthy: a zero is what the spin loops are waiting on.
-    1
+    let preview = snippet.chars().take(160).collect::<String>();
+    Err(wasmtime::Error::msg(format!(
+        "unsupported EM_ASM snippet {preview:?}"
+    )))
 }
 
 /// Fills guest memory with bytes from the deterministic PRNG.
@@ -1024,5 +1057,33 @@ impl BrokenDownTime {
             state.write(ptr + (index * 4) as u32, &value.to_le_bytes())?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_modelled_em_asm_probes_receive_an_answer() {
+        assert_eq!(answer_em_asm("navigator.hardwareConcurrency").unwrap(), 1);
+        assert_eq!(answer_em_asm("crypto.getRandomValues(array)").unwrap(), 1);
+        let error = answer_em_asm("doSomethingElse()").unwrap_err();
+        assert!(error.to_string().contains("unsupported EM_ASM"), "{error}");
+        assert_eq!(
+            answer_em_asm_index(
+                Some("4e37a0a11ba95731bb91ec264fa7718fe130c5dc1638e4ac936062cf2f4257ca"),
+                1_324_292
+            ),
+            Some(1)
+        );
+        assert_eq!(answer_em_asm_index(Some("unknown"), 1_324_292), None);
+        assert_eq!(
+            answer_em_asm_index(
+                Some("2a3d2e9d83b6de3aa2895ce73a2168228b6872ad988232d9c9d7a3e41b50413d"),
+                1_336_996
+            ),
+            Some(1)
+        );
     }
 }

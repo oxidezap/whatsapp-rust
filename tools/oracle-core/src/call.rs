@@ -10,7 +10,7 @@
 //! An unsupported type is an explicit error rather than a silently wrong value,
 //! because a plausible-but-wrong result from an oracle is worse than no result.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use wasmtime::{Ref, Val};
 
 use crate::runtime::Runtime;
@@ -25,6 +25,8 @@ pub enum Value {
     Bool(bool),
     /// An integer of any width the ABI marshals as one.
     Int(i64),
+    /// An unsigned integer too large for `Int`.
+    UInt(u64),
     /// A double.
     Double(f64),
     /// A string, already copied out of guest memory.
@@ -67,6 +69,7 @@ impl Value {
     pub fn as_int(&self) -> Option<i64> {
         match self {
             Self::Int(value) => Some(*value),
+            Self::UInt(value) => i64::try_from(*value).ok(),
             Self::Bool(value) => Some(*value as i64),
             _ => None,
         }
@@ -80,6 +83,23 @@ impl Value {
             _ => None,
         }
     }
+
+    /// The nonnegative integer, if this value can be represented as one.
+    #[must_use]
+    pub fn as_uint(&self) -> Option<u64> {
+        match self {
+            Self::Int(value) => u64::try_from(*value).ok(),
+            Self::UInt(value) => Some(*value),
+            Self::Bool(value) => Some(*value as u64),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IntegerWire {
+    bytes: u8,
+    signed: bool,
 }
 
 /// How a registered C++ type is passed across the boundary.
@@ -90,9 +110,7 @@ enum Wire {
     /// a predicate comes back as `Value::Bool` rather than as 0/1 — the caller
     /// asked a yes/no question and should get one.
     Bool,
-    /// Any integer, all of which travel as i32.
-    I32,
-    I64,
+    Integer(IntegerWire),
     F32,
     F64,
     /// A pointer to `{ u32 length; u8 bytes[length] }` in linear memory.
@@ -115,15 +133,115 @@ fn primitive_wire(type_name: &str) -> Result<Wire, UnknownWire> {
     Ok(match type_name {
         "void" => Wire::Void,
         "bool" => Wire::Bool,
-        "char" | "signed char" | "unsigned char" | "short" | "unsigned short" | "int"
-        | "unsigned int" | "long" | "unsigned long" => Wire::I32,
-        "int64_t" | "uint64_t" | "long long" | "unsigned long long" => Wire::I64,
+        "char" | "signed char" => Wire::Integer(IntegerWire {
+            bytes: 1,
+            signed: true,
+        }),
+        "unsigned char" => Wire::Integer(IntegerWire {
+            bytes: 1,
+            signed: false,
+        }),
+        "short" => Wire::Integer(IntegerWire {
+            bytes: 2,
+            signed: true,
+        }),
+        "unsigned short" => Wire::Integer(IntegerWire {
+            bytes: 2,
+            signed: false,
+        }),
+        "int" | "long" => Wire::Integer(IntegerWire {
+            bytes: 4,
+            signed: true,
+        }),
+        "unsigned int" | "unsigned long" => Wire::Integer(IntegerWire {
+            bytes: 4,
+            signed: false,
+        }),
+        "int64_t" | "long long" => Wire::Integer(IntegerWire {
+            bytes: 8,
+            signed: true,
+        }),
+        "uint64_t" | "unsigned long long" => Wire::Integer(IntegerWire {
+            bytes: 8,
+            signed: false,
+        }),
         "float" => Wire::F32,
         "double" => Wire::F64,
         "std::string" | "std::basic_string<unsigned char>" => Wire::StdString,
         "emscripten::val" => Wire::Emval,
         _ => return Err(UnknownWire),
     })
+}
+
+fn encode_integer(value: &Value, wire: IntegerWire) -> Result<Val> {
+    let bits = u32::from(wire.bytes) * 8;
+    if wire.signed {
+        let value = match value {
+            Value::Bool(value) => *value as i64,
+            Value::Int(value) => *value,
+            Value::UInt(value) => i64::try_from(*value)
+                .map_err(|_| anyhow!("{value} is outside the signed {bits}-bit range"))?,
+            other => return Err(anyhow!("cannot pass {other:?} as a signed integer")),
+        };
+        let (minimum, maximum) = if bits == 64 {
+            (i64::MIN, i64::MAX)
+        } else {
+            (-(1_i64 << (bits - 1)), (1_i64 << (bits - 1)) - 1)
+        };
+        ensure!(
+            (minimum..=maximum).contains(&value),
+            "{value} is outside the signed {bits}-bit range"
+        );
+        return Ok(if wire.bytes <= 4 {
+            Val::I32(value as i32)
+        } else {
+            Val::I64(value)
+        });
+    }
+
+    let value = match value {
+        Value::Bool(value) => *value as u64,
+        Value::Int(value) => u64::try_from(*value)
+            .map_err(|_| anyhow!("{value} is outside the unsigned {bits}-bit range"))?,
+        Value::UInt(value) => *value,
+        other => return Err(anyhow!("cannot pass {other:?} as an unsigned integer")),
+    };
+    let maximum = if bits == 64 {
+        u64::MAX
+    } else {
+        (1_u64 << bits) - 1
+    };
+    ensure!(
+        value <= maximum,
+        "{value} is outside the unsigned {bits}-bit range"
+    );
+    Ok(if wire.bytes <= 4 {
+        Val::I32(value as u32 as i32)
+    } else {
+        Val::I64(value as i64)
+    })
+}
+
+fn decode_integer(wire: IntegerWire, value: Option<&Val>) -> Result<Value> {
+    let bits = u32::from(wire.bytes) * 8;
+    let raw = match (wire.bytes, value) {
+        (1..=4, Some(Val::I32(value))) => u64::from(*value as u32),
+        (8, Some(Val::I64(value))) => *value as u64,
+        (_, value) => return Err(anyhow!("unexpected integer result: {value:?}")),
+    };
+    let raw = if bits == 64 {
+        raw
+    } else {
+        raw & ((1_u64 << bits) - 1)
+    };
+    if wire.signed {
+        let shift = 64 - bits;
+        Ok(Value::Int(((raw << shift) as i64) >> shift))
+    } else if let Ok(value) = i64::try_from(raw) {
+        Ok(Value::Int(value))
+    } else {
+        Ok(Value::UInt(raw))
+    }
 }
 
 impl Runtime {
@@ -171,6 +289,17 @@ impl Runtime {
     /// class instance when the name is not a primitive.
     fn wire_for(&self, type_id: u32) -> Result<Wire> {
         let type_name = self.type_name(type_id);
+        if let Some(integer) = self.integer_type(type_id) {
+            ensure!(
+                matches!(integer.bytes, 1 | 2 | 4 | 8),
+                "type `{type_name}` registered unsupported integer width {}",
+                integer.bytes
+            );
+            return Ok(Wire::Integer(IntegerWire {
+                bytes: integer.bytes as u8,
+                signed: integer.signed,
+            }));
+        }
         if let Ok(wire) = primitive_wire(&type_name) {
             return Ok(wire);
         }
@@ -187,9 +316,7 @@ impl Runtime {
         Ok(match (value, wire) {
             (Value::Bool(value), Wire::Bool) => Val::I32(*value as i32),
             (Value::Int(value), Wire::Bool) => Val::I32(i32::from(*value != 0)),
-            (Value::Bool(value), Wire::I32) => Val::I32(*value as i32),
-            (Value::Int(value), Wire::I32) => Val::I32(*value as i32),
-            (Value::Int(value), Wire::I64) => Val::I64(*value),
+            (value, Wire::Integer(integer)) => encode_integer(value, integer)?,
             (Value::Double(value), Wire::F64) => Val::F64(value.to_bits()),
             (Value::Double(value), Wire::F32) => Val::F32((*value as f32).to_bits()),
             (Value::Int(value), Wire::F64) => Val::F64((*value as f64).to_bits()),
@@ -256,10 +383,11 @@ impl Runtime {
 
         let mut results = match result {
             Wire::Void => vec![],
-            Wire::Bool | Wire::I32 | Wire::StdString | Wire::Class(_) | Wire::Emval => {
+            Wire::Bool | Wire::StdString | Wire::Class(_) | Wire::Emval => {
                 vec![Val::I32(0)]
             }
-            Wire::I64 => vec![Val::I64(0)],
+            Wire::Integer(integer) if integer.bytes <= 4 => vec![Val::I32(0)],
+            Wire::Integer(_) => vec![Val::I64(0)],
             Wire::F32 => vec![Val::F32(0)],
             Wire::F64 => vec![Val::F64(0)],
         };
@@ -269,8 +397,7 @@ impl Runtime {
         Ok(match (result, results.first()) {
             (Wire::Void, _) => Value::Void,
             (Wire::Bool, Some(Val::I32(value))) => Value::Bool(*value != 0),
-            (Wire::I32, Some(Val::I32(value))) => Value::Int(*value as i64),
-            (Wire::I64, Some(Val::I64(value))) => Value::Int(*value),
+            (Wire::Integer(integer), value) => decode_integer(integer, value)?,
             (Wire::F32, Some(Val::F32(bits))) => Value::Double(f32::from_bits(*bits) as f64),
             (Wire::F64, Some(Val::F64(bits))) => Value::Double(f64::from_bits(*bits)),
             (Wire::Emval, Some(Val::I32(handle))) => {
@@ -439,7 +566,7 @@ impl Runtime {
                 }
                 strings.iter().cloned().map(Value::Str).collect()
             }
-            Wire::I32 | Wire::I64 => {
+            Wire::Integer(_) => {
                 if !strings.is_empty() {
                     return Err(anyhow!("`{class_name}` holds numbers, got strings"));
                 }
@@ -593,5 +720,50 @@ impl Runtime {
         (0..len)
             .map(|index| self.call_method(handle, "get", &[Value::Int(index)]))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsigned_integer_wires_preserve_values_and_reject_overflow() {
+        let u32_wire = IntegerWire {
+            bytes: 4,
+            signed: false,
+        };
+        assert!(matches!(
+            encode_integer(&Value::Int(i64::from(u32::MAX)), u32_wire).unwrap(),
+            Val::I32(-1)
+        ));
+        assert_eq!(
+            decode_integer(u32_wire, Some(&Val::I32(-1))).unwrap(),
+            Value::Int(i64::from(u32::MAX))
+        );
+        assert!(encode_integer(&Value::Int(-1), u32_wire).is_err());
+        assert!(encode_integer(&Value::UInt(u64::from(u32::MAX) + 1), u32_wire).is_err());
+
+        let u64_wire = IntegerWire {
+            bytes: 8,
+            signed: false,
+        };
+        assert_eq!(
+            decode_integer(u64_wire, Some(&Val::I64(-1))).unwrap(),
+            Value::UInt(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn narrow_signed_results_are_sign_extended() {
+        let wire = IntegerWire {
+            bytes: 1,
+            signed: true,
+        };
+        assert_eq!(
+            decode_integer(wire, Some(&Val::I32(0xff))).unwrap(),
+            Value::Int(-1)
+        );
+        assert!(encode_integer(&Value::Int(128), wire).is_err());
     }
 }
