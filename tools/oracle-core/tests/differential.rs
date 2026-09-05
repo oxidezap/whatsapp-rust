@@ -29,21 +29,33 @@ fn as_i32(results: &[Val]) -> Option<i32> {
     }
 }
 
-fn module(id: &str) -> Option<Runtime> {
-    let catalog = Catalog::discover().ok()?;
-    let entry = catalog.resolve(id).ok()?;
-    let bytes = std::fs::read(&entry.path).ok()?;
-    Runtime::instantiate(&bytes).ok()
+fn module(id: &str) -> anyhow::Result<Option<Runtime>> {
+    let catalog = match Catalog::discover() {
+        Ok(catalog) => catalog,
+        Err(error)
+            if std::env::var_os(oracle_core::catalog::DIR_ENV).is_none()
+                && error
+                    .to_string()
+                    .starts_with("no directory holding captured .wasm files") =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let entry = catalog.resolve(id)?;
+    let bytes = std::fs::read(&entry.path)?;
+    Runtime::instantiate(&bytes).map(Some)
 }
 
 macro_rules! module_or_skip {
     ($id:expr) => {
         match module($id) {
-            Some(runtime) => runtime,
-            None => {
+            Ok(Some(runtime)) => runtime,
+            Ok(None) => {
                 eprintln!("skipping: {} unavailable (set WA_WASM_DIR)", $id);
                 return;
             }
+            Err(error) => panic!("loading capture {}: {error:#}", $id),
         }
     };
 }

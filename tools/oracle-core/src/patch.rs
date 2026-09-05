@@ -48,7 +48,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use wasmparser::{Operator, Parser, Payload, TypeRef};
 
 /// Where a marker was placed, and what it means.
@@ -173,12 +173,12 @@ pub const DEFAULT_ID_BASE: i32 = 200_000;
 /// - `env::on_call_event_js_sync` — WhatsApp's own callback. Nothing in this
 ///   crate defines it, so `host::define_stubs` answers it: record the
 ///   arguments, return nothing.
-/// - `env::loggingCallback_js_sync` — defined, but it only *reads* the guest
-///   (`read_sized`, then `log`). A marker adds a junk log line and nothing
-///   else. Note what a `value_entry` marker costs here: the value is a guest
-///   local, this import reads it as a length, and an out-of-range one comes
-///   back empty rather than failing — so the noise is bounded but the log is
-///   the thing that pays for it.
+/// - `env::loggingCallback_js_sync` — defined, but it only records the call and
+///   reads the guest (`read_sized`, then `log`). A marker adds a junk log line
+///   and nothing else. Note what a `value_entry` marker costs here: the value
+///   is a guest local, this import reads it as a length, and an out-of-range
+///   one comes back empty rather than failing — so the noise is bounded but
+///   the log is the thing that pays for it.
 /// - `env::mark` — the conventional name for an import a module carries for
 ///   exactly this purpose; the fixtures in `tests/patch.rs` use it.
 ///
@@ -681,6 +681,18 @@ pub fn replace(bytes: &[u8], edits: &[Replace]) -> Result<Vec<u8>> {
         cuts.push((start..end, replacement));
     }
 
+    cuts.sort_by_key(|(range, _)| range.start);
+    for adjacent in cuts.windows(2) {
+        ensure!(
+            adjacent[0].0.end <= adjacent[1].0.start,
+            "replacement ranges {}..{} and {}..{} overlap",
+            adjacent[0].0.start,
+            adjacent[0].0.end,
+            adjacent[1].0.start,
+            adjacent[1].0.end
+        );
+    }
+
     rewrite(bytes, &layout, Vec::new(), &cuts)
 }
 
@@ -717,9 +729,9 @@ fn rewrite(
                 break;
             }
             let (edit, replacement) = pending.next().expect("just peeked");
-            // An edit that starts behind the cursor would mean two overlapping
-            // replacements; the later one is dropped rather than corrupting the
-            // body silently.
+            // `replace` rejects overlapping cuts. Instrumentation can place
+            // multiple zero-width markers at one point, so keep this guard for
+            // the shared rewrite path without discarding any replacement.
             if edit.start < at {
                 continue;
             }

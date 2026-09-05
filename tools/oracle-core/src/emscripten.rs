@@ -182,7 +182,13 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
         |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| {
             crate::state::sync_memory(&mut caller);
             let text = read_sized(&caller, ptr as u32, len as u32);
-            caller.data().log(text);
+            let state = caller.data();
+            state.record(
+                "env",
+                "loggingCallback_js_sync",
+                vec![ptr as i64, len as i64],
+            );
+            state.log(text);
         },
     )?;
 

@@ -19,6 +19,10 @@ use wasm_encoder::{
 /// wasmtime's WAT parser on purpose, and adding it back to write a fixture
 /// would be paying for a parser in every build to save typing in one test.
 fn sample() -> Vec<u8> {
+    sample_with_sink("mark")
+}
+
+fn sample_with_sink(sink: &str) -> Vec<u8> {
     let mut types = TypeSection::new();
     // 0: (i32, i32) -> ()   the sink's shape
     types.ty().function([ValType::I32, ValType::I32], []);
@@ -26,7 +30,7 @@ fn sample() -> Vec<u8> {
     types.ty().function([ValType::I32], [ValType::I32]);
 
     let mut imports = ImportSection::new();
-    imports.import("env", "mark", EntityType::Function(0));
+    imports.import("env", sink, EntityType::Function(0));
 
     let mut functions = FunctionSection::new();
     functions.function(1); // func 1: double
@@ -190,6 +194,18 @@ fn a_call_site_that_never_runs_is_reported_as_such() {
 }
 
 #[test]
+fn the_logging_sink_records_instrumentation_markers() {
+    let original = sample_with_sink("loggingCallback_js_sync");
+    let (rewritten, map) =
+        patch::instrument(&original, &Plan::every_call_in(3)).expect("instrument");
+    let (_, calls) = run(&rewritten, 5);
+    let borrowed = calls
+        .iter()
+        .map(|(symbol, args)| (symbol.as_str(), args.as_slice()));
+    assert_eq!(map.fired(borrowed).len(), 3);
+}
+
+#[test]
 fn replacing_an_instruction_changes_the_answer_it_was_aimed_at() {
     let original = sample();
     let (before, _) = run(&original, 7);
@@ -210,6 +226,30 @@ fn replacing_an_instruction_changes_the_answer_it_was_aimed_at() {
         after, 133,
         "the constant the patch aimed at is the one that moved"
     );
+}
+
+#[test]
+fn overlapping_replacements_are_rejected() {
+    let original = sample();
+    let error = patch::replace(
+        &original,
+        &[
+            Replace {
+                func: 1,
+                at: 0,
+                count: 2,
+                with: vec![Edit::I32(1)],
+            },
+            Replace {
+                func: 1,
+                at: 1,
+                count: 1,
+                with: vec![Edit::I32(2)],
+            },
+        ],
+    )
+    .expect_err("overlapping replacements");
+    assert!(error.to_string().contains("overlap"), "{error:#}");
 }
 
 #[test]

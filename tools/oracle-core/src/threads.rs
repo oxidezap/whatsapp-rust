@@ -147,9 +147,8 @@ impl Spawner {
 ///
 /// Measured rather than assumed: every worker in this capture reports a
 /// distinct value here and `0x10000` at `+56`, which is the 64 KiB the guest's
-/// own `pthread_create` allocated for it. Used below only to know when that
-/// control block has been filled in; see `run_thread` for why the host does not
-/// go on to install those bounds.
+/// own `pthread_create` allocated for it. The worker waits for both fields and
+/// installs those bounds before it can enter guest code.
 ///
 /// Re-measured on the `JgwtTQVeWPm` capture, because `unwasm` reads the same
 /// structure at `(stack, stack_size) = (48, 52)` — Emscripten's own
@@ -228,17 +227,23 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
     // `__emscripten_thread_init` writes them. So the guest's own `pthread_create`
     // fills them on the creating thread while this one is already running, and
     // anything read before that is a half-built structure.
-    {
-        const SPINS: usize = 2000;
-        for _ in 0..SPINS {
-            let ready =
-                read_u32(&store, thread_ptr.saturating_add(STACK_HIGH)).is_some_and(|top| top != 0);
-            if ready {
-                break;
+    const STACK_READY_SPINS: usize = 2000;
+    let (stack_high, stack_size) = (0..STACK_READY_SPINS)
+        .find_map(|_| {
+            let bounds = read_u32(&store, thread_ptr.saturating_add(STACK_HIGH)).and_then(|high| {
+                read_u32(&store, thread_ptr.saturating_add(STACK_SIZE))
+                    .and_then(|size| (high != 0 && size != 0 && high > size).then_some((high, size)))
+            });
+            if bounds.is_none() {
+                std::thread::yield_now();
             }
-            std::thread::yield_now();
-        }
-    }
+            bounds
+        })
+        .with_context(|| {
+            format!(
+                "pthread {thread_ptr:#x} stack bounds were not ready after {STACK_READY_SPINS} yields"
+            )
+        })?;
 
     // Bind the guest's thread-local storage to this instance before running
     // anything: emscripten's runtime reads the pthread pointer from TLS, and a
@@ -287,79 +292,37 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
     init.call(&mut store, &args[..arity], &mut [])
         .context("__emscripten_thread_init")?;
 
-    // No stack of its own for this thread, and that is now a measurement rather
-    // than an oversight — but read the measurement, because it says the
-    // opposite of what it should.
-    //
-    // The stack pointer is a *per-instance* wasm global, every instance is
-    // initialised from the same module, and `__emscripten_thread_init` sets the
-    // TLS globals and nothing else. So every guest thread starts at `0x24cf60`,
-    // the main thread's own region, and pushes its frames over whatever is live
-    // there. That would be survivable if threads took turns; they do not.
-    // `Runtime::max_threads_in_wasm()` peaks at **five or six** — see the note
-    // in AGENTS.md — so this is five call stacks sharing one address range,
-    // which is indefensible on its face.
-    //
-    // Giving each thread its own stack nevertheless makes it strictly worse,
-    // three times now, by three different routes:
-    //
-    // | stack per worker              | result                                |
-    // | ----------------------------- | ------------------------------------- |
-    // | shared (today)                | ~1 corrupt round in 4                 |
-    // | the guest's own 64 KiB        | `startVoipCall` traps 4 attempts of 4 |
-    // | 4 MiB, confirmed by stackSave | "changes nothing"                     |
-    // | 1 MiB from the guest heap     | **8 corrupt rounds of 8**             |
-    //
-    // The last row is this host installing the stack through the module's own
-    // exports — `malloc`, then `emscripten_stack_set_limits(base, end)`, then
-    // `stackRestore(top)` — with the argument order checked against the
-    // bytecode (`base` is global 8, `end` is global 7). It is the correct thing
-    // to do and it fails every time, so something the guest believes about
-    // where a thread's stack lives is not what this host is telling it.
-    // Whoever picks this up: that contradiction is the lead, not the shared
-    // stack itself.
-
-    // Give the thread the stack the *guest* allocated for it.
-    //
-    // This is emscripten's `establishStackSpace`, and it is deliberately the
-    // guest's own region rather than one this host mallocs: `pthread_create`
-    // already reserved 64 KiB and wrote its bounds into the control block, so
-    // taking them from there is reading what the guest believes rather than
-    // telling it something new. That distinction is what the note above says
-    // the earlier attempts got wrong.
-    //
-    // Why retry at all, given that note. The failure it was measured against
-    // was `startVoipCall`, which is broken for unrelated reasons and is a noisy
-    // signal. `patch.rs` supplies a sharp one: mark the string destructor's
-    // deallocate and ask whether it is handed a pointer or a small integer.
-    // With one shared stack a `std::string` built in func 724's own frame is
-    // overwritten by another thread's frame, so `__is_long_` reads set while
-    // `__data_` holds a neighbour's local — and `free(1)` traps. See
-    // `agent_docs/voip_oracle_status.md`.
-    if let (Some(set_limits), Some(restore), Some(high), Some(size)) = (
-        instance.get_func(&mut store, "emscripten_stack_set_limits"),
-        instance.get_func(&mut store, "stackRestore"),
-        read_u32(&store, thread_ptr.saturating_add(STACK_HIGH)),
-        read_u32(&store, thread_ptr.saturating_add(STACK_SIZE)),
-    ) && high != 0
-        && size != 0
-        && high > size
-    {
-        let low = high - size;
-        // `(base, end)`, in that order: the bytecode stores the first argument
-        // into global 8 and the second into global 7.
-        if let Err(error) = set_limits.call(
+    // Install the stack the guest allocated for this pthread. Every worker
+    // instance starts with the main instance's stack-pointer value, while the
+    // workers are measured running concurrently. Emscripten's
+    // `establishStackSpace` reads these same bounds and applies them through
+    // the two exports below; entering the routine without them lets workers
+    // overwrite each other's frames.
+    let stack_names = ["emscripten_stack_set_limits"];
+    let set_limits = instance
+        .get_func(&mut store, stack_names[0])
+        .ok_or_else(|| {
+            crate::exports::missing_from(ctx.shared.exports.get(), "stack setup", &stack_names)
+        })?;
+    let restore_names = ["stackRestore"];
+    let restore = instance
+        .get_func(&mut store, restore_names[0])
+        .ok_or_else(|| {
+            crate::exports::missing_from(ctx.shared.exports.get(), "stack restore", &restore_names)
+        })?;
+    let stack_low = stack_high - stack_size;
+    // `(base, end)`, in that order: the bytecode stores the first argument
+    // into global 8 and the second into global 7.
+    set_limits
+        .call(
             &mut store,
-            &[Val::I32(high as i32), Val::I32(low as i32)],
+            &[Val::I32(stack_high as i32), Val::I32(stack_low as i32)],
             &mut [],
-        ) {
-            ctx.shared
-                .log(ctx.id, format!("stack_set_limits: {}", first_line(&error)));
-        } else if let Err(error) = restore.call(&mut store, &[Val::I32(high as i32)], &mut []) {
-            ctx.shared
-                .log(ctx.id, format!("stackRestore: {}", first_line(&error)));
-        }
-    }
+        )
+        .context("emscripten_stack_set_limits")?;
+    restore
+        .call(&mut store, &[Val::I32(stack_high as i32)], &mut [])
+        .context("stackRestore")?;
 
     // The stack this thread ended up with, read through `stackSave` rather than
     // through an exported global. Global 0 *is* the stack pointer, but this
