@@ -4394,7 +4394,9 @@ dependencies = [
  "sha2",
  "tokio",
  "wacore",
+ "wasm-bindgen",
  "wasm-bindgen-test",
+ "web-sys",
 ]
 
 [[package]]
