@@ -134,3 +134,10 @@ and [consumer regeneration plus MLOW tests](https://github.com/oxidezap/whatsapp
 The 60 ms PCM check also requires exactly 960 samples for every one of the 110 packets; no
 inactive packet is skipped for producing a different length. This additional assertion passed locally.
 The full testdata directory is approximately 9.1 MB, down from 15.8 MB before this migration.
+
+After the ownership split, the local host on Wasmtime 48, all 11 derivations,
+fixture comparison and all 131 MLOW tests passed in
+[the consumer workflow](https://github.com/oxidezap/whatsapp-rust/actions/runs/33983916097).
+The generic decompiler and verified capture store passed independently in the
+[unwasm workflow](https://github.com/oxidezap/unwasm/actions/runs/33982898581)
+and [whatspec workflow](https://github.com/oxidezap/whatspec/actions/runs/33983145320).

@@ -8,6 +8,7 @@ on:
   pull_request:
     branches: [main]
   workflow_call:
+  workflow_dispatch:
   # RUSTSEC advisories land against a lockfile that has not changed, so the
   # audit needs a clock of its own rather than only PR triggers.
   schedule:

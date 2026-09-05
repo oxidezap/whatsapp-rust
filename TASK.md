@@ -131,5 +131,6 @@ o grafo de `tools/xtask` além do grafo de produção.
 - CIs remotos: [unwasm desacoplado](https://github.com/oxidezap/unwasm/actions/runs/33982898581)
   e [whatspec/wa-store + TLS atualizado](https://github.com/oxidezap/whatspec/actions/runs/33983145320).
 
-Nenhum trabalho desta separação permanece aberto; falta apenas o recibo do CI
-desta branch após publicar o commit do consumidor.
+CI remoto do consumidor concluído: [oráculo Wasmtime 48, tarefas, rederivação
+J/S, comparação dos fixtures e 131 testes MLOW](https://github.com/oxidezap/whatsapp-rust/actions/runs/33983916097).
+Nenhum trabalho desta separação permanece aberto.
