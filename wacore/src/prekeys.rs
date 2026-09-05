@@ -717,23 +717,14 @@ mod tests {
 
     #[test]
     fn prekey_fetch_validates_mixed_and_hosted_adv_chains() {
+        use crate::adv::test_util;
         use buffa::Message;
-        use wacore_binary::{JidExt, Server};
         use waproto::whatsapp as wa;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account = KeyPair::generate(&mut rng);
         let device = KeyPair::generate(&mut rng);
-        let identity = device.public_key.public_key_bytes();
         let account_key = account.public_key.public_key_bytes();
-        let jids = [
-            Jid::pn_device("15550000001", 1),
-            Jid::lid_device("100000000000001", 1),
-            Jid::pn_device("15550000001", 99),
-            Jid::lid_device("100000000000001", 99),
-            Jid::new("15550000001", Server::Hosted).with_device(99),
-            Jid::new("100000000000001", Server::HostedLid).with_device(99),
-        ];
-        for jid in jids {
+        for (jid, hosted_device) in test_util::device_cases() {
             let bundle = PreKeyBundle::new(
                 1,
                 u32::from(jid.device).into(),
@@ -744,50 +735,29 @@ mod tests {
                 IdentityKey::new(device.public_key),
             )
             .unwrap();
-            for hosted_signer in [false, true] {
+            for device_type in test_util::ENCRYPTION_TYPES {
                 let details = wa::ADVDeviceIdentity {
                     key_index: Some(0),
-                    device_type: Some(if hosted_signer {
-                        wa::ADVEncryptionType::HOSTED
-                    } else {
-                        wa::ADVEncryptionType::E2EE
-                    }),
+                    device_type,
                     ..Default::default()
                 }
                 .encode_to_vec();
-                let acct_prefix: &[u8] = if hosted_signer { &[6, 5] } else { &[6, 0] };
+                let acct_prefix = test_util::account_prefix(device_type);
                 for include_account_key in [false, true] {
                     for correct_device_prefix in [false, true] {
-                        let dev_prefix: &[u8] = if jid.is_hosted() == correct_device_prefix {
+                        let dev_prefix: &[u8; 2] = if hosted_device == correct_device_prefix {
                             &[6, 6]
                         } else {
                             &[6, 1]
                         };
-                        let signed = wa::ADVSignedDeviceIdentity {
-                            details: Some(details.clone()),
-                            account_signature_key: include_account_key
-                                .then(|| account_key.to_vec()),
-                            account_signature: Some(
-                                account
-                                    .private_key
-                                    .calculate_signature(
-                                        &[acct_prefix, &details, identity].concat(),
-                                        &mut rng,
-                                    )
-                                    .unwrap()
-                                    .to_vec(),
-                            ),
-                            device_signature: Some(
-                                device
-                                    .private_key
-                                    .calculate_signature(
-                                        &[dev_prefix, &details, identity, account_key].concat(),
-                                        &mut rng,
-                                    )
-                                    .unwrap()
-                                    .to_vec(),
-                            ),
-                        };
+                        let signed = test_util::signed_identity(
+                            &account,
+                            &device,
+                            &details,
+                            acct_prefix,
+                            Some(dev_prefix),
+                            include_account_key,
+                        );
                         let user = PreKeyBundleUserNode::from_bundle(
                             jid.clone(),
                             &bundle,
@@ -808,7 +778,7 @@ mod tests {
                         assert_eq!(
                             outcome.bundles.contains_key(&jid),
                             correct_device_prefix,
-                            "jid={jid} hosted_signer={hosted_signer} in_blob={include_account_key}"
+                            "jid={jid} device_type={device_type:?} in_blob={include_account_key}"
                         );
                     }
                 }

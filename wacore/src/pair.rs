@@ -1,6 +1,6 @@
 use crate::adv::{
-    ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE, ADV_PREFIX_ACCOUNT_SIGNATURE, ADV_PREFIX_DEVICE_SIGNATURE,
-    account_signature_prefix,
+    ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE, ADV_PREFIX_ACCOUNT_SIGNATURE, AccountSignatureMessage,
+    DeviceSignatureKind,
 };
 use crate::companion_reg::CompanionWebClientType;
 use crate::libsignal::crypto::aes_256_gcm_encrypt;
@@ -174,7 +174,6 @@ impl PairUtils {
         device_state: &DeviceState,
         device_identity_bytes: &[u8],
     ) -> Result<(Vec<u8>, u32), PairCryptoError> {
-        // 1. Unmarshal HMAC container and verify HMAC
         let hmac_container = waproto::codec::adv_signed_device_identity_hmac_decode(
             device_identity_bytes,
         )
@@ -184,7 +183,6 @@ impl PairUtils {
             source: e.into(),
         })?;
 
-        // Determine if this is a hosted account
         let is_hosted_account = hmac_container.account_type == Some(ADVEncryptionType::HOSTED);
 
         let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(&device_state.adv_secret_key)
@@ -193,7 +191,6 @@ impl PairUtils {
             text: "internal-error",
             source: e.into(),
         })?;
-        // Get details and hmac as slices, handling potential None values
         let details_bytes = hmac_container
             .details
             .as_deref()
@@ -225,7 +222,6 @@ impl PairUtils {
             source: anyhow::anyhow!("ADV signed-device-identity HMAC verification failed"),
         })?;
 
-        // 2. Unmarshal inner container and verify account signature
         let mut signed_identity = waproto::codec::adv_signed_device_identity_decode(details_bytes)
             .map_err(|e| PairCryptoError {
                 code: 500,
@@ -257,11 +253,11 @@ impl PairUtils {
                 source: e.into(),
             })?;
 
-        let msg_to_verify = Self::concat_bytes(&[
-            account_signature_prefix(identity_details.device_type),
+        let msg_to_verify = AccountSignatureMessage::new(
             inner_details_bytes,
-            device_state.identity_key.public_key.public_key_bytes(),
-        ]);
+            &device_state.identity_key.public_key,
+            identity_details.device_type,
+        );
 
         let account_public_key = PublicKey::from_djb_public_key_bytes(account_sig_key_bytes)
             .map_err(|e| PairCryptoError {
@@ -270,7 +266,7 @@ impl PairUtils {
                 source: e.into(),
             })?;
 
-        if !account_public_key.verify_signature(&msg_to_verify, account_sig_bytes) {
+        if !account_public_key.verify_signature(msg_to_verify.as_bytes(), account_sig_bytes) {
             return Err(PairCryptoError {
                 code: 401,
                 text: "signature-mismatch",
@@ -278,13 +274,15 @@ impl PairUtils {
             });
         }
 
+        let key_index = identity_details.key_index.ok_or_else(|| PairCryptoError {
+            code: 500,
+            text: "internal-error",
+            source: anyhow::anyhow!("ADVDeviceIdentity missing key_index"),
+        })?;
+
         // WAWebAdvSignatureApi.generateDeviceSignature always signs a regular companion.
-        let msg_to_sign = Self::concat_bytes(&[
-            &ADV_PREFIX_DEVICE_SIGNATURE,
-            inner_details_bytes,
-            device_state.identity_key.public_key.public_key_bytes(),
-            account_sig_key_bytes,
-        ]);
+        let msg_to_sign =
+            msg_to_verify.for_device(&account_public_key, DeviceSignatureKind::Companion);
         let device_signature = device_state
             .identity_key
             .private_key
@@ -296,13 +294,6 @@ impl PairUtils {
             })?;
         signed_identity.device_signature = Some(device_signature.to_vec());
 
-        let key_index = identity_details.key_index.ok_or_else(|| PairCryptoError {
-            code: 500,
-            text: "internal-error",
-            source: anyhow::anyhow!("ADVDeviceIdentity missing key_index"),
-        })?;
-
-        // 5. Marshal the modified signed_identity to send back
         let self_signed_identity_bytes =
             waproto::codec::adv_signed_device_identity_to_vec(&signed_identity);
 
@@ -443,17 +434,13 @@ impl PairUtils {
             .children([response_content])
             .build()
     }
-
-    /// Helper to concatenate multiple byte slices into a single Vec.
-    fn concat_bytes(slices: &[&[u8]]) -> Vec<u8> {
-        slices.iter().flat_map(|s| s.iter().cloned()).collect()
-    }
 }
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use crate::adv::test_util::{self, ENCRYPTION_TYPES, TEST_PN};
     use buffa::Message;
     use rand::RngExt;
 
@@ -715,28 +702,17 @@ mod tests {
 
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account_kp = KeyPair::generate(&mut rng);
-        let account_sig_prefix: &[u8] = if details.device_type == Some(ADVEncryptionType::HOSTED) {
-            &[6, 5]
-        } else {
-            &[6, 0]
-        };
         let mut inner = details.encode_to_vec();
         // Preserve unknown signed fields byte-for-byte, including noncanonical field order.
         inner.splice(0..0, [0xa0, 0x06, 0x01]);
-        let mut to_sign = Vec::new();
-        to_sign.extend_from_slice(account_sig_prefix);
-        to_sign.extend_from_slice(&inner);
-        to_sign.extend_from_slice(state.identity_key.public_key.public_key_bytes());
-        let sig = account_kp
-            .private_key
-            .calculate_signature(&to_sign, &mut rng)
-            .unwrap();
-        let signed = wa::ADVSignedDeviceIdentity {
-            details: Some(inner),
-            account_signature_key: Some(account_kp.public_key.public_key_bytes().to_vec()),
-            account_signature: Some(sig.to_vec()),
-            device_signature: None,
-        }
+        let signed = test_util::signed_identity(
+            &account_kp,
+            &state.identity_key,
+            &inner,
+            test_util::account_prefix(details.device_type),
+            None,
+            true,
+        )
         .encode_to_vec();
         wrap_pair_success(adv_secret_for_hmac, account_type, signed)
     }
@@ -764,12 +740,7 @@ mod tests {
     fn pairing_account_and_device_types_are_independent() {
         use buffa::Message;
         let state = dummy_device_state();
-        let types = [
-            None,
-            Some(ADVEncryptionType::E2EE),
-            Some(ADVEncryptionType::HOSTED),
-            Some(ADVEncryptionType::NON_E2EE),
-        ];
+        let types = ENCRYPTION_TYPES;
         for outer in types {
             for account_type in types {
                 for device_type in types {
@@ -819,7 +790,7 @@ mod tests {
                                 .try_into()
                                 .unwrap(),
                             None,
-                            &Jid::pn_device("15550000001", 1),
+                            &Jid::pn_device(TEST_PN, 1),
                         ),
                         crate::adv::AdvValidation::Valid
                     );
@@ -838,6 +809,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn pairing_preserves_signed_details_when_signature_buffers_spill() {
+        let state = dummy_device_state();
+        let account = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let mut details = wa::ADVDeviceIdentity {
+            key_index: Some(0),
+            device_type: Some(ADVEncryptionType::HOSTED),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        // Unknown field 100 with a 512-byte payload forces both signature buffers to spill.
+        details.extend_from_slice(&[0xa2, 0x06, 0x80, 0x04]);
+        details.extend_from_slice(&[0xab; 512]);
+        let original = test_util::signed_identity(
+            &account,
+            &state.identity_key,
+            &details,
+            &[6, 5],
+            None,
+            true,
+        );
+        let payload = wrap_pair_success(&state.adv_secret_key, None, original.encode_to_vec());
+        let (result, index) = PairUtils::do_pair_crypto(&state, &payload).unwrap();
+        assert_eq!(index, 0);
+        let signed = waproto::codec::adv_signed_device_identity_decode(&result).unwrap();
+        assert_eq!(signed.details.as_deref(), Some(details.as_slice()));
+        assert!(
+            state.identity_key.public_key.verify_signature(
+                &[
+                    &[6, 1],
+                    details.as_slice(),
+                    state.identity_key.public_key.public_key_bytes(),
+                    account.public_key.public_key_bytes()
+                ]
+                .concat(),
+                signed.device_signature.as_deref().unwrap(),
+            )
+        );
+        assert_eq!(
+            crate::adv::validate_adv_with_identity_key(
+                &result,
+                state
+                    .identity_key
+                    .public_key
+                    .public_key_bytes()
+                    .try_into()
+                    .unwrap(),
+                None,
+                &Jid::pn_device(TEST_PN, 1),
+            ),
+            crate::adv::AdvValidation::Valid
+        );
     }
 
     #[test]
@@ -942,31 +967,19 @@ mod tests {
                     ..Default::default()
                 }
                 .encode_to_vec();
-                let wrong_prefix: &[u8] = if device_type == ADVEncryptionType::HOSTED {
+                let wrong_prefix: &[u8; 2] = if device_type == ADVEncryptionType::HOSTED {
                     &[6, 0]
                 } else {
                     &[6, 5]
                 };
-                let signed = wa::ADVSignedDeviceIdentity {
-                    details: Some(details.clone()),
-                    account_signature_key: Some(account.public_key.public_key_bytes().to_vec()),
-                    account_signature: Some(
-                        account
-                            .private_key
-                            .calculate_signature(
-                                &[
-                                    wrong_prefix,
-                                    &details,
-                                    state.identity_key.public_key.public_key_bytes(),
-                                ]
-                                .concat(),
-                                &mut rng,
-                            )
-                            .unwrap()
-                            .to_vec(),
-                    ),
-                    device_signature: None,
-                };
+                let signed = test_util::signed_identity(
+                    &account,
+                    &state.identity_key,
+                    &details,
+                    wrong_prefix,
+                    None,
+                    true,
+                );
                 let payload =
                     wrap_pair_success(&state.adv_secret_key, Some(outer), signed.encode_to_vec());
                 let err = PairUtils::do_pair_crypto(&state, &payload).unwrap_err();
