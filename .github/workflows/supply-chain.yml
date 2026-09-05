@@ -73,39 +73,10 @@ jobs:
           # Plain output: the progress spinner's escape codes are most of the
           # log's bytes and render as noise once captured to a file.
           CARGO_TERM_COLOR: never
-        run: |
-          set -o pipefail
-          cargo semver-checks check-release --color never \
-            -p wacore -p wacore-binary -p waproto 2>&1 | tee semver.log
+        run: cargo xt ci workflow semver-check
       - name: Publish report to the job summary
         if: always()
-        run: |
-          # The step summary is capped at 1 MiB and a full run comfortably
-          # exceeds it, so only the tail — where the verdict and the offending
-          # items are — goes here. The whole log is attached as an artifact.
-          {
-            echo '## cargo-semver-checks (informational)'
-            echo
-            if [ "${{ steps.semver.outcome }}" = "success" ]; then
-              echo 'No breaking changes detected against the last published release.'
-            else
-              echo 'Breaking changes detected. This does not block the PR — bump the'
-              echo 'minor version if the break is intended.'
-            fi
-            echo
-            echo '<details><summary>Output (tail; full log in the semver-checks-log artifact)</summary>'
-            echo
-            echo '```'
-            if [ -f semver.log ]; then
-              tail -c 200000 semver.log
-            else
-              # Checkout, toolchain or tool install failed before the run.
-              echo 'cargo-semver-checks did not run; see the failed setup step above.'
-            fi
-            echo '```'
-            echo
-            echo '</details>'
-          } >> "$GITHUB_STEP_SUMMARY"
+        run: cargo xt ci workflow semver-summary --outcome '${{ steps.semver.outcome }}'
       - name: Upload the full semver-checks log
         if: always()
         uses: actions/upload-artifact@v7

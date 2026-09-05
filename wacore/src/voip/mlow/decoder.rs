@@ -995,7 +995,7 @@ mod tests {
             pcm_bytes,
             frames.len() * 6 * SMPL_INTF_LEN * 2,
             "reference PCM does not match the frame count; regenerate both halves together with \
-             scripts/regenerate-mlow-vectors.sh"
+             cargo xt mlow c-reference"
         );
     }
 

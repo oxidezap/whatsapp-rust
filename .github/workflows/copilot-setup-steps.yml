@@ -22,7 +22,7 @@ jobs:
     services:
       mock-server:
         # Generated from .github/bartender-image.txt by
-        # scripts/ci/sync-bartender-image.sh.
+        # cargo xt ci sync-bartender-image.
         image: ghcr.io/whiskeysockets-devtools/bartender@sha256:9f3a49dd9f944414fbda50571bba5f66f2ab6fdc48001e6803d4c09a1042c78e
         credentials:
           username: ${{ github.actor }}
@@ -57,17 +57,7 @@ jobs:
         run: cargo fetch
 
       - name: Wait for mock server
-        run: |
-          for i in $(seq 1 30); do
-            if curl -sk https://localhost:8080/ > /dev/null 2>&1; then
-              echo "Mock server is ready"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "Mock server failed to become ready"
-          exit 1
-
+        run: cargo xt ci workflow wait-for-mock
       - name: Export mock server URL
         run: |
           echo "MOCK_SERVER_URL=wss://127.0.0.1:8080/ws/chat" >> "$GITHUB_ENV"

@@ -130,6 +130,7 @@ skip = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# crates.io only. Nothing in this workspace is vendored from a git remote, and
-# a new git source should be an explicit decision rather than a silent one.
+# Host-only shared tooling is pinned by full commit in Cargo.toml. Runtime
+# dependencies still come from crates.io; other Git sources remain denied.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/oxidezap/unwasm.git"]

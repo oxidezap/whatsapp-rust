@@ -58,3 +58,27 @@ No implementation, derivation, packaging or first-CI item from the requested
 scope remains open. The linked runs validate the implementation; subsequent
 documentation receipts and the stronger PCM length assertion are kept in the
 same branch and checked by its workflow.
+
+## Migração cargo xt — 2026-09-05
+
+Os 13 scripts Python/Bash foram substituídos por tarefas Rust, com os
+consumidores/workflows atualizados e utilitários compartilhados com unwasm.
+A equivalência dos hashes e das regras de CI foi verificada sem alterar os
+valores esperados dos fixtures.
+
+### Progresso da migração Rust
+
+- Os 13 arquivos Python/Bash próprios foram substituídos por cargo xt.
+- Workflows chamam tarefas Rust; decisões de features, gates, release,
+  relatórios, espera do mock e instalação de símbolos também estão em Rust.
+- Metadados de features, os três descritores/sidecars e os relatórios de
+  tamanho foram comparados byte a byte com os scripts antigos e coincidiram.
+- Auditores C e todos os artefatos wasm passaram nas verificações nativas.
+- A guarda de biblioteca C desatualizada foi preservada; a referência foi
+  reconstruída para validar também o caminho de geração.
+- `xtask-support` e o oráculo usam o commit Git
+  `6043ff49a2e37667a9a7d65ff2bcc5ea9d140c00`; nenhuma dependência local resta.
+- 131/131 testes MLOW passaram; cargo-deny e actionlint passaram.
+- Os cinco testes das tarefas e clippy do workspace inteiro com warnings
+  negados passaram. A verificação dos fixtures passou novamente com o pin final.
+- A confirmação remota será registrada após a publicação desta migração.

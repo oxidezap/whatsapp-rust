@@ -73,18 +73,7 @@ jobs:
       # compile there, so nothing but this check keeps them from creeping back into
       # the store once the shim exists.
       - name: Guard sqlite-storage's platform shim
-        run: |
-          # Two shapes, because an import renames the call site: the qualified call,
-          # and any `use` that could bring either name into scope unqualified.
-          if grep -rnE --include='*.rs' \
-              -e 'tokio::task::spawn_blocking' \
-              -e 'r2d2::Pool' \
-              -e '^[[:space:]]*use .*tokio::task' \
-              -e '^[[:space:]]*use .*r2d2::\{[^}]*Pool' \
-              storages/sqlite-storage/src | grep -v '^storages/sqlite-storage/src/pool.rs:'; then
-            echo "::error::use crate::pool (spawn_blocking / Pool) instead; only pool.rs may name the native ones"
-            exit 1
-          fi
+        run: cargo xt ci workflow guard-sqlite-shim
       # The sans-IO VoIP core (wacore::voip: the CallEngine, the portable run_call driver,
       # the RelayTransport seam, the MLow codec, SRTP/SFrame crypto) must stay wasm-buildable
       # so a browser front end can drive 1:1 calls.

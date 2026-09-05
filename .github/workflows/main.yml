@@ -43,12 +43,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Check Bartender image pins
-        run: scripts/ci/sync-bartender-image.sh --check
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
           components: rustfmt
+      - name: Check Bartender image pins
+        env:
+          RUSTC_WRAPPER: ""
+        run: cargo xt ci sync-bartender-image --check
       - run: cargo fmt --all -- --check
 
   generated:
@@ -156,7 +158,7 @@ jobs:
         env:
           NEXTEST_PROFILE: ci
           TEST_TIMINGS_DIR: ${{ runner.temp }}/test-timings
-        run: scripts/ci/nextest_timed.sh workspace --workspace --exclude e2e-tests
+        run: cargo xt ci nextest-timed workspace -- --workspace --exclude e2e-tests
       - name: Publish test timings
         if: always()
         uses: actions/upload-artifact@v7
@@ -207,18 +209,7 @@ jobs:
         env:
           NEXTEST_PROFILE: ci
           TEST_TIMINGS_DIR: ${{ runner.temp }}/test-timings
-        run: |
-          # Both representations run whichever one fails, and the job exits with
-          # the first failure rather than the last.
-          status=0
-          for feature in serde-enum-repr serde-snake-case; do
-            echo "::group::$feature"
-            rc=0
-            scripts/ci/nextest_timed.sh "$feature" -p waproto --features "$feature" || rc=$?
-            if [ "$status" -eq 0 ]; then status="$rc"; fi
-            echo "::endgroup::"
-          done
-          exit "$status"
+        run: cargo xt ci test-waproto-features
       - name: Publish test timings
         if: always()
         uses: actions/upload-artifact@v7
@@ -268,7 +259,7 @@ jobs:
       - name: Clippy (all features)
         run: cargo clippy --workspace --exclude e2e-tests --all-features --all-targets -- -D warnings
       # There is no `cargo test --all-features` because a few features cannot
-      # share a build with the rest. `scripts/ci/test_features.sh` derives the
+      # share a build with the rest. `cargo xt ci test-features` derives the
       # set that can from cargo metadata and carries the exclusions with their
       # reasons, so a feature added tomorrow is tested without editing CI.
       # Compiling a test is not running it: the two `--all-features` steps above
@@ -279,20 +270,7 @@ jobs:
         env:
           NEXTEST_PROFILE: ci
           TEST_TIMINGS_DIR: ${{ runner.temp }}/test-timings
-        run: |
-          # Every package runs whichever one fails, and the job exits with the
-          # first failure rather than the last.
-          status=0
-          for package in wacore wacore-libsignal whatsapp-rust; do
-            features="$(./scripts/ci/test_features.sh "$package")"
-            echo "::group::$package [$features]"
-            rc=0
-            scripts/ci/nextest_timed.sh "$package" \
-              -p "$package" --features "$features" --lib --tests || rc=$?
-            if [ "$status" -eq 0 ]; then status="$rc"; fi
-            echo "::endgroup::"
-          done
-          exit "$status"
+        run: cargo xt ci test-feature-packages wacore wacore-libsignal whatsapp-rust
       - name: Publish test timings
         if: always()
         uses: actions/upload-artifact@v7
@@ -345,15 +323,18 @@ jobs:
   feature-matrix-crates:
     name: Feature Matrix (crates)
     runs-on: ubuntu-latest
-    # `cargo metadata` reads manifests; it runs no build script, so this needs
-    # neither protoc nor a compiled workspace and costs about as long as the
-    # checkout.
+    env:
+      RUSTC_WRAPPER: ""
+    # The host-only task derives publishable crates from cargo metadata.
     outputs:
       crates: ${{ steps.crates.outputs.crates }}
     steps:
       - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
       - id: crates
-        run: echo "crates=$(scripts/ci/feature_matrix_crates.sh)" >> "$GITHUB_OUTPUT"
+        run: cargo xt ci feature-matrix-crates --github-output
 
   feature-matrix:
     name: Feature Matrix (${{ matrix.crate }})
@@ -468,11 +449,11 @@ jobs:
       # so run two in a job and the second overwrites the first. This is the only
       # place these crates are measured at the MSRV toolchain.
       - name: Test wacore-binary (stable)
-        run: scripts/ci/nextest_timed.sh wacore-binary -p wacore-binary --lib
+        run: cargo xt ci nextest-timed wacore-binary -- -p wacore-binary --lib
       - name: Test wacore-appstate (stable)
-        run: scripts/ci/nextest_timed.sh wacore-appstate -p wacore-appstate --lib
+        run: cargo xt ci nextest-timed wacore-appstate -- -p wacore-appstate --lib
       - name: Test wacore (stable)
-        run: scripts/ci/nextest_timed.sh wacore -p wacore --lib
+        run: cargo xt ci nextest-timed wacore -- -p wacore --lib
       # `rust-version` is published metadata for every member, but only the
       # three crates above are exercised at that toolchain. This compiles the
       # rest of the publishable set so the declared floor is a checked promise

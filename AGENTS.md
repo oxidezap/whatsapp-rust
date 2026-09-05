@@ -11,6 +11,13 @@ Ground truth for protocol behavior is WhatsApp Web itself: query the structured 
 - **whatsapp-rust** — Tokio runtime, SQLite persistence (Diesel), high-level API.
 - **whatspec-codegen** (`tools/`) — build tooling, never published and outside `default-members`. Regenerates every whatspec-derived file in one pass from a pinned IR commit. Nothing links it.
 
+## Repository tasks
+
+Use `cargo xt --help` for descriptors, MLOW oracles and CI maintenance.
+First-party task logic is Rust under `tools/xtask`, outside default-members;
+`xtask-support` is pinned from unwasm and shared with whatspec-codegen.
+Do not add Python/Bash task implementations or runtime dependencies on these tools.
+
 ## Build & verify
 
 ```bash
