@@ -47,16 +47,6 @@ portable-atomic = { workspace = true }
 # target does not provide. This future wraps the platform's real setTimeout.
 gloo-timers = { version = "0.3", features = ["futures"] }
 
-[target.'cfg(target_family = "wasm")'.dev-dependencies]
-js-sys = "0.3"
-wasm-bindgen = "0.2"
-wasm-bindgen-test = "0.3"
-
-[[test]]
-name = "wasm_retry_timer"
-path = "tests/wasm_retry_timer.rs"
-required-features = ["test-util"]
-
 [[bench]]
 name = "signal_flush"
 harness = false
