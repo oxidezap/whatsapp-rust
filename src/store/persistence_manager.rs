@@ -389,8 +389,8 @@ mod tests {
         pm.process_command(DeviceCommand::SetPushName("after".into()))
             .await;
 
-        // Hold only the guard, without mutating Device, to stop the flush after
-        // its dirty swap but before it can capture or persist the new snapshot.
+        // Block snapshot acquisition without mutating Device; cancellation
+        // must not consume the dirty state while waiting for this guard.
         let guard = pm.device.write().await;
         let mut flush = Box::pin(pm.flush());
         assert!(futures::poll!(flush.as_mut()).is_pending());
