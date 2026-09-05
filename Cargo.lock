@@ -4236,6 +4236,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac 0.13.0",
+ "http",
  "itoa",
  "libc",
  "log",

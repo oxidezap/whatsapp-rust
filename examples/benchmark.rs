@@ -16,20 +16,28 @@ use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
 /// Derive the mock-server admin scan-qr endpoint from a `ws[s]://host:port/...`
-/// WebSocket URL. Same host/port, scheme `ws`→`http` / `wss`→`https`, path
-/// `/admin/mock-phone/scan-qr`. Mirrors `tests/e2e/src/lib.rs`. Returns `None`
-/// for URLs that don't match the ws scheme.
+/// WebSocket URL. Changes only the scheme (`ws`→`http` / `wss`→`https`) and the
+/// path (`/admin/mock-phone/scan-qr`); host, port and query carry over, and any
+/// fragment is dropped (fragments are never sent over HTTP). Mirrors
+/// `tests/e2e/src/lib.rs`. Returns `None` for URLs without a ws scheme or
+/// without an authority.
 fn mock_admin_scan_qr_url(ws_url: &str) -> Option<String> {
-    let http_scheme = if ws_url.starts_with("wss://") {
-        "https://"
-    } else if ws_url.starts_with("ws://") {
-        "http://"
-    } else {
-        return None;
+    // Fragments are client-side only and never reach the wire; strip one up
+    // front so the parser below sees only what an HTTP request would carry.
+    let ws_url = ws_url.split('#').next()?;
+    let uri: http::Uri = ws_url.parse().ok()?;
+    let http_scheme = match uri.scheme_str() {
+        Some("ws") => "http",
+        Some("wss") => "https",
+        _ => return None,
     };
-    let after_scheme = ws_url.split("://").nth(1)?;
-    let host_port = after_scheme.split('/').next()?;
-    Some(format!("{http_scheme}{host_port}/admin/mock-phone/scan-qr"))
+    let authority = uri.authority()?;
+    let mut admin = format!("{http_scheme}://{authority}/admin/mock-phone/scan-qr");
+    if let Some(query) = uri.query() {
+        admin.push('?');
+        admin.push_str(query);
+    }
+    Some(admin)
 }
 
 /// Endpoint + Noise policy selection for this example.
@@ -118,10 +126,8 @@ fn main() {
         .expect("Failed to build tokio runtime");
 
     rt.block_on(async {
-        // Mock mode is explicit: MOCK_SERVER_URL only counts when
-        // WHATSAPP_WS_URL is unset. Build with
-        // `--features danger-skip-tls-verify` for the mock's self-signed TLS;
-        // the Noise bypass below is still per-client and mock-only.
+        // `--features danger-skip-tls-verify` is needed only to talk to the
+        // mock's own-root TLS chain.
         let endpoint = resolve_benchmark_endpoint_from_env();
         if endpoint.is_mock {
             info!("Mock mode: Noise cert bypass scoped to this client");
@@ -169,9 +175,7 @@ fn main() {
                             Event::PairingQrCode(qr) => {
                                 let code = &qr.code;
                                 // Mirrors tests/e2e/src/lib.rs::spawn_qr_autoresponder_http.
-                                // Auto-pair only in explicit mock mode (MOCK_SERVER_URL
-                                // without WHATSAPP_WS_URL); production and custom URLs
-                                // fall back to manual scan via the printed code below.
+                                // Set only in mock mode; otherwise manual scan below.
                                 if let Some(url) = admin_scan_url.as_ref() {
                                     let http = UreqHttpClient::new();
                                     let req = HttpRequest {
@@ -299,6 +303,37 @@ mod tests {
             mock_admin_scan_qr_url("ws://127.0.0.1:8080/ws/chat").as_deref(),
             Some("http://127.0.0.1:8080/admin/mock-phone/scan-qr")
         );
-        assert!(mock_admin_scan_qr_url("https://127.0.0.1:8080/ws/chat").is_none());
+        for non_ws in [
+            "https://127.0.0.1:8080/ws/chat",
+            "http://127.0.0.1:8080/ws/chat",
+            "ftp://127.0.0.1:8080/ws/chat",
+            "not a url",
+            "wss://",
+        ] {
+            assert!(
+                mock_admin_scan_qr_url(non_ws).is_none(),
+                "{non_ws:?} must not yield an admin URL"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_url_preserves_query_and_drops_fragment() {
+        assert_eq!(
+            mock_admin_scan_qr_url("wss://127.0.0.1:8080?session=1").as_deref(),
+            Some("https://127.0.0.1:8080/admin/mock-phone/scan-qr?session=1")
+        );
+        assert_eq!(
+            mock_admin_scan_qr_url("wss://127.0.0.1:8080/ws/chat#frag").as_deref(),
+            Some("https://127.0.0.1:8080/admin/mock-phone/scan-qr")
+        );
+    }
+
+    #[test]
+    fn admin_url_handles_ipv6_authority() {
+        assert_eq!(
+            mock_admin_scan_qr_url("wss://[::1]:8080/ws/chat").as_deref(),
+            Some("https://[::1]:8080/admin/mock-phone/scan-qr")
+        );
     }
 }
