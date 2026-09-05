@@ -2137,7 +2137,8 @@ impl SignalStoreCache {
     ///
     /// Session entry counts include negative (`Absent`) and checked-out slots
     /// — they occupy the map. Byte totals include the key length for every
-    /// slot, but the estimated record payload only for `Present` entries.
+    /// slot; record payloads cover `Present` entries and retained immutable
+    /// lease snapshots in checked-out slots.
     ///
     /// Structural allocations are charged too, through
     /// [`crate::stats::hash_table_bytes`]: each cache's own tables (see
