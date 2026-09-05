@@ -6,9 +6,8 @@ Stanza builders and parsers live in `wacore/src/iq/`. Read this before adding a 
 
 - `ProtocolNode` (`wacore/src/protocol/mod.rs`) maps a struct to a node. The
   trait supports attributes and children; the `ProtocolNode` derive currently
-  generates attribute-only implementations. Nodes with children use explicit
-  implementations so their presence, repetition, ordering, duplicate policy,
-  and parse errors remain visible in the implementation.
+  generates attribute-only implementations. Child-bearing nodes use explicit
+  implementations.
 - `IqSpec` (`wacore/src/iq/spec.rs`) pairs a request with its typed response.
 
 Both carry doc comments on every method; read the source rather than a copy here.
@@ -27,7 +26,7 @@ Non-obvious parts:
 | Derive | For |
 | --- | --- |
 | `EmptyNode` | Nodes that are only a tag |
-| `ProtocolNode` | Nodes with attributes and children; derive support is currently attribute-only |
+| `ProtocolNode` | Struct attributes (attribute-only derive) |
 | `WireEnum` | Every protocol enum |
 
 `StringEnum` is **not** a derive — it is an internal attribute kind inside the `ProtocolNode` derive. Protocol enums use `WireEnum`.
