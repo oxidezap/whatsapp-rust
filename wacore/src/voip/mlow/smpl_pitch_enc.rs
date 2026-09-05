@@ -380,50 +380,55 @@ fn get_maxi_k(x: &[f32], k: usize) -> Vec<usize> {
 /// Running energy of `lag_subfrlen`-length windows ending just before lag `minpitch`, for each of
 /// `numlags` lags. `t` is the window-start anchor in `ltpbuf`.
 fn calc_e1_inner(
-    e1: &mut [f32],
     ltpbuf: &[f32],
     t: usize,
     minpitch: i32,
     maxpitch: i32,
     lag_subfrlen: usize,
-) {
+) -> Vec<f32> {
     let numlags = (maxpitch - minpitch + 1) as usize;
     let base = (t as i32 - minpitch) as usize; // &ltpbuf[t - minpitch]
     let reg = &ltpbuf[base - (numlags - 1)..]; // reg[-i] for i in 0..numlags valid
     // reg points at ltpbuf[t - minpitch]; we index reg[0], reg[-i], reg[lag_subfrlen - i].
     let reg0 = base; // absolute index of reg[0]
-    e1[0] = smpl_nrg(&ltpbuf[reg0..reg0 + lag_subfrlen]).max(1e-9);
+    // Every element is written exactly once, in order, so the buffer is filled as it is built
+    // rather than allocated zeroed and overwritten.
+    let mut e1 = Vec::with_capacity(numlags);
+    e1.push(smpl_nrg(&ltpbuf[reg0..reg0 + lag_subfrlen]).max(1e-9));
     for i in 1..numlags {
         let rm = ltpbuf[reg0 - i];
         let rs = ltpbuf[reg0 + lag_subfrlen - i];
-        e1[i] = (e1[i - 1] + rm * rm - rs * rs).max(1e-9);
+        e1.push((e1[i - 1] + rm * rm - rs * rs).max(1e-9));
     }
     let _ = reg;
+    e1
 }
 
-/// Per-subframe E1 by computing an extended E1_ once then offsetting per subframe.
+/// Per-subframe E1 by computing an extended E1_ once then offsetting per subframe. Returns the
+/// `numlags * numsubfrs` row-major block, built by copying each subframe's window out of the
+/// extended row (again: fully written, so never zeroed first).
 fn calc_e1(
-    e1: &mut [f32],
     ltpbuf: &[f32],
     ltpbuf_len: usize,
     numsubfrs: usize,
     minpitch: i32,
     maxpitch: i32,
     lag_subfrlen: usize,
-) {
+) -> Vec<f32> {
     let numlags = (maxpitch - minpitch + 1) as usize;
     let maxpitch_ = maxpitch + (numsubfrs as i32 - 1) * lag_subfrlen as i32;
     let numlags_ = (maxpitch_ - minpitch + 1) as usize;
     let t = ltpbuf_len - lag_subfrlen;
-    let mut e1_ext = vec![0.0f32; numlags_];
-    calc_e1_inner(&mut e1_ext, ltpbuf, t, minpitch, maxpitch_, lag_subfrlen);
-    let mut offset = (numlags_ - numlags) as isize;
-    for sf in 0..numsubfrs {
-        for i in 0..numlags {
-            e1[sf * numlags + i] = e1_ext[(offset + i as isize) as usize];
-        }
-        offset -= lag_subfrlen as isize;
+    let e1_ext = calc_e1_inner(ltpbuf, t, minpitch, maxpitch_, lag_subfrlen);
+    let mut e1 = Vec::with_capacity(numlags * numsubfrs);
+    // Subframe `sf` reads the extended row shifted back by `sf` lag subframes; the last one lands
+    // exactly on index 0, so the window never runs off the front.
+    let mut offset = numlags_ - numlags;
+    for _ in 0..numsubfrs {
+        e1.extend_from_slice(&e1_ext[offset..offset + numlags]);
+        offset = offset.saturating_sub(lag_subfrlen);
     }
+    e1
 }
 
 fn dot_prod(a: &[f32], b: &[f32], n: usize) -> f32 {
@@ -475,6 +480,23 @@ fn upsamp_c_fast(buf: &mut [f32], numsubfrs: usize, minpitch: &mut i32, numlags:
     }
     *numlags = nout;
     *minpitch *= 2;
+}
+
+/// Longest segment the blockseg table can encode (`uniform(4) + 1`).
+const MAX_SEGLEN: usize = 4;
+/// One memo slot per (start subframe, segment length, block) triple.
+const LAGIND_CACHE_LEN: usize = NUM_SUBFRAMES * MAX_SEGLEN * PITCH_NUM_BLOCKS;
+
+/// Dense slot for the fine-search argmax memo, or `None` for a triple outside the table's declared
+/// ranges -- which the shipped ROM never produces, and which then simply goes unmemoized rather
+/// than indexing out of bounds.
+#[inline]
+fn lagind_cache_slot(start_sf: usize, seglen: usize, block: usize) -> Option<usize> {
+    if start_sf >= NUM_SUBFRAMES || seglen == 0 || seglen > MAX_SEGLEN || block >= PITCH_NUM_BLOCKS
+    {
+        return None;
+    }
+    Some((start_sf * MAX_SEGLEN + (seglen - 1)) * PITCH_NUM_BLOCKS + block)
 }
 
 fn dot_prod_40(a: &[f32], b: &[f32]) -> f32 {
@@ -773,9 +795,7 @@ fn pitch_with_search(
     let stage1_len = pitch_downsample(&stage1, l + offset, &mut stage1_ds);
 
     let numlags0 = NUM_LAGS_STAGE1;
-    let mut e1 = vec![0.0f32; numlags0 * numsubfrs + 16];
-    calc_e1(
-        &mut e1,
+    let e1 = calc_e1(
         &stage1_ds,
         stage1_len,
         numsubfrs,
@@ -788,9 +808,16 @@ fn pitch_with_search(
     let cap = (2 * FS_KHZ / STAGE1_FS_KHZ) as usize * NUM_LAGS_STAGE1 * numsubfrs + 64;
     let mut c = vec![0.0f32; cap];
     let mut e = vec![0.0f32; cap];
-    let mut c_stage1 = vec![0.0f32; numlags0 * numsubfrs];
-    calc_c_e2(&mut c_stage1, &mut e2, &stage1_ds, stage1_len, numsubfrs);
-    c[..numlags0 * numsubfrs].copy_from_slice(&c_stage1);
+    // Stage-1 C is written straight into the head of `c`, which is exactly where the upsample
+    // stages expand it from: a separate stage-1 buffer would be one more zeroed allocation and one
+    // more full copy per call, for the same bytes.
+    calc_c_e2(
+        &mut c[..numlags0 * numsubfrs],
+        &mut e2,
+        &stage1_ds,
+        stage1_len,
+        numsubfrs,
+    );
 
     // E from sqrt-energy blend (stage 1).
     let numlags = numlags0;
@@ -820,22 +847,15 @@ fn pitch_with_search(
     let offset_c0 = (minpitch_coarse - minpitch_c) as usize;
     let offset_e0 = (minpitch_coarse - minpitch_e) as usize;
 
-    // H (coarse) and coarse copies.
+    // H (coarse). The coarse snapshots of C, E and H that used to be built alongside it were never
+    // read again -- the search below works off `h` and the full-resolution C/E -- so they are not
+    // materialized: three zeroed allocations and three full copies per call, for nothing.
     let mut h = vec![0.0f32; numlags_coarse * numsubfrs * 2 + 64];
-    let mut h_coarse = vec![0.0f32; numlags_coarse * numsubfrs];
-    let mut c_coarse = vec![0.0f32; numlags_coarse * numsubfrs];
-    let mut e_coarse = vec![0.0f32; numlags_coarse * numsubfrs];
     for sf in 0..numsubfrs {
         for i in 0..numlags_coarse {
             let cv = c[sf * numlags_c + offset_c0 + i];
             let ev = e[sf * numlags_e + offset_e0 + i];
             h[sf * numlags_coarse + i] = cv / ev;
-        }
-        h_coarse[sf * numlags_coarse..(sf + 1) * numlags_coarse]
-            .copy_from_slice(&h[sf * numlags_coarse..sf * numlags_coarse + numlags_coarse]);
-        for i in 0..numlags_coarse {
-            c_coarse[sf * numlags_coarse + i] = c[sf * numlags_c + offset_c0 + i];
-            e_coarse[sf * numlags_coarse + i] = e[sf * numlags_e + offset_e0 + i];
         }
     }
 
@@ -878,9 +898,7 @@ fn pitch_with_search(
     let track_idx = get_maxi_k(&utils, search.survivors);
 
     // Recompute full-res E1 over the HP signal.
-    let mut e1_fs = vec![0.0f32; numlags_e * numsubfrs + 16];
-    calc_e1(
-        &mut e1_fs,
+    let e1_fs = calc_e1(
         ltp_buf_hp,
         l - look,
         numsubfrs,
@@ -982,10 +1000,15 @@ fn pitch_with_search(
     }
 
     // Fine search: per survivor, per blockseg, per block: combine H over the seg's subframes, argmax.
-    let mut laginds_surv: Vec<[i32; NUM_SUBFRAMES]> = Vec::new();
-    let mut blocksegs_ix_list: Vec<usize> = Vec::new();
+    let survivor_hint = track_idx.len() * 2;
+    let mut laginds_surv: Vec<[i32; NUM_SUBFRAMES]> = Vec::with_capacity(survivor_hint);
+    let mut blocksegs_ix_list: Vec<usize> = Vec::with_capacity(survivor_hint);
     let mut h_comb = [0.0f32; 2 * PITCHBLOCK];
-    let mut lagind_cache: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+    // The memo key is (start subframe, segment length, block), each of them bounded by the table
+    // format: a dense array indexed by that triple replaces a `HashMap` whose hashing and rehashing
+    // cost more than the argmax it memoizes -- and whose `RandomState` made the cost vary per
+    // process.
+    let mut lagind_cache = [-1i32; LAGIND_CACHE_LEN];
     for &idx in &track_idx {
         let range = tab.blocksegs_ix[idx];
         for j in 0..range[1] {
@@ -994,9 +1017,9 @@ fn pitch_with_search(
             let mut laginds_row = [0i32; NUM_SUBFRAMES];
             let mut start_sf = 0usize;
             for n in 0..pblockseg.nblocks {
-                let lookup_key = (((start_sf as i32) << 3) + pblockseg.seglens[n] as i32) << 4
-                    | pblockseg.blocks[n] as i32;
-                let best_i = if let Some(&v) = lagind_cache.get(&lookup_key) {
+                let slot = lagind_cache_slot(start_sf, pblockseg.seglens[n], pblockseg.blocks[n]);
+                let cached = slot.map(|s| lagind_cache[s]).filter(|&v| v >= 0);
+                let best_i = if let Some(v) = cached {
                     v
                 } else {
                     for v in h_comb.iter_mut() {
@@ -1010,7 +1033,9 @@ fn pitch_with_search(
                         }
                     }
                     let bi = get_maxi(&h_comb) as i32;
-                    lagind_cache.insert(lookup_key, bi);
+                    if let Some(s) = slot {
+                        lagind_cache[s] = bi;
+                    }
                     bi
                 };
                 for sf in start_sf..start_sf + pblockseg.seglens[n] {
