@@ -17,6 +17,13 @@ use crate::store::traits::SignalStore;
 
 type StoreIncarnation = [u8; 16];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrekeyProbe {
+    Needed,
+    Durable,
+    Deferred,
+}
+
 // A weak version prevents allocation-address reuse without making ordinary
 // checkouts clone their records while the serialized snapshot is in I/O.
 fn same_flush_version<T: ?Sized>(record: &Arc<T>, version: &Weak<T>) -> bool {
@@ -76,9 +83,9 @@ impl EvictionCandidates {
 /// Negative entries (None values) are evicted first.
 ///
 /// Amortized: the O(n) scan only runs once the map crosses the high watermark
-/// (`max_entries + slack`), then it trims back down to `max_entries`. Steady
-/// state over capacity therefore costs O(1) per call because a fresh scan needs
-/// `slack` more growth inserts before it can fire again. Call it from every path
+/// (`max_entries + slack`), then it trims to `max_entries` when enough entries
+/// are clean. Successful trimming amortizes the scan over `slack` more growth
+/// inserts. Call it from every path
 /// that grows the map, including read-populate (cache-miss) inserts, so the cache
 /// stays bounded even under unique-key read floods; the early-out keeps it cheap.
 fn evict_clean_entries<V>(
@@ -585,6 +592,27 @@ impl SessionStoreState {
         match self.cache.get_key_value(address) {
             Some((existing, _)) => existing.clone(),
             None => Arc::from(address),
+        }
+    }
+
+    fn prekey_probe(
+        &self,
+        removed: &HashMap<u32, Arc<str>>,
+        id: u32,
+        address: &Arc<str>,
+    ) -> PrekeyProbe {
+        if !removed
+            .get(&id)
+            .is_some_and(|current| Arc::ptr_eq(current, address))
+            || self.dirty.contains(address.as_ref())
+            || self.deleted.contains(address.as_ref())
+        {
+            return PrekeyProbe::Deferred;
+        }
+        match self.cache.get(address.as_ref()) {
+            Some(SessionEntry::Present(_)) => PrekeyProbe::Durable,
+            Some(SessionEntry::CheckedOut { .. }) => PrekeyProbe::Deferred,
+            Some(SessionEntry::Absent) | None => PrekeyProbe::Needed,
         }
     }
 
@@ -1848,7 +1876,7 @@ impl SignalStoreCache {
     }
 
     async fn flush_sessions(&self, backend: &dyn SignalStore) -> Result<()> {
-        let (batch, versions, deleted, prekeys) = {
+        let (batch, versions, deleted, mut prekeys) = {
             let state = self.lock_sessions().await;
             let mut batch = Vec::with_capacity(state.dirty.len());
             let mut versions = Vec::with_capacity(state.dirty.len());
@@ -1870,7 +1898,7 @@ impl SignalStoreCache {
             let removed = self.removed_prekeys.lock().await;
             let prekeys = removed
                 .iter()
-                .map(|(&id, address)| (id, address.clone()))
+                .map(|(&id, address)| (id, address.clone(), PrekeyProbe::Needed))
                 .collect::<Vec<_>>();
             (
                 batch,
@@ -1919,6 +1947,32 @@ impl SignalStoreCache {
         if prekeys.is_empty() {
             return Ok(());
         }
+        let incarnation = {
+            let state = self.lock_sessions().await;
+            let removed = self.removed_prekeys.lock().await;
+            for (id, address, probe) in &mut prekeys {
+                *probe = state.prekey_probe(&removed, *id, address);
+            }
+            state.incarnation
+        };
+        // Read-only probes can release both locks. The outer flush gate keeps
+        // backend writes ordered; the destructive phase rechecks live cache
+        // state and consumption identity before trusting a probe result.
+        for (_, address, probe) in &mut prekeys {
+            if *probe == PrekeyProbe::Needed {
+                let durable = backend
+                    .get_session(address.as_ref())
+                    .await?
+                    .as_deref()
+                    .and_then(|bytes| Self::decode_stored_session(address, bytes, &incarnation))
+                    .is_some();
+                *probe = if durable {
+                    PrekeyProbe::Durable
+                } else {
+                    PrekeyProbe::Deferred
+                };
+            }
+        }
         // Private-key deletion is irreversible: a new checkout could consume
         // the same key before its newer session becomes durable. Exclude that
         // window, including the gap between session return and consumption
@@ -1927,26 +1981,11 @@ impl SignalStoreCache {
         let state = self.lock_sessions().await;
         let mut removed = self.removed_prekeys.lock().await;
         let mut deletable = Vec::new();
-        for (id, address) in prekeys {
-            if !removed
-                .get(&id)
-                .is_some_and(|current| Arc::ptr_eq(current, &address))
-                || state.dirty.contains(address.as_ref())
-                || state.deleted.contains(address.as_ref())
-            {
-                continue;
-            }
-            let durable = match state.cache.get(address.as_ref()) {
-                Some(SessionEntry::Present(_)) => true,
-                Some(SessionEntry::CheckedOut { .. }) => false,
-                Some(SessionEntry::Absent) | None => backend
-                    .get_session(&address)
-                    .await?
-                    .as_deref()
-                    .and_then(|bytes| {
-                        Self::decode_stored_session(&address, bytes, &state.incarnation)
-                    })
-                    .is_some(),
+        for (id, address, probe) in prekeys {
+            let durable = match state.prekey_probe(&removed, id, &address) {
+                PrekeyProbe::Durable => true,
+                PrekeyProbe::Deferred => false,
+                PrekeyProbe::Needed => probe == PrekeyProbe::Durable,
             };
             if durable {
                 deletable.push(id);
@@ -6590,6 +6629,7 @@ mod flush_contention_reproduction_tests {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum FlushTarget {
         Sessions,
+        SessionReads,
         Identities,
         SenderKeys,
         SessionDeletes,
@@ -6670,6 +6710,7 @@ mod flush_contention_reproduction_tests {
             &self,
             address: &str,
         ) -> crate::store::error::Result<Option<bytes::Bytes>> {
+            self.gate(FlushTarget::SessionReads).await;
             self.inner.get_session(address).await
         }
 
@@ -6791,6 +6832,92 @@ mod flush_contention_reproduction_tests {
 
         async fn delete_sender_key(&self, address: &str) -> crate::store::error::Result<()> {
             self.inner.delete_sender_key(address).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_prekey_probes_allow_progress_and_revalidate_before_deletion() {
+        #[derive(Clone, Copy, Debug)]
+        enum Race {
+            None,
+            Checkout,
+            Write,
+            Delete,
+            Reconsume,
+        }
+
+        for race in [
+            Race::None,
+            Race::Checkout,
+            Race::Write,
+            Race::Delete,
+            Race::Reconsume,
+        ] {
+            let (entered_tx, entered_rx) = async_channel::bounded(1);
+            let (release_tx, release_rx) = async_channel::bounded(1);
+            let mut backend = ContentionGatedBackend::new(entered_tx, release_rx);
+            backend.target = FlushTarget::SessionReads;
+            let cache = SignalStoreCache::new();
+            let address = signal_address("cold-probe-owner");
+            let incarnation = cache.lock_sessions().await.incarnation;
+            let mut raw = Vec::new();
+            session_at_index(20).serialize_into_for_store(&mut raw, &incarnation);
+            backend
+                .inner
+                .put_session(address.as_str(), &raw)
+                .await
+                .unwrap();
+            backend
+                .inner
+                .store_prekey(9301, b"key", false)
+                .await
+                .unwrap();
+            cache.remove_prekey(9301, address.as_str()).await;
+            backend.enable_gating();
+            let mut flush = Box::pin(cache.flush(&backend));
+            assert!(futures::poll!(flush.as_mut()).is_pending());
+            entered_rx.try_recv().unwrap();
+            backend.gating_enabled.store(false, Ordering::Release);
+            let mut owner = None;
+            match race {
+                Race::None => {}
+                Race::Checkout => {
+                    let mut checkout = Box::pin(cache.checkout_session(&address, &backend));
+                    let Poll::Ready(Ok((record, token))) = futures::poll!(checkout.as_mut()) else {
+                        panic!("readonly durability probe blocked session checkout");
+                    };
+                    owner = Some((record.unwrap(), token));
+                }
+                Race::Write => assert!(
+                    cache
+                        .try_put_session(&address, session_at_index(21))
+                        .is_ok()
+                ),
+                Race::Delete => {
+                    let mut delete = Box::pin(cache.delete_session(&address));
+                    assert!(futures::poll!(delete.as_mut()).is_ready());
+                }
+                Race::Reconsume => {
+                    let mut reconsume = Box::pin(cache.remove_prekey(9301, address.as_str()));
+                    assert!(futures::poll!(reconsume.as_mut()).is_ready());
+                }
+            }
+            release_tx.try_send(()).unwrap();
+            flush.await.unwrap();
+            assert_eq!(
+                backend.inner.load_prekey(9301).await.unwrap().is_none(),
+                matches!(race, Race::None),
+                "{race:?}"
+            );
+            if let Some((record, token)) = owner {
+                cache.restore_session_from_checkout(&address, record, token, true);
+            }
+            cache.flush(&backend).await.unwrap();
+            assert_eq!(
+                backend.inner.load_prekey(9301).await.unwrap().is_some(),
+                matches!(race, Race::Delete),
+                "{race:?}"
+            );
         }
     }
 

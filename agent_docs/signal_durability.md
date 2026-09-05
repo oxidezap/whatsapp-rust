@@ -157,8 +157,13 @@ checked out. It retains both locks through the destructive I/O. An older durable
 snapshot alone is insufficient: the mutable owner could reconsume the same key,
 or return its promoted session just before buffering that consumption. Keeping
 only a newer buffer entry after destroying its private key cannot repair that
-loss. Missing cached rows still require a valid durable backend row. This rare
-verification/delete phase remains serialized; the frequent record writes do not.
+loss. Missing cached rows still require a valid durable backend row, but that
+read-only probe runs outside both data locks. After probing, the cache reacquires
+the locks and revalidates the consumption identity, dirty/deleted state and
+checkout status before deleting anything. Only the irreversible delete retains
+the exclusion through I/O. The race matrix in
+`cold_prekey_probes_allow_progress_and_revalidate_before_deletion` covers no
+mutation, checkout, replacement, deletion and reconsumption during a probe.
 
 An unpublished session lease must remain flushable while a subsequent operation
 checks its record out. Such a checkout retains an immutable `wire_snapshot` in
