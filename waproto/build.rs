@@ -115,7 +115,12 @@ fn main() -> std::io::Result<()> {
         // is its own inline slot) that makes size_of explode recursively,
         // turning decode and Vec growth into large struct memcpys. Box keeps
         // the structs pointer-sized.
+        //
+        // EXPERIMENT (jlucaso1/buffa#2): keep owned fields boxed, but store
+        // acyclic sub-views inline to drop the per-occurrence box on view
+        // decode. Owned layout untouched; views measured separately.
         .box_type(buffa_build::PointerRepr::Box)
+        .view_inline_fields(true)
         // Messages + oneofs: serde over the struct/oneof shape. Serialize always;
         // Deserialize only for the WASM bridge (halves serde codegen).
         .message_attribute(".", "#[derive(serde::Serialize)]")

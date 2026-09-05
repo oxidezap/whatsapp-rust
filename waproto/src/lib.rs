@@ -535,9 +535,10 @@ pub mod codec {
         whatsapp::HandshakeMessage::decode_from_slice(bytes)
     }
 
+    /// EXPERIMENT (jlucaso1/buffa#2): single-pass encode. Revert with the experiment.
     #[inline(never)]
     pub fn handshake_message_to_vec(msg: &whatsapp::HandshakeMessage) -> Vec<u8> {
-        msg.encode_to_vec()
+        msg.encode_to_vec_single_pass()
     }
 
     #[inline(never)]
@@ -617,9 +618,10 @@ pub mod codec {
     /// Secret-addon payloads (enc reactions, event responses, bot msmsg
     /// replies) and per-message sidecars; small trees, but wacore and the
     /// main crate each stamped private copies.
+    /// EXPERIMENT (jlucaso1/buffa#2): single-pass encode. Revert with the experiment.
     #[inline(never)]
     pub fn reaction_message_to_vec(msg: &whatsapp::message::ReactionMessage) -> Vec<u8> {
-        msg.encode_to_vec()
+        msg.encode_to_vec_single_pass()
     }
 
     #[inline(never)]
@@ -629,9 +631,10 @@ pub mod codec {
         whatsapp::message::ReactionMessage::decode_from_slice(bytes)
     }
 
+    /// EXPERIMENT (jlucaso1/buffa#2): single-pass encode. Revert with the experiment.
     #[inline(never)]
     pub fn event_response_message_to_vec(msg: &whatsapp::message::EventResponseMessage) -> Vec<u8> {
-        msg.encode_to_vec()
+        msg.encode_to_vec_single_pass()
     }
 
     #[inline(never)]
