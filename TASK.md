@@ -81,4 +81,11 @@ valores esperados dos fixtures.
 - 131/131 testes MLOW passaram; cargo-deny e actionlint passaram.
 - Os cinco testes das tarefas e clippy do workspace inteiro com warnings
   negados passaram. A verificação dos fixtures passou novamente com o pin final.
-- A confirmação remota será registrada após a publicação desta migração.
+- CI remoto concluído: [rederivação J/S, utilitários Rust, comparação de todos
+  os fixtures e 131 testes MLOW](https://github.com/oxidezap/whatsapp-rust/actions/runs/33945391416).
+- O CI do produtor também passou nas duas capturas:
+  [unwasm J/S](https://github.com/oxidezap/unwasm/actions/runs/33945252397).
+
+Migração encerrada nos commits `249c0250472e4431a203b9a8ad76a3331d8d56bf`
+(consumidor) e `6043ff49a2e37667a9a7d65ff2bcc5ea9d140c00`
+(pin compartilhado/produtor). Nenhum trabalho desta migração permanece aberto.
