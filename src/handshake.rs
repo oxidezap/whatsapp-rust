@@ -669,9 +669,6 @@ mod tests {
 
     #[tokio::test]
     async fn select_pattern_unmarked_cache_returns_xx() {
-        // Records predating signature provenance (including chains cached
-        // while a global bypass was enabled) cannot authorize IK, even when
-        // fresh and otherwise valid.
         let pm = paired_pm().await;
         let mut chain = cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000);
         chain.signature_verified = false;

@@ -23,7 +23,8 @@ pub const WA_CERT_PUB_KEY: [u8; 32] = [
 pub enum NoiseCertPolicy {
     /// Verify both XEdDSA signatures and reuse the trusted IK cache.
     Strict,
-    /// Testing-only opt-in for mock servers that cannot sign their chain.
+    /// Testing-only opt-in for mock servers that cannot produce a
+    /// WhatsApp-rooted chain.
     /// Skips the two XEdDSA signature checks and nothing else: framing,
     /// Noise crypto, structural checks and the leaf-to-static binding still
     /// run, and a chain accepted here is never read from or written to the
