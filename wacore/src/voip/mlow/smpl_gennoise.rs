@@ -652,13 +652,28 @@ mod tests {
     /// running our implementation must reproduce both bit-for-bit across voiced and unvoiced paths.
     #[test]
     fn gen_noise_matches_c() {
+        let recs: Value = crate::voip::mlow::fixture::decode(include_bytes!(
+            "testdata/gennoise_vectors.cbor.zst"
+        ))
+        .unwrap();
+        check_gennoise(recs);
+    }
+
+    #[test]
+    fn gen_noise_matches_shipped_wasm() {
+        let recs: Value =
+            crate::voip::mlow::fixture::decode(include_bytes!("testdata/wasm_gennoise.cbor.zst"))
+                .expect("wasm gennoise");
+        assert_eq!(recs.as_array().unwrap().len(), 1320);
+        check_gennoise(recs);
+    }
+
+    fn check_gennoise(recs: Value) {
         // fcbgains_uv[ix] = 10^(0.05*(ix-90)), ix in 0..=90.
         let fcbgains_uv: Vec<f32> = (0..=90)
             .map(|ix| 10.0f32.powf(0.05 * (ix as f32 - 90.0)))
             .collect();
 
-        let recs: Value =
-            serde_json::from_str(include_str!("testdata/gennoise_vectors.json")).unwrap();
         let arr = recs.as_array().unwrap();
         assert!(!arr.is_empty());
 

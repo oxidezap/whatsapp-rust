@@ -105,6 +105,9 @@ buffa-build = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+# Compact oracle fixtures; pure Rust, test-only, including on wasm targets.
+ciborium = "0.2.2"
+ruzstd = "0.8.3"
 divan = { workspace = true }
 # Compression only: the runtime inflates through `wacore_binary::zlib_pool`
 # (zlib-rs directly), so flate2 stays out of the release dependency set.

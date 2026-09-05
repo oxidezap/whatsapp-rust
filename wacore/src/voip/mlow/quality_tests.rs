@@ -589,7 +589,8 @@ fn voiced_fundamental_survives_in_spectrum() {
 #[test]
 fn decoder_tracks_energy_envelope() {
     let recs: serde_json::Value =
-        serde_json::from_str(include_str!("testdata/e2e_vectors.json")).expect("e2e_vectors");
+        crate::voip::mlow::fixture::decode(include_bytes!("testdata/e2e_vectors.cbor.zst"))
+            .expect("e2e_vectors");
     let arr = recs.as_array().unwrap();
     let mut dec = MlowDecoder::new();
     let mut active_pairs: Vec<(f64, f64)> = Vec::new(); // (ref_rms, rust_rms)
@@ -645,7 +646,8 @@ fn decoder_tracks_energy_envelope() {
 #[test]
 fn decoder_silence_frames_produce_zero() {
     let recs: serde_json::Value =
-        serde_json::from_str(include_str!("testdata/e2e_vectors.json")).expect("e2e_vectors");
+        crate::voip::mlow::fixture::decode(include_bytes!("testdata/e2e_vectors.cbor.zst"))
+            .expect("e2e_vectors");
     let arr = recs.as_array().unwrap();
     let mut dec = MlowDecoder::new();
 
@@ -815,5 +817,77 @@ fn inbound_capture_frames_cover_config1_and_config2_tocs() {
     assert!(
         has(0x50),
         "fixture lost active config-0 (0x50) frames: capture is not a normal call stream"
+    );
+}
+
+/// The wasm-derived oracle pair: `wasm_derived_frames.json` is the shipped
+/// VoIP engine's own encode of `synth_mic.raw` (derived with
+/// `oracle derive --spec specs/mlow_110frames.json` in unwasm, pinned by
+/// module hash — see PROVENANCE.md), and `wasm_derived_ref.raw` is the same
+/// engine's decode of those packets, 960 s16le samples per frame.
+///
+/// Compares our decoder with the shipped decoder on the shipped encoder's
+/// packets. Correlation allows numeric differences in DSP implementations;
+/// the independent C oracle remains covered by the adjacent fixture tests.
+#[test]
+fn wasm_derived_frames_decode_to_wasm_reference() {
+    let frames: Vec<String> =
+        serde_json::from_str(include_str!("testdata/wasm_derived_frames.json"))
+            .expect("wasm_derived_frames.json");
+    let refp: Vec<f32> = include_bytes!("testdata/wasm_derived_ref.raw")
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+        .collect();
+    assert_eq!(
+        refp.len(),
+        frames.len() * 960,
+        "ref must hold 960 samples/frame"
+    );
+
+    let mut dec = MlowDecoder::new();
+    let mut n_active = 0usize;
+    let mut corr_sum = 0.0f64;
+    let mut worst_corr = 1.0f64;
+    for (k, hex_frame) in frames.iter().enumerate() {
+        let frame = hex::decode(hex_frame).unwrap();
+        let out = dec.decode(&frame);
+        assert!(!out.is_empty(), "frame {k}: decoder returned nothing");
+        // DTX/CN frames route short; only active frames carry 960 comparable samples.
+        if out.len() != 960 {
+            continue;
+        }
+        let expected = &refp[k * 960..(k + 1) * 960];
+        let (e_out, e_ref) = (rms(&out), rms(expected));
+        if e_ref < 0.005 {
+            // Quiet in, quiet out: correlation is undefined on near-silence
+            // (`corr` returns 0.0), so assert the envelope instead.
+            assert!(
+                e_out < 0.02,
+                "frame {k}: quiet ref {e_ref:.4} decoded loud at {e_out:.4}"
+            );
+            continue;
+        }
+        let c = corr(&out, expected);
+        worst_corr = worst_corr.min(c);
+        corr_sum += c;
+        n_active += 1;
+        assert!(
+            (0.25..4.0).contains(&(e_out / e_ref)),
+            "frame {k}: energy ratio out {e_out:.4} vs ref {e_ref:.4} outside 4x band"
+        );
+    }
+    assert!(
+        n_active > frames.len() / 2,
+        "only {n_active}/{} active frames; stream decoded short",
+        frames.len()
+    );
+    let mean_corr = corr_sum / n_active as f64;
+    assert!(
+        mean_corr > 0.90,
+        "mean active-frame correlation {mean_corr:.4} too low against the shipped decoder"
+    );
+    assert!(
+        worst_corr > 0.70,
+        "worst active-frame correlation {worst_corr:.4} too low against the shipped decoder"
     );
 }

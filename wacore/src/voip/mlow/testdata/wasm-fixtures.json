@@ -1,0 +1,97 @@
+{
+  "derivation_lock_sha256": "fd8e641645a60b344fa7ed8d1f916b091f9a928c52c5d305e1e5b9538ebbb869",
+  "files": {
+    "wasm_fe.cbor.zst": {
+      "json_sha256": "c4337873961c326c1b912834dcec9d99a267c77273043fc894a1d1a9a3575125",
+      "cbor_sha256": "af0ce0ec313af750ee0c8e9bba03e57d67c7a543ad17435279afa2c4f6bdab51",
+      "zstd_sha256": "67c3e1e6fd4e146fc587007eadb1599e9d24ee7b17cc33b900d7974198660c3f",
+      "json_bytes": 8108933,
+      "cbor_bytes": 2029537,
+      "packed_bytes": 1258019,
+      "records": 330
+    },
+    "wasm_signal_mode.cbor.zst": {
+      "json_sha256": "3063b16f370ac043423a8b819cdc248247d2d00ab77a66259a557f88bd6faaaf",
+      "cbor_sha256": "21aac9ef93305a8ae2b9f12992c9ce442d888b04eb80ec846b0ff3e0060e9155",
+      "zstd_sha256": "dd357b5556116ed696cea009b0a587078eba6b04f4a19d9bae4fd674dce07444",
+      "json_bytes": 1749148,
+      "cbor_bytes": 488783,
+      "packed_bytes": 331621,
+      "records": 330
+    },
+    "wasm_pitch.cbor.zst": {
+      "json_sha256": "e7674a0105ec2008a120bb8013f315ded4b315bbf9e67104e7513e8326672a52",
+      "cbor_sha256": "7bdfe32ed667778a0c4b8002ed50eb16596bd465b235f18abf649c5e1b2fa599",
+      "zstd_sha256": "2645f5bbb904e6591f2ac5361fe91daf58d8361c4ca1f773f0e73c1681d3aefb",
+      "json_bytes": 6368495,
+      "cbor_bytes": 1594979,
+      "packed_bytes": 770099,
+      "records": 330
+    },
+    "wasm_lsf_quant.cbor.zst": {
+      "json_sha256": "1922d55b08684264a2f0d402b11ee9672bcf6bb33caafb067742a0b037c01367",
+      "cbor_sha256": "fbd6a2989205c9a18c72c6cca970d0bde80b9c01163f649d8efa6f9cd09b8dac",
+      "zstd_sha256": "a494a5198be25d27d6f37b4a040b430b9535cdfc5ca94e6fbad640777fe1f918",
+      "json_bytes": 2792182,
+      "cbor_bytes": 711291,
+      "packed_bytes": 523632,
+      "records": 330
+    },
+    "wasm_hp_postfilter.cbor.zst": {
+      "json_sha256": "b6086536e95ea4b58afb3d1021372ab3002c35c5926368e5f5da2f9b9256fd95",
+      "cbor_sha256": "a0a94807dd9efa1e0f02778aabb2976968bcb6c68055e72ec6f365c16bdc650a",
+      "zstd_sha256": "ba291366f7a8fc3dd1cdfcb870c3d80a7c2a8354affe07976356e87a09729599",
+      "json_bytes": 8829825,
+      "cbor_bytes": 2175413,
+      "packed_bytes": 1252990,
+      "records": 330
+    },
+    "wasm_harm_postfilter.cbor.zst": {
+      "json_sha256": "fb47ee07856bd2d88ea008400886ac9ff2a688122005bb353dd14ef8ae04585b",
+      "cbor_sha256": "5b9bc947456dfb0216e81070be2d9b5a2059f47d7b95ff0931a0fada3152834f",
+      "zstd_sha256": "5c04a693c79b3b9a44c24b0ae0539cd37b63be06ad2eb3aa01ec2348649ee06a",
+      "json_bytes": 11461016,
+      "cbor_bytes": 3622499,
+      "packed_bytes": 659553,
+      "records": 110
+    },
+    "wasm_params.cbor.zst": {
+      "json_sha256": "3138ddfe3c542eee38e9bb98922c3af635ba32d8a0f1b46e4de787850bedf13c",
+      "cbor_sha256": "3b2bf63bffe43a02753aa423d6f90ee5433ee48ac54fc9cfad4eff1ad1e50269",
+      "zstd_sha256": "15ee075f068ddd593186d7e634753b6edabfbb4359134c382c99dde9b23be966",
+      "json_bytes": 330107,
+      "cbor_bytes": 176122,
+      "packed_bytes": 23913,
+      "records": 330
+    },
+    "wasm_gennoise.cbor.zst": {
+      "json_sha256": "6935ca8c6db2ea067e3be6e3f64f02b239aebdb2815fcdb59e7b3a048f0cdf79",
+      "cbor_sha256": "a3d7d473a609406f32911c70eecb0c01b437ef110d9f17a05271daca6fc158bb",
+      "zstd_sha256": "0802f85195cf9f041d3f1a0fb189e643766f988e7cb5258590207ee16022cc00",
+      "json_bytes": 7163792,
+      "cbor_bytes": 2326645,
+      "packed_bytes": 1040001,
+      "records": 1320
+    },
+    "wasm_derived_frames.json": {
+      "sha256": "c3b9c0b5140cd48401be07311ec547ec024e3e4c0841f5cdbf8178ede7d24bb3",
+      "bytes": 23291
+    },
+    "wasm_derived_ref.raw": {
+      "sha256": "91c3970882daecc54428fa1d52428a2e3fa364ced10f674af38bf1a971e2a076",
+      "bytes": 211200
+    },
+    "wasm_derived_vad.json": {
+      "sha256": "f797ed038a2dd2353362facfbc778a2f41338cfea1ac8349123e2a77f3955eff",
+      "bytes": 7664
+    },
+    "wasm_derived_120ms_frames.json": {
+      "sha256": "0cf159be86830546b15687e0e61a088c10f7b940fb3806a008c9a3c07cd01304",
+      "bytes": 4087
+    },
+    "wasm_derived_120ms_ref.raw": {
+      "sha256": "0bd296a4b4b12bf494c52b3733d5ede8df29ac336e01ac9eeb81385339cabdc3",
+      "bytes": 30720
+    }
+  }
+}

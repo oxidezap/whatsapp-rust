@@ -10,6 +10,8 @@
 mod analysis;
 mod decoder;
 mod encode;
+#[cfg(test)]
+mod fixture;
 mod golden;
 mod multiframe;
 mod param_decode_match;
