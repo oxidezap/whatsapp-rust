@@ -1004,8 +1004,13 @@ impl Runtime {
             }
             if self.quiesce(TICK.min(remaining)) {
                 // One last drain: a thread that finished during the wait may
-                // have queued its reply on the way out.
-                self.process_queued_calls();
+                // have queued its reply on the way out, and running that
+                // reply may have started a new worker. Recheck quiescence
+                // rather than returning idle with a worker running; the
+                // deadline above still bounds a guest that keeps spawning.
+                if self.process_queued_calls() {
+                    continue;
+                }
                 return true;
             }
         }

@@ -10,10 +10,11 @@
 //! to read or write the host, and an in-memory tree is reproducible.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use wasmtime::error::Context as _;
-use wasmtime::{Caller, Linker, Module, Store, Val};
+use wasmtime::{Caller, FuncType, Linker, Module, Store, Val, ValType};
 
 use crate::state::HostState;
 
@@ -48,6 +49,9 @@ const MAX_FS_BYTES: usize = 256 * 1024 * 1024;
 /// Largest either captured standard stream may grow to. The per-call payload
 /// limit cannot stop a looping guest from retaining output forever.
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
+/// Longest guest pathname the host will copy. The memory-range check alone
+/// still allocates the whole `path_len` before decoding it.
+const MAX_PATH_BYTES: u32 = 4096;
 
 /// WASI clock ids. `2` and `3` are the process and thread CPU-time clocks,
 /// which this host does not have and therefore refuses.
@@ -63,11 +67,20 @@ pub struct OpenFile {
     pub offset: u64,
     /// Whether writes are allowed through it.
     pub writable: bool,
-    /// Bytes kept alive after the path was unlinked; see `unlink_file`.
-    /// Post-unlink clones are per handle: descriptors unlinked from one path
-    /// no longer observe each other's writes.
-    pub retained: Option<Vec<u8>>,
+    /// Contents kept alive after the path was unlinked; see `unlink_file`.
+    /// Shared, not cloned: every handle unlinked from one path reads the
+    /// same bytes until one of them writes, and no unlink can multiply the
+    /// file's footprint by its descriptor count.
+    pub retained: Option<SharedFile>,
 }
+
+/// File contents shared by every descriptor that names them.
+///
+/// Descriptors opened from one path share one object, including across
+/// `unlink`: recreating the path starts a new object while retained handles
+/// keep the old one. The inner lock is only ever taken with the WASI state
+/// lock already held, so no lock ordering exists to invert.
+type SharedFile = Arc<Mutex<Vec<u8>>>;
 
 /// Guest-visible environment: arguments, variables, and an in-memory filesystem.
 #[derive(Debug, Clone, Default)]
@@ -77,7 +90,7 @@ pub struct WasiState {
     /// The environment the guest sees.
     pub env: Vec<(String, String)>,
     /// Files the guest can open, by path.
-    pub files: BTreeMap<String, Vec<u8>>,
+    pub files: BTreeMap<String, SharedFile>,
     /// Everything written to stdout.
     pub stdout: Vec<u8>,
     /// Everything written to stderr.
@@ -89,14 +102,15 @@ pub struct WasiState {
 impl WasiState {
     /// Places a file in the guest filesystem before it runs.
     pub fn add_file(&mut self, path: impl Into<String>, contents: Vec<u8>) {
-        self.files.insert(normalise(&path.into()), contents);
+        self.files
+            .insert(normalise(&path.into()), Arc::new(Mutex::new(contents)));
     }
 
     /// Reads a file back, which is how an output file is collected after a run.
-    pub fn file(&self, path: &str) -> Option<&[u8]> {
+    pub fn file(&self, path: &str) -> Option<Vec<u8>> {
         self.files
             .get(&normalise(path))
-            .map(|bytes| bytes.as_slice())
+            .map(|file| file.lock().expect("WASI file poisoned").clone())
     }
 
     /// Stdout as text, with invalid UTF-8 replaced.
@@ -120,24 +134,26 @@ impl WasiState {
         fd
     }
 
-    /// Bytes visible through `open`: contents retained at unlink, else the live file.
-    fn open_bytes<'a>(&'a self, open: &'a OpenFile) -> Option<&'a [u8]> {
-        if let Some(retained) = &open.retained {
-            return Some(retained);
-        }
-        self.files.get(&open.path).map(Vec::as_slice)
+    /// The shared object visible through `open`: retained post-unlink
+    /// contents, else the live file.
+    fn open_file(&self, open: &OpenFile) -> Option<SharedFile> {
+        open.retained
+            .clone()
+            .or_else(|| self.files.get(&open.path).cloned())
     }
 
-    /// Removes `path`, keeping its bytes alive in every open descriptor that
-    /// names it. Recreating the path starts a new file; retained handles keep
-    /// reading and writing the old bytes. Returns whether the path existed.
+    /// Removes `path`, keeping its object alive in every open descriptor that
+    /// names it. The bytes move, uncloned: any number of descriptors can be
+    /// unlinked from one file without multiplying its footprint. Recreating
+    /// the path starts a new object; retained handles keep the old one.
+    /// Returns whether the path existed.
     fn unlink_file(&mut self, path: &str) -> bool {
-        let Some(contents) = self.files.remove(path) else {
+        let Some(shared) = self.files.remove(path) else {
             return false;
         };
         for open in self.open.values_mut() {
             if open.path == path && open.retained.is_none() {
-                open.retained = Some(contents.clone());
+                open.retained = Some(Arc::clone(&shared));
             }
         }
         true
@@ -145,12 +161,23 @@ impl WasiState {
 }
 
 /// Bytes currently held: live files plus contents retained by unlinked handles.
+///
+/// A retained object still referenced by several descriptors is counted once
+/// per descriptor: the budget stays conservative rather than tracking shares.
 fn fs_bytes(wasi: &WasiState) -> usize {
-    let live: usize = wasi.files.values().map(Vec::len).sum();
+    let live: usize = wasi
+        .files
+        .values()
+        .map(|file| file.lock().expect("WASI file poisoned").len())
+        .sum();
     let retained: usize = wasi
         .open
         .values()
-        .filter_map(|open| open.retained.as_ref().map(Vec::len))
+        .filter_map(|open| {
+            open.retained
+                .as_ref()
+                .map(|file| file.lock().expect("WASI file poisoned").len())
+        })
         .sum();
     live.saturating_add(retained)
 }
@@ -251,29 +278,27 @@ fn fd_write(caller: &mut Caller<'_, HostState>, fd: u32, iovs: u32, count: u32, 
             // Bound growth before the descriptor moves or any byte is
             // allocated: a sparse seek plus a one-byte write must fail rather
             // than resize towards `u64::MAX`.
-            let current = open
-                .retained
-                .as_ref()
-                .map_or_else(|| wasi.files.get(&open.path).map_or(0, Vec::len), Vec::len);
+            let Some(target) = wasi.open_file(open) else {
+                return EBADF;
+            };
+            // The length is read before the budget check: the file lock is
+            // not reentrant, so it cannot be held across `fs_bytes`.
+            let current = target.lock().expect("WASI file poisoned").len();
             if end > MAX_FILE_BYTES
                 || fs_bytes(&wasi).saturating_sub(current).saturating_add(end) > MAX_FS_BYTES
             {
                 return EINVAL;
             }
+            let mut contents = target.lock().expect("WASI file poisoned");
+            if contents.len() < end {
+                contents.resize(end, 0);
+            }
+            contents[offset..end].copy_from_slice(&payload);
+            drop(contents);
             let Some(open) = wasi.open.get_mut(&fd) else {
                 return EBADF;
             };
             open.offset = next_offset;
-            let target: &mut Vec<u8> = if let Some(retained) = open.retained.as_mut() {
-                retained
-            } else {
-                let path = open.path.clone();
-                wasi.files.entry(path).or_default()
-            };
-            if target.len() < end {
-                target.resize(end, 0);
-            }
-            target[offset..end].copy_from_slice(&payload);
         }
     }
 
@@ -335,13 +360,14 @@ fn read_into(
     let Some(open) = wasi.open.get(&fd) else {
         return EBADF;
     };
-    let Some(contents) = wasi.open_bytes(open) else {
+    let Some(target) = wasi.open_file(open) else {
         return EBADF;
     };
 
     let Ok(mut offset) = usize::try_from(at.unwrap_or(open.offset)) else {
         return EINVAL;
     };
+    let contents = target.lock().expect("WASI file poisoned");
     let mut total = 0u32;
     for (ptr, len) in vectors {
         if offset >= contents.len() {
@@ -418,8 +444,10 @@ fn fd_seek(caller: &mut Caller<'_, HostState>, fd: u32, delta: i64, whence: u32,
     let size = wasi
         .open
         .get(&fd)
-        .and_then(|open| wasi.open_bytes(open))
-        .map_or(0, |bytes| bytes.len() as u64);
+        .and_then(|open| wasi.open_file(open))
+        .map_or(0, |file| {
+            file.lock().expect("WASI file poisoned").len() as u64
+        });
     let Some(position) = seek_position(open.offset, size, delta, whence) else {
         return EINVAL;
     };
@@ -474,6 +502,7 @@ fn path_open(caller: &mut Caller<'_, HostState>, args: PathOpenArgs) -> i32 {
     }
     if args.oflags & !SUPPORTED != 0
         || args.fdflags != 0
+        || args.path_len > MAX_PATH_BYTES
         || caller.data().ensure_memory_range(args.out, 4).is_err()
     {
         return EINVAL;
@@ -488,7 +517,6 @@ fn path_open(caller: &mut Caller<'_, HostState>, args: PathOpenArgs) -> i32 {
         return EINVAL;
     };
     let path = normalise(&path);
-
     // What the guest asked for, whether or not it got it. A refusal here is
     // invisible from the outside — the VoIP engine reports only "Failed to get
     // voip storage dir" and carries on — so without this the host cannot tell a
@@ -506,11 +534,14 @@ fn path_open(caller: &mut Caller<'_, HostState>, args: PathOpenArgs) -> i32 {
         if args.oflags & O_CREAT == 0 {
             return ENOENT;
         }
-        wasi.files.insert(path.clone(), Vec::new());
+        wasi.files
+            .insert(path.clone(), Arc::new(Mutex::new(Vec::new())));
     } else if args.oflags & O_TRUNC != 0 {
         wasi.files
-            .get_mut(&path)
+            .get(&path)
             .expect("existence checked")
+            .lock()
+            .expect("WASI file poisoned")
             .clear();
     }
 
@@ -540,7 +571,9 @@ fn fd_filestat_get(caller: &mut Caller<'_, HostState>, fd: u32, out: u32) -> i32
     let state = caller.data();
     let wasi = state.wasi();
     let size = match wasi.open.get(&fd) {
-        Some(open) => wasi.open_bytes(open).map_or(0, |bytes| bytes.len() as u64),
+        Some(open) => wasi.open_file(open).map_or(0, |file| {
+            file.lock().expect("WASI file poisoned").len() as u64
+        }),
         None if fd <= FD_ROOT => 0,
         None => return EBADF,
     };
@@ -655,6 +688,70 @@ fn env_strings(state: &HostState) -> Vec<String> {
         .collect()
 }
 
+/// Exact preview-1 signature each implemented import must declare.
+///
+/// A module that declares a recognized name with another type would otherwise
+/// link, and the argument helpers would silently substitute zero for missing
+/// or mistyped operands — a malformed capture then yields plausible evidence
+/// instead of failing at instantiation.
+fn expected_signatures(name: &str) -> Option<&'static [(&'static [ValType], &'static [ValType])]> {
+    use wasmtime::ValType as T;
+    const R: &[T] = &[T::I32];
+    const NO_RESULTS: &[T] = &[];
+    const A1: &[T] = &[T::I32];
+    const A2: &[T] = &[T::I32, T::I32];
+    const A3: &[T] = &[T::I32, T::I32, T::I32];
+    const A4: &[T] = &[T::I32, T::I32, T::I32, T::I32];
+    const SEEK: &[T] = &[T::I32, T::I64, T::I32, T::I32];
+    const SEEK_LEGALIZED: &[T] = &[T::I32, T::I32, T::I32, T::I32, T::I32];
+    const PREAD: &[T] = &[T::I32, T::I32, T::I32, T::I64, T::I32];
+    const CLOCK: &[T] = &[T::I32, T::I64, T::I32];
+    const OPEN: &[T] = &[
+        T::I32,
+        T::I32,
+        T::I32,
+        T::I32,
+        T::I32,
+        T::I64,
+        T::I64,
+        T::I32,
+        T::I32,
+    ];
+    const SEEK_FORMS: &[(&[T], &[T])] = &[(SEEK, R), (SEEK_LEGALIZED, R)];
+    Some(match name {
+        "fd_write" | "fd_read" => &[(A4, R)],
+        "fd_pread" => &[(PREAD, R)],
+        // Emscripten without BigInt splits the `fd_seek` offset into two
+        // `i32` halves. The VOPRF capture declares exactly this; no other
+        // capture legalizes any import, so only this spelling is accepted
+        // beside the canonical one.
+        "fd_seek" => SEEK_FORMS,
+        "fd_close" => &[(A1, R)],
+        "fd_fdstat_get" | "fd_filestat_get" | "fd_prestat_get" => &[(A2, R)],
+        "fd_prestat_dir_name" | "path_unlink_file" => &[(A3, R)],
+        "path_open" => &[(OPEN, R)],
+        "args_sizes_get" | "args_get" | "environ_sizes_get" | "environ_get" => &[(A2, R)],
+        "clock_time_get" => &[(CLOCK, R)],
+        "random_get" => &[(A2, R)],
+        "proc_exit" => &[(A1, NO_RESULTS)],
+        _ => return None,
+    })
+}
+
+/// Whether a declared import type is exactly the expected signature.
+fn signature_matches(ty: &FuncType, params: &[ValType], results: &[ValType]) -> bool {
+    ty.params().len() == params.len()
+        && ty.results().len() == results.len()
+        && ty
+            .params()
+            .zip(params)
+            .all(|(actual, expected)| ValType::eq(&actual, expected))
+        && ty
+            .results()
+            .zip(results)
+            .all(|(actual, expected)| ValType::eq(&actual, expected))
+}
+
 /// Defines the WASI imports the module declares.
 pub fn define(
     store: &mut Store<HostState>,
@@ -670,6 +767,13 @@ pub fn define(
         let wasmtime::ExternType::Func(ty) = import.ty() else {
             continue;
         };
+        if let Some(forms) = expected_signatures(import.name())
+            && !forms
+                .iter()
+                .any(|(params, results)| signature_matches(&ty, params, results))
+        {
+            bail!("wasi {} declares an unsupported signature", import.name());
+        }
 
         let name = import.name().to_owned();
         let func =
@@ -749,13 +853,18 @@ fn dispatch(name: &str, caller: &mut Caller<'_, HostState>, params: &[Val]) -> i
             arg_i64(params, 3) as u64,
             arg(params, 4),
         ),
-        "fd_seek" => fd_seek(
-            caller,
-            arg(params, 0),
-            arg_i64(params, 1),
-            arg(params, 2),
-            arg(params, 3),
-        ),
+        "fd_seek" => {
+            // Canonical `(fd, offset:i64, whence, out)` or the legalized
+            // `(fd, lo, hi, whence, out)` the VOPRF capture declares. The
+            // signature was validated at definition, so the length decides.
+            let (delta, whence, out) = if params.len() == 5 {
+                let delta = u64::from(arg(params, 1)) | (u64::from(arg(params, 2)) << 32);
+                (delta as i64, arg(params, 3), arg(params, 4))
+            } else {
+                (arg_i64(params, 1), arg(params, 2), arg(params, 3))
+            };
+            fd_seek(caller, arg(params, 0), delta, whence, out)
+        }
         "fd_close" => {
             if caller
                 .data_mut()
@@ -815,6 +924,9 @@ fn dispatch(name: &str, caller: &mut Caller<'_, HostState>, params: &[Val]) -> i
         "path_unlink_file" => {
             if arg(params, 0) != FD_ROOT {
                 return EBADF;
+            }
+            if arg(params, 2) > MAX_PATH_BYTES {
+                return EINVAL;
             }
             let Ok(raw) = caller.data().read(arg(params, 1), arg(params, 2)) else {
                 return EINVAL;
@@ -987,7 +1099,11 @@ mod tests {
                 Val::I32(EINVAL)
             ));
             let wasi = runtime.wasi();
-            assert_eq!(wasi.file("out"), Some([1, 2, 3, 4].as_slice()), "{name}");
+            assert_eq!(
+                wasi.file("out").as_deref(),
+                Some([1, 2, 3, 4].as_slice()),
+                "{name}"
+            );
             assert_eq!(wasi.open[&4].offset, 1, "{name}");
             assert_eq!(runtime.state().read(64, 3).unwrap(), [0x55; 3], "{name}");
         }
@@ -1064,7 +1180,7 @@ mod tests {
             {
                 let wasi = runtime.wasi();
                 assert!(wasi.stdout.is_empty() && wasi.stderr.is_empty());
-                assert_eq!(wasi.file("out"), Some([9].as_slice()));
+                assert_eq!(wasi.file("out").as_deref(), Some([9].as_slice()));
                 assert_eq!(wasi.open[&FIRST_FILE_FD].offset, 1);
             }
             let result = runtime
@@ -1252,10 +1368,28 @@ mod tests {
         ));
         assert_eq!(runtime.read_u32_at(200).unwrap(), 3);
         runtime.wasi().open.get_mut(&4).unwrap().offset = 0;
+        // A second handle to the same path shares the retained object after
+        // unlink instead of cloning the bytes once per descriptor.
+        runtime.wasi().open.insert(
+            5,
+            OpenFile {
+                path: "out".into(),
+                offset: 0,
+                writable: true,
+                retained: None,
+            },
+        );
         assert!(matches!(
             runtime.call("unlink", &[]).unwrap()[0],
             Val::I32(ESUCCESS)
         ));
+        {
+            let wasi = runtime.wasi();
+            let first = wasi.open[&4].retained.clone().unwrap();
+            let second = wasi.open[&5].retained.clone().unwrap();
+            assert!(std::sync::Arc::ptr_eq(&first, &second));
+            assert_eq!(first.lock().expect("retained").len(), 3);
+        }
         assert!(matches!(
             runtime.call("readout", &[]).unwrap()[0],
             Val::I32(ESUCCESS)
@@ -1482,6 +1616,135 @@ mod tests {
             Val::I32(ESUCCESS)
         ));
         assert_eq!(runtime.state().read(64, 1).unwrap(), [b'/']);
+    }
+
+    #[test]
+    fn wasi_symbols_require_preview1_signatures() {
+        let bytes = harness(
+            &[("fd_write", vec![], vec![I32])],
+            &[("write", vec![], vec![I32], vec![Wave::Call(0)])],
+            &[],
+        );
+        assert!(crate::Runtime::instantiate(&bytes).is_err());
+        let bytes = harness(
+            &[("random_get", vec![I32], vec![I32])],
+            &[(
+                "rand",
+                vec![I32],
+                vec![I32],
+                vec![Wave::Arg(0), Wave::Call(0)],
+            )],
+            &[],
+        );
+        assert!(crate::Runtime::instantiate(&bytes).is_err());
+    }
+
+    #[test]
+    fn legalized_seek_offsets_decode_correctly() {
+        let bytes = harness(
+            &[("fd_seek", vec![I32, I32, I32, I32, I32], vec![I32])],
+            &[(
+                "seek5",
+                vec![I32, I32, I32, I32, I32],
+                vec![I32],
+                vec![
+                    Wave::Arg(0),
+                    Wave::Arg(1),
+                    Wave::Arg(2),
+                    Wave::Arg(3),
+                    Wave::Arg(4),
+                    Wave::Call(0),
+                ],
+            )],
+            &[],
+        );
+        let mut runtime = crate::Runtime::instantiate(&bytes).unwrap();
+        runtime.add_file("out", vec![0; 8]);
+        runtime.wasi().open.insert(
+            4,
+            OpenFile {
+                path: "out".into(),
+                offset: 0,
+                writable: true,
+                retained: None,
+            },
+        );
+        // High half 1, low half 5: position 0x1_0000_0005, not 5, and the
+        // result lands in the fifth slot rather than the fourth.
+        assert!(matches!(
+            runtime
+                .call(
+                    "seek5",
+                    &[
+                        Val::I32(4),
+                        Val::I32(5),
+                        Val::I32(1),
+                        Val::I32(0),
+                        Val::I32(200)
+                    ]
+                )
+                .unwrap()[0],
+            Val::I32(ESUCCESS)
+        ));
+        let position = runtime.state().read(200, 8).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(position.try_into().unwrap()),
+            0x1_0000_0005
+        );
+    }
+
+    #[test]
+    fn path_lengths_are_bounded_before_reads() {
+        let bytes = harness(
+            &[
+                (
+                    "path_open",
+                    vec![I32, I32, I32, I32, I32, I64, I64, I32, I32],
+                    vec![I32],
+                ),
+                ("path_unlink_file", vec![I32, I32, I32], vec![I32]),
+            ],
+            &[
+                (
+                    "openat",
+                    vec![I32, I32, I32],
+                    vec![I32],
+                    vec![
+                        Wave::Arg(0),
+                        Wave::I32(0),
+                        Wave::Arg(1),
+                        Wave::Arg(2),
+                        Wave::I32(0),
+                        Wave::I64(0),
+                        Wave::I64(0),
+                        Wave::I32(0),
+                        Wave::I32(208),
+                        Wave::Call(0),
+                    ],
+                ),
+                (
+                    "unlinkat",
+                    vec![I32, I32, I32],
+                    vec![I32],
+                    vec![Wave::Arg(0), Wave::Arg(1), Wave::Arg(2), Wave::Call(1)],
+                ),
+            ],
+            &[],
+        );
+        let mut runtime = crate::Runtime::instantiate(&bytes).unwrap();
+        // 8192 bytes are addressable in the single page, but no pathname is.
+        assert!(matches!(
+            runtime
+                .call("openat", &[Val::I32(3), Val::I32(64), Val::I32(8192)])
+                .unwrap()[0],
+            Val::I32(EINVAL)
+        ));
+        assert!(matches!(
+            runtime
+                .call("unlinkat", &[Val::I32(3), Val::I32(64), Val::I32(8192)])
+                .unwrap()[0],
+            Val::I32(EINVAL)
+        ));
     }
 
     #[test]

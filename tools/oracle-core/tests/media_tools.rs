@@ -37,7 +37,16 @@ fn tool_with_files(id: &str, args: &[&str], files: &[(&str, Vec<u8>)]) -> Option
         code,
         stdout: wasi.stdout_text(),
         stderr: wasi.stderr_text(),
-        files: wasi.files.clone(),
+        files: wasi
+            .files
+            .iter()
+            .map(|(path, contents)| {
+                (
+                    path.clone(),
+                    contents.lock().expect("WASI file poisoned").clone(),
+                )
+            })
+            .collect(),
     })
 }
 

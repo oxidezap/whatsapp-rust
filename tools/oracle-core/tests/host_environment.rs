@@ -136,9 +136,15 @@ fn wasi_filesystem_round_trips() {
     let mut runtime = Runtime::instantiate(&bytes).expect("instantiate");
 
     runtime.add_file("input.bin", vec![1, 2, 3, 4]);
-    assert_eq!(runtime.wasi().file("input.bin"), Some(&[1u8, 2, 3, 4][..]));
+    assert_eq!(
+        runtime.wasi().file("input.bin").as_deref(),
+        Some(&[1u8, 2, 3, 4][..])
+    );
     // Leading slashes must resolve to the same entry.
-    assert_eq!(runtime.wasi().file("/input.bin"), Some(&[1u8, 2, 3, 4][..]));
+    assert_eq!(
+        runtime.wasi().file("/input.bin").as_deref(),
+        Some(&[1u8, 2, 3, 4][..])
+    );
     assert_eq!(runtime.wasi().file("missing.bin"), None);
 }
 
@@ -639,7 +645,10 @@ fn path_open_truncates_an_existing_file() {
         )
         .expect("path_open truncate");
     assert_eq!(errno_of(&result), 0);
-    assert_eq!(runtime.wasi().file("data.bin"), Some([].as_slice()));
+    assert_eq!(
+        runtime.wasi().file("data.bin").as_deref(),
+        Some([].as_slice())
+    );
 }
 
 #[test]
@@ -1190,7 +1199,10 @@ fn unsupported_fdflags_do_not_modify_files() {
             )
             .unwrap();
         assert_eq!(errno_of(&result), 28, "flags {flags}");
-        assert_eq!(runtime.wasi().file("data.bin"), Some([1, 2, 3].as_slice()));
+        assert_eq!(
+            runtime.wasi().file("data.bin").as_deref(),
+            Some([1, 2, 3].as_slice())
+        );
     }
 }
 
@@ -1207,9 +1219,12 @@ fn workers_share_the_process_environment() {
     );
     assert_eq!(worker.wasi().args, ["module"]);
     assert_eq!(worker.wasi().env, [("MODE".into(), "test".into())]);
-    assert_eq!(worker.wasi().file("input"), Some([1, 2].as_slice()));
+    assert_eq!(
+        worker.wasi().file("input").as_deref(),
+        Some([1, 2].as_slice())
+    );
     worker.wasi().stdout.extend_from_slice(b"worker");
     worker.wasi().add_file("output", vec![3]);
     assert_eq!(main.wasi().stdout, b"worker");
-    assert_eq!(main.wasi().file("output"), Some([3].as_slice()));
+    assert_eq!(main.wasi().file("output").as_deref(), Some([3].as_slice()));
 }

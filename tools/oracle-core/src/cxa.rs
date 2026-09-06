@@ -36,6 +36,9 @@ pub struct InFlight {
     pub ptr: u32,
     /// Its type id, as `__cxa_throw` was given it.
     pub type_id: u32,
+    /// Its destructor, as `__cxa_throw` was given it: the table slot to call
+    /// with the object when the catch ends. Zero runs nothing.
+    pub destructor: u32,
 }
 
 /// Reads the type id recorded in an exception's header.
@@ -100,7 +103,12 @@ fn message_of(caller: &mut Caller<'_, HostState>, ptr: u32) -> Option<String> {
 
 /// Records a thrown exception and unwinds, which is what the `invoke_*`
 /// trampoline is waiting for.
-fn throw(caller: &mut Caller<'_, HostState>, ptr: u32, type_id: u32) -> wasmtime::Error {
+fn throw(
+    caller: &mut Caller<'_, HostState>,
+    ptr: u32,
+    type_id: u32,
+    destructor: u32,
+) -> wasmtime::Error {
     // Emscripten writes the type into the header before unwinding; later
     // matching reads it back from there.
     if ptr >= HEADER {
@@ -109,7 +117,11 @@ fn throw(caller: &mut Caller<'_, HostState>, ptr: u32, type_id: u32) -> wasmtime
     }
 
     let described = message_of(caller, ptr);
-    caller.data_mut().in_flight = InFlight { ptr, type_id };
+    caller.data_mut().in_flight = InFlight {
+        ptr,
+        type_id,
+        destructor,
+    };
 
     match described {
         Some(message) => {
@@ -118,6 +130,57 @@ fn throw(caller: &mut Caller<'_, HostState>, ptr: u32, type_id: u32) -> wasmtime
         }
         None => wasmtime::Error::msg(format!("C++ exception at {ptr:#x} (type {type_id})")),
     }
+}
+
+/// The destructor of the exception already in flight at `ptr`, if any.
+/// A rethrow unwraps the same object, so its destructor travels with it; a
+/// different pointer starts a new lifecycle with no destructor.
+fn retained_destructor(caller: &Caller<'_, HostState>, ptr: u32) -> u32 {
+    let in_flight = caller.data().in_flight;
+    if in_flight.ptr == ptr {
+        in_flight.destructor
+    } else {
+        0
+    }
+}
+
+/// Runs the in-flight exception's destructor and releases its reference.
+///
+/// Emscripten destroys the object when the catch ends: the destructor the
+/// guest registered at `__cxa_throw` runs first, then the header reference
+/// `__cxa_current_primary_exception` took is released. A zero destructor runs
+/// nothing; the reference count saturates rather than underflowing an
+/// unmatched release.
+fn end_catch(caller: &mut Caller<'_, HostState>) -> Result<()> {
+    let in_flight = caller.data().in_flight;
+    if in_flight.ptr != 0 && in_flight.destructor != 0 {
+        let name = caller
+            .data()
+            .shared
+            .table_export
+            .get()
+            .cloned()
+            .unwrap_or_else(|| "__indirect_function_table".to_owned());
+        let table = crate::exports::table(caller, &[&name, "__indirect_function_table"])?;
+        let index = u64::from(in_flight.destructor);
+        let Some(wasmtime::Ref::Func(Some(destructor))) = table.get(&mut *caller, index) else {
+            anyhow::bail!("exception destructor at table slot {index} is not a function");
+        };
+        destructor
+            .call(&mut *caller, &[Val::I32(in_flight.ptr as i32)], &mut [])
+            .map_err(|error| anyhow::anyhow!("exception destructor trapped: {error}"))?;
+    }
+    if in_flight.ptr >= HEADER {
+        let header = in_flight.ptr - HEADER + REFCOUNT_OFFSET;
+        let count = caller.data().read_u32(header).unwrap_or(0);
+        if count > 0 {
+            let _ = caller
+                .data()
+                .write(header, &count.saturating_sub(1).to_le_bytes());
+        }
+    }
+    caller.data_mut().in_flight = InFlight::default();
+    Ok(())
 }
 
 /// Sets the module's `tempRet0`, the side channel emscripten's landing pads read
@@ -209,7 +272,8 @@ pub fn define(
             crate::host::host_func(&mut *store, ty.clone(), |caller, params, _results| {
                 let ptr = int_arg(params, 0);
                 let type_id = int_arg(params, 1);
-                Err(throw(caller, ptr, type_id))
+                let destructor = int_arg(params, 2);
+                Err(throw(caller, ptr, type_id, destructor))
             })
         } else if name == "__cxa_rethrow" || name == "__resumeException" {
             let takes_pointer = ty.params().len() > 0;
@@ -220,7 +284,12 @@ pub fn define(
                     caller.data().in_flight.ptr
                 };
                 let type_id = exception_type(caller.data(), ptr);
-                Err(throw(caller, ptr, type_id))
+                Err(throw(
+                    caller,
+                    ptr,
+                    type_id,
+                    retained_destructor(caller, ptr),
+                ))
             })
         } else if name == "__cxa_rethrow_primary_exception" {
             // `std::rethrow_exception`. Emscripten makes this the pointer-taking
@@ -239,7 +308,12 @@ pub fn define(
                     return Ok(());
                 }
                 let type_id = exception_type(caller.data(), ptr);
-                Err(throw(caller, ptr, type_id))
+                Err(throw(
+                    caller,
+                    ptr,
+                    type_id,
+                    retained_destructor(caller, ptr),
+                ))
             })
         } else if name == "__cxa_current_primary_exception" {
             // `std::current_exception`. Hands back the exception in flight and
@@ -284,8 +358,7 @@ pub fn define(
             })
         } else if name == "__cxa_end_catch" {
             crate::host::host_func(&mut *store, ty.clone(), |caller, _params, _results| {
-                caller.data_mut().in_flight = InFlight::default();
-                Ok(())
+                end_catch(caller).map_err(wasmtime::Error::from_anyhow)
             })
         } else if name == "__cxa_get_exception_ptr" || name == "llvm_eh_typeid_for" {
             // Both are identity in emscripten's model: the pointer *is* the
@@ -329,5 +402,104 @@ fn int_arg(params: &[Val], index: usize) -> u32 {
         Some(Val::I32(value)) => *value as u32,
         Some(Val::I64(value)) => *value as u32,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn end_catch_runs_the_registered_destructor() {
+        use wasm_encoder::{
+            CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType, ExportKind,
+            ExportSection, Function, FunctionSection, ImportSection, MemorySection, MemoryType,
+            Module, TableSection, TableType, TypeSection, ValType,
+        };
+        // Imports: __cxa_throw(i32,i32,i32), __cxa_end_catch(). Defined:
+        // destructor (writes a marker), dotthrow, doend. Slot 1 names the
+        // destructor through a function-index element segment; slot 0 keeps
+        // its usual meaning of "no destructor".
+        let mut types = TypeSection::new();
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32, ValType::I32], []);
+        types.ty().function([], []);
+        types.ty().function([ValType::I32], []);
+        let mut imports = ImportSection::new();
+        imports.import("env", "__cxa_throw", EntityType::Function(0));
+        imports.import("env", "__cxa_end_catch", EntityType::Function(1));
+        let mut functions = FunctionSection::new();
+        functions.function(2);
+        functions.function(1);
+        functions.function(1);
+        let mut tables = TableSection::new();
+        tables.table(TableType {
+            element_type: wasm_encoder::RefType::FUNCREF,
+            table64: false,
+            minimum: 2,
+            maximum: None,
+            shared: false,
+        });
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        let mut exports = ExportSection::new();
+        exports.export("memory", ExportKind::Memory, 0);
+        exports.export("__indirect_function_table", ExportKind::Table, 0);
+        exports.export("dotthrow", ExportKind::Func, 3);
+        exports.export("doend", ExportKind::Func, 4);
+        let mut elements = ElementSection::new();
+        elements.active(
+            None,
+            &ConstExpr::i32_const(0),
+            Elements::Functions(vec![3, 2].into()),
+        );
+        let mut code = CodeSection::new();
+        let mut destructor = Function::new([]);
+        destructor
+            .instructions()
+            .local_get(0)
+            .i32_const(0xaa)
+            .i32_store8(wasm_encoder::MemArg {
+                offset: 128,
+                align: 0,
+                memory_index: 0,
+            })
+            .end();
+        code.function(&destructor);
+        let mut dotthrow = Function::new([]);
+        dotthrow
+            .instructions()
+            .i32_const(64)
+            .i32_const(1)
+            .i32_const(1)
+            .call(0)
+            .end();
+        code.function(&dotthrow);
+        let mut doend = Function::new([]);
+        doend.instructions().call(1).end();
+        code.function(&doend);
+        let mut data = DataSection::new();
+        data.active(0, &ConstExpr::i32_const(0), [0; 132]);
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&imports)
+            .section(&functions)
+            .section(&tables)
+            .section(&memories)
+            .section(&exports)
+            .section(&elements)
+            .section(&code)
+            .section(&data);
+        let mut runtime = crate::Runtime::instantiate(&module.finish()).unwrap();
+        assert!(runtime.call("dotthrow", &[]).is_err());
+        runtime.call("doend", &[]).unwrap();
+        // The object lived at 64; the static offset adds another 128.
+        assert_eq!(runtime.state().read(192, 1).unwrap(), [0xaa]);
     }
 }

@@ -33,7 +33,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use wasmparser::{Operator, Parser, Payload};
 
 /// What a parameter appears to be.
@@ -263,6 +263,22 @@ pub fn const_offset(expr: &wasmparser::ConstExpr<'_>) -> Option<u32> {
     (matches!(reader.read().ok()?, Operator::End) && reader.eof()).then_some(value as u32)
 }
 
+/// Decodes one constant table element: exactly `ref.func N` followed by
+/// `End`. Anything else leaves a slot no static inspection can resolve, so
+/// it fails loudly rather than publishing a partial table.
+fn decode_table_element(expr: &wasmparser::ConstExpr<'_>) -> Result<u32> {
+    let mut reader = expr.get_operators_reader();
+    let operator = reader.read().context("table element")?;
+    let wasmparser::Operator::RefFunc { function_index } = operator else {
+        bail!("unsupported table element: {operator:?}");
+    };
+    ensure!(
+        matches!(reader.read().context("table element")?, Operator::End) && reader.eof(),
+        "unsupported table element expression"
+    );
+    Ok(function_index)
+}
+
 /// Infers the ABI of the function a table slot points at.
 ///
 /// This is how a trampoline is followed: `oracle abi` reports the slot an
@@ -438,6 +454,20 @@ impl Layout {
                                     .checked_add(u32::try_from(slot)?)
                                     .context("table slot overflow")?;
                                 table.insert(address, func.context("element")?);
+                            }
+                        } else if let wasmparser::ElementItems::Expressions(ty, items) =
+                            element.items
+                        {
+                            // Only funcref elements name functions; other
+                            // tables carry no dispatch targets.
+                            if ty != wasmparser::RefType::FUNCREF {
+                                continue;
+                            }
+                            for (slot, item) in items.into_iter().enumerate() {
+                                let address = base
+                                    .checked_add(u32::try_from(slot)?)
+                                    .context("table slot overflow")?;
+                                table.insert(address, decode_table_element(&item?)?);
                             }
                         }
                     }
@@ -1454,5 +1484,54 @@ mod offset_tests {
         assert_eq!(offset(&[0x41, 3, 0x41, 4, 0x6a, 0x0b]), None);
         assert_eq!(offset(&[0x41, 3]), None);
         assert_eq!(offset(&[0x41, 3, 0x0b, 0x41, 4]), None);
+    }
+
+    #[test]
+    fn expression_element_segments_resolve_table_slots() {
+        use wasm_encoder::{
+            CodeSection, ConstExpr, ElementSection, Elements, ExportKind, ExportSection, Function,
+            FunctionSection, Module, RefType, TableSection, TableType, TypeSection,
+        };
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        functions.function(0);
+        let mut tables = TableSection::new();
+        tables.table(TableType {
+            element_type: RefType::FUNCREF,
+            table64: false,
+            minimum: 4,
+            maximum: None,
+            shared: false,
+        });
+        let mut elements = ElementSection::new();
+        elements.active(
+            None,
+            &ConstExpr::i32_const(1),
+            Elements::Expressions(
+                RefType::FUNCREF,
+                vec![ConstExpr::ref_func(0), ConstExpr::ref_func(1)].into(),
+            ),
+        );
+        let mut exports = ExportSection::new();
+        exports.export("table", ExportKind::Table, 0);
+        let mut code = CodeSection::new();
+        for _ in 0..2 {
+            let mut body = Function::new([]);
+            body.instructions().end();
+            code.function(&body);
+        }
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&functions)
+            .section(&tables)
+            .section(&exports)
+            .section(&elements)
+            .section(&code);
+        let bytes = module.finish();
+        assert_eq!(table_slots_of(&bytes, 0).unwrap(), [1]);
+        assert_eq!(table_slots_of(&bytes, 1).unwrap(), [2]);
     }
 }

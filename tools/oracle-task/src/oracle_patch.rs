@@ -117,21 +117,57 @@ pub fn offer_errors(source: &Path, destination: &Path) -> Result<()> {
 }
 pub fn offer_guard(source: &Path, destination: &Path) -> Result<()> {
     let mut bytes = std::fs::read(source)?;
-    let mut pattern = vec![0x20, 2, 0x0d, 0, 0x20, 0, 0x2d, 0];
-    662166u32.encode(&mut pattern);
-    pattern.extend([0x0d, 0]);
-    let hits = bytes
-        .windows(pattern.len())
-        .enumerate()
-        .filter_map(|(i, b)| (b == pattern).then_some(i))
-        .collect::<Vec<_>>();
+    let site = guard_site(&bytes)?;
+    edit(&mut bytes, site, &[0x20, 2], &[0x41, 1])?;
+    // The rewrite must still validate as a module, not merely contain the
+    // patched bytes.
+    wasmparser::Validator::new().validate_all(&bytes)?;
+    write(destination, &bytes)
+}
+
+/// Offset of the `local.get 2` opening the offer-guard sequence, located
+/// through decoded operators: a whole-file byte scan also matches data
+/// segments and encoded immediates that merely contain the same bytes.
+fn guard_site(bytes: &[u8]) -> Result<usize> {
+    let mut bodies = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload? {
+            let range = body.range();
+            let start = body.get_operators_reader()?.original_position();
+            bodies.push((range, start));
+        }
+    }
+    let mut hits = Vec::new();
+    for (range, start) in &bodies {
+        let reader = wasmparser::OperatorsReader::new(wasmparser::BinaryReader::new(
+            &bytes[range.clone()][start - range.start..],
+            *start,
+        ));
+        let operators = reader
+            .into_iter_with_offsets()
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for window in operators.windows(5) {
+            let [
+                (wasmparser::Operator::LocalGet { local_index: 2 }, at),
+                (wasmparser::Operator::BrIf { relative_depth: 0 }, _),
+                (wasmparser::Operator::LocalGet { local_index: 0 }, _),
+                (wasmparser::Operator::I32Load8U { memarg }, _),
+                (wasmparser::Operator::BrIf { relative_depth: 0 }, _),
+            ] = window
+            else {
+                continue;
+            };
+            if memarg.align == 0 && memarg.offset == 662166 {
+                hits.push(*at);
+            }
+        }
+    }
     ensure!(
         hits.len() == 1,
         "offer guard has {} matches; refusing to guess",
         hits.len()
     );
-    edit(&mut bytes, hits[0], &[0x20, 2], &[0x41, 1])?;
-    write(destination, &bytes)
+    Ok(hits[0])
 }
 
 #[cfg(test)]
@@ -162,25 +198,108 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_and_ambiguous_patches_do_not_write_outputs() {
+    fn guard_matches_decode_code_not_raw_bytes() {
+        use wasm_encoder::{
+            BlockType, CodeSection, DataSection, ExportKind, ExportSection, Function,
+            FunctionSection, MemArg, MemorySection, MemoryType, Module, TypeSection, ValType,
+        };
+        fn guard_module(copies: usize, decoy: bool) -> Vec<u8> {
+            let mut types = TypeSection::new();
+            types
+                .ty()
+                .function([ValType::I32, ValType::I32, ValType::I32], [ValType::I32]);
+            let mut functions = FunctionSection::new();
+            for _ in 0..copies {
+                functions.function(0);
+            }
+            let mut memories = MemorySection::new();
+            memories.memory(MemoryType {
+                minimum: 16,
+                maximum: None,
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            });
+            let mut exports = ExportSection::new();
+            exports.export("memory", ExportKind::Memory, 0);
+            let mut code = CodeSection::new();
+            for _ in 0..copies {
+                let mut body = Function::new([]);
+                body.instructions()
+                    .block(BlockType::Empty)
+                    .local_get(2)
+                    .br_if(0)
+                    .local_get(0)
+                    .i32_load8_u(MemArg {
+                        offset: 662166,
+                        align: 0,
+                        memory_index: 0,
+                    })
+                    .br_if(0)
+                    .end()
+                    .local_get(0)
+                    .end();
+                code.function(&body);
+            }
+            let mut module = Module::new();
+            module
+                .section(&types)
+                .section(&functions)
+                .section(&memories)
+                .section(&exports)
+                .section(&code);
+            if decoy {
+                let mut pattern = vec![0x20, 2, 0x0d, 0, 0x20, 0, 0x2d, 0];
+                662166u32.encode(&mut pattern);
+                pattern.extend([0x0d, 0]);
+                let mut data = DataSection::new();
+                data.active(0, &wasm_encoder::ConstExpr::i32_const(0), pattern);
+                module.section(&data);
+            }
+            module.finish()
+        }
+        // One code match beside a byte-identical data decoy still patches.
+        let cache = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let directory = tempfile::tempdir_in(cache).unwrap();
+        let source = directory.path().join("input.wasm");
+        let out = directory.path().join("output.wasm");
+        std::fs::write(&source, guard_module(1, true)).unwrap();
+        offer_guard(&source, &out).unwrap();
+        let result = std::fs::read(&out).unwrap();
+        wasmparser::Validator::new().validate_all(&result).unwrap();
+        let input = std::fs::read(&source).unwrap();
+        assert_eq!(input.len(), result.len());
+        let diffs: Vec<usize> = input
+            .iter()
+            .zip(&result)
+            .enumerate()
+            .filter_map(|(index, (before, after))| (before != after).then_some(index))
+            .collect();
+        assert_eq!(diffs.len(), 2, "only the guard head is rewritten");
+        assert_eq!(&result[diffs[0]..diffs[0] + 2], &[0x41, 1]);
+        // Two code matches refuse to guess.
+        std::fs::write(&source, guard_module(2, false)).unwrap();
+        assert!(offer_guard(&source, &out).is_err());
+        // Bytes outside code never match on their own.
+        std::fs::write(&source, guard_module(0, true)).unwrap();
+        assert!(offer_guard(&source, &out).is_err());
+    }
+
+    #[test]
+    fn invalid_modules_do_not_write_outputs() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("input.wasm");
         let out = dir.path().join("output.wasm");
         std::fs::write(&source, b"unrelated bytes").unwrap();
         assert!(offer_guard(&source, &out).is_err());
         assert!(!out.exists());
+        // Raw guard bytes are not a module, so they never match on their own.
         let mut pattern = vec![0x20, 2, 0x0d, 0, 0x20, 0, 0x2d, 0];
         662166u32.encode(&mut pattern);
         pattern.extend([0x0d, 0]);
-        let mut duplicate = pattern.clone();
-        duplicate.extend(&pattern);
-        std::fs::write(&source, duplicate).unwrap();
+        std::fs::write(&source, &pattern).unwrap();
         assert!(offer_guard(&source, &out).is_err());
         assert!(!out.exists());
-        std::fs::write(&source, &pattern).unwrap();
-        offer_guard(&source, &out).unwrap();
-        let result = std::fs::read(&out).unwrap();
-        assert_eq!(&result[..2], &[0x41, 1]);
-        assert_eq!(&result[2..], &pattern[2..]);
     }
 }

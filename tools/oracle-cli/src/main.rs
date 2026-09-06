@@ -459,7 +459,7 @@ fn run_wasi(
         let contents = wasi
             .file(&guest)
             .ok_or_else(|| anyhow::anyhow!("guest wrote no file `{guest}`"))?;
-        std::fs::write(&host, contents).with_context(|| format!("writing {host}"))?;
+        std::fs::write(&host, &contents).with_context(|| format!("writing {host}"))?;
         eprintln!("wrote {host} ({} bytes)", contents.len());
     }
 
