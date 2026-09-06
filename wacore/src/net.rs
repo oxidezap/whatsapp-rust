@@ -4,6 +4,7 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Default WhatsApp Web websocket endpoint.
 pub const WHATSAPP_WEB_WS_URL: &str = "wss://web.whatsapp.com/ws/chat";
@@ -173,8 +174,10 @@ pub trait TransportFactory: crate::sync_marker::MaybeSendSync {
 /// The winner never waits for the loser: [`Transport::disconnect`] carries no
 /// completion bound (a valid transport may stall it forever), so an
 /// already-open loser is closed on `runtime` via [`Runtime::spawn_detached`]
-/// while the winner is returned immediately. Its event channel is dropped
-/// with it, so the loser's close never surfaces as a `DisconnectReason`.
+/// while the winner is returned immediately. The background close is bounded,
+/// so a stalled loser is dropped and its socket released instead of lingering
+/// detached. Its event channel is dropped with it, so the loser's close never
+/// surfaces as a `DisconnectReason`.
 ///
 /// No handshake runs here, so at most one socket ever reaches Noise: this
 /// returns a single transport and the caller handshakes exactly it. The race
@@ -197,8 +200,6 @@ impl RacingTransportFactory {
     /// Races `primary` against `secondary`; the first success wins regardless
     /// of order, so pass the preferred endpoint first only as a tiebreak hint.
     /// For chat parity this is one factory per [`WHATSAPP_WEB_WS_URLS`] entry.
-    /// `runtime` runs the loser's background close; the winner is returned
-    /// without waiting for it.
     pub fn new(
         primary: Arc<dyn TransportFactory>,
         secondary: Arc<dyn TransportFactory>,
@@ -215,11 +216,20 @@ impl RacingTransportFactory {
 type TransportDial =
     Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), anyhow::Error>;
 
+/// Bound for the loser's background close.
+///
+/// A stalled close must still release its socket eventually, or repeated races
+/// would accumulate detached tasks retaining dead transports. Well under the
+/// 20s transport timeout, so the cleanup never overlaps the client's own
+/// connect accounting.
+const LOSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Settles a dial that lost the race: an already-open loser is closed in
 /// background and its late failure suppressed; a still-pending loser is left
 /// for the caller to drop, which aborts the dial per [`TransportFactory`]'s
 /// contract. Never awaits the loser, so a stalled close cannot delay a usable
-/// winner.
+/// winner; the background close itself is bounded, so a stalled loser is
+/// dropped and its socket released instead of lingering detached forever.
 fn settle_loser<F>(
     winner: TransportDial,
     loser: F,
@@ -233,9 +243,12 @@ where
     if winner.is_ok()
         && let Some(Ok((loser_transport, _))) = loser.now_or_never()
     {
-        let runtime = Arc::clone(runtime);
-        runtime.spawn_detached(Box::pin(async move {
-            loser_transport.disconnect().await;
+        let spawner = Arc::clone(runtime);
+        let timer = Arc::clone(runtime);
+        spawner.spawn_detached(Box::pin(async move {
+            let _ =
+                crate::runtime::timeout(&*timer, LOSER_CLOSE_TIMEOUT, loser_transport.disconnect())
+                    .await;
         }));
     }
     winner
@@ -498,6 +511,7 @@ mod racing_tests {
         live: AtomicUsize,
         opened: AtomicUsize,
         disconnects: AtomicUsize,
+        transports_live: AtomicUsize,
     }
 
     impl DialCounters {
@@ -507,6 +521,7 @@ mod racing_tests {
                 live: AtomicUsize::new(0),
                 opened: AtomicUsize::new(0),
                 disconnects: AtomicUsize::new(0),
+                transports_live: AtomicUsize::new(0),
             }
         }
 
@@ -526,6 +541,12 @@ mod racing_tests {
     struct MockDialTransport {
         counters: Arc<DialCounters>,
         stall_disconnect: bool,
+    }
+
+    impl Drop for MockDialTransport {
+        fn drop(&mut self) {
+            self.counters.transports_live.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     #[async_trait::async_trait]
@@ -571,6 +592,7 @@ mod racing_tests {
                 return Err(anyhow::anyhow!("{msg}"));
             }
             self.counters.opened.fetch_add(1, Ordering::AcqRel);
+            self.counters.transports_live.fetch_add(1, Ordering::AcqRel);
             let (_tx, rx) = async_channel::bounded(1);
             Ok((
                 Arc::new(MockDialTransport {
@@ -702,6 +724,41 @@ mod racing_tests {
             .send(Bytes::from_static(b"ping"))
             .await
             .expect("the delivered winner is usable");
+    }
+
+    #[tokio::test]
+    async fn stalled_loser_close_is_bounded_and_releases_its_socket() {
+        // Both dials open instantly and both stall forever on close. The
+        // loser's background close must give up and drop the transport
+        // instead of retaining it detached forever: only the delivered
+        // winner stays alive.
+        let (primary, primary_c) = scripted_full(None, None, true);
+        let (secondary, secondary_c) = scripted_full(None, None, true);
+
+        let (_transport, _rx) = race(primary, secondary)
+            .create_transport()
+            .await
+            .expect("one of the instant dials wins");
+        assert_eq!(
+            primary_c.get(|c| &c.transports_live) + secondary_c.get(|c| &c.transports_live),
+            2,
+            "both dials opened before either could be aborted"
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while primary_c.get(|c| &c.transports_live) + secondary_c.get(|c| &c.transports_live)
+                > 1
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stalled loser is dropped after the close bound");
+
+        // Neither close ever completed: the loser's was aborted by the bound,
+        // the winner's was never asked for.
+        assert_eq!(primary_c.get(|c| &c.disconnects), 0);
+        assert_eq!(secondary_c.get(|c| &c.disconnects), 0);
     }
 
     #[tokio::test]
