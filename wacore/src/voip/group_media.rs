@@ -102,7 +102,7 @@ pub struct ParticipantVideo {
     pub device_jid: Jid,
     pub pid: Option<u32>,
     pub header: RtpHeader,
-    pub access_units: Vec<Vec<u8>>,
+    pub access_units: Vec<(u32, Vec<u8>)>,
 }
 
 struct ParticipantReceiver {
@@ -1308,7 +1308,9 @@ mod tests {
                 .find_map(|packet| registry.unprotect_video(packet))
                 .expect("participant video packet");
             assert_eq!(decoded.device_jid, *peer);
-            assert_eq!(decoded.access_units, [access_unit.to_vec()]);
+            assert_eq!(decoded.access_units.len(), 1);
+            assert_eq!(decoded.access_units[0].0, decoded.header.timestamp);
+            assert_eq!(decoded.access_units[0].1, access_unit);
         }
     }
 

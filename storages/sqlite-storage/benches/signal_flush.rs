@@ -14,6 +14,11 @@
 //!   per backend call, each a `spawn_blocking`, a pool checkout and a WAL
 //!   commit; the batched form is one transaction.
 //!
+//! - **`n = 1` rows are smoke, not gates.** One row is dominated by fixed
+//!   per-call overhead (permit, `spawn_blocking`, commit, one cached
+//!   statement), so a few hundred bytes of absolute movement reads as a large
+//!   relative Memory delta. Gate on `n = 64/256`.
+//!
 //! Insert/delete fixtures reuse a database and generate fresh row keys.
 //! Warm updates reuse fixed keys; first-preparation updates use a fresh store
 //! per input with the target rows seeded through a separate connection.

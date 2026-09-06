@@ -215,6 +215,7 @@ mod tests {
             iq_type: "get".to_string(),
             target,
             exported_function: function.to_string(),
+            response: Default::default(),
         }
     }
 

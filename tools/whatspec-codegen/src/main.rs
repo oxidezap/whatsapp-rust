@@ -290,6 +290,11 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
             rust: true,
         },
         Artifact {
+            path: "wacore/src/iq/join_shapes.rs",
+            content: emit::join_shapes::generate(&iq, wa_version)?,
+            rust: true,
+        },
+        Artifact {
             path: "wacore/src/stanza/wire_tags.rs",
             content: emit::notif::generate(&notif, &srvreq, &stanza)?,
             rust: true,

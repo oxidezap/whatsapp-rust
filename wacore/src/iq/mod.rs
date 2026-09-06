@@ -7,6 +7,7 @@ pub mod contacts;
 pub mod devices;
 pub mod dirty;
 pub mod groups;
+pub mod join_shapes;
 pub mod keepalive;
 pub mod mediaconn;
 pub mod mex;
