@@ -5814,8 +5814,7 @@ mod tests {
         assert_eq!(result, JoinGroupResult::Joined(group_jid));
     }
 
-    /// An unrecognized child is an unknown shape, not a bare success: it must
-    /// reach the strict parser and fail loudly rather than report `Joined`.
+    /// Reject an unrecognized child.
     #[test]
     fn test_accept_group_invite_v4_unknown_child_is_rejected() {
         let (_, spec) = v4_spec();
@@ -5828,8 +5827,7 @@ mod tests {
         assert!(spec.parse_response(&iq.as_node_ref()).is_err());
     }
 
-    /// Scalar payload is content too: `<iq type="result">payload</iq>` is a
-    /// non-empty unknown shape, not a bare success.
+    /// Reject scalar response content.
     #[test]
     fn test_accept_group_invite_v4_scalar_content_is_rejected() {
         let (_, spec) = v4_spec();
