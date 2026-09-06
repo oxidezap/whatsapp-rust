@@ -16,7 +16,9 @@
 //! </iq>
 //!
 //! <!-- Response -->
-//! <iq from="s.whatsapp.net" id="..." type="result"/>
+//! <iq from="s.whatsapp.net" id="..." type="result">
+//!   <active/>
+//! </iq>
 //! ```
 
 use crate::iq::spec::IqSpec;
@@ -66,8 +68,18 @@ impl IqSpec for PassiveModeSpec {
         )
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
-        // Passive mode just needs a successful response
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+        // WA Web's `ActiveIQResponseSuccess` / `PassiveIQResponseSuccess`: the
+        // answer echoes the requested mode as a child (`<active/>` or
+        // `<passive/>`), and the parser gates on its presence without reading
+        // anything off it (see the generated
+        // `super::join_shapes::PASSIVE_ACTIVE_SUCCESS` /
+        // `PASSIVE_PASSIVE_SUCCESS`). A result without it is not this RPC's
+        // success.
+        let tag = if self.passive { "passive" } else { "active" };
+        if response.get_optional_child(tag).is_none() {
+            anyhow::bail!("expected <{tag}> in passive-mode response");
+        }
         Ok(())
     }
 }
@@ -108,12 +120,54 @@ mod tests {
         }
     }
 
+    /// Locks both mode parsers to the generated shape constants: the answer
+    /// must echo the requested mode child. If the next sync flips the
+    /// constants, the parsers above owe a re-read.
+    #[test]
+    fn test_passive_mode_shapes_match_the_ir_lock() {
+        use crate::iq::join_shapes;
+        assert_eq!(
+            join_shapes::PASSIVE_ACTIVE_SUCCESS,
+            &[("ActiveIQResponseSuccess", &["active"][..])]
+        );
+        assert_eq!(
+            join_shapes::PASSIVE_PASSIVE_SUCCESS,
+            &[("PassiveIQResponseSuccess", &["passive"][..])]
+        );
+    }
+
     #[test]
     fn test_passive_mode_spec_parse_response() {
+        let spec = PassiveModeSpec::passive();
+        let child = NodeBuilder::new("passive").build();
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([child])
+            .build();
+
+        let result = spec.parse_response(&response.as_node_ref());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_passive_mode_spec_rejects_result_without_mode_child() {
         let spec = PassiveModeSpec::passive();
         let response = NodeBuilder::new("iq").attr("type", "result").build();
 
         let result = spec.parse_response(&response.as_node_ref());
-        assert!(result.is_ok());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_passive_mode_spec_rejects_wrong_mode_child() {
+        let spec = PassiveModeSpec::passive();
+        let child = NodeBuilder::new("active").build();
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([child])
+            .build();
+
+        let result = spec.parse_response(&response.as_node_ref());
+        assert!(result.is_err());
     }
 }

@@ -2800,7 +2800,7 @@ impl JoinLinkedGroupIq {
 }
 
 impl IqSpec for JoinLinkedGroupIq {
-    type Response = GroupInfoResponse;
+    type Response = JoinGroupResult;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let node = NodeBuilder::new("join_linked_group")
@@ -2815,9 +2815,17 @@ impl IqSpec for JoinLinkedGroupIq {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
-        let linked_node = required_child(response, "linked_group")?;
-        let group_node = required_child(linked_node, "group")?;
-        GroupInfoResponse::try_from_node_ref(group_node)
+        // Same shape pair as the V4 accept (`JoinLinkedGroupResponseSuccess`
+        // bare beside `...GroupJoinRequestSuccess` gated on
+        // `<membership_approval_request>` — see the generated
+        // `super::join_shapes::JOIN_LINKED_GROUP_SUCCESS`): a bare `<iq
+        // type="result">` joins the request's own subgroup, not a malformed
+        // response. Anything present but unrecognized falls through to the
+        // strict parser and fails loudly instead of reporting `Joined`.
+        if response.content.is_none() {
+            return Ok(JoinGroupResult::Joined(self.subgroup_jid.clone()));
+        }
+        parse_join_group_response(response)
     }
 }
 
@@ -5867,5 +5875,67 @@ mod tests {
             .build();
         let result = spec.parse_response(&iq.as_node_ref()).unwrap();
         assert_eq!(result, JoinGroupResult::PendingApproval(group_jid));
+    }
+
+    fn linked_spec() -> (Jid, JoinLinkedGroupIq) {
+        let parent: Jid = "120363000000000001@g.us".parse().unwrap();
+        let subgroup: Jid = "120363000000000042@g.us".parse().unwrap();
+        let spec = JoinLinkedGroupIq::new(&parent, &subgroup);
+        (subgroup, spec)
+    }
+
+    /// Locks the linked-group join parser to its generated shapes: a bare
+    /// result and an approval-gated variant, like the V4 accept.
+    #[test]
+    fn test_join_linked_group_shapes_match_the_ir_lock() {
+        use crate::iq::join_shapes;
+        assert_eq!(
+            join_shapes::JOIN_LINKED_GROUP_SUCCESS,
+            &[
+                (
+                    "JoinLinkedGroupResponseGroupJoinRequestSuccess",
+                    &["membership_approval_request"][..]
+                ),
+                ("JoinLinkedGroupResponseSuccess", &[][..]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_join_linked_group_bare_result_joins_subgroup() {
+        let (subgroup, spec) = linked_spec();
+        let iq = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", "120363000000000001@g.us")
+            .build();
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::Joined(subgroup));
+    }
+
+    #[test]
+    fn test_join_linked_group_approval_child_stays_pending() {
+        let (subgroup, spec) = linked_spec();
+        let approval = NodeBuilder::new("membership_approval_request")
+            .attr("jid", "120363000000000042@g.us")
+            .build();
+        let iq = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", "120363000000000001@g.us")
+            .children([approval])
+            .build();
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::PendingApproval(subgroup));
+    }
+
+    #[test]
+    fn test_join_linked_group_unknown_child_is_rejected() {
+        let (_, spec) = linked_spec();
+        let unknown = NodeBuilder::new("unexpected").build();
+        let iq = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", "120363000000000001@g.us")
+            .children([unknown])
+            .build();
+        assert!(spec.parse_response(&iq.as_node_ref()).is_err());
     }
 }
