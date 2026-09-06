@@ -1,5 +1,8 @@
 // Re-export transport types from wacore
-pub use wacore::net::{DisconnectReason, Transport, TransportEvent, TransportFactory};
+pub use wacore::net::{
+    DisconnectReason, RacingTransportFactory, Transport, TransportEvent, TransportFactory,
+    WHATSAPP_WEB_WS_URL_FALLBACK, WHATSAPP_WEB_WS_URLS, with_edge_routing_param,
+};
 
 #[cfg(feature = "tokio-transport")]
 pub use whatsapp_rust_tokio_transport::{

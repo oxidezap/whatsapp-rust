@@ -2,10 +2,44 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
 /// Default WhatsApp Web websocket endpoint.
 pub const WHATSAPP_WEB_WS_URL: &str = "wss://web.whatsapp.com/ws/chat";
+
+/// Alternate-port WhatsApp Web websocket endpoint.
+///
+/// WA Web dials this concurrently with [`WHATSAPP_WEB_WS_URL`] (its
+/// `openWebSocketsConcurrently` races `wss://web.whatsapp.com/ws/chat` against
+/// `wss://web.whatsapp.com:5222/ws/chat` and keeps the first `onopen`). A
+/// network that blocks 443 but not 5222, or vice versa, connects through the
+/// survivor, where a single-URL dial fails outright.
+pub const WHATSAPP_WEB_WS_URL_FALLBACK: &str = "wss://web.whatsapp.com:5222/ws/chat";
+
+/// Both chat endpoints WA Web dials, primary first.
+pub const WHATSAPP_WEB_WS_URLS: [&str; 2] = [WHATSAPP_WEB_WS_URL, WHATSAPP_WEB_WS_URL_FALLBACK];
+
+/// Appends WA Web's `?ED=` edge-routing query parameter to a chat URL.
+///
+/// The value is the same `edge_routing_info` the handshake already sends as
+/// the binary `ED` pre-intro, here base64url-encoded exactly like WA Web's
+/// `encodeB64UrlSafe` (URL-safe alphabet, padding kept). Both dial URLs carry
+/// it. Returns `url` unchanged when routing is absent, empty, or oversize, the
+/// same omit rules as `build_handshake_header`: a missing query never fails a
+/// handshake, the pre-intro still carries the bytes.
+pub fn with_edge_routing_param(url: &str, edge_routing_info: Option<&[u8]>) -> String {
+    let Some(info) = edge_routing_info else {
+        return url.to_string();
+    };
+    if info.is_empty() || info.len() > wacore_noise::MAX_EDGE_ROUTING_LEN {
+        return url.to_string();
+    }
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::URL_SAFE.encode(info);
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}ED={encoded}")
+}
 
 /// `Origin` sent to every WhatsApp Web endpoint — the chat socket and the media
 /// hosts alike.
@@ -118,9 +152,94 @@ pub trait Transport: crate::sync_marker::MaybeSendSync {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait TransportFactory: crate::sync_marker::MaybeSendSync {
     /// Creates a new transport and returns it, along with a stream of events.
+    ///
+    /// Dropping the returned future must abort the dial without leaking an
+    /// open transport: [`RacingTransportFactory`] cancels the loser by
+    /// dropping it, which is only clean when a half-open dial leaves no
+    /// socket behind.
     async fn create_transport(
         &self,
     ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), anyhow::Error>;
+}
+
+/// Dials two endpoints concurrently and keeps the first success, mirroring WA
+/// Web's `openWebSocketsConcurrently`: the winner is returned, a loser that
+/// already opened is closed cleanly via [`Transport::disconnect`], a loser
+/// still dialling is aborted by dropping it, and an individual failure is
+/// suppressed while the other dial is still in flight. Only when both fail
+/// does this return an error (the one that completed last, as WA Web rejects
+/// with the failure that completes the set).
+///
+/// No handshake runs here, so at most one socket ever reaches Noise: this
+/// returns a single transport and the caller handshakes exactly it. No task is
+/// spawned and no executor primitive is used beyond `futures` combinators, so
+/// this stays portable (wasm32/ESP32) and dropping the race future aborts both
+/// dials with no socket to close.
+///
+/// Inner factories keep their own contracts: TLS session resumption stays
+/// inside each factory's connector, `Origin` stays each factory's, and custom
+/// strategies built on `from_websocket` compose by wrapping the factories.
+pub struct RacingTransportFactory {
+    primary: Arc<dyn TransportFactory>,
+    secondary: Arc<dyn TransportFactory>,
+}
+
+impl RacingTransportFactory {
+    /// Races `primary` against `secondary`; the first success wins regardless
+    /// of order, so pass the preferred endpoint first only as a tiebreak hint.
+    /// For chat parity this is one factory per [`WHATSAPP_WEB_WS_URLS`] entry.
+    pub fn new(primary: Arc<dyn TransportFactory>, secondary: Arc<dyn TransportFactory>) -> Self {
+        Self { primary, secondary }
+    }
+}
+
+type TransportDial =
+    Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), anyhow::Error>;
+
+/// Settles a dial that lost the race: an already-open loser is closed cleanly
+/// and its late failure suppressed; a still-pending loser is left for the
+/// caller to drop, which aborts the dial per [`TransportFactory`]'s contract.
+async fn settle_loser<F>(winner: TransportDial, loser: F) -> TransportDial
+where
+    F: Future<Output = TransportDial>,
+{
+    use futures::future::FutureExt as _;
+
+    let winner = winner?;
+    if let Some(Ok((loser_transport, _))) = loser.now_or_never() {
+        loser_transport.disconnect().await;
+    }
+    Ok(winner)
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl TransportFactory for RacingTransportFactory {
+    async fn create_transport(&self) -> TransportDial {
+        use futures::future::{Either, select};
+        use futures::pin_mut;
+
+        let primary_fut = self.primary.create_transport();
+        let secondary_fut = self.secondary.create_transport();
+        pin_mut!(primary_fut, secondary_fut);
+
+        match select(primary_fut, secondary_fut).await {
+            Either::Left((first, second_fut)) => {
+                if first.is_ok() {
+                    settle_loser(first, second_fut).await
+                } else {
+                    second_fut.await
+                }
+            }
+            Either::Right((second, first_fut)) => {
+                if second.is_ok() {
+                    settle_loser(second, first_fut).await
+                } else {
+                    first_fut.await
+                }
+            }
+        }
+    }
 }
 
 /// A simple structure to represent an HTTP request
@@ -297,5 +416,310 @@ mod tests {
                 "close code {code} must not be treated as a clean shutdown"
             );
         }
+    }
+}
+
+/// Race and `?ED=` tests. The implementation uses only `futures` combinators,
+/// so it is portable; the tests below use Tokio timers purely as controllable
+/// latency/failure scripts for the mock dials.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod racing_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    struct DialCounters {
+        started: AtomicUsize,
+        live: AtomicUsize,
+        opened: AtomicUsize,
+        disconnects: AtomicUsize,
+    }
+
+    impl DialCounters {
+        fn zero() -> Self {
+            Self {
+                started: AtomicUsize::new(0),
+                live: AtomicUsize::new(0),
+                opened: AtomicUsize::new(0),
+                disconnects: AtomicUsize::new(0),
+            }
+        }
+
+        fn get(&self, f: impl Fn(&DialCounters) -> &AtomicUsize) -> usize {
+            f(self).load(Ordering::Acquire)
+        }
+    }
+
+    struct LiveGuard(Arc<DialCounters>);
+
+    impl Drop for LiveGuard {
+        fn drop(&mut self) {
+            self.0.live.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    struct MockDialTransport {
+        counters: Arc<DialCounters>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for MockDialTransport {
+        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+
+        async fn disconnect(&self) {
+            self.counters.disconnects.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// A factory whose dial sleeps, then succeeds or fails on script. `None`
+    /// delay answers immediately, which is what makes the simultaneous-open
+    /// path deterministic.
+    #[derive(Clone)]
+    struct ScriptedDialFactory {
+        delay: Option<Duration>,
+        fail_with: Option<&'static str>,
+        counters: Arc<DialCounters>,
+    }
+
+    #[async_trait::async_trait]
+    impl TransportFactory for ScriptedDialFactory {
+        async fn create_transport(
+            &self,
+        ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), anyhow::Error>
+        {
+            self.counters.started.fetch_add(1, Ordering::AcqRel);
+            self.counters.live.fetch_add(1, Ordering::AcqRel);
+            let _live = LiveGuard(self.counters.clone());
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
+            if let Some(msg) = self.fail_with {
+                return Err(anyhow::anyhow!("{msg}"));
+            }
+            self.counters.opened.fetch_add(1, Ordering::AcqRel);
+            let (_tx, rx) = async_channel::bounded(1);
+            Ok((
+                Arc::new(MockDialTransport {
+                    counters: self.counters.clone(),
+                }),
+                rx,
+            ))
+        }
+    }
+
+    fn scripted(
+        delay_ms: Option<u64>,
+        fail_with: Option<&'static str>,
+    ) -> (ScriptedDialFactory, Arc<DialCounters>) {
+        let counters = Arc::new(DialCounters::zero());
+        (
+            ScriptedDialFactory {
+                delay: delay_ms.map(Duration::from_millis),
+                fail_with,
+                counters: counters.clone(),
+            },
+            counters,
+        )
+    }
+
+    fn race(
+        primary: ScriptedDialFactory,
+        secondary: ScriptedDialFactory,
+    ) -> RacingTransportFactory {
+        RacingTransportFactory::new(Arc::new(primary), Arc::new(secondary))
+    }
+
+    #[tokio::test]
+    async fn fastest_success_wins_and_loser_dial_is_aborted() {
+        let (primary, primary_c) = scripted(Some(100), None);
+        let (secondary, secondary_c) = scripted(Some(5), None);
+
+        let (_transport, _rx) = race(primary, secondary)
+            .create_transport()
+            .await
+            .expect("the fast dial succeeds");
+
+        assert_eq!(secondary_c.get(|c| &c.opened), 1);
+        assert_eq!(
+            primary_c.get(|c| &c.opened),
+            0,
+            "the slow dial never opened"
+        );
+        assert_eq!(
+            primary_c.get(|c| &c.disconnects),
+            0,
+            "a dial that never opened has no socket to close"
+        );
+        assert_eq!(secondary_c.get(|c| &c.disconnects), 0);
+        assert_eq!(primary_c.get(|c| &c.live), 0);
+        assert_eq!(secondary_c.get(|c| &c.live), 0);
+    }
+
+    #[tokio::test]
+    async fn simultaneous_success_closes_loser_cleanly() {
+        let (primary, primary_c) = scripted(None, None);
+        let (secondary, secondary_c) = scripted(None, None);
+
+        let (_transport, _rx) = race(primary, secondary)
+            .create_transport()
+            .await
+            .expect("one of the instant dials wins");
+
+        assert_eq!(
+            primary_c.get(|c| &c.opened) + secondary_c.get(|c| &c.opened),
+            2,
+            "both dials opened before either could be aborted"
+        );
+        let (p_disc, s_disc) = (
+            primary_c.get(|c| &c.disconnects),
+            secondary_c.get(|c| &c.disconnects),
+        );
+        assert!(
+            (p_disc, s_disc) == (0, 1) || (p_disc, s_disc) == (1, 0),
+            "exactly the loser is closed, the winner is untouched (got {p_disc}/{s_disc})"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_failure_waits_for_second_success() {
+        let (primary, _) = scripted(None, Some("primary refused"));
+        let (secondary, secondary_c) = scripted(Some(10), None);
+
+        race(primary, secondary)
+            .create_transport()
+            .await
+            .expect("the surviving dial wins despite the refusal");
+
+        assert_eq!(secondary_c.get(|c| &c.opened), 1);
+    }
+
+    #[tokio::test]
+    async fn double_failure_returns_the_last_error() {
+        // WA Web rejects with the failure that completes the set.
+        let (primary, _) = scripted(Some(20), Some("boom-primary"));
+        let (secondary, _) = scripted(Some(5), Some("boom-secondary"));
+        let err = race(primary, secondary)
+            .create_transport()
+            .await
+            .err()
+            .expect("both dials fail");
+        assert!(
+            err.to_string().contains("boom-primary"),
+            "the last failure wins, got: {err}"
+        );
+
+        let (primary, _) = scripted(Some(5), Some("boom-primary"));
+        let (secondary, _) = scripted(Some(20), Some("boom-secondary"));
+        let err = race(primary, secondary)
+            .create_transport()
+            .await
+            .err()
+            .expect("both dials fail");
+        assert!(
+            err.to_string().contains("boom-secondary"),
+            "the last failure wins, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_race_leaks_no_socket() {
+        use futures::FutureExt as _;
+
+        let (primary, primary_c) = scripted(Some(100), None);
+        let (secondary, secondary_c) = scripted(Some(100), None);
+        let racing = race(primary, secondary);
+
+        assert!(
+            racing.create_transport().now_or_never().is_none(),
+            "both dials are still in flight after one poll"
+        );
+        assert_eq!(primary_c.get(|c| &c.started), 1);
+        assert_eq!(secondary_c.get(|c| &c.started), 1);
+
+        // The race future (and both dials) dropped here.
+        assert_eq!(primary_c.get(|c| &c.live), 0);
+        assert_eq!(secondary_c.get(|c| &c.live), 0);
+        assert_eq!(primary_c.get(|c| &c.opened), 0);
+        assert_eq!(secondary_c.get(|c| &c.opened), 0);
+        assert_eq!(primary_c.get(|c| &c.disconnects), 0);
+        assert_eq!(secondary_c.get(|c| &c.disconnects), 0);
+    }
+
+    #[tokio::test]
+    async fn winner_closed_immediately_after_win_leaves_no_loser() {
+        let (primary, primary_c) = scripted(Some(50), None);
+        let (secondary, secondary_c) = scripted(Some(5), None);
+
+        let (transport, _rx) = race(primary, secondary)
+            .create_transport()
+            .await
+            .expect("the fast dial succeeds");
+        transport.disconnect().await;
+
+        assert_eq!(secondary_c.get(|c| &c.disconnects), 1);
+        assert_eq!(primary_c.get(|c| &c.opened), 0);
+        assert_eq!(primary_c.get(|c| &c.disconnects), 0);
+        assert_eq!(primary_c.get(|c| &c.live), 0);
+        assert_eq!(secondary_c.get(|c| &c.live), 0);
+    }
+
+    #[test]
+    fn edge_routing_param_absent_or_empty_leaves_url_untouched() {
+        assert_eq!(
+            with_edge_routing_param(WHATSAPP_WEB_WS_URL, None),
+            WHATSAPP_WEB_WS_URL
+        );
+        assert_eq!(
+            with_edge_routing_param(WHATSAPP_WEB_WS_URL, Some(&[])),
+            WHATSAPP_WEB_WS_URL
+        );
+    }
+
+    #[test]
+    fn edge_routing_param_encodes_like_wa_web() {
+        assert_eq!(
+            with_edge_routing_param(WHATSAPP_WEB_WS_URL, Some(&[0x01, 0x02, 0x03])),
+            format!("{WHATSAPP_WEB_WS_URL}?ED=AQID")
+        );
+        // WA Web's urlSafeBase64 swaps the alphabet but never strips `=`.
+        assert_eq!(
+            with_edge_routing_param(WHATSAPP_WEB_WS_URL, Some(&[0x01, 0x02])),
+            format!("{WHATSAPP_WEB_WS_URL}?ED=AQI=")
+        );
+        // `+`/`/` become `-`/`_`.
+        assert_eq!(
+            with_edge_routing_param(WHATSAPP_WEB_WS_URL, Some(&[0xFB, 0xFF])),
+            format!("{WHATSAPP_WEB_WS_URL}?ED=-_8=")
+        );
+        let url = with_edge_routing_param(WHATSAPP_WEB_WS_URL, Some(&[0xDE, 0xAD, 0xBE, 0xEF]));
+        let encoded = url.split("?ED=").nth(1).expect("query is present");
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::URL_SAFE
+            .decode(encoded)
+            .expect("valid base64url");
+        assert_eq!(decoded, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn edge_routing_param_oversize_keeps_previous_behavior() {
+        let oversize = vec![0x00u8; wacore_noise::MAX_EDGE_ROUTING_LEN + 1];
+        assert_eq!(
+            with_edge_routing_param(WHATSAPP_WEB_WS_URL, Some(&oversize)),
+            WHATSAPP_WEB_WS_URL
+        );
+    }
+
+    #[test]
+    fn chat_urls_cover_both_wa_web_endpoints() {
+        assert_eq!(
+            WHATSAPP_WEB_WS_URL_FALLBACK,
+            "wss://web.whatsapp.com:5222/ws/chat"
+        );
+        assert_eq!(
+            WHATSAPP_WEB_WS_URLS,
+            [WHATSAPP_WEB_WS_URL, WHATSAPP_WEB_WS_URL_FALLBACK]
+        );
     }
 }
