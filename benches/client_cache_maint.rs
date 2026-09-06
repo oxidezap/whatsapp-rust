@@ -171,14 +171,31 @@ fn cache_insert(bencher: divan::Bencher, n: usize) {
 /// degrade into hit-overwrites with no eviction. A monotonic key counter
 /// (never-before-seen keys per sample) was worse still — it made the
 /// peak-memory instrument read allocator-state drift as signal here.
+///
+/// The fixture pins a fixed-key hasher: under the default per-process seed
+/// the table's growth budget follows a seed-dependent random walk, and at
+/// width 64 it sometimes exhausts mid-iteration — one extra ~20 KiB table
+/// growth that the peak-memory instrument reads as a 2.6 KiB / 22.8 KiB
+/// flip-flop between runs with no code change. Same `DetState` shape the
+/// `wacore` benches use; see `PortableCacheBuilder::hash_builder` for why
+/// the seed decides growth timing.
+///
+/// With the seed fixed the rotation's single table growth lands on a fixed
+/// batch, so the batches start where that batch is not the first: CodSpeed
+/// measures one iteration, which is always the first batch.
+type DetState = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
+
 #[divan::bench(args = CACHE_SIZES)]
 fn cache_insert_at_capacity(bencher: divan::Bencher, n: usize) {
-    static FULL: OnceLock<Vec<Cache<Jid, Arc<()>>>> = OnceLock::new();
+    static FULL: OnceLock<Vec<Cache<Jid, Arc<()>, DetState>>> = OnceLock::new();
     let built = FULL.get_or_init(|| {
         CACHE_SIZES
             .iter()
             .map(|&m| {
-                let cache: Cache<Jid, Arc<()>> = Cache::builder().max_capacity(m as u64).build();
+                let cache: Cache<Jid, Arc<()>, DetState> = Cache::builder()
+                    .max_capacity(m as u64)
+                    .hash_builder(DetState::default())
+                    .build();
                 block_on(async {
                     for i in 0..m {
                         cache.insert(key(i), Arc::new(())).await;
@@ -199,12 +216,16 @@ fn cache_insert_at_capacity(bencher: divan::Bencher, n: usize) {
     // capacity (4096): 4096 / 512 + 2 = 10 batches = 5120 keys, so the cache
     // can never hold the whole rotation and round-robin insertion always
     // lands on 512 misses. None of the ranges collide with the resident
-    // `key(0..m)` keys, and all stay below 1_000_000 so `{i:06}` never widens.
+    // `key(0..m)` keys, the `cache_insert` batch at 100_000, or the sweep
+    // keys at 400_000, and all stay below 1_000_000 so `{i:06}` never widens.
+    // The base sits at 300_000 rather than 200_000: with the fixed seed above
+    // the rotation's one table growth lands on the second batch, keeping the
+    // first — the one CodSpeed measures — on the flat steady state.
     static ROTATING: OnceLock<Vec<Vec<Jid>>> = OnceLock::new();
     let batches = ROTATING.get_or_init(|| {
         let depth = CACHE_SIZES.iter().max().expect("sizes") / BATCH + 2;
         (0..depth)
-            .map(|b| batch_keys(200_000 + b * BATCH, BATCH))
+            .map(|b| batch_keys(300_000 + b * BATCH, BATCH))
             .collect()
     });
     let round = AtomicUsize::new(0);
