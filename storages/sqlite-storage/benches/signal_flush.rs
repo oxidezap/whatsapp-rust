@@ -17,7 +17,7 @@
 //! - **`n = 1` rows are smoke, not gates.** One row is dominated by fixed
 //!   per-call overhead (permit, `spawn_blocking`, commit, one cached
 //!   statement), so a few hundred bytes of absolute movement reads as a large
-//!   relative Memory delta. Gate on `n = 32/256`.
+//!   relative Memory delta. Gate on `n = 64/256`.
 //!
 //! Insert/delete fixtures reuse a database and generate fresh row keys.
 //! Warm updates reuse fixed keys; first-preparation updates use a fresh store
