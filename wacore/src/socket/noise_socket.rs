@@ -180,7 +180,7 @@ impl SendObservers {
 
 pub struct NoiseSocket {
     read_key: Arc<NoiseCipher>,
-    pub read_counter: Arc<AtomicU32>,
+    read_counter: Arc<AtomicU32>,
     /// Channel to send jobs to the dedicated sender task.
     /// Using a channel instead of a mutex avoids blocking callers while
     /// the current send is in progress - they can enqueue their work and
@@ -551,5 +551,16 @@ impl NoiseSocket {
             .decrypt_in_place_with_counter(counter, &mut ciphertext)
             .map_err(SocketError::Cipher)?;
         Ok(ciphertext)
+    }
+
+    /// Read-only snapshot of the current read frame counter.
+    pub fn read_counter(&self) -> u32 {
+        self.read_counter.load(Ordering::SeqCst)
+    }
+
+    /// Explicitly sets the read counter for testing counter exhaustion.
+    #[doc(hidden)]
+    pub fn set_read_counter_for_test(&self, val: u32) {
+        self.read_counter.store(val, Ordering::SeqCst);
     }
 }

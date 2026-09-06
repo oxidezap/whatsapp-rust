@@ -45,7 +45,7 @@ mod tests {
         );
         // At u32::MAX the next read would wrap the counter to 0 and reuse a nonce;
         // the counter check fires before decryption, so the bytes don't matter.
-        socket.read_counter.store(u32::MAX, Ordering::SeqCst);
+        socket.set_read_counter_for_test(u32::MAX);
         let err = socket
             .decrypt_frame(BytesMut::from(&b"ignored"[..]))
             .expect_err("exhausted read counter must error, not wrap");
