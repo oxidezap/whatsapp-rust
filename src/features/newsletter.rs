@@ -1556,9 +1556,6 @@ mod tests {
 
     #[test]
     fn test_message_without_plaintext_is_kept_with_no_payload() {
-        // The bundle gates subtypes on `<plaintext>` presence, but this parser
-        // does not dispatch on it: a message without payload is kept with
-        // `message: None`, never dropped.
         let response = NodeBuilder::new("iq")
             .children([NodeBuilder::new("messages")
                 .children([NodeBuilder::new("message")
