@@ -175,9 +175,11 @@ impl ResponseAssertion {
     /// The required child tag when this assertion is a presence gate
     /// (`kind == "child"` with a tag), `None` otherwise.
     pub fn child_gate(&self) -> Option<&str> {
-        (self.kind.as_deref() == Some("child"))
-            .then(|| self.name.as_deref())
-            .flatten()
+        if self.kind.as_deref() == Some("child") {
+            self.name.as_deref()
+        } else {
+            None
+        }
     }
 }
 

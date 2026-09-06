@@ -2817,7 +2817,23 @@ impl IqSpec for JoinLinkedGroupIq {
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
         // Bare joins the request's own subgroup (same shape pair as the V4
         // accept — see the generated shapes).
-        parse_join_or_bare(response, &self.subgroup_jid)
+        if response.content.is_none() {
+            return Ok(JoinGroupResult::Joined(self.subgroup_jid.clone()));
+        }
+        // Compatibility allowance, not a bundle shape: some servers answer
+        // with the query-shaped `<linked_group><group id/></linked_group>`
+        // metadata instead of the bare result. It carries a real group
+        // identity (the same `id` the query parser reads), so joining it
+        // cannot misreport a non-joined state; anything else present but
+        // unrecognized still fails loudly below.
+        if let Some(linked) = response.get_optional_child("linked_group")
+            && let Some(group) = linked.get_optional_child("group")
+            && let Ok(id_str) = required_attr(group, "id")
+            && let Ok(jid) = parse_group_id(&id_str)
+        {
+            return Ok(JoinGroupResult::Joined(jid));
+        }
+        parse_join_group_response(response)
     }
 }
 
@@ -5921,6 +5937,25 @@ mod tests {
         let iq = result_iq(TEST_PARENT_JID, vec![approval_child(TEST_GROUP_JID)]);
         let result = spec.parse_response(&iq.as_node_ref()).unwrap();
         assert_eq!(result, JoinGroupResult::PendingApproval(subgroup));
+    }
+
+    #[test]
+    fn test_join_linked_group_linked_group_wrapper_is_tolerated() {
+        // Compatibility allowance: a query-shaped answer joins its inner group.
+        let (_, spec) = linked_spec();
+        let group = NodeBuilder::new(JOIN_GROUP_CHILD)
+            .attr("id", "120363000000000042")
+            .build();
+        let linked = NodeBuilder::new("linked_group")
+            .attr("jid", TEST_GROUP_JID)
+            .children([group])
+            .build();
+        let iq = result_iq(TEST_PARENT_JID, vec![linked]);
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(
+            result,
+            JoinGroupResult::Joined(TEST_GROUP_JID.parse().unwrap())
+        );
     }
 
     #[test]
