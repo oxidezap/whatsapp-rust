@@ -2824,14 +2824,18 @@ impl IqSpec for JoinLinkedGroupIq {
         // with the query-shaped `<linked_group><group id/></linked_group>`
         // metadata instead of the bare result. It carries a real group
         // identity (the same `id` the query parser reads), so joining it
-        // cannot misreport a non-joined state; anything else present but
-        // unrecognized still fails loudly below.
+        // cannot misreport a non-joined state — but only as the complete
+        // shape: siblings beside the wrapper (an approval request, unknown
+        // nodes) fall through to the strict parser below instead of being
+        // silently ignored.
         //
         // TODO: drop this allowance once servers answer the bare result and
         // re-tighten to bare-or-approval only; the wrapper exists for a
         // transitional server behavior, not the protocol.
-        if let Some(linked) = response.get_optional_child("linked_group")
-            && let Some(group) = linked.get_optional_child("group")
+        if let Some([linked]) = response.children()
+            && linked.tag.as_ref() == "linked_group"
+            && let Some([group]) = linked.children()
+            && group.tag.as_ref() == "group"
             && let Ok(id_str) = required_attr(group, "id")
             && let Ok(jid) = parse_group_id(&id_str)
         {
@@ -5866,9 +5870,40 @@ mod tests {
 
     /// Reject an unrecognized child.
     #[test]
-    fn test_accept_group_invite_v4_unknown_child_is_rejected() {
-        let (_, spec) = v4_spec();
-        let iq = result_iq(TEST_GROUP_JID, vec![NodeBuilder::new("unexpected").build()]);
+    fn test_join_linked_group_unknown_child_is_rejected() {
+        let (_, spec) = linked_spec();
+        let iq = result_iq(
+            TEST_PARENT_JID,
+            vec![NodeBuilder::new("unexpected").build()],
+        );
+        assert!(spec.parse_response(&iq.as_node_ref()).is_err());
+    }
+
+    #[test]
+    fn test_join_linked_group_wrapper_with_sibling_is_not_enough() {
+        // The tolerance covers exactly the wrapper shape; an approval request
+        // beside it still reports pending, and any other sibling still fails.
+        let (subgroup, spec) = linked_spec();
+        let wrapper = NodeBuilder::new("linked_group")
+            .children([NodeBuilder::new(JOIN_GROUP_CHILD)
+                .attr("id", "120363000000000042")
+                .build()])
+            .build();
+        let approval = approval_child(TEST_GROUP_JID);
+        let iq = result_iq(TEST_PARENT_JID, vec![wrapper, approval]);
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::PendingApproval(subgroup));
+
+        let (_, spec) = linked_spec();
+        let wrapper = NodeBuilder::new("linked_group")
+            .children([NodeBuilder::new(JOIN_GROUP_CHILD)
+                .attr("id", "120363000000000042")
+                .build()])
+            .build();
+        let iq = result_iq(
+            TEST_PARENT_JID,
+            vec![wrapper, NodeBuilder::new("unexpected").build()],
+        );
         assert!(spec.parse_response(&iq.as_node_ref()).is_err());
     }
 
@@ -5960,15 +5995,5 @@ mod tests {
             result,
             JoinGroupResult::Joined(TEST_GROUP_JID.parse().unwrap())
         );
-    }
-
-    #[test]
-    fn test_join_linked_group_unknown_child_is_rejected() {
-        let (_, spec) = linked_spec();
-        let iq = result_iq(
-            TEST_PARENT_JID,
-            vec![NodeBuilder::new("unexpected").build()],
-        );
-        assert!(spec.parse_response(&iq.as_node_ref()).is_err());
     }
 }
