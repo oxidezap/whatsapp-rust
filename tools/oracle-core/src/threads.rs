@@ -28,6 +28,11 @@ use crate::state::{HostState, ThreadPolicy};
 /// will not arrive here — so this bounds it rather than hanging the process.
 const THREAD_FUEL: u64 = 2_000_000_000;
 
+/// Fixed budget of guest workers per runtime. Handles are retained until drop
+/// so shutdown can join every worker; without a cap a looping guest exhausts
+/// threads, stacks and host memory. Real captures use a handful.
+const MAX_WORKERS: usize = 64;
+
 #[derive(Debug, Default)]
 pub(crate) struct Workers(Mutex<WorkerState>);
 
@@ -45,6 +50,12 @@ impl Workers {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
                 "runtime is stopping",
+            ));
+        }
+        if state.handles.len() >= MAX_WORKERS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::QuotaExceeded,
+                "guest worker budget exceeded",
             ));
         }
         state
@@ -542,5 +553,15 @@ mod tests {
             .unwrap();
         assert_eq!(shared.workers.stop_and_join(), 1);
         assert_eq!(shared.live_threads(), 0);
+    }
+
+    #[test]
+    fn worker_spawns_are_bounded() {
+        let workers = Workers::default();
+        for index in 0..MAX_WORKERS {
+            workers.launch(format!("worker-{index}"), || {}).unwrap();
+        }
+        assert!(workers.launch("one-too-many".into(), || {}).is_err());
+        workers.stop_and_join();
     }
 }

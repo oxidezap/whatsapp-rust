@@ -41,6 +41,9 @@ const ROOT_NAME: &str = "/";
 const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
 /// Largest the whole memfs may hold across live files and unlinked-but-open ones.
 const MAX_FS_BYTES: usize = 256 * 1024 * 1024;
+/// Largest either captured standard stream may grow to. The per-call payload
+/// limit cannot stop a looping guest from retaining output forever.
+const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 
 /// WASI clock ids. `2` and `3` are the process and thread CPU-time clocks,
 /// which this host does not have and therefore refuses.
@@ -214,8 +217,17 @@ fn fd_write(caller: &mut Caller<'_, HostState>, fd: u32, iovs: u32, count: u32, 
     let state = caller.data();
     let mut wasi = state.wasi();
     match fd {
-        FD_STDOUT => wasi.stdout.extend_from_slice(&payload),
-        FD_STDERR => wasi.stderr.extend_from_slice(&payload),
+        FD_STDOUT | FD_STDERR => {
+            let stream = if fd == FD_STDOUT {
+                &mut wasi.stdout
+            } else {
+                &mut wasi.stderr
+            };
+            if stream.len().saturating_add(payload.len()) > MAX_STREAM_BYTES {
+                return EINVAL;
+            }
+            stream.extend_from_slice(&payload);
+        }
         _ => {
             let Some(open) = wasi.open.get(&fd) else {
                 return EBADF;
@@ -465,7 +477,12 @@ fn path_open(caller: &mut Caller<'_, HostState>, args: PathOpenArgs) -> i32 {
     let Ok(raw) = caller.data().read(args.path_ptr, args.path_len) else {
         return EINVAL;
     };
-    let path = normalise(&String::from_utf8_lossy(&raw));
+    // A lossy decode could alias invalid bytes onto a valid filename holding
+    // U+FFFD and resolve a file the guest did not name.
+    let Ok(path) = String::from_utf8(raw) else {
+        return EINVAL;
+    };
+    let path = normalise(&path);
 
     // What the guest asked for, whether or not it got it. A refusal here is
     // invisible from the outside — the VoIP engine reports only "Failed to get
@@ -561,24 +578,57 @@ fn fd_fdstat_get(caller: &mut Caller<'_, HostState>, fd: u32, out: u32) -> i32 {
 
 /// Writes a NUL-terminated string list in WASI's argv/environ layout: an array
 /// of pointers, and a packed buffer they point into.
+///
+/// Both destination ranges are preflighted before any byte is written: a
+/// later out-of-bounds entry must fail without leaving a partially written
+/// prefix behind for a guest retry to observe.
 fn write_string_list(state: &HostState, entries: &[String], ptrs: u32, buffer: u32) -> i32 {
     let mut cursor = buffer;
-    for (index, entry) in entries.iter().enumerate() {
-        if write_u32(state, ptrs + index as u32 * 4, cursor).is_err() {
+    let mut slots = Vec::with_capacity(entries.len());
+    let mut spans = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let bytes = entry.len().checked_add(1);
+        let next = bytes.and_then(|len| cursor.checked_add(len as u32));
+        let Some(next) = next else {
+            return EINVAL;
+        };
+        slots.push(cursor);
+        spans.push((cursor, next));
+        cursor = next;
+    }
+    let table_end = (ptrs as u64)
+        .checked_add(entries.len() as u64 * 4)
+        .and_then(|end| u32::try_from(end).ok());
+    let Some(table_end) = table_end else {
+        return EINVAL;
+    };
+    if state.ensure_memory_range(ptrs, table_end - ptrs).is_err()
+        || state.ensure_memory_range(buffer, cursor - buffer).is_err()
+    {
+        return EINVAL;
+    }
+    for (index, at) in slots.into_iter().enumerate() {
+        if write_u32(state, ptrs + index as u32 * 4, at).is_err() {
             return EINVAL;
         }
+    }
+    for (entry, (at, _)) in entries.iter().zip(spans) {
         let mut bytes = entry.clone().into_bytes();
         bytes.push(0);
-        if state.write(cursor, &bytes).is_err() {
+        if state.write(at, &bytes).is_err() {
             return EINVAL;
         }
-        cursor += bytes.len() as u32;
     }
     ESUCCESS
 }
 
 fn list_sizes(state: &HostState, entries: &[String], count_ptr: u32, size_ptr: u32) -> i32 {
     let bytes: usize = entries.iter().map(|entry| entry.len() + 1).sum();
+    if state.ensure_memory_range(count_ptr, 4).is_err()
+        || state.ensure_memory_range(size_ptr, 4).is_err()
+    {
+        return EINVAL;
+    }
     if write_u32(state, count_ptr, entries.len() as u32).is_err()
         || write_u32(state, size_ptr, bytes as u32).is_err()
     {
@@ -753,10 +803,19 @@ fn dispatch(name: &str, caller: &mut Caller<'_, HostState>, params: &[Val]) -> i
             },
         ),
         "path_unlink_file" => {
+            if arg(params, 0) != FD_ROOT {
+                return EBADF;
+            }
             let Ok(raw) = caller.data().read(arg(params, 1), arg(params, 2)) else {
                 return EINVAL;
             };
-            let path = normalise(&String::from_utf8_lossy(&raw));
+            // Unlinking is destructive, so an encoding the host cannot
+            // interpret exactly must fail rather than delete under a
+            // lossy alias.
+            let Ok(path) = String::from_utf8(raw) else {
+                return EINVAL;
+            };
+            let path = normalise(&path);
             if caller.data().wasi().unlink_file(&path) {
                 ESUCCESS
             } else {
@@ -1127,6 +1186,12 @@ mod tests {
                     vec![Wave::I32(3), Wave::I32(128), Wave::I32(3), Wave::Call(0)],
                 ),
                 (
+                    "unlinkat",
+                    vec![I32, I32, I32],
+                    vec![I32],
+                    vec![Wave::Arg(0), Wave::Arg(1), Wave::Arg(2), Wave::Call(0)],
+                ),
+                (
                     "readout",
                     vec![],
                     vec![I32],
@@ -1143,6 +1208,7 @@ mod tests {
                 (0, &[64, 0, 0, 0, 3, 0, 0, 0]),
                 (64, &[0x55; 3]),
                 (128, b"out"),
+                (140, &[0xff, 0xfe]),
             ],
         );
         let mut runtime = crate::Runtime::instantiate(&bytes).unwrap();
@@ -1156,6 +1222,26 @@ mod tests {
                 retained: None,
             },
         );
+        // A descriptor that is not the preopened root cannot unlink.
+        assert!(matches!(
+            runtime
+                .call("unlinkat", &[Val::I32(99), Val::I32(128), Val::I32(3)])
+                .unwrap()[0],
+            Val::I32(EBADF)
+        ));
+        // Invalid UTF-8 cannot name a file, so nothing is deleted.
+        assert!(matches!(
+            runtime
+                .call("unlinkat", &[Val::I32(3), Val::I32(140), Val::I32(2)])
+                .unwrap()[0],
+            Val::I32(EINVAL)
+        ));
+        assert!(matches!(
+            runtime.call("readout", &[]).unwrap()[0],
+            Val::I32(ESUCCESS)
+        ));
+        assert_eq!(runtime.read_u32_at(200).unwrap(), 3);
+        runtime.wasi().open.get_mut(&4).unwrap().offset = 0;
         assert!(matches!(
             runtime.call("unlink", &[]).unwrap()[0],
             Val::I32(ESUCCESS)
@@ -1353,5 +1439,129 @@ mod tests {
             Val::I32(ESUCCESS)
         ));
         assert_eq!(runtime.state().read(64, 1).unwrap(), [b'/']);
+    }
+
+    #[test]
+    fn argv_writes_leave_no_partial_prefix_behind() {
+        let bytes = harness(
+            &[
+                ("args_sizes_get", vec![I32, I32], vec![I32]),
+                ("args_get", vec![I32, I32], vec![I32]),
+            ],
+            &[
+                (
+                    "sizes",
+                    vec![I32, I32],
+                    vec![I32],
+                    vec![Wave::Arg(0), Wave::Arg(1), Wave::Call(0)],
+                ),
+                (
+                    "getargs",
+                    vec![I32, I32],
+                    vec![I32],
+                    vec![Wave::Arg(0), Wave::Arg(1), Wave::Call(1)],
+                ),
+            ],
+            &[(64, &[0x55; 8])],
+        );
+        let mut runtime = crate::Runtime::instantiate(&bytes).unwrap();
+        runtime.set_args(&["ab".to_owned()]);
+        // One argument needs a 4-byte pointer slot and 3 buffer bytes. A
+        // buffer with only 2 bytes left fails without writing the pointer.
+        assert!(matches!(
+            runtime
+                .call("getargs", &[Val::I32(64), Val::I32(65534)])
+                .unwrap()[0],
+            Val::I32(EINVAL)
+        ));
+        assert_eq!(runtime.state().read(64, 4).unwrap(), [0x55; 4]);
+        // Same for the sizes pair: a bad size destination leaves the count.
+        assert!(matches!(
+            runtime
+                .call("sizes", &[Val::I32(64), Val::I32(-1)])
+                .unwrap()[0],
+            Val::I32(EINVAL)
+        ));
+        assert_eq!(runtime.state().read(64, 4).unwrap(), [0x55; 4]);
+        // The valid layout still works (`set_args` prefixes argv[0]).
+        assert!(matches!(
+            runtime
+                .call("getargs", &[Val::I32(64), Val::I32(128)])
+                .unwrap()[0],
+            Val::I32(ESUCCESS)
+        ));
+        assert_eq!(runtime.read_u32_at(64).unwrap(), 128);
+        assert_eq!(runtime.read_u32_at(68).unwrap(), 135);
+        assert_eq!(runtime.state().read(135, 3).unwrap(), b"ab\0");
+    }
+
+    #[test]
+    fn standard_streams_are_bounded() {
+        use wasm_encoder::{
+            CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection,
+            Function as WasmFunction, FunctionSection, ImportSection, MemorySection, MemoryType,
+            Module as WasmModule, TypeSection,
+        };
+        const PAGES: u32 = 2;
+        const CHUNK: usize = 128 * 1024;
+        let mut types = TypeSection::new();
+        types.ty().function([I32, I32, I32, I32], [I32]);
+        types.ty().function([I32], [I32]);
+        let mut imports = ImportSection::new();
+        imports.import(
+            "wasi_snapshot_preview1",
+            "fd_write",
+            EntityType::Function(0),
+        );
+        let mut functions = FunctionSection::new();
+        functions.function(1);
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: PAGES as u64,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        let mut exports = ExportSection::new();
+        exports.export("memory", ExportKind::Memory, 0);
+        exports.export("fill", ExportKind::Func, 1);
+        let mut body = WasmFunction::new([]);
+        let end = PAGES * 65_536;
+        body.instructions()
+            .local_get(0)
+            .i32_const((end - 12) as i32)
+            .i32_const(1)
+            .i32_const((end - 4) as i32)
+            .call(0)
+            .end();
+        let mut code = CodeSection::new();
+        code.function(&body);
+        let mut iovec = 0u32.to_le_bytes().to_vec();
+        iovec.extend_from_slice(&(CHUNK as u32).to_le_bytes());
+        let mut data = DataSection::new();
+        data.active(0, &ConstExpr::i32_const((end - 12) as i32), iovec);
+        let mut module = WasmModule::new();
+        module
+            .section(&types)
+            .section(&imports)
+            .section(&functions)
+            .section(&memories)
+            .section(&exports)
+            .section(&code)
+            .section(&data);
+        let bytes = module.finish();
+        let mut runtime = crate::Runtime::instantiate(&bytes).unwrap();
+        for _ in 0..MAX_STREAM_BYTES / CHUNK {
+            assert!(matches!(
+                runtime.call("fill", &[Val::I32(1)]).unwrap()[0],
+                Val::I32(ESUCCESS)
+            ));
+        }
+        assert!(matches!(
+            runtime.call("fill", &[Val::I32(1)]).unwrap()[0],
+            Val::I32(EINVAL)
+        ));
+        assert_eq!(runtime.wasi().stdout.len(), MAX_STREAM_BYTES);
     }
 }

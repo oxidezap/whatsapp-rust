@@ -346,8 +346,8 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
         |mut caller: Caller<'_, HostState>,
          len: i32,
          _prot: i32,
-         _flags: i32,
-         _fd: i32,
+         flags: i32,
+         fd: i32,
          _offset: i64,
          allocated: i32,
          addr: i32|
@@ -356,9 +356,19 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
             const PAGE: i32 = 65_536;
             /// `ENOMEM`, the errno musl's mmap expects for a refusal.
             const ENOMEM: i32 = -48;
+            /// musl's `MAP_ANONYMOUS`. Only anonymous mappings are served:
+            /// a file-backed request names file contents this host does not
+            /// have, and answering it with zeros is a plausible wrong answer.
+            const MAP_ANONYMOUS: i32 = 0x20;
 
             crate::state::sync_memory(&mut caller);
 
+            if flags & MAP_ANONYMOUS == 0 {
+                caller.data().log(format!(
+                    "_mmap_js: file-backed mapping refused (flags={flags:#x}, fd={fd})"
+                ));
+                return Ok(ENOMEM);
+            }
             let Some(size) = mmap_size(len) else {
                 return Ok(ENOMEM);
             };
@@ -1103,6 +1113,66 @@ impl BrokenDownTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wasm_encoder::ValType::{I32, I64};
+
+    #[test]
+    fn file_backed_mappings_are_refused() {
+        use wasm_encoder::{
+            CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
+            ImportSection, MemorySection, MemoryType, Module, TypeSection,
+        };
+        let mut types = TypeSection::new();
+        types
+            .ty()
+            .function([I32, I32, I32, I32, I64, I32, I32], [I32]);
+        types.ty().function([I32], [I32]);
+        let mut imports = ImportSection::new();
+        imports.import("env", "_mmap_js", EntityType::Function(0));
+        let mut functions = FunctionSection::new();
+        functions.function(1);
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        let mut exports = ExportSection::new();
+        exports.export("memory", ExportKind::Memory, 0);
+        exports.export("dommap", ExportKind::Func, 1);
+        let mut body = Function::new([]);
+        body.instructions()
+            .i32_const(1)
+            .i32_const(0)
+            .local_get(0)
+            .i32_const(-1)
+            .i64_const(0)
+            .i32_const(64)
+            .i32_const(68)
+            .call(0)
+            .end();
+        let mut code = CodeSection::new();
+        code.function(&body);
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&imports)
+            .section(&functions)
+            .section(&memories)
+            .section(&exports)
+            .section(&code);
+        let bytes = module.finish();
+        let mut runtime = crate::Runtime::instantiate(&bytes).unwrap();
+        // MAP_PRIVATE without MAP_ANONYMOUS names file contents: ENOMEM.
+        assert!(matches!(
+            runtime.call("dommap", &[Val::I32(0x2)]).unwrap()[0],
+            Val::I32(-48)
+        ));
+        // The anonymous form passes the gate; this bare module only lacks an
+        // allocator, which surfaces as a trap rather than a refusal.
+        assert!(runtime.call("dommap", &[Val::I32(0x22)]).is_err());
+    }
 
     #[test]
     fn mmap_lengths_are_positive_and_bounded() {

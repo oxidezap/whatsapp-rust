@@ -77,12 +77,17 @@ fn const_offset(kind: &wasmparser::DataKind<'_>) -> Option<u64> {
     };
 
     let mut reader = offset_expr.get_operators_reader();
-    let operator = reader.read().ok()?;
-    match operator {
-        wasmparser::Operator::I32Const { value } => Some(value as u64),
-        wasmparser::Operator::I64Const { value } => Some(value as u64),
-        _ => None,
+    let value = match reader.read().ok()? {
+        wasmparser::Operator::I32Const { value } => value as u64,
+        wasmparser::Operator::I64Const { value } => value as u64,
+        _ => return None,
+    };
+    // Exactly one constant followed by `End`: anything else computes its
+    // offset, and the first operand is not the answer.
+    if !matches!(reader.read().ok()?, wasmparser::Operator::End) {
+        return None;
     }
+    reader.eof().then_some(value)
 }
 
 fn collect_strings(segment: usize, data: &[u8], min_run: usize, out: &mut Vec<DataString>) {
@@ -115,5 +120,22 @@ fn collect_strings(segment: usize, data: &[u8], min_run: usize, out: &mut Vec<Da
             offset: start,
             value: current,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_single_constant_offsets_are_reported() {
+        // One plain segment at 7, one computed expression starting with a
+        // constant 5: the first operand is not the offset.
+        let mut module = b"\0asm\x01\0\0\0\x0b\x0f\x02".to_vec();
+        module.extend_from_slice(&[0x00, 0x41, 0x07, 0x0b, 0x01, 0x41]);
+        module.extend_from_slice(&[0x00, 0x41, 0x05, 0x41, 0x06, 0x0b, 0x01, 0x42]);
+        let report = extract(&module, 100).unwrap();
+        assert_eq!(report.segments.len(), 2);
+        assert_eq!(report.segments[0].memory_offset, Some(7));
+        assert_eq!(report.segments[1].memory_offset, None);
     }
 }

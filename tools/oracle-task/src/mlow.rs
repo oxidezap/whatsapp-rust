@@ -240,15 +240,18 @@ fn pack_legacy(root: &Path, check: bool) -> Result<()> {
         }
         let packed = cbor::compress(&raw)?;
         let target = format!("{name}.zst");
-        let packed_bytes = if check {
+        let record = if check {
             let committed = std::fs::read(data.join(&target))?;
-            ensure!(cbor::decompress(&committed)? == raw, "C raw drift: {name}");
-            committed.len()
+            raw_archive_record(&committed, &raw, name)?
         } else {
             write(&data.join(&target), &packed)?;
-            packed.len()
+            raw_archive_record(&packed, &raw, name)?
         };
-        manifest[target] = json!({"oracle":"C audit","source_revision":revision,"source_file":name,"source_sha256":sha256(&original),"raw_sha256":sha256(&raw),"raw_bytes":raw.len(),"packed_bytes":packed_bytes});
+        let mut entry = json!({"oracle":"C audit","source_revision":revision,"source_file":name,"source_sha256":sha256(&original),"raw_sha256":sha256(&raw),"raw_bytes":raw.len()});
+        for (key, value) in record.as_object().context("archive record")? {
+            entry[key] = value.clone();
+        }
+        manifest[target] = entry;
     }
     if check {
         let committed: Value =
@@ -272,6 +275,15 @@ fn checked_archive_record(archive: &[u8], mut record: Value) -> Result<Value> {
     record["zstd_sha256"] = json!(sha256(archive));
     record["packed_bytes"] = json!(archive.len());
     Ok(record)
+}
+
+/// Verifies a raw audit archive against its expected payload and identifies
+/// the exact committed bytes. Recompression is not byte-stable — a valid
+/// skippable frame changes the bytes without changing the payload — so the
+/// manifest must pin the shipped representation, not just its length.
+fn raw_archive_record(committed: &[u8], raw: &[u8], name: &str) -> Result<Value> {
+    ensure!(cbor::decompress(committed)? == raw, "C raw drift: {name}");
+    Ok(json!({"packed_bytes":committed.len(),"zstd_sha256":sha256(committed)}))
 }
 
 fn regenerate(root: &Path, out: &Path, cached: bool, check: bool) -> Result<()> {
@@ -627,6 +639,24 @@ mod tests {
             actual, generated,
             "stale metadata must fail manifest comparison"
         );
+    }
+
+    #[test]
+    fn raw_audit_manifest_pins_the_committed_bytes() {
+        let raw = b"postfilter payload".to_vec();
+        let packed = cbor::compress(&raw).unwrap();
+        // A valid empty skippable frame changes zstd bytes without changing the payload.
+        let mut altered = packed.clone();
+        altered.extend_from_slice(&[0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0]);
+        assert_eq!(cbor::decompress(&altered).unwrap(), raw);
+        let pinned = raw_archive_record(&packed, &raw, "audit").unwrap();
+        let repacked = raw_archive_record(&altered, &raw, "audit").unwrap();
+        assert_eq!(pinned["packed_bytes"], packed.len());
+        assert_ne!(
+            pinned["zstd_sha256"], repacked["zstd_sha256"],
+            "recompressed bytes must not match the pinned manifest"
+        );
+        assert!(raw_archive_record(b"garbage", &raw, "audit").is_err());
     }
 
     #[test]

@@ -136,7 +136,8 @@
     "source_sha256": "a9772891741f4691841022a9f41c49bf6bca8142e16dda7ca95afaa3485b8db6",
     "raw_sha256": "a9772891741f4691841022a9f41c49bf6bca8142e16dda7ca95afaa3485b8db6",
     "raw_bytes": 857124,
-    "packed_bytes": 619264
+    "packed_bytes": 619264,
+    "zstd_sha256": "d98550ba94254a5293676bbebb0a20d5b9eb68337a21adc4a6830b56ce3e07fb"
   },
   "hp_postfilter_vectors.raw.zst": {
     "oracle": "C audit",
@@ -145,6 +146,7 @@
     "source_sha256": "69710c7ad3966d9caa99588e29cdc7057469b5764f51934540191b477a5cb94a",
     "raw_sha256": "e43152f9a05bdb7041dcdf9904224b27e7e0c921e4f6ac47800839a061156c19",
     "raw_bytes": 133692,
-    "packed_bytes": 123277
+    "packed_bytes": 123277,
+    "zstd_sha256": "63c9bec0a52a95714f5a4fe4188c635571504efc26df4f68f07105790cd94c7e"
   }
 }
