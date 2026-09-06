@@ -7079,7 +7079,8 @@ mod read_routing_tests {
 
         let outcome = tokio::time::timeout(Duration::from_secs(30), async {
             let mut burst = pin!(store.put_mutation_macs("regular", 1, &rows));
-            let _ = poll_fn(|cx| Poll::Ready(burst.as_mut().poll(cx).is_ready())).await;
+            let finished = poll_fn(|cx| Poll::Ready(burst.as_mut().poll(cx).is_ready())).await;
+            assert!(!finished, "the burst finished before the read was issued");
             let (read, _) = tokio::join!(store.get_devices("190455501800"), async {
                 burst.await.expect("write burst")
             });
