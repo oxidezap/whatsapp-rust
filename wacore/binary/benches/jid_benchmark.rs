@@ -51,10 +51,15 @@ fn bench_jid_push_phash_form(bencher: divan::Bencher) {
             (jid, String::with_capacity(64))
         })
         .bench_refs(|(jid, buf)| {
-            jid.push_phash_form_to(buf);
-            // black-box the contents, not just the length: observing only
-            // `len` lets LLVM elide the actual formatting writes.
-            black_box(buf.as_bytes());
+            // The destination has to be opaque BEFORE the write. Observing the
+            // buffer afterwards -- even as `buf.as_bytes()` -- hands LLVM only
+            // the pointer and the length, never the bytes, so it proves the
+            // formatting stores dead and the row measures as nothing at all.
+            // Laundering `buf` through `black_box` first makes the pointer
+            // escape, which is what forces the stores to happen.
+            let buf = black_box(buf);
+            black_box(jid).push_phash_form_to(buf);
+            black_box(buf.len());
         });
 }
 
@@ -84,9 +89,15 @@ fn bench_jid_push_phash_form(bencher: divan::Bencher) {
 
 use divan::counter::ItemsCount;
 use std::collections::HashMap;
-use std::hash::{BuildHasher, RandomState};
+use std::hash::BuildHasher;
 use std::sync::OnceLock;
 use wacore_binary::jid::Server;
+
+/// SipHash with fixed keys: the default `RandomState` seeds per process, so
+/// bucket layout — and with it the cache behavior these probes measure —
+/// would differ between runs. Same shape as `signal_address_probe_benchmark`.
+type DetState = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
+type DetHashMap<K, V> = HashMap<K, V, DetState>;
 
 /// Items per measured iteration. Large enough that the per-iteration overhead
 /// of either instrument is below the per-item cost being read.
@@ -130,9 +141,9 @@ const EQ_CASES: [&str; 5] = [
 ];
 
 fn eq_pair(case: &str) -> &'static (Jid, Jid) {
-    static PAIRS: OnceLock<HashMap<&'static str, (Jid, Jid)>> = OnceLock::new();
+    static PAIRS: OnceLock<DetHashMap<&'static str, (Jid, Jid)>> = OnceLock::new();
     &PAIRS.get_or_init(|| {
-        HashMap::from([
+        [
             (
                 "equal",
                 (pn_device("5511999990000", 7), pn_device("5511999990000", 7)),
@@ -160,7 +171,9 @@ fn eq_pair(case: &str) -> &'static (Jid, Jid) {
                     },
                 ),
             ),
-        ])
+        ]
+        .into_iter()
+        .collect()
     })[case]
 }
 
@@ -178,8 +191,8 @@ fn bench_jid_eq(bencher: divan::Bencher, case: &str) {
 
 #[divan::bench]
 fn bench_jid_hash(bencher: divan::Bencher) {
-    static STATE: OnceLock<(RandomState, Jid)> = OnceLock::new();
-    let (state, jid) = STATE.get_or_init(|| (RandomState::new(), pn_device("5511999990000", 7)));
+    static STATE: OnceLock<(DetState, Jid)> = OnceLock::new();
+    let (state, jid) = STATE.get_or_init(|| (DetState::default(), pn_device("5511999990000", 7)));
     bencher.counter(ItemsCount::new(BATCH)).bench(|| {
         let mut acc = 0u64;
         for _ in 0..BATCH {
@@ -213,7 +226,7 @@ fn fanout(size: usize) -> &'static [Jid] {
 fn bench_jid_hashmap_insert(bencher: divan::Bencher, size: usize) {
     let jids = fanout(size);
     bencher.counter(ItemsCount::new(size)).bench(|| {
-        let mut map = HashMap::with_capacity(jids.len());
+        let mut map = DetHashMap::with_capacity_and_hasher(jids.len(), DetState::default());
         for jid in jids {
             map.insert(jid.clone(), ());
         }
@@ -223,7 +236,7 @@ fn bench_jid_hashmap_insert(bencher: divan::Bencher, size: usize) {
 
 /// A warm map plus a full set of probes for each outcome.
 struct Probed {
-    map: HashMap<Jid, ()>,
+    map: DetHashMap<Jid, ()>,
     hits: Vec<Jid>,
     misses: Vec<Jid>,
 }
@@ -231,12 +244,11 @@ struct Probed {
 /// The per-message shape: one lookup into a warm map. Hit and miss are separate
 /// because a miss stops at the hash and a hit pays the `==` on top of it.
 ///
-/// Each batch cycles through every key rather than repeating one. `HashMap`'s
-/// default hasher is seeded per process, so a single probe's bucket and
-/// collision chain are drawn fresh on every run: repeating it would let the
-/// same code measure differently between a baseline and a PR, and batching
-/// would only amplify whichever path that one draw happened to pick. Averaging
-/// over the whole key set makes the layout wash out instead.
+/// Each batch cycles through every key rather than repeating one, so the
+/// reading averages over the whole key set instead of amplifying whichever
+/// bucket and collision chain a single probe happened to land on. The map
+/// itself uses a fixed-key hasher, so that layout is identical between the
+/// baseline and the branch processes CodSpeed compares.
 #[divan::bench(args = FANOUT_SIZES, consts = [true, false])]
 fn bench_jid_hashmap_get<const HIT: bool>(bencher: divan::Bencher, size: usize) {
     static MAPS: OnceLock<Vec<Probed>> = OnceLock::new();
