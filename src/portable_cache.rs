@@ -607,8 +607,7 @@ pub struct PortableCacheBuilder<K, V, S = RandomState> {
     ttl: Option<Duration>,
     tti: Option<Duration>,
     evict_guard: Option<fn(&V) -> bool>,
-    hash_builder: Option<S>,
-    _marker: std::marker::PhantomData<fn(K, V)>,
+    _marker: std::marker::PhantomData<fn(K, V) -> S>,
 }
 
 impl<K, V> PortableCacheBuilder<K, V, RandomState> {
@@ -618,7 +617,6 @@ impl<K, V> PortableCacheBuilder<K, V, RandomState> {
             ttl: None,
             tti: None,
             evict_guard: None,
-            hash_builder: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -651,16 +649,20 @@ where
     /// Benchmarks pin it so every process measures the same layout.
     /// Everything else keeps the default: a process-wide fixed seed would
     /// re-open HashDoS.
-    pub fn hash_builder<H>(self, hash_builder: H) -> PortableCacheBuilder<K, V, H>
+    ///
+    /// Returns a [`SeededCacheBuilder`]: unlike [`PortableCacheBuilder::build`],
+    /// building it needs no `Default` from the hasher, so an explicitly
+    /// supplied hasher without one still builds.
+    pub fn hash_builder<H>(self, hash_builder: H) -> SeededCacheBuilder<K, V, H>
     where
         H: BuildHasher,
     {
-        PortableCacheBuilder {
+        SeededCacheBuilder {
             max_capacity: self.max_capacity,
             ttl: self.ttl,
             tti: self.tti,
             evict_guard: self.evict_guard,
-            hash_builder: Some(hash_builder),
+            hash_builder,
             _marker: std::marker::PhantomData,
         }
     }
@@ -691,36 +693,111 @@ where
     where
         S: Default,
     {
-        // An evict_guard marks a cache of live coordination objects. Expiry
-        // does not consult the guard, so a timeout would drop an entry a task
-        // still holds and let the next lookup mint a duplicate of it.
-        assert!(
-            self.evict_guard.is_none() || (self.ttl.is_none() && self.tti.is_none()),
-            "a cache with an evict_guard holds live coordination objects and must not expire by time"
-        );
+        // A builder that never pinned a seed hashes like every other
+        // cache: `RandomState::default()` draws per-process.
+        // A builder that never pinned a seed hashes like every other
+        // cache: `RandomState::default()` draws per-process.
+        assemble(
+            self.max_capacity,
+            self.ttl,
+            self.tti,
+            self.evict_guard,
+            S::default(),
+        )
+    }
+}
 
-        // Order is what eviction pops and what the expiry sweep walks, so a
-        // cache with either a capacity bound or a time bound keeps it. A cache
-        // with neither (the default LID/PN maps) is never swept and skips the
-        // BTreeMap node per entry.
-        let track_order = self.max_capacity.is_some_and(|cap| cap != u64::MAX)
-            || self.ttl.is_some()
-            || self.tti.is_some();
-        PortableCache {
-            inner: Arc::new(RwLock::new(CacheInner::new(
-                track_order,
-                // A builder that never pinned a seed hashes like every other
-                // cache: `RandomState::default()` draws per-process.
-                self.hash_builder.unwrap_or_default(),
-            ))),
-            init_locks: OnceLock::new(),
-            max_capacity: self.max_capacity,
-            ttl: self.ttl,
-            tti: self.tti,
-            evict_guard: self.evict_guard,
-            #[cfg(test)]
-            tti_renewals: Arc::new(portable_atomic::AtomicU64::new(0)),
-        }
+/// A builder with an explicitly supplied hash seed (see
+/// [`PortableCacheBuilder::hash_builder`]). Building it needs nothing from
+/// the hasher beyond [`BuildHasher`], so a supplied hasher without `Default`
+/// builds exactly like one with it.
+pub struct SeededCacheBuilder<K, V, H> {
+    max_capacity: Option<u64>,
+    ttl: Option<Duration>,
+    tti: Option<Duration>,
+    evict_guard: Option<fn(&V) -> bool>,
+    hash_builder: H,
+    _marker: std::marker::PhantomData<fn(K, V)>,
+}
+
+impl<K, V, H> SeededCacheBuilder<K, V, H>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    H: BuildHasher,
+{
+    pub fn max_capacity(mut self, cap: u64) -> Self {
+        self.max_capacity = Some(cap);
+        self
+    }
+
+    pub fn time_to_live(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
+    pub fn time_to_idle(mut self, tti: Duration) -> Self {
+        self.tti = Some(tti);
+        self
+    }
+
+    pub fn evict_guard(mut self, guard: fn(&V) -> bool) -> Self {
+        self.evict_guard = Some(guard);
+        self
+    }
+
+    /// # Panics
+    ///
+    /// If an evict guard is combined with a TTL or TTI (same rule as
+    /// [`PortableCacheBuilder::build`]).
+    pub fn build(self) -> PortableCache<K, V, H> {
+        assemble(
+            self.max_capacity,
+            self.ttl,
+            self.tti,
+            self.evict_guard,
+            self.hash_builder,
+        )
+    }
+}
+
+/// Shared assembly for both builders: the evict-guard rule and the order
+/// tracking live once, so the two `build` paths cannot drift apart.
+fn assemble<K, V, S>(
+    max_capacity: Option<u64>,
+    ttl: Option<Duration>,
+    tti: Option<Duration>,
+    evict_guard: Option<fn(&V) -> bool>,
+    hash_builder: S,
+) -> PortableCache<K, V, S>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher,
+{
+    // An evict_guard marks a cache of live coordination objects. Expiry
+    // does not consult the guard, so a timeout would drop an entry a task
+    // still holds and let the next lookup mint a duplicate of it.
+    assert!(
+        evict_guard.is_none() || (ttl.is_none() && tti.is_none()),
+        "a cache with an evict_guard holds live coordination objects and must not expire by time"
+    );
+
+    // Order is what eviction pops and what the expiry sweep walks, so a
+    // cache with either a capacity bound or a time bound keeps it. A cache
+    // with neither (the default LID/PN maps) is never swept and skips the
+    // BTreeMap node per entry.
+    let track_order =
+        max_capacity.is_some_and(|cap| cap != u64::MAX) || ttl.is_some() || tti.is_some();
+    PortableCache {
+        inner: Arc::new(RwLock::new(CacheInner::new(track_order, hash_builder))),
+        init_locks: OnceLock::new(),
+        max_capacity,
+        ttl,
+        tti,
+        evict_guard,
+        #[cfg(test)]
+        tti_renewals: Arc::new(portable_atomic::AtomicU64::new(0)),
     }
 }
 
@@ -1382,6 +1459,43 @@ mod tests {
         assert_eq!(cache.entry_count(), 2);
         assert!(cache.get("a").await.is_none());
         assert_eq!(cache.get("c").await, Some(3));
+    }
+
+    /// A supplied hasher without `Default` still builds: only the
+    /// unseeded path draws a fresh seed, never the explicit one.
+    #[tokio::test]
+    async fn supplied_hasher_without_default_builds() {
+        use std::hash::{BuildHasher, Hasher};
+
+        #[derive(Clone, Copy)]
+        struct FixedSeed(u64);
+        struct FixedHasher(u64);
+        impl Hasher for FixedHasher {
+            fn write(&mut self, bytes: &[u8]) {
+                for b in bytes {
+                    self.0 = self.0.wrapping_mul(0x100000001b3).wrapping_add(*b as u64);
+                }
+            }
+            fn finish(&self) -> u64 {
+                self.0
+            }
+        }
+        impl BuildHasher for FixedSeed {
+            type Hasher = FixedHasher;
+            fn build_hasher(&self) -> FixedHasher {
+                FixedHasher(self.0)
+            }
+        }
+
+        let cache: PortableCache<String, u32, FixedSeed> = PortableCache::builder()
+            .max_capacity(2)
+            .hash_builder(FixedSeed(0x9E3779B97F4A7C15))
+            .build();
+
+        cache.insert("a".into(), 1).await;
+        cache.insert("b".into(), 2).await;
+        cache.insert("c".into(), 3).await;
+        assert_eq!(cache.entry_count(), 2);
     }
 
     #[tokio::test]
