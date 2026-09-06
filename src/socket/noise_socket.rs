@@ -34,27 +34,6 @@ mod tests {
         assert!(result.is_ok(), "encrypt_and_send should succeed");
     }
 
-    #[tokio::test]
-    async fn decrypt_frame_errors_on_counter_exhaustion() {
-        let key = [0u8; 32];
-        let socket = NoiseSocket::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            Arc::new(crate::transport::mock::MockTransport),
-            NoiseCipher::new(&key).expect("32-byte key"),
-            NoiseCipher::new(&key).expect("32-byte key"),
-        );
-        // At u32::MAX the next read would wrap the counter to 0 and reuse a nonce;
-        // the counter check fires before decryption, so the bytes don't matter.
-        socket.set_read_counter_for_test(u32::MAX);
-        let err = socket
-            .decrypt_frame(BytesMut::from(&b"ignored"[..]))
-            .expect_err("exhausted read counter must error, not wrap");
-        assert!(matches!(
-            err,
-            SocketError::Cipher(NoiseError::CounterExhausted)
-        ));
-    }
-
     /// Frames above INLINE_ENCRYPT_THRESHOLD take the blocking path that now moves
     /// the `Bytes` plaintext (refcount) instead of `to_vec()`-copying it. Verify
     /// both a small (inline) and a large (>16KB) frame still encrypt to ciphertext

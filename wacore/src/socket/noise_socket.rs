@@ -569,13 +569,67 @@ impl NoiseSocket {
             Err(poisoned) => *poisoned.into_inner(),
         }
     }
+}
 
-    /// Explicitly sets the read counter for testing counter exhaustion.
-    #[doc(hidden)]
-    pub fn set_read_counter_for_test(&self, val: u32) {
-        match self.read_counter.lock() {
-            Ok(mut g) => *g = val,
-            Err(poisoned) => *poisoned.into_inner() = val,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::Transport;
+    use async_trait::async_trait;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    struct DummyTransport;
+    #[async_trait]
+    impl Transport for DummyTransport {
+        async fn send(&self, _data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+            Ok(())
         }
+        async fn disconnect(&self) {}
+    }
+
+    struct TestRuntime;
+    #[async_trait]
+    impl Runtime for TestRuntime {
+        fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
+            let handle = tokio::spawn(future);
+            AbortHandle::new(move || handle.abort())
+        }
+        fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(tokio::time::sleep(duration))
+        }
+        fn spawn_blocking(
+            &self,
+            f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async move {
+                let _ = tokio::task::spawn_blocking(f).await;
+            })
+        }
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn decrypt_frame_errors_on_counter_exhaustion() {
+        let key = [0u8; 32];
+        let socket = NoiseSocket::new(
+            Arc::new(TestRuntime),
+            Arc::new(DummyTransport),
+            NoiseCipher::new(&key).expect("32-byte key"),
+            NoiseCipher::new(&key).expect("32-byte key"),
+        );
+        // At u32::MAX the next read would wrap the counter to 0 and reuse a nonce;
+        // the counter check fires before decryption, so the bytes don't matter.
+        *socket.read_counter.lock().unwrap() = u32::MAX;
+        let err = socket
+            .decrypt_frame(BytesMut::from(&b"ignored"[..]))
+            .expect_err("exhausted read counter must error, not wrap");
+        assert!(matches!(
+            err,
+            SocketError::Cipher(NoiseError::CounterExhausted)
+        ));
     }
 }
