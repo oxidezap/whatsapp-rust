@@ -273,28 +273,26 @@ pub async fn recv_frame(
     transport_events: &mut async_channel::Receiver<TransportEvent>,
     frame_decoder: &mut crate::framing::FrameDecoder,
 ) -> Result<bytes::BytesMut> {
-    loop {
-        match rt_timeout(
-            &**runtime,
-            NOISE_HANDSHAKE_RESPONSE_TIMEOUT,
-            transport_events.recv(),
-        )
-        .await
-        {
-            Ok(Ok(TransportEvent::DataReceived(data))) => {
-                frame_decoder.feed_owned(data);
-                if let Some(frame) = frame_decoder.decode_frame() {
-                    return Ok(frame);
+    let assemble = async {
+        loop {
+            match transport_events.recv().await {
+                Ok(TransportEvent::DataReceived(data)) => {
+                    frame_decoder.feed_owned(data);
+                    if let Some(frame) = frame_decoder.decode_frame() {
+                        return Ok(frame);
+                    }
                 }
-                continue;
+                Ok(TransportEvent::Connected) => continue,
+                Ok(TransportEvent::Disconnected(reason)) => {
+                    debug!("Transport disconnected during handshake: {reason}");
+                    return Err(HandshakeError::Disconnected);
+                }
+                Err(_) => return Err(HandshakeError::StreamClosed),
             }
-            Ok(Ok(TransportEvent::Connected)) => continue,
-            Ok(Ok(TransportEvent::Disconnected(reason))) => {
-                debug!("Transport disconnected during handshake: {reason}");
-                return Err(HandshakeError::Disconnected);
-            }
-            Ok(Err(_)) => return Err(HandshakeError::StreamClosed),
-            Err(_) => return Err(HandshakeError::Timeout),
         }
+    };
+    match rt_timeout(&**runtime, NOISE_HANDSHAKE_RESPONSE_TIMEOUT, assemble).await {
+        Ok(result) => result,
+        Err(_) => Err(HandshakeError::Timeout),
     }
 }

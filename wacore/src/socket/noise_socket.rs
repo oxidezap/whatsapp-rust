@@ -531,7 +531,7 @@ impl NoiseSocket {
     /// Marshals and encrypts a binary protocol node, sending it through the dedicated sender task.
     pub async fn send_node(&self, node: &wacore_binary::Node) -> SendResult {
         let plaintext = wacore_binary::marshal(node)
-            .map_err(|e| EncryptSendError::crypto(SocketError::Marshal(e)))?;
+            .map_err(|e| EncryptSendError::framing(SocketError::Marshal(e)))?;
         self.encrypt_and_send(plaintext.into()).await
     }
 
@@ -542,14 +542,21 @@ impl NoiseSocket {
     }
 
     /// Decrypts an incoming frame in-place using the connection's read cipher and counter.
+    ///
+    /// Checks for counter exhaustion before decrypting and commits the counter increment
+    /// only after authentication succeeds, preventing corrupted frames from desynchronizing
+    /// future valid frames.
     pub fn decrypt_frame(&self, mut ciphertext: BytesMut) -> Result<BytesMut> {
-        let counter = self
-            .read_counter
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| c.checked_add(1))
-            .map_err(|_| SocketError::Cipher(NoiseError::CounterExhausted))?;
+        let counter = self.read_counter.load(Ordering::SeqCst);
+        if counter == u32::MAX {
+            return Err(SocketError::Cipher(NoiseError::CounterExhausted));
+        }
         self.read_key
             .decrypt_in_place_with_counter(counter, &mut ciphertext)
             .map_err(SocketError::Cipher)?;
+        self.read_counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| c.checked_add(1))
+            .map_err(|_| SocketError::Cipher(NoiseError::CounterExhausted))?;
         Ok(ciphertext)
     }
 
