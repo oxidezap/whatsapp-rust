@@ -65,14 +65,13 @@ fn shapes(iq: &IqIr, parser: &str) -> Result<Vec<(String, Vec<String>)>> {
         .ok_or_else(|| anyhow::anyhow!("join RPC ({parser}) missing from the IQ index"))?;
     let mut out = Vec::new();
     for v in &stanza.response.variants {
-        if v.kind.as_deref() != Some("success") {
+        if !v.is_success() {
             continue;
         }
         let mut children: Vec<String> = v
             .assertions
             .iter()
-            .filter(|a| a.kind.as_deref() == Some("child"))
-            .filter_map(|a| a.name.clone())
+            .filter_map(|a| a.child_gate().map(str::to_string))
             .collect();
         children.sort();
         children.dedup();

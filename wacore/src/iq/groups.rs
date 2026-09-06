@@ -2815,17 +2815,9 @@ impl IqSpec for JoinLinkedGroupIq {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
-        // Same shape pair as the V4 accept (`JoinLinkedGroupResponseSuccess`
-        // bare beside `...GroupJoinRequestSuccess` gated on
-        // `<membership_approval_request>` — see the generated
-        // `super::join_shapes::JOIN_LINKED_GROUP_SUCCESS`): a bare `<iq
-        // type="result">` joins the request's own subgroup, not a malformed
-        // response. Anything present but unrecognized falls through to the
-        // strict parser and fails loudly instead of reporting `Joined`.
-        if response.content.is_none() {
-            return Ok(JoinGroupResult::Joined(self.subgroup_jid.clone()));
-        }
-        parse_join_group_response(response)
+        // Bare joins the request's own subgroup (same shape pair as the V4
+        // accept — see the generated shapes).
+        parse_join_or_bare(response, &self.subgroup_jid)
     }
 }
 
@@ -2910,11 +2902,17 @@ fn parse_group_id(id_str: &str) -> Result<Jid> {
     }
 }
 
+/// Child tags of the join-response shapes, shared by the strict parser and
+/// the bare-result fallbacks below so the two cannot drift apart.
+const JOIN_GROUP_CHILD: &str = "group";
+const JOIN_COMMUNITY_CHILD: &str = "community";
+const JOIN_APPROVAL_CHILD: &str = "membership_approval_request";
+
 /// Shared response parser for group join IQs (both code-based and V4 invite).
 fn parse_join_group_response(response: &NodeRef<'_>) -> Result<JoinGroupResult> {
     if let Some(group_node) = response
-        .get_optional_child("group")
-        .or_else(|| response.get_optional_child("community"))
+        .get_optional_child(JOIN_GROUP_CHILD)
+        .or_else(|| response.get_optional_child(JOIN_COMMUNITY_CHILD))
     {
         let jid_str = required_attr(group_node, "jid")?;
         let jid: Jid = jid_str
@@ -2922,16 +2920,29 @@ fn parse_join_group_response(response: &NodeRef<'_>) -> Result<JoinGroupResult> 
             .map_err(|e| anyhow!("invalid group jid: {e}"))?;
         return Ok(JoinGroupResult::Joined(jid));
     }
-    if let Some(approval_node) = response.get_optional_child("membership_approval_request") {
+    if let Some(approval_node) = response.get_optional_child(JOIN_APPROVAL_CHILD) {
         let jid_str = required_attr(approval_node, "jid")?;
         let jid: Jid = jid_str
             .parse()
             .map_err(|e| anyhow!("invalid group jid: {e}"))?;
         return Ok(JoinGroupResult::PendingApproval(jid));
     }
+    // NOTE: this message is matched downstream (bridge/baileyrs surfaces it);
+    // keep it byte-identical when touching the tags above.
     Err(anyhow!(
         "expected <group>, <community>, or <membership_approval_request> in join response"
     ))
+}
+
+/// Parse a join response that may be a bare `<iq type="result">`: with no
+/// content at all the join succeeded and the group is the request's own
+/// addressee (`fallback`); anything present but unrecognized falls through to
+/// the strict parser and fails loudly instead of reporting `Joined`.
+fn parse_join_or_bare(response: &NodeRef<'_>, fallback: &Jid) -> Result<JoinGroupResult> {
+    if response.content.is_none() {
+        return Ok(JoinGroupResult::Joined(fallback.clone()));
+    }
+    parse_join_group_response(response)
 }
 
 /// ```xml
@@ -3011,25 +3022,10 @@ impl IqSpec for AcceptGroupInviteV4Iq {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
-        // WA Web's `AcceptGroupAddResponseSuccess`: a bare `<iq type="result">`
-        // with none of the join children is a success, not a malformed
-        // response. The joined group is the request's own `to` — the envelope
-        // `from` echoes it — which this spec holds. See the generated
-        // `super::join_shapes::ACCEPT_GROUP_ADD_SUCCESS`: a variant with no
-        // required children accepts the bare result. (The code-based join keeps
-        // the strict parser: addressed at `@g.us`, a bare result there carries
-        // no group identity to return.)
-        //
-        // Bare means no content at all: no child elements and no scalar
-        // payload (`children()` alone cannot tell an absent body from a scalar
-        // one). Anything present but unrecognized is an unknown shape, and
-        // reporting it `Joined` could misreport a future non-joined state as
-        // joined. It falls through to the strict parser, which rejects it
-        // loudly instead.
-        if response.content.is_none() {
-            return Ok(JoinGroupResult::Joined(self.group_jid.clone()));
-        }
-        parse_join_group_response(response)
+        // Bare joins the request's own `to` (`AcceptGroupAddResponseSuccess`
+        // in the generated shapes); the code-based join keeps the strict
+        // parser, whose bare result carries no group identity.
+        parse_join_or_bare(response, &self.group_jid)
     }
 }
 
@@ -5782,17 +5778,43 @@ mod tests {
         );
     }
 
+    const TEST_GROUP_JID: &str = "120363000000000042@g.us";
+    const TEST_PARENT_JID: &str = "120363000000000001@g.us";
+    const TEST_ADMIN_JID: &str = "5511999887766@s.whatsapp.net";
+    const TEST_INVITE_CODE: &str = "A1B2C3D4";
+    const TEST_INVITE_EXPIRATION: i64 = 1_700_000_123;
+
     fn v4_spec() -> (Jid, AcceptGroupInviteV4Iq) {
-        let group_jid: Jid = "120363000000000042@g.us".parse().unwrap();
-        let admin_jid: Jid = "5511999887766@s.whatsapp.net".parse().unwrap();
-        let spec = AcceptGroupInviteV4Iq::new(&group_jid, "A1B2C3D4", 1_700_000_123, &admin_jid);
+        let group_jid: Jid = TEST_GROUP_JID.parse().unwrap();
+        let admin_jid: Jid = TEST_ADMIN_JID.parse().unwrap();
+        let spec = AcceptGroupInviteV4Iq::new(
+            &group_jid,
+            TEST_INVITE_CODE,
+            TEST_INVITE_EXPIRATION,
+            &admin_jid,
+        );
         (group_jid, spec)
     }
 
-    fn bare_join_result() -> Node {
-        NodeBuilder::new("iq")
+    /// `<iq type="result" from=...>` carrying `children` (empty means a bare
+    /// result: no content at all, not an empty child list).
+    fn result_iq(from: &str, children: Vec<Node>) -> Node {
+        let mut iq = NodeBuilder::new("iq")
             .attr("type", "result")
-            .attr("from", "120363000000000042@g.us")
+            .attr("from", from);
+        if !children.is_empty() {
+            iq = iq.children(children);
+        }
+        iq.build()
+    }
+
+    fn bare_join_result() -> Node {
+        result_iq(TEST_GROUP_JID, Vec::new())
+    }
+
+    fn approval_child(jid: &str) -> Node {
+        NodeBuilder::new(JOIN_APPROVAL_CHILD)
+            .attr("jid", jid)
             .build()
     }
 
@@ -5826,12 +5848,7 @@ mod tests {
     #[test]
     fn test_accept_group_invite_v4_unknown_child_is_rejected() {
         let (_, spec) = v4_spec();
-        let unknown = NodeBuilder::new("unexpected").build();
-        let iq = NodeBuilder::new("iq")
-            .attr("type", "result")
-            .attr("from", "120363000000000042@g.us")
-            .children([unknown])
-            .build();
+        let iq = result_iq(TEST_GROUP_JID, vec![NodeBuilder::new("unexpected").build()]);
         assert!(spec.parse_response(&iq.as_node_ref()).is_err());
     }
 
@@ -5841,7 +5858,7 @@ mod tests {
         let (_, spec) = v4_spec();
         let iq = NodeBuilder::new("iq")
             .attr("type", "result")
-            .attr("from", "120363000000000042@g.us")
+            .attr("from", TEST_GROUP_JID)
             .apply_content(Some(NodeContent::String("unexpected payload".into())))
             .build();
         assert!(spec.parse_response(&iq.as_node_ref()).is_err());
@@ -5850,14 +5867,10 @@ mod tests {
     #[test]
     fn test_accept_group_invite_v4_group_child_still_joins() {
         let (group_jid, spec) = v4_spec();
-        let group = NodeBuilder::new("group")
-            .attr("jid", "120363000000000042@g.us")
+        let group = NodeBuilder::new(JOIN_GROUP_CHILD)
+            .attr("jid", TEST_GROUP_JID)
             .build();
-        let iq = NodeBuilder::new("iq")
-            .attr("type", "result")
-            .attr("from", "120363000000000042@g.us")
-            .children([group])
-            .build();
+        let iq = result_iq(TEST_GROUP_JID, vec![group]);
         let result = spec.parse_response(&iq.as_node_ref()).unwrap();
         assert_eq!(result, JoinGroupResult::Joined(group_jid));
     }
@@ -5865,21 +5878,14 @@ mod tests {
     #[test]
     fn test_accept_group_invite_v4_approval_child_stays_pending() {
         let (group_jid, spec) = v4_spec();
-        let approval = NodeBuilder::new("membership_approval_request")
-            .attr("jid", "120363000000000042@g.us")
-            .build();
-        let iq = NodeBuilder::new("iq")
-            .attr("type", "result")
-            .attr("from", "120363000000000042@g.us")
-            .children([approval])
-            .build();
+        let iq = result_iq(TEST_GROUP_JID, vec![approval_child(TEST_GROUP_JID)]);
         let result = spec.parse_response(&iq.as_node_ref()).unwrap();
         assert_eq!(result, JoinGroupResult::PendingApproval(group_jid));
     }
 
     fn linked_spec() -> (Jid, JoinLinkedGroupIq) {
-        let parent: Jid = "120363000000000001@g.us".parse().unwrap();
-        let subgroup: Jid = "120363000000000042@g.us".parse().unwrap();
+        let parent: Jid = TEST_PARENT_JID.parse().unwrap();
+        let subgroup: Jid = TEST_GROUP_JID.parse().unwrap();
         let spec = JoinLinkedGroupIq::new(&parent, &subgroup);
         (subgroup, spec)
     }
@@ -5904,10 +5910,7 @@ mod tests {
     #[test]
     fn test_join_linked_group_bare_result_joins_subgroup() {
         let (subgroup, spec) = linked_spec();
-        let iq = NodeBuilder::new("iq")
-            .attr("type", "result")
-            .attr("from", "120363000000000001@g.us")
-            .build();
+        let iq = result_iq(TEST_PARENT_JID, Vec::new());
         let result = spec.parse_response(&iq.as_node_ref()).unwrap();
         assert_eq!(result, JoinGroupResult::Joined(subgroup));
     }
@@ -5915,14 +5918,7 @@ mod tests {
     #[test]
     fn test_join_linked_group_approval_child_stays_pending() {
         let (subgroup, spec) = linked_spec();
-        let approval = NodeBuilder::new("membership_approval_request")
-            .attr("jid", "120363000000000042@g.us")
-            .build();
-        let iq = NodeBuilder::new("iq")
-            .attr("type", "result")
-            .attr("from", "120363000000000001@g.us")
-            .children([approval])
-            .build();
+        let iq = result_iq(TEST_PARENT_JID, vec![approval_child(TEST_GROUP_JID)]);
         let result = spec.parse_response(&iq.as_node_ref()).unwrap();
         assert_eq!(result, JoinGroupResult::PendingApproval(subgroup));
     }
@@ -5930,12 +5926,10 @@ mod tests {
     #[test]
     fn test_join_linked_group_unknown_child_is_rejected() {
         let (_, spec) = linked_spec();
-        let unknown = NodeBuilder::new("unexpected").build();
-        let iq = NodeBuilder::new("iq")
-            .attr("type", "result")
-            .attr("from", "120363000000000001@g.us")
-            .children([unknown])
-            .build();
+        let iq = result_iq(
+            TEST_PARENT_JID,
+            vec![NodeBuilder::new("unexpected").build()],
+        );
         assert!(spec.parse_response(&iq.as_node_ref()).is_err());
     }
 }

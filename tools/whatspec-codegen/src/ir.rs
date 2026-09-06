@@ -171,6 +171,16 @@ pub struct ResponseAssertion {
     pub name: Option<String>,
 }
 
+impl ResponseAssertion {
+    /// The required child tag when this assertion is a presence gate
+    /// (`kind == "child"` with a tag), `None` otherwise.
+    pub fn child_gate(&self) -> Option<&str> {
+        (self.kind.as_deref() == Some("child"))
+            .then(|| self.name.as_deref())
+            .flatten()
+    }
+}
+
 /// One alternative of a response-root discriminated union. Read only for the
 /// success shapes of the join RPCs: `tag` names the variant, and a `child`
 /// assertion on it names a child the variant requires.
@@ -182,6 +192,13 @@ pub struct ResponseVariant {
     pub kind: Option<String>,
     #[serde(default)]
     pub assertions: Vec<ResponseAssertion>,
+}
+
+impl ResponseVariant {
+    /// Whether this alternative is a success shape (rather than an error arm).
+    pub fn is_success(&self) -> bool {
+        self.kind.as_deref() == Some("success")
+    }
 }
 
 /// The parsed response half of an IQ operation. Read only for `variants`;

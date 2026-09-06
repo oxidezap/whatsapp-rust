@@ -21,6 +21,7 @@
 //! </iq>
 //! ```
 
+use crate::iq::node::required_child;
 use crate::iq::spec::IqSpec;
 use crate::request::InfoQuery;
 use wacore_binary::builder::NodeBuilder;
@@ -77,9 +78,7 @@ impl IqSpec for PassiveModeSpec {
         // `PASSIVE_PASSIVE_SUCCESS`). A result without it is not this RPC's
         // success.
         let tag = if self.passive { "passive" } else { "active" };
-        if response.get_optional_child(tag).is_none() {
-            anyhow::bail!("expected <{tag}> in passive-mode response");
-        }
+        required_child(response, tag)?;
         Ok(())
     }
 }
@@ -87,6 +86,7 @@ impl IqSpec for PassiveModeSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wacore_binary::Node;
 
     #[test]
     fn test_passive_mode_spec_passive() {
@@ -136,38 +136,32 @@ mod tests {
         );
     }
 
+    fn result_iq(child_tag: Option<&'static str>) -> Node {
+        let mut iq = NodeBuilder::new("iq").attr("type", "result");
+        if let Some(tag) = child_tag {
+            iq = iq.children([NodeBuilder::new(tag).build()]);
+        }
+        iq.build()
+    }
+
     #[test]
     fn test_passive_mode_spec_parse_response() {
         let spec = PassiveModeSpec::passive();
-        let child = NodeBuilder::new("passive").build();
-        let response = NodeBuilder::new("iq")
-            .attr("type", "result")
-            .children([child])
-            .build();
-
-        let result = spec.parse_response(&response.as_node_ref());
+        let result = spec.parse_response(&result_iq(Some("passive")).as_node_ref());
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_passive_mode_spec_rejects_result_without_mode_child() {
         let spec = PassiveModeSpec::passive();
-        let response = NodeBuilder::new("iq").attr("type", "result").build();
-
-        let result = spec.parse_response(&response.as_node_ref());
+        let result = spec.parse_response(&result_iq(None).as_node_ref());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_passive_mode_spec_rejects_wrong_mode_child() {
         let spec = PassiveModeSpec::passive();
-        let child = NodeBuilder::new("active").build();
-        let response = NodeBuilder::new("iq")
-            .attr("type", "result")
-            .children([child])
-            .build();
-
-        let result = spec.parse_response(&response.as_node_ref());
+        let result = spec.parse_response(&result_iq(Some("active")).as_node_ref());
         assert!(result.is_err());
     }
 }
