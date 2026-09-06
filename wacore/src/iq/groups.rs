@@ -2826,6 +2826,10 @@ impl IqSpec for JoinLinkedGroupIq {
         // identity (the same `id` the query parser reads), so joining it
         // cannot misreport a non-joined state; anything else present but
         // unrecognized still fails loudly below.
+        //
+        // TODO: drop this allowance once servers answer the bare result and
+        // re-tighten to bare-or-approval only; the wrapper exists for a
+        // transitional server behavior, not the protocol.
         if let Some(linked) = response.get_optional_child("linked_group")
             && let Some(group) = linked.get_optional_child("group")
             && let Ok(id_str) = required_attr(group, "id")
