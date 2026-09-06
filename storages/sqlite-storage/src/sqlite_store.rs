@@ -7063,12 +7063,7 @@ mod read_routing_tests {
         assert_eq!(got.as_deref(), Some(&b"blob"[..]));
     }
 
-    /// The contention bench overlaps one write burst with one write-queue read
-    /// (`benches/store_contention.rs::read_under_write`): the burst is
-    /// first-polled to hold the permit, then both are driven together.
-    /// Driving them in sequence — awaiting the read while the unpolled burst
-    /// holds its permit — deadlocks, and the shard hangs until CI kills it
-    /// with no failing assertion. This pins joint progress with a timeout.
+    /// Ensures a write-queue read completes while a write burst holds the permit.
     #[tokio::test]
     async fn write_queue_read_completes_beside_a_held_burst() {
         use std::future::{Future, poll_fn};
