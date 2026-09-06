@@ -3012,16 +3012,13 @@ impl IqSpec for AcceptGroupInviteV4Iq {
         // the strict parser: addressed at `@g.us`, a bare result there carries
         // no group identity to return.)
         //
-        // Bare means no child elements at all: an unrecognized child is an
-        // unknown shape, and reporting it `Joined` could misreport a future
-        // non-joined state as joined. It falls through to the strict parser,
-        // which rejects it loudly instead.
-        let no_join_child = response.get_optional_child("group").is_none()
-            && response.get_optional_child("community").is_none()
-            && response
-                .get_optional_child("membership_approval_request")
-                .is_none();
-        if no_join_child && response.children().is_none_or(|c| c.is_empty()) {
+        // Bare means no content at all: no child elements and no scalar
+        // payload (`children()` alone cannot tell an absent body from a scalar
+        // one). Anything present but unrecognized is an unknown shape, and
+        // reporting it `Joined` could misreport a future non-joined state as
+        // joined. It falls through to the strict parser, which rejects it
+        // loudly instead.
+        if response.content.is_none() {
             return Ok(JoinGroupResult::Joined(self.group_jid.clone()));
         }
         parse_join_group_response(response)
@@ -5827,6 +5824,19 @@ mod tests {
             .attr("type", "result")
             .attr("from", "120363000000000042@g.us")
             .children([unknown])
+            .build();
+        assert!(spec.parse_response(&iq.as_node_ref()).is_err());
+    }
+
+    /// Scalar payload is content too: `<iq type="result">payload</iq>` is a
+    /// non-empty unknown shape, not a bare success.
+    #[test]
+    fn test_accept_group_invite_v4_scalar_content_is_rejected() {
+        let (_, spec) = v4_spec();
+        let iq = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", "120363000000000042@g.us")
+            .apply_content(Some(NodeContent::String("unexpected payload".into())))
             .build();
         assert!(spec.parse_response(&iq.as_node_ref()).is_err());
     }
