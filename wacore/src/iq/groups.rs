@@ -3011,12 +3011,17 @@ impl IqSpec for AcceptGroupInviteV4Iq {
         // required children accepts the bare result. (The code-based join keeps
         // the strict parser: addressed at `@g.us`, a bare result there carries
         // no group identity to return.)
-        if response.get_optional_child("group").is_none()
+        //
+        // Bare means no child elements at all: an unrecognized child is an
+        // unknown shape, and reporting it `Joined` could misreport a future
+        // non-joined state as joined. It falls through to the strict parser,
+        // which rejects it loudly instead.
+        let no_join_child = response.get_optional_child("group").is_none()
             && response.get_optional_child("community").is_none()
             && response
                 .get_optional_child("membership_approval_request")
-                .is_none()
-        {
+                .is_none();
+        if no_join_child && response.children().is_none_or(|c| c.is_empty()) {
             return Ok(JoinGroupResult::Joined(self.group_jid.clone()));
         }
         parse_join_group_response(response)
@@ -5786,14 +5791,8 @@ mod tests {
             .build()
     }
 
-    /// The join shapes this parser implements, checked against what the
-    /// whatspec IR resolves for each upstream builder (see the generated
-    /// `super::join_shapes::ACCEPT_GROUP_ADD_SUCCESS`, pinned by
-    /// `tools/whatspec-codegen`). The expectations below were read off the IR
-    /// by hand: a bare `<iq type="result">` is a success the lock must keep
-    /// carrying, and the gated variant keeps requiring its child. If the next
-    /// sync flips the constants, the parser above owes a re-read — not a
-    /// silent acceptance of the new shape.
+    /// Locks the parser above to the generated join-shape constants: if the next
+    /// sync flips them, this fails and the parser owes a re-read.
     #[test]
     fn test_join_success_shapes_match_the_ir_lock() {
         use crate::iq::join_shapes;
@@ -5809,17 +5808,27 @@ mod tests {
         );
     }
 
-    /// The server also answers an accepted V4 join with a bare `<iq
-    /// type="result">` — no `<group>`, `<community>` or
-    /// `<membership_approval_request>` child (WA Web's own
-    /// `AcceptGroupAddResponseSuccess` variant requires no child at all). The
-    /// joined group is the request's own `to`, which this spec holds.
+    /// A bare result joins with the request's group JID.
     #[test]
     fn test_accept_group_invite_v4_bare_result_joins() {
         let (group_jid, spec) = v4_spec();
         let iq = bare_join_result();
         let result = spec.parse_response(&iq.as_node_ref()).unwrap();
         assert_eq!(result, JoinGroupResult::Joined(group_jid));
+    }
+
+    /// An unrecognized child is an unknown shape, not a bare success: it must
+    /// reach the strict parser and fail loudly rather than report `Joined`.
+    #[test]
+    fn test_accept_group_invite_v4_unknown_child_is_rejected() {
+        let (_, spec) = v4_spec();
+        let unknown = NodeBuilder::new("unexpected").build();
+        let iq = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", "120363000000000042@g.us")
+            .children([unknown])
+            .build();
+        assert!(spec.parse_response(&iq.as_node_ref()).is_err());
     }
 
     #[test]
