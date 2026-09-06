@@ -154,9 +154,9 @@ pub trait TransportFactory: crate::sync_marker::MaybeSendSync {
     /// Creates a new transport and returns it, along with a stream of events.
     ///
     /// Dropping the returned future must abort the dial without leaking an
-    /// open transport: [`RacingTransportFactory`] cancels the loser by
-    /// dropping it, which is only clean when a half-open dial leaves no
-    /// socket behind.
+    /// open transport: [`RacingTransportFactory`] drops a still-dialling loser
+    /// (aborting it) and closes an already-open one in background, so a
+    /// half-open dial must leave no socket behind when dropped.
     async fn create_transport(
         &self,
     ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), anyhow::Error>;
@@ -170,46 +170,75 @@ pub trait TransportFactory: crate::sync_marker::MaybeSendSync {
 /// does this return an error (the one that completed last, as WA Web rejects
 /// with the failure that completes the set).
 ///
+/// The winner never waits for the loser: [`Transport::disconnect`] carries no
+/// completion bound (a valid transport may stall it forever), so an
+/// already-open loser is closed on `runtime` via [`Runtime::spawn_detached`]
+/// while the winner is returned immediately. Its event channel is dropped
+/// with it, so the loser's close never surfaces as a `DisconnectReason`.
+///
 /// No handshake runs here, so at most one socket ever reaches Noise: this
-/// returns a single transport and the caller handshakes exactly it. No task is
-/// spawned and no executor primitive is used beyond `futures` combinators, so
-/// this stays portable (wasm32/ESP32) and dropping the race future aborts both
-/// dials with no socket to close.
+/// returns a single transport and the caller handshakes exactly it. The race
+/// itself uses only `futures` combinators, so this stays portable
+/// (wasm32/ESP32); dropping the race future aborts both dials with no socket
+/// to close.
 ///
 /// Inner factories keep their own contracts: TLS session resumption stays
 /// inside each factory's connector, `Origin` stays each factory's, and custom
 /// strategies built on `from_websocket` compose by wrapping the factories.
+///
+/// [`Runtime::spawn_detached`]: crate::runtime::Runtime::spawn_detached
 pub struct RacingTransportFactory {
     primary: Arc<dyn TransportFactory>,
     secondary: Arc<dyn TransportFactory>,
+    runtime: Arc<dyn crate::runtime::Runtime>,
 }
 
 impl RacingTransportFactory {
     /// Races `primary` against `secondary`; the first success wins regardless
     /// of order, so pass the preferred endpoint first only as a tiebreak hint.
     /// For chat parity this is one factory per [`WHATSAPP_WEB_WS_URLS`] entry.
-    pub fn new(primary: Arc<dyn TransportFactory>, secondary: Arc<dyn TransportFactory>) -> Self {
-        Self { primary, secondary }
+    /// `runtime` runs the loser's background close; the winner is returned
+    /// without waiting for it.
+    pub fn new(
+        primary: Arc<dyn TransportFactory>,
+        secondary: Arc<dyn TransportFactory>,
+        runtime: Arc<dyn crate::runtime::Runtime>,
+    ) -> Self {
+        Self {
+            primary,
+            secondary,
+            runtime,
+        }
     }
 }
 
 type TransportDial =
     Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), anyhow::Error>;
 
-/// Settles a dial that lost the race: an already-open loser is closed cleanly
-/// and its late failure suppressed; a still-pending loser is left for the
-/// caller to drop, which aborts the dial per [`TransportFactory`]'s contract.
-async fn settle_loser<F>(winner: TransportDial, loser: F) -> TransportDial
+/// Settles a dial that lost the race: an already-open loser is closed in
+/// background and its late failure suppressed; a still-pending loser is left
+/// for the caller to drop, which aborts the dial per [`TransportFactory`]'s
+/// contract. Never awaits the loser, so a stalled close cannot delay a usable
+/// winner.
+fn settle_loser<F>(
+    winner: TransportDial,
+    loser: F,
+    runtime: &Arc<dyn crate::runtime::Runtime>,
+) -> TransportDial
 where
     F: Future<Output = TransportDial>,
 {
     use futures::future::FutureExt as _;
 
-    let winner = winner?;
-    if let Some(Ok((loser_transport, _))) = loser.now_or_never() {
-        loser_transport.disconnect().await;
+    if winner.is_ok()
+        && let Some(Ok((loser_transport, _))) = loser.now_or_never()
+    {
+        let runtime = Arc::clone(runtime);
+        runtime.spawn_detached(Box::pin(async move {
+            loser_transport.disconnect().await;
+        }));
     }
-    Ok(winner)
+    winner
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -226,14 +255,14 @@ impl TransportFactory for RacingTransportFactory {
         match select(primary_fut, secondary_fut).await {
             Either::Left((first, second_fut)) => {
                 if first.is_ok() {
-                    settle_loser(first, second_fut).await
+                    settle_loser(first, second_fut, &self.runtime)
                 } else {
                     second_fut.await
                 }
             }
             Either::Right((second, first_fut)) => {
                 if second.is_ok() {
-                    settle_loser(second, first_fut).await
+                    settle_loser(second, first_fut, &self.runtime)
                 } else {
                     first_fut.await
                 }
@@ -419,14 +448,50 @@ mod tests {
     }
 }
 
-/// Race and `?ED=` tests. The implementation uses only `futures` combinators,
-/// so it is portable; the tests below use Tokio timers purely as controllable
-/// latency/failure scripts for the mock dials.
+/// Race and `?ED=` tests. The race itself uses only `futures` combinators plus
+/// a `Runtime` for the loser's background close, so it stays portable; the
+/// tests below use Tokio timers purely as controllable latency/failure scripts
+/// for the mock dials.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod racing_tests {
     use super::*;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    struct TestRuntime;
+
+    #[async_trait::async_trait]
+    impl crate::runtime::Runtime for TestRuntime {
+        fn spawn(
+            &self,
+            future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+        ) -> crate::runtime::AbortHandle {
+            let handle = tokio::spawn(future);
+            crate::runtime::AbortHandle::new(move || handle.abort())
+        }
+
+        fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(tokio::time::sleep(duration))
+        }
+
+        fn spawn_blocking(
+            &self,
+            f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async move {
+                let _ = tokio::task::spawn_blocking(f).await;
+            })
+        }
+
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+
+    fn test_runtime() -> Arc<dyn crate::runtime::Runtime> {
+        Arc::new(TestRuntime)
+    }
 
     struct DialCounters {
         started: AtomicUsize,
@@ -460,6 +525,7 @@ mod racing_tests {
 
     struct MockDialTransport {
         counters: Arc<DialCounters>,
+        stall_disconnect: bool,
     }
 
     #[async_trait::async_trait]
@@ -469,6 +535,11 @@ mod racing_tests {
         }
 
         async fn disconnect(&self) {
+            // Mirrors `StallingMockTransport`: a valid transport may never
+            // finish closing, which is exactly what must not block the winner.
+            if self.stall_disconnect {
+                std::future::pending::<()>().await;
+            }
             self.counters.disconnects.fetch_add(1, Ordering::AcqRel);
         }
     }
@@ -480,6 +551,7 @@ mod racing_tests {
     struct ScriptedDialFactory {
         delay: Option<Duration>,
         fail_with: Option<&'static str>,
+        stall_disconnect: bool,
         counters: Arc<DialCounters>,
     }
 
@@ -503,32 +575,58 @@ mod racing_tests {
             Ok((
                 Arc::new(MockDialTransport {
                     counters: self.counters.clone(),
+                    stall_disconnect: self.stall_disconnect,
                 }),
                 rx,
             ))
         }
     }
 
-    fn scripted(
+    fn scripted_full(
         delay_ms: Option<u64>,
         fail_with: Option<&'static str>,
+        stall_disconnect: bool,
     ) -> (ScriptedDialFactory, Arc<DialCounters>) {
         let counters = Arc::new(DialCounters::zero());
         (
             ScriptedDialFactory {
                 delay: delay_ms.map(Duration::from_millis),
                 fail_with,
+                stall_disconnect,
                 counters: counters.clone(),
             },
             counters,
         )
     }
 
+    fn scripted(
+        delay_ms: Option<u64>,
+        fail_with: Option<&'static str>,
+    ) -> (ScriptedDialFactory, Arc<DialCounters>) {
+        scripted_full(delay_ms, fail_with, false)
+    }
+
     fn race(
         primary: ScriptedDialFactory,
         secondary: ScriptedDialFactory,
     ) -> RacingTransportFactory {
-        RacingTransportFactory::new(Arc::new(primary), Arc::new(secondary))
+        RacingTransportFactory::new(Arc::new(primary), Arc::new(secondary), test_runtime())
+    }
+
+    /// Background loser closes resolve promptly, but not synchronously: wait
+    /// up to the bound for `disconnects` to reach `want`.
+    async fn await_disconnects(
+        primary_c: &Arc<DialCounters>,
+        secondary_c: &Arc<DialCounters>,
+        want: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while primary_c.get(|c| &c.disconnects) + secondary_c.get(|c| &c.disconnects) < want {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the background loser close runs to completion");
     }
 
     #[tokio::test]
@@ -572,6 +670,9 @@ mod racing_tests {
             2,
             "both dials opened before either could be aborted"
         );
+        // The loser close runs detached: the winner is already returned, so
+        // wait for the background close instead of asserting synchronously.
+        await_disconnects(&primary_c, &secondary_c, 1).await;
         let (p_disc, s_disc) = (
             primary_c.get(|c| &c.disconnects),
             secondary_c.get(|c| &c.disconnects),
@@ -580,6 +681,27 @@ mod racing_tests {
             (p_disc, s_disc) == (0, 1) || (p_disc, s_disc) == (1, 0),
             "exactly the loser is closed, the winner is untouched (got {p_disc}/{s_disc})"
         );
+    }
+
+    #[tokio::test]
+    async fn stalled_loser_close_does_not_block_winner() {
+        // Both dials open instantly and both stall forever on close: whoever
+        // loses, the winner must still be delivered promptly and stay usable.
+        let (primary, _) = scripted_full(None, None, true);
+        let (secondary, _) = scripted_full(None, None, true);
+
+        let (transport, _rx) = tokio::time::timeout(
+            Duration::from_secs(5),
+            race(primary, secondary).create_transport(),
+        )
+        .await
+        .expect("the winner resolves despite the stalled loser close")
+        .expect("one of the instant dials wins");
+
+        transport
+            .send(Bytes::from_static(b"ping"))
+            .await
+            .expect("the delivered winner is usable");
     }
 
     #[tokio::test]
