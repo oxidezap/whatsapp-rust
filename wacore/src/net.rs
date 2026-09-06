@@ -38,8 +38,17 @@ pub fn with_edge_routing_param(url: &str, edge_routing_info: Option<&[u8]>) -> S
     }
     use base64::Engine as _;
     let encoded = base64::engine::general_purpose::URL_SAFE.encode(info);
-    let sep = if url.contains('?') { '&' } else { '?' };
-    format!("{url}{sep}ED={encoded}")
+    // The query goes before any `#fragment`: fragment bytes never reach the
+    // server, so an `ED` appended after `#` would lose the routing hint.
+    let (base, fragment) = match url.split_once('#') {
+        Some((base, fragment)) => (base, Some(fragment)),
+        None => (url, None),
+    };
+    let sep = if base.contains('?') { '&' } else { '?' };
+    match fragment {
+        Some(fragment) => format!("{base}{sep}ED={encoded}#{fragment}"),
+        None => format!("{base}{sep}ED={encoded}"),
+    }
 }
 
 /// `Origin` sent to every WhatsApp Web endpoint — the chat socket and the media
@@ -879,6 +888,18 @@ mod racing_tests {
             .decode(encoded)
             .expect("valid base64url");
         assert_eq!(decoded, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn edge_routing_param_goes_before_any_fragment() {
+        assert_eq!(
+            with_edge_routing_param("wss://example.invalid/ws/chat#frag", Some(&[0x01])),
+            "wss://example.invalid/ws/chat?ED=AQ==#frag"
+        );
+        assert_eq!(
+            with_edge_routing_param("wss://example.invalid/ws/chat?x=1#frag", Some(&[0x01])),
+            "wss://example.invalid/ws/chat?x=1&ED=AQ==#frag"
+        );
     }
 
     #[test]
