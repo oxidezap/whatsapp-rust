@@ -185,6 +185,12 @@ const BURST_SEEDS: [u8; 2] = [1, 2];
 /// and only then parks on its blocking job. A read on the write queue thus
 /// queues behind the burst, and a read on a reader connection runs beside a
 /// write in progress, whatever the scheduler does with either task.
+///
+/// Both futures are driven together with `join!`, never awaited in sequence:
+/// awaiting the read first would park it on the write permit while the burst
+/// future — the only thing that can release it — sits unpolled behind it, a
+/// deterministic deadlock. `join!` keeps the burst polled while the read
+/// waits, so the measured interleaving is the queued one above on every run.
 fn read_under_write<R>(
     h: &'static Harness,
     rows: &[AppStateMutationMAC],
@@ -194,8 +200,7 @@ fn read_under_write<R>(
         let mut burst = pin!(h.store.put_mutation_macs("regular", 1, rows));
         let finished = poll_fn(|cx| Poll::Ready(burst.as_mut().poll(cx).is_ready())).await;
         assert!(!finished, "the burst finished before the read was issued");
-        let out = read.await;
-        burst.await.expect("write burst");
+        let (out, _) = tokio::join!(read, async { burst.await.expect("write burst") });
         out
     })
 }
