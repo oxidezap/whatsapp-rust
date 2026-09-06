@@ -9,7 +9,7 @@ use diesel::sqlite::SqliteConnection;
 use std::sync::Arc;
 use wacore::store::error::{Result, StoreError};
 
-use crate::sqlite_store::{SqlitePool, SqliteStore};
+use crate::sqlite_store::{CommitBarrierHook, SqlitePool, SqliteStore, await_barrier_hook};
 
 /// Clonable handle onto a [`SqliteStore`]'s connection pool and serialization
 /// semaphore. Obtained via [`SqliteStore::shared`]. Holding one does not keep any
@@ -19,6 +19,7 @@ pub struct SharedSqlite {
     pool: SqlitePool,
     semaphore: Arc<tokio::sync::Semaphore>,
     reads: Option<crate::sqlite_store::ReadPool>,
+    commit_barrier: Option<CommitBarrierHook>,
 }
 
 impl SharedSqlite {
@@ -35,7 +36,13 @@ impl SharedSqlite {
         F: FnOnce(&mut SqliteConnection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        Self::run_on(self.pool.clone(), Arc::clone(&self.semaphore), f).await
+        Self::run_on(
+            self.pool.clone(),
+            Arc::clone(&self.semaphore),
+            self.commit_barrier.clone(),
+            f,
+        )
+        .await
     }
 
     /// Run a **read-only** `f` without queueing behind the write permit.
@@ -71,12 +78,13 @@ impl SharedSqlite {
             Some(reads) => (reads.pool.clone(), Arc::clone(&reads.semaphore)),
             None => (self.pool.clone(), Arc::clone(&self.semaphore)),
         };
-        Self::run_on(pool, semaphore, move |conn| read_snapshot(conn, f)).await
+        Self::run_on(pool, semaphore, None, move |conn| read_snapshot(conn, f)).await
     }
 
     async fn run_on<F, T>(
         pool: SqlitePool,
         semaphore: Arc<tokio::sync::Semaphore>,
+        commit_barrier: Option<CommitBarrierHook>,
         f: F,
     ) -> Result<T>
     where
@@ -87,15 +95,19 @@ impl SharedSqlite {
             .acquire_owned()
             .await
             .map_err(|e| StoreError::Database(Box::new(e)))?;
-        crate::pool::spawn_blocking(move || {
-            let _permit = permit;
+        let result = crate::pool::spawn_blocking(move || -> Result<(T, _)> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            f(&mut conn)
+            let result = f(&mut conn)?;
+            Ok((result, permit))
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))?
+        .map_err(|e| StoreError::Database(Box::new(e)))??;
+        let (result, permit) = result;
+        await_barrier_hook(&commit_barrier).await?;
+        drop(permit);
+        Ok(result)
     }
 }
 
@@ -135,6 +147,7 @@ impl SqliteStore {
             pool: self.pool.clone(),
             semaphore: self.db_semaphore.clone(),
             reads: self.reads.clone(),
+            commit_barrier: self.commit_barrier.clone(),
         }
     }
 }
@@ -142,6 +155,7 @@ impl SqliteStore {
 #[cfg(test)]
 mod tests {
     use diesel::prelude::*;
+    use std::sync::Arc;
 
     use crate::sqlite_store::SqliteStore;
     use wacore::store::error::StoreError;
@@ -203,6 +217,250 @@ mod tests {
             .expect("read through cloned handle");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].v, "b");
+    }
+
+    #[tokio::test]
+    async fn shared_write_awaits_barrier_but_read_does_not() {
+        use crate::sqlite_store::{CommitBarrierHook, SqliteStoreConfig};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_hook = Arc::clone(&calls);
+        let barrier: CommitBarrierHook = Arc::new(move || {
+            calls_for_hook.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok::<(), StoreError>(()) })
+        });
+        let store = SqliteStore::with_config(
+            &unique_db_name("barrier"),
+            SqliteStoreConfig::default().with_commit_barrier(barrier),
+        )
+        .await
+        .expect("barrier store");
+        let shared = store.shared();
+        shared
+            .run(|conn| {
+                diesel::sql_query("CREATE TABLE barrier_data (value TEXT)")
+                    .execute(conn)
+                    .map_err(db_err)?;
+                Ok(())
+            })
+            .await
+            .expect("write");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        shared
+            .read(|conn| {
+                diesel::sql_query("SELECT count(*) FROM barrier_data")
+                    .execute(conn)
+                    .map_err(db_err)?;
+                Ok(())
+            })
+            .await
+            .expect("read");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn a_constructor_barrier_failure_rejects_the_store() {
+        use crate::sqlite_store::{CommitBarrierHook, SqliteStoreConfig};
+
+        let barrier: CommitBarrierHook = Arc::new(|| {
+            Box::pin(async { Err(StoreError::Validation("commit barrier failed".into())) })
+        });
+        let result = SqliteStore::with_config(
+            &unique_db_name("barrier_error"),
+            SqliteStoreConfig::default().with_commit_barrier(barrier),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "constructor must propagate barrier failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_barrier_holds_the_write_permit() {
+        use crate::sqlite_store::{CommitBarrierHook, SqliteStoreConfig};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::{Notify, Semaphore};
+
+        let entered = Arc::new(Notify::new());
+        let permits = Arc::new(Semaphore::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook: CommitBarrierHook = {
+            let entered = Arc::clone(&entered);
+            let permits = Arc::clone(&permits);
+            let calls = Arc::clone(&calls);
+            Arc::new(move || {
+                entered.notify_one();
+                calls.fetch_add(1, Ordering::Relaxed);
+                let permits = Arc::clone(&permits);
+                Box::pin(async move {
+                    permits
+                        .acquire()
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| StoreError::Database(Box::new(e)))
+                })
+            })
+        };
+        let mut store = SqliteStore::with_config(
+            &unique_db_name("barrier_pending"),
+            SqliteStoreConfig::default(),
+        )
+        .await
+        .expect("store");
+        store.commit_barrier = Some(hook);
+        let shared = store.shared();
+        let first = tokio::spawn({
+            let shared = shared.clone();
+            async move {
+                shared
+                    .run(|conn| {
+                        diesel::sql_query("CREATE TABLE pending_data (value TEXT)")
+                            .execute(conn)
+                            .map_err(db_err)?;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        entered.notified().await;
+        let mut second = tokio::spawn({
+            let shared = shared.clone();
+            async move {
+                shared
+                    .run(|conn| {
+                        diesel::sql_query("INSERT INTO pending_data (value) VALUES ('later')")
+                            .execute(conn)
+                            .map_err(db_err)?;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut second)
+                .await
+                .is_err()
+        );
+        first.abort();
+        assert!(first.await.is_err(), "canceled write must not complete");
+        permits.add_permits(1);
+        entered.notified().await;
+        permits.add_permits(1);
+        second.await.expect("second join").expect("second write");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn canceling_blocking_write_keeps_permit_until_worker_finishes() {
+        use tokio::sync::oneshot;
+
+        let store = create_test_store("cancel_blocking_write").await;
+        let shared = store.shared();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let first = tokio::spawn({
+            let shared = shared.clone();
+            async move {
+                shared
+                    .run(move |conn| {
+                        diesel::sql_query("CREATE TABLE canceled_data (value TEXT)")
+                            .execute(conn)
+                            .map_err(db_err)?;
+                        let _ = started_tx.send(());
+                        release_rx
+                            .blocking_recv()
+                            .map_err(|_| StoreError::Validation("write release dropped".into()))?;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        started_rx.await.expect("blocking write started");
+        first.abort();
+        assert!(first.await.is_err(), "canceled write must not complete");
+        assert_eq!(
+            shared.semaphore.available_permits(),
+            0,
+            "the canceled worker must retain the write permit"
+        );
+
+        let second = tokio::spawn({
+            let shared = shared.clone();
+            async move {
+                shared
+                    .run(|conn| {
+                        diesel::sql_query(
+                            "INSERT INTO canceled_data (value) VALUES ('after-cancel')",
+                        )
+                        .execute(conn)
+                        .map_err(db_err)?;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        release_tx.send(()).expect("release blocking write");
+        second.await.expect("second join").expect("second write");
+    }
+
+    #[tokio::test]
+    async fn signal_batch_surfaces_barrier_error() {
+        use crate::sqlite_store::{CommitBarrierHook, SqliteStoreConfig};
+        use bytes::Bytes;
+        use wacore::store::traits::SignalStore;
+
+        let mut store = SqliteStore::with_config(
+            &unique_db_name("signal_barrier_error"),
+            SqliteStoreConfig::default(),
+        )
+        .await
+        .expect("store");
+        let barrier: CommitBarrierHook =
+            Arc::new(|| Box::pin(async { Err(StoreError::Validation("IDB quota".into())) }));
+        store.commit_barrier = Some(barrier);
+        let result = store
+            .put_sessions_batch(&[(Arc::from("alice.1"), Bytes::from_static(b"state"))])
+            .await;
+        let error = result.expect_err("Signal writes must fail closed on barrier error");
+        let source = std::error::Error::source(&error).expect("barrier source");
+        assert!(
+            source
+                .downcast_ref::<crate::sqlite_store::CommitBarrierError>()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_write_surfaces_typed_barrier_error() {
+        use crate::sqlite_store::{CommitBarrierHook, SqliteStoreConfig};
+
+        let mut store = SqliteStore::with_config(
+            &unique_db_name("shared_barrier_error"),
+            SqliteStoreConfig::default(),
+        )
+        .await
+        .expect("store");
+        let barrier: CommitBarrierHook =
+            Arc::new(|| Box::pin(async { Err(StoreError::Validation("IDB quota".into())) }));
+        store.commit_barrier = Some(barrier);
+        let error = store
+            .shared()
+            .run(|conn| {
+                diesel::sql_query("CREATE TABLE shared_barrier_data (value TEXT)")
+                    .execute(conn)
+                    .map_err(db_err)?;
+                Ok(())
+            })
+            .await
+            .expect_err("shared write must fail closed");
+        let source = std::error::Error::source(&error).expect("barrier source");
+        assert!(
+            source
+                .downcast_ref::<crate::sqlite_store::CommitBarrierError>()
+                .is_some()
+        );
     }
 
     /// A file-backed store, since reader connections need real WAL and an

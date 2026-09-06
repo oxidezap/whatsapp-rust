@@ -11,7 +11,10 @@ pub(crate) mod upsert_queries;
 mod wire;
 
 pub use shared::SharedSqlite;
-pub use sqlite_store::{ConnectionInitHook, SqliteStore, SqliteStoreConfig, Synchronous};
+pub use sqlite_store::{
+    CommitBarrierError, CommitBarrierFuture, CommitBarrierHook, ConnectionInitHook, SqliteStore,
+    SqliteStoreConfig, Synchronous,
+};
 
 #[cfg(feature = "test-util")]
 #[doc(hidden)]

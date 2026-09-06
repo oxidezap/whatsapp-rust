@@ -8,8 +8,11 @@ use diesel::sqlite::SqliteConnection;
 use diesel::upsert::excluded;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use log::warn;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use thiserror::Error;
 use wacore::appstate::hash::HashState;
 use wacore::appstate::processor::AppStateMutationMAC;
 use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
@@ -237,6 +240,8 @@ type ReadQuery<T> = Box<dyn FnOnce(&mut SqliteConnection) -> Result<T> + Send>;
 /// A unit of work for the write queue, erased for the same reason.
 type BlockingJob<T> = Box<dyn FnOnce() -> Result<T> + Send>;
 
+type WriteJob<T> = Box<dyn FnOnce(&mut SqliteConnection) -> Result<T> + Send>;
+
 /// Reader connections and the permits that bound how many run at once.
 #[derive(Clone)]
 pub(crate) struct ReadPool {
@@ -270,6 +275,7 @@ pub struct SqliteStore {
     /// `SQLITE_LOCKED_SHAREDCACHE`, which `busy_timeout` cannot absorb.
     pub(crate) snapshot_safe: bool,
     pub(crate) database_path: String,
+    pub(crate) commit_barrier: Option<CommitBarrierHook>,
     device_id: i32,
 }
 
@@ -308,6 +314,37 @@ pub type ConnectionInitHook = Arc<
         + Send
         + Sync,
 >;
+
+#[cfg(target_family = "wasm")]
+pub type CommitBarrierFuture = Pin<Box<dyn Future<Output = Result<()>> + 'static>>;
+
+#[cfg(not(target_family = "wasm"))]
+pub type CommitBarrierFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
+
+#[cfg(target_family = "wasm")]
+pub type CommitBarrierHook = Arc<dyn Fn() -> CommitBarrierFuture + Send + Sync + 'static>;
+
+/// A write reached SQLite's commit boundary, but its backing durability hook
+/// failed afterwards. Callers must treat the SQL mutation as committed in the
+/// live connection while retaining any retry state needed by the backend.
+#[derive(Debug, Error)]
+#[error("post-commit durability barrier failed")]
+pub struct CommitBarrierError(#[source] pub StoreError);
+
+pub(crate) fn commit_barrier_error(error: StoreError) -> StoreError {
+    StoreError::Database(Box::new(CommitBarrierError(error)))
+}
+
+#[inline(never)]
+pub(crate) async fn await_barrier_hook(hook: &Option<CommitBarrierHook>) -> Result<()> {
+    if let Some(barrier) = hook {
+        barrier().await.map_err(commit_barrier_error)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub type CommitBarrierHook = Arc<dyn Fn() -> CommitBarrierFuture + Send + Sync + 'static>;
 
 /// Per-store connection tuning. [`Default`] is a low-memory profile sized for one
 /// `SqliteStore` per WhatsApp session on a single process: a single pooled connection
@@ -402,6 +439,11 @@ pub struct SqliteStoreConfig {
     /// pragmas, WAL setup, and migrations. See [`ConnectionInitHook`] for the contract;
     /// set via [`SqliteStoreConfig::with_connection_init`].
     pub connection_init: Option<ConnectionInitHook>,
+    /// Optional awaitable called after each successful SQLite write commit.
+    /// Readers never call it. The callback runs while the write permit is held
+    /// and must not re-enter this store or a [`SharedSqlite`](crate::SharedSqlite)
+    /// handle, which would wait for the permit it already owns.
+    pub commit_barrier: Option<CommitBarrierHook>,
 }
 
 impl Default for SqliteStoreConfig {
@@ -420,6 +462,7 @@ impl Default for SqliteStoreConfig {
             synchronous: Synchronous::Normal,
             thread_pool: None,
             connection_init: None,
+            commit_barrier: None,
         }
     }
 }
@@ -472,6 +515,13 @@ impl SqliteStoreConfig {
             + 'static,
     {
         self.connection_init = Some(Arc::new(hook));
+        self
+    }
+
+    /// Install an awaitable that confirms a write reached the configured
+    /// backend before the write operation returns.
+    pub fn with_commit_barrier(mut self, barrier: CommitBarrierHook) -> Self {
+        self.commit_barrier = Some(barrier);
         self
     }
 }
@@ -715,6 +765,7 @@ impl SqliteStore {
         // Left as the `Option` the embedder gave; `pool::builder` resolves it.
         let thread_pool = config.thread_pool;
         let read_thread_pool = thread_pool.clone();
+        let commit_barrier = config.commit_barrier.clone();
 
         let options = ConnectionOptions {
             cache_size_kib: config.cache_size_kib,
@@ -780,6 +831,9 @@ impl SqliteStore {
         )
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))??;
+        if let Some(barrier) = commit_barrier {
+            await_barrier_hook(&Some(barrier)).await?;
+        }
 
         // Reader connections only pay off under WAL, and only with a page cache
         // per connection. Each of the two ways that can fail turns the intended
@@ -840,6 +894,7 @@ impl SqliteStore {
             reads,
             snapshot_safe: declined.is_none(),
             database_path,
+            commit_barrier: config.commit_barrier,
             device_id,
         })
     }
@@ -914,6 +969,7 @@ impl SqliteStore {
             reads: self.reads.clone(),
             snapshot_safe: self.snapshot_safe,
             database_path: self.database_path.clone(),
+            commit_barrier: self.commit_barrier.clone(),
             device_id,
         }
     }
@@ -1012,10 +1068,70 @@ impl SqliteStore {
         Ok(result)
     }
 
+    async fn await_commit_barrier(&self) -> Result<()> {
+        await_barrier_hook(&self.commit_barrier).await
+    }
+
+    async fn write_blocking<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut SqliteConnection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.write_blocking_erased(Box::new(f)).await
+    }
+
+    #[inline(never)]
+    async fn write_blocking_erased<T: Send + 'static>(&self, f: WriteJob<T>) -> Result<T> {
+        let permit = self
+            .db_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| StoreError::Database(Box::new(e)))?;
+        let pool = self.pool.clone();
+        let (result, permit) = crate::pool::spawn_blocking(move || -> Result<(T, _)> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            let result = f(&mut conn)?;
+            Ok((result, permit))
+        })
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))??;
+        self.await_commit_barrier().await?;
+        drop(permit);
+        Ok(result)
+    }
+
     /// Execute a database operation with semaphore serialization and retry on
     /// transient SQLite lock/busy errors. Mirrors WhatsApp Web's PromiseQueue
     /// pattern that serializes database commits to avoid concurrent write contention.
     async fn with_retry<F, T>(&self, op_name: &str, make_op: F) -> Result<T>
+    where
+        F: Fn() -> Box<
+            dyn FnOnce(&mut SqliteConnection) -> std::result::Result<T, DieselError> + Send,
+        >,
+        T: Send + 'static,
+    {
+        self.with_retry_inner(op_name, make_op, true).await
+    }
+
+    async fn with_read_retry<F, T>(&self, op_name: &str, make_op: F) -> Result<T>
+    where
+        F: Fn() -> Box<
+            dyn FnOnce(&mut SqliteConnection) -> std::result::Result<T, DieselError> + Send,
+        >,
+        T: Send + 'static,
+    {
+        self.with_retry_inner(op_name, make_op, false).await
+    }
+
+    async fn with_retry_inner<F, T>(
+        &self,
+        op_name: &str,
+        make_op: F,
+        await_barrier: bool,
+    ) -> Result<T>
     where
         F: Fn() -> Box<
             dyn FnOnce(&mut SqliteConnection) -> std::result::Result<T, DieselError> + Send,
@@ -1035,21 +1151,32 @@ impl SqliteStore {
             let pool = self.pool.clone();
             let op = make_op();
 
-            let result =
-                crate::pool::spawn_blocking(move || -> std::result::Result<T, DieselOrStore> {
-                    let _permit = permit;
+            let result = crate::pool::spawn_blocking(move || {
+                let result = (|| {
                     let mut conn = pool
                         .get()
                         .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
                     op(&mut conn).map_err(DieselOrStore::Diesel)
-                })
-                .await;
+                })();
+                (result, permit)
+            })
+            .await;
 
             match result {
-                Ok(Ok(val)) => return Ok(val),
-                Ok(Err(DieselOrStore::Diesel(ref e)))
+                Ok((Ok(val), permit)) => {
+                    let barrier = if await_barrier {
+                        self.await_commit_barrier().await
+                    } else {
+                        Ok(())
+                    };
+                    drop(permit);
+                    barrier?;
+                    return Ok(val);
+                }
+                Ok((Err(DieselOrStore::Diesel(ref e)), permit))
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
+                    drop(permit);
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
                     // Skip the first transient blip; warn from the second retry on so
                     // sustained busy/locked contention doesn't go unobserved.
@@ -1062,7 +1189,10 @@ impl SqliteStore {
                     }
                     retry_backoff(delay_ms).await;
                 }
-                Ok(Err(e)) => return Err(e.into()),
+                Ok((Err(e), permit)) => {
+                    drop(permit);
+                    return Err(e.into());
+                }
                 Err(e) => return Err(StoreError::Database(Box::new(e))),
             }
         }
@@ -1454,87 +1584,37 @@ impl SqliteStore {
         key: [u8; 32],
         device_id: i32,
     ) -> Result<()> {
-        let pool = self.pool.clone();
-        let db_semaphore = self.db_semaphore.clone();
-        // The key is a `Copy` array and the address is refcount-shared, so an
-        // attempt costs no heap allocation beyond the closure itself.
+        // The key is a `Copy` array and the address is refcount-shared, so a
+        // retry costs no heap allocation beyond the operation closure.
         let address_owned: Arc<str> = Arc::from(address);
-
-        const MAX_RETRIES: u32 = 5;
-
-        for attempt in 0..=MAX_RETRIES {
-            let permit = db_semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
-
-            let pool_clone = pool.clone();
-            let address_clone = address_owned.clone();
-
-            let result =
-                crate::pool::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
-                    let mut conn = pool_clone
-                        .get()
-                        .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
-                    crate::upsert_queries::UpsertIdentity {
-                        address: address_clone.as_ref(),
-                        key: &key[..],
-                        device_id,
-                    }
-                    .execute(&mut *conn)
-                    .map_err(DieselOrStore::Diesel)?;
-                    Ok(())
-                })
-                .await;
-
-            drop(permit);
-
-            match result {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(DieselOrStore::Diesel(ref e)))
-                    if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
-                {
-                    let delay_ms = 10 * 2u64.pow(attempt);
-                    warn!(
-                        "Identity write failed (attempt {}/{}): {e}. Retrying in {delay_ms}ms...",
-                        attempt + 1,
-                        MAX_RETRIES + 1,
-                    );
-                    retry_backoff(delay_ms).await;
-                    continue;
+        self.with_retry("identity_write", move || {
+            let address = address_owned.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                crate::upsert_queries::UpsertIdentity {
+                    address: address.as_ref(),
+                    key: &key[..],
+                    device_id,
                 }
-                Ok(Err(e)) => return Err(e.into()),
-                Err(e) => return Err(StoreError::Database(Box::new(e))),
-            }
-        }
-
-        Err(StoreError::RetriesExhausted {
-            op: format!("identity_write (after {} attempts)", MAX_RETRIES + 1),
+                .execute(conn)
+            })
         })
+        .await
+        .map(|_| ())
     }
 
     pub async fn delete_identity_for_device(&self, address: &str, device_id: i32) -> Result<()> {
-        let pool = self.pool.clone();
         let address_owned = address.to_string();
-
-        crate::pool::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        self.write_blocking(move |conn| {
             diesel::delete(
                 identities::table
                     .filter(identities::address.eq(address_owned))
                     .filter(identities::device_id.eq(device_id)),
             )
-            .execute(&mut *conn)
+            .execute(conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
-
-        Ok(())
     }
 
     pub async fn load_identity_for_device(
@@ -1582,90 +1662,40 @@ impl SqliteStore {
         session: &[u8],
         device_id: i32,
     ) -> Result<()> {
-        let pool = self.pool.clone();
-        let db_semaphore = self.db_semaphore.clone();
         // Copied once, then refcount-shared across attempts: this runs after
         // every Signal encrypt/decrypt, and a session record is several KiB,
         // so a per-attempt `Vec` clone was a memcpy on the happy path too.
         let address_owned: Arc<str> = Arc::from(address);
         let session_bytes = Bytes::copy_from_slice(session);
-
-        const MAX_RETRIES: u32 = 5;
-
-        for attempt in 0..=MAX_RETRIES {
-            let permit = db_semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
-
-            let pool_clone = pool.clone();
-            let address_clone = address_owned.clone();
-            let session_clone = session_bytes.clone();
-
-            let result =
-                crate::pool::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
-                    let mut conn = pool_clone
-                        .get()
-                        .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
-                    crate::upsert_queries::UpsertSession {
-                        address: address_clone.as_ref(),
-                        record: session_clone.as_ref(),
-                        device_id,
-                    }
-                    .execute(&mut *conn)
-                    .map_err(DieselOrStore::Diesel)?;
-                    Ok(())
-                })
-                .await;
-
-            drop(permit);
-
-            match result {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(DieselOrStore::Diesel(ref e)))
-                    if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
-                {
-                    let delay_ms = 10 * 2u64.pow(attempt);
-                    warn!(
-                        "Session write failed (attempt {}/{}): {e}. Retrying in {delay_ms}ms...",
-                        attempt + 1,
-                        MAX_RETRIES + 1,
-                    );
-                    retry_backoff(delay_ms).await;
-                    continue;
+        self.with_retry("session_write", move || {
+            let address = address_owned.clone();
+            let session = session_bytes.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                crate::upsert_queries::UpsertSession {
+                    address: address.as_ref(),
+                    record: session.as_ref(),
+                    device_id,
                 }
-                Ok(Err(e)) => return Err(e.into()),
-                Err(e) => return Err(StoreError::Database(Box::new(e))),
-            }
-        }
-
-        Err(StoreError::RetriesExhausted {
-            op: format!("session_write (after {} attempts)", MAX_RETRIES + 1),
+                .execute(conn)
+            })
         })
+        .await
+        .map(|_| ())
     }
 
     pub async fn delete_session_for_device(&self, address: &str, device_id: i32) -> Result<()> {
-        let pool = self.pool.clone();
         let address_owned = address.to_string();
-
-        crate::pool::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        self.write_blocking(move |conn| {
             diesel::delete(
                 sessions::table
                     .filter(sessions::address.eq(address_owned))
                     .filter(sessions::device_id.eq(device_id)),
             )
-            .execute(&mut *conn)
+            .execute(conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
-
-        Ok(())
     }
 
     pub async fn put_sender_key_for_device(
@@ -1674,25 +1704,19 @@ impl SqliteStore {
         record: &[u8],
         device_id: i32,
     ) -> Result<()> {
-        let pool = self.pool.clone();
         let address = address.to_string();
         let record_vec = record.to_vec();
-        crate::pool::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        self.write_blocking(move |conn| {
             crate::upsert_queries::UpsertSenderKey {
                 address: &address,
                 record: &record_vec,
                 device_id,
             }
-            .execute(&mut *conn)
+            .execute(conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
-        Ok(())
     }
 
     pub async fn get_sender_key_for_device(
@@ -1715,24 +1739,18 @@ impl SqliteStore {
     }
 
     pub async fn delete_sender_key_for_device(&self, address: &str, device_id: i32) -> Result<()> {
-        let pool = self.pool.clone();
         let address = address.to_string();
-        crate::pool::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        self.write_blocking(move |conn| {
             diesel::delete(
                 sender_keys::table
                     .filter(sender_keys::address.eq(address))
                     .filter(sender_keys::device_id.eq(device_id)),
             )
-            .execute(&mut *conn)
+            .execute(conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
-        Ok(())
     }
 
     pub async fn get_app_state_sync_key_for_device(
@@ -1787,13 +1805,9 @@ impl SqliteStore {
         key: AppStateSyncKey,
         device_id: i32,
     ) -> Result<()> {
-        let pool = self.pool.clone();
         let key_id = key_id.to_vec();
         let data = crate::wire::encode_app_state_sync_key(&key);
-        crate::pool::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        self.write_blocking(move |conn| {
             diesel::insert_into(app_state_keys::table)
                 .values((
                     app_state_keys::key_id.eq(&key_id),
@@ -1803,13 +1817,11 @@ impl SqliteStore {
                 .on_conflict((app_state_keys::key_id, app_state_keys::device_id))
                 .do_update()
                 .set(app_state_keys::key_data.eq(&data))
-                .execute(&mut *conn)
+                .execute(conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
-        Ok(())
     }
 
     pub async fn get_latest_app_state_sync_key_id_for_device(
@@ -2332,66 +2344,30 @@ impl SignalStore for SqliteStore {
     }
 
     async fn store_prekey(&self, id: u32, record: &[u8], uploaded: bool) -> Result<()> {
-        let pool = self.pool.clone();
-        let db_semaphore = self.db_semaphore.clone();
         let device_id = self.device_id;
         // One copy, then refcount clones per attempt (see put_session_for_device).
         let record = Bytes::copy_from_slice(record);
-
-        const MAX_RETRIES: u32 = 5;
-
-        for attempt in 0..=MAX_RETRIES {
-            let permit = db_semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
-
-            let pool_clone = pool.clone();
-            let record_clone = record.clone();
-
-            let result =
-                crate::pool::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
-                    let mut conn = pool_clone
-                        .get()
-                        .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
-                    diesel::insert_into(prekeys::table)
-                        .values((
-                            prekeys::id.eq(id as i32),
-                            prekeys::key.eq(record_clone.as_ref()),
-                            prekeys::uploaded.eq(uploaded),
-                            prekeys::device_id.eq(device_id),
-                        ))
-                        .on_conflict((prekeys::id, prekeys::device_id))
-                        .do_update()
-                        .set((
-                            prekeys::key.eq(record_clone.as_ref()),
-                            prekeys::uploaded.eq(uploaded),
-                        ))
-                        .execute(&mut *conn)
-                        .map_err(DieselOrStore::Diesel)?;
-                    Ok(())
-                })
-                .await;
-
-            drop(permit);
-
-            match result {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(DieselOrStore::Diesel(ref e)))
-                    if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
-                {
-                    let delay_ms = 10u64 * (1u64 << attempt.min(4));
-                    retry_backoff(delay_ms).await;
-                }
-                Ok(Err(e)) => return Err(e.into()),
-                Err(e) => return Err(StoreError::Database(Box::new(e))),
-            }
-        }
-
-        Err(StoreError::RetriesExhausted {
-            op: "store_prekey".to_string(),
+        self.with_retry("store_prekey", move || {
+            let record = record.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                diesel::insert_into(prekeys::table)
+                    .values((
+                        prekeys::id.eq(id as i32),
+                        prekeys::key.eq(record.as_ref()),
+                        prekeys::uploaded.eq(uploaded),
+                        prekeys::device_id.eq(device_id),
+                    ))
+                    .on_conflict((prekeys::id, prekeys::device_id))
+                    .do_update()
+                    .set((
+                        prekeys::key.eq(record.as_ref()),
+                        prekeys::uploaded.eq(uploaded),
+                    ))
+                    .execute(conn)
+            })
         })
+        .await
+        .map(|_| ())
     }
 
     async fn store_prekeys_batch(&self, keys: &[(u32, Bytes)], uploaded: bool) -> Result<()> {
@@ -2473,55 +2449,19 @@ impl SignalStore for SqliteStore {
     }
 
     async fn remove_prekey(&self, id: u32) -> Result<()> {
-        let pool = self.pool.clone();
-        let db_semaphore = self.db_semaphore.clone();
         let device_id = self.device_id;
-
-        const MAX_RETRIES: u32 = 5;
-
-        for attempt in 0..=MAX_RETRIES {
-            let permit = db_semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
-
-            let pool_clone = pool.clone();
-
-            let result =
-                crate::pool::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
-                    let mut conn = pool_clone
-                        .get()
-                        .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
-                    diesel::delete(
-                        prekeys::table
-                            .filter(prekeys::id.eq(id as i32))
-                            .filter(prekeys::device_id.eq(device_id)),
-                    )
-                    .execute(&mut *conn)
-                    .map_err(DieselOrStore::Diesel)?;
-                    Ok(())
-                })
-                .await;
-
-            drop(permit);
-
-            match result {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(DieselOrStore::Diesel(ref e)))
-                    if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
-                {
-                    let delay_ms = 10u64 * (1u64 << attempt.min(4));
-                    retry_backoff(delay_ms).await;
-                }
-                Ok(Err(e)) => return Err(e.into()),
-                Err(e) => return Err(StoreError::Database(Box::new(e))),
-            }
-        }
-
-        Err(StoreError::RetriesExhausted {
-            op: "remove_prekey".to_string(),
+        self.with_retry("remove_prekey", move || {
+            Box::new(move |conn: &mut SqliteConnection| {
+                diesel::delete(
+                    prekeys::table
+                        .filter(prekeys::id.eq(id as i32))
+                        .filter(prekeys::device_id.eq(device_id)),
+                )
+                .execute(conn)
+            })
         })
+        .await
+        .map(|_| ())
     }
 
     async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> Result<()> {
@@ -2593,62 +2533,26 @@ impl SignalStore for SqliteStore {
     }
 
     async fn store_signed_prekey(&self, id: u32, record: &[u8]) -> Result<()> {
-        let pool = self.pool.clone();
-        let db_semaphore = self.db_semaphore.clone();
         let device_id = self.device_id;
         // One copy, then refcount clones per attempt (see put_session_for_device).
         let record = Bytes::copy_from_slice(record);
-
-        const MAX_RETRIES: u32 = 5;
-
-        for attempt in 0..=MAX_RETRIES {
-            let permit = db_semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
-
-            let pool_clone = pool.clone();
-            let record_clone = record.clone();
-
-            let result =
-                crate::pool::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
-                    let mut conn = pool_clone
-                        .get()
-                        .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
-                    diesel::insert_into(signed_prekeys::table)
-                        .values((
-                            signed_prekeys::id.eq(id as i32),
-                            signed_prekeys::record.eq(record_clone.as_ref()),
-                            signed_prekeys::device_id.eq(device_id),
-                        ))
-                        .on_conflict((signed_prekeys::id, signed_prekeys::device_id))
-                        .do_update()
-                        .set(signed_prekeys::record.eq(record_clone.as_ref()))
-                        .execute(&mut *conn)
-                        .map_err(DieselOrStore::Diesel)?;
-                    Ok(())
-                })
-                .await;
-
-            drop(permit);
-
-            match result {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(DieselOrStore::Diesel(ref e)))
-                    if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
-                {
-                    let delay_ms = 10u64 * (1u64 << attempt.min(4));
-                    retry_backoff(delay_ms).await;
-                }
-                Ok(Err(e)) => return Err(e.into()),
-                Err(e) => return Err(StoreError::Database(Box::new(e))),
-            }
-        }
-
-        Err(StoreError::RetriesExhausted {
-            op: "store_signed_prekey".to_string(),
+        self.with_retry("store_signed_prekey", move || {
+            let record = record.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                diesel::insert_into(signed_prekeys::table)
+                    .values((
+                        signed_prekeys::id.eq(id as i32),
+                        signed_prekeys::record.eq(record.as_ref()),
+                        signed_prekeys::device_id.eq(device_id),
+                    ))
+                    .on_conflict((signed_prekeys::id, signed_prekeys::device_id))
+                    .do_update()
+                    .set(signed_prekeys::record.eq(record.as_ref()))
+                    .execute(conn)
+            })
         })
+        .await
+        .map(|_| ())
     }
 
     async fn load_signed_prekey(&self, id: u32) -> Result<Option<Vec<u8>>> {
@@ -2683,55 +2587,19 @@ impl SignalStore for SqliteStore {
     }
 
     async fn remove_signed_prekey(&self, id: u32) -> Result<()> {
-        let pool = self.pool.clone();
-        let db_semaphore = self.db_semaphore.clone();
         let device_id = self.device_id;
-
-        const MAX_RETRIES: u32 = 5;
-
-        for attempt in 0..=MAX_RETRIES {
-            let permit = db_semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
-
-            let pool_clone = pool.clone();
-
-            let result =
-                crate::pool::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
-                    let mut conn = pool_clone
-                        .get()
-                        .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
-                    diesel::delete(
-                        signed_prekeys::table
-                            .filter(signed_prekeys::id.eq(id as i32))
-                            .filter(signed_prekeys::device_id.eq(device_id)),
-                    )
-                    .execute(&mut *conn)
-                    .map_err(DieselOrStore::Diesel)?;
-                    Ok(())
-                })
-                .await;
-
-            drop(permit);
-
-            match result {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(DieselOrStore::Diesel(ref e)))
-                    if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
-                {
-                    let delay_ms = 10u64 * (1u64 << attempt.min(4));
-                    retry_backoff(delay_ms).await;
-                }
-                Ok(Err(e)) => return Err(e.into()),
-                Err(e) => return Err(StoreError::Database(Box::new(e))),
-            }
-        }
-
-        Err(StoreError::RetriesExhausted {
-            op: "remove_signed_prekey".to_string(),
+        self.with_retry("remove_signed_prekey", move || {
+            Box::new(move |conn: &mut SqliteConnection| {
+                diesel::delete(
+                    signed_prekeys::table
+                        .filter(signed_prekeys::id.eq(id as i32))
+                        .filter(signed_prekeys::device_id.eq(device_id)),
+                )
+                .execute(conn)
+            })
         })
+        .await
+        .map(|_| ())
     }
 
     async fn put_sender_key(&self, address: &str, record: &[u8]) -> Result<()> {
@@ -3242,16 +3110,12 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn save_base_key(&self, address: &str, message_id: &str, base_key: &[u8]) -> Result<()> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
         let address = address.to_string();
         let message_id = message_id.to_string();
         let base_key = base_key.to_vec();
         let now = wacore::time::now_secs() as i32;
-        crate::pool::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        self.write_blocking(move |conn| {
             diesel::insert_into(base_keys::table)
                 .values((
                     base_keys::address.eq(&address),
@@ -3267,13 +3131,11 @@ impl ProtocolStore for SqliteStore {
                 ))
                 .do_update()
                 .set(base_keys::base_key.eq(&base_key))
-                .execute(&mut *conn)
+                .execute(conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
-        Ok(())
     }
 
     async fn has_same_base_key(
@@ -3301,27 +3163,21 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn delete_base_key(&self, address: &str, message_id: &str) -> Result<()> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
         let address = address.to_string();
         let message_id = message_id.to_string();
-        crate::pool::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        self.write_blocking(move |conn| {
             diesel::delete(
                 base_keys::table
                     .filter(base_keys::address.eq(&address))
                     .filter(base_keys::message_id.eq(&message_id))
                     .filter(base_keys::device_id.eq(device_id)),
             )
-            .execute(&mut *conn)
+            .execute(conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
-        Ok(())
     }
 
     async fn delete_expired_base_keys(&self, cutoff_timestamp: i64) -> Result<u32> {
@@ -3341,15 +3197,11 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn update_device_list(&self, record: DeviceListRecord) -> Result<()> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
         let devices_json = serde_json::to_string(&*record.devices)
             .map_err(|e| StoreError::Serialization(Box::new(e)))?;
         let now = wacore::time::now_secs() as i32;
-        crate::pool::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        self.write_blocking(move |conn| {
             let raw_id_i32 = record.raw_id.map(|r| r as i32);
             crate::upsert_queries::UpsertDeviceRegistry {
                 user_id: record.user.as_ref(),
@@ -3360,13 +3212,11 @@ impl ProtocolStore for SqliteStore {
                 updated_at: now,
                 raw_id: raw_id_i32,
             }
-            .execute(&mut *conn)
+            .execute(conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
-        Ok(())
     }
 
     async fn update_device_lists(&self, records: Vec<DeviceListRecord>) -> Result<()> {
@@ -3482,25 +3332,19 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn delete_devices(&self, user: &str) -> Result<()> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
         let user = user.to_string();
-        crate::pool::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        self.write_blocking(move |conn| {
             diesel::delete(
                 device_registry::table
                     .filter(device_registry::user_id.eq(&user))
                     .filter(device_registry::device_id.eq(device_id)),
             )
-            .execute(&mut *conn)
+            .execute(conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
-        Ok(())
     }
 
     async fn get_group_metadata(&self, group_jid: &str) -> Result<Option<Vec<u8>>> {
@@ -3520,15 +3364,11 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn put_group_metadata(&self, group_jid: &str, blob: &[u8]) -> Result<()> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
         let group_jid = group_jid.to_string();
         let blob = blob.to_vec();
         let now = wacore::time::now_secs();
-        crate::pool::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        self.write_blocking(move |conn| {
             diesel::insert_into(group_metadata::table)
                 .values((
                     group_metadata::group_jid.eq(&group_jid),
@@ -3542,35 +3382,27 @@ impl ProtocolStore for SqliteStore {
                     group_metadata::info.eq(&blob),
                     group_metadata::updated_at.eq(now),
                 ))
-                .execute(&mut *conn)
+                .execute(conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
-        Ok(())
     }
 
     async fn delete_group_metadata(&self, group_jid: &str) -> Result<()> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
         let group_jid = group_jid.to_string();
-        crate::pool::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        self.write_blocking(move |conn| {
             diesel::delete(
                 group_metadata::table
                     .filter(group_metadata::group_jid.eq(&group_jid))
                     .filter(group_metadata::device_id.eq(device_id)),
             )
-            .execute(&mut *conn)
+            .execute(conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
-        Ok(())
     }
 
     async fn get_tc_token(&self, jid: &str) -> Result<Option<TcTokenEntry>> {
@@ -3655,15 +3487,11 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn put_tc_token(&self, jid: &str, entry: &TcTokenEntry) -> Result<()> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
         let jid = jid.to_string();
         let entry = entry.clone();
         let now = wacore::time::now_secs();
-        crate::pool::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        self.write_blocking(move |conn| {
             diesel::insert_into(tc_tokens::table)
                 .values((
                     tc_tokens::jid.eq(&jid),
@@ -3681,35 +3509,27 @@ impl ProtocolStore for SqliteStore {
                     tc_tokens::sender_timestamp.eq(entry.sender_timestamp),
                     tc_tokens::updated_at.eq(now),
                 ))
-                .execute(&mut *conn)
+                .execute(conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
-        Ok(())
     }
 
     async fn delete_tc_token(&self, jid: &str) -> Result<()> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
         let jid = jid.to_string();
-        crate::pool::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        self.write_blocking(move |conn| {
             diesel::delete(
                 tc_tokens::table
                     .filter(tc_tokens::jid.eq(&jid))
                     .filter(tc_tokens::device_id.eq(device_id)),
             )
-            .execute(&mut *conn)
+            .execute(conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
-        Ok(())
     }
 
     async fn get_all_tc_token_jids(&self) -> Result<Vec<String>> {
@@ -3820,14 +3640,10 @@ impl ProtocolStore for SqliteStore {
         jid: &str,
         sender_timestamp: i64,
     ) -> Result<()> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
         let jid = jid.to_string();
         let now = wacore::time::now_secs();
-        crate::pool::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        self.write_blocking(move |conn| {
             // On conflict touch only sender_timestamp, and only to advance it,
             // so a concurrently stored real token is never overwritten and the
             // sender bucket never regresses.
@@ -3857,13 +3673,11 @@ impl ProtocolStore for SqliteStore {
                     .sql(")")),
                     tc_tokens::updated_at.eq(now),
                 ))
-                .execute(&mut *conn)
+                .execute(conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
-        Ok(())
     }
 
     async fn store_sent_message(
@@ -3985,7 +3799,7 @@ impl ProtocolStore for SqliteStore {
         let device_id = self.device_id;
         // Retry on SQLITE_BUSY: a transient lock here must not surface as a read
         // failure, which fails closed and forces an unnecessary redelivery.
-        self.with_retry("get_pending_inbound", || {
+        self.with_read_retry("get_pending_inbound", || {
             let chat = chat.clone();
             let sender = sender.clone();
             let id = id.clone();
@@ -4339,6 +4153,7 @@ impl DeviceStore for SqliteStore {
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))??;
 
+        self.await_commit_barrier().await?;
         Ok(())
     }
 
@@ -4824,6 +4639,7 @@ mod tests {
                     .build(),
             )),
             connection_init: None,
+            commit_barrier: None,
         };
         let store = SqliteStore::with_config(&db_name, config)
             .await
@@ -7630,6 +7446,7 @@ mod read_routing_tests {
                         "self.pool",
                         "with_semaphore(",
                         "with_retry(",
+                        "with_read_retry(",
                         "spawn_blocking(",
                         // The sibling-crate write path; `shared().read(` is the
                         // read one and is what `read_query` itself uses.

@@ -32,6 +32,7 @@ log = { workspace = true }
 scheduled-thread-pool = "0.2"
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+thiserror = { workspace = true }
 wacore = { workspace = true }
 
 [build-dependencies]
