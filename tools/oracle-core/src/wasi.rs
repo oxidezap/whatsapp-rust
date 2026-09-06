@@ -35,6 +35,13 @@ const FIRST_FILE_FD: u32 = 4;
 /// The name the root preopen is reported under.
 const ROOT_NAME: &str = "/";
 
+/// Largest single file the memfs will hold. The 256 MiB payload limit cannot
+/// stop a sparse attack on its own: seeking a writable descriptor near
+/// `u64::MAX` and writing one byte would otherwise `resize` towards it.
+const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
+/// Largest the whole memfs may hold across live files and unlinked-but-open ones.
+const MAX_FS_BYTES: usize = 256 * 1024 * 1024;
+
 /// WASI clock ids. `2` and `3` are the process and thread CPU-time clocks,
 /// which this host does not have and therefore refuses.
 const CLOCKID_REALTIME: u32 = 0;
@@ -49,6 +56,10 @@ pub struct OpenFile {
     pub offset: u64,
     /// Whether writes are allowed through it.
     pub writable: bool,
+    /// Bytes kept alive after the path was unlinked; see `unlink_file`.
+    /// Post-unlink clones are per handle: descriptors unlinked from one path
+    /// no longer observe each other's writes.
+    pub retained: Option<Vec<u8>>,
 }
 
 /// Guest-visible environment: arguments, variables, and an in-memory filesystem.
@@ -101,6 +112,40 @@ impl WasiState {
         self.next_fd += 1;
         fd
     }
+
+    /// Bytes visible through `open`: contents retained at unlink, else the live file.
+    fn open_bytes<'a>(&'a self, open: &'a OpenFile) -> Option<&'a [u8]> {
+        if let Some(retained) = &open.retained {
+            return Some(retained);
+        }
+        self.files.get(&open.path).map(Vec::as_slice)
+    }
+
+    /// Removes `path`, keeping its bytes alive in every open descriptor that
+    /// names it. Recreating the path starts a new file; retained handles keep
+    /// reading and writing the old bytes. Returns whether the path existed.
+    fn unlink_file(&mut self, path: &str) -> bool {
+        let Some(contents) = self.files.remove(path) else {
+            return false;
+        };
+        for open in self.open.values_mut() {
+            if open.path == path && open.retained.is_none() {
+                open.retained = Some(contents.clone());
+            }
+        }
+        true
+    }
+}
+
+/// Bytes currently held: live files plus contents retained by unlinked handles.
+fn fs_bytes(wasi: &WasiState) -> usize {
+    let live: usize = wasi.files.values().map(Vec::len).sum();
+    let retained: usize = wasi
+        .open
+        .values()
+        .filter_map(|open| open.retained.as_ref().map(Vec::len))
+        .sum();
+    live.saturating_add(retained)
 }
 
 /// Paths arrive with and without a leading slash depending on how the guest
@@ -172,7 +217,7 @@ fn fd_write(caller: &mut Caller<'_, HostState>, fd: u32, iovs: u32, count: u32, 
         FD_STDOUT => wasi.stdout.extend_from_slice(&payload),
         FD_STDERR => wasi.stderr.extend_from_slice(&payload),
         _ => {
-            let Some(open) = wasi.open.get_mut(&fd) else {
+            let Some(open) = wasi.open.get(&fd) else {
                 return EBADF;
             };
             if !open.writable {
@@ -187,14 +232,32 @@ fn fd_write(caller: &mut Caller<'_, HostState>, fd: u32, iovs: u32, count: u32, 
             let Some(next_offset) = open.offset.checked_add(u64::from(written)) else {
                 return EINVAL;
             };
-            let path = open.path.clone();
-            open.offset = next_offset;
-
-            let file = wasi.files.entry(path).or_default();
-            if file.len() < end {
-                file.resize(end, 0);
+            // Bound growth before the descriptor moves or any byte is
+            // allocated: a sparse seek plus a one-byte write must fail rather
+            // than resize towards `u64::MAX`.
+            let current = open
+                .retained
+                .as_ref()
+                .map_or_else(|| wasi.files.get(&open.path).map_or(0, Vec::len), Vec::len);
+            if end > MAX_FILE_BYTES
+                || fs_bytes(&wasi).saturating_sub(current).saturating_add(end) > MAX_FS_BYTES
+            {
+                return EINVAL;
             }
-            file[offset..end].copy_from_slice(&payload);
+            let Some(open) = wasi.open.get_mut(&fd) else {
+                return EBADF;
+            };
+            open.offset = next_offset;
+            let target: &mut Vec<u8> = if let Some(retained) = open.retained.as_mut() {
+                retained
+            } else {
+                let path = open.path.clone();
+                wasi.files.entry(path).or_default()
+            };
+            if target.len() < end {
+                target.resize(end, 0);
+            }
+            target[offset..end].copy_from_slice(&payload);
         }
     }
 
@@ -256,7 +319,7 @@ fn read_into(
     let Some(open) = wasi.open.get(&fd) else {
         return EBADF;
     };
-    let Some(contents) = wasi.files.get(&open.path) else {
+    let Some(contents) = wasi.open_bytes(open) else {
         return EBADF;
     };
 
@@ -305,6 +368,11 @@ fn read_into(
 /// Both clocks come from the same virtual source the emscripten layer uses, so
 /// time is consistent whichever way a module asks for it.
 fn clock_time_get(caller: &mut Caller<'_, HostState>, id: u32, out: u32) -> i32 {
+    // The output range is validated before either clock moves: a failed guest
+    // retry must observe the same deterministic timestamp as the first attempt.
+    if caller.data().ensure_memory_range(out, 8).is_err() {
+        return EINVAL;
+    }
     let nanos = match id {
         CLOCKID_REALTIME => {
             let millis = crate::emscripten::EPOCH_MS + caller.data().shared.tick_wall_clock();
@@ -332,10 +400,10 @@ fn fd_seek(caller: &mut Caller<'_, HostState>, fd: u32, delta: i64, whence: u32,
         return EBADF;
     };
     let size = wasi
-        .files
-        .get(&open.path)
-        .map(|file| file.len() as u64)
-        .unwrap_or(0);
+        .open
+        .get(&fd)
+        .and_then(|open| wasi.open_bytes(open))
+        .map_or(0, |bytes| bytes.len() as u64);
     let Some(position) = seek_position(open.offset, size, delta, whence) else {
         return EINVAL;
     };
@@ -360,27 +428,41 @@ fn seek_position(current: u64, size: u64, delta: i64, whence: u32) -> Option<u64
     u64::try_from(position).ok()
 }
 
-fn path_open(
-    caller: &mut Caller<'_, HostState>,
+/// The validated `path_open` arguments: directory, flags, path and mode.
+struct PathOpenArgs {
+    dirfd: u32,
+    lookupflags: u32,
     path_ptr: u32,
     path_len: u32,
     oflags: u32,
     fdflags: u32,
     out: u32,
-) -> i32 {
+}
+
+fn path_open(caller: &mut Caller<'_, HostState>, args: PathOpenArgs) -> i32 {
     // WASI preview1 oflags: bit 0 is CREAT, bit 3 is TRUNC.
     const O_CREAT: u32 = 1;
     const O_TRUNC: u32 = 8;
     const SUPPORTED: u32 = O_CREAT | O_TRUNC;
 
-    if oflags & !SUPPORTED != 0
-        || fdflags != 0
-        || caller.data().ensure_memory_range(out, 4).is_err()
+    // The memfs has exactly one directory, the preopened root. Anything else
+    // names a capability this host never granted.
+    if args.dirfd != FD_ROOT {
+        return EBADF;
+    }
+    // Bit 0 is SYMLINK_FOLLOW. The memfs has no symlinks, so following them
+    // is vacuous and real modules pass it; any other lookup flag is rejected.
+    if args.lookupflags & !1 != 0 {
+        return EINVAL;
+    }
+    if args.oflags & !SUPPORTED != 0
+        || args.fdflags != 0
+        || caller.data().ensure_memory_range(args.out, 4).is_err()
     {
         return EINVAL;
     }
 
-    let Ok(raw) = caller.data().read(path_ptr, path_len) else {
+    let Ok(raw) = caller.data().read(args.path_ptr, args.path_len) else {
         return EINVAL;
     };
     let path = normalise(&String::from_utf8_lossy(&raw));
@@ -391,19 +473,19 @@ fn path_open(
     // path it should have provided from one the guest never wanted.
     caller.data().log(format!(
         "wasi path_open {path:?} (create={}, truncate={})",
-        oflags & O_CREAT != 0,
-        oflags & O_TRUNC != 0
+        args.oflags & O_CREAT != 0,
+        args.oflags & O_TRUNC != 0
     ));
 
     let state = caller.data();
     let mut wasi = state.wasi();
     let exists = wasi.files.contains_key(&path);
     if !exists {
-        if oflags & O_CREAT == 0 {
+        if args.oflags & O_CREAT == 0 {
             return ENOENT;
         }
         wasi.files.insert(path.clone(), Vec::new());
-    } else if oflags & O_TRUNC != 0 {
+    } else if args.oflags & O_TRUNC != 0 {
         wasi.files
             .get_mut(&path)
             .expect("existence checked")
@@ -417,10 +499,11 @@ fn path_open(
             path,
             offset: 0,
             writable: true,
+            retained: None,
         },
     );
 
-    match write_u32(caller.data(), out, fd) {
+    match write_u32(caller.data(), args.out, fd) {
         Ok(()) => ESUCCESS,
         Err(_) => EINVAL,
     }
@@ -431,11 +514,7 @@ fn fd_filestat_get(caller: &mut Caller<'_, HostState>, fd: u32, out: u32) -> i32
     let state = caller.data();
     let wasi = state.wasi();
     let size = match wasi.open.get(&fd) {
-        Some(open) => wasi
-            .files
-            .get(&open.path)
-            .map(|file| file.len() as u64)
-            .unwrap_or(0),
+        Some(open) => wasi.open_bytes(open).map_or(0, |bytes| bytes.len() as u64),
         None if fd <= FD_ROOT => 0,
         None => return EBADF,
     };
@@ -651,27 +730,37 @@ fn dispatch(name: &str, caller: &mut Caller<'_, HostState>, params: &[Val]) -> i
             if arg(params, 0) != FD_ROOT {
                 return EBADF;
             }
-            match caller.data().write(arg(params, 1), ROOT_NAME.as_bytes()) {
+            let (ptr, len) = (arg(params, 1), arg(params, 2));
+            if len < ROOT_NAME.len() as u32 || caller.data().ensure_memory_range(ptr, len).is_err()
+            {
+                return EINVAL;
+            }
+            match caller.data().write(ptr, ROOT_NAME.as_bytes()) {
                 Ok(()) => ESUCCESS,
                 Err(_) => EINVAL,
             }
         }
         "path_open" => path_open(
             caller,
-            arg(params, 2),
-            arg(params, 3),
-            arg(params, 4),
-            arg(params, 7),
-            arg(params, 8),
+            PathOpenArgs {
+                dirfd: arg(params, 0),
+                lookupflags: arg(params, 1),
+                path_ptr: arg(params, 2),
+                path_len: arg(params, 3),
+                oflags: arg(params, 4),
+                fdflags: arg(params, 7),
+                out: arg(params, 8),
+            },
         ),
         "path_unlink_file" => {
             let Ok(raw) = caller.data().read(arg(params, 1), arg(params, 2)) else {
                 return EINVAL;
             };
             let path = normalise(&String::from_utf8_lossy(&raw));
-            match caller.data().wasi().files.remove(&path) {
-                Some(_) => ESUCCESS,
-                None => ENOENT,
+            if caller.data().wasi().unlink_file(&path) {
+                ESUCCESS
+            } else {
+                ENOENT
             }
         }
         "args_sizes_get" => {
@@ -718,6 +807,7 @@ fn dispatch(name: &str, caller: &mut Caller<'_, HostState>, params: &[Val]) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wasm_encoder::ValType;
 
     #[test]
     fn invalid_result_pointers_do_not_mutate_reads_seeks_or_opens() {
@@ -820,6 +910,7 @@ mod tests {
                     path: "out".into(),
                     offset: 1,
                     writable: true,
+                    retained: None,
                 },
             );
             assert!(matches!(
@@ -894,6 +985,7 @@ mod tests {
                     path: "out".into(),
                     offset: 1,
                     writable: true,
+                    retained: None,
                 },
             );
             let result = runtime
@@ -925,5 +1017,341 @@ mod tests {
         assert_eq!(seek_position(10, 20, -21, 2), None);
         assert_eq!(seek_position(10, 20, -1, 0), None);
         assert_eq!(seek_position(10, 20, 0, 3), None);
+    }
+
+    /// One-page-memory harness: imports each WASI function, re-exports one
+    /// wrapper per entry, and lays out `data` segments. Returns the module
+    /// bytes; the caller drives it through `Runtime`.
+    type ImportSpec = (&'static str, Vec<ValType>, Vec<ValType>);
+    type WrapperSpec = (&'static str, Vec<ValType>, Vec<ValType>, Vec<Wave>);
+    fn harness(imports: &[ImportSpec], wrappers: &[WrapperSpec], data: &[(u32, &[u8])]) -> Vec<u8> {
+        use wasm_encoder::{
+            CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function,
+            FunctionSection, ImportSection, MemorySection, MemoryType, Module, TypeSection,
+        };
+        let mut types = TypeSection::new();
+        let mut import_section = ImportSection::new();
+        for (index, (name, params, results)) in imports.iter().enumerate() {
+            types
+                .ty()
+                .function(params.iter().copied(), results.iter().copied());
+            import_section.import(
+                "wasi_snapshot_preview1",
+                name,
+                EntityType::Function(index as u32),
+            );
+        }
+        let mut functions = FunctionSection::new();
+        let mut exports = ExportSection::new();
+        let mut code = CodeSection::new();
+        for (index, (name, params, results, waves)) in wrappers.iter().enumerate() {
+            let ty = (imports.len() + index) as u32;
+            types
+                .ty()
+                .function(params.iter().copied(), results.iter().copied());
+            functions.function(ty);
+            exports.export(name, ExportKind::Func, (imports.len() + index) as u32);
+            let mut body = Function::new([]);
+            for wave in waves {
+                wave.emit(&mut body);
+            }
+            body.instructions().end();
+            code.function(&body);
+        }
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        exports.export("memory", ExportKind::Memory, 0);
+        let mut data_section = DataSection::new();
+        for (at, bytes) in data {
+            data_section.active(0, &ConstExpr::i32_const(*at as i32), bytes.iter().copied());
+        }
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&import_section)
+            .section(&functions)
+            .section(&memories)
+            .section(&exports)
+            .section(&code)
+            .section(&data_section);
+        module.finish()
+    }
+
+    /// One guest stack push: a constant or a parameter load.
+    enum Wave {
+        I32(i32),
+        I64(i64),
+        Arg(u32),
+        Call(u32),
+    }
+
+    impl Wave {
+        fn emit(&self, body: &mut wasm_encoder::Function) {
+            match *self {
+                Wave::I32(value) => {
+                    body.instructions().i32_const(value);
+                }
+                Wave::I64(value) => {
+                    body.instructions().i64_const(value);
+                }
+                Wave::Arg(index) => {
+                    body.instructions().local_get(index);
+                }
+                Wave::Call(index) => {
+                    body.instructions().call(index);
+                }
+            }
+        }
+    }
+
+    use ValType::{I32, I64};
+
+    #[test]
+    fn unlink_keeps_open_descriptors_usable() {
+        let bytes = harness(
+            &[
+                ("path_unlink_file", vec![I32, I32, I32], vec![I32]),
+                ("fd_read", vec![I32, I32, I32, I32], vec![I32]),
+            ],
+            &[
+                (
+                    "unlink",
+                    vec![],
+                    vec![I32],
+                    vec![Wave::I32(3), Wave::I32(128), Wave::I32(3), Wave::Call(0)],
+                ),
+                (
+                    "readout",
+                    vec![],
+                    vec![I32],
+                    vec![
+                        Wave::I32(4),
+                        Wave::I32(0),
+                        Wave::I32(1),
+                        Wave::I32(200),
+                        Wave::Call(1),
+                    ],
+                ),
+            ],
+            &[
+                (0, &[64, 0, 0, 0, 3, 0, 0, 0]),
+                (64, &[0x55; 3]),
+                (128, b"out"),
+            ],
+        );
+        let mut runtime = crate::Runtime::instantiate(&bytes).unwrap();
+        runtime.add_file("out", vec![7, 8, 9]);
+        runtime.wasi().open.insert(
+            4,
+            OpenFile {
+                path: "out".into(),
+                offset: 0,
+                writable: true,
+                retained: None,
+            },
+        );
+        assert!(matches!(
+            runtime.call("unlink", &[]).unwrap()[0],
+            Val::I32(ESUCCESS)
+        ));
+        assert!(matches!(
+            runtime.call("readout", &[]).unwrap()[0],
+            Val::I32(ESUCCESS)
+        ));
+        assert_eq!(runtime.read_u32_at(200).unwrap(), 3);
+        assert_eq!(runtime.state().read(64, 3).unwrap(), [7, 8, 9]);
+        // Recreating the path starts a new file; the retained handle keeps the old bytes.
+        runtime.add_file("out", vec![1]);
+        runtime.wasi().open.get_mut(&4).unwrap().offset = 0;
+        assert!(matches!(
+            runtime.call("readout", &[]).unwrap()[0],
+            Val::I32(ESUCCESS)
+        ));
+        assert_eq!(runtime.state().read(64, 3).unwrap(), [7, 8, 9]);
+    }
+
+    #[test]
+    fn path_open_validates_its_directory_descriptor_and_flags() {
+        let bytes = harness(
+            &[(
+                "path_open",
+                vec![I32, I32, I32, I32, I32, I64, I64, I32, I32],
+                vec![I32],
+            )],
+            &[(
+                "opendir",
+                vec![I32, I32],
+                vec![I32],
+                vec![
+                    Wave::Arg(0),
+                    Wave::Arg(1),
+                    Wave::I32(128),
+                    Wave::I32(3),
+                    Wave::I32(8),
+                    Wave::I64(0),
+                    Wave::I64(0),
+                    Wave::I32(0),
+                    Wave::I32(208),
+                    Wave::Call(0),
+                ],
+            )],
+            &[(128, b"out")],
+        );
+        let mut runtime = crate::Runtime::instantiate(&bytes).unwrap();
+        runtime.add_file("out", vec![1]);
+        assert!(matches!(
+            runtime
+                .call("opendir", &[Val::I32(99), Val::I32(0)])
+                .unwrap()[0],
+            Val::I32(EBADF)
+        ));
+        assert!(matches!(
+            runtime
+                .call("opendir", &[Val::I32(3), Val::I32(2)])
+                .unwrap()[0],
+            Val::I32(EINVAL)
+        ));
+        // SYMLINK_FOLLOW is vacuous without symlinks and real modules pass
+        // it; only further lookup flags are rejected.
+        assert!(matches!(
+            runtime
+                .call("opendir", &[Val::I32(3), Val::I32(1)])
+                .unwrap()[0],
+            Val::I32(ESUCCESS)
+        ));
+        assert!(matches!(
+            runtime
+                .call("opendir", &[Val::I32(3), Val::I32(0)])
+                .unwrap()[0],
+            Val::I32(ESUCCESS)
+        ));
+    }
+
+    #[test]
+    fn failed_clock_reads_do_not_advance_the_clock() {
+        let bytes = harness(
+            &[("clock_time_get", vec![I32, I64, I32], vec![I32])],
+            &[(
+                "clock",
+                vec![I32, I32],
+                vec![I32],
+                vec![Wave::Arg(0), Wave::I64(0), Wave::Arg(1), Wave::Call(0)],
+            )],
+            &[],
+        );
+        let mut runtime = crate::Runtime::instantiate(&bytes).unwrap();
+        assert!(matches!(
+            runtime.call("clock", &[Val::I32(1), Val::I32(-1)]).unwrap()[0],
+            Val::I32(EINVAL)
+        ));
+        assert!(matches!(
+            runtime.call("clock", &[Val::I32(1), Val::I32(64)]).unwrap()[0],
+            Val::I32(ESUCCESS)
+        ));
+        let first = runtime.state().read(64, 8).unwrap();
+        let mut fresh = crate::Runtime::instantiate(&bytes).unwrap();
+        assert!(matches!(
+            fresh.call("clock", &[Val::I32(1), Val::I32(64)]).unwrap()[0],
+            Val::I32(ESUCCESS)
+        ));
+        let baseline = fresh.state().read(64, 8).unwrap();
+        assert_eq!(
+            first, baseline,
+            "a failed clock_time_get must not consume a tick"
+        );
+    }
+
+    #[test]
+    fn sparse_writes_are_bounded_before_growth() {
+        const FAR: i64 = 64 * 1024 * 1024 + 1;
+        let bytes = harness(
+            &[
+                ("fd_seek", vec![I32, I64, I32, I32], vec![I32]),
+                ("fd_write", vec![I32, I32, I32, I32], vec![I32]),
+            ],
+            &[
+                (
+                    "seekfar",
+                    vec![],
+                    vec![I32],
+                    vec![
+                        Wave::I32(4),
+                        Wave::I64(FAR),
+                        Wave::I32(0),
+                        Wave::I32(200),
+                        Wave::Call(0),
+                    ],
+                ),
+                (
+                    "writeone",
+                    vec![],
+                    vec![I32],
+                    vec![
+                        Wave::I32(4),
+                        Wave::I32(0),
+                        Wave::I32(1),
+                        Wave::I32(208),
+                        Wave::Call(1),
+                    ],
+                ),
+            ],
+            &[(0, &[64, 0, 0, 0, 1, 0, 0, 0]), (64, &[0xAA])],
+        );
+        let mut runtime = crate::Runtime::instantiate(&bytes).unwrap();
+        runtime.add_file("out", vec![0; 16]);
+        runtime.wasi().open.insert(
+            4,
+            OpenFile {
+                path: "out".into(),
+                offset: 0,
+                writable: true,
+                retained: None,
+            },
+        );
+        assert!(matches!(
+            runtime.call("seekfar", &[]).unwrap()[0],
+            Val::I32(ESUCCESS)
+        ));
+        assert!(matches!(
+            runtime.call("writeone", &[]).unwrap()[0],
+            Val::I32(EINVAL)
+        ));
+        assert_eq!(runtime.wasi().file("out").unwrap().len(), 16);
+        assert_eq!(runtime.wasi().open[&4].offset, FAR as u64);
+    }
+
+    #[test]
+    fn prestat_dir_name_honors_the_caller_buffer_length() {
+        let bytes = harness(
+            &[("fd_prestat_dir_name", vec![I32, I32, I32], vec![I32])],
+            &[(
+                "prestat",
+                vec![I32, I32],
+                vec![I32],
+                vec![Wave::I32(3), Wave::Arg(0), Wave::Arg(1), Wave::Call(0)],
+            )],
+            &[(64, &[0x55; 4])],
+        );
+        let mut runtime = crate::Runtime::instantiate(&bytes).unwrap();
+        assert!(matches!(
+            runtime
+                .call("prestat", &[Val::I32(64), Val::I32(0)])
+                .unwrap()[0],
+            Val::I32(EINVAL)
+        ));
+        assert_eq!(runtime.state().read(64, 1).unwrap(), [0x55]);
+        assert!(matches!(
+            runtime
+                .call("prestat", &[Val::I32(64), Val::I32(1)])
+                .unwrap()[0],
+            Val::I32(ESUCCESS)
+        ));
+        assert_eq!(runtime.state().read(64, 1).unwrap(), [b'/']);
     }
 }

@@ -729,6 +729,9 @@ fn parse_arg(raw: &str, type_name: &str) -> Result<Value> {
                 .with_context(|| format!("`{raw}` is not a number"))?,
         ),
         "std::string" => Value::Str(raw.to_owned()),
+        "std::basic_string<unsigned char>" => Value::Bytes(
+            serde_json::from_str(raw).context("byte string arguments require a JSON byte array")?,
+        ),
         "unsigned char" | "unsigned short" | "unsigned int" | "unsigned long" | "uint64_t"
         | "unsigned long long" => Value::UInt(
             raw.parse()
@@ -1221,6 +1224,15 @@ fn carry(catalog: &Catalog, old: &str, new: &str, indices: &[u32]) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_string_arguments_are_lossless() {
+        assert_eq!(
+            parse_arg("[0,255]", "std::basic_string<unsigned char>").unwrap(),
+            Value::Bytes(vec![0, 255])
+        );
+        assert!(parse_arg("[256]", "std::basic_string<unsigned char>").is_err());
+    }
 
     #[test]
     fn run_reports_unsupported_logging_before_executing_the_command() {

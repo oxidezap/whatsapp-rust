@@ -48,26 +48,51 @@ fn capture_pins() -> Result<BTreeMap<String, CapturePin>> {
     Ok(pins)
 }
 
+/// Read one immutable capture, validating the exact bytes returned against its lock.
+pub fn read_pinned_capture(id: &str, path: &Path) -> Result<Vec<u8>> {
+    let pins = capture_pins()?;
+    let pin = pins
+        .get(id)
+        .with_context(|| format!("capture {id} has no trusted pin"))?;
+    read_verified(id, path, pin)
+}
+
+fn read_verified(id: &str, path: &Path, pin: &CapturePin) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    ensure!(
+        file.metadata()?.len() == pin.size,
+        "capture {id}: lock requires {} bytes",
+        pin.size
+    );
+    let mut bytes = Vec::new();
+    file.take(pin.size.checked_add(1).context("capture size overflow")?)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 == pin.size,
+        "capture {id} changed size while reading"
+    );
+    let hash = hex::encode(Sha256::digest(&bytes));
+    ensure!(
+        hash == pin.sha256,
+        "capture {id} hashes to {hash}; lock requires {}",
+        pin.sha256
+    );
+    Ok(bytes)
+}
+
 fn captured_module(path: PathBuf, fallback_id: &str) -> Result<CapturedModule> {
     let id = path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or(fallback_id)
         .to_owned();
-    let size = path.metadata()?.len();
-    if let Some(pin) = capture_pins()?.get(&id) {
-        ensure!(
-            size == pin.size,
-            "capture {id} has {size} bytes; lock requires {}",
-            pin.size
-        );
-        let sha256 = hex::encode(Sha256::digest(std::fs::read(&path)?));
-        ensure!(
-            sha256 == pin.sha256,
-            "capture {id} hashes to {sha256}; lock requires {}",
-            pin.sha256
-        );
-    }
+    let size = if let Some(pin) = capture_pins()?.get(&id) {
+        read_verified(&id, &path, pin)?;
+        pin.size
+    } else {
+        path.metadata()?.len()
+    };
     Ok(CapturedModule { id, path, size })
 }
 

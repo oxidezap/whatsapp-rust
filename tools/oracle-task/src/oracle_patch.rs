@@ -1,6 +1,6 @@
 //! Diagnostic patches preserve refusal rules; they never change the canonical captures.
 use anyhow::{Context, Result, ensure};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use wasm_encoder::{Encode, Instruction};
 use xtask_support::write;
 
@@ -63,24 +63,17 @@ pub fn globals(source: &Path, destination: &Path, count: u32) -> Result<()> {
     }
     anyhow::bail!("no export section found")
 }
-fn target(source: &Path, destination: &Path) -> Result<PathBuf> {
-    ensure!(
-        source.join("D5pLH9sfOOl.wasm").is_file(),
-        "D5 capture missing"
-    );
-    std::fs::create_dir_all(destination)?;
-    if source.canonicalize()? != destination.canonicalize()? {
-        for entry in std::fs::read_dir(source)? {
-            let path = entry?.path();
-            if path.extension().is_some_and(|x| x == "wasm") {
-                std::fs::copy(
-                    &path,
-                    destination.join(path.file_name().context("filename")?),
-                )?;
-            }
-        }
-    }
-    Ok(destination.join("D5pLH9sfOOl.wasm"))
+const D5: &str = "D5pLH9sfOOl";
+
+fn read_d5(source: &Path) -> Result<Vec<u8>> {
+    oracle_core::catalog::read_pinned_capture(D5, &source.join(format!("{D5}.wasm")))
+}
+
+fn write_diagnostic(destination: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    let path = destination.join(format!("{D5}.{name}.wasm"));
+    write(&path, bytes)?;
+    println!("wrote {}", path.display());
+    Ok(())
 }
 fn edit(bytes: &mut [u8], offset: usize, before: &[u8], after: &[u8]) -> Result<()> {
     ensure!(
@@ -98,18 +91,16 @@ fn edit(bytes: &mut [u8], offset: usize, before: &[u8], after: &[u8]) -> Result<
     Ok(())
 }
 pub fn profiler(source: &Path, destination: &Path) -> Result<()> {
-    let path = target(source, destination)?;
-    let mut bytes = std::fs::read(&path)?;
+    let mut bytes = read_d5(source)?;
     ensure!(
         bytes.get(8338642..8338647) == Some(&[0x41, 0xd8, 0xf2, 0xd2, 0x00]),
         "profiler constant moved"
     );
     edit(&mut bytes, 8338647, &[0x2d, 0, 0], &[0x1a, 0x41, 0])?;
-    write(&path, &bytes)
+    write_diagnostic(destination, "profiler", &bytes)
 }
 pub fn offer_errors(source: &Path, destination: &Path) -> Result<()> {
-    let path = target(source, destination)?;
-    let mut bytes = std::fs::read(&path)?;
+    let mut bytes = read_d5(source)?;
     let sites = [
         5095464, 5096178, 5096316, 5097017, 5097359, 5098981, 5099045, 5099100, 5099125,
     ];
@@ -122,7 +113,7 @@ pub fn offer_errors(source: &Path, destination: &Path) -> Result<()> {
         Instruction::I32Const(code).encode(&mut patch);
         edit(&mut bytes, offset, &original, &patch)?;
     }
-    write(&path, &bytes)
+    write_diagnostic(destination, "offer-errors", &bytes)
 }
 pub fn offer_guard(source: &Path, destination: &Path) -> Result<()> {
     let mut bytes = std::fs::read(source)?;
@@ -146,6 +137,30 @@ pub fn offer_guard(source: &Path, destination: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_matching_patch_site_does_not_authenticate_the_capture() {
+        use std::io::{Seek, SeekFrom, Write};
+        let cache = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let directory = tempfile::tempdir_in(cache).unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("patched");
+        std::fs::create_dir(&source).unwrap();
+        let mut file = std::fs::File::create(source.join("D5pLH9sfOOl.wasm")).unwrap();
+        file.set_len(9_794_866).unwrap();
+        let mut header = b"\0asm\x01\0\0\0".to_vec();
+        header.push(0);
+        9_794_853u32.encode(&mut header);
+        header.push(0);
+        file.write_all(&header).unwrap();
+        file.seek(SeekFrom::Start(8_338_642)).unwrap();
+        file.write_all(&[0x41, 0xd8, 0xf2, 0xd2, 0, 0x2d, 0, 0])
+            .unwrap();
+        drop(file);
+        assert!(profiler(&source, &destination).is_err());
+        assert!(!destination.exists());
+    }
+
     #[test]
     fn mismatched_and_ambiguous_patches_do_not_write_outputs() {
         let dir = tempfile::tempdir().unwrap();

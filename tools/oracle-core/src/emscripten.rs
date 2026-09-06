@@ -122,7 +122,12 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
     linker.func_wrap(
         "env",
         "sendSignalingXMPP_js_sync",
-        |mut caller: Caller<'_, HostState>, peer: i32, call_id: i32, stanza: i32, len: i32| {
+        |mut caller: Caller<'_, HostState>,
+         peer: i32,
+         call_id: i32,
+         stanza: i32,
+         len: i32|
+         -> Result<(), wasmtime::Error> {
             crate::state::sync_memory(&mut caller);
             let state = caller.data();
             state.shared.record(
@@ -135,19 +140,22 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
                     i64::from(len),
                 ],
             );
-            // A length the guest gives is not to be trusted onto a read: a
-            // negative or absurd one would be a panic here rather than a
-            // diagnosis. Out-of-range reads come back empty, and an empty
-            // stanza in the record is itself the finding.
-            let bytes = u32::try_from(len)
-                .ok()
-                .and_then(|len| state.read(stanza as u32, len).ok())
-                .unwrap_or_default();
-            state.shared.record_signaling(crate::shared::SignalingCall {
-                peer_jid: state.read_cstr(peer as u32).unwrap_or_default(),
-                call_id: state.read_cstr(call_id as u32).unwrap_or_default(),
-                stanza: bytes,
-            });
+            state
+                .shared
+                .capture_signaling(|| {
+                    let len = u32::try_from(len)
+                        .map_err(|_| anyhow!("negative signaling length {len}"))?;
+                    anyhow::ensure!(
+                        len as usize <= crate::shared::MAX_SIGNAL_STANZA_BYTES,
+                        "signaling stanza exceeds 16 MiB"
+                    );
+                    Ok(crate::shared::SignalingCall {
+                        peer_jid: state.read_cstr(peer as u32)?,
+                        call_id: state.read_cstr(call_id as u32)?,
+                        stanza: state.read(stanza as u32, len)?,
+                    })
+                })
+                .into_wasmtime()
         },
     )?;
 
@@ -351,7 +359,17 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
 
             crate::state::sync_memory(&mut caller);
 
-            let size = (len + PAGE - 1) & !(PAGE - 1);
+            let Some(size) = mmap_size(len) else {
+                return Ok(ENOMEM);
+            };
+            if caller.data().ensure_memory_range(addr as u32, 4).is_err()
+                || caller
+                    .data()
+                    .ensure_memory_range(allocated as u32, 4)
+                    .is_err()
+            {
+                return Ok(ENOMEM);
+            }
             let memalign = crate::exports::func(
                 &mut caller,
                 &["emscripten_builtin_memalign", "memalign", "aligned_alloc"],
@@ -374,6 +392,9 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
 
             // Anonymous pages are zero-filled; the guest relies on it.
             let state = caller.data();
+            state
+                .ensure_memory_range(*ptr as u32, size as u32)
+                .into_wasmtime()?;
             state
                 .write(*ptr as u32, &vec![0u8; size as usize])
                 .into_wasmtime()?;
@@ -887,6 +908,14 @@ fn fill_random(caller: &mut Caller<'_, HostState>, ptr: u32, len: u32) -> Result
     caller.data().write(ptr, &bytes)
 }
 
+fn mmap_size(len: i32) -> Option<i32> {
+    const PAGE: i32 = 65_536;
+    if !(1..=64 * 1024 * 1024).contains(&len) {
+        return None;
+    }
+    Some(len.checked_add(PAGE - 1)? & !(PAGE - 1))
+}
+
 /// Runs the guest's mailbox handler, which dispatches whatever was queued.
 fn check_mailbox(caller: &mut Caller<'_, HostState>) {
     let Ok(check) = crate::exports::func(
@@ -1074,6 +1103,15 @@ impl BrokenDownTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mmap_lengths_are_positive_and_bounded() {
+        for len in [0, -1, i32::MIN, i32::MAX, 64 * 1024 * 1024 + 1] {
+            assert_eq!(mmap_size(len), None);
+        }
+        assert_eq!(mmap_size(1), Some(65_536));
+        assert_eq!(mmap_size(65_537), Some(131_072));
+    }
 
     #[test]
     fn only_modelled_em_asm_probes_receive_an_answer() {

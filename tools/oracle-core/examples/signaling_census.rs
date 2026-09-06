@@ -300,7 +300,7 @@ fn main() -> Result<()> {
             originate(&mut r);
         }
 
-        let before = r.signaling().len();
+        let before = r.signaling()?.len();
         if !method.is_empty() {
             let outcome = r.call_embind(method, args);
             r.refuel();
@@ -317,7 +317,7 @@ fn main() -> Result<()> {
         for line in r.engine_log().iter().rev().take(26).rev() {
             println!("      log: {}", line.trim());
         }
-        let all = r.signaling();
+        let all = r.signaling()?;
         if before > 0 {
             println!("  before this step:");
             report(label, &all[..before]);

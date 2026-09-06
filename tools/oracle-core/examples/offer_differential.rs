@@ -118,7 +118,7 @@ fn engine_offer(bytes: &[u8]) -> Result<(String, Vec<u8>)> {
         r.refuel();
         r.settle(std::time::Duration::from_secs(8));
 
-        if let Some(call) = r.signaling().into_iter().next() {
+        if let Some(call) = r.signaling()?.into_iter().next() {
             return Ok((call.peer_jid, call.stanza));
         }
     }

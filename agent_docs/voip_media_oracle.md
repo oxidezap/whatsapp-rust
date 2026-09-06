@@ -27,11 +27,11 @@ cargo xt oracle compare-media .oracle/wasm-audio .oracle/rust-audio
 cargo xt oracle compare-media .oracle/wasm-video .oracle/rust-video
 ```
 
-The comparison is exact and ordered. It compares stream, sequence, timestamp
-and payload bytes; callback symbols may differ because one side is wasm and the
-other is Rust. Any normalization must happen while producing the two traces,
-where it is explicit and reviewable. The comparator does not reorder packets,
-apply timestamp tolerances or decode lossy content on its own.
+The comparison is exact and ordered. It compares stream, callback symbol,
+sequence, timestamp and payload bytes. Adapters on both sides must map their
+callbacks to one canonical boundary name before comparison: the comparator
+performs no normalization, reordering, timestamp tolerance or lossy decoding
+on its own.
 
 ## Audio scenarios
 

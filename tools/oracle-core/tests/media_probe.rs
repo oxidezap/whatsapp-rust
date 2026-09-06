@@ -117,7 +117,7 @@ fn comparison_reports_the_first_payload_difference() {
         &[changed],
         &[MediaObservation {
             stream: MediaStream::Audio,
-            symbol: "rust::audio".to_owned(),
+            symbol: "env::audio".to_owned(),
             ordinal: 0,
             sequence: Some(1),
             timestamp: Some(960),
@@ -165,4 +165,19 @@ fn metadata_diagnostics_do_not_dump_payloads() {
         .to_string();
     assert!(error.contains("960") && error.contains("1920"));
     assert!(error.len() < 512, "metadata errors must stay bounded");
+}
+
+#[test]
+fn callback_boundaries_are_part_of_media_identity() {
+    let expected = MediaObservation {
+        stream: MediaStream::Audio,
+        symbol: "env::encoded_audio".into(),
+        ordinal: 0,
+        sequence: None,
+        timestamp: None,
+        payload: vec![1, 2, 3],
+    };
+    let mut actual = expected.clone();
+    actual.symbol = "env::decoded_audio".into();
+    assert!(compare_media(&[expected], &[actual]).is_err());
 }

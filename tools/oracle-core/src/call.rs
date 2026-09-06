@@ -110,6 +110,8 @@ enum Wire {
     F64,
     /// A pointer to `{ u32 length; u8 bytes[length] }` in linear memory.
     StdString,
+    /// A length-prefixed `std::basic_string<unsigned char>`, preserved as bytes.
+    ByteString,
     /// An instance of a registered class, passed as a raw pointer.
     Class(u32),
     /// An `emscripten::val` handle. The integer is meaningless on its own; the
@@ -133,7 +135,8 @@ fn primitive_wire(type_name: &str) -> Result<Wire, UnknownWire> {
         "bool" => Wire::Bool,
         "float" => Wire::F32,
         "double" => Wire::F64,
-        "std::string" | "std::basic_string<unsigned char>" => Wire::StdString,
+        "std::string" => Wire::StdString,
+        "std::basic_string<unsigned char>" => Wire::ByteString,
         "emscripten::val" => Wire::Emval,
         _ => return Err(UnknownWire),
     })
@@ -265,11 +268,8 @@ impl Runtime {
             (Value::Double(value), Wire::F64) => Val::F64(value.to_bits()),
             (Value::Double(value), Wire::F32) => Val::F32((*value as f32).to_bits()),
             (Value::Int(value), Wire::F64) => Val::F64((*value as f64).to_bits()),
-            (Value::Str(text), Wire::StdString) => {
-                let ptr = self.write_std_string(text)?;
-                owned.allocations.push(ptr);
-                Val::I32(ptr as i32)
-            }
+            (Value::Str(text), Wire::StdString) => self.encode_string(text.as_bytes(), owned)?,
+            (Value::Bytes(bytes), Wire::ByteString) => self.encode_string(bytes, owned)?,
             (Value::Object(handle), Wire::Class(class_type)) => {
                 if handle.class_type != class_type {
                     return Err(anyhow!(
@@ -328,7 +328,7 @@ impl Runtime {
 
         let mut results = match result {
             Wire::Void => vec![],
-            Wire::Bool | Wire::StdString | Wire::Class(_) | Wire::Emval => {
+            Wire::Bool | Wire::StdString | Wire::ByteString | Wire::Class(_) | Wire::Emval => {
                 vec![Val::I32(0)]
             }
             Wire::Integer(integer) if integer.bytes() <= 4 => vec![Val::I32(0)],
@@ -359,43 +359,40 @@ impl Runtime {
                 ptr: *ptr as u32,
                 class_type,
             }),
-            (Wire::StdString, Some(Val::I32(ptr))) => {
-                let text = self.read_std_string(*ptr as u32)?;
-                // embind's glue frees the returned string after copying it out.
-                let _ = self.free(*ptr as u32);
-                Value::Str(text)
+            (wire @ (Wire::StdString | Wire::ByteString), Some(Val::I32(ptr))) => {
+                let ptr = *ptr as u32;
+                let decoded = match wire {
+                    Wire::StdString => self.read_std_string(ptr).map(Value::Str),
+                    _ => read_string_bytes(self.state(), ptr).map(Value::Bytes),
+                };
+                let freed = if ptr == 0 { Ok(()) } else { self.free(ptr) };
+                let value = decoded?;
+                freed?;
+                value
             }
             (wire, value) => return Err(anyhow!("unexpected {wire:?} result: {value:?}")),
         })
     }
 
-    /// Writes a `std::string` in the layout embind expects: a 32-bit length
-    /// followed by the bytes.
-    fn write_std_string(&mut self, text: &str) -> Result<u32> {
-        let bytes = text.as_bytes();
-        let ptr = self.malloc(4 + bytes.len() as u32 + 1)?;
-
-        let mut buffer = Vec::with_capacity(4 + bytes.len() + 1);
+    fn encode_string(&mut self, bytes: &[u8], owned: &mut Owned) -> Result<Val> {
+        ensure!(
+            bytes.len() <= 16 * 1024 * 1024,
+            "string argument exceeds 16 MiB"
+        );
+        let size = 4 + bytes.len() + 1;
+        let ptr = self.malloc(size as u32)?;
+        owned.allocations.push(ptr);
+        let mut buffer = Vec::with_capacity(size);
         buffer.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         buffer.extend_from_slice(bytes);
         buffer.push(0);
-
         self.write_bytes_at(ptr, &buffer)?;
-        Ok(ptr)
+        Ok(Val::I32(ptr as i32))
     }
 
     fn read_std_string(&self, ptr: u32) -> Result<String> {
-        const MAX: u32 = 16 * 1024 * 1024;
-
-        if ptr == 0 {
-            return Ok(String::new());
-        }
-        let length = self.state().read_u32(ptr)?;
-        if length > MAX {
-            return Err(anyhow!("returned string claims {length} bytes"));
-        }
-        let bytes = self.state().read(ptr + 4, length)?;
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        String::from_utf8(read_string_bytes(self.state(), ptr)?)
+            .context("returned std::string is not UTF-8")
     }
 
     /// Resolves a function-table index.
@@ -668,6 +665,19 @@ impl Runtime {
     }
 }
 
+pub(crate) fn read_string_bytes(state: &crate::HostState, ptr: u32) -> Result<Vec<u8>> {
+    if ptr == 0 {
+        return Ok(Vec::new());
+    }
+    let length = state.read_u32(ptr)?;
+    ensure!(
+        length <= 16 * 1024 * 1024,
+        "returned string claims {length} bytes"
+    );
+    let data = ptr.checked_add(4).context("string address overflow")?;
+    state.read(data, length)
+}
+
 fn checked_vector_len(len: i64) -> Result<i64> {
     ensure!(
         (0..=65_536).contains(&len),
@@ -679,6 +689,19 @@ fn checked_vector_len(len: i64) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn returned_text_must_be_utf8() {
+        let mut runtime = Runtime::instantiate(&crate::derive::probe_module_bytes()).unwrap();
+        runtime.write_bytes_at(32, &1u32.to_le_bytes()).unwrap();
+        runtime.write_bytes_at(36, &[0xff]).unwrap();
+        assert!(runtime.read_std_string(32).is_err());
+        assert_eq!(read_string_bytes(runtime.state(), 32).unwrap(), [0xff]);
+        assert!(matches!(
+            primitive_wire("std::basic_string<unsigned char>"),
+            Ok(Wire::ByteString)
+        ));
+    }
 
     #[test]
     fn vector_lengths_must_be_nonnegative_and_bounded() {

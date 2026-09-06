@@ -363,7 +363,7 @@ fn main() -> anyhow::Result<()> {
         // return. Reading the recorded arguments afterwards shows whatever the
         // allocator handed out next, which is what an earlier version of this
         // example printed.
-        for call in r.signaling() {
+        for call in r.signaling()? {
             println!(
                 "  -> {} / {} : {} bytes",
                 call.peer_jid,

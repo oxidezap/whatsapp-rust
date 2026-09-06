@@ -680,6 +680,70 @@ impl<'a> Executor<'a> {
         }
     }
 
+    fn validate_outputs(&self, spec: &Spec) -> Result<()> {
+        const MAX_OUTPUTS: usize = 65_536;
+        let mut names = std::collections::BTreeSet::<String>::new();
+        let mut name_bytes = 0usize;
+        let mut add = |file: &Path| -> Result<()> {
+            self.output_path(file)?;
+            anyhow::ensure!(
+                file.as_os_str().len() <= 4096,
+                "output path exceeds 4096 bytes"
+            );
+            let name = file
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join("/");
+            anyhow::ensure!(!names.contains(&name), "duplicate derivation output {name}");
+            let mut ancestor = name.as_str();
+            while let Some((parent, _)) = ancestor.rsplit_once('/') {
+                anyhow::ensure!(
+                    !names.contains(parent),
+                    "output {name} is inside output file {parent}"
+                );
+                ancestor = parent;
+            }
+            let prefix = format!("{name}/");
+            anyhow::ensure!(
+                !names
+                    .range(prefix.clone()..)
+                    .next()
+                    .is_some_and(|next| next.starts_with(&prefix)),
+                "output {name} conflicts with an output directory"
+            );
+            name_bytes = name_bytes
+                .checked_add(name.len())
+                .context("output name budget overflow")?;
+            anyhow::ensure!(
+                names.len() < MAX_OUTPUTS && name_bytes <= 16 * 1024 * 1024,
+                "derivation output-name budget exceeded"
+            );
+            names.insert(name);
+            Ok(())
+        };
+        for step in &spec.steps {
+            match step {
+                Step::Read { out, .. } | Step::DumpData { out, .. } => add(out)?,
+                Step::CaptureMemory { out, count, .. } | Step::CaptureValue { out, count, .. } => {
+                    anyhow::ensure!(
+                        *count <= MAX_OUTPUTS && out.len() <= 4096,
+                        "snapshot output-name budget exceeded"
+                    );
+                    self.output_path(Path::new(out))?;
+                    for index in 0..*count {
+                        add(Path::new(&crate::snapshot::output_name(out, index)))?;
+                    }
+                }
+                Step::AssertSha256 { file, .. } => {
+                    self.output_path(file)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Runs every step in order. Resolution happened before this, so every
     /// named function is known good by the time a call runs.
     fn execute(
@@ -688,20 +752,7 @@ impl<'a> Executor<'a> {
         spec: &Spec,
         resolutions: &BTreeMap<String, Resolved>,
     ) -> Result<()> {
-        for step in &spec.steps {
-            match step {
-                Step::Read { out, .. } | Step::DumpData { out, .. } => {
-                    self.output_path(out)?;
-                }
-                Step::CaptureMemory { out, .. } | Step::CaptureValue { out, .. } => {
-                    self.output_path(Path::new(out))?;
-                }
-                Step::AssertSha256 { file, .. } => {
-                    self.output_path(file)?;
-                }
-                _ => {}
-            }
-        }
+        self.validate_outputs(spec)?;
         std::fs::create_dir_all(self.out_dir)
             .with_context(|| format!("creating {}", self.out_dir.display()))?;
         let mut plan = crate::patch::Plan::default();
@@ -1285,6 +1336,32 @@ fn dump_data(bytes: &[u8], segment: usize, offset: usize, len: usize) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_collisions_fail_before_execution() {
+        let directory = tempfile::tempdir().unwrap();
+        for steps in [
+            serde_json::json!([
+                {"op":"dump_data","segment":0,"offset":0,"len":1,"out":"same.bin"},
+                {"op":"dump_data","segment":0,"offset":1,"len":1,"out":"same.bin"}
+            ]),
+            serde_json::json!([
+                {"op":"dump_data","segment":0,"offset":0,"len":1,"out":"span_0000.bin"},
+                {"op":"capture_value","func":"probe","instruction":0,"local":0,"count":1,"out":"span"}
+            ]),
+        ] {
+            let spec: Spec = serde_json::from_value(
+                serde_json::json!({"module":{"id":"probe","sha256":"","size":0},"steps":steps}),
+            )
+            .unwrap();
+            assert!(
+                Executor::new(directory.path())
+                    .validate_outputs(&spec)
+                    .is_err()
+            );
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+    }
 
     #[test]
     fn a_body_hash_rejects_changed_code() {

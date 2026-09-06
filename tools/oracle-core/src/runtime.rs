@@ -380,11 +380,10 @@ impl Runtime {
         // Entering guest code takes a turn, and holds it until the call
         // returns. Yield points inside host calls hand it on.
         let shared = Arc::clone(&self.store.data().shared);
-        shared.scheduler.acquire(0);
+        let _turn = shared.scheduler.turn(0);
         let outcome = func
             .call(&mut self.store, args, &mut results)
             .with_context(|| format!("calling `{name}`"));
-        shared.scheduler.release(0);
         // The call may have grown memory, invalidating the cached window.
         self.sync_memory();
         outcome?;
@@ -646,11 +645,10 @@ impl Runtime {
         results: &mut [Val],
     ) -> Result<()> {
         let shared = Arc::clone(&self.store.data().shared);
-        shared.scheduler.acquire(0);
+        let _turn = shared.scheduler.turn(0);
         let outcome = func
             .call(&mut self.store, args, results)
             .map_err(|error| anyhow!("{error}"));
-        shared.scheduler.release(0);
         // Same reason as `call` and `call_table`: an embind constructor,
         // method or invoker can grow an ordinary exported memory, and a stale
         // window makes every pointer allocated in the new pages look out of
@@ -762,11 +760,10 @@ impl Runtime {
 
         let mut results: Vec<Val> = ty.results().map(zero_value_of).collect();
         let shared = Arc::clone(&self.store.data().shared);
-        shared.scheduler.acquire(0);
+        let _turn = shared.scheduler.turn(0);
         let outcome = func
             .call(&mut self.store, args, &mut results)
             .with_context(|| format!("calling table slot {slot}"));
-        shared.scheduler.release(0);
         self.sync_memory();
         outcome?;
         Ok(results)
@@ -888,8 +885,7 @@ impl Runtime {
     /// Unlike [`Self::all_calls_to`] this is complete and its bytes are real:
     /// the host function copies them while the guest's buffer is still alive,
     /// which is the only moment it is. See `SignalingCall`.
-    #[must_use]
-    pub fn signaling(&self) -> Vec<crate::shared::SignalingCall> {
+    pub fn signaling(&self) -> Result<Vec<crate::shared::SignalingCall>> {
         self.store.data().shared.signaling()
     }
 
@@ -948,7 +944,7 @@ impl Runtime {
         if let Some(mailbox) = self.instance.get_func(&mut self.store, MAILBOX) {
             // Best-effort by nature: a failure here is the guest's, so it is
             // logged rather than propagated.
-            if let Err(error) = mailbox.call(&mut self.store, &[], &mut []) {
+            if let Err(error) = self.call_func(mailbox, &[], &mut []) {
                 self.store.data().log(format!("{MAILBOX} failed: {error}"));
             }
             drained = true;
@@ -957,7 +953,7 @@ impl Runtime {
         if self.store.data().register_main_thread
             && let Some(func) = self.instance.get_func(&mut self.store, LEGACY)
         {
-            if let Err(error) = func.call(&mut self.store, &[], &mut []) {
+            if let Err(error) = self.call_func(func, &[], &mut []) {
                 self.store.data().log(format!("{LEGACY} failed: {error}"));
             }
             drained = true;
@@ -1378,6 +1374,34 @@ impl Runtime {
 #[cfg(test)]
 mod diagnostic_tests {
     use super::*;
+
+    #[test]
+    fn queued_guest_calls_acquire_a_turn() {
+        use wasm_encoder::{
+            CodeSection, ExportKind, ExportSection, Function, FunctionSection, Module, TypeSection,
+        };
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        let mut exports = ExportSection::new();
+        exports.export("_emscripten_check_mailbox", ExportKind::Func, 0);
+        let mut function = Function::new([]);
+        function.instructions().end();
+        let mut code = CodeSection::new();
+        code.function(&function);
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&functions)
+            .section(&exports)
+            .section(&code);
+        let mut runtime = Runtime::instantiate(&module.finish()).unwrap();
+        runtime.shared().scheduler.enable();
+        runtime.shared().scheduler.acquire(99);
+        assert!(runtime.process_queued_calls());
+        assert_eq!(runtime.forced_turns(), 1);
+    }
 
     #[test]
     fn late_stubs_are_counted_after_the_argument_trace_fills() {

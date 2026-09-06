@@ -121,9 +121,12 @@ fn read_through_pointer(
         "std::string" | "std::basic_string<unsigned char>" => {
             // The pointer is to a pointer to the string block.
             let block = state.read_u32(ptr).ok()?;
-            let len = state.read_u32(block).ok()?;
-            let bytes = state.read(block + 4, len).ok()?;
-            Some(Value::Str(String::from_utf8_lossy(&bytes).into_owned()))
+            let bytes = crate::call::read_string_bytes(state, block).ok()?;
+            if type_name == "std::string" {
+                Some(Value::Str(String::from_utf8(bytes).ok()?))
+            } else {
+                Some(Value::Bytes(bytes))
+            }
         }
         _ => None,
     }
@@ -155,17 +158,12 @@ pub fn define(
                     let type_name = state.embind.type_name(type_id);
                     let value = read_through_pointer(state, type_id, &type_name, ptr);
 
-                    let handle = match value {
-                        Some(value) => caller.data_mut().emval.insert(value),
-                        // An unreadable type yields no handle rather than a
-                        // handle to something invented.
-                        None => {
-                            caller.data().log(format!(
-                                "_emval_take_value: no reader for type `{type_name}`"
-                            ));
-                            0
-                        }
-                    };
+                    let value = value.ok_or_else(|| {
+                        wasmtime::Error::msg(format!(
+                            "_emval_take_value: invalid or unsupported value for {type_name}"
+                        ))
+                    })?;
+                    let handle = caller.data_mut().emval.insert(value);
                     if let Some(slot) = results.first_mut() {
                         *slot = Val::I32(handle as i32);
                     }

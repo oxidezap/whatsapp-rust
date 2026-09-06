@@ -11,6 +11,7 @@
 //! worse than no clock. And the PRNG is deliberately *not* shared — see
 //! `seed_for`.
 
+use anyhow::{Context, Result, ensure};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -95,9 +96,19 @@ pub struct SignalingCall {
     pub peer_jid: String,
     /// The call this belongs to.
     pub call_id: String,
-    /// The stanza itself, copied before the guest freed it. Empty if the
-    /// length the guest passed did not name a readable range.
+    /// The stanza bytes, copied before the guest freed them. Invalid ranges fail capture.
     pub stanza: Vec<u8>,
+}
+
+pub(crate) const MAX_SIGNAL_STANZA_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SIGNAL_RECORDS: usize = 4096;
+const MAX_SIGNAL_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct SignalingTrace {
+    calls: Vec<SignalingCall>,
+    bytes: usize,
+    error: Option<String>,
 }
 
 /// The cross-thread half of the host state.
@@ -127,7 +138,7 @@ pub struct SharedHost {
     /// out. A caller that reads the arguments afterwards gets whatever landed
     /// there next. The bytes have to be copied inside the host call, so the
     /// host call is where this is filled.
-    signaling: Mutex<Vec<SignalingCall>>,
+    signaling: Mutex<SignalingTrace>,
     /// Virtual monotonic clock, in milliseconds, advanced under a lock so no
     /// thread ever observes it going backwards.
     clock_ms: Mutex<f64>,
@@ -252,7 +263,7 @@ impl Default for SharedHost {
             marker_sink: Mutex::new(None),
             snapshots: std::sync::OnceLock::new(),
             markers: Mutex::new(std::collections::VecDeque::new()),
-            signaling: Mutex::new(Vec::new()),
+            signaling: Mutex::new(SignalingTrace::default()),
             clock_ms: Mutex::new(0.0),
             wall_ms: Mutex::new(0.0),
             next_seq: AtomicU64::new(0),
@@ -531,20 +542,62 @@ impl SharedHost {
     /// Called from the `sendSignalingXMPP_js_sync` host function, which is the
     /// only moment the stanza exists: its trampoline frees the buffer as soon
     /// as this returns.
-    pub fn record_signaling(&self, call: SignalingCall) {
-        self.signaling
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(call);
+    pub fn record_signaling(&self, call: SignalingCall) -> Result<()> {
+        self.capture_signaling(|| Ok(call))
     }
 
-    /// Every stanza the guest asked the host to send, oldest first.
-    #[must_use]
-    pub fn signaling(&self) -> Vec<SignalingCall> {
-        self.signaling
+    pub(crate) fn capture_signaling(
+        &self,
+        read: impl FnOnce() -> Result<SignalingCall>,
+    ) -> Result<()> {
+        let mut trace = self
+            .signaling
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(error) = &trace.error {
+            anyhow::bail!("incomplete signaling trace: {error}");
+        }
+        let result = (|| -> Result<()> {
+            ensure!(
+                trace.calls.len() < MAX_SIGNAL_RECORDS,
+                "signaling record budget exceeded"
+            );
+            let call = read()?;
+            ensure!(
+                call.stanza.len() <= MAX_SIGNAL_STANZA_BYTES,
+                "signaling stanza exceeds 16 MiB"
+            );
+            let bytes = call
+                .peer_jid
+                .len()
+                .checked_add(call.call_id.len())
+                .and_then(|bytes| bytes.checked_add(call.stanza.len()))
+                .and_then(|bytes| bytes.checked_add(trace.bytes))
+                .context("signaling size overflow")?;
+            ensure!(
+                bytes <= MAX_SIGNAL_TOTAL_BYTES,
+                "signaling trace exceeds 64 MiB"
+            );
+            trace.bytes = bytes;
+            trace.calls.push(call);
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            trace.error = Some(error.to_string());
+        }
+        result
+    }
+
+    /// Every captured stanza, or an error if any capture failed or exceeded a budget.
+    pub fn signaling(&self) -> Result<Vec<SignalingCall>> {
+        let trace = self
+            .signaling
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(error) = &trace.error {
+            anyhow::bail!("incomplete signaling trace: {error}");
+        }
+        Ok(trace.calls.clone())
     }
 
     /// Host symbols by call count, most-called first.
@@ -656,5 +709,54 @@ impl SharedHost {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod signaling_tests {
+    use super::*;
+    #[test]
+    fn signaling_records_cannot_grow_without_a_budget() {
+        let shared = SharedHost::default();
+        for _ in 0..MAX_SIGNAL_RECORDS {
+            shared.record_signaling(call(1)).unwrap();
+        }
+        assert!(shared.record_signaling(call(1)).is_err());
+        assert!(
+            shared.signaling().is_err(),
+            "overflow must not expose a partial trace"
+        );
+        assert_eq!(
+            shared.signaling.lock().unwrap().calls.len(),
+            MAX_SIGNAL_RECORDS
+        );
+    }
+
+    fn call(bytes: usize) -> SignalingCall {
+        SignalingCall {
+            peer_jid: String::new(),
+            call_id: String::new(),
+            stanza: vec![0; bytes],
+        }
+    }
+
+    #[test]
+    fn signaling_byte_budgets_and_read_errors_are_sticky() {
+        let shared = SharedHost::default();
+        for _ in 0..4 {
+            shared
+                .record_signaling(call(MAX_SIGNAL_STANZA_BYTES))
+                .unwrap();
+        }
+        assert!(shared.record_signaling(call(1)).is_err());
+        assert!(shared.signaling().is_err());
+        let shared = SharedHost::default();
+        assert!(
+            shared
+                .capture_signaling(|| anyhow::bail!("invalid guest range"))
+                .is_err()
+        );
+        assert!(shared.record_signaling(call(0)).is_err());
+        assert!(shared.signaling().is_err());
     }
 }

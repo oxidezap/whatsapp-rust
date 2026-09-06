@@ -5,6 +5,11 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
 
+/// Independent bound on captured records. Zero-length spans never grow
+/// `bytes`, so the byte budget alone cannot stop a looping guest from
+/// exhausting host memory with heap-backed entries.
+pub(crate) const MAX_SNAPSHOT_RECORDS: usize = 65_536;
+
 #[derive(Debug)]
 pub(crate) struct Span {
     pub at: u32,
@@ -18,6 +23,7 @@ pub(crate) struct Span {
 struct Captured {
     records: BTreeMap<i32, Vec<Vec<u8>>>,
     bytes: usize,
+    total: usize,
     error: Option<String>,
 }
 
@@ -36,6 +42,7 @@ impl Recorder {
             captured: Mutex::new(Captured {
                 records: BTreeMap::new(),
                 bytes: 0,
+                total: 0,
                 error: None,
             }),
         }
@@ -61,6 +68,10 @@ impl Recorder {
                 "snapshot budget exceeds 64 MiB"
             );
             anyhow::ensure!(
+                captured.total < MAX_SNAPSHOT_RECORDS,
+                "snapshot record budget exceeded"
+            );
+            anyhow::ensure!(
                 captured.records.get(&(*id as i32)).map_or(0, Vec::len) < span.count,
                 "too many hits for {}",
                 span.out
@@ -76,6 +87,7 @@ impl Recorder {
         match result {
             Ok(bytes) => {
                 captured.bytes += bytes.len();
+                captured.total += 1;
                 captured.records.entry(*id as i32).or_default().push(bytes);
             }
             Err(error) => captured.error = Some(format!("snapshot {}: {error:#}", span.out)),
@@ -98,9 +110,44 @@ impl Recorder {
                 records.len()
             );
             for (i, bytes) in records.into_iter().enumerate() {
-                outputs.push((format!("{}_{i:04}.bin", span.out), bytes));
+                outputs.push((output_name(&span.out, i), bytes));
             }
         }
         Ok(outputs)
+    }
+}
+
+pub(crate) fn output_name(prefix: &str, index: usize) -> String {
+    format!("{prefix}_{index:04}.bin")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn records_are_bounded_independently_of_bytes() {
+        // 70_000 scalar hits fit the 64 MiB byte budget and the per-span
+        // count, so only an independent record budget can stop them.
+        let recorder = Recorder::new(
+            "probe::hit".to_owned(),
+            BTreeMap::from([(
+                0,
+                Span {
+                    at: 0,
+                    scalar: true,
+                    len: 0,
+                    count: 70_000,
+                    out: "span".to_owned(),
+                },
+            )]),
+        );
+        let state = crate::state::HostState::default();
+        for _ in 0..70_000 {
+            recorder.record(&state, "probe", "hit", &[0, 0]);
+        }
+        assert!(
+            recorder.finish().is_err(),
+            "record count must be bounded independently of bytes"
+        );
     }
 }

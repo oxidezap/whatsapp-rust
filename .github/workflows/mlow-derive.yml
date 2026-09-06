@@ -27,6 +27,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: . -> target
+      - name: Lint oracle tooling
+        run: cargo clippy --locked --release -p oracle-core -p oracle-cli -p whatsapp-oracle-task --all-targets -- -D warnings
       - name: Test native task utilities
         run: cargo test --locked -p whatsapp-xtask -p xtask-support
       - name: Test oracle task utilities

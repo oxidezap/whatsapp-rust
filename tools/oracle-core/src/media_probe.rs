@@ -324,14 +324,17 @@ pub fn compare_media(expected: &[MediaObservation], actual: &[MediaObservation])
     for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
         ensure!(
             expected.stream == actual.stream
+                && expected.symbol == actual.symbol
                 && expected.sequence == actual.sequence
                 && expected.timestamp == actual.timestamp,
-            "media metadata differs at record {index}: expected {:?}/{:?}/{:?} ({} bytes), got {:?}/{:?}/{:?} ({} bytes)",
+            "media metadata differs at record {index}: expected {:?}/{:?}/{:?}/{:?} ({} bytes), got {:?}/{:?}/{:?}/{:?} ({} bytes)",
             expected.stream,
+            expected.symbol,
             expected.sequence,
             expected.timestamp,
             expected.payload.len(),
             actual.stream,
+            actual.symbol,
             actual.sequence,
             actual.timestamp,
             actual.payload.len()
