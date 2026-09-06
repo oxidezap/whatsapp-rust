@@ -6,8 +6,7 @@ use crate::socket::error::{EncryptSendError, Result, SocketError};
 use async_channel;
 use bytes::BytesMut;
 use futures::channel::oneshot;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub const INLINE_ENCRYPT_THRESHOLD: usize = 16 * 1024;
 
@@ -128,7 +127,7 @@ pub struct SendJob {
 }
 
 /// Observer for plaintext frames sent over the wire before encryption.
-pub trait FrameTap: Send + Sync + 'static {
+pub trait FrameTap: crate::sync_marker::MaybeSendSync + 'static {
     /// Whether the tap is currently active.
     fn enabled(&self) -> bool {
         true
@@ -180,7 +179,7 @@ impl SendObservers {
 
 pub struct NoiseSocket {
     read_key: Arc<NoiseCipher>,
-    read_counter: Arc<AtomicU32>,
+    read_counter: Mutex<u32>,
     /// Channel to send jobs to the dedicated sender task.
     /// Using a channel instead of a mutex avoids blocking callers while
     /// the current send is in progress - they can enqueue their work and
@@ -241,7 +240,7 @@ impl NoiseSocket {
 
         Self {
             read_key,
-            read_counter: Arc::new(AtomicU32::new(0)),
+            read_counter: Mutex::new(0),
             send_job_tx,
             sender_task_handle,
         }
@@ -543,31 +542,40 @@ impl NoiseSocket {
 
     /// Decrypts an incoming frame in-place using the connection's read cipher and counter.
     ///
-    /// Checks for counter exhaustion before decrypting and commits the counter increment
-    /// only after authentication succeeds, preventing corrupted frames from desynchronizing
+    /// The entire operation (counter read, frame authentication, and increment) is serialized
+    /// under a lock. This ensures concurrent callers cannot load the same counter, returns
+    /// genuine counter exhaustion, and guarantees unauthenticated frames never desynchronize
     /// future valid frames.
     pub fn decrypt_frame(&self, mut ciphertext: BytesMut) -> Result<BytesMut> {
-        let counter = self.read_counter.load(Ordering::SeqCst);
-        if counter == u32::MAX {
+        let mut guard = match self.read_counter.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *guard == u32::MAX {
             return Err(SocketError::Cipher(NoiseError::CounterExhausted));
         }
+        let counter = *guard;
         self.read_key
             .decrypt_in_place_with_counter(counter, &mut ciphertext)
             .map_err(SocketError::Cipher)?;
-        self.read_counter
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| c.checked_add(1))
-            .map_err(|_| SocketError::Cipher(NoiseError::CounterExhausted))?;
+        *guard = counter + 1;
         Ok(ciphertext)
     }
 
     /// Read-only snapshot of the current read frame counter.
     pub fn read_counter(&self) -> u32 {
-        self.read_counter.load(Ordering::SeqCst)
+        match self.read_counter.lock() {
+            Ok(g) => *g,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
     }
 
     /// Explicitly sets the read counter for testing counter exhaustion.
     #[doc(hidden)]
     pub fn set_read_counter_for_test(&self, val: u32) {
-        self.read_counter.store(val, Ordering::SeqCst);
+        match self.read_counter.lock() {
+            Ok(mut g) => *g = val,
+            Err(poisoned) => *poisoned.into_inner() = val,
+        }
     }
 }
