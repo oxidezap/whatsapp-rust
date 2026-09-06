@@ -5,7 +5,7 @@
 //! to data segments is what makes the output identify a minified module: string
 //! literals, format strings and lookup tables live there and nowhere else.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use wasmparser::{Parser, Payload};
 
 /// One data segment, as the module declares it.
@@ -46,6 +46,9 @@ pub struct DataReport {
 
 /// Extracts data segments and the printable runs inside them.
 pub fn extract(bytes: &[u8], min_run: usize) -> Result<DataReport> {
+    // A zero minimum emits an empty record for every non-printable byte, so a
+    // large module can produce millions of meaningless records.
+    ensure!(min_run > 0, "minimum string length must be positive");
     let mut report = DataReport::default();
 
     for payload in Parser::new(0).parse_all(bytes) {
@@ -137,5 +140,6 @@ mod tests {
         assert_eq!(report.segments.len(), 2);
         assert_eq!(report.segments[0].memory_offset, Some(7));
         assert_eq!(report.segments[1].memory_offset, None);
+        assert!(extract(&module, 0).is_err());
     }
 }

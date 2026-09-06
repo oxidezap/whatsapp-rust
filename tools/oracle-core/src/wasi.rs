@@ -35,6 +35,10 @@ const FIRST_FILE_FD: u32 = 4;
 /// The name the root preopen is reported under.
 const ROOT_NAME: &str = "/";
 
+/// WASI `RIGHTS_FD_WRITE`: without it the descriptor cannot be written, no
+/// matter which creation flags were used.
+const RIGHTS_FD_WRITE: u32 = 64;
+
 /// Largest single file the memfs will hold. The 256 MiB payload limit cannot
 /// stop a sparse attack on its own: seeking a writable descriptor near
 /// `u64::MAX` and writing one byte would otherwise `resize` towards it.
@@ -447,6 +451,7 @@ struct PathOpenArgs {
     path_ptr: u32,
     path_len: u32,
     oflags: u32,
+    rights_base: u64,
     fdflags: u32,
     out: u32,
 }
@@ -510,12 +515,16 @@ fn path_open(caller: &mut Caller<'_, HostState>, args: PathOpenArgs) -> i32 {
     }
 
     let fd = wasi.allocate_fd();
+    // Writability comes from the requested rights, not the creation flags: a
+    // guest that opens without `RIGHTS_FD_WRITE` gets a read-only descriptor
+    // even if it also passed `O_CREAT`.
+    let writable = args.rights_base & u64::from(RIGHTS_FD_WRITE) != 0;
     wasi.open.insert(
         fd,
         OpenFile {
             path,
             offset: 0,
-            writable: true,
+            writable,
             retained: None,
         },
     );
@@ -798,6 +807,7 @@ fn dispatch(name: &str, caller: &mut Caller<'_, HostState>, params: &[Val]) -> i
                 path_ptr: arg(params, 2),
                 path_len: arg(params, 3),
                 oflags: arg(params, 4),
+                rights_base: arg_i64(params, 5) as u64,
                 fdflags: arg(params, 7),
                 out: arg(params, 8),
             },
@@ -1265,41 +1275,62 @@ mod tests {
     #[test]
     fn path_open_validates_its_directory_descriptor_and_flags() {
         let bytes = harness(
-            &[(
-                "path_open",
-                vec![I32, I32, I32, I32, I32, I64, I64, I32, I32],
-                vec![I32],
-            )],
-            &[(
-                "opendir",
-                vec![I32, I32],
-                vec![I32],
-                vec![
-                    Wave::Arg(0),
-                    Wave::Arg(1),
-                    Wave::I32(128),
-                    Wave::I32(3),
-                    Wave::I32(8),
-                    Wave::I64(0),
-                    Wave::I64(0),
-                    Wave::I32(0),
-                    Wave::I32(208),
-                    Wave::Call(0),
-                ],
-            )],
-            &[(128, b"out")],
+            &[
+                (
+                    "path_open",
+                    vec![I32, I32, I32, I32, I32, I64, I64, I32, I32],
+                    vec![I32],
+                ),
+                ("fd_write", vec![I32, I32, I32, I32], vec![I32]),
+            ],
+            &[
+                (
+                    "opendir",
+                    vec![I32, I32, I64],
+                    vec![I32],
+                    vec![
+                        Wave::Arg(0),
+                        Wave::Arg(1),
+                        Wave::I32(128),
+                        Wave::I32(3),
+                        Wave::I32(8),
+                        Wave::Arg(2),
+                        Wave::I64(0),
+                        Wave::I32(0),
+                        Wave::I32(208),
+                        Wave::Call(0),
+                    ],
+                ),
+                (
+                    "writeout",
+                    vec![I32],
+                    vec![I32],
+                    vec![
+                        Wave::Arg(0),
+                        Wave::I32(0),
+                        Wave::I32(1),
+                        Wave::I32(208),
+                        Wave::Call(1),
+                    ],
+                ),
+            ],
+            &[
+                (0, &[64, 0, 0, 0, 1, 0, 0, 0]),
+                (64, &[0xAA]),
+                (128, b"out"),
+            ],
         );
         let mut runtime = crate::Runtime::instantiate(&bytes).unwrap();
         runtime.add_file("out", vec![1]);
         assert!(matches!(
             runtime
-                .call("opendir", &[Val::I32(99), Val::I32(0)])
+                .call("opendir", &[Val::I32(99), Val::I32(0), Val::I64(0)])
                 .unwrap()[0],
             Val::I32(EBADF)
         ));
         assert!(matches!(
             runtime
-                .call("opendir", &[Val::I32(3), Val::I32(2)])
+                .call("opendir", &[Val::I32(3), Val::I32(2), Val::I64(0)])
                 .unwrap()[0],
             Val::I32(EINVAL)
         ));
@@ -1307,14 +1338,26 @@ mod tests {
         // it; only further lookup flags are rejected.
         assert!(matches!(
             runtime
-                .call("opendir", &[Val::I32(3), Val::I32(1)])
+                .call("opendir", &[Val::I32(3), Val::I32(1), Val::I64(0)])
+                .unwrap()[0],
+            Val::I32(ESUCCESS)
+        ));
+        // Without FD_WRITE the descriptor is read-only even with O_TRUNC.
+        assert!(matches!(
+            runtime.call("writeout", &[Val::I32(4)]).unwrap()[0],
+            Val::I32(EBADF)
+        ));
+        assert!(matches!(
+            runtime
+                .call(
+                    "opendir",
+                    &[Val::I32(3), Val::I32(0), Val::I64(RIGHTS_FD_WRITE as i64)]
+                )
                 .unwrap()[0],
             Val::I32(ESUCCESS)
         ));
         assert!(matches!(
-            runtime
-                .call("opendir", &[Val::I32(3), Val::I32(0)])
-                .unwrap()[0],
+            runtime.call("writeout", &[Val::I32(5)]).unwrap()[0],
             Val::I32(ESUCCESS)
         ));
     }

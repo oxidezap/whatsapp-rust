@@ -303,12 +303,21 @@ impl Runtime {
         })
     }
 
-    fn release_owned(&mut self, owned: Owned) {
+    fn release_owned(&mut self, owned: Owned) -> Result<()> {
+        let mut error = None;
         for handle in owned.objects {
-            let _ = self.release(handle);
+            if let Err(cleanup) = self.release(handle) {
+                error.get_or_insert(cleanup);
+            }
         }
         for ptr in owned.allocations {
-            let _ = self.free(ptr);
+            if let Err(cleanup) = self.free(ptr) {
+                error.get_or_insert(cleanup);
+            }
+        }
+        match error {
+            Some(cleanup) => Err(cleanup),
+            None => Ok(()),
         }
     }
 
@@ -318,8 +327,12 @@ impl Runtime {
     ) -> Result<T> {
         let mut owned = Owned::default();
         let result = operation(self, &mut owned);
-        self.release_owned(owned);
-        result
+        // The operation error wins when both fail; a failed cleanup after a
+        // successful operation is still an error rather than a silent leak.
+        match (&result, self.release_owned(owned)) {
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            _ => result,
+        }
     }
 
     /// Looks the invoker up in the function table and calls it.
@@ -689,6 +702,22 @@ fn checked_vector_len(len: i64) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_failures_surface_unless_the_call_failed() {
+        // The probe module exports no `free`, so releasing any allocation fails.
+        let mut runtime = Runtime::instantiate(&crate::derive::probe_module_bytes()).unwrap();
+        let ok: Result<i32> = runtime.with_owned(|_, owned| {
+            owned.allocations.push(u32::MAX);
+            Ok(1)
+        });
+        assert!(ok.is_err(), "a failed cleanup must not report success");
+        let err: Result<i32> = runtime.with_owned(|_, owned| {
+            owned.allocations.push(u32::MAX);
+            anyhow::bail!("primary")
+        });
+        assert_eq!(err.unwrap_err().to_string(), "primary");
+    }
 
     #[test]
     fn returned_text_must_be_utf8() {

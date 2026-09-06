@@ -126,6 +126,27 @@ fn exported_memory_name(module: &Module) -> Option<String> {
     })
 }
 
+/// The name of the module's function table, selected by element type.
+///
+/// `__indirect_function_table` is the convention, not the name: a minified
+/// module exports it as whatever letter the optimiser chose. An externref or
+/// other table exported first is not it, so the first table export is the
+/// wrong answer whenever several exist; several funcref tables are an
+/// ambiguity the caller resolves through the conventional name instead.
+fn select_function_table(module: &Module) -> Option<String> {
+    let mut funcref = module.exports().filter_map(|export| {
+        if let wasmtime::ExternType::Table(table) = export.ty() {
+            wasmtime::ValType::from(table.element().clone())
+                .is_funcref()
+                .then(|| export.name().to_owned())
+        } else {
+            None
+        }
+    });
+    let name = funcref.next()?;
+    funcref.next().is_none().then_some(name)
+}
+
 /// Records what the host environment needs to know about this module.
 ///
 /// Failing to work either one out is not fatal: the conventional names still
@@ -144,12 +165,12 @@ fn record_module_facts(store: &Store<HostState>, module: &Module, bytes: &[u8]) 
         .set(module.exports().map(|e| e.name().to_owned()).collect())
         .ok();
 
-    if let Some(name) = module.exports().find_map(|export| {
-        matches!(export.ty(), wasmtime::ExternType::Table(_)).then(|| export.name().to_owned())
-    }) {
+    // The dispatch table holds function references; an externref or other
+    // table exported first is not it. Record the single funcref table, and
+    // record nothing when several exist rather than blessing the first one.
+    if let Some(name) = select_function_table(module) {
         shared.table_export.set(name).ok();
     }
-
     let Ok(by_index) = crate::abi::find_invoke_imports(bytes) else {
         return;
     };
@@ -1374,6 +1395,43 @@ impl Runtime {
 #[cfg(test)]
 mod diagnostic_tests {
     use super::*;
+
+    #[test]
+    fn ambiguous_tables_record_nothing() {
+        use wasm_encoder::{
+            ExportKind, ExportSection, Module as WasmModule, RefType, TableSection, TableType,
+        };
+        fn table(element_type: RefType) -> TableType {
+            TableType {
+                element_type,
+                table64: false,
+                minimum: 0,
+                maximum: None,
+                shared: false,
+            }
+        }
+        fn select(tables: &[(RefType, &str)]) -> Option<String> {
+            let mut section = TableSection::new();
+            let mut exports = ExportSection::new();
+            for (index, (element, name)) in tables.iter().enumerate() {
+                section.table(table(*element));
+                exports.export(name, ExportKind::Table, index as u32);
+            }
+            let mut module = WasmModule::new();
+            module.section(&section).section(&exports);
+            let engine = wasmtime::Engine::default();
+            let module = wasmtime::Module::new(&engine, module.finish()).unwrap();
+            select_function_table(&module)
+        }
+        // One funcref table is recorded, whatever it is called.
+        assert_eq!(select(&[(RefType::FUNCREF, "t0")]), Some("t0".to_owned()));
+        // Two funcref tables are an ambiguity, not a first-match win: the
+        // caller falls back to the conventional name instead.
+        assert_eq!(
+            select(&[(RefType::FUNCREF, "aux"), (RefType::FUNCREF, "dispatch")]),
+            None
+        );
+    }
 
     #[test]
     fn queued_guest_calls_acquire_a_turn() {

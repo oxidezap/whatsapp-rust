@@ -12,17 +12,24 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use wasmtime::error::Context as _;
 use wasmtime::{Caller, Linker, Module, Store, Val};
 
 use crate::call::Value;
 use crate::state::HostState;
 
+/// Fixed budget of live emval handles. Worker fuel is replenished at host
+/// boundaries, so a looping guest could otherwise retain values forever.
+const MAX_EMVAL_HANDLES: usize = 4096;
+/// Cumulative retained payload bytes across live string handles.
+const MAX_EMVAL_BYTES: usize = 64 * 1024 * 1024;
+
 /// Values the guest has handed out as `val` handles.
 #[derive(Debug, Default)]
 pub struct EmvalTable {
     values: BTreeMap<u32, Entry>,
+    bytes: usize,
     next: u32,
 }
 
@@ -36,11 +43,21 @@ impl EmvalTable {
     /// Stores a value and returns its handle.
     ///
     /// Handles start at 1 so that zero keeps its usual meaning of "no value".
-    pub fn insert(&mut self, value: Value) -> u32 {
+    pub fn insert(&mut self, value: Value) -> Result<u32> {
+        let size = value_size(&value);
+        ensure!(
+            self.values.len() < MAX_EMVAL_HANDLES,
+            "emval handle budget exceeded"
+        );
+        ensure!(
+            self.bytes.saturating_add(size) <= MAX_EMVAL_BYTES,
+            "emval payload budget exceeded"
+        );
         self.next += 1;
         let handle = self.next;
+        self.bytes += size;
         self.values.insert(handle, Entry { value, refcount: 1 });
-        handle
+        Ok(handle)
     }
 
     /// The value behind a handle, if it is still live.
@@ -66,8 +83,10 @@ impl EmvalTable {
             return;
         };
         entry.refcount = entry.refcount.saturating_sub(1);
-        if entry.refcount == 0 {
-            self.values.remove(&handle);
+        if entry.refcount == 0
+            && let Some(entry) = self.values.remove(&handle)
+        {
+            self.bytes = self.bytes.saturating_sub(value_size(&entry.value));
         }
     }
 
@@ -81,6 +100,16 @@ impl EmvalTable {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
+    }
+}
+
+/// Retained payload bytes of one value. Handles and scalars carry no guest
+/// bytes; strings do, and each one can hold up to 16 MiB.
+fn value_size(value: &Value) -> usize {
+    match value {
+        Value::Str(text) => text.len(),
+        Value::Bytes(bytes) => bytes.len(),
+        _ => 0,
     }
 }
 
@@ -163,7 +192,11 @@ pub fn define(
                             "_emval_take_value: invalid or unsupported value for {type_name}"
                         ))
                     })?;
-                    let handle = caller.data_mut().emval.insert(value);
+                    let handle = caller
+                        .data_mut()
+                        .emval
+                        .insert(value)
+                        .map_err(wasmtime::Error::msg)?;
                     if let Some(slot) = results.first_mut() {
                         *slot = Val::I32(handle as i32);
                     }
@@ -208,5 +241,36 @@ fn int_arg(params: &[Val], index: usize) -> u32 {
         Some(Val::I32(value)) => *value as u32,
         Some(Val::I64(value)) => *value as u32,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn handle_and_payload_budgets_are_enforced() {
+        let mut table = EmvalTable::default();
+        let mut handles = Vec::new();
+        for _ in 0..MAX_EMVAL_HANDLES {
+            handles.push(table.insert(Value::Bool(true)).unwrap());
+        }
+        assert!(table.insert(Value::Bool(true)).is_err());
+        for handle in handles {
+            table.decref(handle);
+        }
+        assert!(table.is_empty());
+        assert!(table.insert(Value::Bool(true)).is_ok());
+
+        let mut table = EmvalTable::default();
+        let chunk = Value::Bytes(vec![0; 16 * 1024 * 1024]);
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(table.insert(chunk.clone()).unwrap());
+        }
+        assert!(table.insert(chunk.clone()).is_err());
+        for handle in held {
+            table.decref(handle);
+        }
+        assert!(table.insert(chunk).is_ok());
     }
 }

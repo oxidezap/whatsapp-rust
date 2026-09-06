@@ -33,6 +33,39 @@ const THREAD_FUEL: u64 = 2_000_000_000;
 /// threads, stacks and host memory. Real captures use a handful.
 const MAX_WORKERS: usize = 64;
 
+/// How long a worker waits for its creator to publish stack bounds.
+///
+/// Yield counts are not time: thousands of yields can complete without the
+/// creator being scheduled on a loaded host, so readiness waits on a real
+/// elapsed-time deadline instead.
+const STACK_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Waits until `read` yields stack bounds, polling until `deadline` passes.
+/// Yields while the creator is expected imminently, then sleeps to avoid
+/// burning a core for the remainder of the wait.
+fn wait_for_stack_bounds(
+    mut read: impl FnMut() -> Option<(u32, u32)>,
+    deadline: std::time::Duration,
+) -> Option<(u32, u32)> {
+    const FAST_YIELDS: u32 = 2000;
+    let start = std::time::Instant::now();
+    let mut spins = 0u32;
+    loop {
+        if let Some(bounds) = read() {
+            return Some(bounds);
+        }
+        if start.elapsed() >= deadline {
+            return None;
+        }
+        spins += 1;
+        if spins <= FAST_YIELDS {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Workers(Mutex<WorkerState>);
 
@@ -285,23 +318,21 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
     // `__emscripten_thread_init` writes them. So the guest's own `pthread_create`
     // fills them on the creating thread while this one is already running, and
     // anything read before that is a half-built structure.
-    const STACK_READY_SPINS: usize = 2000;
-    let (stack_high, stack_size) = (0..STACK_READY_SPINS)
-        .find_map(|_| {
-            let bounds = read_u32(&store, thread_ptr.saturating_add(STACK_HIGH)).and_then(|high| {
-                read_u32(&store, thread_ptr.saturating_add(STACK_SIZE))
-                    .and_then(|size| (high != 0 && size != 0 && high > size).then_some((high, size)))
-            });
-            if bounds.is_none() {
-                std::thread::yield_now();
-            }
-            bounds
-        })
-        .with_context(|| {
-            format!(
-                "pthread {thread_ptr:#x} stack bounds were not ready after {STACK_READY_SPINS} yields"
-            )
-        })?;
+    let (stack_high, stack_size) = wait_for_stack_bounds(
+        || {
+            read_u32(&store, thread_ptr.saturating_add(STACK_HIGH)).and_then(|high| {
+                read_u32(&store, thread_ptr.saturating_add(STACK_SIZE)).and_then(|size| {
+                    (high != 0 && size != 0 && high > size).then_some((high, size))
+                })
+            })
+        },
+        STACK_READY_TIMEOUT,
+    )
+    .with_context(|| {
+        format!(
+            "pthread {thread_ptr:#x} stack bounds were not ready within {STACK_READY_TIMEOUT:?}"
+        )
+    })?;
 
     // Bind the guest's thread-local storage to this instance before running
     // anything: emscripten's runtime reads the pthread pointer from TLS, and a
@@ -563,5 +594,30 @@ mod tests {
         }
         assert!(workers.launch("one-too-many".into(), || {}).is_err());
         workers.stop_and_join();
+    }
+
+    #[test]
+    fn stack_readiness_waits_past_yield_counts() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Bounds appear only after more polls than the old yield budget.
+        let polls = Arc::new(AtomicUsize::new(0));
+        let waiting = Arc::clone(&polls);
+        let bounds = wait_for_stack_bounds(
+            move || {
+                let seen = waiting.fetch_add(1, Ordering::SeqCst) + 1;
+                (seen > 2500).then_some((0x10000, 0x1000))
+            },
+            std::time::Duration::from_secs(30),
+        );
+        assert_eq!(bounds, Some((0x10000, 0x1000)));
+        assert!(polls.load(Ordering::SeqCst) > 2500);
+        // Absent bounds fail at the deadline instead of spinning forever.
+        let start = std::time::Instant::now();
+        assert_eq!(
+            wait_for_stack_bounds(|| None, std::time::Duration::from_millis(50)),
+            None
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 }

@@ -658,12 +658,31 @@ pub fn instrument(bytes: &[u8], plan: &Plan) -> Result<(Vec<u8>, MarkerMap)> {
 
         for item in reader.into_iter_with_offsets() {
             let (op, offset) = item.context("reading operators")?;
-            let Operator::Call { function_index } = op else {
-                continue;
+            // A tail call is both a call and the function's exit: without
+            // these arms `--calls-in` misses the dispatch and `--returns-in`
+            // misses the exit, since the fall-through marker is unreachable
+            // on that path.
+            let detail = match op {
+                Operator::Call { function_index } => {
+                    if only.is_some_and(|wanted| wanted != function_index) {
+                        continue;
+                    }
+                    format!("call {function_index} in func {func}")
+                }
+                Operator::ReturnCall { function_index } => {
+                    if only.is_some_and(|wanted| wanted != function_index) {
+                        continue;
+                    }
+                    format!("tail call {function_index} in func {func}")
+                }
+                Operator::ReturnCallIndirect { .. } | Operator::ReturnCallRef { .. } => {
+                    if only.is_some() {
+                        continue;
+                    }
+                    format!("indirect tail call in func {func}")
+                }
+                _ => continue,
             };
-            if only.is_some_and(|wanted| wanted != function_index) {
-                continue;
-            }
             splices.push(Splice {
                 at: offset,
                 bytes: marker_bytes(next_id, 0, sink),
@@ -672,7 +691,7 @@ pub fn instrument(bytes: &[u8], plan: &Plan) -> Result<(Vec<u8>, MarkerMap)> {
                 id: next_id,
                 kind: "before-call".to_owned(),
                 func,
-                detail: format!("call {function_index} in func {func}"),
+                detail,
             });
             next_id += 1;
         }
@@ -693,19 +712,26 @@ pub fn instrument(bytes: &[u8], plan: &Plan) -> Result<(Vec<u8>, MarkerMap)> {
             if matches!(op, Operator::End) {
                 final_end = Some(offset);
             }
-            if matches!(op, Operator::Return) {
-                splices.push(Splice {
-                    at: offset,
-                    bytes: marker_bytes(next_id, 0, sink),
-                });
-                markers.push(Marker {
-                    id: next_id,
-                    kind: "return".to_owned(),
-                    func,
-                    detail: format!("explicit return in func {func}"),
-                });
-                next_id += 1;
-            }
+            // An explicit return and a tail call both leave the function; the
+            // fall-through marker below is unreachable on either path.
+            let detail = match op {
+                Operator::Return => format!("explicit return in func {func}"),
+                Operator::ReturnCall { .. }
+                | Operator::ReturnCallIndirect { .. }
+                | Operator::ReturnCallRef { .. } => format!("tail call in func {func}"),
+                _ => continue,
+            };
+            splices.push(Splice {
+                at: offset,
+                bytes: marker_bytes(next_id, 0, sink),
+            });
+            markers.push(Marker {
+                id: next_id,
+                kind: "return".to_owned(),
+                func,
+                detail,
+            });
+            next_id += 1;
         }
         let offset = final_end.context("function body has no final end")?;
         splices.push(Splice {

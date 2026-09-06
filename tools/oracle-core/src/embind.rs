@@ -390,6 +390,21 @@ fn apply(caller: &mut Caller<'_, HostState>, layout: Layout, args: &[Val]) -> Re
             else {
                 return Ok(());
             };
+            // A registration without invoker and target operands cannot
+            // dispatch: publishing it with table slot 0 lets a later call run
+            // an unrelated function and report a plausible result.
+            let (Some(invoker), Some(target)) = (arg(args, 4), arg(args, 5)) else {
+                caller.data().log(format!(
+                    "_embind_register_function: registration of arg-set {count} lacks invoker/target"
+                ));
+                return Ok(());
+            };
+            if invoker == 0 || target == 0 {
+                caller.data().log(format!(
+                    "_embind_register_function: registration of arg-set {count} has a null invoker/target"
+                ));
+                return Ok(());
+            }
             let state = caller.data();
             let name = state.read_cstr(name_ptr).unwrap_or_default();
             let arg_types = read_type_ids(state, types_ptr, count)?;
@@ -397,8 +412,8 @@ fn apply(caller: &mut Caller<'_, HostState>, layout: Layout, args: &[Val]) -> Re
             caller.data_mut().embind.functions.push(EmbindFunction {
                 name,
                 arg_types,
-                invoker: arg(args, 4).unwrap_or(0),
-                function: arg(args, 5).unwrap_or(0),
+                invoker,
+                function: target,
                 is_async: arg(args, 6).unwrap_or(0) != 0,
             });
         }
@@ -610,5 +625,93 @@ mod tests {
             ]),
             Some(i64::MIN)
         );
+    }
+
+    #[test]
+    fn registrations_without_targets_are_not_callable() {
+        use wasm_encoder::{
+            CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function,
+            FunctionSection, ImportSection, MemorySection, MemoryType, Module, TypeSection,
+            ValType,
+        };
+        fn registration_module(params: &[ValType], args: &[i32]) -> Vec<u8> {
+            let mut types = TypeSection::new();
+            types.ty().function(params.iter().copied(), []);
+            types.ty().function([], []);
+            let mut imports = ImportSection::new();
+            imports.import("env", "_embind_register_function", EntityType::Function(0));
+            let mut functions = FunctionSection::new();
+            functions.function(1);
+            let mut memories = MemorySection::new();
+            memories.memory(MemoryType {
+                minimum: 1,
+                maximum: None,
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            });
+            let mut exports = ExportSection::new();
+            exports.export("memory", ExportKind::Memory, 0);
+            exports.export("reg", ExportKind::Func, 1);
+            let mut body = Function::new([]);
+            body.instructions().i32_const(64);
+            for arg in args {
+                body.instructions().i32_const(*arg);
+            }
+            body.instructions().call(0).end();
+            let mut code = CodeSection::new();
+            code.function(&body);
+            let mut data = DataSection::new();
+            data.active(0, &ConstExpr::i32_const(64), [b'f', 0]);
+            let mut module = Module::new();
+            module
+                .section(&types)
+                .section(&imports)
+                .section(&functions)
+                .section(&memories)
+                .section(&exports)
+                .section(&code)
+                .section(&data);
+            module.finish()
+        }
+        // A shortened signature omits the invoker/target operands entirely.
+        let short = registration_module(&[ValType::I32, ValType::I32, ValType::I32], &[0, 0]);
+        let mut runtime = crate::Runtime::instantiate(&short).unwrap();
+        runtime.call("reg", &[]).unwrap();
+        assert!(runtime.state().embind.functions.is_empty());
+        // Explicit null operands are equally undispatchable.
+        let zeros = registration_module(
+            &[
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+            ],
+            &[0, 0, 0, 0, 0, 0],
+        );
+        let mut runtime = crate::Runtime::instantiate(&zeros).unwrap();
+        runtime.call("reg", &[]).unwrap();
+        assert!(runtime.state().embind.functions.is_empty());
+        // A complete registration still lands.
+        let full = registration_module(
+            &[
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+            ],
+            &[0, 0, 0, 7, 9, 0],
+        );
+        let mut runtime = crate::Runtime::instantiate(&full).unwrap();
+        runtime.call("reg", &[]).unwrap();
+        let functions = &runtime.state().embind.functions;
+        assert_eq!(functions.len(), 1);
+        assert_eq!((functions[0].invoker, functions[0].function), (7, 9));
     }
 }

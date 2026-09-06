@@ -196,6 +196,53 @@ fn a_call_site_that_never_runs_is_reported_as_such() {
 }
 
 #[test]
+fn tail_calls_are_marked_as_calls_and_returns() {
+    let mut types = TypeSection::new();
+    types.ty().function([ValType::I32, ValType::I32], []);
+    types.ty().function([ValType::I32], [ValType::I32]);
+    let mut imports = ImportSection::new();
+    imports.import("env", "mark", EntityType::Function(0));
+    let mut functions = FunctionSection::new();
+    functions.function(1);
+    functions.function(1);
+    let mut code = CodeSection::new();
+    let mut leaf = Function::new([]);
+    leaf.instructions().local_get(0).end();
+    code.function(&leaf);
+    let mut tail = Function::new([]);
+    tail.instructions().local_get(0).return_call(1).end();
+    code.function(&tail);
+    let mut module = Module::new();
+    module
+        .section(&types)
+        .section(&imports)
+        .section(&functions)
+        .section(&code);
+    let bytes = module.finish();
+    let plan = Plan {
+        before_calls: vec![(2, Some(1))],
+        at_returns: vec![2],
+        sink: Some("mark".to_owned()),
+        ..Plan::default()
+    };
+    let (_rewritten, map) = patch::instrument(&bytes, &plan).expect("instrument");
+    assert!(
+        map.markers.iter().any(|marker| {
+            marker.kind == "before-call" && marker.detail.contains("tail call 1")
+        }),
+        "tail dispatch must be marked as a call: {:?}",
+        map.markers.iter().map(|m| &m.detail).collect::<Vec<_>>()
+    );
+    assert!(
+        map.markers
+            .iter()
+            .any(|marker| { marker.kind == "return" && marker.detail.contains("tail call") }),
+        "tail dispatch must be marked as a return: {:?}",
+        map.markers.iter().map(|m| &m.detail).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn fall_through_returns_are_instrumented() {
     let plan = Plan {
         at_returns: vec![1],
