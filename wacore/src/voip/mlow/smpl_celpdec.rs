@@ -537,7 +537,26 @@ mod tests {
     /// the voiced ACB/LTP synthesis are faithful, independent of the PRNG-driven noise.
     #[test]
     fn exc_pre_matches_c() {
-        let recs: Value = serde_json::from_str(include_str!("testdata/exc_pre_lags.json")).unwrap();
+        let recs: Value =
+            crate::voip::mlow::fixture::decode(include_bytes!("testdata/exc_pre_lags.cbor.zst"))
+                .unwrap();
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/inbound_capture_frames.json")).unwrap();
+        check_excitation(recs, frames, false);
+    }
+
+    #[test]
+    fn excitation_matches_shipped_wasm() {
+        let records: Value =
+            crate::voip::mlow::fixture::decode(include_bytes!("testdata/wasm_gennoise.cbor.zst"))
+                .expect("wasm excitation");
+        assert_eq!(records.as_array().unwrap().len(), 1320);
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/wasm_derived_frames.json")).unwrap();
+        check_excitation(records, frames, true);
+    }
+
+    fn check_excitation(recs: Value, frames: Vec<String>, include_inactive: bool) {
         let carr = recs.as_array().unwrap();
 
         // Key the reference exc_pre by (packet, frame, sf).
@@ -554,8 +573,6 @@ mod tests {
             );
         }
 
-        let frames: Vec<String> =
-            serde_json::from_str(include_str!("testdata/inbound_capture_frames.json")).unwrap();
         let tbl = load_smpl_tables();
         let synth_t = load_smpl_synth_tables();
         let mem = load_smpl_mem();
@@ -572,15 +589,23 @@ mod tests {
                 continue;
             }
             let toc = crate::voip::mlow::toc::parse_mlow_toc(frame[0]);
-            if toc.std_opus || toc.sid || !toc.active {
+            if toc.std_opus || toc.sid || (!include_inactive && !toc.active) {
                 continue;
             }
             let config = (frame[0] >> 2) as usize & 1;
             let low_rate = (frame[0] >> 2) & 1 != 0;
             let mut dec = crate::voip::mlow::rangecoder::RangeDecoder::new(&frame[1..]);
             for f in 0..3 {
-                let lsf = decode_smpl_lsf(&mut dec, tbl, &mut lstate, config, f, true);
-                let pulses = decode_smpl_pulses(&mut dec, cc, 320, 4, 1, config as i32, lsf.stage1);
+                let lsf = decode_smpl_lsf(&mut dec, tbl, &mut lstate, config, f, toc.active);
+                let pulses = decode_smpl_pulses(
+                    &mut dec,
+                    cc,
+                    320,
+                    4,
+                    i32::from(toc.active),
+                    config as i32,
+                    lsf.stage1,
+                );
                 let voiced = lsf.stage1 == 1;
                 let mut params = CelpDecParams {
                     voiced,

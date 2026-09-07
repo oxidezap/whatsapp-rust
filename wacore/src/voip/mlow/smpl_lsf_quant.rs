@@ -602,7 +602,9 @@ mod tests {
     // indices `qi[]` AND the reconstructed `qlsf` must match the reference bit-for-bit.
     #[test]
     fn lsf_quant_matches_c() {
-        let recs: Value = serde_json::from_str(include_str!("testdata/lsf_quant_io.json")).unwrap();
+        let recs: Value =
+            crate::voip::mlow::fixture::decode(include_bytes!("testdata/lsf_quant_io.cbor.zst"))
+                .unwrap();
         let arr = recs.as_array().unwrap();
         assert!(arr.len() >= 12, "need vectors");
         let mut bad = 0usize;
@@ -643,5 +645,41 @@ mod tests {
             }
         }
         assert_eq!(bad, 0, "lsf_quant qi mismatch vs reference");
+    }
+    #[test]
+    fn lsf_quant_matches_shipped_wasm() {
+        use super::super::smpl_lpc::smpl_a2nlsf_16;
+        let records: Value =
+            crate::voip::mlow::fixture::decode(include_bytes!("testdata/wasm_lsf_quant.cbor.zst"))
+                .expect("wasm LSF quantizer");
+        let records = records.as_array().unwrap();
+        assert_eq!(records.len(), 330);
+        let mut previous = vec![0.0f32; 16];
+        let mut conditional = 0;
+        for (i, r) in records.iter().enumerate() {
+            let a = fvec(&r["A"]);
+            let nlsf = smpl_a2nlsf_16(&a);
+            let voiced = r["voiced"].as_u64().unwrap() as usize;
+            let low_rate = r["lowRate"].as_u64().unwrap() as usize;
+            let weight = r["RDw_adj"].as_f64().unwrap() as f32;
+            let survivors = r["surv"].as_u64().unwrap() as usize;
+            let result = if r["cond"].is_null() {
+                lsf_quant(&a, &nlsf, voiced, low_rate, weight, survivors)
+            } else {
+                conditional += 1;
+                lsf_quant_cond(&a, &nlsf, &previous, voiced, low_rate, weight, survivors)
+            };
+            assert_eq!(
+                result.qi.to_vec(),
+                ivec(&r["qi"]),
+                "case {i}: quantized indices"
+            );
+            let expected = fvec(&r["qlsf"]);
+            for (got, want) in result.qlsf.iter().zip(&expected) {
+                assert!((got - want).abs() < 1e-4, "case {i}: quantized LSF");
+            }
+            previous = expected;
+        }
+        assert_eq!(conditional, 219);
     }
 }

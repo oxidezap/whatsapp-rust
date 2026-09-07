@@ -1,19 +1,19 @@
 {
   "repo": "https://github.com/oxidezap/whatspec",
-  "rev": "1d086ce49279afeeee0a37cffedcf8f83ca50347",
+  "rev": "1a441f0329c941fcdb238490a6c604550d8a9939",
   "waVersion": "2.3000.1045368834",
   "files": {
-    "abprops/index.json": "sha256:8a82b844bbf713422c17d086eb03ec38016acd836908c6b1ceed6d0d4537939e",
-    "appstate/index.json": "sha256:c8c0166ba7a2a3e9ca8cd0b232cc4b7c6f38411a18114c69755f7fac02cdfb25",
-    "enums/index.json": "sha256:53ca154bd9c638ccdbeec58182b98a31dc2e24e15c8e6712d7be4330705d1628",
-    "iq/index.json": "sha256:c166fdcc55403e4faf9b284b68e74407a2423ea53eccb353af45308c8ea7bab0",
-    "manifest.json": "sha256:f3f1e45fe8f4d03727ff1a2b9eb91b3fea56a867a0d64e2e54b26802ac5b895d",
-    "mex/index.json": "sha256:e21de62c589ae594d4f7465e50e71260bb34b5e4d6ed7f2e01ad16cdcdfb0a82",
-    "notif/index.json": "sha256:ab1d53a025ba89b0abbe86dbeed5be5a3889f622fa0798580a2a22ac85f863f1",
+    "abprops/index.json": "sha256:512535103698d5c3d59dcaca0b9778dcdd37e1fffd421e0d1606091535ad79fe",
+    "appstate/index.json": "sha256:a2aae2d3d7a40315fc27a67db9445f2f5349229f7149a97c7315d8fb9ce250a7",
+    "enums/index.json": "sha256:68f48fc7e67ab9e5a8070ce437b0ac7c099f29b7b69c0b6e3535530c0b84808b",
+    "iq/index.json": "sha256:209d5d5468892bda7671e7fae77b581a9890cbd02f4d47c0de83dc7f0af7c81c",
+    "manifest.json": "sha256:fa39dfe0f08d026c8b049e8c75f9515c743ac9190e69bf502d2dcfc84e38419b",
+    "mex/index.json": "sha256:4a6cc3f735f3e71481801abeb5edd351d4f20a9836dea616903064a890f00335",
+    "notif/index.json": "sha256:349b580bcf27a76f5b7b36227c81ae9ac93531751767f367fc3e91e2598e28a6",
     "proto/WAProto.proto": "sha256:f3da4ba028402ea225747dc40247a5d55473012da9c4ef0c4b9de5c443117e2f",
-    "srvreq/index.json": "sha256:6900750eb85603564213e06c79dae359a8ef21388dc8a17f14c82de45c0d128a",
-    "stanza/index.json": "sha256:c49afaa82604a52aa0a33f22aa204030886b30935667e5f838c058a0cdab3d41",
-    "tokens/index.json": "sha256:9b74e5fdef0fc980f907ecff1ccdbf5c5acd356f6ba5686acae31fa3f2172488",
-    "wam/index.json": "sha256:0358960b52ec49c94306588e81a0d012756d32c73acc3e1af632fc4e0f880913"
+    "srvreq/index.json": "sha256:84f8460e64043bf63a0a71e565ed5b658367eff1a3677bc9c8ba6fd6b884a8e7",
+    "stanza/index.json": "sha256:735c93fc261298cac74f03d748901747a0eb9681d5c5f3e064f7aaba50520ece",
+    "tokens/index.json": "sha256:0e6e8165d9fdda5b876d125b9710787ea7ec0f2a4ada22ba330728dea2bb9ee0",
+    "wam/index.json": "sha256:9503ca9c02b9d2cfa5a3be802fde7fc44d27bb5aece545930c981b389ffaf37a"
   }
 }

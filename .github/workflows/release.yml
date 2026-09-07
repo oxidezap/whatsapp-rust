@@ -23,31 +23,21 @@ jobs:
   preflight:
     name: Preflight
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: ""
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
 
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+
       - name: Extract and validate version
         id: version
-        run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          # Build metadata is rejected even though Cargo takes it. `+` is not a
-          # legal Docker tag character, so docker/metadata-action rewrites it to
-          # `-`: 0.7.0+build.5 would ship as the image 0.7.0-build.5, which is
-          # the tag a real prerelease of that name would claim. Being stricter
-          # than Cargo is only safe because this runs ahead of publish; as a
-          # post-publish check it would strand the release between crates.io
-          # and the tag.
-          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-            echo "Refusing to release '$VERSION': expected MAJOR.MINOR.PATCH[-prerelease], no build metadata" >&2
-            exit 1
-          fi
-          echo "Releasing $VERSION"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
-
+        run: cargo xt ci workflow release-version
   validate:
     name: Validate
     uses: ./.github/workflows/main.yml
@@ -89,42 +79,26 @@ jobs:
     name: Create GitHub Release
     needs: [preflight, publish]
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+
       - name: Create tag
         env:
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
-        run: |
-          TAG="$RELEASE_TAG"
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null 2>&1; then
-            echo "Tag $TAG already exists on origin, skipping."
-          else
-            git tag "$TAG"
-            git push origin "$TAG"
-          fi
-
+        run: cargo xt ci workflow release-tag
       - name: Create GitHub Release
         env:
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="$RELEASE_TAG"
-          # Hand-written notes win when the release has them: --generate-notes
-          # emits one bullet per PR, which for a release this size is thousands
-          # of lines with no structure. Falls back to the generated list so a
-          # release without a notes file still publishes.
-          NOTES=".github/release-notes/$TAG.md"
-          if gh release view "$TAG" > /dev/null 2>&1; then
-            echo "Release $TAG already exists, skipping."
-          elif [ -f "$NOTES" ]; then
-            gh release create "$TAG" --title "$TAG" --notes-file "$NOTES" --latest
-          else
-            gh release create "$TAG" --title "$TAG" --generate-notes --latest
-          fi
-
+        run: cargo xt ci workflow github-release
   # The tag pushed above with GITHUB_TOKEN can't trigger docker.yml's tag event,
   # so invoke it directly and pass the version for the :X.Y.Z image tag.
   publish-docker:

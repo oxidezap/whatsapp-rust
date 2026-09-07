@@ -248,6 +248,16 @@ impl SentFrameTap {
     }
 }
 
+impl wacore::socket::FrameTap for SentFrameTap {
+    fn enabled(&self) -> bool {
+        self.enabled()
+    }
+
+    fn publish(&self, plaintext: bytes::Bytes) {
+        self.publish(plaintext);
+    }
+}
+
 /// Filter for matching incoming stanzas (nodes) by tag and attributes.
 ///
 /// Used with [`Client::wait_for_node`] to wait for specific stanzas.

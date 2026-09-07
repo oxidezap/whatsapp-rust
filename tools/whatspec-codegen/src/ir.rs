@@ -148,6 +148,8 @@ pub struct IqStanza {
     pub iq_type: String,
     pub target: IqTarget,
     pub exported_function: String,
+    #[serde(default)]
+    pub response: ParsedResponse,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +157,60 @@ pub struct IqStanza {
 pub struct IqIr {
     pub wa_version: String,
     pub stanzas: Vec<IqStanza>,
+}
+
+/// One guard a response parser applies. Read only for presence gates here:
+/// `kind` with `name` carries the required child tag (`child`), anything else
+/// is opaque to this tool.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseAssertion {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+impl ResponseAssertion {
+    /// The required child tag when this assertion is a presence gate
+    /// (`kind == "child"` with a tag), `None` otherwise.
+    pub fn child_gate(&self) -> Option<&str> {
+        if self.kind.as_deref() == Some("child") {
+            self.name.as_deref()
+        } else {
+            None
+        }
+    }
+}
+
+/// One alternative of a response-root discriminated union. Read only for the
+/// success shapes of the join RPCs: `tag` names the variant, and a `child`
+/// assertion on it names a child the variant requires.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseVariant {
+    pub tag: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub assertions: Vec<ResponseAssertion>,
+}
+
+impl ResponseVariant {
+    /// Whether this alternative is a success shape (rather than an error arm).
+    pub fn is_success(&self) -> bool {
+        self.kind.as_deref() == Some("success")
+    }
+}
+
+/// The parsed response half of an IQ operation. Read only for `variants`;
+/// anything else about the response lives in hand-written specs.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedResponse {
+    pub parser_name: String,
+    #[serde(default)]
+    pub variants: Vec<ResponseVariant>,
 }
 
 /// One entry of the top-level stanza dispatcher, and one notification kind.

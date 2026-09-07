@@ -268,10 +268,7 @@ fn test_initial_pattern_hash() {
 /// `name_padded` is the 32-byte pattern bytes used directly as `h0` per Noise
 /// § 5.2 (length <= HASHLEN, no SHA256 of the name).
 ///
-/// Pre-computed via:
-///     python3 -c "import hashlib; \
-///         h=b'Noise_XX_25519_AESGCM_SHA256\x00\x00\x00\x00'+bytes([0x57,0x41,6,3]); \
-///         print(hashlib.sha256(h).hexdigest())"
+/// Reproduce with `cargo xt sha256 --hex 4e6f6973655f58585f32353531395f41455347434d5f5348413235360000000057410603`.
 #[test]
 fn test_xx_h_after_init_matches_known_vector() {
     let nh =

@@ -45,6 +45,7 @@ pub mod send;
 mod serde_helpers;
 pub mod session;
 pub mod shortcake;
+pub mod socket;
 pub mod stanza;
 pub mod stats;
 pub mod sticker_pack;

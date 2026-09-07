@@ -220,8 +220,9 @@ mod tests {
     // counts + the full signed pulse vector against the reference.
     #[test]
     fn pulses_match_go() {
-        let recs: Value = serde_json::from_str(include_str!("testdata/pulse_vectors.json"))
-            .expect("pulse_vectors");
+        let recs: Value =
+            crate::voip::mlow::fixture::decode(include_bytes!("testdata/pulse_vectors.cbor.zst"))
+                .expect("pulse_vectors");
         let tbl = load_smpl_tables();
         let cc = load_cc_tables();
         let arr = recs.as_array().unwrap();

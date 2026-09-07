@@ -86,8 +86,8 @@ pub(crate) struct CapacityStats {
 /// Both lazy and best-effort: expired entries are only removed lazily on
 /// access or in `run_pending_tasks`. `entry_count` may include
 /// expired-but-not-yet-evicted entries.
-pub struct PortableCache<K, V> {
-    inner: Arc<RwLock<CacheInner<K, V>>>,
+pub struct PortableCache<K, V, S = RandomState> {
+    inner: Arc<RwLock<CacheInner<K, V, S>>>,
     /// Shared single-flight init-lock registry (see `InitLocks`), built on the
     /// first [`get_with`](Self::get_with) rather than at construction: a client
     /// builds ~20 of these caches and most of them are only ever `get`/`insert`ed,
@@ -241,10 +241,10 @@ fn finish_clock_walk(
     }
 }
 
-struct CacheInner<K, V> {
+struct CacheInner<K, V, S> {
     /// Hashes keys once at insert; lookups with a borrowed `Q` hash through
     /// the same state, which the `Borrow` contract keeps consistent with `K`.
-    hasher: RandomState,
+    hasher: S,
     table: HashTable<Slot<K, V>>,
     /// Eviction order, `seq -> hash`, oldest first; an entry given a second
     /// chance is re-keyed to the back. Eviction walks from the front (O(log n)
@@ -266,13 +266,14 @@ struct CacheInner<K, V> {
     capacity_eviction_blocks: u64,
 }
 
-impl<K, V> CacheInner<K, V>
+impl<K, V, S> CacheInner<K, V, S>
 where
     K: Hash + Eq + Clone,
+    S: BuildHasher,
 {
-    fn new(track_order: bool) -> Self {
+    fn new(track_order: bool, hasher: S) -> Self {
         Self {
-            hasher: RandomState::new(),
+            hasher,
             table: HashTable::new(),
             order: BTreeMap::new(),
             track_order,
@@ -601,19 +602,15 @@ impl Drop for InitLockCleanup<'_> {
 
 // -- Builder --
 
-pub struct PortableCacheBuilder<K, V> {
+pub struct PortableCacheBuilder<K, V, S = RandomState> {
     max_capacity: Option<u64>,
     ttl: Option<Duration>,
     tti: Option<Duration>,
     evict_guard: Option<fn(&V) -> bool>,
-    _marker: std::marker::PhantomData<fn(K, V)>,
+    _marker: std::marker::PhantomData<fn(K, V) -> S>,
 }
 
-impl<K, V> PortableCacheBuilder<K, V>
-where
-    K: Hash + Eq + Clone + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
-{
+impl<K, V> PortableCacheBuilder<K, V, RandomState> {
     fn new() -> Self {
         Self {
             max_capacity: None,
@@ -623,7 +620,14 @@ where
             _marker: std::marker::PhantomData,
         }
     }
+}
 
+impl<K, V, S> PortableCacheBuilder<K, V, S>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher,
+{
     /// Protect entries a live task still holds from capacity eviction: `guard`
     /// returns `true` when a value is safe to evict. For an `Arc<Mutex>` lock cache,
     /// pass `|v| Arc::strong_count(v) <= 1`, so an entry held elsewhere is never
@@ -635,6 +639,32 @@ where
     pub fn evict_guard(mut self, guard: fn(&V) -> bool) -> Self {
         self.evict_guard = Some(guard);
         self
+    }
+
+    /// Fix the slot table's hash seed instead of drawing a per-process one.
+    ///
+    /// Whether an evict-then-insert cycle spends or restores the table's
+    /// growth budget — and so whether a mid-run table growth fires inside a
+    /// measurement — follows the bucket layout, which follows this seed.
+    /// Benchmarks pin it so every process measures the same layout.
+    /// Everything else keeps the default: a process-wide fixed seed would
+    /// re-open HashDoS.
+    ///
+    /// Returns a [`SeededCacheBuilder`]: unlike [`PortableCacheBuilder::build`],
+    /// building it needs no `Default` from the hasher, so an explicitly
+    /// supplied hasher without one still builds.
+    pub fn hash_builder<H>(self, hash_builder: H) -> SeededCacheBuilder<K, V, H>
+    where
+        H: BuildHasher,
+    {
+        SeededCacheBuilder {
+            max_capacity: self.max_capacity,
+            ttl: self.ttl,
+            tti: self.tti,
+            evict_guard: self.evict_guard,
+            hash_builder,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     pub fn max_capacity(mut self, cap: u64) -> Self {
@@ -659,38 +689,119 @@ where
     /// # Panics
     ///
     /// If an [`evict_guard`](Self::evict_guard) is combined with a TTL or TTI.
-    pub fn build(self) -> PortableCache<K, V> {
-        // An evict_guard marks a cache of live coordination objects. Expiry
-        // does not consult the guard, so a timeout would drop an entry a task
-        // still holds and let the next lookup mint a duplicate of it.
-        assert!(
-            self.evict_guard.is_none() || (self.ttl.is_none() && self.tti.is_none()),
-            "a cache with an evict_guard holds live coordination objects and must not expire by time"
-        );
+    pub fn build(self) -> PortableCache<K, V, S>
+    where
+        S: Default,
+    {
+        // A builder that never pinned a seed hashes like every other
+        // cache: `RandomState::default()` draws per-process.
+        assemble(
+            self.max_capacity,
+            self.ttl,
+            self.tti,
+            self.evict_guard,
+            S::default(),
+        )
+    }
+}
 
-        // Order is what eviction pops and what the expiry sweep walks, so a
-        // cache with either a capacity bound or a time bound keeps it. A cache
-        // with neither (the default LID/PN maps) is never swept and skips the
-        // BTreeMap node per entry.
-        let track_order = self.max_capacity.is_some_and(|cap| cap != u64::MAX)
-            || self.ttl.is_some()
-            || self.tti.is_some();
-        PortableCache {
-            inner: Arc::new(RwLock::new(CacheInner::new(track_order))),
-            init_locks: OnceLock::new(),
-            max_capacity: self.max_capacity,
-            ttl: self.ttl,
-            tti: self.tti,
-            evict_guard: self.evict_guard,
-            #[cfg(test)]
-            tti_renewals: Arc::new(portable_atomic::AtomicU64::new(0)),
-        }
+/// A builder with an explicitly supplied hash seed (see
+/// [`PortableCacheBuilder::hash_builder`]). Building it needs nothing from
+/// the hasher beyond [`BuildHasher`], so a supplied hasher without `Default`
+/// builds exactly like one with it.
+pub struct SeededCacheBuilder<K, V, H> {
+    max_capacity: Option<u64>,
+    ttl: Option<Duration>,
+    tti: Option<Duration>,
+    evict_guard: Option<fn(&V) -> bool>,
+    hash_builder: H,
+    _marker: std::marker::PhantomData<fn(K, V)>,
+}
+
+impl<K, V, H> SeededCacheBuilder<K, V, H>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    H: BuildHasher,
+{
+    pub fn max_capacity(mut self, cap: u64) -> Self {
+        self.max_capacity = Some(cap);
+        self
+    }
+
+    pub fn time_to_live(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
+    pub fn time_to_idle(mut self, tti: Duration) -> Self {
+        self.tti = Some(tti);
+        self
+    }
+
+    pub fn evict_guard(mut self, guard: fn(&V) -> bool) -> Self {
+        self.evict_guard = Some(guard);
+        self
+    }
+
+    /// # Panics
+    ///
+    /// If an evict guard is combined with a TTL or TTI (same rule as
+    /// [`PortableCacheBuilder::build`]).
+    pub fn build(self) -> PortableCache<K, V, H> {
+        assemble(
+            self.max_capacity,
+            self.ttl,
+            self.tti,
+            self.evict_guard,
+            self.hash_builder,
+        )
+    }
+}
+
+/// Shared assembly for both builders: the evict-guard rule and the order
+/// tracking live once, so the two `build` paths cannot drift apart.
+fn assemble<K, V, S>(
+    max_capacity: Option<u64>,
+    ttl: Option<Duration>,
+    tti: Option<Duration>,
+    evict_guard: Option<fn(&V) -> bool>,
+    hash_builder: S,
+) -> PortableCache<K, V, S>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher,
+{
+    // An evict_guard marks a cache of live coordination objects. Expiry
+    // does not consult the guard, so a timeout would drop an entry a task
+    // still holds and let the next lookup mint a duplicate of it.
+    assert!(
+        evict_guard.is_none() || (ttl.is_none() && tti.is_none()),
+        "a cache with an evict_guard holds live coordination objects and must not expire by time"
+    );
+
+    // Order is what eviction pops and what the expiry sweep walks, so a
+    // cache with either a capacity bound or a time bound keeps it. A cache
+    // with neither (the default LID/PN maps) is never swept and skips the
+    // BTreeMap node per entry.
+    let track_order =
+        max_capacity.is_some_and(|cap| cap != u64::MAX) || ttl.is_some() || tti.is_some();
+    PortableCache {
+        inner: Arc::new(RwLock::new(CacheInner::new(track_order, hash_builder))),
+        init_locks: OnceLock::new(),
+        max_capacity,
+        ttl,
+        tti,
+        evict_guard,
+        #[cfg(test)]
+        tti_renewals: Arc::new(portable_atomic::AtomicU64::new(0)),
     }
 }
 
 // -- PortableCache impl --
 
-impl<K, V> PortableCache<K, V> {
+impl<K, V, S> PortableCache<K, V, S> {
     /// The single-flight registry, built on first use. Unbounded impl block so
     /// [`Clone`] can force it too, keeping every clone on one registry.
     fn init_locks(&self) -> &Arc<InitLocks> {
@@ -698,15 +809,22 @@ impl<K, V> PortableCache<K, V> {
     }
 }
 
-impl<K, V> PortableCache<K, V>
+impl<K, V> PortableCache<K, V, RandomState> {
+    /// Start a builder for a cache that draws its hash seed per process.
+    /// Unbounded impl block so existing `Cache::builder()` call sites keep
+    /// inferring the default hasher; pinning a seed is opt-in through
+    /// [`PortableCacheBuilder::hash_builder`].
+    pub fn builder() -> PortableCacheBuilder<K, V, RandomState> {
+        PortableCacheBuilder::new()
+    }
+}
+
+impl<K, V, S> PortableCache<K, V, S>
 where
     K: Hash + Eq + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
+    S: BuildHasher,
 {
-    pub fn builder() -> PortableCacheBuilder<K, V> {
-        PortableCacheBuilder::new()
-    }
-
     /// Read the monotonic clock only for caches that can expire entries.
     /// Non-expiring caches use a stable sentinel because their timestamps are
     /// never observed, avoiding unnecessary clock reads on every operation.
@@ -1028,7 +1146,7 @@ where
         Vec::new().into_iter()
     }
 
-    fn snapshot(guard: &CacheInner<K, V>) -> Vec<(Arc<K>, V)> {
+    fn snapshot(guard: &CacheInner<K, V, S>) -> Vec<(Arc<K>, V)> {
         guard
             .iter()
             .map(|(k, e)| (Arc::new(k.clone()), e.value.clone()))
@@ -1145,7 +1263,7 @@ where
     }
 }
 
-impl<K, V> Clone for PortableCache<K, V> {
+impl<K, V, S> Clone for PortableCache<K, V, S> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -1323,6 +1441,59 @@ mod tests {
                 eviction_blocks: 0,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn fixed_hash_seed_cache_evicts_like_default() {
+        type DetState = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
+        let cache: PortableCache<String, u32, DetState> = PortableCache::builder()
+            .max_capacity(2)
+            .hash_builder(DetState::default())
+            .build();
+
+        cache.insert("a".into(), 1).await;
+        cache.insert("b".into(), 2).await;
+        cache.insert("c".into(), 3).await;
+        assert_eq!(cache.entry_count(), 2);
+        assert!(cache.get("a").await.is_none());
+        assert_eq!(cache.get("c").await, Some(3));
+    }
+
+    /// A supplied hasher without `Default` still builds: only the
+    /// unseeded path draws a fresh seed, never the explicit one.
+    #[tokio::test]
+    async fn supplied_hasher_without_default_builds() {
+        use std::hash::{BuildHasher, Hasher};
+
+        #[derive(Clone, Copy)]
+        struct FixedSeed(u64);
+        struct FixedHasher(u64);
+        impl Hasher for FixedHasher {
+            fn write(&mut self, bytes: &[u8]) {
+                for b in bytes {
+                    self.0 = self.0.wrapping_mul(0x100000001b3).wrapping_add(*b as u64);
+                }
+            }
+            fn finish(&self) -> u64 {
+                self.0
+            }
+        }
+        impl BuildHasher for FixedSeed {
+            type Hasher = FixedHasher;
+            fn build_hasher(&self) -> FixedHasher {
+                FixedHasher(self.0)
+            }
+        }
+
+        let cache: PortableCache<String, u32, FixedSeed> = PortableCache::builder()
+            .max_capacity(2)
+            .hash_builder(FixedSeed(0x9E3779B97F4A7C15))
+            .build();
+
+        cache.insert("a".into(), 1).await;
+        cache.insert("b".into(), 2).await;
+        cache.insert("c".into(), 3).await;
+        assert_eq!(cache.entry_count(), 2);
     }
 
     #[tokio::test]

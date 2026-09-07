@@ -11,6 +11,7 @@ publish = false
 description = "Regenerates the whatspec-derived artifacts committed in this repository."
 
 [dependencies]
+xtask-support.workspace = true
 # `std` on each: the workspace pins these with default-features off for the
 # no_std/wasm builds, and none of that applies to a host-only binary that reads
 # files and shells out.

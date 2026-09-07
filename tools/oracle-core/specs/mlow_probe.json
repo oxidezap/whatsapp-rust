@@ -1,0 +1,60 @@
+{
+  "comment": [
+    "Probe: the first derivation of the MLOW/codec work. It resolves the",
+    "wa_opus.cc cluster (encode/decode/media-init) by independent facts, not",
+    "by recorded indices, then proves the execution pipeline with a",
+    "malloc/write/read round-trip of one synthetic frame. It deliberately does",
+    "NOT call the codec yet: the instance structs behind opus_codec_encode",
+    "need their layout re-derived first (see the repo notes). The manifest",
+    "records module hash, resolved indices/slots and output hashes, so a",
+    "second run over the same bytes must be byte-identical."
+  ],
+  "module": {
+    "id": "JgwtTQVeWPm",
+    "sha256": "97259423aea19cc30c1771478e035105cb0d0e64ab4b0297741b62d01deac8db",
+    "size": 10650934
+  },
+  "functions": {
+    "opus_encode": {
+      "index_hint": 6666,
+      "must_hold_string": "opus_codec_encode"
+    },
+    "opus_decode": {
+      "index_hint": 6670,
+      "must_hold_string": "opus_codec_decode"
+    },
+    "media_init": {
+      "index_hint": 6693,
+      "must_hold_string": "pjmedia_codec_opus_init start"
+    }
+  },
+  "steps": [
+    {
+      "op": "instantiate"
+    },
+    {
+      "op": "run_ctors"
+    },
+    {
+      "op": "malloc",
+      "as": "pcm",
+      "len": 1920
+    },
+    {
+      "op": "write",
+      "ptr": "$pcm",
+      "hex": "00000100020003000400050006000700080009000a000b000c000d000e000f0010001100120013001400150016001700180019001a001b001c001d001e001f00"
+    },
+    {
+      "op": "read",
+      "ptr": "$pcm",
+      "len": 64,
+      "out": "roundtrip.bin"
+    },
+    {
+      "op": "assert_sha256",
+      "file": "roundtrip.bin",
+      "sha256": "8ddaed4c3145c740d216bc4597d5c78cdb33460e1539a147c78f4c5ec1e4d5e8"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+[package]
+name = "whatsapp-xtask"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+license = "MIT"
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std", "float_roundtrip"] }
+xtask-support.workspace = true
+regex = "1"
+tempfile = "3"
+
+[lints]
+workspace = true

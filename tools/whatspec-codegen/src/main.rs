@@ -290,6 +290,11 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
             rust: true,
         },
         Artifact {
+            path: "wacore/src/iq/join_shapes.rs",
+            content: emit::join_shapes::generate(&iq, wa_version)?,
+            rust: true,
+        },
+        Artifact {
             path: "wacore/src/stanza/wire_tags.rs",
             content: emit::notif::generate(&notif, &srvreq, &stanza)?,
             rust: true,
@@ -398,7 +403,7 @@ fn check_proto_descriptor(root: &Path, proto: &str) -> Result<()> {
         ensure!(
             want == got,
             "waproto/src/whatsapp.desc.sha256 records {what} {want} but the {} hashes to {got}\n\
-             run `cargo run -p whatspec-codegen` (or scripts/regenerate-proto-desc.sh)",
+             run `cargo run -p whatspec-codegen` (or cargo xt proto-desc)",
             if what == "proto" {
                 "generated schema"
             } else {
@@ -472,25 +477,18 @@ fn require_protoc() -> Result<()> {
     ensure!(
         found,
         "protoc is not on PATH, and the descriptor is regenerated from the schema this run \
-         writes.\nInstall it, or pass --skip-proto-desc and run scripts/regenerate-proto-desc.sh \
+         writes.\nInstall it, or pass --skip-proto-desc and run cargo xt proto-desc \
          yourself."
     );
     Ok(())
 }
 
 fn regenerate_proto_descriptor(root: &Path) -> Result<()> {
-    let script = root.join("scripts/regenerate-proto-desc.sh");
-    let status = Command::new("bash")
-        .arg(&script)
-        .current_dir(root)
-        .status()
-        .with_context(|| format!("running {}", script.display()))?;
-    ensure!(
-        status.success(),
-        "{} failed; install protoc, or pass --skip-proto-desc and run it yourself",
-        script.display()
-    );
-    Ok(())
+    xtask_support::descriptor(
+        &root.join("waproto/src/whatsapp.proto"),
+        &root.join("waproto/src/whatsapp.desc"),
+        true,
+    )
 }
 
 #[cfg(test)]

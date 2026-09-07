@@ -3,7 +3,7 @@
 //! 1. Edit `src/whatsapp.proto` (kept in the upstream / whatspec camelCase
 //!    form — do NOT hand-rename fields to snake_case).
 //! 2. Optional: format with `buf format src/whatsapp.proto -w`.
-//! 3. Regenerate the descriptor: `scripts/regenerate-proto-desc.sh`
+//! 3. Regenerate the descriptor: `cargo xt proto-desc`
 //!    (wraps `protoc --descriptor_set_out=src/whatsapp.desc …`).
 //! 4. `cargo build` — this script consumes `whatsapp.desc` and writes
 //!    `whatsapp.rs` to `OUT_DIR`. Consumers never need `protoc`; only editors
@@ -361,7 +361,7 @@ fn ensure_proto_descriptor_hash() -> std::io::Result<()> {
     if actual_proto != expected.proto || actual_desc != expected.desc {
         return Err(std::io::Error::other(format!(
             "waproto: src/whatsapp.proto/src/whatsapp.desc do not match src/whatsapp.desc.sha256. \
-             Run `scripts/regenerate-proto-desc.sh` to refresh the descriptor \
+             Run `cargo xt proto-desc` to refresh the descriptor \
              and commit src/whatsapp.proto, src/whatsapp.desc, and \
              src/whatsapp.desc.sha256. expected proto {}, desc {}; got proto {}, desc {}",
             expected.proto, expected.desc, actual_proto, actual_desc

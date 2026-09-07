@@ -1,0 +1,104 @@
+{
+  "comment": [
+    "The captured modules this oracle runs against, pinned by SHA-256. They are not",
+    "vendored: WhatsApp ships them, and a copy inside this repository would drift",
+    "from the capture the protocol notes refer to. scripts/fetch-wasm.py reads this",
+    "file, fetches each module from the origin CDN url recorded with it, falls",
+    "back to the release archives named below, and refuses any payload whose",
+    "bytes do not match.",
+    "",
+    "The origin url is where the capture was taken from, and WhatsApp's CDN still",
+    "serves these exact bytes long after the rollout that produced them has moved",
+    "on \u2014 every hash below verifies against it. It needs no token, which the",
+    "release archives do, so it is tried first. The path segment after rsrc.php is",
+    "part of the address and not decoration: the same file under a different one",
+    "is a 403.",
+    "",
+    "Pinned by hash rather than tracking the latest capture, because every function",
+    "index, table slot and absolute address in README.md, VOIP_STATUS.md and the",
+    "tests was read out of these exact bytes. WhatsApp renames these files on each",
+    "rollout and the module behind a given name stays the same *program* \u2014 but not",
+    "the same *binary*: functions are renumbered and data moves. Swapping one in",
+    "silently invalidates every recorded offset, so replacing a module is a",
+    "re-derivation, never an update. See 'Following a capture forward' in README.md.",
+    "",
+    "The VoIP engine was moved from D5pLH9sfOOl (9,794,866 B) to JgwtTQVeWPm",
+    "(10,650,934 B) so that this oracle and the unwasm decompiler read the same",
+    "bytes; a function index carried between them means nothing otherwise. It is",
+    "no longer in whatspec's current set \u2014 that has rolled on to S_ivh1PriOA \u2014 so",
+    "the CDN url above is the source that still serves it, verified to these",
+    "bytes. The indices re-derived for it are recorded next to each use.",
+    "",
+    "D5pLH9sfOOl is the *previous* VoIP capture, kept pinned rather than dropped. It is what makes `oracle carry` testable: carrying an index between two rollouts cannot be checked with one rollout on disk, and a test that skips for want of a file reports success while proving nothing. It is also the capture every note in VOIP_STATUS.md older than the bump was measured on."
+  ],
+  "sources": [
+    {
+      "repo": "oxidezap/whatspec",
+      "release": "bundle-store",
+      "note": "public; carries whatever wasm set the current WhatsApp rollout serves"
+    },
+    {
+      "repo": "jlucaso1/wa-wasm-oracle",
+      "release": "captured-modules",
+      "note": "private; the pinned captures whatspec's rolling set no longer carries"
+    }
+  ],
+  "modules": [
+    {
+      "fileName": "COs9e0Kj0ic.wasm",
+      "url": "https://static.whatsapp.net/rsrc.php/ye/r/COs9e0Kj0ic.wasm",
+      "sha256": "10ba1e06bfc624bfc18b0df679675b9d17de25d4400df2ee6cfae128a0e32e30",
+      "size": 239926,
+      "what": "VOPRF \u2014 Ristretto255, Naor-Reingold KDF, libsodium"
+    },
+    {
+      "fileName": "php8T1oSIZM.wasm",
+      "url": "https://static.whatsapp.net/rsrc.php/yl/r/php8T1oSIZM.wasm",
+      "sha256": "c80757d132b88e0a35b0a51fca11d12e6201406da46ef63709fcfff7c70f4361",
+      "size": 381499,
+      "what": "mozjpeg"
+    },
+    {
+      "fileName": "ayqr5HQtlkb.wasm",
+      "url": "https://static.whatsapp.net/rsrc.php/yR/r/ayqr5HQtlkb.wasm",
+      "sha256": "b4da7ab0407ad92259e193d2c65208a57382b8ccf1e4d3b568b4317d312852d5",
+      "size": 2047362,
+      "what": "MP4 utils \u2014 check, repair, remux; runs as a CLI"
+    },
+    {
+      "fileName": "rogm88TRRiw.wasm",
+      "url": "https://static.whatsapp.net/rsrc.php/yf/r/rogm88TRRiw.wasm",
+      "sha256": "c47b06d02e62b94a7db8f5b62ce63add4dea3fd4f061fbdc207ea7e6cc401879",
+      "size": 2145877,
+      "what": "WebP / media; runs as a CLI"
+    },
+    {
+      "fileName": "9Nbh3eMuVjD.wasm",
+      "url": "https://static.whatsapp.net/rsrc.php/yl/r/9Nbh3eMuVjD.wasm",
+      "sha256": "8094cf838e5d94036ec1d2e19841a61e5f186e666ae6a9c395748e621668d880",
+      "size": 2985612,
+      "what": "MP4 core \u2014 libmp4operations-rs"
+    },
+    {
+      "fileName": "JgwtTQVeWPm.wasm",
+      "url": "https://static.whatsapp.net/rsrc.php/yV/r/JgwtTQVeWPm.wasm",
+      "sha256": "97259423aea19cc30c1771478e035105cb0d0e64ab4b0297741b62d01deac8db",
+      "size": 10650934,
+      "what": "VoIP engine \u2014 emscripten + embind + pthreads"
+    },
+    {
+      "fileName": "D5pLH9sfOOl.wasm",
+      "url": "https://static.whatsapp.net/rsrc.php/yC/r/D5pLH9sfOOl.wasm",
+      "sha256": "00811f91c1ff7452d788062085bb723a609b0d74c5da19e49df3e5afcaf39e8d",
+      "size": 9794866,
+      "what": "VoIP engine, previous capture \u2014 kept so `carry` can be tested across a real bump"
+    },
+    {
+      "fileName": "S_ivh1PriOA.wasm",
+      "url": "https://static.whatsapp.net/rsrc.php/yZ/r/S_ivh1PriOA.wasm",
+      "sha256": "e55e43babf85e2c0fc76ec65dcb8d47beba0f58b03b135b37a5aaaff7fe70e2f",
+      "size": 10856103,
+      "what": "VoIP MLOW migration oracle; whatspec 3110bdab^ generated/wasm.lock.json"
+    }
+  ]
+}

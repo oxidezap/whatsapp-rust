@@ -3,7 +3,7 @@
 //! The Rust source (`whatsapp.rs`) is produced by `build.rs` from the
 //! pre-compiled descriptor set `whatsapp.desc`, and written to `OUT_DIR` —
 //! not tracked in git. To regenerate the descriptor after editing
-//! `whatsapp.proto`, run `scripts/regenerate-proto-desc.sh` (wraps `protoc`).
+//! `whatsapp.proto`, run `cargo xt proto-desc` (wraps `protoc`).
 
 #![allow(clippy::large_enum_variant)]
 /// Re-exported because its types permeate the generated API; depending on it

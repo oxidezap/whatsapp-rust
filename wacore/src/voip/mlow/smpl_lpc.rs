@@ -23,7 +23,8 @@ pub(crate) const SMPL_LPC_NFFT: usize = 512;
 const SMPL_PI: f32 = 3.1415926535897;
 const SMPL_PI_F64: f64 = SMPL_PI as f64;
 const SMPL_LPC_REG: f32 = 5e-7;
-const SMPL_LPC_BWE: f32 = 0.9999;
+// J#10736 expands the LPC coefficients with f32 bits 0x3f7f9db2.
+const SMPL_LPC_BWE: f32 = 0.9985;
 
 const SMPL_LPC_WIN1_20MS_LEN: usize = 264;
 const SMPL_WIN3_LONG_LEN: usize = 64;
@@ -186,7 +187,9 @@ fn ac2rc_dbl(corr: &[f64], order: usize, reg: f32, rc: &mut [f32]) {
     let mut c0 = vec![0.0f64; order + 1];
     let mut c1 = vec![0.0f64; order + 1];
     c0[..order + 1].copy_from_slice(&corr[..order + 1]);
-    c0[0] *= (1.0f32 + reg) as f64;
+    // J#10797 promotes reg before adding 1. Rounding that sum in f32
+    // changes the LPC solve on quiet, highly correlated input.
+    c0[0] *= 1.0f64 + f64::from(reg);
     c1[..order + 1].copy_from_slice(&c0[..order + 1]);
     for r in rc.iter_mut().take(order) {
         *r = 0.0;
@@ -264,6 +267,15 @@ pub(crate) fn smpl_lpc_analyze_with_f2(
     windowed: &[f32; SMPL_LPC_BUF_LEN],
     fft: &mut FftScratch,
 ) -> ([f32; SMPL_LPC_ORDER + 1], [f32; SMPL_F_LEN]) {
+    let (mut a, f2) = lpc_analyze_unexpanded(windowed, fft);
+    bwe_expand(&mut a, SMPL_LPC_ORDER, SMPL_LPC_BWE);
+    (a, f2)
+}
+
+fn lpc_analyze_unexpanded(
+    windowed: &[f32; SMPL_LPC_BUF_LEN],
+    fft: &mut FftScratch,
+) -> ([f32; SMPL_LPC_ORDER + 1], [f32; SMPL_F_LEN]) {
     // Zero-pad to NFFT and forward real FFT (pffft ordered layout).
     let mut xbuf = [0.0f32; SMPL_LPC_NFFT];
     xbuf[..SMPL_LPC_BUF_LEN].copy_from_slice(windowed);
@@ -286,7 +298,6 @@ pub(crate) fn smpl_lpc_analyze_with_f2(
     ac2rc_dbl(&r, SMPL_LPC_ORDER, SMPL_LPC_REG, &mut rc);
     let mut a = [0.0f32; SMPL_LPC_ORDER + 1];
     rc2a(&rc, SMPL_LPC_ORDER, &mut a);
-    bwe_expand(&mut a, SMPL_LPC_ORDER, SMPL_LPC_BWE);
     (a, f2)
 }
 
@@ -626,7 +637,9 @@ mod tests {
     // exact (NLSF in radians within float rounding of the Q15->radians scale).
     #[test]
     fn a2nlsf_matches_c() {
-        let recs: Value = serde_json::from_str(include_str!("testdata/lsf_quant_io.json")).unwrap();
+        let recs: Value =
+            crate::voip::mlow::fixture::decode(include_bytes!("testdata/lsf_quant_io.cbor.zst"))
+                .unwrap();
         let arr = recs.as_array().unwrap();
         let mut worst = 0.0f32;
         for (n, r) in arr.iter().enumerate() {
@@ -653,7 +666,9 @@ mod tests {
     // like the decoder postfilters).
     #[test]
     fn front_end_a_matches_c() {
-        let recs: Value = serde_json::from_str(include_str!("testdata/fe_dump.json")).unwrap();
+        let recs: Value =
+            crate::voip::mlow::fixture::decode(include_bytes!("testdata/fe_dump.cbor.zst"))
+                .unwrap();
         let arr = recs.as_array().unwrap();
         assert!(arr.len() >= 12, "need front-end vectors");
         let mut worst = 0.0f32;
@@ -671,7 +686,10 @@ mod tests {
             for k in 0..SMPL_LPC_BUF_LEN {
                 worst_win = worst_win.max((win[k] - want_win[k]).abs());
             }
-            let a = smpl_lpc_analyze_with_f2(&win, &mut new_lpc_fft_scratch()).0;
+            // C 84b076e used 0.9999; compare its tuning explicitly. The shipped
+            // profile is checked against the independent wasm corpus below.
+            let mut a = lpc_analyze_unexpanded(&win, &mut new_lpc_fft_scratch()).0;
+            bwe_expand(&mut a, SMPL_LPC_ORDER, 0.9999);
             let want_a = fvec(&r["A"]);
             let r0: f64 = r["R"][0].as_f64().unwrap();
             let mut rd = 0.0f32;
@@ -694,6 +712,61 @@ mod tests {
         assert!(worst_win < 1e-6, "windowing |dwin|={worst_win:.2e}");
     }
 
+    #[test]
+    fn front_end_matches_shipped_wasm() {
+        let records: Value =
+            crate::voip::mlow::fixture::decode(include_bytes!("testdata/wasm_fe.cbor.zst"))
+                .expect("wasm front-end");
+        let records = records.as_array().unwrap();
+        assert_eq!(records.len(), 330);
+        for (i, r) in records.iter().enumerate() {
+            let input: [f32; SMPL_LPC_BUF_LEN] = fvec(&r["lpcbuf"]).try_into().unwrap();
+            let window = smpl_window_lpc20(&input, r["numframe"].as_u64().unwrap() < 2);
+            for (got, want) in window.iter().zip(fvec(&r["windowed"])) {
+                assert!((got - want).abs() < 1e-6, "window case {i}");
+            }
+            let (a, f2) = smpl_lpc_analyze_with_f2(&window, &mut new_lpc_fft_scratch());
+            let expected_a = fvec(&r["A"]);
+            let mut max_coefficient_error = 0.0f32;
+            let mut coefficient_error_sum = 0.0f32;
+            for (got, want) in a.iter().zip(&expected_a) {
+                let error = (got - want).abs();
+                max_coefficient_error = max_coefficient_error.max(error);
+                coefficient_error_sum += error;
+            }
+            // Near silence, FFT rounding is amplified by the ill-conditioned
+            // LPC solve. Bound the resulting prediction error by one PCM LSB,
+            // while checking the solve itself on the exact oracle R below.
+            let input_peak = window.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            assert!(
+                max_coefficient_error < 5e-3 || coefficient_error_sum * input_peak < 1.0 / 32768.0,
+                "case {i}: LPC coefficient error {max_coefficient_error}, prediction bound {}",
+                coefficient_error_sum * input_peak
+            );
+            let oracle_r: Vec<f64> = r["R"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_f64().unwrap())
+                .collect();
+            let mut rc = [0.0f32; SMPL_LPC_ORDER];
+            let mut solved = [0.0f32; SMPL_LPC_ORDER + 1];
+            ac2rc_dbl(&oracle_r, SMPL_LPC_ORDER, SMPL_LPC_REG, &mut rc);
+            rc2a(&rc, SMPL_LPC_ORDER, &mut solved);
+            for (got, want) in solved.iter().zip(fvec(&r["A_before_bwe"])) {
+                assert!(
+                    (got - want).abs() < 1e-5,
+                    "case {i}: LPC solve {got} vs {want}"
+                );
+            }
+            let expected = fvec(&r["F2"]);
+            let scale = expected.iter().copied().fold(1e-8f32, f32::max);
+            for (got, want) in f2.iter().zip(expected) {
+                assert!((got - want).abs() < scale * 1e-5, "spectrum case {i}");
+            }
+        }
+    }
+
     // DIAGNOSTIC: the wire round-trip; feed the captured `qi` (grid+stage2) + threaded prev_nlsf to
     // the decoder's NLSF reconstruction and compare to the captured `qlsf`. Proves grid/stage2 map
     // directly onto the decoder wire (grid=qi[0], cond centroid=16) and that the decoder rebuilds the
@@ -702,7 +775,9 @@ mod tests {
     fn decoder_reconstructs_c_qlsf() {
         use super::super::smpl_lsf_quant::{lsf_quant, lsf_quant_cond};
         use super::super::smpl_synth::{load_smpl_synth_tables, smpl_reconstruct_nlsf};
-        let recs: Value = serde_json::from_str(include_str!("testdata/lsf_quant_io.json")).unwrap();
+        let recs: Value =
+            crate::voip::mlow::fixture::decode(include_bytes!("testdata/lsf_quant_io.cbor.zst"))
+                .unwrap();
         let arr = recs.as_array().unwrap();
         let st = load_smpl_synth_tables();
         let mut prev_nlsf: Vec<f32> = Vec::new();

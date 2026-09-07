@@ -7063,6 +7063,34 @@ mod read_routing_tests {
         assert_eq!(got.as_deref(), Some(&b"blob"[..]));
     }
 
+    /// Ensures a write-queue read completes while a write burst holds the permit.
+    #[tokio::test]
+    async fn write_queue_read_completes_beside_a_held_burst() {
+        use std::future::{Future, poll_fn};
+        use std::pin::pin;
+        use std::task::Poll;
+
+        let db = TempDb::new("held_burst");
+        let store = store_with(1, &db).await;
+        let rows = vec![AppStateMutationMAC {
+            index_mac: vec![0xA1; 32],
+            value_mac: vec![0xC5; 32],
+        }];
+
+        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut burst = pin!(store.put_mutation_macs("regular", 1, &rows));
+            let finished = poll_fn(|cx| Poll::Ready(burst.as_mut().poll(cx).is_ready())).await;
+            assert!(!finished, "the burst finished before the read was issued");
+            let (read, _) = tokio::join!(store.get_devices("190455501800"), async {
+                burst.await.expect("write burst")
+            });
+            read
+        })
+        .await
+        .expect("read and burst complete together");
+        assert!(outcome.expect("read succeeds").is_none());
+    }
+
     /// `pool_size > 1` with no reader connections is reachable config, and there
     /// the permit no longer implies an exclusive connection: the writers that
     /// check one out directly can commit between a multi-statement read's

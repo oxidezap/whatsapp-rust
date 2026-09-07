@@ -917,6 +917,12 @@ pub(crate) fn parse_reaction_counts(node: &NodeRef<'_>) -> Vec<NewsletterReactio
 ///   </message>
 /// </messages>
 /// ```
+///
+/// Deliberately lenient where WA Web discriminates: the bundle gates message
+/// subtypes on `<plaintext>` / `<reaction>` presence, but this parser flattens
+/// every message into one struct without subtype dispatch, so a gate can never
+/// misroute here — absence is `None`, never a rejection. Tightening this
+/// (e.g. requiring `<plaintext>`) would drop messages WA delivers.
 fn parse_newsletter_messages_response(
     response: &NodeRef<'_>,
 ) -> Result<Vec<NewsletterMessage>, NewsletterError> {
@@ -1546,6 +1552,23 @@ mod tests {
         let msgs = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].message_type, NewsletterMessageType::Text);
+    }
+
+    #[test]
+    fn test_message_without_plaintext_is_kept_with_no_payload() {
+        let response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("messages")
+                .children([NodeBuilder::new("message")
+                    .attr("server_id", "42")
+                    .attr("t", "1700000000")
+                    .attr("type", "text")
+                    .build()])
+                .build()])
+            .build();
+
+        let msgs = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].message.is_none());
     }
 
     #[test]

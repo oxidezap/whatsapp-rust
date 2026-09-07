@@ -15,6 +15,11 @@
 //! - **Message secrets**, one per call vs. a batch: the floor the write
 //!   buffer degenerates to when the backend keeps up with the producer.
 //!
+//! - **`n = 1` rows are smoke, not gates.** One row is dominated by fixed
+//!   per-call overhead (permit, `spawn_blocking`, commit, one cached
+//!   statement), so a few hundred bytes of absolute movement reads as a large
+//!   relative Memory delta. Gate on `n = 32/256`.
+//!
 //! One database per benchmark, opened once for the process and grown by every
 //! iteration.
 

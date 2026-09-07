@@ -2,7 +2,7 @@
 //! them) from the committed descriptor `proto/wire.desc`, compiled once from
 //! `proto/wire.proto`. Reading the descriptor means consumers never need
 //! `protoc`; editing the proto requires regenerating the descriptor via
-//! `scripts/regenerate-wire-desc.sh`.
+//! `cargo xt wire-desc`.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/wire.desc");
@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/wire.desc",
         "proto/wire.desc.sha256",
         "sqlite-storage (wire)",
-        "scripts/regenerate-wire-desc.sh",
+        "cargo xt wire-desc",
     )?;
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR must be set by cargo");

@@ -73,7 +73,7 @@ jobs:
       - name: Install ALSA dev headers
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Measure binary size
-        run: python3 scripts/ci/measure_binary_size.py --out-dir size-out
+        run: cargo xt ci measure-binary-size --out-dir size-out
 
       - name: Upload size artifacts
         uses: actions/upload-artifact@v7
@@ -86,22 +86,7 @@ jobs:
         id: baseline
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # --event push: a fork PR from a branch named "main" also matches
-          # --branch main, and its artifact must not become the baseline.
-          run_id=$(gh run list --workflow binary-size.yml --branch main \
-            --event push --status success --limit 1 --json databaseId \
-            --jq '.[0].databaseId' || true)
-          if [ -n "$run_id" ] && [ "$run_id" != "null" ]; then
-            if gh run download "$run_id" --name size-metrics --dir base-out; then
-              echo "dir=base-out" >> "$GITHUB_OUTPUT"
-            else
-              echo "Baseline artifact missing or expired on run $run_id"
-            fi
-          else
-            echo "No successful Binary Size run on main yet"
-          fi
-
+        run: cargo xt ci workflow size-baseline
       # Informational (job summary); the real gate is the report script below.
       # Tolerates the window before the first push run creates the series.
       - name: Compare against gh-pages series
@@ -124,50 +109,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          allow=$(gh api \
-            "repos/${{ github.repository }}/issues/${PR_NUMBER}/labels" \
-            --jq 'map(.name) | index("size-increase-ok") != null')
-          echo "allow=$allow" >> "$GITHUB_OUTPUT"
-
+        run: cargo xt ci workflow size-override
       # No GH_TOKEN here: the report script is PR-controlled code.
       - name: Generate report and evaluate gate
         env:
           BASE_DIR: ${{ steps.baseline.outputs.dir }}
           ALLOW_SIZE_INCREASE: ${{ steps.override.outputs.allow }}
         run: |
-          python3 scripts/ci/binary_size_report.py --head size-out \
-            ${BASE_DIR:+--base "$BASE_DIR"} --out-dir size-out
-          cat size-out/report.md >> "$GITHUB_STEP_SUMMARY"
-
+          cargo xt ci binary-size-report --head size-out --out-dir size-out
+          cargo xt ci workflow append-summary size-out/report.md
       # Fork PRs run with a read-only token, so they only get the job summary.
       - name: Post sticky PR comment
         if: github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          marker='<!-- binary-size-report -->'
-          cid=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-            --paginate \
-            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n1)
-          if [ -n "$cid" ]; then
-            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/${cid}" \
-              -F body=@size-out/report.md
-          else
-            gh api -X POST "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-              -F body=@size-out/report.md
-          fi
-
+        run: cargo xt ci workflow size-comment
       - name: Enforce size budget
-        run: |
-          status=$(head -n1 size-out/gate.txt)
-          if [ "$status" = "FAIL" ]; then
-            echo "::error::Binary size budget exceeded — see the job summary or PR comment. If the increase is expected, add the size-increase-ok label."
-            exit 1
-          fi
-          echo "Gate status: $status"
-
+        run: cargo xt ci workflow size-gate
   binary-size-push:
     # Dispatch only publishes from main so stray branches can't pollute the series.
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
@@ -214,7 +173,7 @@ jobs:
       - name: Install ALSA dev headers
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Measure binary size
-        run: python3 scripts/ci/measure_binary_size.py --out-dir size-out
+        run: cargo xt ci measure-binary-size --out-dir size-out
 
       # This artifact is the comparison baseline for PR runs.
       - name: Upload size artifacts

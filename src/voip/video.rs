@@ -7,9 +7,8 @@
 
 pub use wacore::voip::VideoFrame;
 
-/// One captured access unit with its 90 kHz RTP capture timestamp. The driver adds a private
-/// source generation when this crosses the facade boundary, so callers cannot forge generation
-/// ownership while replacing a source.
+/// One captured access unit with its 90 kHz RTP capture timestamp. This is the outbound source
+/// contract; received media uses [`VideoFrame`], which also carries keyframe and RTP metadata.
 #[derive(Debug, Clone)]
 pub struct TimedVideoFrame {
     pub data: Vec<u8>,
@@ -39,7 +38,9 @@ pub trait VideoSource: Send + Sync + 'static {
 }
 
 /// A video sink for a call: reassembled peer access units, with keyframe/orientation metadata.
-/// VoIP is loss tolerant, so the facade drops a frame if the sink can't keep up.
+/// Each frame also carries its 90 kHz RTP timestamp and the authoritative call generation
+/// stamped by the facade, so consumers can fence stale generations after a same-call-id
+/// replacement. VoIP is loss tolerant, so the facade drops a frame if the sink can't keep up.
 pub trait VideoSink: Send + Sync + 'static {
     /// The channel the facade writes received AUs to. Called once when video starts.
     fn playout(&self) -> async_channel::Sender<VideoFrame>;

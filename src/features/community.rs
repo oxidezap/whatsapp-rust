@@ -16,7 +16,7 @@ use log::warn;
 use thiserror::Error;
 use wacore::iq::groups::{
     CommunityParticipatingIq, DeleteCommunityIq, GetLinkedGroupsParticipantsIq, GroupCreateOptions,
-    JoinLinkedGroupIq, LinkSubgroupsIq, QueryLinkedGroupIq, UnlinkSubgroupsIq,
+    JoinGroupResult, JoinLinkedGroupIq, LinkSubgroupsIq, QueryLinkedGroupIq, UnlinkSubgroupsIq,
 };
 use wacore::iq::mex_operations::{fetch_all_subgroups, query_subgroup_participant_count};
 use wacore_binary::Jid;
@@ -41,6 +41,10 @@ pub enum CommunityError {
     /// The request was malformed or the server response was missing required data.
     #[error("invalid community request: {0}")]
     InvalidRequest(String),
+    /// The subgroup join was received but requires membership approval: the
+    /// caller is not in the group yet.
+    #[error("subgroup join requires membership approval: {0}")]
+    MembershipApprovalRequired(Jid),
 }
 
 // Types
@@ -434,6 +438,11 @@ impl<'a> Community<'a> {
     }
 
     /// Join a linked subgroup via the parent community.
+    ///
+    /// The join RPC itself carries no metadata (WA Web's success variants hold
+    /// no fields), so a joined result is followed by a metadata query. An
+    /// approval-pending join is reported rather than resolved: the caller is
+    /// not in the group, so there is no metadata to return.
     pub async fn join_subgroup(
         &self,
         community_jid: impl Into<Jid>,
@@ -441,11 +450,18 @@ impl<'a> Community<'a> {
     ) -> Result<GroupMetadata, CommunityError> {
         let community_jid = &community_jid.into();
         let subgroup_jid = &subgroup_jid.into();
-        let response = self
+        match self
             .client
             .execute(JoinLinkedGroupIq::new(community_jid, subgroup_jid))
-            .await?;
-        Ok(GroupMetadata::from(response))
+            .await?
+        {
+            JoinGroupResult::Joined(_) => {
+                self.query_linked_group(community_jid, subgroup_jid).await
+            }
+            JoinGroupResult::PendingApproval(jid) => {
+                Err(CommunityError::MembershipApprovalRequired(jid))
+            }
+        }
     }
 
     /// Get all participants across all linked groups of a community.

@@ -2800,7 +2800,7 @@ impl JoinLinkedGroupIq {
 }
 
 impl IqSpec for JoinLinkedGroupIq {
-    type Response = GroupInfoResponse;
+    type Response = JoinGroupResult;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let node = NodeBuilder::new("join_linked_group")
@@ -2815,9 +2815,33 @@ impl IqSpec for JoinLinkedGroupIq {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
-        let linked_node = required_child(response, "linked_group")?;
-        let group_node = required_child(linked_node, "group")?;
-        GroupInfoResponse::try_from_node_ref(group_node)
+        // Bare joins the request's own subgroup (same shape pair as the V4
+        // accept — see the generated shapes).
+        if response.content.is_none() {
+            return Ok(JoinGroupResult::Joined(self.subgroup_jid.clone()));
+        }
+        // Compatibility allowance, not a bundle shape: some servers answer
+        // with the query-shaped `<linked_group><group id/></linked_group>`
+        // metadata instead of the bare result. It carries a real group
+        // identity (the same `id` the query parser reads), so joining it
+        // cannot misreport a non-joined state — but only as the complete
+        // shape: siblings beside the wrapper (an approval request, unknown
+        // nodes) fall through to the strict parser below instead of being
+        // silently ignored.
+        //
+        // TODO: drop this allowance once servers answer the bare result and
+        // re-tighten to bare-or-approval only; the wrapper exists for a
+        // transitional server behavior, not the protocol.
+        if let Some([linked]) = response.children()
+            && linked.tag.as_ref() == "linked_group"
+            && let Some([group]) = linked.children()
+            && group.tag.as_ref() == "group"
+            && let Ok(id_str) = required_attr(group, "id")
+            && let Ok(jid) = parse_group_id(&id_str)
+        {
+            return Ok(JoinGroupResult::Joined(jid));
+        }
+        parse_join_group_response(response)
     }
 }
 
@@ -2902,11 +2926,17 @@ fn parse_group_id(id_str: &str) -> Result<Jid> {
     }
 }
 
+/// Child tags of the join-response shapes, shared by the strict parser and
+/// the bare-result fallbacks below so the two cannot drift apart.
+const JOIN_GROUP_CHILD: &str = "group";
+const JOIN_COMMUNITY_CHILD: &str = "community";
+const JOIN_APPROVAL_CHILD: &str = "membership_approval_request";
+
 /// Shared response parser for group join IQs (both code-based and V4 invite).
 fn parse_join_group_response(response: &NodeRef<'_>) -> Result<JoinGroupResult> {
     if let Some(group_node) = response
-        .get_optional_child("group")
-        .or_else(|| response.get_optional_child("community"))
+        .get_optional_child(JOIN_GROUP_CHILD)
+        .or_else(|| response.get_optional_child(JOIN_COMMUNITY_CHILD))
     {
         let jid_str = required_attr(group_node, "jid")?;
         let jid: Jid = jid_str
@@ -2914,16 +2944,29 @@ fn parse_join_group_response(response: &NodeRef<'_>) -> Result<JoinGroupResult> 
             .map_err(|e| anyhow!("invalid group jid: {e}"))?;
         return Ok(JoinGroupResult::Joined(jid));
     }
-    if let Some(approval_node) = response.get_optional_child("membership_approval_request") {
+    if let Some(approval_node) = response.get_optional_child(JOIN_APPROVAL_CHILD) {
         let jid_str = required_attr(approval_node, "jid")?;
         let jid: Jid = jid_str
             .parse()
             .map_err(|e| anyhow!("invalid group jid: {e}"))?;
         return Ok(JoinGroupResult::PendingApproval(jid));
     }
+    // NOTE: this message is matched downstream (bridge/baileyrs surfaces it);
+    // keep it byte-identical when touching the tags above.
     Err(anyhow!(
         "expected <group>, <community>, or <membership_approval_request> in join response"
     ))
+}
+
+/// Parse a join response that may be a bare `<iq type="result">`: with no
+/// content at all the join succeeded and the group is the request's own
+/// addressee (`fallback`); anything present but unrecognized falls through to
+/// the strict parser and fails loudly instead of reporting `Joined`.
+fn parse_join_or_bare(response: &NodeRef<'_>, fallback: &Jid) -> Result<JoinGroupResult> {
+    if response.content.is_none() {
+        return Ok(JoinGroupResult::Joined(fallback.clone()));
+    }
+    parse_join_group_response(response)
 }
 
 /// ```xml
@@ -3003,7 +3046,10 @@ impl IqSpec for AcceptGroupInviteV4Iq {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
-        parse_join_group_response(response)
+        // Bare joins the request's own `to` (`AcceptGroupAddResponseSuccess`
+        // in the generated shapes); the code-based join keeps the strict
+        // parser, whose bare result carries no group identity.
+        parse_join_or_bare(response, &self.group_jid)
     }
 }
 
@@ -5753,6 +5799,201 @@ mod tests {
         assert_eq!(
             accept.attrs().optional_string("admin").as_deref(),
             Some("5511999887766@s.whatsapp.net"),
+        );
+    }
+
+    const TEST_GROUP_JID: &str = "120363000000000042@g.us";
+    const TEST_PARENT_JID: &str = "120363000000000001@g.us";
+    const TEST_ADMIN_JID: &str = "5511999887766@s.whatsapp.net";
+    const TEST_INVITE_CODE: &str = "A1B2C3D4";
+    const TEST_INVITE_EXPIRATION: i64 = 1_700_000_123;
+
+    fn v4_spec() -> (Jid, AcceptGroupInviteV4Iq) {
+        let group_jid: Jid = TEST_GROUP_JID.parse().unwrap();
+        let admin_jid: Jid = TEST_ADMIN_JID.parse().unwrap();
+        let spec = AcceptGroupInviteV4Iq::new(
+            &group_jid,
+            TEST_INVITE_CODE,
+            TEST_INVITE_EXPIRATION,
+            &admin_jid,
+        );
+        (group_jid, spec)
+    }
+
+    /// `<iq type="result" from=...>` carrying `children` (empty means a bare
+    /// result: no content at all, not an empty child list).
+    fn result_iq(from: &str, children: Vec<Node>) -> Node {
+        let mut iq = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", from);
+        if !children.is_empty() {
+            iq = iq.children(children);
+        }
+        iq.build()
+    }
+
+    fn bare_join_result() -> Node {
+        result_iq(TEST_GROUP_JID, Vec::new())
+    }
+
+    fn approval_child(jid: &str) -> Node {
+        NodeBuilder::new(JOIN_APPROVAL_CHILD)
+            .attr("jid", jid)
+            .build()
+    }
+
+    /// Locks the parser above to the generated join-shape constants: if the next
+    /// sync flips them, this fails and the parser owes a re-read.
+    #[test]
+    fn test_join_success_shapes_match_the_ir_lock() {
+        use crate::iq::join_shapes;
+        assert_eq!(
+            join_shapes::ACCEPT_GROUP_ADD_SUCCESS,
+            &[
+                (
+                    "AcceptGroupAddResponseGroupJoinRequestSuccess",
+                    &["membership_approval_request"][..]
+                ),
+                ("AcceptGroupAddResponseSuccess", &[][..]),
+            ]
+        );
+    }
+
+    /// A bare result joins with the request's group JID.
+    #[test]
+    fn test_accept_group_invite_v4_bare_result_joins() {
+        let (group_jid, spec) = v4_spec();
+        let iq = bare_join_result();
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::Joined(group_jid));
+    }
+
+    /// Reject an unrecognized child.
+    #[test]
+    fn test_join_linked_group_unknown_child_is_rejected() {
+        let (_, spec) = linked_spec();
+        let iq = result_iq(
+            TEST_PARENT_JID,
+            vec![NodeBuilder::new("unexpected").build()],
+        );
+        assert!(spec.parse_response(&iq.as_node_ref()).is_err());
+    }
+
+    #[test]
+    fn test_join_linked_group_wrapper_with_sibling_is_not_enough() {
+        // The tolerance covers exactly the wrapper shape; an approval request
+        // beside it still reports pending, and any other sibling still fails.
+        let (subgroup, spec) = linked_spec();
+        let wrapper = NodeBuilder::new("linked_group")
+            .children([NodeBuilder::new(JOIN_GROUP_CHILD)
+                .attr("id", "120363000000000042")
+                .build()])
+            .build();
+        let approval = approval_child(TEST_GROUP_JID);
+        let iq = result_iq(TEST_PARENT_JID, vec![wrapper, approval]);
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::PendingApproval(subgroup));
+
+        let (_, spec) = linked_spec();
+        let wrapper = NodeBuilder::new("linked_group")
+            .children([NodeBuilder::new(JOIN_GROUP_CHILD)
+                .attr("id", "120363000000000042")
+                .build()])
+            .build();
+        let iq = result_iq(
+            TEST_PARENT_JID,
+            vec![wrapper, NodeBuilder::new("unexpected").build()],
+        );
+        assert!(spec.parse_response(&iq.as_node_ref()).is_err());
+    }
+
+    /// Reject scalar response content.
+    #[test]
+    fn test_accept_group_invite_v4_scalar_content_is_rejected() {
+        let (_, spec) = v4_spec();
+        let iq = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", TEST_GROUP_JID)
+            .apply_content(Some(NodeContent::String("unexpected payload".into())))
+            .build();
+        assert!(spec.parse_response(&iq.as_node_ref()).is_err());
+    }
+
+    #[test]
+    fn test_accept_group_invite_v4_group_child_still_joins() {
+        let (group_jid, spec) = v4_spec();
+        let group = NodeBuilder::new(JOIN_GROUP_CHILD)
+            .attr("jid", TEST_GROUP_JID)
+            .build();
+        let iq = result_iq(TEST_GROUP_JID, vec![group]);
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::Joined(group_jid));
+    }
+
+    #[test]
+    fn test_accept_group_invite_v4_approval_child_stays_pending() {
+        let (group_jid, spec) = v4_spec();
+        let iq = result_iq(TEST_GROUP_JID, vec![approval_child(TEST_GROUP_JID)]);
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::PendingApproval(group_jid));
+    }
+
+    fn linked_spec() -> (Jid, JoinLinkedGroupIq) {
+        let parent: Jid = TEST_PARENT_JID.parse().unwrap();
+        let subgroup: Jid = TEST_GROUP_JID.parse().unwrap();
+        let spec = JoinLinkedGroupIq::new(&parent, &subgroup);
+        (subgroup, spec)
+    }
+
+    /// Locks the linked-group join parser to its generated shapes: a bare
+    /// result and an approval-gated variant, like the V4 accept.
+    #[test]
+    fn test_join_linked_group_shapes_match_the_ir_lock() {
+        use crate::iq::join_shapes;
+        assert_eq!(
+            join_shapes::JOIN_LINKED_GROUP_SUCCESS,
+            &[
+                (
+                    "JoinLinkedGroupResponseGroupJoinRequestSuccess",
+                    &["membership_approval_request"][..]
+                ),
+                ("JoinLinkedGroupResponseSuccess", &[][..]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_join_linked_group_bare_result_joins_subgroup() {
+        let (subgroup, spec) = linked_spec();
+        let iq = result_iq(TEST_PARENT_JID, Vec::new());
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::Joined(subgroup));
+    }
+
+    #[test]
+    fn test_join_linked_group_approval_child_stays_pending() {
+        let (subgroup, spec) = linked_spec();
+        let iq = result_iq(TEST_PARENT_JID, vec![approval_child(TEST_GROUP_JID)]);
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::PendingApproval(subgroup));
+    }
+
+    #[test]
+    fn test_join_linked_group_linked_group_wrapper_is_tolerated() {
+        // Compatibility allowance: a query-shaped answer joins its inner group.
+        let (_, spec) = linked_spec();
+        let group = NodeBuilder::new(JOIN_GROUP_CHILD)
+            .attr("id", "120363000000000042")
+            .build();
+        let linked = NodeBuilder::new("linked_group")
+            .attr("jid", TEST_GROUP_JID)
+            .children([group])
+            .build();
+        let iq = result_iq(TEST_PARENT_JID, vec![linked]);
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(
+            result,
+            JoinGroupResult::Joined(TEST_GROUP_JID.parse().unwrap())
         );
     }
 }

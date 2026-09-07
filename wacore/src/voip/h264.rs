@@ -40,6 +40,10 @@ pub struct VideoFrame {
     pub device: Option<Jid>,
     /// Relay participant id from the authoritative roster.
     pub pid: Option<u32>,
+    /// RTP capture timestamp of the access unit (90 kHz video clock).
+    pub timestamp: u32,
+    /// Call media generation that produced this frame.
+    pub generation: u64,
 }
 
 impl VideoFrame {
@@ -52,6 +56,8 @@ impl VideoFrame {
             sender: None,
             device: None,
             pid: None,
+            timestamp: 0,
+            generation: 0,
         }
     }
 }
@@ -295,9 +301,8 @@ pub struct H264Depacketizer {
     au_timestamp: Option<u32>,
     /// Keeps a marker-completed AU closed when one of its packets arrives late.
     last_completed_timestamp: Option<u32>,
-    /// AUs completed this or a prior push but not yet handed back (drained one per
-    /// `push`), so a timestamp boundary coinciding with a marker never drops one.
-    ready: std::collections::VecDeque<Vec<u8>>,
+    /// AUs completed but not yet returned, paired with their RTP timestamps.
+    ready: std::collections::VecDeque<(u32, Vec<u8>)>,
 }
 
 impl H264Depacketizer {
@@ -310,15 +315,15 @@ impl H264Depacketizer {
         self.ready.clear();
     }
 
-    fn queue_ready(&mut self, au: Vec<u8>) {
+    fn queue_ready(&mut self, timestamp: u32, au: Vec<u8>) {
         if self.ready.len() >= H264_MAX_READY_AUS {
             self.ready.pop_front();
         }
-        self.ready.push_back(au);
+        self.ready.push_back((timestamp, au));
     }
 
-    /// Take another AU completed by the previous [`push`](Self::push).
-    pub fn pop_ready(&mut self) -> Option<Vec<u8>> {
+    /// Take another completed AU while preserving its RTP timestamp.
+    pub fn pop_ready(&mut self) -> Option<(u32, Vec<u8>)> {
         self.ready.pop_front()
     }
 
@@ -343,7 +348,7 @@ impl H264Depacketizer {
         timestamp: u32,
         payload: &[u8],
         marker: bool,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<(u32, Vec<u8>)> {
         if let Some(cur) = self.au_timestamp {
             if timestamp != cur {
                 // Signed wrap-aware compare (RFC 3550): a FORWARD jump begins a new AU, so flush the
@@ -351,22 +356,24 @@ impl H264Depacketizer {
                 // is a reordered packet from an already-past AU — discard it rather than flush the
                 // current partial as complete, which would corrupt video on normal reordering.
                 if (timestamp.wrapping_sub(cur) as i32) > 0 {
+                    // A timestamp boundary invalidates any partial FU, even when
+                    // no complete NAL has reached the access-unit buffer yet.
+                    self.drop_partial_fu();
                     if !self.au_buf.is_empty() {
-                        self.drop_partial_fu();
                         let au = std::mem::take(&mut self.au_buf);
-                        self.queue_ready(au);
+                        self.queue_ready(cur, au);
                     }
                     self.last_completed_timestamp = Some(cur);
                     self.au_timestamp = Some(timestamp);
                 } else {
-                    return self.ready.pop_front();
+                    return self.pop_ready();
                 }
             }
         } else {
             if let Some(completed) = self.last_completed_timestamp
                 && (timestamp.wrapping_sub(completed) as i32) <= 0
             {
-                return self.ready.pop_front();
+                return self.pop_ready();
             }
             self.au_timestamp = Some(timestamp);
         }
@@ -424,24 +431,14 @@ impl H264Depacketizer {
             // Type 0 (empty/garbage) and unsupported aggregation types are ignored.
             _ => {}
         }
-        if let Some(au) = self.flush_on(marker) {
-            self.queue_ready(au);
+        if marker && !self.au_buf.is_empty() {
+            self.drop_partial_fu();
+            let completed_timestamp = self.au_timestamp.take().unwrap_or(timestamp);
+            self.last_completed_timestamp = Some(completed_timestamp);
+            let au = std::mem::take(&mut self.au_buf);
+            self.queue_ready(completed_timestamp, au);
         }
-        // The caller must drain `pop_ready` immediately: a timestamp boundary and marker can finish
-        // two access units in one push.
-        self.ready.pop_front()
-    }
-
-    fn flush_on(&mut self, marker: bool) -> Option<Vec<u8>> {
-        if !marker {
-            return None;
-        }
-        self.drop_partial_fu();
-        self.last_completed_timestamp = self.au_timestamp.take();
-        if self.au_buf.is_empty() {
-            return None;
-        }
-        Some(std::mem::take(&mut self.au_buf))
+        self.pop_ready()
     }
 }
 
@@ -531,7 +528,7 @@ mod tests {
         let mut au = None;
         // All packets of one AU share a timestamp.
         for (i, p) in payloads.enumerate() {
-            if let Some(got) = d.push(i as u16, 9000, p, i == last) {
+            if let Some((_, got)) = d.push(i as u16, 9000, p, i == last) {
                 au = Some(got);
             }
         }
@@ -750,6 +747,26 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_change_clears_incomplete_fu_before_middle_fragment() {
+        let au = au_from_nals(&[nal(5, 2500)]);
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&au, &mut payloads);
+        assert!(payloads.len() >= 3);
+
+        let mut d = H264Depacketizer::default();
+        assert_eq!(d.push(0, 1000, &payloads[0], false), None);
+        // A middle fragment from a new AU must not inherit the old FU.
+        assert_eq!(d.push(1, 2000, &payloads[1], false), None);
+        assert_eq!(d.push(2, 2000, &payloads[2], true), None);
+
+        let next = nal(1, 40);
+        assert_eq!(
+            d.push(3, 3000, &next, true),
+            Some((3000, au_from_nals(&[next])))
+        );
+    }
+
+    #[test]
     fn lost_end_fragment_discards_partial_and_keeps_next_nal() {
         let au = au_from_nals(&[nal(5, 2000)]);
         let mut payloads = PacketizedAu::default();
@@ -765,7 +782,7 @@ mod tests {
         let got = d
             .push(100, 13000, &tail, true)
             .expect("fresh NAL must flush");
-        assert_eq!(got, au_from_nals(&[tail]));
+        assert_eq!(got, (13000, au_from_nals(&[tail])));
     }
 
     #[test]
@@ -808,17 +825,13 @@ mod tests {
         let flushed = d
             .push(2, 2000, &b1, false)
             .expect("a new timestamp must flush the previous AU whose marker was lost");
-        assert_eq!(
-            flushed,
-            au_from_nals(&[a1]),
-            "the flushed AU is the buffered first frame, not a merge of both"
-        );
+        assert_eq!(flushed, (1000, au_from_nals(&[a1])));
         // AU2 completes normally on its marker.
         let b2 = nal(5, 30);
         let au2 = d
             .push(3, 2000, &b2, true)
             .expect("AU2 completes on its marker");
-        assert_eq!(au2, au_from_nals(&[b1, b2]));
+        assert_eq!(au2, (2000, au_from_nals(&[b1, b2])));
     }
 
     // A reordered packet from an OLDER timestamp must not flush the current AU as complete: it is
@@ -829,7 +842,7 @@ mod tests {
         // AU1 @ ts 1000 completes cleanly.
         let a1 = nal(1, 20);
         let want_a1 = au_from_nals(std::slice::from_ref(&a1));
-        assert_eq!(d.push(0, 1000, &a1, true), Some(want_a1));
+        assert_eq!(d.push(0, 1000, &a1, true), Some((1000, want_a1)));
         // AU2 @ ts 2000 starts (first of two packets, no marker yet).
         let b1 = nal(1, 30);
         assert_eq!(d.push(1, 2000, &b1, false), None);
@@ -845,7 +858,7 @@ mod tests {
         let b2 = nal(5, 25);
         assert_eq!(
             d.push(3, 2000, &b2, true),
-            Some(au_from_nals(&[b1, b2])),
+            Some((2000, au_from_nals(&[b1, b2]))),
             "the in-progress AU survives the reordered packet and completes on its marker"
         );
     }
@@ -856,7 +869,7 @@ mod tests {
         let completed = nal(5, 20);
         assert_eq!(
             d.push(10, 1000, &completed, true),
-            Some(au_from_nals(std::slice::from_ref(&completed)))
+            Some((1000, au_from_nals(std::slice::from_ref(&completed))))
         );
 
         let late = nal(1, 15);
@@ -864,7 +877,7 @@ mod tests {
         let next = nal(1, 25);
         assert_eq!(
             d.push(11, 2000, &next, true),
-            Some(au_from_nals(std::slice::from_ref(&next))),
+            Some((2000, au_from_nals(std::slice::from_ref(&next)))),
             "a late packet from the completed timestamp must not leak into the next AU"
         );
     }
@@ -882,11 +895,11 @@ mod tests {
         let first = d
             .push(1, 2000, &b1, true)
             .expect("boundary flush returns AU1");
-        assert_eq!(first, au_from_nals(&[a1]));
+        assert_eq!(first, (1000, au_from_nals(&[a1])));
         let second = d
             .pop_ready()
             .expect("the second completed AU is ready without another packet");
-        assert_eq!(second, au_from_nals(&[b1]));
+        assert_eq!(second, (2000, au_from_nals(&[b1])));
         assert_eq!(d.pop_ready(), None);
     }
 

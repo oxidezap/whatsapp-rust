@@ -414,7 +414,11 @@ mod tests {
     #[test]
     fn hp_postfilter_matches_c() {
         const I16_LSB: f32 = 1.0 / 32768.0;
-        let data = include_bytes!("testdata/hp_postfilter_vectors.raw");
+        let unpacked = crate::voip::mlow::fixture::inflate(include_bytes!(
+            "testdata/hp_postfilter_vectors.raw.zst"
+        ))
+        .expect("C postfilter archive");
+        let data = unpacked.as_slice();
         let mut o = 0usize;
         let count = ri32(data, &mut o);
         let mut worst = 0f32;
@@ -478,5 +482,60 @@ mod tests {
             worst < I16_LSB,
             "hp_postfilter diverges from reference by {worst:.2e} (>= i16 LSB {I16_LSB:.2e})"
         );
+    }
+    #[test]
+    fn hp_postfilter_matches_shipped_wasm() {
+        let records: serde_json::Value = crate::voip::mlow::fixture::decode(include_bytes!(
+            "testdata/wasm_hp_postfilter.cbor.zst"
+        ))
+        .expect("wasm HP postfilter");
+        let records = records.as_array().unwrap();
+        assert_eq!(records.len(), 330);
+        let floats = |v: &serde_json::Value| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect::<Vec<_>>()
+        };
+        for (i, r) in records.iter().enumerate() {
+            let state = floats(&r["state_in"]);
+            let mut state = seed_state(
+                state[0],
+                state[1],
+                state[2..6].try_into().unwrap(),
+                state[6],
+                state[7..327].try_into().unwrap(),
+                state[327..330].try_into().unwrap(),
+                state[330..333].try_into().unwrap(),
+            );
+            let input = floats(&r["input"]);
+            let mut out = vec![0.0; FRAME_LEN];
+            smpl_hp_postfilter(
+                &mut state,
+                &input,
+                FRAME_LEN,
+                r["lag"].as_f64().unwrap() as f32,
+                &mut out,
+            );
+            let mut next_state = vec![state.state_lo_emph1, state.state_lo_emph2];
+            next_state.extend(state.state_hp);
+            next_state.push(state.lag_old);
+            next_state.extend(state.x_old);
+            next_state.extend(state.coef_ma);
+            next_state.extend(state.coef_ar);
+            for (got, want) in next_state.iter().zip(floats(&r["state_out"])) {
+                assert!(
+                    (got - want).abs() < 1.0 / 32768.0,
+                    "frame {i}: HP state {got} vs {want}"
+                );
+            }
+            for (got, want) in out.iter().zip(floats(&r["output"])) {
+                assert!(
+                    (got - want).abs() < 1.0 / 32768.0,
+                    "frame {i}: HP output {got} vs {want}"
+                );
+            }
+        }
     }
 }

@@ -541,4 +541,71 @@ mod ground_truth_tests {
             assert_eq!(cav, c_cav, "pkt {pkt} frame {frame}: cav mismatch");
         }
     }
+
+    // The shipped encoder's own voice-activity routing, derived with
+    // `oracle derive --spec specs/mlow_110frames.json` in unwasm (see
+    // PROVENANCE.md): per 960-sample packet, `cav` is 0 for DTX (`0x10`)
+    // and 1 otherwise — hangover frames (`0x12`) count as active, matching
+    // the decoder's own routing (see the DTX-off test in decoder.rs) and
+    // the encoder's internal active/inactive counters. Our SILK VAD must
+    // route the same packets the same way, over the whole stream — the C
+    // ground truth above only covers a truncated prefix.
+    #[test]
+    fn vad_matches_wasm_routing() {
+        let raw = include_bytes!("testdata/synth_mic.raw");
+        let samples: Vec<i16> = raw
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let gt: Value = serde_json::from_str(include_str!("testdata/wasm_derived_vad.json"))
+            .expect("wasm_derived_vad.json");
+        let gt = gt.as_array().expect("array");
+
+        let mut vad = SmplVadState::new();
+        let mut n_active = 0usize;
+        for (pkt, chunk) in samples.chunks(960).enumerate() {
+            if chunk.len() < 960 {
+                break;
+            }
+            let r = vad.process_packet(chunk, 320);
+            let rec = &gt[pkt];
+            let w_cav = rec["cav"].as_i64().unwrap() as i32;
+            assert_eq!(
+                r.coded_as_active_voice as i32, w_cav,
+                "pkt {pkt}: cav mismatch against shipped routing"
+            );
+            n_active += w_cav as usize;
+        }
+        assert_eq!(gt.len(), 110, "vector must cover the whole synth stream");
+        assert_eq!(
+            n_active, 99,
+            "routing must retain 99 active / 11 inactive packets"
+        );
+    }
+    #[test]
+    fn speech_activity_matches_shipped_wasm() {
+        let records: Value = crate::voip::mlow::fixture::decode(include_bytes!(
+            "testdata/wasm_signal_mode.cbor.zst"
+        ))
+        .expect("wasm speech activity");
+        let records = records.as_array().unwrap();
+        let samples: Vec<i16> = include_bytes!("testdata/synth_mic.raw")
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        let mut vad = SmplVadState::new();
+        assert_eq!(records.len(), 330);
+        for (packet, pcm) in samples.chunks_exact(960).enumerate() {
+            let result = vad.process_packet(pcm, 320);
+            for internal in 0..3 {
+                let expected = records[packet * 3 + internal]["sp_act_prob"]
+                    .as_f64()
+                    .unwrap() as f32;
+                assert_eq!(
+                    result.vad_results[internal], expected,
+                    "packet {packet}, frame {internal}: speech activity"
+                );
+            }
+        }
+    }
 }

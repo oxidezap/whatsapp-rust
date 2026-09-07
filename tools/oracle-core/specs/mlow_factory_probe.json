@@ -1,0 +1,66 @@
+{
+  "comment": [
+    "Trap-driven probe: is the opus codec factory live right after ctors,",
+    "i.e. can opus_alloc_codec run without the media endpoint? Reads the",
+    "globals its body touches: 1377164 (factory), 1377184/1377188 (pool),",
+    "1377192/1377196 (codec list)."
+  ],
+  "module": {
+    "id": "JgwtTQVeWPm",
+    "sha256": "97259423aea19cc30c1771478e035105cb0d0e64ab4b0297741b62d01deac8db",
+    "size": 10650934
+  },
+  "functions": {
+    "opus_alloc": {
+      "index_hint": 6655,
+      "must_hold_string": "opus_alloc_codec"
+    },
+    "opus_open": {
+      "index_hint": 6658,
+      "must_hold_string": "opus_codec_open"
+    }
+  },
+  "steps": [
+    {
+      "op": "instantiate"
+    },
+    {
+      "op": "run_ctors"
+    },
+    {
+      "op": "read_u32",
+      "ptr": 1377164,
+      "as": "factory"
+    },
+    {
+      "op": "read_u32",
+      "ptr": 1377184,
+      "as": "pool"
+    },
+    {
+      "op": "read_u32",
+      "ptr": 1377188,
+      "as": "pool2"
+    },
+    {
+      "op": "read_u32",
+      "ptr": 1377192,
+      "as": "list"
+    },
+    {
+      "op": "read_u32",
+      "ptr": 1377196,
+      "as": "list_head"
+    },
+    {
+      "op": "print",
+      "regs": [
+        "$factory",
+        "$pool",
+        "$pool2",
+        "$list",
+        "$list_head"
+      ]
+    }
+  ]
+}

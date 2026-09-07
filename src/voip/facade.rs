@@ -3191,20 +3191,25 @@ async fn attach_engine(
     // actually goes missing, and it is the last boundary that still knows a picture was lost -- past
     // here the consumer's channel is opaque to us.
     let keyframe_recovery = video_shared.ctl_tx.clone();
+    // Authoritative call generation, stamped here so a same-call-id replacement's frames never
+    // masquerade as this call's: the engine leaves `generation` at zero and only this boundary
+    // knows the registry generation. Never replaced by per-source or arrival metadata.
+    let media_generation = generation;
     let video_out_feed = client.runtime.spawn(Box::pin(async move {
-        while let Ok(frame) = video_out_rx.recv().await {
+        while let Ok(mut frame) = video_out_rx.recv().await {
+            frame.generation = media_generation;
             let tx = sink_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            if let Some(tx) = tx {
-                // Loss tolerant, like the speaker: a stalled sink sheds frames.
-                // Only `Full` is a shed worth recovering from -- a closed sink is
-                // a consumer that has gone away, and asking it for a keyframe an
-                // interval until the call ends buys the peer nothing but its
-                // largest frame.
-                if let Err(async_channel::TrySendError::Full(_)) = tx.try_send(frame) {
-                    keyframe_recovery.send(VideoControl::RequestPeerKeyframe(
-                        KeyframeUrgency::Coalesced,
-                    ));
-                }
+            // Loss tolerant, like the speaker: a stalled sink sheds frames.
+            // Only `Full` is a shed worth recovering from -- a closed sink is
+            // a consumer that has gone away, and asking it for a keyframe an
+            // interval until the call ends buys the peer nothing but its
+            // largest frame.
+            if let Some(tx) = tx
+                && let Err(async_channel::TrySendError::Full(_)) = tx.try_send(frame)
+            {
+                keyframe_recovery.send(VideoControl::RequestPeerKeyframe(
+                    KeyframeUrgency::Coalesced,
+                ));
             }
         }
     }));

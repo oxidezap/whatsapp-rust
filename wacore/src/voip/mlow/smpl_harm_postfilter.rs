@@ -22,8 +22,16 @@ const HARM_DELAY: usize = LAG_SUBFR_LEN; // SMPL_HARM_POSTF_DELAY
 #[cfg(test)]
 pub(crate) const TOT_POSTFILT_DELAY: usize = FB_DELAY + HARM_DELAY; // 48
 const PITCH_NUM_SUBFRAMES: usize = 8;
-const FB_STRENGTH: f32 = 0.4734;
-const STRENGTH: f32 = 0.6438;
+// J#10726: feedback 0.4 (0x3ecccccd), comb strength 0.713 (0x3f36872b).
+#[derive(Clone, Copy)]
+struct HarmTuning {
+    feedback: f32,
+    strength: f32,
+}
+const SHIPPED_TUNING: HarmTuning = HarmTuning {
+    feedback: 0.4,
+    strength: 0.713,
+};
 const CUTOFF_HZ: f32 = 4000.0;
 const NHARM_CUTOFF: f32 = 6.3;
 const REDUCTION_FAC: f32 = 0.0579;
@@ -159,6 +167,7 @@ fn harm_postfilter_core(
     l: usize,
     fb_strength: f32,
     prev_did_filter: &mut i32,
+    tuning: HarmTuning,
 ) {
     let tables = harm_tables();
     let lag_u = lag as usize;
@@ -188,7 +197,7 @@ fn harm_postfilter_core(
         let high_lag_reduction = 1.0
             - REDUCTION_FAC
                 * ((lag - MIN_PITCH_LAG) as f32 / (MAX_PITCH_LAG - MIN_PITCH_LAG) as f32);
-        let strength = strength * high_lag_reduction * STRENGTH;
+        let strength = strength * high_lag_reduction * tuning.strength;
         for i in 0..l {
             out[out_off + i] *= 0.5 * strength;
         }
@@ -244,6 +253,26 @@ pub(crate) fn smpl_harm_postfilter(
     n_lags: usize,
     normalized_bitrate: f32,
 ) {
+    harm_postfilter_with_tuning(
+        st,
+        x,
+        x_len,
+        lags,
+        n_lags,
+        normalized_bitrate,
+        SHIPPED_TUNING,
+    );
+}
+
+fn harm_postfilter_with_tuning(
+    st: &mut HarmPostfilterState,
+    x: &mut [f32],
+    x_len: usize,
+    lags: &[f32],
+    n_lags: usize,
+    normalized_bitrate: f32,
+    tuning: HarmTuning,
+) {
     debug_assert_eq!(x_len, n_lags * LAG_SUBFR_LEN);
     // diff buffer with 16 samples of history prefix: backing is FRAME_LEN + 2*FB_DELAY, diff starts at +2*FB_DELAY.
     const DIFF_PREFIX: usize = 2 * FB_DELAY;
@@ -254,7 +283,7 @@ pub(crate) fn smpl_harm_postfilter(
     let comb_cur = MAX_PITCH_LAG as usize + HARM_DELAY;
     st.state_comb[comb_cur..comb_cur + x_len].copy_from_slice(&x[..x_len]);
 
-    let fb_strength = 1.0 - FB_STRENGTH * normalized_bitrate;
+    let fb_strength = 1.0 - tuning.feedback * normalized_bitrate;
     let mut offset1 = 0usize;
 
     let mut lag_ctr = 0usize;
@@ -279,6 +308,7 @@ pub(crate) fn smpl_harm_postfilter(
                 LAG_SUBFR_LEN,
                 fb_strength,
                 &mut st.prev_did_filter,
+                tuning,
             );
             offset1 += LAG_SUBFR_LEN;
             offset2 += LAG_SUBFR_LEN;
@@ -326,7 +356,11 @@ mod tests {
         const I16_LSB: f32 = 1.0 / 32768.0;
         // The voiced→silence transition zero-input response under -ffast-math; bulk stays under I16_LSB.
         const TRANSITION_TOL: f32 = 6.0e-4;
-        let data = include_bytes!("testdata/harm_postfilter_vectors.raw");
+        let unpacked = crate::voip::mlow::fixture::inflate(include_bytes!(
+            "testdata/harm_postfilter_vectors.raw.zst"
+        ))
+        .expect("C postfilter archive");
+        let data = unpacked.as_slice();
         let mut o = 0usize;
         let count = ri32(data, &mut o);
         let mut st = HarmPostfilterState::default();
@@ -352,7 +386,19 @@ mod tests {
             // A silent packet (lag0 == 0) carries the transition zero-input response in its first 48
             // samples; everywhere else is the i16-exact regime.
             let transition = lags[0] == 0.0;
-            smpl_harm_postfilter(&mut st, &mut inp, plen, &lags, nlags, nbr);
+            // The C audit corpus predates the shipped tuning.
+            harm_postfilter_with_tuning(
+                &mut st,
+                &mut inp,
+                plen,
+                &lags,
+                nlags,
+                nbr,
+                HarmTuning {
+                    feedback: 0.4734,
+                    strength: 0.6438,
+                },
+            );
             for i in 0..plen {
                 let d = (inp[i] - cout[i]).abs();
                 worst = worst.max(d);
@@ -373,5 +419,67 @@ mod tests {
             worst < TRANSITION_TOL,
             "harm_postfilter transition residual {worst:.2e} exceeds tolerance {TRANSITION_TOL:.2e}"
         );
+    }
+    #[test]
+    fn harm_postfilter_matches_shipped_wasm() {
+        let records: serde_json::Value = crate::voip::mlow::fixture::decode(include_bytes!(
+            "testdata/wasm_harm_postfilter.cbor.zst"
+        ))
+        .expect("wasm harmonic postfilter");
+        let records = records.as_array().unwrap();
+        assert_eq!(records.len(), 110);
+        let floats = |v: &serde_json::Value| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect::<Vec<_>>()
+        };
+        for (i, r) in records.iter().enumerate() {
+            let initial = floats(&r["state_in"]);
+            let mut state = HarmPostfilterState {
+                state1: initial[..16].try_into().unwrap(),
+                lpcoefs: initial[16..33].try_into().unwrap(),
+                state_comb: initial[33..2313].to_vec(),
+                prev_lag: initial[2313] as i32,
+                prev_did_filter: initial[2314] as i32,
+            };
+            let mut out = floats(&r["input"]);
+            let lags = floats(&r["lags"]);
+            smpl_harm_postfilter(
+                &mut state,
+                &mut out,
+                960,
+                &lags,
+                24,
+                r["norm_br"].as_f64().unwrap() as f32,
+            );
+            let expected_state = floats(&r["state_out"]);
+            assert_eq!(
+                state.prev_lag, expected_state[2313] as i32,
+                "packet {i}: previous lag"
+            );
+            assert_eq!(
+                state.prev_did_filter, expected_state[2314] as i32,
+                "packet {i}: filter state"
+            );
+            let state_values = state
+                .state1
+                .iter()
+                .chain(state.lpcoefs.iter())
+                .chain(state.state_comb.iter());
+            for (got, want) in state_values.zip(&expected_state[..2313]) {
+                assert!(
+                    (got - want).abs() < 6e-4,
+                    "packet {i}: harmonic state {got} vs {want}"
+                );
+            }
+            for (got, want) in out.iter().zip(floats(&r["output"])) {
+                assert!(
+                    (got - want).abs() < 6e-4,
+                    "packet {i}: harmonic output {got} vs {want}"
+                );
+            }
+        }
     }
 }

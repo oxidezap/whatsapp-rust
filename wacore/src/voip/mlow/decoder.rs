@@ -831,6 +831,55 @@ mod tests {
         );
     }
 
+    /// Same DTX-off property as above, but both halves come from the shipped
+    /// engine (`oracle derive --spec specs/mlow_110frames.json` in unwasm;
+    /// see PROVENANCE.md): the `0x10` frames it encoded over the silent
+    /// stretches must decode (here) to audio matching what it decoded
+    /// itself. The per-frame RMS check also covers near-silent intervals,
+    /// where a correlation coefficient alone is not meaningful.
+    #[test]
+    fn wasm_derived_dtx_frames_decode_to_audio() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/wasm_derived_frames.json"))
+                .expect("wasm_derived_frames.json");
+        let refp: Vec<f32> = include_bytes!("testdata/wasm_derived_ref.raw")
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect();
+
+        let mut dec = MlowDecoder::new();
+        let mut n_dtx = 0usize;
+        let mut n_audible = 0usize;
+        for (k, hex_frame) in frames.iter().enumerate() {
+            let frame = hex::decode(hex_frame).unwrap();
+            let out = dec.decode(&frame);
+            if frame[0] & 0xC2 != 0 {
+                continue;
+            }
+            n_dtx += 1;
+            assert!(!out.is_empty(), "frame {k}: DTX frame decoded empty");
+            let expected = &refp[k * 960..(k + 1) * 960];
+            let rms = |v: &[f32]| {
+                (v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / v.len() as f64).sqrt()
+            };
+            let (e_out, e_ref) = (rms(&out), rms(expected));
+            if e_ref < 0.005 {
+                assert!(
+                    e_out < 0.02,
+                    "frame {k}: silent ref decoded loud at {e_out:.4}"
+                );
+                continue;
+            }
+            n_audible += 1;
+            assert!(
+                e_out > e_ref * 0.5,
+                "frame {k}: DTX frame decoded to {e_out:.5} rms against ref {e_ref:.5}"
+            );
+        }
+        assert!(n_dtx > 0, "fixture lost its DTX frames");
+        assert!(n_audible > 0, "no audible DTX reference to compare against");
+    }
+
     /// A stream that ends where it claims to must be accepted. This is the guard against the
     /// endpoint check being too strict: the synthetic 120 ms vector is a well-formed six-frame
     /// packet, and rejecting it would silence audio that decodes correctly.
@@ -946,7 +995,7 @@ mod tests {
             pcm_bytes,
             frames.len() * 6 * SMPL_INTF_LEN * 2,
             "reference PCM does not match the frame count; regenerate both halves together with \
-             scripts/regenerate-mlow-vectors.sh"
+             cargo xt mlow c-reference"
         );
     }
 
@@ -987,6 +1036,47 @@ mod tests {
         }
         let corr = sxy / (sxx * syy).sqrt();
         assert!(corr > 0.999, "lag-0 corr {corr:.6} vs reference");
+    }
+
+    /// Same shape as above, but both halves come from the shipped engine
+    /// (`oracle derive --spec specs/mlow_120ms.json` in unwasm; see
+    /// PROVENANCE.md): 8 120 ms packets it encoded itself, plus the PCM it
+    /// decoded back. Correlation (not 0.999): our decoder and theirs agree
+    /// closely on the same packets without sharing lineage — the 0.9874
+    /// measured atlock time is the number to beat, with margin.
+    #[test]
+    fn wasm_derived_120ms_decode_matches_wasm_reference() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/wasm_derived_120ms_frames.json"))
+                .expect("wasm_derived_120ms_frames.json");
+        let refp: Vec<f32> = include_bytes!("testdata/wasm_derived_120ms_ref.raw")
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect();
+
+        let mut dec = MlowDecoder::new();
+        let mut out: Vec<f32> = Vec::new();
+        for hex_frame in &frames {
+            let frame = hex::decode(hex_frame).unwrap();
+            assert_eq!(frame[0], 0x58, "the fixture must stay 120 ms packets");
+            out.extend_from_slice(&dec.decode(&frame));
+        }
+        assert_eq!(out.len(), refp.len(), "decode length vs reference");
+
+        let n = refp.len();
+        let (mr, mo) = (
+            refp.iter().map(|&v| v as f64).sum::<f64>() / n as f64,
+            out.iter().map(|&v| v as f64).sum::<f64>() / n as f64,
+        );
+        let (mut sxy, mut sxx, mut syy) = (0f64, 0f64, 0f64);
+        for i in 0..n {
+            let (dr, dz) = (refp[i] as f64 - mr, out[i] as f64 - mo);
+            sxy += dr * dz;
+            sxx += dr * dr;
+            syy += dz * dz;
+        }
+        let corr = sxy / (sxx * syy).sqrt();
+        assert!(corr > 0.95, "lag-0 corr {corr:.6} vs shipped reference");
     }
 
     /// Decoding a multi-frame packet must leave the cross-frame predictor usable: a real 60 ms frame

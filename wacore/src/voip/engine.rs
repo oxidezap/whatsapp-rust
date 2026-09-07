@@ -3009,7 +3009,7 @@ impl CallEngine {
                     now,
                     VIDEO_CLOCK_RATE,
                 );
-                for au in completed {
+                for (timestamp, au) in completed {
                     let keyframe = au_is_keyframe(&au);
                     self.outbox.push_back(Output::VideoPlayout(VideoFrame {
                         data: au,
@@ -3018,6 +3018,8 @@ impl CallEngine {
                         sender: None,
                         device: None,
                         pid: None,
+                        timestamp,
+                        generation: 0,
                     }));
                 }
             }
@@ -3414,7 +3416,7 @@ impl CallEngine {
                 .or_else(|| group.video_orientations.get(&video.user_jid))
                 .copied()
                 .unwrap_or_default();
-            for access_unit in video.access_units {
+            for (timestamp, access_unit) in video.access_units {
                 let keyframe = au_is_keyframe(&access_unit);
                 self.outbox.push_back(Output::VideoPlayout(VideoFrame {
                     data: access_unit,
@@ -3423,6 +3425,8 @@ impl CallEngine {
                     sender: Some(video.user_jid.clone()),
                     device: Some(video.device_jid.clone()),
                     pid: video.pid,
+                    timestamp,
+                    generation: 0,
                 }));
             }
             return;
