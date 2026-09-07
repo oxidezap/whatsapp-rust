@@ -128,6 +128,63 @@ and `0x01` values. The oracle does not decode camera pixels, parse a live
 laptop SPS, run networking, or replace a browser-to-Android visual retest.
 No proprietary WASM, captured JS, or personal data belongs in the test commit.
 
+## Camera-control execution boundary
+
+`tools/oracle-core/tests/camera_controls.rs` executes the J capture above and
+the S capture for the clock callback.
+These tests require a capture and fail if it is missing. Run them explicitly:
+
+```sh
+WA_WASM_DIR=/path/to/captured-wasm cargo test --release -p oracle-core --test camera_controls -- --ignored --test-threads=1 --nocapture
+```
+
+The first test calls J's clock callback at table slot 7708, function 10363,
+and S's at slot 7923, function 10650. Both capture and body hashes are checked.
+J's encoded-body SHA-256 is
+`5563de8f88fefc7c6f88a08ec53d9d1ff918c62e88b1b33a79d00e07f6122742`.
+It must return advancing millisecond wall time, not the integer `1` that the
+host previously supplied as a supposed capability check.
+
+The captured glue in bundle
+`76b6b49b34591d742f3631ff4141f54a966eb35a60677357f2cdd472c736a161`
+defines S's EM_ASM 1336996 as `Date.now()`. Its other entry, 1337019,
+logs two double-precision timestamp-calibration offsets. J's corresponding
+addresses are 1324292 and 1324315. The clock wrappers and calibration bodies
+were inspected in both binaries. J function 10365 and S function 10652 have
+the same 53-instruction control flow with relocated addresses and type IDs.
+The automatic fingerprint carrier does not match this pair, so this is a
+manual structural comparison, not a claimed successful fingerprint carry.
+J's calibration body hash is
+`85dc769226de44834ac972e7fcea1f4a8e47ab66ffbe72f4aecdb2eaac3570df`.
+The host dispatch remains gated by each capture's data-section hash.
+
+Before the host correction, origination trapped on unsupported EM_ASM 1324315.
+After it, the second test originates a video call through `startVoipCall`,
+observes the real calibration callback, then calls `setCallVideoMute` twice.
+Instrumentation only records function entries and arguments. No guest
+function, return value or call-state field is replaced.
+
+The measured stop calls `call_pause_video` with direction 1 and state 6.
+Resume calls `call_resume_video` with direction 1. The self participant moves
+from Enabled to Stopped and back to Enabled while the peer remains Enabled.
+Camera capture stops once and restarts. The test checks every observed stub
+against its explicit host-boundary list.
+
+**This remains a ringing-call test.** The call stays in Calling, and the peer
+decoder and renderer have never started. Stop returns 70020 because the
+engine refuses to send a video-state stanza in lonely state; resume returns
+zero. Only the original offer reaches the signaling callback. These outcomes
+are asserted rather than counted as successful established-call signaling.
+
+An exploratory synthetic accept reached the message parser but failed device
+JID conversion with 70004. Passing a call wrapper first failed with 70012
+because this entry expects the action node itself. Neither attempt established
+media, and neither is conformance evidence. The remaining required cases are
+an established call with inbound frames surviving local stop/resume, peer
+Stopped with both downgrade conditions, and cancellation during a pending
+video upgrade. Production `stop_video`, source/sink ownership and upgrade
+signaling must not be changed on the strength of this ringing test alone.
+
 ## CI shape
 
 Future fixtures should have one producer command under `cargo xt oracle` that

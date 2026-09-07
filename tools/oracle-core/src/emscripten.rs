@@ -581,15 +581,16 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
     linker.func_wrap(
         "env",
         "emscripten_asm_const_int",
-        |mut caller: Caller<'_, HostState>, code: i32, _sig: i32, _args: i32| {
-            answer_asm_const(&mut caller, "emscripten_asm_const_int", code)
+        |mut caller: Caller<'_, HostState>, code: i32, sig: i32, args: i32| {
+            answer_asm_const(&mut caller, "emscripten_asm_const_int", code, sig, args)
+                .map(|value| value as i32)
         },
     )?;
     linker.func_wrap(
         "env",
         "emscripten_asm_const_double",
-        |mut caller: Caller<'_, HostState>, code: i32, _sig: i32, _args: i32| {
-            answer_asm_const(&mut caller, "emscripten_asm_const_double", code).map(f64::from)
+        |mut caller: Caller<'_, HostState>, code: i32, sig: i32, args: i32| {
+            answer_asm_const(&mut caller, "emscripten_asm_const_double", code, sig, args)
         },
     )?;
 
@@ -836,7 +837,9 @@ fn answer_asm_const(
     caller: &mut Caller<'_, HostState>,
     symbol: &str,
     code: i32,
-) -> Result<i32, wasmtime::Error> {
+    sig: i32,
+    args: i32,
+) -> Result<f64, wasmtime::Error> {
     crate::state::sync_memory(caller);
     let state = caller.data();
     state.record("env", symbol, vec![code as i64]);
@@ -844,7 +847,7 @@ fn answer_asm_const(
         .read_cstr(code as u32)
         .map_err(|error| wasmtime::Error::msg(format!("read EM_ASM index {code}: {error}")))?;
     if snippet.is_empty() {
-        return answer_em_asm_index(
+        let answer = answer_em_asm_index(
             state.shared.module_data_sha256.get().map(String::as_str),
             code,
         )
@@ -852,23 +855,70 @@ fn answer_asm_const(
             wasmtime::Error::msg(format!(
                 "unsupported EM_ASM index {code} with no embedded source"
             ))
-        });
+        })?;
+        return match answer {
+            AsmConstAnswer::Constant(value) => Ok(f64::from(value)),
+            AsmConstAnswer::WallClock => {
+                if symbol != "emscripten_asm_const_double" {
+                    return Err(wasmtime::Error::msg(
+                        "Date.now requires the double callback",
+                    ));
+                }
+                Ok(EPOCH_MS + state.shared.tick_wall_clock())
+            }
+            AsmConstAnswer::TimestampCalibration => {
+                let signature = state.read_cstr(sig as u32).map_err(|error| {
+                    wasmtime::Error::msg(format!("read timestamp calibration signature: {error}"))
+                })?;
+                if signature != "dd" {
+                    return Err(wasmtime::Error::msg(format!(
+                        "timestamp calibration requires dd, got {signature:?}"
+                    )));
+                }
+                let bytes = state.read(args as u32, 16).map_err(|error| {
+                    wasmtime::Error::msg(format!("read timestamp calibration arguments: {error}"))
+                })?;
+                let old = f64::from_le_bytes(bytes[..8].try_into().expect("eight bytes"));
+                let new = f64::from_le_bytes(bytes[8..].try_into().expect("eight bytes"));
+                state.log(format!(
+                    "voip: [WasmTimestampCalibration] backgrounding detected: skew_old={old:.1}ms, skew_new={new:.1}ms, delta={:.1}ms",
+                    new - old
+                ));
+                Ok(0.0)
+            }
+        };
     }
-    answer_em_asm(&snippet)
+    answer_em_asm(&snippet).map(f64::from)
 }
 
-fn answer_em_asm_index(module_sha256: Option<&str>, code: i32) -> Option<i32> {
+#[derive(Debug, PartialEq, Eq)]
+enum AsmConstAnswer {
+    Constant(i32),
+    WallClock,
+    TimestampCalibration,
+}
+
+fn answer_em_asm_index(module_sha256: Option<&str>, code: i32) -> Option<AsmConstAnswer> {
     match (module_sha256?, code) {
         // COs9e0Kj0ic func 107 calls this once per requested byte. Its locked
         // oracle behavior is a deterministic nonzero byte.
-        ("d463cda148dae98e98b9a811276a5c0b95edea64ffba768820704e0eb15599c7", 50_356) => Some(1),
+        ("d463cda148dae98e98b9a811276a5c0b95edea64ffba768820704e0eb15599c7", 50_356) => {
+            Some(AsmConstAnswer::Constant(1))
+        }
         // COs9e0Kj0ic sodiumInit uses this as hardware concurrency.
-        ("d463cda148dae98e98b9a811276a5c0b95edea64ffba768820704e0eb15599c7", 50_392) => Some(1),
-        // JgwtTQVeWPm and S_ivh1PriOA use the same zero-argument f64 callback
-        // shape at different data addresses during VoIP stack startup; the
-        // locked startup result is truthy.
-        ("4e37a0a11ba95731bb91ec264fa7718fe130c5dc1638e4ac936062cf2f4257ca", 1_324_292) => Some(1),
-        ("2a3d2e9d83b6de3aa2895ce73a2168228b6872ad988232d9c9d7a3e41b50413d", 1_336_996) => Some(1),
+        ("d463cda148dae98e98b9a811276a5c0b95edea64ffba768820704e0eb15599c7", 50_392) => {
+            Some(AsmConstAnswer::Constant(1))
+        }
+        // The captured glue uses Date.now(), not a truthy capability probe.
+        // Its second callback only logs two double-precision clock offsets.
+        ("4e37a0a11ba95731bb91ec264fa7718fe130c5dc1638e4ac936062cf2f4257ca", 1_324_292)
+        | ("2a3d2e9d83b6de3aa2895ce73a2168228b6872ad988232d9c9d7a3e41b50413d", 1_336_996) => {
+            Some(AsmConstAnswer::WallClock)
+        }
+        ("4e37a0a11ba95731bb91ec264fa7718fe130c5dc1638e4ac936062cf2f4257ca", 1_324_315)
+        | ("2a3d2e9d83b6de3aa2895ce73a2168228b6872ad988232d9c9d7a3e41b50413d", 1_337_019) => {
+            Some(AsmConstAnswer::TimestampCalibration)
+        }
         _ => None,
     }
 }
@@ -1194,15 +1244,30 @@ mod tests {
                 Some("4e37a0a11ba95731bb91ec264fa7718fe130c5dc1638e4ac936062cf2f4257ca"),
                 1_324_292
             ),
-            Some(1)
+            Some(AsmConstAnswer::WallClock)
         );
         assert_eq!(answer_em_asm_index(Some("unknown"), 1_324_292), None);
+        assert_eq!(answer_em_asm_index(Some("unknown"), 1_324_315), None);
+        assert_eq!(
+            answer_em_asm_index(
+                Some("4e37a0a11ba95731bb91ec264fa7718fe130c5dc1638e4ac936062cf2f4257ca"),
+                1_324_315
+            ),
+            Some(AsmConstAnswer::TimestampCalibration)
+        );
+        assert_eq!(
+            answer_em_asm_index(
+                Some("4e37a0a11ba95731bb91ec264fa7718fe130c5dc1638e4ac936062cf2f4257ca"),
+                1_337_019
+            ),
+            None
+        );
         assert_eq!(
             answer_em_asm_index(
                 Some("2a3d2e9d83b6de3aa2895ce73a2168228b6872ad988232d9c9d7a3e41b50413d"),
                 1_336_996
             ),
-            Some(1)
+            Some(AsmConstAnswer::WallClock)
         );
     }
 }
