@@ -22,7 +22,6 @@ fn received_frame_rotation_matches_whatsapp_wasm() -> anyhow::Result<()> {
         "6b4c303d8f48d3adc46ef8ba1c3e8dc0aca0db37193974b53101e1a9071b7131"
     );
     assert!(abi::table_slots_of(&bytes, 828)?.contains(&427));
-    // Serialise Wasmtime engines within and across test binaries.
     let _serial = common::threaded_guard();
     let mut runtime = Runtime::instantiate(&bytes)?;
     runtime.run_ctors()?;
@@ -122,7 +121,6 @@ fn upright_video_frame_info_matches_whatsapp_wasm() -> anyhow::Result<()> {
             ..Default::default()
         },
     )?;
-    // Serialise Wasmtime engines within and across test binaries.
     let _serial = common::threaded_guard();
     let mut runtime = Runtime::instantiate(&instrumented)?;
     runtime.run_ctors()?;

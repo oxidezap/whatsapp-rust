@@ -83,7 +83,8 @@ pub fn capture(id: &str) -> Result<Option<Vec<u8>>> {
         .map(Some)
 }
 
-/// Holds both the per-binary and cross-process engine locks.
+/// Holds both the per-binary and cross-process engine locks, so Wasmtime
+/// engines stay serialised within and across test binaries.
 pub fn threaded_guard() -> (std::sync::MutexGuard<'static, ()>, EngineLock) {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let local = LOCK
