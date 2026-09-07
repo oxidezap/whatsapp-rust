@@ -1,6 +1,6 @@
 //! Encoded browser frame metadata compared with the shipped WhatsApp WASM.
 
-use oracle_core::{Runtime, patch};
+use oracle_core::{Runtime, abi, derive::function_body_sha256, patch};
 use sha2::{Digest, Sha256};
 use wacore::voip::rtp::{VIDEO_MEDIA_FRAME_INFO_DELTA, VIDEO_MEDIA_FRAME_INFO_IDR};
 use wasmtime::Val;
@@ -18,14 +18,43 @@ fn upright_video_frame_info_matches_whatsapp_wasm() -> anyhow::Result<()> {
         "97259423aea19cc30c1771478e035105cb0d0e64ab4b0297741b62d01deac8db"
     );
 
-    // f13128 is anchored by "onEncodedVideoDataFromJsForStream: Manager not
-    // initialized!". It calls f13065, which constructs the encoded pjmedia
-    // frame. Substitute a harmless existing (i32,i32)->i32 callback, f4942,
-    // at the encoder port boundary. It changes only frame.type, not metadata.
+    for (index, hash) in [
+        (
+            4942,
+            "a92611af6bc97b1593bf3a167e60f7c8512a5731a9c223194b859fc8d02529d4",
+        ),
+        (
+            13065,
+            "e95d64415b62bb0b4e0f4c4bb07a96e72eb703d46af8dc6d359522b7f2d0f8ad",
+        ),
+    ] {
+        assert_eq!(function_body_sha256(&bytes, index)?, hash);
+    }
+    for (index, slot, anchor) in [
+        (
+            13128,
+            9602,
+            "onEncodedVideoDataFromJsForStream: Manager not initialized!",
+        ),
+        (4943, 3681, "media_frame_info_build_header_ext"),
+    ] {
+        assert!(
+            abi::find_string_refs(&bytes, anchor)?
+                .iter()
+                .any(|entry| entry.referenced_by.contains(&index))
+        );
+        assert!(abi::table_slots_of(&bytes, index)?.contains(&slot));
+    }
+    assert!(abi::table_slots_of(&bytes, 4942)?.contains(&3680));
+
+    // The pinned f4942 only writes the callback's first output word. With our
+    // zeroed port it writes frame.type=1 and returns zero, leaving metadata intact.
+    // f13065 instruction 1075 calls invoke_iii with (local3, local13, local9+120).
+    // Record local9 there, not at callback entry, to identify this exact call site.
     let (instrumented, _) = patch::instrument(
         &bytes,
         &patch::Plan {
-            value_entry: vec![(4942, 1)],
+            value_at: vec![(13065, 1075, 9, false)],
             ..Default::default()
         },
     )?;
@@ -71,7 +100,9 @@ fn upright_video_frame_info_matches_whatsapp_wasm() -> anyhow::Result<()> {
                 previous_markers + 1,
                 "the encoder port must receive one frame"
             );
-            let frame = u32::try_from(markers[previous_markers].1)?;
+            let frame = u32::try_from(markers[previous_markers].1)?
+                .checked_add(120)
+                .expect("frame pointer");
             let info = runtime.read_u32_at(frame + 52)?;
             assert_eq!(info, 0x800 | (u32::from(keyframe) << 3) | rotation_bits);
             assert_eq!(runtime.read(frame + 72, 4)?, [0, 5, 208, 2]);

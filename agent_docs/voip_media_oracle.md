@@ -93,9 +93,21 @@ The entry is table slot 9602, function 13128, anchored by
 `onEncodedVideoDataFromJsForStream: Manager not initialized!`. Its callee
 13065 constructs an encoded frame with internal presence bit `0x800`,
 keyframe bit `0x08`, and rotation in the low two bits. The test provides a
-synthetic manager and encoder port. It uses existing function 4942 as the
-port callback, with a recording-only entry marker to obtain the frame
-pointer. That callback changes only the frame type, not its metadata.
+synthetic manager and encoder port. It verifies the entry and extension
+builder string anchors and table slots before execution. The substitute
+port callback 4942 has encoded-body SHA-256
+`a92611af6bc97b1593bf3a167e60f7c8512a5731a9c223194b859fc8d02529d4`.
+It writes only the first output word and, with the zeroed synthetic port,
+sets frame type to 1 and returns zero without changing frame metadata.
+
+The caller 13065 has encoded-body SHA-256
+`e95d64415b62bb0b4e0f4c4bb07a96e72eb703d46af8dc6d359522b7f2d0f8ad`.
+Its instruction 1075 calls `invoke_iii` with local 3 as the callback slot,
+local 13 as the port, and local 9 plus 120 as the frame pointer. The marker
+reads local 9 immediately before this call. It does not mark callback entry,
+so another invocation of that callback cannot be mistaken for the encoder
+port call. Both body hashes include local declarations and are checked
+before instrumentation.
 
 The test reads the constructed frame and separately feeds its low metadata
 byte to the real extension builder, function 4943 at table slot 3681,

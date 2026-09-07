@@ -626,7 +626,7 @@ impl SendBatch {
             .first()
             .and_then(|packet| parse_rtp_header(packet))
             .and_then(|header| header.video_extension)
-            .is_some_and(|extension| extension.media_frame_info == VIDEO_MEDIA_FRAME_INFO_IDR);
+            .is_some_and(|extension| extension.media_frame_info & VIDEO_MEDIA_FRAME_INFO_IDR != 0);
         Self {
             bytes: packets.iter().map(Bytes::len).sum(),
             packets: packets.into(),
@@ -3775,6 +3775,23 @@ mod tests {
                 .iter()
                 .all(|batch| batch.kind != SendBatchKind::Video || batch.started)
         );
+    }
+
+    #[test]
+    fn video_batch_keyframe_classification_ignores_rotation() {
+        use crate::voip::rtp::{VideoRtpStream, encode_rtp_header};
+
+        let mut stream = VideoRtpStream::new(0x1122_3344, 4500).unwrap();
+        for rotation in 0..=3 {
+            for keyframe in [false, true] {
+                let info = rotation | if keyframe { 0x08 } else { 0 };
+                let header = stream.next_video_packet(true, info);
+                let packet = Bytes::from(encode_rtp_header(&header));
+                let batch = SendBatch::video(vec![packet.clone()]);
+                assert_eq!(batch.video_keyframe, keyframe, "frame info {info:#04x}");
+                assert_eq!(batch.packets.front(), Some(&packet));
+            }
+        }
     }
 
     #[test]
