@@ -3009,12 +3009,12 @@ impl CallEngine {
                     now,
                     VIDEO_CLOCK_RATE,
                 );
-                for (timestamp, au) in completed {
+                for (timestamp, au, orientation) in completed {
                     let keyframe = au_is_keyframe(&au);
                     self.outbox.push_back(Output::VideoPlayout(VideoFrame {
                         data: au,
                         keyframe,
-                        orientation: self.peer_video_orientation,
+                        orientation: orientation.unwrap_or(self.peer_video_orientation),
                         sender: None,
                         device: None,
                         pid: None,
@@ -3416,12 +3416,14 @@ impl CallEngine {
                 .or_else(|| group.video_orientations.get(&video.user_jid))
                 .copied()
                 .unwrap_or_default();
-            for (timestamp, access_unit) in video.access_units {
+            for ((timestamp, access_unit), frame_orientation) in
+                video.access_units.into_iter().zip(video.orientations)
+            {
                 let keyframe = au_is_keyframe(&access_unit);
                 self.outbox.push_back(Output::VideoPlayout(VideoFrame {
                     data: access_unit,
                     keyframe,
-                    orientation,
+                    orientation: frame_orientation.unwrap_or(orientation),
                     sender: Some(video.user_jid.clone()),
                     device: Some(video.device_jid.clone()),
                     pid: video.pid,
@@ -9118,28 +9120,35 @@ mod tests {
     }
 
     #[test]
-    fn group_video_uses_per_participant_orientation() {
-        let (mut eng, epoch) = group_engine(true);
-        let peer_device = PEER_LID.parse::<Jid>().expect("peer JID");
-        eng.set_participant_video_orientation(peer_device.clone(), 2);
-        let mut peer = group_peer_video(&epoch);
-        let packet = peer
-            .protect_video(&video_au(100))
-            .pop()
-            .expect("one-packet video");
-        eng.handle_input(1, Input::RelayPacket(&packet));
-        let (outputs, _) = drain(&mut eng);
-        let peer_user = Jid::new("222222222222222", Server::Lid);
-        assert!(outputs.iter().any(|output| matches!(
+    fn group_video_frame_metadata_overrides_participant_orientation() {
+        for has_frame_info in [true, false] {
+            let (mut eng, epoch) = group_engine(true);
+            let peer_device = PEER_LID.parse::<Jid>().expect("peer JID");
+            eng.set_participant_video_orientation(peer_device.clone(), 2);
+            let mut peer = group_peer_video(&epoch);
+            let packet = peer
+                .protect_video(&video_au(100))
+                .pop()
+                .expect("one-packet video");
+            let packet = if has_frame_info {
+                packet
+            } else {
+                without_video_frame_info(&packet, &epoch)
+            };
+            eng.handle_input(1, Input::RelayPacket(&packet));
+            let (outputs, _) = drain(&mut eng);
+            let peer_user = Jid::new("222222222222222", Server::Lid);
+            assert!(outputs.iter().any(|output| matches!(
             output,
             Output::VideoPlayout(VideoFrame {
-                orientation: 2,
+                orientation,
                 sender: Some(sender),
                 device: Some(device),
                 pid: Some(2),
                 ..
-            }) if *sender == peer_user && *device == peer_device
+            }) if *sender == peer_user && *device == peer_device && *orientation == if has_frame_info { 0 } else { 2 }
         )));
+        }
     }
 
     #[test]
@@ -10914,12 +10923,58 @@ mod tests {
         assert_eq!(frames.len(), 1, "N packets must reassemble into 1 AU");
         assert_eq!(frames[0].data, au);
         assert!(frames[0].keyframe, "IDR AU must be flagged as keyframe");
-        assert_eq!(frames[0].orientation, 2);
+        assert_eq!(
+            frames[0].orientation, 0,
+            "per-frame RTP rotation overrides stale device orientation"
+        );
         assert_eq!(
             eng.jitter_len(),
             0,
             "video must not leak into the audio jitter buffer"
         );
+    }
+
+    fn without_video_frame_info(packet: &[u8], call_key: &[u8]) -> Vec<u8> {
+        use crate::voip::{e2e_srtp, rtp};
+        let mut header = parse_rtp_header(packet).unwrap();
+        let payload_start = rtp::rtp_header_byte_length(packet).unwrap();
+        header.video_extension = None;
+        let mut result = Vec::new();
+        rtp::encode_rtp_header_into(&header, &mut result);
+        result.extend_from_slice(&packet[payload_start..packet.len() - WARP_MI_TAG_LEN]);
+        let keys =
+            e2e_srtp::derive_e2e_keys(call_key, &ssrc::format_e2e_srtp_participant_id(PEER_LID))
+                .unwrap();
+        e2e_srtp::append_warp_mi_tag_in_place(&keys.auth_key, &mut result, 0, WARP_MI_TAG_LEN);
+        result
+    }
+
+    #[test]
+    fn inbound_video_without_frame_metadata_keeps_signaling_fallback() {
+        let mut eng = engine(true);
+        assert!(eng.enable_video());
+        eng.set_peer_video_orientation(3);
+        let mut peer = peer_video_pipe();
+        let key: Vec<u8> = (0..32).collect();
+        for has_frame_info in [true, false, true] {
+            let packet = peer.protect_video(&video_au(100)).pop().unwrap();
+            let packet = if has_frame_info {
+                packet
+            } else {
+                without_video_frame_info(&packet, &key)
+            };
+            eng.handle_input(1, Input::RelayPacket(&packet));
+            let frames: Vec<_> = drain(&mut eng)
+                .0
+                .into_iter()
+                .filter_map(|output| match output {
+                    Output::VideoPlayout(frame) => Some(frame),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].orientation, if has_frame_info { 0 } else { 3 });
+        }
     }
 
     #[test]

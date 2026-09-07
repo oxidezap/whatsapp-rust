@@ -3590,14 +3590,14 @@ mod tests {
             eng,
         ));
 
-        // Inbound: the peer AU reassembled to the sink, orientation stamped from the control arm.
+        // RTP frame metadata takes precedence over the signaling fallback.
         let frames: Vec<VideoFrame> = std::iter::from_fn(|| vout_rx.try_recv().ok()).collect();
         assert_eq!(frames.len(), 1, "peer AU must reach video_out exactly once");
         assert_eq!(frames[0].data, peer_au);
         assert!(frames[0].keyframe);
         assert_eq!(
-            frames[0].orientation, 1,
-            "SetOrientation must apply before the inbound AU reassembles"
+            frames[0].orientation, 0,
+            "the upright frame must not inherit the device orientation"
         );
 
         // Outbound: the two legacy AUs retain fixed-stride timestamps, while the two current timed AUs

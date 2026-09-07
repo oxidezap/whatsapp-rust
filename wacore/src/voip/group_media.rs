@@ -103,6 +103,7 @@ pub struct ParticipantVideo {
     pub pid: Option<u32>,
     pub header: RtpHeader,
     pub access_units: Vec<(u32, Vec<u8>)>,
+    pub(crate) orientations: Vec<Option<u8>>,
 }
 
 struct ParticipantReceiver {
@@ -465,6 +466,10 @@ impl GroupMediaRegistry {
             return None;
         }
         let (header, access_units) = receiver.video.as_mut()?.unprotect_video_packet(packet)?;
+        let (access_units, orientations) = access_units
+            .into_iter()
+            .map(|(timestamp, data, orientation)| ((timestamp, data), orientation))
+            .unzip();
         Some(ParticipantVideo {
             participant_id,
             user_jid: receiver.user_jid.clone(),
@@ -472,6 +477,7 @@ impl GroupMediaRegistry {
             pid: receiver.pid,
             header,
             access_units,
+            orientations,
         })
     }
 

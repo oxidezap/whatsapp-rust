@@ -32,7 +32,9 @@ pub struct VideoFrame {
     pub data: Vec<u8>,
     /// The AU carries an IDR/SPS/PPS NAL — safe point to (re)start a decoder.
     pub keyframe: bool,
-    /// Peer device orientation in 90° steps (0..3), from `<video device_orientation>`.
+    /// Frame rotation bits (0..3) from RTP metadata, falling back to
+    /// `<video device_orientation>` when absent. Display turns clockwise are
+    /// respectively 0, 270, 180, and 90 degrees, as verified by the WASM oracle.
     pub orientation: u8,
     /// Group sender identity. Absent on 1:1 video.
     pub sender: Option<Jid>,

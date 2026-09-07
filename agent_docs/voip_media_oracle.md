@@ -128,6 +128,42 @@ and `0x01` values. The oracle does not decode camera pixels, parse a live
 laptop SPS, run networking, or replace a browser-to-Android visual retest.
 No proprietary WASM, captured JS, or personal data belongs in the test commit.
 
+## Received video orientation proof
+
+`received_frame_rotation_matches_whatsapp_wasm` requires the same captured J
+module and fails if it is unavailable. It calls function 828 at table slot 427
+with a synthetic H.264 frame descriptor and records `env::renderVideoFrame_js`.
+The function body hash is
+`6b4c303d8f48d3adc46ef8ba1c3e8dc0aca0db37193974b53101e1a9071b7131`.
+All 256 frame-info bytes execute with internal presence bit `0x800` set.
+Low bits `0,1,2,3` yield JS orientation enum `1,4,3,2`; bit `0x08` controls
+the keyframe argument. The other bits do not change orientation at this boundary.
+Payload pointer, byte count, dimensions and format remain unchanged.
+
+In captured bundle
+`561b4bd5677d24a29707db4c05b63edc019b73744b66699fb6bbfd6b361d6c1a`,
+`WAWebVoipVideoRenderer` applies `rotate(Math.PI*(orientation.valueOf()-1)/2)`.
+The resulting clockwise turns are `0,270,180,90` degrees. This agrees with the
+client's existing rotation helper and does not justify camera-facing compensation.
+
+Static inspection of J function 4913, anchored by
+`parse_media_frame_info_header_s`, shows the one-byte extension copied to
+offset 16 with presence recorded in bit `0x08` at offset 4. Function 4891,
+`pjmedia_rtp_ext_get_media_frame_info`, returns that byte with internal presence
+bit `0x800` when requested. These parser functions have not been executed by
+the receive-renderer test. Nor does it execute the intervening decoder pipeline.
+
+Rust previously replaced frame orientation with the last signaling value.
+The engine regression fails before the fix with orientation 2 instead of 0
+for an upright RTP frame. The receive pipeline now retains authenticated RTP
+rotation per AU timestamp, including when one packet completes the previous
+unmarked AU and its own marked AU. Signaling remains a fallback only when
+frame metadata is absent. The synthetic pipeline tests cover all 256 bytes,
+metadata on either end of a fragmented AU, explicit zero versus absence,
+authentication failure, timestamp wrap and reordering, reset, rekey, and SSRC
+replacement. Direct and group engine tests check the signaling fallback.
+Live Android front/rear switching still requires a device retest.
+
 ## Camera-control execution boundary
 
 `tools/oracle-core/tests/camera_controls.rs` executes the J capture above and

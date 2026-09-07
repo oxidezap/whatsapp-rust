@@ -8,6 +8,66 @@ use wasmtime::Val;
 mod common;
 
 #[test]
+fn received_frame_rotation_matches_whatsapp_wasm() -> anyhow::Result<()> {
+    let bytes = common::capture("JgwtTQVeWPm")?
+        .expect("receive orientation proof requires captured WASM; set WA_WASM_DIR");
+    assert_eq!(
+        hex::encode(Sha256::digest(&bytes)),
+        "97259423aea19cc30c1771478e035105cb0d0e64ab4b0297741b62d01deac8db"
+    );
+    assert_eq!(
+        function_body_sha256(&bytes, 828)?,
+        "6b4c303d8f48d3adc46ef8ba1c3e8dc0aca0db37193974b53101e1a9071b7131"
+    );
+    assert!(abi::table_slots_of(&bytes, 828)?.contains(&427));
+    let mut runtime = Runtime::instantiate(&bytes)?;
+    runtime.run_ctors()?;
+    let payload = runtime.write_bytes(&[0, 0, 0, 1, 0x65, 0x88])?;
+    let frame = runtime.write_bytes(&[0; 80])?;
+    let size = runtime.write_bytes(&[3, 0, 0, 0, 2, 0, 0, 0])?;
+    let peer = runtime.write_bytes(&[0; 24])?;
+    runtime.write_bytes_at(frame + 4, &875967048u32.to_le_bytes())?;
+    runtime.write_bytes_at(frame + 8, &payload.to_le_bytes())?;
+    runtime.write_bytes_at(frame + 16, &6u32.to_le_bytes())?;
+    for info in 0..=255u32 {
+        runtime.write_bytes_at(frame + 52, &(0x800 | info).to_le_bytes())?;
+        runtime.shared().clear_trace();
+        runtime.refuel();
+        runtime.call_table(
+            427,
+            &[
+                Val::I32(frame as i32),
+                Val::I32(size as i32),
+                Val::I32(peer as i32),
+            ],
+        )?;
+        let calls = runtime.shared().calls();
+        assert_eq!(calls.len(), 1, "info={info:#04x}");
+        assert_eq!(calls[0].symbol(), "env::renderVideoFrame_js");
+        assert_eq!(
+            calls[0].args,
+            [
+                i64::from(peer + 8),
+                i64::from(payload),
+                6,
+                3,
+                2,
+                [1, 4, 3, 2][(info & 3) as usize],
+                100,
+                0,
+                i64::from(info & 8 != 0),
+                0,
+            ],
+            "info={info:#04x}"
+        );
+    }
+    eprintln!(
+        "executed JgwtTQVeWPm.wasm receive renderer: 256 metadata bytes; rotation bits 0,1,2,3 -> JS enum 1,4,3,2"
+    );
+    Ok(())
+}
+
+#[test]
 fn upright_video_frame_info_matches_whatsapp_wasm() -> anyhow::Result<()> {
     let Some(bytes) = common::capture("JgwtTQVeWPm")? else {
         eprintln!("skipping: JgwtTQVeWPm unavailable (set WA_WASM_DIR)");
