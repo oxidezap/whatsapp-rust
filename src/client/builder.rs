@@ -643,7 +643,7 @@ async fn probe_durability_backend(
     const PROBE_PAYLOAD: &[u8] = b"probe";
     let probe_id = format!(
         "__wa_durability_probe_{}_{}__",
-        std::process::id(),
+        rand::random::<u128>(),
         PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
     );
     let map_err =
@@ -922,6 +922,38 @@ mod tests {
             .with_persistence_manager(persistence_manager)
             .with_transport_factory(MockTransportFactory::new())
             .with_http_client(MockHttpClient)
+    }
+
+    #[tokio::test]
+    async fn durability_probes_round_trip_and_clean_up_without_deleting_other_rows() {
+        let backend: Arc<dyn crate::store::traits::Backend> =
+            Arc::new(wacore::store::in_memory::InMemoryBackend::new());
+        backend
+            .store_pending_inbound("0@s.whatsapp.net", "0@s.whatsapp.net", "existing", b"keep")
+            .await
+            .expect("seed unrelated row");
+
+        let (first, second) = futures::join!(
+            probe_durability_backend(&backend),
+            probe_durability_backend(&backend)
+        );
+        first.expect("first probe");
+        second.expect("second probe");
+        assert_eq!(
+            backend
+                .get_pending_inbound("0@s.whatsapp.net", "0@s.whatsapp.net", "existing")
+                .await
+                .expect("read unrelated row"),
+            Some(b"keep".to_vec())
+        );
+        assert_eq!(
+            backend
+                .delete_expired_pending_inbound(i64::MAX)
+                .await
+                .expect("count remaining rows"),
+            1,
+            "only the unrelated row should remain"
+        );
     }
 
     #[tokio::test]
