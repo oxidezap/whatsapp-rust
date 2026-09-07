@@ -7063,7 +7063,8 @@ mod read_routing_tests {
         assert_eq!(got.as_deref(), Some(&b"blob"[..]));
     }
 
-    /// Ensures a write-queue read completes while a write burst holds the permit.
+    /// A reader-pool read proceeds beside a held burst; a write-queue read waits
+    /// for that burst's permit and completes once it is released.
     #[tokio::test]
     async fn write_queue_read_completes_beside_a_held_burst() {
         use std::future::{Future, poll_fn};
@@ -7071,24 +7072,51 @@ mod read_routing_tests {
         use std::task::Poll;
 
         let db = TempDb::new("held_burst");
-        let store = store_with(1, &db).await;
+        let mut store = store_with(1, &db).await;
         let rows = vec![AppStateMutationMAC {
             index_mac: vec![0xA1; 32],
             value_mac: vec![0xC5; 32],
         }];
 
-        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
-            let mut burst = pin!(store.put_mutation_macs("regular", 1, &rows));
-            let finished = poll_fn(|cx| Poll::Ready(burst.as_mut().poll(cx).is_ready())).await;
-            assert!(!finished, "the burst finished before the read was issued");
-            let (read, _) = tokio::join!(store.get_devices("190455501800"), async {
-                burst.await.expect("write burst")
-            });
-            read
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        store.commit_barrier = Some({
+            let entered = entered.clone();
+            let release = release.clone();
+            Arc::new(move || {
+                let entered = entered.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(())
+                })
+            })
+        });
+
+        let (burst, read) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(store.put_mutation_macs("regular", 1, &rows), async {
+                entered.notified().await;
+                assert_eq!(store.db_semaphore.available_permits(), 0);
+                assert_eq!(
+                    store
+                        .get_mutation_mac("regular", &rows[0].index_mac)
+                        .await
+                        .unwrap(),
+                    Some(rows[0].value_mac.clone()),
+                    "the reader connection sees the committed batch while its barrier is held"
+                );
+                let mut read = pin!(store.get_devices("190455501800"));
+                let pending = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx).is_pending())).await;
+                assert!(pending, "a write-queue read must wait for the held permit");
+                release.notify_one();
+                read.await
+            })
         })
         .await
         .expect("read and burst complete together");
-        assert!(outcome.expect("read succeeds").is_none());
+        burst.expect("write burst");
+        assert!(read.expect("read succeeds").is_none());
     }
 
     /// `pool_size > 1` with no reader connections is reachable config, and there

@@ -68,3 +68,9 @@ Expanded derivation specs are generated from committed bases/recipes into
 `.derive-mlow/specs/`, verified against `mlow.lock.json`, and uploaded alongside
 run manifests. The lightweight `cargo xt` dispatcher launches the release
 `whatsapp-oracle-task` worker; neither is linked into the application runtime.
+
+Capture restoration, code generation checks, and oracle tests precede MLOW
+derivation. A failure in those stages can leave no derivation evidence to
+upload. CI skips an empty upload only after an earlier failure, keeping that
+failure visible. It uploads partial evidence when present and still treats
+missing evidence after a successful gate as an error.

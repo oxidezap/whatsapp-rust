@@ -40,7 +40,9 @@ jobs:
         if: github.event_name == 'schedule'
         run: cargo xt oracle conformance --slow
       - uses: actions/upload-artifact@v7
-        if: always()
+        # Early failures can precede derivation. Preserve partial evidence on
+        # failure, but a successful gate must still produce uploadable evidence.
+        if: ${{ always() && (success() || hashFiles('.derive-mlow/specs/*.json', '.derive-mlow/wasm/*.log', '.derive-mlow/wasm/*/manifest.json') != '') }}
         with:
           name: voip-conformance-evidence
           path: |
