@@ -695,8 +695,6 @@ where
     {
         // A builder that never pinned a seed hashes like every other
         // cache: `RandomState::default()` draws per-process.
-        // A builder that never pinned a seed hashes like every other
-        // cache: `RandomState::default()` draws per-process.
         assemble(
             self.max_capacity,
             self.ttl,
