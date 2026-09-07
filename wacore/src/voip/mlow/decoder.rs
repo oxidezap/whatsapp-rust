@@ -305,7 +305,7 @@ impl MlowDecoder {
         // background noise this way, and the reference decodes it. It goes through the normal path.
         if toc.sid {
             let samps = silence_samps(self.last_packet_samps);
-            log::debug!(
+            log::trace!(
                 "mlow: SID TOC 0x{:02x} -> {samps} samples of silence",
                 frame[0]
             );
@@ -527,7 +527,7 @@ impl MlowDecoder {
             self.had_error = true;
             log::warn!("mlow: range decoder raised its error flag after active-frame decode");
         }
-        log::debug!(
+        log::trace!(
             "mlow: active frame decoded -> {} samples (config={config})",
             out.len()
         );
