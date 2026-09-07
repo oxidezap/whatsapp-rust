@@ -240,13 +240,40 @@ fn cache_insert_at_capacity(bencher: divan::Bencher, n: usize) {
     });
 }
 
+/// Sweeps per measured iteration, because one is far too small to measure.
+///
+/// With neither TTL nor TTI the call is a couple of predicate loads
+/// (`portable_cache.rs:1246`), so a single-sweep iteration billed ~50 ns of
+/// executed instructions against ~1 µs of simulated RAM penalty for the ~35
+/// cold last-level misses of reaching the fixture: ~90% of the row was that
+/// miss count, one miss was worth ~2.6%, and two or three of them crossed the
+/// 5% reporting threshold. Cachegrind takes its cache geometry from the host
+/// CPU, so the row swung ~8-11% whenever base and head landed on different
+/// runner models with bit-identical machine code (PR #1467, EPYC 7763 vs
+/// 9V74) — a report that says nothing about the sweep.
+///
+/// Reaching the cache costs the same misses per iteration either way while the
+/// sweeps scale, so batching them pushes that fixed penalty from ~90% of the
+/// row down to the noise and leaves executed work as the signal. It costs
+/// nothing in coverage: a sweep that started walking the table with no TTL
+/// configured now shows up `SWEEPS` times over.
+const SWEEPS: usize = 1024;
+
 /// The maintenance-tick sweep with nothing expirable: no TTL means no table
 /// walk, so this must stay flat in cache size.
+///
+/// `black_box` on the receiver each round is what keeps the batch honest: the
+/// sweeps are side-effect-free and identical, so without an opaque receiver
+/// the compiler is free to prove all but the first redundant and fold the loop.
 #[divan::bench(args = CACHE_SIZES)]
 fn sweep_idle_no_ttl(bencher: divan::Bencher, n: usize) {
     let cache = warm(n);
-    bencher.counter(ItemsCount::new(1usize)).bench(|| {
-        block_on(cache.run_pending_tasks());
+    bencher.counter(ItemsCount::new(SWEEPS)).bench(|| {
+        block_on(async {
+            for _ in 0..SWEEPS {
+                black_box(cache).run_pending_tasks().await;
+            }
+        });
         black_box(cache.entry_count())
     });
 }
