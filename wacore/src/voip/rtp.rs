@@ -29,10 +29,12 @@ pub const RTP_FIXED_HEADER_LEN: usize = 12;
 pub const WHATSAPP_RTP_HEADER_SIZE: usize = 16;
 pub const WHATSAPP_RTP_HEADER_DTX_SIZE: usize = 20;
 pub const WHATSAPP_VIDEO_RTP_HEADER_SIZE: usize = 28;
-/// WhatsApp frame-present and keyframe flags carried by an IDR access unit.
-pub const VIDEO_MEDIA_FRAME_INFO_IDR: u8 = 0x09;
-/// WhatsApp frame-present flag carried by a dependent H.264 access unit.
-pub const VIDEO_MEDIA_FRAME_INFO_DELTA: u8 = 0x01;
+/// WhatsApp keyframe flag for an upright IDR access unit. The low two bits are
+/// rotation, not presence. Captured WASM uses internal bit 0x800 for presence;
+/// its one-byte RTP extension omits that bit. See the oracle's video_orientation test.
+pub const VIDEO_MEDIA_FRAME_INFO_IDR: u8 = 0x08;
+/// Upright dependent H.264 access unit, with no keyframe or rotation bits.
+pub const VIDEO_MEDIA_FRAME_INFO_DELTA: u8 = 0x00;
 pub const WHATSAPP_RTP_EXTENSION_DTX_WORD: u32 = 0x3001_0000;
 const RTP_VERSION: u8 = 2;
 const SRTP_AUTH_TAG_LEN: usize = 10;
@@ -714,7 +716,7 @@ mod tests {
                 0x00, 0x00, 0x00, 0x00, // timestamp
                 0x11, 0x22, 0x33, 0x44, // SSRC
                 0xde, 0xbe, 0x00, 0x03, // WARP profile, three words
-                0x30, 0x09, // ID 3: one-byte encoded-frame flags (keyframe | IDR)
+                0x30, 0x08, // ID 3: keyframe, zero rotation
                 0x51, 0x00, 0x00, // ID 5: two-byte initial bandwidth
                 0x61, 0x00, 0x00, // ID 6: two-byte short timestamp offset
                 0x91, 0x00, 0x00, // ID 9: two-byte transport sequence
@@ -776,7 +778,7 @@ mod tests {
                 ssrc: 0x9b19_59f0,
                 extension_word: None,
                 video_extension: Some(VideoRtpExtension {
-                    media_frame_info: VIDEO_MEDIA_FRAME_INFO_DELTA,
+                    media_frame_info: 0x01,
                     initial_bandwidth: 0,
                     short_offset: 36,
                     transport_sequence: 0x0a6a,

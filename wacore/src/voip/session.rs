@@ -2290,7 +2290,7 @@ mod tests {
         assert_eq!(
             header.video_extension.unwrap().media_frame_info,
             VIDEO_MEDIA_FRAME_INFO_IDR,
-            "an IDR AU carries WhatsApp's keyframe and IDR bits"
+            "an IDR AU carries WhatsApp's keyframe bit without rotation"
         );
 
         // Pin the send keystream to the SELF lid (same inversion guard as audio).
@@ -2308,7 +2308,7 @@ mod tests {
     }
 
     #[test]
-    fn video_frame_info_is_constant_across_every_au_fragment() {
+    fn upright_video_frame_info_is_constant_across_every_au_fragment() {
         let call_key: Vec<u8> = (0u8..32).collect();
         let mut pipe = VideoPipeline::new(&video_params(
             &call_key,
@@ -2323,7 +2323,7 @@ mod tests {
         assert!(idr_packets.iter().all(|packet| {
             parse_rtp_header(packet)
                 .and_then(|header| header.video_extension)
-                .is_some_and(|extension| extension.media_frame_info == VIDEO_MEDIA_FRAME_INFO_IDR)
+                .is_some_and(|extension| extension.media_frame_info == 0x08)
         }));
 
         let mut delta = vec![0, 0, 0, 1, 0x41];
@@ -2333,7 +2333,7 @@ mod tests {
         assert!(delta_packets.iter().all(|packet| {
             parse_rtp_header(packet)
                 .and_then(|header| header.video_extension)
-                .is_some_and(|extension| extension.media_frame_info == VIDEO_MEDIA_FRAME_INFO_DELTA)
+                .is_some_and(|extension| extension.media_frame_info == 0x00)
         }));
     }
 

@@ -64,6 +64,58 @@ fixture is accepted. Use `oracle inspect`, `oracle callers`, `oracle abi` and a
 marker run to prove pointer/length/sequence/timestamp positions. Put that proof
 beside the future media spec and pin the capture hash through `wasm.lock.json`.
 
+## Outbound video orientation proof
+
+`tools/oracle-core/tests/video_orientation.rs` executes the captured
+`JgwtTQVeWPm.wasm`, rather than a Rust translation of it. The test checks its
+SHA-256 before instrumentation:
+
+```text
+97259423aea19cc30c1771478e035105cb0d0e64ab4b0297741b62d01deac8db
+```
+
+The artifact is pinned in `tools/oracle-core/wasm.lock.json`. Fetch captures
+with `cargo xt oracle fetch`, or point `WA_WASM_DIR` at an existing verified
+capture directory. From the repository root:
+
+```sh
+WA_WASM_DIR=/path/to/captured-wasm cargo test --release -p oracle-core --test video_orientation -- --nocapture
+cargo test -p wacore --features voip-mlow --lib voip::
+```
+
+An explicit missing or corrupt capture fails. An absent implicit cache may
+print `skipping:`, which is not proof. A successful execution prints
+`executed JgwtTQVeWPm.wasm: 10 orientation/keyframe cases` and reports upright
+delta `0x00` and IDR `0x08`. The pre-fix comparison failed with WASM `[0, 8]`
+against Rust `[1, 9]`.
+
+The entry is table slot 9602, function 13128, anchored by
+`onEncodedVideoDataFromJsForStream: Manager not initialized!`. Its callee
+13065 constructs an encoded frame with internal presence bit `0x800`,
+keyframe bit `0x08`, and rotation in the low two bits. The test provides a
+synthetic manager and encoder port. It uses existing function 4942 as the
+port callback, with a recording-only entry marker to obtain the frame
+pointer. That callback changes only the frame type, not its metadata.
+
+The test reads the constructed frame and separately feeds its low metadata
+byte to the real extension builder, function 4943 at table slot 3681,
+anchored by `media_frame_info_build_header_ext`. It does not execute the
+intervening sender pipeline. All ten cases preserve the supplied 1280x720
+dimensions, payload pointer and payload length. The only stub invoked during
+each case is the recording marker.
+
+The JS enum comes from `WAWebVoipMediaEnums` in bundle
+`561b4bd5677d24a29707db4c05b63edc019b73744b66699fb6bbfd6b361d6c1a`.
+Its `Unknown`, `Normal`, `Rotate90`, `Rotate180`, and `Rotate270` values are
+0 through 4. The WASM maps them to rotation bits 0, 0, 3, 2, and 1. This is
+WhatsApp-specific evidence, not an assumed CVO mapping.
+
+The Rust session regression checks upright metadata on every protected IDR
+and delta fragment. Android receive fixtures retain their captured `0x09`
+and `0x01` values. The oracle does not decode camera pixels, parse a live
+laptop SPS, run networking, or replace a browser-to-Android visual retest.
+No proprietary WASM, captured JS, or personal data belongs in the test commit.
+
 ## CI shape
 
 Future fixtures should have one producer command under `cargo xt oracle` that
