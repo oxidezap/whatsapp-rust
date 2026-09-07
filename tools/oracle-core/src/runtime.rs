@@ -189,7 +189,9 @@ fn module_data_sha256(bytes: &[u8]) -> Option<String> {
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         let payload = payload.ok()?;
         if let wasmparser::Payload::DataSection(reader) = payload {
-            data_hash.update(&bytes[reader.range()]);
+            let range = reader.range();
+            let range = usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?;
+            data_hash.update(&bytes[range]);
         }
     }
     Some(hex::encode(data_hash.finalize()))

@@ -51,6 +51,21 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, anyhow, ensure};
 use wasmparser::{Operator, Parser, Payload, TypeRef};
 
+/// wasmparser 0.258 reports byte ranges and positions as `u64`. File offsets
+/// here stay `usize`, so every crossing converts fallibly instead of
+/// truncating with `as`.
+fn to_usize(offset: u64) -> Result<usize> {
+    usize::try_from(offset).context("wasm offset does not fit in usize")
+}
+
+fn to_range(range: std::ops::Range<u64>) -> Result<std::ops::Range<usize>> {
+    Ok(to_usize(range.start)?..to_usize(range.end)?)
+}
+
+fn to_u64(offset: usize) -> Result<u64> {
+    u64::try_from(offset).context("wasm offset does not fit in u64")
+}
+
 /// Where a marker was placed, and what it means.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Marker {
@@ -356,14 +371,15 @@ fn read_layout(bytes: &[u8]) -> Result<Layout> {
             Payload::CodeSectionStart { range, .. } => {
                 // `range` covers the entries; back up over the id and size so
                 // the whole section can be replaced as a unit.
-                code_section = range;
+                code_section = to_range(range)?;
             }
             Payload::CodeSectionEntry(body) => {
-                let range = body.range();
-                let start = body
-                    .get_operators_reader()
-                    .context("reading a function body")?
-                    .original_position();
+                let range = to_range(body.range())?;
+                let start = to_usize(
+                    body.get_operators_reader()
+                        .context("reading a function body")?
+                        .original_position(),
+                )?;
                 bodies.push(range);
                 code_starts.push(start);
             }
@@ -413,7 +429,7 @@ fn local_type(
         .context("function body missing")?;
     let body = wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(
         &bytes[range.clone()],
-        range.start,
+        to_u64(range.start)?,
     ));
     for declaration in body.get_locals_reader().context("reading locals")? {
         let (count, ty) = declaration.context("reading local declaration")?;
@@ -620,12 +636,13 @@ pub fn instrument(bytes: &[u8], plan: &Plan) -> Result<(Vec<u8>, MarkerMap)> {
         let end = layout.bodies[ordinal].end;
         let reader = wasmparser::OperatorsReader::new(wasmparser::BinaryReader::new(
             &bytes[start..end],
-            start,
+            to_u64(start)?,
         ));
         let (_, offset) = reader
             .into_iter_with_offsets()
             .nth(instruction)
             .with_context(|| format!("func {func} has no instruction {instruction}"))??;
+        let offset = to_usize(offset)?;
         let mut marker = Vec::new();
         use wasm_encoder::{Encode, Instruction};
         Instruction::I32Const(next_id).encode(&mut marker);
@@ -653,11 +670,12 @@ pub fn instrument(bytes: &[u8], plan: &Plan) -> Result<(Vec<u8>, MarkerMap)> {
         let base = layout.bodies[ordinal].start;
         let reader = wasmparser::OperatorsReader::new(wasmparser::BinaryReader::new(
             &body[layout.code_starts[ordinal] - base..],
-            layout.code_starts[ordinal],
+            to_u64(layout.code_starts[ordinal])?,
         ));
 
         for item in reader.into_iter_with_offsets() {
             let (op, offset) = item.context("reading operators")?;
+            let offset = to_usize(offset)?;
             // A tail call is both a call and the function's exit: without
             // these arms `--calls-in` misses the dispatch and `--returns-in`
             // misses the exit, since the fall-through marker is unreachable
@@ -703,12 +721,13 @@ pub fn instrument(bytes: &[u8], plan: &Plan) -> Result<(Vec<u8>, MarkerMap)> {
         let base = layout.bodies[ordinal].start;
         let reader = wasmparser::OperatorsReader::new(wasmparser::BinaryReader::new(
             &body[layout.code_starts[ordinal] - base..],
-            layout.code_starts[ordinal],
+            to_u64(layout.code_starts[ordinal])?,
         ));
 
         let mut final_end = None;
         for item in reader.into_iter_with_offsets() {
             let (op, offset) = item.context("reading operators")?;
+            let offset = to_usize(offset)?;
             if matches!(op, Operator::End) {
                 final_end = Some(offset);
             }
@@ -780,14 +799,14 @@ pub fn replace(bytes: &[u8], edits: &[Replace]) -> Result<Vec<u8>> {
         let base = layout.bodies[ordinal].start;
         let reader = wasmparser::OperatorsReader::new(wasmparser::BinaryReader::new(
             &body[layout.code_starts[ordinal] - base..],
-            layout.code_starts[ordinal],
+            to_u64(layout.code_starts[ordinal])?,
         ));
 
         // The offsets of the operators being replaced, and of the one after.
         let mut offsets = Vec::new();
         for item in reader.into_iter_with_offsets() {
             let (_, offset) = item.context("reading operators")?;
-            offsets.push(offset);
+            offsets.push(to_usize(offset)?);
         }
         let start = *offsets.get(edit.at).ok_or_else(|| {
             anyhow!(
@@ -945,7 +964,7 @@ pub fn call_sites(bytes: &[u8], func: u32) -> Result<BTreeMap<u32, usize>> {
     let body = &bytes[range.clone()];
     let reader = wasmparser::OperatorsReader::new(wasmparser::BinaryReader::new(
         &body[layout.code_starts[ordinal] - range.start..],
-        layout.code_starts[ordinal],
+        to_u64(layout.code_starts[ordinal])?,
     ));
 
     let mut counts = BTreeMap::new();

@@ -559,7 +559,10 @@ pub fn function_body_sha256(bytes: &[u8], function: u32) -> Result<String> {
             }
             wasmparser::Payload::CodeSectionEntry(body) => {
                 if index == function {
-                    return Ok(sha256_hex(&bytes[body.range()]));
+                    let range = body.range();
+                    let range = usize::try_from(range.start).context("function body offset")?
+                        ..usize::try_from(range.end).context("function body offset")?;
+                    return Ok(sha256_hex(&bytes[range]));
                 }
                 index = index.checked_add(1).context("function index overflow")?;
             }
@@ -978,6 +981,8 @@ fn export_selectors(bytes: &[u8], resolutions: &BTreeMap<String, Resolved>) -> R
                 inserted = true;
             }
             if id != 7 {
+                let range = usize::try_from(range.start).context("section offset")?
+                    ..usize::try_from(range.end).context("section offset")?;
                 module.section(&RawSection {
                     id,
                     data: &bytes[range],
@@ -1384,7 +1389,8 @@ mod tests {
                 }
             })
             .unwrap();
-        changed[body.start + 1] = 0x00; // Replace nop with unreachable, preserving a valid body.
+        let start = usize::try_from(body.start).unwrap();
+        changed[start + 1] = 0x00; // Replace nop with unreachable, preserving a valid body.
         assert!(resolve_one(&changed, "probe", &selector, 1).is_err());
     }
 
@@ -1509,7 +1515,11 @@ mod tests {
                 .parse_all(bytes)
                 .filter_map(|p| p.expect("valid").as_section())
                 .filter(|(id, _)| *id != 7)
-                .map(|(id, range)| (id, bytes[range].to_vec()))
+                .map(|(id, range)| {
+                    let start = usize::try_from(range.start).expect("section offset");
+                    let end = usize::try_from(range.end).expect("section offset");
+                    (id, bytes[start..end].to_vec())
+                })
                 .collect::<Vec<_>>()
         };
         assert_eq!(sections(&bytes), sections(&exported));

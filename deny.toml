@@ -140,6 +140,15 @@ skip = [
     { name = "hashbrown", version = "=0.15.5" },
     { name = "hashbrown", version = "=0.16.1" },
     { name = "windows-sys", version = "=0.52.0" },
+
+    # Host-oracle tooling moved to the wasm-tools 0.258 / zstd 0.14 line while
+    # Wasmtime 48 and the pinned unwasm-core still pin 0.254 / 0.13. Only the
+    # host-tooling audit sees both lines; the shipped graph never links either
+    # duplicate. Collapses when Wasmtime and unwasm move up.
+    { name = "wasm-encoder", version = "=0.254.0" },
+    { name = "wasmparser", version = "=0.254.0" },
+    { name = "zstd", version = "=0.13.3" },
+    { name = "zstd-safe", version = "=7.3.0" },
 ]
 
 [sources]
