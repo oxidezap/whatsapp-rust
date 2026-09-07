@@ -73,6 +73,14 @@ jobs:
           cargo build -p whatsapp-rust-sqlite-storage --lib --release
           --target wasm32-unknown-unknown
           --no-default-features --features wacore/js
+      - name: Run durability probe ID regression on wasm32
+        env:
+          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+          CARGO_TARGET_DIR: target
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: >
+          cargo test --locked --manifest-path tools/durability-wasm-harness/Cargo.toml
+          --target wasm32-unknown-unknown --test probe -- --nocapture
       - name: Run sqlite retry timer test on wasm32
         env:
           RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'

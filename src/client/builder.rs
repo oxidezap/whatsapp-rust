@@ -636,16 +636,9 @@ impl ClientBuilder {
 async fn probe_durability_backend(
     backend: &Arc<dyn crate::store::traits::Backend>,
 ) -> Result<(), ClientBuilderError> {
-    use portable_atomic::{AtomicU64, Ordering};
-
-    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
     const PROBE_JID: &str = "0@s.whatsapp.net";
     const PROBE_PAYLOAD: &[u8] = b"probe";
-    let probe_id = format!(
-        "__wa_durability_probe_{}_{}__",
-        rand::random::<u128>(),
-        PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
+    let probe_id = super::durability_probe_id::next();
     let map_err =
         |error: StoreError| ClientBuilderError::UnsupportedDurabilityBackend(error.to_string());
 

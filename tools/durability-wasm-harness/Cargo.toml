@@ -1,0 +1,12 @@
+[package]
+name = "durability-wasm-harness"
+version = "0.0.0"
+edition = "2024"
+
+[workspace]
+
+[dev-dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
+rand = "0.10"
+wasm-bindgen-test = "=0.3.77"

@@ -11,6 +11,7 @@ mod context_impl;
 mod device_memo_stats;
 mod device_registry;
 pub(crate) mod device_topology;
+mod durability_probe_id;
 #[cfg(feature = "client-lifecycle")]
 mod extension_lifecycle;
 pub mod interceptor;
