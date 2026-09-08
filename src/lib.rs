@@ -408,5 +408,9 @@ pub mod bench_support;
 #[cfg(test)]
 pub mod test_utils;
 
+#[cfg(any(test, all(feature = "test-support", not(target_arch = "wasm32"))))]
+#[doc(hidden)]
+pub mod test_support;
+
 #[cfg(test)]
 mod reexports_test;
