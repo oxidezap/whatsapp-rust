@@ -989,8 +989,12 @@ impl Client {
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         call_id.hash(&mut hasher);
-        let lane = hasher.finish() as usize % self.voip_state().answer_transition_locks.len();
-        self.voip_state().answer_transition_locks[lane].clone()
+        let locks = self
+            .voip_state()
+            .answer_transition_locks
+            .get_or_init(|| std::array::from_fn(|_| Arc::new(async_lock::Mutex::new(()))));
+        let lane = hasher.finish() as usize % locks.len();
+        locks[lane].clone()
     }
 
     #[cfg(feature = "voip-runtime")]
@@ -2240,6 +2244,45 @@ async fn execute_call_service_request<T>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn answer_transition_lanes_are_lazy_and_shared_on_concurrent_first_use() {
+        let client = crate::test_utils::create_test_client().await;
+        assert!(client.voip_state().answer_transition_locks.get().is_none());
+        client.cleanup_connection_state().await;
+        assert!(client.voip_state().answer_transition_locks.get().is_none());
+        let barrier = std::sync::Barrier::new(8);
+        let locks = std::thread::scope(|scope| {
+            let handles = std::array::from_fn::<_, 8, _>(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    client.answer_transition_lock("LAZY-ANSWER")
+                })
+            });
+            handles.map(|handle| handle.join().expect("lane lookup"))
+        });
+        assert!(locks.iter().all(|lock| Arc::ptr_eq(lock, &locks[0])));
+        let guard = locks[0].lock().await;
+        assert!(
+            client
+                .answer_transition_lock("LAZY-ANSWER")
+                .try_lock()
+                .is_none()
+        );
+        drop(guard);
+        assert!(
+            client
+                .answer_transition_lock("LAZY-ANSWER")
+                .try_lock()
+                .is_some()
+        );
+        client.cleanup_connection_state().await;
+        assert!(Arc::ptr_eq(
+            &client.answer_transition_lock("LAZY-ANSWER"),
+            &locks[0]
+        ));
+    }
+
     /// The admission snapshots the report attributes to this subsystem.
     #[cfg(feature = "voip-runtime")]
     async fn pending_link_updates(client: &Client) -> wacore::stats::CollectionStats {

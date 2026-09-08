@@ -107,7 +107,10 @@ pub(crate) struct VoipState {
     /// Serializes incoming-answer registration with generation-aware teardown. A failed answer
     /// holds its call-id lane until `<terminate>` has been written, so a same-call-id re-offer
     /// cannot become current in the removal-before-send window.
-    pub(crate) answer_transition_locks: [Arc<Mutex<()>>; ANSWER_TRANSITION_LANES],
+    /// Allocate the lanes only on first use; clients that never answer a call
+    /// need none. Once initialized, lane identity survives every reconnect.
+    pub(crate) answer_transition_locks:
+        std::sync::OnceLock<[Arc<Mutex<()>>; ANSWER_TRANSITION_LANES]>,
     /// Outgoing calls awaiting their relay. The initiator's relay is not in the offer; it arrives
     /// from the server AFTER it, so each `voip().call()` parks the material needed to spawn the
     /// engine here, keyed by call-id, until a `<call>` carrying a `<relay>` for that id arrives.
@@ -132,7 +135,7 @@ impl Default for VoipState {
             call_registry: Arc::new(wacore::voip::CallRegistry::new()),
             pending_call_link_joins: Arc::new(std::sync::Mutex::new(Default::default())),
             pending_call_link_join_lane: Mutex::new(()),
-            answer_transition_locks: std::array::from_fn(|_| Arc::new(Mutex::new(()))),
+            answer_transition_locks: std::sync::OnceLock::new(),
             pending_outgoing_calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_transport_provider: std::sync::Mutex::new(None),
         }

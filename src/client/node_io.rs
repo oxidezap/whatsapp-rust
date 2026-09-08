@@ -1327,7 +1327,9 @@ impl Client {
                 debug!("Skipping active IQ: connection closed");
                 return;
             }
-            if let Err(e) = client_clone.set_passive(false).await
+            // Release the IQ future before the offline drain instead of retaining
+            // its tracing-expanded storage in this task for the whole backlog.
+            if let Err(e) = Box::pin(client_clone.set_passive(false)).await
                 && !client_clone.is_shutting_down()
             {
                 warn!("Failed to send post-connect active IQ: {e:?}");
@@ -2389,7 +2391,7 @@ mod tests {
     use std::time::Duration;
     use wacore::runtime::{AbortHandle, Runtime};
 
-    /// Records the concrete size of every future handed to the runtime.
+    /// Records the concrete size of every spawned future without polling it.
     ///
     /// `size_of_val` on the unsized `dyn Future` behind the `Pin<Box<_>>` reads
     /// the vtable, so what it reports is exactly the coroutine layout the boxing
@@ -2406,7 +2408,8 @@ mod tests {
                 .lock()
                 .expect("sizes mutex")
                 .push(size_of_val(&*future));
-            self.inner.spawn(future)
+            drop(future);
+            AbortHandle::noop()
         }
 
         fn spawn_detached(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
@@ -2414,7 +2417,7 @@ mod tests {
                 .lock()
                 .expect("sizes mutex")
                 .push(size_of_val(&*future));
-            self.inner.spawn_detached(future);
+            drop(future);
         }
 
         fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
@@ -2436,10 +2439,9 @@ mod tests {
     /// The post-login task is spawned on every connection and stays parked in
     /// `wait_for_offline_delivery_end` for the whole offline drain, so its
     /// future is resident for minutes on a client with a backlog. Inlining the
-    /// fresh-pairing arm — a branch that runs once per device lifetime — put the
-    /// union of its locals in there and made it 8,224 B; boxing the arm brought
-    /// it to ~1.2 KB. This pins the shape, not the exact number: a future above
-    /// the bound means an arm has been inlined back in.
+    /// fresh-pairing arm made it 8,224 B. The active IQ also needs a box when
+    /// tracing expands its future. Neither belongs in the drain's resident
+    /// storage. This bounds the spawned task, not the temporary boxed work.
     #[tokio::test]
     async fn the_post_login_task_does_not_carry_the_fresh_pairing_arm() {
         const MAX_POST_LOGIN_FUTURE_BYTES: usize = 2048;
@@ -2475,6 +2477,7 @@ mod tests {
             "<success> must spawn the post-login task"
         );
         let largest = spawned.iter().copied().max().unwrap_or(0);
+        eprintln!("post-login spawned={spawned:?}");
         assert!(
             largest < MAX_POST_LOGIN_FUTURE_BYTES,
             "post-login future grew to {largest} B (spawned: {spawned:?}); \

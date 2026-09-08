@@ -2672,6 +2672,9 @@ mod tests {
         // up to `CLIENTS - 1` over the scaled budget round down into it.
         let bytes_per_client = bytes / CLIENTS as i64;
         let allocs_per_client = allocs / CLIENTS as u64;
+        eprintln!(
+            "fixed structure {bytes_per_client} B {allocs_per_client} allocations; totals={bytes}/{allocs}"
+        );
         assert!(
             bytes <= MAX_BYTES_PER_CLIENT * CLIENTS as i64
                 && allocs <= MAX_ALLOCS_PER_CLIENT * CLIENTS as u64,
