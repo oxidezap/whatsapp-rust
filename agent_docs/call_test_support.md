@@ -6,6 +6,11 @@ existing `InMemoryBackend`, Tokio runtime and Noise certificate test utility.
 It does not import the root `test_utils` module or require SQLite, a WebSocket
 client, HTTP access, or native media transport.
 
+The native target guard also applies when `cfg(test)` is set. The shared
+session helper, its test-utils delegate, and the native caller suites are
+excluded together, so WASM tests cannot pull in blocking session setup through
+the test-only path.
+
 ```toml
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 whatsapp-rust = { workspace = true, features = ["test-support"] }
@@ -42,6 +47,14 @@ do not introduce a second copy just for the fixture.
   events. Both report observation overflow rather than silently truncating.
 - `shutdown().await` disconnects the real client and joins its reader. Dropping
   the fixture signals shutdown and lets the reader perform production cleanup.
+
+Before construction succeeds, an abort-on-drop guard owns the reader. If
+`Client::connect` fails, `new` joins that reader and returns its original typed
+error rather than the readiness channel's closure. Constructor deadlines abort
+and join the reader; cancellation aborts it when the constructor future drops.
+Only successful construction transfers reader ownership to the fixture's
+graceful teardown path. `shutdown` also guards a reader taken out for joining,
+so a cancelled or timed-out join cannot leave it running detached.
 
 There is no fabricated `OutgoingReady`, winner setter or event sender. Subscribe
 through `client().subscribe_handler(...)` for callbacks. For the complete inbound
@@ -191,9 +204,20 @@ cargo clippy -p whatsapp-rust --no-default-features --features test-support --te
 cargo check -p whatsapp-rust --no-default-features --features test-support --lib
 cargo check -p whatsapp-rust --no-default-features --lib
 cargo test -p whatsapp-rust --features voip-mlow,test-support --lib voip::facade::tests
+cargo test -p whatsapp-rust --features test-support --lib test_support::call::tests
+cargo test -p whatsapp-rust --test native_test_support_cfg -- --ignored
 cargo fmt --all -- --check
 ```
 
 The existing CI shareable-feature task includes new features automatically and
 runs both library and integration tests. No workflow-specific allowlist is
 needed for this fixture.
+
+The explicit cfg probe requires an installed `wasm32-unknown-unknown` target.
+It extracts the actual fixture/helper/caller guards with `syn` and compiles
+them with rustc on WASM for all four combinations of test and test-support
+cfgs. A native positive control proves every checked path remains enabled.
+This probe checks exclusion, not the complete root unit-test dependency graph.
+The latter still enables Tokio's `full` dev feature and fails in `mio` on
+`wasm32-unknown-unknown` before the root tests compile. Production WASM checks
+with and without `test-support` do not have that dev-dependency limitation.

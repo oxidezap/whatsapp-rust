@@ -4621,6 +4621,7 @@ mod tests {
         assert!(client.jids_share_user_identity(&lid, &pn).await.unwrap());
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn public_retransmission_recaches_the_supplied_message() {
         let mut config = crate::cache_config::CacheConfig::default();

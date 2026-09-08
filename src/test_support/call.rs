@@ -87,6 +87,10 @@ pub struct CallFixture {
 impl CallFixture {
     /// Connect a real client to a synthetic server. Requires a running Tokio runtime.
     pub async fn new() -> Result<Self> {
+        Self::configured(|builder| builder).await
+    }
+
+    async fn configured(configure: impl FnOnce(ClientBuilder) -> ClientBuilder) -> Result<Self> {
         let pm = Arc::new(PersistenceManager::new(Arc::new(InMemoryBackend::new())).await?);
         let own = Jid::new("111111111111111", Server::Lid).with_device(1);
         for command in [
@@ -111,16 +115,18 @@ impl CallFixture {
             offers: offer_tx,
             outgoing: Mutex::new(Vec::new()),
         });
-        let client = ClientBuilder::new()
-            .with_runtime(TokioRuntime)
-            .with_persistence_manager(pm)
-            .with_transport_factory(Factory(transport.clone()))
-            .with_http_client(NoHttp)
-            .with_version_override((2, 3000, 0))
-            .with_noise_cert_policy(NoiseCertPolicy::DangerSkipCertChainVerify)
-            .build()
-            .await?
-            .into_client();
+        let client = configure(
+            ClientBuilder::new()
+                .with_runtime(TokioRuntime)
+                .with_persistence_manager(pm)
+                .with_transport_factory(Factory(transport.clone()))
+                .with_http_client(NoHttp)
+                .with_version_override((2, 3000, 0))
+                .with_noise_cert_policy(NoiseCertPolicy::DangerSkipCertChainVerify),
+        )
+        .build()
+        .await?
+        .into_client();
         client.set_relay_transport_provider(Arc::new(NoRelay));
         let peer = Jid::new("333333333333333", Server::Lid);
         client
@@ -139,28 +145,57 @@ impl CallFixture {
         let events = Arc::new(Events::default());
         client.subscribe_handler(events.clone()).detach();
         let (connected_tx, connected_rx) = oneshot::channel();
-        let reader = tokio::spawn({
-            let client = client.clone();
-            async move {
-                let connection = client.connect().await?;
-                let _ = connected_tx.send(());
-                connection.read_until_disconnected().await;
-                Ok(())
-            }
-        });
+        let mut reader = scopeguard::guard(
+            tokio::spawn({
+                let client = client.clone();
+                async move {
+                    let connection = client.connect().await?;
+                    let _ = connected_tx.send(());
+                    connection.read_until_disconnected().await;
+                    Ok(())
+                }
+            }),
+            |reader| reader.abort(),
+        );
         let fixture = Self {
             client,
             peer,
             transport,
             offers,
             events,
-            reader: Mutex::new(Some(reader)),
+            reader: Mutex::new(None),
         };
-        tokio::time::timeout(DEADLINE, connected_rx).await??;
-        fixture
-            .inject(NodeBuilder::new("success").attr("lid", own).build())
-            .await?;
-        fixture.client.wait_for_connected(DEADLINE).await?;
+        match tokio::time::timeout(DEADLINE, connected_rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                (&mut *reader).await??;
+                anyhow::bail!("fixture connect ended without reporting readiness or an error");
+            }
+            Err(error) => {
+                reader.abort();
+                let _ = (&mut *reader).await;
+                let _ = fixture.shutdown().await;
+                return Err(error.into());
+            }
+        }
+        let ready = async {
+            fixture
+                .inject(NodeBuilder::new("success").attr("lid", own).build())
+                .await?;
+            fixture.client.wait_for_connected(DEADLINE).await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = ready {
+            reader.abort();
+            let _ = (&mut *reader).await;
+            let _ = fixture.shutdown().await;
+            return Err(error);
+        }
+        // Before publication, cancellation must abort the reader. Afterwards, fixture Drop lets
+        // the reader run production cleanup so existing CallHandles are reaped normally.
+        *fixture.reader.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(scopeguard::ScopeGuard::into_inner(reader));
         Ok(fixture)
     }
 
@@ -226,7 +261,8 @@ impl CallFixture {
         self.client.disconnect().await;
         let reader = self.reader.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(reader) = reader {
-            tokio::time::timeout(DEADLINE, reader).await???;
+            let mut reader = scopeguard::guard(reader, |reader| reader.abort());
+            tokio::time::timeout(DEADLINE, &mut *reader).await???;
         }
         Ok(())
     }
@@ -477,5 +513,114 @@ impl Transport for Wire {
 
     async fn disconnect(&self) {
         self.server_tx.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("synthetic transport connect failure")]
+    struct ConnectFault;
+
+    struct FailingFactory;
+
+    #[async_trait]
+    impl TransportFactory for FailingFactory {
+        async fn create_transport(
+            &self,
+        ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)> {
+            Err(ConnectFault.into())
+        }
+    }
+
+    #[tokio::test]
+    async fn constructor_preserves_the_real_connect_error() {
+        let error =
+            CallFixture::configured(|builder| builder.with_transport_factory(FailingFactory))
+                .await
+                .err()
+                .expect("the real connect must fail");
+        assert!(
+            matches!(error.downcast_ref::<crate::ConnectError>(),
+            Some(crate::ConnectError::Transport(cause)) if cause.is::<ConnectFault>()),
+            "lost the typed transport cause: {error:#}"
+        );
+    }
+
+    struct StalledFactory {
+        entered: async_channel::Sender<()>,
+        release: async_channel::Receiver<()>,
+        exited: async_channel::Sender<()>,
+        continued: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TransportFactory for StalledFactory {
+        async fn create_transport(
+            &self,
+        ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)> {
+            let _exited = scopeguard::guard(self.exited.clone(), |exited| {
+                let _ = exited.try_send(());
+            });
+            self.entered.send(()).await?;
+            self.release.recv().await?;
+            self.continued.fetch_add(1, Ordering::SeqCst);
+            Err(ConnectFault.into())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn constructor_deadline_and_cancellation_do_not_detach_the_connect_task() {
+        for cancel in [false, true] {
+            let (entered_tx, entered_rx) = async_channel::bounded(1);
+            let (release_tx, release_rx) = async_channel::bounded(1);
+            let (exited_tx, exited_rx) = async_channel::bounded(1);
+            let continued = Arc::new(AtomicUsize::new(0));
+            let factory = StalledFactory {
+                entered: entered_tx,
+                release: release_rx,
+                exited: exited_tx,
+                continued: continued.clone(),
+            };
+            let constructor = tokio::spawn(CallFixture::configured(move |builder| {
+                builder.with_transport_factory(factory)
+            }));
+            entered_rx
+                .recv()
+                .await
+                .expect("production Client::connect must enter the factory");
+            if cancel {
+                constructor.abort();
+                assert!(
+                    constructor
+                        .await
+                        .err()
+                        .expect("constructor cancelled")
+                        .is_cancelled()
+                );
+            } else {
+                tokio::time::advance(DEADLINE).await;
+                let error = constructor
+                    .await
+                    .expect("constructor task")
+                    .err()
+                    .expect("fixture deadline must expire before the transport deadline");
+                assert!(error.is::<tokio::time::error::Elapsed>(), "{error:#}");
+            }
+            tokio::time::timeout(Duration::from_millis(1), exited_rx.recv())
+                .await
+                .expect("the connect future must be dropped, not detached")
+                .expect("connect exit notification");
+            let _ = release_tx.try_send(());
+            tokio::time::advance(DEADLINE * 3).await;
+            assert_eq!(
+                continued.load(Ordering::SeqCst),
+                0,
+                "cancelled connect resumed its callback"
+            );
+        }
     }
 }

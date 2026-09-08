@@ -3265,7 +3265,8 @@ pub(crate) fn dm_stanza_to(recipient_bare: &Jid, to: &Jid) -> Jid {
     }
 }
 
-#[cfg(test)]
+// This suite shares native Tokio/SQLite fixtures and blocking Signal-session setup.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
@@ -9724,7 +9725,7 @@ mod future_size_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod clock_budget_tests {
     use super::*;
     use crate::store::commands::DeviceCommand;

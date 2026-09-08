@@ -408,7 +408,7 @@ pub mod bench_support;
 #[cfg(test)]
 pub mod test_utils;
 
-#[cfg(any(test, all(feature = "test-support", not(target_arch = "wasm32"))))]
+#[cfg(all(not(target_arch = "wasm32"), any(test, feature = "test-support")))]
 #[doc(hidden)]
 pub mod test_support;
 

@@ -330,6 +330,7 @@ pub(crate) async fn create_test_client_with_transport_factory(
     client
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn seed_peer_session(client: &Arc<Client>, peer: &Jid) {
     crate::test_support::seed_peer_session(client, peer)
         .await
