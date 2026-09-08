@@ -369,7 +369,7 @@ the reason for measuring against one.
 | --- | ---: | ---: |
 | HTTP: pooled TLS connection from the version fetch | 88 KiB | 0 KiB (#1243) |
 | noise: batch buffer after one 60 KiB frame | 60 KiB, vs 8 KiB small-traffic | 8 KiB (#1246) |
-| transport: retained `ClientConfig` | 14 KiB | 9 KiB (#1245) |
+| transport: retained `ClientConfig`, historical construction probe | 14 KiB | 9 KiB at #1245, not a warm-cache measurement |
 | topology log preallocation | 4 KiB | 0 KiB (#1244) |
 
 **The prekey window is a backend artifact, not a per-session cost.** Building a
@@ -396,10 +396,15 @@ and its in-call transient high-water from 63.1 KB to 42.1 KB — but retained is
 bit-identical at 42,072 B either way, because the final table is the same size.
 Reserving is worth it for the allocator traffic; it will never move the 41 KiB.
 
-**The rustls session cache is 5 KiB, not 44.** A whole retained
-`default_tls_connector()` measures 14.0 KiB; disabling resumption entirely takes
-it to 9.0 KiB, and sizing the store for the one host a factory dials takes it to
-9.4 KiB. The other 9 KiB is the config plus the webpki root store.
+**Historical rustls construction measurements.** At #1245, a retained
+`default_tls_connector()` measured 14.0 KiB; disabling resumption measured
+9.0 KiB, and the eight-ticket budget measured 9.4 KiB. These construction
+probes do not establish the footprint after processing session tickets.
+In rustls 0.23.43, that budget immediately evicts the first server-name entry.
+The corrected sixteen-ticket budget retains one name and its ticket deque;
+its empty and populated footprints have not been remeasured. Count an
+explicitly shared configuration once per owner, not once per socket. The
+transport resource estimate covers connection buffers, not this factory cache.
 
 ### Should a residency probe be permanent?
 

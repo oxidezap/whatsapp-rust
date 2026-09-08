@@ -21,14 +21,23 @@ pub const WHATSAPP_WEB_WS_URL_FALLBACK: &str = "wss://web.whatsapp.com:5222/ws/c
 /// Both chat endpoints WA Web dials, primary first.
 pub const WHATSAPP_WEB_WS_URLS: [&str; 2] = [WHATSAPP_WEB_WS_URL, WHATSAPP_WEB_WS_URL_FALLBACK];
 
-/// Appends WA Web's `?ED=` edge-routing query parameter to a chat URL.
+/// Appends an `ED` edge-routing query parameter to a chat URL.
 ///
-/// The value is the same `edge_routing_info` the handshake already sends as
-/// the binary `ED` pre-intro, here base64url-encoded exactly like WA Web's
-/// `encodeB64UrlSafe` (URL-safe alphabet, padding kept). Both dial URLs carry
-/// it. Returns `url` unchanged when routing is absent, empty, or oversize, the
-/// same omit rules as `build_handshake_header`: a missing query never fails a
-/// handshake, the pre-intro still carries the bytes.
+/// Encodes the raw routing bytes, not the binary pre-intro header. This helper
+/// retains its padded base64url output contract. Captured WA Web instead calls
+/// `encodeB64UrlSafe` without the padding flag and emits unpadded base64url.
+/// Callers must apply this helper to each dial URL; it does not configure dials.
+///
+/// Returns `url` unchanged when routing is absent, empty, or longer than
+/// [`wacore_noise::MAX_EDGE_ROUTING_LEN`], including any existing `ED` parameters.
+/// The binary [`wacore_noise::build_handshake_header`] also omits absent or
+/// oversized routing, but emits a zero-length pre-intro for `Some(&[])`.
+///
+/// This is an append-only string helper, not a URL or request validator. It adds
+/// `?ED=` or `&ED=` before the first `#fragment`, preserving existing query text
+/// and fragments without normalization or percent-decoding. Existing `ED`
+/// parameters are neither replaced nor deduplicated. Request parsing, duplicate
+/// rejection, and HTTP size limits belong to the caller.
 pub fn with_edge_routing_param(url: &str, edge_routing_info: Option<&[u8]>) -> String {
     let Some(info) = edge_routing_info else {
         return url.to_string();
@@ -855,39 +864,76 @@ mod racing_tests {
 
     #[test]
     fn edge_routing_param_absent_or_empty_leaves_url_untouched() {
-        assert_eq!(
-            with_edge_routing_param(WHATSAPP_WEB_WS_URL, None),
-            WHATSAPP_WEB_WS_URL
-        );
-        assert_eq!(
-            with_edge_routing_param(WHATSAPP_WEB_WS_URL, Some(&[])),
-            WHATSAPP_WEB_WS_URL
-        );
+        for url in [
+            WHATSAPP_WEB_WS_URL,
+            "wss://example.invalid/ws/chat?ED=%ZZ&ED=#frag",
+        ] {
+            assert_eq!(with_edge_routing_param(url, None), url);
+            assert_eq!(with_edge_routing_param(url, Some(&[])), url);
+        }
+
+        let (header, used) = wacore_noise::build_handshake_header(Some(&[]));
+        assert!(used);
+        assert_eq!(&header[..7], b"ED\x00\x01\x00\x00\x00");
+        assert_eq!(&header[7..], &wacore_binary::consts::WA_CONN_HEADER);
     }
 
     #[test]
-    fn edge_routing_param_encodes_like_wa_web() {
-        assert_eq!(
-            with_edge_routing_param(WHATSAPP_WEB_WS_URL, Some(&[0x01, 0x02, 0x03])),
-            format!("{WHATSAPP_WEB_WS_URL}?ED=AQID")
-        );
-        // WA Web's urlSafeBase64 swaps the alphabet but never strips `=`.
-        assert_eq!(
-            with_edge_routing_param(WHATSAPP_WEB_WS_URL, Some(&[0x01, 0x02])),
-            format!("{WHATSAPP_WEB_WS_URL}?ED=AQI=")
-        );
-        // `+`/`/` become `-`/`_`.
-        assert_eq!(
-            with_edge_routing_param(WHATSAPP_WEB_WS_URL, Some(&[0xFB, 0xFF])),
-            format!("{WHATSAPP_WEB_WS_URL}?ED=-_8=")
-        );
-        let url = with_edge_routing_param(WHATSAPP_WEB_WS_URL, Some(&[0xDE, 0xAD, 0xBE, 0xEF]));
-        let encoded = url.split("?ED=").nth(1).expect("query is present");
+    fn edge_routing_param_retains_padding_unlike_captured_wa_web() {
         use base64::Engine as _;
-        let decoded = base64::engine::general_purpose::URL_SAFE
-            .decode(encoded)
-            .expect("valid base64url");
-        assert_eq!(decoded, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+
+        // Synthetic literals verified by executing WABase64 from official WA
+        // 2.3000.1044770897, bundle content SHA-256
+        // 4de5ec27b53a202be96d64493441fe6aed113d6e35e5745e61d1f32a3341a30a.
+        for (bytes, captured_unpadded, retained_padded) in [
+            (&[0x01][..], "AQ", "AQ=="),
+            (&[0x01, 0x02][..], "AQI", "AQI="),
+            (&[0x01, 0x02, 0x03][..], "AQID", "AQID"),
+            (&[0xFB, 0xFF][..], "-_8", "-_8="),
+            (&[0xDE, 0xAD, 0xBE, 0xEF][..], "3q2-7w", "3q2-7w=="),
+        ] {
+            let url = with_edge_routing_param(WHATSAPP_WEB_WS_URL, Some(bytes));
+            assert_eq!(url, format!("{WHATSAPP_WEB_WS_URL}?ED={retained_padded}"));
+            let (_, encoded) = url.split_once("?ED=").expect("query is present");
+            assert_eq!(encoded.trim_end_matches('='), captured_unpadded);
+            assert_eq!(URL_SAFE.decode(encoded).expect("valid base64url"), bytes);
+            assert_eq!(
+                URL_SAFE_NO_PAD
+                    .decode(captured_unpadded)
+                    .expect("valid captured base64url"),
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn edge_routing_param_appends_without_validating_or_normalizing() {
+        for (url, expected) in [
+            (
+                "wss://example.invalid/ws/chat?x=1",
+                "wss://example.invalid/ws/chat?x=1&ED=AQ==",
+            ),
+            (
+                "wss://example.invalid/ws/chat?ED=old",
+                "wss://example.invalid/ws/chat?ED=old&ED=AQ==",
+            ),
+            (
+                "wss://example.invalid/ws/chat?ED=&ED=%ZZ#frag",
+                "wss://example.invalid/ws/chat?ED=&ED=%ZZ&ED=AQ==#frag",
+            ),
+            (
+                "wss://example.invalid/ws/chat?",
+                "wss://example.invalid/ws/chat?&ED=AQ==",
+            ),
+            (
+                "wss://example.invalid/ws/chat?x=1&",
+                "wss://example.invalid/ws/chat?x=1&&ED=AQ==",
+            ),
+            ("not a URL?%45D=AQ%3D%3D", "not a URL?%45D=AQ%3D%3D&ED=AQ=="),
+        ] {
+            assert_eq!(with_edge_routing_param(url, Some(&[0x01])), expected);
+        }
     }
 
     #[test]
@@ -900,15 +946,25 @@ mod racing_tests {
             with_edge_routing_param("wss://example.invalid/ws/chat?x=1#frag", Some(&[0x01])),
             "wss://example.invalid/ws/chat?x=1&ED=AQ==#frag"
         );
+        assert_eq!(
+            with_edge_routing_param("wss://example.invalid/ws/chat#?ED=old#", Some(&[0x01])),
+            "wss://example.invalid/ws/chat?ED=AQ==#?ED=old#"
+        );
+        assert_eq!(
+            with_edge_routing_param("wss://example.invalid/ws/chat#", Some(&[0x01])),
+            "wss://example.invalid/ws/chat?ED=AQ==#"
+        );
     }
 
     #[test]
     fn edge_routing_param_oversize_keeps_previous_behavior() {
         let oversize = vec![0x00u8; wacore_noise::MAX_EDGE_ROUTING_LEN + 1];
-        assert_eq!(
-            with_edge_routing_param(WHATSAPP_WEB_WS_URL, Some(&oversize)),
-            WHATSAPP_WEB_WS_URL
-        );
+        for url in [
+            WHATSAPP_WEB_WS_URL,
+            "wss://example.invalid/ws/chat?ED=%ZZ&ED=#frag",
+        ] {
+            assert_eq!(with_edge_routing_param(url, Some(&oversize)), url);
+        }
     }
 
     #[test]

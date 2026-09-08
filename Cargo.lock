@@ -5776,6 +5776,7 @@ dependencies = [
  "futures-util",
  "http",
  "log",
+ "rcgen",
  "rustls",
  "tokio",
  "tokio-rustls",

@@ -43,12 +43,10 @@ fn transport_resource_estimate() -> wacore::stats::TransportResourceReport {
 
 static CRYPTO_PROVIDER_INIT: Once = Once::new();
 
-/// A factory dials one URL, so its resumption store only ever needs one server
-/// name. rustls's default asks for 256 sessions, which it turns into a
-/// preallocated table of `⌈256/8⌉ = 32` server names. Eight is its per-server
-/// ticket maximum, so one slot here is a full slot, not a reduction in what can
-/// be resumed for the host actually dialled.
-const RESUMPTION_TICKETS: usize = 8;
+/// rustls 0.23.43 divides this budget by eight to size its server-name queue,
+/// then evicts when the queue reaches capacity. Two slots retain one name;
+/// one slot immediately evicts it. The per-server TLS 1.3 ticket limit stays eight.
+const RESUMPTION_TICKETS: usize = 16;
 
 /// Applies the single-host resumption sizing to a freshly built config.
 fn size_for_one_host(mut config: rustls::ClientConfig) -> rustls::ClientConfig {
@@ -381,6 +379,35 @@ impl TokioWebSocketTransportFactory {
     /// This is the primary extension point for custom TLS configuration
     /// (e.g. custom CA certificates, client certs). For full proxy support,
     /// implement [`TransportFactory`] directly and use [`from_websocket`].
+    ///
+    /// Repeated dials on one factory retain its default connector. Separate
+    /// factories build separate defaults. To share TLS configuration and session
+    /// storage across factories, clone the rustls payload, not `Connector`:
+    ///
+    /// ```
+    /// use whatsapp_rust_tokio_transport::{
+    ///     Connector, TokioWebSocketTransportFactory, default_tls_connector,
+    /// };
+    ///
+    /// # fn main() -> anyhow::Result<()> {
+    /// let Connector::Rustls(tls) = default_tls_connector() else {
+    ///     anyhow::bail!("expected the default rustls connector");
+    /// };
+    /// let primary = TokioWebSocketTransportFactory::new()
+    ///     .with_connector(Connector::Rustls(tls.clone()));
+    /// let secondary = TokioWebSocketTransportFactory::new()
+    ///     .with_url("wss://web.whatsapp.com:5222/ws/chat")
+    ///     .with_connector(Connector::Rustls(tls.clone()));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The clones share an `Arc<ClientConfig>`, not an open socket. Share only
+    /// within the intended trust, client-identity, and tenant policy. The default
+    /// store holds tickets for one server name; supply your own configuration
+    /// for a larger multi-host cache. Changing a port or ED query does not change
+    /// the server-name key, but resumption still requires processed tickets and
+    /// server acceptance. Certificate validation, SNI, and Origin are unchanged.
     pub fn with_connector(mut self, connector: Connector) -> Self {
         self.connector = Some(connector);
         self
@@ -417,7 +444,7 @@ impl TransportFactory for TokioWebSocketTransportFactory {
                 .map_err(|e| anyhow::anyhow!("Failed to set Origin header: {e}"))?;
         }
 
-        debug!("Dialing {}", self.url);
+        debug!("Dialing WebSocket");
         let (ws, _) = builder
             .connect()
             .await
@@ -485,46 +512,377 @@ mod tests {
         );
     }
 
-    /// Dials a port nothing answers on, bounded so a stack that drops rather
-    /// than refuses cannot hang the suite. The connector is chosen before the
-    /// dial, so whether it fails or times out is irrelevant to these tests.
-    async fn attempt_dial(factory: &TokioWebSocketTransportFactory) {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            factory.create_transport(),
-        )
-        .await;
+    async fn attempt_dial(factory: &mut TokioWebSocketTransportFactory) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            factory.url = format!("ws://{}/ws/chat", listener.local_addr().unwrap());
+            let server = async { drop(listener.accept().await.unwrap()) };
+            let client = async { assert!(factory.create_transport().await.is_err()) };
+            tokio::join!(server, client);
+        })
+        .await
+        .expect("local dial timed out");
     }
 
-    /// A reconnect must not rebuild the TLS config. Nothing was retained
-    /// before, which is why the resumption store inside it was always empty.
     #[tokio::test]
     async fn the_default_connector_is_retained_across_dials() {
-        let factory = TokioWebSocketTransportFactory::new().with_url("ws://127.0.0.1:1/ws/chat");
+        let mut factory = TokioWebSocketTransportFactory::new();
         assert!(factory.default_connector.get().is_none());
 
-        attempt_dial(&factory).await;
-        assert!(
-            factory.default_connector.get().is_some(),
-            "the first dial built a connector and dropped it"
-        );
+        attempt_dial(&mut factory).await;
+        let config = rustls_config(factory.default_connector.get().unwrap()).clone();
 
-        attempt_dial(&factory).await;
-        assert!(
-            factory.default_connector.get().is_some(),
-            "a second dial must reuse the retained connector"
-        );
+        attempt_dial(&mut factory).await;
+        assert!(Arc::ptr_eq(
+            &config,
+            rustls_config(factory.default_connector.get().unwrap()),
+        ));
+
+        let mut other = TokioWebSocketTransportFactory::new();
+        attempt_dial(&mut other).await;
+        assert!(!Arc::ptr_eq(
+            &config,
+            rustls_config(other.default_connector.get().unwrap()),
+        ));
+    }
+
+    fn rustls_config(connector: &Connector) -> &Arc<rustls::ClientConfig> {
+        match connector {
+            Connector::Rustls(tls) => tls.config(),
+            _ => panic!("expected rustls"),
+        }
+    }
+
+    #[test]
+    fn single_host_session_cache_retains_state() {
+        use rustls::client::ClientSessionStore;
+        let cache = rustls::client::ClientSessionMemoryCache::new(RESUMPTION_TICKETS);
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        cache.set_kx_hint(name.clone(), rustls::NamedGroup::X25519);
+        assert_eq!(cache.kx_hint(&name), Some(rustls::NamedGroup::X25519));
+    }
+
+    #[derive(Debug)]
+    struct TicketStore {
+        cache: rustls::client::ClientSessionMemoryCache,
+        received: tokio::sync::Semaphore,
+    }
+
+    impl TicketStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                cache: rustls::client::ClientSessionMemoryCache::new(RESUMPTION_TICKETS),
+                received: tokio::sync::Semaphore::new(0),
+            })
+        }
+    }
+
+    impl rustls::client::ClientSessionStore for TicketStore {
+        fn set_kx_hint(
+            &self,
+            name: rustls::pki_types::ServerName<'static>,
+            group: rustls::NamedGroup,
+        ) {
+            self.cache.set_kx_hint(name, group);
+        }
+
+        fn kx_hint(&self, name: &rustls::pki_types::ServerName<'_>) -> Option<rustls::NamedGroup> {
+            self.cache.kx_hint(name)
+        }
+
+        fn set_tls12_session(
+            &self,
+            name: rustls::pki_types::ServerName<'static>,
+            value: rustls::client::Tls12ClientSessionValue,
+        ) {
+            self.cache.set_tls12_session(name, value);
+        }
+
+        fn tls12_session(
+            &self,
+            name: &rustls::pki_types::ServerName<'_>,
+        ) -> Option<rustls::client::Tls12ClientSessionValue> {
+            self.cache.tls12_session(name)
+        }
+
+        fn remove_tls12_session(&self, name: &rustls::pki_types::ServerName<'static>) {
+            self.cache.remove_tls12_session(name);
+        }
+
+        fn insert_tls13_ticket(
+            &self,
+            name: rustls::pki_types::ServerName<'static>,
+            value: rustls::client::Tls13ClientSessionValue,
+        ) {
+            self.cache.insert_tls13_ticket(name, value);
+            self.received.add_permits(1);
+        }
+
+        fn take_tls13_ticket(
+            &self,
+            name: &rustls::pki_types::ServerName<'static>,
+        ) -> Option<rustls::client::Tls13ClientSessionValue> {
+            self.cache.take_tls13_ticket(name)
+        }
+    }
+
+    fn tls_server_config(
+        name: &str,
+    ) -> (
+        Arc<rustls::ServerConfig>,
+        rustls::pki_types::CertificateDer<'static>,
+    ) {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec![name.into()]).unwrap();
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+        )
+        .unwrap();
+        config.send_tls13_tickets = 1;
+        (Arc::new(config), cert.der().clone())
+    }
+
+    fn trusted_connector(
+        cert: rustls::pki_types::CertificateDer<'static>,
+        store: &Arc<TicketStore>,
+    ) -> tokio_rustls::TlsConnector {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        config.resumption = rustls::client::Resumption::store(store.clone());
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+    }
+
+    async fn tls_dial(
+        listener: &tokio::net::TcpListener,
+        server_config: &Arc<rustls::ServerConfig>,
+        factory: &TokioWebSocketTransportFactory,
+        store: &TicketStore,
+        expected_target: &str,
+    ) -> rustls::HandshakeKind {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let server = async {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let tls = tokio_rustls::TlsAcceptor::from(server_config.clone())
+                    .accept(tcp)
+                    .await
+                    .unwrap();
+                assert_eq!(tls.get_ref().1.server_name(), None);
+                let kind = tls.get_ref().1.handshake_kind().unwrap();
+                let (request, mut ws) = tokio_websockets::ServerBuilder::new()
+                    .accept(tls)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    request.uri().path_and_query().unwrap().as_str(),
+                    expected_target
+                );
+                assert_eq!(request.headers()[http::header::ORIGIN], WHATSAPP_WEB_ORIGIN);
+                assert!(ws.next().await.unwrap().unwrap().is_close());
+                kind
+            };
+            let client = async {
+                let (transport, events) = factory.create_transport().await.unwrap();
+                assert!(matches!(
+                    events.recv().await.unwrap(),
+                    TransportEvent::Connected
+                ));
+                // A completed handshake alone does not mean the client has read its ticket.
+                store.received.acquire().await.unwrap().forget();
+                transport.disconnect().await;
+                assert!(matches!(
+                    events.recv().await.unwrap(),
+                    TransportEvent::Disconnected(_)
+                ));
+            };
+            let (kind, ()) = tokio::join!(server, client);
+            kind
+        })
+        .await
+        .expect("local TLS dial timed out")
+    }
+
+    #[tokio::test]
+    async fn shared_factories_retain_tls_sessions_across_ed_and_ports() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (server_config, cert) = tls_server_config("127.0.0.1");
+            let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let store = TicketStore::new();
+            let tls = trusted_connector(cert.clone(), &store);
+            let make_factory = |port, target: &str, tls: tokio_rustls::TlsConnector| {
+                TokioWebSocketTransportFactory::new()
+                    .with_url(format!("wss://127.0.0.1:{port}{target}"))
+                    .with_connector(Connector::Rustls(tls))
+            };
+            let a = make_factory(
+                first.local_addr().unwrap().port(),
+                "/ws/chat?ED=AQ==",
+                tls.clone(),
+            );
+            let b = make_factory(
+                second.local_addr().unwrap().port(),
+                "/ws/chat?ED=Ag==",
+                tls.clone(),
+            );
+            assert!(Arc::ptr_eq(
+                rustls_config(a.connector.as_ref().unwrap()),
+                rustls_config(b.connector.as_ref().unwrap())
+            ));
+            assert_eq!(
+                tls_dial(&first, &server_config, &a, &store, "/ws/chat?ED=AQ==").await,
+                rustls::HandshakeKind::Full
+            );
+            assert_eq!(
+                tls_dial(&first, &server_config, &a, &store, "/ws/chat?ED=AQ==").await,
+                rustls::HandshakeKind::Resumed
+            );
+            drop(a);
+            assert_eq!(
+                tls_dial(&second, &server_config, &b, &store, "/ws/chat?ED=Ag==").await,
+                rustls::HandshakeKind::Resumed
+            );
+            assert!(b.default_connector.get().is_none());
+
+            let isolated_store = TicketStore::new();
+            let isolated_tls = trusted_connector(cert, &isolated_store);
+            assert!(!Arc::ptr_eq(tls.config(), isolated_tls.config()));
+            let isolated = make_factory(
+                second.local_addr().unwrap().port(),
+                "/ws/chat?ED=Aw==",
+                isolated_tls,
+            );
+            assert_eq!(
+                tls_dial(
+                    &second,
+                    &server_config,
+                    &isolated,
+                    &isolated_store,
+                    "/ws/chat?ED=Aw=="
+                )
+                .await,
+                rustls::HandshakeKind::Full
+            );
+            assert_eq!(
+                tls_dial(&second, &server_config, &b, &store, "/ws/chat?ED=Ag==").await,
+                rustls::HandshakeKind::Resumed
+            );
+        })
+        .await
+        .expect("shared TLS factory test timed out");
+    }
+
+    #[tokio::test]
+    async fn tls_rejects_untrusted_certificates_and_wrong_server_names() {
+        let (server_config, cert) = tls_server_config("localhost");
+        let unrelated_key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["unrelated.invalid".into()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Unrelated test root");
+        let unrelated_cert = params.self_signed(&unrelated_key).unwrap().der().clone();
+        for (root, expected_error) in [
+            (unrelated_cert, "UnknownIssuer"),
+            (cert, "certificate not valid for name"),
+        ] {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let factory = TokioWebSocketTransportFactory::new()
+                    .with_url(format!(
+                        "wss://127.0.0.1:{}/ws/chat",
+                        listener.local_addr().unwrap().port()
+                    ))
+                    .with_connector(Connector::Rustls(trusted_connector(
+                        root,
+                        &TicketStore::new(),
+                    )));
+                let server = async {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    assert!(
+                        tokio_rustls::TlsAcceptor::from(server_config.clone())
+                            .accept(tcp)
+                            .await
+                            .is_err()
+                    );
+                };
+                let client = async {
+                    let error = match factory.create_transport().await {
+                        Ok(_) => panic!("invalid TLS peer was accepted"),
+                        Err(error) => error,
+                    };
+                    assert!(error.to_string().contains(expected_error), "{error}");
+                };
+                tokio::join!(server, client);
+            })
+            .await
+            .expect("local TLS rejection timed out");
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_rustls_connector_sends_dns_sni_and_checks_hostname() {
+        let (server_config, cert) = tls_server_config("localhost");
+        let connector = trusted_connector(cert, &TicketStore::new());
+        assert!(connector.config().enable_sni);
+        for name in ["localhost", "wrong.invalid"] {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                // DNS names go only to rustls, never to the socket resolver or factory.
+                let server = async {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    tokio_rustls::TlsAcceptor::from(server_config.clone())
+                        .accept(tcp)
+                        .await
+                };
+                let client = async {
+                    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    connector
+                        .connect(rustls::pki_types::ServerName::try_from(name).unwrap(), tcp)
+                        .await
+                };
+                let (server, client) = tokio::join!(server, client);
+                if name == "localhost" {
+                    assert_eq!(server.unwrap().get_ref().1.server_name(), Some(name));
+                    assert!(client.is_ok());
+                } else {
+                    assert!(server.is_err());
+                    let error = match client {
+                        Ok(_) => panic!("wrong DNS name was accepted"),
+                        Err(error) => error,
+                    };
+                    assert!(
+                        error.to_string().contains("certificate not valid for name"),
+                        "{error}"
+                    );
+                }
+            })
+            .await
+            .expect("direct rustls DNS-name test timed out");
+        }
     }
 
     /// The retained default must stay unbuilt when the caller supplied one:
     /// building it anyway would pay for a TLS config nothing ever dials with.
     #[tokio::test]
     async fn a_custom_connector_leaves_the_default_unbuilt() {
-        let factory = TokioWebSocketTransportFactory::new()
-            .with_url("ws://127.0.0.1:1/ws/chat")
-            .with_connector(default_tls_connector());
+        let mut factory =
+            TokioWebSocketTransportFactory::new().with_connector(default_tls_connector());
 
-        attempt_dial(&factory).await;
+        attempt_dial(&mut factory).await;
 
         assert!(
             factory.default_connector.get().is_none(),
