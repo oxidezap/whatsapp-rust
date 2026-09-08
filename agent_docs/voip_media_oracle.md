@@ -130,8 +130,8 @@ No proprietary WASM, captured JS, or personal data belongs in the test commit.
 
 ## Received video orientation proof
 
-`received_frame_rotation_matches_whatsapp_wasm` requires the same captured J
-module and fails if it is unavailable. It calls function 828 at table slot 427
+`received_frame_rotation_matches_whatsapp_wasm` uses the same captured J
+module under the capture-availability policy above. It calls function 828 at table slot 427
 with a synthetic H.264 frame descriptor and records `env::renderVideoFrame_js`.
 The function body hash is
 `6b4c303d8f48d3adc46ef8ba1c3e8dc0aca0db37193974b53101e1a9071b7131`.
@@ -169,7 +169,7 @@ Live Android front/rear switching still requires a device retest.
 `tools/oracle-core/tests/incoming_orientation_probe.rs` feeds synthetic RTP
 packets to J function 4873 at slot 3954, then passes its parsed extension
 object directly to packet-frame constructor 6003 at slot 4331. The host never
-writes `frame+52`. Missing captures fail rather than skip.
+writes `frame+52`. These probes follow the same capture-availability policy.
 
 The executed profile dispatcher uses functions 4922/4923 and frame-info reader
 4911, then getter 4891. This is distinct from the stream-reader function 4913
