@@ -48,6 +48,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "true"
+      # The host test invokes rustc for WASM cfg checks; do not cross-compile the test itself.
+      - name: Run native fixture cfg probe
+        run: cargo test -p whatsapp-rust --test native_test_support_cfg -- --ignored
       # Mirrors how whatsapp-rust-bridge consumes the crate: lib only (the
       # binary pulls tokio/sqlite), no default features. Guards against code
       # reachable from wasm regressing on tokio/std-only APIs.
