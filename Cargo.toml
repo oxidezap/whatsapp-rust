@@ -263,6 +263,7 @@ bytes = { workspace = true }
 chrono = { workspace = true, features = ["now"] }
 event-listener = { workspace = true }
 futures = { workspace = true, features = ["std"] }
+sha2 = { workspace = true }
 smallvec = { workspace = true }
 hashbrown = { workspace = true }
 hex = { workspace = true }
@@ -330,7 +331,6 @@ hmac = { workspace = true }
 # Raises real SIGINT/SIGTERM at the current process in the shutdown-signal test.
 libc = "0.2"
 metrics-exporter-prometheus = "0.18"
-sha2 = { workspace = true }
 # Parses the crate sources in tests/error_surface.rs. Text scanning silently
 # missed error enums whose doc comments carried unbalanced braces.
 syn = { version = "3.0", features = ["full"] }

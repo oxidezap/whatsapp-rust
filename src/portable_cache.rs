@@ -266,6 +266,134 @@ struct CacheInner<K, V, S> {
     capacity_eviction_blocks: u64,
 }
 
+/// Synchronous TTL admission for publication paths that cannot yield after commit.
+pub(crate) struct SyncTtlCache<K, V> {
+    inner: std::sync::Mutex<CacheInner<K, V, RandomState>>,
+    capacity: u64,
+    ttl: Option<Duration>,
+}
+
+pub(crate) struct SyncTtlGuard<'a, K, V> {
+    inner: std::sync::MutexGuard<'a, CacheInner<K, V, RandomState>>,
+    capacity: u64,
+    ttl: Option<Duration>,
+    now: Instant,
+}
+
+impl<K: Hash + Eq + Clone, V> SyncTtlGuard<'_, K, V> {
+    pub(crate) fn get(&mut self, key: &K) -> Option<&mut V> {
+        if self.inner.get(key).is_some_and(|entry| {
+            self.ttl
+                .is_some_and(|ttl| self.now.saturating_duration_since(entry.inserted_at) >= ttl)
+        }) {
+            self.inner.remove_key(key);
+        }
+        self.inner.get_mut(key).map(|entry| {
+            entry
+                .referenced
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            &mut entry.value
+        })
+    }
+
+    pub(crate) fn insert(&mut self, key: K, value: V) {
+        if let Some(entry) = self.inner.get_mut(&key) {
+            entry.value = value;
+            entry.inserted_at = self.now;
+            entry.last_accessed_at = self.now;
+        } else if self.capacity != 0 {
+            self.inner
+                .insert_new(key, value, self.now, Some(self.capacity), None);
+        }
+    }
+
+    pub(crate) fn find_unique_key(&self, matches: impl Fn(&K, &V) -> bool) -> Option<K> {
+        let mut found = self.inner.iter().filter_map(|(key, entry)| {
+            if self
+                .ttl
+                .is_some_and(|ttl| self.now.saturating_duration_since(entry.inserted_at) >= ttl)
+                || !matches(key, &entry.value)
+            {
+                None
+            } else {
+                Some((key, entry))
+            }
+        });
+        let first = found.next()?;
+        if found.next().is_some() {
+            return None;
+        }
+        first
+            .1
+            .referenced
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Some(first.0.clone())
+    }
+}
+
+impl<K: Hash + Eq + Clone, V: Clone> SyncTtlCache<K, V> {
+    pub(crate) fn new(capacity: u64, ttl: Option<Duration>) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(CacheInner::new(true, RandomState::new())),
+            capacity,
+            ttl,
+        }
+    }
+
+    pub(crate) fn configured_capacity(&self) -> Option<u64> {
+        Some(self.capacity)
+    }
+
+    pub(crate) fn with<R>(&self, access: impl FnOnce(&mut SyncTtlGuard<'_, K, V>) -> R) -> R {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        access(&mut SyncTtlGuard {
+            inner,
+            capacity: self.capacity,
+            ttl: self.ttl,
+            now: Instant::now(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn upsert(&self, key: &K, update: impl FnOnce(Option<&V>) -> Option<V>) {
+        self.with(|cache| {
+            if let Some(value) = update(cache.get(key).as_deref()) {
+                cache.insert(key.clone(), value);
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get(&self, key: &K) -> Option<V> {
+        self.with(|cache| cache.get(key).cloned())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert(&self, key: K, value: V) {
+        self.upsert(&key, |_| Some(value));
+    }
+
+    pub(crate) fn run_pending_tasks(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        let expired: Vec<_> = inner
+            .iter()
+            .filter(|(_, entry)| {
+                self.ttl
+                    .is_some_and(|ttl| now.saturating_duration_since(entry.inserted_at) >= ttl)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in expired {
+            inner.remove_key(&key);
+        }
+    }
+
+    pub(crate) fn entry_count(&self) -> u64 {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).len() as u64
+    }
+}
+
 impl<K, V, S> CacheInner<K, V, S>
 where
     K: Hash + Eq + Clone,
@@ -1282,6 +1410,47 @@ impl<K, V, S> Clone for PortableCache<K, V, S> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn sync_ttl_admission_is_atomic_and_bounded() {
+        let cache = Arc::new(SyncTtlCache::new(2, None));
+        let admitted = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    cache.upsert(&1, |entry| {
+                        if entry.is_none() {
+                            admitted.fetch_add(1, Ordering::Relaxed);
+                            Some(1)
+                        } else {
+                            None
+                        }
+                    })
+                });
+            }
+        });
+        assert_eq!(admitted.load(Ordering::Relaxed), 1);
+        for key in 2..10 {
+            cache.insert(key, key);
+            assert_eq!(cache.entry_count(), 2);
+            assert_eq!(cache.get(&key), Some(key));
+        }
+    }
+
+    #[test]
+    fn sync_ttl_expiry_and_disabled_capacity() {
+        let expired = SyncTtlCache::new(2, Some(Duration::ZERO));
+        expired.insert(1, 1);
+        assert_eq!(expired.get(&1), None);
+        expired.insert(2, 2);
+        expired.run_pending_tasks();
+        assert_eq!(expired.entry_count(), 0);
+
+        let disabled = SyncTtlCache::new(0, None);
+        disabled.insert(1, 1);
+        assert_eq!(disabled.get(&1), None);
+        assert_eq!(disabled.entry_count(), 0);
+    }
 
     #[tokio::test]
     async fn pinned_eviction_has_bounded_probe_work() {

@@ -594,7 +594,10 @@ impl Client {
 
             undecryptable_dispatched: cache_config.undecryptable_dispatched.build_with_ttl(),
 
-            dispatched_messages: cache_config.dispatched_messages.build_with_ttl(),
+            dispatched_messages: crate::portable_cache::SyncTtlCache::new(
+                cache_config.dispatched_messages.capacity,
+                cache_config.dispatched_messages.timeout,
+            ),
             duplicate_dispatch_suppressed: AtomicU64::new(0),
 
             offline_sync_metrics: Arc::new(OfflineSyncMetrics {

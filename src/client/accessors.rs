@@ -491,7 +491,7 @@ impl Client {
             dm_devices_memo,
             message_retry_counts: self.message_retry_counts.entry_count_async().await,
             undecryptable_dispatched: self.undecryptable_dispatched.entry_count_async().await,
-            dispatched_messages: self.dispatched_messages.entry_count_async().await,
+            dispatched_messages: self.dispatched_messages.entry_count(),
             pdo_pending_requests: self.pdo_pending_requests.entry_count_async().await,
             pdo_requested: self.pdo_requested.entry_count_async().await,
             history_sync_tasks,

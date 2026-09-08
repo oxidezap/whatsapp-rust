@@ -373,7 +373,7 @@ impl Client {
         self.message_retry_counts.run_pending_tasks().await;
         self.session_recreate_history.run_pending_tasks().await;
         self.undecryptable_dispatched.run_pending_tasks().await;
-        self.dispatched_messages.run_pending_tasks().await;
+        self.dispatched_messages.run_pending_tasks();
         self.pdo_pending_requests.run_pending_tasks().await;
         self.pdo_requested.run_pending_tasks().await;
         self.device_registry_cache.run_pending_tasks().await;

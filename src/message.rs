@@ -218,6 +218,146 @@ pub(crate) enum MessageDispatch {
     RecoveredCommitted,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DispatchKey {
+    chat: Jid,
+    id: wacore_binary::MessageId,
+    participant: Option<Jid>,
+    from_me: bool,
+}
+
+const MAX_DISPATCH_PAYLOADS: usize = 8;
+const PUBLICATION_PENDING: u8 = 0;
+const PUBLICATION_COMPLETE: u8 = 1;
+const PUBLICATION_INTERRUPTED: u8 = 2;
+
+#[derive(Clone)]
+struct DispatchPayload {
+    fingerprint: [u8; 32],
+    state: MessageDispatch,
+    publication: Arc<AtomicU8>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct DispatchClaim {
+    payloads: smallvec::SmallVec<[DispatchPayload; 1]>,
+    alias: Option<Jid>,
+}
+
+#[derive(Default)]
+pub(crate) struct PublicationGuard {
+    owner: Option<Arc<AtomicU8>>,
+}
+
+impl PublicationGuard {
+    fn owner(&mut self) -> Arc<AtomicU8> {
+        Arc::clone(
+            self.owner
+                .get_or_insert_with(|| Arc::new(AtomicU8::new(PUBLICATION_PENDING))),
+        )
+    }
+
+    pub(crate) fn complete(mut self) {
+        if let Some(owner) = self.owner.take() {
+            owner.store(PUBLICATION_COMPLETE, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for PublicationGuard {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.owner {
+            // Only slots still carrying this token become invalid. A newer
+            // publisher can replace a pending slot without an ABA rollback.
+            owner.store(PUBLICATION_INTERRUPTED, Ordering::Release);
+        }
+    }
+}
+
+impl DispatchClaim {
+    fn prune(&mut self) {
+        self.payloads.retain(|payload| {
+            payload.publication.load(Ordering::Acquire) != PUBLICATION_INTERRUPTED
+        });
+    }
+
+    fn has_deliveries(&self) -> bool {
+        self.payloads
+            .iter()
+            .any(|payload| payload.publication.load(Ordering::Acquire) != PUBLICATION_INTERRUPTED)
+    }
+
+    fn has_recovery(&self) -> bool {
+        self.payloads.iter().any(|payload| {
+            payload.state != MessageDispatch::Decrypted
+                && payload.publication.load(Ordering::Acquire) != PUBLICATION_INTERRUPTED
+        })
+    }
+
+    fn state(&self, fingerprint: &[u8; 32]) -> Option<MessageDispatch> {
+        self.payloads
+            .iter()
+            .find(|payload| {
+                &payload.fingerprint == fingerprint
+                    && payload.publication.load(Ordering::Acquire) != PUBLICATION_INTERRUPTED
+            })
+            .map(|payload| payload.state)
+    }
+
+    fn admit(
+        &mut self,
+        fingerprint: [u8; 32],
+        pdo: bool,
+        hook_committed: bool,
+        publication: &mut PublicationGuard,
+    ) -> bool {
+        if let Some(payload) = self
+            .payloads
+            .iter_mut()
+            .find(|payload| payload.fingerprint == fingerprint)
+        {
+            if pdo {
+                return true;
+            }
+            if payload.state != MessageDispatch::Decrypted {
+                if hook_committed {
+                    payload.state = MessageDispatch::RecoveredCommitted;
+                }
+                return true;
+            }
+            // Ordinary multipart dispatches and hook replays still fan out.
+            // Keep a completed claim, but let a new publisher own a pending one.
+            if payload.publication.load(Ordering::Acquire) != PUBLICATION_COMPLETE {
+                payload.publication = publication.owner();
+            }
+            return false;
+        }
+        if self.payloads.len() < MAX_DISPATCH_PAYLOADS {
+            self.payloads.push(DispatchPayload {
+                fingerprint,
+                state: if pdo {
+                    MessageDispatch::Recovered
+                } else {
+                    MessageDispatch::Decrypted
+                },
+                publication: publication.owner(),
+            });
+        }
+        // Overflow stays unclaimed, never silently discards another payload.
+        false
+    }
+}
+
+impl MessageDispatch {
+    #[inline(never)]
+    pub(crate) fn fingerprint(message: &wa::Message) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        waproto::codec::message_encode_chunks(message, &mut |bytes| digest.update(bytes));
+        digest.finalize().into()
+    }
+}
+
 const INBOUND_COMMIT_PENDING: u8 = 0;
 const INBOUND_COMMIT_DURABLE: u8 = 1;
 const INBOUND_COMMIT_DROPPED: u8 = 2;

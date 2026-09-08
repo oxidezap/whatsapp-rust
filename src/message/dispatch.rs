@@ -13,27 +13,135 @@ fn delivery_receipt_burst_warning(
 }
 
 impl Client {
-    /// Has this message already been dispatched to consumers?
-    ///
-    /// A sender whose network is bad re-runs its own outbox: same message id,
-    /// fresh ciphertext on a new ratchet iteration. Neither ratchet can call
-    /// that a duplicate (`DuplicatedMessage` covers only the byte-identical
-    /// stanza the server replays), so identity is the only thing left that says
-    /// the two deliveries are one message.
-    ///
-    /// Read here and written by [`Self::mark_message_dispatched`] once the
-    /// batch carrying the message becomes observable. Those are two points in
-    /// time, so this cannot be an atomic `get_with` the way the sibling
-    /// `undecryptable_dispatched` gate is: claiming at the check would claim
-    /// for a commit that may still fail. `chat_lanes` serializes incoming
-    /// processing per chat and so closes the window for ordinary traffic, but
-    /// PDO recovery arrives on the phone's lane instead. The commit path
-    /// rechecks recovery claims under the shared publication lock.
+    fn with_message_dispatch<R>(
+        &self,
+        info: &Arc<MessageInfo>,
+        pdo: bool,
+        update: impl FnOnce(&mut DispatchClaim) -> R,
+    ) -> R {
+        let key = Self::dispatch_key(info);
+        self.dispatched_messages.with(|cache| {
+            if let Some(claim) = cache.get(&key) {
+                claim.prune();
+                if !pdo && claim.alias.is_none() {
+                    claim.alias = Self::dispatch_alias(info, &key);
+                }
+                return update(claim);
+            }
+            let mut alias = None;
+            let recovery_key = if pdo {
+                // Only PDO misses scan. Two primaries naming this alternate
+                // are ambiguous, so neither may suppress the recovered event.
+                cache.find_unique_key(|primary, claim| {
+                    if !claim.has_deliveries()
+                        || primary.id != key.id
+                        || primary.from_me != key.from_me
+                    {
+                        return false;
+                    }
+                    match (&primary.participant, &key.participant, &claim.alias) {
+                        (Some(_), Some(participant), Some(alias)) => {
+                            primary.chat == key.chat && participant == alias
+                        }
+                        (None, None, Some(alias)) => &key.chat == alias,
+                        _ => false,
+                    }
+                })
+            } else {
+                alias = Self::dispatch_alias(info, &key);
+                alias.as_ref().and_then(|alternate| {
+                    let alternate_key = DispatchKey {
+                        chat: if key.participant.is_some() {
+                            key.chat.clone()
+                        } else {
+                            alternate.clone()
+                        },
+                        id: key.id.clone(),
+                        participant: key.participant.as_ref().map(|_| alternate.clone()),
+                        from_me: key.from_me,
+                    };
+                    let claim = cache.get(&alternate_key)?;
+                    claim.prune();
+                    let primary = key.participant.as_ref().unwrap_or(&key.chat);
+                    if !claim.has_recovery()
+                        || claim.alias.as_ref().is_some_and(|bound| bound != primary)
+                    {
+                        return None;
+                    }
+                    // Bind only the direct evidence in this stanza. A later
+                    // conflicting primary cannot reuse the PDO claim.
+                    claim.alias.get_or_insert_with(|| primary.clone());
+                    Some(alternate_key)
+                })
+            };
+            if let Some(claim) = recovery_key.as_ref().and_then(|key| cache.get(key)) {
+                claim.prune();
+                return update(claim);
+            }
+            let mut claim = DispatchClaim {
+                alias: alias.or_else(|| Self::dispatch_alias(info, &key)),
+                ..Default::default()
+            };
+            let result = update(&mut claim);
+            if !claim.payloads.is_empty() {
+                cache.insert(key, claim);
+            }
+            result
+        })
+    }
+
+    pub(crate) fn admit_message_dispatch(
+        &self,
+        info: &Arc<MessageInfo>,
+        pdo: bool,
+        fingerprint: Option<[u8; 32]>,
+        hook_committed: bool,
+        publication: &mut PublicationGuard,
+    ) -> bool {
+        let Some(fingerprint) = fingerprint else {
+            return false;
+        };
+        self.with_message_dispatch(info, pdo, |claim| {
+            claim.admit(fingerprint, pdo, hook_committed, publication)
+        })
+    }
+
+    pub(crate) async fn suppress_recovered_or_dispatched(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+        message: &wa::Message,
+    ) -> bool {
+        if !self.dispatch_gate_enabled()
+            || !self.with_message_dispatch(info, false, |claim| claim.has_deliveries())
+        {
+            return false;
+        }
+        let decrypted;
+        let message = if crate::features::message_edit::carries_secret_encrypted(message) {
+            let Some(inner) = self
+                .maybe_decrypt_secret_encrypted_message(message, info)
+                .await
+            else {
+                return false;
+            };
+            decrypted = inner;
+            &decrypted
+        } else {
+            message
+        };
+        let fingerprint = MessageDispatch::fingerprint(message);
+        self.with_message_dispatch(info, false, |claim| {
+            claim.state(&fingerprint).is_some_and(|state| {
+                state != MessageDispatch::Recovered || self.inbound_durability_hook.get().is_none()
+            })
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) async fn message_already_dispatched(&self, info: &Arc<MessageInfo>) -> bool {
         self.dispatched_messages
             .get(&Self::dispatch_key(info))
-            .await
-            .is_some()
+            .is_some_and(|claim| claim.has_deliveries())
     }
 
     /// Whether the dispatch-once gate is on. Capacity 0 is its documented off
@@ -43,20 +151,24 @@ impl Client {
         self.dispatched_messages.configured_capacity() != Some(0)
     }
 
-    /// Claim a message id, called where a committed batch is dispatched.
-    ///
-    /// Placing it there rather than at the call site is what makes the offline
-    /// drain claim as well: a deferred batch dispatches later, and a claim
-    /// taken before that could be taken for a batch that never commits, which
-    /// would suppress and ack the redelivery with nothing ever handed to a
-    /// consumer, losing the message instead of duplicating it.
-    pub(crate) async fn mark_message_dispatched(&self, info: &Arc<MessageInfo>) {
-        self.dispatched_messages
-            .insert(Self::dispatch_key(info), MessageDispatch::Decrypted)
-            .await;
+    #[cfg(test)]
+    pub(crate) async fn mark_message_dispatched(
+        &self,
+        info: &Arc<MessageInfo>,
+        message: &wa::Message,
+    ) {
+        let mut publication = PublicationGuard::default();
+        self.admit_message_dispatch(
+            info,
+            false,
+            Some(MessageDispatch::fingerprint(message)),
+            false,
+            &mut publication,
+        );
+        publication.complete();
     }
 
-    /// The message's identity: chat, id, and the sender without its device.
+    /// The message's identity includes direction and, outside DMs, its author.
     ///
     /// Dropping the device matches WA Web, whose `MsgKey` for a group message
     /// takes `participant: asUserWidOrThrow(author)`, a device-less wid. It
@@ -67,12 +179,40 @@ impl Client {
     ///
     /// The PN/LID namespace stays as it arrived, deliberately unresolved, for
     /// the reasons [`Self::dispatch_undecryptable_event`] states at length.
-    pub(crate) fn dispatch_key(info: &Arc<MessageInfo>) -> wacore::types::message::SenderMessageId {
-        wacore::types::message::SenderMessageId::new(
-            info.source.chat.clone(),
-            info.id.clone(),
-            info.source.sender.to_non_ad(),
-        )
+    /// PDO alternate evidence is stored beside the claim, never folded into
+    /// this primary key or followed through another claim.
+    pub(crate) fn dispatch_key(info: &Arc<MessageInfo>) -> DispatchKey {
+        let source = &info.source;
+        let has_participant = source.chat.is_group()
+            || source.chat.is_broadcast_list()
+            || source.chat.is_status_broadcast();
+        DispatchKey {
+            chat: source.chat.clone(),
+            id: info.id.clone(),
+            participant: has_participant.then(|| source.sender.to_non_ad()),
+            from_me: source.is_from_me,
+        }
+    }
+
+    fn dispatch_alias(info: &Arc<MessageInfo>, key: &DispatchKey) -> Option<Jid> {
+        let source = &info.source;
+        let (primary, alternate) = if let Some(participant) = &key.participant {
+            (participant, source.sender_alt.as_ref()?)
+        } else if source.is_from_me {
+            (&key.chat, source.recipient_alt.as_ref()?)
+        } else {
+            let alternate = source.sender_alt.as_ref()?;
+            if source.sender.to_non_ad() != key.chat {
+                return None;
+            }
+            (&key.chat, alternate)
+        };
+        if !(primary.server.is_pn_family() && alternate.server.is_lid_family()
+            || primary.server.is_lid_family() && alternate.server.is_pn_family())
+        {
+            return None;
+        }
+        Some(alternate.to_non_ad())
     }
 
     /// Dispatches a successfully parsed message to the event bus and sends a delivery receipt.

@@ -837,12 +837,15 @@ impl Client {
         // through to rebuilding from the response, which is the authority on
         // who sent what and is the same path a missing entry already takes.
         let pending = pending.filter(|entry| {
+            if response_from_me != entry.message_info.source.is_from_me {
+                return false;
+            }
             let Some(participant) = response_participant.as_deref() else {
                 // Legitimately absent for a DM and for anything `from_me`, so
                 // the only thing left to agree on is the direction. An incoming
                 // and an outgoing message of one DM can share an id, and both
                 // their responses omit the participant.
-                return response_from_me == entry.message_info.source.is_from_me;
+                return true;
             };
             let Ok(participant) = participant.parse::<Jid>() else {
                 return false;
@@ -906,15 +909,18 @@ impl Client {
             Some(request_id.to_owned())
         };
 
-        let _dispatch_guard = self.inbound_commit_batch.dispatch_lock.lock().await;
-        if self.message_already_dispatched(&message_info).await {
+        let claim = self.dispatch_gate_enabled()
+            && !crate::features::message_edit::carries_secret_encrypted(&message);
+        let fingerprint = claim.then(|| crate::message::MessageDispatch::fingerprint(&message));
+        let mut publication = crate::message::PublicationGuard::default();
+        let suppressed =
+            self.admit_message_dispatch(&message_info, true, fingerprint, false, &mut publication);
+        if suppressed {
             self.duplicate_dispatch_suppressed
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             wacore::telemetry::recv("duplicate_resend");
             return;
         }
-        let claim = !crate::features::message_edit::carries_secret_encrypted(&message);
-        let dispatch_key = Self::dispatch_key(&message_info);
 
         info!(
             "Dispatching PDO-recovered message {} from {} via phone (request_id={})",
@@ -938,11 +944,7 @@ impl Client {
                     .origin(wacore::types::events::BatchOrigin::Live)
                     .build(),
             ));
-        if claim {
-            self.dispatched_messages
-                .insert(dispatch_key, crate::message::MessageDispatch::Recovered)
-                .await;
-        }
+        publication.complete();
     }
 
     /// Reconstructs a MessageInfo from a WebMessageInfo.

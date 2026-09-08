@@ -9997,9 +9997,9 @@ async fn collect_event<F>(
     collector: Arc<crate::test_utils::TestEventCollector>,
     pred: F,
     timeout_ms: u64,
-) -> Option<Arc<wacore::types::events::Event>>
+) -> Option<Arc<Event>>
 where
-    F: Fn(&wacore::types::events::Event) -> bool,
+    F: Fn(&Event) -> bool,
 {
     let _ = client;
     let mut waited = 0u64;
@@ -14978,6 +14978,702 @@ async fn a_namespace_switch_mid_flight_is_seen_as_a_second_message() {
     );
 }
 
+mod pdo_alias_tests {
+    use super::*;
+    use buffa::Message as _;
+    use wacore::types::events::ChannelEventHandler;
+    use wacore::types::message::MessageSource;
+
+    const ID: &str = "SYNTHETIC_PDO_ALIAS";
+    const PN: &str = "15550001001@s.whatsapp.net";
+    const LID: &str = "777000000000101@lid";
+    const OWN: &str = "15550001002@s.whatsapp.net";
+
+    #[test]
+    fn pdo_alias_fingerprint_does_not_allocate_message_sized_buffer() {
+        let message = wa::Message {
+            conversation: Some("x".repeat(8192)),
+            ..Default::default()
+        };
+        let max = crate::test_alloc::min_max_block(1024, || MessageDispatch::fingerprint(&message));
+        assert!(
+            max <= 1024,
+            "fingerprint allocated a {max}-byte block for an 8192-byte body"
+        );
+    }
+
+    #[test]
+    fn pdo_alias_streaming_fingerprint_matches_wire_encoding() {
+        use sha2::{Digest, Sha256};
+        for message in [
+            wa::Message::default(),
+            wa::Message {
+                conversation: Some("synthetic nested message".into()),
+                location_message: buffa::MessageField::some(wa::message::LocationMessage {
+                    degrees_latitude: Some(1.5),
+                    degrees_longitude: Some(-2.25),
+                    jpeg_thumbnail: Some(vec![0x5A; 8192]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ] {
+            let wire = waproto::codec::message_to_vec(&message);
+            let expected: [u8; 32] = Sha256::digest(&wire).into();
+            assert_eq!(MessageDispatch::fingerprint(&message), expected);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Shape {
+        Incoming,
+        Outgoing,
+        Group,
+    }
+
+    fn info(shape: Shape) -> Arc<MessageInfo> {
+        let group = matches!(shape, Shape::Group);
+        let outgoing = matches!(shape, Shape::Outgoing);
+        Arc::new(MessageInfo {
+            id: ID.into(),
+            source: MessageSource {
+                chat: if group {
+                    "120363000000000101@g.us"
+                } else {
+                    LID
+                }
+                .parse()
+                .unwrap(),
+                sender: if outgoing { OWN } else { LID }.parse().unwrap(),
+                sender_alt: Some(
+                    if outgoing { "777000000000102@lid" } else { PN }
+                        .parse()
+                        .unwrap(),
+                ),
+                recipient_alt: outgoing.then(|| PN.parse().unwrap()),
+                is_from_me: outgoing,
+                is_group: group,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    fn response(info: &MessageInfo) -> wa::message::PeerDataOperationRequestResponseMessage {
+        response_with_message(
+            info,
+            wa::Message {
+                conversation: Some("alias payload".into()),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn response_with_message(
+        info: &MessageInfo,
+        message: wa::Message,
+    ) -> wa::message::PeerDataOperationRequestResponseMessage {
+        let web = wa::WebMessageInfo {
+            key: buffa::MessageField::some(wa::MessageKey {
+                id: Some(info.id.to_string()),
+                remote_jid: Some(if info.source.is_group {
+                    info.source.chat.to_string()
+                } else {
+                    PN.into()
+                }),
+                participant: info.source.is_group.then(|| PN.into()),
+                from_me: Some(info.source.is_from_me),
+            }),
+            message: buffa::MessageField::some(message),
+            ..Default::default()
+        };
+        wa::message::PeerDataOperationRequestResponseMessage {
+            peer_data_operation_result: vec![wa::message::peer_data_operation_request_response_message::PeerDataOperationResult {
+                placeholder_message_resend_response: buffa::MessageField::some(
+                    wa::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+                        web_message_info_bytes: Some(web.encode_to_vec()),
+                    }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    async fn retry(client: &Arc<Client>, info: &Arc<MessageInfo>) {
+        retry_message(
+            client,
+            info,
+            &wa::Message {
+                conversation: Some("alias payload".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    async fn retry_message(client: &Arc<Client>, info: &Arc<MessageInfo>, message: &wa::Message) {
+        client
+            .handle_decrypted_plaintext(
+                "msg",
+                MessageUtils::encode_and_pad(message),
+                2,
+                0,
+                Default::default(),
+                info,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn client() -> (Arc<Client>, async_channel::Receiver<Arc<Event>>) {
+        let client = crate::test_utils::create_test_client().await;
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetId(Some(
+                OWN.parse().unwrap(),
+            )))
+            .await;
+        let (handler, events) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+        (client, events)
+    }
+
+    #[tokio::test]
+    async fn pdo_publication_committed_ordinary_part_keeps_distinct_recovery() {
+        for alias in [false, true] {
+            let (client, events) = client().await;
+            let mut info = info(Shape::Incoming);
+            if !alias {
+                let source = &mut Arc::make_mut(&mut info).source;
+                source.chat = PN.parse().unwrap();
+                source.sender = source.chat.clone();
+                source.sender_alt = None;
+            }
+            retry(&client, &info).await;
+            let response = response_with_message(
+                &info,
+                wa::Message {
+                    conversation: Some("distinct PDO part".into()),
+                    ..Default::default()
+                },
+            );
+            client
+                .handle_pdo_response(&response, &MessageInfo::default())
+                .await;
+            client
+                .handle_pdo_response(&response, &MessageInfo::default())
+                .await;
+            assert_eq!(
+                message_texts_for_id(&events, ID),
+                ["alias payload", "distinct PDO part"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pdo_publication_unresolved_distinct_part_is_not_suppressed() {
+        let (client, events) = client().await;
+        let info = info(Shape::Incoming);
+        client
+            .handle_pdo_response(&response(&info), &MessageInfo::default())
+            .await;
+        retry_message(
+            &client,
+            &info,
+            &wa::Message {
+                enc_reaction_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            message_events_for_id(&events, ID),
+            (2, 1),
+            "identity cannot prove an unresolved envelope is the PDO payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn pdo_publication_remembers_the_unmatched_ordinary_part() {
+        struct Hook(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl crate::types::durability_hook::InboundDurabilityHook for Hook {
+            async fn on_messages(
+                &self,
+                _: Arc<Client>,
+                _: &[wacore::types::events::InboundMessage],
+            ) -> anyhow::Result<()> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        for durable in [false, true] {
+            let (client, events) = client().await;
+            let hook = Arc::new(Hook(std::sync::atomic::AtomicUsize::new(0)));
+            if durable {
+                client
+                    .inbound_durability_hook
+                    .set(hook.clone())
+                    .ok()
+                    .unwrap();
+            }
+            let info = info(Shape::Incoming);
+            client
+                .handle_pdo_response(&response(&info), &MessageInfo::default())
+                .await;
+            let part = wa::Message {
+                conversation: Some("ordinary part B".into()),
+                ..Default::default()
+            };
+            retry_message(&client, &info, &part).await;
+            retry_message(&client, &Arc::new((*info).clone()), &part).await;
+            assert_eq!(
+                message_texts_for_id(&events, ID),
+                ["alias payload", "ordinary part B"]
+            );
+            assert_eq!(hook.0.load(Ordering::Relaxed), usize::from(durable));
+        }
+    }
+
+    async fn interrupted_publication(pdo: bool) {
+        use futures::FutureExt as _;
+        struct PanicHandler;
+        impl EventHandler for PanicHandler {
+            fn handle_event(&self, event: Arc<Event>) {
+                assert!(event.as_messages().is_none(), "synthetic subscriber panic");
+            }
+        }
+        let client = crate::test_utils::create_test_client().await;
+        let panicking = client
+            .core
+            .event_bus
+            .subscribe_handler(Arc::new(PanicHandler));
+        let (handler, events) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+        let info = info(Shape::Incoming);
+        let response = response(&info);
+        let interrupted = std::panic::AssertUnwindSafe(async {
+            if pdo {
+                client
+                    .handle_pdo_response(&response, &MessageInfo::default())
+                    .await;
+            } else {
+                retry(&client, &info).await;
+            }
+        })
+        .catch_unwind()
+        .await;
+        assert!(interrupted.is_err());
+        assert_eq!(message_events_for_id(&events, ID), (0, 0));
+        assert!(panicking.unsubscribe());
+        if pdo {
+            client
+                .handle_pdo_response(&response, &MessageInfo::default())
+                .await;
+        } else {
+            retry(&client, &Arc::new((*info).clone())).await;
+        }
+        assert_eq!(
+            message_events_for_id(&events, ID),
+            (1, 1),
+            "interrupted fan-out must not suppress delivery to the surviving subscriber"
+        );
+    }
+
+    #[tokio::test]
+    async fn pdo_publication_panic_allows_recovery_redelivery() {
+        interrupted_publication(true).await;
+    }
+
+    #[tokio::test]
+    async fn pdo_publication_panic_allows_ordinary_redelivery() {
+        interrupted_publication(false).await;
+    }
+
+    #[tokio::test]
+    async fn pdo_publication_rollback_preserves_other_and_newer_owners() {
+        let (client, _) = client().await;
+        let info = info(Shape::Incoming);
+        let a = MessageDispatch::fingerprint(&wa::Message {
+            conversation: Some("A".into()),
+            ..Default::default()
+        });
+        let b = MessageDispatch::fingerprint(&wa::Message {
+            conversation: Some("B".into()),
+            ..Default::default()
+        });
+        let mut interrupted = PublicationGuard::default();
+        assert!(!client.admit_message_dispatch(&info, false, Some(a), false, &mut interrupted));
+        assert!(!client.admit_message_dispatch(&info, true, Some(b), false, &mut interrupted));
+        let mut newer = PublicationGuard::default();
+        assert!(!client.admit_message_dispatch(&info, false, Some(a), false, &mut newer));
+        newer.complete();
+        drop(interrupted);
+        let claim = client
+            .dispatched_messages
+            .get(&Client::dispatch_key(&info))
+            .unwrap();
+        assert!(
+            claim.state(&a) == Some(MessageDispatch::Decrypted),
+            "the later successful publisher owns A"
+        );
+        assert!(
+            claim.state(&b).is_none(),
+            "only the interrupted publisher owned B"
+        );
+    }
+
+    #[tokio::test]
+    async fn pdo_publication_payload_capacity_fails_open() {
+        let (client, events) = client().await;
+        let info = info(Shape::Incoming);
+        let part = |index| wa::Message {
+            conversation: Some(format!("part {index}")),
+            ..Default::default()
+        };
+        for index in 0..=MAX_DISPATCH_PAYLOADS {
+            retry_message(&client, &info, &part(index)).await;
+        }
+        assert_eq!(
+            message_events_for_id(&events, ID).0,
+            MAX_DISPATCH_PAYLOADS + 1
+        );
+        assert_eq!(
+            client
+                .dispatched_messages
+                .get(&Client::dispatch_key(&info))
+                .unwrap()
+                .payloads
+                .len(),
+            MAX_DISPATCH_PAYLOADS
+        );
+        retry_message(&client, &info, &part(0)).await;
+        retry_message(&client, &info, &part(MAX_DISPATCH_PAYLOADS)).await;
+        assert_eq!(
+            message_texts_for_id(&events, ID),
+            [format!("part {MAX_DISPATCH_PAYLOADS}")],
+            "overflow stays deliverable while previously tracked parts stay deduplicated"
+        );
+    }
+
+    async fn arrival_order(recovery_first: bool, queued: bool) {
+        for shape in [Shape::Incoming, Shape::Outgoing, Shape::Group] {
+            for pending in [false, true] {
+                let (client, events) = client().await;
+                let info = info(shape);
+                let response = response(&info);
+                assert!(
+                    client
+                        .lid_pn_cache
+                        .get_phone_number("777000000000101")
+                        .await
+                        .is_none()
+                );
+                if pending {
+                    client
+                        .pdo_pending_requests
+                        .insert(
+                            wacore::types::message::ChatMessageId::new(
+                                if info.source.is_group {
+                                    info.source.chat.clone()
+                                } else {
+                                    PN.parse().unwrap()
+                                },
+                                ID.into(),
+                            ),
+                            crate::pdo::PendingPdoRequest {
+                                message_info: info.clone(),
+                                requested_at: wacore::time::Instant::now(),
+                            },
+                        )
+                        .await;
+                }
+                if queued {
+                    client.inbound_commit_batch.reset();
+                }
+                if recovery_first {
+                    client
+                        .handle_pdo_response(&response, &MessageInfo::default())
+                        .await;
+                }
+                retry(&client, &info).await;
+                if !recovery_first {
+                    client
+                        .handle_pdo_response(&response, &MessageInfo::default())
+                        .await;
+                }
+                if queued {
+                    assert!(
+                        client
+                            .flush_inbound_commits_under_permit(true, None, None)
+                            .await
+                    );
+                }
+                client
+                    .handle_pdo_response(&response, &MessageInfo::default())
+                    .await;
+                assert_eq!(
+                    message_events_for_id(&events, ID),
+                    (1, 1),
+                    "explicit alias must cover the fallback and repeated PDO after pending removal"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pdo_alias_normal_first() {
+        arrival_order(false, false).await;
+    }
+    #[tokio::test]
+    async fn pdo_alias_recovery_first() {
+        arrival_order(true, false).await;
+    }
+    #[tokio::test]
+    async fn pdo_alias_queued_late_filter() {
+        arrival_order(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn pdo_alias_missing_evidence_allows_delivery() {
+        for recovery_first in [false, true] {
+            let (client, events) = client().await;
+            let mut info = info(Shape::Incoming);
+            Arc::make_mut(&mut info).source.sender_alt = None;
+            let response = response(&info);
+            if recovery_first {
+                client
+                    .handle_pdo_response(&response, &MessageInfo::default())
+                    .await;
+            }
+            retry(&client, &info).await;
+            if !recovery_first {
+                client
+                    .handle_pdo_response(&response, &MessageInfo::default())
+                    .await;
+            }
+            assert_eq!(message_events_for_id(&events, ID), (2, 2));
+        }
+    }
+
+    #[tokio::test]
+    async fn pdo_alias_direction_is_part_of_identity() {
+        let (client, events) = client().await;
+        let mut info = info(Shape::Group);
+        Arc::make_mut(&mut info).source.sender = PN.parse().unwrap();
+        let response = response(&info);
+        Arc::make_mut(&mut info).source.is_from_me = true;
+        retry(&client, &info).await;
+        client
+            .handle_pdo_response(&response, &MessageInfo::default())
+            .await;
+        assert_eq!(message_events_for_id(&events, ID), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn pdo_alias_identity_boundaries_fail_open() {
+        for recovery_first in [false, true] {
+            for case in 0..8 {
+                let (client, events) = client().await;
+                let shape = match case {
+                    0..=2 => Shape::Group,
+                    3 | 4 => Shape::Outgoing,
+                    _ => Shape::Incoming,
+                };
+                let mut info = info(shape);
+                let response = response(&info);
+                let info_mut = Arc::make_mut(&mut info);
+                match case {
+                    0 => {
+                        info_mut.source.sender_alt =
+                            Some("15550001003@s.whatsapp.net".parse().unwrap())
+                    }
+                    1 => info_mut.source.chat = "120363000000000103@g.us".parse().unwrap(),
+                    2 => info_mut.id = "DIFFERENT_ID".into(),
+                    3 => {
+                        info_mut.source.recipient_alt = None;
+                        info_mut.source.sender_alt = Some(PN.parse().unwrap());
+                    }
+                    4 => {
+                        info_mut.source.recipient_alt =
+                            Some("15550001003@s.whatsapp.net".parse().unwrap())
+                    }
+                    5 => {
+                        info_mut.source.chat = "15550001001@lid".parse().unwrap();
+                        info_mut.source.sender = info_mut.source.chat.clone();
+                        info_mut.source.sender_alt = None;
+                    }
+                    6 => info_mut.source.sender_alt = Some("777000000000103@lid".parse().unwrap()),
+                    7 => info_mut.source.sender = "777000000000103@lid".parse().unwrap(),
+                    _ => unreachable!(),
+                }
+                if recovery_first {
+                    client
+                        .handle_pdo_response(&response, &MessageInfo::default())
+                        .await;
+                }
+                retry(&client, &info).await;
+                if !recovery_first {
+                    client
+                        .handle_pdo_response(&response, &MessageInfo::default())
+                        .await;
+                }
+                assert_eq!(
+                    drain_message_events(&events).len(),
+                    2,
+                    "identity boundary case {case}, recovery_first={recovery_first}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pdo_alias_conflicting_primaries_do_not_merge() {
+        for recovery_first in [false, true] {
+            let (client, events) = client().await;
+            let first = info(Shape::Incoming);
+            let mut second = first.clone();
+            let source = &mut Arc::make_mut(&mut second).source;
+            source.chat = "777000000000103@lid".parse().unwrap();
+            source.sender = source.chat.clone();
+            let response = response(&first);
+            if recovery_first {
+                client
+                    .handle_pdo_response(&response, &MessageInfo::default())
+                    .await;
+            }
+            retry(&client, &first).await;
+            retry(&client, &second).await;
+            if !recovery_first {
+                client
+                    .handle_pdo_response(&response, &MessageInfo::default())
+                    .await;
+            }
+            assert_eq!(
+                message_events_for_id(&events, ID),
+                if recovery_first { (2, 2) } else { (3, 3) }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pdo_alias_evidence_does_not_merge_ordinary_namespace_switches() {
+        let (client, events) = client().await;
+        let first = info(Shape::Incoming);
+        let mut second = first.clone();
+        let source = &mut Arc::make_mut(&mut second).source;
+        source.chat = PN.parse().unwrap();
+        source.sender = source.chat.clone();
+        source.sender_alt = Some(LID.parse().unwrap());
+        retry(&client, &first).await;
+        retry(&client, &second).await;
+        assert_eq!(message_events_for_id(&events, ID), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn pdo_alias_global_mapping_is_not_evidence() {
+        use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+        for explicit in [false, true] {
+            for recovery_first in [false, true] {
+                let (client, events) = client().await;
+                let mut info = info(Shape::Incoming);
+                if !explicit {
+                    Arc::make_mut(&mut info).source.sender_alt = None;
+                }
+                let mapping = LidPnEntry::new(
+                    "777000000000101",
+                    if explicit {
+                        "15550001003"
+                    } else {
+                        "15550001001"
+                    },
+                    LearningSource::PeerLidMessage,
+                );
+                client.lid_pn_cache.add(&mapping).await;
+                let response = response(&info);
+                if recovery_first {
+                    client
+                        .handle_pdo_response(&response, &MessageInfo::default())
+                        .await;
+                }
+                retry(&client, &info).await;
+                if !recovery_first {
+                    client
+                        .handle_pdo_response(&response, &MessageInfo::default())
+                        .await;
+                }
+                assert_eq!(
+                    message_events_for_id(&events, ID),
+                    if explicit { (1, 1) } else { (2, 2) }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pdo_alias_pending_participant_cannot_override_direction() {
+        let (client, events) = client().await;
+        let mut info = info(Shape::Group);
+        let response = response(&info);
+        Arc::make_mut(&mut info).source.is_from_me = true;
+        client
+            .pdo_pending_requests
+            .insert(
+                wacore::types::message::ChatMessageId::new(info.source.chat.clone(), ID.into()),
+                crate::pdo::PendingPdoRequest {
+                    message_info: info.clone(),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+        retry(&client, &info).await;
+        client
+            .handle_pdo_response(&response, &MessageInfo::default())
+            .await;
+        assert_eq!(message_events_for_id(&events, ID), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn pdo_alias_hook_promotes_the_original_recovery_claim() {
+        struct Hook(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl crate::types::durability_hook::InboundDurabilityHook for Hook {
+            async fn on_messages(
+                &self,
+                _: Arc<Client>,
+                _: &[wacore::types::events::InboundMessage],
+            ) -> anyhow::Result<()> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        let (client, events) = client().await;
+        let hook = Arc::new(Hook(std::sync::atomic::AtomicUsize::new(0)));
+        client
+            .inbound_durability_hook
+            .set(hook.clone())
+            .ok()
+            .unwrap();
+        let info = info(Shape::Incoming);
+        let response = response(&info);
+        client
+            .handle_pdo_response(&response, &MessageInfo::default())
+            .await;
+        retry(&client, &info).await;
+        retry(&client, &info).await;
+        client
+            .handle_pdo_response(&response, &MessageInfo::default())
+            .await;
+        assert_eq!(hook.0.load(Ordering::Relaxed), 1);
+        assert_eq!(message_events_for_id(&events, ID), (1, 1));
+        assert_eq!(
+            client.dispatched_messages.entry_count(),
+            1,
+            "hook promotion must not duplicate the authoritative claim under the alternate key"
+        );
+    }
+}
+
 struct PdoRetryFixture {
     client: Arc<Client>,
     transport: Arc<crate::transport::mock::CapturingMockTransport>,
@@ -15417,22 +16113,8 @@ async fn pdo_retry_missing_recovered_content_does_not_claim() {
 #[tokio::test]
 async fn pdo_retry_concurrent_recoveries_share_publication() {
     let fixture = PdoRetryFixture::new().await;
-    let guard = fixture
-        .client
-        .inbound_commit_batch
-        .dispatch_lock
-        .lock()
-        .await;
     let first = fixture.recover();
     let second = fixture.recover();
-    futures::pin_mut!(first, second);
-    assert!(futures::poll!(&mut first).is_pending());
-    assert!(futures::poll!(&mut second).is_pending());
-    assert_eq!(
-        message_events_for_id(&fixture.events, PdoRetryFixture::ID),
-        (0, 0)
-    );
-    drop(guard);
     futures::join!(first, second);
     fixture.retry().await;
     fixture.assert_once();
@@ -15484,6 +16166,152 @@ async fn pdo_retry_batch_keeps_unrelated_messages() {
             .collect::<Vec<_>>(),
         [PdoRetryFixture::ID, "BEFORE_RECOVERED", "AFTER_RECOVERED"]
     );
+}
+
+async fn pdo_retry_distinct_payloads(recover_first: bool) {
+    let fixture = PdoRetryFixture::new().await;
+    fixture.client.inbound_commit_batch.reset();
+    let info = Arc::new(
+        fixture
+            .client
+            .parse_message_info(fixture.retry.get())
+            .await
+            .unwrap(),
+    );
+    if recover_first {
+        fixture.recover().await;
+    }
+    for text in ["\u{1f980}ping", "distinct multipart body"] {
+        fixture
+            .client
+            .handle_decrypted_plaintext(
+                "msg",
+                MessageUtils::encode_and_pad(&wa::Message {
+                    conversation: Some(text.into()),
+                    ..Default::default()
+                }),
+                2,
+                0,
+                Default::default(),
+                &info,
+            )
+            .await
+            .unwrap();
+    }
+    if !recover_first {
+        fixture.recover().await;
+    }
+    assert!(
+        fixture
+            .client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await
+    );
+    assert_eq!(
+        drain_message_events(&fixture.events).len(),
+        2,
+        "PDO recovered only one payload, not every part sharing its MessageInfo"
+    );
+}
+
+#[tokio::test]
+async fn pdo_retry_late_filter_keeps_distinct_payloads() {
+    pdo_retry_distinct_payloads(false).await;
+}
+
+#[tokio::test]
+async fn pdo_retry_early_gate_keeps_distinct_payloads() {
+    pdo_retry_distinct_payloads(true).await;
+}
+
+async fn pdo_retry_callback_progress(recovery: bool) {
+    struct BlockingHandler {
+        id: &'static str,
+        entered: async_channel::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl EventHandler for BlockingHandler {
+        fn handle_event(&self, event: Arc<Event>) {
+            if event
+                .as_messages()
+                .is_some_and(|batch| batch.iter().any(|m| m.info.id == self.id))
+            {
+                self.entered.try_send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+        }
+    }
+    let fixture = PdoRetryFixture::new().await;
+    let (entered_tx, entered) = async_channel::bounded(1);
+    let (release, release_rx) = std::sync::mpsc::channel();
+    fixture
+        .client
+        .core
+        .event_bus
+        .subscribe_handler(Arc::new(BlockingHandler {
+            id: if recovery {
+                PdoRetryFixture::ID
+            } else {
+                "BLOCKED_CALLBACK"
+            },
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        }))
+        .detach();
+    let mut info = fixture
+        .client
+        .parse_message_info(fixture.retry.get())
+        .await
+        .unwrap();
+    info.id = "BLOCKED_CALLBACK".into();
+    info.source.chat = "120363000000000072@g.us".parse().unwrap();
+    let client = fixture.client.clone();
+    let response = fixture.response.clone();
+    let phone_info = fixture.phone_info.clone();
+    let blocked = tokio::spawn(async move {
+        if recovery {
+            client.handle_pdo_response(&response, &phone_info).await;
+            return;
+        }
+        client
+            .dispatch_parsed_message(
+                wa::Message {
+                    conversation: Some("blocked".into()),
+                    ..Default::default()
+                },
+                &Arc::new(info),
+                false,
+            )
+            .await;
+    });
+    entered.recv().await.unwrap();
+    let progressed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        fixture.recover().await;
+        fixture.retry().await;
+        fixture
+            .client
+            .teardown_inbound_commits_bounded(std::time::Duration::from_secs(5))
+            .await;
+    })
+    .await
+    .is_ok();
+    release.send(()).unwrap();
+    blocked.await.unwrap();
+    assert!(
+        progressed,
+        "callbacks must not block other publications or inbound teardown"
+    );
+    fixture.assert_once();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pdo_retry_blocked_callback_does_not_block_other_publications() {
+    pdo_retry_callback_progress(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pdo_retry_blocked_recovery_callback_admits_no_duplicate() {
+    pdo_retry_callback_progress(true).await;
 }
 
 #[derive(Default)]
@@ -15560,6 +16388,17 @@ async fn pdo_retry_durability_after_recovery(fail_first: bool) {
         );
     }
     assert!(pending().await.unwrap().is_none());
+    assert!(
+        fixture
+            .client
+            .dispatched_messages
+            .get(&Client::dispatch_key(&info))
+            .is_some_and(|claim| claim
+                .payloads
+                .first()
+                .is_some_and(|payload| payload.state == MessageDispatch::RecoveredCommitted)),
+        "promotion records hook success for the PDO event that was already published"
+    );
     fixture
         .client
         .handle_decrypted_plaintext(
@@ -15594,7 +16433,7 @@ async fn pdo_retry_recovered_event_preserves_failed_hook_replay() {
     pdo_retry_durability_after_recovery(true).await;
 }
 
-async fn pdo_retry_cancel_durable_publication(teardown: bool) {
+async fn pdo_retry_synchronous_durable_publication(teardown: bool) {
     let fixture = PdoRetryFixture::new().await;
     fixture.client.flush_signal_cache().await.unwrap();
     let info = fixture
@@ -15612,29 +16451,29 @@ async fn pdo_retry_cancel_durable_publication(teardown: bool) {
     fixture.client.inbound_commit_batch.reset();
     fixture.client.swap_message_semaphore(1);
     fixture.retry().await;
-    let guard = fixture
-        .client
-        .inbound_commit_batch
-        .dispatch_lock
-        .lock()
-        .await;
     fixture
         .client
         .inbound_commit_batch
         .publication_reached
         .store(false, Ordering::Release);
-    let client = fixture.client.clone();
-    let commit = tokio::spawn(async move {
-        client
-            .flush_inbound_commits_under_permit(false, None, None)
-            .await
-    });
-    crate::test_utils::poll_until("publication after the durable Signal flush", || {
-        fixture
+    let commit = fixture
+        .client
+        .flush_inbound_commits_under_permit(false, None, None);
+    futures::pin_mut!(commit);
+    futures::future::poll_fn(|cx| {
+        let polled = Future::poll(commit.as_mut(), cx);
+        if fixture
             .client
             .inbound_commit_batch
             .publication_reached
             .load(Ordering::Acquire)
+        {
+            assert!(
+                polled.is_ready(),
+                "publication must finish in the poll that completed the Signal flush"
+            );
+        }
+        polled
     })
     .await;
     assert_ne!(
@@ -15648,14 +16487,13 @@ async fn pdo_retry_cancel_durable_publication(teardown: bool) {
     );
     assert_eq!(
         message_events_for_id(&fixture.events, PdoRetryFixture::ID),
-        (0, 0)
+        (1, 1),
+        "a completed Signal flush must not introduce a cancellable wait before publication"
     );
-    commit.abort();
-    assert!(commit.await.unwrap_err().is_cancelled());
     assert_eq!(
         fixture.client.inbound_commit_batch.pending_stats().0,
-        1,
-        "cancellation must retain the unpublished plaintext after its ratchet became durable"
+        0,
+        "publication must not depend on retained in-memory plaintext"
     );
     if teardown {
         fixture
@@ -15665,19 +16503,29 @@ async fn pdo_retry_cancel_durable_publication(teardown: bool) {
         fixture.client.inbound_commit_batch.reset();
         assert_eq!(
             fixture.client.inbound_commit_batch.pending_stats().0,
-            1,
-            "reset cannot discard plaintext whose ratchet was already persisted"
+            0,
+            "reset has no unpublished durable plaintext to discard"
         );
     }
-    drop(guard);
     if teardown {
         fixture.retry().await;
         assert_eq!(
             message_events_for_id(&fixture.events, PdoRetryFixture::ID),
             (0, 0),
-            "the persisted ratchet rejects redelivery; the retained plaintext is the only publication copy"
+            "the persisted ratchet rejects redelivery after the event was published"
         );
-        assert_eq!(fixture.client.inbound_commit_batch.pending_stats().0, 1);
+        assert_eq!(fixture.client.inbound_commit_batch.pending_stats().0, 0);
+        let restarted = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+        let (handler, events) = wacore::types::events::ChannelEventHandler::new();
+        restarted.core.event_bus.subscribe_handler(handler).detach();
+        restarted
+            .handle_incoming_message(fixture.retry.clone())
+            .await;
+        assert_eq!(
+            message_events_for_id(&events, PdoRetryFixture::ID),
+            (0, 0),
+            "a new Client cannot recover the persisted duplicate; publication must precede teardown"
+        );
     }
     let mut later_info = info;
     later_info.id = "AFTER_CANCEL".into();
@@ -15707,55 +16555,33 @@ async fn pdo_retry_cancel_durable_publication(teardown: bool) {
             .iter()
             .map(|(id, _)| id.as_str())
             .collect::<Vec<_>>(),
-        [PdoRetryFixture::ID, "AFTER_CANCEL"]
+        ["AFTER_CANCEL"]
     );
     assert_eq!(fixture.client.inbound_commit_batch.pending_stats().0, 0);
 }
 
 #[tokio::test]
-async fn pdo_retry_cancel_after_signal_flush_retains_publication() {
-    pdo_retry_cancel_durable_publication(false).await;
+async fn pdo_retry_signal_flush_publishes_without_cancellation_wait() {
+    pdo_retry_synchronous_durable_publication(false).await;
 }
 
 #[tokio::test]
-async fn pdo_retry_teardown_retains_unpublished_durable_plaintext() {
-    pdo_retry_cancel_durable_publication(true).await;
+async fn pdo_retry_teardown_has_no_unpublished_durable_plaintext() {
+    pdo_retry_synchronous_durable_publication(true).await;
 }
 
-async fn pdo_retry_retained_publication_holds_new_skdm_receipt(teardown: bool) {
+async fn pdo_retry_publication_holds_new_skdm_receipt(teardown: bool) {
     let fixture = PdoRetryFixture::new().await;
     fixture.client.flush_signal_cache().await.unwrap();
     fixture.client.inbound_commit_batch.reset();
     fixture.client.swap_message_semaphore(1);
     fixture.retry().await;
-    let guard = fixture
-        .client
-        .inbound_commit_batch
-        .dispatch_lock
-        .lock()
-        .await;
-    fixture
-        .client
-        .inbound_commit_batch
-        .publication_reached
-        .store(false, Ordering::Release);
-    let client = fixture.client.clone();
-    let commit = tokio::spawn(async move {
-        client
-            .flush_inbound_commits_under_permit(false, None, None)
-            .await
-    });
-    crate::test_utils::poll_until("retained publication", || {
+    assert!(
         fixture
             .client
-            .inbound_commit_batch
-            .publication_reached
-            .load(Ordering::Acquire)
-    })
-    .await;
-    commit.abort();
-    assert!(commit.await.unwrap_err().is_cancelled());
-    drop(guard);
+            .flush_inbound_commits_under_permit(false, None, None)
+            .await
+    );
 
     let mut peer = AlicePeer::new("777000000000003:2@lid").await;
     let group: Jid = "120363000000000071@g.us".parse().unwrap();
@@ -15844,7 +16670,7 @@ async fn pdo_retry_retained_publication_holds_new_skdm_receipt(teardown: bool) {
     assert_eq!(
         delivery_receipts_for(&fixture.transport.sent(), SKDM_ID),
         0,
-        "publishing an old durable batch must not receipt a newer unflushed SKDM"
+        "a previous publication must not receipt a newer unflushed SKDM"
     );
     assert_eq!(
         fixture.client.offline_receipt_buffer.lock().unwrap().len(),
@@ -15868,13 +16694,13 @@ async fn pdo_retry_retained_publication_holds_new_skdm_receipt(teardown: bool) {
 }
 
 #[tokio::test]
-async fn pdo_retry_retained_batch_cannot_release_new_skdm_receipt() {
-    pdo_retry_retained_publication_holds_new_skdm_receipt(false).await;
+async fn pdo_retry_previous_batch_cannot_release_new_skdm_receipt() {
+    pdo_retry_publication_holds_new_skdm_receipt(false).await;
 }
 
 #[tokio::test]
 async fn pdo_retry_teardown_cannot_release_new_skdm_receipt() {
-    pdo_retry_retained_publication_holds_new_skdm_receipt(true).await;
+    pdo_retry_publication_holds_new_skdm_receipt(true).await;
 }
 
 #[tokio::test]
@@ -15942,6 +16768,7 @@ async fn pdo_retry_unresolved_hook_copy_must_materialize_before_promotion() {
         reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
             key: buffa::MessageField::some(target),
             text: Some(text.into()),
+            sender_timestamp_ms: Some(1_700_000_000_000),
             ..Default::default()
         }),
         ..Default::default()
@@ -16029,7 +16856,8 @@ async fn pdo_retry_unresolved_hook_copy_must_materialize_before_promotion() {
     assert_eq!(hook.0.lock().unwrap().len(), 2);
     assert_eq!(
         message_events_for_id(&fixture.events, PdoRetryFixture::ID),
-        (1, 0)
+        (2, 0),
+        "the unresolved envelope stays visible; only its matching materialized copy is suppressed"
     );
 }
 
@@ -16874,7 +17702,7 @@ async fn a_replay_that_fails_to_commit_counts_as_a_suppression() {
         )
         .await
         .expect("buffer a copy");
-    client.mark_message_dispatched(&info).await;
+    client.mark_message_dispatched(&info, &msg).await;
     client
         .inbound_commit_batch
         .fail_commits
