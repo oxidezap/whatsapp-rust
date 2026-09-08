@@ -2,6 +2,17 @@
 use anyhow::{Context, Result, ensure};
 use std::path::Path;
 use wasm_encoder::{Encode, Instruction};
+
+/// wasmparser 0.258 reports byte ranges and positions as `u64`. File offsets
+/// here stay `usize`, so every crossing converts fallibly instead of
+/// truncating with `as`.
+fn to_usize(offset: u64) -> Result<usize> {
+    usize::try_from(offset).context("wasm offset does not fit in usize")
+}
+
+fn to_u64(offset: usize) -> Result<u64> {
+    u64::try_from(offset).context("wasm offset does not fit in u64")
+}
 use xtask_support::write;
 
 pub fn globals(source: &Path, destination: &Path, count: u32) -> Result<()> {
@@ -34,9 +45,11 @@ pub fn globals(source: &Path, destination: &Path, count: u32) -> Result<()> {
                 );
             }
             let range = section.range();
-            let mut reader = wasmparser::BinaryReader::new(&bytes[range.clone()], range.start);
+            let range = to_usize(range.start)?..to_usize(range.end)?;
+            let mut reader =
+                wasmparser::BinaryReader::new(&bytes[range.clone()], to_u64(range.start)?);
             let existing = reader.read_var_u32()?;
-            let entries_start = reader.original_position();
+            let entries_start = to_usize(reader.original_position())?;
             let mut body = Vec::new();
             existing
                 .checked_add(count)
@@ -58,7 +71,7 @@ pub fn globals(source: &Path, destination: &Path, count: u32) -> Result<()> {
             return write(destination, &result);
         }
         if let Some((_, range)) = payload.as_section() {
-            section_start = range.end;
+            section_start = to_usize(range.end)?;
         }
     }
     anyhow::bail!("no export section found")
@@ -133,7 +146,8 @@ fn guard_site(bytes: &[u8]) -> Result<usize> {
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         if let wasmparser::Payload::CodeSectionEntry(body) = payload? {
             let range = body.range();
-            let start = body.get_operators_reader()?.original_position();
+            let range = to_usize(range.start)?..to_usize(range.end)?;
+            let start = to_usize(body.get_operators_reader()?.original_position())?;
             bodies.push((range, start));
         }
     }
@@ -141,7 +155,7 @@ fn guard_site(bytes: &[u8]) -> Result<usize> {
     for (range, start) in &bodies {
         let reader = wasmparser::OperatorsReader::new(wasmparser::BinaryReader::new(
             &bytes[range.clone()][start - range.start..],
-            *start,
+            to_u64(*start)?,
         ));
         let operators = reader
             .into_iter_with_offsets()
@@ -158,7 +172,7 @@ fn guard_site(bytes: &[u8]) -> Result<usize> {
                 continue;
             };
             if memarg.align == 0 && memarg.offset == 662166 {
-                hits.push(*at);
+                hits.push(to_usize(*at)?);
             }
         }
     }
