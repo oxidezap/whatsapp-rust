@@ -6,17 +6,20 @@
 use async_lock::Mutex;
 use log::debug;
 use portable_atomic::{AtomicI64, AtomicU64};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use wacore::ib::{IbStanza, UnifiedSession};
 use wacore::protocol::ProtocolNode;
 use wacore_binary::Node;
 
 /// Manager for unified session telemetry.
+///
+/// Fields are held inline rather than behind `Arc`: the manager is not
+/// `Clone`, exposes no field handles, and every op borrows `&self` from the
+/// `Client` (itself always behind `Arc`), so no independent owner exists.
 pub struct UnifiedSessionManager {
-    server_time_offset_ms: Arc<AtomicI64>,
-    last_sent_id: Arc<Mutex<Option<String>>>,
-    sequence: Arc<AtomicU64>,
+    server_time_offset_ms: AtomicI64,
+    last_sent_id: Mutex<Option<String>>,
+    sequence: AtomicU64,
 }
 
 impl Default for UnifiedSessionManager {
@@ -28,9 +31,9 @@ impl Default for UnifiedSessionManager {
 impl UnifiedSessionManager {
     pub fn new() -> Self {
         Self {
-            server_time_offset_ms: Arc::new(AtomicI64::new(0)),
-            last_sent_id: Arc::new(Mutex::new(None)),
-            sequence: Arc::new(AtomicU64::new(0)),
+            server_time_offset_ms: AtomicI64::new(0),
+            last_sent_id: Mutex::new(None),
+            sequence: AtomicU64::new(0),
         }
     }
 
@@ -131,6 +134,17 @@ impl UnifiedSessionManager {
 mod tests {
     use super::*;
     use wacore_binary::builder::NodeBuilder;
+
+    #[test]
+    fn test_manager_fields_are_inline() {
+        // Locks the inline shape: every field lives in the manager itself, so
+        // `new()` performs zero heap allocations. Reintroducing an `Arc`
+        // wrapper changes this sum and fails the test.
+        assert_eq!(
+            size_of::<UnifiedSessionManager>(),
+            size_of::<AtomicI64>() + size_of::<Mutex<Option<String>>>() + size_of::<AtomicU64>()
+        );
+    }
 
     #[test]
     fn test_manager_default() {

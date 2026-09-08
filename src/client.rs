@@ -1537,8 +1537,10 @@ pub struct Client {
     pub(crate) stats: Arc<wacore::stats::SessionStats>,
 
     pub(crate) transport: Arc<Mutex<Option<Arc<dyn crate::transport::Transport>>>>,
+    // Inline: `Client` is always behind `Arc`, and the receiver is only ever
+    // used via `&self`, so no independent owner exists.
     pub(crate) transport_events:
-        Arc<Mutex<Option<async_channel::Receiver<crate::transport::TransportEvent>>>>,
+        Mutex<Option<async_channel::Receiver<crate::transport::TransportEvent>>>,
     pub(crate) transport_factory: Arc<dyn crate::transport::TransportFactory>,
     /// Replaced per connection, so not a `OnceLock` — but every critical section
     /// is a clone or a store, so a sync lock makes holding it across an `.await`
@@ -1770,7 +1772,8 @@ pub struct Client {
     /// per collection, matches whatsmeow's single `appStateSyncLock` and WA Web
     /// funnelling all collections through one `CollectionsStateMachine`; sends
     /// are user-paced, so there is nothing to gain from finer granularity.
-    pub(crate) app_state_send_lock: Arc<Mutex<()>>,
+    /// Inline: only ever locked via `&self` on the `Arc`-held `Client`.
+    pub(crate) app_state_send_lock: Mutex<()>,
     pub(crate) initial_keys_synced_notifier: Arc<event_listener::Event>,
     pub(crate) initial_app_state_keys_received: AtomicBool,
 
@@ -1923,8 +1926,9 @@ pub struct Client {
     ///
     /// Copy-on-write behind a sync lock, guarded by `chatstate_handler_count` so
     /// the default (no handler registered) never takes the lock nor builds the
-    /// event that only a handler would read.
-    pub(crate) chatstate_handlers: Arc<std::sync::RwLock<Arc<[ChatStateHandler]>>>,
+    /// event that only a handler would read. The outer lock is inline (`Client`
+    /// is always behind `Arc`); only the inner snapshot is `Arc`-shared.
+    pub(crate) chatstate_handlers: std::sync::RwLock<Arc<[ChatStateHandler]>>,
     pub(crate) chatstate_handler_count: AtomicUsize,
 
     pub(crate) pdo_pending_requests: Cache<ChatMessageId, crate::pdo::PendingPdoRequest>,

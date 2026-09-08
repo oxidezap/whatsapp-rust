@@ -160,14 +160,16 @@ pub fn default_tls_connector() -> Connector {
 type Sink<S> = SplitSink<WebSocketStream<S>, Message>;
 
 struct WsTransport<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
-    sink: Arc<Mutex<Option<Sink<S>>>>,
+    // Inline: every `WsTransport` is owned by the `Arc<dyn Transport>` minted
+    // in `from_websocket`, and `Transport` methods take `&self`.
+    sink: Mutex<Option<Sink<S>>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> WsTransport<S> {
     fn new(sink: Sink<S>, shutdown_tx: tokio::sync::watch::Sender<bool>) -> Self {
         Self {
-            sink: Arc::new(Mutex::new(Some(sink))),
+            sink: Mutex::new(Some(sink)),
             shutdown_tx,
         }
     }
