@@ -80,7 +80,7 @@ jobs:
 
       # measure_binary_size builds an example, which pulls the cpal dev-dependency (alsa-sys).
       - name: Install ALSA dev headers
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev unzip
       - name: Measure binary size
         run: |
           cargo run --locked --quiet -p whatsapp-xtask -- ci measure-binary-size --out-dir size-out

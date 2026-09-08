@@ -49,6 +49,7 @@ struct ArtifactRun {
 }
 #[derive(Deserialize)]
 struct Artifact {
+    id: u64,
     name: String,
     expired: bool,
     created_at: String,
@@ -65,6 +66,7 @@ pub fn download(
     repo: &str,
     sha: &str,
     mut gh: impl FnMut(&[&str]) -> Result<Vec<u8>>,
+    mut download_artifact: impl FnMut(u64, &Path) -> Result<()>,
 ) -> Result<()> {
     ensure!(
         !destination.exists(),
@@ -138,55 +140,37 @@ pub fn download(
         let artifacts: Vec<_> = pages
             .iter()
             .flat_map(|page| &page.artifacts)
-            .filter(|artifact| artifact.name == "size-metrics")
+            // Reruns share a run ID. Select this upload before checking uniqueness.
+            .filter(|artifact| {
+                artifact.name == "size-metrics"
+                    && !artifact.expired
+                    && artifact.workflow_run.id == run.id
+                    && artifact.workflow_run.head_branch == "main"
+                    && artifact.workflow_run.head_sha == sha
+                    && upload
+                        .started_at
+                        .as_ref()
+                        .is_some_and(|start| start <= &artifact.created_at)
+                    && upload
+                        .completed_at
+                        .as_ref()
+                        .is_some_and(|end| &artifact.created_at <= end)
+            })
             .collect();
         let [artifact] = artifacts.as_slice() else {
             eprintln!(
-                "Ignoring size run {} without one unambiguous size-metrics artifact",
+                "Ignoring size run {} without one unambiguous current-attempt size-metrics artifact",
                 run.id
             );
             continue;
         };
-        // Reruns share a run ID. An old attempt's artifact must not borrow the new attempt's status.
-        if artifact.expired
-            || artifact.workflow_run.id != run.id
-            || artifact.workflow_run.head_branch != "main"
-            || artifact.workflow_run.head_sha != sha
-            || !upload
-                .started_at
-                .as_ref()
-                .is_some_and(|start| start <= &artifact.created_at)
-            || !upload
-                .completed_at
-                .as_ref()
-                .is_some_and(|end| &artifact.created_at <= end)
-        {
-            eprintln!(
-                "Ignoring size run {} with expired or inconsistent artifact provenance",
-                run.id
-            );
-            continue;
-        }
         let parent = destination
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         std::fs::create_dir_all(parent)?;
         let temporary = tempfile::tempdir_in(parent)?;
-        gh(&[
-            "run",
-            "download",
-            &run.id.to_string(),
-            "--repo",
-            repo,
-            "--name",
-            "size-metrics",
-            "--dir",
-            temporary
-                .path()
-                .to_str()
-                .context("baseline path encoding")?,
-        ])?;
+        download_artifact(artifact.id, temporary.path())?;
         if let Err(error) = super::size::validate_baseline(head, temporary.path(), Some(sha)) {
             if error.is::<super::size::CompilerMismatch>() {
                 eprintln!(
@@ -248,7 +232,7 @@ mod tests {
                 ]
             }]}]),
             artifacts: json!([{"artifacts":[{
-                "name":"size-metrics","expired":false,"created_at":"2026-09-08T00:33:38Z",
+                "id":442,"name":"size-metrics","expired":false,"created_at":"2026-09-08T00:33:38Z",
                 "workflow_run":{"id":42,"head_branch":"main","head_sha":SHA}
             }]}]),
             meta: json!({"commit":SHA,"rustc":"rustc 1.98.0-nightly (01dfd7924 2026-06-15)"}),
@@ -278,57 +262,46 @@ mod tests {
             REPO,
             SHA,
             |args| {
-                if args[0] == "api" {
-                    assert_eq!(&args[..3], &["api", "--paginate", "--slurp"]);
-                    let value = match args[3] {
-                        path if path
-                            == format!(
-                                "repos/{REPO}/actions/workflows/binary-size.yml/runs?branch=main&head_sha={SHA}&status=completed&per_page=100"
-                            ) =>
-                        {
-                            fixture.runs.clone()
-                        }
-                        "repos/example/project/actions/runs/42/attempts/2/jobs?per_page=100"
-                        | "repos/example/project/actions/runs/43/attempts/2/jobs?per_page=100" => {
-                            fixture.jobs.clone()
-                        }
-                        "repos/example/project/actions/runs/42/artifacts?per_page=100" => {
-                            fixture.artifacts.clone()
-                        }
-                        "repos/example/project/actions/runs/43/artifacts?per_page=100" => {
-                            let mut artifacts = fixture.artifacts.clone();
-                            artifacts[0]["artifacts"][0]["workflow_run"]["id"] = json!(43);
-                            artifacts
-                        }
-                        path => panic!("unexpected GitHub query: {path}"),
-                    };
-                    Ok(serde_json::to_vec(&value)?)
-                } else {
-                    assert!(matches!(args[2], "42" | "43"));
-                    assert_eq!(
-                        &args[..8],
-                        &[
-                            "run",
-                            "download",
-                            args[2],
-                            "--repo",
-                            REPO,
-                            "--name",
-                            "size-metrics",
-                            "--dir"
-                        ]
-                    );
-                    downloads += 1;
-                    ensure!(!fixture.fail_download, "GitHub artifact download failed");
-                    let out = Path::new(args[8]);
-                    let mut meta = fixture.meta.clone();
-                    if args[2] == "43" {
-                        meta["rustc"] = json!("different rustc");
+                assert_eq!(&args[..3], &["api", "--paginate", "--slurp"]);
+                let value = match args[3] {
+                    path if path
+                        == format!(
+                            "repos/{REPO}/actions/workflows/binary-size.yml/runs?branch=main&head_sha={SHA}&status=completed&per_page=100"
+                        ) =>
+                    {
+                        fixture.runs.clone()
                     }
-                    write_json(&out.join("size-meta.json"), &meta)?;
-                    write_json(&out.join("size-metrics.json"), &fixture.metrics)?;
-                    Ok(Vec::new())
+                    "repos/example/project/actions/runs/42/attempts/2/jobs?per_page=100"
+                    | "repos/example/project/actions/runs/43/attempts/2/jobs?per_page=100" => {
+                        fixture.jobs.clone()
+                    }
+                    "repos/example/project/actions/runs/42/artifacts?per_page=100" => {
+                        fixture.artifacts.clone()
+                    }
+                    "repos/example/project/actions/runs/43/artifacts?per_page=100" => {
+                        let mut artifacts = fixture.artifacts.clone();
+                        artifacts[0]["artifacts"][0]["workflow_run"]["id"] = json!(43);
+                        artifacts[0]["artifacts"][0]["id"] = json!(443);
+                        artifacts
+                    }
+                    path => panic!("unexpected GitHub query: {path}"),
+                };
+                Ok(serde_json::to_vec(&value)?)
+            },
+            |id, out| {
+                assert!(
+                    matches!(id, 442 | 443),
+                    "download must select the validated artifact ID"
+                );
+                downloads += 1;
+                ensure!(!fixture.fail_download, "GitHub artifact download failed");
+                let mut meta = fixture.meta.clone();
+                if id == 443 {
+                    meta["rustc"] = json!("different rustc");
                 }
+                write_json(&out.join("size-meta.json"), &meta)?;
+                write_json(&out.join("size-metrics.json"), &fixture.metrics)?;
+                Ok(())
             },
         );
         assert_eq!(root.path().join("base-out").exists(), result.is_ok());
@@ -342,6 +315,21 @@ mod tests {
         let mut f = fixture();
         f.runs[1]["workflow_runs"][0]["event"] = json!("workflow_dispatch");
         exercise(f).0.unwrap();
+    }
+
+    #[test]
+    fn current_attempt_artifact_survives_stale_same_name_artifacts() {
+        for stale_first in [false, true] {
+            let mut f = fixture();
+            let mut stale = f.artifacts[0]["artifacts"][0].clone();
+            stale["id"] = json!(441);
+            stale["created_at"] = json!("2026-09-07T00:33:38Z");
+            let artifacts = f.artifacts[0]["artifacts"].as_array_mut().unwrap();
+            artifacts.insert(if stale_first { 0 } else { 1 }, stale);
+            let (result, downloads) = exercise(f);
+            result.unwrap();
+            assert_eq!(downloads, 1);
+        }
     }
     #[test]
     fn rejects_failed_measurement_upload_and_untrusted_runs_before_download() {
@@ -460,9 +448,14 @@ mod tests {
             .push(duplicate);
         assert!(exercise(f).0.is_err());
         let root = tempfile::tempdir().unwrap();
-        let error = download(root.path(), &root.path().join("base"), REPO, SHA, |_| {
-            anyhow::bail!("GitHub API unavailable")
-        })
+        let error = download(
+            root.path(),
+            &root.path().join("base"),
+            REPO,
+            SHA,
+            |_| anyhow::bail!("GitHub API unavailable"),
+            |_, _| panic!("no validated artifact"),
+        )
         .unwrap_err();
         assert_eq!(error.to_string(), "GitHub API unavailable");
     }

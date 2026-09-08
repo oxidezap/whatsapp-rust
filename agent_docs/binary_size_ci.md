@@ -17,13 +17,14 @@ Do NOT switch any metric to rlib size: rlibs carry un-monomorphized generics plu
 
 ## How regressions are caught
 
-- **PR gate** (`cargo xt ci binary-size-report`): absolute per-PR budget — stripped Δ ≤ 64 KiB, .text Δ ≤ 32 KiB. Absolute instead of percentage because sizes are deterministic for a pinned toolchain and 1% of a multi-MiB binary would hide real regressions. The sticky PR comment shows all deltas plus per-crate top movers.
+- **PR gate**. Run `cargo run --locked --quiet -p whatsapp-xtask -- ci binary-size-report`. The per-PR budgets allow at most 64 KiB of stripped growth and 32 KiB of `.text` growth. A percentage of a multi-MiB binary could hide real regressions. The sticky PR comment shows all deltas and per-crate changes.
 - **Escape hatch**: the `size-increase-ok` label downgrades a failed gate to a warning. Use it for toolchain/dependency bumps and accepted feature costs; the increase still lands in the series.
 - **Post-merge safety net**: the push job stores the series at `dev/binary-size` on gh-pages via github-action-benchmark (`alert-threshold: 102%` comments on the offending commit). Graphs: <https://oxidezap.github.io/whatsapp-rust/dev/binary-size/>.
 
 ## Baseline semantics and pitfalls
 
 - The PR baseline must match the event's `pull_request.base.sha`. The selector searches this repository's Binary Size runs on main, including pushes and manual dispatches. It requires successful measurement and upload in the same job and run attempt, an unexpired artifact from that upload, matching commit metadata, and the same rustc version as the head. Graph publication may fail without invalidating a completed measurement.
+- Artifacts from previous attempts are filtered before checking uniqueness. The selected artifact is downloaded by ID through `gh api`; `unzip` reads only the two fixed JSON members. Older artifacts with the same name cannot replace the validated measurement.
 - Missing, expired, malformed or mismatched baselines fail visibly. There is no fallback to older main and no passing gate without a comparison. Run Binary Size on the required main commit, then retry the PR job. A dispatch on a newer main commit cannot supply an older PR's baseline.
 - Metric names are series keys. Renaming one orphans its history in the chart, so keep names stable.
 - Sizes are only comparable under the same pinned toolchain. A toolchain change requires a base measurement with the matching compiler; `size-increase-ok` cannot override missing or incomparable measurements. The selector skips other-compiler candidates at the same base SHA, not metadata or provenance failures.

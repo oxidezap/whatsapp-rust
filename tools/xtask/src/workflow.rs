@@ -344,12 +344,35 @@ pub fn run_task(root: &Path, task: Task) -> Result<()> {
             output("publish", if publish { "true" } else { "false" })?;
         }
         Task::SizeBaseline { head, out_dir } => {
+            let repo = env("GITHUB_REPOSITORY")?;
             super::size_baseline::download(
                 &root.join(&head),
                 &root.join(&out_dir),
-                &env("GITHUB_REPOSITORY")?,
+                &repo,
                 &env("BASE_SHA")?,
                 |args| Ok(capture(Command::new("gh").args(args).current_dir(root))?.stdout),
+                |id, out| {
+                    let archive = tempfile::NamedTempFile::new_in(out)?;
+                    let bytes = capture(Command::new("gh").args([
+                        "api",
+                        "--allow-escape-sequences",
+                        &format!("repos/{repo}/actions/artifacts/{id}/zip"),
+                    ]))?
+                    .stdout;
+                    std::fs::write(archive.path(), bytes)?;
+                    // Read only fixed members, never artifact-controlled extraction paths.
+                    for name in ["size-meta.json", "size-metrics.json"] {
+                        let bytes = capture(
+                            Command::new("unzip")
+                                .arg("-p")
+                                .arg(archive.path())
+                                .arg(name),
+                        )?
+                        .stdout;
+                        std::fs::write(out.join(name), bytes)?;
+                    }
+                    Ok(())
+                },
             )?;
             output("dir", out_dir.to_str().context("baseline path encoding")?)?;
         }
