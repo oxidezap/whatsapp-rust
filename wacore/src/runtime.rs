@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 /// A runtime-agnostic abstraction over async executor capabilities.
 ///
-/// On native targets, futures must be `Send` (multi-threaded executors).
+/// On native targets, futures must be `Send`, even on single-threaded executors.
 /// On wasm32, `Send` is dropped (single-threaded).
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
@@ -32,13 +32,12 @@ pub trait Runtime: Send + Sync + 'static {
     /// Cooperatively yield, allowing other tasks and I/O to make progress.
     ///
     /// Use this in tight async loops that process many items to avoid
-    /// starving other work. Returns `None` if yielding is unnecessary
-    /// (e.g. multi-threaded runtimes where other tasks run on separate
-    /// threads), or `Some(future)` that the caller must `.await` to
-    /// actually yield.
+    /// starving other work. Returns `Some(future)` that the caller must `.await`
+    /// to yield, or `None` if the implementation provides no yield at this point.
     ///
-    /// Returning `None` avoids any allocation or async overhead, making
-    /// the call zero-cost on runtimes that don't need cooperative yielding.
+    /// `None` introduces no scheduling point and does not promise fairness.
+    /// Multi-threaded executors also need tasks to return from each poll;
+    /// multiple workers alone do not make cooperative yielding unnecessary.
     fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>>;
 
     /// How often to yield in tight loops (every N items). Defaults to 10.
@@ -64,8 +63,9 @@ pub trait Runtime: Send + Sync + 'static {
 
     /// Cooperatively yield, allowing other tasks and I/O to make progress.
     ///
-    /// Returns `None` if yielding is unnecessary, or `Some(future)` that
-    /// the caller must `.await` to actually yield.
+    /// Returns `Some(future)` that the caller must `.await` to yield, or `None`
+    /// if the implementation provides no yield at this point. `None` introduces
+    /// no scheduling point and does not promise fairness.
     fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()>>>>;
 
     /// How often to yield in tight loops (every N items). Defaults to 10.
@@ -136,9 +136,9 @@ impl AbortHandle {
 
     /// Detach the handle so the task is NOT aborted on drop.
     ///
-    /// The spawned task will run until completion even if the parent scope
-    /// is dropped. Use this for fire-and-forget tasks where cancellation
-    /// is not desired.
+    /// The task may outlive the parent scope. This does not guarantee completion
+    /// across executor shutdown. Use this for fire-and-forget tasks where
+    /// cancellation on handle drop is not desired.
     pub fn detach(self) {
         *self.abort_fn.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
@@ -303,8 +303,10 @@ where
 ///
 /// # Panics
 ///
-/// Panics if the runtime drops the spawned task before it completes
-/// (e.g. during runtime shutdown).
+/// Panics if the closure panics or the runtime drops the spawned task before
+/// it delivers a result, such as during shutdown. If the runtime catches the
+/// closure's panic, this helper raises a new panic for the missing result
+/// rather than resuming the original panic payload.
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn blocking<T: Send + 'static>(
     rt: &dyn Runtime,
