@@ -241,6 +241,88 @@ async fn refused_offer_cleans_up_without_returning_a_handle() -> Result<()> {
 }
 
 #[tokio::test]
+async fn initial_peer_survives_phone_cache_loss_and_early_spoofed_winner() -> Result<()> {
+    for spoofed in [false, true] {
+        let fixture = Arc::new(CallFixture::new().await?);
+        let requested = fixture.cache_peer_phone("15550003333").await;
+        let starting = tokio::spawn({
+            let client = fixture.client().clone();
+            let requested = requested.clone();
+            async move {
+                let (_mic, mic) = async_channel::bounded::<Vec<i16>>(1);
+                let (speaker, _speaker) = async_channel::bounded::<Vec<i16>>(1);
+                client
+                    .voip()
+                    .call(&requested)
+                    .audio(mic, speaker)
+                    .start()
+                    .await
+            }
+        });
+        let offer = fixture.next_offer().await?;
+        let node = offer.stanza().as_node_ref();
+        assert_eq!(
+            node.attrs().optional_jid("to"),
+            Some(fixture.peer().clone())
+        );
+        let id = node
+            .get_optional_child("offer")
+            .unwrap()
+            .attrs()
+            .optional_string("call-id")
+            .unwrap()
+            .into_owned();
+        fixture.clear_lid_pn_cache().await;
+        assert!(
+            fixture
+                .client()
+                .get_lid_pn_entry(&requested)
+                .await?
+                .is_none()
+        );
+        let winner = if spoofed {
+            Jid::lid("999999999999999").with_device(2)
+        } else {
+            fixture.peer().clone().with_device(2)
+        };
+        let accept = action(&fixture, &id, winner.clone(), "accept", None);
+        let injection = tokio::spawn({
+            let fixture = fixture.clone();
+            async move { fixture.inject(accept).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while fixture
+                .call_snapshot(&id)
+                .and_then(|session| session.answering_device)
+                .as_ref()
+                != Some(&winner)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(!starting.is_finished());
+        offer.complete()?;
+        let handle = starting.await??;
+        injection.await??;
+        assert_eq!(handle.peer_jid(), winner);
+        assert_eq!(handle.initial_peer_jid(), fixture.peer());
+        assert_eq!(handle.clone().initial_peer_jid(), fixture.peer());
+        assert!(
+            fixture
+                .client()
+                .get_lid_pn_entry(&requested)
+                .await?
+                .is_none()
+        );
+        assert!(futures::poll!(std::pin::pin!(handle.wait_ended())).is_pending());
+        fixture.shutdown().await?;
+        assert_eq!(handle.initial_peer_jid(), fixture.peer());
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn dropped_offer_refuses_send_and_dropped_fixture_reaps_a_real_handle() -> Result<()> {
     let fixture = CallFixture::new().await?;
     let first = start(&fixture);

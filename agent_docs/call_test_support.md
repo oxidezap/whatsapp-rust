@@ -31,6 +31,11 @@ do not introduce a second copy just for the fixture.
   event subscriptions and `CallHandle` methods.
 - `peer()` names the fictitious recipient. Its primary device 0 and companion
   device 2 have seeded device records and Signal sessions.
+- `cache_peer_phone(phone).await` adds a memory-only fictitious PN alias and
+  returns its JID. `clear_lid_pn_cache().await` removes cached mappings without
+  ending calls. Clear after `next_offer()` to test identity lookup failure
+  after the builder has resolved the recipient. An unmapped PN is rejected
+  before an offer, even if its device list is cached.
 - `next_offer().await` returns `PendingOffer` at transport entry. Its `stanza()`
   contains the actual production video advertisement and encrypted per-device
   destinations. `complete()` releases send completion; `fail()` or dropping it
@@ -115,6 +120,12 @@ shows the handler's selection. Sibling dismissal blocks behind the pending
 offer send. Complete the offer, then await both futures. The external test
 `accept_before_builder_completion_selects_winner_through_handler` demonstrates
 this ordering without a sleep or a readiness setter.
+
+`CallHandle::initial_peer_jid()` borrows the immutable peer captured during
+handle construction. For a direct outgoing call it is the builder's resolved
+offer target, independent of later cache loss or winner selection. In contrast,
+`peer_jid()` follows the answering device and group promotion for signaling.
+The immutable getter does not change the handler's acceptance policy.
 
 ## Coverage boundaries
 

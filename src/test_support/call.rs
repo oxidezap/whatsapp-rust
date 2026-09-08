@@ -209,6 +209,25 @@ impl CallFixture {
         &self.peer
     }
 
+    /// Cache a fictitious phone alias for the peer without persisting it.
+    /// Clearing the cache then reproduces a missing secondary identity lookup.
+    pub async fn cache_peer_phone(&self, phone: &str) -> Jid {
+        self.client
+            .lid_pn_cache
+            .add(&crate::lid_pn_cache::LidPnEntry::new(
+                self.peer.user.as_str(),
+                phone,
+                crate::lid_pn_cache::LearningSource::Usync,
+            ))
+            .await;
+        Jid::pn(phone)
+    }
+
+    /// Evict identity mappings without changing the connection or registered calls.
+    pub async fn clear_lid_pn_cache(&self) {
+        self.client.lid_pn_cache.clear().await;
+    }
+
     /// Read the registered production session, including a winner selected before start returns.
     /// Mutating this detached snapshot cannot change the live call.
     pub fn call_snapshot(&self, call_id: &str) -> Option<wacore::voip::CallSession> {
@@ -520,6 +539,53 @@ impl Transport for Wire {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn unmapped_phone_is_rejected_before_an_offer() -> Result<()> {
+        let fixture = CallFixture::new().await?;
+        let requested = Jid::pn("15550003333");
+        fixture
+            .client()
+            .update_device_list(DeviceListRecord {
+                user: Arc::from(requested.user.as_str()),
+                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(2, None)]
+                    .into_boxed_slice(),
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await?;
+        assert!(
+            fixture
+                .client()
+                .get_lid_pn_entry(&requested)
+                .await?
+                .is_none()
+        );
+        let (_mic, mic) = async_channel::bounded::<Vec<i16>>(1);
+        let (speaker, _speaker) = async_channel::bounded::<Vec<i16>>(1);
+        let result = fixture
+            .client()
+            .voip()
+            .call(&requested)
+            .audio(mic, speaker)
+            .start()
+            .await;
+        assert!(matches!(
+            result,
+            Err(crate::CallError::Media(
+                "no known LID for the PN callee; cannot derive media keys"
+            ))
+        ));
+        assert!(
+            !fixture
+                .outgoing_stanzas()?
+                .iter()
+                .any(|node| node.as_node_ref().get_optional_child("offer").is_some())
+        );
+        fixture.shutdown().await?;
+        Ok(())
+    }
 
     #[derive(Debug, thiserror::Error)]
     #[error("synthetic transport connect failure")]
