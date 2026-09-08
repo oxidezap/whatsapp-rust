@@ -27,10 +27,8 @@ impl Client {
     /// `undecryptable_dispatched` gate is: claiming at the check would claim
     /// for a commit that may still fail. `chat_lanes` serializes incoming
     /// processing per chat and so closes the window for ordinary traffic, but
-    /// two workers for one chat can coexist after a lane eviction. The race
-    /// they leave is a second dispatch of one message, which is the behaviour
-    /// this gate improves on rather than a regression, and it is the safe
-    /// direction: the alternative loses the message.
+    /// PDO recovery arrives on the phone's lane instead. The commit path
+    /// rechecks recovery claims under the shared publication lock.
     pub(crate) async fn message_already_dispatched(&self, info: &Arc<MessageInfo>) -> bool {
         self.dispatched_messages
             .get(&Self::dispatch_key(info))
@@ -54,7 +52,7 @@ impl Client {
     /// consumer, losing the message instead of duplicating it.
     pub(crate) async fn mark_message_dispatched(&self, info: &Arc<MessageInfo>) {
         self.dispatched_messages
-            .insert(Self::dispatch_key(info), ())
+            .insert(Self::dispatch_key(info), MessageDispatch::Decrypted)
             .await;
     }
 

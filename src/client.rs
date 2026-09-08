@@ -1703,7 +1703,8 @@ pub struct Client {
     /// Dispatch-once gate for a decrypted message. A sender retrying its own
     /// outbox resends one id as fresh ciphertext on a new ratchet iteration,
     /// which decrypts as new traffic, so only message identity can collapse it.
-    pub(crate) dispatched_messages: Cache<wacore::types::message::SenderMessageId, ()>,
+    pub(crate) dispatched_messages:
+        Cache<wacore::types::message::SenderMessageId, crate::message::MessageDispatch>,
 
     /// Lifetime count of resent messages this gate kept from reaching
     /// consumers. Client-level, so it survives reconnects: the sender's retry

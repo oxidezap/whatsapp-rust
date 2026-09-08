@@ -10,6 +10,7 @@
 
 use super::*;
 use portable_atomic::AtomicU64;
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use wacore::store::traits::{PendingInboundKey, PendingInboundRow};
 use wacore::types::events::{BatchOrigin, InboundMessage, MessageBatch};
@@ -40,6 +41,22 @@ struct PendingInboundBatch {
     commit_ticket: Option<InboundCommitTicket>,
 }
 
+#[derive(Clone)]
+struct PendingPublication {
+    items: Arc<[InboundMessage]>,
+    arrived: Arc<[InboundMessage]>,
+    origin: BatchOrigin,
+    hook_committed: bool,
+}
+
+#[derive(Clone, Copy)]
+enum PublicationReceipts {
+    Hold,
+    // The caller flushed current Signal state under the processing permit.
+    // This authorization belongs to the call, never to a retained batch.
+    CurrentFlush,
+}
+
 impl PendingInboundBatch {
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -55,6 +72,14 @@ impl PendingInboundBatch {
 
 pub(crate) struct InboundCommitBatcher {
     state: std::sync::Mutex<BatchState>,
+    // PDO and normal delivery use different lanes. Hold only for publication,
+    // never for backend writes, Signal flushes or consumer durability hooks.
+    pub(crate) dispatch_lock: async_lock::Mutex<()>,
+    // These batches crossed their commit boundary. Their ratchets may already
+    // be persisted, so reconnect reset must retain the unpublished plaintext.
+    publications: std::sync::Mutex<VecDeque<PendingPublication>>,
+    #[cfg(test)]
+    pub(crate) publication_reached: std::sync::atomic::AtomicBool,
     /// Whether inbound commits accumulate here (offline drain) or commit
     /// immediately (live). Flipped off ONLY by the end-of-drain flush while it
     /// holds the single processing permit, so no stanza can straddle the
@@ -93,6 +118,10 @@ impl Default for InboundCommitBatcher {
     fn default() -> Self {
         Self {
             state: std::sync::Mutex::new(BatchState::default()),
+            dispatch_lock: async_lock::Mutex::new(()),
+            publications: std::sync::Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            publication_reached: std::sync::atomic::AtomicBool::new(false),
             active: std::sync::atomic::AtomicBool::new(true),
             pending_live: std::sync::atomic::AtomicBool::new(false),
             epoch: AtomicU64::new(0),
@@ -106,6 +135,12 @@ impl Default for InboundCommitBatcher {
 }
 
 impl InboundCommitBatcher {
+    fn publications(&self) -> std::sync::MutexGuard<'_, VecDeque<PendingPublication>> {
+        self.publications
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, BatchState> {
         match self.state.lock() {
             Ok(guard) => guard,
@@ -137,7 +172,7 @@ impl InboundCommitBatcher {
         !self.lock().entries.is_empty()
     }
 
-    /// Accumulated entries and the encoded bytes they account for, for
+    /// Entries waiting for commit or publication and their encoded bytes, for
     /// `memory_report()`.
     ///
     /// This is the largest thing one client retains: a drain batch holds
@@ -163,7 +198,17 @@ impl InboundCommitBatcher {
     ///   resident for the session.
     pub(crate) fn pending_stats(&self) -> (usize, usize) {
         let state = self.lock();
-        (state.entries.len(), state.bytes)
+        let publications = self.publications();
+        let unpublished = publications.iter().flat_map(|batch| batch.arrived.iter());
+        unpublished.fold(
+            (state.entries.len(), state.bytes),
+            |(count, bytes), item| {
+                (
+                    count + 1,
+                    bytes + waproto::codec::message_encoded_len(&item.message),
+                )
+            },
+        )
     }
 
     /// Switch to immediate (live) commits. Only the end-of-drain flush (or a
@@ -433,6 +478,8 @@ impl Client {
             return true;
         }
         let was_draining = self.inbound_commit_batch.is_active();
+        self.publish_pending_inbound(PublicationReceipts::Hold)
+            .await;
         let batch = self.inbound_commit_batch.take();
         let durable = if batch.is_empty() {
             // Even with nothing to commit, flush the Signal cache under the
@@ -465,6 +512,9 @@ impl Client {
             // entries were taken before the reset and its rows are durable.
             return durable;
         }
+        if durable {
+            self.flush_offline_receipts();
+        }
         if deactivate {
             if durable {
                 self.inbound_commit_batch.deactivate();
@@ -495,13 +545,13 @@ impl Client {
     /// permit held and a durable commit just done, so the flip is as raceless
     /// as the normal end-of-drain one.
     pub(crate) fn complete_deferred_live_transition(&self) {
-        self.inbound_commit_batch.deactivate();
-        self.swap_message_semaphore(64);
         // Receipts buffered during the deferred window (SKDM-only stanzas
         // keep buffering while the batcher is active) are safe to send now:
         // the durable flush that triggered this completion persisted their
         // Signal state.
         self.flush_offline_receipts();
+        self.inbound_commit_batch.deactivate();
+        self.swap_message_semaphore(64);
         // Key-share jobs may have observed the earlier failed transition.
         self.offline_sync_notifier.notify(usize::MAX);
         log::info!("Deferred drain-to-live transition completed after a durable flush");
@@ -559,6 +609,8 @@ impl Client {
     ) {
         let settle = async {
             let _permit = self.acquire_message_processing_permit().await;
+            self.publish_pending_inbound(PublicationReceipts::Hold)
+                .await;
             let batch = self.inbound_commit_batch.take();
             let durable = if batch.is_empty() {
                 true
@@ -577,7 +629,10 @@ impl Client {
             // drop with them instead of persisting rowless.
             if durable && !self.inbound_commit_batch.has_entries() {
                 match self.flush_signal_cache().await {
-                    Ok(()) => self.signal_cache.clear_after_flush().await,
+                    Ok(()) => {
+                        self.flush_offline_receipts();
+                        self.signal_cache.clear_after_flush().await;
+                    }
                     // Committed/acked state the server never redelivers: keep
                     // it resident so the next successful flush persists it.
                     // Safe to carry across the reconnect — the teardown
@@ -1010,56 +1065,126 @@ impl Client {
             if is_drain && !self.drain_signal_flush_reporting().await {
                 return false;
             }
-            reinsert.mark_durable();
         }
 
-        // Acks first (everything durable by now): handle_event runs
-        // synchronously, so a handler that panics or blocks must not be able
-        // to suppress acks for messages the consumer already owns — the
-        // pre-batch at-most-once path acked before dispatching too.
-        for item in arrived.iter() {
-            self.ack_received_message(&item.info);
+        self.inbound_commit_batch
+            .publications()
+            .push_back(PendingPublication {
+                items,
+                arrived,
+                origin,
+                hook_committed,
+            });
+        reinsert.mark_durable();
+        let receipts = if is_drain {
+            PublicationReceipts::CurrentFlush
+        } else {
+            PublicationReceipts::Hold
+        };
+        self.publish_pending_inbound(receipts).await;
+        true
+    }
+
+    async fn publish_pending_inbound(self: &Arc<Self>, receipts: PublicationReceipts) {
+        if self.inbound_commit_batch.publications().is_empty() {
+            return;
         }
-        // WA Web `createSnapshot` sends `sendAggregateOfflineReceipts` per
-        // snapshot, not once at drain end. Flush the receipts this batch's acks
-        // just buffered now that the batch is durable: bounds the buffer over a
-        // large backlog and caps redelivery on a mid-drain disconnect to a
-        // single snapshot instead of the whole backlog (a disconnect clears the
-        // buffer, so anything already flushed is not re-sent). Gated on the
-        // durable path — a non-durable batch returned above without acking.
-        if is_drain {
-            self.flush_offline_receipts();
-        }
-        let dispatched = Arc::clone(&items);
-        self.core.event_bus.dispatch(Event::Messages(
-            MessageBatch::builder()
-                .messages(items)
-                .origin(origin)
-                .hook_committed(hook_committed)
-                .build(),
-        ));
-        // Claimed after the dispatch, never between the acks and it: this is the
-        // one suspension point in that span, and a teardown cancelling it there
-        // would leave the batch acked with its event never sent, which for a
-        // consumer without a hook is a lost message. Cancelled here instead, the
-        // claim is simply missing and a resend dispatches twice.
-        for item in dispatched.iter() {
-            // An unresolved secret envelope is a placeholder in the same sense
-            // as an UndecryptableMessage: what reached the consumer is not the
-            // content. Presence, not extractability: a malformed envelope is
-            // just as unreadable to a consumer as an unopenable one, and
-            // `extract_secret_encrypted` returns `None` for both a plain
-            // message and a malformed envelope. Claiming it would suppress the resend that arrives once
-            // the parent secret is known, so leave it unclaimed and take the
-            // duplicate instead. The batch collapse keeps such a resend for a
-            // related reason: it compares content, and the envelope is not the
-            // content.
-            if crate::features::message_edit::carries_secret_encrypted(&item.message) {
+        #[cfg(test)]
+        self.inbound_commit_batch
+            .publication_reached
+            .store(true, Ordering::Release);
+        let _dispatch_guard = self.inbound_commit_batch.dispatch_lock.lock().await;
+        loop {
+            let Some(PendingPublication {
+                items,
+                arrived,
+                origin,
+                hook_committed,
+            }) = self.inbound_commit_batch.publications().front().cloned()
+            else {
+                break;
+            };
+            // A PDO may have published while this batch waited for durability.
+            // Ordinary claims must not filter multipart messages or hook replays.
+            let mut retained: Option<Vec<InboundMessage>> = None;
+            for (index, item) in items.iter().enumerate() {
+                let key = Self::dispatch_key(&item.info);
+                let state = self.dispatched_messages.get(&key).await;
+                if matches!(
+                    state,
+                    Some(MessageDispatch::Recovered | MessageDispatch::RecoveredCommitted)
+                ) {
+                    if hook_committed
+                        && state == Some(MessageDispatch::Recovered)
+                        && !crate::features::message_edit::carries_secret_encrypted(&item.message)
+                    {
+                        self.dispatched_messages
+                            .insert(key, MessageDispatch::RecoveredCommitted)
+                            .await;
+                    }
+                    retained.get_or_insert_with(|| items[..index].to_vec());
+                } else if let Some(retained) = &mut retained {
+                    retained.push(item.clone());
+                }
+            }
+            let items = retained.map(Arc::from).unwrap_or(items);
+
+            // Remove only after every pre-publication await. Cancellation before
+            // this point leaves the whole batch available to the next publisher.
+            let published = self
+                .inbound_commit_batch
+                .publications()
+                .pop_front()
+                .expect("publication lock owns the front batch");
+            for _ in 0..published.items.len() - items.len() {
+                self.duplicate_dispatch_suppressed
+                    .fetch_add(1, Ordering::Relaxed);
+                wacore::telemetry::recv("duplicate_resend");
+            }
+
+            // Acks first (everything durable by now): handle_event runs
+            // synchronously, so a handler that panics or blocks must not be able
+            // to suppress acks for messages the consumer already owns — the
+            // pre-batch at-most-once path acked before dispatching too.
+            for item in arrived.iter() {
+                self.ack_received_message(&item.info);
+            }
+            if matches!(receipts, PublicationReceipts::CurrentFlush) {
+                self.flush_offline_receipts();
+            }
+            if items.is_empty() {
                 continue;
             }
-            self.mark_message_dispatched(&item.info).await;
+            let dispatched = Arc::clone(&items);
+            self.core.event_bus.dispatch(Event::Messages(
+                MessageBatch::builder()
+                    .messages(items)
+                    .origin(origin)
+                    .hook_committed(hook_committed)
+                    .build(),
+            ));
+            // Claimed after the dispatch, never between the acks and it: this is the
+            // one suspension point in that span, and a teardown cancelling it there
+            // would leave the batch acked with its event never sent, which for a
+            // consumer without a hook is a lost message. Cancelled here instead, the
+            // claim is simply missing and a resend dispatches twice.
+            for item in dispatched.iter() {
+                // An unresolved secret envelope is a placeholder in the same sense
+                // as an UndecryptableMessage: what reached the consumer is not the
+                // content. Presence, not extractability: a malformed envelope is
+                // just as unreadable to a consumer as an unopenable one, and
+                // `extract_secret_encrypted` returns `None` for both a plain
+                // message and a malformed envelope. Claiming it would suppress the resend that arrives once
+                // the parent secret is known, so leave it unclaimed and take the
+                // duplicate instead. The batch collapse keeps such a resend for a
+                // related reason: it compares content, and the envelope is not the
+                // content.
+                if crate::features::message_edit::carries_secret_encrypted(&item.message) {
+                    continue;
+                }
+                self.mark_message_dispatched(&item.info).await;
+            }
         }
-        true
     }
 }
 

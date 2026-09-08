@@ -401,12 +401,10 @@ impl Client {
     /// so the ordering of flag flip vs. semaphore swap is not observable: any
     /// in-flight worker keeps using its old 1-permit Arc and drains normally;
     /// newly-spawned workers pick up the 64-permit semaphore via
-    /// read_message_semaphore(). The flag flip happens-before the receipt
-    /// drain takes the buffer lock, so late offline receipts either land in
-    /// the flush or observe the flag and send 1:1
-    /// (see try_buffer_offline_receipt).
+    /// read_message_semaphore(). Receipt buffering follows the batcher's drain
+    /// mode, changed under the processing permit, not this later completion flag.
     ///
-    /// `durable`: `Some(true)` flushes the buffered offline receipts;
+    /// `durable`: `Some(true)` already flushed receipts under the drain permit;
     /// `Some(false)` drops them — the tail's durable write failed, its entries
     /// are back in the batcher unacked, and receipting SKDM/session state that
     /// never became durable would trade a redeliverable failure for a
@@ -447,15 +445,11 @@ impl Client {
         if durable != Some(false) {
             self.swap_message_semaphore(64);
         }
-        match durable {
-            Some(true) => self.flush_offline_receipts(),
-            Some(false) => {
-                log::warn!(
-                    "finish_offline_sync: tail commit not durable; dropping buffered offline receipts so the server redelivers"
-                );
-                self.clear_offline_receipt_buffer();
-            }
-            None => {}
+        if let Some(false) = durable {
+            log::warn!(
+                "finish_offline_sync: tail commit not durable; dropping buffered offline receipts so the server redelivers"
+            );
+            self.clear_offline_receipt_buffer();
         }
         self.core.event_bus.dispatch(Event::OfflineSyncCompleted(
             OfflineSyncCompleted::builder().count(count).build(),

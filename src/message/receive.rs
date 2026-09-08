@@ -1970,7 +1970,15 @@ impl Client {
                 skdm_only: true,
                 ..Default::default()
             })
-        } else if self.message_already_dispatched(info).await {
+        } else if self
+            .dispatched_messages
+            .get(&Self::dispatch_key(info))
+            .await
+            .is_some_and(|state| {
+                // PDO published an event, not a consumer's durable copy.
+                state != MessageDispatch::Recovered || self.inbound_durability_hook.get().is_none()
+            })
+        {
             // The event is a duplicate; the message secret it carries may not
             // be. Capture is write-behind and can drop an entry when its
             // backend is down, and this branch skips `dispatch_parsed_message`,

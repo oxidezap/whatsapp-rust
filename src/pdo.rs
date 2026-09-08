@@ -906,6 +906,16 @@ impl Client {
             Some(request_id.to_owned())
         };
 
+        let _dispatch_guard = self.inbound_commit_batch.dispatch_lock.lock().await;
+        if self.message_already_dispatched(&message_info).await {
+            self.duplicate_dispatch_suppressed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            wacore::telemetry::recv("duplicate_resend");
+            return;
+        }
+        let claim = !crate::features::message_edit::carries_secret_encrypted(&message);
+        let dispatch_key = Self::dispatch_key(&message_info);
+
         info!(
             "Dispatching PDO-recovered message {} from {} via phone (request_id={})",
             message_info.id,
@@ -928,6 +938,11 @@ impl Client {
                     .origin(wacore::types::events::BatchOrigin::Live)
                     .build(),
             ));
+        if claim {
+            self.dispatched_messages
+                .insert(dispatch_key, crate::message::MessageDispatch::Recovered)
+                .await;
+        }
     }
 
     /// Reconstructs a MessageInfo from a WebMessageInfo.

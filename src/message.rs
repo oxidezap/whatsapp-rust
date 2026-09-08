@@ -211,6 +211,13 @@ pub(crate) struct PlaintextHandleOutcome {
     skdm_only: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MessageDispatch {
+    Decrypted,
+    Recovered,
+    RecoveredCommitted,
+}
+
 const INBOUND_COMMIT_PENDING: u8 = 0;
 const INBOUND_COMMIT_DURABLE: u8 = 1;
 const INBOUND_COMMIT_DROPPED: u8 = 2;

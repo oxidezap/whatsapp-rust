@@ -1478,12 +1478,8 @@ impl Client {
         // buffered receipts stay unsent too, because their SKDM/session state
         // may not be durable yet (receipting an SKDM whose sender key only
         // lives in the cache would lose it to a crash with no redelivery).
-        if self
-            .flush_inbound_commits_bounded(Duration::from_secs(5))
-            .await
-        {
-            self.flush_offline_receipts();
-        }
+        self.flush_inbound_commits_bounded(Duration::from_secs(5))
+            .await;
         // Prevent late receipt producers from escaping the drain window.
         self.outbound_flush.close();
         self.outbound_flush
@@ -1562,12 +1558,8 @@ impl Client {
         self.backoff_reset_suppressed.store(true, Ordering::Relaxed);
 
         // Same durable-before-receipts gate as disconnect().
-        if self
-            .flush_inbound_commits_bounded(Duration::from_secs(2))
-            .await
-        {
-            self.flush_offline_receipts();
-        }
+        self.flush_inbound_commits_bounded(Duration::from_secs(2))
+            .await;
         self.outbound_flush.close();
         self.outbound_flush
             .flush(&*self.runtime, Duration::from_secs(2))
@@ -1598,12 +1590,8 @@ impl Client {
         self.expected_disconnect.store(true, Ordering::Relaxed);
 
         // Same durable-before-receipts gate as disconnect().
-        if self
-            .flush_inbound_commits_bounded(Duration::from_secs(2))
-            .await
-        {
-            self.flush_offline_receipts();
-        }
+        self.flush_inbound_commits_bounded(Duration::from_secs(2))
+            .await;
         self.outbound_flush.close();
         self.outbound_flush
             .flush(&*self.runtime, Duration::from_secs(2))
@@ -1720,12 +1708,8 @@ impl Client {
         self.pause_state_notifier.notify(usize::MAX);
 
         // Same durable-before-receipts gate as disconnect().
-        if self
-            .flush_inbound_commits_bounded(Duration::from_secs(2))
-            .await
-        {
-            self.flush_offline_receipts();
-        }
+        self.flush_inbound_commits_bounded(Duration::from_secs(2))
+            .await;
         // Everything from here touches connection-scoped shared state, and a
         // `resume()` across the await above can have a replacement installed
         // that has already reopened the outbound scope and reset the

@@ -5255,7 +5255,10 @@ async fn cache_maintenance_sweeps_expired_entries() {
     let chat: Jid = "19045550180@s.whatsapp.net".parse().unwrap();
     let key =
         wacore::types::message::SenderMessageId::new(chat.clone(), "3EB0EXPIRING".into(), chat);
-    client.dispatched_messages.insert(key, ()).await;
+    client
+        .dispatched_messages
+        .insert(key, crate::message::MessageDispatch::Decrypted)
+        .await;
     tokio::time::sleep(Duration::from_millis(40)).await;
     assert_eq!(
         client.dispatched_messages.entry_count_async().await,
