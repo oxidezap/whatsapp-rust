@@ -3778,6 +3778,15 @@ impl CallHandle {
         self.media_stats.snapshot()
     }
 
+    /// The peer captured when this handle was created.
+    ///
+    /// For a direct outgoing call, this is the builder's resolved offer target, not the device
+    /// selected by an inbound accept. It does not change after acceptance, group promotion or
+    /// teardown, and does not consult the identity cache. Use [`Self::peer_jid`] for signaling.
+    pub fn initial_peer_jid(&self) -> &Jid {
+        &self.peer_jid
+    }
+
     /// The peer this call is with, as the `<terminate>` target. For an outgoing call this is the
     /// call-scoped JID after an ad-hoc group promotion, otherwise the callee device that answered
     /// (learned from the inbound `<accept>`) once one has, since direct-call signaling is addressed
