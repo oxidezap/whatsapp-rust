@@ -5107,6 +5107,44 @@ mod tests {
     }
 
     #[test]
+    fn source_video_events_account_for_both_jids_and_preserve_legacy_at_capacity_one() {
+        use crate::stats::HeapSize;
+
+        for capacity in [1, 2] {
+            let reg = CallRegistry::new();
+            let generation = reg.insert(session("CID"));
+            let (event_tx, event_rx) = async_channel::bounded(capacity);
+            let (ctl_tx, _ctl_rx) = video_control_channel();
+            reg.set_video_channels("CID", generation, event_tx, ctl_tx, Box::new(|| {}));
+            let source = Jid::new("3".repeat(64), Server::Lid);
+            let call_creator = Jid::new("4".repeat(64), Server::Lid);
+            let expected_heap = source.heap_bytes() + call_creator.heap_bytes();
+            let sourced = CallEvent::PeerVideoStateChanged {
+                source,
+                call_creator,
+                state: VideoState::Stopped,
+                orientation: Some(2),
+                upgrade_token: None,
+            };
+            assert_eq!(sourced.heap_bytes(), expected_heap);
+            assert!(expected_heap > 0);
+            let legacy = CallEvent::VideoStateChanged {
+                state: VideoState::Stopped,
+                orientation: Some(2),
+                upgrade_token: None,
+            };
+            let permit = reg.reserve_call_event("CID").unwrap();
+            assert!(permit.send(sourced.clone()));
+            assert!(permit.send(legacy.clone()));
+            if capacity == 2 {
+                assert_eq!(event_rx.try_recv(), Ok(sourced));
+            }
+            assert_eq!(event_rx.try_recv(), Ok(legacy));
+            assert!(event_rx.is_empty());
+        }
+    }
+
+    #[test]
     fn peer_upgrade_tokens_reject_cancel_request_aba() {
         let reg = CallRegistry::new();
         let generation = reg.insert(session("CID"));

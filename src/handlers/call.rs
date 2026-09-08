@@ -861,6 +861,19 @@ impl StanzaHandler for CallHandler {
                             // A group participant's `<video>` state describes only that sender.
                             // The authoritative roster owns group media mode; never feed this into
                             // the 1:1 negotiation state machine or tear down the local plane.
+                            if dispatch_call {
+                                registry.send_call_event_if_current(
+                                    call_id,
+                                    generation,
+                                    CallEvent::PeerVideoStateChanged {
+                                        source: sender,
+                                        call_creator: call.action.call_creator().clone(),
+                                        state: *state,
+                                        orientation: *orientation,
+                                        upgrade_token: None,
+                                    },
+                                );
+                            }
                             drop(event_permit);
                             drop(_transition_guard);
                             if dispatch_call {
@@ -995,11 +1008,21 @@ impl StanzaHandler for CallHandler {
                                 );
                             }
                             let event_delivered = event_permit.as_ref().is_some_and(|permit| {
-                                permit.send(CallEvent::VideoStateChanged {
+                                let sourced = permit.send(CallEvent::PeerVideoStateChanged {
+                                    source: routed_call_sender(&call),
+                                    call_creator: call.action.call_creator().clone(),
                                     state: *state,
                                     orientation: *orientation,
                                     upgrade_token,
-                                })
+                                });
+                                // Keep the legacy event last so a custom single-slot queue retains
+                                // its previous behavior. Normal handles have room for both events.
+                                let legacy = permit.send(CallEvent::VideoStateChanged {
+                                    state: *state,
+                                    orientation: *orientation,
+                                    upgrade_token,
+                                });
+                                sourced && legacy
                             });
                             if !event_delivered {
                                 warn!("call: video state event receiver closed after typed ack");
@@ -1560,6 +1583,18 @@ mod tests {
         Jid::new("111111111111111", Server::Lid)
     }
 
+    #[cfg(feature = "voip-runtime")]
+    fn next_legacy_event(
+        events: &async_channel::Receiver<CallEvent>,
+    ) -> Result<CallEvent, async_channel::TryRecvError> {
+        loop {
+            let event = events.try_recv()?;
+            if !matches!(event, CallEvent::PeerVideoStateChanged { .. }) {
+                return Ok(event);
+            }
+        }
+    }
+
     fn offer_stanza() -> wacore_binary::Node {
         NodeBuilder::new("call")
             .attr("from", fake_caller_lid())
@@ -1985,7 +2020,7 @@ mod tests {
         );
         let stanza = NodeBuilder::new("call")
             .attr("from", Jid::new("GROUP-CALL", Server::Call))
-            .attr("participant", participant_pn)
+            .attr("participant", participant_pn.clone())
             .attr("id", "PN-ORIENTATION")
             .attr("t", "1766847151")
             .children([NodeBuilder::new("video")
@@ -2015,8 +2050,13 @@ mod tests {
             "participant signaling must not tear down the local group video plane"
         );
         assert!(
+            matches!(event_rx.try_recv(), Ok(CallEvent::PeerVideoStateChanged {
+            source, call_creator, state: VideoState::Disabled, orientation: Some(3), upgrade_token: None,
+        }) if source == participant_pn && call_creator == fake_caller_lid())
+        );
+        assert!(
             event_rx.try_recv().is_err(),
-            "the 1:1 video event lacks participant identity and must stay unused for group peers"
+            "groups must not emit the call-wide legacy event"
         );
         let controls = std::iter::from_fn(|| control_rx.try_recv().ok()).collect::<Vec<_>>();
         assert!(
@@ -2055,6 +2095,12 @@ mod tests {
                 .await
         );
         let device_controls = std::iter::from_fn(|| control_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            matches!(event_rx.try_recv(), Ok(CallEvent::PeerVideoStateChanged {
+            source, state: VideoState::Disabled, orientation: Some(1), upgrade_token: None, ..
+        }) if source == routed_device)
+        );
+        assert!(event_rx.try_recv().is_err());
         assert!(
             device_controls.iter().any(|control| matches!(
                 control,
@@ -3331,7 +3377,7 @@ mod tests {
             fake_caller_lid(),
             fake_caller_lid(),
         ));
-        let (event_tx, event_rx) = async_channel::bounded::<CallEvent>(1);
+        let (event_tx, event_rx) = async_channel::bounded::<CallEvent>(2);
         let (control_tx, _control_rx) = video_control_channel();
         registry.set_video_channels(
             "CALL-ID-0001",
@@ -3363,6 +3409,12 @@ mod tests {
         };
         assert!(handled);
         assert!(cancelled);
+        assert!(
+            matches!(event_rx.try_recv(), Ok(CallEvent::PeerVideoStateChanged {
+            source, call_creator, state: VideoState::UpgradeRequestV2,
+            upgrade_token: Some(_), ..
+        }) if source == fake_caller_lid() && call_creator == fake_caller_lid())
+        );
         assert!(matches!(
             event_rx.try_recv(),
             Ok(CallEvent::VideoStateChanged { .. })
@@ -3401,7 +3453,7 @@ mod tests {
                 )
                 .await
         );
-        let token = match event_rx.try_recv().expect("upgrade request event") {
+        let token = match next_legacy_event(&event_rx).expect("upgrade request event") {
             CallEvent::VideoStateChanged {
                 state: VideoState::UpgradeRequestV2,
                 upgrade_token: Some(token),
@@ -3423,7 +3475,7 @@ mod tests {
         );
         assert!(!registry.peer_video_request_is_current("CALL-ID-0001", token));
         assert!(matches!(
-            event_rx.try_recv(),
+            next_legacy_event(&event_rx),
             Ok(CallEvent::VideoStateChanged {
                 state: VideoState::Disabled,
                 upgrade_token: None,
@@ -3650,7 +3702,7 @@ mod tests {
                 .await
         );
 
-        let ev = ev_rx.try_recv().expect("event must be forwarded");
+        let ev = next_legacy_event(&ev_rx).expect("event must be forwarded");
         assert!(matches!(
             ev,
             CallEvent::VideoStateChanged {

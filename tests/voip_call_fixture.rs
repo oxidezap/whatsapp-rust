@@ -11,20 +11,28 @@ use whatsapp_rust::{test_support::CallFixture, voip::CallHandle};
 fn start(
     fixture: &CallFixture,
 ) -> tokio::task::JoinHandle<Result<CallHandle, whatsapp_rust::CallError>> {
+    start_with_video(fixture, true)
+}
+
+fn start_with_video(
+    fixture: &CallFixture,
+    video: bool,
+) -> tokio::task::JoinHandle<Result<CallHandle, whatsapp_rust::CallError>> {
     let client = fixture.client().clone();
     let peer = fixture.peer().clone();
     tokio::spawn(async move {
         let (_mic, mic) = async_channel::bounded::<Vec<i16>>(1);
         let (speaker, _speaker) = async_channel::bounded::<Vec<i16>>(1);
-        let (_video, video) = async_channel::bounded::<Vec<u8>>(1);
+        let (_video, video_rx) = async_channel::bounded::<Vec<u8>>(1);
         let (sink, _sink) = async_channel::bounded::<wacore::voip::VideoFrame>(1);
-        client
-            .voip()
-            .call(&peer)
-            .audio(mic, speaker)
-            .video(video, sink)
-            .start()
-            .await
+        let voip = client.voip();
+        let builder = voip.call(&peer).audio(mic, speaker);
+        let builder = if video {
+            builder.video(video_rx, sink)
+        } else {
+            builder
+        };
+        builder.start().await
     })
 }
 
@@ -318,6 +326,203 @@ async fn current_handler_accepts_an_unrung_device_as_first_winner() -> Result<()
         uninvited,
         "characterize the handler, do not invent authorization in the fixture"
     );
+    fixture.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn peer_video_queue_keeps_sender_state_and_upgrade_token_in_order() -> Result<()> {
+    use wacore::types::call::VideoState;
+    use wacore::voip::CallEvent;
+
+    let fixture = CallFixture::new().await?;
+    let starting = start_with_video(&fixture, false);
+    fixture.next_offer().await?.complete()?;
+    let handle = starting.await??;
+    let winner = fixture.peer().clone().with_device(2);
+    let sibling = fixture.peer().clone().with_device(0);
+    fixture
+        .inject(action(
+            &fixture,
+            handle.call_id(),
+            winner.clone(),
+            "accept",
+            None,
+        ))
+        .await?;
+    let creator = fixture.client().lid().unwrap();
+    let video_stanza = |source: &Jid, state: VideoState, orientation: u8| {
+        NodeBuilder::new("call")
+            .attr("from", source.clone())
+            .attr("id", format!("VIDEO-{}", state.code()))
+            .attr("t", "1788840000")
+            .children([NodeBuilder::new("video")
+                .attr("call-id", handle.call_id())
+                .attr("call-creator", creator.clone())
+                .attr("state", state.code().to_string())
+                .attr("device_orientation", orientation.to_string())
+                .attr("dec", "H264")
+                .build()])
+            .build()
+    };
+    let (_source_tx, source) = async_channel::bounded::<Vec<u8>>(1);
+    let (sink, _sink_rx) = async_channel::bounded::<wacore::voip::VideoFrame>(1);
+    handle.start_video(source.clone(), sink.clone()).await?;
+    fixture
+        .inject(video_stanza(&winner, VideoState::UpgradeAccept, 1))
+        .await?;
+    fixture
+        .inject(video_stanza(&sibling, VideoState::Stopped, 2))
+        .await?;
+    handle.stop_video().await?;
+    fixture
+        .inject(video_stanza(&winner, VideoState::UpgradeRequestV2, 3))
+        .await?;
+    fixture
+        .inject(video_stanza(&sibling, VideoState::Stopped, 0))
+        .await?;
+
+    let events = handle.events();
+    let queued: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    assert_eq!(
+        queued.len(),
+        8,
+        "one source event and one legacy event per committed direct state"
+    );
+    let observed: Vec<_> = queued
+        .chunks_exact(2)
+        .map(|pair| {
+            let CallEvent::PeerVideoStateChanged {
+                source,
+                call_creator,
+                state,
+                orientation,
+                upgrade_token,
+                ..
+            } = &pair[0]
+            else {
+                panic!("expected source-bearing event, got {:?}", pair[0]);
+            };
+            assert_eq!(call_creator, &creator);
+            assert_eq!(
+                pair[1],
+                CallEvent::VideoStateChanged {
+                    state: *state,
+                    orientation: *orientation,
+                    upgrade_token: *upgrade_token,
+                },
+                "legacy construction remains source-compatible and tokens match exactly"
+            );
+            (source.clone(), *state, *orientation, *upgrade_token)
+        })
+        .collect();
+    assert_eq!(
+        observed.iter().map(|event| event.1).collect::<Vec<_>>(),
+        [
+            VideoState::UpgradeAccept,
+            VideoState::Stopped,
+            VideoState::UpgradeRequestV2,
+            VideoState::Stopped,
+        ]
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .map(|event| event.0.clone())
+            .collect::<Vec<_>>(),
+        [
+            winner.clone(),
+            sibling.clone(),
+            winner.clone(),
+            sibling.clone(),
+        ],
+        "the ordered handle queue must identify each actual sender without consulting the global event bus"
+    );
+    let request = observed[2]
+        .3
+        .expect("the source-bearing request must retain its token");
+    assert_eq!(
+        observed.iter().map(|event| event.2).collect::<Vec<_>>(),
+        [Some(1), Some(2), Some(3), Some(0)]
+    );
+    assert!(
+        observed
+            .iter()
+            .enumerate()
+            .all(|(index, event)| (index == 2) == event.3.is_some())
+    );
+    assert!(matches!(
+        handle.accept_video(request, source, sink).await,
+        Err(whatsapp_rust::CallError::VideoUpgradeExpired)
+    ));
+    assert_eq!(
+        handle.peer_jid(),
+        winner,
+        "metadata must not change current winner policy"
+    );
+    fixture.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn peer_video_metadata_reports_routed_sender_and_supplied_creator_without_new_authorization()
+-> Result<()> {
+    use wacore::types::call::VideoState;
+    use wacore::voip::CallEvent;
+
+    let fixture = CallFixture::new().await?;
+    let handle = dormant(&fixture).await?;
+    let winner = fixture.peer().clone().with_device(2);
+    fixture
+        .inject(action(
+            &fixture,
+            handle.call_id(),
+            winner.clone(),
+            "accept",
+            None,
+        ))
+        .await?;
+    let source = fixture.peer().clone().with_device(0);
+    let supplied_creator = Jid::new("444444444444444", Server::Lid);
+    let video = |state: VideoState| {
+        NodeBuilder::new("call")
+            .attr("from", winner.clone())
+            .attr("participant", source.clone())
+            .attr("id", "ROUTED-VIDEO")
+            .attr("t", "1788840000")
+            .children([NodeBuilder::new("video")
+                .attr("call-id", handle.call_id())
+                .attr("call-creator", supplied_creator.clone())
+                .attr("state", state.code().to_string())
+                .build()])
+            .build()
+    };
+    fixture.inject(video(VideoState::Stopped)).await?;
+    let events = handle.events();
+    assert_eq!(
+        events.try_recv()?,
+        CallEvent::PeerVideoStateChanged {
+            source: source.clone(),
+            call_creator: supplied_creator.clone(),
+            state: VideoState::Stopped,
+            orientation: None,
+            upgrade_token: None,
+        }
+    );
+    assert_eq!(
+        events.try_recv()?,
+        CallEvent::VideoStateChanged {
+            state: VideoState::Stopped,
+            orientation: None,
+            upgrade_token: None,
+        }
+    );
+    fixture.inject(video(VideoState::Unknown(99))).await?;
+    assert!(
+        events.is_empty(),
+        "an ignored transition must publish neither variant"
+    );
+    assert_eq!(handle.peer_jid(), winner);
     fixture.shutdown().await?;
     Ok(())
 }

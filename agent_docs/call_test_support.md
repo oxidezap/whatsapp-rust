@@ -105,6 +105,62 @@ this ordering without a sleep or a readiness setter.
 
 ## Coverage boundaries
 
+### Ordered peer video events
+
+The production `whatsapp_rust::voip::CallEvent::PeerVideoStateChanged` variant
+is available with `voip-runtime`, including on wasm. It does not require the
+native `test-support` feature. Its fields are:
+
+```text
+source: Jid
+call_creator: Jid
+state: VideoState
+orientation: Option<u8>
+upgrade_token: Option<VideoUpgradeToken>
+```
+
+Consume this variant from one `CallHandle::events()` receiver for all peer
+video states, including upgrade requests, accepts and stops. Pass its token to
+`accept_video` when accepting a request. Do not join a separate global
+`IncomingCall` stream to recover identity or update the same state from that
+stream; the two consumers can run in a different order.
+
+The source-bearing event is published after the existing typed-ACK and state
+commit checks, while holding the existing video-transition lock. Direct calls
+then publish the unchanged legacy `VideoStateChanged` on that same queue with
+identical state, orientation and token. New consumers must ignore the legacy
+companion; existing consumers can keep matching the legacy variant and ignore
+unknown variants. The old variant's fields and token type are unchanged.
+
+`source` is the parsed `participant` when present, otherwise `from`. It is not
+replaced with the stored winning device. `call_creator` is the incoming value,
+not an inference from the matched call ID. Group PN aliases remain PN aliases
+in the event, while the existing orientation path still canonicalizes them for
+the media registry. Groups publish only the new participant-scoped variant,
+with no upgrade token, after the existing post-ACK roster reauthorization.
+They still do not emit call-wide legacy video state or enter direct negotiation.
+
+Neither identity field certifies authorization. The current direct handler can
+apply a sibling's state or a state carrying a different creator, and the event
+reports those inputs faithfully so a consumer can apply its own policy.
+
+The queue keeps its bounded eviction behavior. It is not a lossless history or
+an atomic pair mailbox. Normal handles have room for both variants; a custom
+single-slot core queue retains the legacy event, preserving its old behavior.
+Both JID allocations are included in the existing queue byte accounting.
+
+The fixture regression first failed on the original implementation with four
+states in order but four absent sources. It now checks source B's upgrade
+accept followed by source A's stop, then a request/token from B followed by a
+stop from A. Every direct pair agrees exactly, and the stopped request's token
+is expired. Separate tests cover routed identity, supplied creator, ignored
+states, group aliases, ACK ordering and legacy single-slot behavior.
+
+This changes the in-process event API, not wire signaling, codecs, sender
+matching or authorization. It is not evidence of WhatsApp protocol parity.
+
+### Fixture transport
+
 The synthetic server performs real Noise key agreement and authenticates
 outgoing encrypted frames. Its certificates and ADV identity are synthetic;
 the fixture uses the existing per-client certificate-signature bypass, never
