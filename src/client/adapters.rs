@@ -202,7 +202,7 @@ fn log_signal_flush_error(context: &str, id: Option<&str>, e: &SignalMaintenance
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use wacore::store::in_memory::InMemoryBackend;

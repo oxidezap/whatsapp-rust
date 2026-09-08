@@ -697,6 +697,7 @@ mod tests {
         assert!(sent.unchanged_for(&client, "15550000002").await);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn primary_identity_change_is_shared_by_pn_and_lid_aliases() {
         use crate::lid_pn_cache::{LearningSource, LidPnEntry};
@@ -720,6 +721,7 @@ mod tests {
         assert!(sent.unchanged_for(&client, "15550000002").await);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn historical_repair_emits_only_for_a_continuous_account() {
         use crate::store::commands::DeviceCommand;

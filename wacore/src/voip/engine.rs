@@ -625,11 +625,32 @@ pub enum CallEvent {
     /// Pushed by the signaling handler, not the engine; surfaced here so one event stream carries
     /// the whole call. For an upgrade request, pass `upgrade_token` to `accept_video`; a cancelled
     /// or superseded token cannot attach video endpoints.
+    /// Identity-aware consumers should use `PeerVideoStateChanged` instead and ignore this
+    /// compatibility event, rather than joining this queue with the global incoming-call stream.
     VideoStateChanged {
         state: crate::types::call::VideoState,
         orientation: Option<u8>,
         /// Accepting requires this exact token. `None` means simultaneous local and peer requests
         /// were already resolved by the signaling state machine.
+        upgrade_token: Option<super::VideoUpgradeToken>,
+    },
+    /// A committed peer video-state notification with its signaling identity.
+    ///
+    /// Published on the same handle queue, under the same transition lock, as video-upgrade
+    /// tokens. Direct calls publish this before the matching legacy `VideoStateChanged`;
+    /// consume one variant or the other, not both. Group participants publish only this variant
+    /// and never enter the direct-call upgrade state machine.
+    ///
+    /// `source` is the parsed stanza's `participant`, or `from` when absent, not the stored
+    /// winning device. PN aliases are retained. `call_creator` is also the stanza's value.
+    /// These fields report the existing handler's decision; they do not add authorization.
+    /// Queue pressure retains the existing bounded eviction policy, not lossless delivery of pairs.
+    PeerVideoStateChanged {
+        source: Jid,
+        call_creator: Jid,
+        state: crate::types::call::VideoState,
+        orientation: Option<u8>,
+        /// The same token as the direct-call compatibility event; always `None` for groups.
         upgrade_token: Option<super::VideoUpgradeToken>,
     },
     /// Outbound video needs an IDR before anything can go on the wire, and the
@@ -799,6 +820,11 @@ impl CallEvent {
                         .sum::<usize>()
             }
             Self::MediaSetupFailed(reason) => reason.capacity(),
+            Self::PeerVideoStateChanged {
+                source,
+                call_creator,
+                ..
+            } => source.heap_bytes() + call_creator.heap_bytes(),
             Self::RelayAllocated
             | Self::RelayAllocateFailed(_)
             | Self::RelayAllocateTimedOut

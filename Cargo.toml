@@ -200,6 +200,8 @@ tracing-pii = ["wacore/tracing-pii", "wacore-binary/tracing-pii"]
 # target, which links the crate from outside, can reach the crate-private send
 # internals it measures. Never enable it in a shipping build.
 bench-harness = ["tokio-runtime", "tokio/rt-multi-thread"]
+# Native integration fixtures only. Never enable in a shipping dependency.
+test-support = ["voip-runtime", "tokio-runtime", "dep:wacore-noise", "wacore-noise/test-util"]
 danger-skip-tls-verify = ["whatsapp-rust-tokio-transport?/danger-skip-tls-verify"]
 default = [
     "sqlite-storage",
@@ -292,6 +294,7 @@ tokio = { workspace = true, features = ["macros", "rt", "sync", "time"], optiona
 tracing = { workspace = true, optional = true }
 wacore = { workspace = true }
 wacore-binary = { workspace = true }
+wacore-noise = { path = "./wacore/noise", version = "0.7.0", optional = true }
 waproto = { workspace = true }
 zeroize = { workspace = true }
 whatsapp-rust-sqlite-storage = { path = "./storages/sqlite-storage", version = "0.7.0", optional = true }
