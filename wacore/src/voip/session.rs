@@ -1130,7 +1130,7 @@ impl VideoPipeline {
             self.contender_ssrc = None;
         }
         let previous = self.frame_orientation;
-        let rotation = header.video_extension.map(|ext| ext.media_frame_info & 3);
+        let rotation = super::rtp::parse_whatsapp_media_frame_info(packet).map(|info| info & 3);
         match self.frame_orientation {
             Some((timestamp, ref mut orientation)) if timestamp == header.timestamp => {
                 if rotation.is_some() {
@@ -2000,6 +2000,47 @@ mod tests {
                     assert_eq!(
                         completed,
                         [(timestamp, vec![0, 0, 0, 1, 0x65, 0x88, 0x99], expected)]
+                    );
+                } else {
+                    assert!(completed.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frame_info_only_packets_preserve_authenticated_rotation() {
+        let key = [42u8; 32];
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut tx = VideoPipeline::new(&video_params(&key, a, b)).unwrap();
+        let mut rx = VideoPipeline::new(&video_params(&key, b, a)).unwrap();
+        for info in 0..=255u8 {
+            for marker in [false, true] {
+                let mut header = tx.rtp.next_video_packet(marker, info);
+                header.video_extension = None;
+                header.extension_word = Some(u32::from_be_bytes([0x30, info, 0, 0]));
+                let payload: &[u8] = if marker {
+                    &[0x7c, 0x45, 0x99]
+                } else {
+                    &[0x7c, 0x85, 0x88]
+                };
+                let packet =
+                    protect_srtp_packet(&tx.send_keys, &header, 0, WARP_MI_TAG_LEN, payload);
+                let held = rx.frame_orientation;
+                let mut forged = packet.clone();
+                forged[17] ^= 3;
+                assert!(rx.unprotect_video_packet(&forged).is_none());
+                assert_eq!(rx.frame_orientation, held);
+                let completed = rx.unprotect_video_packet(&packet).unwrap().1;
+                if marker {
+                    assert_eq!(
+                        completed,
+                        [(
+                            header.timestamp,
+                            vec![0, 0, 0, 1, 0x65, 0x88, 0x99],
+                            Some(info & 3)
+                        )]
                     );
                 } else {
                     assert!(completed.is_empty());

@@ -227,8 +227,44 @@ pub fn rtp_extension_profile_and_data(data: &[u8]) -> Option<(Option<u16>, &[u8]
     ))
 }
 
-/// Decode the exact WhatsApp video extension set. Other 0xdebe layouts, including audio
-/// piggyback, deliberately return `None`.
+/// Read the frame-info byte independently of the other 0xdebe extensions.
+/// Callers must authenticate the packet and establish its media type before using it.
+/// A truncated element ends the scan without discarding earlier complete metadata.
+pub fn parse_whatsapp_media_frame_info(data: &[u8]) -> Option<u8> {
+    let (Some(WHATSAPP_RTP_EXTENSION_PROFILE), mut extension) =
+        rtp_extension_profile_and_data(data)?
+    else {
+        return None;
+    };
+    let mut info = [None; 3];
+    while let Some((&header, rest)) = extension.split_first() {
+        extension = rest;
+        let id = header >> 4;
+        if id == 0 {
+            continue;
+        }
+        let len = usize::from(header & 0x0f) + 1;
+        let Some((value, rest)) = extension.split_at_checked(len) else {
+            break;
+        };
+        extension = rest;
+        if id == 3 {
+            // Captured rtp_ext readers keep three formats separately; the getter
+            // prefers short, then three-byte, then extended metadata, regardless of order.
+            let format = match len {
+                1..=2 => 0,
+                3..=5 => 1,
+                _ => 2,
+            };
+            info[format] = Some(value[0]);
+        }
+    }
+    info.into_iter().flatten().next()
+}
+
+/// Decode the exact outgoing WhatsApp video extension set. Other 0xdebe layouts,
+/// including audio piggyback, deliberately return `None`. For received frame metadata,
+/// use [`parse_whatsapp_media_frame_info`] without assuming the optional fields exist.
 pub fn parse_whatsapp_video_extension(data: &[u8]) -> Option<VideoRtpExtension> {
     let (Some(profile), extension) = rtp_extension_profile_and_data(data)? else {
         return None;
@@ -702,6 +738,98 @@ mod tests {
         let bytes = encode_rtp_header(&h);
         assert_eq!(rtp_header_byte_length(&bytes), Some(28));
         assert_eq!(parse_rtp_header(&bytes), Some(h));
+    }
+
+    #[test]
+    fn frame_info_is_independent_of_optional_extensions() {
+        for info in 0..=255u8 {
+            for length in 1..=16usize {
+                let mut extension = vec![0; length + 3];
+                extension[..4].copy_from_slice(&[0, 0x0f, 0x30 | (length - 1) as u8, info]);
+                extension.resize(extension.len().next_multiple_of(4), 0);
+                let mut packet = vec![
+                    0x91,
+                    97,
+                    0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    2,
+                    0xde,
+                    0xbe,
+                    0,
+                    (extension.len() / 4) as u8,
+                ];
+                packet.extend_from_slice(&extension);
+                assert_eq!(parse_whatsapp_media_frame_info(&packet), Some(info));
+                assert_eq!(parse_whatsapp_video_extension(&packet), None);
+                packet[16] = 0xbe;
+                packet[17] = 0xde;
+                assert_eq!(parse_whatsapp_media_frame_info(&packet), None);
+            }
+        }
+    }
+
+    #[test]
+    fn frame_info_padding_duplicates_and_truncation_match_wasm() {
+        for (extension, expected) in [
+            (&[0x30, 0, 0, 0][..], Some(0)),
+            (&[0, 0x0f, 0, 0][..], None),
+            (&[0xf0, 0xff, 0x30, 3][..], Some(3)),
+            (&[0x30, 1, 0x30, 3][..], Some(3)),
+            (&[0x30, 3, 0x30, 1][..], Some(1)),
+            (&[0x30, 1, 0x37, 3, 0, 0, 0, 0, 0, 0, 0, 0][..], Some(1)),
+            (&[0x37, 3, 0, 0, 0, 0, 0, 0, 0, 0x30, 1, 0][..], Some(1)),
+            (&[0x32, 1, 0, 0, 0x35, 3, 0, 0, 0, 0, 0, 0][..], Some(1)),
+            (&[0x30, 3, 0xff, 0][..], Some(3)),
+            (&[0xff, 0x30, 3, 0][..], None),
+            (&[0x30, 1, 0x3f, 3][..], Some(1)),
+            (&[0x3f, 3, 0, 0][..], None),
+            (&[0, 0, 0, 0x30][..], None),
+        ] {
+            let mut packet = vec![
+                0x90,
+                97,
+                0,
+                1,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                1,
+                0xde,
+                0xbe,
+                0,
+                (extension.len() / 4) as u8,
+            ];
+            packet.extend_from_slice(extension);
+            assert_eq!(
+                parse_whatsapp_media_frame_info(&packet),
+                expected,
+                "{extension:02x?}"
+            );
+            packet[15] += 1;
+            assert_eq!(
+                parse_whatsapp_media_frame_info(&packet),
+                None,
+                "truncated block"
+            );
+        }
+        for packet in [&[][..], &[0x80; 11], &[0x90; 12], &[0x80; 12], &[0x8f; 12]] {
+            assert_eq!(parse_whatsapp_media_frame_info(packet), None);
+        }
     }
 
     #[test]

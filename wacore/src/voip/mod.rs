@@ -210,6 +210,7 @@ mod fuzz_tests {
                 let _ = rtp::is_rtp_version2(&b);
                 let _ = rtp::rtp_header_byte_length(&b);
                 let _ = rtp::parse_rtp_header(&b);
+                let _ = rtp::parse_whatsapp_media_frame_info(&b);
                 // RTCP
                 let _ = rtcp::is_rtcp_packet(&b);
                 let _ = rtcp::rtcp_payload_type(&b);

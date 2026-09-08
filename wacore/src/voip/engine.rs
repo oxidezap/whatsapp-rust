@@ -10978,6 +10978,46 @@ mod tests {
     }
 
     #[test]
+    fn inbound_frame_info_only_overrides_signaling_without_other_extensions() {
+        use crate::voip::{e2e_srtp, rtp};
+        let mut eng = engine(true);
+        assert!(eng.enable_video());
+        eng.set_peer_video_orientation(1);
+        let mut peer = peer_video_pipe();
+        let key: Vec<u8> = (0..32).collect();
+        let keys = e2e_srtp::derive_e2e_keys(&key, &ssrc::format_e2e_srtp_participant_id(PEER_LID))
+            .unwrap();
+        let au = video_au(100);
+        for info in [Some(3u8), Some(0), None] {
+            let packet = peer.protect_video(&au).pop().unwrap();
+            let mut header = parse_rtp_header(&packet).unwrap();
+            let start = rtp::rtp_header_byte_length(&packet).unwrap();
+            header.video_extension = None;
+            header.extension_word = info.map(|info| u32::from_be_bytes([0x30, info, 0, 0]));
+            let mut rewritten = rtp::encode_rtp_header(&header);
+            rewritten.extend_from_slice(&packet[start..packet.len() - WARP_MI_TAG_LEN]);
+            e2e_srtp::append_warp_mi_tag_in_place(
+                &keys.auth_key,
+                &mut rewritten,
+                0,
+                WARP_MI_TAG_LEN,
+            );
+            eng.handle_input(1, Input::RelayPacket(&rewritten));
+            let frames: Vec<_> = drain(&mut eng)
+                .0
+                .into_iter()
+                .filter_map(|output| match output {
+                    Output::VideoPlayout(frame) => Some(frame),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].data, au);
+            assert_eq!(frames[0].orientation, info.unwrap_or(1));
+        }
+    }
+
+    #[test]
     fn inbound_video_rejects_forged_warp_tag() {
         let mut eng = engine(true);
         assert!(eng.enable_video());
