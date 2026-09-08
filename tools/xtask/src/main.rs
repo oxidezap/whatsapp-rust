@@ -2,6 +2,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 mod ci;
 mod size;
+mod size_baseline;
 mod workflow;
 use anyhow::Result;
 use clap::{Parser, Subcommand};

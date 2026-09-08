@@ -23,12 +23,43 @@ Do NOT switch any metric to rlib size: rlibs carry un-monomorphized generics plu
 
 ## Baseline semantics and pitfalls
 
-- The PR baseline is the `size-metrics` artifact from the **latest successful main run**, not the merge-base. A stale PR can therefore show deltas inherited from main; rebase to clear them.
+- The PR baseline must match the event's `pull_request.base.sha`. The selector searches this repository's Binary Size runs on main, including pushes and manual dispatches. It requires successful measurement and upload in the same job and run attempt, an unexpired artifact from that upload, matching commit metadata, and the same rustc version as the head. Graph publication may fail without invalidating a completed measurement.
+- Missing, expired, malformed or mismatched baselines fail visibly. There is no fallback to older main and no passing gate without a comparison. Run Binary Size on the required main commit, then retry the PR job. A dispatch on a newer main commit cannot supply an older PR's baseline.
 - Metric names are series keys. Renaming one orphans its history in the chart, so keep names stable.
-- Sizes are only comparable under the same pinned toolchain. A `rust-toolchain.toml` bump legitimately moves every metric — expect a gate hit and use the label.
+- Sizes are only comparable under the same pinned toolchain. A toolchain change requires a base measurement with the matching compiler; `size-increase-ok` cannot override missing or incomparable measurements. The selector skips other-compiler candidates at the same base SHA, not metadata or provenance failures.
 - `cargo bloat` exits 0 even on analysis errors; the measure script validates its JSON instead of trusting the exit code.
 - Fork PRs run with a read-only token: they get the job summary and the gate, but no PR comment.
-- Local run: `cargo xt ci measure-binary-size --out-dir size-out` (add `--skip-build` to reuse an existing release build).
+- CI invokes the dispatcher with `cargo run --locked --quiet -p whatsapp-xtask --`. The build, cargo-bloat and cargo-llvm-lines also use `--locked`. Measurement refuses lockfile changes, and CI checks the tracked worktree before uploading. Fix manifest/lock inconsistencies explicitly rather than letting measurement rewrite them and break the subsequent gh-pages checkout.
+- Local measurement uses `cargo run --locked --quiet -p whatsapp-xtask -- ci measure-binary-size --out-dir size-out`. Add `--skip-build` to reuse an existing release build. Reports require `--base <artifact-directory>` or `BASE_DIR`; set `BASE_SHA` to also enforce the expected commit locally.
+
+For a compiler-changing PR, dispatch a matching baseline on main. For example,
+if the PR selects `nightly-2026-07-01`:
+
+```sh
+gh workflow run binary-size.yml --repo oxidezap/whatsapp-rust --ref main -f toolchain=nightly-2026-07-01
+```
+
+Wait for measurement and upload to succeed, then retry the PR job. If the PR's
+base SHA is older than current main, rebase first. The dispatch measures current
+main only, not an arbitrary ref. This workflow support must already be on main.
+
+The optional input defaults to `nightly-2026-06-16`. Only dated nightly identifiers
+are accepted because the build uses nightly-only flags. Input reaches the
+validator through an environment variable, never shell interpolation. Bootstrap
+and tool installation retain the default compiler; the measurement step sets
+`RUSTUP_TOOLCHAIN` to the validated selection for Cargo, cargo-bloat,
+cargo-llvm-lines and `rustc --version`. Metadata records that actual rustc version.
+Alternate-compiler dispatches upload artifacts but skip gh-pages publication, so
+they do not mix compilers in the normal graph series. Pushes and default-compiler
+dispatches retain normal publication.
+
+The stale-baseline failure on PR #1470 illustrates why publication status is not
+measurement status. The parent `47e1b5b41` uploaded valid measurements, then graph
+publication failed on a dirty `Cargo.lock`. The old successful-run selector used
+`2b9a8d799` instead and charged the PR for growth already introduced by group
+resync. Parent and PR artifacts had identical stripped and `.text` sizes. The
+default-feature demo does not enable VoIP, so this says nothing about the size
+cost of a VoIP parser in a VoIP-enabled binary.
 
 ## Per-crate opt-level
 

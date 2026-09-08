@@ -31,8 +31,15 @@ pub enum Task {
     ReleaseTag,
     /// Preserve existing release notes, otherwise create the requested GitHub release.
     GithubRelease,
-    /// Download a baseline only from a successful main push.
-    SizeBaseline,
+    /// Validate a main dispatch's compiler before it reaches rustup or the measurement process.
+    SizeToolchain,
+    /// Download the PR base's validated main measurement, independent of graph publication.
+    SizeBaseline {
+        #[arg(long, default_value = "size-out")]
+        head: PathBuf,
+        #[arg(long, default_value = "base-out")]
+        out_dir: PathBuf,
+    },
     /// Query the live size-increase-ok label and emit the override value.
     SizeOverride,
     /// Update the existing sticky size report, or create it if absent.
@@ -81,6 +88,23 @@ fn env(name: &str) -> Result<String> {
 fn version_valid(version: &str) -> bool {
     regex::Regex::new(r"^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$")
         .is_ok_and(|r| r.is_match(version))
+}
+fn size_toolchain<'a>(
+    event: &str,
+    requested: &'a str,
+    default: &'a str,
+) -> Result<(&'a str, bool)> {
+    let selected = if event == "workflow_dispatch" && !requested.is_empty() {
+        requested
+    } else {
+        default
+    };
+    ensure!(
+        regex::Regex::new(r"\Anightly-[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])\z")?
+            .is_match(selected),
+        "binary size toolchain must be a dated nightly, nightly-YYYY-MM-DD"
+    );
+    Ok((selected, selected == default))
 }
 fn tag() -> Result<String> {
     let tag = env("RELEASE_TAG")?;
@@ -311,48 +335,23 @@ pub fn run_task(root: &Path, task: Task) -> Result<()> {
                 run(&mut c)?;
             }
         }
-        Task::SizeBaseline => {
-            let result = capture(
-                Command::new("gh")
-                    .args([
-                        "run",
-                        "list",
-                        "--workflow",
-                        "binary-size.yml",
-                        "--branch",
-                        "main",
-                        "--event",
-                        "push",
-                        "--status",
-                        "success",
-                        "--limit",
-                        "1",
-                        "--json",
-                        "databaseId",
-                    ])
-                    .current_dir(root),
-            );
-            if let Ok(bytes) = result
-                && let Ok(v) = serde_json::from_slice::<Value>(&bytes.stdout)
-                && let Some(id) = v[0]["databaseId"].as_u64()
-                && quiet(
-                    Command::new("gh")
-                        .args([
-                            "run",
-                            "download",
-                            &id.to_string(),
-                            "--name",
-                            "size-metrics",
-                            "--dir",
-                            "base-out",
-                        ])
-                        .current_dir(root),
-                )?
-            {
-                output("dir", "base-out")?;
-            } else {
-                println!("No baseline artifact available");
-            }
+        Task::SizeToolchain => {
+            let requested = std::env::var("REQUESTED_TOOLCHAIN").unwrap_or_default();
+            let default = env("DEFAULT_SIZE_TOOLCHAIN")?;
+            let (selected, publish) =
+                size_toolchain(&env("GITHUB_EVENT_NAME")?, &requested, &default)?;
+            output("toolchain", selected)?;
+            output("publish", if publish { "true" } else { "false" })?;
+        }
+        Task::SizeBaseline { head, out_dir } => {
+            super::size_baseline::download(
+                &root.join(&head),
+                &root.join(&out_dir),
+                &env("GITHUB_REPOSITORY")?,
+                &env("BASE_SHA")?,
+                |args| Ok(capture(Command::new("gh").args(args).current_dir(root))?.stdout),
+            )?;
+            output("dir", out_dir.to_str().context("baseline path encoding")?)?;
         }
         Task::SizeOverride => {
             let value = github(&format!(
@@ -420,6 +419,57 @@ pub fn run_task(root: &Path, task: Task) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn size_compiler_override_is_dispatch_only_and_does_not_publish() {
+        let default = "nightly-2026-06-16";
+        let alternate = "nightly-2026-07-01";
+        for event in ["push", "pull_request"] {
+            assert_eq!(
+                size_toolchain(event, alternate, default).unwrap(),
+                (default, true)
+            );
+        }
+        for requested in ["", default] {
+            assert_eq!(
+                size_toolchain("workflow_dispatch", requested, default).unwrap(),
+                (default, true)
+            );
+        }
+        assert_eq!(
+            size_toolchain("workflow_dispatch", alternate, default).unwrap(),
+            (alternate, false)
+        );
+        let workflow = include_str!("../../../.github/workflows/binary-size.yml");
+        assert!(workflow.contains(&format!("default: {default}")));
+        assert!(workflow.contains(&format!("RUSTUP_TOOLCHAIN: {default}")));
+        assert!(workflow.contains("REQUESTED_TOOLCHAIN: ${{ inputs.toolchain }}"));
+        assert!(workflow.contains("DEFAULT_SIZE_TOOLCHAIN: ${{ env.RUSTUP_TOOLCHAIN }}"));
+        assert!(workflow.contains("RUSTUP_TOOLCHAIN: ${{ steps.compiler.outputs.toolchain }}"));
+        assert!(workflow.contains("if: steps.compiler.outputs.publish == 'true'"));
+    }
+    #[test]
+    fn size_compiler_input_cannot_supply_flags_paths_or_shell_syntax() {
+        for requested in [
+            "--help",
+            "+nightly-2026-06-16",
+            "nightly",
+            "stable",
+            "../toolchain",
+            "nightly-2026-06-16 --profile complete",
+            "nightly-2026-06-16;id",
+            "$(id)",
+            "nightly-2026-06-16\nRUSTFLAGS=-O",
+            "nightly-2026-06-16\r",
+            "nightly-2026-00-16",
+            "nightly-2026-06-00",
+            "nightly-2026-13-16",
+        ] {
+            assert!(
+                size_toolchain("workflow_dispatch", requested, "nightly-2026-06-16").is_err(),
+                "{requested:?}"
+            );
+        }
+    }
     #[test]
     fn release_preflight_rejects_docker_tag_collisions() {
         assert!(version_valid("0.7.0"));

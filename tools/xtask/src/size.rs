@@ -31,6 +31,9 @@ fn command(root: &Path, program: &str, args: &[&str]) -> Command {
     c.args(args)
         .current_dir(root)
         .env("CARGO_PROFILE_RELEASE_STRIP", "false");
+    if program == "cargo" {
+        c.arg("--locked");
+    }
     c
 }
 fn text(root: &Path, program: &str, args: &[&str]) -> Result<String> {
@@ -78,12 +81,13 @@ fn llvm_total(output: &str) -> Result<(i64, i64)> {
     anyhow::bail!("no TOTAL row in cargo llvm-lines output")
 }
 pub fn measure(root: &Path, out: &Path, skip: bool) -> Result<()> {
+    let lock = std::fs::read(root.join("Cargo.lock"))?;
     std::fs::create_dir_all(out)?;
     if !skip {
         run(&mut command(
             root,
             "cargo",
-            &["build", "--release", "--locked", "--example", "demo"],
+            &["build", "--release", "--example", "demo"],
         ))?;
     }
     let target = std::env::var_os("CARGO_TARGET_DIR")
@@ -174,6 +178,10 @@ pub fn measure(root: &Path, out: &Path, skip: bool) -> Result<()> {
         i64::try_from(count)?,
     ));
     let meta = json!({"commit":text(root,"git",&["rev-parse","HEAD"])?.trim(),"rustc":text(root,"rustc",&["--version"])?.trim()});
+    ensure!(
+        std::fs::read(root.join("Cargo.lock"))? == lock,
+        "measurement changed Cargo.lock; refusing inconsistent size artifacts"
+    );
     write_json(&out.join("size-metrics.json"), &metrics)?;
     write_json(&out.join("size-attribution.json"), &bloat)?;
     write_json(&out.join("size-meta.json"), &meta)?;
@@ -225,6 +233,53 @@ fn metrics(directory: &Path) -> Result<Vec<Metric>> {
         &directory.join("size-metrics.json"),
     )?)?)
 }
+fn validate_metrics(metrics: &[Metric]) -> Result<()> {
+    for (name, _) in GATED {
+        let rows: Vec<_> = metrics.iter().filter(|m| m.name == *name).collect();
+        ensure!(
+            rows.len() == 1 && rows[0].unit == "bytes" && rows[0].value > 0,
+            "size metrics require one positive byte measurement for {name}"
+        );
+    }
+    Ok(())
+}
+#[derive(Deserialize)]
+struct Metadata {
+    commit: String,
+    rustc: String,
+}
+#[derive(Debug)]
+pub(super) struct CompilerMismatch;
+impl std::fmt::Display for CompilerMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("baseline and head rustc differ; size measurements are not comparable")
+    }
+}
+impl std::error::Error for CompilerMismatch {}
+fn metadata(directory: &Path) -> Result<Metadata> {
+    let meta: Metadata = serde_json::from_value(read_json(&directory.join("size-meta.json"))?)?;
+    ensure!(
+        meta.commit.len() == 40
+            && meta.commit.bytes().all(|b| b.is_ascii_hexdigit())
+            && !meta.rustc.trim().is_empty(),
+        "invalid size metadata"
+    );
+    Ok(meta)
+}
+pub fn validate_baseline(head: &Path, base: &Path, expected: Option<&str>) -> Result<()> {
+    let head_meta = metadata(head)?;
+    let base_meta = metadata(base)?;
+    ensure!(
+        expected.is_none_or(|sha| sha == base_meta.commit),
+        "baseline commit does not match PR base SHA"
+    );
+    validate_metrics(&metrics(head)?)?;
+    validate_metrics(&metrics(base)?)?;
+    if head_meta.rustc != base_meta.rustc {
+        return Err(CompilerMismatch.into());
+    }
+    Ok(())
+}
 fn movers(head: &Path, base: &Path) -> Result<Vec<String>> {
     let get = |path: &Path| -> Result<BTreeMap<String, i64>> {
         let v = read_json(&path.join("size-attribution.json"))?;
@@ -274,12 +329,8 @@ fn render(
     base: Option<&[Metric]>,
     allow: bool,
 ) -> Result<(Vec<String>, Vec<String>, String)> {
-    for (name, _) in GATED {
-        ensure!(
-            head.iter().any(|m| m.name == *name),
-            "head metrics missing gated row: {name}"
-        );
-    }
+    validate_metrics(head)?;
+    validate_metrics(base.context("a baseline is required to evaluate the size gate")?)?;
     let mut lines = vec![
         "<!-- binary-size-report -->".into(),
         "## 📦 Binary size report".into(),
@@ -343,13 +394,6 @@ fn render(
         ]);
         lines.extend(crate_rows);
         lines.extend(["".into(), "</details>".into()]);
-    } else {
-        lines.extend(["No baseline available yet (no successful run on main); reporting absolute values only.".into(),"".into(),"| Metric | PR |".into(),"|---|---:|".into()]);
-        for m in head {
-            if !m.name.starts_with(".text ") {
-                lines.push(format!("| {} | {} |", m.name, value(m.value, &m.unit)));
-            }
-        }
     }
     let status = if failures.is_empty() {
         "PASS"
@@ -361,18 +405,23 @@ fn render(
     Ok((lines, failures, status.into()))
 }
 pub fn report(head_dir: &Path, base_dir: Option<&Path>, out: &Path) -> Result<()> {
+    write(
+        &out.join("gate.txt"),
+        b"FAIL\nSize comparison has not completed.\n",
+    )?;
+    let base_dir = base_dir.context("a baseline is required to evaluate the size gate")?;
+    validate_baseline(
+        head_dir,
+        base_dir,
+        std::env::var("BASE_SHA").ok().as_deref(),
+    )?;
     let head = metrics(head_dir)?;
-    let meta = read_json(&head_dir.join("size-meta.json"))?;
-    let base = base_dir
-        .filter(|p| p.join("size-metrics.json").exists())
-        .map(metrics)
-        .transpose()?;
-    let base_meta = base_dir.and_then(|p| read_json(&p.join("size-meta.json")).ok());
+    let meta = metadata(head_dir)?;
+    let base = metrics(base_dir)?;
+    let base_meta = metadata(base_dir)?;
     let allow = std::env::var("ALLOW_SIZE_INCREASE").as_deref() == Ok("true");
-    let (mut lines, failures, status) = render(&head, base.as_deref(), allow)?;
-    if let Some(base_dir) = base_dir
-        && base.is_some()
-        && let Ok(rows) = movers(head_dir, base_dir)
+    let (mut lines, failures, status) = render(&head, Some(&base), allow)?;
+    if let Ok(rows) = movers(head_dir, base_dir)
         && !rows.is_empty()
     {
         lines.extend([
@@ -397,13 +446,10 @@ pub fn report(head_dir: &Path, base_dir: Option<&Path>, out: &Path) -> Result<()
         lines.push(String::new());
         lines.push(if allow{"The `size-increase-ok` label is set, so the gate is not enforced for this PR."}else{"If this increase is expected (toolchain or dependency bump, accepted feature cost), add the `size-increase-ok` label and re-run the failed job."}.into());
     }
-    let baseline = base_meta
-        .as_ref()
-        .and_then(|v| v["commit"].as_str())
-        .unwrap_or("n/a");
-    let head = meta["commit"].as_str().context("head commit missing")?;
+    let baseline = base_meta.commit;
+    let head = meta.commit;
     lines.push(String::new());
-    lines.push(format!("Baseline: `{}` (latest main run) · Head: `{}` · [Graphs](https://oxidezap.github.io/whatsapp-rust/dev/binary-size/)",baseline.chars().take(9).collect::<String>(),head.chars().take(9).collect::<String>()));
+    lines.push(format!("Baseline: `{}` · Head: `{}` · [Graphs](https://oxidezap.github.io/whatsapp-rust/dev/binary-size/)",baseline.chars().take(9).collect::<String>(),head.chars().take(9).collect::<String>()));
     write(&out.join("report.md"), (lines.join("\n") + "\n").as_bytes())?;
     let mut gate = vec![status.clone()];
     gate.extend(failures);
@@ -414,6 +460,107 @@ pub fn report(head_dir: &Path, base_dir: Option<&Path>, out: &Path) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn every_measurement_cargo_command_requires_the_lockfile() {
+        for subcommand in ["build", "bloat", "llvm-lines"] {
+            let command = command(Path::new("."), "cargo", &[subcommand, "--release"]);
+            let args: Vec<_> = command.get_args().collect();
+            assert_eq!(args, [subcommand, "--release", "--locked"]);
+        }
+        let workflow = include_str!("../../../.github/workflows/binary-size.yml");
+        let tasks: Vec<_> = workflow
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains("whatsapp-xtask"))
+            .collect();
+        assert!(!tasks.is_empty());
+        assert!(
+            tasks
+                .iter()
+                .all(|line| line.contains("cargo run --locked --quiet -p whatsapp-xtask --"))
+        );
+        assert_eq!(workflow.matches("git diff --exit-code").count(), 2);
+    }
+    #[test]
+    fn gate_requires_complete_baseline_even_with_override() {
+        let head = vec![
+            metric("bin size (stripped)", "bytes", 100000),
+            metric("bin .text", "bytes", 50000),
+        ];
+        for allow in [false, true] {
+            assert!(render(&head, None, allow).is_err());
+            assert!(render(&head, Some(&head[..1]), allow).is_err());
+        }
+        for invalid in [
+            metric("bin .text", "lines", 50000),
+            metric("bin .text", "bytes", -1),
+            metric("bin .text", "bytes", 0),
+        ] {
+            assert!(render(&head, Some(&[head[0].clone(), invalid]), true).is_err());
+        }
+        let mut duplicate = head.clone();
+        duplicate.push(head[0].clone());
+        assert!(render(&head, Some(&duplicate), true).is_err());
+    }
+    #[test]
+    fn missing_baseline_cannot_leave_a_previous_passing_gate() {
+        let out = tempfile::tempdir().unwrap();
+        write(&out.path().join("gate.txt"), b"PASS\n").unwrap();
+        assert!(report(out.path(), None, out.path()).is_err());
+        assert!(
+            std::fs::read_to_string(out.path().join("gate.txt"))
+                .unwrap()
+                .starts_with("FAIL\n")
+        );
+    }
+    #[test]
+    fn compiler_mismatch_cannot_leave_a_previous_passing_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let head = root.path().join("head");
+        let base = root.path().join("base");
+        let out = root.path().join("out");
+        for (directory, rustc) in [
+            (&head, "rustc 1.99.0-nightly"),
+            (&base, "rustc 1.98.0-nightly"),
+        ] {
+            write_json(
+                &directory.join("size-meta.json"),
+                &json!({
+                    "commit":"47e1b5b41b63c23b59372828901ea945c8149565", "rustc":rustc
+                }),
+            )
+            .unwrap();
+            write_json(
+                &directory.join("size-metrics.json"),
+                &vec![
+                    metric("bin size (stripped)", "bytes", 100000),
+                    metric("bin .text", "bytes", 50000),
+                ],
+            )
+            .unwrap();
+        }
+        write(&out.join("gate.txt"), b"PASS\n").unwrap();
+        assert!(
+            report(&head, Some(&base), &out)
+                .unwrap_err()
+                .is::<CompilerMismatch>()
+        );
+        assert!(
+            std::fs::read_to_string(out.join("gate.txt"))
+                .unwrap()
+                .starts_with("FAIL\n")
+        );
+        write_json(
+            &base.join("size-meta.json"),
+            &read_json(&head.join("size-meta.json")).unwrap(),
+        )
+        .unwrap();
+        report(&head, Some(&base), &out).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.join("gate.txt")).unwrap(),
+            "PASS\n"
+        );
+    }
     #[test]
     fn exact_budget_boundary_and_override_are_preserved() {
         let base = vec![
@@ -427,6 +574,11 @@ mod tests {
         assert_eq!(render(&head, Some(&base), false).unwrap().2, "FAIL");
         assert_eq!(render(&head, Some(&base), true).unwrap().2, "OVERRIDDEN");
         assert!(render(&head[..1], Some(&base), true).is_err());
+        head = base.clone();
+        head[1].value += 32768;
+        assert_eq!(render(&head, Some(&base), false).unwrap().2, "PASS");
+        head[1].value += 1;
+        assert_eq!(render(&head, Some(&base), false).unwrap().2, "FAIL");
     }
     #[test]
     fn parses_tool_outputs_and_refuses_missing_measurements() {

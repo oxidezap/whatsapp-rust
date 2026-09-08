@@ -8,6 +8,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      toolchain:
+        description: Dated nightly for a main baseline; alternate compilers do not publish graphs
+        required: false
+        type: string
+        default: nightly-2026-06-16
 
 concurrency:
   # head_ref alone could collide across forks; the PR number is unique.
@@ -15,6 +21,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  RUSTUP_TOOLCHAIN: nightly-2026-06-16
   CARGO_TERM_COLOR: always
   PROTOC_VERSION: "3.25.3"
   SCCACHE_GHA_ENABLED: "true"
@@ -32,6 +39,8 @@ jobs:
     if: github.event_name == 'pull_request'
     name: Binary Size (PR)
     runs-on: ubuntu-latest
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
     permissions:
       contents: read
       actions: read
@@ -41,7 +50,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
 
       - name: Install tools (protoc, cargo-binstall)
         uses: taiki-e/install-action@v2
@@ -73,20 +82,23 @@ jobs:
       - name: Install ALSA dev headers
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Measure binary size
-        run: cargo xt ci measure-binary-size --out-dir size-out
+        run: |
+          cargo run --locked --quiet -p whatsapp-xtask -- ci measure-binary-size --out-dir size-out
+          git diff --exit-code
 
       - name: Upload size artifacts
         uses: actions/upload-artifact@v7
         with:
           name: size-metrics
           path: size-out/
+          if-no-files-found: error
           retention-days: 90
 
-      - name: Download baseline from latest main run
+      - name: Download validated PR base measurement
         id: baseline
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: cargo xt ci workflow size-baseline
+        run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-baseline
       # Informational (job summary); the real gate is the report script below.
       # Tolerates the window before the first push run creates the series.
       - name: Compare against gh-pages series
@@ -109,24 +121,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: cargo xt ci workflow size-override
+        run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-override
       # No GH_TOKEN here: the report script is PR-controlled code.
       - name: Generate report and evaluate gate
         env:
           BASE_DIR: ${{ steps.baseline.outputs.dir }}
           ALLOW_SIZE_INCREASE: ${{ steps.override.outputs.allow }}
         run: |
-          cargo xt ci binary-size-report --head size-out --out-dir size-out
-          cargo xt ci workflow append-summary size-out/report.md
+          cargo run --locked --quiet -p whatsapp-xtask -- ci binary-size-report --head size-out --out-dir size-out
+          cargo run --locked --quiet -p whatsapp-xtask -- ci workflow append-summary size-out/report.md
       # Fork PRs run with a read-only token, so they only get the job summary.
       - name: Post sticky PR comment
         if: github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: cargo xt ci workflow size-comment
+        run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-comment
       - name: Enforce size budget
-        run: cargo xt ci workflow size-gate
+        run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-gate
   binary-size-push:
     # Dispatch only publishes from main so stray branches can't pollute the series.
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
@@ -141,7 +153,21 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+
+      - name: Validate measurement toolchain
+        id: compiler
+        env:
+          REQUESTED_TOOLCHAIN: ${{ inputs.toolchain }}
+          DEFAULT_SIZE_TOOLCHAIN: ${{ env.RUSTUP_TOOLCHAIN }}
+          RUSTC_WRAPPER: ""
+        run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-toolchain
+
+      - name: Install measurement toolchain
+        if: steps.compiler.outputs.toolchain != env.RUSTUP_TOOLCHAIN
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.compiler.outputs.toolchain }}
 
       - name: Install tools (protoc, cargo-binstall)
         uses: taiki-e/install-action@v2
@@ -173,7 +199,11 @@ jobs:
       - name: Install ALSA dev headers
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Measure binary size
-        run: cargo xt ci measure-binary-size --out-dir size-out
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.compiler.outputs.toolchain }}
+        run: |
+          cargo run --locked --quiet -p whatsapp-xtask -- ci measure-binary-size --out-dir size-out
+          git diff --exit-code
 
       # This artifact is the comparison baseline for PR runs.
       - name: Upload size artifacts
@@ -181,11 +211,13 @@ jobs:
         with:
           name: size-metrics
           path: size-out/
+          if-no-files-found: error
           retention-days: 90
 
       # Post-merge safety net: alerts on the commit when a regression landed
       # despite (or around) the PR gate, e.g. via the size-increase-ok label.
       - name: Store series on gh-pages
+        if: steps.compiler.outputs.publish == 'true'
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: "whatsapp-rust binary size"
