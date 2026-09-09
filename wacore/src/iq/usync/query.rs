@@ -2483,6 +2483,8 @@ mod tests {
         );
     }
 
+    /// Budget: the sparse result rides along on every usync response.
+    /// Rebaseline per agent_docs/layout_asserts.md.
     #[test]
     fn sparse_result_layout_stays_bounded() {
         assert!(size_of::<UsyncProtocolResult>() <= 96);

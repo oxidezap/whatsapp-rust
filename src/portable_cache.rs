@@ -3277,14 +3277,21 @@ mod tests {
     /// The flattened slot packs the 4-byte contact-hash key into the entry
     /// tail padding, so `Slot<u32, Arc<str>>` is one word smaller than the
     /// nested `Slot { key, hash, entry }` it replaces. Wide keys already
-    /// align, so the dispatched slot keeps its size.
+    /// align, so the dispatched slot keeps its size. Budgets, not contracts:
+    /// a smaller slot is never a failure. Rebaseline per
+    /// agent_docs/layout_asserts.md.
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn flattened_slot_reuses_entry_tail_padding() {
-        assert_eq!(size_of::<Slot<u32, Arc<str>>>(), 56);
-        assert_eq!(
-            size_of::<Slot<wacore::types::message::SenderMessageId, ()>>(),
-            128
+        assert!(
+            size_of::<Slot<u32, Arc<str>>>() <= 56,
+            "flat slot grew to {} B (budget 56)",
+            size_of::<Slot<u32, Arc<str>>>()
+        );
+        assert!(
+            size_of::<Slot<wacore::types::message::SenderMessageId, ()>>() <= 128,
+            "wide slot grew to {} B (budget 128)",
+            size_of::<Slot<wacore::types::message::SenderMessageId, ()>>()
         );
     }
 

@@ -1031,7 +1031,8 @@ mod tests {
     /// rounds up. Adding a field that duplicates something already derivable
     /// (the AD_JID domain byte, from the resolved server) cost exactly that
     /// before it was derived instead. Pinned so the next field has to justify
-    /// itself.
+    /// itself. Exact: the per-string width is the contract. Rebaseline per
+    /// agent_docs/layout_asserts.md.
     #[test]
     fn the_hint_tape_stays_five_bytes_wide() {
         assert_eq!(

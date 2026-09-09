@@ -1614,15 +1614,34 @@ mod tests {
                 + size_of::<MessageField<sender_key_state_structure::SenderChainKey>>(),
             4 * size_of::<usize>()
         );
+        // Budget, not contract: the total floats with the protobuf runtime
+        // layout, so only growth fails. Rebaseline per
+        // agent_docs/layout_asserts.md.
         #[cfg(target_pointer_width = "64")]
         {
-            assert_eq!(size_of::<SenderKeyState>(), 224);
-            assert_eq!(size_of::<SenderKeyStateStructure>(), 48);
+            assert!(
+                size_of::<SenderKeyState>() <= 224,
+                "SenderKeyState grew to {} B (budget 224)",
+                size_of::<SenderKeyState>()
+            );
+            assert!(
+                size_of::<SenderKeyStateStructure>() <= 48,
+                "SenderKeyStateStructure grew to {} B (budget 48)",
+                size_of::<SenderKeyStateStructure>()
+            );
         }
         #[cfg(target_pointer_width = "32")]
         {
-            assert_eq!(size_of::<SenderKeyState>(), 204);
-            assert_eq!(size_of::<SenderKeyStateStructure>(), 28);
+            assert!(
+                size_of::<SenderKeyState>() <= 204,
+                "SenderKeyState grew to {} B (budget 204)",
+                size_of::<SenderKeyState>()
+            );
+            assert!(
+                size_of::<SenderKeyStateStructure>() <= 28,
+                "SenderKeyStateStructure grew to {} B (budget 28)",
+                size_of::<SenderKeyStateStructure>()
+            );
         }
     }
 

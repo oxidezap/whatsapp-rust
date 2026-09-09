@@ -471,6 +471,9 @@ mod tests {
         );
     }
 
+    /// The runtime config is built once per client and read on hot paths, so
+    /// it stays a fraction of the construction config and within its byte
+    /// budget. Rebaseline per agent_docs/layout_asserts.md.
     #[test]
     fn runtime_config_is_compact() {
         assert!(
