@@ -99,7 +99,9 @@ fn await_event_thread(r: &mut Runtime, label: &str) {
 /// only the host takes them out. A fixed pass count can sample state while
 /// activation is still pending (processing a callback can enqueue more work),
 /// so quiescence — signaling count and log length unchanged across passes — is
-/// awaited and reported. Returns whether it was reached.
+/// awaited and reported. Each pass yields briefly so guest workers are actually
+/// scheduled between observations; back-to-back passes with no worker progress
+/// would declare a false quiescence. Returns whether it was reached.
 fn drain(r: &mut Runtime) -> bool {
     const PASSES: usize = 20;
     const STABLE: usize = 3;
@@ -108,6 +110,7 @@ fn drain(r: &mut Runtime) -> bool {
     for _ in 0..PASSES {
         r.process_queued_calls();
         r.refuel();
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let (signaling, log) = (
             r.signaling().map(|s| s.len()).unwrap_or(usize::MAX),
             r.engine_log().len(),
@@ -288,7 +291,9 @@ fn side_b_answerer(
         .children(body)
         .build();
     let payload = base64::engine::general_purpose::STANDARD.encode(marshal::marshal(&wrapper)?);
-    r.call_embind(
+    // Preserve the delivery outcome: a trap here must read as a delivery
+    // failure, never as a signaling stall.
+    let delivered = r.call_embind(
         "handleIncomingSignalingOffer",
         &[
             Value::Str(payload),
@@ -301,9 +306,15 @@ fn side_b_answerer(
             Value::Str(caller.to_string()),
             Value::Bytes(Vec::new()),
         ],
-    )
-    .ok();
+    );
     r.refuel();
+    println!(
+        "side B [{label}]: delivered={}",
+        match &delivered {
+            Ok(value) => format!("{value:?}"),
+            Err(_) => "trap".to_owned(),
+        }
+    );
     // No settle here: the virtual clock advances per observation, and settling
     // ages the call past `caller_timeout`, tearing it down as missed before
     // anything can accept it (see `signaling_census`). Drain to observable

@@ -275,14 +275,16 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
     };
     // Collect queued main-thread work to observable quiescence before reading
     // state: a fixed pass count can sample while activation is still pending,
-    // and processing a callback can enqueue more work. A `false` here marks
-    // the probe suspect, not conclusive.
+    // and processing a callback can enqueue more work. Each pass yields briefly
+    // so guest workers are actually scheduled between observations. A `false`
+    // here marks the probe suspect, not conclusive.
     let mut stable = 0;
     let (mut last_signaling, mut last_log) = (usize::MAX, usize::MAX);
     let mut quiesced = false;
     for _ in 0..20 {
         r.process_queued_calls();
         r.refuel();
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let (signaling, log) = (
             r.signaling().map(|s| s.len()).unwrap_or(usize::MAX),
             r.engine_log().len(),
