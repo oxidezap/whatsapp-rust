@@ -180,9 +180,9 @@ pub enum CallAction {
         call_id: String,
         call_creator: Jid,
         /// Why the device rejected. `busy` means THAT DEVICE cannot take the call (already in one,
-        /// or a companion that does not do voice), `enc` means THAT DEVICE could not decrypt the
-        /// offer (its registration changed device-side) - neither is the callee declining, and the
-        /// peer's other devices keep ringing. Absent means an explicit decline by the user.
+        /// or a companion that does not do voice); `enc` means THAT DEVICE could not decrypt the
+        /// offer. Neither is the callee declining, and the peer's other devices keep ringing.
+        /// Absent means an explicit decline by the user.
         reason: Option<String>,
     },
     #[wire = "terminate"]

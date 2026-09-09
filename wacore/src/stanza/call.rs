@@ -394,9 +394,9 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
             }
         }
         CallActionTag::Reject => {
-            // `reason` distinguishes a device that CANNOT take the call (`busy`, or `enc` when the
-            // device could not decrypt the offer) from the callee actually declining; dropping it
-            // made both look identical and ended calls the peer's other devices were still answering.
+            // `reason` distinguishes a device that CANNOT take the call (`busy`, `enc`) from the
+            // callee actually declining; dropping it made both look identical and ended calls the
+            // peer's other devices were still answering.
             let reason = attrs.optional_string("reason").map(|c| c.into_owned());
             attrs.finish().map_err(|e| anyhow!("<reject> attrs: {e}"))?;
             CallAction::Reject {
@@ -657,9 +657,7 @@ pub const TERMINATE_REASON_GROUP_CALL_ENDED: &str = "group_call_ended";
 /// decision: the peer's remaining devices go on ringing and may still answer.
 pub const REJECT_REASON_BUSY: &str = "busy";
 
-/// `<reject reason>` wire token for a device that could not decrypt the offer (its registration
-/// changed device-side, so the offered sender key no longer opens). Like `busy` it speaks for ONE
-/// DEVICE only: the peer's remaining devices go on ringing and may still answer.
+/// Like `busy`, but the device could not decrypt the offer (stale registration). Per-device.
 pub const REJECT_REASON_ENC: &str = "enc";
 
 /// Relay latency wire encoding: `0x2000000 + rtt_ms`.

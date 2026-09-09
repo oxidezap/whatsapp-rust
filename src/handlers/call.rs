@@ -520,9 +520,10 @@ impl StanzaHandler for CallHandler {
                             client.core.event_bus.dispatch(outcome);
                         }
                     }
-                    // A `busy`/`enc` reject speaks for one device, and a group reject speaks for one
-                    // invited participant. Neither tears down the registered call; authoritative
-                    // timeout/terminate or the group roster owns the corresponding final state.
+                    // A per-device reject (`reject_is_device_busy`) speaks for one device, and a group
+                    // reject speaks for one invited participant. Neither tears down the registered
+                    // call; authoritative timeout/terminate or the group roster owns the
+                    // corresponding final state.
                     #[cfg(feature = "voip-runtime")]
                     if let CallAction::Terminate { .. } = &call.action
                         && let Some(generation) = group_transition_generation
@@ -4310,10 +4311,9 @@ mod tests {
         );
     }
 
-    // An `enc` reject is one device saying it could not decrypt the offer (its registration
-    // changed device-side, observed with registration bytes on the reject), not the callee
-    // declining. Like `busy` it must neither tear the call down nor consume the one-shot rung set,
-    // or the remaining siblings stop ringing and a later genuine answer has nothing to dismiss.
+    // An `enc` reject is per-device like `busy` (see `reject_is_device_busy`): it must neither
+    // tear the call down nor consume the one-shot rung set, or the remaining siblings stop ringing
+    // and a later genuine answer has nothing to dismiss.
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn enc_reject_keeps_the_call_and_the_rung_set() {
