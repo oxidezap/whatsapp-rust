@@ -35,7 +35,20 @@ const TTI_RENEWAL_DIVISOR: u32 = 16;
 /// rather than repeatedly walking the growing map without finding a victim.
 const GUARDED_EVICTION_PROBES: usize = 64;
 
-struct CacheEntry<V> {
+/// One table slot: the key, its hash, and the entry fields inline.
+///
+/// Flattened from a `Slot { key, hash, entry: CacheEntry }` nest so a narrow
+/// key reuses the entry tail padding: `referenced` (1 byte) plus `key: u32`
+/// pack into one word ahead of `hash`. Field order matters; moving `key` or
+/// `hash` ahead of the 8-byte fields reopens the gap.
+///
+/// The hash is kept so the table can grow without re-hashing every key and so
+/// the FIFO side can address a slot by `(hash, seq)` instead of holding a
+/// second copy of the key. Before this, `order` was a `BTreeMap<u64, K>`: every
+/// entry carried its key twice, and for a `String`, `Jid` or `SenderMessageId`
+/// key that second copy was a second heap allocation held for the entry's
+/// whole lifetime, across every cache the client keeps.
+struct Slot<K, V> {
     value: V,
     // Monotonic instants (not wall-clock) so TTL/TTI are immune to clock jumps,
     // matching moka's timer semantics.
@@ -50,20 +63,8 @@ struct CacheEntry<V> {
     /// on the hit itself needed the write lock, and once every entry was
     /// being moved on every pass a warm read cost three times what it had.
     referenced: portable_atomic::AtomicBool,
-}
-
-/// One table slot: the key, its hash, and the entry.
-///
-/// The hash is kept so the table can grow without re-hashing every key and so
-/// the FIFO side can address a slot by `(hash, seq)` instead of holding a
-/// second copy of the key. Before this, `order` was a `BTreeMap<u64, K>`: every
-/// entry carried its key twice, and for a `String`, `Jid` or `SenderMessageId`
-/// key that second copy was a second heap allocation held for the entry's
-/// whole lifetime, across every cache the client keeps.
-struct Slot<K, V> {
     key: K,
     hash: u64,
-    entry: CacheEntry<V>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -294,30 +295,26 @@ where
         self.table.len()
     }
 
-    fn get<Q>(&self, key: &Q) -> Option<&CacheEntry<V>>
+    fn get<Q>(&self, key: &Q) -> Option<&Slot<K, V>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
         let hash = self.hash_of(key);
-        self.table
-            .find(hash, |slot| slot.key.borrow() == key)
-            .map(|slot| &slot.entry)
+        self.table.find(hash, |slot| slot.key.borrow() == key)
     }
 
-    fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut CacheEntry<V>>
+    fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut Slot<K, V>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
         let hash = self.hash_of(key);
-        self.table
-            .find_mut(hash, |slot| slot.key.borrow() == key)
-            .map(|slot| &mut slot.entry)
+        self.table.find_mut(hash, |slot| slot.key.borrow() == key)
     }
 
-    fn iter(&self) -> impl Iterator<Item = (&K, &CacheEntry<V>)> {
-        self.table.iter().map(|slot| (&slot.key, &slot.entry))
+    fn iter(&self) -> impl Iterator<Item = (&K, &Slot<K, V>)> {
+        self.table.iter().map(|slot| (&slot.key, slot))
     }
 
     /// Bytes the table and the eviction order themselves hold, on top of the
@@ -344,7 +341,7 @@ where
     /// Borrowed removal: the `order` side is keyed by the entry's own `seq`,
     /// so nothing here ever needs an owned `K`, and callers with a `&str` or
     /// `&Jid` need not clone the key just to delete it.
-    fn remove_key<Q>(&mut self, key: &Q) -> Option<CacheEntry<V>>
+    fn remove_key<Q>(&mut self, key: &Q) -> Option<Slot<K, V>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -355,14 +352,14 @@ where
             .find_entry(hash, |slot| slot.key.borrow() == key)
             .ok()?
             .remove();
-        self.order.remove(&slot.entry.seq);
-        Some(slot.entry)
+        self.order.remove(&slot.seq);
+        Some(slot)
     }
 
     /// Remove the slot the FIFO side named by `(hash, seq)`.
     fn remove_by_seq(&mut self, hash: u64, seq: u64) -> bool {
         self.table
-            .find_entry(hash, |slot| slot.entry.seq == seq)
+            .find_entry(hash, |slot| slot.seq == seq)
             .ok()
             .map(|occupied| occupied.remove())
             .is_some()
@@ -390,30 +387,26 @@ where
         while self.table.len() as u64 >= cap && remaining != 0 {
             let table = &mut self.table;
             let mut probe = |op| match op {
-                ClockOp::Classify { seq, hash } => {
-                    match table.find(hash, |slot| slot.entry.seq == seq) {
-                        None => ClockVerdict::Skip,
-                        Some(slot)
-                            if evict_guard
-                                .is_some_and(|is_evictable| !is_evictable(&slot.entry.value)) =>
-                        {
-                            ClockVerdict::Skip
-                        }
-                        Some(slot)
-                            if slot
-                                .entry
-                                .referenced
-                                .swap(false, std::sync::atomic::Ordering::Relaxed) =>
-                        {
-                            ClockVerdict::SecondChance
-                        }
-                        Some(_) => ClockVerdict::Victim,
+                ClockOp::Classify { seq, hash } => match table.find(hash, |slot| slot.seq == seq) {
+                    None => ClockVerdict::Skip,
+                    Some(slot)
+                        if evict_guard.is_some_and(|is_evictable| !is_evictable(&slot.value)) =>
+                    {
+                        ClockVerdict::Skip
                     }
-                }
+                    Some(slot)
+                        if slot
+                            .referenced
+                            .swap(false, std::sync::atomic::Ordering::Relaxed) =>
+                    {
+                        ClockVerdict::SecondChance
+                    }
+                    Some(_) => ClockVerdict::Victim,
+                },
                 ClockOp::Reseq { seq, hash, fresh } => {
-                    match table.find_mut(hash, |slot| slot.entry.seq == seq) {
+                    match table.find_mut(hash, |slot| slot.seq == seq) {
                         Some(slot) => {
-                            slot.entry.seq = fresh;
+                            slot.seq = fresh;
                             ClockVerdict::Victim
                         }
                         None => ClockVerdict::Skip,
@@ -474,15 +467,13 @@ where
         self.table.insert_unique(
             hash,
             Slot {
+                value,
+                inserted_at: now,
+                last_accessed_at: now,
+                seq,
+                referenced: portable_atomic::AtomicBool::new(false),
                 key,
                 hash,
-                entry: CacheEntry {
-                    value,
-                    inserted_at: now,
-                    last_accessed_at: now,
-                    seq,
-                    referenced: portable_atomic::AtomicBool::new(false),
-                },
             },
             |slot| slot.hash,
         );
@@ -491,7 +482,7 @@ where
     /// Drop expired entries and the FIFO records that named them. Driven by
     /// `order`, which every cache that expires by time maintains (see
     /// `PortableCacheBuilder::build`), so the walk itself is [`expiry_walk`].
-    fn retain_unexpired(&mut self, mut is_expired: impl FnMut(&CacheEntry<V>) -> bool) {
+    fn retain_unexpired(&mut self, mut is_expired: impl FnMut(&Slot<K, V>) -> bool) {
         debug_assert!(
             self.track_order,
             "a cache that expires by time tracks order; the sweep walks it"
@@ -499,8 +490,8 @@ where
         let table = &self.table;
         let expired = expiry_walk(&self.order, &mut |seq, hash| {
             table
-                .find(hash, |slot| slot.entry.seq == seq)
-                .is_some_and(|slot| is_expired(&slot.entry))
+                .find(hash, |slot| slot.seq == seq)
+                .is_some_and(&mut is_expired)
         });
         for (seq, hash) in expired {
             self.order.remove(&seq);
@@ -837,7 +828,7 @@ where
         }
     }
 
-    fn is_expired(&self, entry: &CacheEntry<V>, now: Instant) -> bool {
+    fn is_expired(&self, entry: &Slot<K, V>, now: Instant) -> bool {
         if let Some(ttl) = self.ttl
             && now.saturating_duration_since(entry.inserted_at) >= ttl
         {
@@ -854,7 +845,7 @@ where
     /// Whether `entry`'s access stamp has aged past [`TTI_RENEWAL_DIVISOR`]'s
     /// tolerance and is worth pushing forward under the write lock. A cache
     /// without TTI never renews.
-    fn needs_tti_renewal(&self, entry: &CacheEntry<V>, now: Instant) -> bool {
+    fn needs_tti_renewal(&self, entry: &Slot<K, V>, now: Instant) -> bool {
         self.tti.is_some_and(|tti| {
             now.saturating_duration_since(entry.last_accessed_at) >= tti / TTI_RENEWAL_DIVISOR
         })
@@ -1701,12 +1692,14 @@ mod tests {
             .build();
 
         let inserted = Instant::ZERO + Duration::from_secs(1_000);
-        let entry = CacheEntry {
+        let entry = Slot {
             value: 1,
             inserted_at: inserted,
             last_accessed_at: inserted,
             seq: 0,
             referenced: portable_atomic::AtomicBool::new(false),
+            key: String::new(),
+            hash: 0,
         };
 
         assert!(!cache.is_expired(&entry, inserted + tti - Duration::from_nanos(1)));
@@ -1735,12 +1728,14 @@ mod tests {
             .build();
 
         let stamped = Instant::ZERO + Duration::from_secs(1_000);
-        let entry = CacheEntry {
+        let entry = Slot {
             value: 1,
             inserted_at: stamped,
             last_accessed_at: stamped,
             seq: 0,
             referenced: portable_atomic::AtomicBool::new(false),
+            key: String::new(),
+            hash: 0,
         };
 
         assert!(!cache.needs_tti_renewal(&entry, stamped));
@@ -1776,12 +1771,14 @@ mod tests {
         // elapsed, so the recorded stamp lags it by (almost) a full window.
         let stamped = Instant::ZERO + Duration::from_secs(1_000);
         let real_access = stamped + tolerance - Duration::from_nanos(1);
-        let entry = CacheEntry {
+        let entry = Slot {
             value: 1,
             inserted_at: stamped,
             last_accessed_at: stamped,
             seq: 0,
             referenced: portable_atomic::AtomicBool::new(false),
+            key: String::new(),
+            hash: 0,
         };
 
         // Never late: gone by `real_access + tti` at the very latest.
@@ -2595,5 +2592,19 @@ mod tests {
         assert_eq!((a, b), (1, 2));
         assert_eq!(cache.get("a").await, Some(1));
         assert_eq!(cache.get("b").await, Some(2));
+    }
+
+    /// The flattened slot packs the 4-byte contact-hash key into the entry
+    /// tail padding, so `Slot<u32, Arc<str>>` is one word smaller than the
+    /// nested `Slot { key, hash, entry }` it replaces. Wide keys already
+    /// align, so the dispatched slot keeps its size.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn flattened_slot_reuses_entry_tail_padding() {
+        assert_eq!(size_of::<Slot<u32, Arc<str>>>(), 56);
+        assert_eq!(
+            size_of::<Slot<wacore::types::message::SenderMessageId, ()>>(),
+            128
+        );
     }
 }
