@@ -224,7 +224,9 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         None => now,
     };
     let payload = base64::engine::general_purpose::STANDARD.encode(marshal::marshal(&wrapper)?);
-    r.call_embind(
+    // Preserve the delivery outcome: a trap here must read as a delivery
+    // failure, never as "the engine processed and rejected the offer".
+    let delivered = r.call_embind(
         "handleIncomingSignalingOffer",
         &[
             Value::Str(payload),
@@ -237,9 +239,12 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
             Value::Str(caller.to_string()),
             Value::Bytes(Vec::new()),
         ],
-    )
-    .ok();
+    );
     r.refuel();
+    let delivered = match &delivered {
+        Ok(value) => format!("{value:?}"),
+        Err(_) => "trap".to_owned(),
+    };
     let immediate = format!("{:?}", r.call_embind("getCallInfo", &[]).ok());
     r.refuel();
     let alive = !immediate.contains("\"\"") && immediate.len() > 20;
@@ -266,7 +271,7 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
             .iter()
             .any(|l| l.contains("missed by the user"));
         println!(
-            "PROBE {}: alive={alive} preaccept_torn_down={torn_down_pre_accept} no-accept: alive_later={alive_later} emitted={emitted} missed={missed}",
+            "PROBE {}: delivered={delivered} alive={alive} preaccept_torn_down={torn_down_pre_accept} no-accept: alive_later={alive_later} emitted={emitted} missed={missed}",
             probe.label,
         );
         return Ok(());
@@ -315,7 +320,7 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         .iter()
         .any(|l| l.contains("missed by the user"));
     println!(
-        "PROBE {}: alive={alive} preaccept_torn_down={torn_down_pre_accept} accept={accepted:?} emitted={emitted} missed={missed} {term_reason}",
+        "PROBE {}: delivered={delivered} alive={alive} preaccept_torn_down={torn_down_pre_accept} accept={accepted:?} emitted={emitted} missed={missed} {term_reason}",
         probe.label,
     );
     Ok(())

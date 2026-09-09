@@ -81,14 +81,27 @@ fn start(bytes: &[u8]) -> Result<Runtime> {
 }
 
 /// Decode one recorded stanza, skipping the stream-flag leading byte.
-fn decode(call: &SignalingCall) -> Option<Node> {
-    call.stanza
+///
+/// Loud on failure: a corrupt or truncated capture must surface as a decode
+/// error, never as "the engine emitted nothing" (which would misreport a
+/// broken host path as a signaling stall).
+fn decode(call: &SignalingCall) -> Result<Node> {
+    let body = call
+        .stanza
         .get(1..)
-        .map(marshal::unmarshal_ref)
-        .transpose()
-        .ok()
-        .flatten()
-        .map(|node| node.to_owned())
+        .context("signaling stanza shorter than the stream flag")?;
+    Ok(marshal::unmarshal_ref(body)
+        .with_context(|| format!("undecodable signaling stanza ({} bytes)", body.len()))?
+        .to_owned())
+}
+
+/// Truncate at a character boundary: engine Debug output may hold multi-byte
+/// characters, and byte-index slicing panics mid-character.
+fn clip(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
 }
 
 fn children_of(node: &Node) -> Vec<Node> {
@@ -105,55 +118,54 @@ fn child_tags(node: &Node) -> Vec<String> {
         .collect()
 }
 
-/// Field-level diff of the vendor offer against our video-offer builder.
-/// Returns the first divergence, or `None` when the deterministic fields agree.
-/// Random per-call bytes (`<enc>` ciphertext, `<privacy>`) are excluded: the
-/// engine mints fresh keys every run, so byte equality there is unachievable.
-fn diff_offer(vendor: &Node, rust: &Node) -> Option<String> {
-    let v_tags = child_tags(vendor);
-    let r_tags = child_tags(rust);
-    if v_tags != r_tags {
-        return Some(format!("child order {v_tags:?} vs {r_tags:?}"));
-    }
-    let attr = |node: &Node, tag: &str, name: &str| {
-        children_of(node)
+/// Field-level diff of two same-level stanzas: child order, every child's
+/// attributes, and every child's bytes.
+///
+/// Two exclusions, both stage mismatches rather than drift. `<enc>` carries
+/// fresh ciphertext per run, so its bytes can never agree. And the engine
+/// emits the pre-fanout skeleton (bare `count`), while our builder emits the
+/// post-fanout per-device form (`v`/`type` added by the JS fan-out the engine
+/// never performs) — so only `count` participates for `<enc>`. Per-call
+/// `<privacy>` is deterministic inside this harness (both sides are handed the
+/// same token), so it compares in full.
+fn diff_children(vendor: &Node, rust: &Node) -> Option<String> {
+    // Attribute order is not a wire fact (XML attributes are unordered), so
+    // the signature sorts attributes by name; only the set of pairs matters.
+    fn signature(node: &Node) -> String {
+        let mut attrs: Vec<(String, String)> = node
+            .attrs
             .iter()
-            .find(|c| c.tag == tag)
-            .and_then(|n| {
-                n.attrs()
-                    .optional_string(name)
-                    .as_deref()
-                    .map(str::to_owned)
-            })
-    };
-    for name in [
-        "enc",
-        "dec",
-        "device_orientation",
-        "screen_width",
-        "screen_height",
-    ] {
-        if attr(vendor, "video", name) != attr(rust, "video", name) {
-            return Some(format!(
-                "video attr {name}: {:?} vs {:?}",
-                attr(vendor, "video", name),
-                attr(rust, "video", name)
-            ));
+            .filter(|(k, _)| node.tag != "enc" || k.as_ref() as &str == "count")
+            .map(|(k, v)| (k.to_string(), format!("{v:?}")))
+            .collect();
+        attrs.sort();
+        match &node.content {
+            Some(NodeContent::Bytes(_)) if node.tag == "enc" => {
+                format!("{} {attrs:?}", node.tag)
+            }
+            _ => format!("{} {attrs:?} {:?}", node.tag, node.content),
         }
     }
-    let cap = |node: &Node| {
-        children_of(node)
-            .iter()
-            .find(|c| c.tag == "capability")
-            .and_then(|n| match &n.content {
-                Some(NodeContent::Bytes(bytes)) => Some(bytes.clone()),
-                _ => None,
-            })
-    };
-    if cap(vendor) != cap(rust) {
-        return Some("capability bytes differ".to_owned());
+    let (v_children, r_children) = (children_of(vendor), children_of(rust));
+    if child_tags(vendor) != child_tags(rust) {
+        return Some(format!(
+            "child order {:?} vs {:?}",
+            child_tags(vendor),
+            child_tags(rust)
+        ));
     }
-    None
+    v_children
+        .iter()
+        .zip(r_children.iter())
+        .enumerate()
+        .find_map(|(i, (v, r))| {
+            (signature(v) != signature(r)).then(|| {
+                format!(
+                    "child {i} <{}> differs:\n  vendor {v:?}\n  rust   {r:?}",
+                    v.tag
+                )
+            })
+        })
 }
 
 /// Side A: place a video call, return the emitted `<offer>` node.
@@ -176,15 +188,17 @@ fn side_a_initiator(bytes: &[u8]) -> Result<(Node, String)> {
     r.refuel();
     let ret = outcome.as_ref().ok().and_then(|v| v.as_int());
     let stanzas = r.signaling()?;
-    let total: usize = stanzas.iter().map(|s| s.stanza.len()).sum();
-    let offer = stanzas
+    let decoded: Vec<(usize, Node)> = stanzas
         .iter()
-        .filter_map(decode)
-        .find(|n| n.tag == "offer")
+        .map(|call| decode(call).map(|node| (call.stanza.len(), node)))
+        .collect::<Result<_>>()?;
+    let (offer_len, offer) = decoded
+        .into_iter()
+        .find(|(_, n)| n.tag == "offer")
         .context("side A emitted no <offer>")?;
     let info = r.call_embind("getCallInfo", &[]).ok();
     r.refuel();
-    println!("side A: startVoipCall -> {ret:?}, offer {total} bytes");
+    println!("side A: startVoipCall -> {ret:?}, offer {offer_len} bytes");
     println!("side A: offer children {:?}", child_tags(&offer));
     Ok((offer, format!("{info:?}")))
 }
@@ -230,13 +244,13 @@ fn side_b_answerer(bytes: &[u8], body: Vec<Node>, label: &str) -> Result<Vec<Nod
     let immediate_state = format!("{immediate:?}");
     println!(
         "side B [{label}]: immediate getCallInfo: {}",
-        &immediate_state[..immediate_state.len().min(400)]
+        clip(&immediate_state, 400)
     );
     let accepted = r.call_embind("acceptCall", &[Value::Bool(true), Value::Bool(true)]);
     r.refuel();
     r.settle(std::time::Duration::from_secs(5));
     r.refuel();
-    let emitted: Vec<Node> = r.signaling()?.iter().filter_map(decode).collect();
+    let emitted: Vec<Node> = r.signaling()?.iter().map(decode).collect::<Result<_>>()?;
     println!(
         "side B [{label}]: offer parsed={parsed}, acceptCall -> {accepted:?}, emitted={}",
         emitted.len()
@@ -285,7 +299,8 @@ fn main() -> Result<()> {
         .cloned()
         .context("side A offer has no <video> child")?;
 
-    // Initiator differential: vendor offer vs our builder on deterministic fields.
+    // Initiator differential: vendor offer vs our builder, every deterministic
+    // field (`<enc>` bytes excluded: fresh ciphertext per run).
     let peer = Jid::new("11223344556677", Server::Lid);
     let creator = Jid::new("99887766554433", Server::Lid);
     let rust_offer = build_offer(&OfferParams {
@@ -310,8 +325,8 @@ fn main() -> Result<()> {
         .find(|c| c.tag == "offer")
         .cloned()
         .context("rust offer wrapper holds no <offer>")?;
-    match diff_offer(&offer, &rust_inner) {
-        None => println!("VERDICT initiator: MATCH on deterministic fields"),
+    match diff_children(&offer, &rust_inner) {
+        None => println!("VERDICT initiator: MATCH on all compared fields"),
         Some(d) => println!("VERDICT initiator: DIVERGENCE: {d}"),
     }
 
@@ -359,15 +374,14 @@ fn main() -> Result<()> {
                 .find(|c| c.tag == "accept")
                 .cloned()
                 .context("rust accept wrapper holds no <accept>")?;
-            println!(
-                "VERDICT answerer: vendor accept children {:?} vs rust {:?}",
-                child_tags(vendor_accept),
-                child_tags(&rust_accept)
-            );
+            match diff_children(vendor_accept, &rust_accept) {
+                None => println!("VERDICT answerer: MATCH on all compared fields"),
+                Some(d) => println!("VERDICT answerer: DIVERGENCE: {d}"),
+            }
         }
         None => println!("VERDICT answerer: STALL, no <accept> emitted; nothing to compare"),
     }
 
-    println!("side A call state: {}", &a_state[..a_state.len().min(300)]);
+    println!("side A call state: {}", clip(&a_state, 300));
     Ok(())
 }
