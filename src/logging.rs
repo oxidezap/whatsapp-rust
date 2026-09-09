@@ -341,12 +341,17 @@ impl Builder {
                 Ok(())
             }
             Err(_) => {
-                match log::set_logger(&REJECTED) {
-                    Ok(()) => panic!(
-                        "logging::try_init found no installed logger after a rejected install"
-                    ),
-                    Err(e) => Err(e),
-                }
+                // The slot is full but the winning thread may not have reached
+                // `log::set_logger` yet. Register the slot value so a racy
+                // loser completes the winner's install instead of failing
+                // against a logger that is not installed yet; when a logger
+                // really is installed this fails the same clean way.
+                let installed = INSTALLED
+                    .get()
+                    .unwrap_or_else(|| panic!("logging::INSTALLED is full, so it must read back"));
+                log::set_logger(installed)?;
+                log::set_max_level(installed.filter.max_level());
+                Ok(())
             }
         }
     }
@@ -372,25 +377,9 @@ fn emit_to_stderr(bytes: &[u8]) {
 }
 
 /// Slot for the installed logger. `OnceLock::set` hands a rejected logger
-/// back for dropping, so failed `try_init` calls leak nothing.
+/// back for dropping, so failed `try_init` calls leak nothing, and a racy
+/// loser installs the slot value rather than failing spuriously.
 static INSTALLED: OnceLock<Logger> = OnceLock::new();
-
-/// Throwaway logger used only to manufacture the `SetLoggerError` value when
-/// the slot above is already full; registering it always fails, with no
-/// observable effect, because a global logger is installed by then.
-struct Rejected;
-
-impl log::Log for Rejected {
-    fn enabled(&self, _: &Metadata) -> bool {
-        false
-    }
-
-    fn log(&self, _: &Record) {}
-
-    fn flush(&self) {}
-}
-
-static REJECTED: Rejected = Rejected;
 
 /// Logger installed by [`Builder`]. Stateless across records except for the
 /// calling thread's scratch buffer, which shrinks after the idle threshold.
@@ -411,6 +400,10 @@ impl Logger {
                         buf: Vec::new(),
                         last_use: wacore::time::Instant::now(),
                     });
+                    // Establish the empty-buffer invariant on entry: a panic
+                    // inside a format closure or sink would otherwise leave
+                    // stale bytes for the next record to append to.
+                    scratch.buf.clear();
                     if scratch.last_use.elapsed() >= idle_after {
                         scratch.buf.shrink_to_fit();
                     }
@@ -481,10 +474,14 @@ mod tests {
         }
     }
 
-    fn capture_logger(default_filter: &str) -> (Logger, Arc<Mutex<Vec<u8>>>) {
+    fn capture_logger(spec: &str) -> (Logger, Arc<Mutex<Vec<u8>>>) {
         let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&captured);
-        let mut builder = Builder::from_env(Env::default().default_filter_or(default_filter));
+        // Parse the spec directly instead of routing through `Env`: an
+        // ambient `RUST_LOG` on the test machine must not override the case
+        // under test. `Env` precedence has its own test below.
+        let mut builder = Builder::new();
+        builder.filter = parse_filter(spec);
         let mut logger = builder.build();
         logger.emit = Arc::new(move |bytes: &[u8]| {
             sink.lock()
@@ -631,10 +628,46 @@ mod tests {
 
     #[test]
     fn max_level_covers_configured_directives() {
-        let mut named = Builder::from_env(Env::default().default_filter_or("foo=off"));
+        let mut named = Builder::new();
+        named.filter = parse_filter("foo=off");
         assert_eq!(named.build().filter.max_level(), LevelFilter::Off);
-        let mut global = Builder::from_env(Env::default().default_filter_or("info,foo=off"));
+        let mut global = Builder::new();
+        global.filter = parse_filter("info,foo=off");
         assert_eq!(global.build().filter.max_level(), LevelFilter::Info);
+    }
+
+    #[test]
+    fn env_variable_overrides_the_default() {
+        // Unique variable name so no other test or ambient environment can
+        // observe it; the set/remove pair is scoped to this test.
+        const VAR: &str = "WR_R3_LOGGING_TEST_FILTER";
+        unsafe {
+            std::env::remove_var(VAR);
+        }
+        let unset = Env::default().filter_or(VAR, "info").resolve();
+        assert!(
+            unset.enabled(
+                &Metadata::builder()
+                    .level(log::Level::Info)
+                    .target("app")
+                    .build()
+            )
+        );
+        unsafe {
+            std::env::set_var(VAR, "off");
+        }
+        let set = Env::default().filter_or(VAR, "info").resolve();
+        assert!(
+            !set.enabled(
+                &Metadata::builder()
+                    .level(log::Level::Error)
+                    .target("app")
+                    .build()
+            )
+        );
+        unsafe {
+            std::env::remove_var(VAR);
+        }
     }
 
     #[test]
