@@ -4271,6 +4271,38 @@ impl CallHandle {
         Ok(())
     }
 
+    /// Re-ask for video on a live call: re-emit `<video state=11 dec="H264">`
+    /// without touching endpoints or the initiation guard.
+    ///
+    /// `begin_video(Initiate)` refuses once local video is requested or
+    /// enabled, so an upgrade request the peer never answered cannot be asked
+    /// again through it. This mints a fresh epoch under the reached state and
+    /// sends the identical stanza shape; media, teardown hooks, and the
+    /// previous timeout are the original initiation's and stay untouched,
+    /// except a new timeout is armed for the fresh epoch (the old one goes
+    /// inert on the epoch mismatch). Refuses on audio-only calls, which stay
+    /// on the begin path.
+    pub async fn re_request_video_upgrade(&self) -> Result<(), CallError> {
+        self.ensure_current()?;
+        let client = self.upgrade_client()?;
+        let epoch = self
+            .client_registry
+            .re_request_local_video(&self.call_id, self.generation)
+            .ok_or(CallError::Media("no live video to re-request"))?;
+        let stanza = build_video_state(&VideoStateParams {
+            call_id: &self.call_id,
+            to: &self.peer_jid(),
+            id: &client.generate_request_id(),
+            call_creator: &self.call_creator,
+            state: VideoState::UpgradeRequestV2,
+            dec: Some(VIDEO_DEC_REQUEST),
+            device_orientation: Some(self.local_video_orientation()),
+        });
+        client.send_node(stanza).await?;
+        self.spawn_video_upgrade_timeout(epoch, client);
+        Ok(())
+    }
+
     /// Stop our video direction: sends `<video state=6>` (Stopped, no marker), tears the local
     /// video plane down, and releases the source/sink. The peer may keep sending its direction;
     /// audio is untouched. Idempotent.
@@ -10972,6 +11004,59 @@ mod tests {
                 .expect("session")
                 .is_video,
             "start_video must mark the session as video"
+        );
+        handle.hangup_local().await;
+    }
+
+    // A caller-side upgrade the peer never answered must be askable again: the
+    // begin path refuses a second initiation on live video, so the re-request
+    // API re-emits the identical stanza shape under a fresh epoch.
+    #[tokio::test]
+    async fn re_request_video_upgrade_resends_request_shape_on_live_video() {
+        let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle
+            .re_request_video_upgrade()
+            .await
+            .expect("re-request on live video");
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("re-request must be sent")
+            .expect("waiter");
+        let r = node.as_node_ref();
+        assert!(
+            r.attrs()
+                .optional_string("id")
+                .is_some_and(|id| !id.is_empty()),
+            "the <call> wrapper needs an id so the peer's typed video ack correlates"
+        );
+        let action = call_action_of(&node);
+        let ar = action.as_node_ref();
+        assert_eq!(ar.tag, "video");
+        assert_eq!(ar.attrs().optional_string("state").as_deref(), Some("11"));
+        assert_eq!(ar.attrs().optional_string("dec").as_deref(), Some("H264"));
+        assert_eq!(
+            ar.attrs().optional_string("device_orientation").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            ar.attrs().optional_string("voip_settings").as_deref(),
+            Some("video"),
+            "the re-request must carry the marker attr like the initial request"
+        );
+        handle.hangup_local().await;
+    }
+
+    // Audio-only calls stay on the begin path: with no video state there is
+    // nothing to re-request.
+    #[tokio::test]
+    async fn re_request_video_upgrade_refuses_audio_only_call() {
+        let (_client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        assert!(
+            handle.re_request_video_upgrade().await.is_err(),
+            "audio-only call must refuse the re-request"
         );
         handle.hangup_local().await;
     }

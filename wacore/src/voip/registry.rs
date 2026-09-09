@@ -2674,6 +2674,28 @@ impl CallRegistry {
         Some(epoch)
     }
 
+    /// Re-issue a local upgrade request on live video and return its epoch.
+    ///
+    /// Unlike [`Self::begin_local_video_request`], which refuses once local
+    /// video is requested or enabled, this is the re-request path: the
+    /// handshake already reached a video state (requested and awaiting the
+    /// peer, or enabled) and the caller needs to ask again, e.g. the peer
+    /// never answered. It mints a fresh epoch and re-arms the pending self
+    /// request without touching the reached state, so a peer answer still
+    /// applies and the previous timeout goes inert (its epoch no longer
+    /// matches). Returns `None` when there is no video to re-request
+    /// (audio-only), which stays on the begin path.
+    pub fn re_request_local_video(&self, call_id: &str, generation: u64) -> Option<u64> {
+        let mut map = self.active_calls();
+        let entry = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)?;
+        if entry.video.self_state.is_inactive_for_call_mode() {
+            return None;
+        }
+        Some(entry.video.next_self_request())
+    }
+
     /// Complete a peer request only when the same request is still pending.
     pub fn complete_peer_video_request(&self, call_id: &str, token: VideoUpgradeToken) -> bool {
         let mut map = self.active_calls();
@@ -5229,6 +5251,32 @@ mod tests {
             Some((VideoState::Disabled, VideoState::Disabled))
         );
         assert!(!reg.snapshot("CID").expect("session").is_video);
+    }
+
+    // A re-request on live video mints a fresh epoch under the reached state:
+    // the previous timeout goes inert on the epoch mismatch instead of
+    // tearing down the newer request.
+    #[test]
+    fn re_request_mints_a_fresh_epoch_without_leaving_requested_state() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        assert!(
+            reg.re_request_local_video("CID", generation).is_none(),
+            "audio-only has nothing to re-request"
+        );
+        let first = reg
+            .begin_local_video_request("CID", generation)
+            .expect("begin");
+        let second = reg
+            .re_request_local_video("CID", generation)
+            .expect("re-request");
+        assert_ne!(first, second);
+        assert!(!reg.end_local_video_request("CID", generation, first));
+        assert_eq!(
+            reg.video_states("CID", generation),
+            Some((VideoState::UpgradeRequestV2, VideoState::Disabled))
+        );
+        assert!(reg.end_local_video_request("CID", generation, second));
     }
 
     #[test]
