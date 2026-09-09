@@ -307,6 +307,10 @@ impl<K: Hash + Eq + Clone, V> SyncTtlGuard<'_, K, V> {
         }
     }
 
+    pub(crate) fn remove(&mut self, key: &K) {
+        self.inner.remove_key(key);
+    }
+
     pub(crate) fn find_unique_key(&self, matches: impl Fn(&K, &V) -> bool) -> Option<K> {
         let mut found = self.inner.iter().filter_map(|(key, entry)| {
             if self

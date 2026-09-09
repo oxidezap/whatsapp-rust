@@ -266,6 +266,14 @@ pub(crate) struct PublicationGuard {
     owner: Option<Arc<AtomicU8>>,
 }
 
+/// Duplicate-probe answer with the plaintext already resolved: dispatch must
+/// reuse it instead of resolving the parent secret a second time. Boxed: the
+/// mismatch path is rare and `wa::Message` is close to a kilobyte.
+pub(crate) enum ProbeOutcome {
+    Suppress,
+    Proceed { decrypted: Option<Box<wa::Message>> },
+}
+
 impl PublicationGuard {
     fn owner(&mut self) -> Arc<AtomicU8> {
         Arc::clone(

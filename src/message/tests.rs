@@ -10405,6 +10405,119 @@ async fn secret_encrypted_edit_decrypts_via_resolver_when_store_empty() {
 }
 
 #[tokio::test]
+async fn secret_encrypted_resend_resolves_parent_secret_once() {
+    use crate::cache_config::{CacheConfig, MsgSecretPolicy};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wacore::messages::MessageUtils;
+
+    struct CountingResolver {
+        chat: String,
+        sender: String,
+        msg_id: String,
+        secret: [u8; 32],
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl wacore::msg_secret::OriginalMessageResolver for CountingResolver {
+        async fn resolve_msg_secret(
+            &self,
+            chat: &str,
+            sender: &str,
+            msg_id: &str,
+        ) -> Option<[u8; 32]> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            (chat == self.chat && sender == self.sender && msg_id == self.msg_id)
+                .then_some(self.secret)
+        }
+    }
+
+    let chat = "5511777776666@s.whatsapp.net";
+    let parent_id = "COUNTED_PARENT";
+    let edit_id = "COUNTED_EDIT";
+    let secret = [0x7Au8; 32];
+    let resolver = Arc::new(CountingResolver {
+        chat: chat.to_string(),
+        sender: chat.to_string(),
+        msg_id: parent_id.to_string(),
+        secret,
+        calls: AtomicUsize::new(0),
+    });
+    // Disabled persists nothing, so every decrypt consults the resolver.
+    let cfg = CacheConfig {
+        msg_secret_policy: MsgSecretPolicy::Disabled,
+        original_message_resolver: Some(resolver.clone()),
+        ..Default::default()
+    };
+    let client = crate::test_utils::create_test_client_with_config(
+        "resolver_handoff",
+        Arc::new(MockHttpClient),
+        cfg,
+    )
+    .await;
+    seed_test_pn(&client).await;
+
+    let (handler, events) = wacore::types::events::ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let info = Arc::new(MessageInfo {
+        id: edit_id.into(),
+        source: crate::types::message::MessageSource {
+            chat: chat.parse().unwrap(),
+            sender: chat.parse().unwrap(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let target_key = wa::MessageKey {
+        remote_jid: Some(chat.to_string()),
+        from_me: Some(false),
+        id: Some(parent_id.to_string()),
+        participant: None,
+    };
+    let mut first_calls = 0;
+    for (index, text) in ["first", "second"].iter().enumerate() {
+        let msg = encrypted_message_edit(
+            target_key.clone(),
+            chat,
+            chat,
+            parent_id,
+            &secret,
+            text,
+            None,
+        );
+        client
+            .clone()
+            .handle_decrypted_plaintext(
+                "msg",
+                MessageUtils::encode_and_pad(&msg),
+                2,
+                0,
+                Default::default(),
+                &info,
+            )
+            .await
+            .unwrap();
+        if index == 0 {
+            first_calls = resolver.calls.load(Ordering::Relaxed);
+            assert!(
+                first_calls > 0,
+                "the first delivery must resolve the parent secret"
+            );
+        }
+    }
+    assert_eq!(
+        resolver.calls.load(Ordering::Relaxed),
+        2 * first_calls,
+        "a mismatched resend must reuse the probe's plaintext instead of resolving again"
+    );
+    assert_eq!(
+        message_events_for_id(&events, edit_id).0,
+        2,
+        "both distinct parts must still dispatch"
+    );
+}
+
+#[tokio::test]
 async fn decrypted_message_edit_recaptures_secret_for_next_edit() {
     let (client, _transport) = capturing_client("secret_edit_chain").await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
@@ -15411,6 +15524,43 @@ mod pdo_alias_tests {
             "an interrupted recovery must not suppress the ordinary retry"
         );
         live.complete();
+    }
+
+    #[tokio::test]
+    async fn pdo_publication_pruned_empty_claim_still_resolves_alias() {
+        let (client, _) = client().await;
+        let lid = info(Shape::Incoming);
+        let payload = wa::Message {
+            conversation: Some("alias payload".into()),
+            ..Default::default()
+        };
+        let fingerprint = MessageDispatch::fingerprint(&payload);
+        let mut interrupted = PublicationGuard::default();
+        assert!(!client.admit_message_dispatch(
+            &lid,
+            true,
+            Some(fingerprint),
+            false,
+            &mut interrupted
+        ));
+        drop(interrupted);
+        let pn = Arc::new(MessageInfo {
+            id: ID.into(),
+            source: MessageSource {
+                chat: PN.parse().unwrap(),
+                sender: PN.parse().unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut recovery = PublicationGuard::default();
+        assert!(!client.admit_message_dispatch(&pn, true, Some(fingerprint), false, &mut recovery));
+        recovery.complete();
+        let mut late = PublicationGuard::default();
+        assert!(
+            client.admit_message_dispatch(&lid, false, Some(fingerprint), false, &mut late),
+            "a pruned empty claim must not block alias resolution to the completed recovery"
+        );
     }
 
     #[tokio::test]

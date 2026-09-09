@@ -21,6 +21,16 @@ impl Client {
     ) -> R {
         let key = Self::dispatch_key(info);
         self.dispatched_messages.with(|cache| {
+            if cache.get(&key).is_some_and(|claim| {
+                claim.prune();
+                claim.payloads.is_empty()
+            }) {
+                // A claim left with no live payloads is absent: every owner
+                // rolled back. Drop the stale key so the alternate-spelling
+                // lookup below still runs instead of treating the empty claim
+                // as authoritative.
+                cache.remove(&key);
+            }
             if let Some(claim) = cache.get(&key) {
                 claim.prune();
                 if !pdo && claim.alias.is_none() {
@@ -111,35 +121,43 @@ impl Client {
         })
     }
 
-    pub(crate) async fn suppress_recovered_or_dispatched(
+    pub(crate) async fn probe_message_dispatch(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
         message: &wa::Message,
-    ) -> bool {
+    ) -> ProbeOutcome {
         if !self.dispatch_gate_enabled()
             || !self.with_message_dispatch(info, false, |claim| claim.has_deliveries())
         {
-            return false;
+            return ProbeOutcome::Proceed { decrypted: None };
         }
-        let decrypted;
-        let message = if crate::features::message_edit::carries_secret_encrypted(message) {
-            let Some(inner) = self
+        // A message we cannot materialize compares as its envelope; dispatch
+        // retries the lookup after capturing, so an undecryptable probe must
+        // not suppress.
+        let decrypted = if crate::features::message_edit::carries_secret_encrypted(message) {
+            match self
                 .maybe_decrypt_secret_encrypted_message(message, info)
                 .await
-            else {
-                return false;
-            };
-            decrypted = inner;
-            &decrypted
+            {
+                Some(inner) => Some(inner),
+                None => return ProbeOutcome::Proceed { decrypted: None },
+            }
         } else {
-            message
+            None
         };
-        let fingerprint = MessageDispatch::fingerprint(message);
-        self.with_message_dispatch(info, false, |claim| {
+        let candidate = decrypted.as_ref().map_or(message, |inner| inner);
+        let fingerprint = MessageDispatch::fingerprint(candidate);
+        if self.with_message_dispatch(info, false, |claim| {
             claim.state(&fingerprint).is_some_and(|state| {
                 state != MessageDispatch::Recovered || self.inbound_durability_hook.get().is_none()
             })
-        })
+        }) {
+            ProbeOutcome::Suppress
+        } else {
+            ProbeOutcome::Proceed {
+                decrypted: decrypted.map(Box::new),
+            }
+        }
     }
 
     #[cfg(test)]
@@ -228,6 +246,20 @@ impl Client {
         info: &Arc<MessageInfo>,
         track_commit: bool,
     ) -> InboundCommitState {
+        self.dispatch_parsed_message_with_decrypted(msg, info, track_commit, None)
+            .await
+    }
+
+    /// Same as [`Self::dispatch_parsed_message`], but reuses a plaintext the
+    /// duplicate probe already materialized instead of resolving the parent
+    /// secret a second time.
+    pub(crate) async fn dispatch_parsed_message_with_decrypted(
+        self: &Arc<Self>,
+        msg: wa::Message,
+        info: &Arc<MessageInfo>,
+        track_commit: bool,
+        pre_decrypted: Option<wa::Message>,
+    ) -> InboundCommitState {
         use wacore::proto_helpers::MessageExt;
         wacore::telemetry::recv("decrypted");
         self.stats.record_message_received();
@@ -240,9 +272,13 @@ impl Client {
         // Keep this ordered with dispatch; add-on messages can immediately
         // reference the secret from the stanza just processed.
         self.maybe_capture_inbound_msg_secret(&msg, info).await;
-        let decrypted = self
-            .maybe_decrypt_secret_encrypted_message(&msg, info)
-            .await;
+        let decrypted = match pre_decrypted {
+            Some(inner) => Some(inner),
+            None => {
+                self.maybe_decrypt_secret_encrypted_message(&msg, info)
+                    .await
+            }
+        };
         // A decrypted comment surfaces as its inner body Message, which has no
         // slot for the parent post key; carry the threading link beside it.
         let comment_target = if decrypted.is_some() {
