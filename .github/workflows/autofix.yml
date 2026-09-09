@@ -1,0 +1,27 @@
+name: autofix.ci # needed to securely identify the workflow
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  autofix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Same pinned toolchain as the Format Check job in main.yml, so the
+      # fixer and the gate never disagree on formatting.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+          components: rustfmt
+      # rustfmt only: it is deterministic and never changes semantics. Clippy
+      # stays a manual gate — `clippy --fix` can rewrite logic, and the
+      # generated-artifacts and bartender-pin checks in main.yml must stay
+      # human-reviewed, never auto-committed.
+      - run: cargo fmt --all
+      - uses: autofix-ci/action@c5b2d67aa2274e7b5a18224e8171550871fc7e4a
