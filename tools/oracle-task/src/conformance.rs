@@ -49,23 +49,25 @@ pub fn run(root: &Path, slow: bool) -> Result<()> {
         )?;
     }
     if slow {
-        xtask_support::run(
-            std::process::Command::new(cargo)
-                .args([
-                    "test",
-                    "--release",
-                    "--locked",
-                    "-p",
-                    "oracle-core",
-                    "--test",
-                    "signaling",
-                    "--",
-                    "--ignored",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .current_dir(root),
-        )?;
+        for target in ["signaling", "video_offer"] {
+            xtask_support::run(
+                std::process::Command::new(&cargo)
+                    .args([
+                        "test",
+                        "--release",
+                        "--locked",
+                        "-p",
+                        "oracle-core",
+                        "--test",
+                        target,
+                        "--",
+                        "--ignored",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .current_dir(root),
+            )?;
+        }
     }
     println!("VoIP conformance gates passed");
     Ok(())
