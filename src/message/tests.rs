@@ -15324,6 +15324,36 @@ mod pdo_alias_tests {
     }
 
     #[tokio::test]
+    async fn pdo_publication_interrupted_admission_is_treated_as_absent() {
+        let fingerprint = [0xA5; 32];
+        let mut claim = DispatchClaim::default();
+        let mut interrupted = PublicationGuard::default();
+        assert!(!claim.admit(fingerprint, true, false, &mut interrupted));
+        drop(interrupted);
+        let mut live = PublicationGuard::default();
+        assert!(
+            !claim.admit(fingerprint, true, false, &mut live),
+            "an interrupted PDO admission must not suppress redelivery"
+        );
+        live.complete();
+        assert!(
+            claim.state(&fingerprint).is_some(),
+            "redelivery is admitted under the live guard"
+        );
+
+        let mut claim = DispatchClaim::default();
+        let mut interrupted = PublicationGuard::default();
+        assert!(!claim.admit(fingerprint, true, false, &mut interrupted));
+        drop(interrupted);
+        let mut live = PublicationGuard::default();
+        assert!(
+            !claim.admit(fingerprint, false, false, &mut live),
+            "an interrupted recovery must not suppress the ordinary retry"
+        );
+        live.complete();
+    }
+
+    #[tokio::test]
     async fn pdo_publication_payload_capacity_fails_open() {
         let (client, events) = client().await;
         let info = info(Shape::Incoming);

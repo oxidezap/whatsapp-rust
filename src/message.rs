@@ -311,11 +311,10 @@ impl DispatchClaim {
         hook_committed: bool,
         publication: &mut PublicationGuard,
     ) -> bool {
-        if let Some(payload) = self
-            .payloads
-            .iter_mut()
-            .find(|payload| payload.fingerprint == fingerprint)
-        {
+        if let Some(payload) = self.payloads.iter_mut().find(|payload| {
+            payload.fingerprint == fingerprint
+                && payload.publication.load(Ordering::Acquire) != PUBLICATION_INTERRUPTED
+        }) {
             if pdo {
                 return true;
             }
