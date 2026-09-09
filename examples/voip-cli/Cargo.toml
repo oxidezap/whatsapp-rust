@@ -21,7 +21,6 @@ anyhow = { workspace = true }
 async-channel = { workspace = true }
 bytes = { workspace = true }
 cpal = "0.18"
-env_logger = { workspace = true }
 hex = { workspace = true }
 log = { workspace = true }
 portable-atomic = { workspace = true }

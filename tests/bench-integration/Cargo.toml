@@ -8,7 +8,6 @@ publish = false
 [dependencies]
 divan = { workspace = true }
 e2e-tests = { path = "../e2e" }
-env_logger = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 whatsapp-rust = { path = "../..", default-features = false, features = [
     "danger-skip-tls-verify",

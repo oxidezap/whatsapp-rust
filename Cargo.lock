@@ -385,7 +385,6 @@ version = "0.0.0"
 dependencies = [
  "codspeed-divan-compat",
  "e2e-tests",
- "env_logger",
  "tokio",
  "whatsapp-rust",
 ]
@@ -5804,7 +5803,6 @@ dependencies = [
  "async-channel",
  "bytes",
  "cpal",
- "env_logger",
  "hex",
  "log",
  "portable-atomic",
