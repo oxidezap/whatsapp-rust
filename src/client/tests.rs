@@ -3686,9 +3686,12 @@ async fn runtime_cache_config_honors_disabled_recent_cache() {
 fn client_size_pins_runtime_cache_config_saving() {
     use std::mem::size_of;
 
-    // Measured `size_of::<Client>()` at the head of the #1482 follow-ups,
-    // default features. Optional fields stack on top without padding loss.
-    let mut expected = 4296;
+    // Measured fixed part of `size_of::<Client>()` at the head of the #1482
+    // follow-ups, default features, no subsystem attached. Every
+    // size-varying attachment is measured in this same build and stacked on
+    // top, so no feature combination false-fails: only an unaccounted layout
+    // move trips the assert.
+    let mut expected = 4296 + size_of::<subsystem::Subsystems>();
     if cfg!(feature = "client-lifecycle") {
         expected += size_of::<std::sync::Mutex<()>>() + size_of::<Option<Arc<()>>>();
     }
@@ -3700,8 +3703,9 @@ fn client_size_pins_runtime_cache_config_saving() {
         expected,
         "Client layout moved; if a field was added or removed on purpose, \
          re-measure with `cargo test -p whatsapp-rust --lib \
-         client_size_pins_runtime_cache_config_saving` under default and \
-         `--features client-lifecycle,plugins` and update the base",
+         client_size_pins_runtime_cache_config_saving` under default, \
+         `--features client-lifecycle,plugins`, and the CI feature set, \
+         then update the base",
     );
 }
 
