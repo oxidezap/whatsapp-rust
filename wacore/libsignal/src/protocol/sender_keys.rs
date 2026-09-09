@@ -1603,12 +1603,27 @@ mod tests {
     }
 
     /// The slim state keeps only the id and the signing message. Dropping the
-    /// always-empty protobuf `Vec` (24 bytes) and `MessageField` (8 bytes)
-    /// must shrink the inline struct from 256 to 224 bytes.
+    /// always-empty protobuf `Vec` (three words) and `MessageField` (one word)
+    /// saves exactly those four words off the inline struct on every target.
     #[test]
     fn sender_key_state_layout_dropped_the_protobuf_copies() {
-        assert_eq!(size_of::<SenderKeyState>(), 224);
-        assert_eq!(size_of::<SenderKeyStateStructure>(), 48);
+        // Width-independent: narrower pointers on 32-bit targets shrink the
+        // saving, so only its composition is asserted here.
+        assert_eq!(
+            size_of::<Vec<sender_key_state_structure::SenderMessageKey>>()
+                + size_of::<MessageField<sender_key_state_structure::SenderChainKey>>(),
+            4 * size_of::<usize>()
+        );
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(size_of::<SenderKeyState>(), 224);
+            assert_eq!(size_of::<SenderKeyStateStructure>(), 48);
+        }
+        #[cfg(target_pointer_width = "32")]
+        {
+            assert_eq!(size_of::<SenderKeyState>(), 204);
+            assert_eq!(size_of::<SenderKeyStateStructure>(), 28);
+        }
     }
 
     /// States decoded from structurally incomplete records (missing id,
