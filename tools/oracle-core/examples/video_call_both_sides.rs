@@ -333,10 +333,14 @@ fn main() -> Result<()> {
         "census video offer",
     )?;
 
-    // Answerer differential, if the engine emitted an accept.
+    // Answerer differential, if the engine emitted an accept. The vendor value
+    // is the inner `<accept>` node while `build_accept` returns the outer
+    // `<call>` wrapper, so descend into the wrapper first, as the offer
+    // comparison does; comparing wrapper children would report the protocol
+    // fields against `["accept"]`.
     match emitted.iter().find(|n| n.tag == "accept") {
         Some(vendor_accept) => {
-            let rust_accept = build_accept(&AcceptParams {
+            let rust_wrapper = build_accept(&AcceptParams {
                 call_id: CALL_ID,
                 to: &peer,
                 id: "2",
@@ -350,6 +354,11 @@ fn main() -> Result<()> {
                 peer_abtest_bucket: None,
                 peer_abtest_bucket_id_list: None,
             });
+            let rust_accept = children_of(&rust_wrapper)
+                .iter()
+                .find(|c| c.tag == "accept")
+                .cloned()
+                .context("rust accept wrapper holds no <accept>")?;
             println!(
                 "VERDICT answerer: vendor accept children {:?} vs rust {:?}",
                 child_tags(vendor_accept),

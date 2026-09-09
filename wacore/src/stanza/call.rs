@@ -2016,7 +2016,7 @@ mod tests {
                 .attr("call-creator", fake_caller_lid())
                 .attr("call-id", "CID")
                 .attr("count", "0")
-                .attr("reason", REJECT_REASON_ENC)
+                .attr("reason", "enc")
                 .children([NodeBuilder::new("registration")
                     .bytes(0x12345678u32.to_be_bytes().to_vec())
                     .build()])
