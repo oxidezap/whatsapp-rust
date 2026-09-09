@@ -275,3 +275,14 @@ where
         }
     }
 }
+
+impl<K, V> TypedCache<K, V> {
+    /// Test-only clone of the backing custom store (`None` for the in-process backend).
+    #[cfg(test)]
+    pub(crate) fn custom_store_for_tests(&self) -> Option<Arc<dyn CacheStore>> {
+        match &self.inner {
+            Inner::Local(_) => None,
+            Inner::Custom { store, .. } => Some(Arc::clone(store)),
+        }
+    }
+}
