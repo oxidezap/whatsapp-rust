@@ -480,6 +480,7 @@ impl<K: Hash + Eq + Clone, V> SyncTtlGuard<'_, K, V> {
                 .is_some_and(|ttl| self.now.saturating_duration_since(entry.inserted_at) >= ttl)
         }) {
             self.inner.remove_key(key);
+            self.inner.shrink_if_empty();
         }
         self.inner.get_mut(key).map(|entry| {
             entry
@@ -502,6 +503,7 @@ impl<K: Hash + Eq + Clone, V> SyncTtlGuard<'_, K, V> {
 
     pub(crate) fn remove(&mut self, key: &K) {
         self.inner.remove_key(key);
+        self.inner.shrink_if_empty();
     }
 
     pub(crate) fn find_unique_key(&self, matches: impl Fn(&K, &V) -> bool) -> Option<K> {
@@ -605,10 +607,22 @@ impl<K: Hash + Eq + Clone, V: Clone> SyncTtlCache<K, V> {
         for key in expired {
             inner.remove_key(&key);
         }
+        inner.shrink_if_empty();
     }
 
     pub(crate) fn entry_count(&self) -> u64 {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).len() as u64
+    }
+
+    /// Hash-table buckets currently allocated. Test-only: lets the
+    /// shrink-on-empty test observe the table itself, not just entry counts.
+    #[cfg(test)]
+    pub(crate) fn table_capacity(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .table
+            .capacity()
     }
 }
 
@@ -681,6 +695,21 @@ where
     fn clear(&mut self) {
         self.table.clear();
         self.order.clear();
+    }
+
+    /// Release the slot table's buckets once it holds nothing.
+    ///
+    /// Called only from the synchronous TTL cache (the dispatch-once dedup
+    /// table): hashbrown never shrinks on remove, so a burst that grew the
+    /// table to thousands of buckets kept them with zero entries until the
+    /// next burst. The threshold is empty, not a low-water mark: any
+    /// non-empty table may regrow on the very next insert, paying a realloc
+    /// per dip, while an empty table serves no lookup and frees one
+    /// allocation with no entries to rehash.
+    fn shrink_if_empty(&mut self) {
+        if self.table.is_empty() {
+            self.table.shrink_to(0, |slot| slot.hash);
+        }
     }
 
     /// Borrowed removal: the `order` side is keyed by the entry's own `seq`,
@@ -1803,6 +1832,58 @@ mod tests {
         disabled.insert(1, 1);
         assert_eq!(disabled.get(&1), None);
         assert_eq!(disabled.entry_count(), 0);
+    }
+
+    #[test]
+    fn empty_dedup_table_releases_its_buckets_and_serves_the_next_burst() {
+        const BURST: u32 = 4_000;
+        let cache = SyncTtlCache::new(u64::from(BURST) * 4, None);
+        let cold_start = Instant::now();
+        for key in 0..BURST {
+            cache.insert(key, key);
+        }
+        let cold_fill = cold_start.elapsed();
+        let grown = cache.table_capacity();
+        assert!(
+            grown >= 4096,
+            "churn must grow the table to production size, got {grown} buckets"
+        );
+        let grown_bytes = cache.memory_stats(|_, _| 0).bytes;
+
+        for key in 0..BURST {
+            cache.with(|guard| guard.remove(&key));
+        }
+        assert_eq!(cache.entry_count(), 0);
+        let shrunk = cache.table_capacity();
+        assert!(
+            shrunk < grown,
+            "empty table must release its buckets: {grown} -> {shrunk}"
+        );
+        assert_eq!(
+            shrunk, 0,
+            "empty table must release all buckets: {grown} -> {shrunk}"
+        );
+        let shrunk_bytes = cache.memory_stats(|_, _| 0).bytes;
+        assert_eq!(
+            shrunk_bytes, 0,
+            "empty table must retain no structural bytes"
+        );
+        eprintln!(
+            "dedup shrink: {grown} -> {shrunk} buckets, {grown_bytes} -> {shrunk_bytes} structural bytes (cold fill took {cold_fill:?})"
+        );
+
+        let start = Instant::now();
+        for key in 0..BURST {
+            cache.insert(key, key);
+        }
+        let regrow_fill = start.elapsed();
+        for key in 0..BURST {
+            assert_eq!(cache.get(&key), Some(key));
+        }
+        eprintln!(
+            "dedup regrow: {BURST} inserts in {regrow_fill:?} (cold fill took {cold_fill:?})"
+        );
+        assert_eq!(cache.entry_count(), u64::from(BURST));
     }
 
     #[tokio::test]
