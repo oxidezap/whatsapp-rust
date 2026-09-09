@@ -2005,6 +2005,33 @@ mod tests {
         }
     }
 
+    /// A `<reject>` from a device that could not decrypt the offer carries `reason="enc"`. The
+    /// pinned whatspec IR models `reason` as an opaque string (`WAWebHandleVoipCall` dispatcher,
+    /// `WAWebHandleVoipCallReceipt` parser; no reject-reason wire enum in the catalog), so the
+    /// parser must preserve it verbatim for the handler's per-device dispatch.
+    #[test]
+    fn reject_preserves_an_enc_reason() {
+        let node = base_call_builder()
+            .children([NodeBuilder::new("reject")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CID")
+                .attr("count", "0")
+                .attr("reason", REJECT_REASON_ENC)
+                .children([NodeBuilder::new("registration")
+                    .bytes(0x12345678u32.to_be_bytes().to_vec())
+                    .build()])
+                .build()])
+            .build();
+
+        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+        match call.action {
+            CallAction::Reject { reason, .. } => {
+                assert_eq!(reason.as_deref(), Some(REJECT_REASON_ENC));
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
     /// The failure case for the above: an explicit decline carries no `reason`, and must not be
     /// confused with a busy device.
     #[test]
