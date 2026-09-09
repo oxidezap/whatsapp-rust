@@ -15020,6 +15020,25 @@ mod pdo_alias_tests {
     }
 
     #[test]
+    fn pdo_alias_fingerprint_thread_scratch_does_not_retain_huge_buffers() {
+        let big = wa::Message {
+            conversation: Some("x".repeat(200_000)),
+            ..Default::default()
+        };
+        let _ = MessageDispatch::fingerprint(&big);
+        let capacity = FINGERPRINT_SCRATCH.with(|scratch| scratch.borrow().capacity());
+        assert!(
+            capacity <= 64 * 1024,
+            "thread scratch retained {capacity} bytes after a huge message"
+        );
+        let small = wa::Message {
+            conversation: Some("ok".into()),
+            ..Default::default()
+        };
+        let _ = MessageDispatch::fingerprint(&small);
+    }
+
+    #[test]
     fn pdo_alias_fingerprint_matches_wire_encoding() {
         use sha2::{Digest, Sha256};
         for message in [

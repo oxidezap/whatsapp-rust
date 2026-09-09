@@ -359,7 +359,11 @@ impl DispatchClaim {
 
 // Rare-path callers (PDO recovery, duplicate probes) share one encode buffer
 // per thread instead of allocating a message-sized `Vec` per call. Borrowed
-// synchronously only, never held across an await.
+// synchronously only, never held across an await. Capacity stays bounded: one
+// huge message must not pin a huge buffer on the worker for the rest of the
+// process.
+const MAX_FINGERPRINT_SCRATCH_BYTES: usize = 64 * 1024;
+
 std::thread_local! {
     static FINGERPRINT_SCRATCH: std::cell::RefCell<Vec<u8>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -373,7 +377,12 @@ impl MessageDispatch {
     pub(crate) fn fingerprint(message: &wa::Message) -> [u8; 32] {
         FINGERPRINT_SCRATCH.with(|scratch| {
             let mut scratch = scratch.borrow_mut();
-            Self::fingerprint_into(message, &mut scratch)
+            let fingerprint = Self::fingerprint_into(message, &mut scratch);
+            if scratch.capacity() > MAX_FINGERPRINT_SCRATCH_BYTES {
+                scratch.clear();
+                scratch.shrink_to(MAX_FINGERPRINT_SCRATCH_BYTES);
+            }
+            fingerprint
         })
     }
 
