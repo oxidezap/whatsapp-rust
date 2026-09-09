@@ -842,10 +842,15 @@ pub fn build_accept(p: &AcceptParams<'_>) -> Node {
 /// is where one is set and what carries it from there.
 const INITIAL_DEVICE_ORIENTATION: &str = "0";
 
-/// Default initiator-side geometry used by the WaCalls reference.
-const VIDEO_SCREEN_WIDTH: &str = "1920";
-const VIDEO_SCREEN_HEIGHT: &str = "1080";
-
+/// A 1:1 video offer carries no geometry: the captured J engine
+/// (`JgwtTQVeWPm.wasm`, SHA-256
+/// `97259423aea19cc30c1771478e035105cb0d0e64ab4b0297741b62d01deac8db`,
+/// driven via `startVoipCall` with the video flag set) emits
+/// `screen_width="0" screen_height="0"`, and the captured JS never patches
+/// those attributes before the wire. The `1920x1080` we used to send is the
+/// group-call shape (`group_call.rs` keeps it); on a 1:1 offer it left the
+/// callee answering while never rendering our stream.
+///
 /// The codec names a `<video>` advertisement carries. The two attributes use
 /// *different* spellings of the same codec, which is not a typo on either side.
 ///
@@ -879,8 +884,8 @@ fn video_offer_node() -> Node {
     NodeBuilder::new("video")
         .attr("enc", VIDEO_ENC_H264)
         .attr("dec", VIDEO_DEC_H264)
-        .attr("screen_width", VIDEO_SCREEN_WIDTH)
-        .attr("screen_height", VIDEO_SCREEN_HEIGHT)
+        .attr("screen_width", "0")
+        .attr("screen_height", "0")
         .attr("device_orientation", INITIAL_DEVICE_ORIENTATION)
         .build()
 }
@@ -3090,6 +3095,14 @@ mod tests {
         );
         assert_eq!(
             ovr.attrs().optional_string("device_orientation").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            ovr.attrs().optional_string("screen_width").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            ovr.attrs().optional_string("screen_height").as_deref(),
             Some("0")
         );
 
