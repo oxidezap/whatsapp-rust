@@ -223,7 +223,7 @@ mod device_info_tests {
 
     /// The packed layout is the whole point; a field added carelessly would
     /// undo it silently. Exact: the packing is the contract. Rebaseline per
-    /// [layout asserts](../../agent_docs/layout_asserts.md).
+    /// [layout asserts](../../../agent_docs/layout_asserts.md).
     #[test]
     fn a_device_entry_is_eight_bytes() {
         assert_eq!(size_of::<DeviceInfo>(), 8);
@@ -295,7 +295,7 @@ mod device_info_tests {
     /// `Option<Box<str>>` rather than `String` + `Vec` + `Option<String>` is
     /// what keeps it within 64 bytes instead of 88. Budget, not contract:
     /// a smaller record is never a failure. Rebaseline per
-    /// [layout asserts](../../agent_docs/layout_asserts.md).
+    /// [layout asserts](../../../agent_docs/layout_asserts.md).
     #[test]
     fn a_device_list_record_fits_sixty_four_bytes() {
         assert!(

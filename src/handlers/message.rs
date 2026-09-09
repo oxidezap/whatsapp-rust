@@ -396,7 +396,7 @@ mod tests {
     }
 
     // Exact and width independent: the entry must stay two handles.
-    // Rebaseline per [layout asserts](../agent_docs/layout_asserts.md).
+    // Rebaseline per [layout asserts](../../agent_docs/layout_asserts.md).
     #[test]
     fn queued_chat_message_keeps_two_handles() {
         assert_eq!(size_of::<QueuedChatMessage>(), 2 * size_of::<usize>());

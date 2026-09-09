@@ -37,9 +37,6 @@ Exact, kept exact:
   costs the caller nothing.
 - `Slot<String, u32> > PlainSlot<String, u32>` in `src/portable_cache.rs`.
   Relational: the managed slot must cost more than the plain one.
-- `Slot<DispatchKey, DispatchClaim>` under the spelled-out-identity slot in
-  `src/portable_cache.rs`. Relational: the comparison type carries the
-  budget, so widths and repacks do not matter.
 - `size_of::<Client>()` against a measured base in `src/client/tests.rs`.
   Compositional: the base stacks the fixed part plus each size-varying
   attachment, including feature-gated ones, so only an unaccounted layout
@@ -49,6 +46,11 @@ Exact, kept exact:
   independent. This is the pin that matters there.
 
 Budgets, asserted with `<=`:
+
+- `Slot<DispatchKey, DispatchClaim>` under the spelled-out-identity slot in
+  `src/portable_cache.rs`, 64-bit only. Relational: the comparison type
+  carries the budget, so repacks do not matter, but the gate itself is
+  pointer-width specific.
 
 - `StringHint <= 5`, `ParsedJidMeta <= 5` in `wacore/binary/src/encoder.rs`.
   The hint tape stores one entry per string in the payload, so each byte
@@ -115,6 +117,12 @@ cargo test -p whatsapp-rust --lib retained_bytes_per_device_stay_bounded
 cargo test -p whatsapp-rust --lib an_unbounded_cache_stores_plain_slots_without_metadata
 cargo test -p whatsapp-rust --lib dispatch_gate_slot_stays_below_the_spelled_out_identity
 cargo test -p whatsapp-rust --lib client_size_pins_runtime_cache_config_saving
+cargo test -p whatsapp-rust --features client-lifecycle,plugins --lib client_size_pins_runtime_cache_config_saving
+
+The client-size pin is feature sensitive: run the default and
+`client-lifecycle,plugins` variants above, plus the CI feature set the
+test's own comment names (`cargo xt ci` computes it per package, so read
+the current set off the test before rebaselining).
 cargo test -p whatsapp-rust --lib test_manager_fields_are_inline
 cargo test -p whatsapp-rust --lib handing_back_a_connection_costs_the_caller_nothing
 cargo test -p wacore --lib event_stays_under_its_size_ceiling

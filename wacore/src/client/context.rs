@@ -876,7 +876,7 @@ mod tests {
     /// every identifier short enough to live inline in its `CompactString`.
     /// The two `HashMap`s this replaced needed 2048 buckets for the same 1024
     /// entries and spent 212 bytes per participant. Budget: rebaseline per
-    /// [layout asserts](../../agent_docs/layout_asserts.md).
+    /// [layout asserts](../../../agent_docs/layout_asserts.md).
     #[test]
     fn retained_bytes_per_participant_stay_bounded() {
         use crate::stats::HeapSize;

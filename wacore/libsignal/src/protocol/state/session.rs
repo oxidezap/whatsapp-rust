@@ -2245,7 +2245,7 @@ mod tests {
     /// figure must cover the compact form and must no longer be anywhere
     /// near the protobuf one, or the report would be describing memory the
     /// state no longer holds. Budget: rebaseline per
-    /// [layout asserts](../../../../agent_docs/layout_asserts.md).
+    /// [layout asserts](../../../../../agent_docs/layout_asserts.md).
     #[test]
     fn skipped_message_keys_are_reported_at_their_in_memory_cost() {
         const KEYS: usize = 500;
