@@ -273,12 +273,30 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         Ok(value) => format!("{value:?}"),
         Err(_) => "trap".to_owned(),
     };
-    // Collect queued main-thread work before reading state: with the main
-    // thread registered, answers wait in the proxy queue and only the host
-    // takes them out.
-    for _ in 0..5 {
+    // Collect queued main-thread work to observable quiescence before reading
+    // state: a fixed pass count can sample while activation is still pending,
+    // and processing a callback can enqueue more work. A `false` here marks
+    // the probe suspect, not conclusive.
+    let mut stable = 0;
+    let (mut last_signaling, mut last_log) = (usize::MAX, usize::MAX);
+    let mut quiesced = false;
+    for _ in 0..20 {
         r.process_queued_calls();
         r.refuel();
+        let (signaling, log) = (
+            r.signaling().map(|s| s.len()).unwrap_or(usize::MAX),
+            r.engine_log().len(),
+        );
+        if signaling == last_signaling && log == last_log {
+            stable += 1;
+            if stable >= 3 {
+                quiesced = true;
+                break;
+            }
+        } else {
+            stable = 0;
+            (last_signaling, last_log) = (signaling, log);
+        }
     }
     let immediate = r.call_embind("getCallInfo", &[]);
     r.refuel();
@@ -327,7 +345,7 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
             .iter()
             .any(|l| l.contains("missed by the user"));
         println!(
-            "PROBE {}: delivered={delivered} alive={alive} preaccept_torn_down={torn_down_pre_accept} no-accept: alive_later={alive_later} emitted={emitted} missed={missed}",
+            "PROBE {}: delivered={delivered} quiesced={quiesced} alive={alive} preaccept_torn_down={torn_down_pre_accept} no-accept: alive_later={alive_later} emitted={emitted} missed={missed}",
             probe.label,
         );
         return Ok(());
@@ -379,7 +397,7 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         .iter()
         .any(|l| l.contains("missed by the user"));
     println!(
-        "PROBE {}: delivered={delivered} alive={alive} preaccept_torn_down={torn_down_pre_accept} accept={accepted:?} settled={settled} emitted={emitted} missed={missed} {term_reason}",
+        "PROBE {}: delivered={delivered} quiesced={quiesced} alive={alive} preaccept_torn_down={torn_down_pre_accept} accept={accepted:?} settled={settled} emitted={emitted} missed={missed} {term_reason}",
         probe.label,
     );
     Ok(())

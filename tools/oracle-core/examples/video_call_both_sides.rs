@@ -94,15 +94,35 @@ fn await_event_thread(r: &mut Runtime, label: &str) {
     println!("{label}: event thread never announced itself; results suspect");
 }
 
-/// Drain main-thread work the engine queued: with the main thread registered,
-/// answers wait in the proxy queue and only the host takes them out. Reading
-/// state without draining reports "the engine did nothing" about a run in
-/// which it queued the answer and nobody collected it.
-fn drain(r: &mut Runtime) {
-    for _ in 0..5 {
+/// Drain main-thread work the engine queued, until observable quiescence or a
+/// bound: with the main thread registered, answers wait in the proxy queue and
+/// only the host takes them out. A fixed pass count can sample state while
+/// activation is still pending (processing a callback can enqueue more work),
+/// so quiescence — signaling count and log length unchanged across passes — is
+/// awaited and reported. Returns whether it was reached.
+fn drain(r: &mut Runtime) -> bool {
+    const PASSES: usize = 20;
+    const STABLE: usize = 3;
+    let mut stable = 0;
+    let (mut last_signaling, mut last_log) = (usize::MAX, usize::MAX);
+    for _ in 0..PASSES {
         r.process_queued_calls();
         r.refuel();
+        let (signaling, log) = (
+            r.signaling().map(|s| s.len()).unwrap_or(usize::MAX),
+            r.engine_log().len(),
+        );
+        if signaling == last_signaling && log == last_log {
+            stable += 1;
+            if stable >= STABLE {
+                return true;
+            }
+        } else {
+            stable = 0;
+            (last_signaling, last_log) = (signaling, log);
+        }
     }
+    false
 }
 
 /// Decode one recorded stanza, skipping the stream-flag leading byte.
@@ -286,9 +306,11 @@ fn side_b_answerer(
     r.refuel();
     // No settle here: the virtual clock advances per observation, and settling
     // ages the call past `caller_timeout`, tearing it down as missed before
-    // anything can accept it (see `signaling_census`). Drain first so queued
-    // main-thread work is collected before state is read.
-    drain(&mut r);
+    // anything can accept it (see `signaling_census`). Drain to observable
+    // quiescence first so queued main-thread work is collected before state
+    // is read; a `false` here marks the verdict suspect, not conclusive.
+    let quiesced = drain(&mut r);
+    println!("side B [{label}]: quiesced={quiesced}");
     let parsed = r.engine_log().iter().any(|l| l.contains("!Offer from:"));
     // State immediately after delivery, before accept: is the call EVER active,
     // even transiently, or is it born torn down?
@@ -446,7 +468,9 @@ fn main() -> Result<()> {
                 relay_te: None,
                 rte: None,
                 voip_settings: None,
-                capability: Some(&CAPABILITY_VIDEO_OFFER),
+                // Production from-start video accepts carry no capability
+                // child (see `answer_with_ids`); audio answers advertise one.
+                capability: None,
                 video: true,
                 peer_abtest_bucket: None,
                 peer_abtest_bucket_id_list: None,
