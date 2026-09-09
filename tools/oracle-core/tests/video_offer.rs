@@ -73,19 +73,22 @@ fn video_offer_matches_the_vendor_engine() -> Result<()> {
     }
     assert!(started, "the engine should emit a video offer");
 
-    for (symbol, _) in runtime.stubs_called() {
-        assert!(
-            [
-                "env::query_browser_audio_processing_status_js_sync",
-                "env::on_call_event_js_sync",
-                "env::call_start_video_capture_js_sync",
-                "env::emscripten_check_blocking_allowed",
-                "env::get_persistent_directory_path_js",
-            ]
-            .contains(&symbol.as_str()),
-            "unexpected host stub: {symbol}"
-        );
-    }
+    let mut stubs = runtime.stubs_called();
+    stubs.sort();
+    assert_eq!(
+        stubs,
+        [
+            ("env::call_start_video_capture_js_sync".to_owned(), 1),
+            ("env::emscripten_check_blocking_allowed".to_owned(), 1),
+            ("env::get_persistent_directory_path_js".to_owned(), 1),
+            ("env::on_call_event_js_sync".to_owned(), 3),
+            (
+                "env::query_browser_audio_processing_status_js_sync".to_owned(),
+                4
+            ),
+        ],
+        "a changed stub-dependent path must fail here, not bless new geometry"
+    );
     let sent = runtime.signaling()?;
     let node = marshal::unmarshal_ref(&sent[0].stanza[1..])?;
     assert_eq!(node.tag, "offer");
