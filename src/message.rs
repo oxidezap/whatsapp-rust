@@ -315,6 +315,16 @@ impl DispatchClaim {
             payload.fingerprint == fingerprint
                 && payload.publication.load(Ordering::Acquire) != PUBLICATION_INTERRUPTED
         }) {
+            // Suppress on a live match, including an in-flight one. The only
+            // way it can still roll back is a concurrent panic: this region
+            // runs no awaits between admission and completion, so cancellation
+            // cannot land inside it. Delivering instead would re-enter a
+            // blocked callback on every overlap and break the progress
+            // contract pinned by
+            // `pdo_retry_blocked_recovery_callback_admits_no_duplicate`.
+            // A rolled-back publication stays observable: its token flips to
+            // INTERRUPTED, which the find above skips, so the next redelivery
+            // after the rollback is admitted fresh.
             if pdo {
                 return true;
             }

@@ -15376,6 +15376,50 @@ mod pdo_alias_tests {
     }
 
     #[tokio::test]
+    async fn pdo_publication_live_match_suppresses_and_rolled_back_match_delivers() {
+        // Suppress while the owner is live, even in-flight: delivering instead
+        // would re-enter a blocked callback on every overlap. The rollback
+        // below proves the other half: once the owner drops without
+        // completing, the same redelivery is admitted fresh.
+        let fingerprint = [0x3C; 32];
+        let mut claim = DispatchClaim::default();
+        let mut first = PublicationGuard::default();
+        assert!(!claim.admit(fingerprint, true, false, &mut first));
+        let mut concurrent = PublicationGuard::default();
+        assert!(
+            claim.admit(fingerprint, true, false, &mut concurrent),
+            "a live recovery suppresses the concurrent redelivery"
+        );
+        drop(first);
+        let mut after_rollback = PublicationGuard::default();
+        assert!(
+            !claim.admit(fingerprint, true, false, &mut after_rollback),
+            "a rolled-back recovery must not suppress the next redelivery"
+        );
+        after_rollback.complete();
+        let mut late = PublicationGuard::default();
+        assert!(
+            claim.admit(fingerprint, true, false, &mut late),
+            "a completed recovery suppresses the late redelivery"
+        );
+
+        let mut claim = DispatchClaim::default();
+        let mut recovery = PublicationGuard::default();
+        assert!(!claim.admit(fingerprint, true, false, &mut recovery));
+        let mut retry = PublicationGuard::default();
+        assert!(
+            claim.admit(fingerprint, false, false, &mut retry),
+            "a live recovery suppresses the concurrent retry"
+        );
+        drop(recovery);
+        let mut after_rollback = PublicationGuard::default();
+        assert!(
+            !claim.admit(fingerprint, false, false, &mut after_rollback),
+            "a rolled-back recovery must not suppress the next retry"
+        );
+    }
+
+    #[tokio::test]
     async fn pdo_publication_payload_capacity_fails_open() {
         let (client, events) = client().await;
         let info = info(Shape::Incoming);
