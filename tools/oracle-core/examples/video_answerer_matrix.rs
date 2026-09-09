@@ -1,0 +1,440 @@
+//! Which seeded state, if any, lets the pinned engine keep an inbound video
+//! offer alive long enough to accept it?
+//!
+//! Each probe feeds one inbound offer to a fresh engine, reads `getCallInfo`
+//! immediately (empty means the call never existed, not even transiently),
+//! attempts `acceptCall`, and reports what the engine emitted. Probes vary
+//! three axes: the A/B properties `setABPropsOnWasm` forwards (`AB_PROPS`,
+//! neutral values, copied from `outbound_after_settings.rs`), the offer shape
+//! (settings-only vs video with a clear call key), and the accept arguments.
+//!
+//! All identities are fictitious. Execute in release.
+//!
+//! ```sh
+//! cargo run --release -p oracle-core --example video_answerer_matrix
+//! ```
+//!
+//! `ENGINE` overrides the pinned module (default `JgwtTQVeWPm`).
+
+mod common;
+
+use anyhow::Result;
+use base64::Engine as _;
+use oracle_core::{Runtime, Value};
+use sha2::{Digest, Sha256};
+use wacore_binary::builder::NodeBuilder;
+use wacore_binary::jid::Server;
+use wacore_binary::{Jid, Node, marshal};
+
+const ENGINE: &str = "JgwtTQVeWPm";
+const ENGINE_SHA: &str = "97259423aea19cc30c1771478e035105cb0d0e64ab4b0297741b62d01deac8db";
+
+const SELF: [&str; 3] = [
+    "15550002222@c.us",
+    "15550002222:0@c.us",
+    "99887766554433:0@lid",
+];
+const CALL_ID: &str = "0011223344556677";
+const CALL_KEY: [u8; 32] = [0x5A; 32];
+const SETTINGS: &[u8] =
+    br#"{"encode":{"use_mlow_codec_v1":"false"},"options":{"enable_48khz_rtp_clock":"false","caller_timeout":"45"}}"#;
+
+/// Neutral A/B values, as `WAWebVoipStackInterfaceWebHelpers` would forward
+/// them. Copied from `outbound_after_settings.rs`; the question is the same:
+/// does configuring the engine at all change what it does?
+const AB_PROPS: &[(&str, &str)] = &[
+    ("aigc_version", "int"),
+    ("app_exit_reason_version", "int"),
+    ("attach_transport_rtx", "bool"),
+    ("audio_level_speaking_threshold", "int"),
+    ("call_admin_version", "int"),
+    ("calling_rust_migration_bitmap", "int"),
+    ("calling_rust_migration_incoming_stanza_bitmap", "int"),
+    ("calling_screen_share_milestone_version", "int"),
+    ("default_endpoint_thread_poll_timeout", "int"),
+    ("enable_av_downgrade", "bool"),
+    ("enable_init_bwe_for_group_call", "bool"),
+    (
+        "enable_new_user_action_stanza_for_raise_hand_sender",
+        "bool",
+    ),
+    ("enable_offer_v2_upgrade", "bool"),
+    ("enable_ring_for_gc_on_offer_expire", "bool"),
+    ("enable_silent_offer", "bool"),
+    ("enable_waiting_room_logging", "bool"),
+    ("enable_webcodec_video_encode", "bool"),
+    ("enable_web_voip_audio_driver_lifetime_fix", "bool"),
+    ("heartbeat_interval_s", "int"),
+    ("ignore_joinable_terminate_on_expired_offer", "bool"),
+    ("lobby_timeout_min", "int"),
+    ("max_group_size_for_long_ringtone", "int"),
+    ("max_num_participants_for_ss", "int"),
+    ("allow_reporting_call_replayer_id", "bool"),
+    ("vid_stream_pause_resume_jb_reset_threshold_ms", "int"),
+    ("voice_ai_conversation_starter_latency_tracking", "bool"),
+    ("voip_stack_incoming_message_ownership_transfer", "bool"),
+    ("log_level", "int"),
+];
+
+/// The vendor's own video child, read back from a `startVoipCall` offer so the
+/// inbound shape carries no invented bytes.
+const VIDEO_ATTRS: &[(&str, &str)] = &[
+    ("enc", "h.264"),
+    ("dec", "H264"),
+    ("device_orientation", "0"),
+    ("screen_width", "0"),
+    ("screen_height", "0"),
+];
+
+fn video_child() -> Node {
+    let mut builder = NodeBuilder::new("video");
+    for (name, value) in VIDEO_ATTRS {
+        builder = builder.attr(name, (*value).to_owned());
+    }
+    builder.build()
+}
+
+fn census_video_offer_at(now: Option<u64>) -> Node {
+    let mut offer = NodeBuilder::new("offer");
+    if let Some(now) = now {
+        offer = offer.attr("t", now.to_string());
+    }
+    offer
+        .children([
+            NodeBuilder::new("audio")
+                .attr("enc", "opus")
+                .attr("rate", "16000")
+                .build(),
+            video_child(),
+            NodeBuilder::new("net").attr("medium", "3").build(),
+            NodeBuilder::new("enc")
+                .attr("count", "0")
+                .bytes(CALL_KEY.to_vec())
+                .build(),
+            NodeBuilder::new("encopt").attr("keygen", "2").build(),
+        ])
+        .build()
+}
+
+fn set_ab_props(r: &mut Runtime) -> usize {
+    let mut set = 0;
+    for (key, kind) in AB_PROPS {
+        let call = match *kind {
+            "bool" => r.call_embind(
+                "setABPropBool",
+                &[Value::Str((*key).into()), Value::Bool(true)],
+            ),
+            _ => r.call_embind(
+                "setABPropInt",
+                &[
+                    Value::Str((*key).into()),
+                    Value::Int(if *key == "log_level" { 9 } else { 0 }),
+                ],
+            ),
+        };
+        r.refuel();
+        if call.is_ok() {
+            set += 1;
+        }
+    }
+    set
+}
+
+struct Probe {
+    label: &'static str,
+    ab_props: bool,
+    video: bool,
+    accept: (bool, bool),
+    /// Expiry (`e`) on the `<call>` wrapper: the pinned IR lists it as a known
+    /// inbound attr, and the engine tears the offer down as expired before
+    /// accept, so a missing expiry is a suspect.
+    expiry: bool,
+    /// Send `t` in milliseconds rather than seconds: if the engine reads the
+    /// offer timestamp in ms, a seconds `t` sits 1000x in the past and the
+    /// offer arrives already expired.
+    t_millis: bool,
+    /// Second numeric argument to `handleIncomingSignalingOffer` as an offset
+    /// from now (`None` repeats now, as every harness does). If that slot is
+    /// an expiry rather than a second timestamp, `now` expires the offer on
+    /// arrival, which fits the born-torn-down verdict exactly.
+    second_numeric_offset: Option<u64>,
+    /// Stamp `t` on the inner `<offer>` as well as the `<call>` wrapper.
+    inner_t: bool,
+}
+
+fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
+    let mut r = common::engine(
+        bytes,
+        common::Startup {
+            identity: SELF,
+            attempts: 8,
+            register_main: true,
+            log_bytes: 4 << 20,
+            marker_sink: None,
+        },
+    )?;
+    if probe.ab_props {
+        let set = set_ab_props(&mut r);
+        println!("  ab props accepted {set} of {}", AB_PROPS.len());
+    }
+    let caller = Jid::new("11223344556677", Server::Lid);
+    let now = r.virtual_unix_time();
+    let offer = if probe.video {
+        census_video_offer_at(probe.inner_t.then_some(now))
+    } else {
+        match common::settings_offer(&caller, now, CALL_ID, SETTINGS)
+            .content
+            .clone()
+        {
+            Some(wacore_binary::node::NodeContent::Nodes(children)) => children
+                .iter()
+                .find(|c| c.tag == "offer")
+                .cloned()
+                .expect("settings carrier holds an <offer>"),
+            _ => anyhow::bail!("settings carrier has no children"),
+        }
+    };
+    // The settings sibling rides inside <call>, next to <offer>, on the wire.
+    let mut wrapper = NodeBuilder::new("call")
+        .attr("from", caller.clone())
+        .attr("call-id", CALL_ID)
+        .attr("call-creator", caller.with_device(1))
+        .attr(
+            "t",
+            if probe.t_millis {
+                (now * 1000).to_string()
+            } else {
+                now.to_string()
+            },
+        );
+    if probe.expiry {
+        wrapper = wrapper.attr("e", (now + 45).to_string());
+    }
+    let wrapper = wrapper
+        .children([
+            offer,
+            NodeBuilder::new("voip_settings")
+                .attr("uncompressed", "1")
+                .bytes(SETTINGS.to_vec())
+                .build(),
+        ])
+        .build();
+    let second_numeric = match probe.second_numeric_offset {
+        Some(offset) => now + offset,
+        None => now,
+    };
+    let payload = base64::engine::general_purpose::STANDARD.encode(marshal::marshal(&wrapper)?);
+    r.call_embind(
+        "handleIncomingSignalingOffer",
+        &[
+            Value::Str(payload),
+            Value::Str("web".into()),
+            Value::Str("2.3000.0".into()),
+            Value::Str(now.to_string()),
+            Value::Str(second_numeric.to_string()),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Str(caller.to_string()),
+            Value::Bytes(Vec::new()),
+        ],
+    )
+    .ok();
+    r.refuel();
+    let immediate = format!("{:?}", r.call_embind("getCallInfo", &[]).ok());
+    r.refuel();
+    let alive = !immediate.contains("\"\"") && immediate.len() > 20;
+    // Was it already torn down before accept, or still pending? Snapshot the
+    // teardown markers now: if `missed by the user` is logged pre-accept, the
+    // call was born torn down (timestamp/parse issue); if absent, accept raced
+    // an activation that never completes (missing-state issue).
+    let torn_down_pre_accept = r
+        .engine_log()
+        .iter()
+        .any(|l| l.contains("missed by the user") || l.contains("call_term_reason"));
+    // SKIP_ACCEPT=1: do not race activation. Feed, settle like `load_settings`
+    // does, then read state: if the call is alive here, the premature accept
+    // is what kills it, and the fix is sequencing (wait for active).
+    if std::env::var("SKIP_ACCEPT").is_ok() {
+        r.settle(std::time::Duration::from_secs(3));
+        r.refuel();
+        let later = format!("{:?}", r.call_embind("getCallInfo", &[]).ok());
+        r.refuel();
+        let alive_later = !later.contains("\"\"") && later.len() > 20;
+        let emitted = r.signaling()?.len();
+        let missed = r
+            .engine_log()
+            .iter()
+            .any(|l| l.contains("missed by the user"));
+        println!(
+            "PROBE {}: alive={alive} preaccept_torn_down={torn_down_pre_accept} no-accept: alive_later={alive_later} emitted={emitted} missed={missed}",
+            probe.label,
+        );
+        return Ok(());
+    }
+    // CHECK_CONTEXT=1: replicate the `load_settings` observation. A second
+    // `startVoipCall` reporting already-initialized proves a call context
+    // object exists even when `getCallInfo` reads empty, separating
+    // state (missed) from existence.
+    if std::env::var("CHECK_CONTEXT").is_ok() {
+        let second = r.call_embind(
+            "startVoipCall",
+            &[
+                Value::Str("11223344556677@lid".into()),
+                Value::StringList(vec!["11223344556677:0@lid".into()]),
+                Value::Str("probe-second-start".into()),
+                Value::Bool(true),
+                Value::Str("11223344556677@lid".into()),
+                Value::Bool(false),
+                Value::Bytes(vec![0xA5; 32]),
+            ],
+        );
+        r.refuel();
+        println!("PROBE {}: second start -> {second:?}", probe.label,);
+        for line in r.engine_log().iter().rev().take(6).rev() {
+            println!("    log: {}", line.trim());
+        }
+        return Ok(());
+    }
+    let accepted = r.call_embind(
+        "acceptCall",
+        &[Value::Bool(probe.accept.0), Value::Bool(probe.accept.1)],
+    );
+    r.refuel();
+    r.settle(std::time::Duration::from_secs(5));
+    r.refuel();
+    let emitted = r.signaling()?.len();
+    let term_reason = r
+        .engine_log()
+        .iter()
+        .rev()
+        .find(|l| l.contains("call_term_reason"))
+        .map(|l| l.trim().to_owned())
+        .unwrap_or_default();
+    let missed = r
+        .engine_log()
+        .iter()
+        .any(|l| l.contains("missed by the user"));
+    println!(
+        "PROBE {}: alive={alive} preaccept_torn_down={torn_down_pre_accept} accept={accepted:?} emitted={emitted} missed={missed} {term_reason}",
+        probe.label,
+    );
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let which = std::env::var("ENGINE").unwrap_or_else(|_| ENGINE.into());
+    let catalog = oracle_core::Catalog::discover()?;
+    let entry = catalog.resolve(&which)?;
+    let bytes = std::fs::read(&entry.path)?;
+    if which == ENGINE {
+        assert_eq!(hex::encode(Sha256::digest(&bytes)), ENGINE_SHA);
+    }
+    println!("engine: {which}");
+
+    for probe in [
+        Probe {
+            label: "settings-only",
+            ab_props: false,
+            video: false,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+        },
+        Probe {
+            label: "settings-only+ab",
+            ab_props: true,
+            video: false,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+        },
+        Probe {
+            label: "video+ab",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+        },
+        Probe {
+            label: "video+ab,accept-ff",
+            ab_props: true,
+            video: true,
+            accept: (false, false),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+        },
+        Probe {
+            label: "video+ab+expiry",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: true,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+        },
+        Probe {
+            label: "settings-only+expiry",
+            ab_props: false,
+            video: false,
+            accept: (true, true),
+            expiry: true,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+        },
+        Probe {
+            label: "settings-only+t-ms",
+            ab_props: false,
+            video: false,
+            accept: (true, true),
+            expiry: false,
+            t_millis: true,
+            second_numeric_offset: None,
+            inner_t: false,
+        },
+        Probe {
+            label: "video+ab+t-ms",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: false,
+            t_millis: true,
+            second_numeric_offset: None,
+            inner_t: false,
+        },
+        Probe {
+            label: "video+ab+num45",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: Some(45),
+            inner_t: false,
+        },
+        Probe {
+            label: "video+ab+inner-t",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: true,
+        },
+    ] {
+        println!("=== {}", probe.label);
+        run_probe(&bytes, &probe)?;
+    }
+    Ok(())
+}
