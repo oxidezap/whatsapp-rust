@@ -134,15 +134,16 @@ fn main() {
         };
 
         // Periodic observability: counters and estimated bytes only. The
-        // rendered report carries no JIDs, phone numbers, or message content.
+        // summary carries no JIDs, phone numbers, or message content. It
+        // renders `unbounded_counts()` — the soak-comparison set — plus the
+        // total, rather than the full `Display` report, so the demo links
+        // only the report walk and not its formatter.
         let mem_client = bot.client();
         let mem_logger = memreport_interval().map(|interval| {
             tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(interval);
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    ticker.tick().await;
                     log_memory_report(&mem_client).await;
+                    tokio::time::sleep(interval).await;
                 }
             })
         });
@@ -311,15 +312,19 @@ fn memreport_interval() -> Option<Duration> {
     memreport_interval_from_raw(std::env::var(MEMREPORT_INTERVAL_ENV).ok().as_deref())
 }
 
-/// Counters and estimated bytes only: the rendered report carries no JIDs,
+/// Counters and estimated bytes only: the summary carries no JIDs,
 /// phone numbers, or message content.
 async fn log_memory_report(client: &Client) {
+    use std::fmt::Write as _;
     let report = client.memory_report().await;
-    info!(
-        "memory: {} B retained (est.)\n{}",
-        report.total_estimated_bytes(),
-        report
+    let mut summary = format!(
+        "memory: {} B retained (est.)",
+        report.total_estimated_bytes()
     );
+    for (name, count) in report.unbounded_counts() {
+        let _ = write!(summary, " {name}={count}");
+    }
+    info!("{summary}");
 }
 
 #[cfg(test)]
