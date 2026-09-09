@@ -15125,7 +15125,7 @@ mod pdo_alias_tests {
     /// directly, which is why this is pinned rather than left to drift. The
     /// slot it rides in is pinned beside the cache, in
     /// `dispatch_gate_slot_stays_below_the_spelled_out_identity`.
-    /// Budget: rebaseline per agent_docs/layout_asserts.md.
+    /// Budget: rebaseline per [layout asserts](../agent_docs/layout_asserts.md).
     #[test]
     fn pdo_alias_claim_stays_small() {
         let size = size_of::<DispatchClaim>();

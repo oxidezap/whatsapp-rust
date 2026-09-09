@@ -3279,7 +3279,7 @@ mod tests {
     /// nested `Slot { key, hash, entry }` it replaces. Wide keys already
     /// align, so the dispatched slot keeps its size. Budgets, not contracts:
     /// a smaller slot is never a failure. Rebaseline per
-    /// agent_docs/layout_asserts.md.
+    /// [layout asserts](../agent_docs/layout_asserts.md).
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn flattened_slot_reuses_entry_tail_padding() {

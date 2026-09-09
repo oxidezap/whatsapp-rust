@@ -23,8 +23,9 @@ and a repack that a bare number does not. #1478 and #1479 set this pattern.
 
 Exact, kept exact:
 
-- `DeviceInfo == 8` in `wacore/src/store/traits.rs`. The struct is `u16 + u8
-  + u32` with no padding. Growth means the packing broke.
+- `DeviceInfo == 8` in `wacore/src/store/traits.rs`. The fields are `u16 +
+  u8 + u32`, seven bytes, so the 8-byte size includes one padding byte.
+  Growth means the packing broke.
 - `StringHint == 5`, `ParsedJidMeta == 5` in `wacore/binary/src/encoder.rs`.
   The hint tape stores one entry per string in the payload, so each byte
   multiplies across every string. A wider entry needs justification.
@@ -51,9 +52,11 @@ Budgets, asserted with `<=`:
   per known contact, so this is a per-contact budget.
 - `RuntimeCacheConfig <= 136` in `src/cache_config.rs`, with the companion
   ratio check against `CacheConfig`.
-- `UsyncProtocolResult <= 96`, send futures `<= 192`, dispatch claim
-  `<= 56`, group snapshot `<= 92` per participant. Pure budgets, already
-  bounds.
+- `UsyncProtocolResult <= 96` in `wacore/src/iq/usync/query.rs`, send
+  futures `<= 192` in `src/send/mod.rs`, dispatch claim `<= 56` in
+  `src/message/tests.rs`, group snapshot `<= 92` per participant in
+  `wacore/src/client/context.rs`, sender-key map `<= 36` per device in
+  `src/sender_key_device_cache.rs`. Pure budgets, already bounds.
 
 ## Rebaseline procedure
 
@@ -72,14 +75,20 @@ Budgets, asserted with `<=`:
 6. Run the layout tests listed below and keep the whole diff to tests plus
    this file. No production code changes.
 
-Layout tests to run:
+Layout tests to run, one filter per command so a failure names its assert:
 
 ```bash
-cargo test -p wacore-libsignal --lib protocol::sender_keys
-cargo test -p wacore-binary --lib encoder
-cargo test -p wacore --lib store::traits usync
-cargo test -p whatsapp-rust --lib portable_cache cache_config handlers::message future_size_tests pdo_alias per_participant
+cargo test -p wacore-libsignal --lib sender_key_state_layout_dropped_the_protobuf_copies
+cargo test -p wacore-binary --lib the_hint_tape_stays_five_bytes_wide
+cargo test -p wacore --lib a_device_entry_is_eight_bytes
+cargo test -p wacore --lib a_device_list_record_fits_sixty_four_bytes
+cargo test -p wacore --lib sparse_result_layout_stays_bounded
+cargo test -p wacore --lib retained_bytes_per_participant_stay_bounded
+cargo test -p whatsapp-rust --lib flattened_slot_reuses_entry_tail_padding
+cargo test -p whatsapp-rust --lib runtime_config_is_compact
+cargo test -p whatsapp-rust --lib queued_chat_message_keeps_two_handles
+cargo test -p whatsapp-rust --lib send_futures_stay_small
+cargo test -p whatsapp-rust --lib pdo_alias_claim_stays_small
+cargo test -p whatsapp-rust --lib retained_bytes_per_device_stay_bounded
+cargo test -p whatsapp-rust-ureq-http-client --lib provenance_reconstructs_the_stored_report
 ```
-
-The last line names test modules loosely. `cargo test -p whatsapp-rust --lib
-<name>` with the exact test name from the failure works when in doubt.

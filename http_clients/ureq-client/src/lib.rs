@@ -696,7 +696,7 @@ mod tests {
         );
         // Budget on top of the contract above: our own overhead floats with
         // the compiler layout, so only growth past 24 fails. Rebaseline per
-        // agent_docs/layout_asserts.md.
+        // [layout asserts](../../../agent_docs/layout_asserts.md).
         #[cfg(target_pointer_width = "64")]
         assert!(
             size_of::<UreqHttpClient>() <= size_of::<ureq::Agent>() + 24,

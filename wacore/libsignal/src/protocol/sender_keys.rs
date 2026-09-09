@@ -1616,7 +1616,7 @@ mod tests {
         );
         // Budget, not contract: the total floats with the protobuf runtime
         // layout, so only growth fails. Rebaseline per
-        // agent_docs/layout_asserts.md.
+        // [layout asserts](../../../../agent_docs/layout_asserts.md).
         #[cfg(target_pointer_width = "64")]
         {
             assert!(

@@ -9701,7 +9701,7 @@ mod future_size_tests {
     /// The public send futures embed in every event-handler and spawned-task
     /// frame, so their size is a per-event heap cost. Keep them pointer-scale
     /// (measured 64-128 B; the bound leaves slack only for layout drift).
-    /// Budget: rebaseline per agent_docs/layout_asserts.md.
+    /// Budget: rebaseline per [layout asserts](../agent_docs/layout_asserts.md).
     #[tokio::test]
     async fn send_futures_stay_small() {
         let client = crate::test_utils::create_test_client().await;
