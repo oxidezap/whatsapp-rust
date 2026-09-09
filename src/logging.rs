@@ -340,18 +340,24 @@ impl Builder {
                 log::set_max_level(max);
                 Ok(())
             }
-            Err(_) => {
-                // The slot is full but the winning thread may not have reached
-                // `log::set_logger` yet. Register the slot value so a racy
-                // loser completes the winner's install instead of failing
-                // against a logger that is not installed yet; when a logger
-                // really is installed this fails the same clean way.
+            Err(rejected) => {
+                drop(rejected);
                 let installed = INSTALLED
                     .get()
                     .unwrap_or_else(|| panic!("logging::INSTALLED is full, so it must read back"));
-                log::set_logger(installed)?;
-                log::set_max_level(installed.filter.max_level());
-                Ok(())
+                // Complete the winner's install when it hasn't happened yet,
+                // so a racy handoff can never park the process with no logger.
+                // Then still report failure: this caller's own configuration
+                // was discarded, mirroring env_logger's losing racer. The
+                // second registration always fails — a global logger is
+                // installed by then — and yields the error value.
+                if log::set_logger(installed).is_ok() {
+                    log::set_max_level(installed.filter.max_level());
+                }
+                let Err(e) = log::set_logger(installed) else {
+                    unreachable!("a global logger is installed by now, so registration must fail")
+                };
+                Err(e)
             }
         }
     }
