@@ -755,6 +755,130 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn unbounded_table_resolves_all_four_indexes() {
+        let cache = LidPnCache::new();
+        let entry = LidPnEntry::with_timestamp(
+            "100000012345678".to_string(),
+            "559980000001".to_string(),
+            1000,
+            LearningSource::Usync,
+        );
+        cache.add(&entry).await;
+        cache.mark_persisted(&entry.phone_number, &entry.lid).await;
+
+        assert_eq!(
+            cache.get_current_lid("559980000001").await.as_deref(),
+            Some("100000012345678")
+        );
+        assert_eq!(
+            cache.get_phone_number("100000012345678").await.as_deref(),
+            Some("559980000001")
+        );
+        for user in ["100000012345678", "559980000001"] {
+            let hash = wacore::crypto::contact_notification_hash(user);
+            assert_eq!(
+                cache.lid_for_contact_hash(hash).await.as_deref(),
+                Some("100000012345678")
+            );
+        }
+        assert!(cache.is_persisted("559980000001", "100000012345678").await);
+        assert!(
+            cache
+                .can_skip_relearn("559980000001", "100000012345678")
+                .await
+        );
+        assert_eq!(cache.lid_count().await, 1);
+        assert_eq!(cache.pn_count().await, 1);
+        cache.run_pending_tasks().await;
+        assert_eq!(cache.lid_count().await, 1);
+        assert_eq!(
+            cache.get_current_lid("559980000001").await.as_deref(),
+            Some("100000012345678"),
+            "maintenance must not drop unbounded entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_table_still_evicts_and_expiring_table_still_expires() {
+        let evicting = LidPnCache::with_config(&CacheEntryConfig::new(None, 1), None);
+        evicting
+            .add(&LidPnEntry::with_timestamp(
+                "100000000000001".to_string(),
+                "15550000001".to_string(),
+                1,
+                LearningSource::Usync,
+            ))
+            .await;
+        evicting
+            .add(&LidPnEntry::with_timestamp(
+                "100000000000002".to_string(),
+                "15550000002".to_string(),
+                2,
+                LearningSource::Usync,
+            ))
+            .await;
+        assert_eq!(
+            evicting.lid_count().await,
+            1,
+            "capacity-1 LID map keeps the managed eviction policy"
+        );
+
+        let expiring = LidPnCache::with_config(
+            &CacheEntryConfig::new(Some(std::time::Duration::from_millis(50)), 1_000),
+            None,
+        );
+        expiring
+            .add(&LidPnEntry::new(
+                "100000000000003".to_string(),
+                "15550000003".to_string(),
+                LearningSource::Usync,
+            ))
+            .await;
+        assert!(expiring.get_current_lid("15550000003").await.is_some());
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            expiring.get_current_lid("15550000003").await.is_none(),
+            "idle expiry still applies on the managed path"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbounded_replacement_keeps_pn_winner_rule() {
+        let cache = LidPnCache::new();
+        cache
+            .add(&LidPnEntry::with_timestamp(
+                "100000000000001".to_string(),
+                "15550000004".to_string(),
+                2000,
+                LearningSource::Usync,
+            ))
+            .await;
+        cache
+            .add(&LidPnEntry::with_timestamp(
+                "100000000000002".to_string(),
+                "15550000004".to_string(),
+                1000,
+                LearningSource::Other,
+            ))
+            .await;
+        assert_eq!(
+            cache.get_current_lid("15550000004").await.as_deref(),
+            Some("100000000000001"),
+            "an older PN mapping must not displace the winner"
+        );
+        let phone_hash = wacore::crypto::contact_notification_hash("15550000004");
+        assert_eq!(
+            cache.lid_for_contact_hash(phone_hash).await.as_deref(),
+            Some("100000000000001")
+        );
+        assert_eq!(
+            cache.get_phone_number("100000000000002").await.as_deref(),
+            Some("15550000004"),
+            "the losing LID stays resolvable"
+        );
+    }
+
     #[test]
     fn test_learning_source_serialization() {
         let sources = [

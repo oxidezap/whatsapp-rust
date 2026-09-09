@@ -67,6 +67,166 @@ struct Slot<K, V> {
     hash: u64,
 }
 
+/// One table slot for a cache that can neither evict nor expire: only the key,
+/// its hash, and the value. Chosen at construction (see `assemble`), never per
+/// entry, so the managed path pays nothing for it and this path stores no
+/// timestamps, sequence numbers, or CLOCK bits.
+///
+/// Field order follows the flattened [`Slot`]: payload first, then the key so a
+/// narrow key reuses the tail padding ahead of `hash`.
+struct PlainSlot<K, V> {
+    value: V,
+    key: K,
+    hash: u64,
+}
+
+struct PlainInner<K, V, S> {
+    hasher: S,
+    table: HashTable<PlainSlot<K, V>>,
+}
+
+impl<K, V, S> PlainInner<K, V, S> {
+    fn new(hasher: S) -> Self {
+        Self {
+            hasher,
+            table: HashTable::new(),
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.table.iter().map(|slot| (&slot.key, &slot.value))
+    }
+
+    fn structural_bytes(&self) -> usize {
+        wacore::stats::hash_table_bytes(self.table.capacity(), size_of::<PlainSlot<K, V>>())
+    }
+
+    fn clear(&mut self) {
+        self.table.clear();
+    }
+}
+
+impl<K, V, S> PlainInner<K, V, S>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+{
+    #[inline]
+    fn hash_of<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
+        self.hasher.hash_one(key)
+    }
+
+    /// Table probes below stay out of line: under fat LTO they would otherwise
+    /// inline into every [`PortableCache`] future that dispatches on [`Storage`]
+    /// (`get`, `insert`, `upsert_with_by_ref`, `insert_and_return`, `remove`),
+    /// stamping the hashbrown probe per caller instead of per table. Same
+    /// reason [`expiry_walk`] stays out of line.
+    #[inline(never)]
+    fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hash_of(key);
+        self.table
+            .find(hash, |slot| slot.key.borrow() == key)
+            .map(|slot| &slot.value)
+    }
+
+    #[inline(never)]
+    fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hash_of(key);
+        self.table
+            .find_mut(hash, |slot| slot.key.borrow() == key)
+            .map(|slot| &mut slot.value)
+    }
+
+    #[inline(never)]
+    fn remove_key<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hash_of(key);
+        let (slot, _) = self
+            .table
+            .find_entry(hash, |slot| slot.key.borrow() == key)
+            .ok()?
+            .remove();
+        Some(slot.value)
+    }
+
+    #[inline(never)]
+    fn insert_new(&mut self, key: K, value: V) {
+        let hash = self.hash_of(&key);
+        self.table
+            .insert_unique(hash, PlainSlot { value, key, hash }, |slot| slot.hash);
+    }
+
+    /// Replace-or-insert shared by `insert` and `insert_and_return` so the
+    /// get-then-insert sequence compiles once per table, not per caller.
+    #[inline(never)]
+    fn insert_or_replace(&mut self, key: K, value: V) {
+        if let Some(slot) = self.get_mut(&key) {
+            *slot = value;
+        } else {
+            self.insert_new(key, value);
+        }
+    }
+}
+
+/// Container-level representation, fixed at construction. The unbounded,
+/// non-expiring, guard-free cache (the default LID/PN maps) holds plain
+/// key/value slots; every other configuration keeps the managed table with
+/// timestamps, order, and CLOCK bits.
+enum Storage<K, V, S> {
+    Plain(PlainInner<K, V, S>),
+    Managed(CacheInner<K, V, S>),
+}
+
+impl<K, V, S> Storage<K, V, S>
+where
+    K: Hash + Eq + Clone,
+    S: BuildHasher,
+{
+    /// Out of line so the discriminant check compiles once per table instead
+    /// of inlining into every diagnostic caller (`entry_count`,
+    /// `structural_stats`, `clear`, ...). Hot paths match on the variants
+    /// directly and never come through here.
+    #[inline(never)]
+    fn len(&self) -> usize {
+        match self {
+            Storage::Plain(inner) => inner.len(),
+            Storage::Managed(inner) => inner.len(),
+        }
+    }
+
+    #[inline(never)]
+    fn clear(&mut self) {
+        match self {
+            Storage::Plain(inner) => inner.clear(),
+            Storage::Managed(inner) => inner.clear(),
+        }
+    }
+
+    #[inline(never)]
+    fn structural_bytes(&self) -> usize {
+        match self {
+            Storage::Plain(inner) => inner.structural_bytes(),
+            Storage::Managed(inner) => inner.structural_bytes(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CapacityStats {
     pub entries: u64,
@@ -88,7 +248,7 @@ pub(crate) struct CapacityStats {
 /// access or in `run_pending_tasks`. `entry_count` may include
 /// expired-but-not-yet-evicted entries.
 pub struct PortableCache<K, V, S = RandomState> {
-    inner: Arc<RwLock<CacheInner<K, V, S>>>,
+    inner: Arc<RwLock<Storage<K, V, S>>>,
     /// Shared single-flight init-lock registry (see `InitLocks`), built on the
     /// first [`get_with`](Self::get_with) rather than at construction: a client
     /// builds ~20 of these caches and most of them are only ever `get`/`insert`ed,
@@ -931,8 +1091,19 @@ where
     // BTreeMap node per entry.
     let track_order =
         max_capacity.is_some_and(|cap| cap != u64::MAX) || ttl.is_some() || tti.is_some();
+    // Container-level choice: only a guard-free cache with no capacity bound
+    // (None or u64::MAX), no TTL/TTI, and no order to track drops its
+    // per-entry metadata. Every other configuration keeps the managed table.
+    let unbounded = (max_capacity.is_none() || max_capacity == Some(u64::MAX))
+        && ttl.is_none()
+        && tti.is_none();
+    let inner = if unbounded && evict_guard.is_none() {
+        Storage::Plain(PlainInner::new(hash_builder))
+    } else {
+        Storage::Managed(CacheInner::new(track_order, hash_builder))
+    };
     PortableCache {
-        inner: Arc::new(RwLock::new(CacheInner::new(track_order, hash_builder))),
+        inner: Arc::new(RwLock::new(inner)),
         init_locks: OnceLock::new(),
         max_capacity,
         ttl,
@@ -1011,44 +1182,57 @@ where
     {
         let (value, renew_at) = {
             let guard = self.inner.read().await;
-            let entry = guard.get(key)?;
-            // Read the clock after the lookup: a miss has no timestamp to
-            // compare, and lookups that miss are a large share of the calls
-            // (every negative registry probe, every warm-up).
-            let now = self.entry_time();
-            if self.is_expired(entry, now) {
-                // Identity of the entry judged expired: `seq` moves if the slot
-                // was re-inserted, `inserted_at` if the value was rewritten in
-                // place. Removing without it could drop a replacement written
-                // while the guard was down and judge it by a stale `now`.
-                let observed = (entry.seq, entry.inserted_at);
-                drop(guard);
-                let mut wguard = self.inner.write().await;
-                if let Some(e) = wguard.get(key)
-                    && (e.seq, e.inserted_at) == observed
-                    && self.is_expired(e, now)
-                {
-                    wguard.remove_key(key);
+            match &*guard {
+                Storage::Plain(inner) => {
+                    return inner.get(key).cloned();
                 }
-                return None;
+                Storage::Managed(inner) => {
+                    let entry = inner.get(key)?;
+                    // Read the clock after the lookup: a miss has no timestamp to
+                    // compare, and lookups that miss are a large share of the calls
+                    // (every negative registry probe, every warm-up).
+                    let now = self.entry_time();
+                    if self.is_expired(entry, now) {
+                        // Identity of the entry judged expired: `seq` moves if the slot
+                        // was re-inserted, `inserted_at` if the value was rewritten in
+                        // place. Removing without it could drop a replacement written
+                        // while the guard was down and judge it by a stale `now`.
+                        let observed = (entry.seq, entry.inserted_at);
+                        drop(guard);
+                        let mut wguard = self.inner.write().await;
+                        let Storage::Managed(managed) = &mut *wguard else {
+                            return None;
+                        };
+                        if let Some(e) = managed.get(key)
+                            && (e.seq, e.inserted_at) == observed
+                            && self.is_expired(e, now)
+                        {
+                            managed.remove_key(key);
+                        }
+                        return None;
+                    }
+                    if inner.track_order {
+                        entry
+                            .referenced
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    (
+                        entry.value.clone(),
+                        self.needs_tti_renewal(entry, now).then_some(now),
+                    )
+                }
             }
-            if guard.track_order {
-                entry
-                    .referenced
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            (
-                entry.value.clone(),
-                self.needs_tti_renewal(entry, now).then_some(now),
-            )
         };
 
         if let Some(now) = renew_at {
             let mut guard = self.inner.write().await;
+            let Storage::Managed(managed) = &mut *guard else {
+                return Some(value);
+            };
             // Re-decide under the lock: the key may have been invalidated (the
             // miss leaves it that way) or already refreshed by a racing renewal
             // or insert, whose newer stamp this lookup must leave alone.
-            if let Some(entry) = guard.get_mut(key)
+            if let Some(entry) = managed.get_mut(key)
                 && self.needs_tti_renewal(entry, now)
             {
                 entry.last_accessed_at = now;
@@ -1062,21 +1246,25 @@ where
     }
 
     pub async fn insert(&self, key: K, value: V) {
-        let now = self.entry_time();
-        let mut guard = self.inner.write().await;
-
-        if let Some(entry) = guard.get_mut(&key) {
-            entry.value = value;
-            entry.inserted_at = now;
-            entry.last_accessed_at = now;
-            return;
-        }
-
         if self.max_capacity == Some(0) {
             return;
         }
-
-        guard.insert_new(key, value, now, self.max_capacity, self.evict_guard);
+        let now = self.entry_time();
+        let mut guard = self.inner.write().await;
+        match &mut *guard {
+            Storage::Plain(inner) => {
+                inner.insert_or_replace(key, value);
+            }
+            Storage::Managed(inner) => {
+                if let Some(entry) = inner.get_mut(&key) {
+                    entry.value = value;
+                    entry.inserted_at = now;
+                    entry.last_accessed_at = now;
+                    return;
+                }
+                inner.insert_new(key, value, now, self.max_capacity, self.evict_guard);
+            }
+        }
     }
 
     /// Atomically derive and optionally store a value from the current entry.
@@ -1096,56 +1284,78 @@ where
     {
         let now = self.entry_time();
         let mut guard = self.inner.write().await;
+        match &mut *guard {
+            Storage::Plain(inner) => {
+                let (next, result) = update(inner.get(key));
+                let Some(next) = next else {
+                    return result;
+                };
+                if let Some(slot) = inner.get_mut(key) {
+                    *slot = next;
+                } else if self.max_capacity != Some(0) {
+                    inner.insert_new(key.to_owned(), next);
+                }
+                result
+            }
+            Storage::Managed(inner) => {
+                if inner
+                    .get(key)
+                    .is_some_and(|entry| self.is_expired(entry, now))
+                {
+                    inner.remove_key(key);
+                }
 
-        if guard
-            .get(key)
-            .is_some_and(|entry| self.is_expired(entry, now))
-        {
-            guard.remove_key(key);
+                let (next, result) = update(inner.get(key).map(|entry| &entry.value));
+                let Some(next) = next else {
+                    return result;
+                };
+
+                if let Some(entry) = inner.get_mut(key) {
+                    entry.value = next;
+                    entry.inserted_at = now;
+                    entry.last_accessed_at = now;
+                } else if self.max_capacity != Some(0) {
+                    inner.insert_new(
+                        key.to_owned(),
+                        next,
+                        now,
+                        self.max_capacity,
+                        self.evict_guard,
+                    );
+                }
+
+                result
+            }
         }
-
-        let (next, result) = update(guard.get(key).map(|entry| &entry.value));
-        let Some(next) = next else {
-            return result;
-        };
-
-        if let Some(entry) = guard.get_mut(key) {
-            entry.value = next;
-            entry.inserted_at = now;
-            entry.last_accessed_at = now;
-        } else if self.max_capacity != Some(0) {
-            guard.insert_new(
-                key.to_owned(),
-                next,
-                now,
-                self.max_capacity,
-                self.evict_guard,
-            );
-        }
-
-        result
     }
 
     /// Insert and return a clone of the value in one write lock.
     async fn insert_and_return(&self, key: K, value: V) -> V {
-        let now = self.entry_time();
-        let mut guard = self.inner.write().await;
-
-        if let Some(entry) = guard.get_mut(&key) {
-            let ret = value.clone();
-            entry.value = value;
-            entry.inserted_at = now;
-            entry.last_accessed_at = now;
-            return ret;
-        }
-
         if self.max_capacity == Some(0) {
             return value;
         }
+        let now = self.entry_time();
+        let mut guard = self.inner.write().await;
+        match &mut *guard {
+            Storage::Plain(inner) => {
+                let ret = value.clone();
+                inner.insert_or_replace(key, value);
+                ret
+            }
+            Storage::Managed(inner) => {
+                if let Some(entry) = inner.get_mut(&key) {
+                    let ret = value.clone();
+                    entry.value = value;
+                    entry.inserted_at = now;
+                    entry.last_accessed_at = now;
+                    return ret;
+                }
 
-        let ret = value.clone();
-        guard.insert_new(key, value, now, self.max_capacity, self.evict_guard);
-        ret
+                let ret = value.clone();
+                inner.insert_new(key, value, now, self.max_capacity, self.evict_guard);
+                ret
+            }
+        }
     }
 
     pub async fn remove<Q>(&self, key: &Q) -> Option<V>
@@ -1154,13 +1364,18 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let mut guard = self.inner.write().await;
-        let entry = guard.remove_key(key)?;
-        // Nothing to date until an entry is actually in hand.
-        let now = self.entry_time();
-        if self.is_expired(&entry, now) {
-            None
-        } else {
-            Some(entry.value)
+        match &mut *guard {
+            Storage::Plain(inner) => inner.remove_key(key),
+            Storage::Managed(inner) => {
+                let entry = inner.remove_key(key)?;
+                // Nothing to date until an entry is actually in hand.
+                let now = self.entry_time();
+                if self.is_expired(&entry, now) {
+                    None
+                } else {
+                    Some(entry.value)
+                }
+            }
         }
     }
 
@@ -1170,7 +1385,14 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let mut guard = self.inner.write().await;
-        guard.remove_key(key);
+        match &mut *guard {
+            Storage::Plain(inner) => {
+                inner.remove_key(key);
+            }
+            Storage::Managed(inner) => {
+                inner.remove_key(key);
+            }
+        }
     }
 
     /// Reliably remove all entries, awaiting the write lock. Prefer this in
@@ -1219,10 +1441,17 @@ where
 
     pub(crate) async fn capacity_stats(&self) -> CapacityStats {
         let guard = self.inner.read().await;
-        CapacityStats {
-            entries: guard.len() as u64,
-            evictions: guard.capacity_evictions,
-            eviction_blocks: guard.capacity_eviction_blocks,
+        match &*guard {
+            Storage::Plain(inner) => CapacityStats {
+                entries: inner.len() as u64,
+                evictions: 0,
+                eviction_blocks: 0,
+            },
+            Storage::Managed(inner) => CapacityStats {
+                entries: inner.len() as u64,
+                evictions: inner.capacity_evictions,
+                eviction_blocks: inner.capacity_eviction_blocks,
+            },
         }
     }
 
@@ -1241,7 +1470,10 @@ where
     /// degrade to an empty walk under write contention.
     pub async fn fold_entries<A>(&self, init: A, mut f: impl FnMut(A, &K, &V) -> A) -> A {
         let guard = self.inner.read().await;
-        guard.iter().fold(init, |acc, (k, e)| f(acc, k, &e.value))
+        match &*guard {
+            Storage::Plain(inner) => inner.iter().fold(init, |acc, (k, v)| f(acc, k, v)),
+            Storage::Managed(inner) => inner.iter().fold(init, |acc, (k, e)| f(acc, k, &e.value)),
+        }
     }
 
     /// Entry count plus the bytes of the table and eviction order alone, for
@@ -1263,11 +1495,22 @@ where
         mut per_entry: impl FnMut(&K, &V) -> usize,
     ) -> wacore::stats::CollectionStats {
         let guard = self.inner.read().await;
-        let bytes: usize = guard.iter().map(|(k, e)| per_entry(k, &e.value)).sum();
-        wacore::stats::CollectionStats::new(
-            guard.len() as u64,
-            (bytes + guard.structural_bytes()) as u64,
-        )
+        match &*guard {
+            Storage::Plain(inner) => {
+                let bytes: usize = inner.iter().map(|(k, v)| per_entry(k, v)).sum();
+                wacore::stats::CollectionStats::new(
+                    inner.len() as u64,
+                    (bytes + inner.structural_bytes()) as u64,
+                )
+            }
+            Storage::Managed(inner) => {
+                let bytes: usize = inner.iter().map(|(k, e)| per_entry(k, &e.value)).sum();
+                wacore::stats::CollectionStats::new(
+                    inner.len() as u64,
+                    (bytes + inner.structural_bytes()) as u64,
+                )
+            }
+        }
     }
 
     /// Eager snapshot iterator over `(Arc<K>, V)`: snapshot, not lazy. Includes
@@ -1290,11 +1533,24 @@ where
         Vec::new().into_iter()
     }
 
-    fn snapshot(guard: &CacheInner<K, V, S>) -> Vec<(Arc<K>, V)> {
-        guard
-            .iter()
-            .map(|(k, e)| (Arc::new(k.clone()), e.value.clone()))
-            .collect()
+    fn snapshot(guard: &Storage<K, V, S>) -> Vec<(Arc<K>, V)> {
+        match guard {
+            Storage::Plain(inner) => inner
+                .iter()
+                .map(|(k, v)| (Arc::new(k.clone()), v.clone()))
+                .collect(),
+            Storage::Managed(inner) => inner
+                .iter()
+                .map(|(k, e)| (Arc::new(k.clone()), e.value.clone()))
+                .collect(),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_plain(&self) -> bool {
+        self.inner
+            .try_read()
+            .is_some_and(|guard| matches!(&*guard, Storage::Plain(_)))
     }
 
     /// Get or insert (single-flight). Takes key by value.
@@ -1375,6 +1631,41 @@ where
         self.tti_renewals.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    async fn debug_seq<Q>(&self, key: &Q) -> Option<u64>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let guard = self.inner.read().await;
+        let Storage::Managed(inner) = &*guard else {
+            return None;
+        };
+        inner.get(key).map(|e| e.seq)
+    }
+
+    #[cfg(test)]
+    async fn debug_stamps<Q>(&self, key: &Q) -> Option<(Instant, Instant)>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let guard = self.inner.read().await;
+        let Storage::Managed(inner) = &*guard else {
+            return None;
+        };
+        inner.get(key).map(|e| (e.inserted_at, e.last_accessed_at))
+    }
+
+    #[cfg(test)]
+    async fn debug_order_len(&self) -> usize {
+        let guard = self.inner.read().await;
+        match &*guard {
+            Storage::Plain(_) => 0,
+            Storage::Managed(inner) => inner.order.len(),
+        }
+    }
+
     /// Evict expired entries and clean up unused init locks.
     /// Test-only read that leaves the second-chance bit alone, so a test can
     /// observe eviction order without feeding it.
@@ -1384,7 +1675,11 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.inner.read().await.get(key).map(|e| e.value.clone())
+        let guard = self.inner.read().await;
+        match &*guard {
+            Storage::Plain(inner) => inner.get(key).cloned(),
+            Storage::Managed(inner) => inner.get(key).map(|e| e.value.clone()),
+        }
     }
 
     pub async fn run_pending_tasks(&self) {
@@ -1395,7 +1690,10 @@ where
         if self.ttl.is_some() || self.tti.is_some() {
             let now = self.entry_time();
             let mut guard = self.inner.write().await;
-            guard.retain_unexpired(|entry| self.is_expired(entry, now));
+            let Storage::Managed(managed) = &mut *guard else {
+                return;
+            };
+            managed.retain_unexpired(|entry| self.is_expired(entry, now));
         }
 
         // Clean up init locks not actively held. `get()`, not `init_locks()`: a
@@ -1556,10 +1854,12 @@ mod tests {
         cache.insert("key".into(), "value".into()).await;
         assert_eq!(cache.get("key").await.as_deref(), Some("value"));
 
-        let guard = cache.inner.read().await;
-        let entry = guard.get("key").expect("inserted cache entry");
-        assert_eq!(entry.inserted_at, Instant::ZERO);
-        assert_eq!(entry.last_accessed_at, Instant::ZERO);
+        let stamps = cache
+            .debug_stamps("key")
+            .await
+            .expect("inserted cache entry");
+        assert_eq!(stamps.0, Instant::ZERO);
+        assert_eq!(stamps.1, Instant::ZERO);
     }
 
     #[tokio::test]
@@ -1804,10 +2104,10 @@ mod tests {
     async fn a_hit_is_spent_by_one_eviction_pass() {
         let cache: PortableCache<String, u32> = PortableCache::builder().max_capacity(4).build();
         cache.insert("a".to_string(), 1).await;
-        let seq_before = cache.inner.read().await.get("a").map(|e| e.seq);
+        let seq_before = cache.debug_seq("a").await;
         cache.get("a").await;
         assert_eq!(
-            cache.inner.read().await.get("a").map(|e| e.seq),
+            cache.debug_seq("a").await,
             seq_before,
             "a hit must not reorder under the read lock"
         );
@@ -1817,7 +2117,7 @@ mod tests {
             cache.insert(format!("b{i}"), i).await;
         }
         assert_eq!(cache.get_no_touch("a").await, Some(1));
-        assert!(cache.inner.read().await.get("a").map(|e| e.seq) > seq_before);
+        assert!(cache.debug_seq("a").await > seq_before);
         // Not read since: the next pass over it evicts.
         for i in 4..8u32 {
             cache.insert(format!("b{i}"), i).await;
@@ -1999,7 +2299,7 @@ mod tests {
         cache.insert("k".into(), 1).await;
 
         let stamp = |cache: PortableCache<String, u32>| async move {
-            cache.inner.read().await.get("k").unwrap().last_accessed_at
+            cache.debug_stamps("k").await.expect("entry").1
         };
         let before = stamp(cache.clone()).await;
 
@@ -2029,7 +2329,7 @@ mod tests {
         cache.insert("k".into(), 1).await;
 
         let stamp = |cache: PortableCache<String, u32>| async move {
-            cache.inner.read().await.get("k").unwrap().last_accessed_at
+            cache.debug_stamps("k").await.expect("entry").1
         };
         let before = stamp(cache.clone()).await;
 
@@ -2057,9 +2357,8 @@ mod tests {
             .build();
 
         let identity = |cache: PortableCache<String, u32>| async move {
-            let guard = cache.inner.read().await;
-            let e = guard.get("k").unwrap();
-            (e.seq, e.inserted_at)
+            let stamps = cache.debug_stamps("k").await.expect("entry");
+            (cache.debug_seq("k").await.expect("entry"), stamps.0)
         };
 
         cache.insert("k".into(), 1).await;
@@ -2114,7 +2413,7 @@ mod tests {
         cache.insert("k".into(), 1).await;
 
         let stamp = |cache: PortableCache<String, u32>| async move {
-            cache.inner.read().await.get("k").unwrap().last_accessed_at
+            cache.debug_stamps("k").await.expect("entry").1
         };
         let before = stamp(cache.clone()).await;
         assert_eq!(cache.tti_renewals(), 0);
@@ -2396,12 +2695,79 @@ mod tests {
             }
             assert_eq!(cache.get("k2").await, Some(2));
         }
-        assert!(unbounded.inner.read().await.order.is_empty());
-        assert!(effectively_unbounded.inner.read().await.order.is_empty());
-        assert_eq!(bounded.inner.read().await.order.len(), 4);
+        assert!(unbounded.is_plain());
+        assert!(effectively_unbounded.is_plain());
+        assert!(!bounded.is_plain());
+        assert_eq!(unbounded.debug_order_len().await, 0);
+        assert_eq!(effectively_unbounded.debug_order_len().await, 0);
+        assert_eq!(bounded.debug_order_len().await, 4);
         // Removal on the unbounded caches still works without the index.
         assert_eq!(unbounded.remove("k1").await, Some(1));
         assert_eq!(unbounded.entry_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_cache_stores_plain_slots_without_metadata() {
+        let plain: PortableCache<String, u32> = PortableCache::builder().build();
+        let managed: PortableCache<String, u32> = PortableCache::builder().max_capacity(8).build();
+        assert!(plain.is_plain());
+        assert!(!managed.is_plain());
+        for i in 0..8u32 {
+            plain.insert(format!("k{i}"), i).await;
+            managed.insert(format!("k{i}"), i).await;
+        }
+        for i in 0..8u32 {
+            assert_eq!(plain.get(&format!("k{i}")).await, Some(i));
+        }
+        plain.insert("k0".to_string(), 100).await;
+        assert_eq!(plain.get("k0").await, Some(100));
+        assert_eq!(plain.entry_count(), 8);
+        assert_eq!(
+            plain.remove("k0").await,
+            Some(100),
+            "plain removal returns the value with no expiry to consult"
+        );
+        plain.invalidate("k1").await;
+        assert!(plain.get("k1").await.is_none());
+        plain.clear().await;
+        assert_eq!(plain.entry_count(), 0);
+        assert_eq!(
+            size_of::<PlainSlot<String, u32>>(),
+            40,
+            "plain slot must stay key + hash + value with no metadata tail"
+        );
+        assert!(
+            size_of::<Slot<String, u32>>() > size_of::<PlainSlot<String, u32>>(),
+            "managed slot must cost more than the plain slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_cache_supports_upsert_and_singleflight() {
+        let cache: PortableCache<String, u32> = PortableCache::builder().build();
+        let first = cache
+            .upsert_with_by_ref("counter", |current| {
+                let next = current.copied().unwrap_or_default() + 1;
+                (Some(next), next)
+            })
+            .await;
+        assert_eq!(first, 1);
+        let second = cache
+            .upsert_with_by_ref("counter", |current| {
+                let next = current.copied().unwrap_or_default() + 1;
+                (Some(next), next)
+            })
+            .await;
+        assert_eq!(second, 2);
+        assert_eq!(cache.get("counter").await, Some(2));
+        let single = cache.get_with("fresh".to_string(), async { 7 }).await;
+        assert_eq!(single, 7);
+        assert_eq!(cache.get("fresh").await, Some(7));
+        cache.run_pending_tasks().await;
+        assert_eq!(cache.entry_count(), 2);
+        let stats = cache.capacity_stats().await;
+        assert_eq!(stats.evictions, 0);
+        assert_eq!(stats.eviction_blocks, 0);
     }
 
     #[tokio::test]
