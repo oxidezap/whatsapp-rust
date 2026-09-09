@@ -884,7 +884,7 @@ impl Client {
         // fed can skip re-materializing the batch.
         let mut hook_committed = false;
         let dispatch_gate = self.dispatch_gate_enabled();
-        let mut fingerprints = smallvec::SmallVec::<[Option<[u8; 32]>; 1]>::new();
+        let mut fingerprints = smallvec::SmallVec::<[Option<DispatchFingerprint>; 1]>::new();
         if let Some(hook) = self.inbound_durability_hook() {
             if dispatch_gate {
                 fingerprints.reserve_exact(items.len());
@@ -933,7 +933,9 @@ impl Client {
                             (!crate::features::message_edit::carries_secret_encrypted(
                                 &item.message,
                             ))
-                            .then(|| Sha256::digest(&arena[start..]).into()),
+                            .then(|| {
+                                MessageDispatch::truncate(Sha256::digest(&arena[start..]).into())
+                            }),
                         );
                     }
                 }

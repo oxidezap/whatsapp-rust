@@ -15005,6 +15005,20 @@ mod pdo_alias_tests {
         );
     }
 
+    /// The gate keeps one claim per message identity for the whole TTL, and the
+    /// cache holds them inline in a single table, so the claim's size is what
+    /// the client's resident memory — and every doubling of that table — scales
+    /// with. The `client_receive` memory rows read that growth allocation
+    /// directly, which is why this is pinned rather than left to drift.
+    #[test]
+    fn pdo_alias_claim_stays_small() {
+        let size = size_of::<DispatchClaim>();
+        assert!(
+            size <= 56,
+            "a dispatch claim grew to {size} bytes; the gate retains one per message identity"
+        );
+    }
+
     #[test]
     fn pdo_alias_fingerprint_reuses_thread_scratch_without_message_sized_blocks() {
         let message = wa::Message {
@@ -15056,7 +15070,12 @@ mod pdo_alias_tests {
         ] {
             let wire = waproto::codec::message_to_vec(&message);
             let expected: [u8; 32] = Sha256::digest(&wire).into();
-            assert_eq!(MessageDispatch::fingerprint(&message), expected);
+            let expected = MessageDispatch::truncate(expected);
+            assert_eq!(
+                MessageDispatch::fingerprint(&message),
+                expected,
+                "the retained digest must be the prefix of the wire digest"
+            );
             let mut scratch = Vec::new();
             assert_eq!(
                 MessageDispatch::fingerprint_into(&message, &mut scratch),
@@ -15366,7 +15385,7 @@ mod pdo_alias_tests {
 
     #[tokio::test]
     async fn pdo_publication_interrupted_admission_is_treated_as_absent() {
-        let fingerprint = [0xA5; 32];
+        let fingerprint = [0xA5; size_of::<DispatchFingerprint>()];
         let mut claim = DispatchClaim::default();
         let mut interrupted = PublicationGuard::default();
         assert!(!claim.admit(fingerprint, true, false, &mut interrupted));
@@ -15400,7 +15419,7 @@ mod pdo_alias_tests {
         // would re-enter a blocked callback on every overlap. The rollback
         // below proves the other half: once the owner drops without
         // completing, the same redelivery is admitted fresh.
-        let fingerprint = [0x3C; 32];
+        let fingerprint = [0x3C; size_of::<DispatchFingerprint>()];
         let mut claim = DispatchClaim::default();
         let mut first = PublicationGuard::default();
         assert!(!claim.admit(fingerprint, true, false, &mut first));

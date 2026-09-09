@@ -24,7 +24,7 @@ impl Client {
             if let Some(claim) = cache.get(&key) {
                 claim.prune();
                 if !pdo && claim.alias.is_none() {
-                    claim.alias = Self::dispatch_alias(info, &key);
+                    claim.alias = Self::dispatch_alias(info, &key).map(Box::new);
                 }
                 return update(claim);
             }
@@ -41,9 +41,9 @@ impl Client {
                     }
                     match (&primary.participant, &key.participant, &claim.alias) {
                         (Some(_), Some(participant), Some(alias)) => {
-                            primary.chat == key.chat && participant == alias
+                            primary.chat == key.chat && participant == &**alias
                         }
-                        (None, None, Some(alias)) => &key.chat == alias,
+                        (None, None, Some(alias)) => key.chat == **alias,
                         _ => false,
                     }
                 })
@@ -64,13 +64,16 @@ impl Client {
                     claim.prune();
                     let primary = key.participant.as_ref().unwrap_or(&key.chat);
                     if !claim.has_recovery()
-                        || claim.alias.as_ref().is_some_and(|bound| bound != primary)
+                        || claim
+                            .alias
+                            .as_ref()
+                            .is_some_and(|bound| &**bound != primary)
                     {
                         return None;
                     }
                     // Bind only the direct evidence in this stanza. A later
                     // conflicting primary cannot reuse the PDO claim.
-                    claim.alias.get_or_insert_with(|| primary.clone());
+                    claim.alias.get_or_insert_with(|| Box::new(primary.clone()));
                     Some(alternate_key)
                 })
             };
@@ -79,7 +82,9 @@ impl Client {
                 return update(claim);
             }
             let mut claim = DispatchClaim {
-                alias: alias.or_else(|| Self::dispatch_alias(info, &key)),
+                alias: alias
+                    .or_else(|| Self::dispatch_alias(info, &key))
+                    .map(Box::new),
                 ..Default::default()
             };
             let result = update(&mut claim);
@@ -94,7 +99,7 @@ impl Client {
         &self,
         info: &Arc<MessageInfo>,
         pdo: bool,
-        fingerprint: Option<[u8; 32]>,
+        fingerprint: Option<DispatchFingerprint>,
         hook_committed: bool,
         publication: &mut PublicationGuard,
     ) -> bool {

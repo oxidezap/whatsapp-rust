@@ -231,17 +231,34 @@ const PUBLICATION_PENDING: u8 = 0;
 const PUBLICATION_COMPLETE: u8 = 1;
 const PUBLICATION_INTERRUPTED: u8 = 2;
 
+/// The retained half of a payload's SHA-256.
+///
+/// A digest is only ever compared against the at most
+/// [`MAX_DISPATCH_PAYLOADS`] digests recorded under one message identity, so
+/// what it has to rule out is a second payload for *that* id colliding on 128
+/// bits — a second preimage, not a birthday collision, and unreachable for a
+/// peer that would have to find it. Keeping 32 bytes instead doubled what the
+/// dispatch gate retains per claim, and the gate's table is the largest thing
+/// this feature adds to a client's resident memory.
+pub(crate) type DispatchFingerprint = [u8; 16];
+
 #[derive(Clone)]
 struct DispatchPayload {
-    fingerprint: [u8; 32],
+    fingerprint: DispatchFingerprint,
     state: MessageDispatch,
     publication: Arc<AtomicU8>,
 }
 
+/// Boxed: an alternate identity is evidence a *minority* of claims carry (only
+/// a stanza that spelled both namespaces has one), while the claim itself is
+/// retained for every message id the client dispatches. Inline it cost every
+/// claim a `Jid` whether or not one existed.
+type DispatchAlias = Option<Box<Jid>>;
+
 #[derive(Clone, Default)]
 pub(crate) struct DispatchClaim {
     payloads: smallvec::SmallVec<[DispatchPayload; 1]>,
-    alias: Option<Jid>,
+    alias: DispatchAlias,
 }
 
 #[derive(Default)]
@@ -294,7 +311,7 @@ impl DispatchClaim {
         })
     }
 
-    fn state(&self, fingerprint: &[u8; 32]) -> Option<MessageDispatch> {
+    fn state(&self, fingerprint: &DispatchFingerprint) -> Option<MessageDispatch> {
         self.payloads
             .iter()
             .find(|payload| {
@@ -306,7 +323,7 @@ impl DispatchClaim {
 
     fn admit(
         &mut self,
-        fingerprint: [u8; 32],
+        fingerprint: DispatchFingerprint,
         pdo: bool,
         hook_committed: bool,
         publication: &mut PublicationGuard,
@@ -374,7 +391,7 @@ impl MessageDispatch {
     // stamp the `Message` encode tree once. A second sink type stamps it again
     // (measured +284 KiB .text); see the pinning note on `message_encode_into`.
     #[inline(never)]
-    pub(crate) fn fingerprint(message: &wa::Message) -> [u8; 32] {
+    pub(crate) fn fingerprint(message: &wa::Message) -> DispatchFingerprint {
         FINGERPRINT_SCRATCH.with(|scratch| {
             let mut scratch = scratch.borrow_mut();
             let fingerprint = Self::fingerprint_into(message, &mut scratch);
@@ -387,11 +404,23 @@ impl MessageDispatch {
     }
 
     #[inline(never)]
-    pub(crate) fn fingerprint_into(message: &wa::Message, scratch: &mut Vec<u8>) -> [u8; 32] {
+    pub(crate) fn fingerprint_into(
+        message: &wa::Message,
+        scratch: &mut Vec<u8>,
+    ) -> DispatchFingerprint {
         use sha2::{Digest, Sha256};
         scratch.clear();
         waproto::codec::message_encode_into(message, scratch);
-        Sha256::digest(scratch.as_slice()).into()
+        Self::truncate(Sha256::digest(scratch.as_slice()).into())
+    }
+
+    /// The retained prefix of a full digest, for a caller that already hashed
+    /// the encoded bytes it was writing anyway.
+    pub(crate) fn truncate(digest: [u8; 32]) -> DispatchFingerprint {
+        const LEN: usize = size_of::<DispatchFingerprint>();
+        let mut fingerprint = [0u8; LEN];
+        fingerprint.copy_from_slice(&digest[..LEN]);
+        fingerprint
     }
 }
 
