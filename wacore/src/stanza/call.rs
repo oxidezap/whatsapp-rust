@@ -3097,8 +3097,6 @@ mod tests {
             ovr.attrs().optional_string("device_orientation").as_deref(),
             Some("0")
         );
-        // The captured J engine emits screen_width/height="0" on a 1:1 video
-        // offer; the 1920x1080 we sent left callees answering without rendering.
         assert_eq!(
             ovr.attrs().optional_string("screen_width").as_deref(),
             Some("0")
