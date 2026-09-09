@@ -9,7 +9,7 @@ mod common;
 use anyhow::{Context, Result};
 use oracle_core::{Runtime, ThreadPolicy, Value};
 use sha2::{Digest, Sha256};
-use wacore::stanza::call::{OfferDeviceKey, OfferParams, build_offer};
+use wacore::stanza::call::{CAPABILITY_VIDEO_OFFER, OfferDeviceKey, OfferParams, build_offer};
 use wacore_binary::jid::Server;
 use wacore_binary::node::NodeContent;
 use wacore_binary::{Jid, marshal};
@@ -138,7 +138,7 @@ fn video_offer_matches_the_vendor_engine() -> Result<()> {
             enc_type: "pkmsg".to_string(),
         }],
         privacy_token: Some(&[0xa5; 32]),
-        capability: Some(&[0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x53]),
+        capability: Some(&CAPABILITY_VIDEO_OFFER),
         device_identity: None,
         id: Some("1"),
         multi_device: false,
@@ -173,6 +173,26 @@ fn video_offer_matches_the_vendor_engine() -> Result<()> {
             "builder drift on video {name}"
         );
     }
+    let engine_cap = children
+        .iter()
+        .find(|child| child.tag == "capability")
+        .context("engine capability")?;
+    let rust_cap = match &rust_offer.content {
+        Some(NodeContent::Nodes(inner)) => inner
+            .iter()
+            .find(|child| child.tag == "capability")
+            .context("rust capability child")?,
+        _ => anyhow::bail!("rust offer has no children"),
+    };
+    let rust_cap_bytes = match &rust_cap.content {
+        Some(NodeContent::Bytes(bytes)) => bytes.clone(),
+        _ => anyhow::bail!("rust capability has no bytes"),
+    };
+    assert_eq!(
+        Some(rust_cap_bytes.as_slice()),
+        engine_cap.content_bytes(),
+        "builder drift on video offer capability"
+    );
     eprintln!("executed JgwtTQVeWPm.wasm video offer: engine and builder agree on zero screens");
     Ok(())
 }

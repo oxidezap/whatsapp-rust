@@ -493,10 +493,13 @@ pub const CAPABILITY_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x13]
 pub const CAPABILITY_PREACCEPT: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x07];
 /// Legacy offer order observed on WhatsApp Web.
 pub const DEFAULT_AUDIO_RATES: &[&str] = &["8000", "16000"];
-/// Capability blob a client places in a VIDEO `<offer>`: byte 5 is `0xfa` (video) vs the audio
-/// `0xbb`. Observed in a real from-start video offer. A video CALLEE preaccepts with [`CAPABILITY_OFFER`]
-/// (`0xbb`), not this.
-pub const CAPABILITY_VIDEO_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xfa, 0x13];
+/// Capability blob a client places in a VIDEO `<offer>`, byte-matching the captured J engine driven
+/// with the video flag set (`JgwtTQVeWPm.wasm`, `video_offer_matches_the_vendor_engine`). The `0xfa`
+/// byte 5 seen in one early capture belongs to another platform's offer and must not be sent here:
+/// against Android it left callees answering a call whose video never rendered, while every flow
+/// that renders — our own video preaccepts, audio offers, and the engine's audio and video offers —
+/// stays in the `0xbb` family. A video CALLEE preaccepts with [`CAPABILITY_OFFER`], not this.
+pub const CAPABILITY_VIDEO_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x53];
 
 /// Capability index for `use_mlow_codec_v1`.
 ///
@@ -932,7 +935,7 @@ fn capability_node(blob: &[u8]) -> Node {
 
 /// `<preaccept>`: audio → \[video\] → encopt → capability. `id` is the random call-wrapper id. A video
 /// callee advertises the `<video>` decoder here; the default capability stays the `0xbb`
-/// [`CAPABILITY_OFFER`] blob (the `0xfa` variant is the caller's offer).
+/// [`CAPABILITY_OFFER`] blob (a video offer carries [`CAPABILITY_VIDEO_OFFER`]).
 pub fn build_preaccept(
     call_id: &str,
     to: &Jid,
@@ -2574,7 +2577,7 @@ mod tests {
             video.attrs().optional_string("screen_width").as_deref(),
             Some("0")
         );
-        // A video callee preaccepts with the 0xbb CAPABILITY_OFFER blob, not the 0xfa offer blob.
+        // A video callee preaccepts with the 0xbb CAPABILITY_OFFER blob, not the video offer blob.
         let cap = action.get_optional_child("capability").unwrap();
         assert_eq!(cap.content_bytes().unwrap(), &CAPABILITY_OFFER);
 
