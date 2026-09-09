@@ -73,7 +73,10 @@ Budgets, asserted with `<=`:
   futures `<= 192` in `src/send/mod.rs`, dispatch claim `<= 56` in
   `src/message/tests.rs`, group snapshot `<= 92` per participant in
   `wacore/src/client/context.rs`, sender-key map `<= 36` per device in
-  `src/sender_key_device_cache.rs`. Pure budgets, already bounds.
+  `src/sender_key_device_cache.rs`, group memo `<= 37` per resolved device
+  in `src/client/device_registry.rs`, post-login task future `<= 2048` in
+  `src/client/node_io.rs`, server-sync task future `<= 512` in
+  `src/handlers/notification/groups.rs`. Pure budgets, already bounds.
 - `PlainSlot<String, u32> <= 40` in `src/portable_cache.rs`. The contract is
   key plus hash plus value with no metadata tail; smaller still satisfies it.
 - `SkippedKey <= 40` in `wacore/libsignal/src/protocol/state/session.rs`.
@@ -96,8 +99,11 @@ Budgets, asserted with `<=`:
    take, is a real finding. Fix that instead.
 5. Update the bound and the comment next to it. Say what moved and why the
    new number is right. Never bump a number just to turn CI green.
-6. Run the layout tests listed below and keep the whole diff to tests plus
-   this file. No production code changes.
+6. Run the layout tests listed below. When the rebaseline is caused only
+   by a compiler or dependency move, keep the diff to tests plus this
+   file: no production code changes. When an intentional production change
+   moved the layout, its bound update belongs in the same change, next to
+   the field-level rationale the steps above produced.
 
 Layout tests to run, one filter per command so a failure names its assert:
 
@@ -119,6 +125,10 @@ cargo test -p whatsapp-rust --lib an_unbounded_cache_stores_plain_slots_without_
 cargo test -p whatsapp-rust --lib dispatch_gate_slot_stays_below_the_spelled_out_identity
 cargo test -p whatsapp-rust --lib client_size_pins_runtime_cache_config_saving
 cargo test -p whatsapp-rust --features client-lifecycle,plugins --lib client_size_pins_runtime_cache_config_saving
+cargo test -p whatsapp-rust --features bench-harness,client-lifecycle,debug-snapshots,legacy-session-interop,metrics,passkey,plugins,signal,sqlite-storage,test-support,tokio-native,tokio-runtime,tokio-transport,tracing,ureq-client,voip,voip-encoded,voip-libopus,voip-mlow,voip-relay-native,voip-runtime,whatsapp-rust-sqlite-storage --lib client_size_pins_runtime_cache_config_saving
+cargo test -p whatsapp-rust --lib group_devices_memo_retained_bytes_stay_bounded
+cargo test -p whatsapp-rust --lib the_post_login_task_does_not_carry_the_fresh_pairing_arm
+cargo test -p whatsapp-rust --lib the_server_sync_task_does_not_carry_the_sync_engine
 cargo test -p whatsapp-rust --lib test_manager_fields_are_inline
 cargo test -p whatsapp-rust --lib handing_back_a_connection_costs_the_caller_nothing
 cargo test -p wacore --lib event_stays_under_its_size_ceiling
@@ -126,10 +136,11 @@ cargo test -p wacore-libsignal --lib skipped_message_keys_are_reported_at_their_
 cargo test -p whatsapp-rust-ureq-http-client --lib provenance_reconstructs_the_stored_report
 ```
 
-The client-size pin is feature sensitive: run the default and
-`client-lifecycle,plugins` variants above, plus the CI feature set the
-test's own comment names (`cargo xt ci` computes it per package, so read
-the current set off the test before rebaselining).
+The client-size pin is feature sensitive: run all three variants above. The
+long one is the CI feature set, spelled out so the procedure does not
+depend on remembering it; regenerate it with
+`cargo xt ci test-features whatsapp-rust` when `Cargo.toml` gains or
+loses a feature, since the set follows the manifest.
 
 The sender-key budgets are the only ones with 32-bit branches. The
 `--target i686-unknown-linux-gnu` command above exercises them. It needs

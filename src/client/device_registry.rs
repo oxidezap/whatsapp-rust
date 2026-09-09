@@ -4335,7 +4335,8 @@ mod tests {
     /// The memo is per group and lives as long as the group stays warm, so its
     /// cost has to be a bound rather than a comment. Measured per (member,
     /// device) pair because both halves scale with it: the membership index is
-    /// keyed by user and the device list by device.
+    /// keyed by user and the device list by device. Budget: rebaseline per
+    /// [layout asserts](../../agent_docs/layout_asserts.md).
     #[test]
     fn group_devices_memo_retained_bytes_stay_bounded() {
         use wacore::stats::HeapSize;
