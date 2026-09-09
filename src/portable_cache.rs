@@ -1820,7 +1820,15 @@ mod tests {
             shrunk < grown,
             "empty table must release its buckets: {grown} -> {shrunk}"
         );
+        assert_eq!(
+            shrunk, 0,
+            "empty table must release all buckets: {grown} -> {shrunk}"
+        );
         let shrunk_bytes = cache.memory_stats(|_, _| 0).bytes;
+        assert_eq!(
+            shrunk_bytes, 0,
+            "empty table must retain no structural bytes"
+        );
         eprintln!(
             "dedup shrink: {grown} -> {shrunk} buckets, {grown_bytes} -> {shrunk_bytes} structural bytes (cold fill took {cold_fill:?})"
         );
