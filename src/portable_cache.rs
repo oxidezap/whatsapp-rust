@@ -1799,7 +1799,7 @@ mod tests {
     fn empty_dedup_table_releases_its_buckets_and_serves_the_next_burst() {
         const BURST: u32 = 4_000;
         let cache = SyncTtlCache::new(u64::from(BURST) * 4, None);
-        let cold_start = std::time::Instant::now();
+        let cold_start = Instant::now();
         for key in 0..BURST {
             cache.insert(key, key);
         }
@@ -1833,7 +1833,7 @@ mod tests {
             "dedup shrink: {grown} -> {shrunk} buckets, {grown_bytes} -> {shrunk_bytes} structural bytes (cold fill took {cold_fill:?})"
         );
 
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         for key in 0..BURST {
             cache.insert(key, key);
         }
