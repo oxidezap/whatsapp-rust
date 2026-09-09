@@ -700,7 +700,8 @@ mod tests {
         #[cfg(target_pointer_width = "64")]
         assert!(
             size_of::<UreqHttpClient>() <= size_of::<ureq::Agent>() + 24,
-            "client overhead grew past 24 B on top of the agent"
+            "client overhead grew to {} B past the agent (budget 24)",
+            size_of::<UreqHttpClient>() - size_of::<ureq::Agent>()
         );
 
         // `Debug` still renders the reconstructed `pool_report` field.

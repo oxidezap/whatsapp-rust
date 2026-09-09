@@ -15268,11 +15268,13 @@ mod pdo_alias_tests {
         }
         let retained = client.memory_report().await.dispatched_message_contents;
         assert_eq!(retained.entries, u64::from(IDENTITIES));
-        let per_identity = retained.bytes / retained.entries;
+        // Totals, not a per-identity average: integer division truncates, so
+        // an average could read 288 while the total already exceeds it.
         assert!(
-            per_identity <= 288,
-            "the dispatch gate retains {per_identity} B per identity, more than the \
-             identity-only marker it replaced"
+            retained.bytes <= 288 * u64::from(IDENTITIES),
+            "the dispatch gate retains {} B for {IDENTITIES} identities, more than \
+             288 B per identity of the identity-only marker it replaced",
+            retained.bytes
         );
     }
 

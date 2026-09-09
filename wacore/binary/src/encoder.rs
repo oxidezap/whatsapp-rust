@@ -1039,12 +1039,14 @@ mod tests {
     fn the_hint_tape_stays_five_bytes_wide() {
         assert!(
             size_of::<StringHint>() <= 5,
-            "StringHint got wider than 5 B; the tape is one per string, so this is \
-             peak memory times every string in the payload"
+            "StringHint got wider than 5 B (now {} B); the tape is one per string, so this is \
+             peak memory times every string in the payload",
+            size_of::<StringHint>()
         );
         assert!(
             size_of::<ParsedJidMeta>() <= 5,
-            "ParsedJidMeta got wider than 5 B"
+            "ParsedJidMeta got wider than 5 B (now {} B)",
+            size_of::<ParsedJidMeta>()
         );
     }
 

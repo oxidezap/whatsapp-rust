@@ -2296,7 +2296,8 @@ mod tests {
         );
         assert!(
             size_of::<SkippedKey>() <= 40,
-            "a seed-only skipped key is a u32 and 32 bytes of seed"
+            "a seed-only skipped key is a u32 and 32 bytes of seed, now {} B (budget 40)",
+            size_of::<SkippedKey>()
         );
 
         // And the backlog round-trips: what was moved out comes back on encode.

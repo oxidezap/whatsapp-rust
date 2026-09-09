@@ -103,6 +103,7 @@ Layout tests to run, one filter per command so a failure names its assert:
 
 ```bash
 cargo test -p wacore-libsignal --lib sender_key_state_layout_dropped_the_protobuf_copies
+cargo test -p wacore-libsignal --target i686-unknown-linux-gnu --lib sender_key_state_layout_dropped_the_protobuf_copies
 cargo test -p wacore-binary --lib the_hint_tape_stays_five_bytes_wide
 cargo test -p wacore --lib a_device_entry_is_eight_bytes
 cargo test -p wacore --lib a_device_list_record_fits_sixty_four_bytes
@@ -123,6 +124,11 @@ The client-size pin is feature sensitive: run the default and
 `client-lifecycle,plugins` variants above, plus the CI feature set the
 test's own comment names (`cargo xt ci` computes it per package, so read
 the current set off the test before rebaselining).
+
+The sender-key budgets are the only ones with 32-bit branches. The
+`--target i686-unknown-linux-gnu` command above exercises them (needs
+`rustup target add i686-unknown-linux-gnu` once); the `Slot` and
+`Agent` overhead asserts are 64-bit only by `cfg` gate.
 cargo test -p whatsapp-rust --lib test_manager_fields_are_inline
 cargo test -p whatsapp-rust --lib handing_back_a_connection_costs_the_caller_nothing
 cargo test -p wacore --lib event_stays_under_its_size_ceiling

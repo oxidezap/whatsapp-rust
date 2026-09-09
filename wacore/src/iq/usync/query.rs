@@ -2487,6 +2487,10 @@ mod tests {
     /// Rebaseline per [layout asserts](../../../../agent_docs/layout_asserts.md).
     #[test]
     fn sparse_result_layout_stays_bounded() {
-        assert!(size_of::<UsyncProtocolResult>() <= 96);
+        assert!(
+            size_of::<UsyncProtocolResult>() <= 96,
+            "UsyncProtocolResult grew to {} B (budget 96)",
+            size_of::<UsyncProtocolResult>()
+        );
     }
 }

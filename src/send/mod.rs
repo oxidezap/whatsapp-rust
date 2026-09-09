@@ -9709,18 +9709,31 @@ mod future_size_tests {
         let msg = waproto::whatsapp::Message::default();
 
         let f = client.send_message(jid.clone(), msg.clone());
-        assert!(size_of_val(&f) <= 192, "send_message future grew");
+        assert!(
+            size_of_val(&f) <= 192,
+            "send_message future grew to {} B (budget 192)",
+            size_of_val(&f)
+        );
         drop(f);
         let f = client.send_text(jid.clone(), "x");
-        assert!(size_of_val(&f) <= 192, "send_text future grew");
+        assert!(
+            size_of_val(&f) <= 192,
+            "send_text future grew to {} B (budget 192)",
+            size_of_val(&f)
+        );
         drop(f);
         let f = client.forward_message(jid.clone(), &msg);
-        assert!(size_of_val(&f) <= 192, "forward_message future grew");
+        assert!(
+            size_of_val(&f) <= 192,
+            "forward_message future grew to {} B (budget 192)",
+            size_of_val(&f)
+        );
         drop(f);
         let f = client.send_message_with_options(jid, msg, Default::default());
         assert!(
             size_of_val(&f) <= 192,
-            "send_message_with_options future grew"
+            "send_message_with_options future grew to {} B (budget 192)",
+            size_of_val(&f)
         );
         drop(f);
     }
