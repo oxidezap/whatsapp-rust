@@ -686,8 +686,15 @@ mod tests {
             None
         );
 
-        // The flag (+ cap + shared latch) stays 24 bytes past the agent; the
-        // stored `Option<HttpResourceReport>` it replaces cost 48.
+        // The flag (+ cap + shared latch) stays smaller than the stored
+        // `Option<HttpResourceReport>` it replaces; the 24-byte overhead
+        // below only holds where `usize` is 8 bytes.
+        assert!(
+            size_of::<UreqHttpClient>()
+                < size_of::<ureq::Agent>() + size_of::<Option<HttpResourceReport>>(),
+            "provenance flag must stay smaller than the stored report it replaces"
+        );
+        #[cfg(target_pointer_width = "64")]
         assert_eq!(size_of::<UreqHttpClient>(), size_of::<ureq::Agent>() + 24);
 
         // `Debug` still renders the reconstructed `pool_report` field.
