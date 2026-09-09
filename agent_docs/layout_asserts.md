@@ -119,6 +119,12 @@ cargo test -p whatsapp-rust --lib an_unbounded_cache_stores_plain_slots_without_
 cargo test -p whatsapp-rust --lib dispatch_gate_slot_stays_below_the_spelled_out_identity
 cargo test -p whatsapp-rust --lib client_size_pins_runtime_cache_config_saving
 cargo test -p whatsapp-rust --features client-lifecycle,plugins --lib client_size_pins_runtime_cache_config_saving
+cargo test -p whatsapp-rust --lib test_manager_fields_are_inline
+cargo test -p whatsapp-rust --lib handing_back_a_connection_costs_the_caller_nothing
+cargo test -p wacore --lib event_stays_under_its_size_ceiling
+cargo test -p wacore-libsignal --lib skipped_message_keys_are_reported_at_their_in_memory_cost
+cargo test -p whatsapp-rust-ureq-http-client --lib provenance_reconstructs_the_stored_report
+```
 
 The client-size pin is feature sensitive: run the default and
 `client-lifecycle,plugins` variants above, plus the CI feature set the
@@ -126,12 +132,9 @@ test's own comment names (`cargo xt ci` computes it per package, so read
 the current set off the test before rebaselining).
 
 The sender-key budgets are the only ones with 32-bit branches. The
-`--target i686-unknown-linux-gnu` command above exercises them (needs
-`rustup target add i686-unknown-linux-gnu` once); the `Slot` and
-`Agent` overhead asserts are 64-bit only by `cfg` gate.
-cargo test -p whatsapp-rust --lib test_manager_fields_are_inline
-cargo test -p whatsapp-rust --lib handing_back_a_connection_costs_the_caller_nothing
-cargo test -p wacore --lib event_stays_under_its_size_ceiling
-cargo test -p wacore-libsignal --lib skipped_message_keys_are_reported_at_their_in_memory_cost
-cargo test -p whatsapp-rust-ureq-http-client --lib provenance_reconstructs_the_stored_report
-```
+`--target i686-unknown-linux-gnu` command above exercises them. It needs
+`rustup target add i686-unknown-linux-gnu` once, plus a 32-bit-capable C
+toolchain for the link: on Debian/Ubuntu that is `sudo apt-get install
+gcc-multilib`. Without those the 32-bit run fails before any test
+executes. The `Slot` and `Agent` overhead asserts are 64-bit only by
+`cfg` gate.
