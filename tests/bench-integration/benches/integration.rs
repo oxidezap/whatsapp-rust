@@ -74,9 +74,11 @@ fn rt() -> &'static tokio::runtime::Runtime {
     RT.get_or_init(|| {
         // Best-effort logger init, mirroring the old binary; ignore errors so a
         // second bench module call is harmless.
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-            .try_init()
-            .ok();
+        whatsapp_rust::logging::Builder::from_env(
+            whatsapp_rust::logging::Env::default().default_filter_or("warn"),
+        )
+        .try_init()
+        .ok();
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()

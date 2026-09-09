@@ -79,7 +79,10 @@ async fn print_session_metrics(label: &str, client: &Arc<Client>, cpu: &CpuMeter
 }
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    whatsapp_rust::logging::Builder::from_env(
+        whatsapp_rust::logging::Env::default().default_filter_or("info"),
+    )
+    .init();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

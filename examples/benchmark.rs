@@ -104,19 +104,21 @@ fn resolve_benchmark_endpoint_from_env() -> BenchmarkEndpoint {
 }
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .format(|buf, record| {
-            use std::io::Write;
-            writeln!(
-                buf,
-                "{} [{:<5}] [{}] - {}",
-                wacore::time::now_utc().format("%H:%M:%S"),
-                record.level(),
-                record.target(),
-                record.args()
-            )
-        })
-        .init();
+    whatsapp_rust::logging::Builder::from_env(
+        whatsapp_rust::logging::Env::default().default_filter_or("warn"),
+    )
+    .format(|buf, record| {
+        use std::io::Write;
+        writeln!(
+            buf,
+            "{} [{:<5}] [{}] - {}",
+            wacore::time::now_utc().format("%H:%M:%S"),
+            record.level(),
+            record.target(),
+            record.args()
+        )
+    })
+    .init();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

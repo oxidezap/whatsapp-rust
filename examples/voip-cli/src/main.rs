@@ -166,8 +166,9 @@ async fn main() -> Result<()> {
     // packets on net_conn: Alert is Fatal or Close Notify"), which is benign teardown noise: the
     // call already ended via <terminate> and the disconnect is surfaced through CallEvent. Quiet
     // those crates to error so the demo output stays clean; RUST_LOG still overrides this.
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,webrtc_sctp=error,webrtc_dtls=error"),
+    whatsapp_rust::logging::Builder::from_env(
+        whatsapp_rust::logging::Env::default()
+            .default_filter_or("info,webrtc_sctp=error,webrtc_dtls=error"),
     )
     .format(move |buf, record| {
         use std::io::Write;
