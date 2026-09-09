@@ -444,10 +444,11 @@ fn main() -> Result<()> {
 
     // Side B, probe 2: census shape with the vendor's own <video> child,
     // delivered to an engine running as self with the peer as caller.
+    let census_caller = Jid::new("11223344556677", Server::Lid);
     let emitted = side_b_answerer(
         &bytes,
         [SELF, SELF_DEVICE, SELF_LID],
-        Jid::new("11223344556677", Server::Lid),
+        census_caller.clone(),
         vec![census_video_offer(&video), voip_settings_sibling()],
         "census video offer",
     )?;
@@ -457,19 +458,22 @@ fn main() -> Result<()> {
     // `<call>` wrapper, so descend into the wrapper first, as the offer
     // comparison does; comparing wrapper children would report the protocol
     // fields against `["accept"]`.
+    //
+    // The expectation mirrors the production answer path (`answer_with_ids`):
+    // creator and target are the incoming caller, the audio set is exactly the
+    // offered rate (a conforming accept can select only what was offered), and
+    // a from-start video accept carries no capability child.
     match emitted.iter().find(|n| n.tag == "accept") {
         Some(vendor_accept) => {
             let rust_wrapper = build_accept(&AcceptParams {
                 call_id: CALL_ID,
-                to: &peer,
+                to: &census_caller.clone().with_device(1),
                 id: "2",
-                call_creator: &creator,
-                audio_rates: &["8000", "16000"],
+                call_creator: &census_caller.clone().with_device(1),
+                audio_rates: &["16000"],
                 relay_te: None,
                 rte: None,
                 voip_settings: None,
-                // Production from-start video accepts carry no capability
-                // child (see `answer_with_ids`); audio answers advertise one.
                 capability: None,
                 video: true,
                 peer_abtest_bucket: None,

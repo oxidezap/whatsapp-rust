@@ -300,20 +300,20 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
     }
     let immediate = r.call_embind("getCallInfo", &[]);
     r.refuel();
-    // A trapped state query is a host failure, not a dead call: propagate it
-    // instead of letting the length heuristic below read it as torn down.
-    let alive = match &immediate {
+    // A trapped state query is a host failure, not a dead call: it is a
+    // distinct `unknown` outcome, never folded into dead.
+    let alive: Option<bool> = match &immediate {
         Err(e) => {
             println!("PROBE {}: getCallInfo trapped: {e}", probe.label);
-            false
+            None
         }
-        Ok(Value::Str(s)) => !s.is_empty(),
+        Ok(Value::Str(s)) => Some(!s.is_empty()),
         Ok(other) => {
             println!(
                 "PROBE {}: unexpected getCallInfo shape: {other:?}",
                 probe.label
             );
-            true
+            Some(true)
         }
     };
     // Was it already torn down before accept, or still pending? Snapshot the
@@ -330,13 +330,13 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
     if std::env::var("SKIP_ACCEPT").is_ok() {
         r.settle(std::time::Duration::from_secs(3));
         r.refuel();
-        let alive_later = match r.call_embind("getCallInfo", &[]) {
+        let alive_later: Option<bool> = match r.call_embind("getCallInfo", &[]) {
             Err(e) => {
                 println!("PROBE {}: late getCallInfo trapped: {e}", probe.label);
-                false
+                None
             }
-            Ok(Value::Str(s)) => !s.is_empty(),
-            Ok(_) => true,
+            Ok(Value::Str(s)) => Some(!s.is_empty()),
+            Ok(_) => Some(true),
         };
         r.refuel();
         let emitted = r.signaling()?.len();
@@ -345,7 +345,7 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
             .iter()
             .any(|l| l.contains("missed by the user"));
         println!(
-            "PROBE {}: delivered={delivered} quiesced={quiesced} alive={alive} preaccept_torn_down={torn_down_pre_accept} no-accept: alive_later={alive_later} emitted={emitted} missed={missed}",
+            "PROBE {}: delivered={delivered} quiesced={quiesced} alive={alive:?} preaccept_torn_down={torn_down_pre_accept} no-accept: alive_later={alive_later:?} emitted={emitted} missed={missed}",
             probe.label,
         );
         return Ok(());
@@ -397,7 +397,7 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         .iter()
         .any(|l| l.contains("missed by the user"));
     println!(
-        "PROBE {}: delivered={delivered} quiesced={quiesced} alive={alive} preaccept_torn_down={torn_down_pre_accept} accept={accepted:?} settled={settled} emitted={emitted} missed={missed} {term_reason}",
+        "PROBE {}: delivered={delivered} quiesced={quiesced} alive={alive:?} preaccept_torn_down={torn_down_pre_accept} accept={accepted:?} settled={settled} emitted={emitted} missed={missed} {term_reason}",
         probe.label,
     );
     Ok(())
