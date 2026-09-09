@@ -173,8 +173,7 @@ impl LidPnCache {
         }
     }
 
-    /// Test-only clones of the backing custom stores (one per direction map),
-    /// for pinning the `assemble` store lifetime via `Arc::ptr_eq`.
+    /// Test-only clones of the backing custom stores, one per direction map.
     #[cfg(test)]
     pub(crate) fn custom_stores_for_tests(&self) -> Vec<Arc<dyn wacore::store::CacheStore>> {
         [

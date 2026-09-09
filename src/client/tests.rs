@@ -3712,8 +3712,8 @@ async fn non_group_cache_stores_are_owned_by_live_caches_only() {
     )
     .await;
 
-    // Device-registry store: the live cache keeps the same allocation, and the
-    // construction config must not pin a second Arc (count drops to held + cache).
+    // Device-registry store: same allocation, held once by the test plus once
+    // by the live cache.
     let retained_registry = client
         .device_registry_cache
         .custom_store_for_tests()
@@ -3729,7 +3729,8 @@ async fn non_group_cache_stores_are_owned_by_live_caches_only() {
         "device-registry store must be owned by the test handle plus the live cache only"
     );
 
-    // LID-PN store: both direction maps share the same allocation, same drop rule.
+    // LID-PN store: same allocation in both direction maps, held once by the
+    // test plus twice by the cache.
     let retained_lid = client.lid_pn_cache.custom_stores_for_tests();
     assert_eq!(
         retained_lid.len(),

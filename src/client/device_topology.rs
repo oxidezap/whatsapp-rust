@@ -251,8 +251,7 @@ impl DeviceRegistryCache {
         self.cache.run_pending_tasks().await;
     }
 
-    /// Test-only clone of the backing custom store, for pinning the
-    /// `assemble` store lifetime via `Arc::ptr_eq` + `strong_count`.
+    /// Test-only clone of the backing custom store.
     #[cfg(test)]
     pub(crate) fn custom_store_for_tests(
         &self,
