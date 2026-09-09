@@ -347,6 +347,7 @@ workspace = true
 # `cargo build --example demo` works without `required-features`.
 [[example]]
 name = "demo"
+test = true
 
 # The mock-capable benchmark client. `test = true` makes its `#[cfg(test)]`
 # config tests a nextest target, so the default CI run executes them instead of
