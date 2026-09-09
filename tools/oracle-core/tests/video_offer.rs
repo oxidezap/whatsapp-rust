@@ -162,6 +162,7 @@ fn video_offer_matches_the_vendor_engine() -> Result<()> {
         "device_orientation",
         "screen_width",
         "screen_height",
+        "orientation",
     ] {
         assert_eq!(
             rust_video.attrs().optional_string(name).as_deref(),
