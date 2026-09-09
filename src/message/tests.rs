@@ -15006,6 +15006,20 @@ mod pdo_alias_tests {
     }
 
     #[test]
+    fn pdo_alias_fingerprint_reuses_thread_scratch_without_message_sized_blocks() {
+        let message = wa::Message {
+            conversation: Some("x".repeat(8192)),
+            ..Default::default()
+        };
+        let _ = MessageDispatch::fingerprint(&message);
+        let max = crate::test_alloc::min_max_block(1024, || MessageDispatch::fingerprint(&message));
+        assert!(
+            max <= 1024,
+            "fingerprint allocated a {max}-byte block for an 8192-byte body with a warm buffer"
+        );
+    }
+
+    #[test]
     fn pdo_alias_fingerprint_matches_wire_encoding() {
         use sha2::{Digest, Sha256};
         for message in [

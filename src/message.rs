@@ -347,13 +347,24 @@ impl DispatchClaim {
     }
 }
 
+// Rare-path callers (PDO recovery, duplicate probes) share one encode buffer
+// per thread instead of allocating a message-sized `Vec` per call. Borrowed
+// synchronously only, never held across an await.
+std::thread_local! {
+    static FINGERPRINT_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl MessageDispatch {
     // One `Vec<u8>` sink only: `message_to_vec`/`message_encode_into` already
     // stamp the `Message` encode tree once. A second sink type stamps it again
     // (measured +284 KiB .text); see the pinning note on `message_encode_into`.
     #[inline(never)]
     pub(crate) fn fingerprint(message: &wa::Message) -> [u8; 32] {
-        Self::fingerprint_into(message, &mut Vec::new())
+        FINGERPRINT_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            Self::fingerprint_into(message, &mut scratch)
+        })
     }
 
     #[inline(never)]
