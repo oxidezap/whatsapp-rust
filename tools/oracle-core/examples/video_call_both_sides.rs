@@ -57,27 +57,52 @@ fn load_engine() -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn start(bytes: &[u8]) -> Result<Runtime> {
+fn start(bytes: &[u8], identity: [&str; 3]) -> Result<Runtime> {
     for _ in 0..8 {
         let mut r = Runtime::instantiate(bytes)?;
         r.set_thread_policy(ThreadPolicy::Spawn);
         r.set_main_thread_registration(true);
         r.run_ctors()?;
         r.attach_log_ring(4 << 20)?;
-        let init = r.call_embind(
-            "initVoipStack",
-            &[
-                Value::Str(SELF.into()),
-                Value::Str(SELF_DEVICE.into()),
-                Value::Str(SELF_LID.into()),
-            ],
-        );
+        let args = identity.map(|value| Value::Str(value.to_owned()));
+        let init = r.call_embind("initVoipStack", &args);
         r.refuel();
         if init.as_ref().ok().and_then(|v| v.as_int()) == Some(0) {
             return Ok(r);
         }
     }
     bail!("initVoipStack never returned 0")
+}
+
+/// Wait for the event thread before delivering anything: an offer into the
+/// startup gap lands on a half-started engine and reads as a refusal. Warns
+/// and continues on timeout so a slow host degrades the verdict instead of
+/// hanging the run.
+fn await_event_thread(r: &mut Runtime, label: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        if r.engine_log()
+            .iter()
+            .any(|l| l.contains("call_event_proc resumed"))
+        {
+            return;
+        }
+        r.process_queued_calls();
+        r.refuel();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    println!("{label}: event thread never announced itself; results suspect");
+}
+
+/// Drain main-thread work the engine queued: with the main thread registered,
+/// answers wait in the proxy queue and only the host takes them out. Reading
+/// state without draining reports "the engine did nothing" about a run in
+/// which it queued the answer and nobody collected it.
+fn drain(r: &mut Runtime) {
+    for _ in 0..5 {
+        r.process_queued_calls();
+        r.refuel();
+    }
 }
 
 /// Decode one recorded stanza, skipping the stream-flag leading byte.
@@ -170,7 +195,8 @@ fn diff_children(vendor: &Node, rust: &Node) -> Option<String> {
 
 /// Side A: place a video call, return the emitted `<offer>` node.
 fn side_a_initiator(bytes: &[u8]) -> Result<(Node, String)> {
-    let mut r = start(bytes)?;
+    let mut r = start(bytes, [SELF, SELF_DEVICE, SELF_LID])?;
+    await_event_thread(&mut r, "side A");
     let outcome = r.call_embind(
         "startVoipCall",
         &[
@@ -205,9 +231,18 @@ fn side_a_initiator(bytes: &[u8]) -> Result<(Node, String)> {
 
 /// Side B: deliver one inbound `<call>` body, attempt `acceptCall`, and report
 /// what the engine emitted plus whether the offer parsed.
-fn side_b_answerer(bytes: &[u8], body: Vec<Node>, label: &str) -> Result<Vec<Node>> {
-    let mut r = start(bytes)?;
-    let caller = Jid::new("11223344556677", Server::Lid);
+///
+/// `identity` is the device under test: the raw probe runs the engine as the
+/// peer (the offer's true recipient), the census probe as self.
+fn side_b_answerer(
+    bytes: &[u8],
+    identity: [&str; 3],
+    caller: Jid,
+    body: Vec<Node>,
+    label: &str,
+) -> Result<Vec<Node>> {
+    let mut r = start(bytes, identity)?;
+    await_event_thread(&mut r, label);
     let now = r.virtual_unix_time();
     let wrapper = NodeBuilder::new("call")
         .attr("from", caller.clone())
@@ -235,7 +270,9 @@ fn side_b_answerer(bytes: &[u8], body: Vec<Node>, label: &str) -> Result<Vec<Nod
     r.refuel();
     // No settle here: the virtual clock advances per observation, and settling
     // ages the call past `caller_timeout`, tearing it down as missed before
-    // anything can accept it (see `signaling_census`).
+    // anything can accept it (see `signaling_census`). Drain first so queued
+    // main-thread work is collected before state is read.
+    drain(&mut r);
     let parsed = r.engine_log().iter().any(|l| l.contains("!Offer from:"));
     // State immediately after delivery, before accept: is the call EVER active,
     // even transiently, or is it born torn down?
@@ -248,11 +285,11 @@ fn side_b_answerer(bytes: &[u8], body: Vec<Node>, label: &str) -> Result<Vec<Nod
     );
     let accepted = r.call_embind("acceptCall", &[Value::Bool(true), Value::Bool(true)]);
     r.refuel();
-    r.settle(std::time::Duration::from_secs(5));
+    let settled = r.settle(std::time::Duration::from_secs(5));
     r.refuel();
     let emitted: Vec<Node> = r.signaling()?.iter().map(decode).collect::<Result<_>>()?;
     println!(
-        "side B [{label}]: offer parsed={parsed}, acceptCall -> {accepted:?}, emitted={}",
+        "side B [{label}]: offer parsed={parsed}, acceptCall -> {accepted:?}, settled={settled}, emitted={}",
         emitted.len()
     );
     for line in r.engine_log().iter().rev().take(12).rev() {
@@ -330,9 +367,18 @@ fn main() -> Result<()> {
         Some(d) => println!("VERDICT initiator: DIVERGENCE: {d}"),
     }
 
-    // Side B, probe 1: the vendor's own offer bytes (real ciphertext, no key).
+    // Side B, probe 1: the vendor's own offer bytes (real ciphertext, no key),
+    // delivered to an engine running as the peer — the offer's true recipient —
+    // with Side A as the incoming caller.
+    let peer_caller = Jid::new("99887766554433", Server::Lid);
     let emitted_raw = side_b_answerer(
         &bytes,
+        [
+            "11223344556677@c.us",
+            "11223344556677:0@c.us",
+            "11223344556677:0@lid",
+        ],
+        peer_caller,
         vec![offer.clone(), voip_settings_sibling()],
         "raw vendor offer",
     )?;
@@ -341,9 +387,12 @@ fn main() -> Result<()> {
         emitted_raw.len()
     );
 
-    // Side B, probe 2: census shape with the vendor's own <video> child.
+    // Side B, probe 2: census shape with the vendor's own <video> child,
+    // delivered to an engine running as self with the peer as caller.
     let emitted = side_b_answerer(
         &bytes,
+        [SELF, SELF_DEVICE, SELF_LID],
+        Jid::new("11223344556677", Server::Lid),
         vec![census_video_offer(&video), voip_settings_sibling()],
         "census video offer",
     )?;

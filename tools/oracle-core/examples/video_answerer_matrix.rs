@@ -173,6 +173,28 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
             marker_sink: None,
         },
     )?;
+    // The event thread must be up before delivery: an offer into the startup
+    // gap lands on a half-started engine and reads as a refusal.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut gated = false;
+    while std::time::Instant::now() < deadline {
+        if r.engine_log()
+            .iter()
+            .any(|l| l.contains("call_event_proc resumed"))
+        {
+            gated = true;
+            break;
+        }
+        r.process_queued_calls();
+        r.refuel();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if !gated {
+        println!(
+            "PROBE {}: event thread never announced itself; results suspect",
+            probe.label
+        );
+    };
     if probe.ab_props {
         let set = set_ab_props(&mut r);
         println!("  ab props accepted {set} of {}", AB_PROPS.len());
@@ -223,6 +245,12 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         Some(offset) => now + offset,
         None => now,
     };
+    // Arguments 4 and 5 are the stanza's `e` and `t` timestamps, read with
+    // stoull (see `tests/signaling.rs::deliver`): the probe axes ride here,
+    // not only on the stanza attributes, because the engine reads the header
+    // inputs. `second_numeric_offset` shifts `t` into the future.
+    let (e_arg, t_arg) = (now + if probe.expiry { 45 } else { 0 }, second_numeric);
+    let t_arg = if probe.t_millis { t_arg * 1000 } else { t_arg };
     let payload = base64::engine::general_purpose::STANDARD.encode(marshal::marshal(&wrapper)?);
     // Preserve the delivery outcome: a trap here must read as a delivery
     // failure, never as "the engine processed and rejected the offer".
@@ -232,8 +260,8 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
             Value::Str(payload),
             Value::Str("web".into()),
             Value::Str("2.3000.0".into()),
-            Value::Str(now.to_string()),
-            Value::Str(second_numeric.to_string()),
+            Value::Str(e_arg.to_string()),
+            Value::Str(t_arg.to_string()),
             Value::Bool(false),
             Value::Bool(true),
             Value::Str(caller.to_string()),
@@ -245,6 +273,13 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         Ok(value) => format!("{value:?}"),
         Err(_) => "trap".to_owned(),
     };
+    // Collect queued main-thread work before reading state: with the main
+    // thread registered, answers wait in the proxy queue and only the host
+    // takes them out.
+    for _ in 0..5 {
+        r.process_queued_calls();
+        r.refuel();
+    }
     let immediate = format!("{:?}", r.call_embind("getCallInfo", &[]).ok());
     r.refuel();
     let alive = !immediate.contains("\"\"") && immediate.len() > 20;
@@ -305,7 +340,10 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         &[Value::Bool(probe.accept.0), Value::Bool(probe.accept.1)],
     );
     r.refuel();
-    r.settle(std::time::Duration::from_secs(5));
+    // `settle` drains the proxy queue each tick, but a `false` return means it
+    // never quiesced: reporting a stall then turns harness timing into a
+    // protocol verdict, so quiescence is printed, not discarded.
+    let settled = r.settle(std::time::Duration::from_secs(5));
     r.refuel();
     let emitted = r.signaling()?.len();
     let term_reason = r
@@ -320,7 +358,7 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         .iter()
         .any(|l| l.contains("missed by the user"));
     println!(
-        "PROBE {}: delivered={delivered} alive={alive} preaccept_torn_down={torn_down_pre_accept} accept={accepted:?} emitted={emitted} missed={missed} {term_reason}",
+        "PROBE {}: delivered={delivered} alive={alive} preaccept_torn_down={torn_down_pre_accept} accept={accepted:?} settled={settled} emitted={emitted} missed={missed} {term_reason}",
         probe.label,
     );
     Ok(())
@@ -418,7 +456,7 @@ fn main() -> Result<()> {
             inner_t: false,
         },
         Probe {
-            label: "video+ab+num45",
+            label: "video+ab+future-t",
             ab_props: true,
             video: true,
             accept: (true, true),
