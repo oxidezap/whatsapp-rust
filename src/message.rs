@@ -218,12 +218,40 @@ pub(crate) enum MessageDispatch {
     RecoveredCommitted,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct DispatchKey {
-    chat: Jid,
-    id: wacore_binary::MessageId,
-    participant: Option<Jid>,
-    from_me: bool,
+/// A message identity — chat, id, author and direction — reduced to a keyed
+/// 64-bit digest.
+///
+/// The gate keys one claim per identity for a whole TTL, so what the identity
+/// costs is paid by every dispatched message twice over: once in the table
+/// slot it is stored in, once in the growth allocation that doubles that
+/// table. Spelled out it was a `Jid`, a `MessageId` and an optional second
+/// `Jid` — 96 bytes of the 208-byte slot, and a pair of `CompactString` copies
+/// on every lookup.
+///
+/// Hashing it is sound because a collision cannot suppress anything on its
+/// own: two identities landing on one claim still compare their payload
+/// digests, and a message is only suppressed when one of those 128-bit digests
+/// matches too. Aiming a message at another claim's slot means finding a
+/// collision under [`DISPATCH_IDENTITY`], whose SipHash key is drawn once per
+/// process and never leaves it, so the id and JIDs a peer chooses buy it
+/// nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DispatchKey(std::num::NonZeroU64);
+
+/// The gate's identity key, drawn per process: a fixed hash would let a peer
+/// compute which claim its id lands on.
+static DISPATCH_IDENTITY: std::sync::LazyLock<std::hash::RandomState> =
+    std::sync::LazyLock::new(std::hash::RandomState::new);
+
+impl DispatchKey {
+    /// Hashes an identity through the process key. Zero folds onto one so
+    /// `Option<DispatchKey>` rides in 8 bytes: one extra colliding pair in
+    /// 2^64, below the collision rate the identity already tolerates.
+    fn new(identity: impl std::hash::Hash) -> Self {
+        use std::hash::BuildHasher;
+        let digest = DISPATCH_IDENTITY.hash_one(identity);
+        Self(std::num::NonZeroU64::new(digest).unwrap_or(std::num::NonZeroU64::MIN))
+    }
 }
 
 const MAX_DISPATCH_PAYLOADS: usize = 8;
@@ -249,11 +277,15 @@ struct DispatchPayload {
     publication: Arc<AtomicU8>,
 }
 
-/// Boxed: an alternate identity is evidence a *minority* of claims carry (only
-/// a stanza that spelled both namespaces has one), while the claim itself is
-/// retained for every message id the client dispatches. Inline it cost every
-/// claim a `Jid` whether or not one existed.
-type DispatchAlias = Option<Box<Jid>>;
+/// The identity this claim's message carries under the alternate PN/LID
+/// spelling, when its stanza spelled both out.
+///
+/// The alternate *identity* rather than the alternate `Jid`: every use is a
+/// comparison against some other message's identity, so substituting the
+/// spelling once at admission answers them all without a scan re-deriving it,
+/// and `Option<DispatchKey>` rides in 8 bytes with no allocation for the
+/// minority of claims that have one.
+type DispatchAlias = Option<DispatchKey>;
 
 #[derive(Clone, Default)]
 pub(crate) struct DispatchClaim {
@@ -394,14 +426,6 @@ std::thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-impl wacore::stats::HeapSize for DispatchKey {
-    fn heap_bytes(&self) -> usize {
-        self.chat.heap_bytes()
-            + self.id.heap_bytes()
-            + self.participant.as_ref().map_or(0, |p| p.heap_bytes())
-    }
-}
-
 /// One publication token allocation: the value plus the strong and weak
 /// counts. Allocator rounding above that is not counted, the same floor the
 /// table accounting in `hash_table_bytes` uses.
@@ -409,8 +433,8 @@ const TOKEN_ALLOC_BYTES: usize = 2 * size_of::<usize>() + size_of::<AtomicU8>();
 
 impl wacore::stats::HeapSize for DispatchClaim {
     /// Heap retained beside the table slot: spilled payloads at their
-    /// allocated capacity, one token allocation per payload, and the boxed
-    /// alias. The inline SmallVec slot lives in the slot itself and is
+    /// allocated capacity and one token allocation per payload. The inline
+    /// SmallVec slot and the alias identity live in the slot itself and are
     /// charged with the table.
     fn heap_bytes(&self) -> usize {
         let mut bytes = 0;
@@ -418,9 +442,6 @@ impl wacore::stats::HeapSize for DispatchClaim {
             bytes += self.payloads.capacity() * size_of::<DispatchPayload>();
         }
         bytes += self.payloads.len() * TOKEN_ALLOC_BYTES;
-        if let Some(alias) = &self.alias {
-            bytes += size_of::<Jid>() + alias.heap_bytes();
-        }
         bytes
     }
 }

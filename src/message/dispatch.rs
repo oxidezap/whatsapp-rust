@@ -34,57 +34,29 @@ impl Client {
             if let Some(claim) = cache.get(&key) {
                 claim.prune();
                 if !pdo && claim.alias.is_none() {
-                    claim.alias = Self::dispatch_alias(info, &key).map(Box::new);
+                    claim.alias = Self::dispatch_alias(info);
                 }
                 return update(claim);
             }
             let mut alias = None;
             let recovery_key = if pdo {
-                // Only PDO misses scan. Two primaries naming this alternate
-                // are ambiguous, so neither may suppress the recovered event.
-                cache.find_unique_key(|primary, claim| {
-                    if !claim.has_deliveries()
-                        || primary.id != key.id
-                        || primary.from_me != key.from_me
-                    {
-                        return false;
-                    }
-                    match (&primary.participant, &key.participant, &claim.alias) {
-                        (Some(_), Some(participant), Some(alias)) => {
-                            primary.chat == key.chat && participant == &**alias
-                        }
-                        (None, None, Some(alias)) => key.chat == **alias,
-                        _ => false,
-                    }
-                })
+                // Only PDO misses scan. A claim's alias is the identity its
+                // message carries under the alternate spelling, so naming this
+                // recovery is the whole match. Two claims naming it are
+                // ambiguous, so neither may suppress the recovered event.
+                cache.find_unique_key(|_, claim| claim.has_deliveries() && claim.alias == Some(key))
             } else {
-                alias = Self::dispatch_alias(info, &key);
-                alias.as_ref().and_then(|alternate| {
-                    let alternate_key = DispatchKey {
-                        chat: if key.participant.is_some() {
-                            key.chat.clone()
-                        } else {
-                            alternate.clone()
-                        },
-                        id: key.id.clone(),
-                        participant: key.participant.as_ref().map(|_| alternate.clone()),
-                        from_me: key.from_me,
-                    };
-                    let claim = cache.get(&alternate_key)?;
+                alias = Self::dispatch_alias(info);
+                alias.and_then(|alternate| {
+                    let claim = cache.get(&alternate)?;
                     claim.prune();
-                    let primary = key.participant.as_ref().unwrap_or(&key.chat);
-                    if !claim.has_recovery()
-                        || claim
-                            .alias
-                            .as_ref()
-                            .is_some_and(|bound| &**bound != primary)
-                    {
+                    if !claim.has_recovery() || claim.alias.is_some_and(|bound| bound != key) {
                         return None;
                     }
                     // Bind only the direct evidence in this stanza. A later
                     // conflicting primary cannot reuse the PDO claim.
-                    claim.alias.get_or_insert_with(|| Box::new(primary.clone()));
-                    Some(alternate_key)
+                    claim.alias.get_or_insert(key);
+                    Some(alternate)
                 })
             };
             if let Some(claim) = recovery_key.as_ref().and_then(|key| cache.get(key)) {
@@ -92,9 +64,7 @@ impl Client {
                 return update(claim);
             }
             let mut claim = DispatchClaim {
-                alias: alias
-                    .or_else(|| Self::dispatch_alias(info, &key))
-                    .map(Box::new),
+                alias: alias.or_else(|| Self::dispatch_alias(info)),
                 ..Default::default()
             };
             let result = update(&mut claim);
@@ -206,36 +176,50 @@ impl Client {
     /// this primary key or followed through another claim.
     pub(crate) fn dispatch_key(info: &Arc<MessageInfo>) -> DispatchKey {
         let source = &info.source;
-        let has_participant = source.chat.is_group()
-            || source.chat.is_broadcast_list()
-            || source.chat.is_status_broadcast();
-        DispatchKey {
-            chat: source.chat.clone(),
-            id: info.id.clone(),
-            participant: has_participant.then(|| source.sender.to_non_ad()),
-            from_me: source.is_from_me,
-        }
+        let participant = Self::dispatch_participant(info);
+        DispatchKey::new((&source.chat, &info.id, &participant, source.is_from_me))
     }
 
-    fn dispatch_alias(info: &Arc<MessageInfo>, key: &DispatchKey) -> Option<Jid> {
+    /// The author an identity carries outside DMs, device dropped.
+    fn dispatch_participant(info: &Arc<MessageInfo>) -> Option<Jid> {
+        let chat = &info.source.chat;
+        (chat.is_group() || chat.is_broadcast_list() || chat.is_status_broadcast())
+            .then(|| info.source.sender.to_non_ad())
+    }
+
+    /// The identity this same message carries under the alternate PN/LID
+    /// spelling, when the stanza spelled both out.
+    ///
+    /// Substituting the spelling here rather than retaining the alternate
+    /// `Jid` is what lets every later comparison be one identity equality: the
+    /// PDO scan asks whether a claim names the recovery it is holding, and the
+    /// ordinary path asks whether the claim it found names this stanza. Both
+    /// asked the same question of a `Jid` before, spelled out field by field.
+    fn dispatch_alias(info: &Arc<MessageInfo>) -> Option<DispatchKey> {
         let source = &info.source;
-        let (primary, alternate) = if let Some(participant) = &key.participant {
+        let participant = Self::dispatch_participant(info);
+        let (primary, alternate) = if let Some(participant) = &participant {
             (participant, source.sender_alt.as_ref()?)
         } else if source.is_from_me {
-            (&key.chat, source.recipient_alt.as_ref()?)
+            (&source.chat, source.recipient_alt.as_ref()?)
         } else {
             let alternate = source.sender_alt.as_ref()?;
-            if source.sender.to_non_ad() != key.chat {
+            if source.sender.to_non_ad() != source.chat {
                 return None;
             }
-            (&key.chat, alternate)
+            (&source.chat, alternate)
         };
         if !(primary.server.is_pn_family() && alternate.server.is_lid_family()
             || primary.server.is_lid_family() && alternate.server.is_pn_family())
         {
             return None;
         }
-        Some(alternate.to_non_ad())
+        let alternate = alternate.to_non_ad();
+        Some(if participant.is_some() {
+            DispatchKey::new((&source.chat, &info.id, &Some(alternate), source.is_from_me))
+        } else {
+            DispatchKey::new((&alternate, &info.id, &None::<Jid>, source.is_from_me))
+        })
     }
 
     /// Dispatches a successfully parsed message to the event bus and sends a delivery receipt.

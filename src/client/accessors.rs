@@ -493,9 +493,11 @@ impl Client {
             undecryptable_dispatched: self.undecryptable_dispatched.entry_count_async().await,
             dispatched_messages: self.dispatched_messages.entry_count(),
             dispatched_message_contents: self.dispatched_messages.memory_stats(
-                |key: &crate::message::DispatchKey, claim: &crate::message::DispatchClaim| {
+                // The identity is a 64-bit digest stored in the slot itself,
+                // so only the claim's payloads retain anything beside it.
+                |_key: &crate::message::DispatchKey, claim: &crate::message::DispatchClaim| {
                     use wacore::stats::HeapSize;
-                    key.heap_bytes() + claim.heap_bytes()
+                    claim.heap_bytes()
                 },
             ),
             pdo_pending_requests: self.pdo_pending_requests.entry_count_async().await,

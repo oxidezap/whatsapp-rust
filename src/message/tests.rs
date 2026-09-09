@@ -15122,7 +15122,9 @@ mod pdo_alias_tests {
     /// cache holds them inline in a single table, so the claim's size is what
     /// the client's resident memory — and every doubling of that table — scales
     /// with. The `client_receive` memory rows read that growth allocation
-    /// directly, which is why this is pinned rather than left to drift.
+    /// directly, which is why this is pinned rather than left to drift. The
+    /// slot it rides in is pinned beside the cache, in
+    /// `dispatch_gate_slot_stays_below_the_spelled_out_identity`.
     #[test]
     fn pdo_alias_claim_stays_small() {
         let size = size_of::<DispatchClaim>();
@@ -15230,6 +15232,47 @@ mod pdo_alias_tests {
             },
             ..Default::default()
         })
+    }
+
+    /// What one client actually pays for the gate, end to end: the table it
+    /// keeps a claim in for the whole TTL, plus everything the claims retain
+    /// beside it. This is the quantity the `client_receive` memory rows read,
+    /// and the bound is the 128-byte slot of the identity-only gate this grew
+    /// out of — payload-aware dedup must not cost more resident memory than
+    /// the marker it replaced. Measured: 256 B/identity here, against 436 B
+    /// when the identity was spelled out in the key.
+    #[tokio::test]
+    async fn pdo_alias_gate_retains_no_more_than_the_identity_only_marker() {
+        const IDENTITIES: u32 = 1000;
+        let (client, _) = client().await;
+        for index in 0..IDENTITIES {
+            let info = Arc::new(MessageInfo {
+                id: format!("MSGID{index:08}").into(),
+                source: MessageSource {
+                    chat: LID.parse().unwrap(),
+                    sender: LID.parse().unwrap(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let mut publication = PublicationGuard::default();
+            assert!(!client.admit_message_dispatch(
+                &info,
+                false,
+                Some([index as u8; size_of::<DispatchFingerprint>()]),
+                false,
+                &mut publication
+            ));
+            publication.complete();
+        }
+        let retained = client.memory_report().await.dispatched_message_contents;
+        assert_eq!(retained.entries, u64::from(IDENTITIES));
+        let per_identity = retained.bytes / retained.entries;
+        assert!(
+            per_identity <= 288,
+            "the dispatch gate retains {per_identity} B per identity, more than the \
+             identity-only marker it replaced"
+        );
     }
 
     fn response(info: &MessageInfo) -> wa::message::PeerDataOperationRequestResponseMessage {

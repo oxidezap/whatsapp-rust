@@ -3167,4 +3167,21 @@ mod tests {
             128
         );
     }
+
+    /// The dispatch gate inserts one slot per message the client delivers and
+    /// keeps it for the whole TTL, so this slot is what the `client_receive`
+    /// memory rows read: a burst reports the peak of the growth allocation
+    /// that doubles this table, which scales with the slot. The bound is the
+    /// slot of the `SenderMessageId -> ()` marker this gate replaced: keying
+    /// by a digest instead of the spelled-out identity took it from 208 bytes
+    /// to under that, and it must not drift back.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn dispatch_gate_slot_stays_below_the_spelled_out_identity() {
+        let slot = size_of::<Slot<crate::message::DispatchKey, crate::message::DispatchClaim>>();
+        assert!(
+            slot <= size_of::<Slot<wacore::types::message::SenderMessageId, ()>>(),
+            "a dispatch-gate slot grew to {slot} bytes; the gate keeps one per delivered message"
+        );
+    }
 }
