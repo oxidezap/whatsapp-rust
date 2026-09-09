@@ -16,7 +16,7 @@
 
 use std::cell::RefCell;
 use std::io::{self, Write};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use log::{LevelFilter, Metadata, Record, SetLoggerError};
@@ -203,6 +203,20 @@ fn parse_filter(spec: &str) -> Filter {
     }
 }
 
+/// Pure half of [`Env::resolve`], split out so tests can pin the precedence
+/// without touching the process environment (`set_var` is unsafe to call
+/// while other threads may read it, which a parallel test runner always
+/// risks).
+fn resolve_value(env_value: Option<String>, default: Option<&str>) -> Filter {
+    env_value
+        .or_else(|| default.map(str::to_string))
+        .map(|spec| parse_filter(&spec))
+        .unwrap_or(Filter {
+            directives: Vec::new(),
+            message: None,
+        })
+}
+
 /// Which environment variable carries the filter, and what applies when it is
 /// unset. Shaped like `env_logger::Env` so call sites read unchanged.
 #[derive(Debug, Clone)]
@@ -236,14 +250,7 @@ impl<'a> Env<'a> {
     }
 
     fn resolve(&self) -> Filter {
-        std::env::var(self.filter_var)
-            .ok()
-            .or_else(|| self.default_filter.map(str::to_string))
-            .map(|spec| parse_filter(&spec))
-            .unwrap_or(Filter {
-                directives: Vec::new(),
-                message: None,
-            })
+        resolve_value(std::env::var(self.filter_var).ok(), self.default_filter)
     }
 }
 
@@ -327,10 +334,23 @@ impl Builder {
     pub fn try_init(&mut self) -> Result<(), SetLoggerError> {
         let logger = self.build();
         let max = logger.filter.max_level();
-        // `log` without its `alloc` feature (this workspace's case) has no
-        // `set_boxed_logger`, so the installed logger lives in a `static`
-        // slot. A rejected logger drops here instead of leaking, which a
-        // `Box::leak`-before-`set_logger` sequence cannot do.
+        // Fill and install under one lock so concurrent first-time callers
+        // cannot interleave: exactly one caller owns the install and reports
+        // its outcome, and a loser can never complete someone else's install
+        // and then misreport its own discarded configuration.
+        let _guard = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(installed) = INSTALLED.get() {
+            // Our configuration lost to an earlier install. A global logger
+            // is installed whenever this slot is full — both change under
+            // this lock — so this registration fails and yields the error.
+            let _ = log::set_logger(installed);
+            return match log::set_logger(installed) {
+                Err(e) => Err(e),
+                Ok(()) => unreachable!(
+                    "a global logger is installed whenever the slot is full, so registration must fail"
+                ),
+            };
+        }
         match INSTALLED.set(logger) {
             Ok(()) => {
                 let installed = INSTALLED.get().unwrap_or_else(|| {
@@ -340,24 +360,8 @@ impl Builder {
                 log::set_max_level(max);
                 Ok(())
             }
-            Err(rejected) => {
-                drop(rejected);
-                let installed = INSTALLED
-                    .get()
-                    .unwrap_or_else(|| panic!("logging::INSTALLED is full, so it must read back"));
-                // Complete the winner's install when it hasn't happened yet,
-                // so a racy handoff can never park the process with no logger.
-                // Then still report failure: this caller's own configuration
-                // was discarded, mirroring env_logger's losing racer. The
-                // second registration always fails — a global logger is
-                // installed by then — and yields the error value.
-                if log::set_logger(installed).is_ok() {
-                    log::set_max_level(installed.filter.max_level());
-                }
-                let Err(e) = log::set_logger(installed) else {
-                    unreachable!("a global logger is installed by now, so registration must fail")
-                };
-                Err(e)
+            Err(_) => {
+                unreachable!("the slot was empty under INSTALL_LOCK, so claiming it must succeed")
             }
         }
     }
@@ -383,9 +387,14 @@ fn emit_to_stderr(bytes: &[u8]) {
 }
 
 /// Slot for the installed logger. `OnceLock::set` hands a rejected logger
-/// back for dropping, so failed `try_init` calls leak nothing, and a racy
-/// loser installs the slot value rather than failing spuriously.
+/// back for dropping, so failed `try_init` calls leak nothing. Every fill
+/// and install happens under [`INSTALL_LOCK`], so concurrent first-time
+/// callers serialize: one winner installs and reports its outcome, losers
+/// report failure without touching the installed configuration.
 static INSTALLED: OnceLock<Logger> = OnceLock::new();
+
+/// Serializes [`Builder::try_init`]; see [`INSTALLED`].
+static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 
 /// Logger installed by [`Builder`]. Stateless across records except for the
 /// calling thread's scratch buffer, which shrinks after the idle threshold.
@@ -643,14 +652,10 @@ mod tests {
     }
 
     #[test]
-    fn env_variable_overrides_the_default() {
-        // Unique variable name so no other test or ambient environment can
-        // observe it; the set/remove pair is scoped to this test.
-        const VAR: &str = "WR_R3_LOGGING_TEST_FILTER";
-        unsafe {
-            std::env::remove_var(VAR);
-        }
-        let unset = Env::default().filter_or(VAR, "info").resolve();
+    fn env_value_overrides_the_default() {
+        // Pinned inputs, no process-environment access: `set_var` is unsafe
+        // while sibling test threads may read the environment.
+        let unset = resolve_value(None, Some("info"));
         assert!(
             unset.enabled(
                 &Metadata::builder()
@@ -659,10 +664,7 @@ mod tests {
                     .build()
             )
         );
-        unsafe {
-            std::env::set_var(VAR, "off");
-        }
-        let set = Env::default().filter_or(VAR, "info").resolve();
+        let set = resolve_value(Some("off".to_string()), Some("info"));
         assert!(
             !set.enabled(
                 &Metadata::builder()
@@ -671,9 +673,6 @@ mod tests {
                     .build()
             )
         );
-        unsafe {
-            std::env::remove_var(VAR);
-        }
     }
 
     #[test]
