@@ -20,7 +20,7 @@ impl Client {
             Arc::new(
                 self.cache_config
                     .group_cache
-                    .build_typed_ttl(self.cache_config.cache_stores.group_cache.clone(), "group"),
+                    .build_typed_ttl(self.cache_config.group_cache_store.clone(), "group"),
             )
         })
     }

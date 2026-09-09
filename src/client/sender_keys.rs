@@ -274,7 +274,7 @@ impl Client {
     /// Look up and consume a message by exact `ChatMessageId` (L1 cache then DB).
     async fn try_take_by_key(&self, key: &ChatMessageId) -> Option<wa::Message> {
         let chat_str = key.chat.to_string();
-        let has_l1_cache = self.cache_config.recent_messages.capacity > 0;
+        let has_l1_cache = self.cache_config.recent_messages_enabled;
 
         // L1 cache check (if capacity > 0)
         if has_l1_cache && let Some(bytes) = self.recent_messages.remove(key).await {
@@ -369,7 +369,7 @@ impl Client {
     /// (capacity 0) or misses; the DB is intentionally not read here so the caller
     /// can fall back to the consuming take + re-add path.
     async fn peek_by_key(&self, key: &ChatMessageId) -> Option<wa::Message> {
-        if self.cache_config.recent_messages.capacity == 0 {
+        if !self.cache_config.recent_messages_enabled {
             return None;
         }
         let bytes = self.recent_messages.get(key).await?;
@@ -415,7 +415,7 @@ impl Client {
         &self,
         key: &ChatMessageId,
     ) -> Option<std::sync::Arc<Vec<u8>>> {
-        if self.cache_config.recent_messages.capacity > 0
+        if self.cache_config.recent_messages_enabled
             && let Some(bytes) = self.recent_messages.get(key).await
         {
             return Some(bytes);
@@ -453,7 +453,7 @@ impl Client {
     ) {
         let shared =
             encoded.unwrap_or_else(|| std::sync::Arc::new(waproto::codec::message_to_vec(msg)));
-        let has_l1_cache = self.cache_config.recent_messages.capacity > 0;
+        let has_l1_cache = self.cache_config.recent_messages_enabled;
 
         if has_l1_cache {
             // L1 cache serves reads immediately; DB write can be backgrounded.
@@ -515,7 +515,7 @@ mod tests {
         runtime.block_on(async {
             for cancel_before_query in [true, false] {
                 let client = create_test_client().await;
-                assert_eq!(client.cache_config.recent_messages.capacity, 0);
+                assert!(!client.cache_config.recent_messages_enabled);
                 let chat: Jid = "120363000000000001@g.us".parse().unwrap();
                 let backend = client.persistence_manager.backend();
                 let payload = b"\x0a\x05hello";

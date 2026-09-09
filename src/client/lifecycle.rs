@@ -1,6 +1,7 @@
 //! Client construction and connection lifecycle: connect, run, reconnect, shutdown.
 
 use super::*;
+use crate::cache_config::CacheConfig;
 use wacore::net::DisconnectReason;
 
 /// Why [`Client::run`] stopped supervising the session.
@@ -483,6 +484,7 @@ impl Client {
         let device_topology = device_topology::DeviceTopology::new();
         let sent_frame_tap = Arc::new(SentFrameTap::new(core.event_bus.clone()));
         let stream_waiter_count = Arc::new(AtomicUsize::new(0));
+        let runtime_cache_config = RuntimeCacheConfig::from(&cache_config);
         let this = Self {
             runtime: runtime.clone(),
             core,
@@ -704,7 +706,7 @@ impl Client {
             ab_props_fetch: AtomicBool::new(true),
             automatic_presence: AtomicBool::new(true),
             wanted_pre_key_count: AtomicUsize::new(crate::prekeys::DEFAULT_WANTED_PRE_KEY_COUNT),
-            cache_config,
+            cache_config: runtime_cache_config,
             self_weak: std::sync::OnceLock::new(),
             saver_handle: std::sync::OnceLock::new(),
             alloc_meter: std::sync::OnceLock::new(),
