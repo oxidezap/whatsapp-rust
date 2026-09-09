@@ -2851,10 +2851,13 @@ mod tests {
         assert!(plain.get("k1").await.is_none());
         plain.clear().await;
         assert_eq!(plain.entry_count(), 0);
-        assert_eq!(
-            size_of::<PlainSlot<String, u32>>(),
-            40,
-            "plain slot must stay key + hash + value with no metadata tail"
+        // Budget: key + hash + value with no metadata tail. Smaller still
+        // satisfies that; larger means metadata crept in. Rebaseline per
+        // [layout asserts](../agent_docs/layout_asserts.md).
+        assert!(
+            size_of::<PlainSlot<String, u32>>() <= 40,
+            "plain slot grew to {} B (budget 40)",
+            size_of::<PlainSlot<String, u32>>()
         );
         assert!(
             size_of::<Slot<String, u32>>() > size_of::<PlainSlot<String, u32>>(),

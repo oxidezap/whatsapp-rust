@@ -26,18 +26,26 @@ Exact, kept exact:
 - `DeviceInfo == 8` in `wacore/src/store/traits.rs`. The fields are `u16 +
   u8 + u32`, seven bytes, so the 8-byte size includes one padding byte.
   Growth means the packing broke.
-- `StringHint == 5`, `ParsedJidMeta == 5` in `wacore/binary/src/encoder.rs`.
-  The hint tape stores one entry per string in the payload, so each byte
-  multiplies across every string. A wider entry needs justification.
 - `QueuedChatMessage == 2 * size_of::<usize>()` in
   `src/handlers/message.rs`. Compositional, already width independent. The
   queue entry must stay two handles.
+- `UnifiedSessionManager` equals its fields' sizes in
+  `src/unified_session.rs`. Compositional: every field inline, so `new()`
+  performs zero heap allocations.
+- `Result<Connection, ConnectError> == Result<(), ConnectError>` in
+  `src/client/lifecycle.rs`. Compositional: handing back the connection
+  costs the caller nothing.
+- `Slot<String, u32> > PlainSlot<String, u32>` in `src/portable_cache.rs`.
+  Relational: the managed slot must cost more than the plain one.
 - The four-word saving in `wacore/libsignal/src/protocol/sender_keys.rs`.
   Stated as `Vec + MessageField == 4 * size_of::<usize>()`, width
   independent. This is the pin that matters there.
 
 Budgets, asserted with `<=`:
 
+- `StringHint <= 5`, `ParsedJidMeta <= 5` in `wacore/binary/src/encoder.rs`.
+  The hint tape stores one entry per string in the payload, so each byte
+  multiplies across every string. Only growth fails.
 - `SenderKeyState <= 224` (64-bit) and `<= 204` (32-bit),
   `SenderKeyStateStructure <= 48` and `<= 28`, same file. The total floats
   with the protobuf runtime layout, so only the direction is pinned.
@@ -57,6 +65,13 @@ Budgets, asserted with `<=`:
   `src/message/tests.rs`, group snapshot `<= 92` per participant in
   `wacore/src/client/context.rs`, sender-key map `<= 36` per device in
   `src/sender_key_device_cache.rs`. Pure budgets, already bounds.
+- `PlainSlot<String, u32> <= 40` in `src/portable_cache.rs`. The contract is
+  key plus hash plus value with no metadata tail; smaller still satisfies it.
+- `SkippedKey <= 40` in `wacore/libsignal/src/protocol/state/session.rs`.
+  A seed-only skipped key is a `u32` and 32 bytes of seed.
+- `Event <= 272` in `wacore/src/types/events.rs`. The ceiling is set by
+  `ConnectFailure`; a new variant should box its payload rather than raise
+  it.
 
 ## Rebaseline procedure
 
@@ -90,5 +105,10 @@ cargo test -p whatsapp-rust --lib queued_chat_message_keeps_two_handles
 cargo test -p whatsapp-rust --lib send_futures_stay_small
 cargo test -p whatsapp-rust --lib pdo_alias_claim_stays_small
 cargo test -p whatsapp-rust --lib retained_bytes_per_device_stay_bounded
+cargo test -p whatsapp-rust --lib an_unbounded_cache_stores_plain_slots_without_metadata
+cargo test -p whatsapp-rust --lib test_manager_fields_are_inline
+cargo test -p whatsapp-rust --lib handing_back_a_connection_costs_the_caller_nothing
+cargo test -p wacore --lib event_stays_under_its_size_ceiling
+cargo test -p wacore-libsignal --lib skipped_message_keys_are_reported_at_their_in_memory_cost
 cargo test -p whatsapp-rust-ureq-http-client --lib provenance_reconstructs_the_stored_report
 ```

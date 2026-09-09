@@ -2772,6 +2772,7 @@ mod tests {
     /// The number is not sacred; the order of magnitude is. Raising it means a
     /// new variant just made every event bigger, and the fix is almost always
     /// to box that variant's payload rather than to edit this line.
+    /// Budget: rebaseline per [layout asserts](../../agent_docs/layout_asserts.md).
     #[test]
     fn event_stays_under_its_size_ceiling() {
         const CEILING: usize = 272;
