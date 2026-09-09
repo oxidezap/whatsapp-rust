@@ -5,6 +5,8 @@
 // is the only channel available.
 #![allow(clippy::print_stderr)]
 
+use std::time::Duration;
+
 use log::{error, info};
 use whatsapp_rust::pair_code::PairCodeOptions;
 use whatsapp_rust::prelude::*;
@@ -13,6 +15,12 @@ const PING_TRIGGER: &str = "🦀ping";
 const SEND_TRIGGER: &str = "🦀send";
 const PONG_TEXT: &str = "🏓 Pong!";
 const REACTION_EMOJI: &str = "🏓";
+
+/// Default cadence for the periodic `memory_report()` log line. Zero bytes
+/// saved: this is what makes a slow ramp visible without a forensic dump.
+const DEFAULT_MEMREPORT_INTERVAL_SECS: u64 = 300;
+/// Override with e.g. `WHATSAPP_DEMO_MEMREPORT_INTERVAL_SECS=10`; `0` disables.
+const MEMREPORT_INTERVAL_ENV: &str = "WHATSAPP_DEMO_MEMREPORT_INTERVAL_SECS";
 
 // Usage:
 //   cargo run --example demo                                      # QR code pairing only
@@ -125,6 +133,25 @@ fn main() {
             }
         };
 
+        // Periodic observability: counters and estimated bytes only. The
+        // rendered report carries no JIDs, phone numbers, or message content.
+        let mem_client = bot.client();
+        let mem_logger = memreport_interval().map(|interval| {
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    log_memory_report(&mem_client).await;
+                }
+            })
+        });
+        let stop_mem_logger = || {
+            if let Some(handle) = mem_logger {
+                handle.abort();
+            }
+        };
+
         #[cfg(feature = "signal")]
         {
             let mut handle = bot.spawn();
@@ -138,10 +165,14 @@ fn main() {
                     handle.shutdown().await;
                 }
             }
+            stop_mem_logger();
         }
 
         #[cfg(not(feature = "signal"))]
-        bot.run().await;
+        {
+            bot.run().await;
+            stop_mem_logger();
+        }
     });
 }
 
@@ -263,4 +294,52 @@ fn parse_arg(args: &[String], long: &str, short: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn memreport_interval_from_raw(raw: Option<&str>) -> Option<Duration> {
+    let secs = raw
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MEMREPORT_INTERVAL_SECS);
+    if secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
+    }
+}
+
+fn memreport_interval() -> Option<Duration> {
+    memreport_interval_from_raw(std::env::var(MEMREPORT_INTERVAL_ENV).ok().as_deref())
+}
+
+/// Counters and estimated bytes only: the rendered report carries no JIDs,
+/// phone numbers, or message content.
+async fn log_memory_report(client: &Client) {
+    let report = client.memory_report().await;
+    info!(
+        "memory: {} B retained (est.)\n{}",
+        report.total_estimated_bytes(),
+        report
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memreport_interval_default_override_and_disable() {
+        assert_eq!(
+            memreport_interval_from_raw(None),
+            Some(Duration::from_secs(DEFAULT_MEMREPORT_INTERVAL_SECS))
+        );
+        assert_eq!(
+            memreport_interval_from_raw(Some("10")),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(memreport_interval_from_raw(Some("0")), None);
+        assert_eq!(
+            memreport_interval_from_raw(Some("not-a-number")),
+            Some(Duration::from_secs(DEFAULT_MEMREPORT_INTERVAL_SECS))
+        );
+    }
 }
