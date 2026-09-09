@@ -3673,6 +3673,101 @@ async fn runtime_cache_config_honors_disabled_recent_cache() {
 }
 
 #[tokio::test]
+async fn non_group_cache_stores_are_owned_by_live_caches_only() {
+    use crate::cache_config::CacheStores;
+    use std::time::Duration;
+
+    struct StubStore;
+    #[async_trait::async_trait]
+    impl crate::cache_store::CacheStore for StubStore {
+        async fn get(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn set(&self, _: &str, _: &str, _: &[u8], _: Option<Duration>) -> Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn clear(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    let lid_store: Arc<dyn crate::cache_store::CacheStore> = Arc::new(StubStore);
+    let registry_store: Arc<dyn crate::cache_store::CacheStore> = Arc::new(StubStore);
+    let group_store: Arc<dyn crate::cache_store::CacheStore> = Arc::new(StubStore);
+    let config = CacheConfig {
+        cache_stores: CacheStores {
+            group_cache: Some(Arc::clone(&group_store)),
+            device_registry_cache: Some(Arc::clone(&registry_store)),
+            lid_pn_cache: Some(Arc::clone(&lid_store)),
+        },
+        ..CacheConfig::default()
+    };
+    let client = crate::test_utils::create_test_client_with_config(
+        "non_group_store_lifetime",
+        Arc::new(MockHttpClient),
+        config,
+    )
+    .await;
+
+    // Device-registry store: the live cache keeps the same allocation, and the
+    // construction config must not pin a second Arc (count drops to held + cache).
+    let retained_registry = client
+        .device_registry_cache
+        .custom_store_for_tests()
+        .expect("device-registry cache must retain its custom store");
+    assert!(
+        Arc::ptr_eq(&registry_store, &retained_registry),
+        "device-registry cache must reuse the configured store allocation"
+    );
+    drop(retained_registry);
+    assert_eq!(
+        Arc::strong_count(&registry_store),
+        2,
+        "device-registry store must be owned by the test handle plus the live cache only"
+    );
+
+    // LID-PN store: both direction maps share the same allocation, same drop rule.
+    let retained_lid = client.lid_pn_cache.custom_stores_for_tests();
+    assert_eq!(
+        retained_lid.len(),
+        2,
+        "LID-PN cache must back both direction maps with the custom store"
+    );
+    for store in &retained_lid {
+        assert!(
+            Arc::ptr_eq(&lid_store, store),
+            "LID-PN cache must reuse the configured store allocation"
+        );
+    }
+    drop(retained_lid);
+    assert_eq!(
+        Arc::strong_count(&lid_store),
+        3,
+        "LID-PN store must be owned by the test handle plus the two live direction maps only"
+    );
+
+    // Control: the group store stays pinned by the runtime config for lazy init.
+    let retained_group = client
+        .cache_config
+        .group_cache_store
+        .clone()
+        .expect("group-cache store must be retained for lazy init");
+    assert!(
+        Arc::ptr_eq(&group_store, &retained_group),
+        "group cache must reuse the configured store allocation"
+    );
+    drop(retained_group);
+    assert_eq!(
+        Arc::strong_count(&group_store),
+        2,
+        "group store must be owned by the test handle plus the runtime config only"
+    );
+}
+
+#[tokio::test]
 async fn held_group_distribution_lane_survives_capacity_pressure() {
     let config = CacheConfig {
         group_distribution_locks_capacity: 1,

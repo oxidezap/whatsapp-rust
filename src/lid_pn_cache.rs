@@ -173,6 +173,19 @@ impl LidPnCache {
         }
     }
 
+    /// Test-only clones of the backing custom stores (one per direction map),
+    /// for pinning the `assemble` store lifetime via `Arc::ptr_eq`.
+    #[cfg(test)]
+    pub(crate) fn custom_stores_for_tests(&self) -> Vec<Arc<dyn wacore::store::CacheStore>> {
+        [
+            self.lid_to_entry.custom_store_for_tests(),
+            self.pn_to_entry.custom_store_for_tests(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
     /// Approximate entry counts plus estimated retained bytes for the LID and
     /// PN maps. Bytes are `0` when backed by a custom store (entries live
     /// outside this process).

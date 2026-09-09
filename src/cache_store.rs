@@ -275,3 +275,17 @@ where
         }
     }
 }
+
+impl<K, V> TypedCache<K, V> {
+    /// Test-only clone of the backing custom store, for pinning the store
+    /// lifetime: `assemble` must leave non-group stores owned solely by their
+    /// live caches, so `Arc::ptr_eq` + `strong_count` catch a future refactor
+    /// that pins another `Arc` elsewhere.
+    #[cfg(test)]
+    pub(crate) fn custom_store_for_tests(&self) -> Option<Arc<dyn CacheStore>> {
+        match &self.inner {
+            Inner::Local(_) => None,
+            Inner::Custom { store, .. } => Some(Arc::clone(store)),
+        }
+    }
+}

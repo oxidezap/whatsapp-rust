@@ -251,6 +251,15 @@ impl DeviceRegistryCache {
         self.cache.run_pending_tasks().await;
     }
 
+    /// Test-only clone of the backing custom store, for pinning the
+    /// `assemble` store lifetime via `Arc::ptr_eq` + `strong_count`.
+    #[cfg(test)]
+    pub(crate) fn custom_store_for_tests(
+        &self,
+    ) -> Option<Arc<dyn wacore::store::cache::CacheStore>> {
+        self.cache.custom_store_for_tests()
+    }
+
     /// Test-only raw write that bypasses topology recording, for fixture
     /// seeding and for proving that memo hits really are hits (a raw change
     /// must be served stale).
