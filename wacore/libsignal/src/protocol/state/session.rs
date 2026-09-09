@@ -256,10 +256,16 @@ impl SessionState {
                 if chain.message_keys.is_empty() {
                     return None;
                 }
-                let keys: Vec<SkippedKey> = std::mem::take(&mut chain.message_keys)
-                    .into_iter()
-                    .map(SkippedKey::from_pb)
-                    .collect();
+                // Exact reservation, never `collect()` from the protobuf
+                // backlog: that reuses its buffer (`InPlaceIterable` through
+                // the `Map`), inheriting the decode's spare byte capacity as
+                // extra slots — a 1,000-key backlog kept 2,481 spare slots
+                // (~96 KiB) for the record's lifetime. A fresh buffer costs
+                // one allocation plus the brief overlap with the protobuf
+                // buffer it replaces, and drops the spare with it.
+                let taken = std::mem::take(&mut chain.message_keys);
+                let mut keys = Vec::with_capacity(taken.len());
+                keys.extend(taken.into_iter().map(SkippedKey::from_pb));
                 Some(Arc::new(keys))
             })
             .collect();
@@ -2530,6 +2536,46 @@ mod tests {
         seed[0] = counter as u8;
         seed[1] = (counter >> 8) as u8;
         MessageKeyGenerator::new_from_seed(&seed, counter)
+    }
+
+    /// Cold load must keep each skipped-key backlog at what it holds: the
+    /// conversion walks the over-reserved protobuf backlog once, so an
+    /// exactly reserved buffer costs one allocation plus the brief overlap,
+    /// while a grown one keeps its spare for the record's lifetime. 1,000
+    /// seed-only keys is the offline-drain shape the backlog exists for.
+    #[test]
+    fn cold_load_sizes_skipped_key_buffers_exactly() {
+        const KEYS: u32 = 1000;
+
+        let base_key = KeyPair::generate(&mut rng()).public_key;
+        let mut state = create_test_session_state(3, &base_key);
+        let sender_key = KeyPair::generate(&mut rng()).public_key;
+        state.add_receiver_chain(&sender_key, &ChainKey::new([7u8; 32], 0));
+        for counter in 0..KEYS {
+            state
+                .set_message_keys(&sender_key, create_test_message_key_generator(counter))
+                .expect("skipped key stored");
+        }
+        let bytes = SessionRecord::new(state).serialize().expect("serialize");
+
+        let record = SessionRecord::deserialize(&bytes).expect("cold load");
+        let state = record.session_state().expect("current state");
+        let backlog = state.skipped[0]
+            .as_ref()
+            .expect("backlog survived the load");
+        assert_eq!(backlog.len(), KEYS as usize, "every skipped key must load");
+        let spare = backlog.capacity() - backlog.len();
+        assert!(
+            spare * 16 <= backlog.len(),
+            "a {KEYS}-key backlog keeps {spare} spare slots after a cold load"
+        );
+
+        // And the keys are the ones stored: the record re-encodes byte-for-byte.
+        assert_eq!(
+            record.serialize().expect("re-serialize"),
+            bytes,
+            "the loaded backlog must encode what was written"
+        );
     }
 
     /// The seed is additive: a record written before it existed must still
