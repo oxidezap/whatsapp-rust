@@ -155,8 +155,8 @@ fn child_tags(node: &Node) -> Vec<String> {
 /// same token), so it compares in full.
 fn diff_children(vendor: &Node, rust: &Node) -> Option<String> {
     // Attribute order is not a wire fact (XML attributes are unordered), so
-    // the signature sorts attributes by name; only the set of pairs matters.
-    fn signature(node: &Node) -> String {
+    // signatures sort attributes by name; only the set of pairs matters.
+    fn attr_set(node: &Node) -> Vec<(String, String)> {
         let mut attrs: Vec<(String, String)> = node
             .attrs
             .iter()
@@ -164,12 +164,28 @@ fn diff_children(vendor: &Node, rust: &Node) -> Option<String> {
             .map(|(k, v)| (k.to_string(), format!("{v:?}")))
             .collect();
         attrs.sort();
+        attrs
+    }
+    fn signature(node: &Node) -> String {
         match &node.content {
             Some(NodeContent::Bytes(_)) if node.tag == "enc" => {
-                format!("{} {attrs:?}", node.tag)
+                format!("{} {:?}", node.tag, attr_set(node))
             }
-            _ => format!("{} {attrs:?} {:?}", node.tag, node.content),
+            _ => format!("{} {:?} {:?}", node.tag, attr_set(node), node.content),
         }
+    }
+    // The action nodes themselves carry `call-id`/`call-creator`: an identifier
+    // drift must fail here, not hide behind matching children. (`<enc>`
+    // bytes/`v`/`type` stay excluded per the stage rule above.)
+    if vendor.tag != rust.tag {
+        return Some(format!("action tag {} vs {}", vendor.tag, rust.tag));
+    }
+    if attr_set(vendor) != attr_set(rust) {
+        return Some(format!(
+            "action attrs {:?} vs {:?}",
+            attr_set(vendor),
+            attr_set(rust)
+        ));
     }
     let (v_children, r_children) = (children_of(vendor), children_of(rust));
     if child_tags(vendor) != child_tags(rust) {
@@ -283,6 +299,23 @@ fn side_b_answerer(
         "side B [{label}]: immediate getCallInfo: {}",
         clip(&immediate_state, 400)
     );
+    // Do not race activation: poll for a live call before accepting, bounded
+    // so a never-activating offer still terminates the run with a verdict.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut activated = false;
+    while std::time::Instant::now() < deadline {
+        match r.call_embind("getCallInfo", &[]) {
+            Ok(Value::Str(s)) if !s.is_empty() => {
+                activated = true;
+                break;
+            }
+            _ => {}
+        }
+        r.process_queued_calls();
+        r.refuel();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    println!("side B [{label}]: activated={activated}");
     let accepted = r.call_embind("acceptCall", &[Value::Bool(true), Value::Bool(true)]);
     r.refuel();
     let settled = r.settle(std::time::Duration::from_secs(5));

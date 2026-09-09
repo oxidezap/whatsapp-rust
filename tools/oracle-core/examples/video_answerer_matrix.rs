@@ -280,9 +280,24 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         r.process_queued_calls();
         r.refuel();
     }
-    let immediate = format!("{:?}", r.call_embind("getCallInfo", &[]).ok());
+    let immediate = r.call_embind("getCallInfo", &[]);
     r.refuel();
-    let alive = !immediate.contains("\"\"") && immediate.len() > 20;
+    // A trapped state query is a host failure, not a dead call: propagate it
+    // instead of letting the length heuristic below read it as torn down.
+    let alive = match &immediate {
+        Err(e) => {
+            println!("PROBE {}: getCallInfo trapped: {e}", probe.label);
+            false
+        }
+        Ok(Value::Str(s)) => !s.is_empty(),
+        Ok(other) => {
+            println!(
+                "PROBE {}: unexpected getCallInfo shape: {other:?}",
+                probe.label
+            );
+            true
+        }
+    };
     // Was it already torn down before accept, or still pending? Snapshot the
     // teardown markers now: if `missed by the user` is logged pre-accept, the
     // call was born torn down (timestamp/parse issue); if absent, accept raced
@@ -297,9 +312,15 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
     if std::env::var("SKIP_ACCEPT").is_ok() {
         r.settle(std::time::Duration::from_secs(3));
         r.refuel();
-        let later = format!("{:?}", r.call_embind("getCallInfo", &[]).ok());
+        let alive_later = match r.call_embind("getCallInfo", &[]) {
+            Err(e) => {
+                println!("PROBE {}: late getCallInfo trapped: {e}", probe.label);
+                false
+            }
+            Ok(Value::Str(s)) => !s.is_empty(),
+            Ok(_) => true,
+        };
         r.refuel();
-        let alive_later = !later.contains("\"\"") && later.len() > 20;
         let emitted = r.signaling()?.len();
         let missed = r
             .engine_log()
