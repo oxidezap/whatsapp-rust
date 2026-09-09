@@ -402,16 +402,22 @@ impl wacore::stats::HeapSize for DispatchKey {
     }
 }
 
+/// One publication token allocation: the value plus the strong and weak
+/// counts. Allocator rounding above that is not counted, the same floor the
+/// table accounting in `hash_table_bytes` uses.
+const TOKEN_ALLOC_BYTES: usize = 2 * size_of::<usize>() + size_of::<AtomicU8>();
+
 impl wacore::stats::HeapSize for DispatchClaim {
-    /// Heap retained beside the table slot: spilled payloads, one token
-    /// allocation per payload, and the boxed alias. The inline SmallVec slot
-    /// lives in the slot itself and is charged with the table.
+    /// Heap retained beside the table slot: spilled payloads at their
+    /// allocated capacity, one token allocation per payload, and the boxed
+    /// alias. The inline SmallVec slot lives in the slot itself and is
+    /// charged with the table.
     fn heap_bytes(&self) -> usize {
         let mut bytes = 0;
-        if self.payloads.len() > 1 {
-            bytes += self.payloads.len() * size_of::<DispatchPayload>();
+        if self.payloads.spilled() {
+            bytes += self.payloads.capacity() * size_of::<DispatchPayload>();
         }
-        bytes += self.payloads.len() * size_of::<AtomicU8>();
+        bytes += self.payloads.len() * TOKEN_ALLOC_BYTES;
         if let Some(alias) = &self.alias {
             bytes += size_of::<Jid>() + alias.heap_bytes();
         }
