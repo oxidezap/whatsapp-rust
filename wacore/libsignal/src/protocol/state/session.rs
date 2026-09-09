@@ -2244,7 +2244,8 @@ mod tests {
     /// 32-byte `Bytes` allocation that a seed-only key used to occupy. The
     /// figure must cover the compact form and must no longer be anywhere
     /// near the protobuf one, or the report would be describing memory the
-    /// state no longer holds.
+    /// state no longer holds. Budget: rebaseline per
+    /// [layout asserts](../../../../../agent_docs/layout_asserts.md).
     #[test]
     fn skipped_message_keys_are_reported_at_their_in_memory_cost() {
         const KEYS: usize = 500;
@@ -2295,7 +2296,8 @@ mod tests {
         );
         assert!(
             size_of::<SkippedKey>() <= 40,
-            "a seed-only skipped key is a u32 and 32 bytes of seed"
+            "a seed-only skipped key is a u32 and 32 bytes of seed, now {} B (budget 40)",
+            size_of::<SkippedKey>()
         );
 
         // And the backlog round-trips: what was moved out comes back on encode.

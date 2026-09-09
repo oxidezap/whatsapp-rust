@@ -1,0 +1,151 @@
+# Layout asserts and how to rebaseline them
+
+Several tests pin `size_of` values so a careless field addition shows up as a
+test failure instead of silent memory growth. Those pins break for innocent
+reasons too. A dependency upgrade reshapes an embedded struct, a compiler
+release repacks padding, and the assert fires with no real regression behind
+it. This file lists every pin, says which ones are exact and which are bounds,
+and gives the steps to reset one honestly.
+
+## Policy
+
+Exact equality stays only where the value is a contract. A packed struct whose
+bytes hit disk, an enum whose width multiplies per string, a queue that must
+hold exactly two handles. Everywhere else the assert is a budget, and budgets
+use `<=`. A smaller struct is never a failure.
+
+Pointer width gets a `cfg` gate, never a fudge factor. Where the property can
+be stated without numbers at all, prefer that. `2 * size_of::<usize>()`,
+`size_of::<Agent>() + N`, or `4 * size_of::<usize>()` survive a width change
+and a repack that a bare number does not. #1478 and #1479 set this pattern.
+
+## Inventory
+
+Exact, kept exact:
+
+- `DeviceInfo == 8` in `wacore/src/store/traits.rs`. The fields are `u16 +
+  u8 + u32`, seven bytes, so the 8-byte size includes one padding byte.
+  Growth means the packing broke.
+- `QueuedChatMessage == 2 * size_of::<usize>()` in
+  `src/handlers/message.rs`. Compositional, already width independent. The
+  queue entry must stay two handles.
+- `UnifiedSessionManager` equals its fields' sizes in
+  `src/unified_session.rs`. Compositional: every field inline, so `new()`
+  performs zero heap allocations.
+- `Result<Connection, ConnectError> == Result<(), ConnectError>` in
+  `src/client/lifecycle.rs`. Compositional: handing back the connection
+  costs the caller nothing.
+- `Slot<String, u32> > PlainSlot<String, u32>` in `src/portable_cache.rs`.
+  Relational: the managed slot must cost more than the plain one.
+- `size_of::<Client>()` against a measured base in `src/client/tests.rs`.
+  Compositional: the base stacks the fixed part plus each size-varying
+  attachment, including feature-gated ones, so only an unaccounted layout
+  move trips it.
+- The four-word saving in `wacore/libsignal/src/protocol/sender_keys.rs`.
+  Stated as `Vec + MessageField == 4 * size_of::<usize>()`, width
+  independent. This is the pin that matters there.
+
+Budgets, asserted with `<=`:
+
+- `Slot<DispatchKey, DispatchClaim>` under the spelled-out-identity slot in
+  `src/portable_cache.rs`, 64-bit only. Relational: the comparison type
+  carries the budget, so repacks do not matter, but the gate itself is
+  pointer-width specific.
+
+- `StringHint <= 5`, `ParsedJidMeta <= 5` in `wacore/binary/src/encoder.rs`.
+  The hint tape stores one entry per string in the payload, so each byte
+  multiplies across every string. Only growth fails.
+- `SenderKeyState <= 224` (64-bit) and `<= 204` (32-bit),
+  `SenderKeyStateStructure <= 48` and `<= 28`, same file. The total floats
+  with the protobuf runtime layout, so only the direction is pinned.
+- `Slot<u32, Arc<str>> <= 56`, `Slot<SenderMessageId, ()> <= 128` in
+  `src/portable_cache.rs`, 64-bit only. The win is the flattened layout
+  reusing tail padding. Smaller stays fine.
+- `UreqHttpClient <= Agent + 24` in `http_clients/ureq-client/src/lib.rs`,
+  64-bit only. The `Agent` half moves with each ureq release, so the assert
+  floats with it. The companion `< Agent + Option<HttpResourceReport>` is
+  the actual contract.
+- `DeviceListRecord <= 64` in `wacore/src/store/traits.rs`. One record lives
+  per known contact, so this is a per-contact budget.
+- `RuntimeCacheConfig <= 136` in `src/cache_config.rs`, with the companion
+  ratio check against `CacheConfig`.
+- `UsyncProtocolResult <= 96` in `wacore/src/iq/usync/query.rs`, send
+  futures `<= 192` in `src/send/mod.rs`, dispatch claim `<= 56` in
+  `src/message/tests.rs`, group snapshot `<= 92` per participant in
+  `wacore/src/client/context.rs`, sender-key map `<= 36` per device in
+  `src/sender_key_device_cache.rs`, group memo `<= 37` per resolved device
+  in `src/client/device_registry.rs`, post-login task future `<= 2048` in
+  `src/client/node_io.rs`, server-sync task future `<= 512` in
+  `src/handlers/notification/groups.rs`. Pure budgets, already bounds.
+- `PlainSlot<String, u32> <= 40` in `src/portable_cache.rs`. The contract is
+  key plus hash plus value with no metadata tail; smaller still satisfies it.
+- `SkippedKey <= 40` in `wacore/libsignal/src/protocol/state/session.rs`.
+  A seed-only skipped key is a `u32` and 32 bytes of seed.
+- `Event <= 272` in `wacore/src/types/events.rs`. The ceiling is set by
+  `ConnectFailure`; a new variant should box its payload rather than raise
+  it.
+
+## Rebaseline procedure
+
+1. Run just the failing test and read the actual size from the failure
+   output. Confirm nothing else in that test failed.
+2. Find what moved. `git log` on the struct, `cargo tree` for the dependency
+   that owns an embedded field, `rustc --version` for a toolchain repack.
+   The failure comment names the usual suspect for that assert.
+3. Check the compositional assert first. If the width independent property
+   still holds, the design did not regress. Only the number drifted.
+4. Audit the delta field by field. A new field with a reason is fine.
+   Unexplained growth, or growth from a dependency you did not intend to
+   take, is a real finding. Fix that instead.
+5. Update the bound and the comment next to it. Say what moved and why the
+   new number is right. Never bump a number just to turn CI green.
+6. Run the layout tests listed below. When the rebaseline is caused only
+   by a compiler or dependency move, keep the diff to tests plus this
+   file: no production code changes. When an intentional production change
+   moved the layout, its bound update belongs in the same change, next to
+   the field-level rationale the steps above produced.
+
+Layout tests to run, one filter per command so a failure names its assert:
+
+```bash
+cargo test -p wacore-libsignal --lib sender_key_state_layout_dropped_the_protobuf_copies
+cargo test -p wacore-libsignal --target i686-unknown-linux-gnu --lib sender_key_state_layout_dropped_the_protobuf_copies
+cargo test -p wacore-binary --lib the_hint_tape_stays_five_bytes_wide
+cargo test -p wacore --lib a_device_entry_is_eight_bytes
+cargo test -p wacore --lib a_device_list_record_fits_sixty_four_bytes
+cargo test -p wacore --lib sparse_result_layout_stays_bounded
+cargo test -p wacore --lib retained_bytes_per_participant_stay_bounded
+cargo test -p whatsapp-rust --lib flattened_slot_reuses_entry_tail_padding
+cargo test -p whatsapp-rust --lib runtime_config_is_compact
+cargo test -p whatsapp-rust --lib queued_chat_message_keeps_two_handles
+cargo test -p whatsapp-rust --lib send_futures_stay_small
+cargo test -p whatsapp-rust --lib pdo_alias_claim_stays_small
+cargo test -p whatsapp-rust --lib retained_bytes_per_device_stay_bounded
+cargo test -p whatsapp-rust --lib an_unbounded_cache_stores_plain_slots_without_metadata
+cargo test -p whatsapp-rust --lib dispatch_gate_slot_stays_below_the_spelled_out_identity
+cargo test -p whatsapp-rust --lib client_size_pins_runtime_cache_config_saving
+cargo test -p whatsapp-rust --features client-lifecycle,plugins --lib client_size_pins_runtime_cache_config_saving
+cargo test -p whatsapp-rust --features bench-harness,client-lifecycle,debug-snapshots,legacy-session-interop,metrics,passkey,plugins,signal,sqlite-storage,test-support,tokio-native,tokio-runtime,tokio-transport,tracing,ureq-client,voip,voip-encoded,voip-libopus,voip-mlow,voip-relay-native,voip-runtime,whatsapp-rust-sqlite-storage --lib client_size_pins_runtime_cache_config_saving
+cargo test -p whatsapp-rust --lib group_devices_memo_retained_bytes_stay_bounded
+cargo test -p whatsapp-rust --lib the_post_login_task_does_not_carry_the_fresh_pairing_arm
+cargo test -p whatsapp-rust --lib the_server_sync_task_does_not_carry_the_sync_engine
+cargo test -p whatsapp-rust --lib test_manager_fields_are_inline
+cargo test -p whatsapp-rust --lib handing_back_a_connection_costs_the_caller_nothing
+cargo test -p wacore --lib event_stays_under_its_size_ceiling
+cargo test -p wacore-libsignal --lib skipped_message_keys_are_reported_at_their_in_memory_cost
+cargo test -p whatsapp-rust-ureq-http-client --lib provenance_reconstructs_the_stored_report
+```
+
+The client-size pin is feature sensitive: run all three variants above. The
+long one is the CI feature set, spelled out so the procedure does not
+depend on remembering it; regenerate it with
+`cargo xt ci test-features whatsapp-rust` when `Cargo.toml` gains or
+loses a feature, since the set follows the manifest.
+
+The sender-key budgets are the only ones with 32-bit branches. The
+`--target i686-unknown-linux-gnu` command above exercises them. It needs
+`rustup target add i686-unknown-linux-gnu` once, plus a 32-bit-capable C
+toolchain for the link: on Debian/Ubuntu that is `sudo apt-get install
+gcc-multilib`. Without those the 32-bit run fails before any test
+executes. The `Slot` and `Agent` overhead asserts are 64-bit only by
+`cfg` gate.

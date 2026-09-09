@@ -535,7 +535,8 @@ mod tests {
     /// warm, and there is one per group, so its cost per tracked device is a
     /// bound rather than a comment. Uses the same 1024x3 shape as the device
     /// memo test in `device_registry`, since the two sit side by side behind
-    /// every group send.
+    /// every group send. Budget: rebaseline per
+    /// [layout asserts](../agent_docs/layout_asserts.md).
     #[test]
     fn retained_bytes_per_device_stay_bounded() {
         const USERS: usize = 1024;

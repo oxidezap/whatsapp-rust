@@ -694,8 +694,15 @@ mod tests {
                 < size_of::<ureq::Agent>() + size_of::<Option<HttpResourceReport>>(),
             "provenance flag must stay smaller than the stored report it replaces"
         );
+        // Budget on top of the contract above: our own overhead floats with
+        // the compiler layout, so only growth past 24 fails. Rebaseline per
+        // [layout asserts](../../../agent_docs/layout_asserts.md).
         #[cfg(target_pointer_width = "64")]
-        assert_eq!(size_of::<UreqHttpClient>(), size_of::<ureq::Agent>() + 24);
+        assert!(
+            size_of::<UreqHttpClient>() <= size_of::<ureq::Agent>() + 24,
+            "client overhead grew to {} B past the agent (budget 24)",
+            size_of::<UreqHttpClient>() - size_of::<ureq::Agent>()
+        );
 
         // `Debug` still renders the reconstructed `pool_report` field.
         assert!(format!("{:?}", UreqHttpClient::new()).contains("pool_report: Some("));

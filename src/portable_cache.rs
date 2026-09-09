@@ -2851,10 +2851,13 @@ mod tests {
         assert!(plain.get("k1").await.is_none());
         plain.clear().await;
         assert_eq!(plain.entry_count(), 0);
-        assert_eq!(
-            size_of::<PlainSlot<String, u32>>(),
-            40,
-            "plain slot must stay key + hash + value with no metadata tail"
+        // Budget: key + hash + value with no metadata tail. Smaller still
+        // satisfies that; larger means metadata crept in. Rebaseline per
+        // [layout asserts](../agent_docs/layout_asserts.md).
+        assert!(
+            size_of::<PlainSlot<String, u32>>() <= 40,
+            "plain slot grew to {} B (budget 40)",
+            size_of::<PlainSlot<String, u32>>()
         );
         assert!(
             size_of::<Slot<String, u32>>() > size_of::<PlainSlot<String, u32>>(),
@@ -3277,14 +3280,21 @@ mod tests {
     /// The flattened slot packs the 4-byte contact-hash key into the entry
     /// tail padding, so `Slot<u32, Arc<str>>` is one word smaller than the
     /// nested `Slot { key, hash, entry }` it replaces. Wide keys already
-    /// align, so the dispatched slot keeps its size.
+    /// align, so the dispatched slot keeps its size. Budgets, not contracts:
+    /// a smaller slot is never a failure. Rebaseline per
+    /// [layout asserts](../agent_docs/layout_asserts.md).
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn flattened_slot_reuses_entry_tail_padding() {
-        assert_eq!(size_of::<Slot<u32, Arc<str>>>(), 56);
-        assert_eq!(
-            size_of::<Slot<wacore::types::message::SenderMessageId, ()>>(),
-            128
+        assert!(
+            size_of::<Slot<u32, Arc<str>>>() <= 56,
+            "flat slot grew to {} B (budget 56)",
+            size_of::<Slot<u32, Arc<str>>>()
+        );
+        assert!(
+            size_of::<Slot<wacore::types::message::SenderMessageId, ()>>() <= 128,
+            "wide slot grew to {} B (budget 128)",
+            size_of::<Slot<wacore::types::message::SenderMessageId, ()>>()
         );
     }
 
@@ -3294,7 +3304,9 @@ mod tests {
     /// that doubles this table, which scales with the slot. The bound is the
     /// slot of the `SenderMessageId -> ()` marker this gate replaced: keying
     /// by a digest instead of the spelled-out identity took it from 208 bytes
-    /// to under that, and it must not drift back.
+    /// to under that, and it must not drift back. Relational: the comparison
+    /// type carries the budget, so widths and repacks do not matter.
+    /// Rebaseline per [layout asserts](../agent_docs/layout_asserts.md).
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn dispatch_gate_slot_stays_below_the_spelled_out_identity() {

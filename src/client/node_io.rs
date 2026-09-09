@@ -2442,6 +2442,7 @@ mod tests {
     /// fresh-pairing arm made it 8,224 B. The active IQ also needs a box when
     /// tracing expands its future. Neither belongs in the drain's resident
     /// storage. This bounds the spawned task, not the temporary boxed work.
+    /// Budget: rebaseline per [layout asserts](../../agent_docs/layout_asserts.md).
     #[tokio::test]
     async fn the_post_login_task_does_not_carry_the_fresh_pairing_arm() {
         const MAX_POST_LOGIN_FUTURE_BYTES: usize = 2048;

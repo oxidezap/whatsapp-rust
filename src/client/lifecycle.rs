@@ -2898,7 +2898,8 @@ mod tests {
 
     /// The connection handed back by `connect` is a borrow, so the happy path
     /// carries the same bytes and the same allocations it did when connecting
-    /// resolved to `()`.
+    /// resolved to `()`. Compositional, so widths and repacks do not matter.
+    /// Rebaseline per [layout asserts](../../agent_docs/layout_asserts.md).
     #[test]
     fn handing_back_a_connection_costs_the_caller_nothing() {
         assert_eq!(
