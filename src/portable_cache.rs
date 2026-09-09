@@ -71,10 +71,13 @@ struct Slot<K, V> {
 /// its hash, and the value. Chosen at construction (see `assemble`), never per
 /// entry, so the managed path pays nothing for it and this path stores no
 /// timestamps, sequence numbers, or CLOCK bits.
+///
+/// Field order follows the flattened [`Slot`]: payload first, then the key so a
+/// narrow key reuses the tail padding ahead of `hash`.
 struct PlainSlot<K, V> {
+    value: V,
     key: K,
     hash: u64,
-    value: V,
 }
 
 struct PlainInner<K, V, S> {
@@ -82,11 +85,7 @@ struct PlainInner<K, V, S> {
     table: HashTable<PlainSlot<K, V>>,
 }
 
-impl<K, V, S> PlainInner<K, V, S>
-where
-    K: Hash + Eq + Clone,
-    S: BuildHasher,
-{
+impl<K, V, S> PlainInner<K, V, S> {
     fn new(hasher: S) -> Self {
         Self {
             hasher,
@@ -95,35 +94,8 @@ where
     }
 
     #[inline]
-    fn hash_of<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
-        self.hasher.hash_one(key)
-    }
-
-    #[inline]
     fn len(&self) -> usize {
         self.table.len()
-    }
-
-    fn get<Q>(&self, key: &Q) -> Option<&V>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        let hash = self.hash_of(key);
-        self.table
-            .find(hash, |slot| slot.key.borrow() == key)
-            .map(|slot| &slot.value)
-    }
-
-    fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        let hash = self.hash_of(key);
-        self.table
-            .find_mut(hash, |slot| slot.key.borrow() == key)
-            .map(|slot| &mut slot.value)
     }
 
     fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
@@ -137,7 +109,48 @@ where
     fn clear(&mut self) {
         self.table.clear();
     }
+}
 
+impl<K, V, S> PlainInner<K, V, S>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+{
+    #[inline]
+    fn hash_of<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
+        self.hasher.hash_one(key)
+    }
+
+    /// Table probes below stay out of line: under fat LTO they would otherwise
+    /// inline into every [`PortableCache`] future that dispatches on [`Storage`]
+    /// (`get`, `insert`, `upsert_with_by_ref`, `insert_and_return`, `remove`),
+    /// stamping the hashbrown probe per caller instead of per table. Same
+    /// reason [`expiry_walk`] stays out of line.
+    #[inline(never)]
+    fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hash_of(key);
+        self.table
+            .find(hash, |slot| slot.key.borrow() == key)
+            .map(|slot| &slot.value)
+    }
+
+    #[inline(never)]
+    fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hash_of(key);
+        self.table
+            .find_mut(hash, |slot| slot.key.borrow() == key)
+            .map(|slot| &mut slot.value)
+    }
+
+    #[inline(never)]
     fn remove_key<Q>(&mut self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
@@ -152,10 +165,22 @@ where
         Some(slot.value)
     }
 
+    #[inline(never)]
     fn insert_new(&mut self, key: K, value: V) {
         let hash = self.hash_of(&key);
         self.table
-            .insert_unique(hash, PlainSlot { key, hash, value }, |slot| slot.hash);
+            .insert_unique(hash, PlainSlot { value, key, hash }, |slot| slot.hash);
+    }
+
+    /// Replace-or-insert shared by `insert` and `insert_and_return` so the
+    /// get-then-insert sequence compiles once per table, not per caller.
+    #[inline(never)]
+    fn insert_or_replace(&mut self, key: K, value: V) {
+        if let Some(slot) = self.get_mut(&key) {
+            *slot = value;
+        } else {
+            self.insert_new(key, value);
+        }
     }
 }
 
@@ -173,6 +198,11 @@ where
     K: Hash + Eq + Clone,
     S: BuildHasher,
 {
+    /// Out of line so the discriminant check compiles once per table instead
+    /// of inlining into every diagnostic caller (`entry_count`,
+    /// `structural_stats`, `clear`, ...). Hot paths match on the variants
+    /// directly and never come through here.
+    #[inline(never)]
     fn len(&self) -> usize {
         match self {
             Storage::Plain(inner) => inner.len(),
@@ -180,6 +210,7 @@ where
         }
     }
 
+    #[inline(never)]
     fn clear(&mut self) {
         match self {
             Storage::Plain(inner) => inner.clear(),
@@ -187,6 +218,7 @@ where
         }
     }
 
+    #[inline(never)]
     fn structural_bytes(&self) -> usize {
         match self {
             Storage::Plain(inner) => inner.structural_bytes(),
@@ -1068,11 +1100,7 @@ where
         let mut guard = self.inner.write().await;
         match &mut *guard {
             Storage::Plain(inner) => {
-                if let Some(slot) = inner.get_mut(&key) {
-                    *slot = value;
-                    return;
-                }
-                inner.insert_new(key, value);
+                inner.insert_or_replace(key, value);
             }
             Storage::Managed(inner) => {
                 if let Some(entry) = inner.get_mut(&key) {
@@ -1158,11 +1186,7 @@ where
         match &mut *guard {
             Storage::Plain(inner) => {
                 let ret = value.clone();
-                if let Some(slot) = inner.get_mut(&key) {
-                    *slot = value;
-                    return ret;
-                }
-                inner.insert_new(key, value);
+                inner.insert_or_replace(key, value);
                 ret
             }
             Storage::Managed(inner) => {
