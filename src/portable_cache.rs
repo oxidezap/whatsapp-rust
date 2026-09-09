@@ -358,6 +358,27 @@ impl<K: Hash + Eq + Clone, V: Clone> SyncTtlCache<K, V> {
         })
     }
 
+    /// Entry count plus estimated retained bytes: the table the cache itself
+    /// holds, plus `per_entry` summed over the entries, under the single guard
+    /// so the pair is consistent. Mirrors [`Cache::memory_stats`] without the
+    /// async lock.
+    pub(crate) fn memory_stats(
+        &self,
+        mut per_entry: impl FnMut(&K, &V) -> usize,
+    ) -> wacore::stats::CollectionStats {
+        self.with(|cache| {
+            let bytes: usize = cache
+                .inner
+                .iter()
+                .map(|(key, entry)| per_entry(key, &entry.value))
+                .sum();
+            wacore::stats::CollectionStats::new(
+                cache.inner.len() as u64,
+                (bytes + cache.inner.structural_bytes()) as u64,
+            )
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn upsert(&self, key: &K, update: impl FnOnce(Option<&V>) -> Option<V>) {
         self.with(|cache| {

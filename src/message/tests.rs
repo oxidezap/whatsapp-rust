@@ -15608,6 +15608,45 @@ mod pdo_alias_tests {
     }
 
     #[tokio::test]
+    async fn pdo_publication_memory_report_counts_payloads_and_alias() {
+        let (client, _) = client().await;
+        let empty = client.memory_report().await.dispatched_message_contents;
+        assert_eq!(empty.entries, 0);
+        assert_eq!(empty.bytes, 0);
+        let info = info(Shape::Incoming);
+        let part = |text: &str| wa::Message {
+            conversation: Some(text.into()),
+            ..Default::default()
+        };
+        let mut first = PublicationGuard::default();
+        assert!(!client.admit_message_dispatch(
+            &info,
+            false,
+            Some(MessageDispatch::fingerprint(&part("one"))),
+            false,
+            &mut first,
+        ));
+        first.complete();
+        let one = client.memory_report().await.dispatched_message_contents;
+        assert_eq!(one.entries, 1);
+        let mut second = PublicationGuard::default();
+        assert!(!client.admit_message_dispatch(
+            &info,
+            false,
+            Some(MessageDispatch::fingerprint(&part("two"))),
+            false,
+            &mut second,
+        ));
+        second.complete();
+        let two = client.memory_report().await.dispatched_message_contents;
+        assert_eq!(two.entries, 1, "same identity, one entry");
+        assert!(
+            two.bytes > one.bytes,
+            "a second payload and token must add reported bytes"
+        );
+    }
+
+    #[tokio::test]
     async fn pdo_publication_payload_capacity_fails_open() {
         let (client, events) = client().await;
         let info = info(Shape::Incoming);

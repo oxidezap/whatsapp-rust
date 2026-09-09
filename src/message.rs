@@ -394,6 +394,31 @@ std::thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+impl wacore::stats::HeapSize for DispatchKey {
+    fn heap_bytes(&self) -> usize {
+        self.chat.heap_bytes()
+            + self.id.heap_bytes()
+            + self.participant.as_ref().map_or(0, |p| p.heap_bytes())
+    }
+}
+
+impl wacore::stats::HeapSize for DispatchClaim {
+    /// Heap retained beside the table slot: spilled payloads, one token
+    /// allocation per payload, and the boxed alias. The inline SmallVec slot
+    /// lives in the slot itself and is charged with the table.
+    fn heap_bytes(&self) -> usize {
+        let mut bytes = 0;
+        if self.payloads.len() > 1 {
+            bytes += self.payloads.len() * size_of::<DispatchPayload>();
+        }
+        bytes += self.payloads.len() * size_of::<AtomicU8>();
+        if let Some(alias) = &self.alias {
+            bytes += size_of::<Jid>() + alias.heap_bytes();
+        }
+        bytes
+    }
+}
+
 impl MessageDispatch {
     // One `Vec<u8>` sink only: `message_to_vec`/`message_encode_into` already
     // stamp the `Message` encode tree once. A second sink type stamps it again
