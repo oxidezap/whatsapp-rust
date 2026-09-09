@@ -22,19 +22,33 @@ const MAX_IDLE_CONNECTIONS: u64 = 3;
 
 /// HTTP client implementation using `ureq` for synchronous HTTP requests.
 /// Since `ureq` is blocking, all requests are wrapped in `tokio::task::spawn_blocking`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UreqHttpClient {
     agent: ureq::Agent,
     /// Total-bytes cap for both [`UreqHttpClient::execute`] and the reader from
     /// [`UreqHttpClient::execute_streaming`]. Bounds an in-memory sink so a
     /// hostile CDN can't drive it to OOM; defaults to WA's 2 GiB max file size.
     max_body_bytes: u64,
-    /// Best-effort pool footprint for `resource_report`. `None` when a custom
-    /// agent is supplied (its buffer/pool config is opaque to us).
-    pool_report: Option<HttpResourceReport>,
+    /// Provenance of `agent`: true when built by [`build_agent`]. The pool
+    /// report is a constant of that config, so [`UreqHttpClient::resource_report`]
+    /// reconstructs it instead of storing a copy per client.
+    is_default_agent: bool,
     /// Set by the first request. Shared, because cloning shares the agent and
     /// therefore the pool. Read by [`UreqHttpClient::resource_report`].
     requested: Arc<AtomicBool>,
+}
+
+// Manual `Debug` so the `pool_report` field below keeps rendering exactly what
+// the stored `Option<HttpResourceReport>` used to render.
+impl std::fmt::Debug for UreqHttpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UreqHttpClient")
+            .field("agent", &self.agent)
+            .field("max_body_bytes", &self.max_body_bytes)
+            .field("pool_report", &self.stored_pool_report())
+            .field("requested", &self.requested)
+            .finish()
+    }
 }
 
 /// Pool footprint of the default agent once it has connected: each idle
@@ -96,7 +110,7 @@ impl UreqHttpClient {
         Self {
             agent: build_agent(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
-            pool_report: Some(default_pool_report()),
+            is_default_agent: true,
             requested: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -110,7 +124,7 @@ impl UreqHttpClient {
             agent,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             // A custom agent's buffer/pool sizes are opaque — don't guess.
-            pool_report: None,
+            is_default_agent: false,
             requested: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -121,6 +135,13 @@ impl UreqHttpClient {
     pub fn with_max_body_bytes(mut self, max_body_bytes: u64) -> Self {
         self.max_body_bytes = max_body_bytes;
         self
+    }
+
+    /// The constant report a stored field used to hold: the default agent's
+    /// pool footprint, or `None` for a caller-supplied agent whose buffer/pool
+    /// config is opaque to us.
+    fn stored_pool_report(&self) -> Option<HttpResourceReport> {
+        self.is_default_agent.then(default_pool_report)
     }
 }
 
@@ -349,7 +370,7 @@ impl HttpClient for UreqHttpClient {
     /// reached us, since agents share their pool with every clone, so its pool
     /// is as opaque as its buffer sizes and stays unreported.
     fn resource_report(&self) -> Option<HttpResourceReport> {
-        let pool_report = self.pool_report?;
+        let pool_report = self.stored_pool_report()?;
         if !self.requested.load(Ordering::Relaxed) {
             return Some(EMPTY_POOL_REPORT);
         }
@@ -635,6 +656,53 @@ mod tests {
             assert_eq!(report.pool_buffer_bytes, Some(0));
             assert_eq!(report.total_bytes(), 0);
         }
+    }
+
+    /// The pool report is a constant of the agent's provenance, not per-client
+    /// state: a provenance flag plus the shared request latch reconstruct the
+    /// same answers the stored `Option<HttpResourceReport>` used to hold.
+    #[test]
+    fn provenance_reconstructs_the_stored_report() {
+        assert_eq!(
+            UreqHttpClient::new().resource_report(),
+            Some(EMPTY_POOL_REPORT)
+        );
+        assert_eq!(
+            UreqHttpClient::new()
+                .with_max_body_bytes(1024)
+                .resource_report(),
+            Some(EMPTY_POOL_REPORT)
+        );
+        assert_eq!(
+            UreqHttpClient::with_agent(build_agent()).resource_report(),
+            None
+        );
+        assert_eq!(
+            UreqHttpClient::new().stored_pool_report(),
+            Some(default_pool_report())
+        );
+        assert_eq!(
+            UreqHttpClient::with_agent(build_agent()).stored_pool_report(),
+            None
+        );
+
+        // The flag (+ cap + shared latch) stays smaller than the stored
+        // `Option<HttpResourceReport>` it replaces; the 24-byte overhead
+        // below only holds where `usize` is 8 bytes.
+        assert!(
+            size_of::<UreqHttpClient>()
+                < size_of::<ureq::Agent>() + size_of::<Option<HttpResourceReport>>(),
+            "provenance flag must stay smaller than the stored report it replaces"
+        );
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(size_of::<UreqHttpClient>(), size_of::<ureq::Agent>() + 24);
+
+        // `Debug` still renders the reconstructed `pool_report` field.
+        assert!(format!("{:?}", UreqHttpClient::new()).contains("pool_report: Some("));
+        assert!(
+            format!("{:?}", UreqHttpClient::with_agent(build_agent()))
+                .contains("pool_report: None")
+        );
     }
 
     /// A caller-supplied agent is opaque in both directions: its buffer sizes
