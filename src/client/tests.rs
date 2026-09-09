@@ -5357,18 +5357,27 @@ async fn cache_maintenance_sweeps_expired_entries() {
     .await;
 
     let chat: Jid = "19045550180@s.whatsapp.net".parse().unwrap();
-    let key =
-        wacore::types::message::SenderMessageId::new(chat.clone(), "3EB0EXPIRING".into(), chat);
-    client.dispatched_messages.insert(key, ()).await;
+    let info = Arc::new(crate::types::message::MessageInfo {
+        id: "3EB0EXPIRING".into(),
+        source: crate::types::message::MessageSource {
+            chat: chat.clone(),
+            sender: chat,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    client
+        .mark_message_dispatched(&info, &wa::Message::default())
+        .await;
     tokio::time::sleep(Duration::from_millis(40)).await;
     assert_eq!(
-        client.dispatched_messages.entry_count_async().await,
+        client.dispatched_messages.entry_count(),
         1,
         "a quiet cache keeps its expired entry until swept"
     );
 
     client.run_cache_maintenance().await;
-    assert_eq!(client.dispatched_messages.entry_count_async().await, 0);
+    assert_eq!(client.dispatched_messages.entry_count(), 0);
     assert_eq!(client.memory_report().await.dispatched_messages, 0);
 }
 

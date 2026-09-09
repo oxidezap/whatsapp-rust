@@ -673,6 +673,10 @@ fn a_newtype_or_alias_does_not_hide_its_collection() {
         Some("InboundCommitBatcher::Vec"),
         "the offline-drain commit batch is a Vec behind a newtype"
     );
+    assert!(
+        path("SyncTtlCache").is_some(),
+        "the synchronous publication cache must remain visible to the report scanner"
+    );
     assert_eq!(
         path("MsgSecretWriteBuffer").as_deref(),
         Some("MsgSecretWriteBuffer::HashMap"),

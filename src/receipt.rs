@@ -856,11 +856,7 @@ impl Client {
         // them before the deferred retry flushes would trade a redeliverable
         // failure for a crash-permanent one. Completion of the deferred
         // transition flushes this buffer (after its durable flush).
-        if self
-            .offline_sync_completed
-            .load(std::sync::atomic::Ordering::Acquire)
-            && !self.inbound_commit_batch.is_active()
-        {
+        if !self.inbound_commit_batch.is_active() {
             return false;
         }
         buffer.push(Arc::clone(info));
@@ -3671,6 +3667,11 @@ mod tests {
         client
             .offline_sync_completed
             .store(false, std::sync::atomic::Ordering::Release);
+        assert!(
+            !client.try_buffer_offline_receipt(&late),
+            "a completed drain must not buffer while its completion event is still pending"
+        );
+        client.inbound_commit_batch.reset();
         let straggler = offline_info(
             "OFF4",
             "5511999990000@s.whatsapp.net",

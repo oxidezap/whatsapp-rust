@@ -189,6 +189,9 @@ pub struct CacheConfig {
     /// observed resend window (production logs: median 12s between attempts,
     /// p90 189s, longest plausible resend 285s) and the capacity ~3.6x the
     /// busiest 5-minute burst measured (278 messages). Capacity 0 disables it.
+    /// Capacity counts identities, with up to eight payload digests per identity.
+    /// Further distinct payloads remain deliverable without deduplication.
+    /// The gate does not retain plaintext.
     pub dispatched_messages: CacheEntryConfig,
     /// PDO pending requests (time_to_live). Default: 30s TTL, 200 entries.
     pub pdo_pending_requests: CacheEntryConfig,

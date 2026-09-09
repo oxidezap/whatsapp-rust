@@ -467,6 +467,10 @@ pub struct MemoryReport {
     pub undecryptable_dispatched: u64,
     /// Entries in the dispatch-once gate for decrypted messages.
     pub dispatched_messages: u64,
+    /// Payload digests, tokens and aliases retained per dispatch-gate
+    /// identity, on top of the table slots charged above. The identity count
+    /// stays in [`Self::dispatched_messages`].
+    pub dispatched_message_contents: CollectionStats,
     pub pdo_pending_requests: u64,
     pub pdo_requested: u64,
     /// Queued/running history-sync tasks and their logical compressed-payload
@@ -652,7 +656,7 @@ pub struct SubsystemMemory {
 impl MemoryReport {
     /// Common byte-carrying collections used by both totals and `Display`.
     /// Feature-specific collections stay beside their gated report section.
-    fn collections(&self) -> [(&'static str, &CollectionStats); 17] {
+    fn collections(&self) -> [(&'static str, &CollectionStats); 18] {
         [
             ("group_cache:", &self.group_cache),
             ("device_registry_cache:", &self.device_registry_cache),
@@ -668,6 +672,7 @@ impl MemoryReport {
             ("signal_identities:", &self.signal_identities),
             ("signal_sender_keys:", &self.signal_sender_keys),
             ("history_sync_tasks:", &self.history_sync_tasks),
+            ("dispatch_contents:", &self.dispatched_message_contents),
             ("inbound_commit_batch:", &self.inbound_commit_batch),
             ("offline_receipts:", &self.offline_receipt_buffer),
             ("core_event_handlers:", &self.core_event_handlers),
@@ -1707,7 +1712,10 @@ pub struct Client {
     /// Dispatch-once gate for a decrypted message. A sender retrying its own
     /// outbox resends one id as fresh ciphertext on a new ratchet iteration,
     /// which decrypts as new traffic, so only message identity can collapse it.
-    pub(crate) dispatched_messages: Cache<wacore::types::message::SenderMessageId, ()>,
+    pub(crate) dispatched_messages: crate::portable_cache::SyncTtlCache<
+        crate::message::DispatchKey,
+        crate::message::DispatchClaim,
+    >,
 
     /// Lifetime count of resent messages this gate kept from reaching
     /// consumers. Client-level, so it survives reconnects: the sender's retry

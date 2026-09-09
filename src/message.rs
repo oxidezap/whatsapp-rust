@@ -211,6 +211,258 @@ pub(crate) struct PlaintextHandleOutcome {
     skdm_only: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MessageDispatch {
+    Decrypted,
+    Recovered,
+    RecoveredCommitted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DispatchKey {
+    chat: Jid,
+    id: wacore_binary::MessageId,
+    participant: Option<Jid>,
+    from_me: bool,
+}
+
+const MAX_DISPATCH_PAYLOADS: usize = 8;
+const PUBLICATION_PENDING: u8 = 0;
+const PUBLICATION_COMPLETE: u8 = 1;
+const PUBLICATION_INTERRUPTED: u8 = 2;
+
+/// The retained half of a payload's SHA-256.
+///
+/// A digest is only ever compared against the at most
+/// [`MAX_DISPATCH_PAYLOADS`] digests recorded under one message identity, so
+/// what it has to rule out is a second payload for *that* id colliding on 128
+/// bits — a second preimage, not a birthday collision, and unreachable for a
+/// peer that would have to find it. Keeping 32 bytes instead doubled what the
+/// dispatch gate retains per claim, and the gate's table is the largest thing
+/// this feature adds to a client's resident memory.
+pub(crate) type DispatchFingerprint = [u8; 16];
+
+#[derive(Clone)]
+struct DispatchPayload {
+    fingerprint: DispatchFingerprint,
+    state: MessageDispatch,
+    publication: Arc<AtomicU8>,
+}
+
+/// Boxed: an alternate identity is evidence a *minority* of claims carry (only
+/// a stanza that spelled both namespaces has one), while the claim itself is
+/// retained for every message id the client dispatches. Inline it cost every
+/// claim a `Jid` whether or not one existed.
+type DispatchAlias = Option<Box<Jid>>;
+
+#[derive(Clone, Default)]
+pub(crate) struct DispatchClaim {
+    payloads: smallvec::SmallVec<[DispatchPayload; 1]>,
+    alias: DispatchAlias,
+}
+
+#[derive(Default)]
+pub(crate) struct PublicationGuard {
+    owner: Option<Arc<AtomicU8>>,
+}
+
+/// Duplicate-probe answer with the plaintext already resolved: dispatch must
+/// reuse it instead of resolving the parent secret a second time. Boxed: the
+/// mismatch path is rare and `wa::Message` is close to a kilobyte.
+pub(crate) enum ProbeOutcome {
+    Suppress,
+    Proceed { decrypted: Option<Box<wa::Message>> },
+}
+
+impl PublicationGuard {
+    fn owner(&mut self) -> Arc<AtomicU8> {
+        Arc::clone(
+            self.owner
+                .get_or_insert_with(|| Arc::new(AtomicU8::new(PUBLICATION_PENDING))),
+        )
+    }
+
+    pub(crate) fn complete(mut self) {
+        if let Some(owner) = self.owner.take() {
+            owner.store(PUBLICATION_COMPLETE, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for PublicationGuard {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.owner {
+            // Only slots still carrying this token become invalid. A newer
+            // publisher can replace a pending slot without an ABA rollback.
+            owner.store(PUBLICATION_INTERRUPTED, Ordering::Release);
+        }
+    }
+}
+
+impl DispatchClaim {
+    fn prune(&mut self) {
+        self.payloads.retain(|payload| {
+            payload.publication.load(Ordering::Acquire) != PUBLICATION_INTERRUPTED
+        });
+    }
+
+    fn has_deliveries(&self) -> bool {
+        self.payloads
+            .iter()
+            .any(|payload| payload.publication.load(Ordering::Acquire) != PUBLICATION_INTERRUPTED)
+    }
+
+    fn has_recovery(&self) -> bool {
+        self.payloads.iter().any(|payload| {
+            payload.state != MessageDispatch::Decrypted
+                && payload.publication.load(Ordering::Acquire) != PUBLICATION_INTERRUPTED
+        })
+    }
+
+    fn state(&self, fingerprint: &DispatchFingerprint) -> Option<MessageDispatch> {
+        self.payloads
+            .iter()
+            .find(|payload| {
+                &payload.fingerprint == fingerprint
+                    && payload.publication.load(Ordering::Acquire) != PUBLICATION_INTERRUPTED
+            })
+            .map(|payload| payload.state)
+    }
+
+    fn admit(
+        &mut self,
+        fingerprint: DispatchFingerprint,
+        pdo: bool,
+        hook_committed: bool,
+        publication: &mut PublicationGuard,
+    ) -> bool {
+        if let Some(payload) = self.payloads.iter_mut().find(|payload| {
+            payload.fingerprint == fingerprint
+                && payload.publication.load(Ordering::Acquire) != PUBLICATION_INTERRUPTED
+        }) {
+            // Suppress on a live match, including an in-flight one. The only
+            // way it can still roll back is a concurrent panic: this region
+            // runs no awaits between admission and completion, so cancellation
+            // cannot land inside it. Delivering instead would re-enter a
+            // blocked callback on every overlap and break the progress
+            // contract pinned by
+            // `pdo_retry_blocked_recovery_callback_admits_no_duplicate`.
+            // A rolled-back publication stays observable: its token flips to
+            // INTERRUPTED, which the find above skips, so the next redelivery
+            // after the rollback is admitted fresh.
+            if pdo {
+                return true;
+            }
+            if payload.state != MessageDispatch::Decrypted {
+                if hook_committed {
+                    payload.state = MessageDispatch::RecoveredCommitted;
+                }
+                return true;
+            }
+            // Ordinary multipart dispatches and hook replays still fan out.
+            // Keep a completed claim, but let a new publisher own a pending one.
+            if payload.publication.load(Ordering::Acquire) != PUBLICATION_COMPLETE {
+                payload.publication = publication.owner();
+            }
+            return false;
+        }
+        if self.payloads.len() < MAX_DISPATCH_PAYLOADS {
+            self.payloads.push(DispatchPayload {
+                fingerprint,
+                state: if pdo {
+                    MessageDispatch::Recovered
+                } else {
+                    MessageDispatch::Decrypted
+                },
+                publication: publication.owner(),
+            });
+        }
+        // Overflow stays unclaimed, never silently discards another payload.
+        false
+    }
+}
+
+// Rare-path callers (PDO recovery, duplicate probes) share one encode buffer
+// per thread instead of allocating a message-sized `Vec` per call. Borrowed
+// synchronously only, never held across an await. Capacity stays bounded: one
+// huge message must not pin a huge buffer on the worker for the rest of the
+// process.
+const MAX_FINGERPRINT_SCRATCH_BYTES: usize = 64 * 1024;
+
+std::thread_local! {
+    static FINGERPRINT_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl wacore::stats::HeapSize for DispatchKey {
+    fn heap_bytes(&self) -> usize {
+        self.chat.heap_bytes()
+            + self.id.heap_bytes()
+            + self.participant.as_ref().map_or(0, |p| p.heap_bytes())
+    }
+}
+
+/// One publication token allocation: the value plus the strong and weak
+/// counts. Allocator rounding above that is not counted, the same floor the
+/// table accounting in `hash_table_bytes` uses.
+const TOKEN_ALLOC_BYTES: usize = 2 * size_of::<usize>() + size_of::<AtomicU8>();
+
+impl wacore::stats::HeapSize for DispatchClaim {
+    /// Heap retained beside the table slot: spilled payloads at their
+    /// allocated capacity, one token allocation per payload, and the boxed
+    /// alias. The inline SmallVec slot lives in the slot itself and is
+    /// charged with the table.
+    fn heap_bytes(&self) -> usize {
+        let mut bytes = 0;
+        if self.payloads.spilled() {
+            bytes += self.payloads.capacity() * size_of::<DispatchPayload>();
+        }
+        bytes += self.payloads.len() * TOKEN_ALLOC_BYTES;
+        if let Some(alias) = &self.alias {
+            bytes += size_of::<Jid>() + alias.heap_bytes();
+        }
+        bytes
+    }
+}
+
+impl MessageDispatch {
+    // One `Vec<u8>` sink only: `message_to_vec`/`message_encode_into` already
+    // stamp the `Message` encode tree once. A second sink type stamps it again
+    // (measured +284 KiB .text); see the pinning note on `message_encode_into`.
+    #[inline(never)]
+    pub(crate) fn fingerprint(message: &wa::Message) -> DispatchFingerprint {
+        FINGERPRINT_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let fingerprint = Self::fingerprint_into(message, &mut scratch);
+            if scratch.capacity() > MAX_FINGERPRINT_SCRATCH_BYTES {
+                scratch.clear();
+                scratch.shrink_to(MAX_FINGERPRINT_SCRATCH_BYTES);
+            }
+            fingerprint
+        })
+    }
+
+    #[inline(never)]
+    pub(crate) fn fingerprint_into(
+        message: &wa::Message,
+        scratch: &mut Vec<u8>,
+    ) -> DispatchFingerprint {
+        use sha2::{Digest, Sha256};
+        scratch.clear();
+        waproto::codec::message_encode_into(message, scratch);
+        Self::truncate(Sha256::digest(scratch.as_slice()).into())
+    }
+
+    /// The retained prefix of a full digest, for a caller that already hashed
+    /// the encoded bytes it was writing anyway.
+    pub(crate) fn truncate(digest: [u8; 32]) -> DispatchFingerprint {
+        const LEN: usize = size_of::<DispatchFingerprint>();
+        let mut fingerprint = [0u8; LEN];
+        fingerprint.copy_from_slice(&digest[..LEN]);
+        fingerprint
+    }
+}
+
 const INBOUND_COMMIT_PENDING: u8 = 0;
 const INBOUND_COMMIT_DURABLE: u8 = 1;
 const INBOUND_COMMIT_DROPPED: u8 = 2;

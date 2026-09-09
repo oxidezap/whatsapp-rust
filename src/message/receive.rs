@@ -1970,48 +1970,60 @@ impl Client {
                 skdm_only: true,
                 ..Default::default()
             })
-        } else if self.message_already_dispatched(info).await {
-            // The event is a duplicate; the message secret it carries may not
-            // be. Capture is write-behind and can drop an entry when its
-            // backend is down, and this branch skips `dispatch_parsed_message`,
-            // which is the only other caller: without this the resend is the
-            // second chance we would have thrown away, and every later
-            // encrypted edit, reaction or comment on that parent stays
-            // unopenable. It is a no-op for a message carrying no secret.
-            self.maybe_capture_inbound_msg_secret(&msg, info).await;
-            // The sender resent a message we already handed to consumers. Ack
-            // it the way the ratchet-level duplicate is acked, so a registered
-            // durability hook still gets its replay instead of a bare ack.
-            // status is acked by the should_ack gate. A hook whose buffered copy
-            // survived replays instead of being acked, which dispatches the
-            // message again: that is the documented at-least-once shape, not a
-            // suppression, so it is not counted as one.
-            let replayed =
-                !info.source.chat.is_status_broadcast() && self.ack_or_replay_to_hook(info).await;
-            if !replayed {
-                self.duplicate_dispatch_suppressed
-                    .fetch_add(1, Ordering::Relaxed);
-                wacore::telemetry::recv("duplicate_resend");
-                log::debug!(
-                    "[msg:{}] already dispatched for this sender; suppressing the resend's event",
-                    info.id
-                );
-            }
-            // The event is a duplicate; the key share is not. Our phone asking
-            // again is what it does when it did not get the keys, so the first
-            // delivery's send having been scheduled is no reason to skip this
-            // one. Sending them twice costs a stanza; not sending them leaves
-            // the requester without app-state keys until it changes request id.
-            if let Some((requester, request)) = app_state_key_share_job {
-                self.schedule_app_state_sync_key_share(requester, request, None);
-            }
-            Ok(PlaintextHandleOutcome {
-                dispatched: true,
-                ..Default::default()
-            })
         } else {
+            // The probe may have already materialized a secret envelope while
+            // fingerprinting; hand it to dispatch instead of resolving the
+            // parent secret a second time.
+            let pre_decrypted = match self.probe_message_dispatch(info, &msg).await {
+                ProbeOutcome::Suppress => {
+                    // The event is a duplicate; the message secret it carries may not
+                    // be. Capture is write-behind and can drop an entry when its
+                    // backend is down, and this branch skips `dispatch_parsed_message`,
+                    // which is the only other caller: without this the resend is the
+                    // second chance we would have thrown away, and every later
+                    // encrypted edit, reaction or comment on that parent stays
+                    // unopenable. It is a no-op for a message carrying no secret.
+                    self.maybe_capture_inbound_msg_secret(&msg, info).await;
+                    // The sender resent a message we already handed to consumers. Ack
+                    // it the way the ratchet-level duplicate is acked, so a registered
+                    // durability hook still gets its replay instead of a bare ack.
+                    // status is acked by the should_ack gate. A hook whose buffered copy
+                    // survived replays instead of being acked, which dispatches the
+                    // message again: that is the documented at-least-once shape, not a
+                    // suppression, so it is not counted as one.
+                    let replayed = !info.source.chat.is_status_broadcast()
+                        && self.ack_or_replay_to_hook(info).await;
+                    if !replayed {
+                        self.duplicate_dispatch_suppressed
+                            .fetch_add(1, Ordering::Relaxed);
+                        wacore::telemetry::recv("duplicate_resend");
+                        log::debug!(
+                            "[msg:{}] already dispatched for this sender; suppressing the resend's event",
+                            info.id
+                        );
+                    }
+                    // The event is a duplicate; the key share is not. Our phone asking
+                    // again is what it does when it did not get the keys, so the first
+                    // delivery's send having been scheduled is no reason to skip this
+                    // one. Sending them twice costs a stanza; not sending them leaves
+                    // the requester without app-state keys until it changes request id.
+                    if let Some((requester, request)) = app_state_key_share_job {
+                        self.schedule_app_state_sync_key_share(requester, request, None);
+                    }
+                    return Ok(PlaintextHandleOutcome {
+                        dispatched: true,
+                        ..Default::default()
+                    });
+                }
+                ProbeOutcome::Proceed { decrypted } => decrypted.map(|boxed| *boxed),
+            };
             let commit_state = self
-                .dispatch_parsed_message(msg, info, app_state_key_share_job.is_some())
+                .dispatch_parsed_message_with_decrypted(
+                    msg,
+                    info,
+                    app_state_key_share_job.is_some(),
+                    pre_decrypted,
+                )
                 .await;
             if let Some((requester, request)) = app_state_key_share_job {
                 match commit_state {
