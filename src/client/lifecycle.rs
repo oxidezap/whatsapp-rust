@@ -517,7 +517,7 @@ impl Client {
             stats: Arc::new(wacore::stats::SessionStats::new()),
 
             transport: Arc::new(Mutex::new(None)),
-            transport_events: Arc::new(Mutex::new(None)),
+            transport_events: Mutex::new(None),
             transport_factory,
             noise_socket: Arc::new(std::sync::Mutex::new(None)),
 
@@ -620,7 +620,7 @@ impl Client {
             app_state_processor: std::sync::OnceLock::new(),
             app_state_key_requests: Arc::new(Mutex::new(HashMap::new())),
             app_state_syncing: app_state::SyncInFlight::new(),
-            app_state_send_lock: Arc::new(Mutex::new(())),
+            app_state_send_lock: Mutex::new(()),
             initial_keys_synced_notifier: Arc::new(event_listener::Event::new()),
             initial_app_state_keys_received: AtomicBool::new(false),
             prekey_upload_lock: Arc::new(Mutex::new(())),
@@ -664,7 +664,7 @@ impl Client {
             custom_enc_handlers: std::sync::OnceLock::new(),
             inbound_durability_hook: std::sync::OnceLock::new(),
             retry_admission: std::sync::OnceLock::new(),
-            chatstate_handlers: Arc::new(std::sync::RwLock::new(Arc::from([]))),
+            chatstate_handlers: std::sync::RwLock::new(Arc::from([])),
             chatstate_handler_count: AtomicUsize::new(0),
             pdo_pending_requests: cache_config.pdo_pending_requests.build_with_ttl(),
             pdo_requested: cache_config.pdo_requested.build_with_ttl(),
