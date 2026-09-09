@@ -3681,7 +3681,8 @@ async fn runtime_cache_config_honors_disabled_recent_cache() {
 ///
 /// Rebaseline: the failure message prints the current size; set the base just
 /// above it. Test cfg only: `#[cfg(test)]` fields shift the number versus a
-/// production build.
+/// production build. General procedure:
+/// [layout asserts](../../agent_docs/layout_asserts.md).
 #[test]
 fn client_size_pins_runtime_cache_config_saving() {
     use std::mem::size_of;

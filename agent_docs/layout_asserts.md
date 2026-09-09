@@ -37,6 +37,13 @@ Exact, kept exact:
   costs the caller nothing.
 - `Slot<String, u32> > PlainSlot<String, u32>` in `src/portable_cache.rs`.
   Relational: the managed slot must cost more than the plain one.
+- `Slot<DispatchKey, DispatchClaim>` under the spelled-out-identity slot in
+  `src/portable_cache.rs`. Relational: the comparison type carries the
+  budget, so widths and repacks do not matter.
+- `size_of::<Client>()` against a measured base in `src/client/tests.rs`.
+  Compositional: the base stacks the fixed part plus each size-varying
+  attachment, including feature-gated ones, so only an unaccounted layout
+  move trips it.
 - The four-word saving in `wacore/libsignal/src/protocol/sender_keys.rs`.
   Stated as `Vec + MessageField == 4 * size_of::<usize>()`, width
   independent. This is the pin that matters there.
@@ -106,6 +113,8 @@ cargo test -p whatsapp-rust --lib send_futures_stay_small
 cargo test -p whatsapp-rust --lib pdo_alias_claim_stays_small
 cargo test -p whatsapp-rust --lib retained_bytes_per_device_stay_bounded
 cargo test -p whatsapp-rust --lib an_unbounded_cache_stores_plain_slots_without_metadata
+cargo test -p whatsapp-rust --lib dispatch_gate_slot_stays_below_the_spelled_out_identity
+cargo test -p whatsapp-rust --lib client_size_pins_runtime_cache_config_saving
 cargo test -p whatsapp-rust --lib test_manager_fields_are_inline
 cargo test -p whatsapp-rust --lib handing_back_a_connection_costs_the_caller_nothing
 cargo test -p wacore --lib event_stays_under_its_size_ceiling

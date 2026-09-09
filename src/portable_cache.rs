@@ -3304,7 +3304,9 @@ mod tests {
     /// that doubles this table, which scales with the slot. The bound is the
     /// slot of the `SenderMessageId -> ()` marker this gate replaced: keying
     /// by a digest instead of the spelled-out identity took it from 208 bytes
-    /// to under that, and it must not drift back.
+    /// to under that, and it must not drift back. Relational: the comparison
+    /// type carries the budget, so widths and repacks do not matter.
+    /// Rebaseline per [layout asserts](../agent_docs/layout_asserts.md).
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn dispatch_gate_slot_stays_below_the_spelled_out_identity() {
