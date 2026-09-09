@@ -412,9 +412,47 @@ impl Default for CacheConfig {
     }
 }
 
+/// Runtime-retained subset of [`CacheConfig`].
+///
+/// The constructor consumes most settings into live caches; only these fields
+/// are read after construction (lazy group-cache init, recent-message gate,
+/// sent-message sweep, secret policy). Converted once, so `Client` never
+/// holds the full construction config. Only the group-cache store is kept:
+/// the device-registry and LID-PN stores are owned by their live caches after
+/// construction, and keeping another `Arc` here would pin them for no reason.
+#[derive(Clone)]
+pub(crate) struct RuntimeCacheConfig {
+    pub(crate) group_cache: CacheEntryConfig,
+    pub(crate) group_cache_store: Option<Arc<dyn CacheStore>>,
+    pub(crate) recent_messages_enabled: bool,
+    pub(crate) sent_message_ttl_secs: u64,
+    pub(crate) msg_secret_policy: MsgSecretPolicy,
+    pub(crate) msg_secret_retention: MsgSecretRetention,
+    pub(crate) seed_msg_secrets_from_history: bool,
+    pub(crate) original_message_resolver: Option<Arc<dyn OriginalMessageResolver>>,
+    pub(crate) msg_secret_resolver_timeout: Duration,
+}
+
+impl From<&CacheConfig> for RuntimeCacheConfig {
+    fn from(config: &CacheConfig) -> Self {
+        Self {
+            group_cache: config.group_cache.clone(),
+            group_cache_store: config.cache_stores.group_cache.clone(),
+            recent_messages_enabled: config.recent_messages.capacity > 0,
+            sent_message_ttl_secs: config.sent_message_ttl_secs,
+            msg_secret_policy: config.msg_secret_policy,
+            msg_secret_retention: config.msg_secret_retention,
+            seed_msg_secrets_from_history: config.seed_msg_secrets_from_history,
+            original_message_resolver: config.original_message_resolver.clone(),
+            msg_secret_resolver_timeout: config.msg_secret_resolver_timeout,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::size_of;
 
     #[test]
     fn lid_pn_cache_default_is_effectively_unbounded() {
@@ -428,5 +466,55 @@ mod tests {
             u64::MAX,
             "lid_pn_cache must be effectively unbounded; capacity-LRU re-introduces the eviction bug at higher thresholds"
         );
+    }
+
+    #[test]
+    fn runtime_config_is_compact() {
+        assert!(
+            size_of::<RuntimeCacheConfig>() * 2 < size_of::<CacheConfig>(),
+            "runtime config {} B must stay well under construction config {} B",
+            size_of::<RuntimeCacheConfig>(),
+            size_of::<CacheConfig>()
+        );
+        assert!(
+            size_of::<RuntimeCacheConfig>() <= 136,
+            "runtime config grew to {} B (budget 136)",
+            size_of::<RuntimeCacheConfig>()
+        );
+    }
+
+    #[test]
+    fn runtime_conversion_keeps_nondefault_settings() {
+        let cfg = CacheConfig {
+            group_cache: CacheEntryConfig::new(Some(Duration::from_secs(60)), 10),
+            recent_messages: CacheEntryConfig::new(Some(Duration::from_secs(300)), 64),
+            sent_message_ttl_secs: 60,
+            msg_secret_policy: MsgSecretPolicy::Full,
+            msg_secret_retention: MsgSecretRetention {
+                text: Duration::from_secs(7 * 86_400),
+                poll_event: Duration::from_secs(7 * 86_400),
+                bot: Duration::from_secs(7 * 86_400),
+            },
+            seed_msg_secrets_from_history: false,
+            msg_secret_resolver_timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let runtime = RuntimeCacheConfig::from(&cfg);
+        assert_eq!(runtime.group_cache.capacity, 10);
+        assert_eq!(runtime.group_cache.timeout, Some(Duration::from_secs(60)));
+        assert!(runtime.recent_messages_enabled);
+        assert_eq!(runtime.sent_message_ttl_secs, 60);
+        assert_eq!(runtime.msg_secret_policy, MsgSecretPolicy::Full);
+        assert_eq!(
+            runtime.msg_secret_retention.text,
+            Duration::from_secs(7 * 86_400)
+        );
+        assert!(!runtime.seed_msg_secrets_from_history);
+        assert_eq!(runtime.msg_secret_resolver_timeout, Duration::from_secs(1));
+        assert!(runtime.group_cache_store.is_none());
+        assert!(runtime.original_message_resolver.is_none());
+
+        let disabled = CacheConfig::default();
+        assert!(!RuntimeCacheConfig::from(&disabled).recent_messages_enabled);
     }
 }

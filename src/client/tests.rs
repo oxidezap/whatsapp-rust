@@ -3569,6 +3569,110 @@ async fn test_custom_cache_config_is_respected() {
 }
 
 #[tokio::test]
+async fn runtime_cache_config_propagates_nondefault_settings() {
+    use crate::cache_config::{CacheEntryConfig, CacheStores, MsgSecretPolicy, MsgSecretRetention};
+    use std::time::Duration;
+
+    struct StubStore;
+    #[async_trait::async_trait]
+    impl crate::cache_store::CacheStore for StubStore {
+        async fn get(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn set(&self, _: &str, _: &str, _: &[u8], _: Option<Duration>) -> Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn clear(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct StubResolver;
+    #[async_trait::async_trait]
+    impl crate::cache_config::OriginalMessageResolver for StubResolver {
+        async fn resolve_msg_secret(&self, _: &str, _: &str, _: &str) -> Option<[u8; 32]> {
+            Some([0xABu8; 32])
+        }
+    }
+
+    let store: Arc<dyn crate::cache_store::CacheStore> = Arc::new(StubStore);
+    let resolver: Arc<dyn crate::cache_config::OriginalMessageResolver> = Arc::new(StubResolver);
+    let config = CacheConfig {
+        group_cache: CacheEntryConfig::new(Some(Duration::from_secs(60)), 10),
+        recent_messages: CacheEntryConfig::new(Some(Duration::from_secs(300)), 64),
+        sent_message_ttl_secs: 60,
+        msg_secret_policy: MsgSecretPolicy::Full,
+        msg_secret_retention: MsgSecretRetention {
+            text: Duration::from_secs(7 * 86_400),
+            poll_event: Duration::from_secs(7 * 86_400),
+            bot: Duration::from_secs(7 * 86_400),
+        },
+        seed_msg_secrets_from_history: false,
+        original_message_resolver: Some(Arc::clone(&resolver)),
+        msg_secret_resolver_timeout: Duration::from_secs(1),
+        cache_stores: CacheStores {
+            group_cache: Some(Arc::clone(&store)),
+            ..Default::default()
+        },
+        ..CacheConfig::default()
+    };
+    let client = crate::test_utils::create_test_client_with_config(
+        "runtime_config_propagates",
+        Arc::new(MockHttpClient),
+        config,
+    )
+    .await;
+
+    assert_eq!(client.cache_config.group_cache.capacity, 10);
+    assert_eq!(
+        client.cache_config.group_cache.timeout,
+        Some(Duration::from_secs(60))
+    );
+    assert!(
+        client.cache_config.group_cache_store.is_some(),
+        "custom group-cache store must be retained for lazy init"
+    );
+    assert!(client.cache_config.recent_messages_enabled);
+    assert_eq!(client.cache_config.sent_message_ttl_secs, 60);
+    assert_eq!(client.cache_config.msg_secret_policy, MsgSecretPolicy::Full);
+    assert_eq!(
+        client.cache_config.msg_secret_retention.text,
+        Duration::from_secs(7 * 86_400)
+    );
+    assert!(!client.cache_config.seed_msg_secrets_from_history);
+    assert!(client.cache_config.original_message_resolver.is_some());
+    assert_eq!(
+        client.cache_config.msg_secret_resolver_timeout,
+        Duration::from_secs(1)
+    );
+    // Lazy init must reuse the retained store, not build a local cache.
+    let _ = client.get_group_cache();
+    assert!(client.group_cache.get().is_some());
+}
+
+#[tokio::test]
+async fn runtime_cache_config_honors_disabled_recent_cache() {
+    let client = crate::test_utils::create_test_client_with_config(
+        "runtime_config_recent_disabled",
+        Arc::new(MockHttpClient),
+        CacheConfig::default(),
+    )
+    .await;
+    assert!(
+        !client.cache_config.recent_messages_enabled,
+        "default capacity 0 must surface as disabled"
+    );
+    let chat: Jid = "120363000000000099@g.us".parse().unwrap();
+    assert!(
+        client.peek_recent_message(&chat, "MISSING").await.is_none(),
+        "disabled L1 must fall through to the DB miss path"
+    );
+}
+
+#[tokio::test]
 async fn held_group_distribution_lane_survives_capacity_pressure() {
     let config = CacheConfig {
         group_distribution_locks_capacity: 1,

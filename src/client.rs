@@ -374,7 +374,9 @@ pub(crate) type SkdmWarmMemoEntry = (
 use wacore::runtime::timeout as rt_timeout;
 use waproto::whatsapp as wa;
 
+#[cfg(test)]
 use crate::cache_config::CacheConfig;
+use crate::cache_config::RuntimeCacheConfig;
 use crate::socket::{NoiseSocket, SocketError, error::EncryptSendError};
 use crate::sync_task::MajorSyncTask;
 use wacore::runtime::Runtime;
@@ -2034,9 +2036,9 @@ pub struct Client {
     /// Clamped to the protocol-safe range at upload time.
     pub(crate) wanted_pre_key_count: AtomicUsize,
 
-    /// Cache configuration for TTL and capacity of all caches.
+    /// Runtime subset of the construction [`crate::cache_config::CacheConfig`].
     /// Stored for use by lazily-initialized caches (group_cache).
-    pub(crate) cache_config: CacheConfig,
+    pub(crate) cache_config: RuntimeCacheConfig,
 
     /// Weak self-reference for spawning background tasks from `&self` methods.
     /// Initialized after `Arc::new(this)` in the constructor.

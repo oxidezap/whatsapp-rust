@@ -26,7 +26,7 @@ struct HistorySecretSeedConfig {
 }
 
 impl HistorySecretSeedConfig {
-    fn snapshot(config: &crate::cache_config::CacheConfig) -> Self {
+    fn snapshot(config: &crate::cache_config::RuntimeCacheConfig) -> Self {
         Self {
             enabled: config.seed_msg_secrets_from_history,
             policy: config.msg_secret_policy,
