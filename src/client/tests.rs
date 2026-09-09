@@ -3672,6 +3672,39 @@ async fn runtime_cache_config_honors_disabled_recent_cache() {
     );
 }
 
+/// PR #1482 replaced the per-client `cache_config: CacheConfig` field with
+/// the runtime-retained `RuntimeCacheConfig` (456 B down to 136 B on the
+/// structs). A struct-level delta alone does not prove the per-client saving,
+/// since neighbor-field padding could absorb part of it; measured across the
+/// PR the `Client`-level saving was the full 320 B (4560 down to 4240), so
+/// padding absorbed nothing. This pins that true per-client number.
+///
+/// Rebaseline: the failure message prints the current size; set the base just
+/// above it. Test cfg only: `#[cfg(test)]` fields shift the number versus a
+/// production build.
+#[test]
+fn client_size_pins_runtime_cache_config_saving() {
+    use std::mem::size_of;
+
+    // Measured `size_of::<Client>()` at the head of the #1482 follow-ups,
+    // default features. Optional fields stack on top without padding loss.
+    let mut expected = 4296;
+    if cfg!(feature = "client-lifecycle") {
+        expected += size_of::<std::sync::Mutex<()>>() + size_of::<Option<Arc<()>>>();
+    }
+    if cfg!(feature = "plugins") {
+        expected += size_of::<Option<Arc<()>>>();
+    }
+    assert_eq!(
+        size_of::<Client>(),
+        expected,
+        "Client layout moved; if a field was added or removed on purpose, \
+         re-measure with `cargo test -p whatsapp-rust --lib \
+         client_size_pins_runtime_cache_config_saving` under default and \
+         `--features client-lifecycle,plugins` and update the base",
+    );
+}
+
 #[tokio::test]
 async fn held_group_distribution_lane_survives_capacity_pressure() {
     let config = CacheConfig {
