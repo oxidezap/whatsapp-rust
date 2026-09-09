@@ -168,8 +168,7 @@ where
     #[inline(never)]
     fn insert_new(&mut self, key: K, value: V) {
         let hash = self.hash_of(&key);
-        self.table
-            .insert_unique(hash, PlainSlot { value, key, hash }, |slot| slot.hash);
+        insert_slot(&mut self.table, hash, PlainSlot { value, key, hash });
     }
 
     /// Replace-or-insert shared by `insert` and `insert_and_return` so the
@@ -225,6 +224,39 @@ where
             Storage::Managed(inner) => inner.structural_bytes(),
         }
     }
+}
+
+/// The hash a table slot was inserted with, read back when its table grows so
+/// growth never re-hashes a key. Both slot kinds carry it; the shared
+/// [`insert_slot`] tail reads it through this trait so the two `insert_unique`
+/// call sites compile from one definition instead of one per insert path.
+trait StoredHash {
+    fn stored_hash(&self) -> u64;
+}
+
+impl<K, V> StoredHash for Slot<K, V> {
+    #[inline]
+    fn stored_hash(&self) -> u64 {
+        self.hash
+    }
+}
+
+impl<K, V> StoredHash for PlainSlot<K, V> {
+    #[inline]
+    fn stored_hash(&self) -> u64 {
+        self.hash
+    }
+}
+
+/// Growth tail shared by [`PlainInner::insert_new`] and
+/// [`CacheInner::insert_new`]: grow the table when needed and insert the slot.
+/// Out of line so each `<K, V>` table carries its hashbrown growth chain once,
+/// not once per insert entry point (`insert`, `upsert_with_by_ref`,
+/// `insert_and_return`); a new cache instantiates one copy for its slot type
+/// however many paths insert into it.
+#[inline(never)]
+fn insert_slot<T: StoredHash>(table: &mut HashTable<T>, hash: u64, slot: T) {
+    table.insert_unique(hash, slot, |existing| existing.stored_hash());
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -759,6 +791,13 @@ where
     /// Insert a brand-new entry (the caller has already confirmed the key is
     /// absent), evicting the oldest entries first if at capacity. Assigns and
     /// records the FIFO sequence.
+    ///
+    /// Stays out of line like [`PlainInner::insert_new`]: under fat LTO this
+    /// would otherwise inline into every managed insert path (`insert`,
+    /// `upsert_with_by_ref`, `insert_and_return`, plus the synchronous
+    /// [`SyncTtlGuard::insert`](SyncTtlGuard::insert)), stamping the eviction
+    /// prologue and the hashbrown growth call per caller instead of per table.
+    #[inline(never)]
     fn insert_new(
         &mut self,
         key: K,
@@ -777,7 +816,8 @@ where
         if self.track_order {
             self.order.insert(seq, hash);
         }
-        self.table.insert_unique(
+        insert_slot(
+            &mut self.table,
             hash,
             Slot {
                 value,
@@ -788,7 +828,6 @@ where
                 key,
                 hash,
             },
-            |slot| slot.hash,
         );
     }
 
