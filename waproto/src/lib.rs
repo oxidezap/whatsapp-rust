@@ -170,27 +170,6 @@ pub mod codec {
         msg.encode(out);
     }
 
-    /// Stream wire bytes in order without allocating a contiguous output buffer.
-    #[inline(never)]
-    pub fn message_encode_chunks(msg: &whatsapp::Message, consume: &mut dyn FnMut(&[u8])) {
-        struct ChunkSink<'a>(&'a mut dyn FnMut(&[u8]));
-        impl buffa::EncodeSink for ChunkSink<'_> {
-            fn put_u8(&mut self, value: u8) {
-                (self.0)(&[value]);
-            }
-            fn put_slice(&mut self, bytes: &[u8]) {
-                (self.0)(bytes);
-            }
-            fn put_u32_le(&mut self, value: u32) {
-                (self.0)(&value.to_le_bytes());
-            }
-            fn put_u64_le(&mut self, value: u64) {
-                (self.0)(&value.to_le_bytes());
-            }
-        }
-        msg.encode(&mut ChunkSink(consume));
-    }
-
     #[inline(never)]
     pub fn message_to_vec(msg: &whatsapp::Message) -> Vec<u8> {
         msg.encode_to_vec()

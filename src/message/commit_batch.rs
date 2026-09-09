@@ -1045,13 +1045,16 @@ impl Client {
         // admission holds the cache lock; consumer callbacks never own it.
         let mut retained: Option<Vec<InboundMessage>> = None;
         let mut publication = PublicationGuard::default();
+        // One encode buffer for the whole batch: the hook path already hashed
+        // its arena ranges above, this only serves the no-hook path.
+        let mut encode_scratch = Vec::new();
         for (index, item) in items.iter().enumerate() {
             // A later PDO may carry another part under this id. Comparing it
             // without retaining plaintext requires this ordinary digest now.
             let fingerprint = fingerprints.get(index).copied().unwrap_or_else(|| {
                 (dispatch_gate
                     && !crate::features::message_edit::carries_secret_encrypted(&item.message))
-                .then(|| MessageDispatch::fingerprint(&item.message))
+                .then(|| MessageDispatch::fingerprint_into(&item.message, &mut encode_scratch))
             });
             let suppress = self.admit_message_dispatch(
                 &item.info,

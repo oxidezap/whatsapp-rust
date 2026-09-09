@@ -14990,20 +14990,23 @@ mod pdo_alias_tests {
     const OWN: &str = "15550001002@s.whatsapp.net";
 
     #[test]
-    fn pdo_alias_fingerprint_does_not_allocate_message_sized_buffer() {
+    fn pdo_alias_fingerprint_reuses_scratch_without_message_sized_blocks() {
         let message = wa::Message {
             conversation: Some("x".repeat(8192)),
             ..Default::default()
         };
-        let max = crate::test_alloc::min_max_block(1024, || MessageDispatch::fingerprint(&message));
+        let mut scratch = Vec::with_capacity(65536);
+        let max = crate::test_alloc::min_max_block(1024, || {
+            MessageDispatch::fingerprint_into(&message, &mut scratch)
+        });
         assert!(
             max <= 1024,
-            "fingerprint allocated a {max}-byte block for an 8192-byte body"
+            "fingerprint allocated a {max}-byte block for an 8192-byte body with a reused buffer"
         );
     }
 
     #[test]
-    fn pdo_alias_streaming_fingerprint_matches_wire_encoding() {
+    fn pdo_alias_fingerprint_matches_wire_encoding() {
         use sha2::{Digest, Sha256};
         for message in [
             wa::Message::default(),
@@ -15021,6 +15024,11 @@ mod pdo_alias_tests {
             let wire = waproto::codec::message_to_vec(&message);
             let expected: [u8; 32] = Sha256::digest(&wire).into();
             assert_eq!(MessageDispatch::fingerprint(&message), expected);
+            let mut scratch = Vec::new();
+            assert_eq!(
+                MessageDispatch::fingerprint_into(&message, &mut scratch),
+                expected
+            );
         }
     }
 

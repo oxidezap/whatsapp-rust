@@ -348,12 +348,20 @@ impl DispatchClaim {
 }
 
 impl MessageDispatch {
+    // One `Vec<u8>` sink only: `message_to_vec`/`message_encode_into` already
+    // stamp the `Message` encode tree once. A second sink type stamps it again
+    // (measured +284 KiB .text); see the pinning note on `message_encode_into`.
     #[inline(never)]
     pub(crate) fn fingerprint(message: &wa::Message) -> [u8; 32] {
+        Self::fingerprint_into(message, &mut Vec::new())
+    }
+
+    #[inline(never)]
+    pub(crate) fn fingerprint_into(message: &wa::Message, scratch: &mut Vec<u8>) -> [u8; 32] {
         use sha2::{Digest, Sha256};
-        let mut digest = Sha256::new();
-        waproto::codec::message_encode_chunks(message, &mut |bytes| digest.update(bytes));
-        digest.finalize().into()
+        scratch.clear();
+        waproto::codec::message_encode_into(message, scratch);
+        Sha256::digest(scratch.as_slice()).into()
     }
 }
 
