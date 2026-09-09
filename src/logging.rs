@@ -16,7 +16,7 @@
 
 use std::cell::RefCell;
 use std::io::{self, Write};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use log::{LevelFilter, Metadata, Record, SetLoggerError};
@@ -87,13 +87,20 @@ impl Write for Formatter<'_> {
 type FormatFn = dyn Fn(&mut Formatter, &Record) -> io::Result<()> + Send + Sync;
 
 fn default_format(buf: &mut Formatter, record: &Record) -> io::Result<()> {
-    writeln!(
-        buf,
-        "[{:<5} {}] {}",
-        record.level(),
-        record.target(),
-        record.args()
-    )
+    write!(buf, "[{:<5} {}] ", record.level(), record.target())?;
+    // Continuation lines indent by four spaces, matching env_logger's default
+    // format exactly. Only this default path does it; custom closures receive
+    // the raw record, exactly as under env_logger.
+    let args = record.args().to_string();
+    let mut first = true;
+    for chunk in args.split('\n') {
+        if !first {
+            write!(buf, "\n    ")?;
+        }
+        buf.write_all(chunk.as_bytes())?;
+        first = false;
+    }
+    writeln!(buf)
 }
 
 #[derive(Debug, Clone)]
@@ -102,20 +109,19 @@ struct Directive {
     level: LevelFilter,
 }
 
+/// Parsed filter: target directives plus the optional `/substring` message
+/// filter. Semantics mirror `env_filter` (the crate `env_logger` parses
+/// through here): a bare word that is not a level means `name=trace`, matching
+/// is a plain prefix so `Client` covers the crate's `Client/...` targets, the
+/// longest name wins, and an unmatched target is disabled rather than falling
+/// back to a global level.
 #[derive(Debug, Clone)]
 struct Filter {
     directives: Vec<Directive>,
+    message: Option<String>,
 }
 
 impl Filter {
-    fn global_default(&self) -> LevelFilter {
-        self.directives
-            .iter()
-            .rev()
-            .find_map(|d| d.name.is_none().then_some(d.level))
-            .unwrap_or(LevelFilter::Error)
-    }
-
     fn max_level(&self) -> LevelFilter {
         self.directives
             .iter()
@@ -126,28 +132,37 @@ impl Filter {
 
     fn enabled(&self, metadata: &Metadata) -> bool {
         let target = metadata.target();
-        let mut matched: Option<(usize, LevelFilter)> = None;
-        for directive in &self.directives {
-            if let Some(name) = &directive.name
-                && target_matches(target, name)
-                && matched.is_none_or(|(len, _)| name.len() > len)
-            {
-                matched = Some((name.len(), directive.level));
+        // Directives sort ascending by name length at build, so the reverse
+        // scan meets the longest name first, with bare levels as the fallback.
+        for directive in self.directives.iter().rev() {
+            match &directive.name {
+                Some(name) if !target.starts_with(name) => {}
+                _ => return metadata.level() <= directive.level,
             }
         }
-        metadata.level() <= matched.map_or_else(|| self.global_default(), |(_, level)| level)
+        false
+    }
+
+    fn matches(&self, record: &Record) -> bool {
+        if !self.enabled(record.metadata()) {
+            return false;
+        }
+        if let Some(needle) = &self.message
+            && !record.args().to_string().contains(needle)
+        {
+            return false;
+        }
+        true
     }
 }
 
-fn target_matches(target: &str, name: &str) -> bool {
-    target == name
-        || target
-            .strip_prefix(name)
-            .is_some_and(|rest| rest.starts_with("::"))
-}
-
-fn parse_directives(spec: &str) -> Vec<Directive> {
-    spec.split(',')
+fn parse_filter(spec: &str) -> Filter {
+    let (mods, message) = match spec.split_once('/') {
+        Some((mods, message)) => (mods, Some(message.to_string())),
+        None => (spec, None),
+    };
+    let mut directives: Vec<Directive> = mods
+        .split(',')
         .filter_map(|part| {
             let part = part.trim();
             if part.is_empty() {
@@ -155,17 +170,37 @@ fn parse_directives(spec: &str) -> Vec<Directive> {
             }
             if let Some((name, level)) = part.split_once('=') {
                 let name = name.trim();
-                level.trim().parse().ok().map(|level| Directive {
-                    name: (!name.is_empty()).then(|| name.to_string()),
-                    level,
-                })
+                let level = level.trim();
+                if level.is_empty() {
+                    (!name.is_empty()).then(|| Directive {
+                        name: Some(name.to_string()),
+                        level: LevelFilter::max(),
+                    })
+                } else {
+                    level.parse().ok().map(|level| Directive {
+                        name: (!name.is_empty()).then(|| name.to_string()),
+                        level,
+                    })
+                }
             } else {
-                part.parse()
-                    .ok()
-                    .map(|level| Directive { name: None, level })
+                match part.parse() {
+                    Ok(level) => Some(Directive { name: None, level }),
+                    Err(_) => Some(Directive {
+                        name: Some(part.to_string()),
+                        level: LevelFilter::max(),
+                    }),
+                }
             }
         })
-        .collect()
+        .collect();
+    // Ascending by name length (bare levels first); `enabled` scans in
+    // reverse so the longest name wins. Stable, so equal lengths keep spec
+    // order and the last one in the spec decides ties.
+    directives.sort_by_key(|d| d.name.as_ref().map_or(0, String::len));
+    Filter {
+        directives,
+        message,
+    }
 }
 
 /// Which environment variable carries the filter, and what applies when it is
@@ -200,12 +235,15 @@ impl<'a> Env<'a> {
         self
     }
 
-    fn resolve(&self) -> Vec<Directive> {
+    fn resolve(&self) -> Filter {
         std::env::var(self.filter_var)
             .ok()
             .or_else(|| self.default_filter.map(str::to_string))
-            .map(|spec| parse_directives(&spec))
-            .unwrap_or_default()
+            .map(|spec| parse_filter(&spec))
+            .unwrap_or(Filter {
+                directives: Vec::new(),
+                message: None,
+            })
     }
 }
 
@@ -218,21 +256,24 @@ impl Default for Env<'_> {
 /// Builder shaped like `env_logger::Builder` for the calls this repo makes:
 /// `from_env`, `format`, `filter`, `try_init`, `init`.
 pub struct Builder {
-    directives: Vec<Directive>,
+    filter: Filter,
     format: Option<Box<FormatFn>>,
 }
 
 impl Builder {
     pub fn new() -> Self {
         Self {
-            directives: Vec::new(),
+            filter: Filter {
+                directives: Vec::new(),
+                message: None,
+            },
             format: None,
         }
     }
 
     pub fn from_env<'a>(env: Env<'a>) -> Self {
         Self {
-            directives: env.resolve(),
+            filter: env.resolve(),
             format: None,
         }
     }
@@ -246,7 +287,7 @@ impl Builder {
     }
 
     pub fn filter(&mut self, module: Option<&str>, level: LevelFilter) -> &mut Self {
-        self.directives.push(Directive {
+        self.filter.directives.push(Directive {
             name: module.map(str::to_string),
             level,
         });
@@ -258,10 +299,26 @@ impl Builder {
             Some(custom) => Arc::from(custom),
             None => Arc::new(default_format),
         };
-        Logger {
-            filter: Filter {
-                directives: std::mem::take(&mut self.directives),
+        let mut filter = std::mem::replace(
+            &mut self.filter,
+            Filter {
+                directives: Vec::new(),
+                message: None,
             },
+        );
+        if filter.directives.is_empty() {
+            // Matches `env_filter`: no directives at all means Error.
+            filter.directives.push(Directive {
+                name: None,
+                level: LevelFilter::Error,
+            });
+        } else {
+            filter
+                .directives
+                .sort_by_key(|d| d.name.as_ref().map_or(0, String::len));
+        }
+        Logger {
+            filter,
             format,
             emit: Arc::new(emit_to_stderr),
         }
@@ -270,13 +327,28 @@ impl Builder {
     pub fn try_init(&mut self) -> Result<(), SetLoggerError> {
         let logger = self.build();
         let max = logger.filter.max_level();
-        // `log` without its `alloc` feature (this workspace's case: something
-        // pins it to `std` only) has no `set_boxed_logger`, so leak once and
-        // use the `&'static` form. One Logger per process either way.
-        let logger: &'static Logger = Box::leak(Box::new(logger));
-        log::set_logger(logger)?;
-        log::set_max_level(max);
-        Ok(())
+        // `log` without its `alloc` feature (this workspace's case) has no
+        // `set_boxed_logger`, so the installed logger lives in a `static`
+        // slot. A rejected logger drops here instead of leaking, which a
+        // `Box::leak`-before-`set_logger` sequence cannot do.
+        match INSTALLED.set(logger) {
+            Ok(()) => {
+                let installed = INSTALLED.get().unwrap_or_else(|| {
+                    panic!("logging::INSTALLED was just set, so it must read back")
+                });
+                log::set_logger(installed)?;
+                log::set_max_level(max);
+                Ok(())
+            }
+            Err(_) => {
+                match log::set_logger(&REJECTED) {
+                    Ok(()) => panic!(
+                        "logging::try_init found no installed logger after a rejected install"
+                    ),
+                    Err(e) => Err(e),
+                }
+            }
+        }
     }
 
     pub fn init(&mut self) {
@@ -298,6 +370,27 @@ fn emit_to_stderr(bytes: &[u8]) {
     let _ = handle.write_all(bytes);
     let _ = handle.flush();
 }
+
+/// Slot for the installed logger. `OnceLock::set` hands a rejected logger
+/// back for dropping, so failed `try_init` calls leak nothing.
+static INSTALLED: OnceLock<Logger> = OnceLock::new();
+
+/// Throwaway logger used only to manufacture the `SetLoggerError` value when
+/// the slot above is already full; registering it always fails, with no
+/// observable effect, because a global logger is installed by then.
+struct Rejected;
+
+impl log::Log for Rejected {
+    fn enabled(&self, _: &Metadata) -> bool {
+        false
+    }
+
+    fn log(&self, _: &Record) {}
+
+    fn flush(&self) {}
+}
+
+static REJECTED: Rejected = Rejected;
 
 /// Logger installed by [`Builder`]. Stateless across records except for the
 /// calling thread's scratch buffer, which shrinks after the idle threshold.
@@ -355,7 +448,7 @@ impl log::Log for Logger {
     }
 
     fn log(&self, record: &Record) {
-        if self.filter.enabled(record.metadata()) {
+        if self.filter.matches(record) {
             self.log_inner(record);
         }
     }
@@ -437,7 +530,9 @@ mod tests {
 
     #[test]
     fn log_output_survives_the_shrink() {
-        let _idle = IdleGuard::set(Duration::ZERO);
+        // No idle-guard here on purpose: `scratch_buffer_shrinks_after_idle`
+        // is the single test that retunes the process-global threshold, so
+        // parallel tests cannot race its restore against a probe log.
         let (logger, captured) = capture_logger("info");
 
         logger.log(&record(format_args!("hello-after-idle")));
@@ -462,6 +557,25 @@ mod tests {
         assert!(logger.enabled(&probe("webrtc_sctp", log::Level::Error)));
         assert!(logger.enabled(&probe("webrtc_sctp::conn", log::Level::Error)));
 
+        // A bare word is a target directive at maximum level, not a level:
+        // `RUST_LOG=webrtc_sctp` enables everything under that target.
+        let (bare, _) = capture_logger("webrtc_sctp");
+        assert!(bare.enabled(&probe("webrtc_sctp", log::Level::Trace)));
+        assert!(bare.enabled(&probe("webrtc_sctp::conn", log::Level::Debug)));
+        assert!(!bare.enabled(&probe("app", log::Level::Error)));
+
+        // Prefix matching is plain, so `Client` covers the crate's
+        // `Client/...` custom targets.
+        let (slash, _) = capture_logger("Client=debug");
+        assert!(slash.enabled(&probe("Client/AppState", log::Level::Debug)));
+        assert!(!slash.enabled(&probe("Client/AppState", log::Level::Trace)));
+        assert!(!slash.enabled(&probe("app", log::Level::Error)));
+
+        // Longest name wins over the bare fallback.
+        let (longest, _) = capture_logger("info,whatsapp_rust=debug");
+        assert!(longest.enabled(&probe("whatsapp_rust::x", log::Level::Debug)));
+        assert!(!longest.enabled(&probe("app", log::Level::Debug)));
+
         // Disabled records never reach the sink.
         logger.log(
             &Record::builder()
@@ -479,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn default_format_is_a_single_line() {
+    fn default_format_matches_env_logger_lines() {
         let (logger, captured) = capture_logger("info");
         logger.log(&record(format_args!("one line")));
         let bytes = captured.lock().expect("test holds no other lock").clone();
@@ -489,5 +603,50 @@ mod tests {
             "record must end the line, got: {text:?}"
         );
         assert!(text.contains("INFO") && text.contains("one line"));
+
+        // Continuation lines indent by four spaces, as in env_logger's
+        // default format.
+        captured.lock().expect("test holds no other lock").clear();
+        logger.log(&record(format_args!("first\nsecond")));
+        let bytes = captured.lock().expect("test holds no other lock").clone();
+        let text = String::from_utf8(bytes).expect("logger emits UTF-8");
+        assert!(
+            text.ends_with("first\n    second\n"),
+            "continuation must indent, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn slash_message_filter_screens_records() {
+        let (logger, captured) = capture_logger("info/needle");
+        logger.log(&record(format_args!("find the needle here")));
+        logger.log(&record(format_args!("nothing relevant")));
+        let bytes = captured.lock().expect("test holds no other lock").clone();
+        let text = String::from_utf8(bytes).expect("logger emits UTF-8");
+        assert!(
+            text.contains("needle here") && !text.contains("nothing relevant"),
+            "only matching records pass, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn max_level_covers_configured_directives() {
+        let mut named = Builder::from_env(Env::default().default_filter_or("foo=off"));
+        assert_eq!(named.build().filter.max_level(), LevelFilter::Off);
+        let mut global = Builder::from_env(Env::default().default_filter_or("info,foo=off"));
+        assert_eq!(global.build().filter.max_level(), LevelFilter::Info);
+    }
+
+    #[test]
+    fn repeated_try_init_fails_without_leaking() {
+        let previous = log::max_level();
+        let mut first = Builder::from_env(Env::default().default_filter_or("info"));
+        let _ = first.try_init();
+        let mut second = Builder::from_env(Env::default().default_filter_or("info"));
+        // The slot is full after the first call (whether or not a foreign
+        // logger beat it to the global install), so the second call always
+        // fails — and the rejected logger drops instead of leaking.
+        assert!(second.try_init().is_err());
+        log::set_max_level(previous);
     }
 }
