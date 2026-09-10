@@ -523,10 +523,10 @@ impl H264Depacketizer {
 /// Split a raw Annex-B byte stream (e.g. an encoder's stdout) into access
 /// units, cutting at AUD NALs (type 9) or, for AUD-less encoders, at picture
 /// boundaries: SPS opens a group once a picture is buffered (leading
-/// parameter sets stay with their slices), an IDR following a complete group
-/// closes the previous one, and any VCL slice starting a new picture (`first_mb_in_slice`
-/// zero) with a VCL NAL already buffered splits delta frames apart. Feed
-/// arbitrary chunks; complete AUs come back as they close. PPS alone never
+/// parameter sets stay with their slices), and any VCL slice starting a new
+/// picture (`first_mb_in_slice` zero) with a VCL NAL already buffered closes
+/// the previous group — IDR and delta slices alike, so multi-slice pictures
+/// stay one AU. Feed arbitrary chunks; complete AUs come back as they close. PPS alone never
 /// cuts — it belongs with the SPS that precedes it, not the slices that
 /// follow. Once an AUD is observed, AUDs own the framing and nothing else
 /// cuts, so AUD-bearing streams behave exactly as before.
@@ -535,12 +535,10 @@ pub struct AnnexBAuSplitter {
     buf: Vec<u8>,
     /// Scan resume point: everything before it was already searched for an AUD.
     scan_pos: usize,
-    /// An AUD has been observed: SPS/IDR/VCL cutting stays off while the
+    /// An AUD has been observed: SPS/VCL cutting stays off while the
     /// buffered content survives it. A runaway reset drops the content, so it
     /// drops this too and AUD-less framing can recover.
     seen_aud: bool,
-    /// The buffered bytes already hold an IDR slice.
-    buf_has_idr: bool,
     /// The buffered bytes already hold a VCL NAL.
     buf_has_vcl: bool,
 }
@@ -554,7 +552,6 @@ impl AnnexBAuSplitter {
         self.buf.clear();
         self.scan_pos = 0;
         self.seen_aud = false;
-        self.buf_has_idr = false;
         self.buf_has_vcl = false;
     }
 
@@ -612,24 +609,19 @@ impl AnnexBAuSplitter {
                 && (unit_type == NAL_TYPE_AUD
                     || (!self.seen_aud
                         && ((unit_type == NAL_TYPE_SPS && self.buf_has_vcl)
-                            || (unit_type == NAL_TYPE_IDR && self.buf_has_idr)
                             || (is_vcl && self.buf_has_vcl && new_picture))));
             if cuts_here {
                 let rest = self.buf.split_off(sc.begin);
                 let au = std::mem::replace(&mut self.buf, rest);
                 out.push(au);
                 self.scan_pos = 0;
-                self.buf_has_idr = false;
                 self.buf_has_vcl = false;
             } else {
                 self.scan_pos = sc.end;
             }
             // Record this NAL for the next boundary decision: the flag update
-            // runs after the cut check above, so an IDR never closes the group
-            // its own parameter sets belong to.
-            if unit_type == NAL_TYPE_IDR {
-                self.buf_has_idr = true;
-            }
+            // runs after the cut check above, so a group opener never closes
+            // the group its own parameter sets belong to.
             if is_vcl {
                 self.buf_has_vcl = true;
             }
@@ -1092,14 +1084,20 @@ mod tests {
         assert_eq!(s.finish(), Some(group(2)));
     }
 
-    /// An IDR arriving when the buffer already holds one closes the previous
-    /// group instead of batching a GOP under one timestamp: delta frames ride
-    /// with the group they follow, and the trailing IDR starts the next.
+    /// A new IDR picture still closes the previous group instead of batching
+    /// a GOP under one timestamp: delta frames ride with the group they
+    /// follow, and the trailing IDR starts the next.
     #[test]
     fn au_splitter_cuts_on_idr_after_a_complete_group() {
-        let group = au_from_nals(&[nal(7, 4), nal(8, 4), nal(5, 60)]);
+        // IDR slices opening a picture carry first_mb 0; later slices nonzero.
+        let idr = |len: usize| {
+            let mut n = vec![0x65, 0x80];
+            n.extend((0..len.saturating_sub(2)).map(|i| (i % 251) as u8));
+            n
+        };
+        let group = au_from_nals(&[nal(7, 4), nal(8, 4), idr(60)]);
         let delta = au_from_nals(&[nal(1, 40)]);
-        let lone_idr = au_from_nals(&[nal(5, 60)]);
+        let lone_idr = au_from_nals(&[idr(60)]);
         let mut stream = group.clone();
         stream.extend_from_slice(&delta);
         stream.extend_from_slice(&lone_idr);
@@ -1437,6 +1435,38 @@ mod tests {
         s.push(&stream, &mut out);
         assert!(out.is_empty(), "partitions B/C ride with their partition A");
         assert_eq!(s.finish(), Some(stream));
+    }
+
+    /// Production local-encoder shape: a multi-slice IDR group (SPS, PPS,
+    /// four IDR slices) frames as one AU and survives packetize/depacketize
+    /// intact, still reading as a keyframe.
+    #[test]
+    fn production_multislice_idr_group_round_trips() {
+        let slice = |first: &[u8]| {
+            let mut n = vec![0x65];
+            n.extend_from_slice(first);
+            n.extend((0..60).map(|i| (i % 251) as u8));
+            n
+        };
+        let stream = au_from_nals(&[
+            nal(7, 4),
+            nal(8, 4),
+            slice(&[0x80]),
+            slice(&[0x08, 0x80]),
+            slice(&[0x08, 0x80]),
+            slice(&[0x08, 0x80]),
+        ]);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream, &mut out);
+        assert!(out.is_empty(), "multi-slice IDR stays one AU");
+        let au = s.finish().expect("trailing AU");
+        assert_eq!(au, stream);
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&au, &mut payloads);
+        let got = depacketize_all(payloads.iter()).expect("AU must reassemble");
+        assert_eq!(got, au);
+        assert!(au_is_keyframe(&got));
     }
 
     /// A runaway reset restores AUD-less framing: after the cap drops a
