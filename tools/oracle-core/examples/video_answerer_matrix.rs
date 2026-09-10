@@ -617,7 +617,7 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
                 "PROBE {}: unexpected getCallInfo shape: {other:?}",
                 probe.label
             );
-            Some(true)
+            None
         }
     };
     // Was it already torn down before accept, or still pending? Snapshot the
@@ -640,7 +640,13 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
                 None
             }
             Ok(Value::Str(s)) => Some(!s.is_empty()),
-            Ok(_) => Some(true),
+            Ok(other) => {
+                println!(
+                    "PROBE {}: unexpected late getCallInfo shape: {other:?}",
+                    probe.label
+                );
+                None
+            }
         };
         r.refuel();
         let emitted = r.signaling()?.len();
