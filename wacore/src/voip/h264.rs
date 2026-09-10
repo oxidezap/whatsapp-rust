@@ -1033,11 +1033,11 @@ mod tests {
                 );
                 assert_eq!(types[1], 8, "PPS must follow SPS at index 1, got {types:?}");
                 assert!(
-                    types.iter().any(|t| *t == 5),
+                    types.contains(&5),
                     "the IDR slice must survive, got {types:?}"
                 );
                 assert!(
-                    !types.iter().any(|t| *t == 9),
+                    !types.contains(&9),
                     "no AUD may reach the wire, got {types:?}"
                 );
                 assert_eq!(
@@ -1080,7 +1080,7 @@ mod tests {
         assert_eq!(types[0], 7, "SEI stripped, SPS opens, got {types:?}");
         assert_eq!(nals[0], sps.as_slice(), "SPS bytes intact");
         assert!(
-            !types.iter().any(|t| *t == 6),
+            !types.contains(&6),
             "no SEI may reach the wire, got {types:?}"
         );
     }
