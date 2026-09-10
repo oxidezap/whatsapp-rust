@@ -16,6 +16,7 @@ const H264_FUA_FRAG_SIZE: usize = H264_SINGLE_NAL_MAX - 2;
 pub const H264_MAX_AU_BYTES: usize = 4 * 1024 * 1024;
 
 const NAL_TYPE_IDR: u8 = 5;
+const NAL_TYPE_SEI: u8 = 6;
 const NAL_TYPE_SPS: u8 = 7;
 const NAL_TYPE_PPS: u8 = 8;
 const NAL_TYPE_AUD: u8 = 9;
@@ -66,6 +67,60 @@ impl VideoFrame {
 
 pub fn nal_unit_type(nal: &[u8]) -> u8 {
     nal.first().map(|b| b & 0x1f).unwrap_or(0)
+}
+
+/// `first_mb_in_slice` of a VCL NAL: the first Exp-Golomb code of the slice
+/// header, 0 on a picture's first slice and nonzero after it. Returns `None`
+/// when the NAL is too short to read or carries no decodable code.
+/// Emulation-prevention bytes are removed
+/// before reading, so `00 00 03` never parses as leading zeros.
+fn first_mb_in_slice(nal: &[u8]) -> Option<u32> {
+    const MAX_BYTES: usize = 8;
+    let mut raw = [0u8; MAX_BYTES];
+    let mut len = 0;
+    let mut zeros = 0u8;
+    for &byte in nal.iter().skip(1) {
+        if zeros >= 2 && byte == 0x03 {
+            zeros = 0;
+            continue;
+        }
+        zeros = if byte == 0x00 { zeros + 1 } else { 0 };
+        if len == MAX_BYTES {
+            break;
+        }
+        raw[len] = byte;
+        len += 1;
+    }
+    let total_bits = len * 8;
+    let mut consumed = 0usize;
+    let bit_at = |pos: usize| -> u8 {
+        let byte = raw[pos / 8];
+        (byte >> (7 - pos % 8)) & 1
+    };
+    let mut leading = 0u32;
+    loop {
+        if consumed >= total_bits {
+            return None;
+        }
+        if bit_at(consumed) != 0 {
+            break;
+        }
+        consumed += 1;
+        leading += 1;
+        if leading > 31 {
+            return None;
+        }
+    }
+    consumed += 1;
+    if consumed + leading as usize > total_bits {
+        return None;
+    }
+    let mut value = 0u32;
+    for _ in 0..leading {
+        value = (value << 1) | u32::from(bit_at(consumed));
+        consumed += 1;
+    }
+    Some((1u32 << leading).wrapping_sub(1).wrapping_add(value))
 }
 
 /// Iterate the NAL units of an Annex-B buffer (start codes stripped, empty NALs skipped).
@@ -242,14 +297,35 @@ impl core::ops::Index<usize> for PacketizedAu {
 
 /// Packetize one Annex-B access unit into WhatsApp RTP payloads (no RTP headers): each
 /// media NAL goes out as a single-NAL payload when it fits, or a run of FU-A
-/// fragments otherwise. Encoder-only AUDs are omitted because WhatsApp's H.264
-/// decoder requires SPS/PPS to lead an IDR frame. `out` is cleared and refilled
-/// so the send path can reuse one buffer per AU.
+/// fragments otherwise. Encoder-only AUDs are omitted, and SEI units are
+/// omitted until the first VCL NAL: supplemental metadata no decoder needs
+/// for rendering that would otherwise take NALU index 0 from SPS ahead of an
+/// IDR. `out` is cleared and refilled so the send path can reuse one buffer
+/// per AU.
 pub fn packetize_au(au: &[u8], out: &mut PacketizedAu) {
+    packetize_au_inner(au, out, false);
+}
+
+/// [`packetize_au`] preserving every SEI unit, for the explicit opt-in case of
+/// a peer that needs the metadata. The default strips leading SEI; callers
+/// keep it only deliberately, never by accident.
+pub fn packetize_au_keep_sei(au: &[u8], out: &mut PacketizedAu) {
+    packetize_au_inner(au, out, true);
+}
+
+fn packetize_au_inner(au: &[u8], out: &mut PacketizedAu, keep_sei: bool) {
     out.clear();
+    let mut seen_vcl = false;
     for nal in split_annexb(au) {
-        if nal_unit_type(nal) == NAL_TYPE_AUD {
+        let unit_type = nal_unit_type(nal);
+        if unit_type == NAL_TYPE_AUD {
             continue;
+        }
+        if !keep_sei && !seen_vcl && unit_type == NAL_TYPE_SEI {
+            continue;
+        }
+        if matches!(unit_type, 1..=5) {
+            seen_vcl = true;
         }
         if nal.len() <= H264_SINGLE_NAL_MAX {
             out.data.extend_from_slice(nal);
@@ -445,17 +521,45 @@ impl H264Depacketizer {
 }
 
 /// Split a raw Annex-B byte stream (e.g. an encoder's stdout) into access
-/// units, cutting at AUD NALs (type 9). Feed arbitrary chunks; complete AUs
-/// come back as they close. Requires the producer to emit AUDs (ffmpeg:
-/// `-bsf:v h264_metadata=aud=insert`).
+/// units, cutting at AUD NALs (type 9) or, for AUD-less encoders, at picture
+/// boundaries: SPS opens a group once a picture is buffered (leading
+/// parameter sets stay with their slices), and any VCL slice starting a new
+/// picture (`first_mb_in_slice` zero) with a VCL NAL already buffered closes
+/// the previous group — IDR and delta slices alike, so multi-slice pictures
+/// stay one AU. Feed arbitrary chunks; complete AUs come back as they close. PPS alone never
+/// cuts — it belongs with the SPS that precedes it, not the slices that
+/// follow. Once an AUD is observed, AUDs own the framing and nothing else
+/// cuts, so AUD-bearing streams behave exactly as before.
 #[derive(Default)]
 pub struct AnnexBAuSplitter {
     buf: Vec<u8>,
     /// Scan resume point: everything before it was already searched for an AUD.
     scan_pos: usize,
+    /// An AUD has been observed: SPS/VCL cutting stays off while the
+    /// buffered content survives it. A runaway reset drops the content, so it
+    /// drops this too and AUD-less framing can recover.
+    seen_aud: bool,
+    /// The buffered bytes already hold a VCL NAL.
+    buf_has_vcl: bool,
+    /// Start of a trailing all-SEI run after the last VCL NAL, if any: when
+    /// a group opener or a new picture confirms the boundary, the run rides
+    /// with it instead of the previous AU.
+    pending_sei_start: Option<usize>,
 }
 
 impl AnnexBAuSplitter {
+    /// Drop a runaway buffer: without AUDs the cap is the only bound, so
+    /// every early exit enforces it, not just the loop end. The flags
+    /// describe cleared content, so they reset with it — including `seen_aud`,
+    /// or AUD-less input after the reset could never frame again.
+    fn drop_runaway(&mut self) {
+        self.buf.clear();
+        self.scan_pos = 0;
+        self.seen_aud = false;
+        self.buf_has_vcl = false;
+        self.pending_sei_start = None;
+    }
+
     pub fn push(&mut self, data: &[u8], out: &mut Vec<Vec<u8>>) {
         self.buf.extend_from_slice(data);
         loop {
@@ -465,36 +569,109 @@ impl AnnexBAuSplitter {
                 // here too — keep only the last few bytes so a start code split across chunks still
                 // reassembles.
                 if self.buf.len() > H264_MAX_AU_BYTES {
-                    self.buf.clear();
+                    self.drop_runaway();
                 }
                 self.scan_pos = self.buf.len().saturating_sub(3);
                 break;
             };
             let Some(&nal_byte) = self.buf.get(sc.end) else {
                 // Start code at the buffer edge: wait for the NAL type byte.
+                // This break skips the loop-end check, so enforce the cap here.
                 self.scan_pos = sc.begin;
+                if self.buf.len() > H264_MAX_AU_BYTES {
+                    self.drop_runaway();
+                }
                 break;
             };
-            if nal_byte & 0x1f == NAL_TYPE_AUD && sc.begin > 0 {
-                let rest = self.buf.split_off(sc.begin);
+            let unit_type = nal_byte & 0x1f;
+            if unit_type == NAL_TYPE_AUD {
+                self.seen_aud = true;
+            }
+            let is_vcl = matches!(unit_type, 1..=5);
+            // Only slice-carrying NALs (1, 2, 5) start with
+            // `first_mb_in_slice`: data partitions (3, 4) start with
+            // `slice_id`, where 0 would misread as a new picture and split
+            // the partition away from its group.
+            let nal_end = find_start_code(&self.buf, sc.end)
+                .map(|next| next.begin)
+                .unwrap_or(self.buf.len());
+            let picture = if matches!(unit_type, 1 | 2 | 5) {
+                first_mb_in_slice(&self.buf[sc.end..nal_end])
+            } else {
+                // Readable stand-in: non-slice NALs never picture-split and
+                // skip the wait-for-header path below.
+                Some(1)
+            };
+            if is_vcl && picture.is_none() && nal_end == self.buf.len() {
+                // The header may simply not have arrived yet: rewind and wait
+                // for more bytes rather than advancing past a boundary
+                // forever. A corrupt header never becomes readable, so enforce
+                // the cap here too — this break skips the loop-end check.
+                self.scan_pos = sc.begin;
+                if self.buf.len() > H264_MAX_AU_BYTES {
+                    self.drop_runaway();
+                }
+                break;
+            }
+            let new_picture = picture.unwrap_or(1) == 0;
+            // Every AUD-less cut below. An SEI run preceding a group opener
+            // or a new picture describes what follows: cut before the run so
+            // it rides with its picture, not the previous AU. Other non-VCL
+            // runs (PPS) keep the existing boundary.
+            let audless_cut = !self.seen_aud
+                && ((unit_type == NAL_TYPE_SPS && self.buf_has_vcl)
+                    || (is_vcl && self.buf_has_vcl && new_picture));
+            let sei_handoff = self
+                .pending_sei_start
+                .filter(|&start| start > 0 && audless_cut);
+            let cuts_here = sc.begin > 0 && (unit_type == NAL_TYPE_AUD || audless_cut);
+            if cuts_here {
+                let at = sei_handoff.unwrap_or(sc.begin);
+                let rest = self.buf.split_off(at);
                 let au = std::mem::replace(&mut self.buf, rest);
                 out.push(au);
-                self.scan_pos = 0;
+                self.buf_has_vcl = false;
+                self.pending_sei_start = None;
+                if sei_handoff.is_some() {
+                    // The current NAL was fully evaluated above: resume past
+                    // it, or it cuts itself away from its SEI run on rescan.
+                    // `nal_end` is in old-buffer offsets; the new buffer
+                    // starts at `at`. Keep the usual three-byte overlap so a
+                    // start code split across pushes is still found.
+                    self.scan_pos = (nal_end - at).saturating_sub(3);
+                } else {
+                    self.scan_pos = 0;
+                }
             } else {
                 self.scan_pos = sc.end;
+            }
+            // Record this NAL for the next boundary decision: the flag update
+            // runs after the cut check above, so a group opener never closes
+            // the group its own parameter sets belong to. A VCL NAL ends any
+            // SEI run; other prefix NALs leave a pending run in place, since
+            // they describe the same following picture.
+            if is_vcl {
+                self.buf_has_vcl = true;
+                self.pending_sei_start = None;
+            } else if unit_type == NAL_TYPE_SEI && self.pending_sei_start.is_none() {
+                self.pending_sei_start = Some(sc.begin);
             }
             if self.buf.len() > H264_MAX_AU_BYTES {
                 // Runaway buffer means the stream has no AUDs; dropping is
                 // safer than emitting a cut mid-NAL.
-                self.buf.clear();
-                self.scan_pos = 0;
+                self.drop_runaway();
             }
         }
     }
 
-    /// Flush the trailing AU on end-of-stream.
+    /// Flush the trailing AU on end-of-stream. The splitter is reusable: a
+    /// finished stream leaves no framing facts behind, so the next push
+    /// starts empty rather than inheriting e.g. a stale AUD mode.
     pub fn finish(&mut self) -> Option<Vec<u8>> {
         self.scan_pos = 0;
+        self.seen_aud = false;
+        self.buf_has_vcl = false;
+        self.pending_sei_start = None;
         if self.buf.is_empty() {
             None
         } else {
@@ -915,6 +1092,60 @@ mod tests {
         assert_eq!(d.push(0, 0, &[], true), None);
     }
 
+    /// An AUD-less encoder still frames: every IDR group opens with SPS (the
+    /// decoder keyframe gate requires it), so SPS starts a new access unit
+    /// when bytes precede it. Without this, an AUD-less stream accumulates to
+    /// the 4 MiB cap and is cleared — the call sends nothing, the peer PLIs
+    /// forever, and forced IDRs die in the same buffer.
+    #[test]
+    fn au_splitter_cuts_on_sps_without_aud() {
+        let group = |id: u8| {
+            let mut au = au_from_nals(&[nal(7, 4), nal(8, 4), nal(5, 60)]);
+            au[6] = id;
+            au
+        };
+        let delta = au_from_nals(&[nal(1, 40)]);
+        let mut stream = group(1);
+        stream.extend_from_slice(&delta);
+        stream.extend_from_slice(&group(2));
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream, &mut out);
+        // Like the AUD cut, the boundary lands when the NEXT group's opener
+        // arrives: the delta rides with the group it follows, exactly as with
+        // a trailing AUD.
+        let mut first = group(1);
+        first.extend_from_slice(&delta);
+        assert_eq!(out, vec![first]);
+        assert_eq!(s.finish(), Some(group(2)));
+    }
+
+    /// A new IDR picture still closes the previous group instead of batching
+    /// a GOP under one timestamp: delta frames ride with the group they
+    /// follow, and the trailing IDR starts the next.
+    #[test]
+    fn au_splitter_cuts_on_idr_after_a_complete_group() {
+        // IDR slices opening a picture carry first_mb 0; later slices nonzero.
+        let idr = |len: usize| {
+            let mut n = vec![0x65, 0x80];
+            n.extend((0..len.saturating_sub(2)).map(|i| (i % 251) as u8));
+            n
+        };
+        let group = au_from_nals(&[nal(7, 4), nal(8, 4), idr(60)]);
+        let delta = au_from_nals(&[nal(1, 40)]);
+        let lone_idr = au_from_nals(&[idr(60)]);
+        let mut stream = group.clone();
+        stream.extend_from_slice(&delta);
+        stream.extend_from_slice(&lone_idr);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream, &mut out);
+        let mut first = group;
+        first.extend_from_slice(&delta);
+        assert_eq!(out, vec![first]);
+        assert_eq!(s.finish(), Some(lone_idr));
+    }
+
     #[test]
     fn au_splitter_cuts_on_aud() {
         let au1 = au_from_nals(&[nal(9, 2), nal(7, 4), nal(5, 60)]);
@@ -983,5 +1214,501 @@ mod tests {
         assert_eq!(f.orientation, 0);
         let f = VideoFrame::new(au_from_nals(&[nal(1, 30)]));
         assert!(!f.keyframe);
+    }
+
+    /// Decoder keyframe gate (WhatsApp decoder): every IDR group must open
+    /// with SPS at NALU index 0 plus PPS, SPS bytes constant all call, no
+    /// SEI/AUD at index 0. Round-trips three IDR groups with one constant SPS
+    /// through the real send path (`packetize_au`, including an FU-A-split
+    /// IDR) into the depacketizer and pins the emitted order.
+    #[test]
+    fn outbound_idr_groups_open_sps_pps_idr_with_constant_sps() {
+        let sps = nal(7, 24);
+        let pps = nal(8, 8);
+        // Two IDR groups sharing one SPS, with a delta frame between: the
+        // stream shape a live call repeats.
+        let groups = [
+            au_from_nals(&[sps.clone(), pps.clone(), nal(5, 2000)]),
+            au_from_nals(&[nal(1, 60)]),
+            au_from_nals(&[sps.clone(), pps.clone(), nal(5, 900)]),
+        ];
+        for au in &groups {
+            let mut payloads = PacketizedAu::default();
+            packetize_au(au, &mut payloads);
+            let got = depacketize_all(payloads.iter()).expect("reassembled AU");
+            let nals: Vec<_> = split_annexb(&got).collect();
+            let types: Vec<u8> = nals.iter().map(|n| nal_unit_type(n)).collect();
+            if au_has_idr(au) {
+                assert!(
+                    types.len() >= 3,
+                    "an IDR group must keep SPS, PPS and IDR, got {types:?}"
+                );
+                assert_eq!(
+                    types[0], 7,
+                    "SPS must open the IDR group at NALU index 0, got {types:?}"
+                );
+                assert_eq!(types[1], 8, "PPS must follow SPS at index 1, got {types:?}");
+                assert!(
+                    types.contains(&5),
+                    "the IDR slice must survive, got {types:?}"
+                );
+                assert!(
+                    !types.contains(&9),
+                    "no AUD may reach the wire, got {types:?}"
+                );
+                assert_eq!(
+                    nals[0],
+                    sps.as_slice(),
+                    "SPS bytes must stay constant across the call"
+                );
+            } else {
+                assert_eq!(types, [1], "delta frames pass through untouched");
+            }
+        }
+    }
+
+    /// Encoder-only AUDs never reach the wire: the packetizer drops them so a
+    /// supplier-side AUD cannot take NALU index 0 from SPS.
+    #[test]
+    fn outbound_aud_first_input_still_opens_sps() {
+        let sps = nal(7, 24);
+        let au = au_from_nals(&[nal(9, 2), sps.clone(), nal(8, 8), nal(5, 100)]);
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&au, &mut payloads);
+        let got = depacketize_all(payloads.iter()).expect("reassembled AU");
+        let types: Vec<u8> = split_annexb(&got).map(nal_unit_type).collect();
+        assert_eq!(types[0], 7, "AUD dropped, SPS opens, got {types:?}");
+    }
+
+    /// SEI NALs are supplemental metadata no decoder needs for rendering, and
+    /// a leading SEI breaks the decoder keyframe gate (SPS must open at index
+    /// 0). The packetizer strips them exactly like encoder-only AUDs; a peer
+    /// that needs SEI passthrough uses `packetize_au_keep_sei` explicitly.
+    #[test]
+    fn outbound_sei_first_input_goes_out_sps_first() {
+        let sps = nal(7, 24);
+        let au = au_from_nals(&[nal(6, 12), sps.clone(), nal(8, 8), nal(5, 100)]);
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&au, &mut payloads);
+        let got = depacketize_all(payloads.iter()).expect("reassembled AU");
+        let nals: Vec<_> = split_annexb(&got).collect();
+        let types: Vec<u8> = nals.iter().map(|n| nal_unit_type(n)).collect();
+        assert_eq!(types[0], 7, "SEI stripped, SPS opens, got {types:?}");
+        assert_eq!(nals[0], sps.as_slice(), "SPS bytes intact");
+        assert!(
+            !types.contains(&6),
+            "no SEI may reach the wire, got {types:?}"
+        );
+    }
+
+    /// Explicit opt-in for the strip default above: keeps SEI for a peer that
+    /// needs the metadata, verified byte-identical apart from the kept unit.
+    #[test]
+    fn keep_sei_variant_preserves_sei() {
+        let au = au_from_nals(&[nal(6, 12), nal(7, 24), nal(8, 8), nal(5, 100)]);
+        let mut payloads = PacketizedAu::default();
+        packetize_au_keep_sei(&au, &mut payloads);
+        let got = depacketize_all(payloads.iter()).expect("reassembled AU");
+        let types: Vec<u8> = split_annexb(&got).map(nal_unit_type).collect();
+        assert_eq!(types[0], 6, "keep variant preserves SEI, got {types:?}");
+    }
+
+    /// SEI after the first VCL NAL is metadata, not a gate violation: only
+    /// leading SEI is stripped.
+    #[test]
+    fn outbound_trailing_sei_is_preserved() {
+        let au = au_from_nals(&[nal(7, 24), nal(8, 8), nal(5, 100), nal(6, 12)]);
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&au, &mut payloads);
+        let got = depacketize_all(payloads.iter()).expect("reassembled AU");
+        let types: Vec<u8> = split_annexb(&got).map(nal_unit_type).collect();
+        assert_eq!(types, [7, 8, 5, 6], "trailing SEI kept, got {types:?}");
+    }
+
+    /// `first_mb_in_slice` reads the first Exp-Golomb code: `1` is macroblock
+    /// 0, longer codes count up, emulation prevention is skipped, and short
+    /// input refuses instead of guessing.
+    #[test]
+    fn first_mb_in_slice_reads_exp_golomb() {
+        // `1` → 0; `010` → 1.
+        assert_eq!(first_mb_in_slice(&[0x41, 0x80]), Some(0));
+        assert_eq!(first_mb_in_slice(&[0x41, 0x40]), Some(1));
+        // `00 00 03 80` parses exactly like `00 00 80`: the prevention byte
+        // is skipped, not read as leading zeros.
+        assert_eq!(
+            first_mb_in_slice(&[0x41, 0x00, 0x00, 0x80]),
+            first_mb_in_slice(&[0x41, 0x00, 0x00, 0x03, 0x80])
+        );
+        assert_eq!(first_mb_in_slice(&[0x41]), None);
+        assert_eq!(first_mb_in_slice(&[]), None);
+    }
+
+    /// Non-IDR pictures split on VCL picture starts, not just on SPS: without
+    /// this, every delta between keyframes batches into the previous group
+    /// under one RTP timestamp and marker.
+    #[test]
+    fn au_splitter_cuts_on_vcl_picture_start() {
+        // Slice headers with first_mb 0, then 16: two pictures of one stream.
+        let pic = |first_mb: &[u8], len: usize| {
+            let mut n = vec![0x41];
+            n.extend_from_slice(first_mb);
+            n.extend((0..len.saturating_sub(1 + first_mb.len())).map(|i| (i % 251) as u8));
+            n
+        };
+        let au1 = au_from_nals(&[pic(&[0x80], 30)]);
+        let au2 = au_from_nals(&[pic(&[0x80], 30)]);
+        let mut stream = au1.clone();
+        stream.extend_from_slice(&au2);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream, &mut out);
+        assert_eq!(out, vec![au1]);
+        assert_eq!(s.finish(), Some(au2));
+
+        // A second slice of the SAME picture (first_mb nonzero) never cuts.
+        let multi = au_from_nals(&[vec![0x41, 0x80, 0x01], vec![0x41, 0x08, 0x80, 0x02]]);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&multi, &mut out);
+        assert!(out.is_empty(), "one picture stays one AU");
+        assert_eq!(s.finish(), Some(multi));
+    }
+
+    /// A VCL NAL split across read chunks still frames: when the slice header
+    /// has not fully arrived the splitter rewinds and rechecks on the next
+    /// push instead of advancing past the boundary forever.
+    #[test]
+    fn au_splitter_rechecks_partial_slice_header() {
+        let pic = |first_mb: &[u8], len: usize| {
+            let mut n = vec![0x41];
+            n.extend_from_slice(first_mb);
+            n.extend((0..len.saturating_sub(1 + first_mb.len())).map(|i| (i % 251) as u8));
+            n
+        };
+        let au1 = au_from_nals(&[pic(&[0x80], 30)]);
+        let au2 = au_from_nals(&[pic(&[0x80], 30)]);
+        let mut stream = au1.clone();
+        stream.extend_from_slice(&au2);
+        // Split mid-slice-header of the second picture: the type byte (0x41)
+        // arrives alone, the header bit with the next chunk.
+        let cut = au1.len() + 3 + 1;
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream[..cut], &mut out);
+        assert!(out.is_empty(), "nothing decidable yet");
+        s.push(&stream[cut..], &mut out);
+        assert_eq!(out, vec![au1]);
+        assert_eq!(s.finish(), Some(au2));
+    }
+
+    /// A VCL NAL whose slice header never becomes readable must not grow the
+    /// buffer without bound: the wait path enforces the cap like the loop
+    /// end, and framing recovers on later well-formed input.
+    #[test]
+    fn au_splitter_corrupt_slice_header_is_capped() {
+        // 32 leading zero bits: no decodable Exp-Golomb code, permanently None.
+        let corrupt = vec![0x41, 0x00, 0x00, 0x00, 0x00, 0x40];
+        assert_eq!(first_mb_in_slice(&corrupt), None);
+        let mut first = START_CODE.to_vec();
+        first.extend_from_slice(&corrupt);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&first, &mut out);
+        assert!(out.is_empty());
+        let chunk = vec![0xabu8; 64 * 1024];
+        for _ in 0..80 {
+            s.push(&chunk, &mut out);
+        }
+        assert!(out.is_empty());
+        assert!(
+            s.buf.len() <= H264_MAX_AU_BYTES,
+            "corrupt-header stream must be capped, got {}",
+            s.buf.len()
+        );
+        // Framing recovers: the next group's SPS still cuts an AU boundary.
+        let group = au_from_nals(&[nal(7, 4), nal(8, 4), nal(5, 60)]);
+        s.push(&group, &mut out);
+        s.push(&group, &mut out);
+        assert_eq!(out.len(), 1, "emissions must resume after the cap drop");
+        assert!(
+            out[0].ends_with(&group),
+            "the cut lands on the second group's SPS"
+        );
+    }
+
+    /// Repeated SPS before the first slice stay with their group: SPS only
+    /// opens a group once a picture is buffered, so a parameter-set-only AU
+    /// is never emitted to be dropped downstream.
+    #[test]
+    fn au_splitter_leading_sps_without_vcl_stays_together() {
+        let mut first = au_from_nals(&[nal(7, 4)]);
+        first.extend_from_slice(&au_from_nals(&[nal(7, 4), nal(8, 4), nal(5, 60)]));
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&first, &mut out);
+        assert!(
+            out.is_empty(),
+            "leading SPS must not split before any picture"
+        );
+        let group = au_from_nals(&[nal(7, 4), nal(8, 4), nal(5, 60)]);
+        s.push(&group, &mut out);
+        assert_eq!(out, vec![first]);
+        assert_eq!(s.finish(), Some(group));
+    }
+
+    /// Data partitions (types 3/4) carry slice_id, not first_mb_in_slice: a
+    /// partition with id 0 must not split away from its partition A.
+    #[test]
+    fn au_splitter_data_partitions_stay_with_partition_a() {
+        // 0x80 is ue(0): first_mb 0 on partition A, slice_id 0 on partition B.
+        let mut part_a = vec![0x42, 0x80];
+        part_a.extend((0..28).map(|i| (i % 251) as u8));
+        let mut part_b = vec![0x43, 0x80];
+        part_b.extend((0..28).map(|i| (i % 251) as u8));
+        let stream = au_from_nals(&[part_a, part_b]);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream, &mut out);
+        assert!(out.is_empty(), "partitions B/C ride with their partition A");
+        assert_eq!(s.finish(), Some(stream));
+    }
+
+    /// Production local-encoder shape: a multi-slice IDR group (SPS, PPS,
+    /// four IDR slices) frames as one AU and survives packetize/depacketize
+    /// intact, still reading as a keyframe.
+    #[test]
+    fn production_multislice_idr_group_round_trips() {
+        let slice = |first: &[u8]| {
+            let mut n = vec![0x65];
+            n.extend_from_slice(first);
+            n.extend((0..60).map(|i| (i % 251) as u8));
+            n
+        };
+        let stream = au_from_nals(&[
+            nal(7, 4),
+            nal(8, 4),
+            slice(&[0x80]),
+            slice(&[0x08, 0x80]),
+            slice(&[0x08, 0x80]),
+            slice(&[0x08, 0x80]),
+        ]);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream, &mut out);
+        assert!(out.is_empty(), "multi-slice IDR stays one AU");
+        let au = s.finish().expect("trailing AU");
+        assert_eq!(au, stream);
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&au, &mut payloads);
+        let got = depacketize_all(payloads.iter()).expect("AU must reassemble");
+        assert_eq!(got, au);
+        assert!(au_is_keyframe(&got));
+    }
+
+    /// Prefix NALs between an SEI run and its picture do not break the run:
+    /// VCL, SEI, PPS, VCL frames as [VCL] + [SEI, PPS, VCL].
+    #[test]
+    fn au_splitter_sei_run_survives_prefix_nals() {
+        let vcl = |first: &[u8]| {
+            let mut n = vec![0x41];
+            n.extend_from_slice(first);
+            n.extend((0..30).map(|i| (i % 251) as u8));
+            n
+        };
+        let (first, second) = (vcl(&[0x80]), vcl(&[0x80]));
+        let (sei, pps) = (vec![0x06, 0x05, 0x11, 0x22], nal(8, 4));
+        let stream = au_from_nals(&[first.clone(), sei.clone(), pps.clone(), second.clone()]);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream, &mut out);
+        assert_eq!(out, vec![au_from_nals(&[first])]);
+        assert_eq!(s.finish(), Some(au_from_nals(&[sei, pps, second])));
+    }
+
+    /// An SEI preceding a group opener rides with the group: VCL, SEI, SPS,
+    /// PPS, IDR frames as [VCL] + [SEI, SPS, PPS, IDR], so the metadata keeps
+    /// the timestamp of the picture it describes.
+    #[test]
+    fn au_splitter_sei_rides_with_group_opener() {
+        let vcl = |first: &[u8]| {
+            let mut n = vec![0x41];
+            n.extend_from_slice(first);
+            n.extend((0..30).map(|i| (i % 251) as u8));
+            n
+        };
+        let idr = vec![0x65, 0x80, 0x01, 0x02];
+        let (first, sei, sps, pps) = (
+            vcl(&[0x80]),
+            vec![0x06, 0x05, 0x11, 0x22],
+            nal(7, 4),
+            nal(8, 4),
+        );
+        let stream = au_from_nals(&[
+            first.clone(),
+            sei.clone(),
+            sps.clone(),
+            pps.clone(),
+            idr.clone(),
+        ]);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream, &mut out);
+        assert_eq!(out, vec![au_from_nals(&[first])]);
+        let rest = s.finish().expect("trailing AU");
+        assert_eq!(
+            rest,
+            au_from_nals(&[sei, sps.clone(), pps.clone(), idr.clone()])
+        );
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&rest, &mut payloads);
+        assert_eq!(
+            depacketize_all(payloads.iter()),
+            Some(au_from_nals(&[sps, pps, idr.clone()]))
+        );
+        assert!(au_is_keyframe(&rest));
+    }
+
+    /// An SEI preceding a new picture rides with it: VCL, SEI, VCL frames as
+    /// [VCL] + [SEI, VCL], so the metadata keeps its picture's timestamp.
+    /// Pre-VCL now, the default packetizer drops the SEI instead of sending
+    /// it on the previous picture's timestamp.
+    #[test]
+    fn au_splitter_sei_rides_with_following_picture() {
+        let vcl = |first: &[u8]| {
+            let mut n = vec![0x41];
+            n.extend_from_slice(first);
+            n.extend((0..30).map(|i| (i % 251) as u8));
+            n
+        };
+        let (first, second) = (vcl(&[0x80]), vcl(&[0x80]));
+        let sei = vec![0x06, 0x05, 0x11, 0x22];
+        let stream = au_from_nals(&[first.clone(), sei.clone(), second.clone()]);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream, &mut out);
+        assert_eq!(out, vec![au_from_nals(&[first])]);
+        let rest = s.finish().expect("trailing AU");
+        assert_eq!(rest, au_from_nals(&[sei, second.clone()]));
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&rest, &mut payloads);
+        assert_eq!(
+            depacketize_all(payloads.iter()),
+            Some(au_from_nals(&[second]))
+        );
+    }
+
+    /// Every push ends exactly on a start code here, so only the
+    /// wait-for-type-byte exit runs: it must enforce the cap like every
+    /// other exit, or the buffer grows without bound and `finish` returns it.
+    #[test]
+    fn au_splitter_trailing_start_code_is_capped() {
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        let mut chunk = vec![0xabu8; 64 * 1024];
+        chunk.extend_from_slice(&START_CODE);
+        for _ in 0..80 {
+            s.push(&chunk, &mut out);
+        }
+        assert!(out.is_empty());
+        assert!(
+            s.buf.len() <= H264_MAX_AU_BYTES,
+            "trailing-start-code stream must be capped, got {}",
+            s.buf.len()
+        );
+    }
+
+    /// A start code split across pushes after a handoff is still found: the
+    /// resume keeps the usual three-byte overlap instead of skipping to the
+    /// end and merging the next picture into the current AU.
+    #[test]
+    fn au_splitter_handoff_keeps_start_code_overlap() {
+        let vcl = |first: &[u8]| {
+            let mut n = vec![0x41];
+            n.extend_from_slice(first);
+            n.extend((0..30).map(|i| (i % 251) as u8));
+            n
+        };
+        let (a, b, c) = (vcl(&[0x80]), vcl(&[0x80]), vcl(&[0x80]));
+        let sei = vec![0x06, 0x05, 0x11, 0x22];
+        let mut part1 = au_from_nals(&[a.clone(), sei.clone()]);
+        part1.extend_from_slice(&START_CODE);
+        part1.extend_from_slice(&b);
+        // Trailing start-code prefix; part2 completes it into c's start code.
+        part1.extend_from_slice(&[0x00, 0x00]);
+        let mut part2 = vec![0x00, 0x01];
+        part2.extend_from_slice(&c);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&part1, &mut out);
+        let first_au = au_from_nals(&[a]);
+        let second_au = au_from_nals(&[sei, b]);
+        assert_eq!(out, vec![first_au.clone()]);
+        s.push(&part2, &mut out);
+        assert_eq!(out, vec![first_au, second_au]);
+        assert_eq!(s.finish(), Some(au_from_nals(&[c])));
+    }
+
+    /// A picture following a handed-off SEI still closes its own AU: the
+    /// handoff retains the buffered VCL state, so VCL3 splits away from
+    /// [SEI, VCL2] instead of merging two pictures under one timestamp.
+    #[test]
+    fn au_splitter_picture_after_sei_handoff_still_cuts() {
+        let vcl = |first: &[u8]| {
+            let mut n = vec![0x41];
+            n.extend_from_slice(first);
+            n.extend((0..30).map(|i| (i % 251) as u8));
+            n
+        };
+        let (a, b, c) = (vcl(&[0x80]), vcl(&[0x80]), vcl(&[0x80]));
+        let sei = vec![0x06, 0x05, 0x11, 0x22];
+        let stream = au_from_nals(&[a.clone(), sei.clone(), b.clone(), c.clone()]);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream, &mut out);
+        assert_eq!(out, vec![au_from_nals(&[a]), au_from_nals(&[sei, b])]);
+        assert_eq!(s.finish(), Some(au_from_nals(&[c])));
+    }
+
+    /// `finish` leaves no framing facts behind: a splitter reused for a new
+    /// stream neither keeps a stale AUD mode nor splits the new stream's
+    /// leading parameter sets.
+    #[test]
+    fn au_splitter_finish_resets_framing_state() {
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&au_from_nals(&[nal(9, 2), nal(7, 4), nal(5, 60)]), &mut out);
+        assert!(s.seen_aud && s.buf_has_vcl);
+        s.finish();
+        assert!(!s.seen_aud && !s.buf_has_vcl);
+        // AUD-less groups frame on the reused splitter.
+        let group = au_from_nals(&[nal(7, 4), nal(8, 4), nal(5, 60)]);
+        s.push(&group, &mut out);
+        s.push(&group, &mut out);
+        assert_eq!(out, vec![group.clone()]);
+        assert_eq!(s.finish(), Some(group));
+    }
+
+    /// A runaway reset restores AUD-less framing: after the cap drops a
+    /// stream that once carried AUDs, SPS groups frame again instead of
+    /// accumulating to the cap forever.
+    #[test]
+    fn au_splitter_runaway_reset_restores_audless_framing() {
+        let aud_au = au_from_nals(&[nal(9, 2), nal(7, 4), nal(5, 60)]);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&aud_au, &mut out);
+        assert!(s.seen_aud);
+        let chunk = au_from_nals(&[nal(1, 64 * 1024)]);
+        for _ in 0..80 {
+            s.push(&chunk, &mut out);
+        }
+        let group = au_from_nals(&[nal(7, 4), nal(8, 4), nal(5, 60)]);
+        s.push(&group, &mut out);
+        s.push(&group, &mut out);
+        // The chunk residue cut at the first post-reset SPS is itself an AU;
+        // the point is the second group boundary lands again.
+        assert_eq!(out.len(), 2, "AUD-less groups must frame after the reset");
+        assert_eq!(out[1], group, "the cut lands on the second group's SPS");
+        assert_eq!(s.finish(), Some(group));
     }
 }

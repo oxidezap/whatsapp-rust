@@ -15,6 +15,7 @@ use wasmtime::error::Context as _;
 use wasmtime::{Caller, Func, Linker, Module, Ref, Store, Val, ValType};
 
 use crate::IntoWasmtime as _;
+use crate::exports;
 use crate::state::{HostState, ThreadPolicy};
 
 /// Fixed wall-clock origin: 2021-01-01T00:00:00Z in milliseconds. Arbitrary but
@@ -165,6 +166,65 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
     // reported as one under the single-threaded policies so those pools stay
     // empty, and as a small fixed number when threads really run — fixed rather
     // than the host's actual count, so a run does not depend on the machine.
+
+    // Where the engine keeps file-backed application settings. In a browser
+    // this is JS glue answering with the persistent directory; the recording
+    // stub answers null, the engine reports "Failed to get voip storage dir",
+    // settings stay unapplied, and no inbound call can activate. Answer with
+    // the memfs root — the one directory this host guarantees — allocated
+    // through the guest's own malloc so the pointer stays valid for code that
+    // will later free it.
+    linker.func_wrap(
+        "env",
+        "get_persistent_directory_path_js",
+        |mut caller: Caller<'_, HostState>| -> Result<i32, wasmtime::Error> {
+            crate::state::sync_memory(&mut caller);
+            let state = caller.data();
+            state
+                .shared
+                .record("env", "get_persistent_directory_path_js", Vec::new());
+            let malloc = exports::func(&mut caller, &["malloc", "_malloc"])
+                .map_err(|error| wasmtime::Error::msg(format!("guest allocator: {error}")))?;
+            let mut results = [Val::I32(0)];
+            malloc
+                .call(&mut caller, &[Val::I32(2)], &mut results)
+                .map_err(|error| wasmtime::Error::msg(format!("guest malloc failed: {error}")))?;
+            let ptr = match results[0] {
+                Val::I32(ptr) if ptr != 0 => ptr as u32,
+                _ => return Err(wasmtime::Error::msg("guest malloc returned null")),
+            };
+            // The nested guest call can grow memory, invalidating the cached
+            // view the single pre-call sync took: resynchronize before writing.
+            crate::state::sync_memory(&mut caller);
+            caller.data().write(ptr, b"/\0").map_err(|error| {
+                wasmtime::Error::msg(format!("writing persistent dir: {error}"))
+            })?;
+            Ok(ptr as i32)
+        },
+    )?;
+
+    // What the engine stats under the persistent directory. The recording stub
+    // answers zero (success with a zeroed buffer), which would bless a file
+    // the guest never verified; instead report the path it asked about and
+    // refuse with the musl ABI's negative errno (ENOENT is 2), so a missing
+    // file reads as missing and guest code that distinguishes failures keeps
+    // its intended fallback.
+    linker.func_wrap(
+        "env",
+        "__syscall_stat64",
+        |mut caller: Caller<'_, HostState>, path: i32, _buf: i32| -> Result<i32, wasmtime::Error> {
+            crate::state::sync_memory(&mut caller);
+            let state = caller.data();
+            let name = state
+                .read_cstr(path as u32)
+                .unwrap_or_else(|_| "<unreadable>".to_owned());
+            state
+                .shared
+                .record("env", "__syscall_stat64", vec![i64::from(path)]);
+            state.log(format!("host stat: {name} -> ENOENT"));
+            Ok(-2)
+        },
+    )?;
     linker.func_wrap(
         "env",
         "emscripten_num_logical_cores",

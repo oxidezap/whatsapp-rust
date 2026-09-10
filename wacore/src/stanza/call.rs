@@ -394,9 +394,9 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
             }
         }
         CallActionTag::Reject => {
-            // `reason` distinguishes a device that CANNOT take the call (`busy`) from the callee
-            // actually declining; dropping it made both look identical and ended calls the peer's
-            // other devices were still answering.
+            // `reason` distinguishes a device that CANNOT take the call (`busy`, `enc`) from the
+            // callee actually declining; dropping it made both look identical and ended calls the
+            // peer's other devices were still answering.
             let reason = attrs.optional_string("reason").map(|c| c.into_owned());
             attrs.finish().map_err(|e| anyhow!("<reject> attrs: {e}"))?;
             CallAction::Reject {
@@ -656,6 +656,9 @@ pub const TERMINATE_REASON_GROUP_CALL_ENDED: &str = "group_call_ended";
 /// companion that does not do voice at all. It is a statement about ONE DEVICE, not the callee's
 /// decision: the peer's remaining devices go on ringing and may still answer.
 pub const REJECT_REASON_BUSY: &str = "busy";
+
+/// Like `busy`, but the device could not decrypt the offer (stale registration). Per-device.
+pub const REJECT_REASON_ENC: &str = "enc";
 
 /// Relay latency wire encoding: `0x2000000 + rtt_ms`.
 pub fn encode_latency(rtt_ms: u32) -> String {
@@ -1997,6 +2000,33 @@ mod tests {
         match call.action {
             CallAction::Reject { reason, .. } => {
                 assert_eq!(reason.as_deref(), Some(REJECT_REASON_BUSY));
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// A `<reject>` from a device that could not decrypt the offer carries `reason="enc"`. The
+    /// pinned whatspec IR models `reason` as an opaque string (`WAWebHandleVoipCall` dispatcher,
+    /// `WAWebHandleVoipCallReceipt` parser; no reject-reason wire enum in the catalog), so the
+    /// parser must preserve it verbatim for the handler's per-device dispatch.
+    #[test]
+    fn reject_preserves_an_enc_reason() {
+        let node = base_call_builder()
+            .children([NodeBuilder::new("reject")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CID")
+                .attr("count", "0")
+                .attr("reason", "enc")
+                .children([NodeBuilder::new("registration")
+                    .bytes(0x12345678u32.to_be_bytes().to_vec())
+                    .build()])
+                .build()])
+            .build();
+
+        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+        match call.action {
+            CallAction::Reject { reason, .. } => {
+                assert_eq!(reason.as_deref(), Some(REJECT_REASON_ENC));
             }
             other => panic!("expected Reject, got {other:?}"),
         }

@@ -1,0 +1,981 @@
+//! Which seeded state, if any, lets the pinned engine keep an inbound video
+//! offer alive long enough to accept it?
+//!
+//! Each probe feeds one inbound offer to a fresh engine, reads `getCallInfo`
+//! immediately (empty means the call never existed, not even transiently),
+//! attempts `acceptCall`, and reports what the engine emitted. Probes vary
+//! three axes: the A/B properties `setABPropsOnWasm` forwards (`AB_PROPS`,
+//! neutral values, copied from `outbound_after_settings.rs`), the offer shape
+//! (settings-only vs video with a clear call key), and the accept arguments.
+//!
+//! All identities are fictitious. Execute in release.
+//!
+//! ```sh
+//! cargo run --release -p oracle-core --example video_answerer_matrix
+//! ```
+//!
+//! `ENGINE` overrides the pinned module (default `JgwtTQVeWPm`).
+
+mod common;
+
+use anyhow::{Context, Result, bail};
+use base64::Engine as _;
+use oracle_core::{Runtime, Value};
+use sha2::{Digest, Sha256};
+use wacore_binary::builder::NodeBuilder;
+use wacore_binary::jid::Server;
+use wacore_binary::{Jid, Node, marshal};
+
+const ENGINE: &str = "JgwtTQVeWPm";
+const ENGINE_SHA: &str = "97259423aea19cc30c1771478e035105cb0d0e64ab4b0297741b62d01deac8db";
+
+const SELF: [&str; 3] = [
+    "15550002222@c.us",
+    "15550002222:0@c.us",
+    "99887766554433:0@lid",
+];
+const CALL_ID: &str = "0011223344556677";
+const CALL_KEY: [u8; 32] = [0x5A; 32];
+const SETTINGS: &[u8] =
+    br#"{"encode":{"use_mlow_codec_v1":"false"},"options":{"enable_48khz_rtp_clock":"false","caller_timeout":"45"}}"#;
+
+/// The vendor's own video child, read back from a `startVoipCall` offer so the
+/// inbound shape carries no invented bytes.
+const VIDEO_ATTRS: &[(&str, &str)] = &[
+    ("enc", "h.264"),
+    ("dec", "H264"),
+    ("device_orientation", "0"),
+    ("screen_width", "0"),
+    ("screen_height", "0"),
+];
+
+fn video_child() -> Node {
+    let mut builder = NodeBuilder::new("video");
+    for (name, value) in VIDEO_ATTRS {
+        builder = builder.attr(name, (*value).to_owned());
+    }
+    builder.build()
+}
+
+fn census_video_offer_at(now: Option<u64>) -> Node {
+    let mut offer = NodeBuilder::new("offer");
+    if let Some(now) = now {
+        offer = offer.attr("t", now.to_string());
+    }
+    offer
+        .children([
+            NodeBuilder::new("audio")
+                .attr("enc", "opus")
+                .attr("rate", "16000")
+                .build(),
+            video_child(),
+            NodeBuilder::new("net").attr("medium", "3").build(),
+            NodeBuilder::new("enc")
+                .attr("count", "0")
+                .bytes(CALL_KEY.to_vec())
+                .build(),
+            NodeBuilder::new("encopt").attr("keygen", "2").build(),
+        ])
+        .build()
+}
+
+/// Pinned A/B values from `wacore::iq::abprops` (the whatspec registry), not
+/// neutral guesses: forcing every boolean true exercises a synthetic flag
+/// combination no WhatsApp client runs. Three wasm keys have no registry entry
+/// (`enable_av_downgrade`, `allow_reporting_call_replayer_id`, `log_level`)
+/// and keep neutral values, marked `unpinned` below.
+#[derive(Clone, Copy)]
+enum ABValue {
+    Bool(bool),
+    Int(i64),
+    UnpinnedBool,
+    UnpinnedInt(i64),
+}
+
+const AB_PROPS: &[(&str, ABValue)] = &[
+    ("aigc_version", ABValue::Int(1)),
+    ("app_exit_reason_version", ABValue::Int(0)),
+    ("attach_transport_rtx", ABValue::Bool(false)),
+    ("audio_level_speaking_threshold", ABValue::Int(30)),
+    ("call_admin_version", ABValue::Int(0)),
+    ("calling_rust_migration_bitmap", ABValue::Int(0)),
+    (
+        "calling_rust_migration_incoming_stanza_bitmap",
+        ABValue::Int(0),
+    ),
+    ("calling_screen_share_milestone_version", ABValue::Int(2)),
+    ("default_endpoint_thread_poll_timeout", ABValue::Int(0)),
+    ("enable_av_downgrade", ABValue::UnpinnedBool),
+    ("enable_init_bwe_for_group_call", ABValue::Bool(false)),
+    (
+        "enable_new_user_action_stanza_for_raise_hand_sender",
+        ABValue::Bool(false),
+    ),
+    ("enable_offer_v2_upgrade", ABValue::Bool(false)),
+    ("enable_ring_for_gc_on_offer_expire", ABValue::Bool(false)),
+    ("enable_silent_offer", ABValue::Bool(false)),
+    ("enable_waiting_room_logging", ABValue::Bool(false)),
+    ("enable_webcodec_video_encode", ABValue::Bool(false)),
+    (
+        "enable_web_voip_audio_driver_lifetime_fix",
+        ABValue::Bool(true),
+    ),
+    ("heartbeat_interval_s", ABValue::Int(10)),
+    (
+        "ignore_joinable_terminate_on_expired_offer",
+        ABValue::Bool(false),
+    ),
+    ("lobby_timeout_min", ABValue::Int(0)),
+    ("max_group_size_for_long_ringtone", ABValue::Int(0)),
+    ("max_num_participants_for_ss", ABValue::Int(8)),
+    ("allow_reporting_call_replayer_id", ABValue::UnpinnedBool),
+    (
+        "vid_stream_pause_resume_jb_reset_threshold_ms",
+        ABValue::Int(0),
+    ),
+    (
+        "voice_ai_conversation_starter_latency_tracking",
+        ABValue::Bool(false),
+    ),
+    (
+        "voip_stack_incoming_message_ownership_transfer",
+        ABValue::Bool(false),
+    ),
+    ("log_level", ABValue::UnpinnedInt(9)),
+];
+
+/// Configure the arm from the pinned table. A trapping setter fails the
+/// probe loudly with the key: silently continuing on a subset would make the
+/// row advertise a configuration it never established.
+fn set_ab_props(r: &mut Runtime) -> Result<usize> {
+    use anyhow::Context;
+    let mut set = 0;
+    for (key, value) in AB_PROPS {
+        let call = match *value {
+            ABValue::Bool(v) => r.call_embind(
+                "setABPropBool",
+                &[Value::Str((*key).into()), Value::Bool(v)],
+            ),
+            ABValue::Int(v) => {
+                r.call_embind("setABPropInt", &[Value::Str((*key).into()), Value::Int(v)])
+            }
+            ABValue::UnpinnedBool => r.call_embind(
+                "setABPropBool",
+                &[Value::Str((*key).into()), Value::Bool(true)],
+            ),
+            ABValue::UnpinnedInt(v) => {
+                r.call_embind("setABPropInt", &[Value::Str((*key).into()), Value::Int(v)])
+            }
+        };
+        r.refuel();
+        call.with_context(|| format!("setting A/B prop {key}"))?;
+        set += 1;
+    }
+    Ok(set)
+}
+
+struct Probe {
+    label: &'static str,
+    ab_props: bool,
+    video: bool,
+    accept: (bool, bool),
+    /// Expiry (`e`) on the `<call>` wrapper: the pinned IR lists it as a known
+    /// inbound attr, and the engine tears the offer down as expired before
+    /// accept, so a missing expiry is a suspect.
+    expiry: bool,
+    /// Send `t` in milliseconds rather than seconds: if the engine reads the
+    /// offer timestamp in ms, a seconds `t` sits 1000x in the past and the
+    /// offer arrives already expired.
+    t_millis: bool,
+    /// Second numeric argument to `handleIncomingSignalingOffer` as an offset
+    /// from now (`None` repeats now, as every harness does). If that slot is
+    /// an expiry rather than a second timestamp, `now` expires the offer on
+    /// arrival, which fits the born-torn-down verdict exactly.
+    second_numeric_offset: Option<u64>,
+    /// Stamp `t` on the inner `<offer>` as well as the `<call>` wrapper.
+    inner_t: bool,
+    /// Shift the offer timestamp by this many seconds (wheels the wrapper `t`
+    /// and the `t` arg together). Diagnostic: if `call_offer_elapsed_t`
+    /// follows the shift, the engine reads our timestamp and the miss comes
+    /// from elsewhere; if it stays at the clock epoch, the engine never
+    /// finds it.
+    t_offset: i64,
+    /// Device suffix on the caller JID handed to the engine (untested axis:
+    /// every harness passes bare user form).
+    caller_device: Option<u16>,
+    /// Call-creator device suffix (`None` = bare user form, as the repo
+    /// suite sends; the matrix default is device 1).
+    creator_device: Option<u16>,
+}
+
+fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
+    let mut r = common::engine(
+        bytes,
+        common::Startup {
+            identity: SELF,
+            attempts: 8,
+            // NO_MAIN_THREAD=1: skip main-thread registration. With it on, a
+            // synchronous `handleIncomingSignalingOffer` can spin on work
+            // queued for the blocking main thread (see `state.rs`), and the
+            // scheduler's timeout escape may then surface partial processing
+            // as a verdict. Registration off trades away outbound-signaling
+            // collection (nothing to collect here) for a clean inbound path.
+            register_main: std::env::var("NO_MAIN_THREAD").is_err(),
+            log_bytes: 4 << 20,
+            marker_sink: None,
+        },
+    )?;
+    // LOG_LEVEL=N raises the engine log threshold before delivery: the default
+    // level hides subsystem diagnostics, and the miss decision may explain
+    // itself one level up.
+    if let Ok(level) = std::env::var("LOG_LEVEL")
+        && let Ok(level) = level.parse::<i32>()
+    {
+        match r.set_engine_log_level(level) {
+            Ok(previous) => println!("PROBE {}: log level {previous} -> {level}", probe.label),
+            Err(e) => println!("PROBE {}: set log level failed: {e}", probe.label),
+        }
+        r.refuel();
+    }
+    // The event thread must be up before delivery: an offer into the startup
+    // gap lands on a half-started engine and reads as a refusal.
+    // MINIMAL=1 skips the gate and all seeding: every observation burns the
+    // monotonic clock the guest advances per read, so the earliest possible
+    // feed discriminates clock-burn from unreadiness.
+    let minimal = std::env::var("MINIMAL").is_ok();
+    if !minimal {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut gated = false;
+        while std::time::Instant::now() < deadline {
+            if r.engine_log()
+                .iter()
+                .any(|l| l.contains("call_event_proc resumed"))
+            {
+                gated = true;
+                break;
+            }
+            r.process_queued_calls();
+            r.refuel();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if !gated {
+            bail!(
+                "PROBE {}: event thread never announced itself; delivering into the startup gap reads as refusal",
+                probe.label
+            );
+        }
+    }
+    // REPLICATE_LOAD=1: exact `load_settings` sequence from
+    // `outbound_after_settings.rs` (settings offer, settle, rejectCall to
+    // clear, second start). That flow reports the second start failing with
+    // "already initialized", i.e. a surviving context; if it does not
+    // replicate here, the observation is harness-conditional.
+    if std::env::var("REPLICATE_LOAD").is_ok() {
+        let caller = Jid::new("11223344556677", Server::Lid);
+        let now = r.virtual_unix_time();
+        let payload = base64::engine::general_purpose::STANDARD.encode(marshal::marshal(
+            &common::settings_offer(&caller, now, "0102030405060708", SETTINGS),
+        )?);
+        r.call_embind(
+            "handleIncomingSignalingOffer",
+            &[
+                Value::Str(payload.clone()),
+                Value::Str("web".into()),
+                Value::Str("2.3000.0".into()),
+                Value::Str(now.to_string()),
+                Value::Str(now.to_string()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Str(caller.to_string()),
+                Value::Bytes(Vec::new()),
+            ],
+        )
+        .with_context(|| "REPLICATE_LOAD: settings offer delivery trapped")?;
+        r.refuel();
+        if !r.settle(std::time::Duration::from_secs(3)) {
+            bail!(
+                "REPLICATE_LOAD: offer settle never quiesced; replica sequence is work in flight"
+            );
+        }
+        r.refuel();
+        let rejected = r
+            .call_embind("rejectCall", &[])
+            .with_context(|| "REPLICATE_LOAD: rejectCall trapped")?;
+        r.refuel();
+        if !r.settle(std::time::Duration::from_secs(3)) {
+            bail!(
+                "REPLICATE_LOAD: post-reject settle never quiesced; second start would race teardown"
+            );
+        }
+        r.refuel();
+        let second = r
+            .call_embind(
+                "startVoipCall",
+                &[
+                    Value::Str("11223344556677@lid".into()),
+                    Value::StringList(vec!["11223344556677:0@lid".into()]),
+                    Value::Str("0011223344556677".into()),
+                    Value::Bool(false),
+                    Value::Str("11223344556677@lid".into()),
+                    Value::Bool(false),
+                    Value::Bytes(Vec::new()),
+                ],
+            )
+            .with_context(|| "REPLICATE_LOAD: second startVoipCall trapped")?;
+        r.refuel();
+        println!("REPLICA: rejectCall -> {rejected:?}, second start -> {second:?}");
+        for line in r.engine_log().iter().rev().take(8).rev() {
+            println!("    log: {}", line.trim());
+        }
+        return Ok(());
+    }
+    // COMBINED mode removed: originating first leaves the outbound context
+    // live during the inbound feed, so a failure reads as glare against an
+    // active call rather than answering whether origination allocates the
+    // missing message buffer. Clearing it first (endCall) would be the honest
+    // variant; until then the mode stays out instead of reporting confounded
+    // verdicts.
+    if probe.ab_props && !minimal {
+        let set = set_ab_props(&mut r)?;
+        println!("  ab props accepted {set} of {}", AB_PROPS.len());
+    }
+    let mut caller = Jid::new("11223344556677", Server::Lid);
+    if let Some(device) = probe.caller_device {
+        caller = caller.with_device(device);
+    }
+    let now = r.virtual_unix_time();
+    let shifted: u64 = (now as i64 + probe.t_offset).max(0) as u64;
+    // PRIME=accept|reject: deliver that stanza for the same call id BEFORE the
+    // offer. The miss path scans the message buffer for a prior accept (→14)
+    // or reject (→15) of the call-id; priming decides whether the scan reads
+    // buffer writes at all, isolating "scan never matches" from "scan cannot
+    // match". Any other value is a typo that would silently exercise the
+    // reject path under a wrong label, so it fails loudly.
+    if let Ok(prime) = std::env::var("PRIME") {
+        let action = match prime.as_str() {
+            "accept" => NodeBuilder::new("accept")
+                .attr("call-creator", caller.clone())
+                .attr("call-id", CALL_ID)
+                .build(),
+            "reject" => NodeBuilder::new("reject")
+                .attr("call-creator", caller.clone())
+                .attr("call-id", CALL_ID)
+                .attr("count", "0")
+                .build(),
+            other => anyhow::bail!("unknown PRIME value: {other}"),
+        };
+        let primer = NodeBuilder::new("call")
+            .attr("from", caller.clone())
+            .attr("id", "0")
+            .attr("call-id", CALL_ID)
+            .attr("call-creator", caller.clone())
+            .attr("t", now.to_string())
+            .children([action])
+            .build();
+        let primer_payload =
+            base64::engine::general_purpose::STANDARD.encode(marshal::marshal(&primer)?);
+        let primed = r.call_embind(
+            "handleIncomingSignalingOffer",
+            &[
+                Value::Str(primer_payload),
+                Value::Str("web".into()),
+                Value::Str("2.3000.0".into()),
+                Value::Str(now.to_string()),
+                Value::Str(now.to_string()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Str(caller.to_string()),
+                Value::Bytes(Vec::new()),
+            ],
+        );
+        r.refuel();
+        // A trapped primer never reached the buffer: continuing would report
+        // the offer against a setup that did not happen, so the probe stops
+        // inconclusive instead of printing a verdict.
+        if let Err(error) = &primed {
+            println!("PROBE {}: prime {prime} trapped: {error}", probe.label);
+            println!("PROBE {}: INCONCLUSIVE (primer failed)", probe.label);
+            return Ok(());
+        }
+        println!("PROBE {}: prime {prime} delivered", probe.label);
+    }
+    // MS_PAIR is read here (after priming, before timestamps): millisecond-
+    // consistent timestamps on every channel, expiry 45s after offer, derived
+    // from the shifted clock so past/future rows actually move.
+    let ms_pair = std::env::var("MS_PAIR").is_ok();
+    let t_all: u64 = if ms_pair || probe.t_millis {
+        shifted * 1000
+    } else {
+        shifted
+    };
+    let e_all: u64 = if ms_pair {
+        shifted * 1000 + 45000
+    } else {
+        shifted + if probe.expiry { 45 } else { 0 }
+    };
+    let offer = if probe.video {
+        census_video_offer_at(probe.inner_t.then_some(t_all))
+    } else {
+        match common::settings_offer(&caller, shifted, CALL_ID, SETTINGS)
+            .content
+            .clone()
+        {
+            Some(wacore_binary::node::NodeContent::Nodes(children)) => children
+                .iter()
+                .find(|c| c.tag == "offer")
+                .cloned()
+                .expect("settings carrier holds an <offer>"),
+            _ => anyhow::bail!("settings carrier has no children"),
+        }
+    };
+    // The settings sibling rides inside <call>, next to <offer>, on the wire.
+    // The wrapper carries a stanza `id`: the engine files the record under it
+    // (an idless record keeps transaction_id -1), and the pinned IR requires
+    // it on inbound `<call>`.
+    // ROUTED=1 addresses the stanza like a real server delivery: `recipient`
+    // (this device), `participant` (caller device) and `sender_lid`. The
+    // router may refuse to file an offer it cannot address to itself, and no
+    // probe has ever carried these.
+    let routed = std::env::var("ROUTED").is_ok();
+    let mut wrapper = NodeBuilder::new("call")
+        .attr("from", caller.clone())
+        .attr("id", "1")
+        .attr("call-id", CALL_ID)
+        .attr(
+            "call-creator",
+            match probe.creator_device {
+                Some(device) => caller.with_device(device),
+                None => caller.clone(),
+            },
+        )
+        .attr("t", t_all.to_string());
+    if probe.expiry || ms_pair {
+        wrapper = wrapper.attr("e", e_all.to_string());
+    }
+    if routed {
+        // Self LID from init, caller device from the probe: a server-routed
+        // inbound stanza names both ends. Typed JIDs, not strings: the engine
+        // reads the JID wire encoding, and string attrs arrive malformed.
+        wrapper = wrapper
+            .attr(
+                "recipient",
+                Jid::new("99887766554433", Server::Lid).with_device(0),
+            )
+            .attr("participant", caller.with_device(caller.device))
+            .attr("sender_lid", Jid::new("11223344556677", Server::Lid));
+    }
+    let wrapper = wrapper
+        .children([
+            offer,
+            NodeBuilder::new("voip_settings")
+                .attr("uncompressed", "1")
+                .bytes(SETTINGS.to_vec())
+                .build(),
+        ])
+        .build();
+    let second_numeric = match probe.second_numeric_offset {
+        Some(offset) => shifted + offset,
+        None => shifted,
+    };
+    // Arguments 4 and 5 are the stanza's `e` and `t` timestamps, read with
+    // stoull (see `tests/signaling.rs::deliver`): the probe axes ride here,
+    // not only on the stanza attributes, because the engine reads the header
+    // inputs. `second_numeric_offset` shifts `t` into the future, including
+    // under MS_PAIR (offset applied before the millisecond conversion).
+    let (e_arg, t_arg) = if ms_pair {
+        (e_all, second_numeric * 1000)
+    } else {
+        (
+            shifted + if probe.expiry { 45 } else { 0 },
+            if probe.t_millis {
+                second_numeric * 1000
+            } else {
+                second_numeric
+            },
+        )
+    };
+    let payload = base64::engine::general_purpose::STANDARD.encode(marshal::marshal(&wrapper)?);
+    // Preserve the delivery outcome: a trap here must read as a delivery
+    // failure, never as "the engine processed and rejected the offer".
+    // DELIVER_VIA=message routes through the generic `handleIncomingSignalingMessage`
+    // entry (payload, platform, version, e, t, bool, caller, bytes) instead of
+    // the offer-specific one: same bytes, different router.
+    // Unknown values fail loudly: a misspelled selector must not silently
+    // run the wrong delivery path and report its evidence.
+    let via_message = match std::env::var("DELIVER_VIA").as_deref() {
+        Err(_) => false,
+        Ok("message") => true,
+        Ok(other) => bail!("unknown DELIVER_VIA={other:?}: expected message"),
+    };
+    // DELIVER_TWICE=1 feeds the same offer again on the same engine: the
+    // message-buffer scan decides 14/15/27 by what it finds buffered, so a
+    // second delivery meeting the first one's record must behave differently
+    // if buffer state is the gate.
+    let twice = std::env::var("DELIVER_TWICE").is_ok();
+    let rounds = if twice { 2 } else { 1 };
+    let mut delivered = String::new();
+    for round in 0..rounds {
+        let outcome = if via_message {
+            r.call_embind(
+                "handleIncomingSignalingMessage",
+                &[
+                    Value::Str(payload.clone()),
+                    Value::Str("web".into()),
+                    Value::Str("2.3000.0".into()),
+                    Value::Str(e_arg.to_string()),
+                    Value::Str(t_arg.to_string()),
+                    Value::Bool(false),
+                    Value::Str(caller.to_string()),
+                    Value::Bytes(Vec::new()),
+                ],
+            )
+        } else {
+            r.call_embind(
+                "handleIncomingSignalingOffer",
+                &[
+                    Value::Str(payload.clone()),
+                    Value::Str("web".into()),
+                    Value::Str("2.3000.0".into()),
+                    Value::Str(e_arg.to_string()),
+                    Value::Str(t_arg.to_string()),
+                    Value::Bool(false),
+                    Value::Bool(true),
+                    Value::Str(caller.to_string()),
+                    Value::Bytes(Vec::new()),
+                ],
+            )
+        };
+        r.refuel();
+        // A trapped delivery is a host failure, not a protocol observation:
+        // bail instead of carrying a dead row through state inspection and
+        // accept into an ordinary-looking verdict.
+        let value = outcome
+            .with_context(|| format!("PROBE {}: delivery round {round} trapped", probe.label))?;
+        delivered = format!("{value:?}");
+        if twice {
+            println!("PROBE {}: delivery round {round}: {delivered}", probe.label);
+        }
+    }
+    // Collect queued main-thread work to observable quiescence before reading
+    // state: a fixed pass count can sample while activation is still pending,
+    // and processing a callback can enqueue more work. Each pass yields briefly
+    // so guest workers are actually scheduled between observations. A `false`
+    // here marks the probe suspect, not conclusive.
+    let mut stable = 0;
+    let (mut last_signaling, mut last_log) = (usize::MAX, usize::MAX);
+    let mut quiesced = false;
+    for _ in 0..20 {
+        r.process_queued_calls();
+        r.refuel();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let (signaling, log) = (
+            r.signaling().map(|s| s.len()).unwrap_or(usize::MAX),
+            r.engine_log().len(),
+        );
+        if signaling == last_signaling && log == last_log {
+            stable += 1;
+            if stable >= 3 {
+                quiesced = true;
+                break;
+            }
+        } else {
+            stable = 0;
+            (last_signaling, last_log) = (signaling, log);
+        }
+    }
+    // The scheduler's lock watchdog taints the run: handling stops partway,
+    // which would otherwise read as a protocol observation. Bail on exactly
+    // that complaint, like the signaling tests and the both-sides driver.
+    if r.engine_log()
+        .iter()
+        .any(|l| l.contains("check_locking_order"))
+    {
+        bail!(
+            "PROBE {}: lock-order inversion handling the offer; row tainted",
+            probe.label
+        );
+    }
+    // Did the inbound blob land in the applied settings store? The offer
+    // carries caller_timeout=45; an empty read-back means the expiry path
+    // computes against an unapplied (zero) window and every offer is
+    // instantly stale no matter what timestamps ride it.
+    let applied_timeout = match r.call_embind(
+        "getVoipParam",
+        &[Value::Str("options.caller_timeout".into())],
+    ) {
+        Ok(Value::Str(s)) if s.is_empty() => "empty".to_owned(),
+        Ok(Value::Str(s)) => s,
+        other => format!("{other:?}"),
+    };
+    r.refuel();
+    println!(
+        "PROBE {}: applied caller_timeout={applied_timeout}",
+        probe.label
+    );
+    if std::env::var("LOG_SPAN").is_ok() {
+        let lines = r.engine_log();
+        if let Some(start) = lines.iter().position(|l| l.contains("!Offer from:")) {
+            for line in lines.iter().skip(start).take(60) {
+                println!("    span: {}", line.trim());
+            }
+        } else {
+            println!("    span: no !Offer line; last 10 lines:");
+            for line in lines.iter().rev().take(10).rev() {
+                println!("    span: {}", line.trim());
+            }
+        }
+        for line in r
+            .logs()
+            .iter()
+            .filter(|l| l.contains("host stat:"))
+            .take(10)
+        {
+            println!("    {line}");
+        }
+        return Ok(());
+    }
+    let immediate = r.call_embind("getCallInfo", &[]);
+    r.refuel();
+    // A trapped state query is a host failure, not a dead call: it is a
+    // distinct `unknown` outcome, never folded into dead.
+    let alive: Option<bool> = match &immediate {
+        Err(e) => {
+            println!("PROBE {}: getCallInfo trapped: {e}", probe.label);
+            None
+        }
+        Ok(Value::Str(s)) => Some(!s.is_empty()),
+        Ok(other) => {
+            println!(
+                "PROBE {}: unexpected getCallInfo shape: {other:?}",
+                probe.label
+            );
+            None
+        }
+    };
+    // Was it already torn down before accept, or still pending? Snapshot the
+    // teardown markers now: if `missed by the user` is logged pre-accept, the
+    // call was born torn down (timestamp/parse issue); if absent, accept raced
+    // an activation that never completes (missing-state issue).
+    let torn_down_pre_accept = r
+        .engine_log()
+        .iter()
+        .any(|l| l.contains("missed by the user") || l.contains("call_term_reason"));
+    // SKIP_ACCEPT=1: do not race activation. Feed, settle like `load_settings`
+    // does, then read state: if the call is alive here, the premature accept
+    // is what kills it, and the fix is sequencing (wait for active).
+    if std::env::var("SKIP_ACCEPT").is_ok() {
+        if !r.settle(std::time::Duration::from_secs(3)) {
+            bail!(
+                "PROBE {}: SKIP_ACCEPT settle never quiesced; state below is work in flight, not evidence",
+                probe.label
+            );
+        }
+        r.refuel();
+        let alive_later: Option<bool> = match r.call_embind("getCallInfo", &[]) {
+            Err(e) => {
+                println!("PROBE {}: late getCallInfo trapped: {e}", probe.label);
+                None
+            }
+            Ok(Value::Str(s)) => Some(!s.is_empty()),
+            Ok(other) => {
+                println!(
+                    "PROBE {}: unexpected late getCallInfo shape: {other:?}",
+                    probe.label
+                );
+                None
+            }
+        };
+        r.refuel();
+        let emitted = r.signaling()?.len();
+        let missed = r
+            .engine_log()
+            .iter()
+            .any(|l| l.contains("missed by the user"));
+        println!(
+            "PROBE {}: delivered={delivered} quiesced={quiesced} alive={alive:?} preaccept_torn_down={torn_down_pre_accept} no-accept: alive_later={alive_later:?} emitted={emitted} missed={missed}",
+            probe.label,
+        );
+        return Ok(());
+    }
+    // CHECK_CONTEXT=1: replicate the `load_settings` observation. A second
+    // `startVoipCall` reporting already-initialized proves a call context
+    // object exists even when `getCallInfo` reads empty, separating
+    // state (missed) from existence.
+    if std::env::var("CHECK_CONTEXT").is_ok() {
+        let second = r
+            .call_embind(
+                "startVoipCall",
+                &[
+                    Value::Str("11223344556677@lid".into()),
+                    Value::StringList(vec!["11223344556677:0@lid".into()]),
+                    Value::Str("probe-second-start".into()),
+                    Value::Bool(true),
+                    Value::Str("11223344556677@lid".into()),
+                    Value::Bool(false),
+                    Value::Bytes(vec![0xA5; 32]),
+                ],
+            )
+            .with_context(|| "REPLICATE_LOAD: second startVoipCall trapped")?;
+        r.refuel();
+        println!("PROBE {}: second start -> {second:?}", probe.label,);
+        for line in r.engine_log().iter().rev().take(6).rev() {
+            println!("    log: {}", line.trim());
+        }
+        return Ok(());
+    }
+    let accepted = r
+        .call_embind(
+            "acceptCall",
+            &[Value::Bool(probe.accept.0), Value::Bool(probe.accept.1)],
+        )
+        .with_context(|| format!("PROBE {}: acceptCall trapped", probe.label))?;
+    r.refuel();
+    // `settle` drains the proxy queue each tick, but a `false` return means it
+    // never quiesced: reporting a stall then turns harness timing into a
+    // protocol verdict, so quiescence is printed, not discarded.
+    let settled = r.settle(std::time::Duration::from_secs(5));
+    r.refuel();
+    let emitted = r.signaling()?.len();
+    let term_reason = r
+        .engine_log()
+        .iter()
+        .rev()
+        .find(|l| l.contains("call_term_reason"))
+        .map(|l| l.trim().to_owned())
+        .unwrap_or_default();
+    let missed = r
+        .engine_log()
+        .iter()
+        .any(|l| l.contains("missed by the user"));
+    // Report the elapsed stat the engine logged: it discriminates "reads our
+    // timestamp" (follows the shift) from "never finds it" (stays at epoch).
+    let elapsed = r
+        .engine_log()
+        .iter()
+        .rev()
+        .find(|l| l.contains("call_offer_elapsed_t"))
+        .map(|l| l.trim().to_owned())
+        .unwrap_or_default();
+    println!(
+        "PROBE {}: delivered={delivered} quiesced={quiesced} alive={alive:?} preaccept_torn_down={torn_down_pre_accept} accept={accepted:?} settled={settled} emitted={emitted} missed={missed} {term_reason} | {elapsed}",
+        probe.label,
+    );
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let which = std::env::var("ENGINE").unwrap_or_else(|_| ENGINE.into());
+    let catalog = oracle_core::Catalog::discover()?;
+    let entry = catalog.resolve(&which)?;
+    let bytes = std::fs::read(&entry.path)?;
+    let sha = hex::encode(Sha256::digest(&bytes));
+    if which == ENGINE {
+        assert_eq!(sha, ENGINE_SHA);
+    }
+    // An override never runs silently: its hash prints every run, so a stale
+    // or modified capture cannot masquerade as the pinned engine's evidence.
+    println!("engine: {which} sha256={sha}");
+
+    // PROBE=<label> runs a single probe (default: the whole matrix). A
+    // selector that matches nothing fails loudly: an empty run must never
+    // read as completed evidence.
+    let mut matched = false;
+    for probe in [
+        Probe {
+            label: "settings-only",
+            ab_props: false,
+            video: false,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
+        },
+        Probe {
+            label: "settings-only+ab",
+            ab_props: true,
+            video: false,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
+        },
+        Probe {
+            label: "video+ab",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
+        },
+        Probe {
+            label: "video+ab,accept-ff",
+            ab_props: true,
+            video: true,
+            accept: (false, false),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
+        },
+        Probe {
+            label: "video+ab+expiry",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: true,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
+        },
+        Probe {
+            label: "settings-only+expiry",
+            ab_props: false,
+            video: false,
+            accept: (true, true),
+            expiry: true,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
+        },
+        Probe {
+            label: "settings-only+t-ms",
+            ab_props: false,
+            video: false,
+            accept: (true, true),
+            expiry: false,
+            t_millis: true,
+            second_numeric_offset: None,
+            inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
+        },
+        Probe {
+            label: "video+ab+t-ms",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: false,
+            t_millis: true,
+            second_numeric_offset: None,
+            inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
+        },
+        Probe {
+            label: "video+ab+future-t",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: Some(45),
+            inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
+        },
+        Probe {
+            label: "video+ab+inner-t",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: true,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
+        },
+        Probe {
+            label: "video+ab+t+100k",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+            t_offset: 100000,
+            caller_device: None,
+            creator_device: Some(1),
+        },
+        Probe {
+            label: "video+ab+t-100k",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+            t_offset: -100000,
+            caller_device: None,
+            creator_device: Some(1),
+        },
+        Probe {
+            label: "video+ab+caller-dev0",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+            t_offset: 0,
+            caller_device: Some(0),
+            creator_device: Some(1),
+        },
+        Probe {
+            label: "video+ab+creator-bare",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: None,
+        },
+    ] {
+        // PROBE=<label> runs a single probe (default: the whole matrix).
+        if let Ok(only) = std::env::var("PROBE")
+            && only != probe.label
+        {
+            continue;
+        }
+        matched = true;
+        println!("=== {}", probe.label);
+        run_probe(&bytes, &probe)?;
+    }
+    if !matched {
+        anyhow::bail!("PROBE selector matched no row");
+    }
+    Ok(())
+}

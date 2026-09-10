@@ -75,12 +75,15 @@ fn video_offer_matches_the_vendor_engine() -> Result<()> {
 
     let mut stubs = runtime.stubs_called();
     stubs.sort();
+    // `get_persistent_directory_path_js` and `__syscall_stat64` are
+    // implemented, not stubbed (the engine reads file-backed application
+    // settings through them), so neither appears here. A changed
+    // stub-dependent path must fail here, not bless new geometry.
     assert_eq!(
         stubs,
         [
             ("env::call_start_video_capture_js_sync".to_owned(), 1),
             ("env::emscripten_check_blocking_allowed".to_owned(), 1),
-            ("env::get_persistent_directory_path_js".to_owned(), 1),
             ("env::on_call_event_js_sync".to_owned(), 3),
             (
                 "env::query_browser_audio_processing_status_js_sync".to_owned(),
