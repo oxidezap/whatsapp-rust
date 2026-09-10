@@ -191,6 +191,18 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
             marker_sink: None,
         },
     )?;
+    // LOG_LEVEL=N raises the engine log threshold before delivery: the default
+    // level hides subsystem diagnostics, and the miss decision may explain
+    // itself one level up.
+    if let Ok(level) = std::env::var("LOG_LEVEL")
+        && let Ok(level) = level.parse::<i32>()
+    {
+        match r.set_engine_log_level(level) {
+            Ok(previous) => println!("PROBE {}: log level {previous} -> {level}", probe.label),
+            Err(e) => println!("PROBE {}: set log level failed: {e}", probe.label),
+        }
+        r.refuel();
+    }
     // The event thread must be up before delivery: an offer into the startup
     // gap lands on a half-started engine and reads as a refusal.
     // MINIMAL=1 skips the gate and all seeding: every observation burns the
@@ -230,10 +242,14 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         let payload = base64::engine::general_purpose::STANDARD.encode(marshal::marshal(
             &common::settings_offer(&caller, now, "0102030405060708", SETTINGS),
         )?);
+        if probe.ab_props && !minimal {
+            let set = set_ab_props(&mut r);
+            println!("  ab props accepted {set} of {}", AB_PROPS.len());
+        }
         r.call_embind(
             "handleIncomingSignalingOffer",
             &[
-                Value::Str(payload),
+                Value::Str(payload.clone()),
                 Value::Str("web".into()),
                 Value::Str("2.3000.0".into()),
                 Value::Str(now.to_string()),
@@ -281,8 +297,25 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
     }
     let now = r.virtual_unix_time();
     let shifted: u64 = (now as i64 + probe.t_offset).max(0) as u64;
+    // MS_PAIR=1: millisecond-consistent timestamps on every channel (wrapper
+    // `t` and `e`, inner `t`, args 4/5), expiry 45s after offer. Overrides the
+    // per-probe timestamp flags: earlier t-ms probes kept `e` in seconds
+    // (expiry before offer), so they could not test millisecond reading.
+    let ms_pair = std::env::var("MS_PAIR").is_ok();
+    let t_all: u64 = if ms_pair {
+        now * 1000
+    } else if probe.t_millis {
+        shifted * 1000
+    } else {
+        shifted
+    };
+    let e_all: u64 = if ms_pair {
+        now * 1000 + 45000
+    } else {
+        shifted + if probe.expiry { 45 } else { 0 }
+    };
     let offer = if probe.video {
-        census_video_offer_at(probe.inner_t.then_some(shifted))
+        census_video_offer_at(probe.inner_t.then_some(t_all))
     } else {
         match common::settings_offer(&caller, shifted, CALL_ID, SETTINGS)
             .content
@@ -297,8 +330,12 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         }
     };
     // The settings sibling rides inside <call>, next to <offer>, on the wire.
+    // The wrapper carries a stanza `id`: the engine files the record under it
+    // (an idless record keeps transaction_id -1), and the pinned IR requires
+    // it on inbound `<call>`.
     let mut wrapper = NodeBuilder::new("call")
         .attr("from", caller.clone())
+        .attr("id", "1")
         .attr("call-id", CALL_ID)
         .attr(
             "call-creator",
@@ -307,16 +344,9 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
                 None => caller.clone(),
             },
         )
-        .attr(
-            "t",
-            if probe.t_millis {
-                (shifted * 1000).to_string()
-            } else {
-                shifted.to_string()
-            },
-        );
-    if probe.expiry {
-        wrapper = wrapper.attr("e", (shifted + 45).to_string());
+        .attr("t", t_all.to_string());
+    if probe.expiry || ms_pair {
+        wrapper = wrapper.attr("e", e_all.to_string());
     }
     let wrapper = wrapper
         .children([
@@ -335,8 +365,18 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
     // stoull (see `tests/signaling.rs::deliver`): the probe axes ride here,
     // not only on the stanza attributes, because the engine reads the header
     // inputs. `second_numeric_offset` shifts `t` into the future.
-    let (e_arg, t_arg) = (shifted + if probe.expiry { 45 } else { 0 }, second_numeric);
-    let t_arg = if probe.t_millis { t_arg * 1000 } else { t_arg };
+    let (e_arg, t_arg) = if ms_pair {
+        (e_all, t_all)
+    } else {
+        (
+            shifted + if probe.expiry { 45 } else { 0 },
+            if probe.t_millis {
+                second_numeric * 1000
+            } else {
+                second_numeric
+            },
+        )
+    };
     let payload = base64::engine::general_purpose::STANDARD.encode(marshal::marshal(&wrapper)?);
     // Preserve the delivery outcome: a trap here must read as a delivery
     // failure, never as "the engine processed and rejected the offer".
@@ -344,41 +384,53 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
     // entry (payload, platform, version, e, t, bool, caller, bytes) instead of
     // the offer-specific one: same bytes, different router.
     let via_message = std::env::var("DELIVER_VIA").is_ok_and(|v| v == "message");
-    let delivered = if via_message {
-        r.call_embind(
-            "handleIncomingSignalingMessage",
-            &[
-                Value::Str(payload),
-                Value::Str("web".into()),
-                Value::Str("2.3000.0".into()),
-                Value::Str(e_arg.to_string()),
-                Value::Str(t_arg.to_string()),
-                Value::Bool(false),
-                Value::Str(caller.to_string()),
-                Value::Bytes(Vec::new()),
-            ],
-        )
-    } else {
-        r.call_embind(
-            "handleIncomingSignalingOffer",
-            &[
-                Value::Str(payload),
-                Value::Str("web".into()),
-                Value::Str("2.3000.0".into()),
-                Value::Str(e_arg.to_string()),
-                Value::Str(t_arg.to_string()),
-                Value::Bool(false),
-                Value::Bool(true),
-                Value::Str(caller.to_string()),
-                Value::Bytes(Vec::new()),
-            ],
-        )
-    };
-    r.refuel();
-    let delivered = match &delivered {
-        Ok(value) => format!("{value:?}"),
-        Err(_) => "trap".to_owned(),
-    };
+    // DELIVER_TWICE=1 feeds the same offer again on the same engine: the
+    // message-buffer scan decides 14/15/27 by what it finds buffered, so a
+    // second delivery meeting the first one's record must behave differently
+    // if buffer state is the gate.
+    let twice = std::env::var("DELIVER_TWICE").is_ok();
+    let rounds = if twice { 2 } else { 1 };
+    let mut delivered = String::new();
+    for round in 0..rounds {
+        let outcome = if via_message {
+            r.call_embind(
+                "handleIncomingSignalingMessage",
+                &[
+                    Value::Str(payload.clone()),
+                    Value::Str("web".into()),
+                    Value::Str("2.3000.0".into()),
+                    Value::Str(e_arg.to_string()),
+                    Value::Str(t_arg.to_string()),
+                    Value::Bool(false),
+                    Value::Str(caller.to_string()),
+                    Value::Bytes(Vec::new()),
+                ],
+            )
+        } else {
+            r.call_embind(
+                "handleIncomingSignalingOffer",
+                &[
+                    Value::Str(payload.clone()),
+                    Value::Str("web".into()),
+                    Value::Str("2.3000.0".into()),
+                    Value::Str(e_arg.to_string()),
+                    Value::Str(t_arg.to_string()),
+                    Value::Bool(false),
+                    Value::Bool(true),
+                    Value::Str(caller.to_string()),
+                    Value::Bytes(Vec::new()),
+                ],
+            )
+        };
+        r.refuel();
+        delivered = match &outcome {
+            Ok(value) => format!("{value:?}"),
+            Err(_) => "trap".to_owned(),
+        };
+        if twice {
+            println!("PROBE {}: delivery round {round}: {delivered}", probe.label);
+        }
+    }
     // Collect queued main-thread work to observable quiescence before reading
     // state: a fixed pass count can sample while activation is still pending,
     // and processing a callback can enqueue more work. Each pass yields briefly
