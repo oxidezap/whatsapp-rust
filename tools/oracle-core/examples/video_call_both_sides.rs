@@ -75,10 +75,6 @@ fn start(bytes: &[u8], identity: [&str; 3]) -> Result<Runtime> {
 }
 
 /// Wait for the event thread before delivering anything: an offer into the
-/// startup gap lands on a half-started engine and reads as a refusal. Warns
-/// and continues on timeout so a slow host degrades the verdict instead of
-/// hanging the run.
-/// Wait for the event thread before delivering anything: an offer into the
 /// startup gap lands on a half-started engine and reads as a refusal. A
 /// missing startup marker is a startup failure, not protocol evidence, so a
 /// blown deadline fails loudly instead of letting later verdicts blame the
