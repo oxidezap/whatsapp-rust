@@ -2862,9 +2862,10 @@ impl CallRegistry {
     /// The mute-path re-add: no handshake epoch is minted and no timeout is
     /// armed, because the call is already video and the peer applies a bare
     /// `Enabled` unconditionally. Allowed only with no upgrade outstanding in
-    /// either direction and our direction stopped (or never enabled while the
-    /// peer's is): a fresh upgrade belongs on
-    /// [`Self::begin_local_video_request`], and a pending peer request belongs
+    /// either direction and an inactive self direction while the peer's is
+    /// active: the same rule [`Self::begin_local_video_request`] refuses
+    /// on, so one predicate owns both paths and no negotiation refuses both.
+    /// A fresh upgrade belongs on begin, and a pending peer request belongs
     /// on [`Self::complete_peer_video_request`], which answers it explicitly.
     pub fn resume_local_video(&self, call_id: &str, generation: u64) -> Option<VideoState> {
         let mut map = self.active_calls();
@@ -2876,8 +2877,8 @@ impl CallRegistry {
             return None;
         }
         let resumable = entry.video.self_state == VideoState::Stopped
-            || (entry.video.self_state == VideoState::Disabled
-                && entry.video.peer_state == VideoState::Enabled);
+            || (entry.video.self_state.is_inactive_for_call_mode()
+                && !entry.video.peer_state.is_inactive_for_call_mode());
         if !resumable {
             return None;
         }
@@ -5483,6 +5484,32 @@ mod tests {
             Some((VideoState::Enabled, VideoState::Enabled))
         );
         assert!(reg.snapshot("CID").expect("session").is_video);
+    }
+
+    // The re-add shares the upgrade rule: any inactive self direction with
+    // an active peer is resumable, not just stopped-with-enabled. A paused
+    // (or unknown) peer still holds the call video, and the begin path
+    // refuses it for the same reason, so refusing resume too would leave no
+    // path that enables local video at all.
+    #[test]
+    fn resume_re_adds_against_any_active_peer_direction() {
+        for peer in [VideoState::Paused, VideoState::UnknownPeer] {
+            let reg = CallRegistry::new();
+            let generation = reg.insert(session("CID"));
+            assert!(matches!(
+                reg.apply_peer_video_state("CID", generation, peer),
+                PeerVideoTransition::Applied { .. }
+            ));
+            assert_eq!(
+                reg.resume_local_video("CID", generation),
+                Some(VideoState::Disabled),
+                "{peer:?}: an active peer keeps the call video whatever it sends"
+            );
+            assert_eq!(
+                reg.video_states("CID", generation),
+                Some((VideoState::Enabled, peer))
+            );
+        }
     }
 
     // Resume is only the re-add: a fresh upgrade belongs on the begin path,

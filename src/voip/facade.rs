@@ -11920,6 +11920,41 @@ mod tests {
         handle.hangup_local().await;
     }
 
+    // The previously stuck cell end to end: a paused peer keeps the call
+    // video, so the begin path refuses and the re-add must take it. A bare
+    // `Enabled` is what an already-video peer answers.
+    #[tokio::test]
+    async fn resume_video_re_adds_against_a_paused_peer() {
+        let (client, sends, handle, _relay_keepalive) = sending_handle().await;
+        apply_paused_peer(&handle).await;
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let (vsrc, vsink) = video_endpoints();
+        handle
+            .resume_video(vsrc, vsink)
+            .await
+            .expect("a paused peer still holds the call video");
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("re-add must be announced")
+            .expect("waiter");
+        assert_eq!(
+            call_action_of(&node)
+                .as_node_ref()
+                .attrs()
+                .optional_string("state")
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .video_states(&handle.call_id, handle.generation),
+            Some((VideoState::Enabled, VideoState::Paused))
+        );
+        handle.hangup_local().await;
+    }
+
     // A re-add whose stanza never reaches the peer releases the plane and
     // restores the stopped direction, so a retry stays a resume.
     #[tokio::test]
