@@ -315,10 +315,59 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
     }
     let now = r.virtual_unix_time();
     let shifted: u64 = (now as i64 + probe.t_offset).max(0) as u64;
-    // MS_PAIR=1: millisecond-consistent timestamps on every channel (wrapper
-    // `t` and `e`, inner `t`, args 4/5), expiry 45s after offer. Overrides the
-    // per-probe timestamp flags: earlier t-ms probes kept `e` in seconds
-    // (expiry before offer), so they could not test millisecond reading.
+    // PRIME=accept|reject: deliver that stanza for the same call id BEFORE the
+    // offer. The miss path scans the message buffer for a prior accept (→14)
+    // or reject (→15) of the call-id; priming decides whether the scan reads
+    // buffer writes at all, isolating "scan never matches" from "scan cannot
+    // match".
+    if let Ok(prime) = std::env::var("PRIME") {
+        let action = match prime.as_str() {
+            "accept" => NodeBuilder::new("accept")
+                .attr("call-creator", caller.clone())
+                .attr("call-id", CALL_ID)
+                .build(),
+            _ => NodeBuilder::new("reject")
+                .attr("call-creator", caller.clone())
+                .attr("call-id", CALL_ID)
+                .attr("count", "0")
+                .build(),
+        };
+        let primer = NodeBuilder::new("call")
+            .attr("from", caller.clone())
+            .attr("id", "0")
+            .attr("call-id", CALL_ID)
+            .attr("call-creator", caller.clone())
+            .attr("t", now.to_string())
+            .children([action])
+            .build();
+        let primer_payload =
+            base64::engine::general_purpose::STANDARD.encode(marshal::marshal(&primer)?);
+        let primed = r.call_embind(
+            "handleIncomingSignalingOffer",
+            &[
+                Value::Str(primer_payload),
+                Value::Str("web".into()),
+                Value::Str("2.3000.0".into()),
+                Value::Str(now.to_string()),
+                Value::Str(now.to_string()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Str(caller.to_string()),
+                Value::Bytes(Vec::new()),
+            ],
+        );
+        r.refuel();
+        println!(
+            "PROBE {}: prime {prime} -> {}",
+            probe.label,
+            match &primed {
+                Ok(value) => format!("{value:?}"),
+                Err(_) => "trap".to_owned(),
+            }
+        );
+    }
+    // MS_PAIR is read here (after priming, before timestamps): millisecond-
+    // consistent timestamps on every channel, expiry 45s after offer.
     let ms_pair = std::env::var("MS_PAIR").is_ok();
     let t_all: u64 = if ms_pair {
         now * 1000
