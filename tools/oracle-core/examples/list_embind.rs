@@ -1,4 +1,5 @@
 //! List every embind-registered function name and arity.
+use anyhow::bail;
 use oracle_core::{Catalog, Runtime, ThreadPolicy, Value};
 
 fn main() -> anyhow::Result<()> {
@@ -19,6 +20,11 @@ fn main() -> anyhow::Result<()> {
         ],
     );
     r.refuel();
+    // Registrations happen during initialization: a failed init would list
+    // whatever happened to register before that point as the complete set.
+    if init.as_ref().ok().and_then(|v| v.as_int()) != Some(0) {
+        bail!("initVoipStack failed: {init:?}");
+    }
     println!("init: {init:?}");
     let mut names: Vec<String> = r
         .embind()

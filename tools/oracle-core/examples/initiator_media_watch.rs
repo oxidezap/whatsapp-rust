@@ -88,8 +88,14 @@ fn main() -> Result<()> {
         ],
     );
     r.refuel();
-    println!("startVoipCall -> {outcome:?}");
-    r.settle(std::time::Duration::from_secs(8));
+    // A failed start or an unsettled engine would present as a valid
+    // zero-media result: fail loudly instead of reporting counts.
+    if outcome.as_ref().ok().and_then(|value| value.as_int()) != Some(0) {
+        bail!("startVoipCall failed: {outcome:?}");
+    }
+    if !r.settle(std::time::Duration::from_secs(8)) {
+        bail!("media observation never quiesced; trace may be partial");
+    }
     r.refuel();
 
     let obs = r.take_media_observations()?;

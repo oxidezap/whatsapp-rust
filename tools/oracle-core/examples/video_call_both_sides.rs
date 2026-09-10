@@ -335,9 +335,18 @@ fn side_b_answerer(
     let quiesced = drain(&mut r);
     println!("side B [{label}]: quiesced={quiesced}");
     let parsed = r.engine_log().iter().any(|l| l.contains("!Offer from:"));
+    // The scheduler's lock watchdog taints the run: handling stops after the
+    // offer marker but before status 0, which would otherwise read as a clean
+    // stall. Bail on exactly that complaint, like the signaling tests.
+    if r.engine_log()
+        .iter()
+        .any(|l| l.contains("check_locking_order"))
+    {
+        bail!("side B [{label}]: lock-order inversion handling the offer; run tainted");
+    }
     // State immediately after delivery, before accept: is the call EVER active,
     // even transiently, or is it born torn down?
-    let immediate = r.call_embind("getCallInfo", &[]).ok();
+    let immediate = r.call_embind("getCallInfo", &[]);
     r.refuel();
     let immediate_state = format!("{immediate:?}");
     println!(
@@ -356,6 +365,10 @@ fn side_b_answerer(
     let mut activation_unknown = !parsed;
     if !parsed {
         println!("side B [{label}]: offer never parsed; answerer behavior unobservable");
+    }
+    if let Err(e) = &immediate {
+        println!("side B [{label}]: initial getCallInfo trapped: {e}");
+        activation_unknown = true;
     }
     while std::time::Instant::now() < deadline {
         match r.call_embind("getCallInfo", &[]) {

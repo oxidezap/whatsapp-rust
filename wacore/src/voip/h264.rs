@@ -542,8 +542,8 @@ pub struct AnnexBAuSplitter {
     /// The buffered bytes already hold a VCL NAL.
     buf_has_vcl: bool,
     /// Start of a trailing all-SEI run after the last VCL NAL, if any: when
-    /// a new picture confirms the boundary, the run rides with it instead of
-    /// the previous AU.
+    /// a group opener or a new picture confirms the boundary, the run rides
+    /// with it instead of the previous AU.
     pending_sei_start: Option<usize>,
 }
 
@@ -576,7 +576,11 @@ impl AnnexBAuSplitter {
             };
             let Some(&nal_byte) = self.buf.get(sc.end) else {
                 // Start code at the buffer edge: wait for the NAL type byte.
+                // This break skips the loop-end check, so enforce the cap here.
                 self.scan_pos = sc.begin;
+                if self.buf.len() > H264_MAX_AU_BYTES {
+                    self.drop_runaway();
+                }
                 break;
             };
             let unit_type = nal_byte & 0x1f;
@@ -610,17 +614,17 @@ impl AnnexBAuSplitter {
                 break;
             }
             let new_picture = picture.unwrap_or(1) == 0;
-            // An SEI run preceding a new picture describes it: cut before the
-            // run so it rides with its picture, not the previous AU. Other
-            // non-VCL runs (SPS/PPS) keep the existing boundary.
-            let sei_handoff = self.pending_sei_start.filter(|&start| {
-                start > 0 && is_vcl && self.buf_has_vcl && new_picture && !self.seen_aud
-            });
-            let cuts_here = sc.begin > 0
-                && (unit_type == NAL_TYPE_AUD
-                    || (!self.seen_aud
-                        && ((unit_type == NAL_TYPE_SPS && self.buf_has_vcl)
-                            || (is_vcl && self.buf_has_vcl && new_picture))));
+            // Every AUD-less cut below. An SEI run preceding a group opener
+            // or a new picture describes what follows: cut before the run so
+            // it rides with its picture, not the previous AU. Other non-VCL
+            // runs (PPS) keep the existing boundary.
+            let audless_cut = !self.seen_aud
+                && ((unit_type == NAL_TYPE_SPS && self.buf_has_vcl)
+                    || (is_vcl && self.buf_has_vcl && new_picture));
+            let sei_handoff = self
+                .pending_sei_start
+                .filter(|&start| start > 0 && audless_cut);
+            let cuts_here = sc.begin > 0 && (unit_type == NAL_TYPE_AUD || audless_cut);
             if cuts_here {
                 let at = sei_handoff.unwrap_or(sc.begin);
                 let rest = self.buf.split_off(at);
@@ -1504,6 +1508,49 @@ mod tests {
         assert!(au_is_keyframe(&got));
     }
 
+    /// An SEI preceding a group opener rides with the group: VCL, SEI, SPS,
+    /// PPS, IDR frames as [VCL] + [SEI, SPS, PPS, IDR], so the metadata keeps
+    /// the timestamp of the picture it describes.
+    #[test]
+    fn au_splitter_sei_rides_with_group_opener() {
+        let vcl = |first: &[u8]| {
+            let mut n = vec![0x41];
+            n.extend_from_slice(first);
+            n.extend((0..30).map(|i| (i % 251) as u8));
+            n
+        };
+        let idr = vec![0x65, 0x80, 0x01, 0x02];
+        let (first, sei, sps, pps) = (
+            vcl(&[0x80]),
+            vec![0x06, 0x05, 0x11, 0x22],
+            nal(7, 4),
+            nal(8, 4),
+        );
+        let stream = au_from_nals(&[
+            first.clone(),
+            sei.clone(),
+            sps.clone(),
+            pps.clone(),
+            idr.clone(),
+        ]);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream, &mut out);
+        assert_eq!(out, vec![au_from_nals(&[first])]);
+        let rest = s.finish().expect("trailing AU");
+        assert_eq!(
+            rest,
+            au_from_nals(&[sei, sps.clone(), pps.clone(), idr.clone()])
+        );
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&rest, &mut payloads);
+        assert_eq!(
+            depacketize_all(payloads.iter()),
+            Some(au_from_nals(&[sps, pps, idr.clone()]))
+        );
+        assert!(au_is_keyframe(&rest));
+    }
+
     /// An SEI preceding a new picture rides with it: VCL, SEI, VCL frames as
     /// [VCL] + [SEI, VCL], so the metadata keeps its picture's timestamp.
     /// Pre-VCL now, the default packetizer drops the SEI instead of sending
@@ -1530,6 +1577,26 @@ mod tests {
         assert_eq!(
             depacketize_all(payloads.iter()),
             Some(au_from_nals(&[second]))
+        );
+    }
+
+    /// Every push ends exactly on a start code here, so only the
+    /// wait-for-type-byte exit runs: it must enforce the cap like every
+    /// other exit, or the buffer grows without bound and `finish` returns it.
+    #[test]
+    fn au_splitter_trailing_start_code_is_capped() {
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        let mut chunk = vec![0xabu8; 64 * 1024];
+        chunk.extend_from_slice(&START_CODE);
+        for _ in 0..80 {
+            s.push(&chunk, &mut out);
+        }
+        assert!(out.is_empty());
+        assert!(
+            s.buf.len() <= H264_MAX_AU_BYTES,
+            "trailing-start-code stream must be capped, got {}",
+            s.buf.len()
         );
     }
 
