@@ -290,7 +290,7 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
                 Value::Bytes(Vec::new()),
             ],
         )
-        .ok();
+        .with_context(|| "REPLICATE_LOAD: settings offer delivery trapped")?;
         r.refuel();
         r.settle(std::time::Duration::from_secs(3));
         r.refuel();
@@ -488,7 +488,13 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
     // DELIVER_VIA=message routes through the generic `handleIncomingSignalingMessage`
     // entry (payload, platform, version, e, t, bool, caller, bytes) instead of
     // the offer-specific one: same bytes, different router.
-    let via_message = std::env::var("DELIVER_VIA").is_ok_and(|v| v == "message");
+    // Unknown values fail loudly: a misspelled selector must not silently
+    // run the wrong delivery path and report its evidence.
+    let via_message = match std::env::var("DELIVER_VIA").as_deref() {
+        Err(_) => false,
+        Ok("message") => true,
+        Ok(other) => bail!("unknown DELIVER_VIA={other:?}: expected message"),
+    };
     // DELIVER_TWICE=1 feeds the same offer again on the same engine: the
     // message-buffer scan decides 14/15/27 by what it finds buffered, so a
     // second delivery meeting the first one's record must behave differently

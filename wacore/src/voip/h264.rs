@@ -1532,6 +1532,27 @@ mod tests {
         );
     }
 
+    /// A picture following a handed-off SEI still closes its own AU: the
+    /// handoff retains the buffered VCL state, so VCL3 splits away from
+    /// [SEI, VCL2] instead of merging two pictures under one timestamp.
+    #[test]
+    fn au_splitter_picture_after_sei_handoff_still_cuts() {
+        let vcl = |first: &[u8]| {
+            let mut n = vec![0x41];
+            n.extend_from_slice(first);
+            n.extend((0..30).map(|i| (i % 251) as u8));
+            n
+        };
+        let (a, b, c) = (vcl(&[0x80]), vcl(&[0x80]), vcl(&[0x80]));
+        let sei = vec![0x06, 0x05, 0x11, 0x22];
+        let stream = au_from_nals(&[a.clone(), sei.clone(), b.clone(), c.clone()]);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream, &mut out);
+        assert_eq!(out, vec![au_from_nals(&[a]), au_from_nals(&[sei, b])]);
+        assert_eq!(s.finish(), Some(au_from_nals(&[c])));
+    }
+
     /// `finish` leaves no framing facts behind: a splitter reused for a new
     /// stream neither keeps a stale AUD mode nor splits the new stream's
     /// leading parameter sets.

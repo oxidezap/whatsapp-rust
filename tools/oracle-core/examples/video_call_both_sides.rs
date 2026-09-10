@@ -278,6 +278,8 @@ fn side_a_initiator(bytes: &[u8]) -> Result<(Node, String)> {
 /// what the engine emitted plus whether the offer parsed. Returns the emitted
 /// stanzas and whether the run quiesced throughout: without quiescence a
 /// missing accept is inconclusive host scheduling, not a protocol stall.
+/// The third element reports whether activation was ever unobservable
+/// (trapped or misshapen state queries), which is likewise inconclusive.
 ///
 /// `identity` is the device under test: the raw probe runs the engine as the
 /// peer (the offer's true recipient), the census probe as self.
@@ -287,7 +289,7 @@ fn side_b_answerer(
     caller: Jid,
     body: Vec<Node>,
     label: &str,
-) -> Result<(Vec<Node>, bool)> {
+) -> Result<(Vec<Node>, bool, bool)> {
     let mut r = start(bytes, identity)?;
     await_event_thread(&mut r, label)?;
     let now = r.virtual_unix_time();
@@ -342,13 +344,25 @@ fn side_b_answerer(
     // so a never-activating offer still terminates the run with a verdict.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let mut activated = false;
+    // A trapped or misshapen state query is not an empty state: it means
+    // activation was never successfully observed, which the final verdict
+    // must carry as unknown rather than a clean stall.
+    let mut activation_unknown = false;
     while std::time::Instant::now() < deadline {
         match r.call_embind("getCallInfo", &[]) {
             Ok(Value::Str(s)) if !s.is_empty() => {
                 activated = true;
                 break;
             }
-            _ => {}
+            Ok(Value::Str(_)) => {}
+            Ok(other) => {
+                println!("side B [{label}]: unexpected getCallInfo shape: {other:?}");
+                activation_unknown = true;
+            }
+            Err(e) => {
+                println!("side B [{label}]: getCallInfo trapped: {e}");
+                activation_unknown = true;
+            }
         }
         r.process_queued_calls();
         r.refuel();
@@ -371,7 +385,7 @@ fn side_b_answerer(
     for line in r.engine_log().iter().rev().take(12).rev() {
         println!("    log: {}", line.trim());
     }
-    Ok((emitted, quiesced && settled))
+    Ok((emitted, quiesced && settled, activation_unknown))
 }
 
 fn voip_settings_sibling() -> Node {
@@ -447,7 +461,7 @@ fn main() -> Result<()> {
     // delivered to an engine running as the peer — the offer's true recipient —
     // with Side A as the incoming caller.
     let peer_caller = Jid::new("99887766554433", Server::Lid);
-    let (emitted_raw, raw_quiet) = side_b_answerer(
+    let (emitted_raw, raw_quiet, _raw_unknown) = side_b_answerer(
         &bytes,
         [
             "11223344556677@c.us",
@@ -466,7 +480,7 @@ fn main() -> Result<()> {
     // Side B, probe 2: census shape with the vendor's own <video> child,
     // delivered to an engine running as self with the peer as caller.
     let census_caller = Jid::new("11223344556677", Server::Lid);
-    let (emitted, quiet) = side_b_answerer(
+    let (emitted, quiet, activation_unknown) = side_b_answerer(
         &bytes,
         [SELF, SELF_DEVICE, SELF_LID],
         census_caller.clone(),
@@ -510,11 +524,11 @@ fn main() -> Result<()> {
                 Some(d) => println!("VERDICT answerer: DIVERGENCE: {d}"),
             }
         }
-        None if quiet => {
+        None if quiet && !activation_unknown => {
             println!("VERDICT answerer: STALL, no <accept> emitted; nothing to compare")
         }
         None => println!(
-            "VERDICT answerer: INCONCLUSIVE, no <accept> emitted without quiescence; not a protocol stall"
+            "VERDICT answerer: INCONCLUSIVE, no <accept> emitted without clean activation observation; not a protocol stall"
         ),
     }
 
