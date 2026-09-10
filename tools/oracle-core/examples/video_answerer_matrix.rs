@@ -351,6 +351,11 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
     // The wrapper carries a stanza `id`: the engine files the record under it
     // (an idless record keeps transaction_id -1), and the pinned IR requires
     // it on inbound `<call>`.
+    // ROUTED=1 addresses the stanza like a real server delivery: `recipient`
+    // (this device), `participant` (caller device) and `sender_lid`. The
+    // router may refuse to file an offer it cannot address to itself, and no
+    // probe has ever carried these.
+    let routed = std::env::var("ROUTED").is_ok();
     let mut wrapper = NodeBuilder::new("call")
         .attr("from", caller.clone())
         .attr("id", "1")
@@ -365,6 +370,14 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         .attr("t", t_all.to_string());
     if probe.expiry || ms_pair {
         wrapper = wrapper.attr("e", e_all.to_string());
+    }
+    if routed {
+        // Self LID from init, caller device from the probe: a server-routed
+        // inbound stanza names both ends.
+        wrapper = wrapper
+            .attr("recipient", "99887766554433:0@lid")
+            .attr("participant", caller.with_device(caller.device).to_string())
+            .attr("sender_lid", "11223344556677@lid");
     }
     let wrapper = wrapper
         .children([
