@@ -984,4 +984,86 @@ mod tests {
         let f = VideoFrame::new(au_from_nals(&[nal(1, 30)]));
         assert!(!f.keyframe);
     }
+
+    /// Decoder keyframe gate (WhatsApp decoder): every IDR group must open
+    /// with SPS at NALU index 0 plus PPS, SPS bytes constant all call, no
+    /// SEI/AUD at index 0. Round-trips three IDR groups with one constant SPS
+    /// through the real send path (`packetize_au`, including an FU-A-split
+    /// IDR) into the depacketizer and pins the emitted order.
+    #[test]
+    fn outbound_idr_groups_open_sps_pps_idr_with_constant_sps() {
+        let sps = nal(7, 24);
+        let pps = nal(8, 8);
+        // Two IDR groups sharing one SPS, with a delta frame between: the
+        // stream shape a live call repeats.
+        let groups = [
+            au_from_nals(&[sps.clone(), pps.clone(), nal(5, 2000)]),
+            au_from_nals(&[nal(1, 60)]),
+            au_from_nals(&[sps.clone(), pps.clone(), nal(5, 900)]),
+        ];
+        for au in &groups {
+            let mut payloads = PacketizedAu::default();
+            packetize_au(au, &mut payloads);
+            let got = depacketize_all(payloads.iter()).expect("reassembled AU");
+            let nals: Vec<_> = split_annexb(&got).collect();
+            let types: Vec<u8> = nals.iter().map(|n| nal_unit_type(n)).collect();
+            if au_has_idr(au) {
+                assert!(
+                    types.len() >= 3,
+                    "an IDR group must keep SPS, PPS and IDR, got {types:?}"
+                );
+                assert_eq!(
+                    types[0], 7,
+                    "SPS must open the IDR group at NALU index 0, got {types:?}"
+                );
+                assert_eq!(types[1], 8, "PPS must follow SPS at index 1, got {types:?}");
+                assert!(
+                    types.iter().any(|t| *t == 5),
+                    "the IDR slice must survive, got {types:?}"
+                );
+                assert!(
+                    !types.iter().any(|t| *t == 9),
+                    "no AUD may reach the wire, got {types:?}"
+                );
+                assert_eq!(
+                    nals[0],
+                    sps.as_slice(),
+                    "SPS bytes must stay constant across the call"
+                );
+            } else {
+                assert_eq!(types, [1], "delta frames pass through untouched");
+            }
+        }
+    }
+
+    /// Encoder-only AUDs never reach the wire: the packetizer drops them so a
+    /// supplier-side AUD cannot take NALU index 0 from SPS.
+    #[test]
+    fn outbound_aud_first_input_still_opens_sps() {
+        let sps = nal(7, 24);
+        let au = au_from_nals(&[nal(9, 2), sps.clone(), nal(8, 8), nal(5, 100)]);
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&au, &mut payloads);
+        let got = depacketize_all(payloads.iter()).expect("reassembled AU");
+        let types: Vec<u8> = split_annexb(&got).map(nal_unit_type).collect();
+        assert_eq!(types[0], 7, "AUD dropped, SPS opens, got {types:?}");
+    }
+
+    /// Documents current passthrough, not approved shape: an SEI-first input
+    /// stays SEI-first on the wire — the packetizer preserves supplier order
+    /// and only AUD is filtered. If a live encoder emits SEI-first groups,
+    /// the peer decoder drops the IDR; fixing that belongs at the source (or
+    /// in packetize policy, which is a product decision), not in this test.
+    #[test]
+    fn outbound_sei_first_input_stays_sei_first() {
+        let au = au_from_nals(&[nal(6, 12), nal(7, 24), nal(8, 8), nal(5, 100)]);
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&au, &mut payloads);
+        let got = depacketize_all(payloads.iter()).expect("reassembled AU");
+        let types: Vec<u8> = split_annexb(&got).map(nal_unit_type).collect();
+        assert_eq!(
+            types[0], 6,
+            "SEI currently passes through first, got {types:?}"
+        );
+    }
 }
