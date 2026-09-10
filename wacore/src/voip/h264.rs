@@ -632,8 +632,9 @@ impl AnnexBAuSplitter {
                     // The current NAL was fully evaluated above: resume past
                     // it, or it cuts itself away from its SEI run on rescan.
                     // `nal_end` is in old-buffer offsets; the new buffer
-                    // starts at `at`.
-                    self.scan_pos = nal_end - at;
+                    // starts at `at`. Keep the usual three-byte overlap so a
+                    // start code split across pushes is still found.
+                    self.scan_pos = (nal_end - at).saturating_sub(3);
                 } else {
                     self.scan_pos = 0;
                 }
@@ -1530,6 +1531,37 @@ mod tests {
             depacketize_all(payloads.iter()),
             Some(au_from_nals(&[second]))
         );
+    }
+
+    /// A start code split across pushes after a handoff is still found: the
+    /// resume keeps the usual three-byte overlap instead of skipping to the
+    /// end and merging the next picture into the current AU.
+    #[test]
+    fn au_splitter_handoff_keeps_start_code_overlap() {
+        let vcl = |first: &[u8]| {
+            let mut n = vec![0x41];
+            n.extend_from_slice(first);
+            n.extend((0..30).map(|i| (i % 251) as u8));
+            n
+        };
+        let (a, b, c) = (vcl(&[0x80]), vcl(&[0x80]), vcl(&[0x80]));
+        let sei = vec![0x06, 0x05, 0x11, 0x22];
+        let mut part1 = au_from_nals(&[a.clone(), sei.clone()]);
+        part1.extend_from_slice(&START_CODE);
+        part1.extend_from_slice(&b);
+        // Trailing start-code prefix; part2 completes it into c's start code.
+        part1.extend_from_slice(&[0x00, 0x00]);
+        let mut part2 = vec![0x00, 0x01];
+        part2.extend_from_slice(&c);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&part1, &mut out);
+        let first_au = au_from_nals(&[a]);
+        let second_au = au_from_nals(&[sei, b]);
+        assert_eq!(out, vec![first_au.clone()]);
+        s.push(&part2, &mut out);
+        assert_eq!(out, vec![first_au, second_au]);
+        assert_eq!(s.finish(), Some(au_from_nals(&[c])));
     }
 
     /// A picture following a handed-off SEI still closes its own AU: the
