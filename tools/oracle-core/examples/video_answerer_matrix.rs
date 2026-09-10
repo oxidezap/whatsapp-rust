@@ -18,7 +18,7 @@
 
 mod common;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use oracle_core::{Runtime, Value};
 use sha2::{Digest, Sha256};
@@ -259,8 +259,8 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         if !gated {
-            println!(
-                "PROBE {}: event thread never announced itself; results suspect",
+            bail!(
+                "PROBE {}: event thread never announced itself; delivering into the startup gap reads as refusal",
                 probe.label
             );
         }
@@ -686,10 +686,12 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         }
         return Ok(());
     }
-    let accepted = r.call_embind(
-        "acceptCall",
-        &[Value::Bool(probe.accept.0), Value::Bool(probe.accept.1)],
-    );
+    let accepted = r
+        .call_embind(
+            "acceptCall",
+            &[Value::Bool(probe.accept.0), Value::Bool(probe.accept.1)],
+        )
+        .with_context(|| format!("PROBE {}: acceptCall trapped", probe.label))?;
     r.refuel();
     // `settle` drains the proxy queue each tick, but a `false` return means it
     // never quiesced: reporting a stall then turns harness timing into a

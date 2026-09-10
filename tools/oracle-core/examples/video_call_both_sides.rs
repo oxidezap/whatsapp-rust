@@ -275,7 +275,9 @@ fn side_a_initiator(bytes: &[u8]) -> Result<(Node, String)> {
 }
 
 /// Side B: deliver one inbound `<call>` body, attempt `acceptCall`, and report
-/// what the engine emitted plus whether the offer parsed.
+/// what the engine emitted plus whether the offer parsed. Returns the emitted
+/// stanzas and whether the run quiesced throughout: without quiescence a
+/// missing accept is inconclusive host scheduling, not a protocol stall.
 ///
 /// `identity` is the device under test: the raw probe runs the engine as the
 /// peer (the offer's true recipient), the census probe as self.
@@ -285,7 +287,7 @@ fn side_b_answerer(
     caller: Jid,
     body: Vec<Node>,
     label: &str,
-) -> Result<Vec<Node>> {
+) -> Result<(Vec<Node>, bool)> {
     let mut r = start(bytes, identity)?;
     await_event_thread(&mut r, label)?;
     let now = r.virtual_unix_time();
@@ -369,7 +371,7 @@ fn side_b_answerer(
     for line in r.engine_log().iter().rev().take(12).rev() {
         println!("    log: {}", line.trim());
     }
-    Ok(emitted)
+    Ok((emitted, quiesced && settled))
 }
 
 fn voip_settings_sibling() -> Node {
@@ -445,7 +447,7 @@ fn main() -> Result<()> {
     // delivered to an engine running as the peer — the offer's true recipient —
     // with Side A as the incoming caller.
     let peer_caller = Jid::new("99887766554433", Server::Lid);
-    let emitted_raw = side_b_answerer(
+    let (emitted_raw, raw_quiet) = side_b_answerer(
         &bytes,
         [
             "11223344556677@c.us",
@@ -457,14 +459,14 @@ fn main() -> Result<()> {
         "raw vendor offer",
     )?;
     println!(
-        "VERDICT answerer/raw: emitted {} stanza(s)",
+        "VERDICT answerer/raw: emitted {} stanza(s), quiesced={raw_quiet}",
         emitted_raw.len()
     );
 
     // Side B, probe 2: census shape with the vendor's own <video> child,
     // delivered to an engine running as self with the peer as caller.
     let census_caller = Jid::new("11223344556677", Server::Lid);
-    let emitted = side_b_answerer(
+    let (emitted, quiet) = side_b_answerer(
         &bytes,
         [SELF, SELF_DEVICE, SELF_LID],
         census_caller.clone(),
@@ -508,7 +510,12 @@ fn main() -> Result<()> {
                 Some(d) => println!("VERDICT answerer: DIVERGENCE: {d}"),
             }
         }
-        None => println!("VERDICT answerer: STALL, no <accept> emitted; nothing to compare"),
+        None if quiet => {
+            println!("VERDICT answerer: STALL, no <accept> emitted; nothing to compare")
+        }
+        None => println!(
+            "VERDICT answerer: INCONCLUSIVE, no <accept> emitted without quiescence; not a protocol stall"
+        ),
     }
 
     println!("side A call state: {}", clip(&a_state, 300));

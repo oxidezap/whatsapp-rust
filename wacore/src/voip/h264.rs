@@ -541,6 +541,10 @@ pub struct AnnexBAuSplitter {
     seen_aud: bool,
     /// The buffered bytes already hold a VCL NAL.
     buf_has_vcl: bool,
+    /// Start of a trailing all-SEI run after the last VCL NAL, if any: when
+    /// a new picture confirms the boundary, the run rides with it instead of
+    /// the previous AU.
+    pending_sei_start: Option<usize>,
 }
 
 impl AnnexBAuSplitter {
@@ -553,6 +557,7 @@ impl AnnexBAuSplitter {
         self.scan_pos = 0;
         self.seen_aud = false;
         self.buf_has_vcl = false;
+        self.pending_sei_start = None;
     }
 
     pub fn push(&mut self, data: &[u8], out: &mut Vec<Vec<u8>>) {
@@ -605,25 +610,49 @@ impl AnnexBAuSplitter {
                 break;
             }
             let new_picture = picture.unwrap_or(1) == 0;
+            // An SEI run preceding a new picture describes it: cut before the
+            // run so it rides with its picture, not the previous AU. Other
+            // non-VCL runs (SPS/PPS) keep the existing boundary.
+            let sei_handoff = self.pending_sei_start.filter(|&start| {
+                start > 0 && is_vcl && self.buf_has_vcl && new_picture && !self.seen_aud
+            });
             let cuts_here = sc.begin > 0
                 && (unit_type == NAL_TYPE_AUD
                     || (!self.seen_aud
                         && ((unit_type == NAL_TYPE_SPS && self.buf_has_vcl)
                             || (is_vcl && self.buf_has_vcl && new_picture))));
             if cuts_here {
-                let rest = self.buf.split_off(sc.begin);
+                let at = sei_handoff.unwrap_or(sc.begin);
+                let rest = self.buf.split_off(at);
                 let au = std::mem::replace(&mut self.buf, rest);
                 out.push(au);
-                self.scan_pos = 0;
                 self.buf_has_vcl = false;
+                self.pending_sei_start = None;
+                if sei_handoff.is_some() {
+                    // The current NAL was fully evaluated above: resume past
+                    // it, or it cuts itself away from its SEI run on rescan.
+                    // `nal_end` is in old-buffer offsets; the new buffer
+                    // starts at `at`.
+                    self.scan_pos = nal_end - at;
+                } else {
+                    self.scan_pos = 0;
+                }
             } else {
                 self.scan_pos = sc.end;
             }
             // Record this NAL for the next boundary decision: the flag update
             // runs after the cut check above, so a group opener never closes
-            // the group its own parameter sets belong to.
+            // the group its own parameter sets belong to. A VCL NAL ends any
+            // SEI run; any other non-VCL NAL breaks it.
             if is_vcl {
                 self.buf_has_vcl = true;
+                self.pending_sei_start = None;
+            } else if unit_type == NAL_TYPE_SEI {
+                if self.pending_sei_start.is_none() {
+                    self.pending_sei_start = Some(sc.begin);
+                }
+            } else {
+                self.pending_sei_start = None;
             }
             if self.buf.len() > H264_MAX_AU_BYTES {
                 // Runaway buffer means the stream has no AUDs; dropping is
@@ -640,6 +669,7 @@ impl AnnexBAuSplitter {
         self.scan_pos = 0;
         self.seen_aud = false;
         self.buf_has_vcl = false;
+        self.pending_sei_start = None;
         if self.buf.is_empty() {
             None
         } else {
@@ -1471,6 +1501,35 @@ mod tests {
         let got = depacketize_all(payloads.iter()).expect("AU must reassemble");
         assert_eq!(got, au);
         assert!(au_is_keyframe(&got));
+    }
+
+    /// An SEI preceding a new picture rides with it: VCL, SEI, VCL frames as
+    /// [VCL] + [SEI, VCL], so the metadata keeps its picture's timestamp.
+    /// Pre-VCL now, the default packetizer drops the SEI instead of sending
+    /// it on the previous picture's timestamp.
+    #[test]
+    fn au_splitter_sei_rides_with_following_picture() {
+        let vcl = |first: &[u8]| {
+            let mut n = vec![0x41];
+            n.extend_from_slice(first);
+            n.extend((0..30).map(|i| (i % 251) as u8));
+            n
+        };
+        let (first, second) = (vcl(&[0x80]), vcl(&[0x80]));
+        let sei = vec![0x06, 0x05, 0x11, 0x22];
+        let stream = au_from_nals(&[first.clone(), sei.clone(), second.clone()]);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream, &mut out);
+        assert_eq!(out, vec![au_from_nals(&[first])]);
+        let rest = s.finish().expect("trailing AU");
+        assert_eq!(rest, au_from_nals(&[sei, second.clone()]));
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&rest, &mut payloads);
+        assert_eq!(
+            depacketize_all(payloads.iter()),
+            Some(au_from_nals(&[second]))
+        );
     }
 
     /// `finish` leaves no framing facts behind: a splitter reused for a new
