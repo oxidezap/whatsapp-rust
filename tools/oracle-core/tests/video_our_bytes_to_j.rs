@@ -91,6 +91,21 @@ fn our_idr_stream_through_j_parser_and_constructor() -> Result<()> {
     let second_len = u16::from_be_bytes([second_len[0], second_len[1]]) as usize;
     assert_eq!(nal_unit_type(&rest[..second_len]), 8, "PPS follows SPS");
     assert_eq!(rest.len(), second_len, "STAP-A holds exactly SPS then PPS");
+    for (i, payload) in payloads.iter().enumerate().skip(1) {
+        assert_eq!(nal_unit_type(payload), 28, "IDR rides FU-A, packet {i}");
+        let fu = payload[1];
+        assert_eq!(fu & 0x1f, 5, "FU-A carries the IDR slice, packet {i}");
+        assert_eq!(
+            fu & 0x80 != 0,
+            i == 1,
+            "S bit only on the first fragment, packet {i}"
+        );
+        assert_eq!(
+            fu & 0x40 != 0,
+            i == payloads.len() - 1,
+            "E bit only on the last fragment, packet {i}"
+        );
+    }
     let mut stream = VideoRtpStream::new(0x4996_ed22, VIDEO_TS_STRIDE_15FPS).unwrap();
     let last = payloads.len() - 1;
     let wires: Vec<Vec<u8>> = payloads
