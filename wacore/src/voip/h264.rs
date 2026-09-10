@@ -573,11 +573,19 @@ impl AnnexBAuSplitter {
             // previous VCL NAL is buffered, so parameter sets never separate
             // from their slices. Evaluated before recording this NAL below.
             // The picture check reads this NAL alone (up to the next start
-            // code), never bytes of a following NAL.
+            // code), never bytes of a following NAL. When the NAL runs to the
+            // buffer end and its picture bit is unreadable, the header may
+            // simply not have arrived yet: rewind and wait for more bytes
+            // rather than advancing past a boundary forever.
             let nal_end = find_start_code(&self.buf, sc.end)
                 .map(|next| next.begin)
                 .unwrap_or(self.buf.len());
-            let new_picture = first_mb_in_slice(&self.buf[sc.end..nal_end]).unwrap_or(1) == 0;
+            let picture = first_mb_in_slice(&self.buf[sc.end..nal_end]);
+            if is_vcl && picture.is_none() && nal_end == self.buf.len() {
+                self.scan_pos = sc.begin;
+                break;
+            }
+            let new_picture = picture.unwrap_or(1) == 0;
             let cuts_here = sc.begin > 0
                 && (unit_type == NAL_TYPE_AUD
                     || (!self.seen_aud
@@ -1311,5 +1319,32 @@ mod tests {
         s.push(&multi, &mut out);
         assert!(out.is_empty(), "one picture stays one AU");
         assert_eq!(s.finish(), Some(multi));
+    }
+
+    /// A VCL NAL split across read chunks still frames: when the slice header
+    /// has not fully arrived the splitter rewinds and rechecks on the next
+    /// push instead of advancing past the boundary forever.
+    #[test]
+    fn au_splitter_rechecks_partial_slice_header() {
+        let pic = |first_mb: &[u8], len: usize| {
+            let mut n = vec![0x41];
+            n.extend_from_slice(first_mb);
+            n.extend((0..len.saturating_sub(1 + first_mb.len())).map(|i| (i % 251) as u8));
+            n
+        };
+        let au1 = au_from_nals(&[pic(&[0x80], 30)]);
+        let au2 = au_from_nals(&[pic(&[0x80], 30)]);
+        let mut stream = au1.clone();
+        stream.extend_from_slice(&au2);
+        // Split mid-slice-header of the second picture: the type byte (0x41)
+        // arrives alone, the header bit with the next chunk.
+        let cut = au1.len() + 3 + 1;
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream[..cut], &mut out);
+        assert!(out.is_empty(), "nothing decidable yet");
+        s.push(&stream[cut..], &mut out);
+        assert_eq!(out, vec![au1]);
+        assert_eq!(s.finish(), Some(au2));
     }
 }
