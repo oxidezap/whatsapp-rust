@@ -608,3 +608,41 @@ async fn peer_video_metadata_reports_routed_sender_and_supplied_creator_without_
     fixture.shutdown().await?;
     Ok(())
 }
+
+// The upgrade timeout is a cross-crate contract: clients arm their own
+// answer-wait against it, so it is published rather than hardcoded twice.
+#[test]
+fn upgrade_timeout_is_published_for_client_coordination() {
+    assert_eq!(
+        whatsapp_rust::voip::VIDEO_UPGRADE_TIMEOUT,
+        Duration::from_secs(5)
+    );
+}
+
+// Clients verify negotiation read-back through the handle: a video offer
+// starts both directions enabled, an audio offer both disabled.
+#[tokio::test]
+async fn handle_reports_negotiation_states_for_read_back() -> Result<()> {
+    use wacore::types::call::VideoState;
+
+    let fixture = CallFixture::new().await?;
+    let handle = dormant(&fixture).await?;
+    assert_eq!(
+        handle.video_states(),
+        Some((VideoState::Enabled, VideoState::Enabled)),
+        "a video offer starts both directions enabled"
+    );
+    fixture.shutdown().await?;
+
+    let fixture = CallFixture::new().await?;
+    let starting = start_with_video(&fixture, false);
+    fixture.next_offer().await?.complete()?;
+    let handle = starting.await??;
+    assert_eq!(
+        handle.video_states(),
+        Some((VideoState::Disabled, VideoState::Disabled)),
+        "an audio offer starts both directions disabled"
+    );
+    fixture.shutdown().await?;
+    Ok(())
+}

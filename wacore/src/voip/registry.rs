@@ -2658,6 +2658,12 @@ impl CallRegistry {
     }
 
     /// Begin a local upgrade and return its timeout epoch.
+    ///
+    /// Refuses when the peer direction is already video: the receiver ignores
+    /// an upgrade request against its active direction, so asking would only
+    /// arm the upgrade timeout, which then cancels both directions. Re-add a
+    /// stopped direction inside an already-video call without the handshake
+    /// instead.
     pub fn begin_local_video_request(&self, call_id: &str, generation: u64) -> Option<u64> {
         let mut map = self.active_calls();
         let entry = map
@@ -2665,6 +2671,7 @@ impl CallRegistry {
             .filter(|entry| entry.generation == generation)?;
         if !entry.video.self_state.is_inactive_for_call_mode()
             || entry.video.pending_peer_request.is_some()
+            || !entry.video.peer_state.is_inactive_for_call_mode()
         {
             return None;
         }
@@ -2685,8 +2692,9 @@ impl CallRegistry {
     /// inert (its epoch no longer matches). Returns `None` unless a local
     /// upgrade is actually pending: with no outstanding request there is
     /// nothing to re-ask, and states like fresh-Enabled stay on the begin
-    /// path. Pair with [`Self::rollback_re_request`] when the re-ask never
-    /// reaches the peer.
+    /// path. Like begin, it refuses once the peer direction is video: the
+    /// retry is as unanswerable as the ask. Pair with
+    /// [`Self::rollback_re_request`] when the re-ask never reaches the peer.
     pub fn re_request_local_video(
         &self,
         call_id: &str,
@@ -2698,6 +2706,7 @@ impl CallRegistry {
             .filter(|entry| entry.generation == generation)?;
         if entry.video.self_state.is_inactive_for_call_mode()
             || entry.video.pending_self_request.is_none()
+            || !entry.video.peer_state.is_inactive_for_call_mode()
         {
             return None;
         }
@@ -2783,6 +2792,38 @@ impl CallRegistry {
         true
     }
 
+    /// Stand our unanswered upgrade down without touching the peer's direction.
+    ///
+    /// The upgrade timeout's direction-local half: our request went to a peer
+    /// that stayed video (it ignores requests against its active direction),
+    /// so there is no parked peer request to withdraw with
+    /// `UpgradeCancelByTimeout` -- only our own pending request to clear. Our
+    /// direction reads `Stopped` afterwards (we are not sending), which keeps
+    /// it re-addable, and the call stays video on the peer's direction. The
+    /// caller announces `Stopped`, which the peer applies without touching
+    /// its own direction. Returns false unless our request is still the
+    /// outstanding one against an active peer; the genuine kill
+    /// ([`Self::end_local_video_request`]) owns every other case.
+    pub fn abort_local_video_request(&self, call_id: &str, generation: u64, epoch: u64) -> bool {
+        let mut map = self.active_calls();
+        let Some(entry) = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return false;
+        };
+        if entry.video.pending_self_request != Some(epoch)
+            || !entry.video.self_state.is_upgrade_request()
+            || entry.video.peer_state.is_inactive_for_call_mode()
+        {
+            return false;
+        }
+        entry.video.self_state = VideoState::Stopped;
+        entry.video.pending_self_request = None;
+        entry.session.is_video = entry.video.is_video();
+        true
+    }
+
     /// Clear both directions after a failed handshake or full downgrade.
     pub fn reset_video(&self, call_id: &str, generation: u64) -> bool {
         let mut map = self.active_calls();
@@ -2811,6 +2852,58 @@ impl CallRegistry {
         };
         entry.video.self_state = VideoState::Stopped;
         entry.video.pending_self_request = None;
+        entry.session.is_video = entry.video.is_video();
+        true
+    }
+
+    /// Re-add our direction inside an already-video call and return its
+    /// previous state for rollback.
+    ///
+    /// The mute-path re-add: no handshake epoch is minted and no timeout is
+    /// armed, because the call is already video and the peer applies a bare
+    /// `Enabled` unconditionally. Allowed only with no upgrade outstanding in
+    /// either direction and our direction stopped (or never enabled while the
+    /// peer's is): a fresh upgrade belongs on
+    /// [`Self::begin_local_video_request`], and a pending peer request belongs
+    /// on [`Self::complete_peer_video_request`], which answers it explicitly.
+    pub fn resume_local_video(&self, call_id: &str, generation: u64) -> Option<VideoState> {
+        let mut map = self.active_calls();
+        let entry = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)?;
+        if entry.video.pending_self_request.is_some() || entry.video.pending_peer_request.is_some()
+        {
+            return None;
+        }
+        let resumable = entry.video.self_state == VideoState::Stopped
+            || (entry.video.self_state == VideoState::Disabled
+                && entry.video.peer_state == VideoState::Enabled);
+        if !resumable {
+            return None;
+        }
+        let previous = entry.video.self_state;
+        entry.video.self_state = VideoState::Enabled;
+        entry.session.is_video = entry.video.is_video();
+        Some(previous)
+    }
+
+    /// Return our direction to `state` after a failed resume whose stanza
+    /// never reached the peer, so a retry stays a resume instead of wedging
+    /// on an enabled direction that is not sending.
+    pub fn restore_self_video_state(
+        &self,
+        call_id: &str,
+        generation: u64,
+        state: VideoState,
+    ) -> bool {
+        let mut map = self.active_calls();
+        let Some(entry) = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return false;
+        };
+        entry.video.self_state = state;
         entry.session.is_video = entry.video.is_video();
         true
     }
@@ -5287,6 +5380,161 @@ mod tests {
         assert!(!reg.snapshot("CID").expect("session").is_video);
     }
 
+    // An upgrade asked of a peer that is already video is unanswerable: the
+    // receiver ignores it against its active direction, so beginning must
+    // refuse rather than arm a timeout that kills both directions.
+    #[test]
+    fn begin_refuses_an_upgrade_the_peer_cannot_answer() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        assert!(matches!(
+            reg.apply_peer_video_state("CID", generation, VideoState::Paused),
+            PeerVideoTransition::Applied { .. }
+        ));
+        assert_eq!(
+            reg.video_states("CID", generation),
+            Some((VideoState::Disabled, VideoState::Paused))
+        );
+        assert!(
+            reg.begin_local_video_request("CID", generation).is_none(),
+            "a paused peer is still video: the 11 would be ignored and the timeout would kill both directions"
+        );
+    }
+
+    // Same hole one step later: the peer went video mid-handshake, so
+    // re-asking is as unanswerable as asking, and the refusal must leave the
+    // outstanding request to the timeout's direction-local path.
+    #[test]
+    fn re_request_refuses_when_the_peer_went_video_mid_handshake() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        let first = reg
+            .begin_local_video_request("CID", generation)
+            .expect("begin on an audio call");
+        assert!(matches!(
+            reg.apply_peer_video_state("CID", generation, VideoState::Paused),
+            PeerVideoTransition::Applied { .. }
+        ));
+        assert!(
+            reg.re_request_local_video("CID", generation).is_none(),
+            "re-asking an active peer is as unanswerable as asking"
+        );
+        assert!(
+            reg.end_local_video_request("CID", generation, first),
+            "the refusal must not disturb the outstanding request"
+        );
+    }
+
+    // The timeout's direction-local half: our request went unanswered against
+    // a peer that stayed video, so only our direction stands down. The peer
+    // keeps its direction, the call stays video, and the genuine kill finds
+    // nothing left to cancel.
+    #[test]
+    fn abort_stands_down_only_our_direction_against_an_active_peer() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        let epoch = reg
+            .begin_local_video_request("CID", generation)
+            .expect("begin on an audio call");
+        assert!(!reg.abort_local_video_request("CID", generation, epoch.wrapping_add(1)));
+        assert!(!reg.abort_local_video_request("CID", generation, epoch));
+        assert!(matches!(
+            reg.apply_peer_video_state("CID", generation, VideoState::Paused),
+            PeerVideoTransition::Applied { .. }
+        ));
+        assert!(reg.abort_local_video_request("CID", generation, epoch));
+        assert_eq!(
+            reg.video_states("CID", generation),
+            Some((VideoState::Stopped, VideoState::Paused))
+        );
+        assert!(
+            reg.snapshot("CID").expect("session").is_video,
+            "the peer's direction keeps the call video"
+        );
+        assert!(
+            !reg.end_local_video_request("CID", generation, epoch),
+            "the genuine kill must find no outstanding request"
+        );
+    }
+
+    // The mute-path re-add: a stopped direction inside an already-video call
+    // returns to enabled with no handshake epoch and no pending on either
+    // side. The caller announces bare `Enabled`, which the peer applies
+    // unconditionally.
+    #[test]
+    fn resume_re_adds_a_stopped_direction_without_a_handshake() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        assert!(reg.stop_local_video("CID", generation));
+        assert!(matches!(
+            reg.apply_peer_video_state("CID", generation, VideoState::Enabled),
+            PeerVideoTransition::Applied { .. }
+        ));
+        assert_eq!(
+            reg.video_states("CID", generation),
+            Some((VideoState::Stopped, VideoState::Enabled))
+        );
+        assert_eq!(
+            reg.resume_local_video("CID", generation),
+            Some(VideoState::Stopped)
+        );
+        assert_eq!(
+            reg.video_states("CID", generation),
+            Some((VideoState::Enabled, VideoState::Enabled))
+        );
+        assert!(reg.snapshot("CID").expect("session").is_video);
+    }
+
+    // Resume is only the re-add: a fresh upgrade belongs on the begin path,
+    // an in-flight upgrade stays on its timeout, and a pending peer request
+    // belongs on the explicit accept.
+    #[test]
+    fn resume_refuses_without_a_resumable_direction() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        assert_eq!(reg.resume_local_video("CID", generation), None);
+
+        let epoch = reg
+            .begin_local_video_request("CID", generation)
+            .expect("begin on an audio call");
+        assert_eq!(reg.resume_local_video("CID", generation), None);
+        assert!(reg.end_local_video_request("CID", generation, epoch));
+
+        let token =
+            match reg.apply_peer_video_state("CID", generation, VideoState::UpgradeRequestV2) {
+                PeerVideoTransition::UpgradeRequested(token) => token,
+                transition => panic!("unexpected transition: {transition:?}"),
+            };
+        assert_eq!(reg.resume_local_video("CID", generation), None);
+        assert!(reg.complete_peer_video_request("CID", token));
+        assert_eq!(reg.resume_local_video("CID", generation), None);
+    }
+
+    // A resume whose stanza never reaches the peer returns the negotiation
+    // to what it held, so a retry stays a resume instead of wedging on an
+    // enabled direction that is not sending.
+    #[test]
+    fn restore_returns_a_failed_resume_to_its_previous_direction() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        assert!(reg.stop_local_video("CID", generation));
+        assert!(matches!(
+            reg.apply_peer_video_state("CID", generation, VideoState::Enabled),
+            PeerVideoTransition::Applied { .. }
+        ));
+        assert_eq!(
+            reg.resume_local_video("CID", generation),
+            Some(VideoState::Stopped)
+        );
+        assert!(reg.restore_self_video_state("CID", generation, VideoState::Stopped));
+        assert_eq!(
+            reg.video_states("CID", generation),
+            Some((VideoState::Stopped, VideoState::Enabled))
+        );
+        assert!(reg.snapshot("CID").expect("session").is_video);
+        assert!(!reg.restore_self_video_state("NOPE", generation, VideoState::Stopped));
+    }
+
     // A re-request on an outstanding local upgrade mints a fresh epoch under
     // the reached state: the previous timeout goes inert on the epoch
     // mismatch instead of tearing down the newer request.
@@ -5356,6 +5604,12 @@ mod tests {
         video_session.is_video = true;
         let generation = reg.insert(video_session);
         assert!(reg.stop_local_video("CID", generation));
+        // The begin below needs an answerable peer: an upgrade asked of an
+        // already-video direction is refused, so the peer stands down first.
+        assert!(matches!(
+            reg.apply_peer_video_state("CID", generation, VideoState::Stopped),
+            PeerVideoTransition::Applied { .. }
+        ));
         let epoch = reg
             .begin_local_video_request("CID", generation)
             .expect("local request");
