@@ -292,13 +292,21 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         )
         .with_context(|| "REPLICATE_LOAD: settings offer delivery trapped")?;
         r.refuel();
-        r.settle(std::time::Duration::from_secs(3));
+        if !r.settle(std::time::Duration::from_secs(3)) {
+            bail!(
+                "REPLICATE_LOAD: offer settle never quiesced; replica sequence is work in flight"
+            );
+        }
         r.refuel();
         let rejected = r
             .call_embind("rejectCall", &[])
             .with_context(|| "REPLICATE_LOAD: rejectCall trapped")?;
         r.refuel();
-        r.settle(std::time::Duration::from_secs(3));
+        if !r.settle(std::time::Duration::from_secs(3)) {
+            bail!(
+                "REPLICATE_LOAD: post-reject settle never quiesced; second start would race teardown"
+            );
+        }
         r.refuel();
         let second = r.call_embind(
             "startVoipCall",

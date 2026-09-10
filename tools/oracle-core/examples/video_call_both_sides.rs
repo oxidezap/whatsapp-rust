@@ -466,7 +466,7 @@ fn main() -> Result<()> {
     // delivered to an engine running as the peer — the offer's true recipient —
     // with Side A as the incoming caller.
     let peer_caller = Jid::new("99887766554433", Server::Lid);
-    let (emitted_raw, raw_quiet, _raw_unknown) = side_b_answerer(
+    let (emitted_raw, raw_quiet, raw_unknown) = side_b_answerer(
         &bytes,
         [
             "11223344556677@c.us",
@@ -478,7 +478,7 @@ fn main() -> Result<()> {
         "raw vendor offer",
     )?;
     println!(
-        "VERDICT answerer/raw: emitted {} stanza(s), quiesced={raw_quiet}",
+        "VERDICT answerer/raw: emitted {} stanza(s), quiesced={raw_quiet}, activation_unknown={raw_unknown}",
         emitted_raw.len()
     );
 
