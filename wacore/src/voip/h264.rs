@@ -460,14 +460,20 @@ impl H264Depacketizer {
 }
 
 /// Split a raw Annex-B byte stream (e.g. an encoder's stdout) into access
-/// units, cutting at AUD NALs (type 9). Feed arbitrary chunks; complete AUs
-/// come back as they close. Requires the producer to emit AUDs (ffmpeg:
-/// `-bsf:v h264_metadata=aud=insert`).
+/// units, cutting at AUD NALs (type 9) or, for AUD-less encoders, at SPS NALs
+/// (type 7): every IDR group opens with SPS, so a parameter set with bytes
+/// before it starts the next group. Feed arbitrary chunks; complete AUs come
+/// back as they close. PPS alone never cuts — it belongs with the SPS that
+/// precedes it, not the slices that follow. Once an AUD is observed, AUDs own
+/// the framing and SPS no longer cuts, so AUD-bearing streams behave exactly
+/// as before.
 #[derive(Default)]
 pub struct AnnexBAuSplitter {
     buf: Vec<u8>,
     /// Scan resume point: everything before it was already searched for an AUD.
     scan_pos: usize,
+    /// An AUD has been observed: SPS cutting stays off from here on.
+    seen_aud: bool,
 }
 
 impl AnnexBAuSplitter {
@@ -490,7 +496,15 @@ impl AnnexBAuSplitter {
                 self.scan_pos = sc.begin;
                 break;
             };
+            if nal_byte & 0x1f == NAL_TYPE_AUD {
+                self.seen_aud = true;
+            }
             if nal_byte & 0x1f == NAL_TYPE_AUD && sc.begin > 0 {
+                let rest = self.buf.split_off(sc.begin);
+                let au = std::mem::replace(&mut self.buf, rest);
+                out.push(au);
+                self.scan_pos = 0;
+            } else if !self.seen_aud && nal_byte & 0x1f == NAL_TYPE_SPS && sc.begin > 0 {
                 let rest = self.buf.split_off(sc.begin);
                 let au = std::mem::replace(&mut self.buf, rest);
                 out.push(au);
@@ -928,6 +942,34 @@ mod tests {
         assert!(payloads.is_empty(), "packetize_au must clear stale output");
         let mut d = H264Depacketizer::default();
         assert_eq!(d.push(0, 0, &[], true), None);
+    }
+
+    /// An AUD-less encoder still frames: every IDR group opens with SPS (the
+    /// decoder keyframe gate requires it), so SPS starts a new access unit
+    /// when bytes precede it. Without this, an AUD-less stream accumulates to
+    /// the 4 MiB cap and is cleared — the call sends nothing, the peer PLIs
+    /// forever, and forced IDRs die in the same buffer.
+    #[test]
+    fn au_splitter_cuts_on_sps_without_aud() {
+        let group = |id: u8| {
+            let mut au = au_from_nals(&[nal(7, 4), nal(8, 4), nal(5, 60)]);
+            au[6] = id;
+            au
+        };
+        let delta = au_from_nals(&[nal(1, 40)]);
+        let mut stream = group(1);
+        stream.extend_from_slice(&delta);
+        stream.extend_from_slice(&group(2));
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream, &mut out);
+        // Like the AUD cut, the boundary lands when the NEXT group's opener
+        // arrives: the delta rides with the group it follows, exactly as with
+        // a trailing AUD.
+        let mut first = group(1);
+        first.extend_from_slice(&delta);
+        assert_eq!(out, vec![first]);
+        assert_eq!(s.finish(), Some(group(2)));
     }
 
     #[test]
