@@ -2552,11 +2552,15 @@ mod tests {
 
         let last = &packets[1][..packets[1].len() - WARP_MI_TAG_LEN];
         let header = parse_rtp_header(last).unwrap();
+        assert_eq!(header.payload_type, crate::voip::rtp::RTP_PAYLOAD_TYPE_H264);
         assert!(header.marker, "the AU closes with the marker");
         assert_eq!(
             header.video_extension.unwrap().media_frame_info,
             VIDEO_MEDIA_FRAME_INFO_IDR
         );
+        let header_len = rtp_header_byte_length(last).unwrap();
+        let expect = crypt_payload(&keys, header.ssrc, 1, 0, &[0x65, 0x01, 0x02, 0x03]);
+        assert_eq!(&last[header_len..], expect.as_slice());
     }
 
     #[test]
