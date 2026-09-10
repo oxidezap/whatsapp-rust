@@ -160,6 +160,18 @@ struct Probe {
     second_numeric_offset: Option<u64>,
     /// Stamp `t` on the inner `<offer>` as well as the `<call>` wrapper.
     inner_t: bool,
+    /// Shift the offer timestamp by this many seconds (wheels the wrapper `t`
+    /// and the `t` arg together). Diagnostic: if `call_offer_elapsed_t`
+    /// follows the shift, the engine reads our timestamp and the miss comes
+    /// from elsewhere; if it stays at the clock epoch, the engine never
+    /// finds it.
+    t_offset: i64,
+    /// Device suffix on the caller JID handed to the engine (untested axis:
+    /// every harness passes bare user form).
+    caller_device: Option<u16>,
+    /// Call-creator device suffix (`None` = bare user form, as the repo
+    /// suite sends; the matrix defaultресс is device 1).
+    creator_device: Option<u16>,
 }
 
 fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
@@ -168,43 +180,111 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         common::Startup {
             identity: SELF,
             attempts: 8,
-            register_main: true,
+            // NO_MAIN_THREAD=1: skip main-thread registration. With it on, a
+            // synchronous `handleIncomingSignalingOffer` can spin on work
+            // queued for the blocking main thread (see `state.rs`), and the
+            // scheduler's timeout escape may then surface partial processing
+            // as a verdict. Registration off trades away outbound-signaling
+            // collection (nothing to collect here) for a clean inbound path.
+            register_main: std::env::var("NO_MAIN_THREAD").is_err(),
             log_bytes: 4 << 20,
             marker_sink: None,
         },
     )?;
     // The event thread must be up before delivery: an offer into the startup
     // gap lands on a half-started engine and reads as a refusal.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let mut gated = false;
-    while std::time::Instant::now() < deadline {
-        if r.engine_log()
-            .iter()
-            .any(|l| l.contains("call_event_proc resumed"))
-        {
-            gated = true;
-            break;
+    // MINIMAL=1 skips the gate and all seeding: every observation burns the
+    // monotonic clock the guest advances per read, so the earliest possible
+    // feed discriminates clock-burn from unreadiness.
+    let minimal = std::env::var("MINIMAL").is_ok();
+    if !minimal {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut gated = false;
+        while std::time::Instant::now() < deadline {
+            if r.engine_log()
+                .iter()
+                .any(|l| l.contains("call_event_proc resumed"))
+            {
+                gated = true;
+                break;
+            }
+            r.process_queued_calls();
+            r.refuel();
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        r.process_queued_calls();
-        r.refuel();
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        if !gated {
+            println!(
+                "PROBE {}: event thread never announced itself; results suspect",
+                probe.label
+            );
+        }
     }
-    if !gated {
-        println!(
-            "PROBE {}: event thread never announced itself; results suspect",
-            probe.label
+    // REPLICATE_LOAD=1: exact `load_settings` sequence from
+    // `outbound_after_settings.rs` (settings offer, settle, rejectCall to
+    // clear, second start). That flow reports the second start failing with
+    // "already initialized", i.e. a surviving context; if it does not
+    // replicate here, the observation is harness-conditional.
+    if std::env::var("REPLICATE_LOAD").is_ok() {
+        let caller = Jid::new("11223344556677", Server::Lid);
+        let now = r.virtual_unix_time();
+        let payload = base64::engine::general_purpose::STANDARD.encode(marshal::marshal(
+            &common::settings_offer(&caller, now, "0102030405060708", SETTINGS),
+        )?);
+        r.call_embind(
+            "handleIncomingSignalingOffer",
+            &[
+                Value::Str(payload),
+                Value::Str("web".into()),
+                Value::Str("2.3000.0".into()),
+                Value::Str(now.to_string()),
+                Value::Str(now.to_string()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Str(caller.to_string()),
+                Value::Bytes(Vec::new()),
+            ],
+        )
+        .ok();
+        r.refuel();
+        r.settle(std::time::Duration::from_secs(3));
+        r.refuel();
+        let rejected = r.call_embind("rejectCall", &[]);
+        r.refuel();
+        r.settle(std::time::Duration::from_secs(3));
+        r.refuel();
+        let second = r.call_embind(
+            "startVoipCall",
+            &[
+                Value::Str("11223344556677@lid".into()),
+                Value::StringList(vec!["11223344556677:0@lid".into()]),
+                Value::Str("0011223344556677".into()),
+                Value::Bool(false),
+                Value::Str("11223344556677@lid".into()),
+                Value::Bool(false),
+                Value::Bytes(Vec::new()),
+            ],
         );
-    };
-    if probe.ab_props {
+        r.refuel();
+        println!("REPLICA: rejectCall -> {rejected:?}, second start -> {second:?}");
+        for line in r.engine_log().iter().rev().take(8).rev() {
+            println!("    log: {}", line.trim());
+        }
+        return Ok(());
+    }
+    if probe.ab_props && !minimal {
         let set = set_ab_props(&mut r);
         println!("  ab props accepted {set} of {}", AB_PROPS.len());
     }
-    let caller = Jid::new("11223344556677", Server::Lid);
+    let mut caller = Jid::new("11223344556677", Server::Lid);
+    if let Some(device) = probe.caller_device {
+        caller = caller.with_device(device);
+    }
     let now = r.virtual_unix_time();
+    let shifted: u64 = (now as i64 + probe.t_offset).max(0) as u64;
     let offer = if probe.video {
-        census_video_offer_at(probe.inner_t.then_some(now))
+        census_video_offer_at(probe.inner_t.then_some(shifted))
     } else {
-        match common::settings_offer(&caller, now, CALL_ID, SETTINGS)
+        match common::settings_offer(&caller, shifted, CALL_ID, SETTINGS)
             .content
             .clone()
         {
@@ -220,17 +300,23 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
     let mut wrapper = NodeBuilder::new("call")
         .attr("from", caller.clone())
         .attr("call-id", CALL_ID)
-        .attr("call-creator", caller.with_device(1))
+        .attr(
+            "call-creator",
+            match probe.creator_device {
+                Some(device) => caller.with_device(device),
+                None => caller.clone(),
+            },
+        )
         .attr(
             "t",
             if probe.t_millis {
-                (now * 1000).to_string()
+                (shifted * 1000).to_string()
             } else {
-                now.to_string()
+                shifted.to_string()
             },
         );
     if probe.expiry {
-        wrapper = wrapper.attr("e", (now + 45).to_string());
+        wrapper = wrapper.attr("e", (shifted + 45).to_string());
     }
     let wrapper = wrapper
         .children([
@@ -242,32 +328,52 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         ])
         .build();
     let second_numeric = match probe.second_numeric_offset {
-        Some(offset) => now + offset,
-        None => now,
+        Some(offset) => shifted + offset,
+        None => shifted,
     };
     // Arguments 4 and 5 are the stanza's `e` and `t` timestamps, read with
     // stoull (see `tests/signaling.rs::deliver`): the probe axes ride here,
     // not only on the stanza attributes, because the engine reads the header
     // inputs. `second_numeric_offset` shifts `t` into the future.
-    let (e_arg, t_arg) = (now + if probe.expiry { 45 } else { 0 }, second_numeric);
+    let (e_arg, t_arg) = (shifted + if probe.expiry { 45 } else { 0 }, second_numeric);
     let t_arg = if probe.t_millis { t_arg * 1000 } else { t_arg };
     let payload = base64::engine::general_purpose::STANDARD.encode(marshal::marshal(&wrapper)?);
     // Preserve the delivery outcome: a trap here must read as a delivery
     // failure, never as "the engine processed and rejected the offer".
-    let delivered = r.call_embind(
-        "handleIncomingSignalingOffer",
-        &[
-            Value::Str(payload),
-            Value::Str("web".into()),
-            Value::Str("2.3000.0".into()),
-            Value::Str(e_arg.to_string()),
-            Value::Str(t_arg.to_string()),
-            Value::Bool(false),
-            Value::Bool(true),
-            Value::Str(caller.to_string()),
-            Value::Bytes(Vec::new()),
-        ],
-    );
+    // DELIVER_VIA=message routes through the generic `handleIncomingSignalingMessage`
+    // entry (payload, platform, version, e, t, bool, caller, bytes) instead of
+    // the offer-specific one: same bytes, different router.
+    let via_message = std::env::var("DELIVER_VIA").is_ok_and(|v| v == "message");
+    let delivered = if via_message {
+        r.call_embind(
+            "handleIncomingSignalingMessage",
+            &[
+                Value::Str(payload),
+                Value::Str("web".into()),
+                Value::Str("2.3000.0".into()),
+                Value::Str(e_arg.to_string()),
+                Value::Str(t_arg.to_string()),
+                Value::Bool(false),
+                Value::Str(caller.to_string()),
+                Value::Bytes(Vec::new()),
+            ],
+        )
+    } else {
+        r.call_embind(
+            "handleIncomingSignalingOffer",
+            &[
+                Value::Str(payload),
+                Value::Str("web".into()),
+                Value::Str("2.3000.0".into()),
+                Value::Str(e_arg.to_string()),
+                Value::Str(t_arg.to_string()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Str(caller.to_string()),
+                Value::Bytes(Vec::new()),
+            ],
+        )
+    };
     r.refuel();
     let delivered = match &delivered {
         Ok(value) => format!("{value:?}"),
@@ -299,6 +405,45 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
             stable = 0;
             (last_signaling, last_log) = (signaling, log);
         }
+    }
+    // Did the inbound blob land in the applied settings store? The offer
+    // carries caller_timeout=45; an empty read-back means the expiry path
+    // computes against an unapplied (zero) window and every offer is
+    // instantly stale no matter what timestamps ride it.
+    let applied_timeout = match r.call_embind(
+        "getVoipParam",
+        &[Value::Str("options.caller_timeout".into())],
+    ) {
+        Ok(Value::Str(s)) if s.is_empty() => "empty".to_owned(),
+        Ok(Value::Str(s)) => s,
+        other => format!("{other:?}"),
+    };
+    r.refuel();
+    println!(
+        "PROBE {}: applied caller_timeout={applied_timeout}",
+        probe.label
+    );
+    if std::env::var("LOG_SPAN").is_ok() {
+        let lines = r.engine_log();
+        if let Some(start) = lines.iter().position(|l| l.contains("!Offer from:")) {
+            for line in lines.iter().skip(start).take(60) {
+                println!("    span: {}", line.trim());
+            }
+        } else {
+            println!("    span: no !Offer line; last 10 lines:");
+            for line in lines.iter().rev().take(10).rev() {
+                println!("    span: {}", line.trim());
+            }
+        }
+        for line in r
+            .logs()
+            .iter()
+            .filter(|l| l.contains("host stat:"))
+            .take(10)
+        {
+            println!("    {line}");
+        }
+        return Ok(());
     }
     let immediate = r.call_embind("getCallInfo", &[]);
     r.refuel();
@@ -398,8 +543,17 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         .engine_log()
         .iter()
         .any(|l| l.contains("missed by the user"));
+    // Report the elapsed stat the engine logged: it discriminates "reads our
+    // timestamp" (follows the shift) from "never finds it" (stays at epoch).
+    let elapsed = r
+        .engine_log()
+        .iter()
+        .rev()
+        .find(|l| l.contains("call_offer_elapsed_t"))
+        .map(|l| l.trim().to_owned())
+        .unwrap_or_default();
     println!(
-        "PROBE {}: delivered={delivered} quiesced={quiesced} alive={alive:?} preaccept_torn_down={torn_down_pre_accept} accept={accepted:?} settled={settled} emitted={emitted} missed={missed} {term_reason}",
+        "PROBE {}: delivered={delivered} quiesced={quiesced} alive={alive:?} preaccept_torn_down={torn_down_pre_accept} accept={accepted:?} settled={settled} emitted={emitted} missed={missed} {term_reason} | {elapsed}",
         probe.label,
     );
     Ok(())
@@ -425,6 +579,9 @@ fn main() -> Result<()> {
             t_millis: false,
             second_numeric_offset: None,
             inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
         },
         Probe {
             label: "settings-only+ab",
@@ -435,6 +592,9 @@ fn main() -> Result<()> {
             t_millis: false,
             second_numeric_offset: None,
             inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
         },
         Probe {
             label: "video+ab",
@@ -445,6 +605,9 @@ fn main() -> Result<()> {
             t_millis: false,
             second_numeric_offset: None,
             inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
         },
         Probe {
             label: "video+ab,accept-ff",
@@ -455,6 +618,9 @@ fn main() -> Result<()> {
             t_millis: false,
             second_numeric_offset: None,
             inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
         },
         Probe {
             label: "video+ab+expiry",
@@ -465,6 +631,9 @@ fn main() -> Result<()> {
             t_millis: false,
             second_numeric_offset: None,
             inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
         },
         Probe {
             label: "settings-only+expiry",
@@ -475,6 +644,9 @@ fn main() -> Result<()> {
             t_millis: false,
             second_numeric_offset: None,
             inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
         },
         Probe {
             label: "settings-only+t-ms",
@@ -485,6 +657,9 @@ fn main() -> Result<()> {
             t_millis: true,
             second_numeric_offset: None,
             inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
         },
         Probe {
             label: "video+ab+t-ms",
@@ -495,6 +670,9 @@ fn main() -> Result<()> {
             t_millis: true,
             second_numeric_offset: None,
             inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
         },
         Probe {
             label: "video+ab+future-t",
@@ -505,6 +683,9 @@ fn main() -> Result<()> {
             t_millis: false,
             second_numeric_offset: Some(45),
             inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
         },
         Probe {
             label: "video+ab+inner-t",
@@ -515,8 +696,69 @@ fn main() -> Result<()> {
             t_millis: false,
             second_numeric_offset: None,
             inner_t: true,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: Some(1),
+        },
+        Probe {
+            label: "video+ab+t+100k",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+            t_offset: 100000,
+            caller_device: None,
+            creator_device: Some(1),
+        },
+        Probe {
+            label: "video+ab+t-100k",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+            t_offset: -100000,
+            caller_device: None,
+            creator_device: Some(1),
+        },
+        Probe {
+            label: "video+ab+caller-dev0",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+            t_offset: 0,
+            caller_device: Some(0),
+            creator_device: Some(1),
+        },
+        Probe {
+            label: "video+ab+creator-bare",
+            ab_props: true,
+            video: true,
+            accept: (true, true),
+            expiry: false,
+            t_millis: false,
+            second_numeric_offset: None,
+            inner_t: false,
+            t_offset: 0,
+            caller_device: None,
+            creator_device: None,
         },
     ] {
+        // PROBE=<label> runs a single probe (default: the whole matrix).
+        if let Ok(only) = std::env::var("PROBE")
+            && only != probe.label
+        {
+            continue;
+        }
         println!("=== {}", probe.label);
         run_probe(&bytes, &probe)?;
     }
