@@ -294,7 +294,9 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         r.refuel();
         r.settle(std::time::Duration::from_secs(3));
         r.refuel();
-        let rejected = r.call_embind("rejectCall", &[]);
+        let rejected = r
+            .call_embind("rejectCall", &[])
+            .with_context(|| "REPLICATE_LOAD: rejectCall trapped")?;
         r.refuel();
         r.settle(std::time::Duration::from_secs(3));
         r.refuel();
@@ -640,7 +642,12 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
     // does, then read state: if the call is alive here, the premature accept
     // is what kills it, and the fix is sequencing (wait for active).
     if std::env::var("SKIP_ACCEPT").is_ok() {
-        r.settle(std::time::Duration::from_secs(3));
+        if !r.settle(std::time::Duration::from_secs(3)) {
+            bail!(
+                "PROBE {}: SKIP_ACCEPT settle never quiesced; state below is work in flight, not evidence",
+                probe.label
+            );
+        }
         r.refuel();
         let alive_later: Option<bool> = match r.call_embind("getCallInfo", &[]) {
             Err(e) => {

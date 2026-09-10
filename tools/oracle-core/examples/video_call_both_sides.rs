@@ -346,8 +346,13 @@ fn side_b_answerer(
     let mut activated = false;
     // A trapped or misshapen state query is not an empty state: it means
     // activation was never successfully observed, which the final verdict
-    // must carry as unknown rather than a clean stall.
-    let mut activation_unknown = false;
+    // must carry as unknown rather than a clean stall. An unparsed offer is
+    // the same: with no parse, a later quiet drain cannot make the missing
+    // accept a protocol verdict.
+    let mut activation_unknown = !parsed;
+    if !parsed {
+        println!("side B [{label}]: offer never parsed; answerer behavior unobservable");
+    }
     while std::time::Instant::now() < deadline {
         match r.call_embind("getCallInfo", &[]) {
             Ok(Value::Str(s)) if !s.is_empty() => {
