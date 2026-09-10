@@ -69,6 +69,59 @@ pub fn nal_unit_type(nal: &[u8]) -> u8 {
     nal.first().map(|b| b & 0x1f).unwrap_or(0)
 }
 
+/// `first_mb_in_slice` of a VCL NAL: the first Exp-Golomb code of the slice
+/// header, 0 on a picture's first slice and nonzero after it. Returns `None`
+/// when the NAL is too short to read. Emulation-prevention bytes are removed
+/// before reading, so `00 00 03` never parses as leading zeros.
+fn first_mb_in_slice(nal: &[u8]) -> Option<u32> {
+    const MAX_BYTES: usize = 8;
+    let mut raw = [0u8; MAX_BYTES];
+    let mut len = 0;
+    let mut zeros = 0u8;
+    for &byte in nal.iter().skip(1) {
+        if zeros >= 2 && byte == 0x03 {
+            zeros = 0;
+            continue;
+        }
+        zeros = if byte == 0x00 { zeros + 1 } else { 0 };
+        if len == MAX_BYTES {
+            break;
+        }
+        raw[len] = byte;
+        len += 1;
+    }
+    let total_bits = len * 8;
+    let mut consumed = 0usize;
+    let bit_at = |pos: usize| -> u8 {
+        let byte = raw[pos / 8];
+        (byte >> (7 - pos % 8)) & 1
+    };
+    let mut leading = 0u32;
+    loop {
+        if consumed >= total_bits {
+            return None;
+        }
+        if bit_at(consumed) != 0 {
+            break;
+        }
+        consumed += 1;
+        leading += 1;
+        if leading > 31 {
+            return None;
+        }
+    }
+    consumed += 1;
+    if consumed + leading as usize > total_bits {
+        return None;
+    }
+    let mut value = 0u32;
+    for _ in 0..leading {
+        value = (value << 1) | u32::from(bit_at(consumed));
+        consumed += 1;
+    }
+    Some((1u32 << leading).wrapping_sub(1).wrapping_add(value))
+}
+
 /// Iterate the NAL units of an Annex-B buffer (start codes stripped, empty NALs skipped).
 pub fn split_annexb(data: &[u8]) -> impl Iterator<Item = &[u8]> {
     SplitAnnexB { data, pos: 0 }
@@ -467,24 +520,25 @@ impl H264Depacketizer {
 }
 
 /// Split a raw Annex-B byte stream (e.g. an encoder's stdout) into access
-/// units, cutting at AUD NALs (type 9) or, for AUD-less encoders, at SPS NALs
-/// (type 7) and at IDRs that complete an earlier group: every IDR group opens
-/// with SPS, so a parameter set with bytes before it starts the next group,
-/// and an IDR arriving when the buffer already holds one closes the previous
-/// group instead of batching a GOP under one timestamp. Feed arbitrary
-/// chunks; complete AUs come back as they close. PPS alone never cuts — it
-/// belongs with the SPS that precedes it, not the slices that follow. Once an
-/// AUD is observed, AUDs own the framing and SPS/IDR no longer cut, so
-/// AUD-bearing streams behave exactly as before.
+/// units, cutting at AUD NALs (type 9) or, for AUD-less encoders, at picture
+/// boundaries: SPS opens a group, an IDR following a complete group closes
+/// the previous one, and any VCL slice starting a new picture (`first_mb_in_slice`
+/// zero) with a VCL NAL already buffered splits delta frames apart. Feed
+/// arbitrary chunks; complete AUs come back as they close. PPS alone never
+/// cuts — it belongs with the SPS that precedes it, not the slices that
+/// follow. Once an AUD is observed, AUDs own the framing and nothing else
+/// cuts, so AUD-bearing streams behave exactly as before.
 #[derive(Default)]
 pub struct AnnexBAuSplitter {
     buf: Vec<u8>,
     /// Scan resume point: everything before it was already searched for an AUD.
     scan_pos: usize,
-    /// An AUD has been observed: SPS/IDR cutting stays off from here on.
+    /// An AUD has been observed: SPS/IDR/VCL cutting stays off from here on.
     seen_aud: bool,
     /// The buffered bytes already hold an IDR slice.
     buf_has_idr: bool,
+    /// The buffered bytes already hold a VCL NAL.
+    buf_has_vcl: bool,
 }
 
 impl AnnexBAuSplitter {
@@ -511,26 +565,43 @@ impl AnnexBAuSplitter {
             if unit_type == NAL_TYPE_AUD {
                 self.seen_aud = true;
             }
+            let is_vcl = matches!(unit_type, 1..=5);
             // An IDR closes the previous group only when the buffer already
             // holds one: the IDR's own parameter sets still arrive after it
             // here (SPS-first ordering), so cutting on every IDR would orphan
-            // them. Evaluated before recording this NAL below.
+            // them. A VCL slice starting a new picture splits only when a
+            // previous VCL NAL is buffered, so parameter sets never separate
+            // from their slices. Evaluated before recording this NAL below.
+            // The picture check reads this NAL alone (up to the next start
+            // code), never bytes of a following NAL.
+            let nal_end = find_start_code(&self.buf, sc.end)
+                .map(|next| next.begin)
+                .unwrap_or(self.buf.len());
+            let new_picture = first_mb_in_slice(&self.buf[sc.end..nal_end]).unwrap_or(1) == 0;
             let cuts_here = sc.begin > 0
                 && (unit_type == NAL_TYPE_AUD
                     || (!self.seen_aud
                         && (unit_type == NAL_TYPE_SPS
-                            || (unit_type == NAL_TYPE_IDR && self.buf_has_idr))));
+                            || (unit_type == NAL_TYPE_IDR && self.buf_has_idr)
+                            || (is_vcl && self.buf_has_vcl && new_picture))));
             if cuts_here {
                 let rest = self.buf.split_off(sc.begin);
                 let au = std::mem::replace(&mut self.buf, rest);
                 out.push(au);
                 self.scan_pos = 0;
                 self.buf_has_idr = false;
+                self.buf_has_vcl = false;
             } else {
                 self.scan_pos = sc.end;
             }
+            // Record this NAL for the next boundary decision: the flag update
+            // runs after the cut check above, so an IDR never closes the group
+            // its own parameter sets belong to.
             if unit_type == NAL_TYPE_IDR {
                 self.buf_has_idr = true;
+            }
+            if is_vcl {
+                self.buf_has_vcl = true;
             }
             if self.buf.len() > H264_MAX_AU_BYTES {
                 // Runaway buffer means the stream has no AUDs; dropping is
@@ -538,6 +609,7 @@ impl AnnexBAuSplitter {
                 self.buf.clear();
                 self.scan_pos = 0;
                 self.buf_has_idr = false;
+                self.buf_has_vcl = false;
             }
         }
     }
@@ -1190,5 +1262,54 @@ mod tests {
         let got = depacketize_all(payloads.iter()).expect("reassembled AU");
         let types: Vec<u8> = split_annexb(&got).map(nal_unit_type).collect();
         assert_eq!(types, [7, 8, 5, 6], "trailing SEI kept, got {types:?}");
+    }
+
+    /// `first_mb_in_slice` reads the first Exp-Golomb code: `1` is macroblock
+    /// 0, longer codes count up, emulation prevention is skipped, and short
+    /// input refuses instead of guessing.
+    #[test]
+    fn first_mb_in_slice_reads_exp_golomb() {
+        // `1` → 0; `010` → 1.
+        assert_eq!(first_mb_in_slice(&[0x41, 0x80]), Some(0));
+        assert_eq!(first_mb_in_slice(&[0x41, 0x40]), Some(1));
+        // `00 00 03 80` parses exactly like `00 00 80`: the prevention byte
+        // is skipped, not read as leading zeros.
+        assert_eq!(
+            first_mb_in_slice(&[0x41, 0x00, 0x00, 0x80]),
+            first_mb_in_slice(&[0x41, 0x00, 0x00, 0x03, 0x80])
+        );
+        assert_eq!(first_mb_in_slice(&[0x41]), None);
+        assert_eq!(first_mb_in_slice(&[]), None);
+    }
+
+    /// Non-IDR pictures split on VCL picture starts, not just on SPS: without
+    /// this, every delta between keyframes batches into the previous group
+    /// under one RTP timestamp and marker.
+    #[test]
+    fn au_splitter_cuts_on_vcl_picture_start() {
+        // Slice headers with first_mb 0, then 16: two pictures of one stream.
+        let pic = |first_mb: &[u8], len: usize| {
+            let mut n = vec![0x41];
+            n.extend_from_slice(first_mb);
+            n.extend((0..len.saturating_sub(1 + first_mb.len())).map(|i| (i % 251) as u8));
+            n
+        };
+        let au1 = au_from_nals(&[pic(&[0x80], 30)]);
+        let au2 = au_from_nals(&[pic(&[0x80], 30)]);
+        let mut stream = au1.clone();
+        stream.extend_from_slice(&au2);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream, &mut out);
+        assert_eq!(out, vec![au1]);
+        assert_eq!(s.finish(), Some(au2));
+
+        // A second slice of the SAME picture (first_mb nonzero) never cuts.
+        let multi = au_from_nals(&[vec![0x41, 0x80, 0x01], vec![0x41, 0x08, 0x80, 0x02]]);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&multi, &mut out);
+        assert!(out.is_empty(), "one picture stays one AU");
+        assert_eq!(s.finish(), Some(multi));
     }
 }
