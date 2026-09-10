@@ -4284,6 +4284,24 @@ impl CallHandle {
     /// upgrade. Refuses without an outstanding local upgrade.
     pub async fn re_request_video_upgrade(&self) -> Result<(), CallError> {
         self.ensure_current()?;
+        // Group downgrades also reset video negotiation: take their lane first
+        // like `begin_video` does, so a racing downgrade cannot leave a stale
+        // state=11 in flight for a now-audio group.
+        let group_transition_lock = self
+            .client_registry
+            .group_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call no longer active"))?;
+        let _group_transition_guard = group_transition_lock.lock().await;
+        self.ensure_current()?;
+        if let Some(group) = self
+            .client_registry
+            .group_state_if_current(&self.call_id, self.generation)
+            && !group_video_upgrade_allowed(&group)
+        {
+            return Err(CallError::Media(
+                "group media mode does not allow a video upgrade",
+            ));
+        }
         let transition_lock = self
             .client_registry
             .video_transition_lock(&self.call_id, self.generation)

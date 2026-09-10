@@ -360,7 +360,11 @@ fn side_b_answerer(
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     println!("side B [{label}]: activated={activated}");
-    let accepted = r.call_embind("acceptCall", &[Value::Bool(true), Value::Bool(true)]);
+    // A trapped accept is a host failure, not answerer behavior: bail
+    // inconclusive instead of reporting a stall on signaling that never ran.
+    let accepted = r
+        .call_embind("acceptCall", &[Value::Bool(true), Value::Bool(true)])
+        .context("side B acceptCall trapped")?;
     r.refuel();
     let settled = r.settle(std::time::Duration::from_secs(5));
     r.refuel();

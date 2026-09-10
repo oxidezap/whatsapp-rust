@@ -15,6 +15,7 @@ use wasmtime::error::Context as _;
 use wasmtime::{Caller, Func, Linker, Module, Ref, Store, Val, ValType};
 
 use crate::IntoWasmtime as _;
+use crate::exports;
 use crate::state::{HostState, ThreadPolicy};
 
 /// Fixed wall-clock origin: 2021-01-01T00:00:00Z in milliseconds. Arbitrary but
@@ -182,10 +183,8 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
             state
                 .shared
                 .record("env", "get_persistent_directory_path_js", Vec::new());
-            let malloc = match caller.get_export("malloc") {
-                Some(wasmtime::Extern::Func(func)) => func,
-                _ => return Err(wasmtime::Error::msg("guest has no malloc export")),
-            };
+            let malloc = exports::func(&mut caller, &["malloc", "_malloc"])
+                .map_err(|error| wasmtime::Error::msg(format!("guest allocator: {error}")))?;
             let mut results = [Val::I32(0)];
             malloc
                 .call(&mut caller, &[Val::I32(2)], &mut results)

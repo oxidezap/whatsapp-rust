@@ -39,43 +39,6 @@ const CALL_KEY: [u8; 32] = [0x5A; 32];
 const SETTINGS: &[u8] =
     br#"{"encode":{"use_mlow_codec_v1":"false"},"options":{"enable_48khz_rtp_clock":"false","caller_timeout":"45"}}"#;
 
-/// Neutral A/B values, as `WAWebVoipStackInterfaceWebHelpers` would forward
-/// them. Copied from `outbound_after_settings.rs`; the question is the same:
-/// does configuring the engine at all change what it does?
-const AB_PROPS: &[(&str, &str)] = &[
-    ("aigc_version", "int"),
-    ("app_exit_reason_version", "int"),
-    ("attach_transport_rtx", "bool"),
-    ("audio_level_speaking_threshold", "int"),
-    ("call_admin_version", "int"),
-    ("calling_rust_migration_bitmap", "int"),
-    ("calling_rust_migration_incoming_stanza_bitmap", "int"),
-    ("calling_screen_share_milestone_version", "int"),
-    ("default_endpoint_thread_poll_timeout", "int"),
-    ("enable_av_downgrade", "bool"),
-    ("enable_init_bwe_for_group_call", "bool"),
-    (
-        "enable_new_user_action_stanza_for_raise_hand_sender",
-        "bool",
-    ),
-    ("enable_offer_v2_upgrade", "bool"),
-    ("enable_ring_for_gc_on_offer_expire", "bool"),
-    ("enable_silent_offer", "bool"),
-    ("enable_waiting_room_logging", "bool"),
-    ("enable_webcodec_video_encode", "bool"),
-    ("enable_web_voip_audio_driver_lifetime_fix", "bool"),
-    ("heartbeat_interval_s", "int"),
-    ("ignore_joinable_terminate_on_expired_offer", "bool"),
-    ("lobby_timeout_min", "int"),
-    ("max_group_size_for_long_ringtone", "int"),
-    ("max_num_participants_for_ss", "int"),
-    ("allow_reporting_call_replayer_id", "bool"),
-    ("vid_stream_pause_resume_jb_reset_threshold_ms", "int"),
-    ("voice_ai_conversation_starter_latency_tracking", "bool"),
-    ("voip_stack_incoming_message_ownership_transfer", "bool"),
-    ("log_level", "int"),
-];
-
 /// The vendor's own video child, read back from a `startVoipCall` offer so the
 /// inbound shape carries no invented bytes.
 const VIDEO_ATTRS: &[(&str, &str)] = &[
@@ -116,28 +79,99 @@ fn census_video_offer_at(now: Option<u64>) -> Node {
         .build()
 }
 
-fn set_ab_props(r: &mut Runtime) -> usize {
+/// Pinned A/B values from `wacore::iq::abprops` (the whatspec registry), not
+/// neutral guesses: forcing every boolean true exercises a synthetic flag
+/// combination no WhatsApp client runs. Three wasm keys have no registry entry
+/// (`enable_av_downgrade`, `allow_reporting_call_replayer_id`, `log_level`)
+/// and keep neutral values, marked `unpinned` below.
+#[derive(Clone, Copy)]
+enum ABValue {
+    Bool(bool),
+    Int(i64),
+    UnpinnedBool,
+    UnpinnedInt(i64),
+}
+
+const AB_PROPS: &[(&str, ABValue)] = &[
+    ("aigc_version", ABValue::Int(1)),
+    ("app_exit_reason_version", ABValue::Int(0)),
+    ("attach_transport_rtx", ABValue::Bool(false)),
+    ("audio_level_speaking_threshold", ABValue::Int(30)),
+    ("call_admin_version", ABValue::Int(0)),
+    ("calling_rust_migration_bitmap", ABValue::Int(0)),
+    (
+        "calling_rust_migration_incoming_stanza_bitmap",
+        ABValue::Int(0),
+    ),
+    ("calling_screen_share_milestone_version", ABValue::Int(2)),
+    ("default_endpoint_thread_poll_timeout", ABValue::Int(0)),
+    ("enable_av_downgrade", ABValue::UnpinnedBool),
+    ("enable_init_bwe_for_group_call", ABValue::Bool(false)),
+    (
+        "enable_new_user_action_stanza_for_raise_hand_sender",
+        ABValue::Bool(false),
+    ),
+    ("enable_offer_v2_upgrade", ABValue::Bool(false)),
+    ("enable_ring_for_gc_on_offer_expire", ABValue::Bool(false)),
+    ("enable_silent_offer", ABValue::Bool(false)),
+    ("enable_waiting_room_logging", ABValue::Bool(false)),
+    ("enable_webcodec_video_encode", ABValue::Bool(false)),
+    (
+        "enable_web_voip_audio_driver_lifetime_fix",
+        ABValue::Bool(true),
+    ),
+    ("heartbeat_interval_s", ABValue::Int(10)),
+    (
+        "ignore_joinable_terminate_on_expired_offer",
+        ABValue::Bool(false),
+    ),
+    ("lobby_timeout_min", ABValue::Int(0)),
+    ("max_group_size_for_long_ringtone", ABValue::Int(0)),
+    ("max_num_participants_for_ss", ABValue::Int(8)),
+    ("allow_reporting_call_replayer_id", ABValue::UnpinnedBool),
+    (
+        "vid_stream_pause_resume_jb_reset_threshold_ms",
+        ABValue::Int(0),
+    ),
+    (
+        "voice_ai_conversation_starter_latency_tracking",
+        ABValue::Bool(false),
+    ),
+    (
+        "voip_stack_incoming_message_ownership_transfer",
+        ABValue::Bool(false),
+    ),
+    ("log_level", ABValue::UnpinnedInt(9)),
+];
+
+/// Configure the arm from the pinned table. A trapping setter fails the
+/// probe loudly with the key: silently continuing on a subset would make the
+/// row advertise a configuration it never established.
+fn set_ab_props(r: &mut Runtime) -> Result<usize> {
+    use anyhow::Context;
     let mut set = 0;
-    for (key, kind) in AB_PROPS {
-        let call = match *kind {
-            "bool" => r.call_embind(
+    for (key, value) in AB_PROPS {
+        let call = match *value {
+            ABValue::Bool(v) => r.call_embind(
+                "setABPropBool",
+                &[Value::Str((*key).into()), Value::Bool(v)],
+            ),
+            ABValue::Int(v) => {
+                r.call_embind("setABPropInt", &[Value::Str((*key).into()), Value::Int(v)])
+            }
+            ABValue::UnpinnedBool => r.call_embind(
                 "setABPropBool",
                 &[Value::Str((*key).into()), Value::Bool(true)],
             ),
-            _ => r.call_embind(
-                "setABPropInt",
-                &[
-                    Value::Str((*key).into()),
-                    Value::Int(if *key == "log_level" { 9 } else { 0 }),
-                ],
-            ),
+            ABValue::UnpinnedInt(v) => {
+                r.call_embind("setABPropInt", &[Value::Str((*key).into()), Value::Int(v)])
+            }
         };
         r.refuel();
-        if call.is_ok() {
-            set += 1;
-        }
+        call.with_context(|| format!("setting A/B prop {key}"))?;
+        set += 1;
     }
-    set
+    Ok(set)
 }
 
 struct Probe {
@@ -290,7 +324,7 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
     // variant; until then the mode stays out instead of reporting confounded
     // verdicts.
     if probe.ab_props && !minimal {
-        let set = set_ab_props(&mut r);
+        let set = set_ab_props(&mut r)?;
         println!("  ab props accepted {set} of {}", AB_PROPS.len());
     }
     let mut caller = Jid::new("11223344556677", Server::Lid);
@@ -303,18 +337,20 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
     // offer. The miss path scans the message buffer for a prior accept (→14)
     // or reject (→15) of the call-id; priming decides whether the scan reads
     // buffer writes at all, isolating "scan never matches" from "scan cannot
-    // match".
+    // match". Any other value is a typo that would silently exercise the
+    // reject path under a wrong label, so it fails loudly.
     if let Ok(prime) = std::env::var("PRIME") {
         let action = match prime.as_str() {
             "accept" => NodeBuilder::new("accept")
                 .attr("call-creator", caller.clone())
                 .attr("call-id", CALL_ID)
                 .build(),
-            _ => NodeBuilder::new("reject")
+            "reject" => NodeBuilder::new("reject")
                 .attr("call-creator", caller.clone())
                 .attr("call-id", CALL_ID)
                 .attr("count", "0")
                 .build(),
+            other => anyhow::bail!("unknown PRIME value: {other}"),
         };
         let primer = NodeBuilder::new("call")
             .attr("from", caller.clone())
@@ -341,14 +377,15 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
             ],
         );
         r.refuel();
-        println!(
-            "PROBE {}: prime {prime} -> {}",
-            probe.label,
-            match &primed {
-                Ok(value) => format!("{value:?}"),
-                Err(_) => "trap".to_owned(),
-            }
-        );
+        // A trapped primer never reached the buffer: continuing would report
+        // the offer against a setup that did not happen, so the probe stops
+        // inconclusive instead of printing a verdict.
+        if let Err(error) = &primed {
+            println!("PROBE {}: prime {prime} trapped: {error}", probe.label);
+            println!("PROBE {}: INCONCLUSIVE (primer failed)", probe.label);
+            return Ok(());
+        }
+        println!("PROBE {}: prime {prime} delivered", probe.label);
     }
     // MS_PAIR is read here (after priming, before timestamps): millisecond-
     // consistent timestamps on every channel, expiry 45s after offer, derived
@@ -405,11 +442,15 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
     }
     if routed {
         // Self LID from init, caller device from the probe: a server-routed
-        // inbound stanza names both ends.
+        // inbound stanza names both ends. Typed JIDs, not strings: the engine
+        // reads the JID wire encoding, and string attrs arrive malformed.
         wrapper = wrapper
-            .attr("recipient", "99887766554433:0@lid")
-            .attr("participant", caller.with_device(caller.device).to_string())
-            .attr("sender_lid", "11223344556677@lid");
+            .attr(
+                "recipient",
+                Jid::new("99887766554433", Server::Lid).with_device(0),
+            )
+            .attr("participant", caller.with_device(caller.device))
+            .attr("sender_lid", Jid::new("11223344556677", Server::Lid));
     }
     let wrapper = wrapper
         .children([
@@ -684,6 +725,10 @@ fn main() -> Result<()> {
     }
     println!("engine: {which}");
 
+    // PROBE=<label> runs a single probe (default: the whole matrix). A
+    // selector that matches nothing fails loudly: an empty run must never
+    // read as completed evidence.
+    let mut matched = false;
     for probe in [
         Probe {
             label: "settings-only",
@@ -874,8 +919,12 @@ fn main() -> Result<()> {
         {
             continue;
         }
+        matched = true;
         println!("=== {}", probe.label);
         run_probe(&bytes, &probe)?;
+    }
+    if !matched {
+        anyhow::bail!("PROBE selector matched no row");
     }
     Ok(())
 }
