@@ -2674,26 +2674,60 @@ impl CallRegistry {
         Some(epoch)
     }
 
-    /// Re-issue a local upgrade request on live video and return its epoch.
+    /// Re-issue a local upgrade request for an OUTSTANDING local upgrade and
+    /// return its previous and fresh epochs.
     ///
     /// Unlike [`Self::begin_local_video_request`], which refuses once local
-    /// video is requested or enabled, this is the re-request path: the
-    /// handshake already reached a video state (requested and awaiting the
-    /// peer, or enabled) and the caller needs to ask again, e.g. the peer
-    /// never answered. It mints a fresh epoch and re-arms the pending self
-    /// request without touching the reached state, so a peer answer still
-    /// applies and the previous timeout goes inert (its epoch no longer
-    /// matches). Returns `None` when there is no video to re-request
-    /// (audio-only), which stays on the begin path.
-    pub fn re_request_local_video(&self, call_id: &str, generation: u64) -> Option<u64> {
+    /// video is requested or enabled, this is the retry path: a local upgrade
+    /// was initiated and the peer has not answered yet. It mints a fresh epoch
+    /// and re-arms the pending self request without touching the reached
+    /// state, so a peer answer still applies and the previous timeout goes
+    /// inert (its epoch no longer matches). Returns `None` unless a local
+    /// upgrade is actually pending: with no outstanding request there is
+    /// nothing to re-ask, and states like fresh-Enabled stay on the begin
+    /// path. Pair with [`Self::rollback_re_request`] when the re-ask never
+    /// reaches the peer.
+    pub fn re_request_local_video(
+        &self,
+        call_id: &str,
+        generation: u64,
+    ) -> Option<(Option<u64>, u64)> {
         let mut map = self.active_calls();
         let entry = map
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)?;
-        if entry.video.self_state.is_inactive_for_call_mode() {
+        if entry.video.self_state.is_inactive_for_call_mode()
+            || entry.video.pending_self_request.is_none()
+        {
             return None;
         }
-        Some(entry.video.next_self_request())
+        let previous = entry.video.pending_self_request;
+        Some((previous, entry.video.next_self_request()))
+    }
+
+    /// Undo a re-request whose stanza never reached the peer: restores the
+    /// previous pending epoch, but only when the fresh one is still current,
+    /// so a concurrent newer request is never clobbered. Returns false when
+    /// there was nothing of ours to restore.
+    pub fn rollback_re_request(
+        &self,
+        call_id: &str,
+        generation: u64,
+        previous: Option<u64>,
+        current: u64,
+    ) -> bool {
+        let mut map = self.active_calls();
+        let Some(entry) = map
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return false;
+        };
+        if entry.video.pending_self_request != Some(current) {
+            return false;
+        }
+        entry.video.pending_self_request = previous;
+        true
     }
 
     /// Complete a peer request only when the same request is still pending.
@@ -5253,9 +5287,9 @@ mod tests {
         assert!(!reg.snapshot("CID").expect("session").is_video);
     }
 
-    // A re-request on live video mints a fresh epoch under the reached state:
-    // the previous timeout goes inert on the epoch mismatch instead of
-    // tearing down the newer request.
+    // A re-request on an outstanding local upgrade mints a fresh epoch under
+    // the reached state: the previous timeout goes inert on the epoch
+    // mismatch instead of tearing down the newer request.
     #[test]
     fn re_request_mints_a_fresh_epoch_without_leaving_requested_state() {
         let reg = CallRegistry::new();
@@ -5267,9 +5301,10 @@ mod tests {
         let first = reg
             .begin_local_video_request("CID", generation)
             .expect("begin");
-        let second = reg
+        let (previous, second) = reg
             .re_request_local_video("CID", generation)
             .expect("re-request");
+        assert_eq!(previous, Some(first));
         assert_ne!(first, second);
         assert!(!reg.end_local_video_request("CID", generation, first));
         assert_eq!(
@@ -5277,6 +5312,21 @@ mod tests {
             Some((VideoState::UpgradeRequestV2, VideoState::Disabled))
         );
         assert!(reg.end_local_video_request("CID", generation, second));
+    }
+
+    #[test]
+    fn rollback_re_request_restores_the_previous_epoch_only() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        let first = reg
+            .begin_local_video_request("CID", generation)
+            .expect("begin");
+        let (previous, second) = reg
+            .re_request_local_video("CID", generation)
+            .expect("re-request");
+        assert!(!reg.rollback_re_request("CID", generation, previous, first));
+        assert!(reg.rollback_re_request("CID", generation, previous, second));
+        assert!(reg.end_local_video_request("CID", generation, first));
     }
 
     #[test]

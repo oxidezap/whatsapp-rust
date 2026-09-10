@@ -170,7 +170,7 @@ struct Probe {
     /// every harness passes bare user form).
     caller_device: Option<u16>,
     /// Call-creator device suffix (`None` = bare user form, as the repo
-    /// suite sends; the matrix defaultресс is device 1).
+    /// suite sends; the matrix default is device 1).
     creator_device: Option<u16>,
 }
 
@@ -283,28 +283,12 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         }
         return Ok(());
     }
-    // COMBINED=1: originate an outbound call first, then feed the inbound
-    // offer for a different call id. The miss path bails when the message
-    // buffer is absent, and origination may be what allocates it: if the
-    // inbound call activates here, buffer/global init is the gate.
-    if std::env::var("COMBINED").is_ok() {
-        let started = r.call_embind(
-            "startVoipCall",
-            &[
-                Value::Str("11223344556677@lid".into()),
-                Value::StringList(vec!["11223344556677:0@lid".into()]),
-                Value::Str("outbound-seed".into()),
-                Value::Bool(false),
-                Value::Str("11223344556677@lid".into()),
-                Value::Bool(false),
-                Value::Bytes(vec![0xA5; 32]),
-            ],
-        );
-        r.refuel();
-        r.settle(std::time::Duration::from_secs(5));
-        r.refuel();
-        println!("PROBE {}: seed start -> {started:?}", probe.label);
-    }
+    // COMBINED mode removed: originating first leaves the outbound context
+    // live during the inbound feed, so a failure reads as glare against an
+    // active call rather than answering whether origination allocates the
+    // missing message buffer. Clearing it first (endCall) would be the honest
+    // variant; until then the mode stays out instead of reporting confounded
+    // verdicts.
     if probe.ab_props && !minimal {
         let set = set_ab_props(&mut r);
         println!("  ab props accepted {set} of {}", AB_PROPS.len());
@@ -367,17 +351,16 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         );
     }
     // MS_PAIR is read here (after priming, before timestamps): millisecond-
-    // consistent timestamps on every channel, expiry 45s after offer.
+    // consistent timestamps on every channel, expiry 45s after offer, derived
+    // from the shifted clock so past/future rows actually move.
     let ms_pair = std::env::var("MS_PAIR").is_ok();
-    let t_all: u64 = if ms_pair {
-        now * 1000
-    } else if probe.t_millis {
+    let t_all: u64 = if ms_pair || probe.t_millis {
         shifted * 1000
     } else {
         shifted
     };
     let e_all: u64 = if ms_pair {
-        now * 1000 + 45000
+        shifted * 1000 + 45000
     } else {
         shifted + if probe.expiry { 45 } else { 0 }
     };

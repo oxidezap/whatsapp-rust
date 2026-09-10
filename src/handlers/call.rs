@@ -4311,9 +4311,7 @@ mod tests {
         );
     }
 
-    // An `enc` reject is per-device like `busy` (see `reject_is_device_busy`): it must neither
-    // tear the call down nor consume the one-shot rung set, or the remaining siblings stop ringing
-    // and a later genuine answer has nothing to dismiss.
+    // Per-device reject (see `reject_is_device_busy`): keeps the call and rung set.
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn enc_reject_keeps_the_call_and_the_rung_set() {

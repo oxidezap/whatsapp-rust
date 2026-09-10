@@ -78,20 +78,25 @@ fn start(bytes: &[u8], identity: [&str; 3]) -> Result<Runtime> {
 /// startup gap lands on a half-started engine and reads as a refusal. Warns
 /// and continues on timeout so a slow host degrades the verdict instead of
 /// hanging the run.
-fn await_event_thread(r: &mut Runtime, label: &str) {
+/// Wait for the event thread before delivering anything: an offer into the
+/// startup gap lands on a half-started engine and reads as a refusal. A
+/// missing startup marker is a startup failure, not protocol evidence, so a
+/// blown deadline fails loudly instead of letting later verdicts blame the
+/// signaling.
+fn await_event_thread(r: &mut Runtime, label: &str) -> Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while std::time::Instant::now() < deadline {
         if r.engine_log()
             .iter()
             .any(|l| l.contains("call_event_proc resumed"))
         {
-            return;
+            return Ok(());
         }
         r.process_queued_calls();
         r.refuel();
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    println!("{label}: event thread never announced itself; results suspect");
+    bail!("{label}: event thread never announced itself")
 }
 
 /// Drain main-thread work the engine queued, until observable quiescence or a
@@ -232,10 +237,12 @@ fn diff_children(vendor: &Node, rust: &Node) -> Option<String> {
         })
 }
 
-/// Side A: place a video call, return the emitted `<offer>` node.
+/// Side A: place a video call, return the emitted `<offer>` node. A trapped
+/// or nonzero start is a host failure, not an empty offer: fail loudly
+/// instead of judging the signaling that never ran.
 fn side_a_initiator(bytes: &[u8]) -> Result<(Node, String)> {
     let mut r = start(bytes, [SELF, SELF_DEVICE, SELF_LID])?;
-    await_event_thread(&mut r, "side A");
+    await_event_thread(&mut r, "side A")?;
     let outcome = r.call_embind(
         "startVoipCall",
         &[
@@ -251,7 +258,10 @@ fn side_a_initiator(bytes: &[u8]) -> Result<(Node, String)> {
     r.refuel();
     r.settle(std::time::Duration::from_secs(8));
     r.refuel();
-    let ret = outcome.as_ref().ok().and_then(|v| v.as_int());
+    match &outcome {
+        Ok(value) if value.as_int() == Some(0) => {}
+        other => bail!("side A startVoipCall failed: {other:?}"),
+    }
     let stanzas = r.signaling()?;
     let decoded: Vec<(usize, Node)> = stanzas
         .iter()
@@ -263,7 +273,7 @@ fn side_a_initiator(bytes: &[u8]) -> Result<(Node, String)> {
         .context("side A emitted no <offer>")?;
     let info = r.call_embind("getCallInfo", &[]).ok();
     r.refuel();
-    println!("side A: startVoipCall -> {ret:?}, offer {offer_len} bytes");
+    println!("side A: startVoipCall -> 0, offer {offer_len} bytes");
     println!("side A: offer children {:?}", child_tags(&offer));
     Ok((offer, format!("{info:?}")))
 }
@@ -281,10 +291,11 @@ fn side_b_answerer(
     label: &str,
 ) -> Result<Vec<Node>> {
     let mut r = start(bytes, identity)?;
-    await_event_thread(&mut r, label);
+    await_event_thread(&mut r, label)?;
     let now = r.virtual_unix_time();
     let wrapper = NodeBuilder::new("call")
         .attr("from", caller.clone())
+        .attr("id", "1")
         .attr("call-id", CALL_ID)
         .attr("call-creator", caller.with_device(1))
         .attr("t", now.to_string())

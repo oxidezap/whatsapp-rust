@@ -496,15 +496,13 @@ impl AnnexBAuSplitter {
                 self.scan_pos = sc.begin;
                 break;
             };
-            if nal_byte & 0x1f == NAL_TYPE_AUD {
+            let unit_type = nal_byte & 0x1f;
+            if unit_type == NAL_TYPE_AUD {
                 self.seen_aud = true;
             }
-            if nal_byte & 0x1f == NAL_TYPE_AUD && sc.begin > 0 {
-                let rest = self.buf.split_off(sc.begin);
-                let au = std::mem::replace(&mut self.buf, rest);
-                out.push(au);
-                self.scan_pos = 0;
-            } else if !self.seen_aud && nal_byte & 0x1f == NAL_TYPE_SPS && sc.begin > 0 {
+            let cuts_here = sc.begin > 0
+                && (unit_type == NAL_TYPE_AUD || (!self.seen_aud && unit_type == NAL_TYPE_SPS));
+            if cuts_here {
                 let rest = self.buf.split_off(sc.begin);
                 let au = std::mem::replace(&mut self.buf, rest);
                 out.push(au);

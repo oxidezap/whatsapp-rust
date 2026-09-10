@@ -4271,24 +4271,32 @@ impl CallHandle {
         Ok(())
     }
 
-    /// Re-ask for video on a live call: re-emit `<video state=11 dec="H264">`
-    /// without touching endpoints or the initiation guard.
+    /// Re-ask for video while a local upgrade is outstanding: re-emit
+    /// `<video state=11 dec="H264">` without touching endpoints.
     ///
-    /// `begin_video(Initiate)` refuses once local video is requested or
-    /// enabled, so an upgrade request the peer never answered cannot be asked
-    /// again through it. This mints a fresh epoch under the reached state and
-    /// sends the identical stanza shape; media, teardown hooks, and the
-    /// previous timeout are the original initiation's and stay untouched,
-    /// except a new timeout is armed for the fresh epoch (the old one goes
-    /// inert on the epoch mismatch). Refuses on audio-only calls, which stay
-    /// on the begin path.
+    /// `begin_video(Initiate)` refuses once local video is requested, so an
+    /// upgrade request the peer never answered cannot be asked again through
+    /// it. This mints a fresh epoch under the reached state and sends the
+    /// identical stanza shape; media and teardown hooks stay with the original
+    /// initiation, and a new timeout is armed for the fresh epoch (the old one
+    /// goes inert on the epoch mismatch). A failed send rolls the pending
+    /// epoch back so the previous timeout stays valid instead of stranding the
+    /// upgrade. Refuses without an outstanding local upgrade.
     pub async fn re_request_video_upgrade(&self) -> Result<(), CallError> {
         self.ensure_current()?;
+        let transition_lock = self
+            .client_registry
+            .video_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call no longer active"))?;
+        let _transition_guard = transition_lock.lock().await;
+        self.ensure_current()?;
         let client = self.upgrade_client()?;
-        let epoch = self
+        let (previous, epoch) = self
             .client_registry
             .re_request_local_video(&self.call_id, self.generation)
-            .ok_or(CallError::Media("no live video to re-request"))?;
+            .ok_or(CallError::Media(
+                "no outstanding video upgrade to re-request",
+            ))?;
         let stanza = build_video_state(&VideoStateParams {
             call_id: &self.call_id,
             to: &self.peer_jid(),
@@ -4298,7 +4306,15 @@ impl CallHandle {
             dec: Some(VIDEO_DEC_REQUEST),
             device_orientation: Some(self.local_video_orientation()),
         });
-        client.send_node(stanza).await?;
+        if let Err(e) = client.send_node(stanza).await {
+            self.client_registry.rollback_re_request(
+                &self.call_id,
+                self.generation,
+                previous,
+                epoch,
+            );
+            return Err(e.into());
+        }
         self.spawn_video_upgrade_timeout(epoch, client);
         Ok(())
     }
@@ -11008,9 +11024,7 @@ mod tests {
         handle.hangup_local().await;
     }
 
-    // A caller-side upgrade the peer never answered must be askable again: the
-    // begin path refuses a second initiation on live video, so the re-request
-    // API re-emits the identical stanza shape under a fresh epoch.
+    // Re-request path: identical stanza shape under a fresh epoch.
     #[tokio::test]
     async fn re_request_video_upgrade_resends_request_shape_on_live_video() {
         let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
