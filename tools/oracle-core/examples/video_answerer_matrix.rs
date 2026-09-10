@@ -308,18 +308,20 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
             );
         }
         r.refuel();
-        let second = r.call_embind(
-            "startVoipCall",
-            &[
-                Value::Str("11223344556677@lid".into()),
-                Value::StringList(vec!["11223344556677:0@lid".into()]),
-                Value::Str("0011223344556677".into()),
-                Value::Bool(false),
-                Value::Str("11223344556677@lid".into()),
-                Value::Bool(false),
-                Value::Bytes(Vec::new()),
-            ],
-        );
+        let second = r
+            .call_embind(
+                "startVoipCall",
+                &[
+                    Value::Str("11223344556677@lid".into()),
+                    Value::StringList(vec!["11223344556677:0@lid".into()]),
+                    Value::Str("0011223344556677".into()),
+                    Value::Bool(false),
+                    Value::Str("11223344556677@lid".into()),
+                    Value::Bool(false),
+                    Value::Bytes(Vec::new()),
+                ],
+            )
+            .with_context(|| "REPLICATE_LOAD: second startVoipCall trapped")?;
         r.refuel();
         println!("REPLICA: rejectCall -> {rejected:?}, second start -> {second:?}");
         for line in r.engine_log().iter().rev().take(8).rev() {
@@ -581,6 +583,18 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
             (last_signaling, last_log) = (signaling, log);
         }
     }
+    // The scheduler's lock watchdog taints the run: handling stops partway,
+    // which would otherwise read as a protocol observation. Bail on exactly
+    // that complaint, like the signaling tests and the both-sides driver.
+    if r.engine_log()
+        .iter()
+        .any(|l| l.contains("check_locking_order"))
+    {
+        bail!(
+            "PROBE {}: lock-order inversion handling the offer; row tainted",
+            probe.label
+        );
+    }
     // Did the inbound blob land in the applied settings store? The offer
     // carries caller_timeout=45; an empty read-back means the expiry path
     // computes against an unapplied (zero) window and every offer is
@@ -688,18 +702,20 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
     // object exists even when `getCallInfo` reads empty, separating
     // state (missed) from existence.
     if std::env::var("CHECK_CONTEXT").is_ok() {
-        let second = r.call_embind(
-            "startVoipCall",
-            &[
-                Value::Str("11223344556677@lid".into()),
-                Value::StringList(vec!["11223344556677:0@lid".into()]),
-                Value::Str("probe-second-start".into()),
-                Value::Bool(true),
-                Value::Str("11223344556677@lid".into()),
-                Value::Bool(false),
-                Value::Bytes(vec![0xA5; 32]),
-            ],
-        );
+        let second = r
+            .call_embind(
+                "startVoipCall",
+                &[
+                    Value::Str("11223344556677@lid".into()),
+                    Value::StringList(vec!["11223344556677:0@lid".into()]),
+                    Value::Str("probe-second-start".into()),
+                    Value::Bool(true),
+                    Value::Str("11223344556677@lid".into()),
+                    Value::Bool(false),
+                    Value::Bytes(vec![0xA5; 32]),
+                ],
+            )
+            .with_context(|| "REPLICATE_LOAD: second startVoipCall trapped")?;
         r.refuel();
         println!("PROBE {}: second start -> {second:?}", probe.label,);
         for line in r.engine_log().iter().rev().take(6).rev() {

@@ -648,16 +648,13 @@ impl AnnexBAuSplitter {
             // Record this NAL for the next boundary decision: the flag update
             // runs after the cut check above, so a group opener never closes
             // the group its own parameter sets belong to. A VCL NAL ends any
-            // SEI run; any other non-VCL NAL breaks it.
+            // SEI run; other prefix NALs leave a pending run in place, since
+            // they describe the same following picture.
             if is_vcl {
                 self.buf_has_vcl = true;
                 self.pending_sei_start = None;
-            } else if unit_type == NAL_TYPE_SEI {
-                if self.pending_sei_start.is_none() {
-                    self.pending_sei_start = Some(sc.begin);
-                }
-            } else {
-                self.pending_sei_start = None;
+            } else if unit_type == NAL_TYPE_SEI && self.pending_sei_start.is_none() {
+                self.pending_sei_start = Some(sc.begin);
             }
             if self.buf.len() > H264_MAX_AU_BYTES {
                 // Runaway buffer means the stream has no AUDs; dropping is
@@ -1506,6 +1503,26 @@ mod tests {
         let got = depacketize_all(payloads.iter()).expect("AU must reassemble");
         assert_eq!(got, au);
         assert!(au_is_keyframe(&got));
+    }
+
+    /// Prefix NALs between an SEI run and its picture do not break the run:
+    /// VCL, SEI, PPS, VCL frames as [VCL] + [SEI, PPS, VCL].
+    #[test]
+    fn au_splitter_sei_run_survives_prefix_nals() {
+        let vcl = |first: &[u8]| {
+            let mut n = vec![0x41];
+            n.extend_from_slice(first);
+            n.extend((0..30).map(|i| (i % 251) as u8));
+            n
+        };
+        let (first, second) = (vcl(&[0x80]), vcl(&[0x80]));
+        let (sei, pps) = (vec![0x06, 0x05, 0x11, 0x22], nal(8, 4));
+        let stream = au_from_nals(&[first.clone(), sei.clone(), pps.clone(), second.clone()]);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&stream, &mut out);
+        assert_eq!(out, vec![au_from_nals(&[first])]);
+        assert_eq!(s.finish(), Some(au_from_nals(&[sei, pps, second])));
     }
 
     /// An SEI preceding a group opener rides with the group: VCL, SEI, SPS,
