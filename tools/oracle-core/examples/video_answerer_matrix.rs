@@ -468,9 +468,10 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
     // Arguments 4 and 5 are the stanza's `e` and `t` timestamps, read with
     // stoull (see `tests/signaling.rs::deliver`): the probe axes ride here,
     // not only on the stanza attributes, because the engine reads the header
-    // inputs. `second_numeric_offset` shifts `t` into the future.
+    // inputs. `second_numeric_offset` shifts `t` into the future, including
+    // under MS_PAIR (offset applied before the millisecond conversion).
     let (e_arg, t_arg) = if ms_pair {
-        (e_all, t_all)
+        (e_all, second_numeric * 1000)
     } else {
         (
             shifted + if probe.expiry { 45 } else { 0 },
