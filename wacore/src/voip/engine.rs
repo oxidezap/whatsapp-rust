@@ -2262,6 +2262,15 @@ impl CallEngine {
         }
     }
 
+    /// Hold OUTBOUND video off the wire while inbound keeps decoding (our camera stopped; the
+    /// peer is still sending). A later [`enable_video`](Self::enable_video) ungates it like an
+    /// accepted upgrade, including the keyframe the peer needs for the fresh stream.
+    pub fn gate_video_outbound(&mut self) {
+        if let Some(v) = self.media.as_mut().and_then(|m| m.video.as_mut()) {
+            v.send_gated = true;
+        }
+    }
+
     /// Deactivate the video plane (downgrade): outbound AUs drop, inbound PT-97 is ignored. The
     /// pipeline (and its SRTP send seq/ROC) is PRESERVED so a later re-upgrade continues the
     /// keystream instead of resetting the packet index. The audio plane is untouched. Idempotent.
@@ -10791,6 +10800,48 @@ mod tests {
             count_transmits(&drain(&mut eng).0),
             1,
             "the next IDR resumes outbound video"
+        );
+    }
+
+    // Gating only the outbound camera must not touch the inbound picture: our Stopped leaves
+    // the peer's stream decodable, so a local mute is not a remote blackout.
+    #[test]
+    fn gating_outbound_keeps_inbound_decoding() {
+        let mut eng = engine(true);
+        assert!(eng.enable_video());
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+
+        eng.gate_video_outbound();
+        eng.handle_input(1, Input::VideoFrame(&video_au(200)));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            0,
+            "a gated camera must not transmit our video"
+        );
+        let mut peer = peer_video_pipe();
+        for p in peer.protect_video(&video_au(120)) {
+            eng.handle_input(1, Input::RelayPacket(&p));
+        }
+        assert!(
+            drain(&mut eng)
+                .0
+                .iter()
+                .any(|o| matches!(o, Output::VideoPlayout(_))),
+            "gating our camera must not lose the peer's picture"
+        );
+
+        // Ungating resumes our camera; the peer's stream never left, so no new SSRC is needed.
+        assert!(eng.enable_video());
+        for p in peer.protect_video(&video_au(120)) {
+            eng.handle_input(2, Input::RelayPacket(&p));
+        }
+        assert!(
+            drain(&mut eng)
+                .0
+                .iter()
+                .any(|o| matches!(o, Output::VideoPlayout(_))),
+            "re-enabling after a local mute must play the peer at once"
         );
     }
 

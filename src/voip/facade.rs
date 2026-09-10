@@ -3417,11 +3417,23 @@ impl VideoShared {
     /// Release the endpoints (downgrade / refused upgrade): the source feed is aborted, the sink is
     /// dropped, and the drive loop's video plane is disabled so it stops emitting/decoding video.
     fn detach_endpoints(&self) {
-        *self.sink_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.detach_source();
+        self.detach_sink();
+    }
+
+    /// Drop the local capture feed and gate outbound video off the wire. Inbound keeps decoding,
+    /// so stopping our camera does not lose the picture we are watching.
+    fn detach_source(&self) {
         let feed = self.feed.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(feed) = feed {
             feed.abort();
         }
+        self.send_control(VideoControl::DisableOutbound);
+    }
+
+    /// Drop the attached sink and disable the whole video plane.
+    fn detach_sink(&self) {
+        *self.sink_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.send_control(VideoControl::Disable);
     }
 }
@@ -4354,9 +4366,9 @@ impl CallHandle {
         Ok(())
     }
 
-    /// Stop our video direction: sends `<video state=6>` (Stopped, no marker), tears the local
-    /// video plane down, and releases the source/sink. The peer may keep sending its direction;
-    /// audio is untouched. Idempotent.
+    /// Stop our video direction: sends `<video state=6>` (Stopped, no marker) and releases only
+    /// the local capture feed. The sink stays attached and inbound keeps decoding, so the peer's
+    /// picture keeps flowing; audio is untouched. Idempotent.
     pub async fn stop_video(&self) -> Result<(), CallError> {
         self.ensure_current()?;
         let transition_lock = self
@@ -4366,9 +4378,8 @@ impl CallHandle {
         let _transition_guard = transition_lock.lock().await;
         self.ensure_current()?;
         // Tear local media down FIRST, matching `Voip::terminate`: the app asked to stop video, so
-        // a failed signaling send must NOT leave the camera streaming. If the peer misses the
-        // Stopped it keeps sending video, but our plane is disabled so those PT-97 packets drop.
-        self.release_local_video();
+        // a failed signaling send must NOT leave the camera streaming.
+        self.stop_local_source();
         self.client_registry
             .stop_local_video(&self.call_id, self.generation);
         let client = self.upgrade_client()?;
@@ -4456,8 +4467,7 @@ impl CallHandle {
                 .restore_self_video_state(&self.call_id, self.generation, previous);
             return Err(CallError::Media("call no longer active"));
         }
-        // Ungated, unlike the initiator's `EnableAwaitingAccept`: the peer is
-        // already video, so there is no accept to wait for.
+        // The peer is already video, so no accept to wait for.
         self.video.send_control(VideoControl::Enable);
         let stanza = build_video_state(&VideoStateParams {
             call_id: &self.call_id,
@@ -4500,6 +4510,23 @@ impl CallHandle {
             ),
             None => CallError::Media("call no longer active"),
         }
+    }
+
+    fn stop_local_source(&self) {
+        let pending_video = {
+            // This synchronous map is shared with non-async setup paths; its lock covers only one
+            // lookup/take and is never held across an await.
+            let mut pending = self
+                .pending_outgoing_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            pending
+                .get_mut(&self.call_id)
+                .filter(|entry| entry.generation == self.generation)
+                .and_then(|entry| entry.video.take())
+        };
+        drop(pending_video);
+        self.video.detach_source();
     }
 
     /// Release local codec endpoints without changing the directional signaling state.
@@ -12008,8 +12035,23 @@ mod tests {
         handle.hangup_local().await;
     }
 
+    // A caller stopping its camera must not lose the picture it is
+    // watching: the peer is still sending, so only the local feed goes.
     #[tokio::test]
-    async fn stop_video_sends_stopped_and_releases_endpoints() {
+    async fn stop_video_keeps_the_incoming_sink_attached() {
+        let (_client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        handle.stop_video().await.expect("stop_video");
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_some(),
+            "the remote picture must keep flowing after our camera stops"
+        );
+        handle.hangup_local().await;
+    }
+
+    #[tokio::test]
+    async fn stop_video_sends_stopped_and_keeps_the_remote_sink() {
         let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
         let (vsrc, vsink) = video_endpoints();
         handle.start_video(vsrc, vsink).await.expect("start_video");
@@ -12034,8 +12076,17 @@ mod tests {
             "a downgrade must NOT carry the marker (it re-arms the peer's video)"
         );
         assert!(
-            handle.video.sink_slot.lock().unwrap().is_none(),
-            "stop_video releases the sink"
+            handle.video.sink_slot.lock().unwrap().is_some(),
+            "stopping our camera must not drop the peer's picture"
+        );
+        assert!(
+            handle
+                .video
+                .feed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "stopping our camera must stop the local capture feed"
         );
         assert!(
             !client
