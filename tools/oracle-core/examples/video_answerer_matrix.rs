@@ -18,7 +18,7 @@
 
 mod common;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine as _;
 use oracle_core::{Runtime, Value};
 use sha2::{Digest, Sha256};
@@ -528,10 +528,12 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
             )
         };
         r.refuel();
-        delivered = match &outcome {
-            Ok(value) => format!("{value:?}"),
-            Err(_) => "trap".to_owned(),
-        };
+        // A trapped delivery is a host failure, not a protocol observation:
+        // bail instead of carrying a dead row through state inspection and
+        // accept into an ordinary-looking verdict.
+        let value = outcome
+            .with_context(|| format!("PROBE {}: delivery round {round} trapped", probe.label))?;
+        delivered = format!("{value:?}");
         if twice {
             println!("PROBE {}: delivery round {round}: {delivered}", probe.label);
         }

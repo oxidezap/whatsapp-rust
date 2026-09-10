@@ -4324,6 +4324,11 @@ impl CallHandle {
             dec: Some(VIDEO_DEC_REQUEST),
             device_orientation: Some(self.local_video_orientation()),
         });
+        // Arm the timeout before the send: `send_node` awaits, so a caller
+        // cancelling there would otherwise leave the fresh epoch with no live
+        // timeout. On send failure the rollback below restores the previous
+        // epoch, and this timeout then mismatches and no-ops.
+        self.spawn_video_upgrade_timeout(epoch, client.clone());
         if let Err(e) = client.send_node(stanza).await {
             self.client_registry.rollback_re_request(
                 &self.call_id,
@@ -4333,7 +4338,6 @@ impl CallHandle {
             );
             return Err(e.into());
         }
-        self.spawn_video_upgrade_timeout(epoch, client);
         Ok(())
     }
 

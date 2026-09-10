@@ -298,30 +298,27 @@ fn side_b_answerer(
         .children(body)
         .build();
     let payload = base64::engine::general_purpose::STANDARD.encode(marshal::marshal(&wrapper)?);
-    // Preserve the delivery outcome: a trap here must read as a delivery
-    // failure, never as a signaling stall.
-    let delivered = r.call_embind(
-        "handleIncomingSignalingOffer",
-        &[
-            Value::Str(payload),
-            Value::Str("web".into()),
-            Value::Str("2.3000.0".into()),
-            Value::Str(now.to_string()),
-            Value::Str(now.to_string()),
-            Value::Bool(false),
-            Value::Bool(true),
-            Value::Str(caller.to_string()),
-            Value::Bytes(Vec::new()),
-        ],
-    );
+    // A trapped delivery is a host failure, not answerer behavior: bail
+    // inconclusive instead of draining, accepting, and reporting a stall on
+    // an offer that never arrived.
+    let delivered = r
+        .call_embind(
+            "handleIncomingSignalingOffer",
+            &[
+                Value::Str(payload),
+                Value::Str("web".into()),
+                Value::Str("2.3000.0".into()),
+                Value::Str(now.to_string()),
+                Value::Str(now.to_string()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Str(caller.to_string()),
+                Value::Bytes(Vec::new()),
+            ],
+        )
+        .with_context(|| format!("side B [{label}]: offer delivery trapped"))?;
     r.refuel();
-    println!(
-        "side B [{label}]: delivered={}",
-        match &delivered {
-            Ok(value) => format!("{value:?}"),
-            Err(_) => "trap".to_owned(),
-        }
-    );
+    println!("side B [{label}]: delivered={delivered:?}");
     // No settle here: the virtual clock advances per observation, and settling
     // ages the call past `caller_timeout`, tearing it down as missed before
     // anything can accept it (see `signaling_census`). Drain to observable

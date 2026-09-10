@@ -633,9 +633,13 @@ impl AnnexBAuSplitter {
         }
     }
 
-    /// Flush the trailing AU on end-of-stream.
+    /// Flush the trailing AU on end-of-stream. The splitter is reusable: a
+    /// finished stream leaves no framing facts behind, so the next push
+    /// starts empty rather than inheriting e.g. a stale AUD mode.
     pub fn finish(&mut self) -> Option<Vec<u8>> {
         self.scan_pos = 0;
+        self.seen_aud = false;
+        self.buf_has_vcl = false;
         if self.buf.is_empty() {
             None
         } else {
@@ -1467,6 +1471,25 @@ mod tests {
         let got = depacketize_all(payloads.iter()).expect("AU must reassemble");
         assert_eq!(got, au);
         assert!(au_is_keyframe(&got));
+    }
+
+    /// `finish` leaves no framing facts behind: a splitter reused for a new
+    /// stream neither keeps a stale AUD mode nor splits the new stream's
+    /// leading parameter sets.
+    #[test]
+    fn au_splitter_finish_resets_framing_state() {
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&au_from_nals(&[nal(9, 2), nal(7, 4), nal(5, 60)]), &mut out);
+        assert!(s.seen_aud && s.buf_has_vcl);
+        s.finish();
+        assert!(!s.seen_aud && !s.buf_has_vcl);
+        // AUD-less groups frame on the reused splitter.
+        let group = au_from_nals(&[nal(7, 4), nal(8, 4), nal(5, 60)]);
+        s.push(&group, &mut out);
+        s.push(&group, &mut out);
+        assert_eq!(out, vec![group.clone()]);
+        assert_eq!(s.finish(), Some(group));
     }
 
     /// A runaway reset restores AUD-less framing: after the cap drops a
