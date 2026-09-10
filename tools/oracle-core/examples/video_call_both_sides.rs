@@ -46,15 +46,19 @@ const CALL_KEY: [u8; 32] = [0x5A; 32];
 const SETTINGS: &[u8] =
     br#"{"encode":{"use_mlow_codec_v1":"false"},"options":{"enable_48khz_rtp_clock":"false","caller_timeout":"45"}}"#;
 
-fn load_engine() -> Result<Vec<u8>> {
+fn load_engine() -> Result<(Vec<u8>, String)> {
     let which = std::env::var("ENGINE").unwrap_or_else(|_| ENGINE.into());
     let catalog = Catalog::discover()?;
     let entry = catalog.resolve(&which)?;
     let bytes = std::fs::read(&entry.path)?;
+    let sha = hex::encode(Sha256::digest(&bytes));
     if which == ENGINE {
-        assert_eq!(hex::encode(Sha256::digest(&bytes)), ENGINE_SHA);
+        assert_eq!(sha, ENGINE_SHA);
     }
-    Ok(bytes)
+    // An override never runs silently: its hash prints every run, so a stale
+    // or modified capture cannot masquerade as the pinned engine's evidence.
+    println!("engine: {which} sha256={sha}");
+    Ok((bytes, which))
 }
 
 fn start(bytes: &[u8], identity: [&str; 3]) -> Result<Runtime> {
@@ -421,7 +425,7 @@ fn census_video_offer(video: &Node) -> Node {
 }
 
 fn main() -> Result<()> {
-    let bytes = load_engine()?;
+    let (bytes, _engine) = load_engine()?;
 
     // Side A: initiator.
     let (offer, a_state) = side_a_initiator(&bytes)?;

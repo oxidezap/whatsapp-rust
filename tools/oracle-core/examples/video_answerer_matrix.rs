@@ -752,10 +752,13 @@ fn main() -> Result<()> {
     let catalog = oracle_core::Catalog::discover()?;
     let entry = catalog.resolve(&which)?;
     let bytes = std::fs::read(&entry.path)?;
+    let sha = hex::encode(Sha256::digest(&bytes));
     if which == ENGINE {
-        assert_eq!(hex::encode(Sha256::digest(&bytes)), ENGINE_SHA);
+        assert_eq!(sha, ENGINE_SHA);
     }
-    println!("engine: {which}");
+    // An override never runs silently: its hash prints every run, so a stale
+    // or modified capture cannot masquerade as the pinned engine's evidence.
+    println!("engine: {which} sha256={sha}");
 
     // PROBE=<label> runs a single probe (default: the whole matrix). A
     // selector that matches nothing fails loudly: an empty run must never
