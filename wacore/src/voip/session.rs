@@ -2511,6 +2511,58 @@ mod tests {
         assert_eq!(body, expect.as_slice(), "video send must key on self LID");
     }
 
+    /// Lock the wire shape Android renders: an IDR AU leaves protect_video as
+    /// STAP-A(SPS, PPS) plus slice packets, with PT 97, the keyframe bit on
+    /// every fragment, and the marker on the last packet only. Production
+    /// preview confirmed Android decodes from the first such IDR with no PLI
+    /// storm, after never rendering the old single-NAL parameter sets.
+    #[test]
+    fn protected_idr_opens_with_stap_a_parameter_sets() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let self_lid = "111111111111111:0@lid";
+        let peer_lid = "222222222222222:0@lid";
+        let mut pipe = VideoPipeline::new(&video_params(&call_key, self_lid, peer_lid)).unwrap();
+        let sps = [0x67, 0x42, 0xc0, 0x1f, 0x08, 0x80];
+        let pps = [0x68, 0xce, 0x06, 0xe2];
+        let mut au = vec![0, 0, 0, 1];
+        au.extend_from_slice(&sps);
+        au.extend_from_slice(&[0, 0, 0, 1]);
+        au.extend_from_slice(&pps);
+        au.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x01, 0x02, 0x03]);
+        let packets = pipe.protect_video(&au);
+        assert_eq!(packets.len(), 2, "STAP-A plus the IDR slice");
+
+        let keys = derive_e2e_keys(&call_key, self_lid).unwrap();
+        let first = &packets[0][..packets[0].len() - WARP_MI_TAG_LEN];
+        let header = parse_rtp_header(first).unwrap();
+        assert_eq!(header.payload_type, crate::voip::rtp::RTP_PAYLOAD_TYPE_H264);
+        assert!(!header.marker, "only the last packet of the AU marks");
+        assert_eq!(
+            header.video_extension.unwrap().media_frame_info,
+            VIDEO_MEDIA_FRAME_INFO_IDR
+        );
+        let header_len = rtp_header_byte_length(first).unwrap();
+        let mut stap = vec![0x78]; // STAP-A, NRI 3: the unit tests pin the const mapping.
+        stap.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+        stap.extend_from_slice(&sps);
+        stap.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+        stap.extend_from_slice(&pps);
+        let expect = crypt_payload(&keys, header.ssrc, 0, 0, &stap);
+        assert_eq!(&first[header_len..], expect.as_slice());
+
+        let last = &packets[1][..packets[1].len() - WARP_MI_TAG_LEN];
+        let header = parse_rtp_header(last).unwrap();
+        assert_eq!(header.payload_type, crate::voip::rtp::RTP_PAYLOAD_TYPE_H264);
+        assert!(header.marker, "the AU closes with the marker");
+        assert_eq!(
+            header.video_extension.unwrap().media_frame_info,
+            VIDEO_MEDIA_FRAME_INFO_IDR
+        );
+        let header_len = rtp_header_byte_length(last).unwrap();
+        let expect = crypt_payload(&keys, header.ssrc, 1, 0, &[0x65, 0x01, 0x02, 0x03]);
+        assert_eq!(&last[header_len..], expect.as_slice());
+    }
+
     #[test]
     fn upright_video_frame_info_is_constant_across_every_au_fragment() {
         let call_key: Vec<u8> = (0u8..32).collect();
