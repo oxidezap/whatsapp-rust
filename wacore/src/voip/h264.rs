@@ -16,6 +16,7 @@ const H264_FUA_FRAG_SIZE: usize = H264_SINGLE_NAL_MAX - 2;
 pub const H264_MAX_AU_BYTES: usize = 4 * 1024 * 1024;
 
 const NAL_TYPE_IDR: u8 = 5;
+const NAL_TYPE_SEI: u8 = 6;
 const NAL_TYPE_SPS: u8 = 7;
 const NAL_TYPE_PPS: u8 = 8;
 const NAL_TYPE_AUD: u8 = 9;
@@ -243,12 +244,26 @@ impl core::ops::Index<usize> for PacketizedAu {
 /// Packetize one Annex-B access unit into WhatsApp RTP payloads (no RTP headers): each
 /// media NAL goes out as a single-NAL payload when it fits, or a run of FU-A
 /// fragments otherwise. Encoder-only AUDs are omitted because WhatsApp's H.264
-/// decoder requires SPS/PPS to lead an IDR frame. `out` is cleared and refilled
+/// decoder requires SPS/PPS to lead an IDR frame, and SEI units are omitted
+/// for the same reason: supplemental metadata no decoder needs for rendering
+/// that would otherwise take NALU index 0 from SPS. `out` is cleared and refilled
 /// so the send path can reuse one buffer per AU.
 pub fn packetize_au(au: &[u8], out: &mut PacketizedAu) {
+    packetize_au_inner(au, out, false);
+}
+
+/// [`packetize_au`] preserving SEI units, for the explicit opt-in case of a
+/// peer that needs the metadata. The default strips; callers keep SEI only
+/// deliberately, never by accident.
+pub fn packetize_au_keep_sei(au: &[u8], out: &mut PacketizedAu) {
+    packetize_au_inner(au, out, true);
+}
+
+fn packetize_au_inner(au: &[u8], out: &mut PacketizedAu, keep_sei: bool) {
     out.clear();
     for nal in split_annexb(au) {
-        if nal_unit_type(nal) == NAL_TYPE_AUD {
+        let unit_type = nal_unit_type(nal);
+        if unit_type == NAL_TYPE_AUD || (!keep_sei && unit_type == NAL_TYPE_SEI) {
             continue;
         }
         if nal.len() <= H264_SINGLE_NAL_MAX {
@@ -1049,21 +1064,36 @@ mod tests {
         assert_eq!(types[0], 7, "AUD dropped, SPS opens, got {types:?}");
     }
 
-    /// Documents current passthrough, not approved shape: an SEI-first input
-    /// stays SEI-first on the wire — the packetizer preserves supplier order
-    /// and only AUD is filtered. If a live encoder emits SEI-first groups,
-    /// the peer decoder drops the IDR; fixing that belongs at the source (or
-    /// in packetize policy, which is a product decision), not in this test.
+    /// SEI NALs are supplemental metadata no decoder needs for rendering, and
+    /// a leading SEI breaks the decoder keyframe gate (SPS must open at index
+    /// 0). The packetizer strips them exactly like encoder-only AUDs; a peer
+    /// that needs SEI passthrough uses `packetize_au_keep_sei` explicitly.
     #[test]
-    fn outbound_sei_first_input_stays_sei_first() {
-        let au = au_from_nals(&[nal(6, 12), nal(7, 24), nal(8, 8), nal(5, 100)]);
+    fn outbound_sei_first_input_goes_out_sps_first() {
+        let sps = nal(7, 24);
+        let au = au_from_nals(&[nal(6, 12), sps.clone(), nal(8, 8), nal(5, 100)]);
         let mut payloads = PacketizedAu::default();
         packetize_au(&au, &mut payloads);
         let got = depacketize_all(payloads.iter()).expect("reassembled AU");
-        let types: Vec<u8> = split_annexb(&got).map(nal_unit_type).collect();
-        assert_eq!(
-            types[0], 6,
-            "SEI currently passes through first, got {types:?}"
+        let nals: Vec<_> = split_annexb(&got).collect();
+        let types: Vec<u8> = nals.iter().map(|n| nal_unit_type(n)).collect();
+        assert_eq!(types[0], 7, "SEI stripped, SPS opens, got {types:?}");
+        assert_eq!(nals[0], sps.as_slice(), "SPS bytes intact");
+        assert!(
+            !types.iter().any(|t| *t == 6),
+            "no SEI may reach the wire, got {types:?}"
         );
+    }
+
+    /// Explicit opt-in for the strip default above: keeps SEI for a peer that
+    /// needs the metadata, verified byte-identical apart from the kept unit.
+    #[test]
+    fn keep_sei_variant_preserves_sei() {
+        let au = au_from_nals(&[nal(6, 12), nal(7, 24), nal(8, 8), nal(5, 100)]);
+        let mut payloads = PacketizedAu::default();
+        packetize_au_keep_sei(&au, &mut payloads);
+        let got = depacketize_all(payloads.iter()).expect("reassembled AU");
+        let types: Vec<u8> = split_annexb(&got).map(nal_unit_type).collect();
+        assert_eq!(types[0], 6, "keep variant preserves SEI, got {types:?}");
     }
 }
