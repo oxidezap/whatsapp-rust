@@ -535,7 +535,9 @@ pub struct AnnexBAuSplitter {
     buf: Vec<u8>,
     /// Scan resume point: everything before it was already searched for an AUD.
     scan_pos: usize,
-    /// An AUD has been observed: SPS/IDR/VCL cutting stays off from here on.
+    /// An AUD has been observed: SPS/IDR/VCL cutting stays off while the
+    /// buffered content survives it. A runaway reset drops the content, so it
+    /// drops this too and AUD-less framing can recover.
     seen_aud: bool,
     /// The buffered bytes already hold an IDR slice.
     buf_has_idr: bool,
@@ -545,10 +547,13 @@ pub struct AnnexBAuSplitter {
 
 impl AnnexBAuSplitter {
     /// Drop a runaway buffer: without AUDs the cap is the only bound, so
-    /// every early exit enforces it, not just the loop end.
+    /// every early exit enforces it, not just the loop end. The flags
+    /// describe cleared content, so they reset with it — including `seen_aud`,
+    /// or AUD-less input after the reset could never frame again.
     fn drop_runaway(&mut self) {
         self.buf.clear();
         self.scan_pos = 0;
+        self.seen_aud = false;
         self.buf_has_idr = false;
         self.buf_has_vcl = false;
     }
@@ -562,7 +567,7 @@ impl AnnexBAuSplitter {
                 // here too — keep only the last few bytes so a start code split across chunks still
                 // reassembles.
                 if self.buf.len() > H264_MAX_AU_BYTES {
-                    self.buf.clear();
+                    self.drop_runaway();
                 }
                 self.scan_pos = self.buf.len().saturating_sub(3);
                 break;
@@ -1432,5 +1437,29 @@ mod tests {
         s.push(&stream, &mut out);
         assert!(out.is_empty(), "partitions B/C ride with their partition A");
         assert_eq!(s.finish(), Some(stream));
+    }
+
+    /// A runaway reset restores AUD-less framing: after the cap drops a
+    /// stream that once carried AUDs, SPS groups frame again instead of
+    /// accumulating to the cap forever.
+    #[test]
+    fn au_splitter_runaway_reset_restores_audless_framing() {
+        let aud_au = au_from_nals(&[nal(9, 2), nal(7, 4), nal(5, 60)]);
+        let mut s = AnnexBAuSplitter::default();
+        let mut out = Vec::new();
+        s.push(&aud_au, &mut out);
+        assert!(s.seen_aud);
+        let chunk = au_from_nals(&[nal(1, 64 * 1024)]);
+        for _ in 0..80 {
+            s.push(&chunk, &mut out);
+        }
+        let group = au_from_nals(&[nal(7, 4), nal(8, 4), nal(5, 60)]);
+        s.push(&group, &mut out);
+        s.push(&group, &mut out);
+        // The chunk residue cut at the first post-reset SPS is itself an AU;
+        // the point is the second group boundary lands again.
+        assert_eq!(out.len(), 2, "AUD-less groups must frame after the reset");
+        assert_eq!(out[1], group, "the cut lands on the second group's SPS");
+        assert_eq!(s.finish(), Some(group));
     }
 }
