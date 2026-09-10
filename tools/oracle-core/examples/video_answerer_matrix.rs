@@ -242,10 +242,6 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
         let payload = base64::engine::general_purpose::STANDARD.encode(marshal::marshal(
             &common::settings_offer(&caller, now, "0102030405060708", SETTINGS),
         )?);
-        if probe.ab_props && !minimal {
-            let set = set_ab_props(&mut r);
-            println!("  ab props accepted {set} of {}", AB_PROPS.len());
-        }
         r.call_embind(
             "handleIncomingSignalingOffer",
             &[
@@ -286,6 +282,28 @@ fn run_probe(bytes: &[u8], probe: &Probe) -> Result<()> {
             println!("    log: {}", line.trim());
         }
         return Ok(());
+    }
+    // COMBINED=1: originate an outbound call first, then feed the inbound
+    // offer for a different call id. The miss path bails when the message
+    // buffer is absent, and origination may be what allocates it: if the
+    // inbound call activates here, buffer/global init is the gate.
+    if std::env::var("COMBINED").is_ok() {
+        let started = r.call_embind(
+            "startVoipCall",
+            &[
+                Value::Str("11223344556677@lid".into()),
+                Value::StringList(vec!["11223344556677:0@lid".into()]),
+                Value::Str("outbound-seed".into()),
+                Value::Bool(false),
+                Value::Str("11223344556677@lid".into()),
+                Value::Bool(false),
+                Value::Bytes(vec![0xA5; 32]),
+            ],
+        );
+        r.refuel();
+        r.settle(std::time::Duration::from_secs(5));
+        r.refuel();
+        println!("PROBE {}: seed start -> {started:?}", probe.label);
     }
     if probe.ab_props && !minimal {
         let set = set_ab_props(&mut r);
