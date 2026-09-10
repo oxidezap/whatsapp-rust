@@ -316,6 +316,17 @@ pub fn packetize_au_keep_sei(au: &[u8], out: &mut PacketizedAu) {
 fn packetize_au_inner(au: &[u8], out: &mut PacketizedAu, keep_sei: bool) {
     out.clear();
     let mut seen_vcl = false;
+    // Open STAP-A aggregation, if any: byte offset of its indicator in
+    // `out.data`, plus the F bit (OR) and NRI (max) accumulated over its
+    // members. Small non-VCL NALs (parameter sets) pack into one payload; the
+    // indicator is backpatched at flush once every member is known.
+    let mut stap: Option<(usize, u8, u8)> = None;
+    let flush_stap = |out: &mut PacketizedAu, stap: &mut Option<(usize, u8, u8)>| {
+        if let Some((start, f, nri)) = stap.take() {
+            out.data[start] = f | nri | NAL_TYPE_STAP_A;
+            out.finish_payload();
+        }
+    };
     for nal in split_annexb(au) {
         let unit_type = nal_unit_type(nal);
         if unit_type == NAL_TYPE_AUD {
@@ -325,32 +336,71 @@ fn packetize_au_inner(au: &[u8], out: &mut PacketizedAu, keep_sei: bool) {
             continue;
         }
         if matches!(unit_type, 1..=5) {
+            flush_stap(out, &mut stap);
             seen_vcl = true;
-        }
-        if nal.len() <= H264_SINGLE_NAL_MAX {
-            out.data.extend_from_slice(nal);
-            out.finish_payload();
+            if nal.len() <= H264_SINGLE_NAL_MAX {
+                out.data.extend_from_slice(nal);
+                out.finish_payload();
+                continue;
+            }
+            fragment_nal(nal, out);
             continue;
         }
-        let indicator = (nal[0] & 0xe0) | NAL_TYPE_FU_A;
-        let orig_type = nal[0] & 0x1f;
-        let body = &nal[1..];
-        let n_frags = body.len().div_ceil(H264_FUA_FRAG_SIZE);
-        for (i, chunk) in body.chunks(H264_FUA_FRAG_SIZE).enumerate() {
-            let mut fu_header = orig_type;
-            if i == 0 {
-                fu_header |= 0x80; // S
+        // Non-VCL NAL: aggregate while the run fits, otherwise start a new
+        // STAP-A. A lone oversized unit keeps the old single/FU-A fallback.
+        let stap_cost = 2 + nal.len();
+        let fits = match stap {
+            Some((start, _, _)) => out.data.len() - start + stap_cost <= H264_SINGLE_NAL_MAX,
+            None => stap_cost < H264_SINGLE_NAL_MAX,
+        };
+        if !fits {
+            flush_stap(out, &mut stap);
+            if nal.len() <= H264_SINGLE_NAL_MAX {
+                out.data.extend_from_slice(nal);
+                out.finish_payload();
+                continue;
             }
-            if i == n_frags - 1 {
-                fu_header |= 0x40; // E
-            }
-            out.data.push(indicator);
-            out.data.push(fu_header);
-            out.data.extend_from_slice(chunk);
-            out.finish_payload();
+            fragment_nal(nal, out);
+            continue;
         }
+        match stap.as_mut() {
+            Some((_, f, nri)) => {
+                *f |= nal[0] & 0x80;
+                *nri = (*nri).max(nal[0] & 0x60);
+            }
+            None => {
+                let start = out.data.len();
+                out.data.push(0);
+                stap = Some((start, nal[0] & 0x80, nal[0] & 0x60));
+            }
+        }
+        out.data
+            .extend_from_slice(&(nal.len() as u16).to_be_bytes());
+        out.data.extend_from_slice(nal);
     }
+    flush_stap(out, &mut stap);
     out.release_outlier_capacity();
+}
+
+/// Fragment one oversized NAL into an FU-A run (RFC 6184 section 5.8).
+fn fragment_nal(nal: &[u8], out: &mut PacketizedAu) {
+    let indicator = (nal[0] & 0xe0) | NAL_TYPE_FU_A;
+    let orig_type = nal[0] & 0x1f;
+    let body = &nal[1..];
+    let n_frags = body.len().div_ceil(H264_FUA_FRAG_SIZE);
+    for (i, chunk) in body.chunks(H264_FUA_FRAG_SIZE).enumerate() {
+        let mut fu_header = orig_type;
+        if i == 0 {
+            fu_header |= 0x80; // S
+        }
+        if i == n_frags - 1 {
+            fu_header |= 0x40; // E
+        }
+        out.data.push(indicator);
+        out.data.push(fu_header);
+        out.data.extend_from_slice(chunk);
+        out.finish_payload();
+    }
 }
 
 /// Access units completed but not yet returned can briefly exceed one when a
@@ -815,14 +865,125 @@ mod tests {
 
         packetize_au(&au, &mut payloads);
 
+        // Parameter sets ride aggregated (see
+        // `parameter_sets_aggregate_into_stap_a`); the reassembled AU is
+        // unchanged: AUD dropped, SPS opens, SEI absent.
         assert_eq!(
             payloads.iter().map(nal_unit_type).collect::<Vec<_>>(),
-            [NAL_TYPE_SPS, NAL_TYPE_PPS, NAL_TYPE_IDR]
+            [NAL_TYPE_STAP_A, NAL_TYPE_IDR]
         );
         assert_eq!(
             depacketize_all(payloads.iter()),
             Some(au_from_nals(&[sps, pps, idr]))
         );
+    }
+
+    /// Parameter sets travel aggregated: consecutive small non-VCL NALs
+    /// (SPS/PPS) pack into one STAP-A payload instead of riding as separate
+    /// single-NAL packets. The captured vendor receiver parses an aggregated
+    /// SPS/PPS reliably while a lone single-NAL parameter set takes a fragile
+    /// path, and the Android decoder keeps an STAP-A SPS rewriting path for
+    /// exactly this shape. VCL slices are never aggregated.
+    #[test]
+    fn parameter_sets_aggregate_into_stap_a() {
+        let sps = nal(7, 20);
+        let pps = nal(8, 8);
+        let idr = nal(5, 100);
+        let au = au_from_nals(&[nal(9, 2), sps.clone(), pps.clone(), idr.clone()]);
+        let mut payloads = PacketizedAu::default();
+
+        packetize_au(&au, &mut payloads);
+
+        assert_eq!(payloads.len(), 2, "STAP-A(SPS,PPS) plus the IDR slice");
+        let stap = &payloads[0];
+        assert_eq!(nal_unit_type(stap), NAL_TYPE_STAP_A);
+        let mut rest = &stap[1..];
+        for want in [&sps, &pps] {
+            let len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+            assert_eq!(&rest[2..2 + len], want.as_slice());
+            rest = &rest[2 + len..];
+        }
+        assert!(rest.is_empty(), "STAP-A holds exactly SPS then PPS");
+        assert_eq!(nal_unit_type(&payloads[1]), NAL_TYPE_IDR);
+        assert_eq!(
+            depacketize_all(payloads.iter()),
+            Some(au_from_nals(&[sps, pps, idr]))
+        );
+    }
+
+    /// Slices are never aggregated, however small: STAP-A carries parameter
+    /// sets and small metadata only, so two small slices stay two packets.
+    #[test]
+    fn small_slices_are_never_aggregated() {
+        let au = au_from_nals(&[nal(1, 40), nal(1, 50)]);
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&au, &mut payloads);
+        assert_eq!(
+            payloads.iter().map(nal_unit_type).collect::<Vec<_>>(),
+            [1, 1]
+        );
+        assert_eq!(depacketize_all(payloads.iter()), Some(au));
+    }
+
+    /// Production WebCodecs IDR shape (local debug log: avc1.42c01f, NALs
+    /// [7, 8, 5, 5, 5, 5]): parameter sets aggregate once, every slice keeps
+    /// its own packet, NAL order survives the round trip.
+    #[test]
+    fn production_multislice_idr_keeps_slice_packets() {
+        let sps = nal(7, 18);
+        let pps = nal(8, 4);
+        let slices = [nal(5, 900), nal(5, 1200), nal(5, 800), nal(5, 950)];
+        let mut nals = vec![sps.clone(), pps.clone()];
+        nals.extend(slices.clone());
+        let au = au_from_nals(&nals);
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&au, &mut payloads);
+        let types: Vec<u8> = payloads.iter().map(nal_unit_type).collect();
+        assert_eq!(types[0], NAL_TYPE_STAP_A, "params aggregate, got {types:?}");
+        assert!(
+            types[1..]
+                .iter()
+                .all(|t| *t == NAL_TYPE_FU_A || *t == NAL_TYPE_IDR),
+            "slices never join the STAP-A, got {types:?}"
+        );
+        let got = depacketize_all(payloads.iter()).expect("reassembled AU");
+        assert_eq!(
+            split_annexb(&got).map(nal_unit_type).collect::<Vec<_>>(),
+            [7, 8, 5, 5, 5, 5]
+        );
+    }
+
+    /// Production parameter-set bytes from the failing call's local IDR
+    /// (SPS 18, PPS 4): aggregation carries them byte-identical and the
+    /// reassembled AU opens with the same SPS.
+    #[test]
+    fn production_parameter_sets_round_trip_byte_identical() {
+        let sps = hex::decode("6742c01f8c6805005ba6a0202020f08846a0").unwrap();
+        let pps = hex::decode("68ce3c80").unwrap();
+        assert_eq!(nal_unit_type(&sps), NAL_TYPE_SPS);
+        assert_eq!(nal_unit_type(&pps), NAL_TYPE_PPS);
+        let au = au_from_nals(&[sps.clone(), pps.clone(), nal(5, 60)]);
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&au, &mut payloads);
+        assert_eq!(nal_unit_type(&payloads[0]), NAL_TYPE_STAP_A);
+        let got = depacketize_all(payloads.iter()).expect("reassembled AU");
+        let nals: Vec<_> = split_annexb(&got).collect();
+        assert_eq!(nals[0], sps.as_slice(), "SPS bytes intact");
+        assert_eq!(nals[1], pps.as_slice(), "PPS bytes intact");
+    }
+
+    /// Peer's small keyframe shape (remote debug log: NALs [7, 8, 5], a few
+    /// hundred bytes): one STAP-A plus the slice, decoded back intact.
+    #[test]
+    fn small_peer_keyframe_round_trips() {
+        let au = au_from_nals(&[nal(7, 14), nal(8, 4), nal(5, 200)]);
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&au, &mut payloads);
+        assert_eq!(
+            payloads.iter().map(nal_unit_type).collect::<Vec<_>>(),
+            [NAL_TYPE_STAP_A, NAL_TYPE_IDR]
+        );
+        assert_eq!(depacketize_all(payloads.iter()), Some(au));
     }
 
     #[test]

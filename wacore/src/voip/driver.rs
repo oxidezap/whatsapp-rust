@@ -3699,6 +3699,64 @@ mod tests {
         assert_eq!(sent, (0..40u16).collect::<Vec<_>>());
     }
 
+    /// The STAP-A-first keyframe shape the packetizer now emits must queue as
+    /// one atomic keyframe batch: the keyframe bit is read from the RTP
+    /// extension (identical on every fragment), never from the payload type.
+    #[test]
+    fn stap_a_first_keyframe_au_batches_atomically_as_keyframe() {
+        fn video_packet(seq: u16, marker: bool, payload: &[u8]) -> Bytes {
+            let mut packet = vec![0x90, ((marker as u8) << 7) | RTP_PAYLOAD_TYPE_H264];
+            packet.extend_from_slice(&seq.to_be_bytes());
+            packet.extend_from_slice(&0u32.to_be_bytes());
+            packet.extend_from_slice(&0x1122_3344u32.to_be_bytes());
+            packet.extend_from_slice(&[0xde, 0xbe, 0x00, 0x03]);
+            packet.extend_from_slice(&[
+                0x30,
+                VIDEO_MEDIA_FRAME_INFO_IDR,
+                0x51,
+                0,
+                0,
+                0x61,
+                0,
+                0,
+                0x91,
+                0,
+                0,
+                0,
+            ]);
+            packet.extend_from_slice(payload);
+            Bytes::from(packet)
+        }
+
+        let stap = [0x78, 0, 2, 0x67, 0x42, 0, 2, 0x68, 0xce];
+        let packets = [
+            video_packet(0, false, &stap),
+            video_packet(1, false, &[0x7c, 0x85, 0x01]),
+            video_packet(2, true, &[0x7c, 0x45, 0x02]),
+        ];
+        let mut queue = VecDeque::new();
+        let mut pending = Vec::new();
+        let mut awaiting_keyframe = SendKeyframeGate::default();
+        for packet in &packets {
+            let dropped = queue_transmit(
+                &mut queue,
+                &mut pending,
+                &mut awaiting_keyframe,
+                packet.clone(),
+            );
+            assert_eq!(dropped.packets, 0);
+        }
+        assert!(pending.is_empty());
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].kind, SendBatchKind::Video);
+        assert!(queue[0].video_keyframe, "STAP-A-first AU is a keyframe");
+        assert_eq!(queue[0].packets.len(), 3);
+        let sent: Vec<u16> = std::iter::from_fn(|| pop_next_packet(&mut queue))
+            .map(|(packet, _)| parse_rtp_header(&packet).unwrap().sequence_number)
+            .collect();
+        assert_eq!(sent, vec![0, 1, 2]);
+    }
+
     #[test]
     fn epoch_transition_cancels_media_already_removed_from_the_send_queue() {
         struct DropProbe(Arc<AtomicBool>);
