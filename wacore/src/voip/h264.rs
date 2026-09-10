@@ -355,13 +355,17 @@ fn packetize_au_inner(au: &[u8], out: &mut PacketizedAu, keep_sei: bool) {
         };
         if !fits {
             flush_stap(out, &mut stap);
-            if nal.len() <= H264_SINGLE_NAL_MAX {
-                out.data.extend_from_slice(nal);
-                out.finish_payload();
+            // Reconsider for a fresh aggregate: only a unit too big for even
+            // an empty STAP-A keeps the standalone fallback.
+            if stap_cost >= H264_SINGLE_NAL_MAX {
+                if nal.len() <= H264_SINGLE_NAL_MAX {
+                    out.data.extend_from_slice(nal);
+                    out.finish_payload();
+                } else {
+                    fragment_nal(nal, out);
+                }
                 continue;
             }
-            fragment_nal(nal, out);
-            continue;
         }
         match stap.as_mut() {
             Some((_, f, nri)) => {
@@ -908,6 +912,29 @@ mod tests {
         assert_eq!(
             depacketize_all(payloads.iter()),
             Some(au_from_nals(&[sps, pps, idr]))
+        );
+    }
+
+    /// Overflow starts a new aggregate instead of stranding the triggering
+    /// NAL: a run whose members cannot share one STAP-A still aggregates in
+    /// pairs, so parameter sets stay packed even after a large prefix unit.
+    #[test]
+    fn stap_a_overflow_opens_a_new_aggregate() {
+        let sps = nal(7, 400);
+        let pps = nal(8, 400);
+        let au = au_from_nals(&[sps.clone(), pps.clone(), nal(5, 60)]);
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&au, &mut payloads);
+        let types: Vec<u8> = payloads.iter().map(nal_unit_type).collect();
+        assert_eq!(
+            types,
+            [NAL_TYPE_STAP_A, NAL_TYPE_STAP_A, NAL_TYPE_IDR],
+            "each parameter set aggregates, got {types:?}"
+        );
+        let got = depacketize_all(payloads.iter()).expect("reassembled AU");
+        assert_eq!(
+            split_annexb(&got).map(nal_unit_type).collect::<Vec<_>>(),
+            [7, 8, 5]
         );
     }
 

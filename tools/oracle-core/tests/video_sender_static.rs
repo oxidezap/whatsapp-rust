@@ -9,7 +9,7 @@
 
 mod common;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use oracle_core::abi;
 use sha2::{Digest, Sha256};
 
@@ -18,7 +18,10 @@ const CAPTURE_SHA: &str = "97259423aea19cc30c1771478e035105cb0d0e64ab4b0297741b6
 
 #[test]
 fn transport_egress_chain() -> Result<()> {
-    let bytes = common::capture(CAPTURE)?.with_context(|| format!("missing {CAPTURE}"))?;
+    let Some(bytes) = common::capture(CAPTURE)? else {
+        eprintln!("skipping: {CAPTURE} unavailable (set WA_WASM_DIR)");
+        return Ok(());
+    };
     assert_eq!(hex::encode(Sha256::digest(&bytes)), CAPTURE_SHA);
 
     // Import indices of the transport and capture host functions.
