@@ -9,7 +9,7 @@
 
 mod common;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use oracle_core::abi;
 use sha2::{Digest, Sha256};
 
@@ -53,14 +53,27 @@ fn transport_egress_chain() -> Result<()> {
         .context("call_sendto import")?;
     assert_eq!(abi::find_callers(&bytes, sendto)?, vec![10078]);
     assert_eq!(abi::table_slots_of(&bytes, 10078)?, vec![7472]);
-    // Two paths feed the egress slot: keep both pinned for the follow-up.
-    for (func, slot) in [(10089u32, 7490u32), (12912u32, 9306u32)] {
+    // Two paths feed the egress slot: pin each link so the chain reads
+    // caller -> sender slot -> sender func -> egress slot -> egress func ->
+    // call_sendto, with no unnamed hop in between.
+    let egress_users: Vec<u32> = abi::find_constant_users(&bytes, 7472)?
+        .into_iter()
+        .map(|(f, _)| f)
+        .collect();
+    for (caller, slot, func) in [(10025u32, 7490u32, 10089u32), (12900u32, 9306u32, 12912u32)] {
         assert_eq!(abi::table_slots_of(&bytes, func)?, vec![slot]);
         let users: Vec<u32> = abi::find_constant_users(&bytes, slot as i32)?
             .into_iter()
             .map(|(f, _)| f)
             .collect();
-        assert!(!users.is_empty(), "slot {slot} must have a user");
+        assert!(
+            users.contains(&caller),
+            "slot {slot} must be dispatched by func {caller}, got {users:?}"
+        );
+        assert!(
+            egress_users.contains(&func),
+            "func {func} must dispatch egress slot 7472, got {egress_users:?}"
+        );
     }
     // Capture-start import and its table slot (invoked indirectly).
     let cap = *import_index

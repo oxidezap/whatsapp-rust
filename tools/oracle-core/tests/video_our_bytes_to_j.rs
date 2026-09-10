@@ -19,7 +19,7 @@ mod common;
 use anyhow::Result;
 use oracle_core::{Runtime, abi, derive::function_body_sha256};
 use sha2::{Digest, Sha256};
-use wacore::voip::h264::{PacketizedAu, au_has_idr, packetize_au};
+use wacore::voip::h264::{PacketizedAu, au_has_idr, nal_unit_type, packetize_au};
 use wacore::voip::rtp::{
     VIDEO_MEDIA_FRAME_INFO_DELTA, VIDEO_MEDIA_FRAME_INFO_IDR, VIDEO_TS_STRIDE_15FPS,
     VideoRtpStream, encode_rtp_header,
@@ -79,7 +79,18 @@ fn our_idr_stream_through_j_parser_and_constructor() -> Result<()> {
     let info = VIDEO_MEDIA_FRAME_INFO_IDR;
     let mut payloads = PacketizedAu::default();
     packetize_au(&au, &mut payloads);
-    assert!(payloads.len() > 1);
+    // Pin the wire shape, not just the count: STAP-A(SPS, PPS) opens, then
+    // FU-A fragments carry the IDR slice.
+    assert_eq!(payloads.len(), 5);
+    let stap = &payloads[0];
+    assert_eq!(nal_unit_type(stap), 24);
+    let (first_len, rest) = stap[1..].split_at(2);
+    let first_len = u16::from_be_bytes([first_len[0], first_len[1]]) as usize;
+    assert_eq!(nal_unit_type(&rest[..first_len]), 7, "SPS opens the STAP-A");
+    let (second_len, rest) = rest[first_len..].split_at(2);
+    let second_len = u16::from_be_bytes([second_len[0], second_len[1]]) as usize;
+    assert_eq!(nal_unit_type(&rest[..second_len]), 8, "PPS follows SPS");
+    assert_eq!(rest.len(), second_len, "STAP-A holds exactly SPS then PPS");
     let mut stream = VideoRtpStream::new(0x4996_ed22, VIDEO_TS_STRIDE_15FPS).unwrap();
     let last = payloads.len() - 1;
     let wires: Vec<Vec<u8>> = payloads
