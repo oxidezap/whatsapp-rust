@@ -151,6 +151,9 @@ pub enum VideoControl {
     EnableAwaitingAccept,
     /// Tear the video plane down (downgrade to audio).
     Disable,
+    /// Gate outbound video off the wire while inbound keeps decoding (our camera stopped; the
+    /// peer is still sending). `Enable` later ungates it, like an accepted upgrade.
+    DisableOutbound,
     /// Tear the video plane down while retaining queued legacy AUs for a legacy reattach.
     DisableKeepLegacy,
     /// Require the next outbound access unit to be an IDR frame after changing its source role.
@@ -1681,6 +1684,20 @@ async fn run_call_with_clock_and_wallclock(
                     }
                     Ok(VideoControl::Disable) => {
                         eng.disable_video();
+                        let dropped = purge_unstarted_video(
+                            &mut send_queue,
+                            &mut awaiting_video_keyframe,
+                        );
+                        if dropped.packets != 0 {
+                            let _ = channels.events.try_send(CallEvent::OutboundMediaDropped {
+                                video_access_units: dropped.video_access_units,
+                                packets: dropped.packets,
+                            });
+                        }
+                        drain_video_in = true;
+                    }
+                    Ok(VideoControl::DisableOutbound) => {
+                        eng.gate_video_outbound();
                         let dropped = purge_unstarted_video(
                             &mut send_queue,
                             &mut awaiting_video_keyframe,

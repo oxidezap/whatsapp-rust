@@ -608,3 +608,103 @@ async fn peer_video_metadata_reports_routed_sender_and_supplied_creator_without_
     fixture.shutdown().await?;
     Ok(())
 }
+
+// The upgrade timeout is a cross-crate contract: clients arm their own
+// answer-wait against it, so it is published rather than hardcoded twice.
+#[test]
+fn upgrade_timeout_is_published_for_client_coordination() {
+    assert_eq!(
+        whatsapp_rust::voip::VIDEO_UPGRADE_TIMEOUT,
+        Duration::from_secs(5)
+    );
+}
+
+// Clients verify negotiation read-back through the handle: a video offer
+// starts both directions enabled, an audio offer both disabled.
+#[tokio::test]
+async fn handle_reports_negotiation_states_for_read_back() -> Result<()> {
+    use wacore::types::call::VideoState;
+
+    let fixture = CallFixture::new().await?;
+    let handle = dormant(&fixture).await?;
+    assert_eq!(
+        handle.video_states(),
+        Some((VideoState::Enabled, VideoState::Enabled)),
+        "a video offer starts both directions enabled"
+    );
+    fixture.shutdown().await?;
+
+    let fixture = CallFixture::new().await?;
+    let starting = start_with_video(&fixture, false);
+    fixture.next_offer().await?.complete()?;
+    let handle = starting.await??;
+    assert_eq!(
+        handle.video_states(),
+        Some((VideoState::Disabled, VideoState::Disabled)),
+        "an audio offer starts both directions disabled"
+    );
+    fixture.shutdown().await?;
+    Ok(())
+}
+
+// In an established video call where our direction was stopped, resume_video
+// re-attaches endpoints, emits a bare `Enabled` state stanza without upgrade
+// handshake markers, and returns read-back to (Enabled, Enabled).
+#[tokio::test]
+async fn handle_resumes_local_video_direction_in_video_call() -> Result<()> {
+    use wacore::types::call::VideoState;
+
+    let fixture = CallFixture::new().await?;
+    let handle = dormant(&fixture).await?;
+    assert_eq!(
+        handle.video_states(),
+        Some((VideoState::Enabled, VideoState::Enabled))
+    );
+
+    handle.stop_video().await?;
+    assert_eq!(
+        handle.video_states(),
+        Some((VideoState::Stopped, VideoState::Enabled))
+    );
+
+    let waiter = fixture
+        .client()
+        .wait_for_sent_node(whatsapp_rust::NodeFilter::tag("call"));
+
+    let (_source_tx, source) = async_channel::bounded::<Vec<u8>>(1);
+    let (sink, _sink_rx) = async_channel::bounded::<wacore::voip::VideoFrame>(1);
+    handle.resume_video(source, sink).await?;
+
+    assert_eq!(
+        handle.video_states(),
+        Some((VideoState::Enabled, VideoState::Enabled)),
+        "resumed direction restores both directions enabled"
+    );
+
+    let sent = tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .expect("must emit call node on resume")
+        .expect("waiter");
+    let video_child = sent
+        .children()
+        .unwrap_or_default()
+        .iter()
+        .find(|c| c.tag == "video")
+        .expect("call node must have video child");
+    assert_eq!(
+        video_child.attrs().optional_string("state").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        video_child.attrs().optional_string("dec").as_deref(),
+        Some("H264")
+    );
+    assert_eq!(
+        video_child.attrs().optional_string("voip_settings"),
+        None,
+        "resume must not carry the upgrade handshake marker"
+    );
+
+    fixture.shutdown().await?;
+    Ok(())
+}

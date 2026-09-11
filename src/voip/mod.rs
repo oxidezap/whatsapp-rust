@@ -48,7 +48,7 @@ pub(crate) use state::Voip;
 pub use audio::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
 pub use facade::{
     AcceptCall, CallHandle, CallLinkCall, CallTermination, GroupBoundCall, OutgoingCall,
-    OutgoingGroupCall,
+    OutgoingGroupCall, VIDEO_UPGRADE_TIMEOUT,
 };
 pub use video::{TimedVideoFrame, VideoFrame, VideoSink, VideoSource};
 // Surface core types carried by the facade next to the builders and handle that expose them.
