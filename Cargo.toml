@@ -205,6 +205,7 @@ test-support = ["voip-runtime", "tokio-runtime", "dep:wacore-noise", "wacore-noi
 danger-skip-tls-verify = ["whatsapp-rust-tokio-transport?/danger-skip-tls-verify"]
 default = [
     "sqlite-storage",
+    "sqlite-storage-bundled",
     "tokio-transport",
     "tokio-runtime",
     "ureq-client",
@@ -216,6 +217,7 @@ tokio-transport = ["dep:whatsapp-rust-tokio-transport"]
 tokio-runtime = ["dep:tokio"]
 signal = ["tokio-runtime", "tokio/signal"]
 sqlite-storage = ["whatsapp-rust-sqlite-storage"]
+sqlite-storage-bundled = ["sqlite-storage", "whatsapp-rust-sqlite-storage/bundled-sqlite"]
 tokio-native = ["tokio-runtime", "tokio/rt-multi-thread"]
 # The portable half of the VoIP runtime: call signaling, the facade, and the orchestration around
 # `wacore`'s sans-IO engine. It owns no socket and names no clock, so it builds wherever `wacore`
@@ -298,7 +300,7 @@ wacore-binary = { workspace = true }
 wacore-noise = { path = "./wacore/noise", version = "0.7.0", optional = true }
 waproto = { workspace = true }
 zeroize = { workspace = true }
-whatsapp-rust-sqlite-storage = { path = "./storages/sqlite-storage", version = "0.7.0", optional = true }
+whatsapp-rust-sqlite-storage = { path = "./storages/sqlite-storage", version = "0.7.0", optional = true, default-features = false }
 whatsapp-rust-tokio-transport = { path = "./transports/tokio-transport", version = "0.7.0", optional = true }
 whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version = "0.7.0", optional = true }
 
