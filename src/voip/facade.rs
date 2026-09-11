@@ -3444,6 +3444,31 @@ fn video_teardown_hook(video: &Arc<VideoShared>) -> Box<dyn Fn() + Send + Sync> 
     Box::new(move || video.detach_endpoints())
 }
 
+/// Drop a stale pending upgrade's endpoints and gate local capture off the
+/// wire, keeping the inbound sink: the direction-local abort runs while the
+/// peer is still video, so the remote picture must keep flowing. The terminal
+/// teardown hook stays armed for hangup, which still takes the whole plane.
+fn release_local_video_source(
+    pending_outgoing_calls: &std::sync::Mutex<std::collections::HashMap<String, PendingOutgoing>>,
+    video: &VideoShared,
+    call_id: &str,
+    generation: u64,
+) {
+    let pending_video = {
+        // This synchronous map is shared with non-async setup paths; its lock covers only one
+        // lookup/take and is never held across an await.
+        let mut pending = pending_outgoing_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pending
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+            .and_then(|entry| entry.video.take())
+    };
+    drop(pending_video);
+    video.detach_source();
+}
+
 fn release_video_endpoints(
     registry: &wacore::voip::CallRegistry,
     pending_outgoing_calls: &std::sync::Mutex<std::collections::HashMap<String, PendingOutgoing>>,
@@ -4748,7 +4773,7 @@ impl CallHandle {
                 // the initial upgrade, where both directions are down and the
                 // peer may still hold our request.
                 if registry.abort_local_video_request(&call_id, generation, epoch) {
-                    release_video_endpoints(&registry, &pending, &video, &call_id, generation);
+                    release_local_video_source(&pending, &video, &call_id, generation);
                     let Some(client) = weak_client.upgrade() else {
                         return;
                     };
@@ -10926,6 +10951,16 @@ mod tests {
         drops: Arc<AtomicUsize>,
     }
 
+    struct ChannelVideoSink {
+        playout: async_channel::Sender<VideoFrame>,
+    }
+
+    impl VideoSink for ChannelVideoSink {
+        fn playout(&self) -> async_channel::Sender<VideoFrame> {
+            self.playout.clone()
+        }
+    }
+
     impl VideoSource for DropTrackedVideoSource {
         fn frames(&self) -> async_channel::Receiver<Vec<u8>> {
             self.frames.clone()
@@ -11787,7 +11822,9 @@ mod tests {
             frames,
             drops: drops.clone(),
         };
-        let (sink, _sink_rx) = async_channel::unbounded::<VideoFrame>();
+        let (sink_tx, _sink_rx) = async_channel::unbounded::<VideoFrame>();
+        let sink = ChannelVideoSink { playout: sink_tx };
+        std::mem::forget(_sink_rx);
         handle
             .start_video(source, sink)
             .await
@@ -11824,6 +11861,10 @@ mod tests {
         assert_eq!(
             registry.video_states("CID-FACADE", generation),
             Some((VideoState::Stopped, VideoState::Paused))
+        );
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_some(),
+            "a direction-local abort must not drop the peer's picture"
         );
         handle.hangup_local().await;
     }
