@@ -248,12 +248,12 @@ fn smpl_filt_ma2(x: &[f32], n: usize, coef: &[f32], state: &[f32; 2], y: &mut [f
 // autocorrelation -> reflection coeffs, Levinson, double precision.
 fn smpl_ac2rc_dbl(corr: &[f64], order: usize, reg: f64, rc: &mut [f32]) {
     debug_assert!(order > 0);
-    debug_assert!(order - 1 <= SMPL_MAX_SF_LEN);
-    let mut c0 = vec![0.0f64; order + 1];
-    let mut c1 = vec![0.0f64; order + 1];
+    assert!(order < SMPL_MAX_L_RESP);
+    let mut c0 = [0.0f64; SMPL_MAX_L_RESP];
+    let mut c1 = [0.0f64; SMPL_MAX_L_RESP];
     c0[..(order + 1)].copy_from_slice(&corr[..(order + 1)]);
     c0[0] *= 1.0f64 + reg;
-    c1.copy_from_slice(&c0);
+    c1[..=order].copy_from_slice(&c0[..=order]);
     for r in rc[..order].iter_mut() {
         *r = 0.0;
     }
@@ -283,8 +283,8 @@ fn smpl_ac2rc_dbl(corr: &[f64], order: usize, reg: f64, rc: &mut [f32]) {
 // Float wrapper that promotes to double precision before Levinson.
 fn smpl_ac2rc(corr: &[f32], order: usize, reg: f32, rc: &mut [f32]) {
     debug_assert!(order > 0);
-    debug_assert!(order - 1 <= SMPL_MAX_SF_LEN);
-    let mut corr_dbl = vec![0.0f64; order + 1];
+    assert!(order < SMPL_MAX_L_RESP);
+    let mut corr_dbl = [0.0f64; SMPL_MAX_L_RESP];
     for i in 0..(order + 1) {
         corr_dbl[i] = corr[i] as f64;
     }
