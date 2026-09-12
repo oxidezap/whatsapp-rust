@@ -738,7 +738,7 @@ fn non_zero_range(col: i32, perc_resp_len: usize, fcb_subfrlen: usize) -> (usize
 // Public output of the per-subframe encoder.
 
 pub(crate) struct CelpSubframeOut {
-    pub pulses: [Vec<i16>; SMPL_CELP_MAX_RATES],
+    pub pulses: [[i16; SMPL_MAX_PULSES_PER_SF]; SMPL_CELP_MAX_RATES],
     pub n_pulses: [i16; SMPL_CELP_MAX_RATES],
     pub acb_idx: [i16; SMPL_CELP_MAX_RATES],
     pub gain_idx: [i16; SMPL_CELP_MAX_RATES],
@@ -2239,12 +2239,6 @@ impl CelpEncoder {
         }
         self.fcbgain = fcbgain;
 
-        // Materialize pulses Vecs trimmed to n_pulses.
-        let pulses_fec: Vec<i16> =
-            pulses[SMPL_CELP_IDX_FEC][..n_pulses[SMPL_CELP_IDX_FEC].max(0) as usize].to_vec();
-        let pulses_main: Vec<i16> =
-            pulses[SMPL_CELP_IDX_MAIN][..n_pulses[SMPL_CELP_IDX_MAIN].max(0) as usize].to_vec();
-
         // Return the pooled subframe buffers for reuse next call.
         self.sf.imp_lpc_rev = imp_lpc_rev;
         self.sf.res_lpc_pad = res_lpc_pad;
@@ -2259,7 +2253,7 @@ impl CelpEncoder {
         self.sf.exc_fcb_raw = exc_fcb_raw;
 
         CelpSubframeOut {
-            pulses: [pulses_fec, pulses_main],
+            pulses,
             n_pulses,
             acb_idx,
             gain_idx,

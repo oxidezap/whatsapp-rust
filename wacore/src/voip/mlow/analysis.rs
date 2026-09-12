@@ -125,7 +125,7 @@ struct Candidate {
     stage1: i32,
     grid: i32,
     qsym: [i32; 16],
-    pulse_vec: Vec<i32>,
+    pulse_vec: [i32; SMPL_INTF_LEN],
     /// Per-subframe excitation gainQ used by the synthesis (rate-control gain for unvoiced, 0 for
     /// voiced). Must match what `commit_candidate` feeds the shadow synth (warm history).
     gain_q: [i32; 4],
@@ -462,7 +462,7 @@ fn commit_candidate(
             &cand.ip.lsf.stage2,
             prev_nlsf,
         );
-        let pulse_vec = vec![0i32; SMPL_INTF_LEN];
+        let pulse_vec = [0i32; SMPL_INTF_LEN];
         synth_internal_frame(
             synth_t,
             st,
@@ -550,12 +550,12 @@ fn smpl_unvoiced_candidate(
 
     // Map CELP pulses -> per-position pulse train; collect the per-subframe FCB gain index (= the
     // wire `nrg_res` symbol, which the decoder reads back as `fcbg_idx`).
-    let mut pulse_vec = vec![0i32; SMPL_INTF_LEN];
+    let mut pulse_vec = [0i32; SMPL_INTF_LEN];
     let mut fcbg_idx = [0i32; 4];
     const MAIN: usize = 1;
     for sf in 0..SMPL_SUBFR_COUNT {
         let out = &celp_out[sf];
-        for &v in &out.pulses[MAIN] {
+        for &v in &out.pulses[MAIN][..out.n_pulses[MAIN].max(0) as usize] {
             // Same unpacking as the C: sign = 1 + 2*(v>>15); pos = v*sign - 1; pPulses[pos] += sign.
             let sign = 1 + 2 * ((v as i32) >> 15);
             let pos = (v as i32 * sign) - 1;
@@ -838,7 +838,7 @@ fn smpl_silent_internal(synth_t: &SmplSynthTables) -> Candidate {
         stage1: 0,
         grid: 0,
         qsym: sym,
-        pulse_vec: vec![0i32; SMPL_INTF_LEN],
+        pulse_vec: [0i32; SMPL_INTF_LEN],
         gain_q: [0; 4],
         pitch: unvoiced_pitch(),
         silent: true,
@@ -1233,12 +1233,12 @@ fn smpl_voiced_candidate(
 
     // Unpack the MAIN-rate pulses into a per-position train; collect acb/fcb indices per subframe.
     const MAIN: usize = 1;
-    let mut pulse_vec = vec![0i32; SMPL_INTF_LEN];
+    let mut pulse_vec = [0i32; SMPL_INTF_LEN];
     let mut acbg = [0i32; 4];
     let mut fcbg = [0i32; 4];
     for sf in 0..SMPL_SUBFR_COUNT {
         let out = &celp_out[sf];
-        for &v in &out.pulses[MAIN] {
+        for &v in &out.pulses[MAIN][..out.n_pulses[MAIN].max(0) as usize] {
             let sign = 1 + 2 * ((v as i32) >> 15);
             let pos = (v as i32 * sign) - 1;
             if (0..SMPL_SUBFR_LEN as i32).contains(&pos) {
