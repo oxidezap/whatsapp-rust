@@ -63,6 +63,20 @@ fn main() {
     let frames: Vec<Vec<f32>> = (0..8).map(|i| tone(i * SAMPLES)).collect();
 
     match mode {
+        #[cfg(feature = "dhat-heap")]
+        "encoder-live" => {
+            let mut warm = MlowEncoder::new();
+            let _ = warm.encode(&frames[0]).unwrap();
+            drop(warm);
+            let before = dhat::HeapStats::get().curr_bytes;
+            let mut enc = MlowEncoder::new();
+            for frame in &frames {
+                let _ = enc.encode(frame).unwrap();
+            }
+            let live = dhat::HeapStats::get().curr_bytes - before;
+            eprintln!("encoder live heap: {live} bytes");
+            black_box(&enc);
+        }
         "encode" => {
             let mut enc = MlowEncoder::new();
             let _ = enc.encode(&frames[0]); // prime past the first-frame path
@@ -81,6 +95,8 @@ fn main() {
             let _ = dec.decode(&packets[0]); // prime
             hot_decode(&mut dec, &packets, n);
         }
-        other => eprintln!("usage: voip_profile <encode|encode-into|decode> <n>; got {other:?}"),
+        other => eprintln!(
+            "usage: voip_profile <encode|encode-into|decode> <n>, or encoder-live with dhat-heap; got {other:?}"
+        ),
     }
 }

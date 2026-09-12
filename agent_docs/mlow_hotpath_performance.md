@@ -97,3 +97,118 @@ per-encoder live-heap estimate.
 Local CodSpeed Memory also recorded the isolated encode benchmark, producing
 1,358 memory events. It warned that privilege elevation could not adjust
 kernel memory tunables. Retain that warning when comparing local memory runs.
+
+## Kept batches
+
+1. Replace the three perceptual Levinson vectors with 33-element f64 arrays.
+   Arithmetic and iteration order remain unchanged.
+2. Keep CELP pulse output in its existing fixed storage and use explicit pulse
+   lengths at both production consumers. Store candidate pulses in 320-element
+   i32 arrays.
+3. Write perceptual LPC responses into fixed caller storage with the internal
+   `smpl_perc_ac2a_into`. Production uses it for both pitch and CELP weighting.
+4. Add `MlowEncoder::encode_i16_into`, used by
+   `CallEngine::encode_mlow_frame`. It normalizes into the existing encoder
+   scratch and removes the engine's extra 960-element f32 buffer. This saves
+   3,840 bytes of persistent call storage and one 3,840-byte staging write/read
+   per non-silent packet. The exact-zero DTX branch still returns before encoding.
+
+No arithmetic reassociation, precision change, dependency, unsafe code, codec
+decision, packet timing or decoder API change is included.
+
+## Rejected pitch experiments
+
+Persistent stage1, downsample, C, E, H and energy buffers passed golden and
+pitch fixtures, including a poison-buffer test. They reduced Divan encode
+allocation bytes to 134.8 KB but increased local encode instructions from
+8,017,287 to 8,348,887. Pitch-stage instructions increased from 502,593 to
+632,501. Removing energy-buffer reuse still left 609,652 pitch instructions.
+Both versions were reverted, including their experiment-only test.
+
+The profile attributes substantial work to clearing the reused buffers. This
+does not establish that every possible pitch scratch design regresses. A future
+attempt needs a tighter write-before-read proof and isolated measurements.
+
+## Combined local results
+
+CPU columns below are raw instructions from separate local CodSpeed simulation
+invocations. Memory columns are Divan allocated bytes, excluding separately
+reported growth. These are different instruments and are labelled accordingly.
+
+| Benchmark | Base Ir | Head Ir | Base allocation bytes | Head allocation bytes |
+| --- | ---: | ---: | ---: | ---: |
+| mlow_encode | 8,017,287 | 8,020,308 | 395.6 KB | 376.0 KB |
+| mlow_encode_reused_output | 8,016,851 | 8,017,956 | 395.1 KB | 375.5 KB |
+| engine_outbound_frame | 8,373,354 | 8,372,742 | 547.8 KB | 528.2 KB |
+| mlow_decode | 324,532 | 324,563 | 25.92 KB | 25.92 KB |
+| engine_inbound_packet | 395,743 | 397,838 | 26.0 KB | 26.0 KB |
+| codec_stages::pitch_search | 502,593 | 500,507 | 85.28 KB | 85.28 KB |
+| codec_stages::perc_model_frame | 791,015 | 791,009 | 2.064 KB | 2.064 KB |
+| codec_stages::celp_subframes_frame | 675,307 | 672,220 | 24.84 KB | 21.56 KB |
+| call_second_two_peers | 284,044,856 | 283,961,974 | 14.69 MB | 14.03 MB |
+
+The FFT and entropy instruction totals are identical. LPC is 226,798 to
+226,658, LSF is unchanged at 59,907, and analysis is 8,019,831 to 8,018,253.
+The new i16 reused-output row records 8,018,834 instructions. Its quantized
+input differs from the f32 row, so it is not a direct API speed comparison.
+
+Cycle-estimation events also matter. Encode Ct is 560,717,713 to 562,982,939
+and Cl is 1,948,318,127 to 1,976,744,162. Outbound Ct is 598,722,215 to
+601,744,466 and Cl is 2,017,557,983 to 2,043,936,499. Instruction counts alone
+would hide those increases. No combined CPU improvement is claimed from these
+local measurements.
+
+Paired native runs pinned to CPU 2 gave encode medians of 305.2 to 305.5 µs,
+reused-output 304.1 to 306.1 µs, outbound 323.7 to 312.0 µs and two-peer
+call-second 11.30 to 11.29 ms. Other rows showed substantial time variation even
+when their code was unchanged. Treat the native data as a regression check,
+not evidence for a decoder speedup or a precise outbound percentage.
+
+| Allocation measure | Base | Head |
+| --- | ---: | ---: |
+| Divan encode allocation calls | 451 | 338 |
+| Divan reused-output allocation calls | 450 | 337 |
+| Divan outbound allocation calls | 540 | 423 |
+| Divan CELP-stage allocation calls | 63 | 42 |
+| Divan two-peer call-second allocation calls | 17,368 | 13,521 |
+| DHAT blocks per packet, including reallocations | 468.53 | 351.88 |
+| DHAT bytes per packet | 396,606.48 | 376,971.76 |
+| Warm encoder live heap, shared tables excluded | 157,725 B | 157,725 B |
+
+DHAT uses the same 100-packet stream and selects only `hot_encode` stacks.
+`voip_profile encoder-live`, with `dhat-heap`, warms shared tables with a
+discarded encoder, then measures a second encoder after eight packets. The
+same profiler-only driver change was applied to the detached baseline worktree.
+
+The three Levinson allocation sites each fall from 24 calls and 4,704 bytes
+per packet to zero. Their sum is 72 calls and 14,112 bytes per packet.
+The perceptual response vector falls from 24 calls and 2,352 bytes per packet
+to zero. Pitch C/E/H remain the largest allocated-byte family.
+
+## Correctness and portability
+
+- 2,397 wacore library tests passed, with three ignored tests reported separately.
+- The explicitly invoked 2,048-packet encode/decode stream passed.
+- New i16 equivalence coverage exercises every i16 value, reused oversized output,
+  invalid lengths between valid frames and reset boundaries.
+- Golden checksums and C/Go/wasm fixture expectations were not changed.
+- Targeted MLOW Clippy and workspace all-targets Clippy passed.
+- wasm32 builds with `--no-default-features --features voip-mlow,js`.
+  Omitting the existing `js` feature fails in getrandom before reaching the codec.
+- The symbolized release DHAT driver text grows from 1,140,053 to 1,140,885 bytes,
+  an increase of 832 bytes. This is an executable measurement, not codec-only size.
+- New local arrays hold 792 bytes of f64 Levinson storage, 1,280 bytes per candidate
+  pulse array and 512 bytes per response matrix. Native stack-frame and wasm stack
+  high-water measurements remain outstanding.
+
+## Remaining work
+
+The largest remaining byte costs are pitch scratch, followed by CELP subframe
+temporaries. Decoder work remains much smaller than encoder work. ACB basis
+scratch, correlation storage, pulse entropy buffers, playout allocation and
+jitter operations have not been changed. The next CPU investigation should
+start from the retained FFT/CELP/pitch profiles rather than propose another FFT
+algorithm without evidence.
+
+Publication and the final CodSpeed PR comparison are pending. Local results do
+not substitute for the repository's CI simulation and memory report.
