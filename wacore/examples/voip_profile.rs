@@ -2,8 +2,9 @@
 //! attribution). Not a benchmark -- no timing, no sampling: it runs `encode`, `encode-into`, or `decode` N
 //! times over a small stream so an external profiler can attribute instructions and allocations to
 //! the real per-stage functions.
+//! See `agent_docs/mlow_hotpath_performance.md` for the `encoder-live` heap measurement mode.
 //!
-//!   cargo build -p wacore --release --example voip_profile --features voip
+//!   cargo build -p wacore --release --example voip_profile --features voip-mlow
 //!   valgrind --tool=callgrind --collect-atstart=no --toggle-collect='*hot_encode*' \
 //!     --callgrind-out-file=cg.enc target/release/examples/voip_profile encode 30
 //!   callgrind_annotate cg.enc | head -60

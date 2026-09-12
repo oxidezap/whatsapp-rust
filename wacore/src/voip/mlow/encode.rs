@@ -31,9 +31,10 @@ pub enum MlowError {
     BufferOverflow,
 }
 
-/// Stateful pure-Rust MLow encoder: 60 ms PCM (960 f32 @16 kHz, ~[-1,1]) -> a wire MLow frame the
-/// WhatsApp peer decodes. Emits active config=0 (`0x50`) frames, choosing voiced (LTP) or unvoiced
-/// per internal frame via analysis-by-synthesis.
+/// Stateful pure-Rust MLow encoder for 60 ms mono PCM frames at 16 kHz.
+/// Accepts normalized `f32` samples through [`Self::encode`] or [`Self::encode_into`],
+/// and signed 16-bit samples through [`Self::encode_i16_into`]. Emits active config=0
+/// (`0x50`) wire frames, choosing voiced or unvoiced per internal frame via analysis-by-synthesis.
 pub struct MlowEncoder {
     state: SmplEncoderState,
     clean: Vec<f32>,

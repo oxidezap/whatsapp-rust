@@ -104,7 +104,7 @@ const SMPL_CELP_FCB_SUBFRLEN: usize = 80;
 /// 12 subframes per 60 ms packet (4 subframes/internal frame x 3 internal frames).
 const SMPL_CELP_SUBFR_PER_PACKET: usize = 12;
 /// `perc_resp_len + SMPL_PERC_EMPH_V_LEN - 1` (= 33 = SMPL_MAX_L_RESP): the perceptual autocorrelation
-/// length the perc model returns and `smpl_perc_ac2a` consumes.
+/// length the perc model returns and `smpl_perc_ac2a_into` consumes.
 const SMPL_PERC_R_LEN: usize = SMPL_CELP_PERC_RESP_LEN + 1;
 /// `smpl_fcb_tot_surv_20ms_max` for complexity 5-8 (the perc_resp_len=32 path). Drives `tot_surv`.
 const SMPL_FCB_TOT_SURV_20MS_MAX: i32 = 100;
@@ -745,7 +745,7 @@ fn compute_perc_corrs(cs: &mut CelpFrameCtx) -> [Vec<f32>; SMPL_SUBFR_COUNT] {
 }
 
 /// Derive the per-subframe `perc_wght_resp` (length perc_resp_len) from precomputed `perc_corrs` for
-/// the given emphasis (`smpl_perc_ac2a`, voiced vs unvoiced). Pure (no state).
+/// the given voiced or unvoiced emphasis via `smpl_perc_ac2a_into`. Pure, with no state.
 fn perc_corrs_to_wght(
     corrs: &[Vec<f32>],
     emph: [f32; 2],
