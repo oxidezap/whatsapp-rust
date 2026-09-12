@@ -924,6 +924,19 @@ pub(crate) fn smpl_perc_ac2a(
     perc_resp_len: usize,
     reg: f32,
 ) -> Vec<f32> {
+    let mut a = vec![0.0f32; perc_resp_len];
+    smpl_perc_ac2a_into(r, len_r, perc_emph, perc_resp_len, reg, &mut a);
+    a
+}
+
+pub(crate) fn smpl_perc_ac2a_into(
+    r: &[f32],
+    len_r: usize,
+    perc_emph: f32,
+    perc_resp_len: usize,
+    reg: f32,
+    a: &mut [f32],
+) {
     debug_assert!(len_r >= perc_resp_len + 1);
     debug_assert!(SMPL_MAX_L_RESP >= perc_resp_len);
 
@@ -937,9 +950,7 @@ pub(crate) fn smpl_perc_ac2a(
     let mut rc = [0.0f32; SMPL_MAX_L_RESP];
     smpl_ac2rc(&r_, perc_resp_len - 1, reg, &mut rc);
 
-    let mut a = vec![0.0f32; perc_resp_len];
-    smpl_rc2a(&rc, perc_resp_len - 1, &mut a);
-    a
+    smpl_rc2a(&rc, perc_resp_len - 1, a);
 }
 
 // Bitrate controller
@@ -1205,6 +1216,26 @@ pub(crate) fn rfft_backward_ordered_ref_sc(f: &[f32], time: &mut [f32], sc: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn perceptual_response_overwrites_reused_destination() {
+        let mut reused = [f32::NAN; SMPL_MAX_L_RESP];
+        for len in [32, 17, 32] {
+            let corr: [f32; SMPL_MAX_L_RESP] = std::array::from_fn(|i| 0.8f32.powi(i as i32));
+            let expected = smpl_perc_ac2a(&corr, corr.len(), -0.72, len, SMPL_PERC_REG);
+            reused.fill(f32::NAN);
+            smpl_perc_ac2a_into(
+                &corr,
+                corr.len(),
+                -0.72,
+                len,
+                SMPL_PERC_REG,
+                &mut reused[..len],
+            );
+            assert_eq!(&reused[..len], expected.as_slice());
+            assert!(reused[len..].iter().all(|x| x.is_nan()));
+        }
+    }
 
     // The precomputed twiddle tables MUST reproduce the inline cos/sin to the bit, or the golden
     // checksum shifts. Assert every used (n, k, q) combine entry and (n, k, j) base entry equals the

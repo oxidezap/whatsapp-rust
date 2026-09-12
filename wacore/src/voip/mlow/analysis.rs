@@ -24,7 +24,7 @@ use super::smpl_lsf_quant::{lsf_quant, lsf_quant_cond};
 use super::smpl_mem::{SmplMem, load_smpl_mem};
 use super::smpl_perc::{
     BitrateController, BitrateControllerInputs, PercModelState, SMPL_PERC_EMPH_UV,
-    SMPL_PERC_EMPH_V, SMPL_PERC_REG, smpl_perc_ac2a, smpl_perc_model,
+    SMPL_PERC_EMPH_V, SMPL_PERC_REG, smpl_perc_ac2a_into, smpl_perc_model,
 };
 use super::smpl_signal_mode::{VuvMode, smpl_get_signal_mode};
 use super::smpl_synth::{
@@ -746,19 +746,24 @@ fn compute_perc_corrs(cs: &mut CelpFrameCtx) -> [Vec<f32>; SMPL_SUBFR_COUNT] {
 
 /// Derive the per-subframe `perc_wght_resp` (length perc_resp_len) from precomputed `perc_corrs` for
 /// the given emphasis (`smpl_perc_ac2a`, voiced vs unvoiced). Pure (no state).
-fn perc_corrs_to_wght(corrs: &[Vec<f32>], emph: [f32; 2], resp_len: usize) -> Vec<Vec<f32>> {
-    corrs
-        .iter()
-        .map(|c| {
-            smpl_perc_ac2a(
-                c,
-                SMPL_PERC_R_LEN,
-                emph[if SMPL_CELP_LOW_RATE { 1 } else { 0 }],
-                resp_len,
-                SMPL_PERC_REG,
-            )
-        })
-        .collect()
+fn perc_corrs_to_wght(
+    corrs: &[Vec<f32>],
+    emph: [f32; 2],
+    resp_len: usize,
+) -> [[f32; SMPL_CELP_PERC_RESP_LEN]; SMPL_SUBFR_COUNT] {
+    assert_eq!(corrs.len(), SMPL_SUBFR_COUNT);
+    std::array::from_fn(|sf| {
+        let mut response = [0.0; SMPL_CELP_PERC_RESP_LEN];
+        smpl_perc_ac2a_into(
+            &corrs[sf],
+            SMPL_PERC_R_LEN,
+            emph[if SMPL_CELP_LOW_RATE { 1 } else { 0 }],
+            resp_len,
+            SMPL_PERC_REG,
+            &mut response[..resp_len],
+        );
+        response
+    })
 }
 
 /// The per-subframe residual + interpolated predcoef for `lsf_interpol_idx` 0, and the alternative
