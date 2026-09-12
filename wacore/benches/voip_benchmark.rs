@@ -189,6 +189,29 @@ fn mlow_encode_reused_output(bencher: Bencher) {
         });
 }
 
+#[divan::bench]
+fn mlow_encode_i16_reused_output(bencher: Bencher) {
+    bencher
+        .with_inputs(|| {
+            let frames: Vec<Vec<i16>> = (0..STREAM)
+                .map(|i| {
+                    tone_f32(i * SAMPLES)
+                        .iter()
+                        .map(|s| (s * 32768.0) as i16)
+                        .collect()
+                })
+                .collect();
+            (primed_encoder(), frames, 0usize, Vec::with_capacity(2048))
+        })
+        .bench_refs(|(enc, frames, i, output)| {
+            let f = &frames[*i % frames.len()];
+            *i += 1;
+            enc.encode_i16_into(black_box(f.as_slice()), output)
+                .unwrap();
+            black_box(output.len())
+        });
+}
+
 /// MLow decode over a varied stream -- the inbound CPU floor (runs once per received audio packet).
 #[divan::bench]
 fn mlow_decode(bencher: Bencher) {

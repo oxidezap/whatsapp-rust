@@ -979,10 +979,6 @@ struct PcmAudioState {
     encoder: mlow::MlowEncoder,
     #[cfg(feature = "voip-mlow")]
     decoder: mlow::MlowDecoder,
-    /// Reused per outbound frame to hold the i16->f32 conversion, so the encode hot path doesn't
-    /// allocate a fresh Vec each frame.
-    #[cfg(feature = "voip-mlow")]
-    scratch: Vec<f32>,
     /// Reused codec output before SRTP copies it into the protected packet.
     #[cfg(feature = "voip-mlow")]
     encoded: Vec<u8>,
@@ -1359,8 +1355,6 @@ impl CallEngine {
                     encoder: mlow::MlowEncoder::new(),
                     #[cfg(feature = "voip-mlow")]
                     decoder: mlow::MlowDecoder::new(),
-                    #[cfg(feature = "voip-mlow")]
-                    scratch: Vec::with_capacity(config.audio.format.samples_per_frame as usize),
                     #[cfg(feature = "voip-mlow")]
                     encoded: Vec::with_capacity(MLOW_ENCODED_CAPACITY),
                     jitter: VecDeque::new(),
@@ -3855,17 +3849,13 @@ impl CallEngine {
             self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
             return;
         }
-        pcm_state.scratch.clear();
-        pcm_state
-            .scratch
-            .extend(pcm.iter().map(|&s| s as f32 / 32768.0));
         // A transient encode failure drops just this frame; the next one resyncs. Counted the same
         // way the foreign encoder's refusal is: a run of them stops outbound RTP, and every other
         // counter here watches the inbound direction, so without this the peer stops hearing us
         // while `media_stats()` reports a healthy call.
         if pcm_state
             .encoder
-            .encode_into(&pcm_state.scratch, &mut pcm_state.encoded)
+            .encode_i16_into(pcm, &mut pcm_state.encoded)
             .is_err()
         {
             self.media_stats.outbound_frames_without_encoder = self
