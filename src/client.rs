@@ -1931,10 +1931,9 @@ pub struct Client {
     pub(crate) retry_admission:
         std::sync::OnceLock<Arc<dyn crate::types::retry_admission::RetryAdmission>>,
 
-    /// Optional inbound history-sync admission policy. Set once at build time
-    /// and read lock-free before history-sync activity is created.
+    /// Optional inbound history-sync admission policy, fixed during assembly.
     pub(crate) history_sync_admission:
-        std::sync::OnceLock<Arc<dyn crate::types::history_sync_admission::HistorySyncAdmission>>,
+        Option<Arc<dyn crate::types::history_sync_admission::HistorySyncAdmission>>,
 
     /// Chat state (typing indicator) handlers registered by external consumers.
     /// Each handler receives a `ChatStateEvent` describing the chat, optional participant and state.

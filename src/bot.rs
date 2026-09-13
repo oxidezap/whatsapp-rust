@@ -1316,6 +1316,15 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
+    /// Register an already-shared history-sync admission policy.
+    pub fn with_history_sync_admission_arc(
+        mut self,
+        admission: Arc<dyn HistorySyncAdmission>,
+    ) -> Self {
+        self.history_sync_admission = Some(admission);
+        self
+    }
+
     /// Override the WhatsApp version used by the client.
     ///
     /// By default, the client will automatically fetch the latest version from WhatsApp's servers.
@@ -2331,6 +2340,54 @@ mod tests {
             .expect("Failed to build bot");
 
         assert!(!bot.client().skip_history_sync_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_bot_builder_history_sync_admission_reaches_client() {
+        let backend = create_test_sqlite_backend().await;
+        let decisions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admission_decisions = Arc::clone(&decisions);
+        struct Admission {
+            decisions: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl HistorySyncAdmission for Admission {
+            fn decide(
+                &self,
+                _metadata: &crate::HistorySyncMetadata<'_>,
+            ) -> crate::HistorySyncDecision {
+                self.decisions
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::HistorySyncDecision::Accept
+            }
+        }
+
+        let bot = Bot::builder()
+            .with_backend_arc(backend)
+            .with_history_sync_admission(Admission {
+                decisions: admission_decisions,
+            })
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot");
+
+        let client = bot.client();
+        let admission = client
+            .history_sync_admission
+            .as_ref()
+            .expect("builder-installed history-sync admission");
+        assert_eq!(
+            admission.decide(&crate::HistorySyncMetadata {
+                sync_type: None,
+                chunk_order: None,
+                progress: None,
+                file_length: None,
+                inline_payload_len: None,
+                peer_data_request_session_id: None,
+            }),
+            crate::HistorySyncDecision::Accept
+        );
+        assert_eq!(decisions.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -216,7 +216,9 @@ pub async fn create_test_client() -> Arc<Client> {
 }
 
 #[cfg(test)]
-pub(crate) async fn create_test_client_with_sync_receiver() -> (
+pub(crate) async fn create_test_client_with_sync_receiver_and_admission(
+    admission: Arc<dyn crate::HistorySyncAdmission>,
+) -> (
     Arc<Client>,
     async_channel::Receiver<crate::sync_task::MajorSyncTask>,
 ) {
@@ -225,14 +227,16 @@ pub(crate) async fn create_test_client_with_sync_receiver() -> (
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, receiver) = Client::new(
-        Arc::new(TokioRuntime),
-        pm,
-        Arc::new(MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let build = Client::builder()
+        .with_runtime(TokioRuntime)
+        .with_persistence_manager(pm)
+        .with_transport_factory(MockTransportFactory::new())
+        .with_http_client(MockHttpClient)
+        .with_history_sync_admission_arc(admission)
+        .build()
+        .await
+        .expect("client builder should initialize");
+    let (client, receiver) = build.into_parts();
     client.enter_live_mode_for_tests();
     (client, receiver)
 }

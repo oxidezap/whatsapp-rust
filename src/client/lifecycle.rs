@@ -464,6 +464,7 @@ impl Client {
             #[cfg(feature = "plugins")]
             plugin_host,
             noise_cert_policy,
+            history_sync_admission,
         } = extensions;
         let mut unique_id_bytes = [0u8; 2];
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut unique_id_bytes);
@@ -669,7 +670,7 @@ impl Client {
             custom_enc_handlers: std::sync::OnceLock::new(),
             inbound_durability_hook: std::sync::OnceLock::new(),
             retry_admission: std::sync::OnceLock::new(),
-            history_sync_admission: std::sync::OnceLock::new(),
+            history_sync_admission,
             chatstate_handlers: std::sync::RwLock::new(Arc::from([])),
             chatstate_handler_count: AtomicUsize::new(0),
             pdo_pending_requests: cache_config.pdo_pending_requests.build_with_ttl(),
@@ -2640,6 +2641,7 @@ mod tests {
                     #[cfg(feature = "plugins")]
                     plugin_host: None,
                     noise_cert_policy: wacore::handshake::NoiseCertPolicy::default(),
+                    history_sync_admission: None,
                 },
             )
         };
