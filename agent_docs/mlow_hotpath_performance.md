@@ -129,7 +129,7 @@ The profile attributes substantial work to clearing the reused buffers. This
 does not establish that every possible pitch scratch design regresses. A future
 attempt needs a tighter write-before-read proof and isolated measurements.
 
-## Combined local results
+## Combined local results before the LPC and top-K additions
 
 CPU columns below are raw instructions from separate local CodSpeed simulation
 invocations. Memory columns are Divan allocated bytes, excluding separately
@@ -184,6 +184,85 @@ The three Levinson allocation sites each fall from 24 calls and 4,704 bytes
 per packet to zero. Their sum is 72 calls and 14,112 bytes per packet.
 The perceptual response vector falls from 24 calls and 2,352 bytes per packet
 to zero. Pitch C/E/H remain the largest allocated-byte family.
+
+## Incremental LPC and CELP measurements
+
+The following evidence was supplied by the calling agent from the detached
+experiment based on `77d8ae91`. The two tested code diffs were copied exactly.
+The main baseline remains `6502b871e35664ffb80044ba7c6317a6427754e2`.
+Earlier tables retain the four-batch results and are not measurements of this
+new head.
+
+Immutable LPC windows now use `OnceLock<LpcWindows>` with 264-, 64- and
+32-element f32 arrays generated with the original formulas on each target.
+After initialization this removes six allocations and 952 trigonometric
+evaluations per 60 ms packet. LPC Levinson uses two 17-element f64 arrays,
+removing six more allocations per packet without changing arithmetic.
+CELP top-K uses the caller's bounded index array for insertion selection,
+with an argmax path for k=1. NaNs retain the legacy scan because its
+first-unselected NaN behavior cannot be expressed by a comparator. Strict
+comparisons, lowest-index ties, repeated index zero after candidate exhaustion
+and the untouched destination tail are preserved.
+
+The caller read a real-call CPU profile over seconds 15 through 33. It contains
+340,285 µs in the engine, 303,519 µs in encode, 19,901 µs in decode,
+15,659 µs in CELP top-K and 31,361 µs in FFT. The bridge uses `6502b871`
+with different code generation from release, so these numbers support
+attribution only, not absolute production CPU estimates.
+
+Local CodSpeed profiles ran one row per invocation without upload. The caller
+retained them under `/home/jlucaso/projects/whatsapp-rust/target/` with prefixes
+`lpc-windows-*`, `lpc-levinson-*` and `celp-topk-*`.
+
+| Encode implementation | Ir | Ct | Cl |
+| --- | ---: | ---: | ---: |
+| Prior PR | 8,020,308 | 562,982,939 | 1,976,744,162 |
+| Plus cached LPC windows | 7,980,057 | 560,486,094 | 1,966,750,461 |
+| Plus LPC Levinson arrays | 7,978,828 | 560,401,404 | 1,966,478,862 |
+| Plus CELP top-K | 7,921,074 | 559,414,269 | 1,964,267,338 |
+
+Outbound instructions fall incrementally from 8,372,742 to 8,279,386.
+CELP-stage instructions fall from 672,220 to 652,555. Against main, aggregate
+encode instructions are 8,017,287 to 7,921,074, outbound 8,373,354 to
+8,279,386 and CELP-stage 675,307 to 652,555. Aggregate encode Ct falls from
+560,717,713 to 559,414,269, while Cl remains above main's 1,948,318,127.
+
+| CPU 2 pinned native median | Prior PR | With additions |
+| --- | ---: | ---: |
+| Encode | 304.8 µs | 300.0 µs |
+| Reused-output encode | 304.9 µs | 298.2 µs |
+| Two-peer call-second | 11.28 ms | 11.03 ms |
+| Outbound | 311.2 µs | 313.9 µs |
+
+Native outbound is noisy and flat. These measurements do not show a native
+outbound improvement.
+
+Divan encode falls from 338 allocation calls and 376 KB to 326 calls and
+371.4 KB. Outbound falls from 423 calls to 411, and LPC-stage from seven to
+three. Against main, aggregate encode calls fall from 451 to 326 and outbound
+from 540 to 411. The earlier DHAT and warm-heap measurements have not been
+remeasured for these additions. The windows contain 1,440 bytes of shared
+immutable array storage; the two LPC arrays contain 272 bytes of local storage.
+These sizes do not establish runtime peak stack usage.
+
+The experiment passed independent legacy-reference comparisons over one
+million random float/tie vectors and exhaustive seven-value alphabets through
+length five, including signed zeros, infinities, NaNs and k=0 through 8.
+Bitwise long/short LPC-window checks, golden and LPC C/wasm fixtures, and
+targeted all-targets Clippy also passed in the experiment. No golden constants,
+FFT, decoder, framing, bridge, release profiles or public APIs changed.
+The engine still uses `encode_i16_into`. The rejected pitch scratch remains
+reverted.
+
+In the managed worktree, all 136 selected MLOW library tests passed with
+`cargo nextest run -p wacore --features voip-mlow --lib -E 'test(voip::mlow)'`.
+Targeted all-targets Clippy with `voip-mlow,bench-internals`, formatting and
+diff checks passed. The two code patches match the experiment exactly.
+
+New-head cloud CodSpeed results, final stack measurements, full validation,
+PR metadata and thread resolution remain with the outer executor. The
+published comparison below predates these additions and cannot establish
+their CI improvement.
 
 ## Correctness and portability
 

@@ -35,17 +35,29 @@ pub(crate) const SMPL_LPC_BUF_LEN: usize = 448;
 // window generation (gen_sin_win / gen_cos_win)
 
 /// `gen_sin_win`: `win[i] = sinf((i+1)/(N+1) * PI/2)`.
-fn gen_sin_win(n: usize) -> Vec<f32> {
-    (0..n)
-        .map(|i| ((i as f32 + 1.0) / (n as f32 + 1.0) * SMPL_PI / 2.0).sin())
-        .collect()
+fn gen_sin_win<const N: usize>() -> [f32; N] {
+    std::array::from_fn(|i| ((i as f32 + 1.0) / (N as f32 + 1.0) * SMPL_PI / 2.0).sin())
 }
 
 /// `gen_cos_win`: `win[i] = cosf((i+1)/(N+1) * PI/2)`.
-fn gen_cos_win(n: usize) -> Vec<f32> {
-    (0..n)
-        .map(|i| ((i as f32 + 1.0) / (n as f32 + 1.0) * SMPL_PI / 2.0).cos())
-        .collect()
+fn gen_cos_win<const N: usize>() -> [f32; N] {
+    std::array::from_fn(|i| ((i as f32 + 1.0) / (N as f32 + 1.0) * SMPL_PI / 2.0).cos())
+}
+
+struct LpcWindows {
+    leading: [f32; SMPL_LPC_WIN1_20MS_LEN],
+    trailing_long: [f32; SMPL_WIN3_LONG_LEN],
+    trailing_short: [f32; SMPL_WIN3_SHORT_LEN],
+}
+
+/// Share immutable windows across streams, preserving the original f32 formula on each target.
+fn lpc_windows() -> &'static LpcWindows {
+    static WINDOWS: std::sync::OnceLock<LpcWindows> = std::sync::OnceLock::new();
+    WINDOWS.get_or_init(|| LpcWindows {
+        leading: gen_sin_win(),
+        trailing_long: gen_cos_win(),
+        trailing_short: gen_cos_win(),
+    })
 }
 
 /// `smpl_window` for the LPC 20 ms path (`use_lpc_win=true`, `frame_ms=20`, `len=448`).
@@ -55,12 +67,14 @@ pub(crate) fn smpl_window_lpc20(
     input: &[f32; SMPL_LPC_BUF_LEN],
     use_long_win: bool,
 ) -> [f32; SMPL_LPC_BUF_LEN] {
-    let win1 = gen_sin_win(SMPL_LPC_WIN1_20MS_LEN);
-    let (win3, win3len) = if use_long_win {
-        (gen_cos_win(SMPL_WIN3_LONG_LEN), SMPL_WIN3_LONG_LEN)
+    let windows = lpc_windows();
+    let win1 = &windows.leading;
+    let win3: &[f32] = if use_long_win {
+        &windows.trailing_long
     } else {
-        (gen_cos_win(SMPL_WIN3_SHORT_LEN), SMPL_WIN3_SHORT_LEN)
+        &windows.trailing_short
     };
+    let win3len = win3.len();
     let mut out = [0.0f32; SMPL_LPC_BUF_LEN];
     for i in 0..SMPL_LPC_WIN1_20MS_LEN {
         out[i] = input[i] * win1[i];
@@ -184,8 +198,9 @@ fn brute_dct(t: &DctTables, f2: &[f64], order: usize, r: &mut [f64]) {
 /// `smpl_ac2rc_dbl`: autocorrelation `R[0..order]` -> reflection coefficients (Schur), with
 /// `C0[0] *= (1 + reg)`. `rc[k]` is truncated to f32 each step (load-bearing for bit-faithfulness).
 fn ac2rc_dbl(corr: &[f64], order: usize, reg: f32, rc: &mut [f32]) {
-    let mut c0 = vec![0.0f64; order + 1];
-    let mut c1 = vec![0.0f64; order + 1];
+    debug_assert!(order <= SMPL_LPC_ORDER);
+    let mut c0 = [0.0f64; SMPL_LPC_ORDER + 1];
+    let mut c1 = [0.0f64; SMPL_LPC_ORDER + 1];
     c0[..order + 1].copy_from_slice(&corr[..order + 1]);
     // J#10797 promotes reg before adding 1. Rounding that sum in f32
     // changes the LPC solve on quiet, highly correlated input.
@@ -623,6 +638,45 @@ pub(crate) fn smpl_a2nlsf_16(a: &[f32]) -> [f32; SMPL_LPC_ORDER] {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn cached_lpc_windows_match_per_call_generation_bitwise() {
+        for use_long in [true, false, true, false] {
+            let trailing = if use_long {
+                SMPL_WIN3_LONG_LEN
+            } else {
+                SMPL_WIN3_SHORT_LEN
+            };
+            let leading: Vec<f32> = (0..SMPL_LPC_WIN1_20MS_LEN)
+                .map(|i| {
+                    ((i as f32 + 1.0) / (SMPL_LPC_WIN1_20MS_LEN as f32 + 1.0) * SMPL_PI / 2.0).sin()
+                })
+                .collect();
+            let ending: Vec<f32> = (0..trailing)
+                .map(|i| ((i as f32 + 1.0) / (trailing as f32 + 1.0) * SMPL_PI / 2.0).cos())
+                .collect();
+            for scale in [0.0, -0.0, 0.001, -1.0, 32768.0] {
+                let input = std::array::from_fn(|i| ((i as f32) - 224.0) * scale);
+                let actual = smpl_window_lpc20(&input, use_long);
+                for i in 0..SMPL_LPC_BUF_LEN {
+                    let expected = if i < SMPL_LPC_WIN1_20MS_LEN {
+                        input[i] * leading[i]
+                    } else if i < SMPL_LPC_BUF_LEN - SMPL_WIN3_LONG_LEN {
+                        input[i]
+                    } else if i < SMPL_LPC_BUF_LEN - SMPL_WIN3_LONG_LEN + trailing {
+                        input[i] * ending[i - (SMPL_LPC_BUF_LEN - SMPL_WIN3_LONG_LEN)]
+                    } else {
+                        0.0
+                    };
+                    assert_eq!(
+                        actual[i].to_bits(),
+                        expected.to_bits(),
+                        "long={use_long} scale={scale} sample={i}"
+                    );
+                }
+            }
+        }
+    }
 
     fn fvec(v: &Value) -> Vec<f32> {
         v.as_array()
