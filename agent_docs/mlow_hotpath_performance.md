@@ -1,5 +1,19 @@
 # MLOW hot-path measurements
 
+## Latest local result
+
+The complete allocation, LPC, top-K and direct-VAD batch reduces steady-state
+DHAT blocks from 468.53 to 339.88 per 60 ms packet, and allocated bytes from
+396,606.48 to 372,347.76. These include reallocations. The public f32 APIs retain
+their contracts. The additive `encode_i16_into` API is used by the call engine
+and now passes the original PCM directly to VAD.
+
+CPU improvements are small compared with the allocation reduction. Local
+instruction counts and native timings are reported separately below; neither
+is substituted for a published CodSpeed comparison. No post-change live
+product-call performance measurement was captured. The supplied live-call
+profile covers the original baseline only.
+
 ## Baseline
 
 Base commit `6502b871e35664ffb80044ba7c6317a6427754e2`, verified against
@@ -111,7 +125,13 @@ kernel memory tunables. Retain that warning when comparing local memory runs.
    `CallEngine::encode_mlow_frame`. It normalizes into the existing encoder
    scratch and removes the engine's extra 960-element f32 buffer. This saves
    3,840 bytes of persistent call storage and one 3,840-byte staging write/read
-   per non-silent packet. The exact-zero DTX branch still returns before encoding.
+    per non-silent packet. The exact-zero DTX branch still returns before encoding.
+5. Cache the immutable LPC windows, preserving the target's original f32 formulas.
+6. Replace LPC Levinson's two temporary vectors with 17-element f64 arrays.
+7. Select CELP survivors with bounded insertion into the caller's index buffer,
+   retaining the original NaN behavior and lowest-index ties.
+8. Pass the original i16 PCM to VAD, removing the exact conversion back from f32
+   and avoiding 1,920 bytes of conversion scratch for an i16-only encoder.
 
 No arithmetic reassociation, precision change, dependency, unsafe code, codec
 decision, packet timing or decoder API change is included.
@@ -187,8 +207,7 @@ to zero. Pitch C/E/H remain the largest allocated-byte family.
 
 ## Incremental LPC and CELP measurements
 
-The following evidence was supplied by the calling agent from the detached
-experiment based on `77d8ae91`. The two tested code diffs were copied exactly.
+The following measurements cover the detached experiment based on `77d8ae91`.
 The main baseline remains `6502b871e35664ffb80044ba7c6317a6427754e2`.
 Earlier tables retain the four-batch results and are not measurements of this
 new head.
@@ -204,14 +223,18 @@ first-unselected NaN behavior cannot be expressed by a comparator. Strict
 comparisons, lowest-index ties, repeated index zero after candidate exhaustion
 and the untouched destination tail are preserved.
 
-The caller read a real-call CPU profile over seconds 15 through 33. It contains
+The supplied real-call CPU profile over seconds 15 through 33 contains
 340,285 µs in the engine, 303,519 µs in encode, 19,901 µs in decode,
 15,659 µs in CELP top-K and 31,361 µs in FFT. The bridge uses `6502b871`
 with different code generation from release, so these numbers support
-attribution only, not absolute production CPU estimates.
+attribution only, not absolute production CPU estimates. Reconstructing the
+sample ancestry and weighting by `timeDeltas` reproduces 89.20% encode within
+the engine, 5.16% CELP top-K within encode and 10.33% FFT within encode.
+The V8 heap profile contains 33 samples totaling 20,770,808 bytes; it does not
+attribute Rust allocations inside wasm linear memory.
 
-Local CodSpeed profiles ran one row per invocation without upload. The caller
-retained them under `/home/jlucaso/projects/whatsapp-rust/target/` with prefixes
+Local CodSpeed profiles ran one row per invocation without upload. Profiles
+are retained under `target/` with prefixes
 `lpc-windows-*`, `lpc-levinson-*` and `celp-topk-*`.
 
 | Encode implementation | Ir | Ct | Cl |
@@ -240,8 +263,8 @@ outbound improvement.
 Divan encode falls from 338 allocation calls and 376 KB to 326 calls and
 371.4 KB. Outbound falls from 423 calls to 411, and LPC-stage from seven to
 three. Against main, aggregate encode calls fall from 451 to 326 and outbound
-from 540 to 411. The earlier DHAT and warm-heap measurements have not been
-remeasured for these additions. The windows contain 1,440 bytes of shared
+from 540 to 411. The final DHAT and warm-heap measurements are below.
+The windows contain 1,440 bytes of shared
 immutable array storage; the two LPC arrays contain 272 bytes of local storage.
 These sizes do not establish runtime peak stack usage.
 
@@ -250,41 +273,146 @@ million random float/tie vectors and exhaustive seven-value alphabets through
 length five, including signed zeros, infinities, NaNs and k=0 through 8.
 Bitwise long/short LPC-window checks, golden and LPC C/wasm fixtures, and
 targeted all-targets Clippy also passed in the experiment. No golden constants,
-FFT, decoder, framing, bridge, release profiles or public APIs changed.
-The engine still uses `encode_i16_into`. The rejected pitch scratch remains
-reverted.
+FFT, decoder, framing, bridge or release profiles changed. Existing public APIs
+remain compatible; this PR adds `MlowEncoder::encode_i16_into`, which the engine
+uses internally. The rejected pitch scratch remains reverted.
 
 In the managed worktree, all 136 selected MLOW library tests passed with
 `cargo nextest run -p wacore --features voip-mlow --lib -E 'test(voip::mlow)'`.
 Targeted all-targets Clippy with `voip-mlow,bench-internals`, formatting and
 diff checks passed. The two code patches match the experiment exactly.
 
-New-head cloud CodSpeed results, final stack measurements, full validation,
-PR metadata and thread resolution remain with the outer executor. The
-published comparison below predates these additions and cannot establish
-their CI improvement.
+These checks are completed evidence, not pending work. The published CI
+checkpoint below names its exact revision and must not be read as a measurement
+of later changes. Final PR checks and review status are linked from PR #1500.
+
+## Direct i16 input to VAD
+
+Every i16 sample is represented exactly after conversion to f32 and division by
+32768. Multiplication by 32768, rounding and clamping previously reconstructed
+that same i16 value for VAD. The new path borrows the original samples instead.
+A debug invariant checks that the two input representations agree. The f32 API
+retains its conversion buffer, including after alternating between APIs.
+
+The isolated VAD experiment compares against the LPC/top-K version, using the
+same i16 benchmark input in both runs.
+
+| Measure | Before direct VAD | After direct VAD |
+| --- | ---: | ---: |
+| i16 reused-output Ir | 7,918,025 | 7,883,980 |
+| i16 reused-output Ct | 559,080,303 | 557,129,194 |
+| i16 reused-output Cl | 1,963,888,738 | 1,955,523,737 |
+| Engine outbound Ir | 8,279,386 | 8,248,696 |
+| i16 native median, CPU 2, 500 samples | 296.3 µs | 294.4 µs |
+| Outbound native median, CPU 2, 500 samples | 308.2 µs | 305.5 µs |
+| i16-only warm encoder heap | 157,725 B | 155,805 B |
+
+This small deterministic reduction and the smaller retained heap justify the
+internal dataflow change. It adds no public API beyond the engine-used i16
+method already in the PR. Together, the engine staging removal and direct VAD
+remove 5,760 bytes of retained PCM conversion storage from an i16-only call.
+They avoid 5,760 bytes of staging writes and 7,680 bytes of staging reads per
+non-silent packet. Required normalization and VAD's input read still happen.
+
+## Final allocation attribution
+
+The same 100-packet DHAT stream records 33,988 blocks and 37,234,776 bytes on
+`hot_encode` stacks, excluding setup and priming. The baseline records 46,853
+blocks and 39,660,648 bytes. This is a 27.46% block reduction and 6.12% byte
+reduction; it is not zero-allocation encoding.
+
+| Measured allocation site | Base calls/packet | Final | Base bytes/packet | Final |
+| --- | ---: | ---: | ---: | ---: |
+| Perceptual Levinson scratch | 72 | 0 | 14,112 | 0 |
+| Perceptual response vectors | 24 | 0 | 2,352 | 0 |
+| Perceptual response outer vectors | 6 | 0 | 576 | 0 |
+| Candidate pulse storage | 3 | 0 | 3,840 | 0 |
+| CELP trimmed pulse output | 11.65 | 0 | 98.72 | 0 |
+| LPC window vectors | 6 | 0 | 3,808 | 0 |
+| LPC Levinson scratch | 6 | 0 | 816 | 0 |
+| CELP subframe output container | 3 | 3 | 1,056 | 2,400 |
+
+The last row grows because its elements now contain inline pulses. Its extra
+1,344 bytes offset part of the savings; the table reconciles to 128.65 fewer
+blocks and 24,258.72 fewer bytes per packet. Pitch C/E/H remain unchanged at
+178,176 allocated bytes per packet combined. The f32 encoder's warm live heap
+remains 157,725 bytes; an i16-only encoder now retains 155,805 bytes, measured
+with `voip_profile encoder-live-i16` and `dhat-heap`.
+
+## Runtime stack measurements
+
+Measurements compare baseline `6502b871` with the full batch, including direct
+VAD. The diagnostic package uses opt-level 3, fat LTO, one codegen unit, aborting
+panics and debug level 1. It drives the actual public encoder methods after
+eight warmup packets, then measures 128 sequential packets for each of four
+input families: varied tone, silence, deterministic noise, and silence followed
+by alternating i16 extrema. `encode`, `encode_into` and the head-only
+`encode_i16_into` reach the same peak within each target.
+
+| Target and runtime metric | Base | Final | Delta |
+| --- | ---: | ---: | ---: |
+| x86-64, touched-stack high-water | 25,096 B | 28,088 B | +2,992 B |
+| i686, touched-stack high-water | 24,224 B | 27,256 B | +3,032 B |
+| wasm32, shadow-stack pointer peak | 19,376 B | 24,432 B | +5,056 B |
+| wasm32, touched-memory high-water | 19,376 B | 24,272 B | +4,896 B |
+
+Native measurement paints 256 KiB in a no-inline Rust function, returns from
+that function, and uses GDB to scan the sentinel after the measured calls.
+Setup, painting and warmup are outside the interval. The first changed 64-bit
+word gives an eight-byte-resolution touched-memory high-water, not a proof
+about every reserved but untouched native stack slot.
+
+The wasm observer is inserted after every `global.set $__stack_pointer` in the
+compiled module. It tracks the minimum pointer while the measurement marker is
+active, without allocating guest stack or changing codec arithmetic. A separate
+sentinel scan corroborates touched memory. The final pointer peak exceeds the
+touched peak by 160 bytes, so the two measures are deliberately not conflated.
+The deepest pointer is observed in CELP's `smpl_get_maxi_k`. Original and
+instrumented modules produced identical packet-stream digests, and baseline/head
+digests match within each target and input family.
+
+Dynamic depth at entry to `smpl_analyze_frame_st` after its prologue is separate
+from its descendants' peak: x86-64 is 14,312 to 14,296 bytes, i686 is 14,348 to
+14,076 bytes, and wasm32 is 13,568 to 13,296 bytes. A smaller entry depth does
+not imply a smaller whole-chain peak.
+
+The observed increases are bounded absolute costs of about 2.92 KiB, 2.96 KiB
+and 4.94 KiB. The arrays remain; no per-frame heap allocation was reintroduced.
+These are workload/build-specific measurements, not universal task-stack size
+recommendations. Caller and runtime frames need their own budget. i686 supplies
+a representative 32-bit measurement, not an ESP32 hardware measurement.
+
+The local diagnostic source, manifests, GDB commands, wasm observer and initial
+logs are archived in `.cache/mlow-evidence/local-profiles-and-stack-probe.tar.gz`.
+Final logs are `.cache/mlow-evidence/native64-final.log`, `native32-final.log`
+and `wasm-final.json`. The observer verifies all expected stack-write sites
+exist, and validates the transformed module before execution.
 
 ## Correctness and portability
 
-- 2,397 wacore library tests passed, with three ignored tests reported separately.
-- The explicitly invoked 2,048-packet encode/decode stream passed.
+- The complete wacore suite passed after the functional changes, including engine,
+  golden, C/Go/wasm fixtures and the million-vector top-K comparison.
+- The 2,048-packet encode/decode stream passed. It is now a normal, non-ignored
+  test so regular CI also exercises long i16 continuity.
 - New i16 equivalence coverage exercises every i16 value, reused oversized output,
   invalid lengths between valid frames and reset boundaries.
 - Golden checksums and C/Go/wasm fixture expectations were not changed.
 - Targeted MLOW Clippy and workspace all-targets Clippy passed.
 - wasm32 builds with `--no-default-features --features voip-mlow,js`.
   Omitting the existing `js` feature fails in getrandom before reaching the codec.
-- The symbolized release DHAT driver text grows from 1,140,053 to 1,140,885 bytes,
-  an increase of 832 bytes. This is an executable measurement, not codec-only size.
-- New local arrays hold 792 bytes of f64 Levinson storage, 1,280 bytes per candidate
-  pulse array and 512 bytes per response matrix. Native stack-frame and wasm stack
-  high-water measurements remain outstanding.
+- The equivalent diagnostic executable's native text grows from 778,159 to
+  780,391 bytes, an increase of 2,232 bytes. After stripping custom sections,
+  its wasm module grows from 446,143 to 447,230 bytes, an increase of 1,087 bytes.
+  These are executable measurements with the shared diagnostic driver, not
+  codec-only text sizes or downstream wasm-opt results.
+- Runtime stack measurements are complete for native 64-bit, native 32-bit
+  and wasm32, with their measurement boundaries documented above.
 
-## Published CI comparison
+## Published CI checkpoint before LPC, top-K and direct VAD
 
 [PR #1500](https://github.com/oxidezap/whatsapp-rust/pull/1500) uses branch
 `perf/voip-mlow-hotpath-batch` and the title
-`fix(wacore): reduce MLOW encoding allocations and PCM staging`.
+`perf(voip): reduce MLOW encoding allocations and PCM staging`.
 The completed [CodSpeed check](https://github.com/oxidezap/whatsapp-rust/runs/103640418292)
 compares baseline `6502b871e35664ffb80044ba7c6317a6427754e2` with
 head `e2664f1c7cdbd4b9f00570ddf4fb47ef3909699a`.
@@ -310,7 +438,7 @@ therefore establish no improvement. The summary does not publish individual
 values for the 789 untouched rows. The H.264 regression remains reported;
 the environment warning alone does not establish its cause.
 
-## Remaining work
+## Remaining hotspots and validation limits
 
 The largest remaining byte costs are pitch scratch, followed by CELP subframe
 temporaries. Decoder work remains much smaller than encoder work. ACB basis
@@ -319,8 +447,15 @@ jitter operations have not been changed. The next CPU investigation should
 start from the retained FFT/CELP/pitch profiles rather than propose another FFT
 algorithm without evidence.
 
-Runtime peak stack measurements for baseline and head on native 64-bit and
-wasm32 remain outstanding. Array sizes above are storage sizes, not measured
-stack peaks. Review-thread resolution and any further PR metadata changes
-remain with the outer executor. The completed CodSpeed comparison above
-does not close the stack evidence gap or establish a combined CPU improvement.
+The completed CodSpeed checkpoint above predates later batches. The PR body
+records the final-head comparison and its exact run link when available.
+Conformance rederivation is blocked by unavailable pinned wasm captures,
+including `9Nbh3eMuVjD.wasm`; existing committed codec fixtures pass.
+The informational semver check reports pre-existing changes against published
+0.7.0 releases. These failures are not reported as green checks.
+
+No post-change live WhatsApp call was validated. A follow-up live comparison
+should repeat the supplied symbolized profile after updating the consumer pin.
+The next core CPU investigation should attribute residual analysis and CELP
+work after the top-K change. Downstream optimization-level experiments belong
+in the consumer and do not change this repository's release profile.

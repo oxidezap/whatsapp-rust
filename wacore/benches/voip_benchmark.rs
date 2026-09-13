@@ -189,6 +189,7 @@ fn mlow_encode_reused_output(bencher: Bencher) {
         });
 }
 
+/// Quantized tone input establishes a separate baseline rather than a direct comparison to the f32 row.
 #[divan::bench]
 fn mlow_encode_i16_reused_output(bencher: Bencher) {
     bencher
@@ -206,8 +207,9 @@ fn mlow_encode_i16_reused_output(bencher: Bencher) {
         .bench_refs(|(enc, frames, i, output)| {
             let f = &frames[*i % frames.len()];
             *i += 1;
-            enc.encode_i16_into(black_box(f.as_slice()), output)
-                .unwrap();
+            if let Err(error) = enc.encode_i16_into(black_box(f.as_slice()), output) {
+                panic!("valid i16 benchmark frame failed to encode: {error}");
+            }
             black_box(output.len())
         });
 }

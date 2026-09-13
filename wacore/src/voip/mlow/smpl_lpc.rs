@@ -44,6 +44,7 @@ fn gen_cos_win<const N: usize>() -> [f32; N] {
     std::array::from_fn(|i| ((i as f32 + 1.0) / (N as f32 + 1.0) * SMPL_PI / 2.0).cos())
 }
 
+/// The short taper has its own denominator; it is not a prefix of the long taper.
 struct LpcWindows {
     leading: [f32; SMPL_LPC_WIN1_20MS_LEN],
     trailing_long: [f32; SMPL_WIN3_LONG_LEN],
@@ -639,6 +640,7 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
+    /// Signed-zero bits distinguish window multiplication from the trailing positive-zero padding.
     #[test]
     fn cached_lpc_windows_match_per_call_generation_bitwise() {
         for use_long in [true, false, true, false] {

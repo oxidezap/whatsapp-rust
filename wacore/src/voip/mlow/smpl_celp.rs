@@ -449,6 +449,7 @@ fn smpl_get_maxi_k(x: &[f32], idx: &mut [i32], x_len: usize, k: usize) {
     idx[limit..k].fill(0);
 }
 
+/// Preserve repeated-selection semantics, including index zero after nonempty input is exhausted.
 fn smpl_get_maxi_k_scan(x: &[f32], idx: &mut [i32], x_len: usize, k: usize) {
     debug_assert!(x_len <= SMPL_MAX_SF_LEN);
     let mut taken_buf = [false; SMPL_MAX_SF_LEN];
@@ -2339,6 +2340,7 @@ pub(crate) fn cb_acbgains_lr_q14() -> &'static [i16] {
 mod tests {
     use super::*;
 
+    /// Keep this oracle independent of the production fallback so a shared defect cannot self-validate.
     fn reference_maxi_k(x: &[f32], idx: &mut [i32], x_len: usize, k: usize) {
         let mut taken = [false; SMPL_MAX_SF_LEN];
         for dest in &mut idx[..k] {
@@ -2357,6 +2359,7 @@ mod tests {
         }
     }
 
+    /// Compare the entire destination to observe writes past the requested survivor count.
     fn check_maxi_k(x: &[f32], x_len: usize, k: usize) {
         let mut expected = [-123; SMPL_CELP_MAX_NUMSURV];
         let mut actual = expected;
@@ -2365,6 +2368,7 @@ mod tests {
         assert_eq!(actual, expected, "k={k}, live={:?}", &x[..x_len]);
     }
 
+    /// A total-order comparator would change the reference's NaN and signed-zero choices.
     #[test]
     fn top_k_matches_selection_for_exhaustive_ties_and_nonfinite_values() {
         let values = [
@@ -2391,6 +2395,7 @@ mod tests {
         }
     }
 
+    /// Mix raw IEEE-754 patterns with a small integer alphabet that forces repeated tied scores.
     #[test]
     fn top_k_matches_selection_over_a_million_vectors() {
         let mut seed = 0x715fba91u32;
