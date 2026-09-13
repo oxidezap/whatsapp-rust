@@ -929,6 +929,13 @@ pub(crate) fn smpl_perc_ac2a(
     a
 }
 
+/// Write the perceptual LPC response into `a[..perc_resp_len]` without allocating.
+/// Overwrites every active coefficient, including the leading 1.0, and leaves
+/// any destination tail untouched. Input and output storage can be reused across calls.
+///
+/// Requires `2 <= perc_resp_len <= SMPL_MAX_L_RESP`,
+/// `r.len() >= len_r >= perc_resp_len + 1`, and `a.len() >= perc_resp_len`.
+/// These are internal caller invariants, not recoverable input errors.
 pub(crate) fn smpl_perc_ac2a_into(
     r: &[f32],
     len_r: usize,
@@ -942,8 +949,7 @@ pub(crate) fn smpl_perc_ac2a_into(
 
     let b = [perc_emph, 1.0 + perc_emph * perc_emph, perc_emph];
     let state = [r[0], r[1]];
-    // `SMPL_MAX_L_RESP` is 33, so both intermediates are 132 bytes: on the stack they cost nothing,
-    // while as `vec!` they were two heap allocations per call and this runs 16x per 60 ms frame.
+    // Fixed intermediates avoid heap allocation but contribute to the runtime stack peak.
     let mut r_ = [0.0f32; SMPL_MAX_L_RESP];
     smpl_filt_ma2(&r[1..], perc_resp_len, &b, &state, &mut r_);
 

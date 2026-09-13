@@ -106,6 +106,10 @@ impl MlowEncoder {
         self.encode_clean(output)
     }
 
+    /// Consume exactly one frame of normalized PCM already staged in `self.clean`.
+    /// Both input APIs validate and fill that scratch before entering here.
+    /// Analysis advances before entropy encoding, so an encoding error does not
+    /// roll back history, although the caller's output remains unchanged.
     fn encode_clean(&mut self, output: &mut Vec<u8>) -> Result<(), MlowError> {
         let fp = smpl_analyze_frame_st(&mut self.state, &self.clean);
         encode_smpl_frame_into(&fp, &mut self.range, output)

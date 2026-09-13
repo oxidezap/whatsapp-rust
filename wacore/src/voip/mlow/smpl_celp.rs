@@ -738,6 +738,8 @@ fn non_zero_range(col: i32, perc_resp_len: usize, fcb_subfrlen: usize) -> (usize
 // Public output of the per-subframe encoder.
 
 pub(crate) struct CelpSubframeOut {
+    /// Packed pulses for each rate. Only the prefix selected by `n_pulses`
+    /// belongs to the subframe; consumers must ignore the remaining capacity.
     pub pulses: [[i16; SMPL_MAX_PULSES_PER_SF]; SMPL_CELP_MAX_RATES],
     pub n_pulses: [i16; SMPL_CELP_MAX_RATES],
     pub acb_idx: [i16; SMPL_CELP_MAX_RATES],
