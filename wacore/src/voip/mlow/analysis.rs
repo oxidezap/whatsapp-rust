@@ -50,7 +50,7 @@ const SMPL_LSF_RDW_ADJ: f32 = 1.1952286;
 #[derive(Default)]
 pub(crate) struct SmplEncoderState {
     hist: Vec<f64>,
-    /// Reused because VAD runs for every packet on the realtime encode path.
+    /// Reused for f32 input conversion. The i16 path lends its original PCM to VAD.
     vad_pcm: Vec<i16>,
     /// Reused to avoid four packet-sized allocations on the realtime encode path.
     hp: Vec<f32>,
