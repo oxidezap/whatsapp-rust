@@ -215,6 +215,28 @@ pub async fn create_test_client() -> Arc<Client> {
     create_test_client_with_name("default").await
 }
 
+#[cfg(test)]
+pub(crate) async fn create_test_client_with_sync_receiver() -> (
+    Arc<Client>,
+    async_channel::Receiver<crate::sync_task::MajorSyncTask>,
+) {
+    let pm = Arc::new(
+        PersistenceManager::new(create_test_backend().await)
+            .await
+            .expect("persistence manager should initialize"),
+    );
+    let (client, receiver) = Client::new(
+        Arc::new(TokioRuntime),
+        pm,
+        Arc::new(MockTransportFactory::new()),
+        Arc::new(MockHttpClient),
+        None,
+    )
+    .await;
+    client.enter_live_mode_for_tests();
+    (client, receiver)
+}
+
 pub async fn create_test_client_with_name(name: &str) -> Arc<Client> {
     create_test_client_with_http(name, Arc::new(MockHttpClient)).await
 }

@@ -11,8 +11,26 @@ use wacore::store::traits::MsgSecretEntry;
 use wacore_binary::{Jid, JidExt as _};
 
 use crate::client::Client;
+use crate::types::history_sync_admission::{HistorySyncDecision, HistorySyncMetadata};
 
 const HISTORY_MSG_SECRET_SIZE: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
+
+fn history_sync_metadata(notification: &DetachedHistorySyncNotification) -> HistorySyncMetadata {
+    HistorySyncMetadata {
+        sync_type: notification
+            .notification
+            .sync_type
+            .map(|sync_type| sync_type as i32),
+        chunk_order: notification.notification.chunk_order,
+        progress: notification.notification.progress,
+        file_length: notification.notification.file_length,
+        has_inline_payload: notification.inline_payload.is_some(),
+        peer_data_request_session_id: notification
+            .notification
+            .peer_data_request_session_id
+            .clone(),
+    }
+}
 
 /// Immutable seed policy snapshot shared by the streaming filter and the
 /// persistence pass. Keeping one snapshot prevents a long parse from applying
@@ -268,6 +286,23 @@ impl Client {
             )
             .await;
             return;
+        }
+
+        if let Some(admission) = self.history_sync_admission.get() {
+            let metadata = history_sync_metadata(&notification);
+            if admission.decide(&metadata) == HistorySyncDecision::Reject {
+                log::debug!(
+                    "Rejecting history sync {} by admission policy (Type: {:?})",
+                    message_id,
+                    notification.notification.sync_type
+                );
+                self.send_protocol_receipt(
+                    message_id,
+                    crate::types::presence::ReceiptType::HistorySync,
+                )
+                .await;
+                return;
+            }
         }
 
         // Enqueue a MajorSyncTask for the dedicated sync worker to consume.
@@ -735,9 +770,144 @@ mod tests {
     use buffa::Message as ProtoMessage;
     use flate2::{Compression, write::ZlibEncoder};
     use std::io::Write;
-    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use waproto::whatsapp as wa;
     use waproto::whatsapp::message::HistorySyncNotification;
+
+    struct RecordingAdmission {
+        decision: HistorySyncDecision,
+        calls: AtomicUsize,
+        metadata: Mutex<Vec<HistorySyncMetadata>>,
+    }
+
+    impl RecordingAdmission {
+        fn new(decision: HistorySyncDecision) -> Self {
+            Self {
+                decision,
+                calls: AtomicUsize::new(0),
+                metadata: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl crate::HistorySyncAdmission for RecordingAdmission {
+        fn decide(&self, metadata: &HistorySyncMetadata) -> HistorySyncDecision {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.metadata.lock().unwrap().push(metadata.clone());
+            self.decision
+        }
+    }
+
+    fn admission_notification() -> DetachedHistorySyncNotification {
+        HistorySyncNotification {
+            file_length: Some(42),
+            sync_type: Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP),
+            chunk_order: Some(7),
+            progress: Some(55),
+            peer_data_request_session_id: Some("session-test".to_string()),
+            initial_hist_bootstrap_inline_payload: Some(vec![1, 2, 3]),
+            ..Default::default()
+        }
+        .into()
+    }
+
+    async fn client_with_receipt_waiter(
+        name: &str,
+    ) -> (
+        Arc<Client>,
+        futures::channel::oneshot::Receiver<Arc<wacore_binary::Node>>,
+    ) {
+        let client = crate::test_utils::create_test_client_with_name(name).await;
+        client.is_running.store(true, Ordering::Relaxed);
+        client
+            .persistence_manager
+            .process_command(wacore::store::commands::DeviceCommand::SetId(Some(
+                "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+            )))
+            .await;
+        let receipt = client.wait_for_sent_node(crate::client::NodeFilter::tag("receipt"));
+        (client, receipt)
+    }
+
+    #[test]
+    fn history_sync_admission_metadata_maps_detached_notification() {
+        let metadata = history_sync_metadata(&admission_notification());
+
+        assert_eq!(metadata.sync_type, Some(0));
+        assert_eq!(metadata.chunk_order, Some(7));
+        assert_eq!(metadata.progress, Some(55));
+        assert_eq!(metadata.file_length, Some(42));
+        assert!(metadata.has_inline_payload);
+        assert_eq!(
+            metadata.peer_data_request_session_id.as_deref(),
+            Some("session-test")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_history_sync_sends_receipt_without_activity() {
+        let (client, receipt) = client_with_receipt_waiter("history_admission_reject").await;
+        let admission = Arc::new(RecordingAdmission::new(HistorySyncDecision::Reject));
+        assert!(client.history_sync_admission.set(admission.clone()).is_ok());
+
+        client
+            .handle_history_sync("HISTORY-REJECT".to_string(), admission_notification())
+            .await;
+
+        let receipt = receipt.await.expect("history-sync receipt");
+        assert_eq!(
+            receipt.attrs().optional_string("id").as_deref(),
+            Some("HISTORY-REJECT")
+        );
+        assert_eq!(
+            receipt.attrs().optional_string("type").as_deref(),
+            Some("hist_sync")
+        );
+        assert_eq!(client.history_sync_activity.snapshot().tasks, 0);
+        assert_eq!(admission.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn skip_history_sync_sends_receipt_without_invoking_admission() {
+        let (client, receipt) = client_with_receipt_waiter("history_admission_skip").await;
+        client.set_skip_history_sync(true);
+        let admission = Arc::new(RecordingAdmission::new(HistorySyncDecision::Reject));
+        assert!(client.history_sync_admission.set(admission.clone()).is_ok());
+
+        client
+            .handle_history_sync("HISTORY-SKIP".to_string(), admission_notification())
+            .await;
+
+        let receipt = receipt.await.expect("history-sync receipt");
+        assert_eq!(
+            receipt.attrs().optional_string("id").as_deref(),
+            Some("HISTORY-SKIP")
+        );
+        assert_eq!(admission.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(client.history_sync_activity.snapshot().tasks, 0);
+    }
+
+    #[tokio::test]
+    async fn accepted_history_sync_consults_admission_and_keeps_default_path() {
+        let (client, receiver) = crate::test_utils::create_test_client_with_sync_receiver().await;
+        client.is_running.store(true, Ordering::Relaxed);
+        let admission = Arc::new(RecordingAdmission::new(HistorySyncDecision::Accept));
+        assert!(client.history_sync_admission.set(admission.clone()).is_ok());
+
+        client
+            .handle_history_sync("HISTORY-ACCEPT".to_string(), admission_notification())
+            .await;
+
+        assert_eq!(admission.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(admission.metadata.lock().unwrap().len(), 1);
+        let task = receiver.recv().await.expect("accepted history-sync task");
+        assert!(matches!(
+            task,
+            crate::sync_task::MajorSyncTask::HistorySync { .. }
+        ));
+        assert_eq!(client.history_sync_activity.snapshot().tasks, 1);
+    }
 
     fn compress_history_sync(history_sync: &wa::HistorySync) -> Vec<u8> {
         let raw = history_sync.encode_to_vec();

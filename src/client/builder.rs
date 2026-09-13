@@ -21,6 +21,7 @@ use crate::sync_task::MajorSyncTask;
 use crate::transport::TransportFactory;
 use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
+use crate::types::history_sync_admission::HistorySyncAdmission;
 use wacore::handshake::NoiseCertPolicy;
 use wacore::runtime::Runtime;
 
@@ -115,6 +116,7 @@ pub struct ClientBuilder {
     cache_config: CacheConfig,
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
+    history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
     skip_history_sync: bool,
     ab_props_fetch: bool,
     presence_policy: PresencePolicy,
@@ -150,6 +152,7 @@ impl ClientBuilder {
             cache_config: CacheConfig::default(),
             custom_enc_handlers: HashMap::new(),
             inbound_durability_hook: None,
+            history_sync_admission: None,
             skip_history_sync: false,
             ab_props_fetch: true,
             presence_policy: PresencePolicy::default(),
@@ -272,6 +275,25 @@ impl ClientBuilder {
         hook: Arc<dyn InboundDurabilityHook>,
     ) -> Self {
         self.inbound_durability_hook = Some(hook);
+        self
+    }
+
+    /// Register a synchronous policy that can reject inbound history-sync
+    /// notifications before they create history-sync work.
+    pub fn with_history_sync_admission<A>(mut self, admission: A) -> Self
+    where
+        A: HistorySyncAdmission + 'static,
+    {
+        self.history_sync_admission = Some(Arc::new(admission));
+        self
+    }
+
+    /// Register an already-shared history-sync admission policy.
+    pub fn with_history_sync_admission_arc(
+        mut self,
+        admission: Arc<dyn HistorySyncAdmission>,
+    ) -> Self {
+        self.history_sync_admission = Some(admission);
         self
     }
 
@@ -566,6 +588,9 @@ impl ClientBuilder {
         }
         if let Some(hook) = self.inbound_durability_hook {
             let _ = client.inbound_durability_hook.set(hook);
+        }
+        if let Some(admission) = self.history_sync_admission {
+            let _ = client.history_sync_admission.set(admission);
         }
         if self.skip_history_sync {
             client.set_skip_history_sync(true);
