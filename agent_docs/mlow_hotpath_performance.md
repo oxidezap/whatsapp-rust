@@ -1,6 +1,6 @@
 # MLOW hot-path measurements
 
-## Latest local result
+## Latest result
 
 The complete allocation, LPC, top-K and direct-VAD batch reduces steady-state
 DHAT blocks from 468.53 to 339.88 per 60 ms packet, and allocated bytes from
@@ -10,7 +10,10 @@ and now passes the original PCM directly to VAD.
 
 CPU improvements are small compared with the allocation reduction. Local
 instruction counts and native timings are reported separately below; neither
-is substituted for a published CodSpeed comparison. No post-change live
+is substituted for a published CodSpeed comparison. The completed
+[final functional-code CI comparison](#final-functional-code-ci) records the
+Simulation and Memory results for `c9617fdd`, including small CPU cost changes
+and lower allocation counts. No post-change live
 product-call performance measurement was captured. The supplied live-call
 profile covers the original baseline only.
 
@@ -125,7 +128,7 @@ kernel memory tunables. Retain that warning when comparing local memory runs.
    `CallEngine::encode_mlow_frame`. It normalizes into the existing encoder
    scratch and removes the engine's extra 960-element f32 buffer. This saves
    3,840 bytes of persistent call storage and one 3,840-byte staging write/read
-    per non-silent packet. The exact-zero DTX branch still returns before encoding.
+   per non-silent packet. The exact-zero DTX branch still returns before encoding.
 5. Cache the immutable LPC windows, preserving the target's original f32 formulas.
 6. Replace LPC Levinson's two temporary vectors with 17-element f64 arrays.
 7. Select CELP survivors with bounded insertion into the caller's index buffer,
@@ -447,8 +450,8 @@ jitter operations have not been changed. The next CPU investigation should
 start from the retained FFT/CELP/pitch profiles rather than propose another FFT
 algorithm without evidence.
 
-The completed CodSpeed checkpoint above predates later batches. The PR body
-records the final-head comparison and its exact run link when available.
+The earlier CodSpeed checkpoint predates later batches. The final functional-code
+comparison below covers the complete batch at `c9617fdd`.
 Conformance rederivation is blocked by unavailable pinned wasm captures,
 including `9Nbh3eMuVjD.wasm`; existing committed codec fixtures pass.
 The informational semver check reports pre-existing changes against published
@@ -459,3 +462,85 @@ should repeat the supplied symbolized profile after updating the consumer pin.
 The next core CPU investigation should attribute residual analysis and CELP
 work after the top-K change. Downstream optimization-level experiments belong
 in the consumer and do not change this repository's release profile.
+
+
+## Final functional-code CI
+
+For [PR #1500](https://github.com/oxidezap/whatsapp-rust/pull/1500) on
+`perf/voip-mlow-hotpath-batch`, the completed comparison uses baseline
+`6502b871e35664ffb80044ba7c6317a6427754e2` and final functional-code head
+`c9617fdd93719f22fcecbcc60d568535e3267ec0`.
+Both Simulation and Memory completed, as did the
+[core CI shard](https://github.com/oxidezap/whatsapp-rust/actions/runs/34735907163/job/103667181538).
+The source runs are the
+[baseline run](https://app.codspeed.io/oxidezap/whatsapp-rust/runs/6aa3fd64220f2056a184c1b6)
+and [final head run](https://app.codspeed.io/oxidezap/whatsapp-rust/runs/6aa61bd7c66960167dbc18c7).
+The caller verified the measured rows in public `NEXT_DATA` at
+`pageProps.branch.report.paginatedBenchmarkReports` and asserted that
+`run.commit.hash` equals the full head hash above. These results are bound to
+that functional revision, not to subsequent documentation commits.
+
+CPU cost delta is `100 × (head / base - 1)`, so negative values mean lower
+cost. Times are CodSpeed Simulation measurements, not native wall time.
+Allocated bytes and allocation calls are totals per benchmark invocation,
+including growth. Encode rows process a 60 ms packet; the two-peer row measures
+its whole call-second workload.
+
+| Benchmark | Base CPU | Head CPU | CPU cost delta | Base allocated B | Head allocated B | Base calls | Head calls |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| mlow_encode | 7.116545365 ms | 7.081356699 ms | -0.49% | 396,168 | 371,934 | 458 | 333 |
+| mlow_encode_reused_output | 7.099895862 ms | 7.071931807 ms | -0.39% | 395,655 | 371,421 | 457 | 332 |
+| engine_outbound_frame | 7.608067360 ms | 7.549508485 ms | -0.77% | 550,765 | 524,545 | 562 | 432 |
+| mlow_decode | 390.078810 µs | 391.025980 µs | +0.24% | 25,216 | 25,216 | 48 | 48 |
+| engine_inbound_packet | 475.438653 µs | 473.227109 µs | -0.47% | 31,977 | 31,977 | 71 | 71 |
+| codec_stages::lpc_front_end | 264.312284 µs | 248.753806 µs | -5.89% | 3,712 | 2,128 | 7 | 3 |
+| codec_stages::celp_subframes_frame | 735.263703 µs | 716.454036 µs | -2.56% | 24,856 | 21,568 | 63 | 42 |
+| codec_stages::perc_model_frame | 591.387567 µs | 591.575067 µs | +0.03% | 2,064 | 2,064 | 6 | 6 |
+| codec_stages::pitch_search | 644.822841 µs | 645.326165 µs | +0.08% | 85,287 | 85,287 | 14 | 14 |
+| call_second_two_peers | 236.124726 ms | 234.896908 ms | -0.52% | 14,713,100 | 13,885,378 | 17,689 | 13,432 |
+
+The new `mlow_encode_i16_reused_output` row measures 7.039588905 ms,
+371,485 allocated bytes, 334 allocation calls including growth, and 87,320 bytes
+of peak memory. It has no main baseline. Its quantized input differs from the
+f32 input, so comparing those rows does not establish a direct API speedup.
+
+Peak memory is distinct from total allocated bytes and retained encoder heap.
+
+| Benchmark | Base peak B | Head peak B |
+| --- | ---: | ---: |
+| mlow_encode | 87,817 | 87,817 |
+| engine_outbound_frame | 239,860 | 237,940 |
+| call_second_two_peers | 406,306 | 402,466 |
+| codec_stages::lpc_front_end | 2,328 | 2,056 |
+| codec_stages::celp_subframes_frame | 3,900 | 3,696 |
+
+The report lists one improved row, one regressed, 788 untouched, two new and
+12 skipped. All MLOW CPU rows are classified Untouched, below the 8% threshold;
+these results do not establish a statistically significant large CPU win.
+The improved row is LPC Memory at +13.23% inverse-efficiency, calculated as
+`100 × (base / head - 1)`. Its peak cost falls by 11.68%. These percentages use
+different denominators and must not be interchanged. The 12 skipped rows include
+retired split FFT rows and reuse baseline values.
+
+H.264 `h264_depacketize_fua_stream` remains flagged at 233.2 to 336.3 µs,
+reported as -30.65% efficiency. CodSpeed warns about different runtime
+environments, with EPYC 9V74 versus 7763 and changed libc/loader build IDs.
+`memcpy` dominates the profile. A local comparison of the final head in the
+same environment records 45,845 to 45,821 instructions and does not reproduce
+the large cloud delta. This does not dismiss the cloud flag or prove its cause.
+No H.264 code or regression threshold changed.
+
+The local DHAT and runtime stack evidence above remains separate, with its
+original measurement limits. Final native touched-stack peaks are 25,096 to
+28,088 bytes, i686 peaks are 24,224 to 27,256 bytes, and wasm shadow-stack
+pointer peaks are 19,376 to 24,432 bytes. Cloud heap metrics do not replace
+these workload-specific stack measurements.
+
+CodeRabbit documentation coverage is now 82.61%, and its latest review has no
+actionable comments. The stack and unwrap review threads received evidence
+replies and were resolved. The known informational semver failure against
+published 0.7.0 and conformance rederivation failure from unavailable pinned
+captures remain not green. The missing captures include `9Nbh3eMuVjD.wasm` and
+`D5pLH9sfOOl.wasm`, which returned 404 before conformance execution. This report
+neither waives those failures nor changes their checks. No post-change live
+product-call measurement is claimed.
