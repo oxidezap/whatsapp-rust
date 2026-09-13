@@ -544,3 +544,68 @@ captures remain not green. The missing captures include `9Nbh3eMuVjD.wasm` and
 `D5pLH9sfOOl.wasm`, which returned 404 before conformance execution. This report
 neither waives those failures nor changes their checks. No post-change live
 product-call measurement is claimed.
+
+## H.264 depacketize fixture: measured cause and change
+
+The flagged `h264_depacketize_fua_stream` row was investigated directly rather
+than left to the environment warning.
+
+A same-environment A/B was run on this machine with the CodSpeed simulation
+instrument, building each side with
+`cargo codspeed build -p wacore -m simulation --features voip-mlow,bench-internals --bench voip_benchmark`
+and reading the callgrind totals for the row. Baseline
+`6502b871e35664ffb80044ba7c6317a6427754e2` and head `3af7b995` both execute
+45,967 instructions, with cold-miss counts differing by at most two events.
+The work this row performs is therefore identical on both sides.
+
+The cloud profiles locate the entire difference in one call. Both runs copy the
+same two buffers: 42 fragment copies into the FU buffer and one 32 KB copy of
+the completed NAL into the access-unit buffer. The head run contains a third
+`__memcpy_avx_unaligned_erms`, called from `_int_realloc` and costing 117.2 µs,
+which the base run does not have. The reported delta is 103.1 µs, because the
+two shared copies together measured about 18 µs less on the head runner. That
+extra call alone therefore accounts for the whole regression. It is a
+growth `realloc` moving the FU buffer instead of extending it in place. The two
+runs used different CPUs and different libc and loader build IDs, and the same
+decision is made differently by those allocators.
+
+The benchmark exposed that decision because it started each timed iteration from
+`H264Depacketizer::default()`, so the timed body contained the FU buffer's whole
+0 to 32 KB growth. A live depacketizer is many frames old and reuses that buffer,
+which is why the packetize rows in the same file already prime their output
+outside the timed body.
+
+The fixture now primes the depacketizer with one keyframe and calls `reset()`,
+which clears the buffers and keeps their capacity. The timed body is unchanged
+and still reassembles the whole FU-A run of the 32 KB keyframe.
+
+Measured effect of the fixture change, same machine, same build flags:
+
+| Measure | Unprimed | Primed |
+| --- | ---: | ---: |
+| Simulation instructions | 45,967 | 43,720 |
+| `realloc` calls in the timed body | 10 | 3 |
+| Growth events reported by divan | 10 | 3 |
+| Bytes moved by growth | 83.93 KB | 32.8 KB |
+| Peak live memory | 84.07 KB | 32.81 KB |
+| Native median, 100 samples | 2.335 µs | 2.177 µs |
+
+The same row was also measured with the whole `voip_benchmark` suite running
+before it, so the heap history matched a real shard rather than an isolated run:
+46,423 instructions unprimed and 44,313 primed, with the same 10 to 3 drop in
+`realloc` calls. In every local run the moves stayed between 42 and 52
+instructions, that is, in-place or near-empty: the expensive move the head cloud
+runner made is a decision this machine's allocator never took, which is why the
+fix is stated as removing the exposure rather than as a speedup.
+
+The remaining growth moves at most the 48 bytes of parameter-set NALs already in
+the access-unit buffer, because that buffer is handed to the caller on
+completion and is rebuilt each frame by design. The largest copies, the fragment
+copies and the 32 KB NAL copy, are the row's real work and stay in the timed
+body.
+
+This is a benchmark fixture change, not an H.264 code change: no depacketizer
+behavior, threshold or suppression was altered. Because the timed body now holds
+fewer allocations, the Simulation and Memory rows for this benchmark take a
+one-time step and their earlier values are not comparable across it. The peak
+memory row moves from 84.07 KB to 32.81 KB for that reason alone.

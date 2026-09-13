@@ -473,7 +473,21 @@ fn h264_depacketize_fua_stream(bencher: Bencher) {
         out.iter().map(<[u8]>::to_vec).collect()
     };
     bencher
-        .with_inputs(H264Depacketizer::default)
+        .with_inputs(|| {
+            // One keyframe reassembled outside the timed body, then `reset()` (which clears the
+            // buffers but keeps their capacity), so the row measures a steady-state frame the way
+            // the packetize rows above do. A depacketizer straight from `default()` grew its FU
+            // buffer 0 -> 32 KB inside the timed body, and whether glibc could extend that chunk in
+            // place or had to move it decided a third of the row: the same code measured 233 us and
+            // 336 us on two runners whose only difference was the CPU and the libc build.
+            let mut d = H264Depacketizer::default();
+            let last = payloads.len() - 1;
+            for (i, p) in payloads.iter().enumerate() {
+                d.push(i as u16, 90_000, p.as_slice(), i == last);
+            }
+            d.reset();
+            d
+        })
         .bench_refs(|d| {
             let last = payloads.len() - 1;
             for (i, p) in payloads.iter().enumerate() {
