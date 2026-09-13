@@ -84,12 +84,13 @@ impl MlowEncoder {
             pcm.iter()
                 .map(|&s| if s.is_nan() { 0.0 } else { s.clamp(-1.0, 1.0) }),
         );
-        self.encode_clean(output)
+        self.encode_clean(None, output)
     }
 
     /// Encode exactly 960 signed 16-bit mono samples at 16 kHz.
     ///
     /// Normalizes each sample as `sample as f32 / 32768.0` in encoder-owned scratch.
+    /// VAD reads the original samples, avoiding an exact but redundant conversion back to i16.
     /// Success replaces `output`, reusing its capacity and removing any previous tail.
     /// An error leaves `output` unchanged. A frame-length error also leaves codec state
     /// unchanged; a range-buffer overflow advances analysis state as in [`Self::encode_into`].
@@ -103,15 +104,19 @@ impl MlowEncoder {
         }
         self.clean.clear();
         self.clean.extend(pcm.iter().map(|&s| s as f32 / 32768.0));
-        self.encode_clean(output)
+        self.encode_clean(Some(pcm), output)
     }
 
     /// Consume exactly one frame of normalized PCM already staged in `self.clean`.
     /// Both input APIs validate and fill that scratch before entering here.
     /// Analysis advances before entropy encoding, so an encoding error does not
     /// roll back history, although the caller's output remains unchanged.
-    fn encode_clean(&mut self, output: &mut Vec<u8>) -> Result<(), MlowError> {
-        let fp = smpl_analyze_frame_st(&mut self.state, &self.clean);
+    fn encode_clean(
+        &mut self,
+        original_pcm: Option<&[i16]>,
+        output: &mut Vec<u8>,
+    ) -> Result<(), MlowError> {
+        let fp = smpl_analyze_frame_st(&mut self.state, &self.clean, original_pcm);
         encode_smpl_frame_into(&fp, &mut self.range, output)
     }
 }
@@ -490,7 +495,37 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "long stateful codec equivalence run"]
+    fn alternating_input_apis_preserves_vad_and_encoder_state() {
+        let mut reference = MlowEncoder::new();
+        let mut mixed = MlowEncoder::new();
+        let mut expected = Vec::new();
+        let mut output = Vec::new();
+        for frame in 0..96 {
+            if frame == 48 {
+                reference.reset();
+                mixed.reset();
+            }
+            let pcm: Vec<i16> = (0..OPUS_FRAME_SAMPS)
+                .map(|i| {
+                    if frame % 11 < 3 {
+                        0
+                    } else {
+                        (frame * OPUS_FRAME_SAMPS + i) as i16
+                    }
+                })
+                .collect();
+            let normalized: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+            reference.encode_into(&normalized, &mut expected).unwrap();
+            if frame % 2 == 0 {
+                mixed.encode_i16_into(&pcm, &mut output).unwrap();
+            } else {
+                mixed.encode_into(&normalized, &mut output).unwrap();
+            }
+            assert_eq!(output, expected, "frame {frame}");
+        }
+    }
+
+    #[test]
     fn i16_long_stream_matches_float_encoding() {
         let mut normalized = MlowEncoder::new();
         let mut integer = MlowEncoder::new();

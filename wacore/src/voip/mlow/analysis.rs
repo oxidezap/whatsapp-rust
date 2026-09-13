@@ -170,9 +170,12 @@ struct CelpFrameCtx<'a> {
 }
 
 /// Turn one 60 ms PCM frame (960 f32 @16 kHz, ~[-1,1]) into params, advancing `es`.
+/// If supplied, `original_pcm` must contain the 960 i16 samples whose normalization produced `pcm`.
+/// VAD borrows them directly; the f32 path instead reuses its conversion buffer.
 pub(crate) fn smpl_analyze_frame_st(
     es: &mut SmplEncoderState,
     pcm: &[f32],
+    original_pcm: Option<&[i16]>,
 ) -> super::params::SmplFrameParams {
     let need = SMPL_INTF_LEN * 3;
     let mut owned;
@@ -187,16 +190,30 @@ pub(crate) fn smpl_analyze_frame_st(
 
     // SILK VAD on the int16 input PCM (runs on the raw API samples, before the encoder HP). Produces
     // the per-internal-frame speech-activity probability + the packet coded_as_active_voice.
-    es.vad_pcm.clear();
-    es.vad_pcm.extend(
-        pcm[..need]
-            .iter()
-            .map(|&s| (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16),
-    );
+    let vad_pcm = if let Some(original) = original_pcm {
+        debug_assert_eq!(original.len(), need);
+        debug_assert!(
+            original
+                .iter()
+                .zip(&pcm[..need])
+                .all(|(&raw, &normalized)| {
+                    (raw as f32 / 32768.0).to_bits() == normalized.to_bits()
+                })
+        );
+        original
+    } else {
+        es.vad_pcm.clear();
+        es.vad_pcm.extend(
+            pcm[..need]
+                .iter()
+                .map(|&s| (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16),
+        );
+        &es.vad_pcm
+    };
     let vad = es
         .vad
         .get_or_insert_with(super::smpl_vad::SmplVadState::new)
-        .process_packet(&es.vad_pcm, SMPL_INTF_LEN);
+        .process_packet(vad_pcm, SMPL_INTF_LEN);
     let sp_act_prob = vad.vad_results;
     let coded_as_active_voice = vad.coded_as_active_voice;
 
@@ -1439,7 +1456,7 @@ pub mod stage_bench {
         pub fn new() -> Self {
             let mut es = SmplEncoderState::default();
             for k in 0..WARMUP_FRAMES {
-                let _ = smpl_analyze_frame_st(&mut es, &tone(k * SMPL_INTF_LEN * 3));
+                let _ = smpl_analyze_frame_st(&mut es, &tone(k * SMPL_INTF_LEN * 3), None);
             }
             let pcm: Vec<Vec<f32>> = (0..STREAM)
                 .map(|k| tone((WARMUP_FRAMES + k) * SMPL_INTF_LEN * 3))
@@ -1449,7 +1466,7 @@ pub mod stage_bench {
             // the state `es` is left in.
             let fps: Vec<_> = pcm
                 .iter()
-                .map(|f| smpl_analyze_frame_st(&mut es, f))
+                .map(|f| smpl_analyze_frame_st(&mut es, f, None))
                 .collect();
 
             let hp = es.hp.clone();
@@ -1772,7 +1789,7 @@ pub mod stage_bench {
         pub fn analyze_frame(&mut self) -> u8 {
             let frame = &self.pcm[self.pcm_at % self.pcm.len()];
             self.pcm_at += 1;
-            let fp = smpl_analyze_frame_st(&mut self.es, frame);
+            let fp = smpl_analyze_frame_st(&mut self.es, frame, None);
             fp.toc
         }
 

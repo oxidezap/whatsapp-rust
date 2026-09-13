@@ -13,6 +13,7 @@
 #![allow(clippy::print_stderr)]
 
 use std::hint::black_box;
+use wacore::voip::mlow::MlowError;
 use wacore::voip::{MlowDecoder, MlowEncoder};
 
 // With `--features dhat-heap`, dhat is the global allocator and writes dhat-heap.json (per-call-site
@@ -31,20 +32,21 @@ fn tone(phase: usize) -> Vec<f32> {
 }
 
 #[inline(never)]
-fn hot_encode(enc: &mut MlowEncoder, frames: &[Vec<f32>], n: usize) {
+fn hot_encode(enc: &mut MlowEncoder, frames: &[Vec<f32>], n: usize) -> Result<(), MlowError> {
     for k in 0..n {
-        black_box(enc.encode(black_box(&frames[k % frames.len()])).unwrap());
+        black_box(enc.encode(black_box(&frames[k % frames.len()]))?);
     }
+    Ok(())
 }
 
 #[inline(never)]
-fn hot_encode_into(enc: &mut MlowEncoder, frames: &[Vec<f32>], n: usize) {
+fn hot_encode_into(enc: &mut MlowEncoder, frames: &[Vec<f32>], n: usize) -> Result<(), MlowError> {
     let mut output = Vec::with_capacity(2048);
     for k in 0..n {
-        enc.encode_into(black_box(&frames[k % frames.len()]), &mut output)
-            .unwrap();
+        enc.encode_into(black_box(&frames[k % frames.len()]), &mut output)?;
         black_box(output.as_slice());
     }
+    Ok(())
 }
 
 #[inline(never)]
@@ -54,7 +56,8 @@ fn hot_decode(dec: &mut MlowDecoder, packets: &[Vec<u8>], n: usize) {
     }
 }
 
-fn main() {
+/// Keep setup outside the hot-loop symbols so profiler filters can isolate steady-state processing.
+fn main() -> Result<(), MlowError> {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("encode");
     let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
@@ -65,14 +68,23 @@ fn main() {
 
     match mode {
         #[cfg(feature = "dhat-heap")]
-        "encoder-live" => {
+        "encoder-live" | "encoder-live-i16" => {
+            let integer_frames: Vec<Vec<i16>> = frames
+                .iter()
+                .map(|f| f.iter().map(|s| (s * 32768.0) as i16).collect())
+                .collect();
             let mut warm = MlowEncoder::new();
-            let _ = warm.encode(&frames[0]).unwrap();
+            let _ = warm.encode(&frames[0])?;
             drop(warm);
             let before = dhat::HeapStats::get().curr_bytes;
             let mut enc = MlowEncoder::new();
-            for frame in &frames {
-                let _ = enc.encode(frame).unwrap();
+            for (frame, integers) in frames.iter().zip(&integer_frames) {
+                if mode == "encoder-live-i16" {
+                    let mut output = Vec::new();
+                    enc.encode_i16_into(integers, &mut output)?;
+                } else {
+                    let _ = enc.encode(frame)?;
+                }
             }
             let live = dhat::HeapStats::get().curr_bytes - before;
             eprintln!("encoder live heap: {live} bytes");
@@ -80,24 +92,28 @@ fn main() {
         }
         "encode" => {
             let mut enc = MlowEncoder::new();
-            let _ = enc.encode(&frames[0]); // prime past the first-frame path
-            hot_encode(&mut enc, &frames, n);
+            let _ = enc.encode(&frames[0])?; // prime past the first-frame path
+            hot_encode(&mut enc, &frames, n)?;
         }
         "encode-into" => {
             let mut enc = MlowEncoder::new();
-            let _ = enc.encode(&frames[0]);
-            hot_encode_into(&mut enc, &frames, n);
+            let _ = enc.encode(&frames[0])?;
+            hot_encode_into(&mut enc, &frames, n)?;
         }
         "decode" => {
             let mut enc = MlowEncoder::new();
-            let _ = enc.encode(&frames[0]);
-            let packets: Vec<Vec<u8>> = frames.iter().map(|f| enc.encode(f).unwrap()).collect();
+            let _ = enc.encode(&frames[0])?;
+            let packets: Vec<Vec<u8>> = frames
+                .iter()
+                .map(|f| enc.encode(f))
+                .collect::<Result<_, _>>()?;
             let mut dec = MlowDecoder::new();
             let _ = dec.decode(&packets[0]); // prime
             hot_decode(&mut dec, &packets, n);
         }
         other => eprintln!(
-            "usage: voip_profile <encode|encode-into|decode> <n>, or encoder-live with dhat-heap; got {other:?}"
+            "usage: voip_profile <encode|encode-into|decode> <n>, or encoder-live[-i16] with dhat-heap; got {other:?}"
         ),
     }
+    Ok(())
 }
