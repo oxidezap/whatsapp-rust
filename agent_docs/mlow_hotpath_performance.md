@@ -201,6 +201,36 @@ to zero. Pitch C/E/H remain the largest allocated-byte family.
   pulse array and 512 bytes per response matrix. Native stack-frame and wasm stack
   high-water measurements remain outstanding.
 
+## Published CI comparison
+
+[PR #1500](https://github.com/oxidezap/whatsapp-rust/pull/1500) uses branch
+`perf/voip-mlow-hotpath-batch` and the title
+`fix(wacore): reduce MLOW encoding allocations and PCM staging`.
+The completed [CodSpeed check](https://github.com/oxidezap/whatsapp-rust/runs/103640418292)
+compares baseline `6502b871e35664ffb80044ba7c6317a6427754e2` with
+head `e2664f1c7cdbd4b9f00570ddf4fb47ef3909699a`.
+These results apply to that head, before this report update.
+
+The check completed on September 12, 2026 at 23:42:38 UTC with a neutral
+conclusion. It reports one regressed benchmark, 789 untouched benchmarks,
+two new benchmarks and 12 skipped benchmarks. Skipped rows use baseline
+results. CodSpeed warns that some significant changes compare different
+runtime environments, which may affect accuracy.
+
+The following are the actual rows in the check's Performance Changes table.
+
+| Mode | Benchmark | Base | Head | Efficiency |
+| --- | --- | ---: | ---: | ---: |
+| Simulation | h264_depacketize_fua_stream | 233.2 µs | 358.1 µs | -34.87% |
+| Memory | mlow_encode_i16_reused_output | N/A | 85.3 KB | N/A |
+| Simulation | mlow_encode_i16_reused_output | N/A | 7.1 ms | N/A |
+
+The memory row is CodSpeed's reported metric, not DHAT allocated bytes per
+packet or warm encoder live heap. The new i16 rows have no baseline and
+therefore establish no improvement. The summary does not publish individual
+values for the 789 untouched rows. The H.264 regression remains reported;
+the environment warning alone does not establish its cause.
+
 ## Remaining work
 
 The largest remaining byte costs are pitch scratch, followed by CELP subframe
@@ -210,5 +240,8 @@ jitter operations have not been changed. The next CPU investigation should
 start from the retained FFT/CELP/pitch profiles rather than propose another FFT
 algorithm without evidence.
 
-Publication and the final CodSpeed PR comparison are pending. Local results do
-not substitute for the repository's CI simulation and memory report.
+Runtime peak stack measurements for baseline and head on native 64-bit and
+wasm32 remain outstanding. Array sizes above are storage sizes, not measured
+stack peaks. Review-thread resolution and any further PR metadata changes
+remain with the outer executor. The completed CodSpeed comparison above
+does not close the stack evidence gap or establish a combined CPU improvement.

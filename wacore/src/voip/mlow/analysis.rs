@@ -744,8 +744,12 @@ fn compute_perc_corrs(cs: &mut CelpFrameCtx) -> [Vec<f32>; SMPL_SUBFR_COUNT] {
     corrs
 }
 
-/// Derive the per-subframe `perc_wght_resp` (length perc_resp_len) from precomputed `perc_corrs` for
-/// the given voiced or unvoiced emphasis via `smpl_perc_ac2a_into`. Pure, with no state.
+/// Derive one weighting response per subframe from precomputed perceptual correlations.
+/// Only the first `resp_len` coefficients are active; the rest of each row remain zero.
+/// The fixed matrix avoids allocating a response vector for each subframe.
+///
+/// Panics if `corrs` does not contain `SMPL_SUBFR_COUNT` rows or if `resp_len`
+/// exceeds `SMPL_CELP_PERC_RESP_LEN`.
 fn perc_corrs_to_wght(
     corrs: &[Vec<f32>],
     emph: [f32; 2],
