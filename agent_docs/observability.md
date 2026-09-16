@@ -575,9 +575,20 @@ client construction spawns detached in `start_services`. The keepalive cadence
 covers a connection that stays up; startup covers the gap where a process was
 closed long enough for secrets to expire, and the case of an app that opens the
 store without ever holding a connection (a batch job or an inspector), for which
-the keepalive tick may never fire at all. Both entry points run the same
-`run_retention_cleanup` body through the store's single write permit, so they
-cannot race each other.
+the keepalive tick may never fire at all. Startup runs the same
+`run_retention_cleanup` body as the tick, minus the pending-inbound prune (see
+below).
+
+Each delete in the sweep acquires and releases the store's write permit on its
+own, through the backend's `with_retry` wrapper; no permit is held across the
+whole sweep. An overlapping startup and keepalive sweep can therefore interleave
+their deletes, and on a store opened with `pool_size > 1` the individual
+operations can overlap outright. That is safe because every delete is idempotent
+and scoped by device and deadline: whichever sweep runs one, the result is the
+same. The startup pass does leave the pending-inbound durability buffer alone,
+because those rows are the only recoverable copy of a message whose hook has not
+committed yet; the keepalive pass, which runs only once the connection is up,
+prunes them.
 
 The last two exist because a process that holds one connection for weeks never
 reruns connect-time work: before them a session outliving the 27-day rotation

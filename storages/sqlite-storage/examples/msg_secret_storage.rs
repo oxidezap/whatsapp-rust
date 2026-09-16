@@ -23,7 +23,7 @@
 
 // A measurement harness: prints are its output. Same allow as the sibling
 // `per_connection_memory` example.
-#![allow(clippy::print_stdout)]
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use wacore::time::Instant;
 
@@ -37,6 +37,10 @@ const SHARED_COLUMNS: &str = "chat TEXT NOT NULL, sender TEXT NOT NULL, msg_id T
 
 fn main() {
     let rows: usize = arg(1, 400_000);
+    if rows < 8 {
+        eprintln!("rows must be at least 8, got {rows}");
+        std::process::exit(2);
+    }
     let never_percent: usize = arg(2, 15).min(100);
     let devices: i64 = arg(3, 2).max(1) as i64;
     let db_dir = std::env::temp_dir();

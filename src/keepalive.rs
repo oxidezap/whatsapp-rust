@@ -424,6 +424,30 @@ impl Client {
     /// the store without ever holding a connection still reaps what expired
     /// while it was closed.
     pub(crate) async fn run_retention_cleanup(&self, sent_msg_ttl: u64) {
+        self.run_retention_cleanup_scope(sent_msg_ttl, true).await;
+    }
+
+    /// The startup subset of the retention sweep: everything except the
+    /// pending-inbound buffer.
+    ///
+    /// Those rows are the only recoverable plaintext for a decrypted message
+    /// whose inbound durability hook has not committed. The server can
+    /// redeliver one after a restart, and [`Client::ack_or_replay_to_hook`]
+    /// uses the buffered copy to re-run the hook; if the row is gone first, the
+    /// redelivery looks like a genuine duplicate and is acked without the hook,
+    /// losing the message. The buffer is therefore swept only on the keepalive
+    /// tick, by which point the connection has been up long enough for the
+    /// offline redelivery to have replayed what it can. Secrets, sent messages
+    /// and base keys have no such replay dependency and are safe pre-connection.
+    pub(crate) async fn run_startup_retention_cleanup(&self) {
+        let sent_msg_ttl = self.cache_config.sent_message_ttl_secs;
+        self.run_retention_cleanup_scope(sent_msg_ttl, false).await;
+    }
+
+    /// Shared body: `sweep_pending_inbound` decides whether the durability
+    /// buffer is pruned. See [`Self::run_startup_retention_cleanup`] for why
+    /// the startup caller passes `false`.
+    async fn run_retention_cleanup_scope(&self, sent_msg_ttl: u64, sweep_pending_inbound: bool) {
         let now = wacore::time::now_secs();
         let cutoff_for = |ttl: u64| now.saturating_sub(i64::try_from(ttl).unwrap_or(i64::MAX));
 
@@ -454,7 +478,9 @@ impl Client {
             warn!(target: "Client/Keepalive", "Sent message cleanup error: {e}");
         }
 
-        if let Err(e) = backend.delete_expired_pending_inbound(pending_cutoff).await {
+        if sweep_pending_inbound
+            && let Err(e) = backend.delete_expired_pending_inbound(pending_cutoff).await
+        {
             warn!(target: "Client/Keepalive", "Pending inbound cleanup error: {e}");
         }
 
@@ -488,14 +514,18 @@ impl Client {
     /// deadline until the next connect. This closes that gap without waiting
     /// for the network: the store is already migrated by the time this is
     /// spawned (client construction runs after `PersistenceManager` is built),
-    /// and the sweep goes through the same single write permit as every other
-    /// write, so it cannot race a migration or a concurrent sweeper.
+    /// and the sweep deletes through the store's ordinary write path.
+    ///
+    /// It deliberately runs the startup subset
+    /// ([`Self::run_startup_retention_cleanup`]), which leaves the
+    /// pending-inbound durability buffer alone: the server may still redeliver
+    /// one of those messages, and the buffered copy is what lets the hook
+    /// re-commit it instead of the redelivery being acked as a duplicate.
     pub(crate) fn run_startup_maintenance(self: &Arc<Self>) {
         let client = Arc::clone(self);
-        let sent_msg_ttl = self.cache_config.sent_message_ttl_secs;
         self.runtime
             .spawn(Box::pin(async move {
-                client.run_retention_cleanup(sent_msg_ttl).await;
+                client.run_startup_retention_cleanup().await;
             }))
             .detach();
     }

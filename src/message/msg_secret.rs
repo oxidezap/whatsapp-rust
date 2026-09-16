@@ -253,9 +253,10 @@ impl Client {
         };
         // On a total store miss, ask the app-supplied resolver (if any) for the
         // parent secret. This is what lets the Disabled policy still decrypt. A
-        // resolver that knows the parent's event time may also return it, and
-        // that timestamp feeds the same edit-window check a store row does; one
-        // that does not return `0` here, leaving `parent_ts == 0` (unknown).
+        // resolver that reports the parent's event time feeds it into the same
+        // edit-window check a store row uses; a legacy resolver that reports no
+        // timestamp yields `0` here, which the check reads as unknown and
+        // leaves permissive.
         let (secret, parent_ts) = match store_secret {
             Some((secret, ts)) => (secret, ts),
             None => {

@@ -190,6 +190,13 @@ pub fn classify_from_flags(bot_context: bool, poll_or_event: bool) -> RetentionC
 /// time; when unknown it falls back to `now` so an unknown-age secret still
 /// expires a horizon from when we first saw it (bounded), rather than living
 /// forever — but it is never dropped at write for lacking a timestamp.
+///
+/// `0` is the store's sentinel for "unknown", the same as `None`: the receive
+/// path already reads a stored `0` that way when it checks the edit window. It
+/// must be treated as unknown here too. A stanza whose `t` attribute is absent
+/// parses to the Unix epoch, and taking that literally would mint a deadline in
+/// 1970, so the row would be born already expired and the next sweep would drop
+/// a secret captured moments ago.
 pub fn expires_at(
     policy: MsgSecretPolicy,
     retention: &MsgSecretRetention,
@@ -201,6 +208,7 @@ pub fn expires_at(
         return 0;
     }
     let base = message_ts
+        .filter(|&ts| ts != 0)
         .and_then(|t| i64::try_from(t).ok())
         .unwrap_or(now);
     let horizon = i64::try_from(retention.horizon_secs(class)).unwrap_or(i64::MAX);
@@ -450,6 +458,28 @@ mod tests {
             now,
         );
         assert_eq!(got, now + 30 * DAY, "unknown age is bounded, never 0");
+    }
+
+    /// `0` is the store's "unknown" sentinel, not a real 1970 event time. A
+    /// stanza with no `t` attribute parses to the epoch, and taking it literally
+    /// would mint a deadline in 1970: the row would be born expired and the next
+    /// sweep would drop a secret captured moments earlier.
+    #[test]
+    fn a_zero_timestamp_is_unknown_not_the_epoch() {
+        let r = MsgSecretRetention::default();
+        let now = 1_800_000_000i64;
+        let got = expires_at(
+            MsgSecretPolicy::Managed,
+            &r,
+            RetentionClass::Text,
+            Some(0),
+            now,
+        );
+        assert_eq!(
+            got,
+            now + 30 * DAY,
+            "Some(0) must read as unknown and expire a horizon from now"
+        );
     }
 
     #[test]

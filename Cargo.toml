@@ -319,6 +319,10 @@ send_wrapper = { version = "0.6", features = ["futures"] }
 [dev-dependencies]
 aes = { workspace = true }
 cbc = { workspace = true, features = ["block-padding"] }
+# The startup-retention test ages a pending-inbound row directly, since the
+# backend trait exposes no UPDATE. Dev-only; the crate already links diesel
+# through `whatsapp-rust-sqlite-storage` in production.
+diesel = { workspace = true }
 divan = { workspace = true }
 env_logger = { workspace = true }
 # URL parser for the benchmark example's mock admin endpoint derivation.
