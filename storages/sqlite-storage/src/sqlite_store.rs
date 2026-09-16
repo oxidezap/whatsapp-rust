@@ -231,6 +231,18 @@ impl FreshDeviceRow {
 /// listed here too: `reset_device` deletes the row the cascade springs from, and
 /// letting only that one table lean on the cascade would make the two teardown
 /// paths disagree about what "purged" means.
+///
+/// **Sibling tables owned by other stores.** A second store sharing this
+/// database file, for chats, messages or receipts, keeps its account-scoped
+/// rows in tables this list cannot name. Those tables are swept by the
+/// `DELETE FROM device` at the center of both teardown paths, because every
+/// pooled connection sets `PRAGMA foreign_keys = ON`, so a row with
+/// `FOREIGN KEY(device_id) REFERENCES device(id) ON DELETE CASCADE` goes with
+/// it. That cascade is the contract: a sibling store that keys state by
+/// `device_id` must declare it, exactly as `lid_pn_mapping` does, or its rows
+/// outlive the account. `a_sibling_table_cascades_away_with_its_account` pins
+/// the mechanism. A sibling owner cannot register in this `const`, so the
+/// cascade is the only channel available to it.
 const ACCOUNT_SCOPED_TABLES: &[&str] = &[
     "app_state_keys",
     "app_state_mutation_macs",
@@ -1761,6 +1773,16 @@ impl SqliteStore {
     /// state is what is disposable.
     ///
     /// Missing account is [`StoreError::DeviceNotFound`].
+    ///
+    /// **Other handles are not invalidated.** A store sharing this device_id,
+    /// whether a sibling from [`SqliteStore::share_for_device`] or a second
+    /// [`SqliteStore::new_for_device`] on the same file, keeps working, and its
+    /// next write lands on the recreated account. Calling this while another
+    /// handle still holds live in-memory state for the account is therefore a
+    /// caller error: the caller owns the client lifecycle, and must stop that
+    /// account's background work (device background saver, Signal flush) before
+    /// resetting. Enforcing it here would need a per-write liveness check on
+    /// every Signal and device write, which this storage boundary does not own.
     pub async fn reset_device(&self, device_id: i32) -> Result<SqliteStore> {
         let row = Arc::new(FreshDeviceRow::new(Some(device_id))?);
         self.with_retry("reset_device", move || {
@@ -1794,6 +1816,11 @@ impl SqliteStore {
     /// purge leaves no account-scoped row behind for a future id to inherit.
     ///
     /// Missing account is [`StoreError::DeviceNotFound`].
+    ///
+    /// **Other handles are not invalidated.** A live handle for this device can
+    /// recreate the row with its next `save`, and a Signal write can repopulate
+    /// the purged tables, so the caller must stop that account's background work
+    /// before removing it, the same way [`SqliteStore::reset_device`] requires.
     pub async fn remove_device(&self, device_id: i32) -> Result<()> {
         self.with_retry("remove_device", move || {
             Box::new(move |conn: &mut SqliteConnection| {
@@ -8603,6 +8630,85 @@ mod lifecycle_tests {
             .map(|d| d.id)
             .collect();
         assert_eq!(listed, unique, "every allocated id has exactly one row");
+    }
+
+    /// The purge contract for tables this crate does not own. A sibling store
+    /// keeps its rows in tables `ACCOUNT_SCOPED_TABLES` cannot name, so it has
+    /// to get them swept by the `DELETE FROM device` both teardown paths run.
+    /// That only happens if the sibling declares `ON DELETE CASCADE`, which is
+    /// what `lid_pn_mapping` already does and what this pins, so a future
+    /// sibling cannot quietly keep account history alive.
+    #[tokio::test]
+    async fn a_sibling_table_cascades_away_with_its_account() {
+        let db = TempDb::new("lifecycle_cascade");
+        let base = store(&db).await;
+        let (id, account) = base.create_sibling_device().await.expect("create");
+
+        // Stand in for a sibling store's table: keyed by device_id, owned by
+        // someone else, declared the way the contract requires.
+        {
+            let pool = account.pool.clone();
+            let mut conn = pool.get().expect("a connection");
+            diesel::sql_query(
+                "CREATE TABLE sibling_chat_store (
+                     chat_jid TEXT NOT NULL,
+                     device_id INTEGER NOT NULL,
+                     PRIMARY KEY (chat_jid, device_id),
+                     FOREIGN KEY(device_id) REFERENCES device(id) ON DELETE CASCADE
+                 )",
+            )
+            .execute(&mut *conn)
+            .expect("sibling table");
+            diesel::sql_query(
+                "INSERT INTO sibling_chat_store (chat_jid, device_id) VALUES ('chat@c.us', ?)",
+            )
+            .bind::<diesel::sql_types::Integer, _>(id)
+            .execute(&mut *conn)
+            .expect("sibling row");
+        }
+
+        let sibling_rows = |store: &SqliteStore| {
+            #[derive(QueryableByName)]
+            struct Count {
+                #[diesel(sql_type = diesel::sql_types::BigInt)]
+                n: i64,
+            }
+            let pool = store.pool.clone();
+            let mut conn = pool.get().expect("a connection");
+            diesel::sql_query("SELECT count(*) AS n FROM sibling_chat_store")
+                .get_result::<Count>(&mut *conn)
+                .expect("count sibling rows")
+                .n
+        };
+
+        assert_eq!(sibling_rows(&base), 1, "the sibling row is really there");
+
+        // reset_device recreates the device row, so the cascade has to run on
+        // the delete in the middle, not on the reinsert.
+        base.reset_device(id).await.expect("reset");
+        assert_eq!(
+            sibling_rows(&base),
+            0,
+            "reset must cascade the sibling store's rows away"
+        );
+
+        // And again for remove, on a freshly seeded row.
+        {
+            let pool = account.pool.clone();
+            let mut conn = pool.get().expect("a connection");
+            diesel::sql_query(
+                "INSERT INTO sibling_chat_store (chat_jid, device_id) VALUES ('chat2@c.us', ?)",
+            )
+            .bind::<diesel::sql_types::Integer, _>(id)
+            .execute(&mut *conn)
+            .expect("sibling row again");
+        }
+        base.remove_device(id).await.expect("remove");
+        assert_eq!(
+            sibling_rows(&base),
+            0,
+            "remove must cascade the sibling store's rows away"
+        );
     }
 }
 
