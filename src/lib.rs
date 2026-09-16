@@ -385,7 +385,7 @@ pub mod prelude {
     #[cfg(feature = "signal")]
     pub use crate::shutdown::shutdown_signal;
     #[cfg(feature = "sqlite-storage")]
-    pub use crate::store::SqliteStore;
+    pub use crate::store::{SqliteStore, StoredDeviceSummary};
     pub use crate::types::events::{
         BatchOrigin, ChannelEventHandler, ChannelEventStats, Event, EventHandler, EventInterest,
         EventKind, InboundMessage, MessageBatch, Subscription,

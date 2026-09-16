@@ -13,7 +13,7 @@ mod wire;
 pub use shared::SharedSqlite;
 pub use sqlite_store::{
     CommitBarrierError, CommitBarrierFuture, CommitBarrierHook, ConnectionInitHook, SqliteStore,
-    SqliteStoreConfig, Synchronous,
+    SqliteStoreConfig, StoredDeviceSummary, Synchronous,
 };
 
 #[cfg(feature = "test-util")]

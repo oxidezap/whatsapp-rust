@@ -19,6 +19,7 @@ use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
 use wacore::store::Device as CoreDevice;
 use wacore::store::error::{Result, StoreError};
 use wacore::store::traits::*;
+use wacore_binary::Jid;
 
 /// Internal error type that preserves the Diesel error for structured matching
 /// before converting to `StoreError`. Used in retry loops where we need to
@@ -106,6 +107,208 @@ struct DeviceRow {
     last_signed_pre_key_rotation_ms: i64,
     read_receipts_disabled: bool,
     server_client_expiration: Option<String>,
+}
+
+/// One account in a database that holds several, as [`SqliteStore::list_devices`]
+/// reports it.
+///
+/// `linked` mirrors [`wacore::store::Device::is_registered`]: the row exists from
+/// the moment it is created, but it only counts as a paired account once the
+/// server has handed it a phone number, which is what `pn` carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredDeviceSummary {
+    pub id: i32,
+    pub pn: Option<Jid>,
+    pub lid: Option<Jid>,
+    pub push_name: String,
+    pub linked: bool,
+}
+
+/// A freshly generated [`CoreDevice`] laid out as one row of `device`.
+///
+/// The point of the type is the two callers that must produce identical fresh
+/// accounts: [`SqliteStore::create_sibling_device`] and
+/// [`SqliteStore::reset_device`]. Building the column list twice is how the two
+/// drift as fields are added.
+///
+/// `id` uses `treat_none_as_default_value`, so `None` drops the column from the
+/// insert entirely and leaves allocation to `device.id`'s `AUTOINCREMENT`.
+/// Choosing the id in Rust instead (`MAX(id) + 1`) races between concurrent
+/// creates and can hand back an id that was deleted, which would make an
+/// `AccountId` resolve to a different person.
+#[derive(Insertable)]
+#[diesel(table_name = device)]
+struct FreshDeviceRow {
+    #[diesel(treat_none_as_default_value = true)]
+    id: Option<i32>,
+    lid: String,
+    pn: String,
+    registration_id: i32,
+    noise_key: Vec<u8>,
+    identity_key: Vec<u8>,
+    signed_pre_key: Vec<u8>,
+    signed_pre_key_id: i32,
+    signed_pre_key_signature: Vec<u8>,
+    adv_secret_key: Vec<u8>,
+    account: Option<Vec<u8>>,
+    push_name: String,
+    app_version_primary: i32,
+    app_version_secondary: i32,
+    app_version_tertiary: i64,
+    app_version_last_fetched_ms: i64,
+    edge_routing_info: Option<Vec<u8>>,
+    props_hash: Option<String>,
+    next_pre_key_id: i32,
+    nct_salt: Option<Vec<u8>>,
+    server_has_prekeys: bool,
+    server_cert_chain: Option<Vec<u8>>,
+    login_counter: i32,
+    first_unupload_pre_key_id: i32,
+    lid_migrated: bool,
+    last_signed_pre_key_rotation_ms: i64,
+    read_receipts_disabled: bool,
+    server_client_expiration: Option<String>,
+}
+
+impl FreshDeviceRow {
+    /// Build the row for a brand-new, unpaired account, optionally pinning the
+    /// id. Serialization of the key pairs is the only fallible step.
+    fn new(id: Option<i32>) -> Result<Self> {
+        let device = CoreDevice::new();
+        Ok(Self {
+            id,
+            lid: String::new(),
+            pn: String::new(),
+            registration_id: device.registration_id as i32,
+            noise_key: serialize_keypair(&device.noise_key)?,
+            identity_key: serialize_keypair(&device.identity_key)?,
+            signed_pre_key: serialize_keypair(&device.signed_pre_key)?,
+            signed_pre_key_id: device.signed_pre_key_id as i32,
+            signed_pre_key_signature: device.signed_pre_key_signature.to_vec(),
+            adv_secret_key: device.adv_secret_key.to_vec(),
+            account: None,
+            push_name: device.push_name,
+            app_version_primary: device.app_version_primary as i32,
+            app_version_secondary: device.app_version_secondary as i32,
+            app_version_tertiary: device.app_version_tertiary as i64,
+            app_version_last_fetched_ms: device.app_version_last_fetched_ms,
+            edge_routing_info: None,
+            props_hash: None,
+            next_pre_key_id: device.next_pre_key_id as i32,
+            nct_salt: None,
+            server_has_prekeys: device.server_has_prekeys,
+            server_cert_chain: None,
+            login_counter: 0,
+            first_unupload_pre_key_id: device.first_unupload_pre_key_id as i32,
+            lid_migrated: false,
+            last_signed_pre_key_rotation_ms: device.last_signed_pre_key_rotation_ms,
+            read_receipts_disabled: false,
+            server_client_expiration: None,
+        })
+    }
+
+    fn insert(&self, conn: &mut SqliteConnection) -> std::result::Result<(), DieselError> {
+        diesel::insert_into(device::table)
+            .values(self)
+            .execute(conn)
+            .map(|_| ())
+    }
+}
+
+/// Every table that carries a per-account `device_id`, and therefore everything
+/// that has to go when an account is reset or removed.
+///
+/// Deliberately one list read by both [`SqliteStore::reset_device`] and
+/// [`SqliteStore::remove_device`], so the two cannot drift. A test
+/// (`account_scoped_table_list_covers_the_schema`) compares it against
+/// `pragma_table_info` and fails on any `device_id` column the list is missing,
+/// which is the only way a newly added table cannot silently leak account state.
+///
+/// `device` itself is intentionally absent: teardown deletes that row
+/// separately, and `reset_device` recreates it.
+///
+/// `lid_pn_mapping` also declares `ON DELETE CASCADE` to `device`, but it is
+/// listed here too: `reset_device` deletes the row the cascade springs from, and
+/// letting only that one table lean on the cascade would make the two teardown
+/// paths disagree about what "purged" means.
+const ACCOUNT_SCOPED_TABLES: &[&str] = &[
+    "app_state_keys",
+    "app_state_mutation_macs",
+    "app_state_versions",
+    "base_keys",
+    "device_registry",
+    "group_metadata",
+    "identities",
+    "lid_pn_mapping",
+    "msg_secrets",
+    "pending_inbound_messages",
+    "prekeys",
+    "sender_key_devices",
+    "sender_keys",
+    "sent_messages",
+    "sessions",
+    "signed_prekeys",
+    "tc_tokens",
+];
+
+/// `last_insert_rowid()` on the connection that just inserted, which is why the
+/// insert and this read share one `write_blocking`/`with_retry` closure: the
+/// value is per-connection state, not per-database.
+fn last_insert_rowid(conn: &mut SqliteConnection) -> std::result::Result<i32, DieselError> {
+    diesel::select(diesel::dsl::sql::<diesel::sql_types::Integer>(
+        "last_insert_rowid()",
+    ))
+    .get_result(conn)
+}
+
+/// Delete every account-scoped row for `device_id`.
+///
+/// Raw SQL rather than Diesel's query builder because the table list is runtime
+/// data (a `const &[&str]`). The identifiers are compile-time literals from
+/// [`ACCOUNT_SCOPED_TABLES`], never caller input, so interpolating them is not
+/// an injection surface; the id is bound.
+fn purge_account_state(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+) -> std::result::Result<(), DieselError> {
+    for table in ACCOUNT_SCOPED_TABLES {
+        diesel::sql_query(format!("DELETE FROM {table} WHERE device_id = ?"))
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .execute(conn)?;
+    }
+    Ok(())
+}
+
+/// Translate the sentinel a lifecycle transaction raises when its `device` row
+/// is absent into the typed error callers match on. Any other error passes
+/// through untouched.
+///
+/// [`DieselError::NotFound`] is the sentinel rather than a private enum because
+/// the write queue transports `DieselError`; the lifecycle closures issue only
+/// `execute`/`count` statements, none of which produce `NotFound`, so the match
+/// cannot swallow a real one.
+fn missing_device(error: StoreError, device_id: i32) -> StoreError {
+    match &error {
+        StoreError::Database(inner)
+            if inner
+                .downcast_ref::<DieselError>()
+                .is_some_and(|d| matches!(d, DieselError::NotFound)) =>
+        {
+            StoreError::DeviceNotFound(device_id)
+        }
+        _ => error,
+    }
+}
+
+/// Serialize a key pair the way the `device` columns store it: private scalar
+/// then public key, 64 bytes. A free function because [`FreshDeviceRow`] builds
+/// rows before any store handle exists, and it must produce byte-identical
+/// output to [`SqliteStore::serialize_keypair`] (which delegates here).
+fn serialize_keypair(key_pair: &KeyPair) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(key_pair.private_key.serialize());
+    bytes.extend_from_slice(key_pair.public_key.public_key_bytes());
+    Ok(bytes)
 }
 
 /// Max ids per `eq_any` list, under SQLite's default 999 host-parameter limit.
@@ -1203,10 +1406,7 @@ impl SqliteStore {
     }
 
     fn serialize_keypair(&self, key_pair: &KeyPair) -> Result<Vec<u8>> {
-        let mut bytes = Vec::with_capacity(64);
-        bytes.extend_from_slice(key_pair.private_key.serialize());
-        bytes.extend_from_slice(key_pair.public_key.public_key_bytes());
-        Ok(bytes)
+        serialize_keypair(key_pair)
     }
 
     fn deserialize_keypair(&self, bytes: &[u8]) -> Result<KeyPair> {
@@ -1449,6 +1649,168 @@ impl SqliteStore {
             })
         })
         .await
+    }
+
+    /// Every account in this database file, newest allocation last.
+    ///
+    /// This is the read side of the multi-account shape: `device` is a table of
+    /// accounts, and the only way to learn which `AccountId`s exist without
+    /// reaching into a private schema. Ordered by `id` so callers that treat the
+    /// first row as "the primary account" get a stable answer.
+    ///
+    /// The startup pattern for a fleet of mostly idle accounts: enumerate here
+    /// once, then hand each id to [`SqliteStore::share_for_device`] rather than
+    /// opening a store per account, since each store would carry its own pool
+    /// and connection.
+    ///
+    /// ```no_run
+    /// # use whatsapp_rust_sqlite_storage::SqliteStore;
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let store = SqliteStore::new("whatsapp.db").await?;
+    /// for account in store.list_devices().await? {
+    ///     let session = store.share_for_device(account.id);
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub async fn list_devices(&self) -> Result<Vec<StoredDeviceSummary>> {
+        self.read_query(|conn| {
+            #[derive(QueryableByName)]
+            struct Row {
+                #[diesel(sql_type = diesel::sql_types::Integer)]
+                id: i32,
+                #[diesel(sql_type = diesel::sql_types::Text)]
+                pn: String,
+                #[diesel(sql_type = diesel::sql_types::Text)]
+                lid: String,
+                #[diesel(sql_type = diesel::sql_types::Text)]
+                push_name: String,
+            }
+
+            let rows: Vec<Row> =
+                diesel::sql_query("SELECT id, pn, lid, push_name FROM device ORDER BY id ASC")
+                    .load(conn)
+                    .map_err(|e| StoreError::Database(Box::new(e)))?;
+
+            Ok(rows
+                .into_iter()
+                .map(|row| {
+                    let pn = row.pn.parse().ok();
+                    StoredDeviceSummary {
+                        id: row.id,
+                        linked: pn.is_some(),
+                        pn,
+                        lid: if row.lid.is_empty() {
+                            None
+                        } else {
+                            row.lid.parse().ok()
+                        },
+                        push_name: row.push_name,
+                    }
+                })
+                .collect())
+        })
+        .await
+    }
+
+    /// Create another account in this database and return a handle bound to it.
+    ///
+    /// The id is allocated by SQLite's `AUTOINCREMENT` inside the same
+    /// transaction as the insert, via `last_insert_rowid()` on the connection
+    /// that wrote the row. Choosing it in Rust (`MAX(id) + 1`) races between
+    /// concurrent creates and, worse, can reuse an id a `remove_device` deleted,
+    /// which would make an `AccountId` resolve to a different person.
+    ///
+    /// The returned handle reuses this store's pool and write permit via
+    /// [`SqliteStore::share_for_device`], which is the shape a fleet of mostly
+    /// idle accounts wants: see that method for what is shared and what it
+    /// costs.
+    ///
+    /// ```no_run
+    /// # use whatsapp_rust_sqlite_storage::SqliteStore;
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let store = SqliteStore::new("whatsapp.db").await?;
+    /// let (id, account) = store.create_sibling_device().await?;
+    /// assert_eq!(account.device_id(), id);
+    /// # Ok(()) }
+    /// ```
+    pub async fn create_sibling_device(&self) -> Result<(i32, SqliteStore)> {
+        let row = Arc::new(FreshDeviceRow::new(None)?);
+        let device_id = self
+            .with_retry("create_sibling_device", move || {
+                let row = Arc::clone(&row);
+                Box::new(move |conn: &mut SqliteConnection| {
+                    // One transaction around insert + id read so a retry after a
+                    // partial failure cannot leave a second row behind.
+                    conn.immediate_transaction(|conn| {
+                        row.insert(conn)?;
+                        last_insert_rowid(conn)
+                    })
+                })
+            })
+            .await?;
+        Ok((device_id, self.share_for_device(device_id)))
+    }
+
+    /// Wipe an account's state and start it over under the same id.
+    ///
+    /// Everything account-scoped goes, and the `device` row is recreated with
+    /// the same id and freshly generated keys, in one `BEGIN IMMEDIATE`
+    /// transaction: `AccountId(2)` stays `AccountId(2)`, but its identity,
+    /// prekeys, sessions and app-state are gone and pairing starts from zero.
+    /// The id is preserved precisely so the caller's references stay valid;
+    /// state is what is disposable.
+    ///
+    /// Missing account is [`StoreError::DeviceNotFound`].
+    pub async fn reset_device(&self, device_id: i32) -> Result<SqliteStore> {
+        let row = Arc::new(FreshDeviceRow::new(Some(device_id))?);
+        self.with_retry("reset_device", move || {
+            let row = Arc::clone(&row);
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.immediate_transaction(|conn| {
+                    let deleted = diesel::delete(device::table.filter(device::id.eq(device_id)))
+                        .execute(conn)?;
+                    if deleted == 0 {
+                        // Rolls the (empty) transaction back; translated to the
+                        // typed error by `missing_device` below.
+                        return Err(DieselError::NotFound);
+                    }
+                    purge_account_state(conn, device_id)?;
+                    // Same id, fresh keys: the account keeps its identity while
+                    // its state starts over.
+                    row.insert(conn)?;
+                    Ok(())
+                })
+            })
+        })
+        .await
+        .map_err(|e| missing_device(e, device_id))?;
+        Ok(self.share_for_device(device_id))
+    }
+
+    /// Delete an account's state and its `device` row, atomically.
+    ///
+    /// Like [`SqliteStore::reset_device`], but the row does not come back, so
+    /// the id is retired for good: `AUTOINCREMENT` will not reissue it, and the
+    /// purge leaves no account-scoped row behind for a future id to inherit.
+    ///
+    /// Missing account is [`StoreError::DeviceNotFound`].
+    pub async fn remove_device(&self, device_id: i32) -> Result<()> {
+        self.with_retry("remove_device", move || {
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.immediate_transaction(|conn| {
+                    let deleted = diesel::delete(device::table.filter(device::id.eq(device_id)))
+                        .execute(conn)?;
+                    if deleted == 0 {
+                        return Err(DieselError::NotFound);
+                    }
+                    purge_account_state(conn, device_id)?;
+                    Ok(())
+                })
+            })
+        })
+        .await
+        .map_err(|e| missing_device(e, device_id))?;
+        Ok(())
     }
 
     pub async fn device_exists(&self, device_id: i32) -> Result<bool> {
@@ -7906,6 +8268,344 @@ mod share_for_device_tests {
 }
 
 /// Periodic engine maintenance: the WAL cap and the `maintenance()` pass.
+/// Account lifecycle: enumeration, allocation, reset and removal.
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::read_routing_tests::TempDb;
+    use super::*;
+    use std::collections::HashSet;
+
+    async fn store(db: &TempDb) -> SqliteStore {
+        SqliteStore::new(&db.url()).await.expect("store opens")
+    }
+
+    /// Seat one row in every account-scoped table for `device_id`, using each
+    /// table's real columns, so the purge tests exercise every table the
+    /// production list names and not a convenient subset.
+    ///
+    /// Only columns that are `NOT NULL` without a default need a value (plus
+    /// `device_id` itself); everything else is omitted so SQLite applies its
+    /// default or NULL. That keeps the insert valid without the helper having to
+    /// know any table's semantics. Values are chosen from the column's declared
+    /// type. `pragma_table_info` is what makes this track the real schema, so a
+    /// column added later is covered without editing the helper.
+    fn seed_account_scoped_rows(conn: &mut SqliteConnection, device_id: i32) {
+        for table in ACCOUNT_SCOPED_TABLES {
+            #[derive(QueryableByName)]
+            struct Column {
+                #[diesel(sql_type = diesel::sql_types::Text)]
+                name: String,
+                #[diesel(sql_type = diesel::sql_types::Text)]
+                column_type: String,
+                #[diesel(sql_type = diesel::sql_types::Integer)]
+                notnull: i32,
+                #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+                dflt_value: Option<String>,
+            }
+
+            let columns: Vec<Column> = diesel::sql_query(format!(
+                "SELECT name, type AS column_type, \"notnull\", dflt_value \
+                 FROM pragma_table_info('{table}')"
+            ))
+            .load(conn)
+            .expect("column metadata");
+
+            let mut names = Vec::new();
+            let mut values = Vec::new();
+            for column in &columns {
+                let value = if column.name == "device_id" {
+                    device_id.to_string()
+                } else if column.notnull == 1 && column.dflt_value.is_none() {
+                    let upper = column.column_type.to_ascii_uppercase();
+                    if upper == "BLOB" {
+                        "X'00'".to_string()
+                    } else if matches!(upper.as_str(), "INTEGER" | "BIGINT" | "BOOLEAN") {
+                        "0".to_string()
+                    } else {
+                        format!("'seed-{table}-{device_id}'")
+                    }
+                } else {
+                    continue;
+                };
+                names.push(column.name.clone());
+                values.push(value);
+            }
+
+            diesel::sql_query(format!(
+                "INSERT INTO {table} ({}) VALUES ({})",
+                names.join(", "),
+                values.join(", ")
+            ))
+            .execute(conn)
+            .unwrap_or_else(|e| panic!("seed {table}: {e}"));
+        }
+    }
+
+    /// Raw account-scoped row counts for `device_id`, read with the same
+    /// `ACCOUNT_SCOPED_TABLES` the purge uses so the two cannot disagree.
+    fn scoped_row_counts(store: &SqliteStore, device_id: i32) -> Vec<(String, i64)> {
+        let pool = store.pool.clone();
+        let mut conn = pool.get().expect("a connection");
+        ACCOUNT_SCOPED_TABLES
+            .iter()
+            .map(|table| {
+                #[derive(QueryableByName)]
+                struct Count {
+                    #[diesel(sql_type = diesel::sql_types::BigInt)]
+                    n: i64,
+                }
+                let n = diesel::sql_query(format!(
+                    "SELECT count(*) AS n FROM {table} WHERE device_id = ?"
+                ))
+                .bind::<diesel::sql_types::Integer, _>(device_id)
+                .get_result::<Count>(&mut *conn)
+                .unwrap_or_else(|e| panic!("count {table}: {e}"))
+                .n;
+                ((*table).to_string(), n)
+            })
+            .collect()
+    }
+
+    /// The build-time guard the plan asks for: the hand-written
+    /// `ACCOUNT_SCOPED_TABLES` must name every table that has a `device_id`
+    /// column, or a table added later leaks account state through teardown.
+    /// Reading the live schema is what makes this fail on a new table rather
+    /// than on a new entry in the list.
+    #[tokio::test]
+    async fn account_scoped_table_list_covers_the_schema() {
+        let db = TempDb::new("lifecycle_schema_guard");
+        let store = store(&db).await;
+
+        #[derive(QueryableByName)]
+        struct TableName {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            name: String,
+        }
+
+        let pool = store.pool.clone();
+        let mut conn = pool.get().expect("a connection");
+        let found: Vec<TableName> = diesel::sql_query(
+            "SELECT m.name AS name FROM sqlite_master AS m \
+             WHERE m.type = 'table' \
+               AND m.name NOT LIKE 'sqlite_%' \
+               AND m.name <> 'device' \
+               AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) WHERE name = 'device_id') \
+             ORDER BY m.name",
+        )
+        .load(&mut *conn)
+        .expect("schema scan");
+
+        let found: HashSet<String> = found.into_iter().map(|t| t.name).collect();
+        let listed: HashSet<String> = ACCOUNT_SCOPED_TABLES
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+        assert_eq!(
+            found, listed,
+            "ACCOUNT_SCOPED_TABLES must name exactly the tables carrying device_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sibling_device_allocates_and_binds() {
+        let db = TempDb::new("lifecycle_create");
+        let base = store(&db).await;
+
+        let (first_id, first) = base.create_sibling_device().await.expect("create");
+        let (second_id, second) = base.create_sibling_device().await.expect("create");
+        assert_eq!(first.device_id(), first_id);
+        assert_eq!(second.device_id(), second_id);
+        assert_ne!(first_id, second_id, "allocated ids must be distinct");
+
+        let listed = base.list_devices().await.expect("list");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, first_id);
+        assert!(listed.iter().all(|d| !d.linked));
+    }
+
+    #[tokio::test]
+    async fn list_devices_reports_pn_lid_and_push_name() {
+        let db = TempDb::new("lifecycle_list");
+        let base = store(&db).await;
+        base.create_new_device().await.expect("seed device 1");
+
+        // A paired row: pn set, lid set, named.
+        base.with_retry("test_pair", || {
+            Box::new(|conn: &mut SqliteConnection| {
+                diesel::update(device::table.filter(device::id.eq(1)))
+                    .set((
+                        device::pn.eq("559980000001@s.whatsapp.net"),
+                        device::lid.eq("100000012345678@lid"),
+                        device::push_name.eq("Alice"),
+                    ))
+                    .execute(conn)?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("pair device 1");
+
+        let (id, _) = base.create_sibling_device().await.expect("create");
+        let listed = base.list_devices().await.expect("list");
+        assert_eq!(listed.len(), 2);
+
+        let paired = listed.iter().find(|d| d.id == 1).expect("device 1");
+        assert_eq!(paired.push_name, "Alice");
+        assert!(paired.linked);
+        assert_eq!(
+            paired.pn.as_ref().map(|j| j.user.as_str()),
+            Some("559980000001")
+        );
+        assert_eq!(
+            paired.lid.as_ref().map(|j| j.user.as_str()),
+            Some("100000012345678")
+        );
+
+        let fresh = listed.iter().find(|d| d.id == id).expect("fresh device");
+        assert!(!fresh.linked);
+        assert!(fresh.pn.is_none() && fresh.lid.is_none());
+    }
+
+    #[tokio::test]
+    async fn reset_device_clears_state_and_keeps_the_id() {
+        let db = TempDb::new("lifecycle_reset");
+        let base = store(&db).await;
+        let (id, account) = base.create_sibling_device().await.expect("create");
+        {
+            let pool = account.pool.clone();
+            let mut conn = pool.get().expect("a connection");
+            seed_account_scoped_rows(&mut conn, id);
+        }
+        // The state is really there before the reset, or the test proves nothing.
+        // Every table must be seeded: a helper that skipped one would let the
+        // purge assertion pass without covering it.
+        let before = scoped_row_counts(&base, id);
+        let unseeded: Vec<_> = before.iter().filter(|(_, n)| *n == 0).collect();
+        assert!(
+            unseeded.is_empty(),
+            "seed must write a row in every account-scoped table, missing: {unseeded:?}"
+        );
+
+        let reset = base.reset_device(id).await.expect("reset");
+        assert_eq!(reset.device_id(), id, "reset keeps the account id");
+
+        let after = scoped_row_counts(&base, id);
+        assert!(
+            after.iter().all(|(_, n)| *n == 0),
+            "reset must purge every account-scoped table, left: {:?}",
+            after.iter().filter(|(_, n)| *n > 0).collect::<Vec<_>>()
+        );
+
+        // The row is back, with fresh keys.
+        let reloaded = base
+            .load_device_data_for_device(id)
+            .await
+            .expect("load after reset")
+            .expect("device row recreated");
+        assert!(reloaded.pn.is_none(), "reset leaves the account unpaired");
+        let listed = base.list_devices().await.expect("list");
+        assert!(listed.iter().any(|d| d.id == id));
+    }
+
+    #[tokio::test]
+    async fn remove_device_purges_and_retires_the_id() {
+        let db = TempDb::new("lifecycle_remove");
+        let base = store(&db).await;
+        let (id, account) = base.create_sibling_device().await.expect("create");
+        {
+            let pool = account.pool.clone();
+            let mut conn = pool.get().expect("a connection");
+            seed_account_scoped_rows(&mut conn, id);
+        }
+
+        let seeded = scoped_row_counts(&base, id);
+        assert!(
+            seeded.iter().all(|(_, n)| *n > 0),
+            "seed must write a row in every account-scoped table, missing: {:?}",
+            seeded.iter().filter(|(_, n)| *n == 0).collect::<Vec<_>>()
+        );
+
+        base.remove_device(id).await.expect("remove");
+
+        assert!(!base.device_exists(id).await.expect("exists"));
+        let after = scoped_row_counts(&base, id);
+        assert!(
+            after.iter().all(|(_, n)| *n == 0),
+            "remove must purge every account-scoped table, left: {:?}",
+            after.iter().filter(|(_, n)| *n > 0).collect::<Vec<_>>()
+        );
+
+        // AUTOINCREMENT retires the id: no later allocation may reuse it.
+        let (next_id, _) = base.create_sibling_device().await.expect("create");
+        assert_ne!(next_id, id, "a removed id must never be reissued");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_ops_reject_an_unknown_device() {
+        let db = TempDb::new("lifecycle_missing");
+        let base = store(&db).await;
+        base.create_new_device().await.expect("device 1");
+
+        let reset = base.reset_device(9_999).await.err();
+        assert!(
+            matches!(reset, Some(StoreError::DeviceNotFound(9_999))),
+            "reset of an unknown device names it, got {reset:?}"
+        );
+        let remove = base.remove_device(9_999).await.err();
+        assert!(
+            matches!(remove, Some(StoreError::DeviceNotFound(9_999))),
+            "remove of an unknown device names it, got {remove:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_creates_never_collide() {
+        let db = TempDb::new("lifecycle_concurrent");
+        const CREATES: usize = 16;
+        // A wider write pool so the creates genuinely interleave on separate
+        // connections. At the default pool_size the store's own permit would
+        // serialize them and the test would pass without exercising SQLite's
+        // allocation at all. Each create is a single INSERT, so the
+        // read-then-write deadlock the config warns about does not arise.
+        let base = SqliteStore::with_config(
+            &db.url(),
+            SqliteStoreConfig {
+                pool_size: CREATES as u32,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("store opens");
+
+        let mut tasks = Vec::new();
+        for _ in 0..CREATES {
+            let base = base.clone();
+            tasks.push(tokio::spawn(async move {
+                base.create_sibling_device().await.expect("create").0
+            }));
+        }
+        let mut ids = Vec::new();
+        for task in tasks {
+            ids.push(task.await.expect("join"));
+        }
+
+        let unique: HashSet<i32> = ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            CREATES,
+            "concurrent creates returned a duplicate id: {ids:?}"
+        );
+        let listed: HashSet<i32> = base
+            .list_devices()
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(listed, unique, "every allocated id has exactly one row");
+    }
+}
+
 #[cfg(test)]
 mod maintenance_tests {
     use super::read_routing_tests::TempDb;
