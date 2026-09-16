@@ -566,9 +566,18 @@ takes the idle-ping early return) still reaches them:
 
 | pass | cadence | what it does |
 | --- | --- | --- |
-| retention sweeps | every 12 ticks (~4.5 min) | `sent_messages`, `pending_inbound_messages`, `base_keys` and `msg_secrets` expiry, sequentially in one task, each through the store's write permit |
-| engine maintenance | ~1 h of ticks | `DeviceStore::maintenance()` — for SQLite, `analysis_limit` + `PRAGMA optimize` and an opportunistic `wal_checkpoint(TRUNCATE)` |
+| retention sweeps | every 12 ticks (~4.5 min), plus once at startup | `sent_messages`, `pending_inbound_messages`, `base_keys` and `msg_secrets` expiry, sequentially in one task, each through the store's write permit |
+| engine maintenance | ~1 h of ticks | `DeviceStore::maintenance()` — for SQLite, `analysis_limit` + `PRAGMA optimize`, an opportunistic `wal_checkpoint(TRUNCATE)`, and (only when opted in and the DB is already in `auto_vacuum=INCREMENTAL`) a bounded `incremental_vacuum` |
 | session maintenance | ~6 h of ticks | signed pre-key rotation check and the tcToken prune, both of which used to run only at connect |
+
+The retention sweep also runs once from `Client::run_startup_maintenance`, which
+client construction spawns detached in `start_services`. The keepalive cadence
+covers a connection that stays up; startup covers the gap where a process was
+closed long enough for secrets to expire, and the case of an app that opens the
+store without ever holding a connection (a batch job or an inspector), for which
+the keepalive tick may never fire at all. Both entry points run the same
+`run_retention_cleanup` body through the store's single write permit, so they
+cannot race each other.
 
 The last two exist because a process that holds one connection for weeks never
 reruns connect-time work: before them a session outliving the 27-day rotation
@@ -580,7 +589,10 @@ being bounded.
 `maintenance()` is a defaulted method on `DeviceStore`, for the same reason
 `resource_report` is. What it must never do is take an exclusive lock on the
 whole database: `VACUUM` (the only thing that returns free-list pages to the
-filesystem) stays an explicit embedder call.
+filesystem) stays an explicit embedder call. The SQLite incremental-vacuum
+support (`SqliteStoreConfig::incremental_vacuum`) is the safe subset: it is
+opt-in, it never switches an existing database out of its mode, and it reclaims
+at most a bounded page count per pass.
 
 ### `SqliteStoreConfig::mmap_size` — page-cache tuning knob
 
