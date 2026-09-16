@@ -217,16 +217,21 @@ pub fn expires_at(
 
 /// Whether a history-sync secret with parent event time `message_ts` is still
 /// within its retention horizon at `now` and is worth seeding. Records with no
-/// timestamp are kept (we cannot prove they are too old). Only `Managed`/
-/// `BotOnly` filter; `Full` seeds everything and `Disabled` seeds nothing
-/// (decided by the caller, not here).
+/// timestamp are kept (we cannot prove they are too old); `0` is the same
+/// "unknown" sentinel [`expires_at`] reads, not Unix time zero, so a history
+/// record carrying it is seeded rather than rejected as decades old. Only
+/// `Managed`/`BotOnly` filter; `Full` seeds everything and `Disabled` seeds
+/// nothing (decided by the caller, not here).
 pub fn within_seed_horizon(
     retention: &MsgSecretRetention,
     class: RetentionClass,
     message_ts: Option<u64>,
     now: i64,
 ) -> bool {
-    let Some(ts) = message_ts.and_then(|t| i64::try_from(t).ok()) else {
+    let Some(ts) = message_ts
+        .filter(|&t| t != 0)
+        .and_then(|t| i64::try_from(t).ok())
+    else {
         return true;
     };
     let horizon = i64::try_from(retention.horizon_secs(class)).unwrap_or(i64::MAX);
@@ -509,6 +514,10 @@ mod tests {
         ));
         // Unknown age is conservatively kept.
         assert!(within_seed_horizon(&r, RetentionClass::Text, None, now));
+        // `Some(0)` is the same "unknown" sentinel `expires_at` reads, so it is
+        // kept too. Reading it as Unix time zero would reject the record as
+        // decades old and drop a secret the write path would have kept.
+        assert!(within_seed_horizon(&r, RetentionClass::Text, Some(0), now));
     }
 
     #[test]

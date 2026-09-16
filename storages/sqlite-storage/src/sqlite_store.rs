@@ -770,14 +770,17 @@ impl SqliteStoreConfig {
 
     /// Opt into returning free pages to the filesystem during maintenance.
     ///
-    /// `pages` is the per-pass batch (0 disables the pass). Enabling this never
-    /// forces a reorganization: `auto_vacuum = INCREMENTAL` is set only when the
-    /// store opens a brand-new empty file, and the maintenance pass reclaims
-    /// only when the database is already in that mode. See
-    /// [`SqliteStoreConfig::incremental_vacuum`] for why a full `VACUUM` is not
-    /// run.
+    /// `pages` is the per-pass batch. Zero leaves the option off entirely, so
+    /// it neither reclaims nor switches a fresh database into
+    /// `auto_vacuum = INCREMENTAL`; the latter is a one-way mode change outside
+    /// a full `VACUUM`, and enabling it with nothing ever reclaimed would only
+    /// add pointer-map overhead. Enabling this never forces a reorganization:
+    /// `auto_vacuum` is set only when the store opens a brand-new empty file,
+    /// and the maintenance pass reclaims only when the database is already in
+    /// that mode. See [`SqliteStoreConfig::incremental_vacuum`] for why a full
+    /// `VACUUM` is not run.
     pub fn with_incremental_vacuum(mut self, pages: u32) -> Self {
-        self.incremental_vacuum = true;
+        self.incremental_vacuum = pages > 0;
         self.incremental_vacuum_pages = pages;
         self
     }
@@ -9225,6 +9228,29 @@ mod maintenance_tests {
         DeviceStore::maintenance(&reopened)
             .await
             .expect("maintenance on a NONE-mode database is a no-op, not an error");
+        drop(reopened);
+
+        // `with_incremental_vacuum(0)` disables the option rather than enabling
+        // a pass that reclaims nothing: switching a fresh file into INCREMENTAL
+        // is one-way outside a VACUUM, so it must not happen with no reclaim to
+        // justify the pointer-map overhead.
+        let cfg = SqliteStoreConfig::default().with_incremental_vacuum(0);
+        assert!(
+            !cfg.incremental_vacuum,
+            "a zero batch leaves the option off"
+        );
+        let db = TempDb::new("maintenance_av_zero");
+        let zero = SqliteStore::with_config(&db.url(), cfg)
+            .await
+            .expect("store opens");
+        assert_eq!(
+            auto_vacuum_mode(&zero),
+            0,
+            "a zero batch must not switch a fresh file into INCREMENTAL"
+        );
+        DeviceStore::maintenance(&zero)
+            .await
+            .expect("maintenance with the option off is a no-op");
     }
 
     /// A single large transaction is what leaves a WAL permanently big, so this
