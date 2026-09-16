@@ -405,7 +405,25 @@ impl Client {
     /// buys three blocking threads queueing for the same slot ahead of live
     /// traffic. Failures are logged at `warn!` because a sweep that fails every
     /// time is how a bounded table quietly stops being bounded.
-    fn spawn_retention_cleanup(&self, sent_msg_ttl: u64) {
+    fn spawn_retention_cleanup(self: &Arc<Self>, sent_msg_ttl: u64) {
+        let client = Arc::clone(self);
+        self.runtime
+            .spawn(Box::pin(async move {
+                client.run_retention_cleanup(sent_msg_ttl).await;
+            }))
+            .detach();
+    }
+
+    /// The body of [`Self::spawn_retention_cleanup`], separate so startup can
+    /// await the same sweep without racing a detached task and so a test can
+    /// drive it directly.
+    ///
+    /// Runs every retention pass in sequence behind the store's single write
+    /// permit. Callers: the keepalive's ~5-minute tick, and once at client
+    /// startup (see [`Self::run_startup_maintenance`]) so a process that opens
+    /// the store without ever holding a connection still reaps what expired
+    /// while it was closed.
+    pub(crate) async fn run_retention_cleanup(&self, sent_msg_ttl: u64) {
         let now = wacore::time::now_secs();
         let cutoff_for = |ttl: u64| now.saturating_sub(i64::try_from(ttl).unwrap_or(i64::MAX));
 
@@ -430,36 +448,54 @@ impl Client {
         let base_key_cutoff = cutoff_for(BASE_KEY_TTL_SECS);
         let prune_msg_secrets = self.cache_config.msg_secret_policy.prunes();
 
+        if let Some(cutoff) = sent_cutoff
+            && let Err(e) = backend.delete_expired_sent_messages(cutoff).await
+        {
+            warn!(target: "Client/Keepalive", "Sent message cleanup error: {e}");
+        }
+
+        if let Err(e) = backend.delete_expired_pending_inbound(pending_cutoff).await {
+            warn!(target: "Client/Keepalive", "Pending inbound cleanup error: {e}");
+        }
+
+        if let Err(e) = backend.delete_expired_base_keys(base_key_cutoff).await {
+            warn!(target: "Client/Keepalive", "Base key cleanup error: {e}");
+        }
+
+        // msg_secrets retention: prune rows whose per-row deadline has passed.
+        // expires_at is absolute, so the cutoff is simply "now"; per-kind
+        // horizons and never-expire (0) rows are baked in at write time.
+        if prune_msg_secrets {
+            match backend.delete_expired_msg_secrets(now).await {
+                Ok(n) if n > 0 => {
+                    debug!(target: "Client/Keepalive", "Pruned {n} expired msg_secrets");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(target: "Client/Keepalive", "msg_secrets cleanup error: {e}");
+                }
+            }
+        }
+    }
+
+    /// One retention pass at client startup, detached so it never sits on the
+    /// construction path.
+    ///
+    /// The keepalive sweep only runs once a connection reaches its ~5-minute
+    /// tick, and an app that opens the store without keeping a connection up
+    /// (a batch job, an inspection tool) may never reach one at all. Secrets
+    /// that expired while the process was closed would then sit past their
+    /// deadline until the next connect. This closes that gap without waiting
+    /// for the network: the store is already migrated by the time this is
+    /// spawned (client construction runs after `PersistenceManager` is built),
+    /// and the sweep goes through the same single write permit as every other
+    /// write, so it cannot race a migration or a concurrent sweeper.
+    pub(crate) fn run_startup_maintenance(self: &Arc<Self>) {
+        let client = Arc::clone(self);
+        let sent_msg_ttl = self.cache_config.sent_message_ttl_secs;
         self.runtime
             .spawn(Box::pin(async move {
-                if let Some(cutoff) = sent_cutoff
-                    && let Err(e) = backend.delete_expired_sent_messages(cutoff).await
-                {
-                    warn!(target: "Client/Keepalive", "Sent message cleanup error: {e}");
-                }
-
-                if let Err(e) = backend.delete_expired_pending_inbound(pending_cutoff).await {
-                    warn!(target: "Client/Keepalive", "Pending inbound cleanup error: {e}");
-                }
-
-                if let Err(e) = backend.delete_expired_base_keys(base_key_cutoff).await {
-                    warn!(target: "Client/Keepalive", "Base key cleanup error: {e}");
-                }
-
-                // msg_secrets retention: prune rows whose per-row deadline has passed.
-                // expires_at is absolute, so the cutoff is simply "now"; per-kind
-                // horizons and never-expire (0) rows are baked in at write time.
-                if prune_msg_secrets {
-                    match backend.delete_expired_msg_secrets(now).await {
-                        Ok(n) if n > 0 => {
-                            debug!(target: "Client/Keepalive", "Pruned {n} expired msg_secrets");
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            warn!(target: "Client/Keepalive", "msg_secrets cleanup error: {e}");
-                        }
-                    }
-                }
+                client.run_retention_cleanup(sent_msg_ttl).await;
             }))
             .detach();
     }

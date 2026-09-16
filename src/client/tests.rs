@@ -5516,6 +5516,78 @@ async fn cache_maintenance_sweeps_expired_entries() {
     assert_eq!(client.memory_report().await.dispatched_messages, 0);
 }
 
+/// Startup reaps what expired while the process was closed, without waiting for
+/// a connection to reach the keepalive tick. `expires_at = 0` (never) and
+/// future deadlines must survive.
+#[tokio::test]
+async fn startup_maintenance_sweeps_expired_secrets_without_a_connection() {
+    use wacore::store::traits::MsgSecretEntry;
+
+    let now = wacore::time::now_secs();
+    let backend = crate::test_utils::create_test_backend().await;
+    backend
+        .put_msg_secrets(vec![
+            MsgSecretEntry {
+                chat: "19045550180@s.whatsapp.net".into(),
+                sender: "19045550180@s.whatsapp.net".into(),
+                msg_id: "STARTUP_NEVER".into(),
+                secret: [1u8; 32],
+                expires_at: 0,
+                message_ts: 0,
+            },
+            MsgSecretEntry {
+                chat: "19045550180@s.whatsapp.net".into(),
+                sender: "19045550180@s.whatsapp.net".into(),
+                msg_id: "STARTUP_FUTURE".into(),
+                secret: [2u8; 32],
+                expires_at: now + 86_400,
+                message_ts: 0,
+            },
+            MsgSecretEntry {
+                chat: "19045550180@s.whatsapp.net".into(),
+                sender: "19045550180@s.whatsapp.net".into(),
+                msg_id: "STARTUP_EXPIRED".into(),
+                secret: [3u8; 32],
+                expires_at: now - 86_400,
+                message_ts: 0,
+            },
+        ])
+        .await
+        .expect("seed secrets");
+
+    let client = crate::test_utils::create_test_client_with_backend(Arc::clone(&backend)).await;
+    // Construction spawns the sweep detached; run the body directly so the
+    // test is deterministic instead of racing a task.
+    client.run_retention_cleanup(7200).await;
+
+    let present = |id: &'static str| {
+        let backend = Arc::clone(&backend);
+        async move {
+            backend
+                .get_msg_secret(
+                    "19045550180@s.whatsapp.net",
+                    "19045550180@s.whatsapp.net",
+                    id,
+                )
+                .await
+                .expect("lookup")
+                .is_some()
+        }
+    };
+    assert!(
+        present("STARTUP_NEVER").await,
+        "expires_at = 0 must survive"
+    );
+    assert!(
+        present("STARTUP_FUTURE").await,
+        "a future deadline must survive"
+    );
+    assert!(
+        !present("STARTUP_EXPIRED").await,
+        "the startup pass must reap a passed deadline"
+    );
+}
+
 #[tokio::test]
 async fn memory_report_on_fresh_client() {
     // recent_messages is capacity-0 (disabled) by default; enable it so the
