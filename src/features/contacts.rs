@@ -289,7 +289,9 @@ impl<'a> Contacts<'a> {
         .await
     }
 
-    /// Lookup a profile picture with full options (tctoken, existing ID, common group, timeout).
+    /// Lookup a profile picture with configurable picture, cache, group, invite, persona, and timeout options.
+    ///
+    /// A valid privacy token is loaded automatically from the client store when applicable.
     pub async fn lookup_profile_picture_with_options(
         &self,
         options: ProfilePictureLookupOptions<'_>,
@@ -305,12 +307,30 @@ impl<'a> Contacts<'a> {
             options.picture_type, jid, options.existing_id
         );
 
+        let spec = self.profile_picture_spec(&options).await;
+        match self.client.execute(spec).await {
+            Ok(lookup) => Ok(lookup),
+            // Server-level IQ error mappings (WA Web parseIqResponse / whatspec GetResponseError):
+            Err(IqError::ServerError { code: 404, .. }) => Ok(ProfilePictureLookup::NotFound),
+            Err(IqError::ServerError {
+                code: 401 | 403, ..
+            }) => Ok(ProfilePictureLookup::NotAuthorized),
+            Err(IqError::ServerError { code: 429, .. }) => Ok(ProfilePictureLookup::RateOverlimit),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Builds the `<picture>` request for `options`, including the privacy-token
+    /// versus `common_gid` fallback. Shared by the typed lookup and the legacy
+    /// getter so the two agree on the wire.
+    async fn profile_picture_spec(
+        &self,
+        options: &ProfilePictureLookupOptions<'_>,
+    ) -> ProfilePictureSpec {
+        let jid = options.jid;
         let mut spec = ProfilePictureSpec::new(jid, options.picture_type);
         if let Some(id) = options.existing_id {
             spec = spec.with_existing_id(id);
-        }
-        if let Some(common_gid) = options.common_gid {
-            spec = spec.with_common_gid(common_gid.clone());
         }
         if let Some(invite) = options.invite {
             spec = spec.with_invite(invite);
@@ -324,7 +344,7 @@ impl<'a> Contacts<'a> {
 
         // Skip own JID: server never responds when tctoken is sent for self
         let is_own_jid = self.client.is_own_jid(jid);
-        if !jid.is_group()
+        let tc_token = if !jid.is_group()
             && !jid.is_newsletter()
             && !jid.is_bot()
             && !jid.is_broadcast_list()
@@ -335,21 +355,19 @@ impl<'a> Contacts<'a> {
                 .ab_props
                 .is_enabled(wacore::iq::props::stale::PROFILE_PIC_PRIVACY_TOKEN)
                 .await
-            && let Some(token) = self.client.lookup_tc_token_for_jid(jid).await
         {
-            spec = spec.with_tc_token(token);
-        }
+            self.client.lookup_tc_token_for_jid(jid).await
+        } else {
+            None
+        };
 
-        match self.client.execute(spec).await {
-            Ok(lookup) => Ok(lookup),
-            // Server-level IQ error mappings (WA Web parseIqResponse / whatspec GetResponseError):
-            Err(IqError::ServerError { code: 404, .. }) => Ok(ProfilePictureLookup::NotFound),
-            Err(IqError::ServerError {
-                code: 401 | 403, ..
-            }) => Ok(ProfilePictureLookup::NotAuthorized),
-            Err(IqError::ServerError { code: 429, .. }) => Ok(ProfilePictureLookup::RateOverlimit),
-            Err(e) => Err(e.into()),
+        // WhatsApp Web uses common_gid as a fallback only when no tctoken is present.
+        if let Some(token) = tc_token {
+            spec = spec.with_tc_token(token);
+        } else if let Some(common_gid) = options.common_gid {
+            spec = spec.with_common_gid(common_gid.clone());
         }
+        spec
     }
 
     /// Fetch a profile picture URL for a given JID.
@@ -381,14 +399,26 @@ impl<'a> Contacts<'a> {
         preview: bool,
         timeout: Option<Duration>,
     ) -> Result<Option<ProfilePicture>, ContactError> {
-        let lookup = self
-            .lookup_profile_picture_with_options(
-                ProfilePictureLookupOptions::new(jid)
-                    .preview(preview)
-                    .timeout(timeout),
-            )
-            .await?;
-        Ok(lookup.into_found())
+        // The system JID never answers this IQ; skip it to save the full timeout.
+        if jid.is_psa() {
+            return Ok(None);
+        }
+        // Executed directly rather than through `lookup_profile_picture_with_options`
+        // so a 429 keeps its server `<iq type="error">` (the `backoff` a caller must
+        // honour), which the typed outcome does not carry.
+        let options = ProfilePictureLookupOptions::new(jid)
+            .preview(preview)
+            .timeout(timeout);
+        let spec = self.profile_picture_spec(&options).await;
+        match self.client.execute(spec).await {
+            Ok(lookup) => Ok(lookup.into_found()),
+            // 404/401/403 = no profile picture (or not authorized to see it).
+            Err(IqError::ServerError {
+                code: 404 | 401 | 403,
+                ..
+            }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub async fn get_user_info(

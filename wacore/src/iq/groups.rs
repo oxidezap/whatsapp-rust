@@ -3541,9 +3541,9 @@ pub struct GroupPictureEntry {
 }
 
 impl GroupPictureEntry {
-    pub fn new(jid: Jid, picture_type: PictureType) -> Self {
+    pub fn new(jid: &Jid, picture_type: PictureType) -> Self {
         Self {
-            jid,
+            jid: jid.clone(),
             picture_type,
             existing_id: None,
             is_parent_group: false,
@@ -3585,7 +3585,7 @@ impl GetGroupProfilePicturesIq {
         Self {
             entries: group_jids
                 .iter()
-                .map(|jid| GroupPictureEntry::new(jid.clone(), PictureType::Preview))
+                .map(|jid| GroupPictureEntry::new(jid, PictureType::Preview))
                 .collect(),
             to_jid: None,
             membership_hint: None,
@@ -3596,7 +3596,7 @@ impl GetGroupProfilePicturesIq {
         Self {
             entries: groups
                 .iter()
-                .map(|(jid, pic_type)| GroupPictureEntry::new(jid.clone(), *pic_type))
+                .map(|(jid, pic_type)| GroupPictureEntry::new(jid, *pic_type))
                 .collect(),
             to_jid: None,
             membership_hint: None,
@@ -3683,7 +3683,8 @@ impl IqSpec for GetGroupProfilePicturesIq {
                 .optional_string("sub_group_jid")
                 .or_else(|| attrs.optional_string("parent_group_jid"))
                 .or_else(|| attrs.optional_string("jid"))
-                .and_then(|jid_str| parse_group_id(&jid_str).ok());
+                .map(|jid_str| parse_group_id(&jid_str))
+                .transpose()?;
 
             if let Some(jid) = group_jid {
                 let status = attrs
@@ -6211,7 +6212,7 @@ mod tests {
     #[test]
     fn test_get_group_profile_pictures_build_iq_community_routing() {
         let community: Jid = "120363000000000099@g.us".parse().unwrap();
-        let entry = GroupPictureEntry::new(community.clone(), PictureType::Image)
+        let entry = GroupPictureEntry::new(&community, PictureType::Image)
             .with_existing_id("photo-42")
             .as_parent_group(true);
 
@@ -6336,5 +6337,23 @@ mod tests {
             results[3].outcome(),
             GroupProfilePictureOutcome::Error { code: 500 }
         );
+    }
+
+    #[test]
+    fn test_get_group_profile_pictures_parse_malformed_jid_fails() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let spec = GetGroupProfilePicturesIq::new(&[group]);
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("pictures")
+                .children([NodeBuilder::new("picture")
+                    .attr("sub_group_jid", "invalid@@@")
+                    .attr("status", "200")
+                    .build()])
+                .build()])
+            .build();
+
+        assert!(spec.parse_response(&response.as_node_ref()).is_err());
     }
 }

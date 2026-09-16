@@ -1779,6 +1779,7 @@ impl<'a> Groups<'a> {
             Err(IqError::ServerError {
                 code: 401 | 403, ..
             }) => Ok(ProfilePictureLookup::NotAuthorized),
+            Err(IqError::ServerError { code: 429, .. }) => Ok(ProfilePictureLookup::RateOverlimit),
             Err(e) => Err(e.into()),
         }
     }
@@ -1805,6 +1806,7 @@ impl<'a> Groups<'a> {
             Err(IqError::ServerError {
                 code: 401 | 403, ..
             }) => Ok(ProfilePictureLookup::NotAuthorized),
+            Err(IqError::ServerError { code: 429, .. }) => Ok(ProfilePictureLookup::RateOverlimit),
             Err(e) => Err(e.into()),
         }
     }
