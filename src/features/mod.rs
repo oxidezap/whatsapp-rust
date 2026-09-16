@@ -62,9 +62,9 @@ pub use chatstate::{ChatStateError, ChatStateType, Chatstate};
 pub use comments::Comments;
 
 pub use contacts::{
-    ContactError, Contacts, IsOnWhatsAppResult, ProfilePicture, USERNAME_MAX_LENGTH,
-    USERNAME_MIN_LENGTH, UserInfo, UsernameLookup, UsernameLookupError, UsernameLookupUser,
-    UsyncSubprotocolError, VerifiedName,
+    ContactError, Contacts, IsOnWhatsAppResult, ProfilePicture, ProfilePictureLookup,
+    ProfilePictureLookupOptions, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UserInfo,
+    UsernameLookup, UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError, VerifiedName,
 };
 
 pub use events::{EventCreationParams, EventResponseType, Events};
@@ -72,11 +72,11 @@ pub use events::{EventCreationParams, EventResponseType, Events};
 pub use groups::{
     BatchGroupResult, CreateGroupResult, GroupAppealStatus, GroupCreateOptions, GroupDescription,
     GroupEphemeralSettings, GroupError, GroupJoinError, GroupMessageReporter, GroupMetadata,
-    GroupParticipant, GroupParticipantDetails, GroupParticipantOptions, GroupProfilePicture,
-    GroupSubject, Groups, GrowthLockInfo, InviteInfoError, JoinGroupResult, MemberAddMode,
-    MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest,
-    ParticipantChangeResponse, ParticipantType, PictureType, PreviousDescription,
-    ReportedGroupMessage, ReportedGroupMessages,
+    GroupParticipant, GroupParticipantDetails, GroupParticipantOptions, GroupPictureEntry,
+    GroupProfilePicture, GroupProfilePictureOutcome, GroupSubject, Groups, GrowthLockInfo,
+    InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode, MemberShareHistoryMode,
+    MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse, ParticipantType,
+    PictureType, PreviousDescription, ReportedGroupMessage, ReportedGroupMessages,
 };
 
 pub use labels::Labels;

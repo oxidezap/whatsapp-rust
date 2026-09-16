@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 use wacore::client::context::GroupInfo;
-use wacore::iq::contacts::SetProfilePictureSpec;
-// Returned by set/remove_profile_picture; re-exported so callers don't reach
-// into wacore directly (consistent with GroupProfilePicture below).
+pub use wacore::iq::contacts::ProfilePictureLookup;
 pub use wacore::iq::contacts::SetProfilePictureResponse;
+use wacore::iq::contacts::SetProfilePictureSpec;
+use wacore::iq::contacts::{ProfilePictureSpec, ProfilePictureType as ContactPictureType};
 use wacore::iq::groups::{
     AcceptGroupInviteIq, AcceptGroupInviteV4Iq, AcknowledgeGroupIq, AddParticipantsIq,
     BatchGetGroupInfoIq, CancelMembershipRequestsIq, DemoteParticipantsIq, GetGroupInviteInfoIq,
@@ -30,10 +30,10 @@ use wacore::iq::groups::BatchGroupInfoResult as RawBatchResult;
 pub use wacore::iq::groups::{
     GroupAppealStatus, GroupCreateOptions, GroupDescription, GroupEphemeralSettings,
     GroupJoinError, GroupMessageReporter, GroupParticipantDetails, GroupParticipantOptions,
-    GroupProfilePicture, GroupSubject, GrowthLockInfo, InviteInfoError, JoinGroupResult,
-    MemberAddMode, MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode,
-    MembershipRequest, ParticipantChangeResponse, ParticipantType, PictureType,
-    ReportedGroupMessage, ReportedGroupMessages,
+    GroupPictureEntry, GroupProfilePicture, GroupProfilePictureOutcome, GroupSubject,
+    GrowthLockInfo, InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode,
+    MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
+    ParticipantType, PictureType, ReportedGroupMessage, ReportedGroupMessages,
 };
 
 /// Error returned by group operations (metadata queries, participant and
@@ -1754,6 +1754,59 @@ impl<'a> Groups<'a> {
             .client
             .execute(GetGroupProfilePicturesIq::with_type(&groups))
             .await?)
+    }
+
+    /// Lookup an individual group's profile picture preserving detailed protocol outcomes:
+    /// `Found`, `Unchanged`, `NotFound`, `NotAuthorized`.
+    pub async fn lookup_profile_picture(
+        &self,
+        group_jid: &Jid,
+        preview: bool,
+        existing_id: Option<&str>,
+    ) -> Result<ProfilePictureLookup, GroupError> {
+        let picture_type = if preview {
+            ContactPictureType::Preview
+        } else {
+            ContactPictureType::Full
+        };
+        let mut spec = ProfilePictureSpec::new(group_jid, picture_type);
+        if let Some(id) = existing_id {
+            spec = spec.with_existing_id(id);
+        }
+        match self.client.execute(spec).await {
+            Ok(lookup) => Ok(lookup),
+            Err(IqError::ServerError { code: 404, .. }) => Ok(ProfilePictureLookup::NotFound),
+            Err(IqError::ServerError {
+                code: 401 | 403, ..
+            }) => Ok(ProfilePictureLookup::NotAuthorized),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Lookup a community parent group's profile picture via `w:g2`.
+    pub async fn lookup_community_profile_picture(
+        &self,
+        community_jid: &Jid,
+        preview: bool,
+        existing_id: Option<&str>,
+    ) -> Result<ProfilePictureLookup, GroupError> {
+        let picture_type = if preview {
+            ContactPictureType::Preview
+        } else {
+            ContactPictureType::Full
+        };
+        let mut spec = ProfilePictureSpec::community(community_jid, picture_type);
+        if let Some(id) = existing_id {
+            spec = spec.with_existing_id(id);
+        }
+        match self.client.execute(spec).await {
+            Ok(lookup) => Ok(lookup),
+            Err(IqError::ServerError { code: 404, .. }) => Ok(ProfilePictureLookup::NotFound),
+            Err(IqError::ServerError {
+                code: 401 | 403, ..
+            }) => Ok(ProfilePictureLookup::NotAuthorized),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Set a group's profile picture (admin operation).

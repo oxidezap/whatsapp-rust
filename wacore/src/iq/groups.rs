@@ -3455,8 +3455,25 @@ impl IqSpec for BatchGetGroupInfoIq {
 // Get group profile pictures (batch)
 // ---------------------------------------------------------------------------
 
-/// A single group profile picture result.
-#[derive(Debug, Clone)]
+/// Detailed outcome of a single group profile picture entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupProfilePictureOutcome {
+    /// Found group profile picture.
+    Found {
+        url: String,
+        direct_path: Option<String>,
+        photo_id: Option<String>,
+    },
+    /// Picture unchanged (status 304).
+    Unchanged,
+    /// Picture not found / no picture set (status 204 or missing).
+    NotFound,
+    /// Server or permission error for this item (status 500, 405, etc.).
+    Error { code: u16 },
+}
+
+/// Profile picture information for a group in a batch query.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupProfilePicture {
     pub group_jid: Jid,
     /// Direct URL to the picture.
@@ -3465,6 +3482,46 @@ pub struct GroupProfilePicture {
     pub direct_path: Option<String>,
     /// Photo ID / version tag.
     pub photo_id: Option<String>,
+    /// HTTP-like status code returned by the server for this entry (e.g. 200, 304, 204, 500, 405).
+    pub status: Option<u16>,
+}
+
+impl GroupProfilePicture {
+    /// Returns `true` if the server returned status 304 (picture unchanged).
+    pub fn is_unchanged(&self) -> bool {
+        self.status == Some(304)
+    }
+
+    /// Returns `true` if the server returned status 204 (picture not found).
+    pub fn is_not_found(&self) -> bool {
+        self.status == Some(204)
+    }
+
+    /// Returns `true` if a picture URL was returned.
+    pub fn is_found(&self) -> bool {
+        self.url.is_some()
+    }
+
+    /// Converts this item into a typed outcome.
+    pub fn outcome(&self) -> GroupProfilePictureOutcome {
+        if self.status == Some(304) {
+            GroupProfilePictureOutcome::Unchanged
+        } else if self.status == Some(204) {
+            GroupProfilePictureOutcome::NotFound
+        } else if let Some(code) = self.status
+            && code >= 400
+        {
+            GroupProfilePictureOutcome::Error { code }
+        } else if let Some(url) = &self.url {
+            GroupProfilePictureOutcome::Found {
+                url: url.clone(),
+                direct_path: self.direct_path.clone(),
+                photo_id: self.photo_id.clone(),
+            }
+        } else {
+            GroupProfilePictureOutcome::NotFound
+        }
+    }
 }
 
 /// Profile picture query type.
@@ -3474,34 +3531,96 @@ pub enum PictureType {
     Image,
 }
 
+/// Single group request item in a batch profile picture query.
+#[derive(Debug, Clone)]
+pub struct GroupPictureEntry {
+    pub jid: Jid,
+    pub picture_type: PictureType,
+    pub existing_id: Option<String>,
+    pub is_parent_group: bool,
+}
+
+impl GroupPictureEntry {
+    pub fn new(jid: Jid, picture_type: PictureType) -> Self {
+        Self {
+            jid,
+            picture_type,
+            existing_id: None,
+            is_parent_group: false,
+        }
+    }
+
+    pub fn with_existing_id(mut self, id: impl Into<String>) -> Self {
+        self.existing_id = Some(id.into());
+        self
+    }
+
+    pub fn as_parent_group(mut self, is_parent_group: bool) -> Self {
+        self.is_parent_group = is_parent_group;
+        self
+    }
+}
+
 /// Batch fetch group profile pictures.
 ///
+/// In WhatsApp Web (`WASmaxOutGroupsGetGroupProfilePicturesRequest`):
 /// ```xml
 /// <iq type="get" xmlns="w:g2" to="@g.us">
 ///   <pictures>
-///     <picture jid="{group_jid}" type="preview"/>
+///     <picture sub_group_jid="{group_jid}" type="preview" query="url"/>
 ///   </pictures>
 /// </iq>
 /// ```
 #[derive(Debug, Clone)]
 pub struct GetGroupProfilePicturesIq {
-    pub groups: Vec<(Jid, PictureType)>,
+    pub entries: Vec<GroupPictureEntry>,
+    /// Target destination: either the group server `@g.us` or a community parent JID.
+    pub to_jid: Option<Jid>,
+    /// Optional linked groups membership hint on `<pictures>`.
+    pub membership_hint: Option<Jid>,
 }
 
 impl GetGroupProfilePicturesIq {
     pub fn new(group_jids: &[Jid]) -> Self {
         Self {
-            groups: group_jids
+            entries: group_jids
                 .iter()
-                .map(|jid| (jid.clone(), PictureType::Preview))
+                .map(|jid| GroupPictureEntry::new(jid.clone(), PictureType::Preview))
                 .collect(),
+            to_jid: None,
+            membership_hint: None,
         }
     }
 
     pub fn with_type(groups: &[(Jid, PictureType)]) -> Self {
         Self {
-            groups: groups.to_vec(),
+            entries: groups
+                .iter()
+                .map(|(jid, pic_type)| GroupPictureEntry::new(jid.clone(), *pic_type))
+                .collect(),
+            to_jid: None,
+            membership_hint: None,
         }
+    }
+
+    pub fn with_entries(entries: Vec<GroupPictureEntry>) -> Self {
+        Self {
+            entries,
+            to_jid: None,
+            membership_hint: None,
+        }
+    }
+
+    /// Set the destination JID (e.g. community parent JID). Defaults to `@g.us`.
+    pub fn with_to_jid(mut self, to: Jid) -> Self {
+        self.to_jid = Some(to);
+        self
+    }
+
+    /// Set the linked groups membership hint.
+    pub fn with_membership_hint(mut self, hint: Jid) -> Self {
+        self.membership_hint = Some(hint);
+        self
     }
 }
 
@@ -3510,26 +3629,45 @@ impl IqSpec for GetGroupProfilePicturesIq {
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let children: Vec<Node> = self
-            .groups
+            .entries
             .iter()
-            .map(|(jid, pic_type)| {
-                let type_str = match pic_type {
+            .map(|entry| {
+                let type_str = match entry.picture_type {
                     PictureType::Preview => "preview",
                     PictureType::Image => "image",
                 };
-                NodeBuilder::new("picture")
-                    .attr("jid", jid)
+                let mut b = NodeBuilder::new("picture")
                     .attr("type", type_str)
-                    .build()
+                    .attr("query", "url");
+
+                if entry.is_parent_group {
+                    b = b.attr("parent_group_jid", &entry.jid);
+                } else {
+                    b = b.attr("sub_group_jid", &entry.jid);
+                }
+
+                if let Some(id) = &entry.existing_id {
+                    b = b.attr("id", id);
+                }
+
+                b.build()
             })
             .collect();
 
-        let pictures_node = NodeBuilder::new("pictures").children(children).build();
+        let mut pictures_builder = NodeBuilder::new("pictures").children(children);
+        if let Some(hint) = &self.membership_hint {
+            pictures_builder = pictures_builder.attr("linked_groups_membership_hint", hint);
+        }
+
+        let to_jid = self
+            .to_jid
+            .clone()
+            .unwrap_or_else(|| Jid::new("", Server::Group));
 
         InfoQuery::get(
             GROUP_IQ_NAMESPACE,
-            Jid::new("", Server::Group),
-            Some(NodeContent::Nodes(vec![pictures_node])),
+            to_jid,
+            Some(NodeContent::Nodes(vec![pictures_builder.build()])),
         )
     }
 
@@ -3539,13 +3677,28 @@ impl IqSpec for GetGroupProfilePicturesIq {
 
         for pic_node in pictures_node.get_children_by_tag("picture") {
             let mut attrs = pic_node.attrs();
-            if let Some(jid_str) = attrs.optional_string("jid") {
-                let jid = parse_group_id(&jid_str)?;
+            // Protocol ground truth: WhatsApp Web uses sub_group_jid or parent_group_jid,
+            // with jid supported as a legacy/compatibility fallback.
+            let group_jid = attrs
+                .optional_string("sub_group_jid")
+                .or_else(|| attrs.optional_string("parent_group_jid"))
+                .or_else(|| attrs.optional_string("jid"))
+                .and_then(|jid_str| parse_group_id(&jid_str).ok());
+
+            if let Some(jid) = group_jid {
+                let status = attrs
+                    .optional_string("status")
+                    .and_then(|s| s.parse::<u16>().ok());
+                let url = attrs.optional_string("url").map(|s| s.to_string());
+                let direct_path = attrs.optional_string("direct_path").map(|s| s.to_string());
+                let photo_id = attrs.optional_string("id").map(|s| s.to_string());
+
                 results.push(GroupProfilePicture {
                     group_jid: jid,
-                    url: attrs.optional_string("url").map(|s| s.to_string()),
-                    direct_path: attrs.optional_string("direct_path").map(|s| s.to_string()),
-                    photo_id: attrs.optional_string("id").map(|s| s.to_string()),
+                    url,
+                    direct_path,
+                    photo_id,
+                    status,
                 });
             }
         }
@@ -5994,6 +6147,194 @@ mod tests {
         assert_eq!(
             result,
             JoinGroupResult::Joined(TEST_GROUP_JID.parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_get_group_profile_pictures_build_iq_server_routing() {
+        let group1: Jid = "120363000000000001@g.us".parse().unwrap();
+        let group2: Jid = "120363000000000002@g.us".parse().unwrap();
+
+        let iq = GetGroupProfilePicturesIq::with_type(&[
+            (group1.clone(), PictureType::Preview),
+            (group2.clone(), PictureType::Image),
+        ])
+        .build_iq();
+
+        assert_eq!(iq.namespace, GROUP_IQ_NAMESPACE);
+        assert_eq!(iq.to, Jid::new("", Server::Group));
+
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected NodeContent::Nodes");
+        };
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].tag, "pictures");
+
+        let pics: Vec<_> = nodes[0].get_children_by_tag("picture").collect();
+        assert_eq!(pics.len(), 2);
+
+        assert_eq!(
+            pics[0]
+                .attrs
+                .get("sub_group_jid")
+                .map(|v| v.as_str())
+                .as_deref(),
+            Some("120363000000000001@g.us")
+        );
+        assert_eq!(
+            pics[0].attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("preview")
+        );
+        assert_eq!(
+            pics[0].attrs.get("query").map(|v| v.as_str()).as_deref(),
+            Some("url")
+        );
+
+        assert_eq!(
+            pics[1]
+                .attrs
+                .get("sub_group_jid")
+                .map(|v| v.as_str())
+                .as_deref(),
+            Some("120363000000000002@g.us")
+        );
+        assert_eq!(
+            pics[1].attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("image")
+        );
+        assert_eq!(
+            pics[1].attrs.get("query").map(|v| v.as_str()).as_deref(),
+            Some("url")
+        );
+    }
+
+    #[test]
+    fn test_get_group_profile_pictures_build_iq_community_routing() {
+        let community: Jid = "120363000000000099@g.us".parse().unwrap();
+        let entry = GroupPictureEntry::new(community.clone(), PictureType::Image)
+            .with_existing_id("photo-42")
+            .as_parent_group(true);
+
+        let iq = GetGroupProfilePicturesIq::with_entries(vec![entry])
+            .with_to_jid(community.clone())
+            .build_iq();
+
+        assert_eq!(iq.namespace, GROUP_IQ_NAMESPACE);
+        assert_eq!(iq.to, community);
+
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected NodeContent::Nodes");
+        };
+        assert_eq!(nodes[0].tag, "pictures");
+
+        let pics: Vec<_> = nodes[0].get_children_by_tag("picture").collect();
+        assert_eq!(pics.len(), 1);
+        assert_eq!(
+            pics[0]
+                .attrs
+                .get("parent_group_jid")
+                .map(|v| v.as_str())
+                .as_deref(),
+            Some("120363000000000099@g.us")
+        );
+        assert_eq!(
+            pics[0].attrs.get("id").map(|v| v.as_str()).as_deref(),
+            Some("photo-42")
+        );
+        assert_eq!(
+            pics[0].attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("image")
+        );
+        assert_eq!(
+            pics[0].attrs.get("query").map(|v| v.as_str()).as_deref(),
+            Some("url")
+        );
+    }
+
+    #[test]
+    fn test_get_group_profile_pictures_parse_response_with_status_codes() {
+        let group1: Jid = "120363000000000001@g.us".parse().unwrap();
+        let group2: Jid = "120363000000000002@g.us".parse().unwrap();
+        let group3: Jid = "120363000000000003@g.us".parse().unwrap();
+        let group4: Jid = "120363000000000004@g.us".parse().unwrap();
+
+        let spec = GetGroupProfilePicturesIq::new(&[
+            group1.clone(),
+            group2.clone(),
+            group3.clone(),
+            group4.clone(),
+        ]);
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("pictures")
+                .children([
+                    // 1. Success
+                    NodeBuilder::new("picture")
+                        .attr("sub_group_jid", "120363000000000001@g.us")
+                        .attr("id", "pic-1")
+                        .attr("url", "https://pps.whatsapp.net/pic1.jpg")
+                        .attr("direct_path", "/v/pic1.jpg")
+                        .build(),
+                    // 2. Unchanged (status 304)
+                    NodeBuilder::new("picture")
+                        .attr("sub_group_jid", "120363000000000002@g.us")
+                        .attr("status", "304")
+                        .build(),
+                    // 3. Not found (status 204)
+                    NodeBuilder::new("picture")
+                        .attr("sub_group_jid", "120363000000000003@g.us")
+                        .attr("status", "204")
+                        .build(),
+                    // 4. Server error (status 500)
+                    NodeBuilder::new("picture")
+                        .attr("parent_group_jid", "120363000000000004@g.us")
+                        .attr("status", "500")
+                        .build(),
+                ])
+                .build()])
+            .build();
+
+        let results = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(results.len(), 4);
+
+        // Group 1: Found
+        assert_eq!(results[0].group_jid, group1);
+        assert!(results[0].is_found());
+        assert!(!results[0].is_unchanged());
+        assert!(!results[0].is_not_found());
+        assert_eq!(
+            results[0].url.as_deref(),
+            Some("https://pps.whatsapp.net/pic1.jpg")
+        );
+        assert_eq!(results[0].photo_id.as_deref(), Some("pic-1"));
+        assert_eq!(
+            results[0].outcome(),
+            GroupProfilePictureOutcome::Found {
+                url: "https://pps.whatsapp.net/pic1.jpg".to_string(),
+                direct_path: Some("/v/pic1.jpg".to_string()),
+                photo_id: Some("pic-1".to_string()),
+            }
+        );
+
+        // Group 2: Unchanged (304)
+        assert_eq!(results[1].group_jid, group2);
+        assert!(results[1].is_unchanged());
+        assert_eq!(results[1].status, Some(304));
+        assert_eq!(results[1].outcome(), GroupProfilePictureOutcome::Unchanged);
+
+        // Group 3: NotFound (204)
+        assert_eq!(results[2].group_jid, group3);
+        assert!(results[2].is_not_found());
+        assert_eq!(results[2].status, Some(204));
+        assert_eq!(results[2].outcome(), GroupProfilePictureOutcome::NotFound);
+
+        // Group 4: Server Error (500)
+        assert_eq!(results[3].group_jid, group4);
+        assert_eq!(results[3].status, Some(500));
+        assert_eq!(
+            results[3].outcome(),
+            GroupProfilePictureOutcome::Error { code: 500 }
         );
     }
 }
