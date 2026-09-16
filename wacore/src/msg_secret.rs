@@ -10,7 +10,24 @@
 //!
 //! This module turns the three scattered decisions (capture / seed / prune)
 //! into one [`MsgSecretPolicy`] and bounds retention by the *parent message's*
-//! event time, per add-on kind, via [`expires_at`].
+//! event time, per add-on kind, via `expires_at`.
+//!
+//! # The store contract
+//!
+//! A row is keyed by `(chat, sender, msg_id)` and carries a 32-byte `secret`,
+//! an absolute `expires_at` deadline (`0` = never), and the parent's
+//! `message_ts` (`0` = unknown). `created_at` was removed: it had no reader
+//! once `expires_at` became the retention model, so it was pure write
+//! amplification. The SQLite backend keeps its expiry index partial over
+//! `expires_at <> 0`, so rows that can never expire cost nothing in it.
+//!
+//! # Pruning
+//!
+//! Retention fires from the keepalive's ~5-minute tick and once at startup
+//! (`Client::run_startup_maintenance`), both through the store's write permit.
+//! The startup pass is what reaps rows that expired while the process was
+//! closed, and covers an app that opens the store without a connection. `Full`
+//! is the only policy that does not prune.
 
 use std::time::Duration;
 
@@ -228,12 +245,81 @@ pub fn within_seed_horizon(
 #[async_trait]
 pub trait OriginalMessageResolver: Send + Sync {
     async fn resolve_msg_secret(&self, chat: &str, sender: &str, msg_id: &str) -> Option<[u8; 32]>;
+
+    /// Metadata-carrying variant of [`Self::resolve_msg_secret`].
+    ///
+    /// An app that stores its own messages also knows the parent's event time,
+    /// and returning it lets the receive path enforce the same
+    /// edit-processing window it applies to a row that came from the in-core
+    /// store (`editTs < message_ts + EDIT_PROCESSING_WINDOW_SECS`). Without it
+    /// the window cannot be checked and the core stays permissive, which
+    /// accepts a stale edit that WhatsApp Web would drop — accepting a
+    /// superseded edit's text is a correctness gap, not just a cosmetic one.
+    ///
+    /// Defaults to the plain secret with an unknown timestamp, so an existing
+    /// implementation keeps working and simply opts out of the window check.
+    /// Override this (not the trait) to supply the parent time.
+    async fn resolve_msg_secret_with_metadata(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> Option<ResolvedMessageSecret> {
+        self.resolve_msg_secret(chat, sender, msg_id)
+            .await
+            .map(ResolvedMessageSecret::without_timestamp)
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
 #[async_trait(?Send)]
 pub trait OriginalMessageResolver {
     async fn resolve_msg_secret(&self, chat: &str, sender: &str, msg_id: &str) -> Option<[u8; 32]>;
+
+    /// See the native trait's [`OriginalMessageResolver::resolve_msg_secret_with_metadata`].
+    async fn resolve_msg_secret_with_metadata(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> Option<ResolvedMessageSecret> {
+        self.resolve_msg_secret(chat, sender, msg_id)
+            .await
+            .map(ResolvedMessageSecret::without_timestamp)
+    }
+}
+
+/// A parent `messageSecret` recovered by an [`OriginalMessageResolver`],
+/// together with whatever the app knows about the parent's event time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedMessageSecret {
+    /// The 32-byte `messageSecret` of the parent message.
+    pub secret: [u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
+    /// Parent message event time (unix seconds), or `None` when the app does
+    /// not track it. `Some` enables the edit-processing window check; `None`
+    /// leaves it unenforced, the historical behaviour.
+    pub message_ts: Option<i64>,
+}
+
+impl ResolvedMessageSecret {
+    /// A secret with no known parent timestamp: the edit window is not checked.
+    pub const fn without_timestamp(
+        secret: [u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
+    ) -> Self {
+        Self {
+            secret,
+            message_ts: None,
+        }
+    }
+
+    /// The parent timestamp as the store reports it: `0` when unknown, so the
+    /// receive path can share one check for rows from either source.
+    pub const fn message_ts_or_zero(&self) -> i64 {
+        match self.message_ts {
+            Some(ts) => ts,
+            None => 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +327,68 @@ mod tests {
     use super::*;
 
     const DAY: i64 = 86_400;
+
+    /// The metadata variant defaults to the plain secret with no timestamp, so
+    /// a resolver that implements only `resolve_msg_secret` keeps working and
+    /// opts out of the edit-window check. This is the compatibility contract.
+    #[tokio::test]
+    async fn legacy_resolver_defaults_to_no_timestamp() {
+        struct Legacy;
+        #[async_trait]
+        impl OriginalMessageResolver for Legacy {
+            async fn resolve_msg_secret(&self, _: &str, _: &str, _: &str) -> Option<[u8; 32]> {
+                Some([0x11; 32])
+            }
+        }
+
+        let got = Legacy
+            .resolve_msg_secret_with_metadata("c", "s", "m")
+            .await
+            .expect("the legacy secret must surface");
+        assert_eq!(got.secret, [0x11; 32]);
+        assert_eq!(got.message_ts, None);
+        assert_eq!(
+            got.message_ts_or_zero(),
+            0,
+            "an absent timestamp reads as unknown for the shared window check"
+        );
+    }
+
+    /// A resolver that knows the parent time reports it, and a miss stays a miss.
+    #[tokio::test]
+    async fn metadata_resolver_reports_the_parent_time() {
+        struct WithTs;
+        #[async_trait]
+        impl OriginalMessageResolver for WithTs {
+            async fn resolve_msg_secret(&self, _: &str, _: &str, _: &str) -> Option<[u8; 32]> {
+                None
+            }
+            async fn resolve_msg_secret_with_metadata(
+                &self,
+                _: &str,
+                _: &str,
+                msg_id: &str,
+            ) -> Option<ResolvedMessageSecret> {
+                (msg_id == "hit").then_some(ResolvedMessageSecret {
+                    secret: [0x22; 32],
+                    message_ts: Some(1_700_000_000),
+                })
+            }
+        }
+
+        let hit = WithTs
+            .resolve_msg_secret_with_metadata("c", "s", "hit")
+            .await
+            .expect("hit");
+        assert_eq!(hit.secret, [0x22; 32]);
+        assert_eq!(hit.message_ts_or_zero(), 1_700_000_000);
+        assert!(
+            WithTs
+                .resolve_msg_secret_with_metadata("c", "s", "miss")
+                .await
+                .is_none()
+        );
+    }
 
     #[test]
     fn full_and_disabled_never_expire() {

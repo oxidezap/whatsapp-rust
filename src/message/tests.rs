@@ -10295,6 +10295,243 @@ async fn secret_edit_unknown_parent_ts_is_permissive() {
     );
 }
 
+/// Seed a secret only through the app resolver (`Disabled` persists nothing)
+/// and dispatch a secret-encrypted edit. Returns whether the edit dispatched.
+/// `resolver_ts` is the parent event time the resolver reports; `None` leaves
+/// the window unchecked, mirroring a legacy resolver.
+async fn run_secret_edit_via_resolver(
+    test_id: &str,
+    resolver_ts: Option<i64>,
+    edit_offset: i64,
+) -> bool {
+    use crate::cache_config::{CacheConfig, MsgSecretPolicy};
+
+    struct TimestampResolver {
+        chat: String,
+        parent_id: String,
+        secret: [u8; 32],
+        message_ts: Option<i64>,
+    }
+    #[async_trait::async_trait]
+    impl wacore::msg_secret::OriginalMessageResolver for TimestampResolver {
+        async fn resolve_msg_secret(
+            &self,
+            chat: &str,
+            sender: &str,
+            msg_id: &str,
+        ) -> Option<[u8; 32]> {
+            (chat == self.chat && sender == self.chat && msg_id == self.parent_id)
+                .then_some(self.secret)
+        }
+        async fn resolve_msg_secret_with_metadata(
+            &self,
+            chat: &str,
+            sender: &str,
+            msg_id: &str,
+        ) -> Option<wacore::msg_secret::ResolvedMessageSecret> {
+            self.resolve_msg_secret(chat, sender, msg_id)
+                .await
+                .map(|secret| wacore::msg_secret::ResolvedMessageSecret {
+                    secret,
+                    message_ts: self.message_ts,
+                })
+        }
+    }
+
+    let chat = "5511777776666@s.whatsapp.net";
+    let parent_id = "RESOLVER_TS_PARENT";
+    let edit_id = "RESOLVER_TS_EDIT";
+    let secret = [0x42u8; 32];
+    let parent_ts = resolver_ts.unwrap_or(1_700_000_000);
+
+    let resolver = Arc::new(TimestampResolver {
+        chat: chat.to_string(),
+        parent_id: parent_id.to_string(),
+        secret,
+        message_ts: resolver_ts,
+    });
+    let cfg = CacheConfig {
+        msg_secret_policy: MsgSecretPolicy::Disabled,
+        original_message_resolver: Some(resolver),
+        ..Default::default()
+    };
+    let client =
+        crate::test_utils::create_test_client_with_config(test_id, Arc::new(MockHttpClient), cfg)
+            .await;
+    seed_test_pn(&client).await;
+
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    client.subscribe_handler(collector.clone()).detach();
+
+    let info = Arc::new(MessageInfo {
+        id: edit_id.into(),
+        timestamp: chrono::DateTime::<chrono::Utc>::from_timestamp(parent_ts + edit_offset, 0)
+            .unwrap(),
+        source: crate::types::message::MessageSource {
+            chat: chat.parse().unwrap(),
+            sender: chat.parse().unwrap(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let target_key = wa::MessageKey {
+        remote_jid: Some(chat.to_string()),
+        from_me: Some(false),
+        id: Some(parent_id.to_string()),
+        participant: None,
+    };
+    let msg = encrypted_message_edit(target_key, chat, chat, parent_id, &secret, "edited", None);
+    client.dispatch_parsed_message(msg, &info, false).await;
+
+    collect_event(
+        &client,
+        collector,
+        |e| {
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == edit_id
+                    && legacy_edit_text(msg.as_ref()) == Some("edited")
+                    && msg.secret_encrypted_message.is_unset()
+            })
+        },
+        500,
+    )
+    .await
+    .is_some()
+}
+
+/// A resolver that reports the parent timestamp now feeds the same 20-minute
+/// edit window a store row does: an in-window edit applies.
+#[tokio::test]
+async fn secret_edit_via_resolver_with_timestamp_within_window_is_applied() {
+    assert!(
+        run_secret_edit_via_resolver(
+            "resolver_ts_in_window",
+            Some(1_700_000_000),
+            600 // 10 min, inside the 1200s window
+        )
+        .await,
+        "an in-window edit resolved through the app resolver must apply"
+    );
+}
+
+/// ...and an out-of-window one is dropped, which is the whole point of the
+/// timestamp: without it the resolver path could never enforce the window and
+/// would accept a stale edit WA Web drops.
+#[tokio::test]
+async fn secret_edit_via_resolver_with_timestamp_outside_window_is_dropped() {
+    assert!(
+        !run_secret_edit_via_resolver(
+            "resolver_ts_out_window",
+            Some(1_700_000_000),
+            1800 // 30 min, past the 1200s window
+        )
+        .await,
+        "an out-of-window edit resolved through the app resolver must be dropped"
+    );
+}
+
+/// A resolver that reports no timestamp stays permissive, so a legacy
+/// implementation is not silently turned into a drop.
+#[tokio::test]
+async fn secret_edit_via_resolver_without_timestamp_is_permissive() {
+    assert!(
+        run_secret_edit_via_resolver("resolver_ts_absent", None, 5_000_000).await,
+        "a resolver without a parent timestamp must keep the historical permissive behaviour"
+    );
+}
+
+/// A store hit must never reach the app resolver: the resolver is the last
+/// resort after both the in-core store and the LID/PN alternate miss, and
+/// consulting it on a hit would put an app callback on the hot decrypt path.
+#[tokio::test]
+async fn store_hit_does_not_consult_the_resolver() {
+    use crate::cache_config::{CacheConfig, MsgSecretPolicy};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingResolver {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl wacore::msg_secret::OriginalMessageResolver for CountingResolver {
+        async fn resolve_msg_secret(&self, _: &str, _: &str, _: &str) -> Option<[u8; 32]> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Some([0xFFu8; 32])
+        }
+    }
+
+    let chat = "5511777776666@s.whatsapp.net";
+    let parent_id = "STORE_HIT_PARENT";
+    let edit_id = "STORE_HIT_EDIT";
+    let secret = [0x33u8; 32];
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resolver = Arc::new(CountingResolver {
+        calls: Arc::clone(&calls),
+    });
+    // Managed persists the parent, so the store answers and the resolver must
+    // stay untouched.
+    let cfg = CacheConfig {
+        msg_secret_policy: MsgSecretPolicy::Managed,
+        original_message_resolver: Some(resolver),
+        ..Default::default()
+    };
+    let client = crate::test_utils::create_test_client_with_config(
+        "store_hit_resolver_skip",
+        Arc::new(MockHttpClient),
+        cfg,
+    )
+    .await;
+    seed_test_pn(&client).await;
+
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    client.subscribe_handler(collector.clone()).detach();
+
+    client
+        .persistence_manager
+        .backend()
+        .put_msg_secret(chat, chat, parent_id, &secret)
+        .await
+        .unwrap();
+
+    let info = Arc::new(MessageInfo {
+        id: edit_id.into(),
+        source: crate::types::message::MessageSource {
+            chat: chat.parse().unwrap(),
+            sender: chat.parse().unwrap(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let target_key = wa::MessageKey {
+        remote_jid: Some(chat.to_string()),
+        from_me: Some(false),
+        id: Some(parent_id.to_string()),
+        participant: None,
+    };
+    let msg = encrypted_message_edit(target_key, chat, chat, parent_id, &secret, "edited", None);
+    client.dispatch_parsed_message(msg, &info, false).await;
+
+    assert!(
+        collect_event(
+            &client,
+            collector,
+            |e| e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == edit_id && legacy_edit_text(msg.as_ref()) == Some("edited")
+            }),
+            500,
+        )
+        .await
+        .is_some(),
+        "the store-resolved edit must dispatch"
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "a store hit must not reach the app resolver"
+    );
+}
+
 #[tokio::test]
 async fn secret_encrypted_edit_decrypts_via_resolver_when_store_empty() {
     use crate::cache_config::{CacheConfig, MsgSecretPolicy};

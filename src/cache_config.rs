@@ -247,11 +247,21 @@ pub struct CacheConfig {
 
     // --- MsgSecret retention ---
     /// How the per-message `messageSecret` store is managed (capture / seed /
-    /// prune). Default [`MsgSecretPolicy::Managed`] bounds DB growth: it seeds
-    /// only the still-relevant slice of history and prunes by a per-add-on-kind
-    /// event-time horizon. Set [`MsgSecretPolicy::Full`] to keep everything
-    /// forever, or [`MsgSecretPolicy::Disabled`] to persist nothing and delegate
-    /// to [`original_message_resolver`].
+    /// prune). The four tiers:
+    ///
+    /// * [`MsgSecretPolicy::Managed`] (default) — capture live secrets, seed
+    ///   only the still-relevant slice of history, and prune by a per-kind
+    ///   event-time horizon. This is the bounded default.
+    /// * [`MsgSecretPolicy::BotOnly`] — pre-#665 behavior: capture/seed only
+    ///   secrets in bot contexts, still pruned by the same horizons.
+    /// * [`MsgSecretPolicy::Full`] — capture and seed everything, never prune
+    ///   (`expires_at = 0` on every row). The store keeps growing; choose it
+    ///   only when the app needs every add-on to decrypt forever.
+    /// * [`MsgSecretPolicy::Disabled`] — persist nothing in core. Add-on
+    ///   decryption relies entirely on [`original_message_resolver`].
+    ///
+    /// `Disabled` still prunes legacy rows a prior policy left behind: it
+    /// writes none, but a policy change must not strand the old ones forever.
     ///
     /// [`original_message_resolver`]: CacheConfig::original_message_resolver
     pub msg_secret_policy: MsgSecretPolicy,
@@ -283,6 +293,13 @@ pub struct CacheConfig {
     /// is absent from the store (and its LID/PN alternates). Lets an app that
     /// keeps its own message store own secret retention; required for the
     /// `Disabled` policy to decrypt anything beyond what it has seen live.
+    ///
+    /// An implementation that also knows the parent message's event time should
+    /// override [`OriginalMessageResolver::resolve_msg_secret_with_metadata`],
+    /// which carries the timestamp and lets the receive path enforce the
+    /// 20-minute edit-processing window the same way a store row does. A
+    /// resolver that implements only `resolve_msg_secret` keeps compiling and
+    /// keeps the historical permissive behavior (no window check).
     pub original_message_resolver: Option<Arc<dyn OriginalMessageResolver>>,
     /// Bound on each [`original_message_resolver`] call. The resolver runs
     /// inside the per-chat receive lane, so a slow callback would stall that
