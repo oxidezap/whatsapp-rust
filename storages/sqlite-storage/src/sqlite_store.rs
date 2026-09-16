@@ -491,6 +491,11 @@ pub struct SqliteStore {
     pub(crate) snapshot_safe: bool,
     pub(crate) database_path: String,
     pub(crate) commit_barrier: Option<CommitBarrierHook>,
+    /// Opt-in reclaim of free pages during maintenance. Only acts when the
+    /// database is already in `auto_vacuum = INCREMENTAL`; see
+    /// [`SqliteStoreConfig::incremental_vacuum`].
+    incremental_vacuum: bool,
+    incremental_vacuum_pages: u32,
     device_id: i32,
 }
 
@@ -659,6 +664,27 @@ pub struct SqliteStoreConfig {
     /// and must not re-enter this store or a [`SharedSqlite`](crate::SharedSqlite)
     /// handle, which would wait for the permit it already owns.
     pub commit_barrier: Option<CommitBarrierHook>,
+    /// Opt-in: return free pages to the filesystem during
+    /// [`DeviceStore::maintenance`](wacore::store::traits::DeviceStore::maintenance),
+    /// via `PRAGMA incremental_vacuum`.
+    ///
+    /// Off by default, and **never** performs a full reorganization. It acts
+    /// only when the database is already in `auto_vacuum = INCREMENTAL` mode,
+    /// either because a previous run configured it or because this store opened
+    /// a brand-new empty file and enabled it there (which is metadata-only, no
+    /// rewrite). On a database still in the default mode this flag does
+    /// nothing: switching modes requires a full `VACUUM`, which this headless
+    /// library must not trigger on a file an embedder may be sharing (the same
+    /// file may host rowid or FTS `external-content` tables whose stable
+    /// rowids a reorganization invalidates).
+    ///
+    /// Each maintenance pass reclaims at most [`Self::incremental_vacuum_pages`]
+    /// pages, so the work stays bounded and off the hot path.
+    pub incremental_vacuum: bool,
+    /// Pages reclaimed per maintenance pass when [`Self::incremental_vacuum`] is
+    /// set. Default 400 (~1.6 MiB at a 4 KiB page size). `0` disables the pass
+    /// while leaving the mode untouched.
+    pub incremental_vacuum_pages: u32,
 }
 
 impl Default for SqliteStoreConfig {
@@ -678,6 +704,8 @@ impl Default for SqliteStoreConfig {
             thread_pool: None,
             connection_init: None,
             commit_barrier: None,
+            incremental_vacuum: false,
+            incremental_vacuum_pages: 400,
         }
     }
 }
@@ -737,6 +765,23 @@ impl SqliteStoreConfig {
     /// backend before the write operation returns.
     pub fn with_commit_barrier(mut self, barrier: CommitBarrierHook) -> Self {
         self.commit_barrier = Some(barrier);
+        self
+    }
+
+    /// Opt into returning free pages to the filesystem during maintenance.
+    ///
+    /// `pages` is the per-pass batch. Zero leaves the option off entirely, so
+    /// it neither reclaims nor switches a fresh database into
+    /// `auto_vacuum = INCREMENTAL`; the latter is a one-way mode change outside
+    /// a full `VACUUM`, and enabling it with nothing ever reclaimed would only
+    /// add pointer-map overhead. Enabling this never forces a reorganization:
+    /// `auto_vacuum` is set only when the store opens a brand-new empty file,
+    /// and the maintenance pass reclaims only when the database is already in
+    /// that mode. See [`SqliteStoreConfig::incremental_vacuum`] for why a full
+    /// `VACUUM` is not run.
+    pub fn with_incremental_vacuum(mut self, pages: u32) -> Self {
+        self.incremental_vacuum = pages > 0;
+        self.incremental_vacuum_pages = pages;
         self
     }
 }
@@ -1006,6 +1051,7 @@ impl SqliteStore {
         // pool AND run migrations inside one blocking task to keep the async runtime
         // unblocked (matters when many stores open at once).
         let db_url = database_url.to_string();
+        let want_incremental_vacuum = config.incremental_vacuum;
         let (pool, journal_mode) = crate::pool::spawn_blocking(
             move || -> std::result::Result<(SqlitePool, String), StoreError> {
                 // test_on_check_out(false): a local SQLite file connection doesn't
@@ -1022,6 +1068,32 @@ impl SqliteStore {
                 let mut conn = pool
                     .get()
                     .map_err(|e| StoreError::Connection(Box::new(e)))?;
+
+                // auto_vacuum only takes effect if set before the database has
+                // any page at all, and on a populated database SQLite silently
+                // ignores the pragma (the only way to change it later is a full
+                // VACUUM, which this library must not run on a file it may be
+                // sharing). It also has to be set BEFORE `journal_mode = WAL`,
+                // which writes page 1 and would make the file non-empty. So
+                // this enables INCREMENTAL only on a brand-new, still-empty
+                // file; an existing database is left exactly as it was, and the
+                // maintenance pass reacts to whatever mode it is really in.
+                if want_incremental_vacuum {
+                    #[derive(diesel::QueryableByName)]
+                    struct PageCount {
+                        #[diesel(sql_type = diesel::sql_types::BigInt)]
+                        page_count: i64,
+                    }
+                    let page_count: PageCount = diesel::sql_query("PRAGMA page_count;")
+                        .get_result(&mut *conn)
+                        .map_err(|e| StoreError::Database(Box::new(e)))?;
+                    if page_count.page_count == 0 {
+                        diesel::sql_query("PRAGMA auto_vacuum = INCREMENTAL;")
+                            .execute(&mut *conn)
+                            .map_err(|e| StoreError::Database(Box::new(e)))?;
+                    }
+                }
+
                 // The PRAGMA reports the mode actually in effect, which is not
                 // always the one asked for — an in-memory database has no WAL
                 // to switch to and stays on its own journal.
@@ -1034,6 +1106,7 @@ impl SqliteStore {
                     .get_result::<JournalMode>(&mut *conn)
                     .map_err(|e| StoreError::Database(Box::new(e)))?
                     .journal_mode;
+
                 conn.run_pending_migrations(MIGRATIONS)
                     .map_err(StoreError::Migration)?;
                 // Returned to the pool before the pool is: on the web the
@@ -1110,6 +1183,8 @@ impl SqliteStore {
             snapshot_safe: declined.is_none(),
             database_path,
             commit_barrier: config.commit_barrier,
+            incremental_vacuum: config.incremental_vacuum,
+            incremental_vacuum_pages: config.incremental_vacuum_pages,
             device_id,
         })
     }
@@ -1185,6 +1260,8 @@ impl SqliteStore {
             snapshot_safe: self.snapshot_safe,
             database_path: self.database_path.clone(),
             commit_barrier: self.commit_barrier.clone(),
+            incremental_vacuum: self.incremental_vacuum,
+            incremental_vacuum_pages: self.incremental_vacuum_pages,
             device_id,
         }
     }
@@ -4339,7 +4416,6 @@ impl MsgSecretStore for SqliteStore {
         // Vec to Arc<[T]> allocates a second full-size slice and moves every
         // item, which is especially costly for large seed batches.
         let entries = Arc::new(entries);
-        let now = wacore::time::now_secs();
         self.with_retry("put_msg_secrets", || {
             let entries = Arc::clone(&entries);
             Box::new(move |conn: &mut SqliteConnection| {
@@ -4358,7 +4434,6 @@ impl MsgSecretStore for SqliteStore {
                                     msg_secrets::msg_id.eq(entry.msg_id.as_ref()),
                                     msg_secrets::secret.eq(entry.secret.as_ref()),
                                     msg_secrets::device_id.eq(device_id),
-                                    msg_secrets::created_at.eq(now),
                                     msg_secrets::expires_at.eq(entry.expires_at),
                                     msg_secrets::message_ts.eq(entry.message_ts),
                                 )
@@ -4375,7 +4450,6 @@ impl MsgSecretStore for SqliteStore {
                             .do_update()
                             .set((
                                 msg_secrets::secret.eq(excluded(msg_secrets::secret)),
-                                msg_secrets::created_at.eq(now),
                                 // Keep the later deadline; 0 (never) wins. Mirrors
                                 // merge_msg_secret_expiry so a redelivery or edit
                                 // re-persist never shortens an existing window.
@@ -4567,6 +4641,9 @@ impl DeviceStore for SqliteStore {
     }
 
     async fn maintenance(&self) -> Result<()> {
+        let reclaim_pages = self
+            .incremental_vacuum
+            .then_some(self.incremental_vacuum_pages);
         self.with_retry("maintenance", || {
             Box::new(move |conn: &mut SqliteConnection| {
                 // Caps how many index rows each ANALYZE samples. Without it the
@@ -4596,6 +4673,26 @@ impl DeviceStore for SqliteStore {
                     && !is_retriable_sqlite_error(&e)
                 {
                     return Err(e);
+                }
+
+                // Opt-in and mode-gated: reclaim a bounded batch of free pages
+                // only when the database is actually in INCREMENTAL auto_vacuum.
+                // On a default-mode database this is a cheap read of the mode
+                // and no write, so enabling the option can never trigger the
+                // full reorganization this library refuses to run.
+                if let Some(pages) = reclaim_pages {
+                    #[derive(diesel::QueryableByName)]
+                    struct AutoVacuum {
+                        #[diesel(sql_type = diesel::sql_types::BigInt)]
+                        auto_vacuum: i64,
+                    }
+                    let mode: AutoVacuum =
+                        diesel::sql_query("PRAGMA auto_vacuum;").get_result(conn)?;
+                    // 2 = INCREMENTAL.
+                    if mode.auto_vacuum == 2 && pages > 0 {
+                        diesel::sql_query(format!("PRAGMA incremental_vacuum({pages});"))
+                            .execute(conn)?;
+                    }
                 }
                 Ok(())
             })
@@ -5023,6 +5120,241 @@ mod tests {
         );
     }
 
+    /// The `created_at` column and the non-partial expiry index are gone, and
+    /// the partial index only covers rows that can actually expire.
+    ///
+    /// The schema is what ships on a fresh database (the migrations ran at
+    /// open); the query plan is the second half of the contract, because an
+    /// index the optimizer ignores would be dead weight the next writer still
+    /// pays for.
+    #[tokio::test]
+    async fn msg_secrets_drops_created_at_and_uses_a_partial_expiry_index() {
+        let store = create_test_store().await;
+        let mut conn = store.pool.get().expect("a connection");
+
+        let columns: String = diesel::dsl::sql::<diesel::sql_types::Text>(
+            "SELECT group_concat(name, ',') FROM pragma_table_info('msg_secrets') ORDER BY cid",
+        )
+        .get_result(&mut *conn)
+        .expect("read columns");
+        assert!(
+            !columns.split(',').any(|c| c == "created_at"),
+            "created_at must be gone from the schema, got {columns:?}"
+        );
+
+        // The index exists, is partial, and its predicate is exactly the
+        // `expires_at <> 0` term the prune relies on.
+        let ddl: String = diesel::dsl::sql::<diesel::sql_types::Text>(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_msg_secrets_expires'",
+        )
+        .get_result(&mut *conn)
+        .expect("read index ddl");
+        assert!(
+            ddl.to_ascii_uppercase().contains("WHERE"),
+            "the expiry index must be partial, got {ddl}"
+        );
+
+        // The plan still localizes the range scan to one device and deadline
+        // range: `SEARCH ... USING INDEX idx_msg_secrets_expires`.
+        let plan = explain_query_plan(
+            &mut conn,
+            "DELETE FROM msg_secrets WHERE device_id = 1 AND expires_at <> 0 AND expires_at <= 1",
+        );
+        assert!(
+            plan.contains("idx_msg_secrets_expires") && plan.contains("SEARCH"),
+            "the prune must use the expiry index, got {plan}"
+        );
+
+        // The primary-key lookup is the one hot read and must keep using the
+        // autoindex, not the expiry index.
+        let lookup = explain_query_plan(
+            &mut conn,
+            "SELECT secret, message_ts FROM msg_secrets \
+             WHERE chat = 'c' AND sender = 's' AND msg_id = 'M' AND device_id = 1",
+        );
+        assert!(
+            lookup.contains("sqlite_autoindex_msg_secrets_1"),
+            "the secret lookup must use the composite primary key, got {lookup}"
+        );
+    }
+
+    /// Render `EXPLAIN QUERY PLAN` as one string, for shape assertions.
+    fn explain_query_plan(conn: &mut SqliteConnection, sql: &str) -> String {
+        #[derive(diesel::QueryableByName)]
+        struct PlanRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            detail: String,
+        }
+        diesel::sql_query(format!("EXPLAIN QUERY PLAN {sql}"))
+            .load::<PlanRow>(conn)
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.detail)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// The upgrade path from a database that still carries `created_at` and the
+    /// non-partial expiry index: the column is dropped, existing rows keep their
+    /// secret, key, deadline and parent time, and the index is rebuilt partial.
+    ///
+    /// Run against the migration file itself so the SQL under test cannot drift
+    /// from the SQL that ships.
+    #[tokio::test]
+    async fn the_msg_secret_migration_preserves_rows_and_rebuilds_the_index() {
+        use diesel::connection::SimpleConnection;
+
+        const DROP_COLUMN: &str =
+            include_str!("../migrations/2026-09-16-000000_drop_msg_secrets_created_at/up.sql");
+        const PARTIAL_INDEX: &str =
+            include_str!("../migrations/2026-09-16-000001_msg_secrets_partial_expiry_index/up.sql");
+
+        let store = create_test_store().await;
+        let mut conn = store.pool.get().expect("a connection");
+
+        // The pre-migration shape, written by hand, including the index the
+        // migration has to replace.
+        conn.batch_execute(
+            "DROP TABLE msg_secrets;
+             CREATE TABLE msg_secrets (
+                 chat TEXT NOT NULL,
+                 sender TEXT NOT NULL,
+                 msg_id TEXT NOT NULL,
+                 secret BLOB NOT NULL,
+                 device_id INTEGER NOT NULL DEFAULT 1,
+                 created_at INTEGER NOT NULL DEFAULT 0,
+                 expires_at INTEGER NOT NULL DEFAULT 0,
+                 message_ts INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (chat, sender, msg_id, device_id));
+             CREATE INDEX idx_msg_secrets_expires ON msg_secrets (device_id, expires_at);
+             INSERT INTO msg_secrets VALUES
+                 ('c', 's', 'NEVER', x'07', 1, 100, 0, 0),
+                 ('c', 's', 'PAST',  x'08', 1, 100, 50, 1700000000),
+                 ('c', 's', 'FUTURE', x'09', 2, 100, 9999999999, 1700000001);",
+        )
+        .expect("seed the pre-migration shape");
+
+        conn.batch_execute(DROP_COLUMN).expect("drop column");
+        conn.batch_execute(PARTIAL_INDEX).expect("partial index");
+
+        let count = |conn: &mut _, sql: &str| -> i64 {
+            diesel::dsl::sql::<diesel::sql_types::BigInt>(sql)
+                .get_result::<i64>(conn)
+                .expect("one row")
+        };
+        assert_eq!(
+            count(&mut *conn, "SELECT count(*) FROM msg_secrets"),
+            3,
+            "the migration must not drop rows"
+        );
+        assert_eq!(
+            count(
+                &mut *conn,
+                "SELECT count(*) FROM pragma_table_info('msg_secrets') WHERE name = 'created_at'"
+            ),
+            0,
+            "created_at must be dropped"
+        );
+        let ddl: String = diesel::dsl::sql::<diesel::sql_types::Text>(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_msg_secrets_expires'",
+        )
+        .get_result(&mut *conn)
+        .expect("index ddl");
+        assert!(
+            ddl.to_ascii_uppercase().contains("WHERE"),
+            "the rebuilt index must be partial, got {ddl}"
+        );
+        // A preserved row still round-trips through the real accessor.
+        assert_eq!(
+            count(
+                &mut *conn,
+                "SELECT message_ts FROM msg_secrets WHERE msg_id = 'FUTURE'"
+            ),
+            1700000001,
+            "message_ts must survive the column drop"
+        );
+    }
+
+    /// The upgrade as diesel would actually run it: a database that recorded
+    /// every migration but this one, carrying the old table shape.
+    ///
+    /// The old shape is reconstructed on a freshly migrated file by adding the
+    /// column back and rebuilding the old index, then deleting this migration's
+    /// row from the ledger. `SqliteStore::new` then runs it for real.
+    #[tokio::test]
+    async fn reopening_an_old_database_runs_the_migration_and_upgrades_it() {
+        use diesel::connection::SimpleConnection;
+
+        let db = read_routing_tests::TempDb::new("upgrade_old_db");
+        let url = db.url();
+        let store = SqliteStore::new(&url).await.expect("fresh store");
+        store
+            .put_msg_secrets(vec![MsgSecretEntry {
+                chat: Arc::from("19045550180@s.whatsapp.net"),
+                sender: Arc::from("19045550180@s.whatsapp.net"),
+                msg_id: Arc::from("OLD_ROW"),
+                secret: [0x42; wacore::reporting_token::MESSAGE_SECRET_SIZE],
+                expires_at: 0,
+                message_ts: 1_700_000_000,
+            }])
+            .await
+            .expect("seed a row through the new schema");
+        drop(store);
+
+        // Put the file back in the shape a pre-migration process left it in.
+        {
+            let mut conn = SqliteConnection::establish(&url).expect("reopen raw");
+            conn.batch_execute(
+                "ALTER TABLE msg_secrets ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
+                 DROP INDEX idx_msg_secrets_expires;
+                 CREATE INDEX idx_msg_secrets_expires ON msg_secrets (device_id, expires_at);
+                 DELETE FROM __diesel_schema_migrations WHERE version IN ('20260916000000', '20260916000001');",
+            )
+            .expect("restore the old shape");
+        }
+
+        // Reopening runs the pending migration for real.
+        let upgraded = SqliteStore::new(&url)
+            .await
+            .expect("the store must migrate an old database");
+
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::Binary)]
+            secret: Vec<u8>,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            message_ts: i64,
+        }
+        let mut conn = upgraded.pool.get().expect("connection");
+        let row: Option<Row> = diesel::sql_query(
+            "SELECT secret, message_ts FROM msg_secrets WHERE msg_id = 'OLD_ROW'",
+        )
+        .get_result(&mut *conn)
+        .optional()
+        .expect("read the surviving row");
+        let Row { secret, message_ts } =
+            row.expect("the pre-existing row must survive the upgrade");
+        assert_eq!(secret, vec![0x42; 32], "the secret must be preserved");
+        assert_eq!(message_ts, 1_700_000_000);
+
+        let has_created_at: i64 = diesel::dsl::sql::<diesel::sql_types::BigInt>(
+            "SELECT count(*) FROM pragma_table_info('msg_secrets') WHERE name = 'created_at'",
+        )
+        .get_result(&mut *conn)
+        .expect("column probe");
+        assert_eq!(has_created_at, 0, "created_at must be dropped on upgrade");
+
+        let ddl: String = diesel::dsl::sql::<diesel::sql_types::Text>(
+            "SELECT sql FROM sqlite_master WHERE name = 'idx_msg_secrets_expires'",
+        )
+        .get_result(&mut *conn)
+        .expect("index ddl");
+        assert!(
+            ddl.to_ascii_uppercase().contains("WHERE"),
+            "the index must be rebuilt partial, got {ddl}"
+        );
+    }
+
     /// `delete_version` is how a rebuild is expressed, so what it does to a row
     /// that is not there, and to another device's row, is load-bearing.
     #[tokio::test]
@@ -5109,6 +5441,8 @@ mod tests {
             )),
             connection_init: None,
             commit_barrier: None,
+            incremental_vacuum: false,
+            incremental_vacuum_pages: 400,
         };
         let store = SqliteStore::with_config(&db_name, config)
             .await
@@ -8151,6 +8485,61 @@ mod share_for_device_tests {
         );
     }
 
+    /// The secret prune is scoped by device. The partial expiry index leads
+    /// with `device_id`, so a sweep through one sibling must not touch another
+    /// account's expired rows even when both hold the same key.
+    #[tokio::test]
+    async fn the_secret_prune_is_scoped_to_one_device() {
+        let db = TempDb::new("share_secret_prune");
+        let device_1 = base_store(&db).await;
+        let device_2 = device_1.share_for_device(2);
+        let now = wacore::time::now_secs();
+
+        for (store, marker) in [(&device_1, 1u8), (&device_2, 2u8)] {
+            store
+                .put_msg_secrets(vec![MsgSecretEntry {
+                    chat: Arc::from("19045550180@s.whatsapp.net"),
+                    sender: Arc::from("19045550180@s.whatsapp.net"),
+                    msg_id: Arc::from("SHARED_EXPIRED"),
+                    secret: [marker; wacore::reporting_token::MESSAGE_SECRET_SIZE],
+                    expires_at: now - 86_400,
+                    message_ts: 0,
+                }])
+                .await
+                .expect("seed both devices");
+        }
+
+        let removed = device_1
+            .delete_expired_msg_secrets(now)
+            .await
+            .expect("prune device 1");
+        assert_eq!(removed, 1, "only device 1's row is in scope");
+        assert!(
+            device_1
+                .get_msg_secret(
+                    "19045550180@s.whatsapp.net",
+                    "19045550180@s.whatsapp.net",
+                    "SHARED_EXPIRED"
+                )
+                .await
+                .expect("lookup")
+                .is_none(),
+            "device 1's row is gone"
+        );
+        assert!(
+            device_2
+                .get_msg_secret(
+                    "19045550180@s.whatsapp.net",
+                    "19045550180@s.whatsapp.net",
+                    "SHARED_EXPIRED"
+                )
+                .await
+                .expect("lookup")
+                .is_some(),
+            "the sibling device's row must survive another device's sweep"
+        );
+    }
+
     /// The whole point of the method, asserted the only way that proves it:
     /// by counting connections. A fleet of handles opens one; a fleet of
     /// stores opens one each.
@@ -8747,6 +9136,121 @@ mod maintenance_tests {
         DeviceStore::maintenance(&store)
             .await
             .expect("maintenance succeeds on a fresh store");
+    }
+
+    fn auto_vacuum_mode(store: &SqliteStore) -> i64 {
+        #[derive(diesel::QueryableByName)]
+        struct Mode {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            auto_vacuum: i64,
+        }
+        let mut conn = store.pool.get().expect("connection");
+        diesel::sql_query("PRAGMA auto_vacuum;")
+            .get_result::<Mode>(&mut *conn)
+            .expect("read auto_vacuum")
+            .auto_vacuum
+    }
+
+    /// The opt-in reclaim must never turn into a reorganization:
+    /// - it is off by default, so the mode stays NONE;
+    /// - enabled on a fresh empty file, it sets INCREMENTAL before any table
+    ///   exists (allowed, no rewrite) and maintenance reclaims without error;
+    /// - enabled on an already-populated database it is a no-op, because SQLite
+    ///   ignores `auto_vacuum` after the first table and this library must not
+    ///   run the `VACUUM` that would otherwise be required.
+    #[tokio::test]
+    async fn incremental_vacuum_is_opt_in_and_never_reorganizes_an_existing_db() {
+        // Default: off.
+        let db = TempDb::new("maintenance_av_default");
+        let store = SqliteStore::new(&db.url()).await.expect("store opens");
+        assert_eq!(
+            auto_vacuum_mode(&store),
+            0,
+            "default leaves auto_vacuum off"
+        );
+        DeviceStore::maintenance(&store).await.expect("maintenance");
+        drop(store);
+
+        // Fresh file + opt-in: the mode is set, and the pass reclaims pages
+        // without error.
+        let db = TempDb::new("maintenance_av_fresh");
+        let cfg = SqliteStoreConfig::default().with_incremental_vacuum(100);
+        let store = SqliteStore::with_config(&db.url(), cfg)
+            .await
+            .expect("store opens");
+        assert_eq!(
+            auto_vacuum_mode(&store),
+            2,
+            "a fresh file can be put in INCREMENTAL mode"
+        );
+        for i in 0..200u64 {
+            store
+                .put_msg_secrets(vec![MsgSecretEntry {
+                    chat: Arc::from(format!("1904555{:04}@s.whatsapp.net", i % 50).as_str()),
+                    sender: Arc::from("100000000000002@lid"),
+                    msg_id: Arc::from(format!("AV{i:016X}").as_str()),
+                    secret: [0x7A; wacore::reporting_token::MESSAGE_SECRET_SIZE],
+                    expires_at: if i % 2 == 0 { 0 } else { 1 },
+                    message_ts: 1_700_000_000,
+                }])
+                .await
+                .expect("seed");
+        }
+        // Delete the expired half so there are free pages to reclaim.
+        store
+            .delete_expired_msg_secrets(wacore::time::now_secs())
+            .await
+            .expect("prune");
+        DeviceStore::maintenance(&store)
+            .await
+            .expect("maintenance reclaims without reorganizing");
+        drop(store);
+
+        // Populated database + opt-in: SQLite ignores the mode change, so the
+        // store must leave it at NONE and simply not reclaim. No VACUUM.
+        let db = TempDb::new("maintenance_av_populated");
+        let plain = SqliteStore::new(&db.url()).await.expect("store opens");
+        plain
+            .put_msg_secret("c", "s", "M", &[1u8; 32])
+            .await
+            .expect("populate");
+        drop(plain);
+
+        let cfg = SqliteStoreConfig::default().with_incremental_vacuum(100);
+        let reopened = SqliteStore::with_config(&db.url(), cfg)
+            .await
+            .expect("reopen");
+        assert_eq!(
+            auto_vacuum_mode(&reopened),
+            0,
+            "an existing database must not be switched out of NONE"
+        );
+        DeviceStore::maintenance(&reopened)
+            .await
+            .expect("maintenance on a NONE-mode database is a no-op, not an error");
+        drop(reopened);
+
+        // `with_incremental_vacuum(0)` disables the option rather than enabling
+        // a pass that reclaims nothing: switching a fresh file into INCREMENTAL
+        // is one-way outside a VACUUM, so it must not happen with no reclaim to
+        // justify the pointer-map overhead.
+        let cfg = SqliteStoreConfig::default().with_incremental_vacuum(0);
+        assert!(
+            !cfg.incremental_vacuum,
+            "a zero batch leaves the option off"
+        );
+        let db = TempDb::new("maintenance_av_zero");
+        let zero = SqliteStore::with_config(&db.url(), cfg)
+            .await
+            .expect("store opens");
+        assert_eq!(
+            auto_vacuum_mode(&zero),
+            0,
+            "a zero batch must not switch a fresh file into INCREMENTAL"
+        );
+        DeviceStore::maintenance(&zero)
+            .await
+            .expect("maintenance with the option off is a no-op");
     }
 
     /// A single large transaction is what leaves a WAL permanently big, so this

@@ -743,6 +743,12 @@ impl Client {
                 }
             }))
             .detach();
+        // Reap rows that expired while the process was closed, without waiting
+        // for a connection to reach the keepalive tick. Detached and behind the
+        // store's write permit, so it neither delays construction nor races the
+        // migrations the store already ran before this client existed. See
+        // `Client::run_startup_maintenance`.
+        self.run_startup_maintenance();
     }
 
     /// Run the session: connect, read the socket until the connection ends,

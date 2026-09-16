@@ -252,8 +252,11 @@ impl Client {
             },
         };
         // On a total store miss, ask the app-supplied resolver (if any) for the
-        // parent secret. This is what lets the Disabled policy still decrypt. The
-        // resolver carries no parent timestamp, so parent_ts stays 0 (unknown).
+        // parent secret. This is what lets the Disabled policy still decrypt. A
+        // resolver that reports the parent's event time feeds it into the same
+        // edit-window check a store row uses; a legacy resolver that reports no
+        // timestamp yields `0` here, which the check reads as unknown and
+        // leaves permissive.
         let (secret, parent_ts) = match store_secret {
             Some((secret, ts)) => (secret, ts),
             None => {
@@ -269,7 +272,7 @@ impl Client {
                     )
                     .await
                 {
-                    Some(secret) => (secret, 0),
+                    Some(found) => (found.secret.to_vec(), found.message_ts_or_zero()),
                     None => return None,
                 }
             }
@@ -671,7 +674,7 @@ impl Client {
                     )
                     .await
                 {
-                    Some(s) => s,
+                    Some(found) => found.secret.to_vec(),
                     None => {
                         // For a group bot invocation initiated by our PRIMARY
                         // device, the messageSecret lives in the bot-addressed
@@ -991,6 +994,7 @@ impl Client {
                     target_id,
                 )
                 .await
+                .map(|found| found.secret.to_vec())
                 .ok_or_else(|| {
                     SendError::InvalidRequest(format!(
                         "no messageSecret stored for target {target_id}; the parent \
@@ -1047,20 +1051,22 @@ impl Client {
         primary_sender: &str,
         alternate_sender: Option<&str>,
         msg_id: &str,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<wacore::msg_secret::ResolvedMessageSecret> {
         let resolver = self.cache_config.original_message_resolver.as_ref()?;
         let lookup = async {
-            if let Some(secret) = resolver
-                .resolve_msg_secret(chat, primary_sender, msg_id)
+            if let Some(found) = resolver
+                .resolve_msg_secret_with_metadata(chat, primary_sender, msg_id)
                 .await
             {
-                return Some(secret);
+                return Some(found);
             }
             if let Some(alt) = alternate_sender
                 && alt != primary_sender
-                && let Some(secret) = resolver.resolve_msg_secret(chat, alt, msg_id).await
+                && let Some(found) = resolver
+                    .resolve_msg_secret_with_metadata(chat, alt, msg_id)
+                    .await
             {
-                return Some(secret);
+                return Some(found);
             }
             None
         };
@@ -1071,7 +1077,7 @@ impl Client {
         )
         .await
         {
-            Ok(Some(secret)) => Some(secret.to_vec()),
+            Ok(Some(found)) => Some(found),
             Ok(None) => None,
             Err(_) => {
                 log::warn!("[msg:{msg_id}] original_message_resolver timed out");

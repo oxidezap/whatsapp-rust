@@ -1,0 +1,11 @@
+-- Drop `created_at`. It was written on every insert and refreshed on every
+-- conflict-update, but the retention model moved to the absolute `expires_at`
+-- deadline (see 2026-05-31-000000_msg_secret_expires_at), and the functional
+-- reads use only `secret`, `message_ts`, `expires_at` and the key columns. The
+-- only reader `created_at` ever had -- the one-shot backfill of `expires_at`
+-- during that migration -- has already run by the time this one does, so
+-- nothing reads it again. Removing it takes the 8-byte column plus its
+-- alignment slack out of every row and out of the insert/upsert column lists,
+-- so a busy account stops paying for it on every write. The old
+-- `idx_msg_secrets_created` index was already dropped there.
+ALTER TABLE msg_secrets DROP COLUMN created_at;

@@ -5516,6 +5516,147 @@ async fn cache_maintenance_sweeps_expired_entries() {
     assert_eq!(client.memory_report().await.dispatched_messages, 0);
 }
 
+/// Startup reaps what expired while the process was closed, without waiting for
+/// a connection to reach the keepalive tick. `expires_at = 0` (never) and
+/// future deadlines must survive.
+#[tokio::test]
+async fn startup_maintenance_sweeps_expired_secrets_without_a_connection() {
+    use wacore::store::traits::MsgSecretEntry;
+
+    let now = wacore::time::now_secs();
+    let backend = crate::test_utils::create_test_backend().await;
+    backend
+        .put_msg_secrets(vec![
+            MsgSecretEntry {
+                chat: "19045550180@s.whatsapp.net".into(),
+                sender: "19045550180@s.whatsapp.net".into(),
+                msg_id: "STARTUP_NEVER".into(),
+                secret: [1u8; 32],
+                expires_at: 0,
+                message_ts: 0,
+            },
+            MsgSecretEntry {
+                chat: "19045550180@s.whatsapp.net".into(),
+                sender: "19045550180@s.whatsapp.net".into(),
+                msg_id: "STARTUP_FUTURE".into(),
+                secret: [2u8; 32],
+                expires_at: now + 86_400,
+                message_ts: 0,
+            },
+            MsgSecretEntry {
+                chat: "19045550180@s.whatsapp.net".into(),
+                sender: "19045550180@s.whatsapp.net".into(),
+                msg_id: "STARTUP_EXPIRED".into(),
+                secret: [3u8; 32],
+                expires_at: now - 86_400,
+                message_ts: 0,
+            },
+        ])
+        .await
+        .expect("seed secrets");
+
+    let client = crate::test_utils::create_test_client_with_backend(Arc::clone(&backend)).await;
+    // Construction spawns the sweep detached; run the startup body directly so
+    // the test is deterministic instead of racing a task.
+    client.run_startup_retention_cleanup().await;
+
+    let present = |id: &'static str| {
+        let backend = Arc::clone(&backend);
+        async move {
+            backend
+                .get_msg_secret(
+                    "19045550180@s.whatsapp.net",
+                    "19045550180@s.whatsapp.net",
+                    id,
+                )
+                .await
+                .expect("lookup")
+                .is_some()
+        }
+    };
+    assert!(
+        present("STARTUP_NEVER").await,
+        "expires_at = 0 must survive"
+    );
+    assert!(
+        present("STARTUP_FUTURE").await,
+        "a future deadline must survive"
+    );
+    assert!(
+        !present("STARTUP_EXPIRED").await,
+        "the startup pass must reap a passed deadline"
+    );
+}
+
+/// The startup pass must not touch the pending-inbound durability buffer: a
+/// message whose hook has not committed is still replayable, and deleting its
+/// buffered copy before the server redelivers it turns the redelivery into an
+/// acked duplicate that never reaches the hook.
+#[tokio::test]
+async fn startup_maintenance_leaves_the_pending_inbound_buffer_alone() {
+    use crate::store::SqliteStore;
+    use portable_atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique_id = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let db_name = format!(
+        "file:startup_pending_{}_{}?mode=memory&cache=shared",
+        std::process::id(),
+        unique_id
+    );
+    let sqlite = SqliteStore::new(&db_name)
+        .await
+        .expect("backend initializes");
+    let shared = sqlite.shared();
+    let store: Arc<dyn crate::store::traits::Backend> = Arc::new(sqlite);
+    let chat = "19045550180@s.whatsapp.net";
+    store
+        .store_pending_inbound(chat, chat, "STARTUP_PENDING", b"plaintext")
+        .await
+        .expect("seed pending inbound");
+
+    // Age the row past the 7-day pending-inbound TTL so a full sweep would
+    // delete it. The backend trait has no UPDATE, so this goes through the
+    // store's own query handle.
+    shared
+        .run(|conn| {
+            use diesel::RunQueryDsl;
+            diesel::sql_query(
+                "UPDATE pending_inbound_messages SET inserted_at = 0 WHERE id = 'STARTUP_PENDING';",
+            )
+            .execute(conn)
+            .map_err(|e| crate::store::error::StoreError::Database(Box::new(e)))?;
+            Ok(())
+        })
+        .await
+        .expect("age the row");
+
+    let client = crate::test_utils::create_test_client_with_backend(Arc::clone(&store)).await;
+    client.run_startup_retention_cleanup().await;
+
+    assert!(
+        store
+            .get_pending_inbound(chat, chat, "STARTUP_PENDING")
+            .await
+            .expect("lookup")
+            .is_some(),
+        "the startup pass must preserve a buffered message awaiting redelivery"
+    );
+
+    // The control: the full sweep does prune it, so the assertion above is
+    // about the scope, not about a row that could never be deleted.
+    client.run_retention_cleanup(7200).await;
+    assert!(
+        store
+            .get_pending_inbound(chat, chat, "STARTUP_PENDING")
+            .await
+            .expect("lookup")
+            .is_none(),
+        "the keepalive sweep must still prune an expired pending-inbound row"
+    );
+}
+
 #[tokio::test]
 async fn memory_report_on_fresh_client() {
     // recent_messages is capacity-0 (disabled) by default; enable it so the

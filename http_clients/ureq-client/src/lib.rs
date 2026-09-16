@@ -89,13 +89,19 @@ fn mark_if_dispatchable<Any>(requested: &AtomicBool, req: &ureq::RequestBuilder<
     let Some(headers) = req.headers_ref() else {
         return;
     };
-    // Mirrors ureq's own rule byte for byte (`ureq_proto`'s `Call::new` compares
-    // the whole header value to `close`), because the question here is what ureq
-    // will do with the socket, not what the RFC lets a caller write.
+    // Mirrors ureq's own rule (`ureq_proto`'s `Call::new` asks its
+    // `HeaderIterExt::has` for the `close` token), because the question here is
+    // what ureq will do with the socket, not what the RFC lets a caller write.
+    // `has` reads `Connection` as the comma-separated token list RFC 9110 says
+    // it is: each element trimmed and compared case-insensitively. `keep-alive,
+    // close` therefore closes the connection, which the earlier whole-value
+    // comparison against `close` got wrong.
     let pools = !headers
         .get_all(ureq::http::header::CONNECTION)
         .iter()
-        .any(|value| value.as_bytes() == b"close");
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|element| element.trim().eq_ignore_ascii_case("close"));
     let dispatchable = pools
         && ureq::http::Uri::try_from(url).is_ok_and(|uri| {
             uri.authority().is_some() && matches!(uri.scheme_str(), Some("http" | "https"))
@@ -883,12 +889,12 @@ mod tests {
         );
     }
 
-    /// RFC 9110 lets `Connection` carry a token list, and ureq does not read one
-    /// — it compares the whole value to `close`. The estimate deliberately
-    /// follows ureq rather than the RFC, so this pins the pair together: widen
-    /// one and this fails until the other widens too.
+    /// RFC 9110 lets `Connection` carry a token list, and ureq reads it as one:
+    /// `keep-alive, close` contains the `close` token, so the connection is not
+    /// pooled. This pins our estimate to ureq's rule, since the estimate is a
+    /// claim about what ureq did with the socket.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_token_list_close_is_pooled_by_ureq_and_reported_as_pooled() {
+    async fn a_token_list_close_is_not_pooled_by_ureq() {
         let (url, accepted) = spawn_keep_alive_server();
         let client = UreqHttpClient::new();
         for _ in 0..2 {
@@ -900,8 +906,34 @@ mod tests {
 
         assert_eq!(
             accepted.load(Ordering::Relaxed),
+            2,
+            "a token list containing `close` must not reuse a pooled connection"
+        );
+        assert_eq!(
+            client.resource_report().and_then(|r| r.pool_buffer_bytes),
+            Some(0),
+            "nothing was pooled, so the estimate must not claim the cap"
+        );
+    }
+
+    /// The other half of the token-list rule: a list without `close` still
+    /// pools. `close` has to be matched as a whole token, so `keep-alive` and a
+    /// value like `closer` must not be read as a close.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_token_list_without_close_is_pooled_by_ureq() {
+        let (url, accepted) = spawn_keep_alive_server();
+        let client = UreqHttpClient::new();
+        for _ in 0..2 {
+            client
+                .execute(get(url.clone()).with_header("connection", "keep-alive, closer"))
+                .await
+                .expect("the request to answer");
+        }
+
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
             1,
-            "ureq pooled a token-list close; the estimate below assumes it did"
+            "no `close` token means the connection is pooled and reused"
         );
         assert_eq!(
             client.resource_report().and_then(|r| r.pool_connections),
