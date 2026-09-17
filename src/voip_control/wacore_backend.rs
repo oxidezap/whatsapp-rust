@@ -24,8 +24,8 @@ use wacore::voip::transport::RelayEndpointParams;
 use wacore::voip_control::{
     MediaAudioCodec, MediaAudioFormat, MediaAudioRtpProfile, MediaAudioSpec, MediaCloseReason,
     MediaCodecDecisionSource, MediaDirection, MediaEncodedFrame, MediaEvent, MediaGroupControlKind,
-    MediaGroupSpec, MediaSetupError, MediaSilenceReason, MediaVideoUpgradeToken, VoipMediaBackend,
-    VoipMediaSession,
+    MediaGroupSpec, MediaSessionSpec, MediaSetupError, MediaSilenceReason, MediaVideoUpgradeToken,
+    VoipMediaBackend, VoipMediaSession,
 };
 
 /// Build the engine's [`AudioConfig`] from the neutral flat spec.
@@ -38,7 +38,7 @@ fn audio_config(spec: MediaAudioSpec) -> Result<AudioConfig, MediaSetupError> {
 /// [`CallConfig`] is the one engine struct that is not `#[non_exhaustive]`, so this can be a field
 /// assignment and the neutral spec is a direct projection of it.
 pub fn call_config(
-    spec: &wacore::voip_control::MediaSessionSpec,
+    spec: &MediaSessionSpec,
     group: Option<&MediaGroupSpec>,
 ) -> Result<CallConfig, MediaSetupError> {
     let audio = audio_config(spec.audio)?;
@@ -97,8 +97,8 @@ pub fn relay_endpoint(config: &CallConfig) -> Result<RelayEndpointParams, MediaS
 /// Project an engine config onto the neutral spec, so a platform that already parsed a `<relay>`
 /// can build its engine through the seam.
 #[must_use]
-pub fn spec_from_config(config: &CallConfig) -> wacore::voip_control::MediaSessionSpec {
-    wacore::voip_control::MediaSessionSpec {
+pub fn spec_from_config(config: &CallConfig) -> MediaSessionSpec {
+    MediaSessionSpec {
         call_id: config.call_id.clone(),
         direction: match config.direction {
             CallDirection::Outgoing => MediaDirection::Outgoing,
@@ -160,7 +160,7 @@ pub fn with_platform_audio_codec(engine: CallEngine) -> CallEngine {
 
 /// Build the engine from the neutral spec, optionally layering group media.
 pub fn build_engine(
-    spec: &wacore::voip_control::MediaSessionSpec,
+    spec: &MediaSessionSpec,
     group: Option<&MediaGroupSpec>,
     tx_ids: Box<dyn wacore::voip::engine::TxIdSource>,
 ) -> Result<CallEngine, MediaSetupError> {
@@ -474,7 +474,7 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
     async fn open(
         &self,
         _session: &Arc<dyn VoipMediaSession>,
-        spec: wacore::voip_control::MediaSessionSpec,
+        spec: MediaSessionSpec,
     ) -> Result<(), MediaSetupError> {
         build_engine(
             &spec,
@@ -494,7 +494,7 @@ pub fn neutral_stats(stats: wacore::voip::CallMediaStats) -> wacore::voip_contro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wacore::voip_control::{MediaAudioIo, MediaSessionSpec};
+    use wacore::voip_control::MediaAudioIo;
 
     fn spec() -> MediaSessionSpec {
         MediaSessionSpec {
