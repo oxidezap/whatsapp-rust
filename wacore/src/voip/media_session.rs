@@ -40,14 +40,17 @@ pub(crate) fn group_control_of(command: &MediaCommand) -> Option<GroupControl> {
         MediaCommand::ApplyGroupUpdate(update) => Some(GroupControl::Update(update.clone())),
         MediaCommand::ApplyGroupTransition(transition) => Some(GroupControl::Transition {
             update: transition.update.clone(),
-            epoch: GroupRawEpoch::new(transition.transaction_id, transition.raw_epoch.clone()),
+            epoch: GroupRawEpoch::new(
+                transition.transaction_id,
+                transition.raw_epoch.as_bytes().to_vec(),
+            ),
         }),
         MediaCommand::ApplyGroupEpoch {
             transaction_id,
             raw_epoch,
         } => Some(GroupControl::RawEpoch(GroupRawEpoch::new(
             *transaction_id,
-            raw_epoch.clone(),
+            raw_epoch.as_bytes().to_vec(),
         ))),
         MediaCommand::SendGroupReaction(emoji) => Some(GroupControl::Reaction(emoji.clone())),
         _ => None,
@@ -325,7 +328,11 @@ impl VoipMediaSession for ResidentMediaSession {
                 .is_some_and(|tx| tx.try_send(control));
         }
         match command {
-            MediaCommand::SetMuted(_) => true,
+            // The seam does not own mute yet: the live client applies it through `MuteFeed`, which
+            // gates the PCM the drive loop reads, and that path is unchanged. Reporting `true` here
+            // would tell a direct seam caller its mute landed when nothing moved, so the honest
+            // answer is `false` until this session owns the mute state.
+            MediaCommand::SetMuted(_) => false,
             MediaCommand::EnableVideo { awaiting_accept } => self.send_video(if awaiting_accept {
                 VideoControl::EnableAwaitingAccept
             } else {
@@ -411,10 +418,10 @@ impl VoipMediaSession for ResidentMediaSession {
     fn deliver_group_epoch(
         &self,
         transaction_id: u32,
-        raw_epoch: Vec<u8>,
+        raw_epoch: crate::voip_control::MediaGroupEpoch,
         committed: Option<GroupCallUpdate>,
     ) -> bool {
-        let epoch = GroupRawEpoch::new(transaction_id, raw_epoch);
+        let epoch = GroupRawEpoch::new(transaction_id, raw_epoch.into_bytes());
         let mut mailboxes = self.mailboxes();
         let Some(tx) = mailboxes.group.clone() else {
             // Retain the newest epoch until media attaches; `set_group_sender` pairs it with the
@@ -564,7 +571,11 @@ mod tests {
             .rekey_requested(false)
             .participants(Vec::new())
             .build();
-        assert!(session.deliver_group_epoch(3, vec![9; 32], None));
+        assert!(session.deliver_group_epoch(
+            3,
+            crate::voip_control::MediaGroupEpoch::new(vec![9; 32]),
+            None
+        ));
         assert_eq!(session.pending_group_epoch(), Some(3));
         // Attach replays the retained epoch rather than dropping the key.
         let (tx, rx) = async_channel::bounded(4);

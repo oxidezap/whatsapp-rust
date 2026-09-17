@@ -17,10 +17,46 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use wacore_binary::Jid;
+use zeroize::Zeroizing;
 
 use crate::sync_marker::MaybeSendSync;
 use crate::types::call::VideoState;
 use crate::types::group_call::{GroupCallUpdate, ScreenShare, WaitingRoom};
+
+/// One decrypted keygen-v2 epoch, kept as secret material.
+///
+/// The engine's `GroupRawEpoch` is in `crate::voip::driver`, which is gated by the very feature this
+/// contract exists to compile without, so it cannot be named here. This is the neutral twin: it
+/// holds the bytes in [`Zeroizing`], so they are erased when the value drops, and its `Debug` prints
+/// `[redacted]`, so a stray `{:?}` in a log cannot leak the decrypted key. Both properties matter
+/// and are why a bare `Vec<u8>` is not the type: a manual `Debug` alone leaves the bytes in memory
+/// after drop, and `Clone` alone leaves a second copy that never gets erased.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MediaGroupEpoch(Zeroizing<Vec<u8>>);
+
+impl MediaGroupEpoch {
+    #[must_use]
+    pub fn new(raw_epoch: Vec<u8>) -> Self {
+        Self(Zeroizing::new(raw_epoch))
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    /// Take the bytes out, leaving an empty buffer whose allocation is erased on drop.
+    #[must_use]
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        std::mem::take(&mut *self.0)
+    }
+}
+
+impl core::fmt::Debug for MediaGroupEpoch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("MediaGroupEpoch([redacted])")
+    }
+}
 
 /// Call direction, without the engine's `CallDirection`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +92,8 @@ pub enum MediaAudioIo {
 
 /// Flat audio timing and format. Mirrors `crate::voip::audio::AudioFormat` field for field without
 /// depending on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bon::Builder)]
+#[non_exhaustive]
 pub struct MediaAudioFormat {
     pub codec: MediaAudioCodec,
     pub rtp_profile: MediaAudioRtpProfile,
@@ -98,7 +135,8 @@ impl MediaAudioFormat {
 }
 
 /// Format plus I/O selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bon::Builder)]
+#[non_exhaustive]
 pub struct MediaAudioSpec {
     pub format: MediaAudioFormat,
     pub io: MediaAudioIo,
@@ -123,12 +161,12 @@ pub struct MediaVideoUpgradeToken {
 
 /// A roster snapshot plus its decrypted epoch, kept indivisible. Replaces the engine's
 /// `GroupControl::Transition`, whose whole reason for existing is that the pair must not separate
-/// under mailbox backpressure.
+/// under mailbox backpressure. The epoch stays secret through [`MediaGroupEpoch`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct MediaGroupTransition {
     pub update: Box<GroupCallUpdate>,
     pub transaction_id: u32,
-    pub raw_epoch: Vec<u8>,
+    pub raw_epoch: MediaGroupEpoch,
 }
 
 /// What decided a codec switch.
@@ -153,7 +191,8 @@ pub enum MediaSilenceReason {
 
 /// One decrypted codec payload from the peer, flattened. Replaces the engine's
 /// `EncodedAudioFrame`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[non_exhaustive]
 pub struct MediaEncodedFrame {
     pub format: MediaAudioFormat,
     pub codec: MediaAudioCodec,
@@ -168,7 +207,8 @@ pub struct MediaEncodedFrame {
 }
 
 /// One RTCP report block, flattened from the engine's `RtcpReportBlock`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[non_exhaustive]
 pub struct MediaRtcpReportBlock {
     pub ssrc: u32,
     pub fraction_lost: u8,
@@ -181,7 +221,8 @@ pub struct MediaRtcpReportBlock {
 }
 
 /// One RTCP feedback packet, flattened from the engine's `RtcpFeedback`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[non_exhaustive]
 pub struct MediaRtcpFeedback {
     pub packet_type: u8,
     pub fmt: u8,
@@ -195,8 +236,10 @@ pub struct MediaRtcpFeedback {
 /// All relay and key material rides here as plain data (`Vec<u8>`, `String`): the engine needs it to
 /// derive SRTP keys and sign the STUN allocate, and a foreign backend needs it to build its own
 /// transport. It is deliberately its own struct so [`Debug`] can redact the secrets in one place
-/// rather than depending on the engine's redaction.
-#[derive(Clone)]
+/// rather than depending on the engine's redaction. The secret fields are `call_key`, `relay_token`,
+/// `auth_token` and `integrity_key`; a `Debug` of this struct never prints them.
+#[derive(Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct MediaSessionSpec {
     pub call_id: String,
     pub direction: MediaDirection,
@@ -304,7 +347,7 @@ pub enum MediaCommand {
     /// A decrypted keygen-v2 epoch.
     ApplyGroupEpoch {
         transaction_id: u32,
-        raw_epoch: Vec<u8>,
+        raw_epoch: MediaGroupEpoch,
     },
     /// One authenticated group reaction to broadcast.
     SendGroupReaction(String),
@@ -450,27 +493,48 @@ pub enum MediaSetupError {
 }
 
 /// Per-call media counters. Replaces the engine's `CallMediaStats`, field for field.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, bon::Builder)]
+#[non_exhaustive]
 pub struct MediaStats {
+    #[builder(default)]
     pub rtp_received: u32,
+    #[builder(default)]
     pub rtp_payload_type_unexpected: u32,
+    #[builder(default)]
     pub srtp_unprotect_failed: u32,
+    #[builder(default)]
     pub sframe_decrypt_failed: u32,
+    #[builder(default)]
     pub audio_frames_decoded: u32,
+    #[builder(default)]
     pub audio_frames_delivered: u32,
+    #[builder(default)]
     pub audio_frames_concealed: u32,
+    #[builder(default)]
     pub mlow_off_point_dropped: u32,
+    #[builder(default)]
     pub mlow_inactive_or_sid: u32,
+    #[builder(default)]
     pub foreign_frames_decoded: u32,
+    #[builder(default)]
     pub audio_frames_without_decoder: u32,
+    #[builder(default)]
     pub outbound_frames_without_encoder: u32,
+    #[builder(default)]
     pub playout_trimmed_samples: u32,
+    #[builder(default)]
     pub inbound_pipe_dropped: u32,
+    #[builder(default)]
     pub audio_sink_dropped: u32,
+    #[builder(default)]
     pub video_sink_dropped: u32,
+    #[builder(default)]
     pub peer_keyframe_requests: u32,
+    #[builder(default)]
     pub relay_packet_unclassified: u32,
+    #[builder(default)]
     pub forwarding_envelope_rejected: u32,
+    #[builder(default)]
     pub codec_switches: u16,
 }
 
@@ -484,23 +548,37 @@ impl MediaStats {
     }
 }
 
-/// Opens media sessions.
+/// The boundary a media engine implements.
 ///
 /// The executor and the relay transport are constructor state of an implementation, never fields of
 /// [`MediaSessionSpec`]: they are Rust trait objects that cannot cross a process or wasm module
 /// boundary, which is exactly why they cannot be part of the neutral contract.
+///
+/// **This contract does not yet own the session lifecycle.** In this phase the resident backend's
+/// [`open`](Self::open) validates the spec against what the engine accepts and returns the error it
+/// would; the live call path constructs the engine through the backend's
+/// `build_engine_from_config` and keeps owning the drive task, because the socket and the runtime
+/// are the facade's. Until the next phase splits `wacore::voip` into a signaling half and an engine
+/// half, `reserve`/`open` are not the path a real call takes. Their doc comments say exactly what
+/// they currently do, not what a future version will.
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait VoipMediaBackend: MaybeSendSync {
-    /// Reserve one call's session and its command mailbox, before the engine exists.
+    /// Hand back a session for one call.
     ///
-    /// A real call registers at offer time and attaches a media plane minutes later, and signaling
-    /// that arrives in between (a caller's one-shot rekey, a mid-call video command) has to survive
-    /// that gap. Commands submitted before [`open`](Self::open) are buffered, matching the driver's
-    /// bounded pre-attach queues. Idempotent per call id.
+    /// The session owns the media command mailboxes for its call. The resident implementation
+    /// returns a fresh, unwired session; wiring a driver's mailboxes into it is backend-specific and
+    /// happens when the engine attaches. A foreign backend returns whatever session type its
+    /// adapter drives.
     fn reserve(&self, call_id: &str, direction: MediaDirection) -> Arc<dyn VoipMediaSession>;
 
-    /// Build the engine from `spec` and start driving the reserved `session`.
+    /// Build the engine for `spec`.
+    ///
+    /// The resident implementation validates the spec against the engine's constructors and returns
+    /// the same [`MediaSetupError`] the engine would; it does not start a drive task or attach the
+    /// reserved `session`, because the caller owns the runtime and transport. See the trait doc for
+    /// why the full lifecycle is the next phase. A foreign backend that owns its executor may start
+    /// driving here.
     async fn open(
         &self,
         session: &Arc<dyn VoipMediaSession>,
@@ -546,20 +624,29 @@ pub trait VoipMediaSession: MaybeSendSync + 'static {
     ///
     /// The pairing matters: the engine rebuilds its participant key map from the roster and its
     /// epoch together, so an epoch that arrives without the roster it belongs to must not be
-    /// delivered alone. A session with no media attached retains the epoch and reports success;
-    /// [`Self::deliver_group_update`] and the attach-time replay pair it later.
+    /// delivered alone. A resident session with no media attached retains the epoch and reports
+    /// success, and the attach-time replay pairs it with the committed roster then. Returns the
+    /// actual submission result, so the control plane does not consume a signaling transaction the
+    /// media plane refused.
     fn deliver_group_epoch(
         &self,
         transaction_id: u32,
-        raw_epoch: Vec<u8>,
+        raw_epoch: MediaGroupEpoch,
         committed: Option<GroupCallUpdate>,
     ) -> bool {
-        self.submit_lossless(MediaCommand::ApplyGroupEpoch {
-            transaction_id,
-            raw_epoch,
-        });
-        let _ = committed;
-        true
+        match committed {
+            Some(update) => {
+                self.submit_lossless(MediaCommand::ApplyGroupTransition(MediaGroupTransition {
+                    update: Box::new(update),
+                    transaction_id,
+                    raw_epoch,
+                }))
+            }
+            None => self.submit_lossless(MediaCommand::ApplyGroupEpoch {
+                transaction_id,
+                raw_epoch,
+            }),
+        }
     }
 
     /// Whether [`Self::submit`] would accept `command` right now, without consuming it.
@@ -626,7 +713,7 @@ impl<T: VoipMediaSession + ?Sized> VoipMediaSession for Arc<T> {
     fn deliver_group_epoch(
         &self,
         transaction_id: u32,
-        raw_epoch: Vec<u8>,
+        raw_epoch: MediaGroupEpoch,
         committed: Option<GroupCallUpdate>,
     ) -> bool {
         (**self).deliver_group_epoch(transaction_id, raw_epoch, committed)
@@ -715,5 +802,16 @@ mod tests {
         assert!(rendered.contains("[redacted]"));
         assert!(!rendered.contains("171"));
         assert!(!rendered.contains("205"));
+    }
+
+    #[test]
+    fn the_neutral_epoch_redacts_its_bytes() {
+        // A decrypted group epoch is key material. It must not print, and it must not survive as a
+        // plain `Vec<u8>` a log could reach; `MediaGroupEpoch` guarantees both.
+        let epoch = MediaGroupEpoch::new(vec![0x5A; 32]);
+        let rendered = format!("{epoch:?}");
+        assert_eq!(rendered, "MediaGroupEpoch([redacted])");
+        assert!(!rendered.contains("90"));
+        assert_eq!(epoch.as_bytes(), &[0x5A; 32]);
     }
 }

@@ -1787,7 +1787,8 @@ impl CallRegistry {
             peer_video_orientations: Vec::new(),
             peer_orientation_seq: 0,
             session,
-            media: Some(Arc::new(ResidentMediaSession::new())),
+            // `new()` already returns `Arc<Self>`; the only coercion left is to `dyn`.
+            media: Some(ResidentMediaSession::new()),
             media_task: None,
             media_stats: None,
             waiting_room_task: None,
@@ -2317,7 +2318,11 @@ impl CallRegistry {
             .as_ref()
             .and_then(GroupCallState::snapshot)
             .cloned();
-        media.deliver_group_epoch(transaction_id, raw_epoch, committed)
+        media.deliver_group_epoch(
+            transaction_id,
+            crate::voip_control::MediaGroupEpoch::new(raw_epoch),
+            committed,
+        )
     }
 
     /// The retained epoch transaction for one call generation before its media driver attaches.
