@@ -128,6 +128,88 @@ Moving them under `src/voip/` would pass test 3 by separating each from the
 Signal-session, response-waiter and tc-token code it belongs with. Worse code
 for a better number, so they stay, and this row is the record of that choice.
 
+### The media seam: `voip-control` and the engine behind it
+
+A media engine ships inside the call flow today, and every consumer of VoIP pays
+for it. The first step out is a **neutral contract**, not a byte cut: the
+boundary a media engine implements, with no engine type in its API.
+
+`wacore::voip_control` is that contract, gated on `voip-control`. It declares
+`VoipMediaBackend` and `VoipMediaSession` plus the flat data they carry
+(`MediaSessionSpec`, `MediaCommand`, `MediaEvent`, `MediaStats`, and the structs
+and enums they need). Nothing in it names a `crate::voip` type, so a build can
+enable it and not `voip`; the compiler names the leak if a draft reaches for one.
+`MediaSessionSpec`'s `Debug` redacts the callKey, relay token, auth token and
+integrity key, the same material `CallConfig`'s redaction protects.
+
+In `whatsapp-rust`, `voip-control` re-exports that contract and `voip-engine-wacore`
+adds the resident backend (`voip_control::wacore_backend`) that builds a
+`wacore::voip::CallEngine` from the neutral spec and translates events and
+counters back. `voip-runtime` composes both, so **what it delivers is unchanged**:
+signaling, the facade, and the engine, exactly as before. No observable behavior
+moved; the only new thing is that the engine now sits behind a trait the call
+registry stores.
+
+**What the registry stores, and why the engine is `!Sync`.** `CallEntry` used to
+hold six driver fields (`media_task`, `media_stats`, `rekey_tx`, `event_tx`,
+`video_ctl_tx`, `group_ctl_tx`). Swapping the engine constructor alone does not
+decouple anything while those stay typed by `PeerAnswer`, `VideoControl`,
+`GroupControl` and `CallEvent`. They are gone: the entry stores
+`Arc<dyn VoipMediaSession>`, and the media command mailboxes live on the resident
+session behind it. What stays on the entry is control-plane data the registry
+owns: the consumer-facing `CallEvent` queue, the counters cell the `CallHandle`
+reads, the media-task abort handle, the video negotiation state, and the teardown
+hook.
+
+The engine is `Send` but not `Sync`: `CallEngine` holds
+`Box<dyn ForeignAudioCodec>`, whose trait is bounded `MaybeSend` and deliberately
+not `Sync`, because libopus's decoder is `Send` but not `Sync`. The seam trait is
+`MaybeSendSync`, so a shared session object cannot hold the engine directly. Two
+ways out exist: a `Mutex<CallEngine>` inside the session, or exclusive ownership
+by the drive task with a command handle. This tree takes the second, which is what
+the architecture already was: `run_call` owns the engine on one task, and the
+session is a handle over its bounded mailboxes. That keeps the seam `Sync` without
+putting a lock on the media path, and it is why `media_session.rs` carries no
+`Mutex<CallEngine>`.
+
+**Three openings in `wacore`, and no more.** A backend outside the crate could not
+build what the seam required, so exactly three APIs opened:
+
+- `AudioFormat::from_neutral` / `AudioConfig::from_neutral` (and their `to_neutral`
+  inverses). Both engine types are `#[non_exhaustive]`, so a backend could only
+  pick from the named constants until these constructors existed; a backend with
+  its own timing had no way to express it.
+- `VideoUpgradeToken::epoch()` and `from_parts`. The epoch distinguishes two
+  upgrade requests in one generation and was private, so accepting an upgrade
+  across the seam was ambiguous.
+- The `voip-control` feature itself, on `wacore` and `whatsapp-rust`.
+
+Nothing else in the engine's public surface changed.
+
+**What this is not, and the next phase.** Under `voip-control` alone the facade
+and the registry do not compile: `src/voip` is gated on `voip-runtime` and names
+signaling types that still live in `wacore::voip` -- `CallSession`, `CallPhase`,
+`CallEvent` and its payloads (`EncodedAudioFrame`, `VideoFrame`,
+`RtcpReportBlock`, `RtcpFeedback`), `CallRegistry`, `GroupCallState`,
+`relay_parse` and the `RelayTransportFactory` seam. So the seam is ready and the
+byte cut is not: a `voip-control` build carries the contract, not the call flow.
+The next phase splits `wacore::voip` into a signaling half and an engine half so
+`src/voip` compiles with the engine absent, which requires rebuilding the public
+event and command surface (`CallHandle::events()` returns
+`Receiver<CallEvent>` today) on the neutral types. That rewrite is deliberately
+not in this change, so a regression from it is attributable to the split rather
+than tangled with the seam.
+
+The proof this phase does carry: a `wasm32-unknown-unknown` build of
+`--features voip-control` compiles and its artifact contains `MediaCommand` and
+`VoipMediaSession` but none of `CallEngine`, `MlowEncoder`, `MlowDecoder`,
+`SframeSession`, `run_call`, `CallConfig` or `MediaPipeline`.
+
+The gate count does not move. The contract lives in `wacore/src/voip_control/`
+and `whatsapp-rust/src/voip_control/`, neither of which the guard scans for
+`voip-runtime`, and the only new gate in a scanned file is one `mod` line in each
+`lib.rs`. The `voip-runtime` budget stays at 9.
+
 ### Not a subsystem: WAM
 
 Asked and answered rather than left for the next reader, because telemetry looks

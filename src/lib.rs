@@ -295,6 +295,8 @@ pub mod transport;
 pub mod upload;
 #[cfg(feature = "voip-runtime")]
 pub mod voip;
+#[cfg(feature = "voip-control")]
+pub mod voip_control;
 pub use upload::UploadOptions;
 
 pub mod pdo;

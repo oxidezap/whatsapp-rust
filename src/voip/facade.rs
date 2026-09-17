@@ -36,9 +36,9 @@ use wacore::voip::relay_parse::RelayData;
 use wacore::voip::transport::RelayTransportFactory;
 use wacore::voip::{
     AudioCodec, AudioConfig, AudioFormat, AudioRtpProfile, CallChannels, CallConfig, CallDirection,
-    CallEngine, CallEvent, CallPhase, CodecDecisionSource, EncodedAudioFrame, GroupEngineConfig,
-    KeyframeUrgency, VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame,
-    VideoInput, VideoUpgradeToken, run_call, video_control_channel,
+    CallEngine, CallEvent, CallPhase, CodecDecisionSource, EncodedAudioFrame, KeyframeUrgency,
+    VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame, VideoInput,
+    VideoUpgradeToken, run_call, video_control_channel,
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
@@ -455,17 +455,18 @@ impl<'a> AcceptCall<'a> {
             config.audio = audio;
             config.enable_video = enable_video;
             let relay_endpoint = relay_endpoint_from_config(&config)?;
-            let mut engine = CallEngine::new(config, Box::new(RandTxIds))
-                .map(with_platform_audio_codec)
-                .map_err(|error| CallError::Setup(error.to_string()))?;
-            engine
-                .configure_group(GroupEngineConfig {
-                    call_creator: call_creator.clone(),
-                    self_jid: own_lid,
-                    initial_update: group.clone(),
-                    direct_peer: None,
-                })
-                .map_err(|error| CallError::Setup(error.to_string()))?;
+            let group_spec = crate::voip_control::MediaGroupSpec {
+                call_creator: call_creator.clone(),
+                self_jid: own_lid,
+                initial_update: group.clone(),
+                direct_peer: None,
+            };
+            let engine = crate::voip_control::wacore_backend::build_engine_from_config(
+                config,
+                Some(group_spec),
+                Box::new(RandTxIds),
+            )
+            .map_err(|error| CallError::Setup(error.to_string()))?;
             return Ok((engine, call_id.clone(), relay_endpoint));
         }
 
@@ -508,11 +509,14 @@ impl<'a> AcceptCall<'a> {
             .map_err(|e| CallError::Setup(e.to_string()))?;
         config.audio = audio;
         config.enable_video = enable_video;
-        // Read the dial addr off the config before CallEngine::new consumes it (no second relay walk).
+        // Read the dial addr off the config before the backend consumes it (no second relay walk).
         let relay_endpoint = relay_endpoint_from_config(&config)?;
-        let engine = CallEngine::new(config, Box::new(RandTxIds))
-            .map(with_platform_audio_codec)
-            .map_err(|e| CallError::Setup(e.to_string()))?;
+        let engine = crate::voip_control::wacore_backend::build_engine_from_config(
+            config,
+            None,
+            Box::new(RandTxIds),
+        )
+        .map_err(|e| CallError::Setup(e.to_string()))?;
         Ok((engine, call_id.clone(), relay_endpoint))
     }
 }
@@ -934,17 +938,18 @@ impl<'a> OutgoingGroupCall<'a> {
         config.audio = audio.config();
         config.enable_video = video.is_some();
         let relay_endpoint = relay_endpoint_from_config(&config)?;
-        let mut engine = CallEngine::new(config, Box::new(RandTxIds))
-            .map(with_platform_audio_codec)
-            .map_err(|error| CallError::Setup(error.to_string()))?;
-        engine
-            .configure_group(GroupEngineConfig {
-                call_creator: own_lid.clone(),
-                self_jid: own_lid.clone(),
-                initial_update: update.clone(),
-                direct_peer: None,
-            })
-            .map_err(|error| CallError::Setup(error.to_string()))?;
+        let group_spec = crate::voip_control::MediaGroupSpec {
+            call_creator: own_lid.clone(),
+            self_jid: own_lid.clone(),
+            initial_update: update.clone(),
+            direct_peer: None,
+        };
+        let mut engine = crate::voip_control::wacore_backend::build_engine_from_config(
+            config,
+            Some(group_spec),
+            Box::new(RandTxIds),
+        )
+        .map_err(|error| CallError::Setup(error.to_string()))?;
         // A newer pre-ACK update may have overtaken this ACK without requesting its own rekey.
         // Honor the ACK request unless the serialized signaling handler retained an equal/newer
         // epoch; fan out against the current roster so newly arrived participants receive it too.
@@ -1144,17 +1149,18 @@ impl<'a> CallLinkCall<'a> {
         config.audio = audio.config();
         config.enable_video = video.is_some();
         let relay_endpoint = relay_endpoint_from_config(&config)?;
-        let mut engine = CallEngine::new(config, Box::new(RandTxIds))
-            .map(with_platform_audio_codec)
-            .map_err(|error| CallError::Setup(error.to_string()))?;
-        engine
-            .configure_group(GroupEngineConfig {
-                call_creator: join.call_creator.clone(),
-                self_jid: own_lid,
-                initial_update: update.clone(),
-                direct_peer: None,
-            })
-            .map_err(|error| CallError::Setup(error.to_string()))?;
+        let group_spec = crate::voip_control::MediaGroupSpec {
+            call_creator: join.call_creator.clone(),
+            self_jid: own_lid,
+            initial_update: update.clone(),
+            direct_peer: None,
+        };
+        let engine = crate::voip_control::wacore_backend::build_engine_from_config(
+            config,
+            Some(group_spec),
+            Box::new(RandTxIds),
+        )
+        .map_err(|error| CallError::Setup(error.to_string()))?;
 
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
@@ -1220,31 +1226,6 @@ pub(crate) fn offer_capability(video: bool, audio: AudioFormat) -> &'static [u8]
         (true, false) => &CAPABILITY_VIDEO_OFFER,
         (false, false) => &CAPABILITY_OFFER,
     }
-}
-
-/// Give the engine the platform's standard-Opus codec, when this build has one.
-///
-/// A no-op without `voip-libopus`, and that is the honest outcome: the call still runs, and if the
-/// peer turns out to speak Opus the engine reports `CallEvent::AudioSilent` with
-/// `NoDecoderForNegotiatedCodec` rather than a call that looks connected and carries nothing.
-fn with_platform_audio_codec(engine: CallEngine) -> CallEngine {
-    #[cfg(feature = "voip-libopus")]
-    {
-        // Both seams, because a call can be either shape: the instance decodes the direct path, the
-        // factory gives each group participant their own (one decoder cannot serve several
-        // speakers -- it carries inter-frame state).
-        let engine = engine
-            .with_foreign_audio_codec_factory(Box::new(crate::voip::audio::LibopusCodecFactory));
-        match crate::voip::audio::LibopusAudioCodec::new() {
-            Ok(codec) => engine.with_foreign_audio_codec(Box::new(codec)),
-            Err(e) => {
-                log::warn!("voip: libopus unavailable for this call, Opus will not decode: {e}");
-                engine
-            }
-        }
-    }
-    #[cfg(not(feature = "voip-libopus"))]
-    engine
 }
 
 /// The codec the offering peer's `<capability>` selects, or `None` when the local choice stands.
@@ -2448,12 +2429,15 @@ pub(crate) async fn attach_outgoing_relay(
         .map_err(|e| SetupStop::Failed(CallError::Setup(e.to_string())))?;
         config.audio = pending.audio.config();
         config.enable_video = pending.video.is_some();
-        // Read the dial endpoint off the config before CallEngine::new consumes it (no second relay
+        // Read the dial endpoint off the config before the backend consumes it (no second relay
         // walk).
         let relay_endpoint = relay_endpoint_from_config(&config).map_err(SetupStop::Failed)?;
-        let engine = CallEngine::new(config, Box::new(RandTxIds))
-            .map(with_platform_audio_codec)
-            .map_err(|e| SetupStop::Failed(CallError::Setup(e.to_string())))?;
+        let engine = crate::voip_control::wacore_backend::build_engine_from_config(
+            config,
+            None,
+            Box::new(RandTxIds),
+        )
+        .map_err(|e| SetupStop::Failed(CallError::Setup(e.to_string())))?;
         // Raced against the call's own ending, not merely bounded by
         // `RELAY_PROVIDER_TIMEOUT`. The timeout is the floor -- it stops a provider that never
         // answers from parking any setup path -- but this one path can be *cancelled* rather than

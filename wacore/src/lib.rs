@@ -59,6 +59,8 @@ pub mod upload;
 pub mod usync;
 #[cfg(feature = "voip")]
 pub mod voip;
+#[cfg(feature = "voip-control")]
+pub mod voip_control;
 pub mod webp;
 
 pub mod version;

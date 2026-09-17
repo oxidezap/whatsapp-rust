@@ -219,6 +219,68 @@ impl AudioFormat {
             && self.rtp_timestamp_step != 0
             && self.rtp_payload_type <= 127
     }
+
+    /// Project this format onto the neutral seam's flat [`MediaAudioFormat`].
+    ///
+    /// The inverse of [`Self::from_neutral`], for a platform that already holds a
+    /// [`CallConfig`](crate::voip::engine::CallConfig) and builds the engine through the seam.
+    ///
+    /// [`MediaAudioFormat`]: crate::voip_control::MediaAudioFormat
+    #[must_use]
+    pub fn to_neutral(self) -> crate::voip_control::MediaAudioFormat {
+        use crate::voip_control::{MediaAudioCodec, MediaAudioRtpProfile};
+
+        crate::voip_control::MediaAudioFormat {
+            codec: match self.codec {
+                AudioCodec::Mlow => MediaAudioCodec::Mlow,
+                AudioCodec::Opus => MediaAudioCodec::Opus,
+            },
+            rtp_profile: match self.rtp_profile {
+                AudioRtpProfile::Mlow => MediaAudioRtpProfile::Mlow,
+                AudioRtpProfile::StandardOpus => MediaAudioRtpProfile::StandardOpus,
+            },
+            signaling_rate: self.signaling_rate,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            samples_per_frame: self.samples_per_frame,
+            rtp_clock_rate: self.rtp_clock_rate,
+            rtp_timestamp_step: self.rtp_timestamp_step,
+            rtp_payload_type: self.rtp_payload_type,
+        }
+    }
+
+    /// Build a format from the neutral seam's flat [`MediaAudioFormat`].
+    ///
+    /// `AudioFormat` is `#[non_exhaustive]`, so a backend outside this crate cannot use a struct
+    /// literal; without this it could only pick from the named constants the engine happens to
+    /// define, and a backend carrying its own timing would have no way to express it. The neutral
+    /// spec is a field-for-field projection, so the conversion is total. Returns `None` when the
+    /// result would be an invalid format (a zero timing or channel value).
+    ///
+    /// [`MediaAudioFormat`]: crate::voip_control::MediaAudioFormat
+    #[must_use]
+    pub fn from_neutral(format: crate::voip_control::MediaAudioFormat) -> Option<Self> {
+        use crate::voip_control::{MediaAudioCodec, MediaAudioRtpProfile};
+
+        let built = Self {
+            codec: match format.codec {
+                MediaAudioCodec::Mlow => AudioCodec::Mlow,
+                MediaAudioCodec::Opus => AudioCodec::Opus,
+            },
+            rtp_profile: match format.rtp_profile {
+                MediaAudioRtpProfile::Mlow => AudioRtpProfile::Mlow,
+                MediaAudioRtpProfile::StandardOpus => AudioRtpProfile::StandardOpus,
+            },
+            signaling_rate: format.signaling_rate,
+            sample_rate: format.sample_rate,
+            channels: format.channels,
+            samples_per_frame: format.samples_per_frame,
+            rtp_clock_rate: format.rtp_clock_rate,
+            rtp_timestamp_step: format.rtp_timestamp_step,
+            rtp_payload_type: format.rtp_payload_type,
+        };
+        built.is_valid().then_some(built)
+    }
 }
 
 fn is_mlow_embedded_opus(payload: &[u8]) -> bool {
@@ -525,6 +587,42 @@ impl AudioConfig {
         Self {
             format,
             io: AudioIo::Encoded,
+        }
+    }
+
+    /// Build a config from the neutral seam's flat [`MediaAudioSpec`].
+    ///
+    /// Counterpart to [`AudioFormat::from_neutral`]: `AudioConfig` is also `#[non_exhaustive]`, so a
+    /// backend outside this crate cannot assemble one from fields.
+    ///
+    /// [`MediaAudioSpec`]: crate::voip_control::MediaAudioSpec
+    #[must_use]
+    pub fn from_neutral(spec: crate::voip_control::MediaAudioSpec) -> Option<Self> {
+        use crate::voip_control::MediaAudioIo;
+
+        let format = AudioFormat::from_neutral(spec.format)?;
+        Some(Self {
+            format,
+            io: match spec.io {
+                MediaAudioIo::Pcm => AudioIo::Pcm,
+                MediaAudioIo::Encoded => AudioIo::Encoded,
+            },
+        })
+    }
+
+    /// Project this config onto the neutral seam's flat [`MediaAudioSpec`].
+    ///
+    /// [`MediaAudioSpec`]: crate::voip_control::MediaAudioSpec
+    #[must_use]
+    pub fn to_neutral(self) -> crate::voip_control::MediaAudioSpec {
+        use crate::voip_control::MediaAudioIo;
+
+        crate::voip_control::MediaAudioSpec {
+            format: self.format.to_neutral(),
+            io: match self.io {
+                AudioIo::Pcm => MediaAudioIo::Pcm,
+                AudioIo::Encoded => MediaAudioIo::Encoded,
+            },
         }
     }
 }

@@ -22,6 +22,7 @@ pub mod group_audio;
 pub mod group_media;
 pub mod h264;
 pub mod hbh_srtp;
+pub mod media_session;
 pub mod media_stats;
 #[cfg(feature = "voip-mlow")]
 pub mod mlow;
