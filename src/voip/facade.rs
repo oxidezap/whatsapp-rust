@@ -362,7 +362,7 @@ impl<'a> AcceptCall<'a> {
             &registration,
             &mut teardown,
             preaccept,
-            self.build_engine(has_video, audio_config, group),
+            self.build_engine(has_video, audio_config, group, registration.generation),
         )
         .await?;
         // Before a single packet: the escape and native Opus share every timing field, so this
@@ -424,6 +424,7 @@ impl<'a> AcceptCall<'a> {
         enable_video: bool,
         audio: AudioConfig,
         group: Option<GroupCallUpdate>,
+        generation: u64,
     ) -> Result<(CallEngine, String, wacore::voip::RelayEndpointParams), CallError> {
         let CallAction::Offer {
             call_id,
@@ -455,14 +456,14 @@ impl<'a> AcceptCall<'a> {
             config.audio = audio;
             config.enable_video = enable_video;
             let relay_endpoint = relay_endpoint_from_config(&config)?;
-            let group_spec = crate::voip_control::MediaGroupSpec {
-                call_creator: call_creator.clone(),
-                self_jid: own_lid,
-                initial_update: group.clone(),
-                direct_peer: None,
-            };
+            let group_spec = crate::voip_control::MediaGroupSpec::builder()
+                .call_creator(call_creator.clone())
+                .self_jid(own_lid)
+                .initial_update(group.clone())
+                .build();
             let engine = crate::voip_control::wacore_backend::build_engine_from_config(
                 config,
+                generation,
                 Some(group_spec),
                 Box::new(RandTxIds),
             )
@@ -513,6 +514,7 @@ impl<'a> AcceptCall<'a> {
         let relay_endpoint = relay_endpoint_from_config(&config)?;
         let engine = crate::voip_control::wacore_backend::build_engine_from_config(
             config,
+            generation,
             None,
             Box::new(RandTxIds),
         )
@@ -938,14 +940,14 @@ impl<'a> OutgoingGroupCall<'a> {
         config.audio = audio.config();
         config.enable_video = video.is_some();
         let relay_endpoint = relay_endpoint_from_config(&config)?;
-        let group_spec = crate::voip_control::MediaGroupSpec {
-            call_creator: own_lid.clone(),
-            self_jid: own_lid.clone(),
-            initial_update: update.clone(),
-            direct_peer: None,
-        };
+        let group_spec = crate::voip_control::MediaGroupSpec::builder()
+            .call_creator(own_lid.clone())
+            .self_jid(own_lid.clone())
+            .initial_update(update.clone())
+            .build();
         let mut engine = crate::voip_control::wacore_backend::build_engine_from_config(
             config,
+            registration.generation,
             Some(group_spec),
             Box::new(RandTxIds),
         )
@@ -1149,14 +1151,14 @@ impl<'a> CallLinkCall<'a> {
         config.audio = audio.config();
         config.enable_video = video.is_some();
         let relay_endpoint = relay_endpoint_from_config(&config)?;
-        let group_spec = crate::voip_control::MediaGroupSpec {
-            call_creator: join.call_creator.clone(),
-            self_jid: own_lid,
-            initial_update: update.clone(),
-            direct_peer: None,
-        };
+        let group_spec = crate::voip_control::MediaGroupSpec::builder()
+            .call_creator(join.call_creator.clone())
+            .self_jid(own_lid)
+            .initial_update(update.clone())
+            .build();
         let engine = crate::voip_control::wacore_backend::build_engine_from_config(
             config,
+            generation,
             Some(group_spec),
             Box::new(RandTxIds),
         )
@@ -2434,6 +2436,7 @@ pub(crate) async fn attach_outgoing_relay(
         let relay_endpoint = relay_endpoint_from_config(&config).map_err(SetupStop::Failed)?;
         let engine = crate::voip_control::wacore_backend::build_engine_from_config(
             config,
+            pending.generation,
             None,
             Box::new(RandTxIds),
         )

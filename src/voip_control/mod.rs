@@ -14,9 +14,9 @@ pub use wacore::voip_control::{
     MediaAudioCodec, MediaAudioFormat, MediaAudioIo, MediaAudioRtpProfile, MediaAudioSpec,
     MediaCloseReason, MediaCodecDecisionSource, MediaCommand, MediaDirectPeer, MediaDirection,
     MediaEncodedFrame, MediaEvent, MediaGroupControlKind, MediaGroupSpec, MediaGroupTransition,
-    MediaKeyframeUrgency, MediaRtcpFeedback, MediaRtcpReportBlock, MediaSessionSpec,
-    MediaSetupError, MediaSilenceReason, MediaStats, MediaVideoUpgradeToken, VoipMediaBackend,
-    VoipMediaSession,
+    MediaKeyframeUrgency, MediaRtcpFeedback, MediaRtcpReportBlock, MediaSessionKey,
+    MediaSessionSpec, MediaSetupError, MediaSilenceReason, MediaStats, MediaVideoUpgradeToken,
+    VoipMediaBackend, VoipMediaSession,
 };
 
 #[cfg(feature = "voip-engine-wacore")]

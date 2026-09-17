@@ -446,16 +446,6 @@ impl VoipMediaSession for ResidentMediaSession {
         tx.force_send_preserving_epoch(command)
     }
 
-    fn accepts(&self, command: &MediaCommand) -> bool {
-        let Some(control) = group_control_of(command) else {
-            return true;
-        };
-        self.mailboxes()
-            .group
-            .as_ref()
-            .is_some_and(|tx| tx.accepts(&control))
-    }
-
     fn group_update_fits(&self, update: &GroupCallUpdate, is_call_link: bool) -> bool {
         let control = GroupControl::Update(Box::new(update.clone()));
         let mailboxes = self.mailboxes();

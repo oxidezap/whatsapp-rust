@@ -23,6 +23,11 @@ use crate::sync_marker::MaybeSendSync;
 use crate::types::call::VideoState;
 use crate::types::group_call::{GroupCallUpdate, ScreenShare, WaitingRoom};
 
+// The one place the neutral contract meets the engine: the consuming `TryFrom` conversions. Kept
+// out of this file so the compiler enforces that everything above stays free of `crate::voip`.
+#[cfg(feature = "voip")]
+mod engine_bridge;
+
 /// One decrypted keygen-v2 epoch, kept as secret material.
 ///
 /// The engine's `GroupRawEpoch` is in `crate::voip::driver`, which is gated by the very feature this
@@ -46,8 +51,12 @@ impl MediaGroupEpoch {
     }
 
     /// Take the bytes out, leaving an empty buffer whose allocation is erased on drop.
+    ///
+    /// Crate-private on purpose: an external consumer leaving with a bare `Vec<u8>` would escape
+    /// the erasure this type promises. A consumer that needs the bytes without taking ownership
+    /// uses [`as_bytes`](Self::as_bytes).
     #[must_use]
-    pub fn into_bytes(mut self) -> Vec<u8> {
+    pub(crate) fn into_bytes(mut self) -> Vec<u8> {
         std::mem::take(&mut *self.0)
     }
 }
@@ -56,6 +65,20 @@ impl core::fmt::Debug for MediaGroupEpoch {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("MediaGroupEpoch([redacted])")
     }
+}
+
+/// The generational identity of one media session.
+///
+/// A `call_id` alone is not an identity. The registry distinguishes `call ABC gen 12` from a later
+/// `call ABC gen 13` so that a finishing task only reaps its OWN registration (the ABA hazard), and
+/// a foreign backend keyed only on the call-id could deliver a late message from the old generation
+/// into the new session. The generation is the same monotonic token the control plane assigns per
+/// registration; a session that never reuses a call-id still carries one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, bon::Builder)]
+#[non_exhaustive]
+pub struct MediaSessionKey {
+    pub call_id: String,
+    pub generation: u64,
 }
 
 /// Call direction, without the engine's `CallDirection`.
@@ -238,10 +261,15 @@ pub struct MediaRtcpFeedback {
 /// transport. It is deliberately its own struct so [`Debug`] can redact the secrets in one place
 /// rather than depending on the engine's redaction. The secret fields are `call_key`, `relay_token`,
 /// `auth_token` and `integrity_key`; a `Debug` of this struct never prints them.
+///
+/// This is everything a backend needs to open the session, group media included: [`key`](Self::key)
+/// carries the generational identity and `group` the optional group media inputs. A backend never
+/// receives those as separate arguments.
 #[derive(Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct MediaSessionSpec {
-    pub call_id: String,
+    /// The generational identity of this session, not a bare call-id.
+    pub key: MediaSessionKey,
     pub direction: MediaDirection,
     pub self_lid: String,
     pub peer_lid: String,
@@ -261,12 +289,14 @@ pub struct MediaSessionSpec {
     pub enable_media: bool,
     pub enable_video: bool,
     pub enable_sframe: bool,
+    /// Group-media inputs, present only for a group call.
+    pub group: Option<MediaGroupSpec>,
 }
 
 impl core::fmt::Debug for MediaSessionSpec {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MediaSessionSpec")
-            .field("call_id", &self.call_id)
+            .field("key", &self.key)
             .field("direction", &self.direction)
             .field("self_lid", &self.self_lid)
             .field("peer_lid", &self.peer_lid)
@@ -282,18 +312,34 @@ impl core::fmt::Debug for MediaSessionSpec {
             .field("enable_media", &self.enable_media)
             .field("enable_video", &self.enable_video)
             .field("enable_sframe", &self.enable_sframe)
+            .field("group", &self.group)
             .finish()
     }
 }
 
 /// Authenticated direct-call participant retained during an in-place group promotion.
+#[derive(Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct MediaDirectPeer {
     pub user_jid: Jid,
     pub device_jid: Jid,
+    /// The direct-call callKey. Secret.
     pub call_key: Vec<u8>,
 }
 
+impl core::fmt::Debug for MediaDirectPeer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MediaDirectPeer")
+            .field("user_jid", &self.user_jid)
+            .field("device_jid", &self.device_jid)
+            .field("call_key", &"[redacted]")
+            .finish()
+    }
+}
+
 /// Group-media inputs layered onto a regular session.
+#[derive(Clone, Debug, bon::Builder)]
+#[non_exhaustive]
 pub struct MediaGroupSpec {
     pub call_creator: Jid,
     pub self_jid: Jid,
@@ -649,15 +695,15 @@ pub trait VoipMediaSession: MaybeSendSync + 'static {
         }
     }
 
-    /// Whether [`Self::submit`] would accept `command` right now, without consuming it.
-    ///
-    /// The control plane commits group state and media routing together, so it has to ask the
-    /// question before it commits rather than after a rejected submit.
-    fn accepts(&self, command: &MediaCommand) -> bool;
-
     /// Whether a committed roster would fit the media mailbox under the same budget the delivery
     /// uses. `is_call_link` charges an unattached call-link admission against the default slot
     /// count, matching the pre-attach reservation.
+    ///
+    /// This is the one non-consuming preflight the control plane needs: it commits group state and
+    /// media routing together, so it has to ask the question before it commits rather than after a
+    /// rejected submit. There is deliberately no generic `accepts(&MediaCommand)`: a command's
+    /// readiness depends on mailbox wiring the session may install later, so advertising readiness
+    /// for the whole catalogue would be a promise [`submit`](Self::submit) cannot keep.
     fn group_update_fits(&self, update: &GroupCallUpdate, is_call_link: bool) -> bool;
 
     /// The retained epoch transaction waiting for media to attach, if any.
@@ -719,10 +765,6 @@ impl<T: VoipMediaSession + ?Sized> VoipMediaSession for Arc<T> {
         (**self).deliver_group_epoch(transaction_id, raw_epoch, committed)
     }
 
-    fn accepts(&self, command: &MediaCommand) -> bool {
-        (**self).accepts(command)
-    }
-
     fn group_update_fits(&self, update: &GroupCallUpdate, is_call_link: bool) -> bool {
         (**self).group_update_fits(update, is_call_link)
     }
@@ -777,31 +819,69 @@ mod tests {
 
     #[test]
     fn spec_debug_redacts_call_secrets() {
-        let spec = MediaSessionSpec {
-            call_id: "cid".into(),
-            direction: MediaDirection::Incoming,
-            self_lid: "1:0@lid".into(),
-            peer_lid: "2:0@lid".into(),
-            call_key: vec![0xAB; 32],
-            ssrc: 1,
-            audio: MediaAudioSpec {
-                format: MediaAudioFormat::MLOW_16KHZ_60MS,
-                io: MediaAudioIo::Pcm,
-            },
-            relay_token: vec![0xCD; 8],
-            auth_token: vec![0xEF; 8],
-            relay_ip: "127.0.0.1".into(),
-            relay_port: 3478,
-            integrity_key: vec![b'k'; 20],
-            warp_mi_tag_len: 4,
-            enable_media: true,
-            enable_video: false,
-            enable_sframe: true,
-        };
+        let spec = MediaSessionSpec::builder()
+            .key(
+                MediaSessionKey::builder()
+                    .call_id("cid".into())
+                    .generation(3)
+                    .build(),
+            )
+            .direction(MediaDirection::Incoming)
+            .self_lid("1:0@lid".into())
+            .peer_lid("2:0@lid".into())
+            .call_key(vec![0xAB; 32])
+            .ssrc(1)
+            .audio(
+                MediaAudioSpec::builder()
+                    .format(MediaAudioFormat::MLOW_16KHZ_60MS)
+                    .io(MediaAudioIo::Pcm)
+                    .build(),
+            )
+            .relay_token(vec![0xCD; 8])
+            .auth_token(vec![0xEF; 8])
+            .relay_ip("127.0.0.1".into())
+            .relay_port(3478)
+            .integrity_key(vec![b'k'; 20])
+            .warp_mi_tag_len(4)
+            .enable_media(true)
+            .enable_video(false)
+            .enable_sframe(true)
+            .build();
         let rendered = format!("{spec:?}");
         assert!(rendered.contains("[redacted]"));
         assert!(!rendered.contains("171"));
         assert!(!rendered.contains("205"));
+    }
+
+    #[test]
+    fn the_session_key_is_part_of_the_identity() {
+        // The call-id alone is not the identity: the registry separates same-call-id generations,
+        // and the neutral key must carry that separation across the seam.
+        let key = MediaSessionKey::builder()
+            .call_id("ABC".into())
+            .generation(12)
+            .build();
+        assert_eq!(key.call_id, "ABC");
+        assert_eq!(key.generation, 12);
+        assert_ne!(
+            key,
+            MediaSessionKey::builder()
+                .call_id("ABC".into())
+                .generation(13)
+                .build()
+        );
+    }
+
+    #[test]
+    fn a_direct_peer_debug_redacts_its_call_key() {
+        let peer = MediaDirectPeer::builder()
+            .user_jid(Jid::new("1", wacore_binary::Server::Lid))
+            .device_jid(Jid::new("1", wacore_binary::Server::Lid))
+            .call_key(vec![0x11; 32])
+            .build();
+        let rendered = format!("{peer:?}");
+        assert!(rendered.contains("[redacted]"));
+        assert!(!rendered.contains("17"));
     }
 
     #[test]

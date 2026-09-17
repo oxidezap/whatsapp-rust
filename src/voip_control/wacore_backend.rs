@@ -12,74 +12,20 @@
 
 use std::sync::Arc;
 
-use wacore::voip::audio::{AudioCodec, AudioConfig, AudioFormat, AudioRtpProfile};
+use wacore::voip::audio::{AudioCodec, AudioFormat, AudioRtpProfile};
 use wacore::voip::engine::{
     CallConfig, CallEngine, CallEvent, CodecDecisionSource, GroupControlKind,
 };
 use wacore::voip::media_session::{ResidentMediaSession, stats_to_neutral};
 use wacore::voip::media_stats::AudioSilenceReason;
 use wacore::voip::rtcp::{RtcpFeedback, RtcpReportBlock};
-use wacore::voip::session::CallDirection;
 use wacore::voip::transport::RelayEndpointParams;
 use wacore::voip_control::{
-    MediaAudioCodec, MediaAudioFormat, MediaAudioRtpProfile, MediaAudioSpec,
-    MediaCodecDecisionSource, MediaDirection, MediaEncodedFrame, MediaEvent, MediaGroupControlKind,
-    MediaGroupSpec, MediaSessionSpec, MediaSetupError, MediaSilenceReason, MediaVideoUpgradeToken,
+    MediaAudioCodec, MediaAudioFormat, MediaAudioRtpProfile, MediaCodecDecisionSource,
+    MediaDirection, MediaEncodedFrame, MediaEvent, MediaGroupControlKind, MediaGroupSpec,
+    MediaSessionSpec, MediaSetupError, MediaSilenceReason, MediaVideoUpgradeToken,
     VoipMediaBackend, VoipMediaSession,
 };
-
-/// Build the engine's [`AudioConfig`] from the neutral flat spec.
-fn audio_config(spec: MediaAudioSpec) -> Result<AudioConfig, MediaSetupError> {
-    AudioConfig::from_neutral(spec).ok_or(MediaSetupError::BadAudioFormat)
-}
-
-/// Project the neutral spec onto the engine config.
-///
-/// [`CallConfig`] is the one engine struct that is not `#[non_exhaustive]`, so this can be a field
-/// assignment and the neutral spec is a direct projection of it.
-pub fn call_config(
-    spec: &MediaSessionSpec,
-    group: Option<&MediaGroupSpec>,
-) -> Result<CallConfig, MediaSetupError> {
-    let audio = audio_config(spec.audio)?;
-    if spec.relay_ip.parse::<std::net::Ipv4Addr>().is_err() {
-        return Err(MediaSetupError::BadEndpoint);
-    }
-    if spec.call_key.len() < 32 {
-        return Err(MediaSetupError::BadCallKey);
-    }
-    let peer_lid = group
-        .map(|group| group.call_creator.to_string())
-        .unwrap_or_else(|| spec.peer_lid.clone());
-    Ok(CallConfig {
-        call_id: spec.call_id.clone(),
-        direction: match spec.direction {
-            MediaDirection::Outgoing => CallDirection::Outgoing,
-            MediaDirection::Incoming => CallDirection::Incoming,
-            // `#[non_exhaustive]`: a new direction the engine does not name cannot be dialed, and
-            // refusing is the honest answer rather than guessing a side.
-            _ => {
-                return Err(MediaSetupError::Backend(
-                    "unsupported call direction".into(),
-                ));
-            }
-        },
-        self_lid: spec.self_lid.clone(),
-        peer_lid,
-        call_key: spec.call_key.clone(),
-        ssrc: spec.ssrc,
-        audio,
-        relay_token: spec.relay_token.clone(),
-        auth_token: spec.auth_token.clone(),
-        relay_ip: spec.relay_ip.clone(),
-        relay_port: spec.relay_port,
-        integrity_key: spec.integrity_key.clone(),
-        warp_mi_tag_len: spec.warp_mi_tag_len,
-        enable_media: spec.enable_media,
-        enable_video: spec.enable_video,
-        enable_sframe: spec.enable_sframe,
-    })
-}
 
 /// The relay endpoint a platform transport dials, read off the engine config the relay walk
 /// already resolved.
@@ -94,47 +40,22 @@ pub fn relay_endpoint(config: &CallConfig) -> Result<RelayEndpointParams, MediaS
     })
 }
 
-/// Project an engine config onto the neutral spec, so a platform that already parsed a `<relay>`
-/// can build its engine through the seam.
-#[must_use]
-pub fn spec_from_config(config: &CallConfig) -> MediaSessionSpec {
-    MediaSessionSpec::builder()
-        .call_id(config.call_id.clone())
-        .direction(match config.direction {
-            CallDirection::Outgoing => MediaDirection::Outgoing,
-            CallDirection::Incoming => MediaDirection::Incoming,
-            _ => MediaDirection::Incoming,
-        })
-        .self_lid(config.self_lid.clone())
-        .peer_lid(config.peer_lid.clone())
-        .call_key(config.call_key.clone())
-        .ssrc(config.ssrc)
-        .audio(config.audio.to_neutral())
-        .relay_token(config.relay_token.clone())
-        .auth_token(config.auth_token.clone())
-        .relay_ip(config.relay_ip.clone())
-        .relay_port(config.relay_port)
-        .integrity_key(config.integrity_key.clone())
-        .warp_mi_tag_len(config.warp_mi_tag_len)
-        .enable_media(config.enable_media)
-        .enable_video(config.enable_video)
-        .enable_sframe(config.enable_sframe)
-        .build()
-}
-
 /// Build the engine from an already-parsed [`CallConfig`], through the neutral spec.
 ///
 /// This is the resident backend's entry point on the live path: the facade parses the `<relay>` and
 /// decrypts the callKey exactly as before, then hands the resulting config across the seam instead
-/// of reaching for `CallEngine::new` itself. The round trip is behavior-preserving because the
-/// neutral spec is a field-for-field projection of [`CallConfig`].
+/// of reaching for `CallEngine::new` itself. `generation` is the registration token the call
+/// registry assigned, carried into the neutral [`MediaSessionSpec::key`] so a foreign backend can
+/// reject a message from a superseded generation.
 pub fn build_engine_from_config(
     config: CallConfig,
+    generation: u64,
     group: Option<MediaGroupSpec>,
     tx_ids: Box<dyn wacore::voip::engine::TxIdSource>,
 ) -> Result<CallEngine, MediaSetupError> {
-    let spec = spec_from_config(&config);
-    build_engine(&spec, group.as_ref(), tx_ids)
+    let mut spec = MediaSessionSpec::try_from((config, generation))?;
+    spec.group = group;
+    build_engine(spec, tx_ids)
 }
 
 /// Give the engine the platform's standard-Opus codec, when this build has one.
@@ -158,13 +79,15 @@ pub fn with_platform_audio_codec(engine: CallEngine) -> CallEngine {
     engine
 }
 
-/// Build the engine from the neutral spec, optionally layering group media.
+/// Build the engine from the neutral spec, applying the group media the spec carries.
 pub fn build_engine(
-    spec: &MediaSessionSpec,
-    group: Option<&MediaGroupSpec>,
+    mut spec: MediaSessionSpec,
     tx_ids: Box<dyn wacore::voip::engine::TxIdSource>,
 ) -> Result<CallEngine, MediaSetupError> {
-    let config = call_config(spec, group)?;
+    // Take the group before the config projection consumes the spec; it is applied to the engine
+    // after construction, not carried by `CallConfig`.
+    let group = spec.group.take();
+    let config = CallConfig::try_from(spec)?;
     let engine = CallEngine::new(config, tx_ids)
         .map(with_platform_audio_codec)
         .map_err(|error| MediaSetupError::Backend(error.to_string()))?;
@@ -174,82 +97,90 @@ pub fn build_engine(
     let mut engine = engine;
     engine
         .configure_group(wacore::voip::engine::GroupEngineConfig {
-            call_creator: group.call_creator.clone(),
-            self_jid: group.self_jid.clone(),
-            initial_update: group.initial_update.clone(),
+            call_creator: group.call_creator,
+            self_jid: group.self_jid,
+            initial_update: group.initial_update,
             direct_peer: group
                 .direct_peer
-                .as_ref()
                 .map(|peer| wacore::voip::engine::DirectPeer {
-                    user_jid: peer.user_jid.clone(),
-                    device_jid: peer.device_jid.clone(),
-                    call_key: peer.call_key.clone(),
+                    user_jid: peer.user_jid,
+                    device_jid: peer.device_jid,
+                    call_key: peer.call_key,
                 }),
         })
         .map_err(|error| MediaSetupError::Backend(error.to_string()))?;
     Ok(engine)
 }
 
-fn codec_to_neutral(codec: AudioCodec) -> MediaAudioCodec {
+/// Translate an engine codec, or `None` when the neutral seam does not name it.
+///
+/// Both enums are `#[non_exhaustive]`. A codec added upstream has no neutral spelling, and picking
+/// the nearest one would claim a decode the seam cannot describe; refusing lets the caller drop the
+/// event instead.
+fn codec_to_neutral(codec: AudioCodec) -> Option<MediaAudioCodec> {
     match codec {
-        AudioCodec::Mlow => MediaAudioCodec::Mlow,
-        AudioCodec::Opus => MediaAudioCodec::Opus,
-        // `#[non_exhaustive]`: a codec added upstream maps to the closest neutral spelling.
-        _ => MediaAudioCodec::Opus,
+        AudioCodec::Mlow => Some(MediaAudioCodec::Mlow),
+        AudioCodec::Opus => Some(MediaAudioCodec::Opus),
+        _ => None,
     }
 }
 
-fn rtp_profile_to_neutral(profile: AudioRtpProfile) -> MediaAudioRtpProfile {
+fn rtp_profile_to_neutral(profile: AudioRtpProfile) -> Option<MediaAudioRtpProfile> {
     match profile {
-        AudioRtpProfile::Mlow => MediaAudioRtpProfile::Mlow,
-        AudioRtpProfile::StandardOpus => MediaAudioRtpProfile::StandardOpus,
-        _ => MediaAudioRtpProfile::Mlow,
+        AudioRtpProfile::Mlow => Some(MediaAudioRtpProfile::Mlow),
+        AudioRtpProfile::StandardOpus => Some(MediaAudioRtpProfile::StandardOpus),
+        _ => None,
     }
 }
 
-fn format_to_neutral(format: AudioFormat) -> MediaAudioFormat {
-    MediaAudioFormat::builder()
-        .codec(codec_to_neutral(format.codec))
-        .rtp_profile(rtp_profile_to_neutral(format.rtp_profile))
-        .signaling_rate(format.signaling_rate)
-        .sample_rate(format.sample_rate)
-        .channels(format.channels)
-        .samples_per_frame(format.samples_per_frame)
-        .rtp_clock_rate(format.rtp_clock_rate)
-        .rtp_timestamp_step(format.rtp_timestamp_step)
-        .rtp_payload_type(format.rtp_payload_type)
-        .build()
+fn format_to_neutral(format: AudioFormat) -> Option<MediaAudioFormat> {
+    Some(
+        MediaAudioFormat::builder()
+            .codec(codec_to_neutral(format.codec)?)
+            .rtp_profile(rtp_profile_to_neutral(format.rtp_profile)?)
+            .signaling_rate(format.signaling_rate)
+            .sample_rate(format.sample_rate)
+            .channels(format.channels)
+            .samples_per_frame(format.samples_per_frame)
+            .rtp_clock_rate(format.rtp_clock_rate)
+            .rtp_timestamp_step(format.rtp_timestamp_step)
+            .rtp_payload_type(format.rtp_payload_type)
+            .build(),
+    )
 }
 
-fn decision_to_neutral(source: CodecDecisionSource) -> MediaCodecDecisionSource {
+fn decision_to_neutral(source: CodecDecisionSource) -> Option<MediaCodecDecisionSource> {
     match source {
-        CodecDecisionSource::Negotiated => MediaCodecDecisionSource::Negotiated,
-        CodecDecisionSource::Content => MediaCodecDecisionSource::Content,
-        _ => MediaCodecDecisionSource::Negotiated,
+        CodecDecisionSource::Negotiated => Some(MediaCodecDecisionSource::Negotiated),
+        CodecDecisionSource::Content => Some(MediaCodecDecisionSource::Content),
+        _ => None,
     }
 }
 
-fn silence_to_neutral(reason: AudioSilenceReason) -> MediaSilenceReason {
+fn silence_to_neutral(reason: AudioSilenceReason) -> Option<MediaSilenceReason> {
     match reason {
         AudioSilenceReason::NoDecoderForNegotiatedCodec => {
-            MediaSilenceReason::NoDecoderForNegotiatedCodec
+            Some(MediaSilenceReason::NoDecoderForNegotiatedCodec)
         }
-        AudioSilenceReason::AuthenticationFailing => MediaSilenceReason::AuthenticationFailing,
-        AudioSilenceReason::UnexpectedPayloadType => MediaSilenceReason::UnexpectedPayloadType,
-        AudioSilenceReason::CodecRejectingFrames => MediaSilenceReason::CodecRejectingFrames,
-        AudioSilenceReason::CodecFlapping => MediaSilenceReason::CodecFlapping,
-        // `#[non_exhaustive]`: a reason added upstream must still translate.
-        _ => MediaSilenceReason::Unknown,
+        AudioSilenceReason::AuthenticationFailing => {
+            Some(MediaSilenceReason::AuthenticationFailing)
+        }
+        AudioSilenceReason::UnexpectedPayloadType => {
+            Some(MediaSilenceReason::UnexpectedPayloadType)
+        }
+        AudioSilenceReason::CodecRejectingFrames => Some(MediaSilenceReason::CodecRejectingFrames),
+        AudioSilenceReason::CodecFlapping => Some(MediaSilenceReason::CodecFlapping),
+        AudioSilenceReason::Unknown => Some(MediaSilenceReason::Unknown),
+        _ => None,
     }
 }
 
-fn group_kind_to_neutral(control: GroupControlKind) -> MediaGroupControlKind {
+fn group_kind_to_neutral(control: GroupControlKind) -> Option<MediaGroupControlKind> {
     match control {
-        GroupControlKind::Update => MediaGroupControlKind::Update,
-        GroupControlKind::Epoch => MediaGroupControlKind::Epoch,
-        GroupControlKind::Reaction => MediaGroupControlKind::Reaction,
-        // `#[non_exhaustive]`: a control added upstream maps to the closest neutral spelling.
-        _ => MediaGroupControlKind::Update,
+        GroupControlKind::Update => Some(MediaGroupControlKind::Update),
+        GroupControlKind::Epoch => Some(MediaGroupControlKind::Epoch),
+        GroupControlKind::Reaction => Some(MediaGroupControlKind::Reaction),
+        _ => None,
     }
 }
 
@@ -276,28 +207,34 @@ fn rtcp_feedback_to_neutral(feedback: RtcpFeedback) -> wacore::voip_control::Med
         .build()
 }
 
-fn frame_to_neutral(frame: wacore::voip::EncodedAudioFrame) -> MediaEncodedFrame {
-    MediaEncodedFrame::builder()
-        .format(format_to_neutral(frame.format))
-        .codec(codec_to_neutral(frame.codec))
-        .data(frame.data)
-        .payload_type(frame.payload_type)
-        .sequence_number(frame.sequence_number)
-        .timestamp(frame.timestamp)
-        .marker(frame.marker)
-        .maybe_sender(frame.sender)
-        .maybe_device(frame.device)
-        .maybe_pid(frame.pid)
-        .build()
+fn frame_to_neutral(frame: wacore::voip::EncodedAudioFrame) -> Option<MediaEncodedFrame> {
+    Some(
+        MediaEncodedFrame::builder()
+            .format(format_to_neutral(frame.format)?)
+            .codec(codec_to_neutral(frame.codec)?)
+            .data(frame.data)
+            .payload_type(frame.payload_type)
+            .sequence_number(frame.sequence_number)
+            .timestamp(frame.timestamp)
+            .marker(frame.marker)
+            .maybe_sender(frame.sender)
+            .maybe_device(frame.device)
+            .maybe_pid(frame.pid)
+            .build(),
+    )
 }
 
 /// Translate an engine event into the neutral one, or `None` when the seam does not carry it.
 ///
-/// The engine enum is `#[non_exhaustive]`, so the trailing arm is required by the compiler even
-/// with every current variant handled. A future variant is **ignored, never fatal**: the media
-/// plane raising an event the seam does not model is not a reason to tear down a healthy call, so
-/// the arm logs and returns `None`. The alternative -- surfacing an untranslated event as a
-/// terminal `Closed` -- would drop a live call over a variant that had nothing to do with failure.
+/// The engine enum is `#[non_exhaustive]`, so a trailing arm is required by the compiler even with
+/// every current variant handled. Three things return `None`, and none is fatal to a healthy call:
+///
+/// - A future variant the compiler has not seen. Logged and dropped, never surfaced as a terminal
+///   `Closed`, because an event the adapter does not model is not a reason to tear down media.
+/// - A known variant whose payload names a known-unknown enum value (a codec, silence reason, or
+///   group-control kind added upstream). Inventing the nearest neutral spelling would claim a fact
+///   the seam cannot describe, so the event is dropped.
+/// - The compatibility spelling `VideoStateChanged`, which the seam deliberately does not carry.
 pub fn translate_event(event: CallEvent) -> Option<MediaEvent> {
     let neutral = match event {
         CallEvent::RelayAllocated => MediaEvent::RelayAllocated,
@@ -314,7 +251,7 @@ pub fn translate_event(event: CallEvent) -> Option<MediaEvent> {
             silent_for_ms,
             rtp_received,
             frames_produced,
-            dominant_reason: silence_to_neutral(dominant_reason),
+            dominant_reason: silence_to_neutral(dominant_reason)?,
         },
         CallEvent::AudioReceptionStalled { silent_for_ms } => {
             MediaEvent::AudioReceptionStalled { silent_for_ms }
@@ -325,9 +262,9 @@ pub fn translate_event(event: CallEvent) -> Option<MediaEvent> {
             source,
             packets_observed,
         } => MediaEvent::AudioCodecSwitched {
-            from: codec_to_neutral(from),
-            to: codec_to_neutral(to),
-            source: decision_to_neutral(source),
+            from: codec_to_neutral(from)?,
+            to: codec_to_neutral(to)?,
+            source: decision_to_neutral(source)?,
             packets_observed,
         },
         CallEvent::AudioCodecSourceIsFixed {
@@ -335,9 +272,9 @@ pub fn translate_event(event: CallEvent) -> Option<MediaEvent> {
             peer_expects,
             source,
         } => MediaEvent::AudioCodecSourceIsFixed {
-            sending: codec_to_neutral(sending),
-            peer_expects: codec_to_neutral(peer_expects),
-            source: decision_to_neutral(source),
+            sending: codec_to_neutral(sending)?,
+            peer_expects: codec_to_neutral(peer_expects)?,
+            source: decision_to_neutral(source)?,
         },
         CallEvent::AudioFormatMismatch {
             expected_rate,
@@ -376,7 +313,7 @@ pub fn translate_event(event: CallEvent) -> Option<MediaEvent> {
         },
         CallEvent::ForeignAudio(data) => MediaEvent::ForeignAudio(data),
         CallEvent::ForeignGroupAudio(frame) => {
-            MediaEvent::ForeignGroupAudio(frame_to_neutral(frame))
+            MediaEvent::ForeignGroupAudio(frame_to_neutral(frame)?)
         }
         CallEvent::PeerVideoStateChanged {
             source,
@@ -400,7 +337,7 @@ pub fn translate_event(event: CallEvent) -> Option<MediaEvent> {
         CallEvent::WaitingRoomUpdated(room) => MediaEvent::WaitingRoomUpdated(room),
         CallEvent::WaitingRoomHeartbeatFailed => MediaEvent::WaitingRoomHeartbeatFailed,
         CallEvent::GroupControlRejected { control } => {
-            MediaEvent::GroupControlRejected(group_kind_to_neutral(control))
+            MediaEvent::GroupControlRejected(group_kind_to_neutral(control)?)
         }
         CallEvent::GroupRekeyFailed => MediaEvent::GroupRekeyFailed,
         CallEvent::HandRaised {
@@ -488,12 +425,7 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         _session: &Arc<dyn VoipMediaSession>,
         spec: MediaSessionSpec,
     ) -> Result<(), MediaSetupError> {
-        build_engine(
-            &spec,
-            None,
-            Box::new(wacore::voip::engine::SequentialTxIds::new()),
-        )
-        .map(|_| ())
+        build_engine(spec, Box::new(wacore::voip::engine::SequentialTxIds::new())).map(|_| ())
     }
 }
 
@@ -506,11 +438,16 @@ pub fn neutral_stats(stats: wacore::voip::CallMediaStats) -> wacore::voip_contro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wacore::voip_control::MediaAudioIo;
+    use wacore::voip_control::{MediaAudioIo, MediaAudioSpec, MediaSessionKey};
 
     fn spec() -> MediaSessionSpec {
         MediaSessionSpec::builder()
-            .call_id("SEAM-1".into())
+            .key(
+                MediaSessionKey::builder()
+                    .call_id("SEAM-1".into())
+                    .generation(1)
+                    .build(),
+            )
             .direction(MediaDirection::Incoming)
             .self_lid("1:0@lid".into())
             .peer_lid("2:0@lid".into())
@@ -534,15 +471,89 @@ mod tests {
             .build()
     }
 
+    fn tx_ids() -> Box<dyn wacore::voip::engine::TxIdSource> {
+        Box::new(wacore::voip::engine::SequentialTxIds::new())
+    }
+
     #[test]
     fn the_engine_builds_from_the_neutral_spec() {
-        let engine = build_engine(
-            &spec(),
-            None,
-            Box::new(wacore::voip::engine::SequentialTxIds::new()),
-        )
-        .expect("the neutral spec builds an engine");
+        let engine = build_engine(spec(), tx_ids()).expect("the neutral spec builds an engine");
         assert_eq!(engine.call_id(), "SEAM-1");
+    }
+
+    #[test]
+    fn the_spec_carries_the_generational_identity() {
+        // The registry distinguishes `call ABC gen 12` from `gen 13`; the neutral spec must too, or
+        // a foreign backend keyed on the call-id alone could route a stale generation into the new
+        // session. The key survives the config projection.
+        let spec = spec();
+        let key = spec.key.clone();
+        assert_eq!(key.call_id, "SEAM-1");
+        assert_eq!(key.generation, 1);
+        let config = CallConfig::try_from(spec).expect("the spec projects onto a config");
+        assert_eq!(config.call_id, "SEAM-1");
+    }
+
+    #[test]
+    fn a_group_spec_rides_the_session_spec_and_configures_the_engine() {
+        // Item 3: a foreign backend cannot open a group call without the group inputs, so they ride
+        // the spec rather than a separate `open` parameter. The roster carries a relay and the local
+        // participant is connected, so `configure_group` accepts it and the engine reports a group.
+        let group = MediaGroupSpec::builder()
+            .call_creator(wacore_binary::Jid::new("1", wacore_binary::Server::Lid))
+            .self_jid(wacore_binary::Jid::new("1", wacore_binary::Server::Lid))
+            .initial_update(group_update())
+            .build();
+        let mut spec = spec();
+        spec.enable_media = true;
+        spec.group = Some(group);
+        let engine = build_engine(spec, tx_ids()).expect("a group spec builds a group engine");
+        assert!(engine.is_group());
+    }
+
+    fn group_update() -> wacore::types::group_call::GroupCallUpdate {
+        use wacore::types::group_call::{
+            GroupCallDevice, GroupCallParticipant, GroupCallRelay, GroupCallRelayEndpoint,
+            GroupCallUpdate,
+        };
+        let jid = wacore_binary::Jid::new("1", wacore_binary::Server::Lid);
+        let mut local =
+            GroupCallParticipant::new(jid.clone(), vec![GroupCallDevice::new(jid.clone())]);
+        local.state = Some("connected".to_string());
+        let relay = GroupCallRelay::builder()
+            .transaction_id(1)
+            .self_pid(1)
+            .uuid("relay".to_string())
+            .participant_uuid("participant".to_string())
+            .attribute_padding(false)
+            .warp_mi_tag_len(4)
+            .key(b"relay-key".to_vec())
+            .tokens(vec![vec![0x47]])
+            .auth_tokens(vec![vec![0x57]])
+            .endpoints(vec![
+                GroupCallRelayEndpoint::builder()
+                    .relay_id(1)
+                    .token_id(0)
+                    .auth_token_id(0)
+                    .relay_name("relay-1".to_string())
+                    .is_fna(false)
+                    .ipv4("203.0.113.7".to_string())
+                    .port(3480)
+                    .build(),
+            ])
+            .build();
+        GroupCallUpdate::builder()
+            .call_id("SEAM-1".to_string())
+            .call_creator(jid)
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![local])
+            .relay(relay)
+            .build()
     }
 
     #[test]
@@ -550,12 +561,7 @@ mod tests {
         let mut bad = spec();
         bad.call_key = vec![0u8; 8];
         assert_eq!(
-            build_engine(
-                &bad,
-                None,
-                Box::new(wacore::voip::engine::SequentialTxIds::new())
-            )
-            .err(),
+            build_engine(bad, tx_ids()).err(),
             Some(MediaSetupError::BadCallKey)
         );
     }
@@ -565,12 +571,7 @@ mod tests {
         let mut bad = spec();
         bad.audio.format.sample_rate = 0;
         assert_eq!(
-            build_engine(
-                &bad,
-                None,
-                Box::new(wacore::voip::engine::SequentialTxIds::new())
-            )
-            .err(),
+            build_engine(bad, tx_ids()).err(),
             Some(MediaSetupError::BadAudioFormat)
         );
     }
