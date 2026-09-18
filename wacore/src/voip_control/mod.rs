@@ -667,14 +667,45 @@ pub trait VoipMediaSession: MaybeSendSync + 'static {
         0
     }
 
-    /// The concrete implementation, so the backend that built this session can install its own
-    /// driver mailboxes into it.
+    /// Install the video-control mailbox the shell steers the plane through.
     ///
-    /// The control plane holds the session behind this trait, but wiring a driver's mailboxes is
-    /// backend-specific. This is the one narrow downcast the resident wiring path needs; a foreign
-    /// backend returns `None` and wires through its own adapter.
-    fn as_any(&self) -> Option<&dyn core::any::Any> {
-        None
+    /// A backend that owns its own video path returns `false` and needs no installation; the
+    /// resident session stores it so `submit(MediaCommand::EnableVideo …)` reaches the drive loop.
+    /// Defaults to refusing, so an implementation that does not know the mailbox is never wired into.
+    fn install_video_sender(&self, _tx: control::VideoControlSender) -> bool {
+        false
+    }
+
+    /// Install the counter cell the drive loop publishes into.
+    ///
+    /// The cell is shared with the `CallHandle` so the final counters survive registry removal; a
+    /// session that keeps its own counters returns `false` and reports them through [`stats`](Self::stats).
+    fn install_stats_cell(&self, _cell: Arc<media_stats::MediaStatsCell>) -> bool {
+        false
+    }
+
+    /// Install the caller-only recv-rekey mailbox.
+    ///
+    /// One-shot on the resident side: the first answerer wins, so a later install does not replace
+    /// a consumed sender. A backend that applies rekey through [`submit`](Self::submit) returns
+    /// `false`.
+    fn install_rekey_sender(&self, _tx: async_channel::Sender<control::PeerAnswer>) -> bool {
+        false
+    }
+
+    /// Install the group-control mailbox and replay the retained startup state.
+    ///
+    /// `warp_mi_tag_len` is the tag width baked into the attached pipelines; `established` is what
+    /// the call's own roster recorded, so a refresh that would move the packet boundary under an
+    /// attached pipeline is refused. A backend that owns its group path returns `false`.
+    fn install_group_sender(
+        &self,
+        _tx: async_channel::Sender<control::GroupControl>,
+        _warp_mi_tag_len: Option<usize>,
+        _committed: Option<GroupCallUpdate>,
+        _established_warp_mi_tag_len: Option<usize>,
+    ) -> bool {
+        false
     }
 
     /// Snapshot of the counters the control plane republishes for `CallHandle`.
@@ -722,8 +753,26 @@ impl<T: VoipMediaSession + ?Sized> VoipMediaSession for Arc<T> {
         (**self).retained_bytes()
     }
 
-    fn as_any(&self) -> Option<&dyn core::any::Any> {
-        (**self).as_any()
+    fn install_video_sender(&self, tx: control::VideoControlSender) -> bool {
+        (**self).install_video_sender(tx)
+    }
+
+    fn install_stats_cell(&self, cell: Arc<media_stats::MediaStatsCell>) -> bool {
+        (**self).install_stats_cell(cell)
+    }
+
+    fn install_rekey_sender(&self, tx: async_channel::Sender<control::PeerAnswer>) -> bool {
+        (**self).install_rekey_sender(tx)
+    }
+
+    fn install_group_sender(
+        &self,
+        tx: async_channel::Sender<control::GroupControl>,
+        warp_mi_tag_len: Option<usize>,
+        committed: Option<GroupCallUpdate>,
+        established_warp_mi_tag_len: Option<usize>,
+    ) -> bool {
+        (**self).install_group_sender(tx, warp_mi_tag_len, committed, established_warp_mi_tag_len)
     }
 
     fn stats(&self) -> MediaStats {

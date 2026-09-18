@@ -470,8 +470,29 @@ impl VoipMediaSession for ResidentMediaSession {
             )
     }
 
-    fn as_any(&self) -> Option<&dyn core::any::Any> {
-        Some(self)
+    fn install_video_sender(&self, tx: VideoControlSender) -> bool {
+        self.set_video_sender(tx);
+        true
+    }
+
+    fn install_stats_cell(&self, cell: Arc<MediaStatsCell>) -> bool {
+        self.set_stats_cell(cell);
+        true
+    }
+
+    fn install_rekey_sender(&self, tx: async_channel::Sender<PeerAnswer>) -> bool {
+        self.set_rekey_sender(tx);
+        true
+    }
+
+    fn install_group_sender(
+        &self,
+        tx: async_channel::Sender<GroupControl>,
+        warp_mi_tag_len: Option<usize>,
+        committed: Option<GroupCallUpdate>,
+        established_warp_mi_tag_len: Option<usize>,
+    ) -> bool {
+        self.set_group_sender(tx, warp_mi_tag_len, committed, established_warp_mi_tag_len)
     }
 
     fn stats(&self) -> MediaStats {

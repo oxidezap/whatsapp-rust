@@ -25,7 +25,7 @@ use crate::voip_control::CallEvent;
 use crate::voip_control::control::{GroupControl, VideoControl, VideoControlSender};
 use crate::voip_control::group::{GroupCallState, GroupStateApply, group_device_is_local};
 use crate::voip_control::resident_session::{
-    ResidentMediaBackend, ResidentMediaSession, codec_to_neutral, video_control_to_command,
+    ResidentMediaBackend, codec_to_neutral, video_control_to_command,
 };
 use crate::voip_control::{CallPhase, CallSession};
 use crate::voip_control::{MediaCommand, MediaSessionKey, VoipMediaBackend, VoipMediaSession};
@@ -316,19 +316,6 @@ fn upsert_peer_orientation(orientations: &mut Vec<PeerOrientation>, announced: P
 }
 
 impl CallEntry {
-    /// The resident session behind the seam, when this entry was built by the resident backend.
-    ///
-    /// The registry reaches media only through the neutral [`VoipMediaSession`] trait; this narrow
-    /// downcast exists because wiring the driver's concrete mailboxes is a backend concern. A
-    /// session built by another backend returns `None` here and gets no resident wiring, which is
-    /// the correct outcome: its media lives in its own process.
-    fn resident_media(&self) -> Option<&ResidentMediaSession> {
-        self.media
-            .as_ref()
-            .and_then(|media| media.as_any())
-            .and_then(|any| any.downcast_ref::<ResidentMediaSession>())
-    }
-
     /// Install a replacement session, carrying over the facts an entry holds
     /// outside it. A re-offer, a glare resolution and a group promotion all
     /// rebuild the session, and the peer's rotation is stated on the offer and
@@ -1857,8 +1844,10 @@ impl CallRegistry {
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
         {
-            if let Some(media) = entry.resident_media() {
-                media.set_stats_cell(cell.clone());
+            // Through the neutral seam: the resident session stores the shared cell so its `stats`
+            // reports the live call; a foreign backend keeps its own counters and refuses this.
+            if let Some(media) = entry.media.as_ref() {
+                media.install_stats_cell(cell.clone());
             }
             entry.media_stats = Some(cell);
         }
@@ -2092,9 +2081,9 @@ impl CallRegistry {
     ) {
         if let Some(entry) = self.active_calls().get_mut(call_id)
             && entry.generation == generation
-            && let Some(media) = entry.resident_media()
+            && let Some(media) = entry.media.as_ref()
         {
-            media.set_rekey_sender(tx);
+            media.install_rekey_sender(tx);
         }
     }
 
@@ -2126,10 +2115,10 @@ impl CallRegistry {
                 })
                 .collect();
             entry.video_teardown = Some(video_teardown);
-            let Some(media) = entry.resident_media() else {
+            let Some(media) = entry.media.as_ref() else {
                 return;
             };
-            media.set_video_sender(video_ctl_tx);
+            media.install_video_sender(video_ctl_tx);
             for control in replayed {
                 media.submit(video_control_to_command(control));
             }
@@ -2221,10 +2210,10 @@ impl CallRegistry {
             .and_then(GroupCallState::snapshot)
             .and_then(|snapshot| snapshot.relay.as_ref())
             .map(|relay| relay.warp_mi_tag_len.unwrap_or(4) as usize);
-        let Some(media) = entry.resident_media() else {
+        let Some(media) = entry.media.as_ref() else {
             return false;
         };
-        if !media.set_group_sender(tx, warp_mi_tag_len, committed, established) {
+        if !media.install_group_sender(tx, warp_mi_tag_len, committed, established) {
             return false;
         }
         entry.group_warp_mi_tag_len = warp_mi_tag_len;
