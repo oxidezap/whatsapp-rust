@@ -3363,6 +3363,16 @@ mod tests {
         assert!(registry.send_group_update_if_current("FAKE-CALL", generation, group_update(1)));
         assert!(registry.send_group_epoch_if_current("FAKE-CALL", generation, 6, vec![4, 5, 6]));
 
+        // The session publishes a media event on its own subscription, proving the neutral event
+        // stream works end to end without the engine.
+        let events = media.subscribe();
+        assert!(media.publish(crate::voip_control::MediaEvent::RelayAllocated));
+        assert_eq!(
+            events.try_recv(),
+            Ok(crate::voip_control::MediaEvent::RelayAllocated),
+            "a backend event reaches a subscriber"
+        );
+
         // Close ends this generation's media.
         registry.remove_if_current("FAKE-CALL", generation);
 
@@ -3381,8 +3391,57 @@ mod tests {
                 .any(|(c, _)| matches!(c, MediaCommand::ApplyGroupEpoch { .. })),
             "the decrypted epoch reached the neutral session"
         );
+        assert_eq!(
+            record.closed,
+            Some(crate::voip_control::MediaCloseReason::Local),
+            "close reached the neutral session"
+        );
         // The group epoch is erased by `MediaGroupEpoch` on drop; assert we built a neutral one.
         let _ = MediaGroupEpoch::new(vec![0; 32]);
+    }
+
+    #[tokio::test]
+    async fn a_backend_open_is_a_real_lifecycle_step() {
+        use crate::voip_control::fake_backend::FakeMediaBackend;
+        use crate::voip_control::{MediaSessionKey, MediaSessionSpec, MediaSetupError};
+
+        // `open` is a real operation on the backend: a spec it refuses comes back as its typed
+        // error, and the same call on a permissive backend succeeds. No engine, no registry types.
+        let refusing = FakeMediaBackend::refusing();
+        let accepting = FakeMediaBackend::new();
+        let key = MediaSessionKey {
+            call_id: "OPEN-CALL".to_string(),
+            generation: 1,
+        };
+        let session = refusing.reserve(&key, crate::voip_control::CallDirection::Outgoing);
+        let spec = MediaSessionSpec::builder()
+            .key(key)
+            .direction(crate::voip_control::CallDirection::Outgoing)
+            .self_lid("1:0@lid".into())
+            .peer_lid("2:0@lid".into())
+            .call_key(vec![0u8; 32])
+            .ssrc(1)
+            .audio(
+                crate::voip_control::MediaAudioSpec::builder()
+                    .format(crate::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS)
+                    .io(crate::voip_control::MediaAudioIo::Pcm)
+                    .build(),
+            )
+            .relay_token(vec![])
+            .auth_token(vec![])
+            .relay_ip("127.0.0.1".into())
+            .relay_port(3478)
+            .integrity_key(vec![])
+            .warp_mi_tag_len(4)
+            .enable_media(false)
+            .enable_video(false)
+            .enable_sframe(false)
+            .build();
+        assert!(matches!(
+            refusing.open(&session, spec.clone()).await,
+            Err(MediaSetupError::Backend(_))
+        ));
+        assert!(accepting.open(&session, spec).await.is_ok());
     }
 
     #[test]
