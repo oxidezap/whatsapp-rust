@@ -1222,6 +1222,7 @@ impl VideoEndpoints {
     }
 
     /// The neutral opening ports this video endpoint pair maps to, moving the trait objects across.
+    #[cfg(test)]
     fn into_ports(self) -> wacore::voip_control::MediaVideoPorts {
         wacore::voip_control::MediaVideoPorts {
             source: self.source,
@@ -2015,6 +2016,7 @@ async fn place_call(
                 call_key: call_key.to_vec(),
                 audio,
                 video,
+                video_shared: video_shared.clone(),
                 muted: muted.clone(),
                 ended: ended.clone(),
                 ev_tx,
@@ -2366,12 +2368,46 @@ pub(crate) struct PendingOutgoing {
     audio: AudioEndpoints,
     /// `.video()` endpoints for a video-from-the-start call; `None` for audio-only.
     video: Option<VideoEndpoints>,
+    /// The handle's video plumbing, created at place time so `start_video` works while the call is
+    /// still dormant. Its loop halves are handed to `open` when the relay arrives.
+    video_shared: Arc<VideoShared>,
     muted: Arc<AtomicBool>,
     ended: Arc<EndedFlag>,
     ev_tx: async_channel::Sender<CallEvent>,
     /// Receiver half of the one-shot recv-rekey channel (sender lives on the registry). Handed to the
     /// drive loop when the relay arrives so a `<accept>` that beat the relay is still applied (buffered).
     rekey_rx: async_channel::Receiver<wacore::voip::driver::PeerAnswer>,
+}
+
+/// Take the video plumbing's loop halves and wire the out-drain, yielding the neutral channels the
+/// backend's `open` consumes. Shared by the outgoing relay-attach path and the other three.
+fn take_video_channels(
+    client: &Client,
+    video_shared: &Arc<VideoShared>,
+    ended: Arc<EndedFlag>,
+    generation: u64,
+) -> wacore::voip_control::MediaVideoChannels {
+    let (video_in, timed_video_in, control) = video_shared.take_receivers();
+    let control_sender = video_shared.ctl_tx.clone();
+    let (video_out, video_out_rx) = async_channel::bounded::<VideoFrame>(VIDEO_OUT_CHANNEL_CAP);
+    let sink_slot = video_shared.sink_slot.clone();
+    client.runtime.spawn_detached(Box::pin(async move {
+        while let Ok(mut frame) = video_out_rx.recv().await {
+            frame.generation = generation;
+            let tx = sink_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(tx) = tx {
+                let _ = tx.try_send(frame);
+            }
+        }
+    }));
+    let _ = ended;
+    wacore::voip_control::MediaVideoChannels {
+        control,
+        control_sender,
+        video_in,
+        timed_video_in: Some(timed_video_in),
+        video_out,
+    }
 }
 
 /// The relay socket address to dial, read off a built config's already-parsed endpoint (avoids
@@ -2472,13 +2508,29 @@ pub(crate) async fn attach_outgoing_relay(
             .ok_or_else(|| {
                 SetupStop::Cancelled(CallError::Connect("call ended during relay connect".into()))
             })?;
+        if let Some(v) = &pending.video {
+            // `.video()` from the start: attach the endpoints before the loop reads the channels.
+            pending.video_shared.attach_endpoints(
+                client,
+                &v.source,
+                &v.sink,
+                pending.ended.clone(),
+            );
+            pending.video_shared.send_control(VideoControl::Enable);
+        }
+        let video_channels = take_video_channels(
+            client,
+            &pending.video_shared,
+            pending.ended.clone(),
+            pending.generation,
+        );
         let ctx = wacore::voip_control::MediaOpenContext {
             audio: pending.audio.clone().into_ports(),
-            video: pending.video.clone().map(|v| v.into_ports()),
+            video: None,
             events: pending.ev_tx.clone(),
             // Outgoing: the drive loop rekeys recv to the answering device (buffered if the accept
             // beat this relay).
-            video_channels: None,
+            video_channels: Some(video_channels),
             rekey: Some(pending.rekey_rx.clone()),
             group_epoch: None,
             initial_codec: None,
