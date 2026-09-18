@@ -13,11 +13,6 @@
 /// takes it by reference, and without this re-export that signature would force a `wacore`
 /// import through the seam.
 pub use wacore::types::group_call::GroupCallUpdate;
-/// Test-only video ports, matching the `wacore::voip_control` gate: the only constructor is the
-/// facade's test-only endpoint mapping. `cfg(test)` rather than `test-util` because this crate
-/// declares no such feature, and the only in-tree user is the facade's own unit tests.
-#[cfg(test)]
-pub use wacore::voip_control::MediaVideoPorts;
 /// The seam surface, spelled so an external crate implements [`VoipMediaBackend`] importing only
 /// `whatsapp_rust::voip_control::*`: every neutral command, event, port, and channel the contract
 /// names, with no `wacore` in the path.

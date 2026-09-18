@@ -213,10 +213,18 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         }
         let warp_mi_tag_len = engine.media_warp_mi_tag_len();
 
-        let factory = client
-            .relay_transport_factory(&endpoint)
-            .await
-            .map_err(|e| MediaSetupError::Backend(e.to_string()))?;
+        let factory =
+            client
+                .relay_transport_factory(&endpoint)
+                .await
+                .map_err(|error| match error {
+                    // Preserve the variant across the seam: the facade maps it back on return, so a
+                    // provider refusal arrives as the same `Setup` it left as instead of a doubly
+                    // wrapped "call setup failed: media session setup failed: ...".
+                    crate::client::CallError::Connect(reason) => MediaSetupError::Connect(reason),
+                    crate::client::CallError::Setup(reason) => MediaSetupError::Backend(reason),
+                    other => MediaSetupError::Backend(other.to_string()),
+                })?;
         // The dial runs under a ceiling: a provider factory that never resolves must fail the
         // call, not park it. Dropping this future (the control plane's ended race) drops the
         // in-flight connect with it.

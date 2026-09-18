@@ -68,8 +68,6 @@ pub mod registry;
 // The media endpoint ports (audio/video source and sink) and the video frame type, so a backend can
 // be handed the platform's endpoints without the engine.
 pub mod ports;
-#[cfg(any(test, feature = "test-util"))]
-pub use ports::MediaVideoPorts;
 pub use ports::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
 pub use ports::{
     MediaAudioPorts, MediaOpenContext, MediaVideoChannels, TimedVideoFrame, VideoFrame, VideoInput,
@@ -478,8 +476,9 @@ pub enum MediaSetupError {
     /// The relay block could not supply a usable endpoint, token or integrity key.
     #[error("relay setup failed: {0}")]
     Relay(String),
-    /// The relay transport failed to connect: the factory refused, the dial ceiling expired,
-    /// or the socket dropped mid-setup. This is transport failure, distinct from [`Self::Backend`]:
+    /// The relay transport failed to connect: `RelayTransportFactory::connect()` was refused, the
+    /// dial ceiling expired, or the socket dropped mid-setup. This is transport failure, distinct
+    /// from [`Self::Backend`]:
     /// the facade maps it to `CallError::Connect`, everything else to `CallError::Setup`.
     #[error("relay transport connect failed: {0}")]
     Connect(String),
@@ -584,8 +583,9 @@ pub trait VoipMediaBackend: MaybeSendSync {
     /// over its own media. `ctx` is the neutral opening context: ports, never a backend's
     /// internal mailboxes.
     ///
-    /// Error grammar: [`MediaSetupError::Connect`] is transport failure (the factory refused,
-    /// the dial ceiling expired, the socket dropped); [`MediaSetupError::Backend`] is everything
+    /// Error grammar: [`MediaSetupError::Connect`] is transport failure
+    /// (`RelayTransportFactory::connect()` refused, the dial ceiling expired, the socket
+    /// dropped); [`MediaSetupError::Backend`] is everything
     /// else. The facade maps `Connect` to `CallError::Connect` and the rest to `CallError::Setup`,
     /// so observable behavior for existing users does not change.
     ///

@@ -11,8 +11,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-#[cfg(test)]
-use bytes::Bytes;
 use log::warn;
 use portable_atomic::{AtomicU64, Ordering as PortableOrdering};
 use wacore::message_processing::EncType;
@@ -37,7 +35,7 @@ use wacore::types::group_call::{
 #[cfg(all(test, feature = "voip-engine-wacore"))]
 use wacore::voip::transport::RelayTransportFactory;
 #[cfg(all(test, feature = "voip-engine-wacore"))]
-use wacore::voip::{CallChannels, CallConfig, CallEngine, EncodedAudioFrame, run_call};
+use wacore::voip::{CallConfig, EncodedAudioFrame};
 use wacore::voip_control::control::{
     VideoControl, VideoControlReceiver, VideoControlSender, video_control_channel,
 };
@@ -56,8 +54,6 @@ use crate::client::{CallError, Client, ResponseWaiter};
 #[cfg(all(test, feature = "voip-engine-wacore"))]
 use crate::voip::audio::WA_FRAME_SAMPLES;
 use crate::voip::audio::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
-#[cfg(all(test, feature = "voip-engine-wacore"))]
-use crate::voip::driver::RandTxIds;
 use crate::voip::video::{TimedVideoFrame, VideoSink, VideoSource};
 
 #[derive(Clone)]
@@ -1224,15 +1220,6 @@ impl VideoEndpoints {
     fn has_valid_timing(&self) -> bool {
         self.source.rtp_timestamp_stride() != 0
     }
-
-    /// The neutral opening ports this video endpoint pair maps to, moving the trait objects across.
-    #[cfg(test)]
-    fn into_ports(self) -> wacore::voip_control::MediaVideoPorts {
-        wacore::voip_control::MediaVideoPorts::builder()
-            .source(self.source)
-            .sink(self.sink)
-            .build()
-    }
 }
 
 /// Drop hosted (Cloud-API) companions from the offer's device set: the client never establishes
@@ -2085,19 +2072,6 @@ fn client_weak(client: &Client) -> std::sync::Weak<Client> {
 /// Time to wait for the server's `<ack type=offer>` carrying the relay before giving up.
 const OFFER_ACK_RELAY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Three 60 ms frames absorb scheduling jitter without building a long capture delay.
-#[cfg(test)]
-const MIC_CHANNEL_CAPACITY: usize = 3;
-
-/// Bound on the legacy test-only engine path's `CallEvent` queue. Production calls read the
-/// session's own stream (bounded by `DEFAULT_CALL_EVENT_QUEUE_CAPACITY`, the same 64) from
-/// reservation, so this only sizes the direct-`attach_engine` harness below.
-#[cfg(all(test, feature = "voip-engine-wacore"))]
-const CALL_EVENT_CHANNEL_CAPACITY: usize = 64;
-/// Signaling controls are rare, but the queue stays bounded against a stalled media task.
-#[cfg(test)]
-const GROUP_CONTROL_CHANNEL_CAPACITY: usize = 64;
-
 /// Returned by `CallError::Connect` when the socket drops mid-setup, before the engine is attached.
 const ERR_DISCONNECTED_DURING_SETUP: &str = "connection dropped during call setup";
 
@@ -2249,41 +2223,6 @@ impl SetupStop {
             }
             Self::Cancelled(e) => e,
         }
-    }
-}
-
-/// The provider await, *cancelled* by the call ending rather than merely bounded by
-/// `RELAY_PROVIDER_TIMEOUT`.
-///
-/// The timeout is the floor and not the answer. A peer `<terminate>`, a decline from another
-/// device, or a connection cleanup removes the registration and fires `ended` while an installed
-/// provider is still building its factory — and these three callers are *awaited* by whoever
-/// called `accept()` or `start()`, so a wait that watched only the timeout would be their wait
-/// too: up to `RELAY_PROVIDER_TIMEOUT` holding the engine, the audio endpoints and the call key
-/// for a call that is already over.
-///
-/// `attach_outgoing_relay` already races this same flag on the dormant 1:1 path, and
-/// `attach_engine` races it around the dial. This is that rule for the paths a `RegisteredCall`
-/// owns, which were the three that still only had the ceiling.
-///
-/// Cancellation, not failure: the error says the call ended, and the caller drops its endpoints
-/// on the way out rather than publishing a media setup failure for an ordinary ending.
-#[cfg(all(test, feature = "voip-engine-wacore"))]
-async fn relay_factory_or_ended(
-    client: &Client,
-    registration: &RegisteredCall,
-    endpoint: &wacore::voip_control::transport::RelayEndpointParams,
-) -> Result<Arc<dyn RelayTransportFactory>, CallError> {
-    match futures::future::select(
-        std::pin::pin!(client.relay_transport_factory(endpoint)),
-        std::pin::pin!(registration.ended.wait()),
-    )
-    .await
-    {
-        futures::future::Either::Left((built, _)) => built,
-        futures::future::Either::Right(((), _)) => Err(CallError::Connect(
-            "the call ended while the relay transport was being built".into(),
-        )),
     }
 }
 
@@ -2968,101 +2907,25 @@ pub(crate) async fn send_answer_terminate(
     }
 }
 
-/// Spawn the call driver over `factory` after registering it. Generic over the relay factory so a
-/// test can inject an in-memory transport instead of the real DTLS/SCTP dialer.
-#[cfg(test)]
-#[cfg(all(test, feature = "voip-engine-wacore"))]
-async fn spawn_call(
-    client: &Client,
-    session: wacore::voip_control::CallSession,
-    engine: CallEngine,
-    factory: &dyn RelayTransportFactory,
-    audio: AudioEndpoints,
-    video: Option<VideoEndpoints>,
-) -> Result<CallHandle, CallError> {
-    let mut registration = RegisteredCall::new(client, session).await;
-    let result = spawn_registered_call(client, &registration, engine, factory, audio, video).await;
-    if result.is_ok() {
-        registration.disarm();
-    }
-    result
-}
-
-/// Attach media to a generation that is already registered. Answering uses this after registering
-/// before call-key decryption; the generic spawn wrapper above uses the same path for tests.
-#[cfg(all(test, feature = "voip-engine-wacore"))]
-async fn spawn_registered_call(
-    client: &Client,
-    registration: &RegisteredCall,
-    engine: CallEngine,
-    factory: &dyn RelayTransportFactory,
-    audio: AudioEndpoints,
-    video: Option<VideoEndpoints>,
-) -> Result<CallHandle, CallError> {
-    registration.ensure_current()?;
-    let registry = &registration.registry;
-    let muted = Arc::new(AtomicBool::new(false));
-    let media_stats = Arc::new(wacore::voip::MediaStatsCell::default());
-    let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(CALL_EVENT_CHANNEL_CAPACITY);
-    let video_shared = Arc::new(VideoShared::new());
-    registry.set_video_channels(
-        &registration.call_id,
-        registration.generation,
-        ev_tx.clone(),
-        video_shared.ctl_tx.clone(),
-        video_teardown_hook(&video_shared),
-    );
-    attach_engine(
-        client,
-        &registration.call_id,
-        registration.generation,
-        FailureCleanup::Guard,
-        engine,
-        factory,
-        audio,
-        video,
-        video_shared.clone(),
-        muted.clone(),
-        registration.ended.clone(),
-        ev_tx,
-        // Incoming (callee): no recv-rekey — the callee already keys recv on its own self LID.
-        None,
-        media_stats.clone(),
-    )
-    .await?;
-    Ok(CallHandle {
-        call_id: registration.call_id.clone(),
-        generation: registration.generation,
-        peer_jid: registration.peer_jid.clone(),
-        call_creator: registration.call_creator.clone(),
-        client_registry: client.call_registry(),
-        pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
-        client: client_weak(client),
-        muted,
-        video: video_shared,
-        events: ev_rx,
-        ended: registration.ended.clone(),
-        media: client
-            .call_registry()
-            .media_session(&registration.call_id, registration.generation),
-    })
-}
-
 /// Attach media to an already-registered generation by driving the backend's `open`.
 ///
-/// This is the modern path: the facade builds the neutral spec and opening context, hands its own
-/// video plumbing and event stream to the backend, and lets `open` own the engine and the drive
-/// loop. The `CallHandle` reads the session's stream and holds the session.
-#[allow(clippy::too_many_arguments)]
+/// This is the sole media startup path: the facade builds the neutral spec and opening context,
+/// hands its own video plumbing and event stream to the backend, and lets `open` own the engine
+/// and the drive loop. The `CallHandle` reads the session's stream and holds the session.
 /// Map a backend setup failure onto the call error surface: transport failures stay
 /// `CallError::Connect` (the relay never came up), everything else is `CallError::Setup`.
 fn map_setup_error(error: wacore::voip_control::MediaSetupError) -> CallError {
     match error {
         wacore::voip_control::MediaSetupError::Connect(reason) => CallError::Connect(reason),
+        // Unwrap one layer, never serialize the type into itself: `Backend` already carries the
+        // reason string, so formatting the whole error would stack "call setup failed: media
+        // session setup failed: ..." on every provider refusal crossing the seam twice.
+        wacore::voip_control::MediaSetupError::Backend(reason) => CallError::Setup(reason),
         other => CallError::Setup(other.to_string()),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn open_registered_media(
     client: &Client,
     registration: &RegisteredCall,
@@ -3157,7 +3020,17 @@ async fn open_registered_media(
             return Err(CallError::Connect("call ended during relay connect".into()));
         }
     };
-    result.map_err(map_setup_error)?;
+    // A failed open is a setup failure, not a local hangup: record it now, or the caller's
+    // registration guard drops the entry with the `Local` default when `close` runs.
+    // The ended-race arm above is external cancellation, not a failure, so it records nothing.
+    if let Err(error) = result {
+        registry.set_close_reason(
+            &registration.call_id,
+            registration.generation,
+            wacore::voip_control::MediaCloseReason::SetupFailed(error.to_string()),
+        );
+        return Err(map_setup_error(error));
+    }
     // The open awaited the relay dial, so the call may have ended or been superseded while it
     // waited: returning the handle now would hand out a stale generation, and the backend would
     // have installed its drive task after the teardown. Close what open started and report the
@@ -3181,331 +3054,6 @@ async fn open_registered_media(
         ended: registration.ended.clone(),
         media: Some(session),
     })
-}
-
-/// Connect the relay and spawn the driver task against pre-built shared handle state (mute flag,
-/// ended flag, event sender). Shared so the outgoing relay-arrival path can drive the same
-/// already-handed-out [`CallHandle`]. The registry entry under `generation` must already exist.
-#[cfg(test)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FailureCleanup {
-    /// No outer registration guard remains, so attach_engine reaps failures itself.
-    Here,
-    /// RegisteredCall/AnswerTeardown owns generation-aware cleanup.
-    Guard,
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(all(test, feature = "voip-engine-wacore"))]
-async fn attach_engine(
-    client: &Client,
-    call_id: &str,
-    generation: u64,
-    failure_cleanup: FailureCleanup,
-    engine: CallEngine,
-    factory: &dyn RelayTransportFactory,
-    audio: AudioEndpoints,
-    video: Option<VideoEndpoints>,
-    video_shared: Arc<VideoShared>,
-    muted: Arc<AtomicBool>,
-    ended: Arc<EndedFlag>,
-    ev_tx: async_channel::Sender<CallEvent>,
-    // Caller-only recv-rekey receiver; `None` for an incoming call (the callee keys recv on its own
-    // self LID and never rekeys).
-    rekey_rx: Option<async_channel::Receiver<wacore::voip_control::control::PeerAnswer>>,
-    media_stats: Arc<wacore::voip::MediaStatsCell>,
-) -> Result<(), CallError> {
-    // The session owns the public stream the handle reads; the harness's own sink only remains
-    // for the drive loop below. Resolve once: later arms may run after the entry is gone, and the
-    // held session still publishes then. The `ev_tx` fallback covers an entry removed before the
-    // first poll, where the old code published into the harness sink.
-    let media = client.call_registry().media_session(call_id, generation);
-    let publish_failure = |reason: String| {
-        // Prefer the session stream the handle reads, but an arm that already removed the entry
-        // closed it: then the harness sink is the only listener left, as before.
-        let delivered = media
-            .as_ref()
-            .is_some_and(|media| media.publish(CallEvent::MediaSetupFailed(reason.clone())));
-        if !delivered {
-            let _ = ev_tx.force_send(CallEvent::MediaSetupFailed(reason));
-        }
-    };
-    let (group_tx, group_rx) = async_channel::bounded(GROUP_CONTROL_CHANNEL_CAPACITY);
-    if !client.call_registry().set_group_control_sender(
-        call_id,
-        generation,
-        engine.media_warp_mi_tag_len(),
-        group_tx,
-    ) {
-        // Every exit below that *fails* says why through `publish_failure`, and the one that is
-        // merely cancelled does not. A caller that awaits the `Err` directly gets the reason
-        // twice and pays one queued event for it; a dormant handle gets it once instead of never.
-        let e = CallError::Setup(
-            "group relay WARP tag length changed during media attachment".to_string(),
-        );
-        // Record the reason before the entry can drop, so the session's `close` sees `SetupFailed`
-        // rather than the `Local` default.
-        client.call_registry().set_close_reason(
-            call_id,
-            generation,
-            wacore::voip_control::MediaCloseReason::SetupFailed(e.to_string()),
-        );
-        if failure_cleanup == FailureCleanup::Here {
-            client
-                .call_registry()
-                .remove_if_current(call_id, generation);
-        }
-        publish_failure(e.to_string());
-        ended.notify();
-        return Err(e);
-    }
-    let group_ctl = Some(group_rx);
-    // The registry entry already exists. Re-check is_connected NOW (after insert, before connect) so a
-    // disconnect that clears is_connected before abort_all can't slip through the gap between an
-    // earlier guard's load and the insert: either we inserted before abort_all (it catches us) or this
-    // sees !is_connected and the direct caller / outer registration guard cleans up. Wake
-    // wait_ended() before bailing so a parked waiter resolves.
-    if !client.is_connected() {
-        let e = CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into());
-        client.call_registry().set_close_reason(
-            call_id,
-            generation,
-            wacore::voip_control::MediaCloseReason::SetupFailed(e.to_string()),
-        );
-        if failure_cleanup == FailureCleanup::Here {
-            client
-                .call_registry()
-                .remove_if_current(call_id, generation);
-        }
-        publish_failure(e.to_string());
-        ended.notify();
-        return Err(e);
-    }
-
-    // Connect failure leaves the call already visible (registry entry inserted before connect; for an
-    // outgoing call the PendingOutgoing was already removed by attach_outgoing_relay). Direct callers
-    // reap here; guarded callers retain the generation so answer teardown can claim it atomically.
-    // Either way, wake wait_ended() before propagating.
-    //
-    // Race the dial against the call ending. A hangup, a peer <terminate>, or a disconnect landing in
-    // this window all remove our registry entry, and its `on_terminal` hook notifies `ended` even
-    // though no media task exists yet -- so selecting on `ended` drops the in-flight connect future to
-    // abort the unwanted DTLS/SCTP dial instead of letting it run to success while wait_ended() stays
-    // parked.
-    //
-    // And bounded, which the race alone is not. The native factory carries its own
-    // `RELAY_CONNECT_TIMEOUT` and so needed nothing here; a factory an installed provider returned
-    // carries whatever its author gave it, and a browser whose ICE never settles gives it nothing.
-    // Ending is not a floor either -- an incoming `accept()` or a group `start()` is *awaited* by
-    // its caller, so with no peer terminate there is nothing to notify `ended` and the call would
-    // hang rather than fail. This ceiling sits above the native one, so a native dial still fails
-    // with its own more specific message and only a stalled provider reaches this.
-    // Scoped, because the pinned `ended.wait()` borrows a flag this function later moves into the
-    // driver task's guard: what leaves the block is the dial's own answer, or nothing.
-    let dialed = {
-        let dial = factory.connect();
-        let ending = ended.wait();
-        futures::pin_mut!(ending);
-        match wacore::runtime::timeout(
-            &*client.runtime,
-            crate::voip_control::wacore_backend::RELAY_DIAL_CEILING,
-            futures::future::select(dial, ending),
-        )
-        .await
-        {
-            Ok(futures::future::Either::Left((result, _))) => Some(result),
-            // Ended mid-dial: the loser `dial` future drops here, aborting the connect.
-            Ok(futures::future::Either::Right(((), _dial))) => None,
-            Err(_) => {
-                let ceiling = crate::voip_control::wacore_backend::RELAY_DIAL_CEILING;
-                let e = CallError::Connect(format!(
-                    "the relay transport did not connect within {ceiling:?}"
-                ));
-                client.call_registry().set_close_reason(
-                    call_id,
-                    generation,
-                    wacore::voip_control::MediaCloseReason::SetupFailed(e.to_string()),
-                );
-                if failure_cleanup == FailureCleanup::Here {
-                    client
-                        .call_registry()
-                        .remove_if_current(call_id, generation);
-                }
-                publish_failure(e.to_string());
-                ended.notify();
-                return Err(e);
-            }
-        }
-    };
-    let (transport, relay_events) = match dialed {
-        Some(Ok(pair)) => pair,
-        Some(Err(dial_err)) => {
-            let e = CallError::Connect(dial_err.to_string());
-            client.call_registry().set_close_reason(
-                call_id,
-                generation,
-                wacore::voip_control::MediaCloseReason::SetupFailed(e.to_string()),
-            );
-            if failure_cleanup == FailureCleanup::Here {
-                client
-                    .call_registry()
-                    .remove_if_current(call_id, generation);
-            }
-            publish_failure(e.to_string());
-            ended.notify();
-            return Err(e);
-        }
-        // The generation was already reaped by whoever ended us; reap defensively and stop.
-        //
-        // No `MediaSetupFailed` on this one arm, and it is the reason the two are told apart at
-        // all: reaching here means `ended` won the race above, so the call was hung up,
-        // terminated by the peer, or disconnected while the dial was in flight. That is an
-        // ordinary ending, and publishing a terminal setup failure for it would tell whoever
-        // ended the call that its media had broken.
-        None => {
-            client
-                .call_registry()
-                .remove_if_current(call_id, generation);
-            return Err(CallError::Connect("call ended during relay connect".into()));
-        }
-    };
-
-    // Only the selected I/O pair stays open. Closed inactive channels make their driver select arms
-    // retire immediately without per-frame branching or idle tasks. The endpoints are mapped to the
-    // neutral ports first, so this path and the backend's `open` build the same channel shape.
-    let (mic_rx, speaker, encoded_audio_in, encoded_audio_out, audio_feed) = match audio
-        .into_ports()
-    {
-        wacore::voip_control::MediaAudioPorts::Pcm { source, sink } => {
-            let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(MIC_CHANNEL_CAPACITY);
-            let mute_feed = MuteFeed {
-                src: source.frames(),
-                out: mic_tx,
-                muted,
-            };
-            let feed = client.runtime.spawn(Box::pin(mute_feed.run()));
-            let (_encoded_tx, encoded_audio_in) = async_channel::bounded::<Bytes>(1);
-            let (encoded_audio_out, _encoded_rx) = async_channel::bounded::<EncodedAudioFrame>(1);
-            (
-                mic_rx,
-                sink.playout(),
-                encoded_audio_in,
-                encoded_audio_out,
-                Some(feed),
-            )
-        }
-        wacore::voip_control::MediaAudioPorts::Encoded { source, sink } => {
-            let (_mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
-            let (speaker, _speaker_rx) = async_channel::bounded::<Vec<i16>>(1);
-            (mic_rx, speaker, source.frames(), sink.frames(), None)
-        }
-        // The ports enum is non-exhaustive: a future I/O mode refuses instead of silently
-        // running with dead audio.
-        _ => {
-            return Err(CallError::Connect("unsupported audio ports".into()));
-        }
-    };
-
-    // Video plumbing: the drive loop always gets the channels; the endpoints attach now (a
-    // `.video()` call) or later (an upgrade via CallHandle::start_video/accept_video).
-    let (video_in_rx, timed_video_in_rx, video_ctl_rx) = video_shared.take_receivers();
-    let (video_out_tx, video_out_rx) = async_channel::bounded::<VideoFrame>(VIDEO_OUT_CHANNEL_CAP);
-    // Forwarder from the drive loop to whatever sink is CURRENTLY attached (swappable mid-call).
-    // Ends when the drive loop drops its video_out sender; moved into the media task like mic_feed.
-    let sink_slot = video_shared.sink_slot.clone();
-    // The drive loop watches its own `video_out` for the same purpose, but that queue is drained by
-    // THIS task and so is rarely the one that fills. A sink the consumer attached is where a frame
-    // actually goes missing, and it is the last boundary that still knows a picture was lost -- past
-    // here the consumer's channel is opaque to us.
-    let keyframe_recovery = video_shared.ctl_tx.clone();
-    // Authoritative call generation, stamped here so a same-call-id replacement's frames never
-    // masquerade as this call's: the engine leaves `generation` at zero and only this boundary
-    // knows the registry generation. Never replaced by per-source or arrival metadata.
-    let media_generation = generation;
-    let video_out_feed = client.runtime.spawn(Box::pin(async move {
-        while let Ok(mut frame) = video_out_rx.recv().await {
-            frame.generation = media_generation;
-            let tx = sink_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            // Loss tolerant, like the speaker: a stalled sink sheds frames.
-            // Only `Full` is a shed worth recovering from -- a closed sink is
-            // a consumer that has gone away, and asking it for a keyframe an
-            // interval until the call ends buys the peer nothing but its
-            // largest frame.
-            if let Some(tx) = tx
-                && let Err(async_channel::TrySendError::Full(_)) = tx.try_send(frame)
-            {
-                keyframe_recovery.send(VideoControl::RequestPeerKeyframe(
-                    KeyframeUrgency::Coalesced,
-                ));
-            }
-        }
-    }));
-    if let Some(v) = video {
-        // Mapped to the neutral ports so this path and the backend's `open` attach the same
-        // endpoints; `attach_endpoints` takes them back by trait object.
-        let ports = v.into_ports();
-        video_shared.attach_endpoints(client, &ports.source, &ports.sink, ended.clone());
-        // From-start video: the engine was built with enable_video, but a same-path Enable is
-        // idempotent and keeps one code path for both entries.
-        video_shared.send_control(VideoControl::Enable);
-    }
-
-    // One cell, three readers: the drive loop publishes into it, the consumer's `CallHandle` holds
-    // it directly, and the registry hands it to anyone who has only a call id. The handle's own
-    // reference is what makes the FINAL counters readable: the registry entry is removed before
-    // `wait_ended()` fires, which is exactly when a consumer inspects a call that failed.
-    client
-        .call_registry()
-        .set_media_stats(call_id, generation, media_stats.clone());
-
-    let channels = CallChannels {
-        mic: mic_rx,
-        speaker,
-        encoded_audio_in,
-        encoded_audio_out,
-        events: ev_tx,
-        rekey: rekey_rx,
-        video_in: video_in_rx,
-        timed_video_in: Some(timed_video_in_rx),
-        video_out: video_out_tx,
-        video_ctl: video_ctl_rx,
-        group_ctl,
-        media_stats,
-    };
-
-    let registry = client.call_registry();
-    let registry_for_task = registry.clone();
-    let cid = call_id.to_string();
-    // Build the notify-on-drop guard OUTSIDE the future and move it in. A captured value is dropped
-    // with the future even if the task is aborted before its first poll; a value `let`-bound inside
-    // the body is only constructed on poll, so it would be skipped on an abort-before-poll and leave
-    // a parked wait_ended() waiter asleep forever.
-    let ended_guard = scopeguard::guard(ended, |e| {
-        e.notify();
-    });
-    // The driver's runtime is the client's own, not a hardcoded Tokio one. `run_call` has always
-    // been portable and taken the runtime as an argument; naming Tokio here was what put the one
-    // remaining executor assumption in the call path, and it is exactly the assumption a page
-    // cannot satisfy.
-    let driver_runtime = client.runtime.clone();
-    let task = client.runtime.spawn(Box::pin(async move {
-        // All are captured (moved in), so any teardown -- even an abort before the first poll --
-        // drops them: the feeds are aborted and `ended` is notified.
-        let _ended_guard = ended_guard;
-        let _audio_feed = audio_feed;
-        let _video_out_feed = video_out_feed;
-        let reason = run_call(driver_runtime, transport, relay_events, channels, engine).await;
-        // Record why the drive ended before dropping our own entry, so the entry's `Drop` hands the
-        // real reason to `VoipMediaSession::close` instead of the `Local` default. A relay-drop or a
-        // failed write is a media failure a foreign backend can tell apart from a hangup.
-        registry_for_task.set_close_reason(&cid, generation, reason);
-        // A locally-ended call gets no <terminate>; drop our own entry so the registry doesn't grow.
-        // The call's `ring_devices` live on the session, so this also drops the sibling-dismiss
-        // tracking -- no separate map to clean up.
-        registry_for_task.remove_if_current(&cid, generation);
-    }));
-    registry.set_media_task(call_id, generation, task);
-    Ok(())
 }
 
 /// Outbound video AU backlog before the source feed back-pressures (AUs are large; keep it short).
@@ -3547,7 +3095,7 @@ pub(crate) struct VideoShared {
     /// The live source feed, aborted on downgrade/replacement.
     feed: std::sync::Mutex<Option<wacore::runtime::AbortHandle>>,
     generation: AtomicU64,
-    /// Receiver halves parked until `attach_engine` hands them to the drive loop.
+    /// Receiver halves parked until `backend.open` takes them into the drive loop.
     receivers: std::sync::Mutex<Option<VideoReceivers>>,
 }
 
@@ -3574,8 +3122,8 @@ impl VideoShared {
         }
     }
 
-    /// The drive-loop halves. After the one real take (attach_engine), fresh closed channels are
-    /// returned defensively — their arms disable themselves in the driver.
+    /// The drive-loop halves. After the one real take (the backend's open), fresh closed
+    /// channels are returned defensively — their arms disable themselves in the driver.
     fn take_receivers(&self) -> VideoReceivers {
         self.receivers
             .lock()
@@ -3801,7 +3349,7 @@ impl VideoFeed {
             };
             // Await the send (the bounded channel back-pressures a source that outruns the wire),
             // but race it against `ended` too: a dormant call whose 4-AU queue filled before
-            // `attach_engine` drained it would otherwise park here forever past teardown.
+            // the backend's open drained it would otherwise park here forever past teardown.
             let ended = self.ended.wait().fuse();
             let send = self.out.send(au).fuse();
             futures::pin_mut!(ended, send);
@@ -5107,9 +4655,10 @@ impl CallHandle {
         //
         // Notify `ended` whenever we actually removed our own registration. For an attached call this
         // is redundant with the task drop-guard; it's load-bearing in the window where the relay dial
-        // (attach_engine's connect) is still in flight -- no media task exists yet to fire a drop-guard
-        // and the PendingOutgoing was already consumed, so nothing else would wake wait_ended() or stop
-        // the dial. A superseded/already-gone handle removed nothing and stays quiet.
+        // (the backend open's connect) is still in flight -- no media task exists yet to fire a
+        // drop-guard and the PendingOutgoing was already consumed, so nothing else would wake
+        // wait_ended() or stop the dial. A superseded/already-gone handle removed nothing and stays
+        // quiet.
         if removed_registry || removed_pending.is_some() {
             self.ended.notify();
         }
@@ -6841,18 +6390,6 @@ mod tests {
         );
     }
 
-    fn engine() -> CallEngine {
-        let cfg = CallConfig::for_incoming(
-            "CID-FACADE",
-            "111111111111111:0@lid",
-            "222222222222222:0@lid",
-            (0u8..32).collect(),
-            &sample_relay(),
-        )
-        .expect("config");
-        CallEngine::new(cfg, Box::new(RandTxIds)).expect("engine")
-    }
-
     /// A relay provider that always hands out the test's own factory, so a migrated test keeps
     /// its in-memory (or gated, or failing) transport while driving the production startup path.
     /// The resident backend dials through the client's installed provider; this is what plugs the
@@ -6875,8 +6412,8 @@ mod tests {
 
     /// Test-only bridge from the retired `spawn_call` harness to the production startup path.
     ///
-    /// Builds the same neutral spec the shared `engine()` helper's config carries (incoming
-    /// CID-FACADE over `sample_relay()`), installs `factory` as the client's relay provider, and
+    /// Builds the neutral spec for the shared incoming CID-FACADE call over `sample_relay()`,
+    /// installs `factory` as the client's relay provider, and
     /// drives `open_registered_media` — the `reserve() + backend.open()` production uses. Migrated
     /// tests keep their asserts; the media startup under them is the one that ships.
     #[cfg(feature = "voip-engine-wacore")]
@@ -6952,6 +6489,63 @@ mod tests {
         }
     }
 
+    /// A failed `open` must record `SetupFailed` on the entry before the registration guard
+    /// drops it: without the record the entry falls back to `Local`, and a lingering handle
+    /// cannot tell a failed setup from a hangup.
+    #[tokio::test]
+    async fn failed_open_records_setup_failed_close_reason() {
+        use wacore::voip_control::fake_backend::FakeMediaBackend;
+
+        let backend = Arc::new(FakeMediaBackend::refusing());
+        let client = crate::test_utils::create_test_client_with_voip_backend(backend.clone()).await;
+        let registration = RegisteredCall::new(&client, mk_session()).await;
+        let key = wacore::voip_control::MediaSessionKey::builder()
+            .call_id(registration.call_id.clone())
+            .generation(registration.generation)
+            .build();
+        let spec = wacore::voip_control::MediaSessionSpec::from_relay(
+            CallDirection::Incoming,
+            key.clone(),
+            "111111111111111:0@lid",
+            "222222222222222:0@lid",
+            (0u8..32).collect(),
+            &sample_relay(),
+        )
+        .expect("sample spec");
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+
+        // CallHandle has no Debug, so match on the Result rather than expect_err.
+        let res = open_registered_media(
+            &client,
+            &registration,
+            spec,
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(CallError::Setup(_))),
+            "a refused open must surface a Setup error"
+        );
+        let session = backend.session(&key).expect("reserved session");
+        drop(registration);
+        assert_eq!(
+            client.call_registry().active_count(),
+            0,
+            "a refused open must not leak the registry entry"
+        );
+        assert!(
+            matches!(
+                session.record().closed,
+                Some(wacore::voip_control::MediaCloseReason::SetupFailed(_))
+            ),
+            "the session close must carry the setup failure, not Local"
+        );
+    }
+
     /// The generation the background drive registered, so a trigger handle can target it. The
     /// bridge registers before dialing; a trigger that lands before that would hang up nothing.
     async fn poll_generation(client: &Arc<Client>) -> u64 {
@@ -6965,7 +6559,7 @@ mod tests {
     }
 
     /// In-memory relay factory: returns a transport that records sends and a channel the test feeds
-    /// inbound events through. Lets `spawn_call` be exercised without a real DTLS/SCTP dialer.
+    /// inbound events through. Lets the backend's dial be exercised without a real DTLS/SCTP dialer.
     struct MockFactory {
         sent: Arc<Mutex<Vec<Bytes>>>,
         relay_rx: Mutex<Option<async_channel::Receiver<RelayTransportEvent>>>,
@@ -7137,7 +6731,7 @@ mod tests {
                 std::future::pending().await
             }
         }
-        // Through `spawn_call` rather than the outgoing relay waiter, deliberately: that path also
+        // Through the bridge rather than the outgoing relay waiter, deliberately: that path also
         // carries `OFFER_ACK_RELAY_TIMEOUT`, which under a paused clock fires first and ends the
         // call before this ceiling can. Real, and a different mechanism -- what is under test here
         // is the one that has to hold when nothing else ends the call, which is exactly an
@@ -7283,7 +6877,7 @@ mod tests {
     /// version tests `RELAY_DIAL_CEILING` and cannot be written here: under a paused clock this
     /// path carries a shorter timer of its own, which fires first, ends the call, and sends the
     /// dial into its *cancelled* arm -- so the test would pass or fail on a mechanism it is not
-    /// about. The ceiling has its own test through `spawn_call`
+    /// about. The ceiling has its own test through the bridge
     /// (`a_factory_that_never_connects_fails_the_call`); what is under test here is the
     /// publication, and a refusing dial reaches the same exit with no clock involved.
     #[tokio::test]
@@ -7344,9 +6938,8 @@ mod tests {
     /// `RELAY_PROVIDER_TIMEOUT` is the floor and not the answer here. `accept()` and the group
     /// starts are *awaited* by their callers, so a wait that watched only the ceiling would be
     /// the caller's wait too — up to fifteen seconds holding the engine, the audio endpoints and
-    /// the call key for a call the peer has already hung up. The dormant 1:1 path got this race
-    /// when the provider seam landed; the three paths a `RegisteredCall` owns did not, which is
-    /// the hole this closes.
+    /// the call key for a call the peer has already hung up. The production open races the
+    /// provider await against the registration's `ended` flag, so the terminate ends it.
     ///
     /// On a real clock deliberately: under `start_paused` the fifteen-second ceiling
     /// auto-advances and fires, so the test would pass without the race and prove nothing. Two
@@ -7368,13 +6961,32 @@ mod tests {
         let incoming = incoming_offer(false);
         let registration = register_answer(&client, &incoming).await;
         client.set_relay_transport_provider(Arc::new(NeverAnswers));
-        let endpoint = wacore::voip_control::transport::RelayEndpointParams {
-            addr: "203.0.113.9:3478".parse().expect("addr"),
-            ice_ufrag: String::new(),
-            ice_pwd: String::new(),
-        };
-
-        let awaiting = relay_factory_or_ended(&client, &registration, &endpoint);
+        // Drive the production open: it parks inside the provider's factory await, and the
+        // peer terminate ends it through the open-vs-ended race.
+        let key = wacore::voip_control::MediaSessionKey::builder()
+            .call_id(incoming.action.call_id().to_string())
+            .generation(registration.generation)
+            .build();
+        let spec = wacore::voip_control::MediaSessionSpec::from_relay(
+            CallDirection::Incoming,
+            key,
+            "111111111111111:0@lid",
+            "222222222222222:0@lid",
+            (0u8..32).collect(),
+            &sample_relay(),
+        )
+        .expect("sample spec");
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+        let drive = open_registered_media(
+            &client,
+            &registration,
+            spec,
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            None,
+            None,
+            None,
+        );
         let end_peer = async {
             tokio::task::yield_now().await;
             terminate_call(&client, incoming.action.call_id());
@@ -7382,7 +6994,7 @@ mod tests {
 
         let (result, ()) = tokio::time::timeout(
             Duration::from_secs(2),
-            futures::future::join(awaiting, end_peer),
+            futures::future::join(drive, end_peer),
         )
         .await
         .expect("the peer's terminate must end the await, not leave it on the provider");
@@ -7392,7 +7004,7 @@ mod tests {
             Err(error) => error,
         };
         assert!(
-            error.to_string().contains("the call ended"),
+            error.to_string().contains("call ended"),
             "the reason has to name the ending rather than the ceiling, got: {error}"
         );
     }
@@ -7471,7 +7083,7 @@ mod tests {
         );
     }
 
-    // spawn_call: connects via the injected factory, registers the call, emits the STUN allocate,
+    // The bridge: connects via the injected factory, registers the call, emits the STUN allocate,
     // and tears down (registry empties, handle.wait_ended resolves) when the relay disconnects.
     #[tokio::test]
     async fn spawn_call_registers_drives_and_tears_down() {
@@ -9686,13 +9298,13 @@ mod tests {
     }
 
     // Finding 1: the call is registered BEFORE the relay connect().await. If cleanup_connection_state
-    // (abort_all) runs during that connect gap, the entry is gone by the time connect returns, so
-    // set_media_task aborts the just-spawned media task immediately. The call must not survive as a
-    // stale entry, and wait_ended() must resolve (the aborted task's drop-guard fires `ended`).
+    // (abort_all) runs during that connect gap, the drive's ended race fires off the entry removal
+    // and production answers the setup with an error rather than a dead handle: the call must not
+    // survive as a stale entry, and the end must still be observable.
     #[tokio::test]
     async fn cleanup_during_connect_gap_aborts_the_spawned_task() {
         let client = make_client().await;
-        let (gate_tx, gate_rx) = async_channel::bounded::<()>(1);
+        let (_gate_tx, gate_rx) = async_channel::bounded::<()>(1);
         let (_relay_tx, relay_rx) = async_channel::unbounded();
         let factory = GatedFactory {
             gate: gate_rx,
@@ -9702,15 +9314,14 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
-        // spawn_call registers the entry, then parks inside the gated connect().
-        let spawn = tokio::spawn({
+        // The bridge registers the entry, then the production open parks inside the gated connect().
+        let drive = tokio::spawn({
             let client = client.clone();
             async move {
-                spawn_call(
+                spawn_call_via_backend(
                     &client,
                     mk_session(),
-                    engine(),
-                    &factory,
+                    Arc::new(factory),
                     pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
                     None,
                 )
@@ -9719,7 +9330,9 @@ mod tests {
         });
 
         // Wait until the entry is registered (proves register-before-connect), then simulate the
-        // disconnect that removes it while connect is still parked.
+        // disconnect that removes it while connect is still parked. Subscribe the session stream
+        // first: with the drive done the session drops, and the stream closing is the end signal
+        // a handle would have read through wait_ended.
         for _ in 0..100 {
             if client.call_registry().active_count() == 1 {
                 break;
@@ -9731,26 +9344,42 @@ mod tests {
             1,
             "the call must be registered before the relay connect"
         );
+        let generation = poll_generation(&client).await;
+        let stream = {
+            let session = client
+                .call_registry()
+                .media_session("CID-FACADE", generation)
+                .expect("registered session");
+            session.subscribe()
+        };
         assert_eq!(client.call_registry().abort_all(), 1, "cleanup removes it");
 
-        // Release the gate so connect returns; set_media_task now finds no entry and aborts the task.
-        gate_tx.send(()).await.unwrap();
-        let handle = spawn.await.expect("spawn task").expect("spawn_call");
+        // The gate is never released: a passing test proves the dial was aborted (not awaited).
+        let res = drive.await.expect("drive task");
+        assert!(
+            matches!(
+                res,
+                Err(CallError::Connect(_) | CallError::CallEndedDuringSetup)
+            ),
+            "cleanup during the connect gap must fail the setup, not hand out a dead handle"
+        );
 
         assert_eq!(
             client.call_registry().active_count(),
             0,
-            "the spawned task must not resurrect a stale entry after cleanup"
+            "the drive must not resurrect a stale entry after cleanup"
         );
-        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
-            .await
-            .expect("an aborted-before-poll task must still notify ended via the drop-guard");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stream.recv().await.is_ok() {}
+        })
+        .await
+        .expect("a cleanup in the connect gap must still end the session stream");
     }
 
-    // Finding T: the pre-connect re-check inside attach_engine. The entry is registered, then a
-    // disconnect clears is_connected while the gated connect is parked. attach_engine re-checks
+    // Finding T: the disconnected refusal inside the backend's open. The entry is registered, then a
+    // disconnect clears is_connected while the gated connect is parked. The open refuses
     // is_connected AFTER the insert but BEFORE connect returns -- here the gate is never released, so
-    // the connect would block forever; the re-check must instead self-clean (remove the just-registered
+    // the connect would block forever; the refusal must instead self-clean (remove the just-registered
     // entry, notify `ended`) and return a Connect error, so the entry can't leak and wait_ended resolves.
     #[tokio::test]
     async fn cleanup_before_connect_self_cleans_via_preconnect_recheck() {
@@ -9789,8 +9418,8 @@ mod tests {
         );
     }
 
-    // Codex window: hangup landing while attach_engine is parked in the relay dial -- registry entry
-    // present, media task not registered yet, PendingOutgoing already consumed -- must wake
+    // Codex window: hangup landing while the backend's open is parked in the relay dial -- registry
+    // entry present, media task not registered yet, PendingOutgoing already consumed -- must wake
     // wait_ended() promptly and abort the dial, not park until the dial succeeds or times out. The
     // gate is NEVER released, so a passing test proves the dial was aborted (not awaited).
     #[tokio::test]
@@ -9990,7 +9619,7 @@ mod tests {
         assert!(!attached, "no pending call → no attach");
     }
 
-    /// A factory whose connect() always fails, to exercise attach_engine's connect-error cleanup.
+    /// A factory whose connect() always fails, to exercise the backend open's connect-error cleanup.
     struct FailingFactory;
     #[async_trait]
     impl RelayTransportFactory for FailingFactory {
@@ -10005,10 +9634,10 @@ mod tests {
     }
 
     // Finding G: a relay connect() failure must reap the (already-registered) call and wake any
-    // wait_ended() waiter. spawn_call inserts the registry entry before connect, so without cleanup the
-    // call would leak in the registry and an outgoing handle's wait_ended() would hang. Driven here via
-    // the incoming spawn_call path (registry-insert before connect); the outgoing path shares the same
-    // attach_engine.
+    // wait_ended() waiter. The bridge inserts the registry entry before connect, so without cleanup
+    // the call would leak in the registry and an outgoing handle's wait_ended() would hang. Driven
+    // here via the incoming bridge path (registry-insert before connect); the outgoing path shares
+    // the same backend open.
     #[tokio::test]
     async fn connect_failure_reaps_registry_and_resolves_wait_ended() {
         let client = make_client().await;
@@ -10953,10 +10582,16 @@ mod tests {
             .expect("the reason must reach the handle rather than only the log")
             .expect("the event stream must carry it before it closes");
         match event {
-            CallEvent::MediaSetupFailed(reason) => assert!(
-                reason.contains("this browser has no WebRTC"),
-                "the provider's own reason has to survive to the caller, got: {reason}"
-            ),
+            CallEvent::MediaSetupFailed(reason) => {
+                assert!(
+                    reason.contains("this browser has no WebRTC"),
+                    "the provider's own reason has to survive to the caller, got: {reason}"
+                );
+                assert!(
+                    !reason.contains("call setup failed: media session setup failed"),
+                    "the reason must not stack error types inside each other, got: {reason}"
+                );
+            }
             other => panic!("expected MediaSetupFailed, got {other:?}"),
         }
 
