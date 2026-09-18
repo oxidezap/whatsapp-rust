@@ -472,7 +472,7 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         &self,
         _session: &Arc<dyn VoipMediaSession>,
         spec: MediaSessionSpec,
-        ctx: wacore::voip_control::MediaOpenContext,
+        mut ctx: wacore::voip_control::MediaOpenContext,
     ) -> Result<(), MediaSetupError> {
         let client = self.client.upgrade().ok_or(MediaSetupError::NoBackend)?;
         // A call cannot start media over a dropped session. The facade checked this before the
@@ -536,7 +536,10 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
                 "group relay WARP tag length changed during media attachment".into(),
             )
         })?);
-        let channels = build_channels(&client, ctx, stats, group_ctl, key.generation)?;
+        // The outbound recv-rekey receiver: the caller may hand one in (foreign backends), else the
+        // session's own (resident).
+        let rekey = ctx.rekey.take().or_else(|| resident.take_rekey_receiver());
+        let channels = build_channels(&client, ctx, stats, group_ctl, key.generation, rekey)?;
 
         let runtime = Arc::clone(&self.runtime);
         let registry = client.call_registry();
@@ -567,6 +570,7 @@ fn build_channels(
     media_stats: Arc<wacore::voip_control::media_stats::MediaStatsCell>,
     group_ctl: Option<async_channel::Receiver<wacore::voip::GroupControl>>,
     generation: u64,
+    rekey: Option<async_channel::Receiver<wacore::voip::driver::PeerAnswer>>,
 ) -> Result<wacore::voip::CallChannels, MediaSetupError> {
     use wacore::voip::CallChannels;
 
@@ -646,7 +650,7 @@ fn build_channels(
         encoded_audio_in,
         encoded_audio_out,
         events: ctx.events,
-        rekey: ctx.rekey,
+        rekey,
         video_in,
         timed_video_in,
         video_out,

@@ -3249,10 +3249,11 @@ mod tests {
     async fn call_scoped_accept_records_the_routed_participant_device() {
         let client = make_sending_client().await;
         let (_event_rx, generation) = register_native_opus_call(&client, Vec::new());
-        let (rekey_tx, rekey_rx) = async_channel::bounded(1);
-        client
+        let rekey_rx = client
             .call_registry()
-            .set_rekey_sender("CALL-ID-0001", generation, rekey_tx);
+            .media_session("CALL-ID-0001", generation)
+            .and_then(|media| media.take_rekey_receiver())
+            .expect("the resident session owns a rekey receiver");
         let participant = fake_caller_lid().with_device(4);
         let accept = NodeBuilder::new("call")
             .attr("from", Jid::new("CALL-ID-0001", Server::Call))

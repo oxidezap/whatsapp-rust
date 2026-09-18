@@ -137,7 +137,6 @@ pub fn stats_to_neutral(stats: CallMediaStats) -> MediaStats {
 struct Mailboxes {
     video: Option<VideoControlSender>,
     group: Option<GroupControlQueue>,
-    rekey: Option<async_channel::Sender<PeerAnswer>>,
     // The drive task's abort handle, if this session was handed one. `close` aborts it so a
     // terminal registry entry ends the media task without the registry holding a parallel handle.
     media_task: Option<crate::runtime::AbortHandle>,
@@ -159,6 +158,11 @@ pub struct ResidentMediaSession {
         async_channel::Sender<MediaEvent>,
         async_channel::Receiver<MediaEvent>,
     )>,
+    /// The one-shot recv-rekey channel, created at reservation so a callee `<accept>` that races
+    /// ahead of the relay is buffered (bounded(1)) rather than lost. The receiver is handed to the
+    /// drive loop through [`take_rekey_receiver`](Self::take_rekey_receiver).
+    rekey_tx: async_channel::Sender<PeerAnswer>,
+    rekey_rx: Mutex<Option<async_channel::Receiver<PeerAnswer>>>,
 }
 
 impl ResidentMediaSession {
@@ -172,10 +176,13 @@ impl ResidentMediaSession {
     #[must_use]
     pub fn with_stats(stats: Arc<MediaStatsCell>) -> Arc<Self> {
         let (events_tx, events_rx) = async_channel::bounded(DEFAULT_CALL_EVENT_QUEUE_CAPACITY);
+        let (rekey_tx, rekey_rx) = async_channel::bounded(1);
         Arc::new(Self {
             mailboxes: Mutex::new(Mailboxes::default()),
             stats: Mutex::new(stats),
             events: Mutex::new((events_tx, events_rx)),
+            rekey_tx,
+            rekey_rx: Mutex::new(Some(rekey_rx)),
         })
     }
 
@@ -228,12 +235,10 @@ impl ResidentMediaSession {
             .then_some(rx)
     }
 
-    /// Create and install this session's recv-rekey mailbox, returning the drive-loop half.
+    /// The drive-loop half of the session-owned recv-rekey channel.
     #[must_use]
-    pub fn install_rekey_channel(&self) -> async_channel::Receiver<PeerAnswer> {
-        let (tx, rx) = async_channel::bounded(1);
-        self.set_rekey_sender(tx);
-        rx
+    pub fn install_rekey_channel(&self) -> Option<async_channel::Receiver<PeerAnswer>> {
+        self.take_rekey_receiver()
     }
 
     /// A fresh counter cell, installed on this session and returned for the `CallHandle` to hold.
@@ -263,11 +268,6 @@ impl ResidentMediaSession {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
-    }
-
-    /// Attach the caller-only recv-rekey mailbox. Caller side only.
-    pub(crate) fn set_rekey_sender(&self, tx: async_channel::Sender<PeerAnswer>) {
-        self.mailboxes().rekey = Some(tx);
     }
 
     /// Attach the video-control mailbox.
@@ -432,17 +432,15 @@ impl VoipMediaSession for ResidentMediaSession {
                 answering_lid,
                 audio_codec,
             } => {
-                // Take the sender: a duplicate or late `<accept>` from another device is a no-op,
-                // because the first answerer wins. That is the old registry `send_rekey` contract.
-                let mut mailboxes = self.mailboxes();
-                let Some(tx) = mailboxes.rekey.take() else {
-                    return false;
-                };
-                tx.try_send(PeerAnswer {
-                    answering_lid,
-                    audio_codec: audio_codec.map(codec_to_core),
-                })
-                .is_ok()
+                // First answerer wins: a duplicate or late `<accept>` from another device finds the
+                // receiver already taken by the drive loop and is a no-op. Buffered by bounded(1)
+                // when media has not attached yet.
+                self.rekey_tx
+                    .try_send(PeerAnswer {
+                        answering_lid,
+                        audio_codec: audio_codec.map(codec_to_core),
+                    })
+                    .is_ok()
             }
             MediaCommand::SwitchAudioCodec { .. } => {
                 // Codec selection is applied at engine construction or through the rekey, which
@@ -534,10 +532,9 @@ impl VoipMediaSession for ResidentMediaSession {
 
     fn retained_bytes(&self) -> usize {
         let mailboxes = self.mailboxes();
-        mailboxes
-            .rekey
-            .as_ref()
-            .map_or(0, |tx| tx.len().saturating_mul(size_of::<PeerAnswer>()))
+        self.rekey_tx
+            .len()
+            .saturating_mul(size_of::<PeerAnswer>())
             .saturating_add(
                 mailboxes
                     .video
@@ -558,6 +555,13 @@ impl VoipMediaSession for ResidentMediaSession {
             )
     }
 
+    fn take_rekey_receiver(&self) -> Option<async_channel::Receiver<PeerAnswer>> {
+        self.rekey_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
     fn install_video_sender(&self, tx: VideoControlSender) -> bool {
         self.set_video_sender(tx);
         true
@@ -565,11 +569,6 @@ impl VoipMediaSession for ResidentMediaSession {
 
     fn install_stats_cell(&self, cell: Arc<MediaStatsCell>) -> bool {
         self.set_stats_cell(cell);
-        true
-    }
-
-    fn install_rekey_sender(&self, tx: async_channel::Sender<PeerAnswer>) -> bool {
-        self.set_rekey_sender(tx);
         true
     }
 
@@ -729,18 +728,17 @@ mod tests {
     #[test]
     fn a_rekey_is_one_shot() {
         let session = ResidentMediaSession::new();
-        let (tx, rx) = async_channel::bounded(1);
-        session.set_rekey_sender(tx);
+        let rx = session
+            .take_rekey_receiver()
+            .expect("the session owns a rekey receiver");
         assert!(session.submit(MediaCommand::RekeyRecv {
             answering_lid: "2:0@lid".into(),
             audio_codec: None,
         }));
         assert!(rx.try_recv().is_ok());
-        // The first answerer wins; a duplicate finds no sender.
-        assert!(!session.submit(MediaCommand::RekeyRecv {
-            answering_lid: "3:0@lid".into(),
-            audio_codec: None,
-        }));
+        // The receiver is one-shot: once the drive loop has taken it, a second answer stays queued
+        // for nobody, and a further `take` returns `None`.
+        assert!(session.take_rekey_receiver().is_none());
     }
 
     #[test]

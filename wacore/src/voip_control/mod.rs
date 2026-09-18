@@ -688,15 +688,6 @@ pub trait VoipMediaSession: MaybeSendSync + 'static {
         false
     }
 
-    /// Install the caller-only recv-rekey mailbox.
-    ///
-    /// One-shot on the resident side: the first answerer wins, so a later install does not replace
-    /// a consumed sender. A backend that applies rekey through [`submit`](Self::submit) returns
-    /// `false`.
-    fn install_rekey_sender(&self, _tx: async_channel::Sender<control::PeerAnswer>) -> bool {
-        false
-    }
-
     /// Install the group-control mailbox and replay the retained startup state.
     ///
     /// `warp_mi_tag_len` is the tag width baked into the attached pipelines; `established` is what
@@ -728,6 +719,15 @@ pub trait VoipMediaSession: MaybeSendSync + 'static {
     /// backpressure, in which case the caller decides whether to retry.
     fn publish(&self, _event: MediaEvent) -> bool {
         false
+    }
+
+    /// Hand the drive loop its one-shot recv-rekey receiver, if the implementation owns one.
+    ///
+    /// The resident session owns the channel (created at reservation, so an accept that beats the
+    /// relay is buffered); a foreign backend applies rekey through [`submit`](Self::submit) and
+    /// returns `None`. One-shot: a second call returns `None`.
+    fn take_rekey_receiver(&self) -> Option<async_channel::Receiver<control::PeerAnswer>> {
+        None
     }
 
     /// Adopt an externally-created public event sender.
@@ -793,10 +793,6 @@ impl<T: VoipMediaSession + ?Sized> VoipMediaSession for Arc<T> {
         (**self).install_stats_cell(cell)
     }
 
-    fn install_rekey_sender(&self, tx: async_channel::Sender<control::PeerAnswer>) -> bool {
-        (**self).install_rekey_sender(tx)
-    }
-
     fn install_group_sender(
         &self,
         tx: async_channel::Sender<control::GroupControl>,
@@ -817,6 +813,10 @@ impl<T: VoipMediaSession + ?Sized> VoipMediaSession for Arc<T> {
 
     fn install_event_sender(&self, tx: async_channel::Sender<MediaEvent>) -> bool {
         (**self).install_event_sender(tx)
+    }
+
+    fn take_rekey_receiver(&self) -> Option<async_channel::Receiver<control::PeerAnswer>> {
+        (**self).take_rekey_receiver()
     }
 
     fn stats(&self) -> MediaStats {

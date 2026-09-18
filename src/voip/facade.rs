@@ -1983,12 +1983,9 @@ async fn place_call(
     });
     let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(CALL_EVENT_CHANNEL_CAPACITY);
 
-    // Recv-rekey channel, created now (not at engine build) so a `<accept>` that races ahead of the
-    // relay still lands: the sender lives on the registry from this point; the receiver is parked on
-    // the pending entry and handed to the drive loop when the relay arrives (the bounded(1) buffers a
-    // pre-engine rekey). One slot is enough — the rekey is one-shot (first answerer wins).
-    let (rekey_tx, rekey_rx) = async_channel::bounded::<wacore::voip::driver::PeerAnswer>(1);
-    registry.set_rekey_sender(&call_id, generation, rekey_tx);
+    // The recv-rekey channel is session-owned (created at reservation), so an `<accept>` that
+    // races ahead of the relay is buffered there. The drive loop takes its receiver when the relay
+    // arrives; the control plane only delivers `RekeyRecv` commands.
 
     // Video plumbing exists for EVERY call (idle channels cost nothing): the signaling handler and
     // CallHandle::start_video need the senders even when the call starts audio-only.
@@ -2020,7 +2017,6 @@ async fn place_call(
                 muted: muted.clone(),
                 ended: ended.clone(),
                 ev_tx,
-                rekey_rx,
             },
         );
 
@@ -2374,9 +2370,6 @@ pub(crate) struct PendingOutgoing {
     muted: Arc<AtomicBool>,
     ended: Arc<EndedFlag>,
     ev_tx: async_channel::Sender<CallEvent>,
-    /// Receiver half of the one-shot recv-rekey channel (sender lives on the registry). Handed to the
-    /// drive loop when the relay arrives so a `<accept>` that beat the relay is still applied (buffered).
-    rekey_rx: async_channel::Receiver<wacore::voip::driver::PeerAnswer>,
 }
 
 /// Take the video plumbing's loop halves and wire the out-drain, yielding the neutral channels the
@@ -2528,10 +2521,9 @@ pub(crate) async fn attach_outgoing_relay(
             audio: pending.audio.clone().into_ports(),
             video: None,
             events: pending.ev_tx.clone(),
-            // Outgoing: the drive loop rekeys recv to the answering device (buffered if the accept
-            // beat this relay).
             video_channels: Some(video_channels),
-            rekey: Some(pending.rekey_rx.clone()),
+            // The recv-rekey receiver is session-owned; `open` takes it for the drive loop.
+            rekey: None,
             group_epoch: None,
             initial_codec: None,
             muted: pending.muted.clone(),

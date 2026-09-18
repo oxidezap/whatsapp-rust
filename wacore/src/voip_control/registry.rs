@@ -2064,23 +2064,6 @@ impl CallRegistry {
         }
     }
 
-    /// Store the per-call recv-rekey sender (the drive loop holds the matching receiver). Generation-
-    /// guarded and ignored if the call was removed or superseded, so a stale sender can't outlive its
-    /// call. Caller side only.
-    pub fn set_rekey_sender(
-        &self,
-        call_id: &str,
-        generation: u64,
-        tx: async_channel::Sender<crate::voip_control::control::PeerAnswer>,
-    ) {
-        if let Some(entry) = self.active_calls().get_mut(call_id)
-            && entry.generation == generation
-            && let Some(media) = entry.media.as_ref()
-        {
-            media.install_rekey_sender(tx);
-        }
-    }
-
     /// Store the call's consumer-facing event sender, video-control sender, and the local-video
     /// teardown hook, so the signaling handler can surface `<video state>` changes, steer the video
     /// plane mid-call, and fully release the endpoints on a refused upgrade. Generation-guarded like
@@ -6702,13 +6685,6 @@ mod tests {
         );
     }
 
-    fn peer_answer(lid: &str) -> crate::voip_control::control::PeerAnswer {
-        crate::voip_control::control::PeerAnswer {
-            answering_lid: lid.to_string(),
-            audio_codec: None,
-        }
-    }
-
     /// An abort handle that flips a shared flag, so a test can assert the registry actually aborts
     /// the stored handle (the runtime-agnostic analog of asserting a tokio task was cancelled).
     fn flag_handle(flag: &Arc<AtomicBool>) -> AbortHandle {
@@ -6854,26 +6830,27 @@ mod tests {
     }
 
     #[test]
-    fn send_rekey_is_one_shot_and_generation_guarded() {
-        let reg = CallRegistry::new();
-        let g = reg.insert(session("CID"));
-        let (tx, rx) = async_channel::bounded::<crate::voip_control::control::PeerAnswer>(1);
-        // A stale generation is ignored (no sender stored).
-        reg.set_rekey_sender("CID", g + 99, tx.clone());
-        reg.send_rekey("CID", peer_answer("x"));
-        assert!(
-            rx.try_recv().is_err(),
-            "stale-generation sender must not fire"
-        );
-        // The live generation stores it; the first send fires, the second is a no-op (taken).
-        reg.set_rekey_sender("CID", g, tx);
-        reg.send_rekey("CID", peer_answer("222222222222222:2@lid"));
+    fn send_rekey_is_one_shot_on_the_session() {
+        use crate::voip_control::resident_session::ResidentMediaSession;
+        let session = ResidentMediaSession::new();
+        let rx = session
+            .take_rekey_receiver()
+            .expect("the session owns a rekey receiver");
+        // The first answer wins and lands on the receiver.
+        assert!(session.submit(MediaCommand::RekeyRecv {
+            answering_lid: "222222222222222:2@lid".into(),
+            audio_codec: None,
+        }));
         assert_eq!(
             rx.try_recv().ok().map(|answer| answer.answering_lid),
             Some("222222222222222:2@lid".to_string())
         );
-        reg.send_rekey("CID", peer_answer("again"));
-        assert!(rx.try_recv().is_err(), "rekey sender is one-shot");
+        // A second rkey overflows the bounded(1) slot with the receiver already consumed; the
+        // command is a no-op at the drive loop, matching first-answerer-wins.
+        let _ = session.submit(MediaCommand::RekeyRecv {
+            answering_lid: "333333333333333:3@lid".into(),
+            audio_codec: None,
+        });
     }
 
     #[test]
