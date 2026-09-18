@@ -3741,10 +3741,6 @@ fn prepare_group_relay_refresh(
     }))
 }
 
-pub(crate) fn validate_group_relay_update(update: &GroupCallUpdate) -> Result<(), GroupMediaError> {
-    prepare_group_relay_refresh(update).map(drop)
-}
-
 fn get_group_media_relay_endpoint(
     relay: &GroupCallRelay,
 ) -> Option<&crate::types::group_call::GroupCallRelayEndpoint> {

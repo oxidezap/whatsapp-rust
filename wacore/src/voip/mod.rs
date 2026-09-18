@@ -5,7 +5,9 @@
 //! tests pass even when both directions are wrong identically, so known-answer vectors are
 //! the only real guard.
 
-pub mod app_data;
+// RTC app-data envelope encoding moved to the neutral contract so the registry validates a
+// reaction without the engine. Re-exported for the historical path.
+pub use crate::voip_control::app_data;
 pub mod audio;
 // The content corroborator is an internal decision, not API: exposing it would invite a consumer to
 // make codec choices from payload bytes, which is the reflex this whole module exists to avoid. Not
@@ -36,7 +38,9 @@ pub use crate::voip_control::media_stats;
 #[cfg(feature = "voip-mlow")]
 pub mod mlow;
 pub mod opus_packet;
-pub mod registry;
+// The call registry moved to the neutral contract (`crate::voip_control::registry`): it stores
+// `Arc<dyn VoipMediaSession>` and names no engine type. Re-exported for `crate::voip::registry`.
+pub use crate::voip_control::registry;
 // Relay `<relay>` parsing belongs to the control plane, not the engine: a call's signaling reads it
 // to decide where media will go, and the registry needs `RelayData` without the engine. Moved to
 // `crate::voip_control::relay_parse`; re-exported so the historical `crate::voip::relay_parse` path

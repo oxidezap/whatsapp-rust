@@ -59,6 +59,11 @@ pub mod audio_format;
 // The resident media session: the neutral handle over a running call's command mailboxes. It names
 // no engine type, so registry-only builds store it as `Arc<dyn VoipMediaSession>`.
 pub mod resident_session;
+// The call registry: active calls, generations, and the media session behind each. Names no engine
+// type, so the call flow compiles with the engine off.
+pub mod registry;
+// RTC app-data payload encoding (reactions), pure and engine-free.
+pub mod app_data;
 // The pure KDF/JID/varint helpers, moved here so the registry names them without the engine.
 pub(crate) mod kdf;
 // SSRC derivation and participant-id formatting, engine-free.
@@ -79,12 +84,11 @@ pub use signaling::{CallDirection, CallPhase, CallSession};
 
 /// One decrypted keygen-v2 epoch, kept as secret material.
 ///
-/// The engine's `GroupRawEpoch` is in `crate::voip::driver`, which is gated by the very feature this
-/// contract exists to compile without, so it cannot be named here. This is the neutral twin: it
-/// holds the bytes in [`Zeroizing`], so they are erased when the value drops, and its `Debug` prints
-/// `[redacted]`, so a stray `{:?}` in a log cannot leak the decrypted key. Both properties matter
-/// and are why a bare `Vec<u8>` is not the type: a manual `Debug` alone leaves the bytes in memory
-/// after drop, and `Clone` alone leaves a second copy that never gets erased.
+/// The engine's `GroupRawEpoch` lives in the neutral `control` module and takes these bytes; this
+/// type is the public spelling, holding them in [`Zeroizing`] so they are erased when the value
+/// drops, and printing `[redacted]`, so a stray `{:?}` in a log cannot leak the decrypted key. Both
+/// properties matter and are why a bare `Vec<u8>` is not the type: a manual `Debug` alone leaves the
+/// bytes in memory after drop, and `Clone` alone leaves a second copy that never gets erased.
 #[derive(Clone, PartialEq, Eq)]
 pub struct MediaGroupEpoch(Zeroizing<Vec<u8>>);
 
@@ -103,8 +107,7 @@ impl MediaGroupEpoch {
     ///
     /// Crate-private on purpose: an external consumer leaving with a bare `Vec<u8>` would escape
     /// the erasure this type promises. A consumer that needs the bytes without taking ownership
-    /// uses [`as_bytes`](Self::as_bytes). Only the `voip`-gated resident adapter consumes it.
-    #[cfg(feature = "voip")]
+    /// uses [`as_bytes`](Self::as_bytes). Only the resident adapter consumes it.
     #[must_use]
     pub(crate) fn into_bytes(mut self) -> Vec<u8> {
         std::mem::take(&mut *self.0)

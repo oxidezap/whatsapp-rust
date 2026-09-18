@@ -9,7 +9,8 @@ use std::collections::{HashMap, HashSet};
 use wacore_binary::Jid;
 
 use crate::types::group_call::{
-    GROUP_CALL_MAX_PARTICIPANTS, GroupCallUpdate, ScreenShare, ScreenShareState, WaitingRoom,
+    GROUP_CALL_MAX_PARTICIPANTS, GroupCallDevice, GroupCallParticipant, GroupCallUpdate,
+    ScreenShare, ScreenShareState, WaitingRoom,
 };
 
 /// Result of applying an authoritative group or waiting-room update.
@@ -318,6 +319,67 @@ pub(crate) fn validate_group_snapshot_for_media(update: &GroupCallUpdate) -> Res
             }
         }
     }
+    Ok(())
+}
+
+///
+/// Matches on the user (LID or its PN alias) and the device id together: the same device id on a
+/// different account is a different device, and a PN alias of the local account is still local.
+pub(crate) fn group_device_is_local(
+    participant: &GroupCallParticipant,
+    device: &GroupCallDevice,
+    local_device: &Jid,
+) -> bool {
+    use wacore_binary::JidExt;
+
+    let owns_local_user = participant.jid.is_same_user_as(local_device)
+        || participant
+            .pn
+            .as_ref()
+            .is_some_and(|pn| pn.is_same_user_as(local_device));
+    owns_local_user
+        && device.jid.device == local_device.device
+        && (device.jid.is_same_user_as(&participant.jid)
+            || participant
+                .pn
+                .as_ref()
+                .is_some_and(|pn| device.jid.is_same_user_as(pn)))
+}
+
+/// Whether a roster's relay block is usable for media: a valid warp tag width, a non-empty key and
+/// token, and an endpoint with a parseable IPv4 and a non-zero port.
+///
+/// Pure validation, so the control plane can reject an unusable relay snapshot with the engine off.
+/// The engine's richer form additionally derives the allocate material; this checks everything that
+/// can make a snapshot invalid without touching crypto.
+pub(crate) fn validate_group_relay_update(update: &GroupCallUpdate) -> Result<(), ()> {
+    use crate::voip_control::relay_parse::WEB_CLIENT_RELAY_PORT;
+
+    let Some(relay) = update.relay.as_ref() else {
+        return Ok(());
+    };
+    let warp_mi_tag_len = relay.warp_mi_tag_len.unwrap_or(4);
+    if !(1..=20).contains(&warp_mi_tag_len) || relay.key.is_empty() {
+        return Err(());
+    }
+    let usable = |endpoint: &&crate::types::group_call::GroupCallRelayEndpoint| {
+        !endpoint.is_fna
+            && endpoint.ipv4.is_some()
+            && endpoint.port.is_some_and(|port| port != 0)
+            && relay
+                .tokens
+                .get(endpoint.token_id as usize)
+                .is_some_and(|token| !token.is_empty())
+    };
+    let endpoint = relay
+        .endpoints
+        .iter()
+        .filter(usable)
+        .find(|endpoint| endpoint.port == Some(WEB_CLIENT_RELAY_PORT))
+        .or_else(|| relay.endpoints.iter().find(usable))
+        .ok_or(())?;
+    let ipv4 = endpoint.ipv4.as_deref().ok_or(())?;
+    ipv4.parse::<std::net::Ipv4Addr>().map_err(|_| ())?;
     Ok(())
 }
 

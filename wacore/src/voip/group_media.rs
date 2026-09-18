@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use subtle::ConstantTimeEq;
-use wacore_binary::{Jid, JidExt};
+use wacore_binary::Jid;
 use zeroize::Zeroize;
 
 use crate::types::group_call::{
@@ -770,24 +770,7 @@ pub(crate) fn validate_group_media_snapshot(
         .map_err(|()| GroupMediaError::InvalidSnapshot)
 }
 
-pub(crate) fn group_device_is_local(
-    participant: &GroupCallParticipant,
-    device: &GroupCallDevice,
-    local_device: &Jid,
-) -> bool {
-    let owns_local_user = participant.jid.is_same_user_as(local_device)
-        || participant
-            .pn
-            .as_ref()
-            .is_some_and(|pn| pn.is_same_user_as(local_device));
-    owns_local_user
-        && device.jid.device == local_device.device
-        && (device.jid.is_same_user_as(&participant.jid)
-            || participant
-                .pn
-                .as_ref()
-                .is_some_and(|pn| device.jid.is_same_user_as(pn)))
-}
+pub(crate) use crate::voip_control::group::group_device_is_local;
 
 fn active_devices<'a>(
     update: &'a GroupCallUpdate,

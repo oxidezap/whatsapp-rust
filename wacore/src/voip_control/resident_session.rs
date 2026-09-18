@@ -515,13 +515,12 @@ impl VoipMediaBackend for ResidentMediaBackend {
     async fn open(
         &self,
         _session: &Arc<dyn VoipMediaSession>,
-        spec: MediaSessionSpec,
+        _spec: MediaSessionSpec,
     ) -> Result<(), MediaSetupError> {
-        // The registry's own fallback validates the projection and builds no task: the live call
-        // path drives the engine through `whatsapp-rust`'s backend, which owns the runtime and
-        // transport. A spec the engine refuses is refused here too.
-        let _ = crate::voip_control::engine_bridge::into_engine_parts(spec)?;
-        Ok(())
+        // The registry's fallback carries no engine, so it cannot start media. `whatsapp-rust`
+        // injects `WacoreVoipMediaBackend`, which owns the runtime and transport and does the real
+        // open; reaching this one on a live call is the typed `NoBackend` refusal the caller sees.
+        Err(MediaSetupError::NoBackend)
     }
 }
 

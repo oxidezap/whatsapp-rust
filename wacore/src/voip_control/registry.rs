@@ -21,14 +21,13 @@ use crate::types::call::{CallAction, IncomingCall, VideoState};
 use crate::types::group_call::{
     GroupCallDevice, GroupCallParticipant, GroupCallUpdate, ScreenShare, WaitingRoom,
 };
-use crate::voip::driver::{GroupControl, VideoControl, VideoControlSender};
-use crate::voip::engine::CallEvent;
-use crate::voip::group::{GroupCallState, GroupStateApply};
-use crate::voip::group_media::group_device_is_local;
-use crate::voip::media_session::{
-    ResidentMediaSession, codec_to_neutral, video_control_to_command,
+use crate::voip_control::CallEvent;
+use crate::voip_control::control::{GroupControl, VideoControl, VideoControlSender};
+use crate::voip_control::group::{GroupCallState, GroupStateApply, group_device_is_local};
+use crate::voip_control::resident_session::{
+    ResidentMediaBackend, ResidentMediaSession, codec_to_neutral, video_control_to_command,
 };
-use crate::voip::session::{CallPhase, CallSession};
+use crate::voip_control::{CallPhase, CallSession};
 use crate::voip_control::{MediaCommand, MediaSessionKey, VoipMediaBackend, VoipMediaSession};
 use wacore_binary::Jid;
 
@@ -40,8 +39,10 @@ const MAX_PENDING_INITIAL_GROUP_CONTROL_BYTES: usize = 1024 * 1024;
 /// global buffer indefinitely, while controls from an in-flight offer still survive reordering.
 const PENDING_INITIAL_GROUP_CONTROL_TTL: Duration = Duration::from_secs(10);
 const MAX_CALL_EVENT_QUEUE_BYTES: usize = 1024 * 1024;
+#[cfg(test)]
+pub(crate) use crate::voip_control::control::MAX_GROUP_CONTROL_QUEUE_BYTES;
 pub(crate) use crate::voip_control::control::{
-    DEFAULT_CALL_EVENT_QUEUE_CAPACITY, GroupControlQueue, MAX_GROUP_CONTROL_QUEUE_BYTES,
+    DEFAULT_CALL_EVENT_QUEUE_CAPACITY, GroupControlQueue,
 };
 
 /// Peer devices whose `<capability>` statement one call retains. A peer answers from one device;
@@ -184,7 +185,7 @@ struct CallEntry {
     /// Media counters published by the drive loop, readable through the consumer's `CallHandle`.
     /// Installed when the engine attaches; absent before that, which reads as all-zero rather than
     /// as an error, because a call with no media plane genuinely has no media to count.
-    media_stats: Option<Arc<crate::voip::media_stats::MediaStatsCell>>,
+    media_stats: Option<Arc<crate::voip_control::media_stats::MediaStatsCell>>,
     /// Keeps a pending call-link admission alive. Cleared on admission and aborted with the entry.
     waiting_room_task: Option<AbortHandle>,
     /// Monotonic token distinguishing this registration from a later same-call-id replacement, so a
@@ -480,7 +481,9 @@ impl CallEntry {
                 // Fixed-size and behind one Arc: the counters are all integers, so the allocation
                 // is the whole cost. Counted anyway -- a per-call allocation that no report
                 // mentions is how an estimate drifts from the heap it claims to describe.
-                .map_or(0, |_| size_of::<crate::voip::media_stats::MediaStatsCell>())
+                .map_or(0, |_| {
+                    size_of::<crate::voip_control::media_stats::MediaStatsCell>()
+                })
             + self
                 .peer_announced_capability
                 .capacity()
@@ -695,7 +698,7 @@ impl CallRegistry {
     #[must_use]
     pub fn backend(&self) -> Arc<dyn VoipMediaBackend> {
         self.backend
-            .get_or_init(|| Arc::new(crate::voip::media_session::ResidentMediaBackend))
+            .get_or_init(|| Arc::new(ResidentMediaBackend))
             .clone()
     }
 
@@ -984,7 +987,7 @@ impl CallRegistry {
         update: GroupCallUpdate,
         generation: Option<u64>,
     ) -> GroupStateApply {
-        if super::engine::validate_group_relay_update(&update).is_err() {
+        if crate::voip_control::group::validate_group_relay_update(&update).is_err() {
             return GroupStateApply::InvalidSnapshot;
         }
         // Held so the commit lookup survives `update` being moved into the preview.
@@ -1501,7 +1504,7 @@ impl CallRegistry {
         is_call_link: bool,
     ) -> Result<u64, GroupStateApply> {
         if let Some(initial_update) = session.group.as_ref() {
-            if super::engine::validate_group_relay_update(initial_update).is_err() {
+            if crate::voip_control::group::validate_group_relay_update(initial_update).is_err() {
                 return Err(GroupStateApply::InvalidSnapshot);
             }
             let mut initial_state =
@@ -1545,7 +1548,7 @@ impl CallRegistry {
         let Some(initial_update) = session.group.as_ref() else {
             return Err(GroupStateApply::InvalidSnapshot);
         };
-        if super::engine::validate_group_relay_update(initial_update).is_err() {
+        if crate::voip_control::group::validate_group_relay_update(initial_update).is_err() {
             return Err(GroupStateApply::InvalidSnapshot);
         }
         let mut initial_state =
@@ -1847,7 +1850,7 @@ impl CallRegistry {
         &self,
         call_id: &str,
         generation: u64,
-        cell: Arc<crate::voip::media_stats::MediaStatsCell>,
+        cell: Arc<crate::voip_control::media_stats::MediaStatsCell>,
     ) {
         if let Some(entry) = self
             .active_calls()
@@ -2085,7 +2088,7 @@ impl CallRegistry {
         &self,
         call_id: &str,
         generation: u64,
-        tx: async_channel::Sender<crate::voip::driver::PeerAnswer>,
+        tx: async_channel::Sender<crate::voip_control::control::PeerAnswer>,
     ) {
         if let Some(entry) = self.active_calls().get_mut(call_id)
             && entry.generation == generation
@@ -2305,7 +2308,7 @@ impl CallRegistry {
 
     /// Queue one RTC reaction on the active group media stream.
     pub fn send_group_reaction(&self, call_id: &str, emoji: String) -> bool {
-        if crate::voip::app_data::encode_reaction(1, &emoji).is_err() {
+        if crate::voip_control::app_data::encode_reaction(1, &emoji).is_err() {
             return false;
         }
         self.active_calls()
@@ -2322,7 +2325,7 @@ impl CallRegistry {
         generation: u64,
         emoji: String,
     ) -> bool {
-        if crate::voip::app_data::encode_reaction(1, &emoji).is_err() {
+        if crate::voip_control::app_data::encode_reaction(1, &emoji).is_err() {
             return false;
         }
         self.active_calls()
@@ -2955,8 +2958,8 @@ impl CallRegistry {
         &self,
         call_id: &str,
         peer: crate::stanza::call::CapabilityBit,
-    ) -> Option<crate::voip::audio::AudioCodec> {
-        use crate::voip::audio::AudioCodec;
+    ) -> Option<crate::voip_control::MediaAudioCodec> {
+        use crate::voip_control::MediaAudioCodec as AudioCodec;
 
         let format = self
             .active_calls()
@@ -2981,7 +2984,7 @@ impl CallRegistry {
     /// One-shot: the sender is TAKEN, so a duplicate or late `<accept>` from another device is a
     /// no-op (first answerer wins, matching WA Web). Silently ignored when absent (no engine yet, an
     /// incoming call, or the call is torn down).
-    pub fn send_rekey(&self, call_id: &str, answer: crate::voip::driver::PeerAnswer) {
+    pub fn send_rekey(&self, call_id: &str, answer: crate::voip_control::control::PeerAnswer) {
         let media = self
             .active_calls()
             .get(call_id)
@@ -3182,8 +3185,8 @@ mod tests {
         CallLinkMedia, GroupCallDevice, GroupCallEncRekey, GroupCallParticipant, GroupCallRelay,
         GroupCallRelayEndpoint, GroupCallUpdate, ScreenShareState, WaitingRoom,
     };
-    use crate::voip::GroupRawEpoch;
-    use crate::voip::driver::video_control_channel;
+    use crate::voip_control::control::GroupRawEpoch;
+    use crate::voip_control::control::video_control_channel;
     use futures::FutureExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -6343,7 +6346,7 @@ mod tests {
         assert!(force_send_call_event(
             &tx,
             CallEvent::GroupControlRejected {
-                control: crate::voip::engine::GroupControlKind::Update,
+                control: crate::voip_control::MediaGroupControlKind::Update,
             }
         ));
         assert!(force_send_call_event(&tx, CallEvent::RelayAllocated));
@@ -6726,8 +6729,8 @@ mod tests {
         );
     }
 
-    fn peer_answer(lid: &str) -> crate::voip::driver::PeerAnswer {
-        crate::voip::driver::PeerAnswer {
+    fn peer_answer(lid: &str) -> crate::voip_control::control::PeerAnswer {
+        crate::voip_control::control::PeerAnswer {
             answering_lid: lid.to_string(),
             audio_codec: None,
         }
@@ -6745,7 +6748,7 @@ mod tests {
     #[test]
     fn a_peer_that_clears_the_mlow_bit_selects_opus_for_a_live_call() {
         use crate::stanza::call::CapabilityBit;
-        use crate::voip::audio::AudioCodec;
+        use crate::voip_control::MediaAudioCodec as AudioCodec;
 
         let reg = CallRegistry::new();
         let mut s = session("CID");
@@ -6881,7 +6884,7 @@ mod tests {
     fn send_rekey_is_one_shot_and_generation_guarded() {
         let reg = CallRegistry::new();
         let g = reg.insert(session("CID"));
-        let (tx, rx) = async_channel::bounded::<crate::voip::driver::PeerAnswer>(1);
+        let (tx, rx) = async_channel::bounded::<crate::voip_control::control::PeerAnswer>(1);
         // A stale generation is ignored (no sender stored).
         reg.set_rekey_sender("CID", g + 99, tx.clone());
         reg.send_rekey("CID", peer_answer("x"));

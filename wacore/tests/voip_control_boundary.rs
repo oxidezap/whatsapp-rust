@@ -29,6 +29,38 @@ fn is_doc_or_comment(line: &str) -> bool {
     line.starts_with("//")
 }
 
+/// Code lines that belong to a `#[cfg(test)]` module are ignored: the byte cut is about what a
+/// shipping build compiles, and test scaffolding is never linked into it. A test may reach for the
+/// engine's KAT vectors without coupling the contract.
+fn non_test_code_lines(source: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    let mut test_depth: Option<i32> = None;
+    let mut pending_test = false;
+    let mut depth: i32 = 0;
+    for (index, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if test_depth.is_none() && trimmed.starts_with("#[cfg(test)]") {
+            pending_test = true;
+        }
+        // Track brace depth so a `#[cfg(test)] mod tests {` region can be skipped whole.
+        if pending_test && trimmed.starts_with("mod ") {
+            test_depth = Some(depth);
+            pending_test = false;
+        }
+        if test_depth.is_none() {
+            out.push((index + 1, line));
+        }
+        depth += line.matches('{').count() as i32;
+        depth -= line.matches('}').count() as i32;
+        if let Some(start) = test_depth
+            && depth <= start
+        {
+            test_depth = None;
+        }
+    }
+    out
+}
+
 fn contract_dirs() -> Vec<PathBuf> {
     // `CARGO_MANIFEST_DIR` is this crate's root (`wacore/`).
     vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/voip_control")]
@@ -64,12 +96,17 @@ fn the_contract_never_names_the_engine() {
             continue;
         }
         let source = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
-        for (index, line) in source.lines().enumerate() {
+        for (line_number, line) in non_test_code_lines(&source) {
             if is_doc_or_comment(line) {
                 continue;
             }
             if FORBIDDEN.iter().any(|needle| line.contains(needle)) {
-                offenders.push(format!("{}:{} {}", path.display(), index + 1, line.trim()));
+                offenders.push(format!(
+                    "{}:{} {}",
+                    path.display(),
+                    line_number,
+                    line.trim()
+                ));
             }
         }
     }
