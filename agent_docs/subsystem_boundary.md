@@ -131,21 +131,24 @@ for a better number, so they stay, and this row is the record of that choice.
 ### The media seam: `voip-control` and the engine behind it
 
 A media engine ships inside the call flow today, and every consumer of VoIP pays
-for it. The first step out is a **neutral contract**, not a byte cut: the
-boundary a media engine implements, with no engine type in its API.
+for it. The way out is a **neutral contract** carried by a byte cut: the
+boundary a media engine implements, with no engine type in its API, with the
+call flow compiling engine-free on the other side of it.
 
 `wacore::voip_control` is that contract, gated on `voip-control`. It declares
 `VoipMediaBackend` and `VoipMediaSession` plus the flat data they carry
 (`MediaSessionSpec`, `MediaCommand`, `MediaEvent`, `MediaStats`, and the structs
-and enums they need). Nothing in it names a `crate::voip` type, so a build can
+and enums they need). Nothing in it names a `wacore::voip` type, so a build can
 enable it and not `voip`; the compiler names the leak if a draft reaches for one.
 `MediaSessionSpec`'s `Debug` redacts the callKey, relay token, auth token and
 integrity key, the same material `CallConfig`'s redaction protects.
 
 In `whatsapp-rust`, `voip-control` re-exports that contract and `voip-engine-wacore`
 adds the resident backend (`voip_control::wacore_backend`) that builds a
-`wacore::voip::CallEngine` from the neutral spec and translates events and
-counters back. `voip-runtime` composes both, so **what it delivers is unchanged**:
+`wacore::voip::CallEngine` from the neutral spec and publishes stats through the
+session. Events need no translation: `MediaEvent` is `CallEvent` under its seam
+name, so the drive loop publishes it directly. `voip-runtime` composes both, so
+**what it delivers is unchanged**:
 signaling, the facade, and the engine, exactly as before. No observable behavior
 moved; the only new thing is that the engine now sits behind a trait the call
 registry stores.
@@ -157,9 +160,11 @@ decouple anything while those stay typed by `PeerAnswer`, `VideoControl`,
 `GroupControl` and `CallEvent`. They are gone: the entry stores
 `Arc<dyn VoipMediaSession>`, and the media command mailboxes live on the resident
 session behind it. What stays on the entry is control-plane data the registry
-owns: the consumer-facing `CallEvent` queue, the counters cell the `CallHandle`
-reads, the media-task abort handle, the video negotiation state, and the teardown
-hook.
+owns: the signaling session, the close reason, the generation token, the video
+negotiation state and retained peer rotations, the group warp width, and the
+teardown hook. The consumer-facing event queue, the counters cell, and the
+media-task abort handle it used to hold moved onto the session: the `CallHandle`
+reads them through `subscribe()`/`stats()`, and `close()` ends the drive task.
 
 The engine is `Send` but not `Sync`: `CallEngine` holds
 `Box<dyn ForeignAudioCodec>`, whose trait is bounded `MaybeSend` and deliberately
@@ -213,11 +218,13 @@ only the doc-comment mentions, no code). The facade's own media startup goes
 only through `VoipMediaBackend::open`, so the control plane never names an
 engine type in production.
 
-The gate count moves down. `voip-runtime` now names only four sites outside the
+The gate count moves down. `voip-runtime` names only four sites outside the
 subsystem's own files, all test scaffolding (two `create_test_client*` helpers
 and two `should_issue_tc_token` tests); no production code outside `src/voip`,
-`src/client/voip.rs` and `src/handlers/call.rs` names it. The budget records
-that final number, 4.
+`src/client/voip.rs` and `src/handlers/call.rs` names it. A second guard caps
+`voip-control` at 16: the two `mod` declarations, the `subsystems!` entry, the 7
+builder lines of the backend injection point, 3 control-plane-driven core hooks,
+and 3 test gates. The budgets record those final numbers, 4 and 16.
 
 ### Not a subsystem: WAM
 
@@ -461,7 +468,7 @@ after this batch:
 
 ## What the guard proves, and what it does not
 
-`tests/subsystem_boundary.rs` holds two guards, one per verdict.
+`tests/subsystem_boundary.rs` holds three guards: one cuttable, two disciplined.
 
 **Cuttable.** The core may not name the subsystem outside the files it owns and
 its two allowed mentions. It scans text, so it sees a mention in a comment too,
@@ -475,9 +482,10 @@ and the gate arm requires the line to *end* as an attribute, or a one-line
 `#[cfg(feature = "x")] pub use crate::x::Thing;` would open like a gate and pass.
 
 **Coupled but disciplined.** A subsystem that cannot leave still has gates in the
-core, so the guard caps how many. VoIP's is 9 outside the files it owns, and
-raising it is meant to be a decision with a line in this document behind it. The
-cap counts production and test gates together, because telling them apart needs
+core, so each guard caps how many. `voip-runtime` allows 4 outside the files it
+owns, `voip-control` 16, and raising either is meant to be a decision with a
+line in this document behind it. The cap counts production and test gates
+together, because telling them apart needs
 a parser the guard does not have and a new gate is worth a look either way.
 
 It counts the `feature = "..."` term rather than a whole `cfg(feature = "...")`,
