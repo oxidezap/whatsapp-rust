@@ -2522,6 +2522,8 @@ pub(crate) async fn attach_outgoing_relay(
             video: None,
             events: pending.ev_tx.clone(),
             video_channels: Some(video_channels),
+            video_teardown: None,
+            peer_video_orientations: Vec::new(),
             // The recv-rekey receiver is session-owned; `open` takes it for the drive loop.
             rekey: None,
             group_epoch: None,
@@ -3081,6 +3083,8 @@ async fn open_registered_media(
             timed_video_in: Some(timed_video_in),
             video_out,
         }),
+        video_teardown: None,
+        peer_video_orientations: Vec::new(),
         events: ev_tx.clone(),
         rekey: rekey_rx,
         muted: muted.clone(),

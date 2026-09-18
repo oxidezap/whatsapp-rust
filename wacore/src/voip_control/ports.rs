@@ -159,6 +159,13 @@ pub struct MediaOpenContext {
     pub video: Option<MediaVideoPorts>,
     /// The drive-loop video halves, when the caller pre-created the video plumbing.
     pub video_channels: Option<MediaVideoChannels>,
+    /// Releases the local video endpoints on a refused upgrade or terminal teardown. The control
+    /// plane owns the hook (it holds the consumer's endpoints); the backend stores it so the same
+    /// teardown runs wherever the session ends.
+    pub video_teardown: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Rotations a peer announced before media attached, in announcement order. The backend applies
+    /// them the moment the plane is up, or the peer's first frames are stamped upright.
+    pub peer_video_orientations: Vec<(Option<wacore_binary::Jid>, u8)>,
     /// The public, ordered call event sink the handle reads.
     pub events: async_channel::Sender<super::CallEvent>,
     /// The caller-only recv-rekey receiver; `None` on the callee side.
@@ -195,6 +202,8 @@ impl MediaOpenContext {
             },
             video: None,
             video_channels: None,
+            video_teardown: None,
+            peer_video_orientations: Vec::new(),
             events,
             rekey: None,
             muted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
