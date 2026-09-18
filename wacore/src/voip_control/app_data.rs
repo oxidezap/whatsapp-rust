@@ -2,6 +2,9 @@
 
 const MAX_APP_DATA_BYTES: usize = 4096;
 const MAX_REACTION_BYTES: usize = 256;
+/// Engine-only: the app-data RTP timestamp stride the drive loop stamps. Named by
+/// `wacore::voip`, so it is compiled only when the engine is.
+#[cfg(feature = "voip")]
 pub(crate) const APP_DATA_RTP_TIMESTAMP_STRIDE: u32 = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

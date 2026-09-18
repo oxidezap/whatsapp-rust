@@ -6,6 +6,7 @@
 
 /// HKDF-SHA256 (extract with `salt`, expand with `info`): the one KDF shape all of
 /// WhatsApp's VoIP key derivations reduce to.
+#[cfg(feature = "voip")]
 pub(crate) fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> {
     debug_assert!(len <= 255 * 32, "HKDF-SHA256 max output is 8160 bytes");
     crate::crypto::hkdf_sha256(ikm, len, Some(salt), info).expect("HKDF length within bounds")
@@ -31,6 +32,7 @@ pub(crate) fn format_participant_id(jid: &str) -> String {
 }
 
 /// LEB128 varint append (`SFrame` header + DC STUN attributes use the same encoding).
+#[cfg(feature = "voip")]
 pub(crate) fn encode_varint(out: &mut Vec<u8>, value: u64) {
     let mut v = value;
     while v > 0x7f {
