@@ -141,8 +141,11 @@ pub struct MediaVideoPorts {
 /// backend must use these rather than create its own, or the sender the handle steers would reach
 /// a different channel.
 pub struct MediaVideoChannels {
-    /// Plane control (enable/disable/orientation/keyframe).
+    /// Plane control (enable/disable/orientation/keyframe) the drive loop reads.
     pub control: super::control::VideoControlReceiver,
+    /// The sender half of `control`. The backend installs it on the session so
+    /// `submit(MediaCommand::EnableVideo …)` reaches this receiver.
+    pub control_sender: super::control::VideoControlSender,
     /// Outbound AUs produced by the source feed.
     pub video_in: async_channel::Receiver<Vec<u8>>,
     /// Optional capture-timestamped AUs.

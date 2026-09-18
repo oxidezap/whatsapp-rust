@@ -3004,6 +3004,7 @@ async fn open_registered_media(
     // The handle's video plumbing is created before media exists (so a dormant handle can steer),
     // so its loop halves are taken here and handed to `open`, which must use them.
     let (video_in, timed_video_in, video_ctl) = video_shared.take_receivers();
+    let video_ctl_sender = video_shared.ctl_tx.clone();
     let (video_out, video_out_rx) = async_channel::bounded::<VideoFrame>(VIDEO_OUT_CHANNEL_CAP);
     // Drain the loop's output into whatever sink is currently attached (swappable mid-call).
     let sink_slot = video_shared.sink_slot.clone();
@@ -3031,6 +3032,7 @@ async fn open_registered_media(
         video: None,
         video_channels: Some(wacore::voip_control::MediaVideoChannels {
             control: video_ctl,
+            control_sender: video_ctl_sender,
             video_in,
             timed_video_in: Some(timed_video_in),
             video_out,

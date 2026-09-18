@@ -518,6 +518,12 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         // Adopt the caller's public event sender so signaling events and media events share one
         // ordered stream the `CallHandle` reads.
         resident.install_event_sender(ctx.events.clone());
+        // If the caller pre-created the video plumbing, adopt its control sender so
+        // `submit(MediaCommand::EnableVideo …)` reaches the loop's receiver while the handle steers
+        // the same channel.
+        if let Some(channels) = ctx.video_channels.as_ref() {
+            resident.install_video_sender(channels.control_sender.clone());
+        }
         // Replay the committed roster and reject a changed WARP tag width, exactly as the registry's
         // attach-time group wiring did; a refusal is the typed setup failure the facade reported.
         let (committed, established) = client
