@@ -511,7 +511,6 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         // Adopt the caller's public event sender so signaling events and media events share one
         // ordered stream the `CallHandle` reads.
         resident.install_event_sender(ctx.events.clone());
-        let video_ctl = resident.install_video_channel();
         // Replay the committed roster and reject a changed WARP tag width, exactly as the registry's
         // attach-time group wiring did; a refusal is the typed setup failure the facade reported.
         let (committed, established) = client
@@ -524,7 +523,7 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
                 "group relay WARP tag length changed during media attachment".into(),
             )
         })?);
-        let channels = build_channels(&client, ctx, stats, video_ctl, group_ctl, key.generation)?;
+        let channels = build_channels(&client, ctx, stats, group_ctl, key.generation)?;
 
         let runtime = Arc::clone(&self.runtime);
         let registry = client.call_registry();
@@ -553,7 +552,6 @@ fn build_channels(
     client: &crate::client::Client,
     ctx: wacore::voip_control::MediaOpenContext,
     media_stats: Arc<wacore::voip_control::media_stats::MediaStatsCell>,
-    video_ctl: wacore::voip::VideoControlReceiver,
     group_ctl: Option<async_channel::Receiver<wacore::voip::GroupControl>>,
     generation: u64,
 ) -> Result<wacore::voip::CallChannels, MediaSetupError> {
@@ -584,36 +582,50 @@ fn build_channels(
         }
     };
 
-    // Video: the drive loop always gets the channels. With a source, the source pumps into them and
-    // the out-forwarder stamps the authoritative call generation before the sink; without one, the
-    // far halves are closed so their driver arms retire.
-    let (video_in_tx, video_in) = async_channel::bounded::<Vec<u8>>(VIDEO_IN_CHANNEL_CAP);
-    let (timed_video_in_tx, timed_video_in) =
-        async_channel::bounded::<wacore::voip::VideoInput>(VIDEO_IN_CHANNEL_CAP);
-    let (video_out, video_out_rx) =
-        async_channel::bounded::<wacore::voip::VideoFrame>(VIDEO_OUT_CHANNEL_CAP);
-    if let Some(video) = ctx.video {
-        let sink = video.sink.playout();
-        client.runtime.spawn_detached(Box::pin(async move {
-            while let Ok(mut frame) = video_out_rx.recv().await {
-                frame.generation = generation;
-                // Loss tolerant: a stalled sink sheds frames rather than back-pressuring the loop.
-                let _ = sink.try_send(frame);
+    // Video: the drive loop needs the loop halves. When the caller pre-created the plumbing (so a
+    // dormant handle can steer video), those halves arrive in `ctx.video_channels` and the caller's
+    // own feed/sink machinery owns the other ends; the backend must not create its own, or the
+    // handle's sender would reach a different channel.
+    let (video_in, timed_video_in, video_ctl, video_out) = match ctx.video_channels {
+        Some(channels) => (
+            channels.video_in,
+            channels.timed_video_in,
+            channels.control,
+            channels.video_out,
+        ),
+        None => {
+            // No pre-created plumbing: wire the source and sink directly, or retire the arms.
+            let (video_in_tx, video_in) = async_channel::bounded::<Vec<u8>>(VIDEO_IN_CHANNEL_CAP);
+            let (timed_video_in_tx, timed_video_in) =
+                async_channel::bounded::<wacore::voip::VideoInput>(VIDEO_IN_CHANNEL_CAP);
+            let (_ctl_tx, video_ctl) = wacore::voip::video_control_channel();
+            let (video_out, video_out_rx) =
+                async_channel::bounded::<wacore::voip::VideoFrame>(VIDEO_OUT_CHANNEL_CAP);
+            if let Some(video) = ctx.video {
+                let sink = video.sink.playout();
+                client.runtime.spawn_detached(Box::pin(async move {
+                    while let Ok(mut frame) = video_out_rx.recv().await {
+                        frame.generation = generation;
+                        // Loss tolerant: a stalled sink sheds frames rather than back-pressuring.
+                        let _ = sink.try_send(frame);
+                    }
+                }));
+                client.runtime.spawn_detached(Box::pin(
+                    SourceFeed {
+                        source: video.source,
+                        out_legacy: video_in_tx,
+                        out_timed: timed_video_in_tx,
+                    }
+                    .run(),
+                ));
+            } else {
+                drop(video_out_rx);
+                drop(video_in_tx);
+                drop(timed_video_in_tx);
             }
-        }));
-        client.runtime.spawn_detached(Box::pin(
-            SourceFeed {
-                source: video.source,
-                out_legacy: video_in_tx,
-                out_timed: timed_video_in_tx,
-            }
-            .run(),
-        ));
-    } else {
-        drop(video_out_rx);
-        drop(video_in_tx);
-        drop(timed_video_in_tx);
-    }
+            (video_in, Some(timed_video_in), video_ctl, video_out)
+        }
+    };
 
     Ok(CallChannels {
         mic,
@@ -623,7 +635,7 @@ fn build_channels(
         events: ctx.events,
         rekey: ctx.rekey,
         video_in,
-        timed_video_in: Some(timed_video_in),
+        timed_video_in,
         video_out,
         video_ctl,
         group_ctl,
