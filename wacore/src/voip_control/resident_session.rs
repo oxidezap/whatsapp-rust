@@ -163,6 +163,10 @@ pub struct ResidentMediaSession {
     /// drive loop through [`take_rekey_receiver`](Self::take_rekey_receiver).
     rekey_tx: async_channel::Sender<PeerAnswer>,
     rekey_rx: Mutex<Option<async_channel::Receiver<PeerAnswer>>>,
+    /// Test-only weak self, so the registry's test accessor can hand an owned handle back without
+    /// production code holding the concrete type.
+    #[cfg(any(test, feature = "test-util"))]
+    self_weak: std::sync::OnceLock<std::sync::Weak<Self>>,
 }
 
 impl ResidentMediaSession {
@@ -177,13 +181,26 @@ impl ResidentMediaSession {
     pub fn with_stats(stats: Arc<MediaStatsCell>) -> Arc<Self> {
         let (events_tx, events_rx) = async_channel::bounded(DEFAULT_CALL_EVENT_QUEUE_CAPACITY);
         let (rekey_tx, rekey_rx) = async_channel::bounded(1);
-        Arc::new(Self {
+        let session = Self {
             mailboxes: Mutex::new(Mailboxes::default()),
             stats: Mutex::new(stats),
             events: Mutex::new((events_tx, events_rx)),
             rekey_tx,
             rekey_rx: Mutex::new(Some(rekey_rx)),
-        })
+            #[cfg(any(test, feature = "test-util"))]
+            self_weak: std::sync::OnceLock::new(),
+        };
+        let session = Arc::new(session);
+        #[cfg(any(test, feature = "test-util"))]
+        let _ = session.self_weak.set(Arc::downgrade(&session));
+        session
+    }
+
+    /// Test-only: an owned handle to this session.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn resident_arc(&self) -> Option<Arc<Self>> {
+        self.self_weak.get().and_then(|weak| weak.upgrade())
     }
 
     /// The event sender the drive loop publishes through.
@@ -255,6 +272,46 @@ impl ResidentMediaSession {
     /// aborts it. The control plane never sees this handle (F6/F14).
     pub fn install_drive_task(&self, handle: crate::runtime::AbortHandle) {
         self.mailboxes().media_task = Some(handle);
+    }
+
+    /// Adopt the caller's public event sender (created once at registration).
+    pub fn install_event_sender(&self, tx: async_channel::Sender<MediaEvent>) {
+        self.events().0 = tx;
+    }
+
+    /// Take the one-shot recv-rekey receiver for the drive loop.
+    #[must_use]
+    pub fn take_rekey_receiver(&self) -> Option<async_channel::Receiver<PeerAnswer>> {
+        self.rekey_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    /// Install the video-control sender the shell steers the plane through.
+    pub fn install_video_sender(&self, tx: VideoControlSender) {
+        self.set_video_sender(tx);
+    }
+
+    /// Install the shared counter cell the drive loop publishes into.
+    pub fn install_stats_cell(&self, cell: Arc<MediaStatsCell>) {
+        self.set_stats_cell(cell);
+    }
+
+    /// Install the group-control mailbox and replay the retained startup state.
+    pub fn install_group_sender(
+        &self,
+        tx: async_channel::Sender<GroupControl>,
+        warp_mi_tag_len: Option<usize>,
+        committed: Option<GroupCallUpdate>,
+        established_warp_mi_tag_len: Option<usize>,
+    ) -> bool {
+        self.set_group_sender(tx, warp_mi_tag_len, committed, established_warp_mi_tag_len)
+    }
+
+    /// Install the drive task's abort handle (alias of [`install_drive_task`](Self::install_drive_task)).
+    pub fn install_media_task(&self, handle: crate::runtime::AbortHandle) {
+        self.install_drive_task(handle);
     }
 
     fn mailboxes(&self) -> std::sync::MutexGuard<'_, Mailboxes> {
@@ -555,38 +612,6 @@ impl VoipMediaSession for ResidentMediaSession {
             )
     }
 
-    fn take_rekey_receiver(&self) -> Option<async_channel::Receiver<PeerAnswer>> {
-        self.rekey_rx
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-    }
-
-    fn install_video_sender(&self, tx: VideoControlSender) -> bool {
-        self.set_video_sender(tx);
-        true
-    }
-
-    fn install_stats_cell(&self, cell: Arc<MediaStatsCell>) -> bool {
-        self.set_stats_cell(cell);
-        true
-    }
-
-    fn install_group_sender(
-        &self,
-        tx: async_channel::Sender<GroupControl>,
-        warp_mi_tag_len: Option<usize>,
-        committed: Option<GroupCallUpdate>,
-        established_warp_mi_tag_len: Option<usize>,
-    ) -> bool {
-        self.set_group_sender(tx, warp_mi_tag_len, committed, established_warp_mi_tag_len)
-    }
-
-    fn install_media_task(&self, handle: crate::runtime::AbortHandle) -> bool {
-        self.mailboxes().media_task = Some(handle);
-        true
-    }
-
     fn stats(&self) -> MediaStats {
         stats_to_neutral(self.stats_cell().snapshot())
     }
@@ -603,9 +628,9 @@ impl VoipMediaSession for ResidentMediaSession {
         crate::voip_control::registry::publish_call_event(&self.events().0, event)
     }
 
-    fn install_event_sender(&self, tx: async_channel::Sender<MediaEvent>) -> bool {
-        self.events().0 = tx;
-        true
+    #[cfg(any(test, feature = "test-util"))]
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
     }
 
     fn close(&self, _reason: crate::voip_control::MediaCloseReason) {

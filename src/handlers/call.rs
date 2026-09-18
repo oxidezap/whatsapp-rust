@@ -3251,8 +3251,8 @@ mod tests {
         let (_event_rx, generation) = register_native_opus_call(&client, Vec::new());
         let rekey_rx = client
             .call_registry()
-            .media_session("CALL-ID-0001", generation)
-            .and_then(|media| media.take_rekey_receiver())
+            .resident_session("CALL-ID-0001", generation)
+            .and_then(|session| session.take_rekey_receiver())
             .expect("the resident session owns a rekey receiver");
         let participant = fake_caller_lid().with_device(4);
         let accept = NodeBuilder::new("call")

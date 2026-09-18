@@ -269,6 +269,20 @@ fn upsert_peer_orientation(orientations: &mut Vec<PeerOrientation>, announced: P
 }
 
 impl CallEntry {
+    /// Test-only: the concrete resident session behind the seam, for tests that drive its concrete
+    /// wiring. Production never downcasts.
+    #[cfg(any(test, feature = "test-util"))]
+    fn resident_test(
+        &self,
+    ) -> Option<&crate::voip_control::resident_session::ResidentMediaSession> {
+        self.media
+            .as_ref()
+            .and_then(|media| media.as_any())
+            .and_then(|any| {
+                any.downcast_ref::<crate::voip_control::resident_session::ResidentMediaSession>()
+            })
+    }
+
     /// Install a replacement session, carrying over the facts an entry holds
     /// outside it. A re-offer, a glare resolution and a group promotion all
     /// rebuild the session, and the peer's rotation is stated on the offer and
@@ -1811,26 +1825,6 @@ impl CallRegistry {
         true
     }
 
-    /// Install the cell the drive loop publishes media counters into.
-    pub fn set_media_stats(
-        &self,
-        call_id: &str,
-        generation: u64,
-        cell: Arc<crate::voip_control::media_stats::MediaStatsCell>,
-    ) {
-        if let Some(entry) = self
-            .active_calls()
-            .get_mut(call_id)
-            .filter(|entry| entry.generation == generation)
-        {
-            // Through the neutral seam: the resident session stores the shared cell so its `stats`
-            // reports the live call; a foreign backend keeps its own counters and refuses this.
-            if let Some(media) = entry.media.as_ref() {
-                media.install_stats_cell(cell);
-            }
-        }
-    }
-
     /// Media counters for one call generation, read through the neutral seam.
     ///
     /// A backend that owns a foreign engine reports its own [`MediaStats`](crate::voip_control::MediaStats)
@@ -1845,6 +1839,83 @@ impl CallRegistry {
             .unwrap_or_default()
     }
 
+    /// Test-only: the concrete resident session for a generation, so a unit test can drive its
+    /// concrete wiring. Production never downcasts; a foreign backend yields `None`.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn resident_session(
+        &self,
+        call_id: &str,
+        generation: u64,
+    ) -> Option<Arc<crate::voip_control::resident_session::ResidentMediaSession>> {
+        let media = self
+            .active_calls()
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+            .and_then(|entry| entry.media.clone())?;
+        let resident = media.as_any().and_then(|any| {
+            any.downcast_ref::<crate::voip_control::resident_session::ResidentMediaSession>()
+        })?;
+        resident.resident_arc()
+    }
+
+    /// The peer rotations retained for a call, resolved to the neutral `(participant, orientation)`
+    /// shape an opener submits. `participant` is `None` for a 1:1 call and the roster's name for a
+    /// group sender.
+    #[must_use]
+    pub fn peer_video_orientations(
+        &self,
+        call_id: &str,
+        generation: u64,
+    ) -> Option<Vec<(Option<Jid>, u8)>> {
+        let map = self.active_calls();
+        let entry = map
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)?;
+        Some(
+            entry
+                .peer_video_orientations
+                .iter()
+                .map(|announced| {
+                    match entry
+                        .peer_orientation_control(&announced.announcer, announced.orientation)
+                    {
+                        VideoControl::SetOrientation(orientation) => (None, orientation),
+                        VideoControl::SetParticipantOrientation {
+                            participant,
+                            orientation,
+                        } => (Some(participant), orientation),
+                        _ => (None, announced.orientation),
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// Test-only: install the drive task's abort handle on the resident session of a generation.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_media_task(&self, call_id: &str, generation: u64, handle: AbortHandle) {
+        let resident = self.resident_session(call_id, generation);
+        match resident {
+            Some(session) => session.install_media_task(handle),
+            // No matching generation: abort the task immediately, as the old path did.
+            None => drop(handle),
+        }
+    }
+
+    /// Test-only: install the shared counters cell on the resident session of a generation.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_media_stats(
+        &self,
+        call_id: &str,
+        generation: u64,
+        cell: Arc<crate::voip_control::media_stats::MediaStatsCell>,
+    ) {
+        if let Some(session) = self.resident_session(call_id, generation) {
+            session.install_stats_cell(cell);
+        }
+    }
+
     /// The media session for one call generation, so a consumer can hold it and read live counters
     /// through [`VoipMediaSession::stats`] even after the registry entry is gone.
     #[must_use]
@@ -1857,23 +1928,6 @@ impl CallRegistry {
             .get(call_id)
             .filter(|entry| entry.generation == generation)
             .and_then(|entry| entry.media.clone())
-    }
-
-    /// Attach (or replace) the media task for the call registered under `generation`. If the call
-    /// was removed or superseded by a newer generation, the handle is aborted immediately so its
-    /// task can't outlive the call.
-    pub fn set_media_task(&self, call_id: &str, generation: u64, handle: AbortHandle) {
-        // Cloned under the lock; installed outside it, so a handle whose abort re-enters the
-        // registry cannot deadlock. A backend that owns no comparable handle refuses, and the
-        // handle drops (aborts) right here.
-        let media = self
-            .active_calls()
-            .get(call_id)
-            .filter(|entry| entry.generation == generation)
-            .and_then(|entry| entry.media.clone());
-        if let Some(media) = media {
-            media.install_media_task(handle);
-        }
     }
 
     /// Attach the repeating waiting-room heartbeat to one call generation.
@@ -2068,6 +2122,7 @@ impl CallRegistry {
     /// teardown hook, so the signaling handler can surface `<video state>` changes, steer the video
     /// plane mid-call, and fully release the endpoints on a refused upgrade. Generation-guarded like
     /// the rekey sender.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn set_video_channels(
         &self,
         call_id: &str,
@@ -2081,8 +2136,8 @@ impl CallRegistry {
         {
             // The caller created the stream so its `CallHandle` holds the receiver; the session
             // adopts the sender and becomes the one publisher.
-            if let Some(media) = entry.media.as_ref() {
-                media.install_event_sender(event_tx);
+            if let Some(resident) = entry.resident_test() {
+                resident.install_event_sender(event_tx);
             }
             // Before the sender is published, so the rotation the offer
             // announced is the first thing the drive loop reads rather than
@@ -2096,12 +2151,12 @@ impl CallRegistry {
                 })
                 .collect();
             entry.video_teardown = Some(video_teardown);
-            let Some(media) = entry.media.as_ref() else {
+            let Some(resident) = entry.resident_test() else {
                 return;
             };
-            media.install_video_sender(video_ctl_tx);
+            resident.install_video_sender(video_ctl_tx);
             for control in replayed {
-                media.submit(video_control_to_command(control));
+                resident.submit(video_control_to_command(control));
             }
         }
     }
@@ -2162,6 +2217,7 @@ impl CallRegistry {
     }
 
     /// Attach the group-media control sender for this call generation.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn set_group_control_sender(
         &self,
         call_id: &str,
@@ -2191,10 +2247,10 @@ impl CallRegistry {
             .and_then(GroupCallState::snapshot)
             .and_then(|snapshot| snapshot.relay.as_ref())
             .map(|relay| relay.warp_mi_tag_len.unwrap_or(4) as usize);
-        let Some(media) = entry.media.as_ref() else {
+        let Some(resident) = entry.resident_test() else {
             return false;
         };
-        if !media.install_group_sender(tx, warp_mi_tag_len, committed, established) {
+        if !resident.install_group_sender(tx, warp_mi_tag_len, committed, established) {
             return false;
         }
         entry.group_warp_mi_tag_len = warp_mi_tag_len;

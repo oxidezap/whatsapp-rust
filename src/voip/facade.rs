@@ -1988,15 +1988,13 @@ async fn place_call(
     // arrives; the control plane only delivers `RekeyRecv` commands.
 
     // Video plumbing exists for EVERY call (idle channels cost nothing): the signaling handler and
-    // CallHandle::start_video need the senders even when the call starts audio-only.
+    // CallHandle::start_video need the senders even when the call starts audio-only. The teardown
+    // hook and any retained rotation travel through the open context now, not a registry setter.
     let video_shared = Arc::new(VideoShared::new());
-    registry.set_video_channels(
-        &call_id,
-        generation,
-        ev_tx.clone(),
-        video_shared.ctl_tx.clone(),
-        video_teardown_hook(&video_shared),
-    );
+    let video_teardown = video_teardown_hook(&video_shared);
+    let peer_video_orientations = registry
+        .peer_video_orientations(&call_id, generation)
+        .unwrap_or_default();
 
     // Park the material needed to spawn the engine once the relay arrives. Keyed by call-id.
     client
@@ -2014,6 +2012,8 @@ async fn place_call(
                 audio,
                 video,
                 video_shared: video_shared.clone(),
+                video_teardown,
+                peer_video_orientations,
                 muted: muted.clone(),
                 ended: ended.clone(),
                 ev_tx,
@@ -2367,6 +2367,10 @@ pub(crate) struct PendingOutgoing {
     /// The handle's video plumbing, created at place time so `start_video` works while the call is
     /// still dormant. Its loop halves are handed to `open` when the relay arrives.
     video_shared: Arc<VideoShared>,
+    /// Releases the local video endpoints on a terminal teardown or refused upgrade.
+    video_teardown: Box<dyn Fn() + Send + Sync>,
+    /// Rotations the peer announced before media attached, replayed on attach.
+    peer_video_orientations: Vec<(Option<Jid>, u8)>,
     muted: Arc<AtomicBool>,
     ended: Arc<EndedFlag>,
     ev_tx: async_channel::Sender<CallEvent>,
@@ -2522,8 +2526,8 @@ pub(crate) async fn attach_outgoing_relay(
             video: None,
             events: pending.ev_tx.clone(),
             video_channels: Some(video_channels),
-            video_teardown: None,
-            peer_video_orientations: Vec::new(),
+            video_teardown: Some(pending.video_teardown),
+            peer_video_orientations: pending.peer_video_orientations.clone(),
             // The recv-rekey receiver is session-owned; `open` takes it for the drive loop.
             rekey: None,
             group_epoch: None,

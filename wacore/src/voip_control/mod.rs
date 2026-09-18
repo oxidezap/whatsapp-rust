@@ -671,46 +671,6 @@ pub trait VoipMediaSession: MaybeSendSync + 'static {
         0
     }
 
-    /// Install the video-control mailbox the shell steers the plane through.
-    ///
-    /// A backend that owns its own video path returns `false` and needs no installation; the
-    /// resident session stores it so `submit(MediaCommand::EnableVideo …)` reaches the drive loop.
-    /// Defaults to refusing, so an implementation that does not know the mailbox is never wired into.
-    fn install_video_sender(&self, _tx: control::VideoControlSender) -> bool {
-        false
-    }
-
-    /// Install the counter cell the drive loop publishes into.
-    ///
-    /// The cell is shared with the `CallHandle` so the final counters survive registry removal; a
-    /// session that keeps its own counters returns `false` and reports them through [`stats`](Self::stats).
-    fn install_stats_cell(&self, _cell: Arc<media_stats::MediaStatsCell>) -> bool {
-        false
-    }
-
-    /// Install the group-control mailbox and replay the retained startup state.
-    ///
-    /// `warp_mi_tag_len` is the tag width baked into the attached pipelines; `established` is what
-    /// the call's own roster recorded, so a refresh that would move the packet boundary under an
-    /// attached pipeline is refused. A backend that owns its group path returns `false`.
-    fn install_group_sender(
-        &self,
-        _tx: async_channel::Sender<control::GroupControl>,
-        _warp_mi_tag_len: Option<usize>,
-        _committed: Option<GroupCallUpdate>,
-        _established_warp_mi_tag_len: Option<usize>,
-    ) -> bool {
-        false
-    }
-
-    /// Take ownership of the drive task's abort handle, so [`close`](Self::close) can end it.
-    ///
-    /// The control plane no longer keeps a parallel `media_task` abort: whichever backend drives
-    /// media owns its own teardown, and a foreign backend that keeps no such handle returns `false`.
-    fn install_media_task(&self, _handle: crate::runtime::AbortHandle) -> bool {
-        false
-    }
-
     /// Publish a signaling event into this session's public stream.
     ///
     /// The control plane surfaces a committed peer video-state change or a group control answer
@@ -718,25 +678,6 @@ pub trait VoipMediaSession: MaybeSendSync + 'static {
     /// when the event was queued; `false` when the implementation has no such stream or it is under
     /// backpressure, in which case the caller decides whether to retry.
     fn publish(&self, _event: MediaEvent) -> bool {
-        false
-    }
-
-    /// Hand the drive loop its one-shot recv-rekey receiver, if the implementation owns one.
-    ///
-    /// The resident session owns the channel (created at reservation, so an accept that beats the
-    /// relay is buffered); a foreign backend applies rekey through [`submit`](Self::submit) and
-    /// returns `None`. One-shot: a second call returns `None`.
-    fn take_rekey_receiver(&self) -> Option<async_channel::Receiver<control::PeerAnswer>> {
-        None
-    }
-
-    /// Adopt an externally-created public event sender.
-    ///
-    /// The control plane creates the channel once at registration (so a dormant `CallHandle` holds
-    /// the receiver before media attaches) and hands the sender in here. The session then owns
-    /// publication over it; a foreign backend and the resident one behave the same. Returns `false`
-    /// when the implementation raises no public events.
-    fn install_event_sender(&self, _tx: async_channel::Sender<MediaEvent>) -> bool {
         false
     }
 
@@ -749,6 +690,15 @@ pub trait VoipMediaSession: MaybeSendSync + 'static {
 
     /// Idempotent close; releases the transport.
     fn close(&self, reason: MediaCloseReason);
+
+    /// Test-only downcast to the resident session, so a unit test can drive its concrete wiring.
+    ///
+    /// Gated on `test-util`: production control flow never downcasts, and a foreign backend returns
+    /// `None` even under test. The allowed uses are the registry's own test helpers.
+    #[cfg(any(test, feature = "test-util"))]
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        None
+    }
 }
 /// Blanket impls so a session behind an `Arc` is usable as one session.
 impl<T: VoipMediaSession + ?Sized> VoipMediaSession for Arc<T> {
@@ -785,38 +735,8 @@ impl<T: VoipMediaSession + ?Sized> VoipMediaSession for Arc<T> {
         (**self).retained_bytes()
     }
 
-    fn install_video_sender(&self, tx: control::VideoControlSender) -> bool {
-        (**self).install_video_sender(tx)
-    }
-
-    fn install_stats_cell(&self, cell: Arc<media_stats::MediaStatsCell>) -> bool {
-        (**self).install_stats_cell(cell)
-    }
-
-    fn install_group_sender(
-        &self,
-        tx: async_channel::Sender<control::GroupControl>,
-        warp_mi_tag_len: Option<usize>,
-        committed: Option<GroupCallUpdate>,
-        established_warp_mi_tag_len: Option<usize>,
-    ) -> bool {
-        (**self).install_group_sender(tx, warp_mi_tag_len, committed, established_warp_mi_tag_len)
-    }
-
-    fn install_media_task(&self, handle: crate::runtime::AbortHandle) -> bool {
-        (**self).install_media_task(handle)
-    }
-
     fn publish(&self, event: MediaEvent) -> bool {
         (**self).publish(event)
-    }
-
-    fn install_event_sender(&self, tx: async_channel::Sender<MediaEvent>) -> bool {
-        (**self).install_event_sender(tx)
-    }
-
-    fn take_rekey_receiver(&self) -> Option<async_channel::Receiver<control::PeerAnswer>> {
-        (**self).take_rekey_receiver()
     }
 
     fn stats(&self) -> MediaStats {
@@ -829,6 +749,11 @@ impl<T: VoipMediaSession + ?Sized> VoipMediaSession for Arc<T> {
 
     fn close(&self, reason: MediaCloseReason) {
         (**self).close(reason)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        (**self).as_any()
     }
 }
 

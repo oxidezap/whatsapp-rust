@@ -112,13 +112,6 @@ impl VoipMediaSession for FakeMediaSession {
         FakeMediaSession::publish(self, event)
     }
 
-    fn install_event_sender(&self, tx: async_channel::Sender<MediaEvent>) -> bool {
-        // Swap the sender for the caller's, so a test reading the receiver it created sees what the
-        // control plane publishes.
-        *self.events.lock().unwrap_or_else(|e| e.into_inner()) = tx;
-        true
-    }
-
     fn close(&self, reason: MediaCloseReason) {
         self.record.lock().unwrap_or_else(|e| e.into_inner()).closed = Some(reason);
     }
