@@ -1401,7 +1401,7 @@ impl Voip<'_> {
             Jid::new(&join.call_id, Server::Call),
             join.call_creator.clone(),
         );
-        session.audio_format = Some(audio_format.to_neutral());
+        session.audio_format = Some(audio_format);
         session.is_video = media == CallLinkMedia::Video;
         session.group = join.group.clone();
         let _ = session.transition_to(CallPhase::Calling);

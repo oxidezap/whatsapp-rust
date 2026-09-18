@@ -90,8 +90,8 @@ pub enum ClientBuilderError {
     /// Two media backends were installed, or one was installed after assembly already bound the
     /// registry's. Silently ignoring the requested backend would leave a caller running on one it
     /// did not ask for, so the conflict is an error.
-    #[cfg(feature = "voip-runtime")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "voip-runtime")))]
+    #[cfg(feature = "voip-control")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "voip-control")))]
     #[error("a VoIP media backend is already installed on this client")]
     VoipMediaBackendAlreadyInstalled,
     #[cfg(feature = "client-lifecycle")]
@@ -142,7 +142,7 @@ pub struct ClientBuilder {
     /// The media backend the call subsystem reserves sessions from, when the application wants a
     /// foreign implementation. `None` means "use whatever this build defaults to": the resident
     /// `WacoreVoipMediaBackend` on a `voip-engine-wacore` build, or none at all.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     voip_media_backend: Option<Arc<dyn wacore::voip_control::VoipMediaBackend>>,
 }
 
@@ -180,7 +180,7 @@ impl ClientBuilder {
             plugins: Vec::new(),
             #[cfg(feature = "plugins")]
             plugin_host_config: PluginHostConfig::default(),
-            #[cfg(feature = "voip-runtime")]
+            #[cfg(feature = "voip-control")]
             voip_media_backend: None,
         }
     }
@@ -241,7 +241,7 @@ impl ClientBuilder {
     /// `reserve` one session per call. Supplying one is what lets a caller run calls on a foreign
     /// engine instead of the resident one, and a `voip-control`-only build has no other way to get
     /// media at all.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     pub fn with_voip_media_backend<B>(mut self, backend: B) -> Self
     where
         B: wacore::voip_control::VoipMediaBackend + 'static,
@@ -251,7 +251,7 @@ impl ClientBuilder {
     }
 
     /// [`with_voip_media_backend`](Self::with_voip_media_backend) for an already-shared backend.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     pub fn with_voip_media_backend_arc(
         mut self,
         backend: Arc<dyn wacore::voip_control::VoipMediaBackend>,

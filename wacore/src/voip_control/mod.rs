@@ -43,6 +43,11 @@ pub mod fake_backend;
 // the call flow can name a session with the engine off. `crate::voip::session` re-exports these.
 pub mod signaling;
 
+// Fundamental audio format types, moved out of the `voip`-gated audio module so the contract names
+// one type and the engine re-exports it. The `voip::audio` module keeps the payload-inspecting
+// helpers as a second inherent impl on `AudioFormat`.
+pub mod audio_format;
+
 pub use signaling::{CallDirection, CallPhase, CallSession};
 
 /// One decrypted keygen-v2 epoch, kept as secret material.
@@ -102,73 +107,11 @@ pub struct MediaSessionKey {
 // `CallDirection` is gone: `signaling::CallDirection` is the one direction enum, and it lives on
 // the neutral side already, so a separate spelling would only be a second thing to keep in sync.
 
-/// Audio codec carried inside the RTP payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum MediaAudioCodec {
-    Mlow,
-    Opus,
-}
-
-/// RTP payload family, independent of the codec bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum MediaAudioRtpProfile {
-    Mlow,
-    StandardOpus,
-}
-
-/// Where encoding and decoding happen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum MediaAudioIo {
-    Pcm,
-    Encoded,
-}
-
-/// Flat audio timing and format. Mirrors `crate::voip::audio::AudioFormat` field for field without
-/// depending on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, bon::Builder)]
-#[non_exhaustive]
-pub struct MediaAudioFormat {
-    pub codec: MediaAudioCodec,
-    pub rtp_profile: MediaAudioRtpProfile,
-    pub signaling_rate: u32,
-    pub sample_rate: u32,
-    pub channels: u8,
-    pub samples_per_frame: u32,
-    pub rtp_clock_rate: u32,
-    pub rtp_timestamp_step: u32,
-    pub rtp_payload_type: u8,
-}
-
-impl MediaAudioFormat {
-    /// The implemented MLOW operating point: mono, 16 kHz, 60 ms.
-    pub const MLOW_16KHZ_60MS: Self = Self {
-        codec: MediaAudioCodec::Mlow,
-        rtp_profile: MediaAudioRtpProfile::Mlow,
-        signaling_rate: 16_000,
-        sample_rate: 16_000,
-        channels: 1,
-        samples_per_frame: 960,
-        rtp_clock_rate: 16_000,
-        rtp_timestamp_step: 960,
-        rtp_payload_type: 120,
-    };
-
-    /// Native Opus timing at PT 120 and a 16 kHz RTP clock.
-    pub const OPUS_16KHZ_60MS: Self = Self {
-        codec: MediaAudioCodec::Opus,
-        rtp_profile: MediaAudioRtpProfile::StandardOpus,
-        signaling_rate: 16_000,
-        sample_rate: 16_000,
-        channels: 1,
-        samples_per_frame: 960,
-        rtp_clock_rate: 16_000,
-        rtp_timestamp_step: 960,
-        rtp_payload_type: 120,
-    };
-}
+// The audio format types are the moved originals (`audio_format`), not twins. The `MediaAudio*`
+// names are kept as aliases for source compatibility with the already-published surface; there is
+// exactly one type behind each, so the two can no longer drift.
+pub use audio_format::{AudioCodec as MediaAudioCodec, AudioFormat as MediaAudioFormat};
+pub use audio_format::{AudioIo as MediaAudioIo, AudioRtpProfile as MediaAudioRtpProfile};
 
 /// Format plus I/O selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, bon::Builder)]

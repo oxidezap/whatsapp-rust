@@ -320,7 +320,7 @@ impl<'a> AcceptCall<'a> {
         };
         let mut session =
             wacore::voip::CallSession::new_incoming(call_id, peer_jid, call_creator.clone());
-        session.audio_format = Some(wire_format.to_neutral());
+        session.audio_format = Some(wire_format);
         session.is_video = has_video;
         // Why this has to survive registration: `CallEntry::peer_video_orientations`.
         // Keyed by the offering device, which for a group offer rides the outer
@@ -860,7 +860,7 @@ impl<'a> OutgoingGroupCall<'a> {
             Jid::new(&call_id, Server::Call),
             own_lid.clone(),
         );
-        session.audio_format = Some(audio.config().format.to_neutral());
+        session.audio_format = Some(audio.config().format);
         session.is_video = video.is_some();
         let _ = session.transition_to(CallPhase::Calling);
         // Register before the offer reaches the wire. A creator-authenticated group update can
@@ -1919,7 +1919,7 @@ async fn place_call(
     let registry = client.call_registry();
     let mut session =
         wacore::voip::CallSession::new_outgoing(&call_id, peer.clone(), call_creator.clone());
-    session.audio_format = Some(audio.config().format.to_neutral());
+    session.audio_format = Some(audio.config().format);
     session.is_video = video.is_some();
     // The rung device set lives on the session so an inbound <accept>/<reject> from one callee device
     // can dismiss the rest (caller-driven accepted_elsewhere); it is dropped automatically whenever the
