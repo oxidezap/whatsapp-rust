@@ -27,7 +27,8 @@ use std::sync::{Arc, Mutex};
 use crate::types::group_call::GroupCallUpdate;
 use crate::voip_control::control::{DEFAULT_CALL_EVENT_QUEUE_CAPACITY, GroupControlQueue};
 use crate::voip_control::control::{
-    GroupControl, GroupRawEpoch, PeerAnswer, VideoControl, VideoControlSender,
+    GroupControl, GroupRawEpoch, PeerAnswer, VideoControl, VideoControlReceiver,
+    VideoControlSender, video_control_channel,
 };
 use crate::voip_control::media_stats::{CallMediaStats, MediaStatsCell};
 use crate::voip_control::{
@@ -180,6 +181,45 @@ impl ResidentMediaSession {
     #[must_use]
     pub fn event_sender(&self) -> async_channel::Sender<MediaEvent> {
         self.events_tx.clone()
+    }
+
+    /// Create and install this session's video-control mailbox, returning the drive-loop half.
+    ///
+    /// Concrete (not on the trait) because only the resident backend wires a `run_call` loop; a
+    /// foreign backend owns its own video path. The session keeps the sender so `submit` reaches the
+    /// loop; the returned receiver is handed to `CallChannels`.
+    #[must_use]
+    pub fn install_video_channel(&self) -> VideoControlReceiver {
+        let (tx, rx) = video_control_channel();
+        self.set_video_sender(tx);
+        rx
+    }
+
+    /// Create and install this session's group-control mailbox, returning the drive-loop half.
+    #[must_use]
+    pub fn install_group_channel(&self) -> async_channel::Receiver<GroupControl> {
+        // The committed roster and any retained epoch are replayed when the sender is installed; a
+        // fresh rekey channel is empty here, so pass `None` for both and let `deliver_group_*`
+        // retain anything that arrived earlier.
+        let (tx, rx) = async_channel::bounded(DEFAULT_CALL_EVENT_QUEUE_CAPACITY);
+        let _ = self.set_group_sender(tx, None, None, None);
+        rx
+    }
+
+    /// Create and install this session's recv-rekey mailbox, returning the drive-loop half.
+    #[must_use]
+    pub fn install_rekey_channel(&self) -> async_channel::Receiver<PeerAnswer> {
+        let (tx, rx) = async_channel::bounded(1);
+        self.set_rekey_sender(tx);
+        rx
+    }
+
+    /// A fresh counter cell, installed on this session and returned for the `CallHandle` to hold.
+    #[must_use]
+    pub fn install_fresh_stats_cell(&self) -> Arc<MediaStatsCell> {
+        let cell = Arc::new(MediaStatsCell::default());
+        self.set_stats_cell(cell.clone());
+        cell
     }
 
     fn mailboxes(&self) -> std::sync::MutexGuard<'_, Mailboxes> {
