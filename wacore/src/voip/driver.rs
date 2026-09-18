@@ -64,16 +64,9 @@ pub struct CallChannels {
     pub media_stats: Arc<crate::voip::media_stats::MediaStatsCell>,
 }
 
-/// A pre-encoded video access unit with an RTP-clock capture timestamp.
-#[derive(Debug, Clone)]
-pub struct VideoInput {
-    /// Complete Annex-B H.264 access unit.
-    pub data: Vec<u8>,
-    /// Capture timestamp in the 90 kHz RTP clock, compared modulo `u32`.
-    pub timestamp: u32,
-    /// Source generation assigned by the facade. Stale generations are discarded at the driver.
-    pub generation: u64,
-}
+/// A pre-encoded video access unit with an RTP-clock capture timestamp. The neutral
+/// [`VideoInput`](crate::voip_control::VideoInput) is the one definition.
+pub use crate::voip_control::VideoInput;
 
 /// Bound slow relay writes without truncating a complete video access unit.
 const SEND_QUEUE_BATCH_CAP: usize = 64;

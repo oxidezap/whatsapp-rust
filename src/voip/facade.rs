@@ -2460,6 +2460,7 @@ pub(crate) async fn attach_outgoing_relay(
             events: pending.ev_tx.clone(),
             // Outgoing: the drive loop rekeys recv to the answering device (buffered if the accept
             // beat this relay).
+            video_channels: None,
             rekey: Some(pending.rekey_rx.clone()),
             group_epoch: None,
             muted: pending.muted.clone(),

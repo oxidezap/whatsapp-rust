@@ -69,8 +69,8 @@ pub mod registry;
 pub mod ports;
 pub use ports::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
 pub use ports::{
-    MediaAudioPorts, MediaOpenContext, MediaVideoPorts, TimedVideoFrame, VideoFrame, VideoSink,
-    VideoSource,
+    MediaAudioPorts, MediaOpenContext, MediaVideoChannels, MediaVideoPorts, TimedVideoFrame,
+    VideoFrame, VideoInput, VideoSink, VideoSource,
 };
 // RTC app-data payload encoding (reactions), pure and engine-free.
 pub mod app_data;

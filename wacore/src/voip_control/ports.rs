@@ -67,6 +67,18 @@ pub struct TimedVideoFrame {
     pub timestamp: u32,
 }
 
+/// A pre-encoded video access unit with an RTP-clock capture timestamp, as the drive loop consumes
+/// it: the source generation lets a replaced source's stale AUs be discarded.
+#[derive(Debug, Clone)]
+pub struct VideoInput {
+    /// Complete Annex-B H.264 access unit.
+    pub data: Vec<u8>,
+    /// Capture timestamp in the 90 kHz RTP clock, compared modulo `u32`.
+    pub timestamp: u32,
+    /// Source generation assigned by the caller. Stale generations are discarded at the driver.
+    pub generation: u64,
+}
+
 /// Video RTP timestamp clock (90 kHz).
 pub const VIDEO_CLOCK_RATE: u32 = 90_000;
 /// RTP clock increment per access unit at the reference 15 fps cadence.
@@ -122,9 +134,28 @@ pub struct MediaVideoPorts {
 /// A backend's [`open`](super::VoipMediaBackend::open) owns the rest of the lifecycle: it builds
 /// its media, wires the session's own mailboxes, and starts driving. The control plane never hands
 /// a backend its internal mailboxes through the contract.
+/// The drive-loop halves of the video channels, pre-created by the control plane.
+///
+/// The control plane creates the video plumbing once at registration (so a dormant handle can
+/// attach or detach endpoints before media exists) and hands the loop's halves in here. The
+/// backend must use these rather than create its own, or the sender the handle steers would reach
+/// a different channel.
+pub struct MediaVideoChannels {
+    /// Plane control (enable/disable/orientation/keyframe).
+    pub control: super::control::VideoControlReceiver,
+    /// Outbound AUs produced by the source feed.
+    pub video_in: async_channel::Receiver<Vec<u8>>,
+    /// Optional capture-timestamped AUs.
+    pub timed_video_in: Option<async_channel::Receiver<VideoInput>>,
+    /// Reassembled peer AUs the loop writes; the control plane drains this to the sink.
+    pub video_out: async_channel::Sender<VideoFrame>,
+}
+
 pub struct MediaOpenContext {
     pub audio: MediaAudioPorts,
     pub video: Option<MediaVideoPorts>,
+    /// The drive-loop video halves, when the caller pre-created the video plumbing.
+    pub video_channels: Option<MediaVideoChannels>,
     /// The public, ordered call event sink the handle reads.
     pub events: async_channel::Sender<super::CallEvent>,
     /// The caller-only recv-rekey receiver; `None` on the callee side.
@@ -156,6 +187,7 @@ impl MediaOpenContext {
                 sink: Arc::new(speaker),
             },
             video: None,
+            video_channels: None,
             events,
             rekey: None,
             muted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
