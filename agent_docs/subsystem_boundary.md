@@ -186,32 +186,38 @@ build what the seam required, so exactly three APIs opened:
 
 Nothing else in the engine's public surface changed.
 
-**What this is not, and the next phase.** Under `voip-control` alone the facade
-and the registry do not compile: `src/voip` is gated on `voip-runtime` and names
-signaling types that still live in `wacore::voip` -- `CallSession`, `CallPhase`,
-`CallEvent` and its payloads (`EncodedAudioFrame`, `VideoFrame`,
-`RtcpReportBlock`, `RtcpFeedback`), `CallRegistry`, `GroupCallState`,
-`relay_parse` and the `RelayTransportFactory` seam. So the seam is ready and the
-byte cut is not: a `voip-control` build carries the contract, not the call flow.
-The next phase splits `wacore::voip` into a signaling half and an engine half so
-`src/voip` compiles with the engine absent, which requires rebuilding the public
-event and command surface (`CallHandle::events()` returns
-`Receiver<CallEvent>` today) on the neutral types. That rewrite is deliberately
-not in this change, so a regression from it is attributable to the split rather
-than tangled with the seam.
+**The byte cut is done.** `src/voip` (the facade, the registry, the signaling
+call state) now lives on the neutral contract and compiles under `voip-control`
+alone, with the resident engine off. The signaling types that used to live in
+`wacore::voip` -- `CallSession`, `CallPhase`, `CallEvent` and its payloads,
+`CallRegistry`, `GroupCallState`, `relay_parse`, the transport seam, the audio
+format types, the group control vocabulary -- were moved into
+`wacore::voip_control`, and `wacore::voip` re-exports them, so the historical
+paths keep resolving. The public event and command surface
+(`CallHandle::events()`, `CallHandle::media_stats()`) reads the session through
+`subscribe()`/`stats()`, not an engine-owned enum or cell.
 
-The proof this phase does carry: a `wasm32-unknown-unknown` build of
-`--features voip-control` compiles and its artifact contains `MediaCommand` and
+`voip-control` carries the contract **and** the call flow: `src/voip` is gated on
+it in `src/lib.rs`, and `src/client/voip.rs` (which owns `CallError`,
+`call_registry()`, `PendingCallLinkJoins`, `LocalTeardown`) is gated on it too.
+`voip-engine-wacore` adds the resident `WacoreVoipMediaBackend` on top, and
+`voip-runtime` composes both, so what it delivers is unchanged. A build with
+`voip-control` alone and no injected backend returns the typed
+`MediaSetupError::NoBackend` when media starts, never a panic or a silent no-op.
+
+The proof: a `wasm32-unknown-unknown` build of `--features voip-control`
+compiles and its artifact contains `MediaSessionSpec`, `MediaCommand` and
 `VoipMediaSession` but none of `CallEngine`, `MlowEncoder`, `MlowDecoder`,
-`SframeSession`, `run_call`, `CallConfig` or `MediaPipeline`.
+`SframeSession`, `run_call`, `CallConfig` or `MediaPipeline` (a byte scan finds
+only the doc-comment mentions, no code). The facade's own media startup goes
+only through `VoipMediaBackend::open`, so the control plane never names an
+engine type in production.
 
-The gate count moves by one. The contract lives in `wacore/src/voip_control/`
-and `whatsapp-rust/src/voip_control/`, neither of which the guard scans for
-`voip-runtime`, and the only new gate in a scanned file is one `mod` line in each
-`lib.rs`. A second gate is added in `ClientBuilder`, which installs the injected
-media backend into the call registry: the backend is a dependency of the call
-subsystem, and the builder is the one place a client is handed its dependencies,
-so the installation belongs there. The `voip-runtime` budget moves to 10.
+The gate count moves down. `voip-runtime` now names only four sites outside the
+subsystem's own files, all test scaffolding (two `create_test_client*` helpers
+and two `should_issue_tc_token` tests); no production code outside `src/voip`,
+`src/client/voip.rs` and `src/handlers/call.rs` names it. The budget records
+that final number, 4.
 
 ### Not a subsystem: WAM
 

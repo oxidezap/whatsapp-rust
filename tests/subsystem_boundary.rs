@@ -93,13 +93,13 @@ fn names_feature(line: &str, feature: &str) -> bool {
 const DISCIPLINED: &[Disciplined] = &[Disciplined {
     feature: "voip-runtime",
     owns: &["src/voip", "src/client/voip.rs", "src/handlers/call.rs"],
-    // 6 in production: the `mod` declaration, the `subsystems!` entry, the three
-    // `pub(crate)` helpers whose only caller is VoIP (a deliberate keep the
-    // document records), and one in `ClientBuilder` that installs the injected
-    // media backend into the call registry -- the injection point Phase 4 of the
-    // seam work adds, which has nowhere else to live because the builder is what
-    // hands the registry its backend. The other 4 are test scaffolding.
-    budget: 10,
+    // 4 test-only gates: two `create_test_client*` helpers that inject a media
+    // backend or a call-link admission, and two `should_issue_tc_token` tests
+    // that drive the tctoken lifecycle through the call path. No production code
+    // outside the subsystem's own files names `voip-runtime` any more: the call
+    // control plane compiles under `voip-control`, and this budget records that
+    // the coupling is test scaffolding, not a production dependency.
+    budget: 4,
 }];
 
 fn crate_root() -> PathBuf {

@@ -232,12 +232,11 @@ voip-runtime = ["voip-control", "voip-engine-wacore"]
 # `whatsapp_rust::voip_control`. Its API names no `wacore::voip` type, so this feature compiles with
 # the engine off. It is the boundary a media backend implements; it carries no backend itself.
 #
-# Note what this is NOT, so a reader does not mistake the seam for the byte cut: with only this
-# feature, `src/voip` (the facade and the call registry) is not compiled, and neither is the
-# resident engine backend below. `src/voip` still names signaling types that live in `wacore::voip`
-# (`CallSession`, `CallPhase`, `CallEvent`, `relay_parse`), so the facade does not yet build without
-# the engine. Splitting `wacore::voip` into a signaling half and an engine half is the next phase;
-# `agent_docs/subsystem_boundary.md` records exactly which types have to migrate.
+# This feature carries the call flow, not only the contract: `src/voip` (the facade, the registry,
+# the signaling state) and `src/client/voip.rs` are gated on it, and they compile with the engine
+# off by naming the neutral `wacore::voip_control` types. The resident engine backend below is the
+# only part that turns `wacore/voip` on. Starting media on a `voip-control`-only build with no
+# injected backend is the typed `MediaSetupError::NoBackend`, never a panic or a silent no-op.
 voip-control = ["wacore/voip-control"]
 # The resident backend that implements `voip-control`'s traits on top of `wacore::voip`'s engine:
 # spec translation, command dispatch, and event/stats translation. This is the only media feature

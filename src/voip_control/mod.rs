@@ -4,11 +4,9 @@
 //! compiles under the `voip-control` feature with the engine off, and a media backend implements
 //! [`VoipMediaBackend`]/[`VoipMediaSession`] against it without linking the engine.
 //!
-//! What this module is not: the byte cut. `src/voip` (the facade and call registry) is gated on
-//! `voip-runtime` and still names signaling types that live in `wacore::voip`, so a build with only
-//! `voip-control` does not compile the call flow at all. Splitting `wacore::voip` into a signaling
-//! half and an engine half is the next phase; `agent_docs/subsystem_boundary.md` records which
-//! types have to move.
+//! This is the byte cut, not only the seam: `src/voip` (the facade and call registry) and
+//! `src/client/voip.rs` are gated on `voip-control` and compile against these neutral types with
+//! the engine off. `voip-engine-wacore` adds the resident `WacoreVoipMediaBackend` on top.
 
 pub use wacore::voip_control::{
     CallDirection, MediaAudioCodec, MediaAudioFormat, MediaAudioIo, MediaAudioRtpProfile,
