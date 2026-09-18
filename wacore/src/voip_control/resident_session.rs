@@ -222,6 +222,14 @@ impl ResidentMediaSession {
         cell
     }
 
+    /// Take ownership of the drive task's abort handle.
+    ///
+    /// Concrete, not on the trait: the backend that spawned the loop owns the task, and `close`
+    /// aborts it. The control plane never sees this handle (F6/F14).
+    pub fn install_drive_task(&self, handle: crate::runtime::AbortHandle) {
+        self.mailboxes().media_task = Some(handle);
+    }
+
     fn mailboxes(&self) -> std::sync::MutexGuard<'_, Mailboxes> {
         self.mailboxes
             .lock()

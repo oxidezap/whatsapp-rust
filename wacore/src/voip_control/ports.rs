@@ -129,6 +129,9 @@ pub struct MediaOpenContext {
     pub events: async_channel::Sender<super::CallEvent>,
     /// The caller-only recv-rekey receiver; `None` on the callee side.
     pub rekey: Option<async_channel::Receiver<super::control::PeerAnswer>>,
+    /// The microphone mute flag, shared with the consumer's `CallHandle`. A backend that wraps a
+    /// PCM source through its own feed zeroes frames while this is set.
+    pub muted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MediaOpenContext {
@@ -151,6 +154,7 @@ impl MediaOpenContext {
             video: None,
             events,
             rekey: None,
+            muted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
