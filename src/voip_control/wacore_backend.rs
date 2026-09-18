@@ -650,6 +650,11 @@ fn build_channels(
             let (speaker, _speaker_rx) = async_channel::bounded::<Vec<i16>>(1);
             (mic_rx, speaker, source.frames(), sink.frames())
         }
+        // The ports enum is non-exhaustive: a future I/O mode refuses with a typed setup error
+        // instead of silently running with dead audio.
+        _ => {
+            return Err(MediaSetupError::Backend("unsupported audio ports".into()));
+        }
     };
 
     // Video: the drive loop needs the loop halves. When the caller pre-created the plumbing (so a
@@ -747,11 +752,13 @@ impl SourceFeed {
             while let Ok(frame) = timed.recv().await {
                 if self
                     .out_timed
-                    .send(wacore::voip::VideoInput {
-                        data: frame.data,
-                        timestamp: frame.timestamp,
-                        generation: 0,
-                    })
+                    .send(
+                        wacore::voip::VideoInput::builder()
+                            .data(frame.data)
+                            .timestamp(frame.timestamp)
+                            .generation(0)
+                            .build(),
+                    )
                     .await
                     .is_err()
                 {

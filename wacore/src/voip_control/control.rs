@@ -83,6 +83,10 @@ impl From<GroupControl> for NormalizedGroupControl {
 
 /// One decrypted keygen-v2 epoch. Debug output is deliberately redacted and the bytes are erased
 /// when the command leaves the driver, regardless of whether the engine accepted it.
+///
+/// Sealed like every other seam DTO: `#[non_exhaustive]` plus a builder.
+#[derive(bon::Builder)]
+#[non_exhaustive]
 pub struct GroupRawEpoch {
     pub transaction_id: u32,
     raw_epoch: Vec<u8>,

@@ -1238,10 +1238,10 @@ impl VideoEndpoints {
     /// The neutral opening ports this video endpoint pair maps to, moving the trait objects across.
     #[cfg(test)]
     fn into_ports(self) -> wacore::voip_control::MediaVideoPorts {
-        wacore::voip_control::MediaVideoPorts {
-            source: self.source,
-            sink: self.sink,
-        }
+        wacore::voip_control::MediaVideoPorts::builder()
+            .source(self.source)
+            .sink(self.sink)
+            .build()
     }
 }
 
@@ -2418,13 +2418,13 @@ fn take_video_channels(
         }
     }));
     let _ = ended;
-    wacore::voip_control::MediaVideoChannels {
-        control,
-        control_sender,
-        video_in,
-        timed_video_in: Some(timed_video_in),
-        video_out,
-    }
+    wacore::voip_control::MediaVideoChannels::builder()
+        .control(control)
+        .control_sender(control_sender)
+        .video_in(video_in)
+        .timed_video_in(timed_video_in)
+        .video_out(video_out)
+        .build()
 }
 
 /// The relay socket address to dial, read off a built config's already-parsed endpoint (avoids
@@ -2541,23 +2541,21 @@ pub(crate) async fn attach_outgoing_relay(
             pending.ended.clone(),
             pending.generation,
         );
-        let ctx = wacore::voip_control::MediaOpenContext {
-            audio: pending.audio.clone().into_ports(),
-            video: None,
-            video_channels: Some(video_channels),
-            video_teardown: Some(pending.video_teardown),
+        let ctx = wacore::voip_control::MediaOpenContext::builder()
+            .audio(pending.audio.clone().into_ports())
+            .video_channels(video_channels)
+            .video_teardown(pending.video_teardown)
             // Re-read at open time, not parked at registration: a rotation the peer announced
             // between the offer and the relay ack must still stamp the first frames.
-            peer_video_orientations: client
-                .call_registry()
-                .peer_video_orientations(call_id, pending.generation)
-                .unwrap_or_default(),
+            .peer_video_orientations(
+                client
+                    .call_registry()
+                    .peer_video_orientations(call_id, pending.generation)
+                    .unwrap_or_default(),
+            )
             // The recv-rekey receiver is session-owned; `open` takes it for the drive loop.
-            rekey: None,
-            group_epoch: None,
-            initial_codec: None,
-            muted: pending.muted.clone(),
-        };
+            .muted(pending.muted.clone())
+            .build();
         Ok::<_, SetupStop>((session, spec, ctx))
     }
     .await;
@@ -3108,28 +3106,28 @@ async fn open_registered_media(
     spec.audio = audio.config();
     spec.enable_video = video.is_some();
 
-    let ctx = wacore::voip_control::MediaOpenContext {
-        audio: audio.into_ports(),
-        video: None,
-        video_channels: Some(wacore::voip_control::MediaVideoChannels {
-            control: video_ctl,
-            control_sender: video_ctl_sender,
-            video_in,
-            timed_video_in: Some(timed_video_in),
-            video_out,
-        }),
-        video_teardown: None,
-        peer_video_orientations: Vec::new(),
-        rekey: rekey_rx,
-        muted: muted.clone(),
-        group_epoch: group_epoch.map(|(transaction_id, epoch)| {
+    let ctx = wacore::voip_control::MediaOpenContext::builder()
+        .audio(audio.into_ports())
+        .video_channels(
+            wacore::voip_control::MediaVideoChannels::builder()
+                .control(video_ctl)
+                .control_sender(video_ctl_sender)
+                .video_in(video_in)
+                .timed_video_in(timed_video_in)
+                .video_out(video_out)
+                .build(),
+        )
+        .maybe_rekey(rekey_rx)
+        .peer_video_orientations(Vec::new())
+        .muted(muted.clone())
+        .maybe_group_epoch(group_epoch.map(|(transaction_id, epoch)| {
             (
                 transaction_id,
                 wacore::voip_control::MediaGroupEpoch::new(epoch),
             )
-        }),
-        initial_codec,
-    };
+        }))
+        .maybe_initial_codec(initial_codec)
+        .build();
     let backend = registry.backend();
     backend
         .open(&session, spec, ctx)
@@ -3400,6 +3398,11 @@ async fn attach_engine(
             let (_mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
             let (speaker, _speaker_rx) = async_channel::bounded::<Vec<i16>>(1);
             (mic_rx, speaker, source.frames(), sink.frames(), None)
+        }
+        // The ports enum is non-exhaustive: a future I/O mode refuses instead of silently
+        // running with dead audio.
+        _ => {
+            return Err(CallError::Connect("unsupported audio ports".into()));
         }
     };
 
@@ -3760,11 +3763,13 @@ impl TimedVideoFeed {
             let ended = self.ended.wait().fuse();
             let send = self
                 .out
-                .send(VideoInput {
-                    data: frame.data,
-                    timestamp: frame.timestamp,
-                    generation: self.generation,
-                })
+                .send(
+                    VideoInput::builder()
+                        .data(frame.data)
+                        .timestamp(frame.timestamp)
+                        .generation(self.generation)
+                        .build(),
+                )
                 .fuse();
             futures::pin_mut!(ended, send);
             futures::select_biased! {
@@ -12521,10 +12526,12 @@ mod tests {
             VideoControl::SetTimestampStride(6000)
         );
         src_tx
-            .send(TimedVideoFrame {
-                data: vec![1, 2, 3],
-                timestamp: 12_000,
-            })
+            .send(
+                TimedVideoFrame::builder()
+                    .data(vec![1, 2, 3])
+                    .timestamp(12_000)
+                    .build(),
+            )
             .await
             .unwrap();
         let forwarded = timed_rx.recv().await.unwrap();

@@ -61,7 +61,8 @@ pub struct VideoFrame {
 }
 
 /// One captured access unit with its 90 kHz RTP capture timestamp.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct TimedVideoFrame {
     pub data: Vec<u8>,
     pub timestamp: u32,
@@ -69,7 +70,8 @@ pub struct TimedVideoFrame {
 
 /// A pre-encoded video access unit with an RTP-clock capture timestamp, as the drive loop consumes
 /// it: the source generation lets a replaced source's stale AUs be discarded.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct VideoInput {
     /// Complete Annex-B H.264 access unit.
     pub data: Vec<u8>,
@@ -105,6 +107,7 @@ pub trait VideoSink: Send + Sync + 'static {
 }
 
 /// The audio ports a session reads and writes, selected by the negotiated I/O mode.
+#[non_exhaustive]
 pub enum MediaAudioPorts {
     /// PCM frames in and out: a microphone source and a speaker sink.
     Pcm {
@@ -119,6 +122,8 @@ pub enum MediaAudioPorts {
 }
 
 /// The optional video ports a session reads and writes.
+#[derive(bon::Builder)]
+#[non_exhaustive]
 pub struct MediaVideoPorts {
     pub source: Arc<dyn VideoSource>,
     pub sink: Arc<dyn VideoSink>,
@@ -142,6 +147,8 @@ pub struct MediaVideoPorts {
 /// attach or detach endpoints before media exists) and hands the loop's halves in here. The
 /// backend must use these rather than create its own, or the sender the handle steers would reach
 /// a different channel.
+#[derive(bon::Builder)]
+#[non_exhaustive]
 pub struct MediaVideoChannels {
     /// Plane control (enable/disable/orientation/keyframe) the drive loop reads.
     pub control: super::control::VideoControlReceiver,
@@ -156,6 +163,10 @@ pub struct MediaVideoChannels {
     pub video_out: async_channel::Sender<VideoFrame>,
 }
 
+/// Sealed like every other seam DTO: `#[non_exhaustive]` plus a builder, so a later field does
+/// not break a backend that builds it.
+#[derive(bon::Builder)]
+#[non_exhaustive]
 pub struct MediaOpenContext {
     pub audio: MediaAudioPorts,
     pub video: Option<MediaVideoPorts>,
