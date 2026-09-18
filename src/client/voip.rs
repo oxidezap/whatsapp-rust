@@ -30,6 +30,7 @@ use wacore::types::group_call::{
     CallLink, CallLinkJoin, CallLinkMedia, CallLinkPreview, GroupCallUpdate, ScreenShare,
     ScreenShareState, WaitingRoom,
 };
+#[cfg(feature = "voip-control")]
 use wacore::voip_control::control::VideoControl;
 #[cfg(feature = "voip-control")]
 use wacore::voip_control::{CallEvent, CallPhase, CallSession, MediaAudioFormat as AudioFormat};
@@ -2310,9 +2311,11 @@ mod tests {
         CallLinkMedia, GroupCallDevice, GroupCallParticipant, GroupCallRelay,
         GroupCallRelayEndpoint, GroupCallUpdate, ScreenShareState, WaitingRoom,
     };
+    #[cfg(feature = "voip-control")]
     use wacore::voip_control::control::VideoControl;
     #[cfg(feature = "voip-control")]
     use wacore::voip_control::control::video_control_channel;
+    #[cfg(feature = "voip-control")]
     use wacore::voip_control::{
         CallEvent, CallPhase, CallSession, MediaAudioFormat as AudioFormat,
     };

@@ -71,7 +71,13 @@ fn compile(source: &str, wasm: bool, test: bool, feature: bool) -> Output {
         command.args(["--cfg", "test"]);
     }
     if feature {
-        command.args(["--cfg", "feature=\"test-support\""]);
+        // Raw rustc has no feature resolver, so spell out what `test-support` implies in the real
+        // manifest (`test-support` -> `voip-runtime` -> `voip-engine-wacore`) and the term the
+        // facade's test module is gated on. Without these the native positive control would miss
+        // guards that cargo turns on transitively.
+        for feature in ["test-support", "voip-runtime", "voip-engine-wacore"] {
+            command.args(["--cfg", &format!("feature=\"{feature}\"")]);
+        }
     }
     let mut child = command
         .stdin(Stdio::piped())

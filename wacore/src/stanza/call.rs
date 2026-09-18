@@ -77,7 +77,7 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
     } else {
         None
     };
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-control")]
     let media = is_offer
         .then(|| parse_media_offer(node, child, participant.as_ref().unwrap_or(&from)))
         .flatten()
@@ -98,8 +98,9 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
         .maybe_group(group);
     let call = call.build();
     // The media facade (decrypt callKey + connect relay) needs the offer's <enc>/<relay>;
-    // capture it only on an <offer> and only when `voip` is on (RelayData lives there).
-    #[cfg(feature = "voip")]
+    // capture it only on an <offer> and only when `voip-control` is on, because `MediaOffer`
+    // carries the neutral `RelayData` and the control plane is what turns it into a media spec.
+    #[cfg(feature = "voip-control")]
     let call = call.with_media(media);
 
     Ok(Some(call))
@@ -108,7 +109,7 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
 /// Extract the media material from an `<offer>`: the `<enc>` addressed to us (direct child or under
 /// `<destination><to><enc>`) and the `<relay>` block (searched anywhere in the `<call>` subtree, as
 /// the example does). Returns `None` when the offer carries no `<enc>` for us (nothing to decrypt).
-#[cfg(feature = "voip")]
+#[cfg(feature = "voip-control")]
 fn parse_media_offer(
     call: &NodeRef<'_>,
     offer: &NodeRef<'_>,
@@ -152,7 +153,7 @@ fn parse_media_offer(
         return None;
     }
 
-    let relay = find_relay(call).and_then(crate::voip::relay_parse::parse_relay_data);
+    let relay = find_relay(call).and_then(crate::voip_control::relay_parse::parse_relay_data);
     let (peer_abtest_bucket, peer_abtest_bucket_id_list) = offer
         .get_optional_child("metadata")
         .map(|metadata| {
@@ -195,7 +196,7 @@ fn parse_media_offer(
 }
 
 /// Parse one `<enc>` node into the ciphertext plus the wire `type`/`v` needed to decrypt the callKey.
-#[cfg(feature = "voip")]
+#[cfg(feature = "voip-control")]
 fn parse_offer_enc(enc_node: &NodeRef<'_>) -> Option<crate::types::call::OfferEnc> {
     use crate::types::call::OfferEnc;
     let ciphertext = enc_node.content_bytes()?.to_vec();
@@ -1384,7 +1385,7 @@ mod tests {
         n.as_node_ref()
     }
 
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-control")]
     fn parsed_peer_capability(
         version: Option<&str>,
     ) -> Option<crate::types::group_call::GroupCallDevice> {
@@ -1423,7 +1424,7 @@ mod tests {
     /// while an unreadable blob resets every capability-gated parameter. Discarding the device for a
     /// malformed `ver` collapsed the second into the first, which keeps MLOW enabled against a peer
     /// that cannot decode it. See `capability_bit`.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-control")]
     #[test]
     fn a_present_capability_survives_an_unreadable_version() {
         assert_eq!(
@@ -1481,7 +1482,7 @@ mod tests {
     // IncomingCall.media so the media facade can decrypt the callKey and connect the relay without
     // re-walking the raw stanza. Covers the bare-<enc> form; the <destination><to><enc> form is the
     // multi-device variant the parser also accepts.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-control")]
     #[test]
     fn offer_captures_enc_and_relay_for_media() {
         let relay = NodeBuilder::new("relay")
@@ -1551,7 +1552,7 @@ mod tests {
         assert_eq!(rd.endpoints[0].relay_name, "gru1c02");
     }
 
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-control")]
     #[test]
     fn peer_capability_binds_to_the_routed_participant() {
         let participant = fake_caller_lid().with_device(3);
@@ -1584,7 +1585,7 @@ mod tests {
 
     // An offer with no <enc> for us (e.g. a different device's destination) yields media=None: there
     // is nothing to decrypt, so the media facade has nothing to drive.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-control")]
     #[test]
     fn offer_without_enc_has_no_media() {
         let node = base_call_builder()
@@ -1602,7 +1603,7 @@ mod tests {
     // A multi-device offer lists one <to jid><enc> per recipient device. The parser keeps every
     // entry, and enc_for selects by OUR device jid, not by child order, so a linked (non-first)
     // device decrypts its own callKey instead of another device's.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-control")]
     #[test]
     fn offer_multi_device_selects_enc_for_our_device() {
         let dev1: Jid = "111111111111111:3@lid".parse().unwrap();
@@ -1647,7 +1648,7 @@ mod tests {
     // server. The stanza goes through marshal/unmarshal here so the `<to jid>` is
     // produced by the real AD-JID decode rather than handed to the parser as an
     // already-built value.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-control")]
     #[test]
     fn offer_to_jid_matches_our_own_jid_field_for_field() {
         let wire_to = Jid {
