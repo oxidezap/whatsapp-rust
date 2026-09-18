@@ -1197,7 +1197,7 @@ impl Client {
     /// session with an un-acked pre-key still pending). Reuses the send path's
     /// pre-flight so the voip offer treats a session-present-but-unacked device as
     /// pkmsg too, not as plain msg.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     pub(crate) async fn would_emit_pkmsg(&self, jid: &Jid) -> Result<bool, anyhow::Error> {
         let device_store = self.persistence_manager.clone();
         let mut adapter = self.signal_adapter_from(device_store);

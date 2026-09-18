@@ -182,7 +182,7 @@ macro_rules! subsystems {
 subsystems! {
     #[cfg(feature = "passkey")]
     passkey: crate::passkey::Passkey,
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     voip: crate::voip::Voip,
 }
 

@@ -376,7 +376,7 @@ impl Client {
     /// out of its ack. A phash check does not, which is why that path uses
     /// [`Self::register_phash_waiter`] and pays no channel per message. Gated on
     /// the only consumer's feature, or it is dead code in a default build.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     pub(crate) fn register_ack_waiter(
         &self,
         message_id: &str,
