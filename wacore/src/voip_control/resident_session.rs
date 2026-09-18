@@ -640,6 +640,22 @@ impl VoipMediaSession for ResidentMediaSession {
         // transport. Idempotent because the handle is taken once.
         let task = self.mailboxes().media_task.take();
         drop(task);
+        // Release every mailbox the drive loop may still hold the far half of: dropping the
+        // senders closes the channels, so a parked loop wakes and ends instead of lingering on a
+        // dead call. Dropping the retained epoch erases its key bytes through `GroupRawEpoch`'s
+        // `Drop`. Idempotent: each handle is taken once.
+        let mut mailboxes = self.mailboxes();
+        mailboxes.video.take();
+        mailboxes.group.take();
+        mailboxes.pending_group_epoch.take();
+        drop(mailboxes);
+        // Drop the rekey receiver nobody will now take, and close the sender so a late answer
+        // fails instead of queueing key material for a dead call.
+        self.rekey_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        self.rekey_tx.close();
         // Then close the public stream. The entry-owned queue this session replaced closed when
         // the entry dropped, so a lingering handle's `recv` ends instead of parking: buffered
         // events still drain, and a publish racing the close fails cleanly like a closed queue.
@@ -797,6 +813,36 @@ mod tests {
         assert!(session.set_group_sender(tx, Some(4), Some(update), None));
         assert!(matches!(rx.try_recv(), Ok(GroupControl::Transition { .. })));
         assert_eq!(session.pending_group_epoch(), None);
+    }
+
+    #[test]
+    fn close_releases_every_mailbox_and_ends_the_stream() {
+        // Item 3: a closed session must not hold the drive loop's mailboxes, a retained epoch's
+        // key bytes, or a parked event stream.
+        let session = ResidentMediaSession::new();
+        let _video_rx = session.install_video_channel();
+        assert!(session.submit(MediaCommand::RequireVideoKeyframe));
+        assert!(session.deliver_group_epoch(
+            3,
+            crate::voip_control::MediaGroupEpoch::new(vec![9; 32]),
+            None
+        ));
+        assert_eq!(session.pending_group_epoch(), Some(3));
+        let events = session.subscribe();
+        session.close(crate::voip_control::MediaCloseReason::Local);
+        assert_eq!(session.pending_group_epoch(), None);
+        assert_eq!(session.retained_bytes(), 0);
+        assert!(!session.submit(MediaCommand::RequireVideoKeyframe));
+        // A late answer fails instead of queueing key material for a dead call.
+        assert!(!session.submit(MediaCommand::RekeyRecv {
+            answering_lid: "2:0@lid".into(),
+            audio_codec: None,
+        }));
+        // The public stream ends instead of parking a lingering handle.
+        assert!(matches!(
+            events.try_recv(),
+            Err(async_channel::TryRecvError::Closed)
+        ));
     }
 
     #[test]

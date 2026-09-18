@@ -407,8 +407,13 @@ pub struct WacoreVoipMediaBackend {
     /// Weak so the backend does not keep the client alive; upgraded for `is_connected` and the
     /// relay-transport factory on the live path.
     client: std::sync::Weak<crate::client::Client>,
+    /// Weak so a closed or dropped call's session frees once its last handle does: the registry
+    /// entry owns the session, never this map. Dead entries are pruned on lookup.
     sessions: std::sync::Mutex<
-        std::collections::HashMap<wacore::voip_control::MediaSessionKey, Arc<ResidentMediaSession>>,
+        std::collections::HashMap<
+            wacore::voip_control::MediaSessionKey,
+            std::sync::Weak<ResidentMediaSession>,
+        >,
     >,
 }
 
@@ -431,11 +436,11 @@ impl WacoreVoipMediaBackend {
         &self,
         key: &wacore::voip_control::MediaSessionKey,
     ) -> Option<Arc<ResidentMediaSession>> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(key)
-            .cloned()
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        // Prune entries whose session dropped: a long-lived client must not accumulate a dead key
+        // per call it ever placed.
+        sessions.retain(|_, weak| weak.strong_count() > 0);
+        sessions.get(key).and_then(|weak| weak.upgrade())
     }
 
     #[must_use]
@@ -456,7 +461,7 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         self.sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key.clone(), session.clone());
+            .insert(key.clone(), Arc::downgrade(&session));
         session
     }
 
@@ -829,6 +834,21 @@ mod tests {
             .build();
         let session = backend.reserve(&key, CallDirection::Outgoing);
         assert_eq!(session.stats(), wacore::voip_control::MediaStats::default());
+    }
+
+    #[test]
+    fn a_dropped_session_leaves_no_entry_behind() {
+        // Item 3: the map holds only a weak handle, so a closed call's session frees once its
+        // last handle does, and the dead key is pruned on lookup.
+        let backend = backend();
+        let key = MediaSessionKey::builder()
+            .call_id("SEAM-WEAK".into())
+            .generation(1)
+            .build();
+        let session = backend.reserve(&key, CallDirection::Outgoing);
+        assert!(backend.resident_session(&key).is_some());
+        drop(session);
+        assert!(backend.resident_session(&key).is_none());
     }
 
     #[test]
