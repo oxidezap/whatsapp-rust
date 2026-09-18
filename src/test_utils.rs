@@ -245,6 +245,31 @@ pub async fn create_test_client_with_name(name: &str) -> Arc<Client> {
     create_test_client_with_http(name, Arc::new(MockHttpClient)).await
 }
 
+/// Build an in-memory test client with an explicit VoIP media backend, so a test can substitute a
+/// fake for the default resident engine.
+#[cfg(feature = "voip-runtime")]
+pub async fn create_test_client_with_voip_backend(
+    backend: Arc<dyn wacore::voip_control::VoipMediaBackend>,
+) -> Arc<Client> {
+    let pm = Arc::new(
+        PersistenceManager::new(create_test_backend().await)
+            .await
+            .expect("persistence manager should initialize"),
+    );
+    let build = Client::builder()
+        .with_runtime(TokioRuntime)
+        .with_persistence_manager(pm)
+        .with_transport_factory(MockTransportFactory::new())
+        .with_http_client(MockHttpClient)
+        .with_voip_media_backend_arc(backend)
+        .build()
+        .await
+        .expect("client builder should initialize");
+    let (client, _rx) = build.into_parts();
+    client.enter_live_mode_for_tests();
+    client
+}
+
 pub async fn create_test_client_with_failing_http(name: &str) -> Arc<Client> {
     create_test_client_with_http(name, Arc::new(FailingMockHttpClient)).await
 }

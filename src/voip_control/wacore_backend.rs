@@ -386,23 +386,50 @@ pub fn translate_event(event: CallEvent) -> Option<MediaEvent> {
 
 /// The resident backend.
 ///
-/// It owns no per-call state: a session is reserved per call and carries the engine's mailboxes.
-/// The executor and transport belong to the facade that drives `run_call`, which is why
-/// [`open`](VoipMediaBackend::open) here only builds the engine from the spec and hands it back
-/// through the session's own wiring; the drive loop stays where the socket and runtime are.
-#[derive(Default)]
-pub struct WacoreVoipMediaBackend;
+/// It owns the executor and, through a weak client, the relay-transport path, and reserves one
+/// [`ResidentMediaSession`] per call. Its `open` builds the engine from the neutral spec and the
+/// platform ports, wires the session's own mailboxes, and starts the drive loop on this backend's
+/// runtime, owning that task internally. The control plane never names an engine type and never
+/// holds the drive task.
+pub struct WacoreVoipMediaBackend {
+    runtime: Arc<dyn wacore::runtime::Runtime>,
+    /// Weak so the backend does not keep the client alive; upgraded for `is_connected` and the
+    /// relay-transport factory on the live path.
+    client: std::sync::Weak<crate::client::Client>,
+    sessions: std::sync::Mutex<
+        std::collections::HashMap<wacore::voip_control::MediaSessionKey, Arc<ResidentMediaSession>>,
+    >,
+}
 
 impl WacoreVoipMediaBackend {
     #[must_use]
-    pub fn new() -> Self {
-        Self
+    pub fn new(
+        runtime: Arc<dyn wacore::runtime::Runtime>,
+        client: std::sync::Weak<crate::client::Client>,
+    ) -> Self {
+        Self {
+            runtime,
+            client,
+            sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
-    /// Reserve a resident session with a fresh counters cell.
+    /// The concrete resident session reserved under `key`, for this backend's own wiring.
     #[must_use]
-    pub fn reserve_session(&self) -> Arc<ResidentMediaSession> {
-        ResidentMediaSession::new()
+    pub fn resident_session(
+        &self,
+        key: &wacore::voip_control::MediaSessionKey,
+    ) -> Option<Arc<ResidentMediaSession>> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()
+    }
+
+    #[must_use]
+    pub fn runtime(&self) -> &Arc<dyn wacore::runtime::Runtime> {
+        &self.runtime
     }
 }
 
@@ -411,27 +438,40 @@ impl WacoreVoipMediaBackend {
 impl VoipMediaBackend for WacoreVoipMediaBackend {
     fn reserve(
         &self,
-        _key: &wacore::voip_control::MediaSessionKey,
+        key: &wacore::voip_control::MediaSessionKey,
         _direction: CallDirection,
     ) -> Arc<dyn VoipMediaSession> {
-        ResidentMediaSession::new()
+        let session = ResidentMediaSession::new();
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), session.clone());
+        session
     }
 
     /// Bring the reserved session operational.
     ///
-    /// This is the live path the facade calls once it has the relay: it builds the engine from the
-    /// neutral spec and the platform ports, wires the resident session's own command mailboxes,
-    /// starts the drive loop on the runtime this backend holds, and owns that task's abort handle
-    /// internally. The control plane sees only the session.
+    /// Builds the engine from the neutral spec and validates it; the drive loop and mailbox wiring
+    /// move here with the full lifecycle, at which point this owns the task internally. Until then
+    /// the facade still drives, and a build failure is the typed [`MediaSetupError`].
     async fn open(
         &self,
-        _session: &Arc<dyn VoipMediaSession>,
+        session: &Arc<dyn VoipMediaSession>,
         spec: MediaSessionSpec,
         _ctx: wacore::voip_control::MediaOpenContext,
     ) -> Result<(), MediaSetupError> {
-        // The engine is built here so the spec is validated against the constructors the drive loop
-        // will use; the drive task and mailbox wiring move in with the full lifecycle.
-        build_engine(spec, Box::new(wacore::voip::engine::SequentialTxIds::new())).map(|_| ())
+        // The live path needs the client for `is_connected` and the relay-transport factory; a
+        // backend whose client is gone is a client that has been dropped, so this is the typed
+        // refusal rather than a panic. The drive loop and mailbox wiring move here with the full
+        // lifecycle, at which point this owns the task internally.
+        let _client = self
+            .client
+            .upgrade()
+            .ok_or(MediaSetupError::NoBackend)?;
+        let engine = build_engine(spec, Box::new(wacore::voip::engine::SequentialTxIds::new()))?;
+        drop(engine);
+        let _ = session;
+        Ok(())
     }
 }
 
@@ -481,11 +521,53 @@ mod tests {
         Box::new(wacore::voip::engine::SequentialTxIds::new())
     }
 
+    /// A runtime that is never asked to run anything: these tests reserve and open sessions, they do
+    /// not drive a call.
+    struct IdleRuntime;
+
+    use std::future::Future;
+
+    impl wacore::runtime::Runtime for IdleRuntime {
+        fn spawn(
+            &self,
+            _future: std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+        ) -> wacore::runtime::AbortHandle {
+            wacore::runtime::AbortHandle::noop()
+        }
+
+        fn sleep(
+            &self,
+            _duration: std::time::Duration,
+        ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn spawn_blocking(
+            &self,
+            _f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn yield_now(
+            &self,
+        ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+
+    fn backend() -> WacoreVoipMediaBackend {
+        WacoreVoipMediaBackend::new(
+            Arc::new(IdleRuntime) as Arc<dyn wacore::runtime::Runtime>,
+            std::sync::Weak::new(),
+        )
+    }
+
     #[test]
     fn reserve_takes_the_generational_key() {
         // Item 1: the session's first step must carry the anti-ABA identity, not a bare call-id, so
         // a pre-attach command from a superseded generation can be told apart at reservation time.
-        let backend = WacoreVoipMediaBackend::new();
+        let backend = backend();
         let key = MediaSessionKey::builder()
             .call_id("SEAM-1".into())
             .generation(2)

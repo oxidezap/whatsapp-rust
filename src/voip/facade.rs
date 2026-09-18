@@ -7312,8 +7312,8 @@ mod tests {
     async fn media_stats_survive_the_end_of_the_call() {
         use wacore::voip_control::fake_backend::FakeMediaBackend;
         let backend = Arc::new(FakeMediaBackend::new());
-        let client = make_client().await;
-        client.call_registry().install_backend(backend.clone());
+        let client = crate::test_utils::create_test_client_with_voip_backend(backend.clone()).await;
+        client.set_connected_for_test(true);
         let generation = client.call_registry().insert(mk_session());
         let (_ev_tx, ev_rx) = async_channel::unbounded::<CallEvent>();
         let handle = CallHandle {

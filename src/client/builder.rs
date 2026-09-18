@@ -621,13 +621,32 @@ impl ClientBuilder {
         );
         let client = assembly.client();
         #[cfg(feature = "voip-runtime")]
-        if let Some(backend) = self.voip_media_backend.clone()
-            && !client.call_registry().install_backend(backend)
         {
-            // A caller that asked for a specific backend must never end up on another. The only
-            // way this fails is a second install, which is a programming error, not a runtime
-            // condition, so it is surfaced rather than dropped.
-            return Err(ClientBuilderError::VoipMediaBackendAlreadyInstalled);
+            // A caller-supplied backend wins; otherwise the resident one is the default. The
+            // resident backend owns the runtime and holds the client weakly, so the control plane
+            // never has to be handed either. Only a `voip-engine-wacore` build has a resident
+            // engine to install; a `voip-control`-only build leaves the registry with no backend,
+            // and starting media reports the typed `MediaSetupError::NoBackend`.
+            #[allow(unused_mut)]
+            let mut backend: Option<Arc<dyn wacore::voip_control::VoipMediaBackend>> =
+                self.voip_media_backend.clone();
+            #[cfg(feature = "voip-engine-wacore")]
+            if backend.is_none() {
+                backend = Some(Arc::new(
+                    crate::voip_control::wacore_backend::WacoreVoipMediaBackend::new(
+                        Arc::clone(&runtime),
+                        Arc::downgrade(&client),
+                    ),
+                ));
+            }
+            if let Some(backend) = backend
+                && !client.call_registry().install_backend(backend)
+            {
+                // A caller that asked for a specific backend must never end up on another. The only
+                // way this fails is a second install, which is a programming error, not a runtime
+                // condition, so it is surfaced rather than dropped.
+                return Err(ClientBuilderError::VoipMediaBackendAlreadyInstalled);
+            }
         }
         #[cfg(feature = "client-lifecycle")]
         let mut construction = ClientConstructionGuard::new(Arc::clone(&client));
