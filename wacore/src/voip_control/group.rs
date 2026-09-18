@@ -266,7 +266,59 @@ fn valid_group_snapshot(update: &GroupCallUpdate) -> bool {
                     && devices.insert(device.jid.clone())
                     && device.pid.is_none_or(|pid| pid != 0 && pids.insert(pid))
             })
-    }) && super::group_media::validate_group_media_snapshot(update).is_ok()
+    }) && validate_group_snapshot_for_media(update).is_ok()
+}
+
+/// Reject a roster whose connected devices collide on a participant identity or an SSRC.
+///
+/// The media engine depends on this before it routes a packet: a duplicate SSRC would let one
+/// participant's media land in another's decoder. The check is pure (HKDF over the call-id and
+/// participant id via the neutral `ssrc` module), so it belongs to the control plane and runs the
+/// same whether or not the engine is compiled.
+pub(crate) fn validate_group_snapshot_for_media(update: &GroupCallUpdate) -> Result<(), ()> {
+    use crate::voip_control::ssrc::{
+        APP_DATA_SSRC_SLOT_WORD, VIDEO_SSRC_SLOT_WORD, derive_wasm_participant_ssrc,
+        format_e2e_srtp_participant_id,
+    };
+
+    const RELAY_STREAM_SLOT_COUNT: u32 = 9;
+    let mut pids = HashSet::new();
+    let mut devices = HashSet::new();
+    let mut audio = HashSet::new();
+    let mut video = HashSet::new();
+    let mut app_data = HashSet::new();
+    let mut rtcp = HashSet::new();
+    for device in update
+        .participants
+        .iter()
+        .filter(|participant| participant.state.as_deref() == Some("connected"))
+        .flat_map(|participant| &participant.devices)
+    {
+        let Some(pid) = device.pid else {
+            continue;
+        };
+        let participant_id = format_e2e_srtp_participant_id(&device.jid.to_string());
+        if pid == 0 || !pids.insert(pid) || !devices.insert(participant_id.clone()) {
+            return Err(());
+        }
+        let audio_ssrc = derive_wasm_participant_ssrc(&update.call_id, &participant_id, 0);
+        let video_ssrc =
+            derive_wasm_participant_ssrc(&update.call_id, &participant_id, VIDEO_SSRC_SLOT_WORD);
+        let app_data_ssrc =
+            derive_wasm_participant_ssrc(&update.call_id, &participant_id, APP_DATA_SSRC_SLOT_WORD);
+        if !audio.insert(audio_ssrc) || !video.insert(video_ssrc) || !app_data.insert(app_data_ssrc)
+        {
+            return Err(());
+        }
+        for slot_word in 0..RELAY_STREAM_SLOT_COUNT {
+            let rtcp_ssrc =
+                derive_wasm_participant_ssrc(&update.call_id, &participant_id, slot_word);
+            if !rtcp.insert(rtcp_ssrc) {
+                return Err(());
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

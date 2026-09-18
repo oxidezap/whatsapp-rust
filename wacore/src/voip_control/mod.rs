@@ -56,6 +56,14 @@ pub mod relay_parse;
 // helpers as a second inherent impl on `AudioFormat`.
 pub mod audio_format;
 
+// The pure KDF/JID/varint helpers, moved here so the registry names them without the engine.
+pub(crate) mod kdf;
+// SSRC derivation and participant-id formatting, engine-free.
+pub mod ssrc;
+// Group-call membership/control state, engine-free: the server owns the roster and this is the
+// transaction-ordered client view of it.
+pub mod group;
+
 // Per-call media counters and the audio-health watchdog. Neutral: the counters are the seam's
 // [`MediaStats`], and the watchdog reads a clock the shell supplies. `crate::voip::media_stats`
 // re-exports this module, so the engine and a foreign backend count the same fields.
