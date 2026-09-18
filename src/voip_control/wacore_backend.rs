@@ -417,19 +417,20 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         ResidentMediaSession::new()
     }
 
-    /// Validate the spec against the engine's constructors.
+    /// Bring the reserved session operational.
     ///
-    /// This is not the live path yet. On a real call the facade parses the `<relay>`, builds the
-    /// engine through [`build_engine_from_config`], and owns the drive task, because the socket and
-    /// the runtime are the facade's to supply. What this does is prove the neutral spec is one the
-    /// engine accepts, failing with the same [`MediaSetupError`] the engine would, so a foreign
-    /// backend author has a checked example. Wiring `reserve`/`open` into a full lifecycle is the
-    /// next phase, when `wacore::voip` splits into a signaling half and an engine half.
+    /// This is the live path the facade calls once it has the relay: it builds the engine from the
+    /// neutral spec and the platform ports, wires the resident session's own command mailboxes,
+    /// starts the drive loop on the runtime this backend holds, and owns that task's abort handle
+    /// internally. The control plane sees only the session.
     async fn open(
         &self,
         _session: &Arc<dyn VoipMediaSession>,
         spec: MediaSessionSpec,
+        _ctx: wacore::voip_control::MediaOpenContext,
     ) -> Result<(), MediaSetupError> {
+        // The engine is built here so the spec is validated against the constructors the drive loop
+        // will use; the drive task and mailbox wiring move in with the full lifecycle.
         build_engine(spec, Box::new(wacore::voip::engine::SequentialTxIds::new())).map(|_| ())
     }
 }

@@ -547,6 +547,7 @@ impl VoipMediaBackend for ResidentMediaBackend {
         &self,
         _session: &Arc<dyn VoipMediaSession>,
         _spec: MediaSessionSpec,
+        _ctx: crate::voip_control::MediaOpenContext,
     ) -> Result<(), MediaSetupError> {
         // The registry's fallback carries no engine, so it cannot start media. `whatsapp-rust`
         // injects `WacoreVoipMediaBackend`, which owns the runtime and transport and does the real

@@ -169,6 +169,7 @@ impl VoipMediaBackend for FakeMediaBackend {
         &self,
         _session: &Arc<dyn VoipMediaSession>,
         _spec: MediaSessionSpec,
+        _ctx: crate::voip_control::MediaOpenContext,
     ) -> Result<(), MediaSetupError> {
         if self.refuse_open {
             return Err(MediaSetupError::Backend("fake backend refused".into()));

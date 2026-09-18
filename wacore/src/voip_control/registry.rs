@@ -3308,10 +3308,25 @@ mod tests {
             .enable_sframe(false)
             .build();
         assert!(matches!(
-            refusing.open(&session, spec.clone()).await,
+            refusing
+                .open(
+                    &session,
+                    spec.clone(),
+                    crate::voip_control::MediaOpenContext::for_test()
+                )
+                .await,
             Err(MediaSetupError::Backend(_))
         ));
-        assert!(accepting.open(&session, spec).await.is_ok());
+        assert!(
+            accepting
+                .open(
+                    &session,
+                    spec,
+                    crate::voip_control::MediaOpenContext::for_test()
+                )
+                .await
+                .is_ok()
+        );
     }
 
     #[test]

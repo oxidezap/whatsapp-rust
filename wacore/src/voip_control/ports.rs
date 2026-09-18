@@ -131,6 +131,30 @@ pub struct MediaOpenContext {
     pub rekey: Option<async_channel::Receiver<super::control::PeerAnswer>>,
 }
 
+impl MediaOpenContext {
+    /// A minimal context for tests that only need `open` to be callable: stub ports, an event sink
+    /// nobody reads, and no rekey.
+    #[must_use]
+    pub fn for_test() -> Self {
+        let (events, events_rx) = async_channel::bounded(1);
+        events_rx.close();
+        let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
+        mic_rx.close();
+        drop(mic_tx);
+        let (speaker, speaker_rx) = async_channel::bounded::<Vec<i16>>(1);
+        speaker_rx.close();
+        Self {
+            audio: MediaAudioPorts::Pcm {
+                source: Arc::new(mic_rx),
+                sink: Arc::new(speaker),
+            },
+            video: None,
+            events,
+            rekey: None,
+        }
+    }
+}
+
 // Blanket impls so a bare `async_channel` endpoint is usable directly as a source/sink, matching the
 // audio ports: the common case is "I already have a channel".
 impl AudioSource for async_channel::Receiver<Vec<i16>> {

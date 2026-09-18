@@ -544,16 +544,12 @@ impl MediaStats {
 /// The boundary a media engine implements.
 ///
 /// The executor and the relay transport are constructor state of an implementation, never fields of
-/// [`MediaSessionSpec`]: they are Rust trait objects that cannot cross a process or wasm module
-/// boundary, which is exactly why they cannot be part of the neutral contract.
+/// [`MediaSessionSpec`] or of the opening context: they are Rust trait objects that cannot cross a
+/// process or wasm module boundary, which is exactly why they cannot be part of the neutral contract.
 ///
-/// **This contract does not yet own the session lifecycle.** In this phase the resident backend's
-/// [`open`](Self::open) validates the spec against what the engine accepts and returns the error it
-/// would; the live call path constructs the engine through the backend's
-/// `build_engine_from_config` and keeps owning the drive task, because the socket and the runtime
-/// are the facade's. Until the next phase splits `wacore::voip` into a signaling half and an engine
-/// half, `reserve`/`open` are not the path a real call takes. Their doc comments say exactly what
-/// they currently do, not what a future version will.
+/// The lifecycle is `reserve` → `open` → `submit`/`deliver_group_*`/`stats`/`subscribe` → `close`.
+/// `open` makes the reserved session operational: the resident backend builds and drives its engine
+/// there, over the platform ports the opening context carries.
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait VoipMediaBackend: MaybeSendSync {
@@ -571,17 +567,17 @@ pub trait VoipMediaBackend: MaybeSendSync {
     fn reserve(&self, key: &MediaSessionKey, direction: CallDirection)
     -> Arc<dyn VoipMediaSession>;
 
-    /// Build the engine for `spec`.
+    /// Bring the reserved session operational for `spec`.
     ///
-    /// The resident implementation validates the spec against the engine's constructors and returns
-    /// the same [`MediaSetupError`] the engine would; it does not start a drive task or attach the
-    /// reserved `session`, because the caller owns the runtime and transport. See the trait doc for
-    /// why the full lifecycle is the next phase. A foreign backend that owns its executor may start
-    /// driving here.
+    /// The resident implementation builds the engine from the spec and the platform ports in `ctx`,
+    /// wires the session's own mailboxes, and starts driving on the executor it holds. A foreign
+    /// backend that owns its executor does the same over its own media. `ctx` is the neutral opening
+    /// context: ports and the public event sink, never a backend's internal mailboxes.
     async fn open(
         &self,
         session: &Arc<dyn VoipMediaSession>,
         spec: MediaSessionSpec,
+        ctx: MediaOpenContext,
     ) -> Result<(), MediaSetupError>;
 }
 
