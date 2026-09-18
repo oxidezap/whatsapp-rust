@@ -2888,7 +2888,7 @@ mod tests {
         client: &Client,
         ring_devices: Vec<Jid>,
     ) -> (async_channel::Receiver<CallEvent>, u64) {
-        use wacore::voip::{AudioFormat, CallEvent};
+        use wacore::voip::CallEvent;
 
         let registry = client.call_registry();
         let mut session = wacore::voip::CallSession::new_outgoing(

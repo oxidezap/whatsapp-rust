@@ -6669,7 +6669,7 @@ mod tests {
     #[test]
     fn a_peer_that_clears_the_mlow_bit_selects_opus_for_a_live_call() {
         use crate::stanza::call::CapabilityBit;
-        use crate::voip::audio::{AudioCodec, AudioFormat};
+        use crate::voip::audio::AudioCodec;
 
         let reg = CallRegistry::new();
         let mut s = session("CID");
@@ -6696,7 +6696,6 @@ mod tests {
     #[test]
     fn a_locally_chosen_opus_call_is_never_pulled_back_to_mlow() {
         use crate::stanza::call::CapabilityBit;
-        use crate::voip::audio::AudioFormat;
 
         let reg = CallRegistry::new();
         let mut s = session("CID");
