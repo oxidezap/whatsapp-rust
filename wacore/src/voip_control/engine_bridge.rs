@@ -14,6 +14,10 @@ use crate::voip_control::{MediaGroupSpec, MediaSessionKey, MediaSessionSpec, Med
 
 /// The engine-side pieces of a neutral spec, with nothing dropped.
 ///
+/// Internal adapter API: this module is `#[doc(hidden)]` because it exists only to cross the
+/// crate boundary for the resident backend. A foreign backend never touches it; it implements
+/// [`VoipMediaBackend`](super::VoipMediaBackend) directly against the neutral contract.
+///
 /// [`MediaSessionSpec`] carries the generational [`MediaSessionKey`] and an optional
 /// [`MediaGroupSpec`], and [`CallConfig`] represents neither. A bare `TryFrom<MediaSessionSpec>`
 /// would therefore be a lossy public conversion: a caller could consume a spec and silently lose
@@ -28,6 +32,9 @@ pub struct EngineParts {
 }
 
 /// Split a neutral spec into everything the engine needs, consuming the spec.
+///
+/// Internal adapter API, called only by the resident backend: a foreign backend implements
+/// [`VoipMediaBackend`](super::VoipMediaBackend) without crossing this bridge.
 ///
 /// The config is validated and moved, while the group and the key come back beside it rather than
 /// being folded into `CallConfig`, which cannot hold them. Callers that only need the engine pass

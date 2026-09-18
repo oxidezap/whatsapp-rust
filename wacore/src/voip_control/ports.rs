@@ -122,6 +122,10 @@ pub enum MediaAudioPorts {
 }
 
 /// The optional video ports a session reads and writes.
+///
+/// Test-only: the only constructor is the facade's test-only endpoint mapping, so production
+/// builds carry no public surface for it.
+#[cfg(any(test, feature = "test-util"))]
 #[derive(bon::Builder)]
 #[non_exhaustive]
 pub struct MediaVideoPorts {

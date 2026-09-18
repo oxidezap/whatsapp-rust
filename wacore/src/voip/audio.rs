@@ -62,7 +62,7 @@ impl AudioFormat {
     /// Same type now; returns `None` when the result would be invalid (a zero timing or channel
     /// value), matching the old conversion's contract.
     #[must_use]
-    pub fn from_neutral(format: crate::voip_control::MediaAudioFormat) -> Option<Self> {
+    pub(crate) fn from_neutral(format: crate::voip_control::MediaAudioFormat) -> Option<Self> {
         format.is_valid().then_some(format)
     }
 }
@@ -377,7 +377,7 @@ impl AudioConfig {
     ///
     /// [`MediaAudioSpec`]: crate::voip_control::MediaAudioSpec
     #[must_use]
-    pub fn from_neutral(spec: crate::voip_control::MediaAudioSpec) -> Option<Self> {
+    pub(crate) fn from_neutral(spec: crate::voip_control::MediaAudioSpec) -> Option<Self> {
         use crate::voip_control::MediaAudioIo;
 
         let format = AudioFormat::from_neutral(spec.format)?;

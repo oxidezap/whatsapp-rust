@@ -26,6 +26,7 @@ use crate::types::group_call::GroupCallUpdate;
 // and the engine config. Kept out of this file so the compiler enforces that everything above stays
 // free of `crate::voip`.
 #[cfg(feature = "voip")]
+#[doc(hidden)]
 pub mod engine_bridge;
 
 // The relay-transport seam: a dumb packet pipe the platform implements. It belongs to the contract,
@@ -67,10 +68,12 @@ pub mod registry;
 // The media endpoint ports (audio/video source and sink) and the video frame type, so a backend can
 // be handed the platform's endpoints without the engine.
 pub mod ports;
+#[cfg(any(test, feature = "test-util"))]
+pub use ports::MediaVideoPorts;
 pub use ports::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
 pub use ports::{
-    MediaAudioPorts, MediaOpenContext, MediaVideoChannels, MediaVideoPorts, TimedVideoFrame,
-    VideoFrame, VideoInput, VideoSink, VideoSource,
+    MediaAudioPorts, MediaOpenContext, MediaVideoChannels, TimedVideoFrame, VideoFrame, VideoInput,
+    VideoSink, VideoSource,
 };
 // RTC app-data payload encoding (reactions), pure and engine-free.
 pub mod app_data;

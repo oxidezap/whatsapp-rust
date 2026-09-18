@@ -32,7 +32,7 @@ const WA_FRAME_SAMPLES: usize = 960;
 ///
 /// A no-op without `voip-libopus`, and that is the honest outcome: the call still runs, and if the
 /// peer turns out to speak Opus the engine reports `AudioSilence` with `NoDecoderForNegotiatedCodec`.
-pub fn with_platform_audio_codec(engine: CallEngine) -> CallEngine {
+fn with_platform_audio_codec(engine: CallEngine) -> CallEngine {
     #[cfg(feature = "voip-libopus")]
     {
         let engine = engine
@@ -50,7 +50,7 @@ pub fn with_platform_audio_codec(engine: CallEngine) -> CallEngine {
 }
 
 /// Build the engine from the neutral spec, applying the group media the spec carries.
-pub fn build_engine(
+fn build_engine(
     spec: MediaSessionSpec,
     tx_ids: Box<dyn wacore::voip::engine::TxIdSource>,
 ) -> Result<CallEngine, MediaSetupError> {
@@ -118,7 +118,7 @@ impl WacoreVoipMediaBackend {
 
     /// The concrete resident session reserved under `key`, for this backend's own wiring.
     #[must_use]
-    pub fn resident_session(
+    fn resident_session(
         &self,
         key: &wacore::voip_control::MediaSessionKey,
     ) -> Option<Arc<ResidentMediaSession>> {
