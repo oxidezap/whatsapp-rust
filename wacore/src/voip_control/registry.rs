@@ -25,7 +25,7 @@ use crate::voip_control::CallEvent;
 use crate::voip_control::control::{GroupControl, VideoControl, VideoControlSender};
 use crate::voip_control::group::{GroupCallState, GroupStateApply, group_device_is_local};
 use crate::voip_control::resident_session::{
-    ResidentMediaBackend, codec_to_neutral, video_control_to_command,
+    NoMediaBackend, codec_to_neutral, video_control_to_command,
 };
 use crate::voip_control::{CallPhase, CallSession};
 use crate::voip_control::{MediaCommand, MediaSessionKey, VoipMediaBackend, VoipMediaSession};
@@ -671,7 +671,7 @@ impl CallRegistry {
     #[must_use]
     pub fn backend(&self) -> Arc<dyn VoipMediaBackend> {
         self.backend
-            .get_or_init(|| Arc::new(ResidentMediaBackend))
+            .get_or_init(|| Arc::new(NoMediaBackend))
             .clone()
     }
 

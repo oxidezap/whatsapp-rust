@@ -523,18 +523,20 @@ impl VoipMediaSession for ResidentMediaSession {
     }
 }
 
-/// The in-process resident backend: reserves a [`ResidentMediaSession`] per call.
+/// The backend a `CallRegistry` carries when none is injected.
 ///
-/// This is the default a `CallRegistry` carries when no backend is injected, so registry-only
-/// builds and unit tests keep the exact pre-injection behavior. `whatsapp-rust` injects its own
-/// [`WacoreVoipMediaBackend`](crate::voip_control) instead, which owns the engine and the drive
-/// task; this one exists so the registry never has to name `ResidentMediaSession` itself.
+/// It reserves a [`ResidentMediaSession`] so commands that arrive before a real backend is installed
+/// still have somewhere to land, but it carries no engine: [`open`](VoipMediaBackend::open) returns
+/// the typed [`MediaSetupError::NoBackend`]. That is the honest answer for a `voip-control`-only
+/// build -- the call flow compiles, and starting media without an injected backend fails with a
+/// clear error rather than a panic or a silent no-op. A `whatsapp-rust` client installs
+/// [`WacoreVoipMediaBackend`](crate::voip_control) instead.
 #[derive(Default)]
-pub struct ResidentMediaBackend;
+pub struct NoMediaBackend;
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-impl VoipMediaBackend for ResidentMediaBackend {
+impl VoipMediaBackend for NoMediaBackend {
     fn reserve(
         &self,
         _key: &MediaSessionKey,
@@ -560,6 +562,51 @@ impl VoipMediaBackend for ResidentMediaBackend {
 mod tests {
     use super::*;
     use crate::voip_control::control::video_control_channel;
+
+    #[tokio::test]
+    async fn the_default_backend_refuses_to_open_with_a_typed_error() {
+        // F12: a `voip-control`-only build has no engine, so starting media without an injected
+        // backend must be this typed refusal, never a panic or a silent no-op.
+        use crate::voip_control::{
+            CallDirection, MediaAudioFormat, MediaAudioIo, MediaAudioSpec, MediaOpenContext,
+            MediaSessionKey, MediaSessionSpec, VoipMediaBackend,
+        };
+        let backend = NoMediaBackend;
+        let key = MediaSessionKey::builder()
+            .call_id("NO-BACKEND".into())
+            .generation(1)
+            .build();
+        let session = backend.reserve(&key, CallDirection::Outgoing);
+        let spec = MediaSessionSpec::builder()
+            .key(key)
+            .direction(CallDirection::Outgoing)
+            .self_lid("1:0@lid".into())
+            .peer_lid("2:0@lid".into())
+            .call_key(vec![0u8; 32])
+            .ssrc(1)
+            .audio(
+                MediaAudioSpec::builder()
+                    .format(MediaAudioFormat::MLOW_16KHZ_60MS)
+                    .io(MediaAudioIo::Pcm)
+                    .build(),
+            )
+            .relay_token(vec![])
+            .auth_token(vec![])
+            .relay_ip("127.0.0.1".into())
+            .relay_port(3478)
+            .integrity_key(vec![])
+            .warp_mi_tag_len(4)
+            .enable_media(false)
+            .enable_video(false)
+            .enable_sframe(false)
+            .build();
+        assert_eq!(
+            backend
+                .open(&session, spec, MediaOpenContext::for_test())
+                .await,
+            Err(MediaSetupError::NoBackend)
+        );
+    }
 
     #[test]
     fn a_video_command_lands_on_the_drive_mailbox() {
