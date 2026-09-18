@@ -3136,6 +3136,14 @@ async fn open_registered_media(
         .open(&session, spec, ctx)
         .await
         .map_err(|error| CallError::Setup(error.to_string()))?;
+    // The open awaited the relay dial, so the call may have ended or been superseded while it
+    // waited: returning the handle now would hand out a stale generation, and the backend would
+    // have installed its drive task after the teardown. Close what open started and report the
+    // end instead.
+    if !registry.is_current(&registration.call_id, registration.generation) {
+        session.close(wacore::voip_control::MediaCloseReason::Local);
+        return Err(CallError::CallEndedDuringSetup);
+    }
 
     Ok(CallHandle {
         call_id: registration.call_id.clone(),
@@ -12719,8 +12727,8 @@ mod control_only_tests {
     use super::*;
     use wacore::voip_control::fake_backend::FakeMediaBackend;
     use wacore::voip_control::{
-        MediaCommand, MediaEvent, MediaSessionKey, MediaSessionSpec, MediaSetupError,
-        VoipMediaSession,
+        CallDirection, MediaCommand, MediaEvent, MediaOpenContext, MediaSessionKey,
+        MediaSessionSpec, MediaSetupError, VoipMediaBackend, VoipMediaSession,
     };
 
     async fn client_with_fake_backend() -> (Arc<Client>, Arc<FakeMediaBackend>) {
@@ -12782,6 +12790,39 @@ mod control_only_tests {
         );
         *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
         (client, backend)
+    }
+
+    /// A backend whose `open` parks until the test releases it, so the test can end or
+    /// supersede the call mid-open. Everything else delegates to the fake.
+    struct StalledOpenBackend {
+        inner: Arc<FakeMediaBackend>,
+        entered: async_channel::Sender<()>,
+        release: async_channel::Receiver<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl VoipMediaBackend for StalledOpenBackend {
+        fn reserve(
+            &self,
+            key: &MediaSessionKey,
+            direction: CallDirection,
+        ) -> Arc<dyn VoipMediaSession> {
+            self.inner.reserve(key, direction)
+        }
+
+        async fn open(
+            &self,
+            session: &Arc<dyn VoipMediaSession>,
+            spec: MediaSessionSpec,
+            ctx: MediaOpenContext,
+        ) -> Result<(), MediaSetupError> {
+            let _ = self.entered.send(()).await;
+            self.release
+                .recv()
+                .await
+                .map_err(|_| MediaSetupError::Backend("open released".into()))?;
+            self.inner.open(session, spec, ctx).await
+        }
     }
 
     fn sample_relay() -> wacore::voip_control::relay_parse::RelayData {
@@ -13093,6 +13134,186 @@ mod control_only_tests {
                 .call_registry()
                 .send_call_event(&call_id, MediaEvent::RelayAllocated),
             "a removed entry publishes nothing"
+        );
+    }
+
+    /// Registration plus an open spec for the mid-open race tests: the backend parks inside
+    /// `open` until the test releases it.
+    async fn stalled_open_setup(
+        call_id: &str,
+    ) -> (
+        Arc<Client>,
+        Arc<FakeMediaBackend>,
+        async_channel::Receiver<()>,
+        async_channel::Sender<()>,
+        super::RegisteredCall,
+    ) {
+        let (entered_tx, entered_rx) = async_channel::bounded::<()>(1);
+        let (release_tx, release_rx) = async_channel::bounded::<()>(1);
+        let inner = Arc::new(FakeMediaBackend::new());
+        let stalled: Arc<dyn VoipMediaBackend> = Arc::new(StalledOpenBackend {
+            inner: inner.clone(),
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let client = crate::test_utils::create_test_client_with_voip_backend(stalled).await;
+        let peer = Jid::new("333333333333333", Server::Lid);
+        let session = wacore::voip_control::CallSession::new_incoming(call_id, peer.clone(), peer);
+        let registration = super::RegisteredCall::new(&client, session).await;
+        (client, inner, entered_rx, release_tx, registration)
+    }
+
+    fn open_spec(key: MediaSessionKey) -> MediaSessionSpec {
+        MediaSessionSpec::builder()
+            .key(key)
+            .direction(CallDirection::Incoming)
+            .self_lid("111111111111111:0@lid".into())
+            .peer_lid("333333333333333:0@lid".into())
+            .call_key(vec![0u8; 32])
+            .ssrc(1)
+            .audio(
+                wacore::voip_control::MediaAudioSpec::builder()
+                    .format(wacore::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS)
+                    .io(wacore::voip_control::MediaAudioIo::Pcm)
+                    .build(),
+            )
+            .relay_token(vec![])
+            .auth_token(vec![])
+            .relay_ip("127.0.0.1".into())
+            .relay_port(3478)
+            .integrity_key(vec![])
+            .warp_mi_tag_len(4)
+            .enable_media(false)
+            .enable_video(false)
+            .enable_sframe(false)
+            .build()
+    }
+
+    fn pcm_endpoints() -> AudioEndpoints {
+        let (_mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
+        let (spk_tx, _spk_rx) = async_channel::bounded::<Vec<i16>>(1);
+        AudioEndpoints::Pcm {
+            source: Arc::new(mic_rx),
+            sink: Arc::new(spk_tx),
+        }
+    }
+
+    /// Terminating the call while `open` awaits the relay dial must not hand out a handle: the
+    /// generation check after the await closes what open started and reports the end.
+    #[tokio::test]
+    async fn terminate_during_open_ends_without_a_handle() {
+        let (client, inner, entered_rx, release_tx, registration) =
+            stalled_open_setup("RACE-CALL").await;
+        let call_id = registration.call_id.clone();
+        let generation = registration.generation;
+        let key = MediaSessionKey::builder()
+            .call_id(call_id.clone())
+            .generation(generation)
+            .build();
+        let spec = open_spec(key.clone());
+        let open = tokio::spawn({
+            let client = client.clone();
+            async move {
+                super::open_registered_media(
+                    &client,
+                    &registration,
+                    spec,
+                    pcm_endpoints(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
+        });
+        entered_rx
+            .recv()
+            .await
+            .expect("the backend parks inside open");
+        client
+            .call_registry()
+            .remove_if_current(&call_id, generation);
+        release_tx.send(()).await.expect("release the open");
+        let result = open.await.expect("open task joins");
+        assert!(
+            matches!(result, Err(CallError::CallEndedDuringSetup)),
+            "a call terminated mid-open ends in setup"
+        );
+        assert_eq!(
+            inner
+                .session(&key)
+                .expect("the session outlives the entry")
+                .record()
+                .closed,
+            Some(wacore::voip_control::MediaCloseReason::Local),
+            "the mid-open session is closed, not leaked running"
+        );
+        assert_eq!(
+            client.call_registry().generation_of(&call_id),
+            None,
+            "the terminated entry stays reaped"
+        );
+    }
+
+    /// Superseding the call while `open` awaits must retire the old generation without touching
+    /// the replacement: same stale-handle refusal, and the live generation stays current.
+    #[tokio::test]
+    async fn replacement_during_open_retires_only_the_stale_generation() {
+        let (client, inner, entered_rx, release_tx, registration) =
+            stalled_open_setup("RACE-CALL").await;
+        let call_id = registration.call_id.clone();
+        let generation = registration.generation;
+        let key = MediaSessionKey::builder()
+            .call_id(call_id.clone())
+            .generation(generation)
+            .build();
+        let spec = open_spec(key.clone());
+        let open = tokio::spawn({
+            let client = client.clone();
+            async move {
+                super::open_registered_media(
+                    &client,
+                    &registration,
+                    spec,
+                    pcm_endpoints(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
+        });
+        entered_rx
+            .recv()
+            .await
+            .expect("the backend parks inside open");
+        let peer = Jid::new("333333333333333", Server::Lid);
+        let replacement_session =
+            wacore::voip_control::CallSession::new_incoming(&call_id, peer.clone(), peer);
+        let replacement = super::RegisteredCall::new(&client, replacement_session).await;
+        let live_generation = replacement.generation;
+        assert_ne!(live_generation, generation);
+        release_tx.send(()).await.expect("release the open");
+        let result = open.await.expect("open task joins");
+        assert!(
+            matches!(result, Err(CallError::CallEndedDuringSetup)),
+            "a superseded mid-open ends in setup"
+        );
+        assert_eq!(
+            inner
+                .session(&key)
+                .expect("the stale session outlives the entry")
+                .record()
+                .closed,
+            Some(wacore::voip_control::MediaCloseReason::Local),
+            "the stale mid-open session is closed"
+        );
+        assert_eq!(
+            client.call_registry().generation_of(&call_id),
+            Some(live_generation),
+            "the replacement generation stays current"
         );
     }
 }
