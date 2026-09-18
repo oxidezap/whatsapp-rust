@@ -1158,36 +1158,31 @@ impl<'a> CallLinkCall<'a> {
             .as_ref()
             .ok_or(CallError::Media("call-link group snapshot has no relay"))?;
         let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
-        let mut config = CallConfig::for_group(
+        let key = wacore::voip_control::MediaSessionKey::builder()
+            .call_id(join.call_id.clone())
+            .generation(generation)
+            .build();
+        let mut spec = wacore::voip_control::MediaSessionSpec::for_group(
             CallDirection::Outgoing,
-            &join.call_id,
+            key,
             &own_lid.to_string(),
             &join.call_creator.to_string(),
             relay,
         )
         .map_err(|error| CallError::Setup(error.to_string()))?;
-        config.audio = audio.config();
-        config.enable_video = video.is_some();
-        let relay_endpoint = relay_endpoint_from_config(&config)?;
-        let group_spec = crate::voip_control::MediaGroupSpec::builder()
-            .call_creator(join.call_creator.clone())
-            .self_jid(own_lid)
-            .initial_update(update.clone())
-            .build();
-        let engine = crate::voip_control::wacore_backend::build_engine_from_config(
-            config,
-            generation,
-            Some(group_spec),
-            Box::new(RandTxIds),
-        )
-        .map_err(|error| CallError::Setup(error.to_string()))?;
+        spec.group = Some(
+            crate::voip_control::MediaGroupSpec::builder()
+                .call_creator(join.call_creator.clone())
+                .self_jid(own_lid)
+                .initial_update(update.clone())
+                .build(),
+        );
 
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let factory = relay_factory_or_ended(self.client, &registration, &relay_endpoint).await?;
         let handle =
-            spawn_registered_call(self.client, &registration, engine, &*factory, audio, video)
+            open_registered_media(self.client, &registration, spec, audio, video, None, None)
                 .await?;
         registration.disarm();
         teardown.disarm();
