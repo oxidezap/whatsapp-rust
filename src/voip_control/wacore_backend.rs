@@ -4,7 +4,7 @@
 //! [`VoipMediaBackend`]/[`VoipMediaSession`] with no engine type in the API; this module implements
 //! them on top of [`wacore::voip::CallEngine`], translating the flat [`MediaSessionSpec`] into the
 //! engine's [`CallConfig`]. Events need no translation: [`MediaEvent`] is the engine's
-//! [`CallEvent`] under its seam name, so the drive loop publishes it directly.
+//! `CallEvent` under its seam name, so the drive loop publishes it directly.
 //!
 //! The executor and the relay transport are constructor state here, never fields of the spec:
 //! they are trait objects that cannot cross a process boundary, which is why the neutral contract
