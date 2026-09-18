@@ -496,6 +496,13 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
                 .apply_group_raw_epoch(*transaction_id, epoch.as_bytes())
                 .map_err(|e| MediaSetupError::Backend(e.to_string()))?;
         }
+        // A codec the caller selected from the peer's capability, adopted before the first packet.
+        // The source keeps its own grammar; only the wire grammar moves.
+        if let Some(codec) = ctx.initial_codec {
+            engine
+                .switch_audio_codec(codec, CodecDecisionSource::Negotiated)
+                .map_err(|e| MediaSetupError::Backend(e.to_string()))?;
+        }
         let warp_mi_tag_len = engine.media_warp_mi_tag_len();
 
         let factory = client

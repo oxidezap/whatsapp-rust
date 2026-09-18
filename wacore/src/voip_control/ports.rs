@@ -167,6 +167,10 @@ pub struct MediaOpenContext {
     /// engine before media starts. A group call that needed its initiator's epoch applied holds it
     /// here rather than on the engine, because the backend builds the engine.
     pub group_epoch: Option<(u32, super::MediaGroupEpoch)>,
+    /// A codec the caller selected from the peer's capability that the engine must adopt before its
+    /// first packet, without changing the source's grammar. `None` when the negotiated format is
+    /// already correct.
+    pub initial_codec: Option<super::MediaAudioCodec>,
 }
 
 impl MediaOpenContext {
@@ -192,6 +196,7 @@ impl MediaOpenContext {
             rekey: None,
             muted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             group_epoch: None,
+            initial_codec: None,
         }
     }
 }

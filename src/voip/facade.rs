@@ -991,6 +991,7 @@ impl<'a> OutgoingGroupCall<'a> {
             video,
             None,
             group_epoch,
+            None,
         )
         .await?;
         registration.disarm();
@@ -1181,9 +1182,17 @@ impl<'a> CallLinkCall<'a> {
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let handle =
-            open_registered_media(self.client, &registration, spec, audio, video, None, None)
-                .await?;
+        let handle = open_registered_media(
+            self.client,
+            &registration,
+            spec,
+            audio,
+            video,
+            None,
+            None,
+            None,
+        )
+        .await?;
         registration.disarm();
         teardown.disarm();
         Ok(handle)
@@ -2463,6 +2472,7 @@ pub(crate) async fn attach_outgoing_relay(
             video_channels: None,
             rekey: Some(pending.rekey_rx.clone()),
             group_epoch: None,
+            initial_codec: None,
             muted: pending.muted.clone(),
         };
         Ok::<_, SetupStop>((session, spec, ctx))
@@ -2973,6 +2983,7 @@ async fn open_registered_media(
     video: Option<VideoEndpoints>,
     rekey_rx: Option<async_channel::Receiver<wacore::voip::driver::PeerAnswer>>,
     group_epoch: Option<(u32, Vec<u8>)>,
+    initial_codec: Option<AudioCodec>,
 ) -> Result<CallHandle, CallError> {
     registration.ensure_current()?;
     let registry = registration.registry.clone();
@@ -3022,6 +3033,7 @@ async fn open_registered_media(
                 wacore::voip_control::MediaGroupEpoch::new(epoch),
             )
         }),
+        initial_codec,
     };
     let session = registry
         .media_session(&registration.call_id, registration.generation)
