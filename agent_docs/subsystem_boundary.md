@@ -205,10 +205,13 @@ The proof this phase does carry: a `wasm32-unknown-unknown` build of
 `VoipMediaSession` but none of `CallEngine`, `MlowEncoder`, `MlowDecoder`,
 `SframeSession`, `run_call`, `CallConfig` or `MediaPipeline`.
 
-The gate count does not move. The contract lives in `wacore/src/voip_control/`
+The gate count moves by one. The contract lives in `wacore/src/voip_control/`
 and `whatsapp-rust/src/voip_control/`, neither of which the guard scans for
 `voip-runtime`, and the only new gate in a scanned file is one `mod` line in each
-`lib.rs`. The `voip-runtime` budget stays at 9.
+`lib.rs`. A second gate is added in `ClientBuilder`, which installs the injected
+media backend into the call registry: the backend is a dependency of the call
+subsystem, and the builder is the one place a client is handed its dependencies,
+so the installation belongs there. The `voip-runtime` budget moves to 10.
 
 ### Not a subsystem: WAM
 

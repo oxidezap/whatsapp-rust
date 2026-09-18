@@ -4,7 +4,7 @@
 //! `crate::voip::session`, which is gated by `voip`, so the control plane could not name them
 //! without the engine. They carry no engine type now: the one piece of media state a call needs at
 //! signaling time is its negotiated audio format, and that is the neutral
-//! [`MediaAudioFormat`](crate::voip_control::MediaAudioFormat). `crate::voip::session` re-exports
+//! [`MediaAudioFormat`]. `crate::voip::session` re-exports
 //! every one of these, so the historical paths keep resolving.
 
 use wacore_binary::Jid;
