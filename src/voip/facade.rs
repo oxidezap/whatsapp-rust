@@ -6863,6 +6863,105 @@ mod tests {
         CallEngine::new(cfg, Box::new(RandTxIds)).expect("engine")
     }
 
+    /// A relay provider that always hands out the test's own factory, so a migrated test keeps
+    /// its in-memory (or gated, or failing) transport while driving the production startup path.
+    /// The resident backend dials through the client's installed provider; this is what plugs the
+    /// test factory into that dial without touching production.
+    #[cfg(feature = "voip-engine-wacore")]
+    struct FixedProvider {
+        factory: Arc<dyn RelayTransportFactory>,
+    }
+
+    #[cfg(feature = "voip-engine-wacore")]
+    #[async_trait]
+    impl wacore::voip_control::transport::RelayTransportProvider for FixedProvider {
+        async fn factory(
+            &self,
+            _relay: &wacore::voip_control::transport::RelayEndpointParams,
+        ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+            Ok(self.factory.clone())
+        }
+    }
+
+    /// Test-only bridge from the retired `spawn_call` harness to the production startup path.
+    ///
+    /// Builds the same neutral spec the shared `engine()` helper's config carries (incoming
+    /// CID-FACADE over `sample_relay()`), installs `factory` as the client's relay provider, and
+    /// drives `open_registered_media` — the `reserve() + backend.open()` production uses. Migrated
+    /// tests keep their asserts; the media startup under them is the one that ships.
+    #[cfg(feature = "voip-engine-wacore")]
+    async fn spawn_call_via_backend(
+        client: &Client,
+        session: wacore::voip_control::CallSession,
+        factory: Arc<dyn RelayTransportFactory>,
+        audio: AudioEndpoints,
+        video: Option<VideoEndpoints>,
+    ) -> Result<CallHandle, CallError> {
+        client.set_relay_transport_provider(Arc::new(FixedProvider { factory }));
+        let mut registration = RegisteredCall::new(client, session).await;
+        let key = wacore::voip_control::MediaSessionKey::builder()
+            .call_id(registration.call_id.clone())
+            .generation(registration.generation)
+            .build();
+        let spec = wacore::voip_control::MediaSessionSpec::from_relay(
+            CallDirection::Incoming,
+            key,
+            "111111111111111:0@lid",
+            "222222222222222:0@lid",
+            (0u8..32).collect(),
+            &sample_relay(),
+        )
+        .expect("sample spec");
+        let result =
+            open_registered_media(client, &registration, spec, audio, video, None, None).await;
+        if result.is_ok() {
+            registration.disarm();
+        }
+        result
+    }
+
+    /// Test-only bridge from the retired `spawn_answered_call` harness to the production path.
+    ///
+    /// Mirrors `spawn_answered_call` exactly: on success both guards disarm, on failure the armed
+    /// teardown terminates the peer. A timeout that drops this future still triggers
+    /// `AnswerTeardown::drop`, which sends the terminate — the same cancel semantics as the old
+    /// harness, with media startup going through `open_registered_media`.
+    #[cfg(feature = "voip-engine-wacore")]
+    async fn spawn_answered_via_backend(
+        client: &Client,
+        registration: &mut RegisteredCall,
+        mut teardown: AnswerTeardown,
+        factory: Arc<dyn RelayTransportFactory>,
+        audio: AudioEndpoints,
+        video: Option<VideoEndpoints>,
+    ) -> Result<CallHandle, CallError> {
+        client.set_relay_transport_provider(Arc::new(FixedProvider { factory }));
+        let key = wacore::voip_control::MediaSessionKey::builder()
+            .call_id(registration.call_id.clone())
+            .generation(registration.generation)
+            .build();
+        let spec = wacore::voip_control::MediaSessionSpec::from_relay(
+            CallDirection::Incoming,
+            key,
+            "111111111111111:0@lid",
+            "222222222222222:0@lid",
+            (0u8..32).collect(),
+            &sample_relay(),
+        )
+        .expect("sample spec");
+        match open_registered_media(client, registration, spec, audio, video, None, None).await {
+            Ok(handle) => {
+                teardown.disarm();
+                registration.disarm();
+                Ok(handle)
+            }
+            Err(error) => {
+                teardown.terminate(client).await;
+                Err(error)
+            }
+        }
+    }
+
     /// In-memory relay factory: returns a transport that records sends and a channel the test feeds
     /// inbound events through. Lets `spawn_call` be exercised without a real DTLS/SCTP dialer.
     struct MockFactory {
@@ -7387,11 +7486,10 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
-        let handle = spawn_call(
+        let handle = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &factory,
+            Arc::new(factory),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
@@ -7454,11 +7552,10 @@ mod tests {
             wacore::voip_control::CallSession::new_outgoing("CID-FACADE", caller(), caller());
         session.ring_devices = vec![caller().with_device(1), caller().with_device(2)];
 
-        let handle = spawn_call(
+        let handle = spawn_call_via_backend(
             &client,
             session,
-            engine(),
-            &factory,
+            Arc::new(factory),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
@@ -7506,11 +7603,10 @@ mod tests {
         };
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
-        let handle = spawn_call(
+        let handle = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &factory,
+            Arc::new(factory),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
@@ -8384,11 +8480,10 @@ mod tests {
         };
 
         let (f1, mic1, spk1) = spawn(&client);
-        let stale = spawn_call(
+        let stale = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &f1,
+            Arc::new(f1),
             pcm_audio(mic1, spk1),
             None,
         )
@@ -8396,11 +8491,10 @@ mod tests {
         .expect("first spawn_call");
         // A same-call-id re-offer replaces the first (new generation, aborts its task).
         let (f2, mic2, spk2) = spawn(&client);
-        let live = spawn_call(
+        let live = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &f2,
+            Arc::new(f2),
             pcm_audio(mic2, spk2),
             None,
         )
@@ -8458,22 +8552,20 @@ mod tests {
         };
 
         let (f1, mic1, spk1) = spawn(&client);
-        let stale = spawn_call(
+        let stale = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &f1,
+            Arc::new(f1),
             pcm_audio(mic1, spk1),
             None,
         )
         .await
         .expect("first spawn_call");
         let (f2, mic2, spk2) = spawn(&client);
-        let _live = spawn_call(
+        let _live = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &f2,
+            Arc::new(f2),
             pcm_audio(mic2, spk2),
             None,
         )
@@ -8502,11 +8594,10 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
         let handle = Arc::new(
-            spawn_call(
+            spawn_call_via_backend(
                 &client,
                 mk_session(),
-                engine(),
-                &factory,
+                Arc::new(factory),
                 pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
                 None,
             )
@@ -10728,12 +10819,11 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(20),
-            spawn_answered_call(
+            spawn_answered_via_backend(
                 &client,
                 &mut registration,
                 teardown,
-                engine(),
-                &factory,
+                Arc::new(factory),
                 pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
                 None,
             ),
@@ -11153,11 +11243,10 @@ mod tests {
         };
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
-        let handle = spawn_call(
+        let handle = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &factory,
+            Arc::new(factory),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
@@ -11344,22 +11433,20 @@ mod tests {
         };
 
         let (f1, mic1, spk1) = spawn(&client);
-        let stale = spawn_call(
+        let stale = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &f1,
+            Arc::new(f1),
             pcm_audio(mic1, spk1),
             None,
         )
         .await
         .expect("first spawn_call");
         let (f2, mic2, spk2) = spawn(&client);
-        let live = spawn_call(
+        let live = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &f2,
+            Arc::new(f2),
             pcm_audio(mic2, spk2),
             None,
         )
