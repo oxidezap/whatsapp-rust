@@ -30,6 +30,7 @@ use crate::voip::h264::VideoFrame;
 use crate::voip::registry::force_send_call_event;
 use crate::voip::rtp::{RTP_PAYLOAD_TYPE_H264, VIDEO_MEDIA_FRAME_INFO_IDR, parse_rtp_header};
 use crate::voip::transport::{RelayTransport, RelayTransportEvent};
+use crate::voip_control::MediaCloseReason;
 
 /// Lossless, ordered signaling mutations consumed by the sans-I/O group-media engine.
 pub enum GroupControl {
@@ -1105,7 +1106,7 @@ pub async fn run_call(
     relay_events: async_channel::Receiver<RelayTransportEvent>,
     channels: CallChannels,
     eng: CallEngine,
-) {
+) -> MediaCloseReason {
     let epoch = Instant::now();
     let wallclock_ms = crate::time::now_millis().max(0) as u64;
     run_call_with_clock_and_wallclock(
@@ -1117,7 +1118,7 @@ pub async fn run_call(
         move || epoch.elapsed().as_millis() as u64,
         wallclock_ms,
     )
-    .await;
+    .await
 }
 
 /// [`run_call`] with an injectable monotonic clock, so tests can drive the keepalive/playout timers
@@ -1141,7 +1142,7 @@ async fn run_call_with_clock(
     channels: CallChannels,
     eng: CallEngine,
     now_ms: impl Fn() -> engine::Millis,
-) {
+) -> MediaCloseReason {
     run_call_with_clock_and_wallclock(
         rt,
         transport,
@@ -1151,7 +1152,7 @@ async fn run_call_with_clock(
         now_ms,
         1_700_000_000_000,
     )
-    .await;
+    .await
 }
 
 async fn run_call_with_clock_and_wallclock(
@@ -1162,7 +1163,7 @@ async fn run_call_with_clock_and_wallclock(
     mut eng: CallEngine,
     now_ms: impl Fn() -> engine::Millis,
     wallclock_ms: u64,
-) {
+) -> MediaCloseReason {
     eng.start(now_ms(), wallclock_ms);
 
     #[cfg(feature = "tracing")]
@@ -1211,6 +1212,11 @@ async fn run_call_with_clock_and_wallclock(
 
     let mut timer: DeadlineTimer = Fuse::terminated();
     let mut armed_deadline: Option<engine::Millis> = None;
+
+    // Why the drive ends, handed back to the shell so `VoipMediaSession::close` receives the real
+    // reason instead of the `Local` default. A plain hangup leaves it `Local`; every break below
+    // that is a failure records its own.
+    let mut close_reason = MediaCloseReason::Local;
 
     // Only republished when a counter actually moved: comparing fifteen `u32`s is cheaper than
     // taking the lock, and on a healthy call only `rtp_received` and one decode counter ever move.
@@ -1362,10 +1368,12 @@ async fn run_call_with_clock_and_wallclock(
                 result = reconnect => result,
                 () = timeout => {
                     let _ = publish_engine_event(&channels.events, CallEvent::RelayReconnectTimedOut);
+                    close_reason = MediaCloseReason::RelayDisconnected;
                     break 'drive;
                 },
             };
             let Ok((replacement, replacement_events)) = reconnect_result else {
+                close_reason = MediaCloseReason::RelayDisconnected;
                 break 'drive;
             };
             let retired = std::mem::replace(&mut transport, replacement);
@@ -1515,7 +1523,8 @@ async fn run_call_with_clock_and_wallclock(
             // The in-flight send completed. A failure tears the call down (the old inline behavior).
             res = &mut sending.future => {
                 sending.kind = None;
-                if res.is_err() {
+                if let Err(error) = res {
+                    close_reason = MediaCloseReason::SendFailed(error.to_string());
                     break 'drive;
                 }
             },
@@ -1776,7 +1785,10 @@ async fn run_call_with_clock_and_wallclock(
                 }
                 // The channel is already open by the time we run; Connected is a redundant confirm.
                 Ok(RelayTransportEvent::Connected) => {}
-                Ok(RelayTransportEvent::Disconnected(_)) | Err(_) => break 'drive,
+                Ok(RelayTransportEvent::Disconnected(_)) | Err(_) => {
+                    close_reason = MediaCloseReason::RelayDisconnected;
+                    break 'drive;
+                }
             },
             frame = mic_fut => match frame {
                 Ok(pcm) => {
@@ -1858,6 +1870,7 @@ async fn run_call_with_clock_and_wallclock(
     #[cfg(feature = "tracing")]
     tracing::debug!(call_id = %call_id, "voip call drive ended");
     transport.disconnect().await;
+    close_reason
 }
 
 #[cfg(all(test, feature = "voip-mlow"))]

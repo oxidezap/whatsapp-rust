@@ -3517,6 +3517,66 @@ mod tests {
         assert_eq!(first_media.record().closed, Some(MediaCloseReason::Local));
     }
 
+    #[test]
+    fn a_recorded_failure_reason_reaches_the_closed_session() {
+        use crate::voip_control::fake_backend::FakeMediaBackend;
+        use crate::voip_control::{MediaCloseReason, MediaSessionKey};
+
+        // A setup or send failure must reach the backend as its own reason, not as the `Local`
+        // default a plain hangup carries, or a foreign backend cannot tell a broken call from an
+        // ended one. `set_close_reason` is the control plane's record; the entry's `Drop` delivers it.
+        let backend = Arc::new(FakeMediaBackend::new());
+        let registry = CallRegistry::with_backend(backend.clone());
+        let generation = registry.insert(session("FAIL-CALL"));
+        let media = backend
+            .session(&MediaSessionKey {
+                call_id: "FAIL-CALL".to_string(),
+                generation,
+            })
+            .expect("reserved");
+
+        registry.set_close_reason(
+            "FAIL-CALL",
+            generation,
+            MediaCloseReason::SendFailed("sctp write failed".to_string()),
+        );
+        assert!(registry.remove_if_current("FAIL-CALL", generation));
+        assert_eq!(
+            media.record().closed,
+            Some(MediaCloseReason::SendFailed(
+                "sctp write failed".to_string()
+            )),
+            "the failure reason reaches close, not Local"
+        );
+    }
+
+    #[test]
+    fn a_stale_generation_close_reason_is_ignored() {
+        use crate::voip_control::fake_backend::FakeMediaBackend;
+        use crate::voip_control::{MediaCloseReason, MediaSessionKey};
+
+        // The reason is generation-guarded: a late failure from a superseded generation must not
+        // relabel the live one's close.
+        let backend = Arc::new(FakeMediaBackend::new());
+        let registry = CallRegistry::with_backend(backend.clone());
+        let old = registry.insert(session("GEN"));
+        let live = registry.insert(session("GEN"));
+        let live_media = backend
+            .session(&MediaSessionKey {
+                call_id: "GEN".to_string(),
+                generation: live,
+            })
+            .expect("reserved");
+
+        registry.set_close_reason(
+            "GEN",
+            old,
+            MediaCloseReason::SendFailed("stale".to_string()),
+        );
+        assert!(registry.remove_if_current("GEN", live));
+        assert_eq!(live_media.record().closed, Some(MediaCloseReason::Local));
+    }
+
     fn group_update(transaction_id: u32) -> GroupCallUpdate {
         GroupCallUpdate {
             call_id: "GROUP-CALL".to_string(),

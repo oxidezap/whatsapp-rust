@@ -3024,11 +3024,6 @@ async fn attach_engine(
         engine.media_warp_mi_tag_len(),
         group_tx,
     ) {
-        if failure_cleanup == FailureCleanup::Here {
-            client
-                .call_registry()
-                .remove_if_current(call_id, generation);
-        }
         // Every exit below that *fails* says why through `ev_tx`, and the one that is merely
         // cancelled does not. It has to be said here: for an outgoing call
         // `attach_outgoing_relay` removed the `PendingOutgoing` before calling this, so the
@@ -3039,6 +3034,18 @@ async fn attach_engine(
         let e = CallError::Setup(
             "group relay WARP tag length changed during media attachment".to_string(),
         );
+        // Record the reason before the entry can drop, so the session's `close` sees `SetupFailed`
+        // rather than the `Local` default.
+        client.call_registry().set_close_reason(
+            call_id,
+            generation,
+            wacore::voip_control::MediaCloseReason::SetupFailed(e.to_string()),
+        );
+        if failure_cleanup == FailureCleanup::Here {
+            client
+                .call_registry()
+                .remove_if_current(call_id, generation);
+        }
         publish_setup_failure(&ev_tx, e.to_string());
         ended.notify();
         return Err(e);
@@ -3050,12 +3057,17 @@ async fn attach_engine(
     // sees !is_connected and the direct caller / outer registration guard cleans up. Wake
     // wait_ended() before bailing so a parked waiter resolves.
     if !client.is_connected() {
+        let e = CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into());
+        client.call_registry().set_close_reason(
+            call_id,
+            generation,
+            wacore::voip_control::MediaCloseReason::SetupFailed(e.to_string()),
+        );
         if failure_cleanup == FailureCleanup::Here {
             client
                 .call_registry()
                 .remove_if_current(call_id, generation);
         }
-        let e = CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into());
         publish_setup_failure(&ev_tx, e.to_string());
         ended.notify();
         return Err(e);
@@ -3096,14 +3108,19 @@ async fn attach_engine(
             // Ended mid-dial: the loser `dial` future drops here, aborting the connect.
             Ok(futures::future::Either::Right(((), _dial))) => None,
             Err(_) => {
+                let e = CallError::Connect(format!(
+                    "the relay transport did not connect within {RELAY_DIAL_CEILING:?}"
+                ));
+                client.call_registry().set_close_reason(
+                    call_id,
+                    generation,
+                    wacore::voip_control::MediaCloseReason::SetupFailed(e.to_string()),
+                );
                 if failure_cleanup == FailureCleanup::Here {
                     client
                         .call_registry()
                         .remove_if_current(call_id, generation);
                 }
-                let e = CallError::Connect(format!(
-                    "the relay transport did not connect within {RELAY_DIAL_CEILING:?}"
-                ));
                 publish_setup_failure(&ev_tx, e.to_string());
                 ended.notify();
                 return Err(e);
@@ -3113,12 +3130,17 @@ async fn attach_engine(
     let (transport, relay_events) = match dialed {
         Some(Ok(pair)) => pair,
         Some(Err(dial_err)) => {
+            let e = CallError::Connect(dial_err.to_string());
+            client.call_registry().set_close_reason(
+                call_id,
+                generation,
+                wacore::voip_control::MediaCloseReason::SetupFailed(e.to_string()),
+            );
             if failure_cleanup == FailureCleanup::Here {
                 client
                     .call_registry()
                     .remove_if_current(call_id, generation);
             }
-            let e = CallError::Connect(dial_err.to_string());
             publish_setup_failure(&ev_tx, e.to_string());
             ended.notify();
             return Err(e);
@@ -3251,7 +3273,11 @@ async fn attach_engine(
         let _ended_guard = ended_guard;
         let _audio_feed = audio_feed;
         let _video_out_feed = video_out_feed;
-        run_call(driver_runtime, transport, relay_events, channels, engine).await;
+        let reason = run_call(driver_runtime, transport, relay_events, channels, engine).await;
+        // Record why the drive ended before dropping our own entry, so the entry's `Drop` hands the
+        // real reason to `VoipMediaSession::close` instead of the `Local` default. A relay-drop or a
+        // failed write is a media failure a foreign backend can tell apart from a hangup.
+        registry_for_task.set_close_reason(&cid, generation, reason);
         // A locally-ended call gets no <terminate>; drop our own entry so the registry doesn't grow.
         // The call's `ring_devices` live on the session, so this also drops the sibling-dismiss
         // tracking -- no separate map to clean up.
