@@ -29,7 +29,9 @@ use crate::voip::media_session::{
     ResidentMediaSession, codec_to_neutral, video_control_to_command,
 };
 use crate::voip::session::{CallPhase, CallSession};
-use crate::voip_control::{MediaCommand, VoipMediaSession};
+use crate::voip_control::{
+    MediaCommand, MediaDirection, MediaSessionKey, VoipMediaBackend, VoipMediaSession,
+};
 use wacore_binary::Jid;
 
 const MAX_PENDING_INITIAL_GROUP_CONTROLS: usize = 64;
@@ -735,10 +737,13 @@ fn pending_initial_group_control_matches(
 }
 
 /// Thread-safe map of active calls keyed by call-id.
-#[derive(Default)]
 pub struct CallRegistry {
     inner: Mutex<HashMap<String, CallEntry>>,
     next_gen: AtomicU64,
+    /// The media backend every new call's session comes from. The registry never names a concrete
+    /// implementation: it asks the injected backend to `reserve` one per registration, so a build
+    /// that ships no engine (or a test that ships a fake) is substituted at construction.
+    backend: Arc<dyn VoipMediaBackend>,
     /// Creator-authenticated controls that overtook their initial group offer. A bounded value
     /// queue avoids retaining one task per fabricated call id while preserving the real offer race.
     pending_initial_group_controls: Mutex<VecDeque<PendingInitialGroupControl>>,
@@ -751,9 +756,42 @@ pub struct CallRegistry {
     ringing: Mutex<HashSet<String>>,
 }
 
+impl Default for CallRegistry {
+    fn default() -> Self {
+        Self::with_backend(Arc::new(crate::voip::media_session::ResidentMediaBackend))
+    }
+}
+
 impl CallRegistry {
+    /// A registry with the in-process resident backend.
+    ///
+    /// Kept so every existing construction site (registry unit tests, and any caller that only
+    /// needs a registry) compiles unchanged; a client injects its own backend through
+    /// [`with_backend`](Self::with_backend).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A registry whose calls get their media session from `backend`.
+    ///
+    /// This is the one place the choice of media implementation enters the control plane. The
+    /// registry stores the trait object and asks it to `reserve`; it never names `ResidentMediaSession`
+    /// or any other engine type.
+    pub fn with_backend(backend: Arc<dyn VoipMediaBackend>) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            next_gen: AtomicU64::new(0),
+            backend,
+            pending_initial_group_controls: Mutex::new(VecDeque::new()),
+            registration_event: Arc::new(event_listener::Event::new()),
+            ringing: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// The media backend this registry reserves sessions from.
+    #[must_use]
+    pub fn backend(&self) -> &Arc<dyn VoipMediaBackend> {
+        &self.backend
     }
 
     /// The active-call map, recovering the guard from a poisoned mutex instead of panicking.
@@ -1682,7 +1720,7 @@ impl CallRegistry {
                         )
                     });
                 let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
-                let entry = Self::new_entry(session, generation, true, false);
+                let entry = Self::new_entry(&self.backend, session, generation, true, false);
                 if ringing_group_entries >= MAX_RINGING_GROUP_CALLS
                     || ringing_group_bytes.saturating_add(entry.retained_bytes(&call_id))
                         > MAX_RINGING_GROUP_CALL_BYTES
@@ -1716,7 +1754,13 @@ impl CallRegistry {
             let mut map = self.active_calls();
             map.insert(
                 session.call_id.clone(),
-                Self::new_entry(session, generation, force_group, is_call_link),
+                Self::new_entry(
+                    &self.backend,
+                    session,
+                    generation,
+                    force_group,
+                    is_call_link,
+                ),
             )
         };
         // The superseded entry drops here, OUTSIDE the lock: its media-task AbortHandle aborts and its
@@ -1764,11 +1808,24 @@ impl CallRegistry {
     }
 
     fn new_entry(
+        backend: &Arc<dyn VoipMediaBackend>,
         session: CallSession,
         generation: u64,
         force_group: bool,
         is_call_link: bool,
     ) -> CallEntry {
+        let direction = match session.direction {
+            crate::voip::session::CallDirection::Outgoing => MediaDirection::Outgoing,
+            crate::voip::session::CallDirection::Incoming => MediaDirection::Incoming,
+        };
+        // Reserved through the injected backend, so the registry never names a concrete media
+        // implementation. The key carries the generation from the first step, so a command from a
+        // superseded generation can never reach this session.
+        let key = MediaSessionKey {
+            call_id: session.call_id.clone(),
+            generation,
+        };
+        let media = backend.reserve(&key, direction);
         let video = VideoNegotiation::new(session.is_video);
         let is_group_call = force_group || session.group.is_some();
         let group = session.group.as_ref().map(|update| {
@@ -1787,8 +1844,7 @@ impl CallRegistry {
             peer_video_orientations: Vec::new(),
             peer_orientation_seq: 0,
             session,
-            // `new()` already returns `Arc<Self>`; the only coercion left is to `dyn`.
-            media: Some(ResidentMediaSession::new()),
+            media: Some(media),
             media_task: None,
             media_stats: None,
             waiting_room_task: None,

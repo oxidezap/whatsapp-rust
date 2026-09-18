@@ -31,7 +31,9 @@ use crate::voip::driver::{
 use crate::voip::media_stats::{CallMediaStats, MediaStatsCell};
 use crate::voip::registry::{DEFAULT_CALL_EVENT_QUEUE_CAPACITY, GroupControlQueue};
 use crate::voip_control::{
-    MediaAudioCodec, MediaCommand, MediaEvent, MediaKeyframeUrgency, MediaStats, VoipMediaSession,
+    MediaAudioCodec, MediaCommand, MediaDirection, MediaEvent, MediaKeyframeUrgency,
+    MediaSessionKey, MediaSessionSpec, MediaSetupError, MediaStats, VoipMediaBackend,
+    VoipMediaSession,
 };
 
 /// The core group control a neutral command carries, when it carries one.
@@ -513,6 +515,39 @@ impl VoipMediaSession for ResidentMediaSession {
     fn close(&self, _reason: crate::voip_control::MediaCloseReason) {
         // The drive task owns teardown; dropping the session drops the mailboxes. The registry
         // entry's media-task abort ends the call.
+    }
+}
+
+/// The in-process resident backend: reserves a [`ResidentMediaSession`] per call.
+///
+/// This is the default a `CallRegistry` carries when no backend is injected, so registry-only
+/// builds and unit tests keep the exact pre-injection behavior. `whatsapp-rust` injects its own
+/// [`WacoreVoipMediaBackend`](crate::voip_control) instead, which owns the engine and the drive
+/// task; this one exists so the registry never has to name `ResidentMediaSession` itself.
+#[derive(Default)]
+pub struct ResidentMediaBackend;
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl VoipMediaBackend for ResidentMediaBackend {
+    fn reserve(
+        &self,
+        _key: &MediaSessionKey,
+        _direction: MediaDirection,
+    ) -> Arc<dyn VoipMediaSession> {
+        ResidentMediaSession::new()
+    }
+
+    async fn open(
+        &self,
+        _session: &Arc<dyn VoipMediaSession>,
+        spec: MediaSessionSpec,
+    ) -> Result<(), MediaSetupError> {
+        // The registry's own fallback validates the projection and builds no task: the live call
+        // path drives the engine through `whatsapp-rust`'s backend, which owns the runtime and
+        // transport. A spec the engine refuses is refused here too.
+        let _ = crate::voip_control::engine_bridge::into_engine_parts(spec)?;
+        Ok(())
     }
 }
 

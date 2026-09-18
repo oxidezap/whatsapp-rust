@@ -546,6 +546,11 @@ pub enum MediaSetupError {
     MlowUnavailable,
     #[error("media session setup failed: {0}")]
     Backend(String),
+    /// No media backend was injected. A `voip-control`-only build compiles the call flow but ships
+    /// no engine; starting media without a backend is this typed refusal rather than a panic or a
+    /// silent no-op.
+    #[error("no VoIP media backend is installed for this client")]
+    NoBackend,
 }
 
 /// Per-call media counters. Replaces the engine's `CallMediaStats`, field for field.
