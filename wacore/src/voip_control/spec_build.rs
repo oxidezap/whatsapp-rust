@@ -98,10 +98,7 @@ impl MediaSessionSpec {
                 io: MediaAudioIo::Pcm,
             },
             relay_token,
-            auth_token: super::relay_parse::select_auth_token(
-                &relay.auth_tokens,
-                endpoint.auth_token_id,
-            ),
+            auth_token: select_auth_token(&relay.auth_tokens, endpoint.auth_token_id),
             relay_ip,
             relay_port,
             integrity_key: relay.key.clone(),
