@@ -29,6 +29,11 @@ use crate::types::group_call::{GroupCallUpdate, ScreenShare, WaitingRoom};
 #[cfg(feature = "voip")]
 pub mod engine_bridge;
 
+// The relay-transport seam: a dumb packet pipe the platform implements. It belongs to the contract,
+// not the engine, because a foreign backend reaches its own relay through it -- a `voip-control`
+// build names these traits to supply a transport, and none of them touches `crate::voip`.
+pub mod transport;
+
 /// One decrypted keygen-v2 epoch, kept as secret material.
 ///
 /// The engine's `GroupRawEpoch` is in `crate::voip::driver`, which is gated by the very feature this
@@ -55,7 +60,8 @@ impl MediaGroupEpoch {
     ///
     /// Crate-private on purpose: an external consumer leaving with a bare `Vec<u8>` would escape
     /// the erasure this type promises. A consumer that needs the bytes without taking ownership
-    /// uses [`as_bytes`](Self::as_bytes).
+    /// uses [`as_bytes`](Self::as_bytes). Only the `voip`-gated resident adapter consumes it.
+    #[cfg(feature = "voip")]
     #[must_use]
     pub(crate) fn into_bytes(mut self) -> Vec<u8> {
         std::mem::take(&mut *self.0)

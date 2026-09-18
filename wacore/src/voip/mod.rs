@@ -41,7 +41,10 @@ pub mod stun;
 // of a dump. Note that the runtime does not yet expose a factory injection point for a live call,
 // so today this is reachable from a shell that builds its own transport, not from `CallHandle`.
 pub mod tap;
-pub mod transport;
+// The relay-transport seam now lives in the neutral contract (`crate::voip_control::transport`),
+// because a foreign backend supplies its own transport and must be able to name these traits with
+// the engine off. Re-exported here so the historical `wacore::voip::*` paths keep resolving.
+pub use crate::voip_control::transport;
 pub mod warp;
 
 // Curated facade: the headline entry points a consumer reaches for, hoisted to `voip::`.
