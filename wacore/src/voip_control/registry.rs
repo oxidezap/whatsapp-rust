@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_lock::Mutex as AsyncMutex;
-use portable_atomic::{AtomicBool, AtomicU64, AtomicUsize};
+use portable_atomic::{AtomicBool, AtomicU64};
 
 use crate::runtime::AbortHandle;
 use crate::types::call::{CallAction, IncomingCall, VideoState};
@@ -134,43 +134,6 @@ impl Drop for EndedNotify {
     }
 }
 
-#[derive(Clone)]
-struct CallEventQueue {
-    tx: async_channel::Sender<CallEvent>,
-    max_payload_bytes: Arc<AtomicUsize>,
-}
-
-impl CallEventQueue {
-    fn new(tx: async_channel::Sender<CallEvent>) -> Self {
-        Self {
-            tx,
-            max_payload_bytes: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    fn force_send(&self, event: CallEvent) -> bool {
-        let payload_bytes = event.heap_bytes();
-        let queue_capacity = self
-            .tx
-            .capacity()
-            .unwrap_or(DEFAULT_CALL_EVENT_QUEUE_CAPACITY)
-            .max(1);
-        let max_event_bytes = MAX_CALL_EVENT_QUEUE_BYTES / queue_capacity;
-        if size_of::<CallEvent>().saturating_add(payload_bytes) > max_event_bytes {
-            return false;
-        }
-        self.max_payload_bytes
-            .fetch_max(payload_bytes, Ordering::Relaxed);
-        force_send_call_event(&self.tx, event)
-    }
-
-    fn retained_bytes(&self) -> usize {
-        self.tx.len().saturating_mul(
-            size_of::<CallEvent>().saturating_add(self.max_payload_bytes.load(Ordering::Relaxed)),
-        )
-    }
-}
-
 struct CallEntry {
     session: CallSession,
     /// The media plane, behind the neutral seam. It owns the driver command mailboxes (recv-rekey,
@@ -186,11 +149,6 @@ struct CallEntry {
     /// Monotonic token distinguishing this registration from a later same-call-id replacement, so a
     /// finishing task only reaps its OWN entry (the ABA hazard).
     generation: u64,
-    /// The call's consumer-facing event queue (same channel `CallHandle::events()` reads), so the
-    /// SIGNALING handler can surface `<video state>` changes next to the engine's events. Owned by
-    /// the control plane: signaling publishes engine-typed events into it, which is why it is not
-    /// behind the neutral seam.
-    event_tx: Option<CallEventQueue>,
     /// WARP authentication-tag width baked into the attached media pipelines. A relay refresh
     /// cannot change this packet boundary without rebuilding every sender and receiver atomically.
     group_warp_mi_tag_len: Option<usize>,
@@ -433,14 +391,9 @@ impl CallEntry {
         use crate::stats::HeapSize;
 
         let queued_bytes = self
-            .event_tx
+            .media
             .as_ref()
-            .map_or(0, CallEventQueue::retained_bytes)
-            .saturating_add(
-                self.media
-                    .as_ref()
-                    .map_or(0, |media| media.retained_bytes()),
-            );
+            .map_or(0, |media| media.retained_bytes());
         self.session.heap_bytes()
             + self.group.as_ref().map_or(0, HeapSize::heap_bytes)
             + self
@@ -495,6 +448,25 @@ impl CallEntry {
 /// so the restore displaces the event just inserted. The request is the one
 /// whose loss is permanent, so it is what stays, and the caller is told its own
 /// event never reached the consumer rather than being left to assume it did.
+/// Publish one event with the per-event byte budget, then force-send it.
+///
+/// A single event larger than `MAX_CALL_EVENT_QUEUE_BYTES / capacity` is refused rather than
+/// displacing the whole bounded queue; everything else is force-sent, dropping the oldest entry
+/// when full. This is the same policy the registry applied through its event queue, kept beside the
+/// session that now owns the stream.
+pub(crate) fn publish_call_event(tx: &async_channel::Sender<CallEvent>, event: CallEvent) -> bool {
+    let payload_bytes = event.heap_bytes();
+    let queue_capacity = tx
+        .capacity()
+        .unwrap_or(DEFAULT_CALL_EVENT_QUEUE_CAPACITY)
+        .max(1);
+    let max_event_bytes = MAX_CALL_EVENT_QUEUE_BYTES / queue_capacity;
+    if size_of::<CallEvent>().saturating_add(payload_bytes) > max_event_bytes {
+        return false;
+    }
+    force_send_call_event(tx, event)
+}
+
 pub(crate) fn force_send_call_event(
     tx: &async_channel::Sender<CallEvent>,
     event: CallEvent,
@@ -511,7 +483,7 @@ pub(crate) fn force_send_call_event(
 
 /// Exclusive publication right for an actionable signaling event awaiting its typed ack.
 pub struct CallEventPermit {
-    tx: CallEventQueue,
+    media: Arc<dyn VoipMediaSession>,
     reserved: Arc<AtomicBool>,
     generation: u64,
 }
@@ -523,7 +495,7 @@ impl CallEventPermit {
 
     pub fn send(&self, event: CallEvent) -> bool {
         // The latest committed state must remain observable even when its consumer is behind.
-        self.tx.force_send(event)
+        self.media.publish(event)
     }
 }
 
@@ -917,13 +889,12 @@ impl CallRegistry {
         self.registration_event.listen()
     }
 
-    /// Deliver a signaling event through the call's consumer queue.
+    /// Deliver a signaling event through the call's session-owned public stream.
     pub fn send_call_event(&self, call_id: &str, event: CallEvent) -> bool {
-        let tx = self
-            .active_calls()
+        self.active_calls()
             .get(call_id)
-            .and_then(|entry| entry.event_tx.clone());
-        tx.is_some_and(|tx| tx.force_send(event))
+            .and_then(|entry| entry.media.clone())
+            .is_some_and(|media| media.publish(event))
     }
 
     /// Deliver an event only while `generation` still owns this call-id.
@@ -933,12 +904,11 @@ impl CallRegistry {
         generation: u64,
         event: CallEvent,
     ) -> bool {
-        let tx = self
-            .active_calls()
+        self.active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation)
-            .and_then(|entry| entry.event_tx.clone());
-        tx.is_some_and(|tx| tx.force_send(event))
+            .and_then(|entry| entry.media.clone())
+            .is_some_and(|media| media.publish(event))
     }
 
     /// Atomically apply a newer authoritative group snapshot to an active call.
@@ -1728,7 +1698,6 @@ impl CallRegistry {
             close_reason: crate::voip_control::MediaCloseReason::Local,
             waiting_room_task: None,
             generation,
-            event_tx: None,
             group_warp_mi_tag_len: None,
             video_teardown: None,
             event_publication_reserved: Arc::new(AtomicBool::new(false)),
@@ -2101,7 +2070,11 @@ impl CallRegistry {
         if let Some(entry) = self.active_calls().get_mut(call_id)
             && entry.generation == generation
         {
-            entry.event_tx = Some(CallEventQueue::new(event_tx));
+            // The caller created the stream so its `CallHandle` holds the receiver; the session
+            // adopts the sender and becomes the one publisher.
+            if let Some(media) = entry.media.as_ref() {
+                media.install_event_sender(event_tx);
+            }
             // Before the sender is published, so the rotation the offer
             // announced is the first thing the drive loop reads rather than
             // racing the first inbound frame.
@@ -2359,24 +2332,23 @@ impl CallRegistry {
     /// Serialize an actionable signaling event across its typed ack. The permit force-inserts the
     /// committed transition, so queue pressure cannot hide peer-visible state from the consumer.
     pub fn reserve_call_event(&self, call_id: &str) -> Option<CallEventPermit> {
-        let (tx, reserved, generation) = {
+        let (media, reserved, generation) = {
             let map = self.active_calls();
             let entry = map.get(call_id)?;
             (
-                entry.event_tx.clone()?,
+                entry.media.clone()?,
                 entry.event_publication_reserved.clone(),
                 entry.generation,
             )
         };
-        if tx.tx.is_closed()
-            || reserved
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
+        if reserved
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
             return None;
         }
         Some(CallEventPermit {
-            tx,
+            media,
             reserved,
             generation,
         })
@@ -4446,34 +4418,6 @@ mod tests {
         assert!(
             reg.memory_stats().bytes >= baseline + payload_bytes.saturating_mul(2),
             "both queued boxes must include their retained roster allocations"
-        );
-    }
-
-    #[test]
-    fn call_event_queue_rejects_payloads_that_break_its_total_byte_budget() {
-        let (event_tx, event_rx) = async_channel::bounded(DEFAULT_CALL_EVENT_QUEUE_CAPACITY);
-        let queue = CallEventQueue::new(event_tx);
-        let mut update = group_update(1);
-        update.participants.push(GroupCallParticipant {
-            jid: Jid::new("222222222222222", Server::Lid),
-            pn: None,
-            state: Some("connected".to_string()),
-            participant_type: None,
-            devices: vec![GroupCallDevice {
-                jid: Jid::new("222222222222222", Server::Lid).with_device(1),
-                platform: Some("web".to_string()),
-                pid: Some(2),
-                capability_version: Some(1),
-                capability: vec![7; MAX_CALL_EVENT_QUEUE_BYTES],
-            }],
-        });
-
-        assert!(!queue.force_send(CallEvent::GroupUpdated(Box::new(update))));
-        assert!(event_rx.is_empty());
-        assert_eq!(queue.retained_bytes(), 0);
-        assert!(
-            queue.force_send(CallEvent::RelayAllocated),
-            "rejecting an oversized snapshot must leave capacity for lifecycle events"
         );
     }
 

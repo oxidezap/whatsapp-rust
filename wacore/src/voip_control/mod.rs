@@ -720,6 +720,26 @@ pub trait VoipMediaSession: MaybeSendSync + 'static {
         false
     }
 
+    /// Publish a signaling event into this session's public stream.
+    ///
+    /// The control plane surfaces a committed peer video-state change or a group control answer
+    /// next to the backend's own media events, so one ordered stream carries the whole call. `true`
+    /// when the event was queued; `false` when the implementation has no such stream or it is under
+    /// backpressure, in which case the caller decides whether to retry.
+    fn publish(&self, _event: MediaEvent) -> bool {
+        false
+    }
+
+    /// Adopt an externally-created public event sender.
+    ///
+    /// The control plane creates the channel once at registration (so a dormant `CallHandle` holds
+    /// the receiver before media attaches) and hands the sender in here. The session then owns
+    /// publication over it; a foreign backend and the resident one behave the same. Returns `false`
+    /// when the implementation raises no public events.
+    fn install_event_sender(&self, _tx: async_channel::Sender<MediaEvent>) -> bool {
+        false
+    }
+
     /// Snapshot of the counters the control plane republishes for `CallHandle`.
     fn stats(&self) -> MediaStats;
 
@@ -789,6 +809,14 @@ impl<T: VoipMediaSession + ?Sized> VoipMediaSession for Arc<T> {
 
     fn install_media_task(&self, handle: crate::runtime::AbortHandle) -> bool {
         (**self).install_media_task(handle)
+    }
+
+    fn publish(&self, event: MediaEvent) -> bool {
+        (**self).publish(event)
+    }
+
+    fn install_event_sender(&self, tx: async_channel::Sender<MediaEvent>) -> bool {
+        (**self).install_event_sender(tx)
     }
 
     fn stats(&self) -> MediaStats {

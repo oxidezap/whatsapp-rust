@@ -150,12 +150,15 @@ struct Mailboxes {
 pub struct ResidentMediaSession {
     mailboxes: Mutex<Mailboxes>,
     stats: Mutex<Arc<MediaStatsCell>>,
-    /// The public event stream for this call. The drive loop publishes into `events_tx`; every
-    /// [`subscribe`](VoipMediaSession::subscribe) hands back a clone of `events_rx`, so one session
-    /// has one ordered stream a consumer (and the `CallHandle`) reads, whether it is the resident
-    /// engine or a foreign one.
-    events_tx: async_channel::Sender<MediaEvent>,
-    events_rx: async_channel::Receiver<MediaEvent>,
+    /// The public event stream for this call: the sender the drive loop and the control plane
+    /// publish through, and the receiver every [`subscribe`](VoipMediaSession::subscribe) clones.
+    /// One session has one ordered stream a consumer (and the `CallHandle`) reads, whether it is the
+    /// resident engine or a foreign one. Interior-mutable so the control plane can install the
+    /// sender it created.
+    events: Mutex<(
+        async_channel::Sender<MediaEvent>,
+        async_channel::Receiver<MediaEvent>,
+    )>,
 }
 
 impl ResidentMediaSession {
@@ -172,15 +175,28 @@ impl ResidentMediaSession {
         Arc::new(Self {
             mailboxes: Mutex::new(Mailboxes::default()),
             stats: Mutex::new(stats),
-            events_tx,
-            events_rx,
+            events: Mutex::new((events_tx, events_rx)),
         })
     }
 
     /// The event sender the drive loop publishes through.
     #[must_use]
     pub fn event_sender(&self) -> async_channel::Sender<MediaEvent> {
-        self.events_tx.clone()
+        self.events().0.clone()
+    }
+
+    fn events(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        (
+            async_channel::Sender<MediaEvent>,
+            async_channel::Receiver<MediaEvent>,
+        ),
+    > {
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Create and install this session's video-control mailbox, returning the drive-loop half.
@@ -573,7 +589,18 @@ impl VoipMediaSession for ResidentMediaSession {
     fn subscribe(&self) -> async_channel::Receiver<MediaEvent> {
         // A clone over the same bounded stream: every subscriber sees the published events, and the
         // drive loop publishes through `event_sender` into this one.
-        self.events_rx.clone()
+        self.events().1.clone()
+    }
+
+    fn publish(&self, event: MediaEvent) -> bool {
+        // The control plane surfaces a signaling event (a peer video-state change, a group-control
+        // answer) on the same ordered stream the backend's media events travel.
+        crate::voip_control::registry::publish_call_event(&self.events().0, event)
+    }
+
+    fn install_event_sender(&self, tx: async_channel::Sender<MediaEvent>) -> bool {
+        self.events().0 = tx;
+        true
     }
 
     fn close(&self, _reason: crate::voip_control::MediaCloseReason) {

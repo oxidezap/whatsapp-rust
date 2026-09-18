@@ -32,8 +32,9 @@ pub struct FakeSessionRecord {
 pub struct FakeMediaSession {
     key: MediaSessionKey,
     record: Mutex<FakeSessionRecord>,
-    /// The single event sender, so a test holding the receiver sees what the test publishes.
-    events: async_channel::Sender<MediaEvent>,
+    /// The single event sender, swap-able for the control plane's at registration, so a test
+    /// holding the receiver sees what the session publishes.
+    events: Mutex<async_channel::Sender<MediaEvent>>,
     /// A cloneable handle to the same stream, handed back by [`VoipMediaSession::subscribe`].
     events_rx: async_channel::Receiver<MediaEvent>,
 }
@@ -46,7 +47,7 @@ impl FakeMediaSession {
         let session = Arc::new(Self {
             key,
             record: Mutex::new(FakeSessionRecord::default()),
-            events: tx,
+            events: Mutex::new(tx),
             events_rx: rx.clone(),
         });
         (session, rx)
@@ -71,7 +72,11 @@ impl FakeMediaSession {
 
     /// Publish one media event to this session's subscriber.
     pub fn publish(&self, event: MediaEvent) -> bool {
-        self.events.try_send(event).is_ok()
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_send(event)
+            .is_ok()
     }
 
     /// Set the counters [`VoipMediaSession::stats`] reports.
@@ -101,6 +106,17 @@ impl VoipMediaSession for FakeMediaSession {
     fn subscribe(&self) -> async_channel::Receiver<MediaEvent> {
         // A clone over the same bounded stream, so every subscriber sees the published events.
         self.events_rx.clone()
+    }
+
+    fn publish(&self, event: MediaEvent) -> bool {
+        FakeMediaSession::publish(self, event)
+    }
+
+    fn install_event_sender(&self, tx: async_channel::Sender<MediaEvent>) -> bool {
+        // Swap the sender for the caller's, so a test reading the receiver it created sees what the
+        // control plane publishes.
+        *self.events.lock().unwrap_or_else(|e| e.into_inner()) = tx;
+        true
     }
 
     fn close(&self, reason: MediaCloseReason) {
