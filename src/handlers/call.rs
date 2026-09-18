@@ -438,10 +438,10 @@ impl StanzaHandler for CallHandler {
                             .peer_selected_audio_codec(call.action.call_id(), peer_mlow_bit);
                         client.call_registry().send_rekey(
                             call.action.call_id(),
-                            wacore::voip_control::control::PeerAnswer {
-                                answering_lid: sender.to_string(),
-                                audio_codec,
-                            },
+                            wacore::voip_control::control::PeerAnswer::builder()
+                                .answering_lid(sender.to_string())
+                                .maybe_audio_codec(audio_codec)
+                                .build(),
                         );
                         if let Some(generation) =
                             client.call_registry().generation_of(call.action.call_id())

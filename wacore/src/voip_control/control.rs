@@ -535,7 +535,10 @@ impl VideoControlReceiver {
 /// they travel together rather than racing down two channels. The callee needs no equivalent: its
 /// peer's capability arrives in the `<offer>`, before the engine exists, so it simply starts with
 /// the right format.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Sealed like every other seam DTO: `#[non_exhaustive]` plus a builder.
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[non_exhaustive]
 pub struct PeerAnswer {
     /// The answering device's LID. Recv keys are re-derived from it.
     pub answering_lid: String,

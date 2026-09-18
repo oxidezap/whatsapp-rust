@@ -168,6 +168,16 @@ impl WacoreVoipMediaBackend {
     pub fn runtime(&self) -> &Arc<dyn wacore::runtime::Runtime> {
         &self.runtime
     }
+
+    /// Live map size, so tests can pin the anti-accumulation invariant. Production never
+    /// needs it: pruning happens on reserve and lookup.
+    #[cfg(test)]
+    fn session_count(&self) -> usize {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -179,10 +189,11 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         _direction: CallDirection,
     ) -> Arc<dyn VoipMediaSession> {
         let session = ResidentMediaSession::new();
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key.clone(), Arc::downgrade(&session));
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        // Same prune as the lookup path: calls reserved and ended before `open` must not
+        // accumulate a dead key per reservation on a long-lived client.
+        sessions.retain(|_, weak| weak.strong_count() > 0);
+        sessions.insert(key.clone(), Arc::downgrade(&session));
         session
     }
 
@@ -660,6 +671,28 @@ mod tests {
         assert!(backend.resident_session(&key).is_some());
         drop(session);
         assert!(backend.resident_session(&key).is_none());
+    }
+
+    #[test]
+    fn reserve_prunes_sessions_dropped_before_open() {
+        // Item 3: calls reserved and ended before `open` must not accumulate a dead key per
+        // reservation; the next reserve prunes them.
+        let backend = backend();
+        let first = MediaSessionKey::builder()
+            .call_id("SEAM-DEAD".into())
+            .generation(1)
+            .build();
+        let session = backend.reserve(&first, CallDirection::Outgoing);
+        assert_eq!(backend.session_count(), 1);
+        drop(session);
+        let second = MediaSessionKey::builder()
+            .call_id("SEAM-LIVE".into())
+            .generation(1)
+            .build();
+        let _live = backend.reserve(&second, CallDirection::Outgoing);
+        assert_eq!(backend.session_count(), 1);
+        assert!(backend.resident_session(&first).is_none());
+        assert!(backend.resident_session(&second).is_some());
     }
 
     #[test]
