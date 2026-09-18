@@ -15,6 +15,105 @@ use super::{
 /// Default WARP authentication-tag width when the relay omits `warp_mi_tag_len`.
 const WARP_MI_TAG_LEN: usize = 4;
 
+/// Select the endpoint a group relay's media should use.
+fn group_media_relay_endpoint(
+    relay: &crate::types::group_call::GroupCallRelay,
+) -> Option<&crate::types::group_call::GroupCallRelayEndpoint> {
+    use crate::types::group_call::GroupCallRelayEndpoint;
+    let usable = |endpoint: &&GroupCallRelayEndpoint| {
+        !endpoint.is_fna
+            && endpoint.ipv4.is_some()
+            && endpoint.port.is_some_and(|port| port != 0)
+            && relay
+                .tokens
+                .get(endpoint.token_id as usize)
+                .is_some_and(|token| !token.is_empty())
+    };
+    relay
+        .endpoints
+        .iter()
+        .filter(usable)
+        .find(|endpoint| endpoint.port == Some(super::relay_parse::WEB_CLIENT_RELAY_PORT))
+        .or_else(|| relay.endpoints.iter().find(usable))
+}
+
+impl MediaSessionSpec {
+    /// Build a native group-call spec before its shared keygen-v2 epoch arrives.
+    ///
+    /// The callKey is zeroed: media is gated until an authenticated epoch installs the real key, so
+    /// the bootstrap value is never permitted onto the wire. Mirrors the 1:1 constructor but pulls
+    /// the endpoint and token from the group relay block, which indexes its own token sets.
+    pub fn for_group(
+        direction: CallDirection,
+        key: MediaSessionKey,
+        self_lid: &str,
+        call_creator: &str,
+        relay: &crate::types::group_call::GroupCallRelay,
+    ) -> Result<Self, MediaSetupError> {
+        let endpoint = group_media_relay_endpoint(relay)
+            .ok_or_else(|| MediaSetupError::Relay("group relay has no endpoint".into()))?;
+        let relay_ip = endpoint
+            .ipv4
+            .clone()
+            .ok_or_else(|| MediaSetupError::Relay("group relay endpoint has no IPv4".into()))?;
+        let relay_port = endpoint
+            .port
+            .ok_or_else(|| MediaSetupError::Relay("group relay endpoint has no port".into()))?;
+        let relay_token = relay
+            .tokens
+            .get(endpoint.token_id as usize)
+            .filter(|token| !token.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                MediaSetupError::Relay(format!("group relay has no token #{}", endpoint.token_id))
+            })?;
+        if relay.key.is_empty() {
+            return Err(MediaSetupError::Relay(
+                "group relay has no <key> (STUN integrity key)".into(),
+            ));
+        }
+        let warp_mi_tag_len = relay
+            .warp_mi_tag_len
+            .map(|value| value as usize)
+            .unwrap_or(WARP_MI_TAG_LEN);
+        if !(1..=20).contains(&warp_mi_tag_len) {
+            return Err(MediaSetupError::Relay(format!(
+                "group relay advertised an unsupported WARP MI tag length: {warp_mi_tag_len}"
+            )));
+        }
+        let our_ssrc = super::ssrc::derive_wasm_participant_ssrc(
+            &key.call_id,
+            &super::ssrc::format_e2e_srtp_participant_id(self_lid),
+            0,
+        );
+        Ok(Self {
+            key,
+            direction,
+            self_lid: self_lid.to_string(),
+            peer_lid: call_creator.to_string(),
+            call_key: vec![0; 32],
+            ssrc: our_ssrc,
+            audio: MediaAudioSpec {
+                format: super::MediaAudioFormat::MLOW_16KHZ_60MS,
+                io: MediaAudioIo::Pcm,
+            },
+            relay_token,
+            auth_token: super::relay_parse::select_auth_token(
+                &relay.auth_tokens,
+                endpoint.auth_token_id,
+            ),
+            relay_ip,
+            relay_port,
+            integrity_key: relay.key.clone(),
+            warp_mi_tag_len,
+            enable_media: true,
+            enable_video: false,
+            enable_sframe: false,
+            group: None,
+        })
+    }
+}
+
 impl MediaSessionSpec {
     /// Build the spec from the callKey and the parsed `<relay>`.
     ///
@@ -178,5 +277,44 @@ mod tests {
         )
         .err();
         assert!(matches!(error, Some(MediaSetupError::Relay(_))));
+    }
+
+    #[test]
+    fn a_group_relay_builds_a_zero_key_spec() {
+        use crate::types::group_call::{GroupCallRelay, GroupCallRelayEndpoint};
+        let relay = GroupCallRelay::builder()
+            .uuid("relay".into())
+            .participant_uuid("participant".into())
+            .attribute_padding(false)
+            .warp_mi_tag_len(4)
+            .key(b"relay-key".to_vec())
+            .tokens(vec![vec![0xAB; 16]])
+            .auth_tokens(vec![vec![0xCD; 8]])
+            .endpoints(vec![
+                GroupCallRelayEndpoint::builder()
+                    .relay_id(1)
+                    .token_id(0)
+                    .auth_token_id(0)
+                    .relay_name("relay-1".into())
+                    .is_fna(false)
+                    .ipv4("203.0.113.9".into())
+                    .port(3480)
+                    .build(),
+            ])
+            .build();
+        let spec = MediaSessionSpec::for_group(
+            CallDirection::Outgoing,
+            key(),
+            "1:0@lid",
+            "2:0@lid",
+            &relay,
+        )
+        .expect("a complete group relay builds a spec");
+        assert_eq!(spec.relay_ip, "203.0.113.9");
+        assert_eq!(spec.relay_port, 3480);
+        assert_eq!(spec.relay_token, vec![0xAB; 16]);
+        assert_eq!(spec.auth_token, vec![0xCD; 8]);
+        assert_eq!(spec.call_key, vec![0u8; 32], "bootstrap key is zeroed");
+        assert!(!spec.enable_sframe);
     }
 }
