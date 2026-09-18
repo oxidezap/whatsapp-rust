@@ -12,6 +12,7 @@
 //! ([`ResidentMediaSession`]), which the call registry stores.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 
@@ -27,6 +28,14 @@ use wacore::voip_control::{
 const MIC_CHANNEL_CAPACITY: usize = 3;
 /// Mono 16 kHz 60 ms frame length the engine expects; a muted frame is zeroed only at this length.
 const WA_FRAME_SAMPLES: usize = 960;
+
+/// How long *any* relay factory has to hand back a connected transport.
+///
+/// Above the native dialer's own `RELAY_CONNECT_TIMEOUT`, deliberately: that one is more specific
+/// and names the endpoints it tried, so it should be the error a native call gets. This is the
+/// backstop for a factory an installed provider returned, which carries whatever bound its author
+/// gave it and, in a browser whose ICE never settles, may carry none.
+pub(crate) const RELAY_DIAL_CEILING: Duration = Duration::from_secs(20);
 
 /// Give the engine the platform's standard-Opus codec, when this build has one.
 ///
@@ -174,7 +183,9 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         // A call cannot start media over a dropped session. The facade checked this before the
         // dial; `open` is the sole startup path now, so the check lives here.
         if !client.is_connected() {
-            return Err(MediaSetupError::Backend(
+            // Transport failure, not a setup bug: the socket dropped mid-setup, so the facade
+            // maps this to `CallError::Connect`, as the old pre-connect recheck did.
+            return Err(MediaSetupError::Connect(
                 "connection dropped during call setup".into(),
             ));
         }
@@ -206,10 +217,20 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
             .relay_transport_factory(&endpoint)
             .await
             .map_err(|e| MediaSetupError::Backend(e.to_string()))?;
-        let (transport, relay_events) = factory
-            .connect()
-            .await
-            .map_err(|e| MediaSetupError::Backend(e.to_string()))?;
+        // The dial runs under a ceiling: a provider factory that never resolves must fail the
+        // call, not park it. Dropping this future (the control plane's ended race) drops the
+        // in-flight connect with it.
+        let dialed =
+            wacore::runtime::timeout(&*self.runtime, RELAY_DIAL_CEILING, factory.connect()).await;
+        let (transport, relay_events) = match dialed {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(error)) => return Err(MediaSetupError::Connect(error.to_string())),
+            Err(_) => {
+                return Err(MediaSetupError::Connect(format!(
+                    "the relay transport did not connect within {RELAY_DIAL_CEILING:?}"
+                )));
+            }
+        };
 
         let stats = resident.install_fresh_stats_cell();
         // The session has owned the public event stream since reservation, and the `CallHandle`
@@ -442,10 +463,7 @@ mod tests {
             wacore::runtime::AbortHandle::noop()
         }
 
-        fn sleep(
-            &self,
-            _duration: std::time::Duration,
-        ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+        fn sleep(&self, _duration: Duration) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
             Box::pin(std::future::pending())
         }
 

@@ -478,6 +478,11 @@ pub enum MediaSetupError {
     /// The relay block could not supply a usable endpoint, token or integrity key.
     #[error("relay setup failed: {0}")]
     Relay(String),
+    /// The relay transport failed to connect: the factory refused, the dial ceiling expired,
+    /// or the socket dropped mid-setup. This is transport failure, distinct from [`Self::Backend`]:
+    /// the facade maps it to `CallError::Connect`, everything else to `CallError::Setup`.
+    #[error("relay transport connect failed: {0}")]
+    Connect(String),
     #[error("media session setup failed: {0}")]
     Backend(String),
     /// No media backend was injected. A `voip-control`-only build compiles the call flow but ships
@@ -578,6 +583,16 @@ pub trait VoipMediaBackend: MaybeSendSync {
     /// driving on the executor it holds. A foreign backend that owns its executor does the same
     /// over its own media. `ctx` is the neutral opening context: ports, never a backend's
     /// internal mailboxes.
+    ///
+    /// Error grammar: [`MediaSetupError::Connect`] is transport failure (the factory refused,
+    /// the dial ceiling expired, the socket dropped); [`MediaSetupError::Backend`] is everything
+    /// else. The facade maps `Connect` to `CallError::Connect` and the rest to `CallError::Setup`,
+    /// so observable behavior for existing users does not change.
+    ///
+    /// Cancellation-safe: the control plane may drop this future when the call ends or is
+    /// superseded mid-setup. Dropping it before `Ok(())` installs no detached work — the drive
+    /// task is spawned synchronously with the `Ok`, with no await between — and any installed
+    /// work stops through [`VoipMediaSession::close`].
     async fn open(
         &self,
         spec: MediaSessionSpec,

@@ -2101,15 +2101,6 @@ const GROUP_CONTROL_CHANNEL_CAPACITY: usize = 64;
 /// Returned by `CallError::Connect` when the socket drops mid-setup, before the engine is attached.
 const ERR_DISCONNECTED_DURING_SETUP: &str = "connection dropped during call setup";
 
-/// How long *any* relay factory has to hand back a connected transport.
-///
-/// Above the native dialer's own `RELAY_CONNECT_TIMEOUT`, deliberately: that one is more specific
-/// and names the endpoints it tried, so it should be the error a native call gets. This is the
-/// backstop for a factory an installed provider returned, which carries whatever bound its author
-/// gave it and, in a browser whose ICE never settles, may carry none.
-#[cfg(test)]
-const RELAY_DIAL_CEILING: Duration = Duration::from_secs(20);
-
 /// Spawn the task that turns the offer's `<ack>` into a connected media engine: await the ack-waiter
 /// (bounded), and on a node carrying a `<relay>` attach the engine via [`attach_outgoing_relay`]
 /// (reusing its for_outgoing + generation handling). On timeout / no relay / closed channel the call
@@ -2590,7 +2581,7 @@ pub(crate) async fn attach_outgoing_relay(
             .call_registry()
             .remove_if_current(call_id, pending.generation);
         pending.ended.notify();
-        return Err(CallError::Setup(error.to_string()));
+        return Err(map_setup_error(error));
     }
     // The open awaited the relay dial, so the call may have ended or been superseded while it
     // waited: returning `Ok(true)` now would leave a live drive task behind a stale handle.
@@ -3063,6 +3054,15 @@ async fn spawn_registered_call(
 /// video plumbing and event stream to the backend, and lets `open` own the engine and the drive
 /// loop. The `CallHandle` reads the session's stream and holds the session.
 #[allow(clippy::too_many_arguments)]
+/// Map a backend setup failure onto the call error surface: transport failures stay
+/// `CallError::Connect` (the relay never came up), everything else is `CallError::Setup`.
+fn map_setup_error(error: wacore::voip_control::MediaSetupError) -> CallError {
+    match error {
+        wacore::voip_control::MediaSetupError::Connect(reason) => CallError::Connect(reason),
+        other => CallError::Setup(other.to_string()),
+    }
+}
+
 async fn open_registered_media(
     client: &Client,
     registration: &RegisteredCall,
@@ -3138,11 +3138,26 @@ async fn open_registered_media(
         }))
         .maybe_initial_codec(initial_codec)
         .build();
+    // Race the backend's setup against the call ending, mirroring the outgoing path: a hangup,
+    // peer terminate, or disconnect landing mid-dial drops the in-flight `open` future with it
+    // instead of holding callKey, credentials, and engine until the dial ceiling. The open future
+    // is cancellation-safe, so nothing detached survives the drop.
     let backend = registry.backend();
-    backend
-        .open(spec, ctx)
-        .await
-        .map_err(|error| CallError::Setup(error.to_string()))?;
+    let open = backend.open(spec, ctx);
+    let ending = registration.ended.wait();
+    futures::pin_mut!(open, ending);
+    let result = match futures::future::select(open, ending).await {
+        futures::future::Either::Left((result, _)) => result,
+        // Ended mid-setup: the loser `open` future drops here, aborting the in-flight dial.
+        // `Connect`, mirroring the outgoing race arm: the relay never came up because the call
+        // went away first, which is transport failure, not a setup bug.
+        futures::future::Either::Right(((), _)) => {
+            registry.remove_if_current(&registration.call_id, registration.generation);
+            registration.ended.notify();
+            return Err(CallError::Connect("call ended during relay connect".into()));
+        }
+    };
+    result.map_err(map_setup_error)?;
     // The open awaited the relay dial, so the call may have ended or been superseded while it
     // waited: returning the handle now would hand out a stale generation, and the backend would
     // have installed its drive task after the teardown. Close what open started and report the
@@ -3166,32 +3181,6 @@ async fn open_registered_media(
         ended: registration.ended.clone(),
         media: Some(session),
     })
-}
-
-/// Finish an answer after the peer has received `<accept>`. The teardown guard explicitly ends a
-/// locally failed or cancelled startup, but its generation claim no-ops after peer termination or
-/// same-call-id supersession.
-#[cfg(all(test, feature = "voip-engine-wacore"))]
-async fn spawn_answered_call(
-    client: &Client,
-    registration: &mut RegisteredCall,
-    mut teardown: AnswerTeardown,
-    engine: CallEngine,
-    factory: &dyn RelayTransportFactory,
-    audio: AudioEndpoints,
-    video: Option<VideoEndpoints>,
-) -> Result<CallHandle, CallError> {
-    match spawn_registered_call(client, registration, engine, factory, audio, video).await {
-        Ok(handle) => {
-            teardown.disarm();
-            registration.disarm();
-            Ok(handle)
-        }
-        Err(error) => {
-            teardown.terminate(client).await;
-            Err(error)
-        }
-    }
 }
 
 /// Connect the relay and spawn the driver task against pre-built shared handle state (mute flag,
@@ -3319,7 +3308,7 @@ async fn attach_engine(
         futures::pin_mut!(ending);
         match wacore::runtime::timeout(
             &*client.runtime,
-            RELAY_DIAL_CEILING,
+            crate::voip_control::wacore_backend::RELAY_DIAL_CEILING,
             futures::future::select(dial, ending),
         )
         .await
@@ -3328,8 +3317,9 @@ async fn attach_engine(
             // Ended mid-dial: the loser `dial` future drops here, aborting the connect.
             Ok(futures::future::Either::Right(((), _dial))) => None,
             Err(_) => {
+                let ceiling = crate::voip_control::wacore_backend::RELAY_DIAL_CEILING;
                 let e = CallError::Connect(format!(
-                    "the relay transport did not connect within {RELAY_DIAL_CEILING:?}"
+                    "the relay transport did not connect within {ceiling:?}"
                 ));
                 client.call_registry().set_close_reason(
                     call_id,
@@ -6962,6 +6952,18 @@ mod tests {
         }
     }
 
+    /// The generation the background drive registered, so a trigger handle can target it. The
+    /// bridge registers before dialing; a trigger that lands before that would hang up nothing.
+    async fn poll_generation(client: &Arc<Client>) -> u64 {
+        for _ in 0..100 {
+            if let Some(generation) = client.call_registry().generation_of("CID-FACADE") {
+                return generation;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the drive must register before the relay connect");
+    }
+
     /// In-memory relay factory: returns a transport that records sends and a channel the test feeds
     /// inbound events through. Lets `spawn_call` be exercised without a real DTLS/SCTP dialer.
     struct MockFactory {
@@ -7144,11 +7146,10 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
-        let error = match spawn_call(
+        let error = match spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &NeverConnects,
+            Arc::new(NeverConnects),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
@@ -7317,7 +7318,7 @@ mod tests {
 
         let res = attach_outgoing_relay(&client, &call_id, &sample_relay()).await;
         assert!(
-            matches!(res, Err(CallError::Setup(_))),
+            matches!(res, Err(CallError::Connect(_))),
             "a dial that refuses must fail the attach, got {res:?}"
         );
 
@@ -9769,11 +9770,10 @@ mod tests {
         // Disconnect clears is_connected before the connect path runs.
         client.set_connected_for_test(false);
 
-        let res = spawn_call(
+        let res = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &factory,
+            Arc::new(factory),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
@@ -9806,52 +9806,25 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
-        // The registry entry exists (as it would by the time the relay arrives); the handle is already
-        // out (as for an outgoing call), sharing the engine's `ended`/`muted`/events state.
-        let generation = client.call_registry().insert(mk_session());
-        let muted = Arc::new(AtomicBool::new(false));
-        let ended = Arc::new(EndedFlag::default());
-        let (ev_tx, ev_rx) = async_channel::unbounded::<CallEvent>();
-        let handle = CallHandle {
-            call_id: "CID-FACADE".into(),
-            generation,
-            peer_jid: caller(),
-            call_creator: caller(),
-            client_registry: client.call_registry(),
-            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
-            client: std::sync::Weak::new(),
-            muted: muted.clone(),
-            video: Arc::new(VideoShared::new()),
-            events: ev_rx,
-            ended: ended.clone(),
-            media: None,
-        };
-
-        // Drive attach_engine in the background; it parks in the gated connect.
-        let attach = tokio::spawn({
+        // Drive the production open in the background; it parks in the gated connect.
+        let drive = tokio::spawn({
             let client = client.clone();
             let factory = factory.clone();
             async move {
-                attach_engine(
+                spawn_call_via_backend(
                     &client,
-                    "CID-FACADE",
-                    generation,
-                    FailureCleanup::Here,
-                    engine(),
-                    &*factory,
+                    mk_session(),
+                    factory,
                     pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
                     None,
-                    Arc::new(VideoShared::new()),
-                    muted,
-                    ended,
-                    ev_tx,
-                    None,
-                    Arc::new(wacore::voip::MediaStatsCell::default()),
                 )
                 .await
             }
         });
-        // Let attach_engine reach the gated connect before hanging up.
+        // The bridge registers before dialing; resolve the generation for the trigger handle.
+        let generation = poll_generation(&client).await;
+        let handle = registry_handle(&client, generation);
+        // Let the drive reach the gated connect before hanging up.
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         handle.hangup_local().await;
@@ -9862,10 +9835,10 @@ mod tests {
                 "hangup in the connect window must wake wait_ended without the dial completing",
             );
 
-        let res = tokio::time::timeout(Duration::from_secs(2), attach)
+        let res = tokio::time::timeout(Duration::from_secs(2), drive)
             .await
-            .expect("attach_engine must return once hangup aborts the dial")
-            .expect("attach task");
+            .expect("the drive must return once hangup aborts the dial")
+            .expect("drive task");
         assert!(
             matches!(res, Err(CallError::Connect(_))),
             "an aborted dial surfaces a Connect error"
@@ -9894,62 +9867,54 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
-        let generation = client.call_registry().insert(mk_session());
-        let muted = Arc::new(AtomicBool::new(false));
-        let ended = Arc::new(EndedFlag::default());
-        // place_call/spawn_call wire this hook; replicate it so removing the entry wakes `ended`.
-        client
-            .call_registry()
-            .set_ended_notify("CID-FACADE", generation, {
-                let ended = ended.clone();
-                move || ended.notify()
-            });
-        let (ev_tx, _ev_rx) = async_channel::unbounded::<CallEvent>();
-
-        let attach = tokio::spawn({
+        // Drive the production open in the background; it parks in the gated connect.
+        let drive = tokio::spawn({
             let client = client.clone();
             let factory = factory.clone();
-            let ended = ended.clone();
             async move {
-                attach_engine(
+                spawn_call_via_backend(
                     &client,
-                    "CID-FACADE",
-                    generation,
-                    FailureCleanup::Here,
-                    engine(),
-                    &*factory,
+                    mk_session(),
+                    factory,
                     pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
                     None,
-                    Arc::new(VideoShared::new()),
-                    muted,
-                    ended,
-                    ev_tx,
-                    None,
-                    Arc::new(wacore::voip::MediaStatsCell::default()),
                 )
                 .await
             }
         });
-        // Let attach_engine park in the gated connect.
+        // The bridge registers before dialing; subscribe the session stream before the trigger
+        // so its end is observable. The internal registration owns the entry-wired hook now;
+        // the architecture's public end-signal is the session stream closing.
+        let generation = poll_generation(&client).await;
+        let stream = {
+            let session = client
+                .call_registry()
+                .media_session("CID-FACADE", generation)
+                .expect("registered session");
+            session.subscribe()
+        };
+        // Let the drive park in the gated connect.
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        // A disconnect clears the task-less registry entry, whose on_terminal hook wakes `ended`.
+        // A disconnect clears the task-less registry entry, whose on_terminal hook wakes the
+        // drive's ended race.
         client.call_registry().abort_all();
 
-        tokio::time::timeout(Duration::from_secs(2), ended.wait())
+        let res = tokio::time::timeout(Duration::from_secs(2), drive)
             .await
-            .expect(
-                "a disconnect in the connect window must wake `ended` without the dial completing",
-            );
-
-        let res = tokio::time::timeout(Duration::from_secs(2), attach)
-            .await
-            .expect("attach_engine must return once the disconnect aborts the dial")
-            .expect("attach task");
+            .expect("the drive must return once the disconnect aborts the dial")
+            .expect("drive task");
         assert!(
             matches!(res, Err(CallError::Connect(_))),
             "an aborted dial surfaces a Connect error"
         );
+        // With the drive done the session drops, closing the public stream: that close is the
+        // ended signal, and it must arrive without the dial completing.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stream.recv().await.is_ok() {}
+        })
+        .await
+        .expect("a disconnect in the connect window must end the session stream");
     }
 
     // A peer <terminate>/<reject> during the connect window removes the task-less registry entry via
@@ -9968,56 +9933,50 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
-        let generation = client.call_registry().insert(mk_session());
-        let muted = Arc::new(AtomicBool::new(false));
-        let ended = Arc::new(EndedFlag::default());
-        client
-            .call_registry()
-            .set_ended_notify("CID-FACADE", generation, {
-                let ended = ended.clone();
-                move || ended.notify()
-            });
-        let (ev_tx, _ev_rx) = async_channel::unbounded::<CallEvent>();
-
-        let attach = tokio::spawn({
+        // Drive the production open in the background; it parks in the gated connect.
+        let drive = tokio::spawn({
             let client = client.clone();
             let factory = factory.clone();
-            let ended = ended.clone();
             async move {
-                attach_engine(
+                spawn_call_via_backend(
                     &client,
-                    "CID-FACADE",
-                    generation,
-                    FailureCleanup::Here,
-                    engine(),
-                    &*factory,
+                    mk_session(),
+                    factory,
                     pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
                     None,
-                    Arc::new(VideoShared::new()),
-                    muted,
-                    ended,
-                    ev_tx,
-                    None,
-                    Arc::new(wacore::voip::MediaStatsCell::default()),
                 )
                 .await
             }
         });
+        // The bridge registers before dialing; subscribe the session stream before the trigger
+        // so its end is observable. The internal registration owns the entry-wired hook now;
+        // the architecture's public end-signal is the session stream closing.
+        let generation = poll_generation(&client).await;
+        let stream = {
+            let session = client
+                .call_registry()
+                .media_session("CID-FACADE", generation)
+                .expect("registered session");
+            session.subscribe()
+        };
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         // The peer terminal-stanza path (no pending entry; entry has no media task yet).
         terminate_call(&client, "CID-FACADE");
 
-        tokio::time::timeout(Duration::from_secs(2), ended.wait())
+        let res = tokio::time::timeout(Duration::from_secs(2), drive)
             .await
-            .expect("a peer terminate in the connect window must wake `ended`");
-
-        let res = tokio::time::timeout(Duration::from_secs(2), attach)
-            .await
-            .expect("attach_engine must return once the terminate aborts the dial")
-            .expect("attach task");
+            .expect("the drive must return once the terminate aborts the dial")
+            .expect("drive task");
         assert!(matches!(res, Err(CallError::Connect(_))));
         assert_eq!(client.call_registry().active_count(), 0);
+        // With the drive done the session drops, closing the public stream: that close is the
+        // ended signal, and it must arrive without the dial completing.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stream.recv().await.is_ok() {}
+        })
+        .await
+        .expect("a peer terminate in the connect window must end the session stream");
     }
 
     // A pending-outgoing call with no matching call-id leaves attach_outgoing_relay a no-op (returns
@@ -10056,11 +10015,10 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
         // CallHandle has no Debug, so match on the Result rather than expect_err.
-        let res = spawn_call(
+        let res = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &FailingFactory,
+            Arc::new(FailingFactory),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
@@ -10085,12 +10043,11 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
-        let result = spawn_answered_call(
+        let result = spawn_answered_via_backend(
             &client,
             &mut registration,
             teardown,
-            engine(),
-            &FailingFactory,
+            Arc::new(FailingFactory),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
@@ -10723,12 +10680,11 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
-        let spawn = spawn_answered_call(
+        let spawn = spawn_answered_via_backend(
             &client,
             &mut registration,
             teardown,
-            engine(),
-            &factory,
+            Arc::new(factory),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         );
