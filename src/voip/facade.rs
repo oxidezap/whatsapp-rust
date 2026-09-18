@@ -74,6 +74,18 @@ impl AudioEndpoints {
     fn signaling_rate(&self) -> u32 {
         self.config().format.signaling_rate
     }
+
+    /// The neutral opening ports this endpoint pair maps to, moving the trait objects across.
+    fn into_ports(self) -> wacore::voip_control::MediaAudioPorts {
+        match self {
+            Self::Pcm { source, sink } => {
+                wacore::voip_control::MediaAudioPorts::Pcm { source, sink }
+            }
+            Self::Encoded { source, sink, .. } => {
+                wacore::voip_control::MediaAudioPorts::Encoded { source, sink }
+            }
+        }
+    }
 }
 
 macro_rules! impl_media_builder_methods {
@@ -1193,6 +1205,14 @@ impl VideoEndpoints {
 
     fn has_valid_timing(&self) -> bool {
         self.source.rtp_timestamp_stride() != 0
+    }
+
+    /// The neutral opening ports this video endpoint pair maps to, moving the trait objects across.
+    fn into_ports(self) -> wacore::voip_control::MediaVideoPorts {
+        wacore::voip_control::MediaVideoPorts {
+            source: self.source,
+            sink: self.sink,
+        }
     }
 }
 
