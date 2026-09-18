@@ -34,10 +34,9 @@ use wacore::types::group_call::{
     CallLinkMedia, GROUP_CALL_MAX_PARTICIPANTS, GROUP_CALL_MAX_REMOTE_PARTICIPANTS,
     GroupCallDevice, GroupCallParticipant, GroupCallUpdate, ScreenShareState,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 use wacore::voip::transport::RelayTransportFactory;
-#[cfg(test)]
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 use wacore::voip::{CallChannels, CallConfig, CallEngine, EncodedAudioFrame, run_call};
 use wacore::voip_control::control::{
     VideoControl, VideoControlReceiver, VideoControlSender, video_control_channel,
@@ -54,10 +53,10 @@ use waproto::whatsapp as wa;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::client::{CallError, Client, ResponseWaiter};
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 use crate::voip::audio::WA_FRAME_SAMPLES;
 use crate::voip::audio::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 use crate::voip::driver::RandTxIds;
 use crate::voip::video::{TimedVideoFrame, VideoSink, VideoSource};
 
@@ -2289,7 +2288,7 @@ impl SetupStop {
 ///
 /// Cancellation, not failure: the error says the call ended, and the caller drops its endpoints
 /// on the way out rather than publishing a media setup failure for an ordinary ending.
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 async fn relay_factory_or_ended(
     client: &Client,
     registration: &RegisteredCall,
@@ -2427,7 +2426,7 @@ fn take_video_channels(
 
 /// The relay socket address to dial, read off a built config's already-parsed endpoint (avoids
 /// re-walking the relay block, which `CallConfig::for_*` already did into `relay_ip`/`relay_port`).
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 fn socket_addr_from_config(config: &CallConfig) -> Result<SocketAddr, CallError> {
     format!("{}:{}", config.relay_ip, config.relay_port)
         .parse()
@@ -2448,7 +2447,7 @@ fn socket_addr_from_config(config: &CallConfig) -> Result<SocketAddr, CallError>
 /// differ a ufrag built from the allocate token is one the relay refuses the browser's very first
 /// connectivity check over. `token_to_ice_ufrag`'s own doc has always named its input the auth
 /// token.
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 fn relay_endpoint_from_config(
     config: &CallConfig,
 ) -> Result<wacore::voip_control::transport::RelayEndpointParams, CallError> {
@@ -2971,7 +2970,7 @@ pub(crate) async fn send_answer_terminate(
 /// Spawn the call driver over `factory` after registering it. Generic over the relay factory so a
 /// test can inject an in-memory transport instead of the real DTLS/SCTP dialer.
 #[cfg(test)]
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 async fn spawn_call(
     client: &Client,
     session: wacore::voip_control::CallSession,
@@ -2990,7 +2989,7 @@ async fn spawn_call(
 
 /// Attach media to a generation that is already registered. Answering uses this after registering
 /// before call-key decryption; the generic spawn wrapper above uses the same path for tests.
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 async fn spawn_registered_call(
     client: &Client,
     registration: &RegisteredCall,
@@ -3146,7 +3145,7 @@ async fn open_registered_media(
 /// Finish an answer after the peer has received `<accept>`. The teardown guard explicitly ends a
 /// locally failed or cancelled startup, but its generation claim no-ops after peer termination or
 /// same-call-id supersession.
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 async fn spawn_answered_call(
     client: &Client,
     registration: &mut RegisteredCall,
@@ -3182,7 +3181,7 @@ enum FailureCleanup {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 async fn attach_engine(
     client: &Client,
     call_id: &str,
@@ -3787,14 +3786,14 @@ impl VideoFeed {
 /// Forwards mic frames to the engine, zeroing them while muted. Zeroing (vs. dropping) keeps the
 /// media stream fed: the engine turns an exact-zero frame into a one-byte DTX comfort-noise packet,
 /// so the relay's consent-freshness timer never sees a gap (a gap makes the peer re-negotiate).
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 struct MuteFeed {
     src: async_channel::Receiver<Vec<i16>>,
     out: async_channel::Sender<Vec<i16>>,
     muted: Arc<AtomicBool>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 impl MuteFeed {
     async fn run(self) {
         while let Ok(mut frame) = self.src.recv().await {
@@ -5147,7 +5146,7 @@ impl CallHandle {
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "voip-engine-wacore", not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use async_trait::async_trait;
@@ -12688,5 +12687,206 @@ mod tests {
         assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::Enable));
         assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::SetOrientation(3)));
         assert_eq!(ctl_rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+}
+
+/// The control-plane vertical slice: a real `Client` with an injected `FakeMediaBackend`, compiled
+/// **without** the resident engine. This is the architectural gate for the seam — if any production
+/// path it exercises reached for `CallEngine` or the engine feature, this module would not build.
+#[cfg(all(test, feature = "voip-control", not(feature = "voip-engine-wacore")))]
+mod control_only_tests {
+    use super::*;
+    use wacore::voip_control::fake_backend::FakeMediaBackend;
+    use wacore::voip_control::{
+        MediaCommand, MediaEvent, MediaSessionKey, MediaSessionSpec, MediaSetupError,
+        VoipMediaSession,
+    };
+
+    async fn client_with_fake_backend() -> (Arc<Client>, Arc<FakeMediaBackend>) {
+        let backend = Arc::new(FakeMediaBackend::new());
+        let client = crate::test_utils::create_test_client_with_voip_backend(backend.clone()).await;
+        client.set_connected_for_test(true);
+        (client, backend)
+    }
+
+    fn session(id: &str) -> wacore::voip_control::CallSession {
+        wacore::voip_control::CallSession::new_outgoing(
+            id,
+            Jid::new("222222222222222", Server::Lid),
+            Jid::new("111111111111111", Server::Lid),
+        )
+    }
+
+    /// Injecting a backend through the builder means the registry reserves a fake session, the
+    /// control plane can drive it, publish events into its stream, read its stats, and close it —
+    /// all with the engine feature off.
+    #[tokio::test]
+    async fn a_fake_backend_drives_the_control_plane_end_to_end() {
+        let (client, backend) = client_with_fake_backend().await;
+        let registry = client.call_registry();
+        assert_eq!(
+            registry
+                .backend()
+                .reserve(
+                    &MediaSessionKey::builder()
+                        .call_id("SEAM".into())
+                        .generation(0)
+                        .build(),
+                    CallDirection::Outgoing,
+                )
+                .stats(),
+            wacore::voip_control::MediaStats::default(),
+            "the injected backend is the one the registry reserves from"
+        );
+
+        let generation = registry.insert(session("SEAM-VERTICAL"));
+        let key = MediaSessionKey::builder()
+            .call_id("SEAM-VERTICAL".into())
+            .generation(generation)
+            .build();
+        let media = backend
+            .session(&key)
+            .expect("the fake backend reserved a session");
+
+        // The public event stream the `CallHandle` reads is the session's: a backend event reaches
+        // a subscriber, and a signaling event published through the registry lands there too.
+        let events = media.subscribe();
+        assert!(registry.send_call_event("SEAM-VERTICAL", MediaEvent::RelayAllocated));
+        assert_eq!(events.try_recv(), Ok(MediaEvent::RelayAllocated));
+
+        // A command the control plane submits reaches the session.
+        assert!(media.submit(MediaCommand::RequireVideoKeyframe));
+        assert!(
+            media
+                .record()
+                .commands
+                .iter()
+                .any(|(c, _)| matches!(c, MediaCommand::RequireVideoKeyframe))
+        );
+
+        // Stats flow through the seam and outlive the registry entry.
+        media.set_stats(
+            wacore::voip_control::MediaStats::builder()
+                .rtp_received(42)
+                .build(),
+        );
+        let handle_stats = registry.media_session("SEAM-VERTICAL", generation);
+        assert_eq!(handle_stats.expect("session held").stats().rtp_received, 42);
+
+        // Terminal close runs through the session and records its reason.
+        client.call_registry().set_close_reason(
+            "SEAM-VERTICAL",
+            generation,
+            wacore::voip_control::MediaCloseReason::Local,
+        );
+        assert!(registry.remove_if_current("SEAM-VERTICAL", generation));
+        assert_eq!(
+            media.record().closed,
+            Some(wacore::voip_control::MediaCloseReason::Local)
+        );
+    }
+
+    /// Starting media with no backend injected is the typed refusal the control-only build promises,
+    /// never a panic or a silent no-op.
+    #[tokio::test]
+    async fn starting_media_without_a_backend_is_a_typed_refusal() {
+        let client = crate::test_utils::create_test_client().await;
+        client.set_connected_for_test(true);
+        let registry = client.call_registry();
+        let generation = registry.insert(session("NO-BACKEND"));
+        let media = registry
+            .media_session("NO-BACKEND", generation)
+            .expect("the default registry still reserves a session");
+        assert_eq!(
+            registry
+                .backend()
+                .open(
+                    &media,
+                    MediaSessionSpec::builder()
+                        .key(
+                            MediaSessionKey::builder()
+                                .call_id("NO-BACKEND".into())
+                                .generation(generation)
+                                .build()
+                        )
+                        .direction(CallDirection::Outgoing)
+                        .self_lid("1:0@lid".into())
+                        .peer_lid("2:0@lid".into())
+                        .call_key(vec![0u8; 32])
+                        .ssrc(1)
+                        .audio(
+                            wacore::voip_control::MediaAudioSpec::builder()
+                                .format(wacore::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS)
+                                .io(wacore::voip_control::MediaAudioIo::Pcm)
+                                .build()
+                        )
+                        .relay_token(vec![])
+                        .auth_token(vec![])
+                        .relay_ip("127.0.0.1".into())
+                        .relay_port(3478)
+                        .integrity_key(vec![])
+                        .warp_mi_tag_len(4)
+                        .enable_media(false)
+                        .enable_video(false)
+                        .enable_sframe(false)
+                        .build(),
+                    wacore::voip_control::MediaOpenContext::for_test(),
+                )
+                .await,
+            Err(MediaSetupError::NoBackend)
+        );
+    }
+
+    /// ABA: two generations of the same call-id do not cross. A command for the superseded
+    /// generation is refused, and the old session is closed while the live one stays open.
+    #[tokio::test]
+    async fn a_superseded_generation_does_not_cross_into_the_live_one() {
+        let (client, backend) = client_with_fake_backend().await;
+        let registry = client.call_registry();
+
+        let old = registry.insert(session("ABA"));
+        backend
+            .session(
+                &MediaSessionKey::builder()
+                    .call_id("ABA".into())
+                    .generation(old)
+                    .build(),
+            )
+            .expect("old reserved");
+
+        let live = registry.insert(session("ABA"));
+        assert_ne!(old, live);
+        let live_media = backend
+            .session(
+                &MediaSessionKey::builder()
+                    .call_id("ABA".into())
+                    .generation(live)
+                    .build(),
+            )
+            .expect("live reserved");
+
+        // A late command/close for the old generation must not reach the live session.
+        registry.set_close_reason(
+            "ABA",
+            old,
+            wacore::voip_control::MediaCloseReason::SendFailed("stale".into()),
+        );
+        assert!(registry.remove_if_current("ABA", live));
+        assert_eq!(
+            live_media.record().closed,
+            Some(wacore::voip_control::MediaCloseReason::Local),
+            "the live generation closed with its own reason"
+        );
+        assert!(
+            backend
+                .session(
+                    &MediaSessionKey::builder()
+                        .call_id("ABA".into())
+                        .generation(old)
+                        .build()
+                )
+                .is_some(),
+            "the old session is not confused with the live one"
+        );
     }
 }

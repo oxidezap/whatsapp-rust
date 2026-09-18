@@ -24,7 +24,7 @@ const NAL_TYPE_FU_A: u8 = 28;
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
 /// One received access unit, reassembled back into Annex-B form.
-/// One received access unit. The neutral [`VideoFrame`](crate::voip_control::VideoFrame) is the one
+/// One received access unit. The neutral [`VideoFrame`] is the one
 /// definition, so the engine's reassembly and the public sink carry the same type.
 pub use crate::voip_control::VideoFrame;
 

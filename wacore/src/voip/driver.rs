@@ -65,7 +65,7 @@ pub struct CallChannels {
 }
 
 /// A pre-encoded video access unit with an RTP-clock capture timestamp. The neutral
-/// [`VideoInput`](crate::voip_control::VideoInput) is the one definition.
+/// [`VideoInput`] is the one definition.
 pub use crate::voip_control::VideoInput;
 
 /// Bound slow relay writes without truncating a complete video access unit.

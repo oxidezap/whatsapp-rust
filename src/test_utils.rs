@@ -247,7 +247,7 @@ pub async fn create_test_client_with_name(name: &str) -> Arc<Client> {
 
 /// Build an in-memory test client with an explicit VoIP media backend, so a test can substitute a
 /// fake for the default resident engine.
-#[cfg(feature = "voip-runtime")]
+#[cfg(feature = "voip-control")]
 pub async fn create_test_client_with_voip_backend(
     backend: Arc<dyn wacore::voip_control::VoipMediaBackend>,
 ) -> Arc<Client> {
@@ -709,7 +709,7 @@ pub(crate) async fn answer_iq(
     .await
     .unwrap_or_else(|_| panic!("an IQ waiter should be registered for {request_id}"));
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     client.bind_pending_call_link_join_ack(&response.as_node_ref());
     let delivered = node_to_owned_ref(response);
     // Test helper: the map only ever holds Iq waiters in these fixtures.

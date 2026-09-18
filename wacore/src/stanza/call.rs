@@ -216,6 +216,7 @@ fn parse_offer_enc(enc_node: &NodeRef<'_>) -> Option<crate::types::call::OfferEn
 
 /// Find the first `<relay>` node anywhere in the subtree (the offer's relay may sit under `<call>`
 /// or `<offer>` depending on server framing).
+#[cfg(feature = "voip-control")]
 pub use crate::voip_control::relay_parse::find_relay;
 
 /// The `device_orientation` a `<video>` advertisement child carries, in quarter

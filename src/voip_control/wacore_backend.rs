@@ -464,10 +464,10 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
     ///
     /// This is the sole media startup path: it builds the engine from the neutral spec, dials the
     /// relay through the client's transport factory, wires the session's own command mailboxes and
-    /// the platform ports into a [`CallChannels`], and runs the drive loop on this backend's
-    /// runtime. The drive task's abort handle is owned by the session, so `close` ends it; the
-    /// control plane never sees it. On return the terminal reason is recorded and the registry
-    /// entry reaped.
+    /// the platform ports into a [`CallChannels`](wacore::voip::CallChannels), and runs the drive
+    /// loop on this backend's runtime. The drive task's abort handle is owned by the session, so
+    /// `close` ends it; the control plane never sees it. On return the terminal reason is recorded
+    /// and the registry entry reaped.
     async fn open(
         &self,
         _session: &Arc<dyn VoipMediaSession>,

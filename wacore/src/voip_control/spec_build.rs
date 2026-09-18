@@ -1,4 +1,4 @@
-//! Building a [`MediaSessionSpec`](super::MediaSessionSpec) from a parsed relay block.
+//! Building a [`MediaSessionSpec`] from a parsed relay block.
 //!
 //! The 1:1 offer and the outgoing ack both carry a `<relay>`; this projects it onto the neutral spec
 //! the backend opens, deriving our participant SSRC and selecting the endpoint, token and integrity
