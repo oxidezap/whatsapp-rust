@@ -46,7 +46,7 @@ use wacore::voip_control::{
     CallDirection, CallEvent, CallPhase, MediaAudioCodec as AudioCodec,
     MediaAudioFormat as AudioFormat, MediaAudioRtpProfile as AudioRtpProfile,
     MediaKeyframeUrgency as KeyframeUrgency, MediaVideoUpgradeToken as VideoUpgradeToken,
-    VideoFrame, VideoInput,
+    VideoFrame, VideoInput, VoipMediaSession,
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
@@ -1998,7 +1998,14 @@ async fn place_call(
         let ended = ended.clone();
         move || ended.notify()
     });
-    let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(CALL_EVENT_CHANNEL_CAPACITY);
+    // The handle reads the session's own public stream from birth, so a signaling event that lands
+    // while the call is still dormant (no relay yet, `open` never ran) reaches the same queue the
+    // drive loop publishes into later. No await separates this from the insert above, so the
+    // freshly registered generation is still current.
+    let media = registry
+        .media_session(&call_id, generation)
+        .ok_or(CallError::CallEndedDuringSetup)?;
+    let ev_rx = media.subscribe();
 
     // The recv-rekey channel is session-owned (created at reservation), so an `<accept>` that
     // races ahead of the relay is buffered there. The drive loop takes its receiver when the relay
@@ -2033,7 +2040,7 @@ async fn place_call(
                 peer_video_orientations,
                 muted: muted.clone(),
                 ended: ended.clone(),
-                ev_tx,
+                media: media.clone(),
             },
         );
 
@@ -2075,7 +2082,7 @@ async fn place_call(
         video: video_shared,
         events: ev_rx,
         ended,
-        media: registry.media_session(&call_id, generation),
+        media: Some(media),
     })
 }
 
@@ -2096,10 +2103,10 @@ const OFFER_ACK_RELAY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const MIC_CHANNEL_CAPACITY: usize = 3;
 
-/// Bound on the consumer-facing `CallEvent` queue. The driver posts with `try_send`, so once a slow
-/// or absent consumer lets it fill, further diagnostics drop instead of growing without bound.
-/// Lifecycle events (RelayAllocated/Failed/TimedOut) are emitted before media flows, so they are
-/// never dropped, and call teardown is driven by the `ended` flag, not this channel.
+/// Bound on the legacy test-only engine path's `CallEvent` queue. Production calls read the
+/// session's own stream (bounded by `DEFAULT_CALL_EVENT_QUEUE_CAPACITY`, the same 64) from
+/// reservation, so this only sizes the direct-`attach_engine` harness below.
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 const CALL_EVENT_CHANNEL_CAPACITY: usize = 64;
 /// Signaling controls are rare, but the queue stays bounded against a stalled media task.
 #[cfg(test)]
@@ -2227,16 +2234,12 @@ fn take_pending_if_current(
 
 /// Put the reason a call never started onto its handle's stream.
 ///
-/// `force_send` rather than `try_send`, which is what every other publish onto this queue uses and
-/// is wrong for this one: a full queue would drop the one event that explains the teardown, and it
-/// is the *last* event either way -- so if something has to go, the oldest diagnostic is a better
-/// loss than the reason the call failed. Never blocks; a teardown cannot wait on a consumer.
-///
-/// The queue is empty in every case reachable today, since a dormant outgoing call has no driver
-/// publishing to it -- which is exactly why this is `force_send` rather than that assumption
-/// written down as a comment.
-fn publish_setup_failure(events: &async_channel::Sender<CallEvent>, reason: String) {
-    let _ = events.force_send(CallEvent::MediaSetupFailed(reason));
+/// Through the session's public stream (the dormant handle reads it): the entry may already be
+/// removed, but the held session still publishes. `VoipMediaSession::publish` force-sends, which
+/// is what this event needs -- a full queue must drop the oldest diagnostic, never the reason
+/// the call failed. Never blocks; a teardown cannot wait on a consumer.
+fn publish_setup_failure(media: &Arc<dyn VoipMediaSession>, reason: String) {
+    let _ = media.publish(CallEvent::MediaSetupFailed(reason));
 }
 
 /// Why a setup path stopped, which is not the same question as what went wrong.
@@ -2259,12 +2262,12 @@ enum SetupStop {
 impl SetupStop {
     /// The error to propagate, having published the reason if there was one to publish.
     ///
-    /// Takes the sender rather than being called beside `publish_setup_failure` so the choice is
+    /// Takes the session rather than being called beside `publish_setup_failure` so the choice is
     /// made once, at the one exit both kinds leave through.
-    fn into_error(self, events: &async_channel::Sender<CallEvent>) -> CallError {
+    fn into_error(self, media: &Arc<dyn VoipMediaSession>) -> CallError {
         match self {
             Self::Failed(e) => {
-                publish_setup_failure(events, e.to_string());
+                publish_setup_failure(media, e.to_string());
                 e
             }
             Self::Cancelled(e) => e,
@@ -2339,13 +2342,16 @@ fn fail_pending_outgoing_with(
         call_id,
         generation,
     );
+    // Queue the reason before the removal below closes the session stream.
+    if let Some(reason) = reason
+        && let Some(pending) = pending.as_ref()
+    {
+        publish_setup_failure(&pending.media, reason);
+    }
     client
         .call_registry()
         .remove_if_current(call_id, generation);
     if let Some(pending) = pending {
-        if let Some(reason) = reason {
-            publish_setup_failure(&pending.ev_tx, reason);
-        }
         pending.ended.notify();
     }
 }
@@ -2390,7 +2396,10 @@ pub(crate) struct PendingOutgoing {
     peer_video_orientations: Vec<(Option<Jid>, u8)>,
     muted: Arc<AtomicBool>,
     ended: Arc<EndedFlag>,
-    ev_tx: async_channel::Sender<CallEvent>,
+    /// The reserved media session. Setup failures publish through it (it owns the public stream
+    /// the dormant handle reads), so the reason survives even when the registry entry is already
+    /// gone -- the same reason the old facade-owned sender was held here rather than re-read.
+    media: Arc<dyn VoipMediaSession>,
 }
 
 /// Take the video plumbing's loop halves and wire the out-drain, yielding the neutral channels the
@@ -2541,7 +2550,6 @@ pub(crate) async fn attach_outgoing_relay(
         let ctx = wacore::voip_control::MediaOpenContext {
             audio: pending.audio.clone().into_ports(),
             video: None,
-            events: pending.ev_tx.clone(),
             video_channels: Some(video_channels),
             video_teardown: Some(pending.video_teardown),
             peer_video_orientations: pending.peer_video_orientations.clone(),
@@ -2557,10 +2565,11 @@ pub(crate) async fn attach_outgoing_relay(
     let (session, spec, ctx) = match build {
         Ok(triple) => triple,
         Err(stop) => {
+            // Queue the reason before the removal below closes the session stream.
+            let e = stop.into_error(&pending.media);
             client
                 .call_registry()
                 .remove_if_current(call_id, pending.generation);
-            let e = stop.into_error(&pending.ev_tx);
             pending.ended.notify();
             return Err(e);
         }
@@ -2588,10 +2597,11 @@ pub(crate) async fn attach_outgoing_relay(
             pending.generation,
             wacore::voip_control::MediaCloseReason::SetupFailed(error.to_string()),
         );
+        // Queue the reason before the removal below closes the session stream.
+        publish_setup_failure(&pending.media, error.to_string());
         client
             .call_registry()
             .remove_if_current(call_id, pending.generation);
-        publish_setup_failure(&pending.ev_tx, error.to_string());
         pending.ended.notify();
         return Err(CallError::Setup(error.to_string()));
     }
@@ -3066,7 +3076,12 @@ async fn open_registered_media(
     registration.ensure_current()?;
     let registry = registration.registry.clone();
     let muted = Arc::new(AtomicBool::new(false));
-    let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(CALL_EVENT_CHANNEL_CAPACITY);
+    // The handle reads the session's own public stream: the callee's accept-time signaling (peer
+    // video states racing the answer) lands in the same queue as the drive loop's media events.
+    let session = registry
+        .media_session(&registration.call_id, registration.generation)
+        .ok_or(CallError::CallEndedDuringSetup)?;
+    let ev_rx = session.subscribe();
     let video_shared = Arc::new(VideoShared::new());
     // The handle's video plumbing is created before media exists (so a dormant handle can steer),
     // so its loop halves are taken here and handed to `open`, which must use them.
@@ -3106,7 +3121,6 @@ async fn open_registered_media(
         }),
         video_teardown: None,
         peer_video_orientations: Vec::new(),
-        events: ev_tx.clone(),
         rekey: rekey_rx,
         muted: muted.clone(),
         group_epoch: group_epoch.map(|(transaction_id, epoch)| {
@@ -3117,9 +3131,6 @@ async fn open_registered_media(
         }),
         initial_codec,
     };
-    let session = registry
-        .media_session(&registration.call_id, registration.generation)
-        .ok_or(CallError::CallEndedDuringSetup)?;
     let backend = registry.backend();
     backend
         .open(&session, spec, ctx)
@@ -3200,6 +3211,21 @@ async fn attach_engine(
     rekey_rx: Option<async_channel::Receiver<wacore::voip_control::control::PeerAnswer>>,
     media_stats: Arc<wacore::voip::MediaStatsCell>,
 ) -> Result<(), CallError> {
+    // The session owns the public stream the handle reads; the harness's own sink only remains
+    // for the drive loop below. Resolve once: later arms may run after the entry is gone, and the
+    // held session still publishes then. The `ev_tx` fallback covers an entry removed before the
+    // first poll, where the old code published into the harness sink.
+    let media = client.call_registry().media_session(call_id, generation);
+    let publish_failure = |reason: String| {
+        // Prefer the session stream the handle reads, but an arm that already removed the entry
+        // closed it: then the harness sink is the only listener left, as before.
+        let delivered = media
+            .as_ref()
+            .is_some_and(|media| media.publish(CallEvent::MediaSetupFailed(reason.clone())));
+        if !delivered {
+            let _ = ev_tx.force_send(CallEvent::MediaSetupFailed(reason));
+        }
+    };
     let (group_tx, group_rx) = async_channel::bounded(GROUP_CONTROL_CHANNEL_CAPACITY);
     if !client.call_registry().set_group_control_sender(
         call_id,
@@ -3207,13 +3233,9 @@ async fn attach_engine(
         engine.media_warp_mi_tag_len(),
         group_tx,
     ) {
-        // Every exit below that *fails* says why through `ev_tx`, and the one that is merely
-        // cancelled does not. It has to be said here: for an outgoing call
-        // `attach_outgoing_relay` removed the `PendingOutgoing` before calling this, so the
-        // relay waiter's `fail_pending_outgoing_with` finds nothing and drops the reason with
-        // the sender it needed -- this function is the last owner of it. A caller that awaits
-        // the `Err` directly gets the reason twice and pays one queued event for it; a dormant
-        // outgoing handle gets it once instead of never.
+        // Every exit below that *fails* says why through `publish_failure`, and the one that is
+        // merely cancelled does not. A caller that awaits the `Err` directly gets the reason
+        // twice and pays one queued event for it; a dormant handle gets it once instead of never.
         let e = CallError::Setup(
             "group relay WARP tag length changed during media attachment".to_string(),
         );
@@ -3229,7 +3251,7 @@ async fn attach_engine(
                 .call_registry()
                 .remove_if_current(call_id, generation);
         }
-        publish_setup_failure(&ev_tx, e.to_string());
+        publish_failure(e.to_string());
         ended.notify();
         return Err(e);
     }
@@ -3251,7 +3273,7 @@ async fn attach_engine(
                 .call_registry()
                 .remove_if_current(call_id, generation);
         }
-        publish_setup_failure(&ev_tx, e.to_string());
+        publish_failure(e.to_string());
         ended.notify();
         return Err(e);
     }
@@ -3304,7 +3326,7 @@ async fn attach_engine(
                         .call_registry()
                         .remove_if_current(call_id, generation);
                 }
-                publish_setup_failure(&ev_tx, e.to_string());
+                publish_failure(e.to_string());
                 ended.notify();
                 return Err(e);
             }
@@ -3324,7 +3346,7 @@ async fn attach_engine(
                     .call_registry()
                     .remove_if_current(call_id, generation);
             }
-            publish_setup_failure(&ev_tx, e.to_string());
+            publish_failure(e.to_string());
             ended.notify();
             return Err(e);
         }
@@ -3891,7 +3913,7 @@ pub struct CallHandle {
     /// The media session this call reserved. Held so counters are read through the seam
     /// (`VoipMediaSession::stats`) rather than a parallel cell, and so the handle can steer video
     /// without reaching into a backend.
-    media: Option<Arc<dyn wacore::voip_control::VoipMediaSession>>,
+    media: Option<Arc<dyn VoipMediaSession>>,
 }
 
 fn ensure_group_invite_capacity(
@@ -7129,11 +7151,10 @@ mod tests {
 
     /// A dial that fails reaches a dormant outgoing handle, rather than only its caller.
     ///
-    /// `attach_outgoing_relay` removes the `PendingOutgoing` on its way in, so by the time
-    /// `attach_engine` gives up on the dial there is no pending entry left for the relay waiter's
-    /// `fail_pending_outgoing_with` to publish through -- it finds nothing and drops the reason
-    /// with the sender it needed. `attach_engine` is the last owner of `ev_tx`, so the reason is
-    /// said there or nowhere, and every exit of it that *fails* says one.
+    /// `attach_outgoing_relay` removes the `PendingOutgoing` on its way in, so by the time the
+    /// backend's `open` gives up on the dial there is no pending entry left for the relay
+    /// waiter's `fail_pending_outgoing_with` to publish through. The held session still
+    /// publishes, so the reason is said on the handle's own stream or nowhere.
     ///
     /// Through a `connect()` that refuses rather than one that stalls, deliberately. The stalling
     /// version tests `RELAY_DIAL_CEILING` and cannot be written here: under a paused clock this

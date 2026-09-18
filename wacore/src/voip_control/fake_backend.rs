@@ -32,8 +32,8 @@ pub struct FakeSessionRecord {
 pub struct FakeMediaSession {
     key: MediaSessionKey,
     record: Mutex<FakeSessionRecord>,
-    /// The single event sender, swap-able for the control plane's at registration, so a test
-    /// holding the receiver sees what the session publishes.
+    /// The session's own event sender from reservation. The handle subscribes to this stream, so
+    /// a test publishing here reaches the same queue the control plane publishes signaling into.
     events: Mutex<async_channel::Sender<MediaEvent>>,
     /// A cloneable handle to the same stream, handed back by [`VoipMediaSession::subscribe`].
     events_rx: async_channel::Receiver<MediaEvent>,
@@ -114,6 +114,12 @@ impl VoipMediaSession for FakeMediaSession {
 
     fn close(&self, reason: MediaCloseReason) {
         self.record.lock().unwrap_or_else(|e| e.into_inner()).closed = Some(reason);
+        // Same stream-close contract as the resident session: a lingering subscriber's `recv`
+        // ends instead of parking, and buffered events still drain.
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .close();
     }
 }
 

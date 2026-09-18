@@ -152,8 +152,8 @@ pub struct ResidentMediaSession {
     /// The public event stream for this call: the sender the drive loop and the control plane
     /// publish through, and the receiver every [`subscribe`](VoipMediaSession::subscribe) clones.
     /// One session has one ordered stream a consumer (and the `CallHandle`) reads, whether it is the
-    /// resident engine or a foreign one. Interior-mutable so the control plane can install the
-    /// sender it created.
+    /// resident engine or a foreign one. Interior-mutable so tests can swap the sender before they
+    /// subscribe; production keeps the reservation-time pair for the life of the call.
     events: Mutex<(
         async_channel::Sender<MediaEvent>,
         async_channel::Receiver<MediaEvent>,
@@ -274,7 +274,9 @@ impl ResidentMediaSession {
         self.mailboxes().media_task = Some(handle);
     }
 
-    /// Adopt the caller's public event sender (created once at registration).
+    /// Swap the public stream's sender, for tests that install their own sink before subscribing.
+    /// Production never calls this: the handle subscribes to the reservation-time stream, and a
+    /// swap after that would orphan its receiver.
     pub fn install_event_sender(&self, tx: async_channel::Sender<MediaEvent>) {
         self.events().0 = tx;
     }
@@ -638,6 +640,10 @@ impl VoipMediaSession for ResidentMediaSession {
         // transport. Idempotent because the handle is taken once.
         let task = self.mailboxes().media_task.take();
         drop(task);
+        // Then close the public stream. The entry-owned queue this session replaced closed when
+        // the entry dropped, so a lingering handle's `recv` ends instead of parking: buffered
+        // events still drain, and a publish racing the close fails cleanly like a closed queue.
+        self.events().0.close();
     }
 }
 

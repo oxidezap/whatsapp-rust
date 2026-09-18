@@ -126,10 +126,12 @@ pub struct MediaVideoPorts {
 
 /// Everything a backend needs to bring a reserved session operational, besides the spec.
 ///
-/// This is the neutral opening context: the platform's endpoints, the public event sink, and the
-/// one-shot recv-rekey source. The executor and the relay transport are deliberately absent -- they
-/// are Rust trait objects that cannot cross a process boundary, so they are constructor state of
-/// the backend, never context (F9).
+/// This is the neutral opening context: the platform's endpoints and the one-shot recv-rekey
+/// source. The public event stream is deliberately absent -- the session owns it from reservation
+/// and the handle reads it through `subscribe`, so a signaling event published before media
+/// attaches reaches the same stream the drive loop later publishes into. The executor and the
+/// relay transport are deliberately absent too -- they are Rust trait objects that cannot cross a
+/// process boundary, so they are constructor state of the backend, never context (F9).
 ///
 /// A backend's [`open`](super::VoipMediaBackend::open) owns the rest of the lifecycle: it builds
 /// its media, wires the session's own mailboxes, and starts driving. The control plane never hands
@@ -166,8 +168,6 @@ pub struct MediaOpenContext {
     /// Rotations a peer announced before media attached, in announcement order. The backend applies
     /// them the moment the plane is up, or the peer's first frames are stamped upright.
     pub peer_video_orientations: Vec<(Option<wacore_binary::Jid>, u8)>,
-    /// The public, ordered call event sink the handle reads.
-    pub events: async_channel::Sender<super::CallEvent>,
     /// The caller-only recv-rekey receiver; `None` on the callee side.
     pub rekey: Option<async_channel::Receiver<super::control::PeerAnswer>>,
     /// The microphone mute flag, shared with the consumer's `CallHandle`. A backend that wraps a
@@ -184,12 +184,10 @@ pub struct MediaOpenContext {
 }
 
 impl MediaOpenContext {
-    /// A minimal context for tests that only need `open` to be callable: stub ports, an event sink
-    /// nobody reads, and no rekey.
+    /// A minimal context for tests that only need `open` to be callable: stub ports and no rekey.
+    /// The event stream needs no stub: the session owns it, and `open` never touches it.
     #[must_use]
     pub fn for_test() -> Self {
-        let (events, events_rx) = async_channel::bounded(1);
-        events_rx.close();
         let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
         mic_rx.close();
         drop(mic_tx);
@@ -204,7 +202,6 @@ impl MediaOpenContext {
             video_channels: None,
             video_teardown: None,
             peer_video_orientations: Vec::new(),
-            events,
             rekey: None,
             muted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             group_epoch: None,

@@ -515,9 +515,9 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
             .map_err(|e| MediaSetupError::Backend(e.to_string()))?;
 
         let stats = resident.install_fresh_stats_cell();
-        // Adopt the caller's public event sender so signaling events and media events share one
-        // ordered stream the `CallHandle` reads.
-        resident.install_event_sender(ctx.events.clone());
+        // The session has owned the public event stream since reservation, and the `CallHandle`
+        // already reads it through `subscribe`: signaling events published before media attaches
+        // and the drive loop's media events share that one ordered stream with no install here.
         // If the caller pre-created the video plumbing, adopt its control sender so
         // `submit(MediaCommand::EnableVideo …)` reaches the loop's receiver while the handle steers
         // the same channel.
@@ -539,7 +539,18 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         // The outbound recv-rekey receiver: the caller may hand one in (foreign backends), else the
         // session's own (resident).
         let rekey = ctx.rekey.take().or_else(|| resident.take_rekey_receiver());
-        let channels = build_channels(&client, ctx, stats, group_ctl, key.generation, rekey)?;
+        // The drive loop publishes into the session's own stream, which the handle subscribed at
+        // registration: installing the context sender here would swap the stream out from under it.
+        let events = resident.event_sender();
+        let channels = build_channels(
+            &client,
+            ctx,
+            stats,
+            group_ctl,
+            key.generation,
+            rekey,
+            events,
+        )?;
 
         let runtime = Arc::clone(&self.runtime);
         let registry = client.call_registry();
@@ -571,6 +582,7 @@ fn build_channels(
     group_ctl: Option<async_channel::Receiver<wacore::voip::GroupControl>>,
     generation: u64,
     rekey: Option<async_channel::Receiver<wacore::voip_control::control::PeerAnswer>>,
+    events: async_channel::Sender<MediaEvent>,
 ) -> Result<wacore::voip::CallChannels, MediaSetupError> {
     use wacore::voip::CallChannels;
 
@@ -649,7 +661,7 @@ fn build_channels(
         speaker,
         encoded_audio_in,
         encoded_audio_out,
-        events: ctx.events,
+        events,
         rekey,
         video_in,
         timed_video_in,
