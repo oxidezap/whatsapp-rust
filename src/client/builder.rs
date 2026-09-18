@@ -620,13 +620,13 @@ impl ClientBuilder {
             },
         );
         let client = assembly.client();
-        #[cfg(feature = "voip-runtime")]
+        #[cfg(feature = "voip-control")]
         {
-            // A caller-supplied backend wins; otherwise the resident one is the default. The
-            // resident backend owns the runtime and holds the client weakly, so the control plane
-            // never has to be handed either. Only a `voip-engine-wacore` build has a resident
-            // engine to install; a `voip-control`-only build leaves the registry with no backend,
-            // and starting media reports the typed `MediaSetupError::NoBackend`.
+            // A caller-supplied backend wins; otherwise the resident one is the default when the
+            // engine feature is on. The resident backend owns the runtime and holds the client
+            // weakly, so the control plane never has to be handed either. A `voip-control`-only
+            // build with no backend injected leaves the registry with none, and starting media
+            // reports the typed `MediaSetupError::NoBackend`.
             #[allow(unused_mut)]
             let mut backend: Option<Arc<dyn wacore::voip_control::VoipMediaBackend>> =
                 self.voip_media_backend.clone();
