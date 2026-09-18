@@ -5,11 +5,13 @@
 //! feature; reject/terminate stay feature-free in `super`.
 
 use std::future::Future;
+#[cfg(test)]
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+#[cfg(test)]
 use bytes::Bytes;
 use log::warn;
 use portable_atomic::{AtomicU64, Ordering as PortableOrdering};
@@ -33,21 +35,24 @@ use wacore::types::group_call::{
     GroupCallDevice, GroupCallParticipant, GroupCallUpdate, ScreenShareState,
 };
 use wacore::voip::relay_parse::RelayData;
+#[cfg(test)]
 use wacore::voip::transport::RelayTransportFactory;
 use wacore::voip::{
-    AudioCodec, AudioConfig, AudioFormat, AudioRtpProfile, CallChannels, CallConfig, CallDirection,
-    CallEngine, CallEvent, CallPhase, CodecDecisionSource, EncodedAudioFrame, KeyframeUrgency,
-    VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame, VideoInput,
-    VideoUpgradeToken, run_call, video_control_channel,
+    AudioCodec, AudioConfig, AudioFormat, AudioRtpProfile, CallDirection, CallEvent, CallPhase,
+    KeyframeUrgency, VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame,
+    VideoInput, VideoUpgradeToken, video_control_channel,
 };
+#[cfg(test)]
+use wacore::voip::{CallChannels, CallConfig, CallEngine, EncodedAudioFrame, run_call};
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::client::{CallError, Client, ResponseWaiter};
-use crate::voip::audio::{
-    AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource, WA_FRAME_SAMPLES,
-};
+#[cfg(test)]
+use crate::voip::audio::WA_FRAME_SAMPLES;
+use crate::voip::audio::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
+#[cfg(test)]
 use crate::voip::driver::RandTxIds;
 use crate::voip::video::{TimedVideoFrame, VideoSink, VideoSource};
 
@@ -370,25 +375,14 @@ impl<'a> AcceptCall<'a> {
             &preaccept_id,
             &accept_id,
         )?;
-        let (mut engine, built_call_id, relay_endpoint) = send_preaccept_then_prepare(
+        let (spec, built_call_id) = send_preaccept_then_prepare(
             self.client,
             &registration,
             &mut teardown,
             preaccept,
-            self.build_engine(has_video, audio_config, group, registration.generation),
+            self.build_spec(has_video, audio_config, group, registration.generation),
         )
         .await?;
-        // Before a single packet: the escape and native Opus share every timing field, so this
-        // changes no RTP header and nothing that was signaled above, only which grammar the engine
-        // puts on the wire -- while `audio.format` keeps describing what the source hands it.
-        if let Some(codec) = engine_switch
-            && let Err(e) = engine.switch_audio_codec(codec, CodecDecisionSource::Negotiated)
-        {
-            log::debug!("voip: the offer selected {codec:?} and the engine refused it: {e}");
-            return Err(CallError::Media(
-                "the audio codec the peer selected could not be installed",
-            ));
-        }
         debug_assert_eq!(built_call_id, registration.call_id);
         // The decrypt above may await on the network (prekey fetch). If the connection dropped
         // meanwhile, cleanup_connection_state reaped the pending registration. Preserve the
@@ -397,20 +391,32 @@ impl<'a> AcceptCall<'a> {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
         registration.ensure_current()?;
-        let factory = relay_factory_or_ended(self.client, &registration, &relay_endpoint).await?;
         // Final acceptance waits until media setup succeeded and the registered generation is still
         // current; only then may the caller apply the participant keys and enter the call.
         send_answer_node(self.client, &registration, &mut teardown, accept).await?;
-        let handle = spawn_answered_call(
+        let result = open_registered_media(
             self.client,
-            &mut registration,
-            teardown,
-            engine,
-            &*factory,
+            &registration,
+            spec,
             audio,
             video,
+            None,
+            // Incoming group epoch is applied through the roster replay, not here.
+            None,
+            engine_switch,
         )
-        .await?;
+        .await;
+        let handle = match result {
+            Ok(handle) => {
+                teardown.disarm();
+                registration.disarm();
+                handle
+            }
+            Err(error) => {
+                teardown.terminate(self.client).await;
+                return Err(error);
+            }
+        };
         if !is_group && let Some(own_lid) = self.client.lid() {
             self.client.call_registry().set_group_invite_self_device(
                 &handle.call_id,
@@ -429,16 +435,17 @@ impl<'a> AcceptCall<'a> {
         Ok(handle)
     }
 
-    /// Build the [`CallEngine`] from the offer: decrypt the callKey over the Signal session, then
-    /// assemble the incoming-call config from the parsed relay. No network I/O beyond the Signal
-    /// session the decrypt needs.
-    async fn build_engine(
+    /// Build the neutral [`MediaSessionSpec`] from the offer: decrypt the callKey over the Signal
+    /// session, then assemble the incoming-call spec from the parsed relay. No network I/O beyond
+    /// the Signal session the decrypt needs. `self_lid` comes back so the caller can mark the
+    /// session's participant identity without an engine.
+    async fn build_spec(
         &self,
         enable_video: bool,
         audio: AudioConfig,
         group: Option<GroupCallUpdate>,
         generation: u64,
-    ) -> Result<(CallEngine, String, wacore::voip::RelayEndpointParams), CallError> {
+    ) -> Result<(wacore::voip_control::MediaSessionSpec, String), CallError> {
         let CallAction::Offer {
             call_id,
             call_creator,
@@ -454,34 +461,32 @@ impl<'a> AcceptCall<'a> {
         // Our own device LID: used both to pick the callKey enc for THIS device (a multi-device
         // offer lists one per `<destination><to jid>`) and as the send-side SRTP participant id.
         let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
+        let key = wacore::voip_control::MediaSessionKey::builder()
+            .call_id(call_id.clone())
+            .generation(generation)
+            .build();
         if let Some(group) = group.as_ref()
             && let Some(relay) = group.relay.as_ref()
         {
             let self_lid = own_lid.to_string();
-            let mut config = CallConfig::for_group(
+            let mut spec = wacore::voip_control::MediaSessionSpec::for_group(
                 CallDirection::Incoming,
-                call_id,
+                key,
                 &self_lid,
                 &call_creator.to_string(),
                 relay,
             )
             .map_err(|error| CallError::Setup(error.to_string()))?;
-            config.audio = audio;
-            config.enable_video = enable_video;
-            let relay_endpoint = relay_endpoint_from_config(&config)?;
-            let group_spec = crate::voip_control::MediaGroupSpec::builder()
-                .call_creator(call_creator.clone())
-                .self_jid(own_lid)
-                .initial_update(group.clone())
-                .build();
-            let engine = crate::voip_control::wacore_backend::build_engine_from_config(
-                config,
-                generation,
-                Some(group_spec),
-                Box::new(RandTxIds),
-            )
-            .map_err(|error| CallError::Setup(error.to_string()))?;
-            return Ok((engine, call_id.clone(), relay_endpoint));
+            spec.audio = audio.to_neutral();
+            spec.enable_video = enable_video;
+            spec.group = Some(
+                crate::voip_control::MediaGroupSpec::builder()
+                    .call_creator(call_creator.clone())
+                    .self_jid(own_lid)
+                    .initial_update(group.clone())
+                    .build(),
+            );
+            return Ok((spec, call_id.clone()));
         }
 
         let media = self
@@ -519,20 +524,18 @@ impl<'a> AcceptCall<'a> {
             .as_ref()
             .ok_or(CallError::Media("offer carried no <relay>"))?;
 
-        let mut config = CallConfig::for_incoming(call_id, &self_lid, &peer_lid, call_key, relay)
-            .map_err(|e| CallError::Setup(e.to_string()))?;
-        config.audio = audio;
-        config.enable_video = enable_video;
-        // Read the dial addr off the config before the backend consumes it (no second relay walk).
-        let relay_endpoint = relay_endpoint_from_config(&config)?;
-        let engine = crate::voip_control::wacore_backend::build_engine_from_config(
-            config,
-            generation,
-            None,
-            Box::new(RandTxIds),
+        let mut spec = wacore::voip_control::MediaSessionSpec::from_relay(
+            CallDirection::Incoming,
+            key,
+            &self_lid,
+            &peer_lid,
+            call_key,
+            relay,
         )
         .map_err(|e| CallError::Setup(e.to_string()))?;
-        Ok((engine, call_id.clone(), relay_endpoint))
+        spec.audio = audio.to_neutral();
+        spec.enable_video = enable_video;
+        Ok((spec, call_id.clone()))
     }
 }
 
@@ -2075,6 +2078,7 @@ fn client_weak(client: &Client) -> std::sync::Weak<Client> {
 const OFFER_ACK_RELAY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Three 60 ms frames absorb scheduling jitter without building a long capture delay.
+#[cfg(test)]
 const MIC_CHANNEL_CAPACITY: usize = 3;
 
 /// Bound on the consumer-facing `CallEvent` queue. The driver posts with `try_send`, so once a slow
@@ -2083,6 +2087,7 @@ const MIC_CHANNEL_CAPACITY: usize = 3;
 /// never dropped, and call teardown is driven by the `ended` flag, not this channel.
 const CALL_EVENT_CHANNEL_CAPACITY: usize = 64;
 /// Signaling controls are rare, but the queue stays bounded against a stalled media task.
+#[cfg(test)]
 const GROUP_CONTROL_CHANNEL_CAPACITY: usize = 64;
 
 /// Returned by `CallError::Connect` when the socket drops mid-setup, before the engine is attached.
@@ -2094,6 +2099,7 @@ const ERR_DISCONNECTED_DURING_SETUP: &str = "connection dropped during call setu
 /// and names the endpoints it tried, so it should be the error a native call gets. This is the
 /// backstop for a factory an installed provider returned, which carries whatever bound its author
 /// gave it and, in a browser whose ICE never settles, may carry none.
+#[cfg(test)]
 const RELAY_DIAL_CEILING: Duration = Duration::from_secs(20);
 
 /// Spawn the task that turns the offer's `<ack>` into a connected media engine: await the ack-waiter
@@ -2267,6 +2273,7 @@ impl SetupStop {
 ///
 /// Cancellation, not failure: the error says the call ended, and the caller drops its endpoints
 /// on the way out rather than publishing a media setup failure for an ordinary ending.
+#[cfg(test)]
 async fn relay_factory_or_ended(
     client: &Client,
     registration: &RegisteredCall,
@@ -2369,6 +2376,7 @@ pub(crate) struct PendingOutgoing {
 
 /// The relay socket address to dial, read off a built config's already-parsed endpoint (avoids
 /// re-walking the relay block, which `CallConfig::for_*` already did into `relay_ip`/`relay_port`).
+#[cfg(test)]
 fn socket_addr_from_config(config: &CallConfig) -> Result<SocketAddr, CallError> {
     format!("{}:{}", config.relay_ip, config.relay_port)
         .parse()
@@ -2389,6 +2397,7 @@ fn socket_addr_from_config(config: &CallConfig) -> Result<SocketAddr, CallError>
 /// differ a ufrag built from the allocate token is one the relay refuses the browser's very first
 /// connectivity check over. `token_to_ice_ufrag`'s own doc has always named its input the auth
 /// token.
+#[cfg(test)]
 fn relay_endpoint_from_config(
     config: &CallConfig,
 ) -> Result<wacore::voip::RelayEndpointParams, CallError> {
@@ -2894,6 +2903,7 @@ pub(crate) async fn send_answer_terminate(
 /// Spawn the call driver over `factory` after registering it. Generic over the relay factory so a
 /// test can inject an in-memory transport instead of the real DTLS/SCTP dialer.
 #[cfg(test)]
+#[cfg(test)]
 async fn spawn_call(
     client: &Client,
     session: wacore::voip::CallSession,
@@ -2912,6 +2922,7 @@ async fn spawn_call(
 
 /// Attach media to a generation that is already registered. Answering uses this after registering
 /// before call-key decryption; the generic spawn wrapper above uses the same path for tests.
+#[cfg(test)]
 async fn spawn_registered_call(
     client: &Client,
     registration: &RegisteredCall,
@@ -3063,6 +3074,7 @@ async fn open_registered_media(
 /// Finish an answer after the peer has received `<accept>`. The teardown guard explicitly ends a
 /// locally failed or cancelled startup, but its generation claim no-ops after peer termination or
 /// same-call-id supersession.
+#[cfg(test)]
 async fn spawn_answered_call(
     client: &Client,
     registration: &mut RegisteredCall,
@@ -3088,6 +3100,7 @@ async fn spawn_answered_call(
 /// Connect the relay and spawn the driver task against pre-built shared handle state (mute flag,
 /// ended flag, event sender). Shared so the outgoing relay-arrival path can drive the same
 /// already-handed-out [`CallHandle`]. The registry entry under `generation` must already exist.
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FailureCleanup {
     /// No outer registration guard remains, so attach_engine reaps failures itself.
@@ -3097,6 +3110,7 @@ enum FailureCleanup {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn attach_engine(
     client: &Client,
     call_id: &str,
@@ -3701,12 +3715,14 @@ impl VideoFeed {
 /// Forwards mic frames to the engine, zeroing them while muted. Zeroing (vs. dropping) keeps the
 /// media stream fed: the engine turns an exact-zero frame into a one-byte DTX comfort-noise packet,
 /// so the relay's consent-freshness timer never sees a gap (a gap makes the peer re-negotiate).
+#[cfg(test)]
 struct MuteFeed {
     src: async_channel::Receiver<Vec<i16>>,
     out: async_channel::Sender<Vec<i16>>,
     muted: Arc<AtomicBool>,
 }
 
+#[cfg(test)]
 impl MuteFeed {
     async fn run(self) {
         while let Ok(mut frame) = self.src.recv().await {
@@ -5063,6 +5079,7 @@ impl CallHandle {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    #[cfg(test)]
     use bytes::Bytes;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
