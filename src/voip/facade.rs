@@ -3183,9 +3183,12 @@ async fn attach_engine(
     };
 
     // Only the selected I/O pair stays open. Closed inactive channels make their driver select arms
-    // retire immediately without per-frame branching or idle tasks.
-    let (mic_rx, speaker, encoded_audio_in, encoded_audio_out, audio_feed) = match audio {
-        AudioEndpoints::Pcm { source, sink } => {
+    // retire immediately without per-frame branching or idle tasks. The endpoints are mapped to the
+    // neutral ports first, so this path and the backend's `open` build the same channel shape.
+    let (mic_rx, speaker, encoded_audio_in, encoded_audio_out, audio_feed) = match audio
+        .into_ports()
+    {
+        wacore::voip_control::MediaAudioPorts::Pcm { source, sink } => {
             let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(MIC_CHANNEL_CAPACITY);
             let mute_feed = MuteFeed {
                 src: source.frames(),
@@ -3203,7 +3206,7 @@ async fn attach_engine(
                 Some(feed),
             )
         }
-        AudioEndpoints::Encoded { source, sink, .. } => {
+        wacore::voip_control::MediaAudioPorts::Encoded { source, sink } => {
             let (_mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
             let (speaker, _speaker_rx) = async_channel::bounded::<Vec<i16>>(1);
             (mic_rx, speaker, source.frames(), sink.frames(), None)
@@ -3244,8 +3247,11 @@ async fn attach_engine(
             }
         }
     }));
-    if let Some(v) = &video {
-        video_shared.attach_endpoints(client, &v.source, &v.sink, ended.clone());
+    if let Some(v) = video {
+        // Mapped to the neutral ports so this path and the backend's `open` attach the same
+        // endpoints; `attach_endpoints` takes them back by trait object.
+        let ports = v.into_ports();
+        video_shared.attach_endpoints(client, &ports.source, &ports.sink, ended.clone());
         // From-start video: the engine was built with enable_video, but a same-path Enable is
         // idempotent and keeps one code path for both entries.
         video_shared.send_control(VideoControl::Enable);

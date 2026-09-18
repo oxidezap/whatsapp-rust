@@ -495,15 +495,7 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         let stats = resident.install_fresh_stats_cell();
         let video_ctl = resident.install_video_channel();
         let group_ctl = Some(resident.install_group_channel());
-        let channels = build_channels(
-            &client,
-            &resident,
-            ctx,
-            stats,
-            video_ctl,
-            group_ctl,
-            key.generation,
-        )?;
+        let channels = build_channels(&client, ctx, stats, video_ctl, group_ctl, key.generation)?;
 
         let runtime = Arc::clone(&self.runtime);
         let registry = client.call_registry();
@@ -530,7 +522,6 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
 /// far half dropped, so its select arm retires immediately without per-frame branching.
 fn build_channels(
     client: &crate::client::Client,
-    resident: &Arc<ResidentMediaSession>,
     ctx: wacore::voip_control::MediaOpenContext,
     media_stats: Arc<wacore::voip_control::media_stats::MediaStatsCell>,
     video_ctl: wacore::voip::VideoControlReceiver,
@@ -600,7 +591,7 @@ fn build_channels(
         speaker,
         encoded_audio_in,
         encoded_audio_out,
-        events: resident.event_sender(),
+        events: ctx.events,
         rekey: ctx.rekey,
         video_in,
         timed_video_in: Some(timed_video_in),
