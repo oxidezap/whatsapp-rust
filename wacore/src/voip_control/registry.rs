@@ -22,7 +22,11 @@ use crate::types::group_call::{
     GroupCallDevice, GroupCallParticipant, GroupCallUpdate, ScreenShare, WaitingRoom,
 };
 use crate::voip_control::CallEvent;
-use crate::voip_control::control::{GroupControl, VideoControl, VideoControlSender};
+use crate::voip_control::control::{GroupControl, VideoControl};
+// Only `set_video_channels` names the sender, and it is test-only: an unconditional import
+// warns (and fails `-D warnings`) in every build without `test`/`test-util`.
+#[cfg(any(test, feature = "test-util"))]
+use crate::voip_control::control::VideoControlSender;
 use crate::voip_control::group::{GroupCallState, GroupStateApply, group_device_is_local};
 use crate::voip_control::resident_session::{
     NoMediaBackend, codec_to_neutral, video_control_to_command,
