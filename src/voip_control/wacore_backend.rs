@@ -81,17 +81,16 @@ pub fn with_platform_audio_codec(engine: CallEngine) -> CallEngine {
 
 /// Build the engine from the neutral spec, applying the group media the spec carries.
 pub fn build_engine(
-    mut spec: MediaSessionSpec,
+    spec: MediaSessionSpec,
     tx_ids: Box<dyn wacore::voip::engine::TxIdSource>,
 ) -> Result<CallEngine, MediaSetupError> {
-    // Take the group before the config projection consumes the spec; it is applied to the engine
-    // after construction, not carried by `CallConfig`.
-    let group = spec.group.take();
-    let config = CallConfig::try_from(spec)?;
-    let engine = CallEngine::new(config, tx_ids)
+    // The non-lossy split: the group and the key come back beside the config, because `CallConfig`
+    // cannot hold them.
+    let parts = wacore::voip_control::engine_bridge::into_engine_parts(spec)?;
+    let engine = CallEngine::new(parts.config, tx_ids)
         .map(with_platform_audio_codec)
         .map_err(|error| MediaSetupError::Backend(error.to_string()))?;
-    let Some(group) = group else {
+    let Some(group) = parts.group else {
         return Ok(engine);
     };
     let mut engine = engine;
@@ -410,7 +409,11 @@ impl WacoreVoipMediaBackend {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl VoipMediaBackend for WacoreVoipMediaBackend {
-    fn reserve(&self, _call_id: &str, _direction: MediaDirection) -> Arc<dyn VoipMediaSession> {
+    fn reserve(
+        &self,
+        _key: &wacore::voip_control::MediaSessionKey,
+        _direction: MediaDirection,
+    ) -> Arc<dyn VoipMediaSession> {
         ResidentMediaSession::new()
     }
 
@@ -478,6 +481,19 @@ mod tests {
     }
 
     #[test]
+    fn reserve_takes_the_generational_key() {
+        // Item 1: the session's first step must carry the anti-ABA identity, not a bare call-id, so
+        // a pre-attach command from a superseded generation can be told apart at reservation time.
+        let backend = WacoreVoipMediaBackend::new();
+        let key = MediaSessionKey::builder()
+            .call_id("SEAM-1".into())
+            .generation(2)
+            .build();
+        let session = backend.reserve(&key, MediaDirection::Outgoing);
+        assert_eq!(session.stats(), wacore::voip_control::MediaStats::default());
+    }
+
+    #[test]
     fn the_engine_builds_from_the_neutral_spec() {
         let engine = build_engine(spec(), tx_ids()).expect("the neutral spec builds an engine");
         assert_eq!(engine.call_id(), "SEAM-1");
@@ -492,8 +508,10 @@ mod tests {
         let key = spec.key.clone();
         assert_eq!(key.call_id, "SEAM-1");
         assert_eq!(key.generation, 1);
-        let config = CallConfig::try_from(spec).expect("the spec projects onto a config");
-        assert_eq!(config.call_id, "SEAM-1");
+        let parts = wacore::voip_control::engine_bridge::into_engine_parts(spec)
+            .expect("the spec splits into engine parts");
+        assert_eq!(parts.key, key);
+        assert_eq!(parts.config.call_id, "SEAM-1");
     }
 
     #[test]

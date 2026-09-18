@@ -23,10 +23,11 @@ use crate::sync_marker::MaybeSendSync;
 use crate::types::call::VideoState;
 use crate::types::group_call::{GroupCallUpdate, ScreenShare, WaitingRoom};
 
-// The one place the neutral contract meets the engine: the consuming `TryFrom` conversions. Kept
-// out of this file so the compiler enforces that everything above stays free of `crate::voip`.
+// The one place the neutral contract meets the engine: the consuming conversions between the spec
+// and the engine config. Kept out of this file so the compiler enforces that everything above stays
+// free of `crate::voip`.
 #[cfg(feature = "voip")]
-mod engine_bridge;
+pub mod engine_bridge;
 
 /// One decrypted keygen-v2 epoch, kept as secret material.
 ///
@@ -619,13 +620,22 @@ impl MediaStats {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait VoipMediaBackend: MaybeSendSync {
-    /// Hand back a session for one call.
+    /// Hand back a session for `key`.
     ///
     /// The session owns the media command mailboxes for its call. The resident implementation
     /// returns a fresh, unwired session; wiring a driver's mailboxes into it is backend-specific and
     /// happens when the engine attaches. A foreign backend returns whatever session type its
     /// adapter drives.
-    fn reserve(&self, call_id: &str, direction: MediaDirection) -> Arc<dyn VoipMediaSession>;
+    ///
+    /// The key, not a bare call-id: the generational identity has to be present from the first
+    /// step, or a command that arrives before the engine attaches from a superseded generation of
+    /// the same call-id could reach the new session. [`MediaSessionSpec::key`] carries the same
+    /// key for the `open` half.
+    fn reserve(
+        &self,
+        key: &MediaSessionKey,
+        direction: MediaDirection,
+    ) -> Arc<dyn VoipMediaSession>;
 
     /// Build the engine for `spec`.
     ///

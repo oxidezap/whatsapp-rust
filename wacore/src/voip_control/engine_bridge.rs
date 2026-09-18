@@ -13,7 +13,9 @@
 use crate::voip::audio::AudioConfig;
 use crate::voip::engine::CallConfig;
 use crate::voip::session::CallDirection;
-use crate::voip_control::{MediaDirection, MediaSessionKey, MediaSessionSpec, MediaSetupError};
+use crate::voip_control::{
+    MediaDirection, MediaGroupSpec, MediaSessionKey, MediaSessionSpec, MediaSetupError,
+};
 
 impl TryFrom<(CallConfig, u64)> for MediaSessionSpec {
     type Error = MediaSetupError;
@@ -55,46 +57,79 @@ impl TryFrom<(CallConfig, u64)> for MediaSessionSpec {
     }
 }
 
-impl TryFrom<MediaSessionSpec> for CallConfig {
-    type Error = MediaSetupError;
+/// The engine-side pieces of a neutral spec, with nothing dropped.
+///
+/// [`MediaSessionSpec`] carries the generational [`MediaSessionKey`] and an optional
+/// [`MediaGroupSpec`], and [`CallConfig`] represents neither. A bare `TryFrom<MediaSessionSpec>`
+/// would therefore be a lossy public conversion: a caller could consume a spec and silently lose
+/// the group and the identity. This bundle keeps all three halves together, so the only public way
+/// across the boundary hands back everything.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct EngineParts {
+    pub key: MediaSessionKey,
+    pub config: CallConfig,
+    pub group: Option<MediaGroupSpec>,
+}
 
-    /// Project the neutral spec onto the engine config, consuming the spec.
-    ///
-    /// The inverse of [`TryFrom<(CallConfig, u64)>`](MediaSessionSpec). It no longer takes the group
-    /// separately: the group rides [`MediaSessionSpec::group`], and the caller applies it to the
-    /// engine after construction.
-    fn try_from(spec: MediaSessionSpec) -> Result<Self, Self::Error> {
-        let audio = AudioConfig::from_neutral(spec.audio).ok_or(MediaSetupError::BadAudioFormat)?;
-        if spec.relay_ip.parse::<std::net::Ipv4Addr>().is_err() {
-            return Err(MediaSetupError::BadEndpoint);
-        }
-        if spec.call_key.len() < 32 {
-            return Err(MediaSetupError::BadCallKey);
-        }
-        Ok(CallConfig {
-            call_id: spec.key.call_id,
-            // Exhaustive on purpose: a new direction fails to compile here rather than being
-            // silently dialed as the wrong side.
-            direction: match spec.direction {
-                MediaDirection::Outgoing => CallDirection::Outgoing,
-                MediaDirection::Incoming => CallDirection::Incoming,
-            },
-            self_lid: spec.self_lid,
-            peer_lid: spec.peer_lid,
-            call_key: spec.call_key,
-            ssrc: spec.ssrc,
-            audio,
-            relay_token: spec.relay_token,
-            auth_token: spec.auth_token,
-            relay_ip: spec.relay_ip,
-            relay_port: spec.relay_port,
-            integrity_key: spec.integrity_key,
-            warp_mi_tag_len: spec.warp_mi_tag_len,
-            enable_media: spec.enable_media,
-            enable_video: spec.enable_video,
-            enable_sframe: spec.enable_sframe,
-        })
+/// Split a neutral spec into everything the engine needs, consuming the spec.
+///
+/// This is the non-lossy inverse of [`TryFrom<(CallConfig, u64)>`](MediaSessionSpec): the config is
+/// validated and moved, while the group and the key come back beside it rather than being folded
+/// into `CallConfig`, which cannot hold them. Callers that only need the engine pass the `group`
+/// to `configure_group`; callers that need the identity read `key`.
+pub fn into_engine_parts(spec: MediaSessionSpec) -> Result<EngineParts, MediaSetupError> {
+    let audio = AudioConfig::from_neutral(spec.audio).ok_or(MediaSetupError::BadAudioFormat)?;
+    if spec.relay_ip.parse::<std::net::Ipv4Addr>().is_err() {
+        return Err(MediaSetupError::BadEndpoint);
     }
+    if spec.call_key.len() < 32 {
+        return Err(MediaSetupError::BadCallKey);
+    }
+    let MediaSessionSpec {
+        key,
+        direction,
+        self_lid,
+        peer_lid,
+        call_key,
+        ssrc,
+        relay_token,
+        auth_token,
+        relay_ip,
+        relay_port,
+        integrity_key,
+        warp_mi_tag_len,
+        enable_media,
+        enable_video,
+        enable_sframe,
+        group,
+        // `audio` is validated above; the format is rebuilt from the engine's own type.
+        audio: _,
+    } = spec;
+    let config = CallConfig {
+        call_id: key.call_id.clone(),
+        // Exhaustive on purpose: a new direction fails to compile here rather than being silently
+        // dialed as the wrong side.
+        direction: match direction {
+            MediaDirection::Outgoing => CallDirection::Outgoing,
+            MediaDirection::Incoming => CallDirection::Incoming,
+        },
+        self_lid,
+        peer_lid,
+        call_key,
+        ssrc,
+        audio,
+        relay_token,
+        auth_token,
+        relay_ip,
+        relay_port,
+        integrity_key,
+        warp_mi_tag_len,
+        enable_media,
+        enable_video,
+        enable_sframe,
+    };
+    Ok(EngineParts { key, config, group })
 }
 
 #[cfg(test)]
@@ -134,10 +169,13 @@ mod tests {
         assert_eq!(spec.key.call_id, "CID");
         assert_eq!(spec.key.generation, 42);
         assert_eq!(spec.call_key, call_key);
-        let rebuilt = CallConfig::try_from(spec).expect("the spec projects back");
-        assert_eq!(rebuilt.call_id, "CID");
-        assert_eq!(rebuilt.call_key, call_key);
-        assert_eq!(rebuilt.direction, CallDirection::Incoming);
+        let parts = into_engine_parts(spec).expect("the spec splits");
+        assert_eq!(parts.key.call_id, "CID");
+        assert_eq!(parts.key.generation, 42);
+        assert!(parts.group.is_none());
+        assert_eq!(parts.config.call_id, "CID");
+        assert_eq!(parts.config.call_key, call_key);
+        assert_eq!(parts.config.direction, CallDirection::Incoming);
     }
 
     #[test]
@@ -149,7 +187,7 @@ mod tests {
         };
         let spec = MediaSessionSpec::try_from((config, 1)).expect("projection does not validate");
         assert_eq!(
-            CallConfig::try_from(spec).err(),
+            into_engine_parts(spec).err(),
             Some(MediaSetupError::BadCallKey)
         );
     }
@@ -162,7 +200,7 @@ mod tests {
         let mut spec = MediaSessionSpec::try_from((config, 1)).expect("the config projects");
         spec.audio.format.sample_rate = 0;
         assert_eq!(
-            CallConfig::try_from(spec).err(),
+            into_engine_parts(spec).err(),
             Some(MediaSetupError::BadAudioFormat)
         );
     }
