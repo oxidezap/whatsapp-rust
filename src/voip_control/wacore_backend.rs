@@ -337,9 +337,9 @@ pub fn translate_event(event: CallEvent) -> Option<MediaEvent> {
         CallEvent::GroupUpdated(update) => MediaEvent::GroupUpdated(update),
         CallEvent::WaitingRoomUpdated(room) => MediaEvent::WaitingRoomUpdated(room),
         CallEvent::WaitingRoomHeartbeatFailed => MediaEvent::WaitingRoomHeartbeatFailed,
-        CallEvent::GroupControlRejected { control } => {
-            MediaEvent::GroupControlRejected(group_kind_to_neutral(control)?)
-        }
+        CallEvent::GroupControlRejected { control } => MediaEvent::GroupControlRejected {
+            control: group_kind_to_neutral(control)?,
+        },
         CallEvent::GroupRekeyFailed => MediaEvent::GroupRekeyFailed,
         CallEvent::HandRaised {
             participant,

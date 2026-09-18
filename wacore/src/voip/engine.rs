@@ -30,13 +30,14 @@ use super::group_media::{
     GroupRosterApply, group_device_is_local,
 };
 use super::h264::{VideoFrame, au_has_idr, au_is_keyframe};
-use super::media_stats::{
-    AudioHealthAlarm, AudioHealthWatch, AudioSilenceReason, CODEC_FLAP_LIMIT, CallMediaStats,
-};
+use super::media_stats::{AudioHealthAlarm, AudioHealthWatch, CODEC_FLAP_LIMIT, CallMediaStats};
+// Re-exported for the engine's tests and for callers that name the silence reason from this module;
+// the type itself lives in the neutral contract.
+pub use super::media_stats::AudioSilenceReason;
 #[cfg(feature = "voip-mlow")]
 use super::mlow;
 use super::rtcp::{
-    RTCP_PT_PSFB, RtcpFeedback, RtcpReportBlock, RtpReceptionStats, build_whatsapp_rtcp_cname,
+    RTCP_PT_PSFB, RtcpFeedback, RtpReceptionStats, build_whatsapp_rtcp_cname,
     parse_sender_report_timing, summarize_rtcp,
 };
 #[cfg(feature = "voip-mlow")]
@@ -50,7 +51,7 @@ use super::session::{
 };
 use super::sframe::{SframeIn, SframeSession};
 use super::{ssrc, stun};
-use crate::types::group_call::{GroupCallRelay, GroupCallUpdate, ScreenShare, WaitingRoom};
+use crate::types::group_call::{GroupCallRelay, GroupCallUpdate};
 use wacore_binary::Jid;
 use zeroize::Zeroize;
 
@@ -556,16 +557,10 @@ pub enum Output {
 }
 
 /// What decided a codec switch, so a consumer can tell parity from a rescue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum CodecDecisionSource {
-    /// The peer's `<capability>` said so. The normative source; this is what the official client
-    /// uses and the only thing it uses.
-    Negotiated,
-    /// The bytes on the wire said so, and they disagreed with the negotiation. Worth surfacing:
-    /// it means our model of the peer is wrong, not just that the audio was rescued.
-    Content,
-}
+///
+/// The neutral [`MediaCodecDecisionSource`](crate::voip_control::MediaCodecDecisionSource) is the
+/// one definition; the engine and the public event share it.
+pub use crate::voip_control::MediaCodecDecisionSource as CodecDecisionSource;
 
 /// Why a requested codec switch was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -580,267 +575,16 @@ pub enum CodecSwitchError {
 }
 
 /// Group-control command rejected without terminating the media driver.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum GroupControlKind {
-    Update,
-    Epoch,
-    Reaction,
-}
+///
+/// The neutral [`MediaGroupControlKind`](crate::voip_control::MediaGroupControlKind) is the one
+/// definition; the engine and the public event share it.
+pub use crate::voip_control::MediaGroupControlKind as GroupControlKind;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum CallEvent {
-    /// The relay accepted our allocate (an allocate/binding success arrived); media path is live.
-    RelayAllocated,
-    /// A standard Opus packet carried through MLOW's in-profile escape while PCM/MLOW I/O is
-    /// selected. Shells with an Opus decoder can play it; codec selection still follows signaling.
-    ForeignAudio(Bytes),
-    /// A standard Opus fallback packet received in PCM/MLOW mode from one authenticated group
-    /// participant. The participant metadata lets consumers keep one stateful decoder per sender.
-    ForeignGroupAudio(EncodedAudioFrame),
-    /// The peer selected signaling rates incompatible with the single profile offered locally.
-    AudioFormatMismatch {
-        expected_rate: u32,
-        received_rates: Vec<u32>,
-    },
-    /// The relay rejected our allocate. Terminal; carries the STUN error code (class*100 + number).
-    RelayAllocateFailed(u16),
-    /// The relay never acked the allocate within the deadline (wedged relay). Terminal.
-    RelayAllocateTimedOut,
-    /// The media path was never built, and this is why. Terminal.
-    ///
-    /// Distinct from the two above, which are the relay *answering* badly. This one is everything
-    /// before there is a relay to answer: no `<relay>` in the offer ack, an engine that would not
-    /// build, or a platform whose transport provider refused -- the last of which is a browser
-    /// with no `RTCPeerConnection`, where it is not an edge case but every outgoing call.
-    ///
-    /// It exists because `wait_ended()` resolving says a call is *over*, not that it never
-    /// started, so without this a setup failure was indistinguishable from an ordinary remote
-    /// hangup and its reason lived only in a log line.
-    MediaSetupFailed(String),
-    /// Replacing a migrated relay transport did not finish within the reconnect deadline.
-    RelayReconnectTimedOut,
-    /// The peer's `<video state=N>` signaling arrived (upgrade requested/accepted, stopped, ...).
-    /// Pushed by the signaling handler, not the engine; surfaced here so one event stream carries
-    /// the whole call. For an upgrade request, pass `upgrade_token` to `accept_video`; a cancelled
-    /// or superseded token cannot attach video endpoints.
-    /// Identity-aware consumers should use `PeerVideoStateChanged` instead and ignore this
-    /// compatibility event, rather than joining this queue with the global incoming-call stream.
-    VideoStateChanged {
-        state: crate::types::call::VideoState,
-        orientation: Option<u8>,
-        /// Accepting requires this exact token. `None` means simultaneous local and peer requests
-        /// were already resolved by the signaling state machine.
-        upgrade_token: Option<super::VideoUpgradeToken>,
-    },
-    /// A committed peer video-state notification with its signaling identity.
-    ///
-    /// Published on the same handle queue, under the same transition lock, as video-upgrade
-    /// tokens. Direct calls publish this before the matching legacy `VideoStateChanged`;
-    /// consume one variant or the other, not both. Group participants publish only this variant
-    /// and never enter the direct-call upgrade state machine.
-    ///
-    /// `source` is the parsed stanza's `participant`, or `from` when absent, not the stored
-    /// winning device. PN aliases are retained. `call_creator` is also the stanza's value.
-    /// These fields report the existing handler's decision; they do not add authorization.
-    /// Queue pressure retains the existing bounded eviction policy, not lossless delivery of pairs.
-    PeerVideoStateChanged {
-        source: Jid,
-        call_creator: Jid,
-        state: crate::types::call::VideoState,
-        orientation: Option<u8>,
-        /// The same token as the direct-call compatibility event; always `None` for groups.
-        upgrade_token: Option<super::VideoUpgradeToken>,
-    },
-    /// Outbound video needs an IDR before anything can go on the wire, and the
-    /// engine cannot make one — it transports encoded access units and never
-    /// touches pixels, so only the application's encoder can.
-    ///
-    /// Raised the moment the requirement appears, not once per dropped frame:
-    /// an upgrade being ungated, a group epoch commit, a source switch, or the
-    /// peer's own RTCP asking for one. Until an access unit carrying an IDR
-    /// arrives, every frame handed to the engine is dropped — so a consumer
-    /// that ignores this event sends nothing until its encoder's own keyframe
-    /// period comes round, which for a mid-call upgrade is the difference
-    /// between a picture appearing at once and appearing seconds later.
-    ///
-    /// The shipped client does the same thing at the same moments
-    /// (`pjmedia_vid_stream_request_keyframe`, and its "requesting keyframe
-    /// after dropped frames" / "will request keyframe on resume" paths).
-    VideoKeyframeNeeded,
-    /// A newer authoritative group membership/relay snapshot was committed.
-    GroupUpdated(Box<GroupCallUpdate>),
-    /// A newer authoritative call-link admission snapshot was committed.
-    WaitingRoomUpdated(Box<WaitingRoom>),
-    /// Repeated waiting-room heartbeats failed and the pending call-link admission was abandoned.
-    WaitingRoomHeartbeatFailed,
-    /// One signaling/app-data control was rejected while the call itself remained healthy.
-    GroupControlRejected { control: GroupControlKind },
-    /// A server-requested shared epoch could not be distributed or committed locally.
-    GroupRekeyFailed,
-    /// One participant raised or lowered their hand.
-    HandRaised { participant: Jid, raised: bool },
-    /// One participant started or stopped screen sharing.
-    ScreenShareChanged {
-        participant: Jid,
-        screen_share: ScreenShare,
-    },
-    /// One authenticated, participant-attributed RTC reaction.
-    Reaction {
-        participant: Jid,
-        device: Jid,
-        pid: Option<u32>,
-        /// `None` removes the participant's previous reaction.
-        emoji: Option<String>,
-        removed: bool,
-    },
-    /// Authenticated peer RTCP. A referenced local video SSRC proves the peer built a receiver for
-    /// our outbound stream; RR, NACK, PLI and FIR are all represented here.
-    RtcpReceived {
-        packet_types: Vec<u8>,
-        sender_ssrc: u32,
-        referenced_ssrcs: Vec<u32>,
-        reports_audio: bool,
-        reports_video: bool,
-        report_blocks: Vec<RtcpReportBlock>,
-        feedback: Vec<RtcpFeedback>,
-    },
-    /// Relay-send backpressure discarded complete media units before transmission.
-    OutboundMediaDropped {
-        video_access_units: u32,
-        packets: u32,
-    },
-    /// Audio RTP keeps arriving and none of it is becoming sound.
-    ///
-    /// The consumer-visible answer to the failure mode behind issue #1105: a call that connects,
-    /// stays connected, and carries silence used to be indistinguishable from a peer who is not
-    /// speaking. Re-emitted on a fixed cadence while the condition holds, with a monotonic
-    /// `silent_for_ms`, so a truncated log still catches it. Diagnostic, never terminal.
-    AudioSilent {
-        silent_for_ms: Millis,
-        /// Packets counted in the window that produced this alarm, not for the whole call.
-        rtp_received: u32,
-        frames_produced: u32,
-        dominant_reason: AudioSilenceReason,
-    },
-    /// The payload grammar in use changed inside the negotiated RTP timing.
-    ///
-    /// `source: Content` means the peer's bytes contradicted its signaling, which is a statement
-    /// about our model of the peer and not only about this call.
-    AudioCodecSwitched {
-        from: AudioCodec,
-        to: AudioCodec,
-        source: CodecDecisionSource,
-        /// Audio packets seen before the switch, so a late switch is distinguishable from an
-        /// immediate one without correlating timestamps.
-        packets_observed: u32,
-    },
-    /// The peer speaks one codec and this call's encoded source emits another, and neither can
-    /// move: the source was built by the application and carries no per-frame codec, so the engine
-    /// cannot re-point it the way it re-points its own encoder.
-    ///
-    /// The mid-call twin of [`CallError::EncodedAudioCodecNotNegotiated`][enc], which refuses the
-    /// same mismatch at answer time. Nothing is switched -- switching would keep taking the
-    /// application's bytes and send them under a profile that accepts any nonempty payload, so the
-    /// peer would hear noise with nothing on this side noticing. Only the application can pick a
-    /// codec, so only it can end or rebuild this call.
-    ///
-    /// [enc]: https://docs.rs/whatsapp-rust/latest/whatsapp_rust/voip/enum.CallError.html
-    AudioCodecSourceIsFixed {
-        /// What the application's source emits, and what this call keeps sending.
-        sending: AudioCodec,
-        /// What the peer says it speaks.
-        peer_expects: AudioCodec,
-        /// Whether the peer said so in signaling or in its packets.
-        source: CodecDecisionSource,
-    },
-    /// Audio RTP has stopped arriving: either none ever did since the relay allocated, or the
-    /// peer's media stopped mid-call. `silent_for_ms` measures from the last packet, or from the
-    /// allocate when there has been none.
-    ///
-    /// Deliberately distinct from [`Self::AudioSilent`]: this one is a transport problem and that
-    /// one is a codec problem, and conflating them is exactly how #1105 was mis-triaged for months.
-    /// Emitted once per stall -- reception recovering re-arms it, so a call that drops out twice
-    /// says so twice.
-    AudioReceptionStalled { silent_for_ms: Millis },
-}
-
-impl CallEvent {
-    pub(crate) fn heap_bytes(&self) -> usize {
-        use core::mem::size_of;
-
-        use crate::stats::HeapSize;
-
-        match self {
-            // A unit variant: no heap behind it.
-            Self::VideoKeyframeNeeded => 0,
-            Self::ForeignAudio(data) => data.len(),
-            Self::ForeignGroupAudio(frame) => {
-                frame.data.len()
-                    + frame.sender.as_ref().map_or(0, HeapSize::heap_bytes)
-                    + frame.device.as_ref().map_or(0, HeapSize::heap_bytes)
-            }
-            Self::AudioFormatMismatch { received_rates, .. } => {
-                received_rates.capacity() * size_of::<u32>()
-            }
-            Self::GroupUpdated(update) => size_of::<GroupCallUpdate>() + update.heap_bytes(),
-            Self::WaitingRoomUpdated(room) => size_of::<WaitingRoom>() + room.heap_bytes(),
-            Self::HandRaised { participant, .. } | Self::ScreenShareChanged { participant, .. } => {
-                participant.heap_bytes()
-            }
-            Self::Reaction {
-                participant,
-                device,
-                emoji,
-                ..
-            } => {
-                participant.heap_bytes()
-                    + device.heap_bytes()
-                    + emoji.as_ref().map_or(0, String::capacity)
-            }
-            Self::RtcpReceived {
-                packet_types,
-                referenced_ssrcs,
-                report_blocks,
-                feedback,
-                ..
-            } => {
-                packet_types.capacity()
-                    + referenced_ssrcs.capacity() * size_of::<u32>()
-                    + report_blocks.capacity() * size_of::<RtcpReportBlock>()
-                    + report_blocks
-                        .iter()
-                        .map(|report| report.profile_extension.capacity())
-                        .sum::<usize>()
-                    + feedback.capacity() * size_of::<RtcpFeedback>()
-                    + feedback
-                        .iter()
-                        .map(|item| item.fci.capacity())
-                        .sum::<usize>()
-            }
-            Self::MediaSetupFailed(reason) => reason.capacity(),
-            Self::PeerVideoStateChanged {
-                source,
-                call_creator,
-                ..
-            } => source.heap_bytes() + call_creator.heap_bytes(),
-            Self::RelayAllocated
-            | Self::RelayAllocateFailed(_)
-            | Self::RelayAllocateTimedOut
-            | Self::RelayReconnectTimedOut
-            | Self::VideoStateChanged { .. }
-            | Self::WaitingRoomHeartbeatFailed
-            | Self::GroupControlRejected { .. }
-            | Self::GroupRekeyFailed
-            | Self::OutboundMediaDropped { .. }
-            | Self::AudioSilent { .. }
-            | Self::AudioCodecSwitched { .. }
-            | Self::AudioCodecSourceIsFixed { .. }
-            | Self::AudioReceptionStalled { .. } => 0,
-        }
-    }
-}
+/// The public call event stream, owned by the control plane.
+///
+/// The enum itself lives in `crate::voip_control` (see its docs); this re-export keeps the historical
+/// `crate::voip::CallEvent` path and lets the engine emit it without naming an engine-owned type.
+pub use crate::voip_control::CallEvent;
 
 /// Restore an encoded source's payload for an active format it was not configured for.
 ///

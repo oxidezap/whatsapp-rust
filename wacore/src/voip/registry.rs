@@ -50,33 +50,11 @@ const MAX_RINGING_GROUP_CALLS: usize = 64;
 const MAX_RINGING_GROUP_CALL_BYTES: usize = 1024 * 1024;
 
 /// Identifies one peer video-upgrade request within one call generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VideoUpgradeToken {
-    generation: u64,
-    epoch: u64,
-}
-
-impl VideoUpgradeToken {
-    pub fn generation(self) -> u64 {
-        self.generation
-    }
-
-    /// The per-generation request sequence number.
-    ///
-    /// Two requests can share a generation (a peer cancels and re-requests), so `epoch` is what
-    /// distinguishes them. Exposed so a media backend can carry the token across the neutral seam
-    /// and hand it back unchanged on accept; without it the seam could only preserve `generation`,
-    /// and accepting an upgrade through a foreign backend would be ambiguous.
-    pub fn epoch(self) -> u64 {
-        self.epoch
-    }
-
-    /// Rebuild a token from its parts, as carried across the neutral seam.
-    #[must_use]
-    pub fn from_parts(generation: u64, epoch: u64) -> Self {
-        Self { generation, epoch }
-    }
-}
+///
+/// This is the neutral [`MediaVideoUpgradeToken`](crate::voip_control::MediaVideoUpgradeToken) under
+/// its historical name: one type, so the token the signaling handler mints and the token the public
+/// event carries cannot drift.
+pub use crate::voip_control::MediaVideoUpgradeToken as VideoUpgradeToken;
 
 /// Result of applying a committed peer video-state transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

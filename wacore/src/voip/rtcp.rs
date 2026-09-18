@@ -44,27 +44,10 @@ pub struct RtcpSummary {
     pub uses_whatsapp_profile_extension: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RtcpFeedback {
-    pub packet_type: u8,
-    pub fmt: u8,
-    pub sender_ssrc: u32,
-    pub media_ssrc: u32,
-    pub fci: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RtcpReportBlock {
-    pub ssrc: u32,
-    pub fraction_lost: u8,
-    pub cumulative_lost: i32,
-    pub extended_highest_sequence: u32,
-    pub jitter: u32,
-    pub last_sender_report: u32,
-    pub delay_since_last_sender_report: u32,
-    /// WhatsApp appends per-stream fields after the RFC 3550 block.
-    pub profile_extension: Vec<u8>,
-}
+/// The neutral RTCP payload types are the one definition: the parser fills them and the public
+/// `CallEvent::RtcpReceived` carries them across the seam.
+pub use crate::voip_control::MediaRtcpFeedback as RtcpFeedback;
+pub use crate::voip_control::MediaRtcpReportBlock as RtcpReportBlock;
 
 fn parse_sdes_cname_lengths(packet: &[u8], source_count: usize) -> Option<Vec<usize>> {
     let mut cursor = 4usize;

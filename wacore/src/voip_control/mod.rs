@@ -20,8 +20,7 @@ use wacore_binary::Jid;
 use zeroize::Zeroizing;
 
 use crate::sync_marker::MaybeSendSync;
-use crate::types::call::VideoState;
-use crate::types::group_call::{GroupCallUpdate, ScreenShare, WaitingRoom};
+use crate::types::group_call::GroupCallUpdate;
 
 // The one place the neutral contract meets the engine: the consuming conversions between the spec
 // and the engine config. Kept out of this file so the compiler enforces that everything above stays
@@ -42,6 +41,11 @@ pub mod fake_backend;
 // Signaling/control call state -- identity, direction, lifecycle -- that carries no engine type, so
 // the call flow can name a session with the engine off. `crate::voip::session` re-exports these.
 pub mod signaling;
+
+// The public, ordered call event stream. Moved out of the engine so the public API no longer names
+// an engine enum; the engine re-exports it as `crate::voip::CallEvent`.
+pub mod events;
+pub use events::CallEvent;
 
 // The relay `<relay>` parser: pure signaling metadata (endpoints, tokens, keys) that the control
 // plane reads before any engine exists. Names only `NodeRef` and `base64`, so it belongs here.
@@ -150,6 +154,30 @@ pub enum MediaKeyframeUrgency {
 pub struct MediaVideoUpgradeToken {
     pub generation: u64,
     pub epoch: u64,
+}
+
+impl MediaVideoUpgradeToken {
+    /// The call generation this request belongs to.
+    #[must_use]
+    pub fn generation(self) -> u64 {
+        self.generation
+    }
+
+    /// The per-generation request sequence number.
+    ///
+    /// The rotation is what distinguishes two requests in one generation: a peer can cancel and
+    /// re-request, and accepting the older token would attach video for a request the peer withdrew.
+    #[must_use]
+    pub fn epoch(self) -> u64 {
+        self.epoch
+    }
+
+    /// Rebuild the token where the fields are not directly nameable, e.g. from `(generation, epoch)`
+    /// carried as a pair across a seam.
+    #[must_use]
+    pub fn from_parts(generation: u64, epoch: u64) -> Self {
+        Self { generation, epoch }
+    }
 }
 
 /// A roster snapshot plus its decrypted epoch, kept indivisible. Replaces the engine's
@@ -373,103 +401,11 @@ pub enum MediaCommand {
     SendGroupReaction(String),
 }
 
-/// One event the media plane raises to the control plane. Replaces the engine-owned subset of the
-/// engine's `CallEvent`.
+/// One event the media plane raises to the control plane.
 ///
-/// Signaling-born events (`VideoStateChanged`, `GroupUpdated`, `WaitingRoomUpdated`, `HandRaised`,
-/// `ScreenShareChanged`, `Reaction`) are named here only where they originate in the media plane:
-/// the registry and handler keep producing their signaling copies.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum MediaEvent {
-    RelayAllocated,
-    RelayAllocateFailed(u16),
-    RelayAllocateTimedOut,
-    RelayReconnectTimedOut,
-    MediaSetupFailed(String),
-    AudioSilent {
-        silent_for_ms: u64,
-        rtp_received: u32,
-        frames_produced: u32,
-        dominant_reason: MediaSilenceReason,
-    },
-    AudioReceptionStalled {
-        silent_for_ms: u64,
-    },
-    AudioCodecSwitched {
-        from: MediaAudioCodec,
-        to: MediaAudioCodec,
-        source: MediaCodecDecisionSource,
-        packets_observed: u32,
-    },
-    AudioCodecSourceIsFixed {
-        sending: MediaAudioCodec,
-        peer_expects: MediaAudioCodec,
-        source: MediaCodecDecisionSource,
-    },
-    AudioFormatMismatch {
-        expected_rate: u32,
-        received_rates: Vec<u32>,
-    },
-    OutboundMediaDropped {
-        video_access_units: u32,
-        packets: u32,
-    },
-    VideoKeyframeNeeded,
-    RtcpReceived {
-        packet_types: Vec<u8>,
-        sender_ssrc: u32,
-        referenced_ssrcs: Vec<u32>,
-        reports_audio: bool,
-        reports_video: bool,
-        report_blocks: Vec<MediaRtcpReportBlock>,
-        feedback: Vec<MediaRtcpFeedback>,
-    },
-    /// A decrypted standard-Opus packet a shell with its own decoder can play.
-    ForeignAudio(Bytes),
-    /// The same, attributed to a group participant.
-    ForeignGroupAudio(MediaEncodedFrame),
-    /// A committed peer video-state notification.
-    PeerVideoStateChanged {
-        source: Jid,
-        call_creator: Jid,
-        state: VideoState,
-        orientation: Option<u8>,
-        /// The token to pass back to accept an upgrade. `None` when signaling already resolved
-        /// simultaneous requests.
-        upgrade_token: Option<MediaVideoUpgradeToken>,
-    },
-    /// A newer authoritative group membership/relay snapshot was committed.
-    GroupUpdated(Box<GroupCallUpdate>),
-    /// A newer authoritative call-link admission snapshot was committed.
-    WaitingRoomUpdated(Box<WaitingRoom>),
-    /// Repeated waiting-room heartbeats failed.
-    WaitingRoomHeartbeatFailed,
-    /// One signaling/app-data control was rejected while the call stayed healthy.
-    GroupControlRejected(MediaGroupControlKind),
-    /// A server-requested shared epoch could not be distributed or committed locally.
-    GroupRekeyFailed,
-    /// One participant raised or lowered their hand.
-    HandRaised {
-        participant: Jid,
-        raised: bool,
-    },
-    /// One participant started or stopped screen sharing.
-    ScreenShareChanged {
-        participant: Jid,
-        screen_share: ScreenShare,
-    },
-    /// One authenticated, participant-attributed RTC reaction.
-    Reaction {
-        participant: Jid,
-        device: Jid,
-        pid: Option<u32>,
-        emoji: Option<String>,
-        removed: bool,
-    },
-    /// The session closed, with why.
-    Closed(MediaCloseReason),
-}
+/// This is the same [`CallEvent`] the public handle stream carries, not a parallel vocabulary: a
+/// backend at the seam and a consumer of the call read one enum, so an event cannot mean two things.
+pub use events::CallEvent as MediaEvent;
 
 /// Which group control was rejected. Replaces the engine's `GroupControlKind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
