@@ -90,17 +90,36 @@ fn names_feature(line: &str, feature: &str) -> bool {
     line.contains(&format!("feature = \"{feature}\""))
 }
 
-const DISCIPLINED: &[Disciplined] = &[Disciplined {
-    feature: "voip-runtime",
-    owns: &["src/voip", "src/client/voip.rs", "src/handlers/call.rs"],
-    // 4 test-only gates: two `create_test_client*` helpers that inject a media
-    // backend or a call-link admission, and two `should_issue_tc_token` tests
-    // that drive the tctoken lifecycle through the call path. No production code
-    // outside the subsystem's own files names `voip-runtime` any more: the call
-    // control plane compiles under `voip-control`, and this budget records that
-    // the coupling is test scaffolding, not a production dependency.
-    budget: 4,
-}];
+const DISCIPLINED: &[Disciplined] = &[
+    Disciplined {
+        feature: "voip-runtime",
+        owns: &["src/voip", "src/client/voip.rs", "src/handlers/call.rs"],
+        // 4 test-only gates: two `create_test_client*` helpers that inject a media
+        // backend or a call-link admission, and two `should_issue_tc_token` tests
+        // that drive the tctoken lifecycle through the call path. No production code
+        // outside the subsystem's own files names `voip-runtime` any more: the call
+        // control plane compiles under `voip-control`, and this budget records that
+        // the coupling is test scaffolding, not a production dependency.
+        budget: 4,
+    },
+    Disciplined {
+        feature: "voip-control",
+        owns: &[
+            "src/voip",
+            "src/voip_control",
+            "src/client/voip.rs",
+            "src/handlers/call.rs",
+        ],
+        // 16 gates, every one accounted for: 3 declarations (`pub mod voip;`,
+        // `pub mod voip_control;`, the subsystems! entry); 7 builder lines for the
+        // media-backend injection point (field, two constructors, default install,
+        // docsrs); 3 control-plane-driven core hooks (ack waiter, pkmsg emission,
+        // tc-token issue); 3 test-scaffolding gates. The call control plane compiles
+        // under `voip-control` with the engine off; this budget stops the feature
+        // spreading one field at a time from here.
+        budget: 16,
+    },
+];
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
