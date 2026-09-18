@@ -2896,7 +2896,7 @@ mod tests {
             fake_caller_lid(),
             fake_caller_lid(),
         );
-        session.audio_format = Some(AudioFormat::OPUS_16KHZ_60MS);
+        session.audio_format = Some(wacore::voip_control::MediaAudioFormat::OPUS_16KHZ_60MS);
         session.ring_devices = ring_devices;
         let generation = registry.insert(session);
         assert!(

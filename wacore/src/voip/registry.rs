@@ -3077,7 +3077,7 @@ impl CallRegistry {
         // profile carries standard Opus in MLOW's framing, so a peer that cleared the bit cannot
         // parse it either. Keyed on the codec, an escape call would sail past this check and put a
         // rewritten TOC on the wire for a peer that registered native Opus on the same payload type.
-        let local_mlow = format.rtp_profile == crate::voip::audio::AudioRtpProfile::Mlow;
+        let local_mlow = format.rtp_profile == crate::voip_control::MediaAudioRtpProfile::Mlow;
         let effective_mlow = crate::stanza::call::mlow_after_peer_capability(local_mlow, peer);
         (effective_mlow != local_mlow).then_some(if effective_mlow {
             AudioCodec::Mlow
@@ -6673,7 +6673,7 @@ mod tests {
 
         let reg = CallRegistry::new();
         let mut s = session("CID");
-        s.audio_format = Some(AudioFormat::MLOW_16KHZ_60MS);
+        s.audio_format = Some(crate::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS);
         reg.insert(s);
         assert_eq!(
             reg.peer_selected_audio_codec("CID", CapabilityBit::Clear),
@@ -6700,7 +6700,7 @@ mod tests {
 
         let reg = CallRegistry::new();
         let mut s = session("CID");
-        s.audio_format = Some(AudioFormat::OPUS_16KHZ_60MS);
+        s.audio_format = Some(crate::voip_control::MediaAudioFormat::OPUS_16KHZ_60MS);
         reg.insert(s);
         for peer in [
             CapabilityBit::Set,

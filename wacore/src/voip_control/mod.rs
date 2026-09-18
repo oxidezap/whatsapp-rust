@@ -39,6 +39,12 @@ pub mod transport;
 #[cfg(any(test, feature = "test-util"))]
 pub mod fake_backend;
 
+// Signaling/control call state -- identity, direction, lifecycle -- that carries no engine type, so
+// the call flow can name a session with the engine off. `crate::voip::session` re-exports these.
+pub mod signaling;
+
+pub use signaling::{CallDirection, CallPhase, CallSession};
+
 /// One decrypted keygen-v2 epoch, kept as secret material.
 ///
 /// The engine's `GroupRawEpoch` is in `crate::voip::driver`, which is gated by the very feature this
