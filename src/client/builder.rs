@@ -132,6 +132,11 @@ pub struct ClientBuilder {
     plugins: Vec<PluginRegistration>,
     #[cfg(feature = "plugins")]
     plugin_host_config: PluginHostConfig,
+    /// The media backend the call subsystem reserves sessions from, when the application wants a
+    /// foreign implementation. `None` means "use whatever this build defaults to": the resident
+    /// `WacoreVoipMediaBackend` on a `voip-engine-wacore` build, or none at all.
+    #[cfg(feature = "voip-control")]
+    voip_media_backend: Option<Arc<dyn wacore::voip_control::VoipMediaBackend>>,
 }
 
 impl Default for ClientBuilder {
@@ -168,6 +173,8 @@ impl ClientBuilder {
             plugins: Vec::new(),
             #[cfg(feature = "plugins")]
             plugin_host_config: PluginHostConfig::default(),
+            #[cfg(feature = "voip-control")]
+            voip_media_backend: None,
         }
     }
 
@@ -218,6 +225,31 @@ impl ClientBuilder {
 
     pub fn with_http_client_arc(mut self, http_client: Arc<dyn HttpClient>) -> Self {
         self.http_client = Some(http_client);
+        self
+    }
+
+    /// Install the media backend the call subsystem reserves sessions from.
+    ///
+    /// The call registry never names a concrete media implementation; it asks this backend to
+    /// `reserve` one session per call. Supplying one is what lets a caller run calls on a foreign
+    /// engine instead of the resident one, and a `voip-control`-only build has no other way to get
+    /// media at all.
+    #[cfg(feature = "voip-control")]
+    pub fn with_voip_media_backend<B>(mut self, backend: B) -> Self
+    where
+        B: wacore::voip_control::VoipMediaBackend + 'static,
+    {
+        self.voip_media_backend = Some(Arc::new(backend));
+        self
+    }
+
+    /// [`with_voip_media_backend`](Self::with_voip_media_backend) for an already-shared backend.
+    #[cfg(feature = "voip-control")]
+    pub fn with_voip_media_backend_arc(
+        mut self,
+        backend: Arc<dyn wacore::voip_control::VoipMediaBackend>,
+    ) -> Self {
+        self.voip_media_backend = Some(backend);
         self
     }
 
@@ -581,6 +613,10 @@ impl ClientBuilder {
             },
         );
         let client = assembly.client();
+        #[cfg(feature = "voip-runtime")]
+        if let Some(backend) = self.voip_media_backend.clone() {
+            let _ = client.call_registry().install_backend(backend);
+        }
         #[cfg(feature = "client-lifecycle")]
         let mut construction = ClientConstructionGuard::new(Arc::clone(&client));
 

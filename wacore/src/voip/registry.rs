@@ -743,7 +743,11 @@ pub struct CallRegistry {
     /// The media backend every new call's session comes from. The registry never names a concrete
     /// implementation: it asks the injected backend to `reserve` one per registration, so a build
     /// that ships no engine (or a test that ships a fake) is substituted at construction.
-    backend: Arc<dyn VoipMediaBackend>,
+    ///
+    /// Settable at most once, from the client builder: calls can only be registered after a client
+    /// exists, so the install always wins. Until then the in-process resident backend answers, which
+    /// is what registry-only tests and `Default` get.
+    backend: std::sync::OnceLock<Arc<dyn VoipMediaBackend>>,
     /// Creator-authenticated controls that overtook their initial group offer. A bounded value
     /// queue avoids retaining one task per fabricated call id while preserving the real offer race.
     pending_initial_group_controls: Mutex<VecDeque<PendingInitialGroupControl>>,
@@ -758,7 +762,14 @@ pub struct CallRegistry {
 
 impl Default for CallRegistry {
     fn default() -> Self {
-        Self::with_backend(Arc::new(crate::voip::media_session::ResidentMediaBackend))
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            next_gen: AtomicU64::new(0),
+            backend: std::sync::OnceLock::new(),
+            pending_initial_group_controls: Mutex::new(VecDeque::new()),
+            registration_event: Arc::new(event_listener::Event::new()),
+            ringing: Mutex::new(HashSet::new()),
+        }
     }
 }
 
@@ -778,20 +789,25 @@ impl CallRegistry {
     /// registry stores the trait object and asks it to `reserve`; it never names `ResidentMediaSession`
     /// or any other engine type.
     pub fn with_backend(backend: Arc<dyn VoipMediaBackend>) -> Self {
-        Self {
-            inner: Mutex::new(HashMap::new()),
-            next_gen: AtomicU64::new(0),
-            backend,
-            pending_initial_group_controls: Mutex::new(VecDeque::new()),
-            registration_event: Arc::new(event_listener::Event::new()),
-            ringing: Mutex::new(HashSet::new()),
-        }
+        let registry = Self::default();
+        let _ = registry.backend.set(backend);
+        registry
+    }
+
+    /// Install the media backend, at most once. Called during client assembly.
+    ///
+    /// Returns `false` if a backend was already installed, which is a programming error rather than
+    /// a runtime condition: nothing installs twice.
+    pub fn install_backend(&self, backend: Arc<dyn VoipMediaBackend>) -> bool {
+        self.backend.set(backend).is_ok()
     }
 
     /// The media backend this registry reserves sessions from.
     #[must_use]
-    pub fn backend(&self) -> &Arc<dyn VoipMediaBackend> {
-        &self.backend
+    pub fn backend(&self) -> Arc<dyn VoipMediaBackend> {
+        self.backend
+            .get_or_init(|| Arc::new(crate::voip::media_session::ResidentMediaBackend))
+            .clone()
     }
 
     /// The active-call map, recovering the guard from a poisoned mutex instead of panicking.
@@ -1720,7 +1736,7 @@ impl CallRegistry {
                         )
                     });
                 let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
-                let entry = Self::new_entry(&self.backend, session, generation, true, false);
+                let entry = Self::new_entry(&self.backend(), session, generation, true, false);
                 if ringing_group_entries >= MAX_RINGING_GROUP_CALLS
                     || ringing_group_bytes.saturating_add(entry.retained_bytes(&call_id))
                         > MAX_RINGING_GROUP_CALL_BYTES
@@ -1755,7 +1771,7 @@ impl CallRegistry {
             map.insert(
                 session.call_id.clone(),
                 Self::new_entry(
-                    &self.backend,
+                    &self.backend(),
                     session,
                     generation,
                     force_group,
@@ -1956,13 +1972,17 @@ impl CallRegistry {
         }
     }
 
-    /// Media counters for one call generation, or all-zero before the engine attaches.
-    pub fn media_stats(&self, call_id: &str, generation: u64) -> crate::voip::CallMediaStats {
+    /// Media counters for one call generation, read through the neutral seam.
+    ///
+    /// A backend that owns a foreign engine reports its own [`MediaStats`](crate::voip_control::MediaStats)
+    /// here; the resident session reports the same counters its drive loop publishes. All-zero is
+    /// the honest answer before media attaches, not an error.
+    pub fn media_stats(&self, call_id: &str, generation: u64) -> crate::voip_control::MediaStats {
         self.active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation)
-            .and_then(|entry| entry.media_stats.as_ref())
-            .map(|cell| cell.snapshot())
+            .and_then(|entry| entry.media.as_ref())
+            .map(|media| media.stats())
             .unwrap_or_default()
     }
 
@@ -3263,6 +3283,122 @@ mod tests {
             Jid::new("222222222222222", Server::Lid),
             Jid::new("111111111111111", Server::Lid),
         )
+    }
+
+    #[test]
+    fn a_fake_backend_drives_the_whole_vertical_slice_through_the_contract() {
+        use crate::voip_control::fake_backend::FakeMediaBackend;
+        use crate::voip_control::{MediaCommand, MediaGroupEpoch, MediaSessionKey};
+
+        // The architectural gate: reserve through the injected backend, then drive commands, stats,
+        // group roster/epoch and close without the registry ever naming the engine. If this test
+        // needed `ResidentMediaSession`, `as_any` or a downcast, the seam would not be neutral.
+        let backend = Arc::new(FakeMediaBackend::new());
+        let registry = CallRegistry::with_backend(backend.clone());
+
+        let generation = registry.insert(session("FAKE-CALL"));
+        let key = MediaSessionKey {
+            call_id: "FAKE-CALL".to_string(),
+            generation,
+        };
+        let media = backend
+            .session(&key)
+            .expect("the backend reserved a session for this generation");
+
+        // Pre-attach command: the key existed from reservation, so this lands on the right session.
+        assert!(registry.send_group_epoch_if_current("FAKE-CALL", generation, 5, vec![1, 2, 3]));
+
+        // Stats flow through the seam, set by the backend.
+        let stats = wacore::voip_control::MediaStats::builder()
+            .rtp_received(11)
+            .audio_frames_decoded(7)
+            .build();
+        media.set_stats(stats);
+        assert_eq!(
+            registry.media_stats("FAKE-CALL", generation).rtp_received,
+            11
+        );
+        assert_eq!(
+            registry
+                .media_stats("FAKE-CALL", generation)
+                .audio_frames_decoded,
+            7
+        );
+
+        // A roster and a decrypted epoch delivered through the neutral path.
+        assert!(registry.send_group_update_if_current("FAKE-CALL", generation, group_update(1)));
+        assert!(registry.send_group_epoch_if_current("FAKE-CALL", generation, 6, vec![4, 5, 6]));
+
+        // Close ends this generation's media.
+        registry.remove_if_current("FAKE-CALL", generation);
+
+        let record = media.record();
+        assert!(
+            record
+                .commands
+                .iter()
+                .any(|(c, _)| matches!(c, MediaCommand::ApplyGroupUpdate(_))),
+            "the roster reached the neutral session"
+        );
+        assert!(
+            record
+                .commands
+                .iter()
+                .any(|(c, _)| matches!(c, MediaCommand::ApplyGroupEpoch { .. })),
+            "the decrypted epoch reached the neutral session"
+        );
+        // The group epoch is erased by `MediaGroupEpoch` on drop; assert we built a neutral one.
+        let _ = MediaGroupEpoch::new(vec![0; 32]);
+    }
+
+    #[test]
+    fn a_generation_aba_replacement_does_not_cross_sessions() {
+        use crate::voip_control::fake_backend::FakeMediaBackend;
+        use crate::voip_control::{MediaCommand, MediaSessionKey};
+
+        // ABA: call_id X gen 10, then call_id X gen 11. A late command carrying gen 10 must not
+        // reach gen 11's session, and vice versa.
+        let backend = Arc::new(FakeMediaBackend::new());
+        let registry = CallRegistry::with_backend(backend.clone());
+
+        let generation_10 = registry.insert(session("X"));
+        let old = backend
+            .session(&MediaSessionKey {
+                call_id: "X".to_string(),
+                generation: generation_10,
+            })
+            .expect("gen 10 reserved");
+
+        // Re-registering the same call-id supersedes gen 10.
+        let generation_11 = registry.insert(session("X"));
+        assert_ne!(generation_10, generation_11);
+        let new = backend
+            .session(&MediaSessionKey {
+                call_id: "X".to_string(),
+                generation: generation_11,
+            })
+            .expect("gen 11 reserved");
+
+        // A late epoch for gen 10 is refused; the live generation accepts its own.
+        assert!(!registry.send_group_epoch_if_current("X", generation_10, 1, vec![9]));
+        assert!(registry.send_group_epoch_if_current("X", generation_11, 2, vec![8]));
+
+        let old_record = old.record();
+        let new_record = new.record();
+        assert!(
+            !old_record
+                .commands
+                .iter()
+                .any(|(c, _)| matches!(c, MediaCommand::ApplyGroupEpoch { .. })),
+            "a superseded generation must not receive commands"
+        );
+        assert!(
+            new_record
+                .commands
+                .iter()
+                .any(|(c, _)| matches!(c, MediaCommand::ApplyGroupEpoch { .. })),
+            "the live generation receives its own command"
+        );
     }
 
     fn group_update(transaction_id: u32) -> GroupCallUpdate {

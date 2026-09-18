@@ -34,6 +34,11 @@ pub mod engine_bridge;
 // build names these traits to supply a transport, and none of them touches `crate::voip`.
 pub mod transport;
 
+// A fake backend that implements only this contract, for the architectural gate. Gated so a
+// shipping build carries no test scaffolding.
+#[cfg(any(test, feature = "test-util"))]
+pub mod fake_backend;
+
 /// One decrypted keygen-v2 epoch, kept as secret material.
 ///
 /// The engine's `GroupRawEpoch` is in `crate::voip::driver`, which is gated by the very feature this
