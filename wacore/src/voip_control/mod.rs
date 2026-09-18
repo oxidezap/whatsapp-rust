@@ -8,10 +8,10 @@
 //! names the leak if a draft reaches for an engine type.
 //!
 //! The engine-facing half is intentionally not here. `whatsapp-rust`'s resident backend implements
-//! [`VoipMediaBackend`] on top of `wacore::voip::CallEngine` and translates commands, events and
-//! counters across this boundary. `agent_docs/subsystem_boundary.md` records why the byte cut (a
-//! facade that compiles with `voip` off) is a later phase: the registry and facade still name
-//! signaling types that live in `crate::voip`.
+//! [`VoipMediaBackend`] on top of `wacore::voip::CallEngine` and builds the engine from the neutral
+//! spec across this boundary. Events need no translation: the public event type is the engine's own
+//! event type under its seam name. `agent_docs/subsystem_boundary.md` records the byte cut (a
+//! facade that compiles with `voip` off) and what it took to get there.
 
 use std::sync::Arc;
 
@@ -84,6 +84,7 @@ pub mod group;
 // The control vocabulary a call sends into its media plane: group roster/epoch transitions,
 // video-plane controls, and the recv-rekey answer, with the mailbox types that carry them.
 pub mod control;
+pub use control::{VideoControl, VideoControlReceiver};
 
 // Per-call media counters and the audio-health watchdog. Neutral: the counters are the seam's
 // [`MediaStats`], and the watchdog reads a clock the shell supplies. `crate::voip::media_stats`
@@ -296,7 +297,10 @@ pub struct MediaRtcpFeedback {
 /// This is everything a backend needs to open the session, group media included: [`key`](Self::key)
 /// carries the generational identity and `group` the optional group media inputs. A backend never
 /// receives those as separate arguments.
-#[derive(Clone, bon::Builder)]
+///
+/// Not `Clone`: a spec carries the call key, relay and auth tokens, and the integrity key, and is
+/// consumed by exactly one `open`, so there is never a second copy of that key material.
+#[derive(bon::Builder)]
 #[non_exhaustive]
 pub struct MediaSessionSpec {
     /// The generational identity of this session, not a bare call-id.
@@ -349,7 +353,7 @@ impl core::fmt::Debug for MediaSessionSpec {
 }
 
 /// Authenticated direct-call participant retained during an in-place group promotion.
-#[derive(Clone, bon::Builder)]
+#[derive(bon::Builder)]
 #[non_exhaustive]
 pub struct MediaDirectPeer {
     pub user_jid: Jid,
@@ -369,7 +373,7 @@ impl core::fmt::Debug for MediaDirectPeer {
 }
 
 /// Group-media inputs layered onto a regular session.
-#[derive(Clone, Debug, bon::Builder)]
+#[derive(Debug, bon::Builder)]
 #[non_exhaustive]
 pub struct MediaGroupSpec {
     pub call_creator: Jid,
@@ -379,13 +383,13 @@ pub struct MediaGroupSpec {
 }
 
 /// One intent the control plane sends into the media plane. Covers the engine's `VideoControl` and
-/// `GroupControl` plus the loose engine methods (`set_muted`, `rekey_recv`,
-/// `switch_audio_codec`, `request_peer_keyframe`, `send_group_reaction`).
+/// `GroupControl` plus the loose engine methods (`rekey_recv`, `request_peer_keyframe`,
+/// `send_group_reaction`). Mute stays out: the live client applies it through `MuteFeed`, and
+/// codec selection happens at engine construction or through the rekey, so neither has a
+/// constructor and neither is named here.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum MediaCommand {
-    /// Local microphone mute. The `<mute>` stanza itself stays in signaling.
-    SetMuted(bool),
     /// Bring the video plane up. `awaiting_accept` gates outbound until the peer accepts.
     EnableVideo { awaiting_accept: bool },
     /// Tear the video plane down, optionally retaining legacy AUs for a reattach.
@@ -411,11 +415,6 @@ pub enum MediaCommand {
     RekeyRecv {
         answering_lid: String,
         audio_codec: Option<MediaAudioCodec>,
-    },
-    /// Swap the audio payload grammar within the negotiated timing.
-    SwitchAudioCodec {
-        to: MediaAudioCodec,
-        source: MediaCodecDecisionSource,
     },
     /// A newer authoritative group roster/relay snapshot.
     ApplyGroupUpdate(Box<GroupCallUpdate>),
@@ -569,13 +568,15 @@ pub trait VoipMediaBackend: MaybeSendSync {
 
     /// Bring the reserved session operational for `spec`.
     ///
-    /// The resident implementation builds the engine from the spec and the platform ports in `ctx`,
-    /// wires the session's own mailboxes, and starts driving on the executor it holds. A foreign
-    /// backend that owns its executor does the same over its own media. `ctx` is the neutral opening
-    /// context: ports and the public event sink, never a backend's internal mailboxes.
+    /// The session is identified by [`MediaSessionSpec::key`]: every implementation reserved it
+    /// under that key and upgrades it the same way, so passing the handle again would be a
+    /// second spelling of the same identity. The resident implementation builds the engine from
+    /// the spec and the platform ports in `ctx`, wires the session's own mailboxes, and starts
+    /// driving on the executor it holds. A foreign backend that owns its executor does the same
+    /// over its own media. `ctx` is the neutral opening context: ports, never a backend's
+    /// internal mailboxes.
     async fn open(
         &self,
-        session: &Arc<dyn VoipMediaSession>,
         spec: MediaSessionSpec,
         ctx: MediaOpenContext,
     ) -> Result<(), MediaSetupError>;

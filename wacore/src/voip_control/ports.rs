@@ -131,11 +131,12 @@ pub struct MediaVideoPorts {
 
 /// Everything a backend needs to bring a reserved session operational, besides the spec.
 ///
-/// This is the neutral opening context: the platform's endpoints and the one-shot recv-rekey
-/// source. The public event stream is deliberately absent -- the session owns it from reservation
+/// This is the neutral opening context: the platform's endpoints. The recv-rekey receiver is
+/// deliberately absent -- the session owns it from reservation and the drive loop takes it.
+/// The public event stream is deliberately absent too -- the session owns it from reservation
 /// and the handle reads it through `subscribe`, so a signaling event published before media
 /// attaches reaches the same stream the drive loop later publishes into. The executor and the
-/// relay transport are deliberately absent too -- they are Rust trait objects that cannot cross a
+/// relay transport are deliberately absent as well -- they are Rust trait objects that cannot cross a
 /// process boundary, so they are constructor state of the backend, never context (F9).
 ///
 /// A backend's [`open`](super::VoipMediaBackend::open) owns the rest of the lifecycle: it builds
@@ -169,9 +170,11 @@ pub struct MediaVideoChannels {
 #[non_exhaustive]
 pub struct MediaOpenContext {
     pub audio: MediaAudioPorts,
-    pub video: Option<MediaVideoPorts>,
-    /// The drive-loop video halves, when the caller pre-created the video plumbing.
-    pub video_channels: Option<MediaVideoChannels>,
+    /// The drive-loop video halves, always pre-created by the control plane at registration (so a
+    /// dormant handle can attach or detach endpoints before media exists). The backend must use
+    /// these rather than create its own, or the sender the handle steers would reach a different
+    /// channel.
+    pub video_channels: MediaVideoChannels,
     /// Releases the local video endpoints on a refused upgrade or terminal teardown. The control
     /// plane owns the hook (it holds the consumer's endpoints); the backend stores it so the same
     /// teardown runs wherever the session ends.
@@ -179,8 +182,6 @@ pub struct MediaOpenContext {
     /// Rotations a peer announced before media attached, in announcement order. The backend applies
     /// them the moment the plane is up, or the peer's first frames are stamped upright.
     pub peer_video_orientations: Vec<(Option<wacore_binary::Jid>, u8)>,
-    /// The caller-only recv-rekey receiver; `None` on the callee side.
-    pub rekey: Option<async_channel::Receiver<super::control::PeerAnswer>>,
     /// The microphone mute flag, shared with the consumer's `CallHandle`. A backend that wraps a
     /// PCM source through its own feed zeroes frames while this is set.
     pub muted: Arc<std::sync::atomic::AtomicBool>,
@@ -195,8 +196,12 @@ pub struct MediaOpenContext {
 }
 
 impl MediaOpenContext {
-    /// A minimal context for tests that only need `open` to be callable: stub ports and no rekey.
-    /// The event stream needs no stub: the session owns it, and `open` never touches it.
+    /// A minimal context for tests that only need `open` to be callable: stub ports and stub
+    /// video plumbing. The event stream and the rekey receiver need no stub: the session owns
+    /// both, and `open` never touches them.
+    ///
+    /// Test-only: gated so production never builds a stub context by accident.
+    #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub fn for_test() -> Self {
         let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
@@ -204,20 +209,30 @@ impl MediaOpenContext {
         drop(mic_tx);
         let (speaker, speaker_rx) = async_channel::bounded::<Vec<i16>>(1);
         speaker_rx.close();
-        Self {
-            audio: MediaAudioPorts::Pcm {
+        let (control_sender, control) = super::control::video_control_channel();
+        let (_video_in_tx, video_in) = async_channel::bounded::<Vec<u8>>(1);
+        video_in.close();
+        let (_timed_in_tx, timed_video_in) = async_channel::bounded::<VideoInput>(1);
+        timed_video_in.close();
+        let (video_out, video_out_rx) = async_channel::bounded::<VideoFrame>(1);
+        video_out_rx.close();
+        Self::builder()
+            .audio(MediaAudioPorts::Pcm {
                 source: Arc::new(mic_rx),
                 sink: Arc::new(speaker),
-            },
-            video: None,
-            video_channels: None,
-            video_teardown: None,
-            peer_video_orientations: Vec::new(),
-            rekey: None,
-            muted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            group_epoch: None,
-            initial_codec: None,
-        }
+            })
+            .video_channels(
+                MediaVideoChannels::builder()
+                    .control(control)
+                    .control_sender(control_sender)
+                    .video_in(video_in)
+                    .maybe_timed_video_in(Some(timed_video_in))
+                    .video_out(video_out)
+                    .build(),
+            )
+            .peer_video_orientations(Vec::new())
+            .muted(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .build()
     }
 }
 

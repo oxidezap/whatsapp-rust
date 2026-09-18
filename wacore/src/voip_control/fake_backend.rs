@@ -182,7 +182,6 @@ impl VoipMediaBackend for FakeMediaBackend {
 
     async fn open(
         &self,
-        _session: &Arc<dyn VoipMediaSession>,
         _spec: MediaSessionSpec,
         _ctx: crate::voip_control::MediaOpenContext,
     ) -> Result<(), MediaSetupError> {

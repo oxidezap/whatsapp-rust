@@ -3,7 +3,7 @@
 //! This is the other half of the seam. `wacore::voip_control` declares
 //! [`VoipMediaBackend`]/[`VoipMediaSession`] with no engine type in the API; this module implements
 //! them on top of [`wacore::voip::CallEngine`], translating the flat [`MediaSessionSpec`] into the
-//! engine's [`CallConfig`]. Events need no translation: [`MediaEvent`] is the engine's
+//! engine's `CallConfig`. Events need no translation: [`MediaEvent`] is the engine's
 //! `CallEvent` under its seam name, so the drive loop publishes it directly.
 //!
 //! The executor and the relay transport are constructor state here, never fields of the spec:
@@ -15,53 +15,18 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use wacore::voip::engine::{CallConfig, CallEngine, CodecDecisionSource};
+use wacore::voip::engine::{CallEngine, CodecDecisionSource};
 use wacore::voip::media_session::ResidentMediaSession;
 use wacore::voip::transport::RelayEndpointParams;
 use wacore::voip_control::{
-    CallDirection, MediaCommand, MediaEvent, MediaGroupSpec, MediaSessionSpec, MediaSetupError,
-    VoipMediaBackend, VoipMediaSession,
+    CallDirection, MediaCommand, MediaEvent, MediaSessionSpec, MediaSetupError, VoipMediaBackend,
+    VoipMediaSession,
 };
 
 /// Three 60 ms frames absorb scheduling jitter without building a long capture delay.
 const MIC_CHANNEL_CAPACITY: usize = 3;
 /// Mono 16 kHz 60 ms frame length the engine expects; a muted frame is zeroed only at this length.
 const WA_FRAME_SAMPLES: usize = 960;
-/// Outbound video AU backlog before the source feed back-pressures.
-const VIDEO_IN_CHANNEL_CAP: usize = 4;
-/// Inbound video AU backlog between the drive loop and the sink forwarder.
-const VIDEO_OUT_CHANNEL_CAP: usize = 8;
-
-/// The relay endpoint a platform transport dials, read off the engine config the relay walk
-/// already resolved.
-pub fn relay_endpoint(config: &CallConfig) -> Result<RelayEndpointParams, MediaSetupError> {
-    let addr = format!("{}:{}", config.relay_ip, config.relay_port)
-        .parse()
-        .map_err(|_| MediaSetupError::BadEndpoint)?;
-    Ok(RelayEndpointParams {
-        addr,
-        ice_ufrag: wacore::voip_control::relay_parse::token_to_ice_ufrag(&config.auth_token),
-        ice_pwd: String::from_utf8_lossy(&config.integrity_key).into_owned(),
-    })
-}
-
-/// Build the engine from an already-parsed [`CallConfig`], through the neutral spec.
-///
-/// This is the resident backend's entry point on the live path: the facade parses the `<relay>` and
-/// decrypts the callKey exactly as before, then hands the resulting config across the seam instead
-/// of reaching for `CallEngine::new` itself. `generation` is the registration token the call
-/// registry assigned, carried into the neutral [`MediaSessionSpec::key`] so a foreign backend can
-/// reject a message from a superseded generation.
-pub fn build_engine_from_config(
-    config: CallConfig,
-    generation: u64,
-    group: Option<MediaGroupSpec>,
-    tx_ids: Box<dyn wacore::voip::engine::TxIdSource>,
-) -> Result<CallEngine, MediaSetupError> {
-    let mut spec = MediaSessionSpec::try_from((config, generation))?;
-    spec.group = group;
-    build_engine(spec, tx_ids)
-}
 
 /// Give the engine the platform's standard-Opus codec, when this build has one.
 ///
@@ -164,11 +129,6 @@ impl WacoreVoipMediaBackend {
         sessions.get(key).and_then(|weak| weak.upgrade())
     }
 
-    #[must_use]
-    pub fn runtime(&self) -> &Arc<dyn wacore::runtime::Runtime> {
-        &self.runtime
-    }
-
     /// Live map size, so tests can pin the anti-accumulation invariant. Production never
     /// needs it: pruning happens on reserve and lookup.
     #[cfg(test)]
@@ -207,7 +167,6 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
     /// and the registry entry reaped.
     async fn open(
         &self,
-        _session: &Arc<dyn VoipMediaSession>,
         spec: MediaSessionSpec,
         mut ctx: wacore::voip_control::MediaOpenContext,
     ) -> Result<(), MediaSetupError> {
@@ -256,12 +215,10 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         // The session has owned the public event stream since reservation, and the `CallHandle`
         // already reads it through `subscribe`: signaling events published before media attaches
         // and the drive loop's media events share that one ordered stream with no install here.
-        // If the caller pre-created the video plumbing, adopt its control sender so
-        // `submit(MediaCommand::EnableVideo …)` reaches the loop's receiver while the handle steers
-        // the same channel.
-        if let Some(channels) = ctx.video_channels.as_ref() {
-            resident.install_video_sender(channels.control_sender.clone());
-        }
+        // The caller always pre-creates the video plumbing, so adopt its control sender and the
+        // loop's halves below unconditionally: `submit(MediaCommand::EnableVideo …)` reaches the
+        // loop's receiver while the handle steers the same channel.
+        resident.install_video_sender(ctx.video_channels.control_sender.clone());
         // Adopt the caller-held video state: replay the peer rotations the registry retained
         // before media attached, and install the teardown hook on the entry. Both must happen
         // before the drive loop starts, so the first frames are stamped and the call's drop
@@ -285,21 +242,13 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
                 "group relay WARP tag length changed during media attachment".into(),
             )
         })?);
-        // The outbound recv-rekey receiver: the caller may hand one in (foreign backends), else the
-        // session's own (resident).
-        let rekey = ctx.rekey.take().or_else(|| resident.take_rekey_receiver());
+        // The outbound recv-rekey receiver is the session's own: it owns one from reservation
+        // and the drive loop takes it.
+        let rekey = resident.take_rekey_receiver();
         // The drive loop publishes into the session's own stream, which the handle subscribed at
         // registration: installing the context sender here would swap the stream out from under it.
         let events = resident.event_sender();
-        let channels = build_channels(
-            &client,
-            ctx,
-            stats,
-            group_ctl,
-            key.generation,
-            rekey,
-            events,
-        )?;
+        let channels = build_channels(&client, ctx, stats, group_ctl, rekey, events)?;
 
         let runtime = Arc::clone(&self.runtime);
         let registry_for_task = Arc::clone(&registry);
@@ -353,7 +302,6 @@ fn build_channels(
     ctx: wacore::voip_control::MediaOpenContext,
     media_stats: Arc<wacore::voip_control::media_stats::MediaStatsCell>,
     group_ctl: Option<async_channel::Receiver<wacore::voip::GroupControl>>,
-    generation: u64,
     rekey: Option<async_channel::Receiver<wacore::voip_control::control::PeerAnswer>>,
     events: async_channel::Sender<MediaEvent>,
 ) -> Result<wacore::voip::CallChannels, MediaSetupError> {
@@ -389,50 +337,17 @@ fn build_channels(
         }
     };
 
-    // Video: the drive loop needs the loop halves. When the caller pre-created the plumbing (so a
-    // dormant handle can steer video), those halves arrive in `ctx.video_channels` and the caller's
-    // own feed/sink machinery owns the other ends; the backend must not create its own, or the
-    // handle's sender would reach a different channel.
-    let (video_in, timed_video_in, video_ctl, video_out) = match ctx.video_channels {
-        Some(channels) => (
-            channels.video_in,
-            channels.timed_video_in,
-            channels.control,
-            channels.video_out,
-        ),
-        None => {
-            // No pre-created plumbing: wire the source and sink directly, or retire the arms.
-            let (video_in_tx, video_in) = async_channel::bounded::<Vec<u8>>(VIDEO_IN_CHANNEL_CAP);
-            let (timed_video_in_tx, timed_video_in) =
-                async_channel::bounded::<wacore::voip::VideoInput>(VIDEO_IN_CHANNEL_CAP);
-            let (_ctl_tx, video_ctl) = wacore::voip::video_control_channel();
-            let (video_out, video_out_rx) =
-                async_channel::bounded::<wacore::voip::VideoFrame>(VIDEO_OUT_CHANNEL_CAP);
-            if let Some(video) = ctx.video {
-                let sink = video.sink.playout();
-                client.runtime.spawn_detached(Box::pin(async move {
-                    while let Ok(mut frame) = video_out_rx.recv().await {
-                        frame.generation = generation;
-                        // Loss tolerant: a stalled sink sheds frames rather than back-pressuring.
-                        let _ = sink.try_send(frame);
-                    }
-                }));
-                client.runtime.spawn_detached(Box::pin(
-                    SourceFeed {
-                        source: video.source,
-                        out_legacy: video_in_tx,
-                        out_timed: timed_video_in_tx,
-                    }
-                    .run(),
-                ));
-            } else {
-                drop(video_out_rx);
-                drop(video_in_tx);
-                drop(timed_video_in_tx);
-            }
-            (video_in, Some(timed_video_in), video_ctl, video_out)
-        }
-    };
+    // Video: the drive loop needs the loop halves. The caller always pre-created the plumbing
+    // (so a dormant handle can steer video): those halves arrive in `ctx.video_channels` and the
+    // caller's own feed/sink machinery owns the other ends; the backend must not create its own,
+    // or the handle's sender would reach a different channel.
+    let wacore::voip_control::MediaVideoChannels {
+        control: video_ctl,
+        video_in,
+        timed_video_in,
+        video_out,
+        ..
+    } = ctx.video_channels;
 
     Ok(CallChannels {
         mic,
@@ -471,47 +386,12 @@ impl MuteFeed {
     }
 }
 
-/// Pumps a video source into the drive loop's legacy and (if present) timestamped inputs.
-struct SourceFeed {
-    source: Arc<dyn wacore::voip_control::VideoSource>,
-    out_legacy: async_channel::Sender<Vec<u8>>,
-    out_timed: async_channel::Sender<wacore::voip::VideoInput>,
-}
-
-impl SourceFeed {
-    async fn run(self) {
-        if let Some(timed) = self.source.timed_frames() {
-            while let Ok(frame) = timed.recv().await {
-                if self
-                    .out_timed
-                    .send(
-                        wacore::voip::VideoInput::builder()
-                            .data(frame.data)
-                            .timestamp(frame.timestamp)
-                            .generation(0)
-                            .build(),
-                    )
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            return;
-        }
-        let legacy = self.source.frames();
-        while let Ok(au) = legacy.recv().await {
-            if self.out_legacy.send(au).await.is_err() {
-                break;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wacore::voip_control::{MediaAudioFormat, MediaAudioIo, MediaAudioSpec, MediaSessionKey};
+    use wacore::voip_control::{
+        MediaAudioFormat, MediaAudioIo, MediaAudioSpec, MediaGroupSpec, MediaSessionKey,
+    };
 
     fn spec() -> MediaSessionSpec {
         MediaSessionSpec::builder()

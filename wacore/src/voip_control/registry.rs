@@ -28,9 +28,7 @@ use crate::voip_control::control::{GroupControl, VideoControl};
 #[cfg(any(test, feature = "test-util"))]
 use crate::voip_control::control::VideoControlSender;
 use crate::voip_control::group::{GroupCallState, GroupStateApply, group_device_is_local};
-use crate::voip_control::resident_session::{
-    NoMediaBackend, codec_to_neutral, video_control_to_command,
-};
+use crate::voip_control::resident_session::{NoMediaBackend, video_control_to_command};
 use crate::voip_control::{CallPhase, CallSession};
 use crate::voip_control::{MediaCommand, MediaSessionKey, VoipMediaBackend, VoipMediaSession};
 use wacore_binary::Jid;
@@ -3021,7 +3019,7 @@ impl CallRegistry {
         if let Some(media) = media {
             media.submit(MediaCommand::RekeyRecv {
                 answering_lid: answer.answering_lid,
-                audio_codec: answer.audio_codec.map(codec_to_neutral),
+                audio_codec: answer.audio_codec,
             });
         }
     }
@@ -3319,51 +3317,45 @@ mod tests {
         // error, and the same call on a permissive backend succeeds. No engine, no registry types.
         let refusing = FakeMediaBackend::refusing();
         let accepting = FakeMediaBackend::new();
-        let key = MediaSessionKey {
-            call_id: "OPEN-CALL".to_string(),
-            generation: 1,
+        // Built twice rather than cloned: `MediaSessionSpec` is not `Clone`, so a spec is
+        // consumed by exactly one `open`.
+        let spec = || {
+            MediaSessionSpec::builder()
+                .key(MediaSessionKey {
+                    call_id: "OPEN-CALL".to_string(),
+                    generation: 1,
+                })
+                .direction(crate::voip_control::CallDirection::Outgoing)
+                .self_lid("1:0@lid".into())
+                .peer_lid("2:0@lid".into())
+                .call_key(vec![0u8; 32])
+                .ssrc(1)
+                .audio(
+                    crate::voip_control::MediaAudioSpec::builder()
+                        .format(crate::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS)
+                        .io(crate::voip_control::MediaAudioIo::Pcm)
+                        .build(),
+                )
+                .relay_token(vec![])
+                .auth_token(vec![])
+                .relay_ip("127.0.0.1".into())
+                .relay_port(3478)
+                .integrity_key(vec![])
+                .warp_mi_tag_len(4)
+                .enable_media(false)
+                .enable_video(false)
+                .enable_sframe(false)
+                .build()
         };
-        let session = refusing.reserve(&key, crate::voip_control::CallDirection::Outgoing);
-        let spec = MediaSessionSpec::builder()
-            .key(key)
-            .direction(crate::voip_control::CallDirection::Outgoing)
-            .self_lid("1:0@lid".into())
-            .peer_lid("2:0@lid".into())
-            .call_key(vec![0u8; 32])
-            .ssrc(1)
-            .audio(
-                crate::voip_control::MediaAudioSpec::builder()
-                    .format(crate::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS)
-                    .io(crate::voip_control::MediaAudioIo::Pcm)
-                    .build(),
-            )
-            .relay_token(vec![])
-            .auth_token(vec![])
-            .relay_ip("127.0.0.1".into())
-            .relay_port(3478)
-            .integrity_key(vec![])
-            .warp_mi_tag_len(4)
-            .enable_media(false)
-            .enable_video(false)
-            .enable_sframe(false)
-            .build();
         assert!(matches!(
             refusing
-                .open(
-                    &session,
-                    spec.clone(),
-                    crate::voip_control::MediaOpenContext::for_test()
-                )
+                .open(spec(), crate::voip_control::MediaOpenContext::for_test())
                 .await,
             Err(MediaSetupError::Backend(_))
         ));
         assert!(
             accepting
-                .open(
-                    &session,
-                    spec,
-                    crate::voip_control::MediaOpenContext::for_test()
-                )
+                .open(spec(), crate::voip_control::MediaOpenContext::for_test())
                 .await
                 .is_ok()
         );

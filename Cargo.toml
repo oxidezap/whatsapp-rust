@@ -239,7 +239,8 @@ voip-runtime = ["voip-control", "voip-engine-wacore"]
 # injected backend is the typed `MediaSetupError::NoBackend`, never a panic or a silent no-op.
 voip-control = ["wacore/voip-control"]
 # The resident backend that implements `voip-control`'s traits on top of `wacore::voip`'s engine:
-# spec translation, command dispatch, and event/stats translation. This is the only media feature
+# spec validation, command dispatch, and stats publication. Events need no translation: the public
+# event type is the engine's own event type under its seam name. This is the only media feature
 # that turns `wacore/voip` on.
 voip-engine-wacore = ["voip-control", "wacore/voip"]
 # The native relay media transport: one UDP socket per call, DTLS, SCTP, and the pre-negotiated

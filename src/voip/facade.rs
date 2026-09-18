@@ -413,7 +413,6 @@ impl<'a> AcceptCall<'a> {
             spec,
             audio,
             video,
-            None,
             // Incoming group epoch is applied through the roster replay, not here.
             None,
             engine_switch,
@@ -1006,7 +1005,6 @@ impl<'a> OutgoingGroupCall<'a> {
             spec,
             audio,
             video,
-            None,
             group_epoch,
             None,
         )
@@ -1199,17 +1197,9 @@ impl<'a> CallLinkCall<'a> {
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let handle = open_registered_media(
-            self.client,
-            &registration,
-            spec,
-            audio,
-            video,
-            None,
-            None,
-            None,
-        )
-        .await?;
+        let handle =
+            open_registered_media(self.client, &registration, spec, audio, video, None, None)
+                .await?;
         registration.disarm();
         teardown.disarm();
         Ok(handle)
@@ -2575,7 +2565,7 @@ pub(crate) async fn attach_outgoing_relay(
     // Race the backend's setup against the call ending: a hangup arriving now must cancel an
     // in-flight provider without leaving a parked `wait_ended()`.
     let backend = client.call_registry().backend();
-    let open = backend.open(&session, spec, ctx);
+    let open = backend.open(spec, ctx);
     let ending = pending.ended.wait();
     futures::pin_mut!(open, ending);
     let result = match futures::future::select(open, ending).await {
@@ -3079,7 +3069,6 @@ async fn open_registered_media(
     mut spec: wacore::voip_control::MediaSessionSpec,
     audio: AudioEndpoints,
     video: Option<VideoEndpoints>,
-    rekey_rx: Option<async_channel::Receiver<wacore::voip_control::control::PeerAnswer>>,
     group_epoch: Option<(u32, Vec<u8>)>,
     initial_codec: Option<AudioCodec>,
 ) -> Result<CallHandle, CallError> {
@@ -3130,7 +3119,6 @@ async fn open_registered_media(
                 .video_out(video_out)
                 .build(),
         )
-        .maybe_rekey(rekey_rx)
         // Incoming, group, and call-link paths retain the offer's rotation the same way the
         // outgoing path does; replay it at open so the first frames are stamped.
         .peer_video_orientations(
@@ -3152,7 +3140,7 @@ async fn open_registered_media(
         .build();
     let backend = registry.backend();
     backend
-        .open(&session, spec, ctx)
+        .open(spec, ctx)
         .await
         .map_err(|error| CallError::Setup(error.to_string()))?;
     // The open awaited the relay dial, so the call may have ended or been superseded while it
@@ -12843,7 +12831,6 @@ mod control_only_tests {
 
         async fn open(
             &self,
-            session: &Arc<dyn VoipMediaSession>,
             spec: MediaSessionSpec,
             ctx: MediaOpenContext,
         ) -> Result<(), MediaSetupError> {
@@ -12852,7 +12839,7 @@ mod control_only_tests {
                 .recv()
                 .await
                 .map_err(|_| MediaSetupError::Backend("open released".into()))?;
-            self.inner.open(session, spec, ctx).await
+            self.inner.open(spec, ctx).await
         }
     }
 
@@ -12964,14 +12951,13 @@ mod control_only_tests {
         client.set_connected_for_test(true);
         let registry = client.call_registry();
         let generation = registry.insert(session("NO-BACKEND"));
-        let media = registry
+        registry
             .media_session("NO-BACKEND", generation)
             .expect("the default registry still reserves a session");
         assert_eq!(
             registry
                 .backend()
                 .open(
-                    &media,
                     MediaSessionSpec::builder()
                         .key(
                             MediaSessionKey::builder()
@@ -13253,7 +13239,6 @@ mod control_only_tests {
                     None,
                     None,
                     None,
-                    None,
                 )
                 .await
             }
@@ -13308,7 +13293,6 @@ mod control_only_tests {
                     &registration,
                     spec,
                     pcm_endpoints(),
-                    None,
                     None,
                     None,
                     None,

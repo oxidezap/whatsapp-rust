@@ -17,24 +17,24 @@
 //! the same choice.
 //!
 //! The registry's media command fields are absorbed here: the recv-rekey and video-control
-//! mailboxes, the lossless group-control queue with its byte-budgeted coalescing, and the epoch
-//! retained before media attaches. The control plane keeps what is its own -- the consumer-facing
-//! `CallEvent` queue, the counters cell, the media-task abort handle, and the teardown hook.
+//! mailboxes, the lossless group-control queue with its byte-budgeted coalescing, the epoch
+//! retained before media attaches, the consumer-facing event stream, the counters cell, and the
+//! media-task abort handle. The control plane keeps what is its own -- signaling state, close
+//! reasons, generation guards, and the teardown hook.
 
 use std::mem::size_of;
 use std::sync::{Arc, Mutex};
 
 use crate::types::group_call::GroupCallUpdate;
+use crate::voip_control::control::VideoControlSender;
 use crate::voip_control::control::{DEFAULT_CALL_EVENT_QUEUE_CAPACITY, GroupControlQueue};
-use crate::voip_control::control::{
-    GroupControl, GroupRawEpoch, PeerAnswer, VideoControl, VideoControlReceiver,
-    VideoControlSender, video_control_channel,
-};
-use crate::voip_control::media_stats::{CallMediaStats, MediaStatsCell};
+use crate::voip_control::control::{GroupControl, GroupRawEpoch, PeerAnswer, VideoControl};
+#[cfg(any(test, feature = "test-util"))]
+use crate::voip_control::control::{VideoControlReceiver, video_control_channel};
+use crate::voip_control::media_stats::MediaStatsCell;
 use crate::voip_control::{
-    CallDirection, MediaAudioCodec, MediaCommand, MediaEvent, MediaKeyframeUrgency,
-    MediaSessionKey, MediaSessionSpec, MediaSetupError, MediaStats, VoipMediaBackend,
-    VoipMediaSession,
+    CallDirection, MediaCommand, MediaEvent, MediaKeyframeUrgency, MediaSessionKey,
+    MediaSessionSpec, MediaSetupError, MediaStats, VoipMediaBackend, VoipMediaSession,
 };
 
 /// The core group control a neutral command carries, when it carries one.
@@ -109,29 +109,6 @@ pub(crate) fn video_control_to_command(control: VideoControl) -> MediaCommand {
     }
 }
 
-fn codec_to_core(codec: MediaAudioCodec) -> MediaAudioCodec {
-    codec
-}
-
-/// The neutral codec for an engine one.
-pub(crate) fn codec_to_neutral(codec: MediaAudioCodec) -> MediaAudioCodec {
-    codec
-}
-
-fn urgency_to_core(urgency: MediaKeyframeUrgency) -> MediaKeyframeUrgency {
-    urgency
-}
-
-/// The neutral counters for an engine snapshot.
-///
-/// `CallMediaStats` is the seam's [`MediaStats`] under its historical engine name, so this is the
-/// identity and exists only so the resident adapter's call sites read the same as they did when the
-/// two were distinct structs.
-#[must_use]
-pub fn stats_to_neutral(stats: CallMediaStats) -> MediaStats {
-    stats
-}
-
 /// Mailboxes into one running drive task, attached incrementally as a call is set up.
 #[derive(Default)]
 struct Mailboxes {
@@ -178,7 +155,7 @@ impl ResidentMediaSession {
 
     /// A session that publishes through `stats`, shared with the `CallHandle`.
     #[must_use]
-    pub fn with_stats(stats: Arc<MediaStatsCell>) -> Arc<Self> {
+    fn with_stats(stats: Arc<MediaStatsCell>) -> Arc<Self> {
         let (events_tx, events_rx) = async_channel::bounded(DEFAULT_CALL_EVENT_QUEUE_CAPACITY);
         let (rekey_tx, rekey_rx) = async_channel::bounded(1);
         let session = Self {
@@ -223,6 +200,8 @@ impl ResidentMediaSession {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Test-only: reached through the test-gated registry setters.
+    #[cfg(any(test, feature = "test-util"))]
     /// Create and install this session's video-control mailbox, returning the drive-loop half.
     ///
     /// Concrete (not on the trait) because only the resident backend wires a `run_call` loop; a
@@ -252,12 +231,6 @@ impl ResidentMediaSession {
             .then_some(rx)
     }
 
-    /// The drive-loop half of the session-owned recv-rekey channel.
-    #[must_use]
-    pub fn install_rekey_channel(&self) -> Option<async_channel::Receiver<PeerAnswer>> {
-        self.take_rekey_receiver()
-    }
-
     /// A fresh counter cell, installed on this session and returned for the `CallHandle` to hold.
     #[must_use]
     pub fn install_fresh_stats_cell(&self) -> Arc<MediaStatsCell> {
@@ -274,6 +247,8 @@ impl ResidentMediaSession {
         self.mailboxes().media_task = Some(handle);
     }
 
+    /// Test-only: reached through the test-gated registry setters.
+    #[cfg(any(test, feature = "test-util"))]
     /// Swap the public stream's sender, for tests that install their own sink before subscribing.
     /// Production never calls this: the handle subscribes to the reservation-time stream, and a
     /// swap after that would orphan its receiver.
@@ -295,11 +270,15 @@ impl ResidentMediaSession {
         self.set_video_sender(tx);
     }
 
+    /// Test-only: reached through the test-gated registry setters.
+    #[cfg(any(test, feature = "test-util"))]
     /// Install the shared counter cell the drive loop publishes into.
     pub fn install_stats_cell(&self, cell: Arc<MediaStatsCell>) {
         self.set_stats_cell(cell);
     }
 
+    /// Test-only: reached through the test-gated registry setters.
+    #[cfg(any(test, feature = "test-util"))]
     /// Install the group-control mailbox and replay the retained startup state.
     pub fn install_group_sender(
         &self,
@@ -311,6 +290,8 @@ impl ResidentMediaSession {
         self.set_group_sender(tx, warp_mi_tag_len, committed, established_warp_mi_tag_len)
     }
 
+    /// Test-only: reached through the test-gated registry setters.
+    #[cfg(any(test, feature = "test-util"))]
     /// Install the drive task's abort handle (alias of [`install_drive_task`](Self::install_drive_task)).
     pub fn install_media_task(&self, handle: crate::runtime::AbortHandle) {
         self.install_drive_task(handle);
@@ -410,12 +391,6 @@ impl ResidentMediaSession {
         true
     }
 
-    /// A snapshot in the engine's own counter type.
-    #[must_use]
-    pub fn core_stats(&self) -> CallMediaStats {
-        self.stats_cell().snapshot()
-    }
-
     /// Install the counter cell the drive loop publishes into.
     ///
     /// The cell is created by the control plane and shared with the `CallHandle`; the session reads
@@ -425,12 +400,6 @@ impl ResidentMediaSession {
             .stats
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = cell;
-    }
-
-    /// The counter cell, for the control plane's `CallHandle` path.
-    #[must_use]
-    pub fn stats_cell_arc(&self) -> Arc<MediaStatsCell> {
-        self.stats_cell()
     }
 
     fn send_video(&self, control: VideoControl) -> bool {
@@ -451,11 +420,6 @@ impl VoipMediaSession for ResidentMediaSession {
                 .is_some_and(|tx| tx.try_send(control));
         }
         match command {
-            // The seam does not own mute yet: the live client applies it through `MuteFeed`, which
-            // gates the PCM the drive loop reads, and that path is unchanged. Reporting `true` here
-            // would tell a direct seam caller its mute landed when nothing moved, so the honest
-            // answer is `false` until this session owns the mute state.
-            MediaCommand::SetMuted(_) => false,
             MediaCommand::EnableVideo { awaiting_accept } => self.send_video(if awaiting_accept {
                 VideoControl::EnableAwaitingAccept
             } else {
@@ -469,7 +433,7 @@ impl VoipMediaSession for ResidentMediaSession {
             MediaCommand::DisableVideoOutbound => self.send_video(VideoControl::DisableOutbound),
             MediaCommand::RequireVideoKeyframe => self.send_video(VideoControl::RequireKeyframe),
             MediaCommand::RequestPeerKeyframe(urgency) => {
-                self.send_video(VideoControl::RequestPeerKeyframe(urgency_to_core(urgency)))
+                self.send_video(VideoControl::RequestPeerKeyframe(urgency))
             }
             MediaCommand::SetVideoOrientation {
                 participant,
@@ -497,15 +461,9 @@ impl VoipMediaSession for ResidentMediaSession {
                 self.rekey_tx
                     .try_send(PeerAnswer {
                         answering_lid,
-                        audio_codec: audio_codec.map(codec_to_core),
+                        audio_codec,
                     })
                     .is_ok()
-            }
-            MediaCommand::SwitchAudioCodec { .. } => {
-                // Codec selection is applied at engine construction or through the rekey, which
-                // carries the peer's capability. A live swap without one is not wired through the
-                // seam, and answering `false` is how the caller learns that.
-                false
             }
             MediaCommand::ApplyGroupUpdate(_)
             | MediaCommand::ApplyGroupTransition(_)
@@ -615,7 +573,7 @@ impl VoipMediaSession for ResidentMediaSession {
     }
 
     fn stats(&self) -> MediaStats {
-        stats_to_neutral(self.stats_cell().snapshot())
+        self.stats_cell().snapshot()
     }
 
     fn subscribe(&self) -> async_channel::Receiver<MediaEvent> {
@@ -687,7 +645,6 @@ impl VoipMediaBackend for NoMediaBackend {
 
     async fn open(
         &self,
-        _session: &Arc<dyn VoipMediaSession>,
         _spec: MediaSessionSpec,
         _ctx: crate::voip_control::MediaOpenContext,
     ) -> Result<(), MediaSetupError> {
@@ -716,7 +673,6 @@ mod tests {
             .call_id("NO-BACKEND".into())
             .generation(1)
             .build();
-        let session = backend.reserve(&key, CallDirection::Outgoing);
         let spec = MediaSessionSpec::builder()
             .key(key)
             .direction(CallDirection::Outgoing)
@@ -741,9 +697,7 @@ mod tests {
             .enable_sframe(false)
             .build();
         assert_eq!(
-            backend
-                .open(&session, spec, MediaOpenContext::for_test())
-                .await,
+            backend.open(spec, MediaOpenContext::for_test()).await,
             Err(MediaSetupError::NoBackend)
         );
     }

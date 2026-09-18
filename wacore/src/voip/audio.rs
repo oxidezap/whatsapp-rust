@@ -57,15 +57,6 @@ impl AudioFormat {
 }
 
 impl AudioFormat {
-    /// Project this format onto the neutral seam's flat format.
-    ///
-    /// `AudioFormat` and `MediaAudioFormat` are now the same type, so this is the identity. Kept as
-    /// a named conversion while the call sites that predate the merge still call it.
-    #[must_use]
-    pub fn to_neutral(self) -> crate::voip_control::MediaAudioFormat {
-        self
-    }
-
     /// Validate a neutral format as an engine format.
     ///
     /// Same type now; returns `None` when the result would be invalid (a zero timing or channel
@@ -397,22 +388,6 @@ impl AudioConfig {
                 MediaAudioIo::Encoded => AudioIo::Encoded,
             },
         })
-    }
-
-    /// Project this config onto the neutral seam's flat [`MediaAudioSpec`].
-    ///
-    /// [`MediaAudioSpec`]: crate::voip_control::MediaAudioSpec
-    #[must_use]
-    pub fn to_neutral(self) -> crate::voip_control::MediaAudioSpec {
-        use crate::voip_control::MediaAudioIo;
-
-        crate::voip_control::MediaAudioSpec {
-            format: self.format.to_neutral(),
-            io: match self.io {
-                AudioIo::Pcm => MediaAudioIo::Pcm,
-                AudioIo::Encoded => MediaAudioIo::Encoded,
-            },
-        }
     }
 }
 

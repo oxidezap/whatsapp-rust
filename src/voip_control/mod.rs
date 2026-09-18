@@ -8,13 +8,19 @@
 //! `src/client/voip.rs` are gated on `voip-control` and compile against these neutral types with
 //! the engine off. `voip-engine-wacore` adds the resident `WacoreVoipMediaBackend` on top.
 
+/// The seam surface, spelled so an external crate implements [`VoipMediaBackend`] importing only
+/// `whatsapp_rust::voip_control::*`: every neutral command, event, port, and channel the contract
+/// names, with no `wacore` in the path.
 pub use wacore::voip_control::{
-    CallDirection, MediaAudioCodec, MediaAudioFormat, MediaAudioIo, MediaAudioRtpProfile,
-    MediaAudioSpec, MediaCloseReason, MediaCodecDecisionSource, MediaCommand, MediaDirectPeer,
-    MediaEncodedFrame, MediaEvent, MediaGroupControlKind, MediaGroupSpec, MediaGroupTransition,
-    MediaKeyframeUrgency, MediaRtcpFeedback, MediaRtcpReportBlock, MediaSessionKey,
-    MediaSessionSpec, MediaSetupError, MediaSilenceReason, MediaStats, MediaVideoUpgradeToken,
-    VoipMediaBackend, VoipMediaSession,
+    AudioSink, AudioSource, CallDirection, EncodedAudioSink, EncodedAudioSource, MediaAudioCodec,
+    MediaAudioFormat, MediaAudioIo, MediaAudioPorts, MediaAudioRtpProfile, MediaAudioSpec,
+    MediaCloseReason, MediaCodecDecisionSource, MediaCommand, MediaDirectPeer, MediaEncodedFrame,
+    MediaEvent, MediaGroupControlKind, MediaGroupEpoch, MediaGroupSpec, MediaGroupTransition,
+    MediaKeyframeUrgency, MediaOpenContext, MediaRtcpFeedback, MediaRtcpReportBlock,
+    MediaSessionKey, MediaSessionSpec, MediaSetupError, MediaSilenceReason, MediaStats,
+    MediaVideoChannels, MediaVideoPorts, MediaVideoUpgradeToken, TimedVideoFrame, VideoControl,
+    VideoControlReceiver, VideoFrame, VideoInput, VideoSink, VideoSource, VoipMediaBackend,
+    VoipMediaSession,
 };
 
 #[cfg(feature = "voip-engine-wacore")]
