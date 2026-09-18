@@ -55,10 +55,10 @@ use wacore_binary::Jid;
 use zeroize::Zeroize;
 
 /// Monotonic milliseconds. The shell supplies it; the engine never reads a clock.
-pub type Millis = u64;
+pub use crate::voip_control::media_stats::Millis;
 
 /// Sentinel deadline meaning "no timer pending"; the shell waits only on I/O until the next input.
-pub const NEVER: Millis = u64::MAX;
+pub use crate::voip_control::media_stats::NEVER;
 
 /// Relay consent-freshness cadence: re-send the STUN allocate + a WA ping every second. The relay
 /// drops the client after ~4s without traffic, which is what makes the peer reconnect/terminate.

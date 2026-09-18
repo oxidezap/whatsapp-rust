@@ -130,31 +130,14 @@ fn urgency_to_core(urgency: MediaKeyframeUrgency) -> crate::voip::engine::Keyfra
     }
 }
 
-/// Project the engine's counters onto the neutral struct, field for field.
+/// The neutral counters for an engine snapshot.
+///
+/// `CallMediaStats` is the seam's [`MediaStats`] under its historical engine name, so this is the
+/// identity and exists only so the resident adapter's call sites read the same as they did when the
+/// two were distinct structs.
 #[must_use]
 pub fn stats_to_neutral(stats: CallMediaStats) -> MediaStats {
-    MediaStats {
-        rtp_received: stats.rtp_received,
-        rtp_payload_type_unexpected: stats.rtp_payload_type_unexpected,
-        srtp_unprotect_failed: stats.srtp_unprotect_failed,
-        sframe_decrypt_failed: stats.sframe_decrypt_failed,
-        audio_frames_decoded: stats.audio_frames_decoded,
-        audio_frames_delivered: stats.audio_frames_delivered,
-        audio_frames_concealed: stats.audio_frames_concealed,
-        mlow_off_point_dropped: stats.mlow_off_point_dropped,
-        mlow_inactive_or_sid: stats.mlow_inactive_or_sid,
-        foreign_frames_decoded: stats.foreign_frames_decoded,
-        audio_frames_without_decoder: stats.audio_frames_without_decoder,
-        outbound_frames_without_encoder: stats.outbound_frames_without_encoder,
-        playout_trimmed_samples: stats.playout_trimmed_samples,
-        inbound_pipe_dropped: stats.inbound_pipe_dropped,
-        audio_sink_dropped: stats.audio_sink_dropped,
-        video_sink_dropped: stats.video_sink_dropped,
-        peer_keyframe_requests: stats.peer_keyframe_requests,
-        relay_packet_unclassified: stats.relay_packet_unclassified,
-        forwarding_envelope_rejected: stats.forwarding_envelope_rejected,
-        codec_switches: stats.codec_switches,
-    }
+    stats
 }
 
 /// Mailboxes into one running drive task, attached incrementally as a call is set up.

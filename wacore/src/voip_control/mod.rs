@@ -48,6 +48,11 @@ pub mod signaling;
 // helpers as a second inherent impl on `AudioFormat`.
 pub mod audio_format;
 
+// Per-call media counters and the audio-health watchdog. Neutral: the counters are the seam's
+// [`MediaStats`], and the watchdog reads a clock the shell supplies. `crate::voip::media_stats`
+// re-exports this module, so the engine and a foreign backend count the same fields.
+pub mod media_stats;
+
 pub use signaling::{CallDirection, CallPhase, CallSession};
 
 /// One decrypted keygen-v2 epoch, kept as secret material.

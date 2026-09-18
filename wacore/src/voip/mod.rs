@@ -23,7 +23,11 @@ pub mod group_media;
 pub mod h264;
 pub mod hbh_srtp;
 pub mod media_session;
-pub mod media_stats;
+// The per-call counters and the audio-health watchdog now live in the neutral contract
+// (`crate::voip_control::media_stats`): `CallMediaStats` is the seam's `MediaStats`, so the engine
+// and a foreign backend count the same fields. Re-exported so the historical `crate::voip::*` paths
+// and the watchdog's module path keep resolving.
+pub use crate::voip_control::media_stats;
 #[cfg(feature = "voip-mlow")]
 pub mod mlow;
 pub mod opus_packet;

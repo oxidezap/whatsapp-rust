@@ -1,8 +1,5 @@
 //! Audio format and I/O contracts shared by the sans-I/O engine and platform drivers.
 
-use bytes::Bytes;
-use wacore_binary::Jid;
-
 use super::rtp::RTP_PAYLOAD_TYPE_MLOW_RED;
 
 // The fundamental format types now live in the neutral contract, so the control plane can name
@@ -426,25 +423,11 @@ impl Default for AudioConfig {
 }
 
 /// One decrypted codec payload received from the peer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct EncodedAudioFrame {
-    pub format: AudioFormat,
-    /// Codec detected within the negotiated RTP profile for this packet.
-    pub codec: AudioCodec,
-    pub data: Bytes,
-    /// Actual RTP payload type. MLOW redundancy uses PT 121 while the primary format uses PT 120.
-    pub payload_type: u8,
-    pub sequence_number: u16,
-    pub timestamp: u32,
-    pub marker: bool,
-    /// Group sender identity. Absent on 1:1 audio.
-    pub sender: Option<Jid>,
-    /// Group sender device identity. Absent on 1:1 audio.
-    pub device: Option<Jid>,
-    /// Relay participant id from the authoritative roster.
-    pub pid: Option<u32>,
-}
+///
+/// This is the neutral [`MediaEncodedFrame`](crate::voip_control::MediaEncodedFrame) under its
+/// historical engine name: one definition, so the engine's payload and the public event's payload
+/// cannot drift.
+pub use crate::voip_control::MediaEncodedFrame as EncodedAudioFrame;
 
 #[cfg(test)]
 mod tests {
