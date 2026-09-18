@@ -12,6 +12,8 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use wacore::voip::audio::{AudioCodec, AudioFormat, AudioRtpProfile};
 use wacore::voip::engine::{
     CallConfig, CallEngine, CallEvent, CodecDecisionSource, GroupControlKind,
@@ -26,6 +28,15 @@ use wacore::voip_control::{
     MediaSessionSpec, MediaSetupError, MediaSilenceReason, MediaVideoUpgradeToken,
     VoipMediaBackend, VoipMediaSession,
 };
+
+/// Three 60 ms frames absorb scheduling jitter without building a long capture delay.
+const MIC_CHANNEL_CAPACITY: usize = 3;
+/// Mono 16 kHz 60 ms frame length the engine expects; a muted frame is zeroed only at this length.
+const WA_FRAME_SAMPLES: usize = 960;
+/// Outbound video AU backlog before the source feed back-pressures.
+const VIDEO_IN_CHANNEL_CAP: usize = 4;
+/// Inbound video AU backlog between the drive loop and the sink forwarder.
+const VIDEO_OUT_CHANNEL_CAP: usize = 8;
 
 /// The relay endpoint a platform transport dials, read off the engine config the relay walk
 /// already resolved.
@@ -451,24 +462,208 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
 
     /// Bring the reserved session operational.
     ///
-    /// Builds the engine from the neutral spec and validates it; the drive loop and mailbox wiring
-    /// move here with the full lifecycle, at which point this owns the task internally. Until then
-    /// the facade still drives, and a build failure is the typed [`MediaSetupError`].
+    /// This is the sole media startup path: it builds the engine from the neutral spec, dials the
+    /// relay through the client's transport factory, wires the session's own command mailboxes and
+    /// the platform ports into a [`CallChannels`], and runs the drive loop on this backend's
+    /// runtime. The drive task's abort handle is owned by the session, so `close` ends it; the
+    /// control plane never sees it. On return the terminal reason is recorded and the registry
+    /// entry reaped.
     async fn open(
         &self,
-        session: &Arc<dyn VoipMediaSession>,
+        _session: &Arc<dyn VoipMediaSession>,
         spec: MediaSessionSpec,
-        _ctx: wacore::voip_control::MediaOpenContext,
+        ctx: wacore::voip_control::MediaOpenContext,
     ) -> Result<(), MediaSetupError> {
-        // The live path needs the client for `is_connected` and the relay-transport factory; a
-        // backend whose client is gone is a client that has been dropped, so this is the typed
-        // refusal rather than a panic. The drive loop and mailbox wiring move here with the full
-        // lifecycle, at which point this owns the task internally.
-        let _client = self.client.upgrade().ok_or(MediaSetupError::NoBackend)?;
-        let engine = build_engine(spec, Box::new(wacore::voip::engine::SequentialTxIds::new()))?;
-        drop(engine);
-        let _ = session;
+        let client = self.client.upgrade().ok_or(MediaSetupError::NoBackend)?;
+        let resident = self
+            .resident_session(&spec.key)
+            .ok_or(MediaSetupError::NoBackend)?;
+        let key = spec.key.clone();
+
+        let endpoint = RelayEndpointParams::from_spec(&spec).ok_or(MediaSetupError::BadEndpoint)?;
+        let engine = build_engine(spec, Box::new(crate::voip::driver::RandTxIds))?;
+
+        let factory = client
+            .relay_transport_factory(&endpoint)
+            .await
+            .map_err(|e| MediaSetupError::Backend(e.to_string()))?;
+        let (transport, relay_events) = factory
+            .connect()
+            .await
+            .map_err(|e| MediaSetupError::Backend(e.to_string()))?;
+
+        let stats = resident.install_fresh_stats_cell();
+        let video_ctl = resident.install_video_channel();
+        let group_ctl = Some(resident.install_group_channel());
+        let channels = build_channels(
+            &client,
+            &resident,
+            ctx,
+            stats,
+            video_ctl,
+            group_ctl,
+            key.generation,
+        )?;
+
+        let runtime = Arc::clone(&self.runtime);
+        let registry = client.call_registry();
+        let registry_for_task = Arc::clone(&registry);
+        let cid = key.call_id.clone();
+        let generation = key.generation;
+        let task = self.runtime.spawn(Box::pin(async move {
+            let reason =
+                wacore::voip::run_call(runtime, transport, relay_events, channels, engine).await;
+            // Record why the drive ended before the entry drops, so the session's `close` receives
+            // the real reason rather than the `Local` default.
+            registry_for_task.set_close_reason(&cid, generation, reason);
+            registry_for_task.remove_if_current(&cid, generation);
+        }));
+        // The session owns the task; `close` aborts it (F6/F14).
+        resident.install_drive_task(task);
         Ok(())
+    }
+}
+
+/// Wire the platform ports and the session's command mailboxes into the driver's channels.
+///
+/// Only the selected audio I/O pair stays open; the inactive pair is a bounded(1) channel with the
+/// far half dropped, so its select arm retires immediately without per-frame branching.
+fn build_channels(
+    client: &crate::client::Client,
+    resident: &Arc<ResidentMediaSession>,
+    ctx: wacore::voip_control::MediaOpenContext,
+    media_stats: Arc<wacore::voip_control::media_stats::MediaStatsCell>,
+    video_ctl: wacore::voip::VideoControlReceiver,
+    group_ctl: Option<async_channel::Receiver<wacore::voip::GroupControl>>,
+    generation: u64,
+) -> Result<wacore::voip::CallChannels, MediaSetupError> {
+    use wacore::voip::CallChannels;
+
+    // Audio: the selected pair stays open; the other is a closed bounded(1) stub. The mute feed and
+    // the video feeds are detached: each ends when the drive loop drops the receiver it writes to,
+    // which happens when the drive task ends.
+    let (mic, speaker, encoded_audio_in, encoded_audio_out) = match ctx.audio {
+        wacore::voip_control::MediaAudioPorts::Pcm { source, sink } => {
+            let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(MIC_CHANNEL_CAPACITY);
+            client.runtime.spawn_detached(Box::pin(
+                MuteFeed {
+                    src: source.frames(),
+                    out: mic_tx,
+                    muted: ctx.muted.clone(),
+                }
+                .run(),
+            ));
+            let (_enc_tx, enc_in) = async_channel::bounded::<Bytes>(1);
+            let (enc_out, _enc_rx) = async_channel::bounded::<wacore::voip::EncodedAudioFrame>(1);
+            (mic_rx, sink.playout(), enc_in, enc_out)
+        }
+        wacore::voip_control::MediaAudioPorts::Encoded { source, sink } => {
+            let (_mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
+            let (speaker, _speaker_rx) = async_channel::bounded::<Vec<i16>>(1);
+            (mic_rx, speaker, source.frames(), sink.frames())
+        }
+    };
+
+    // Video: the drive loop always gets the channels. With a source, the source pumps into them and
+    // the out-forwarder stamps the authoritative call generation before the sink; without one, the
+    // far halves are closed so their driver arms retire.
+    let (video_in_tx, video_in) = async_channel::bounded::<Vec<u8>>(VIDEO_IN_CHANNEL_CAP);
+    let (timed_video_in_tx, timed_video_in) =
+        async_channel::bounded::<wacore::voip::VideoInput>(VIDEO_IN_CHANNEL_CAP);
+    let (video_out, video_out_rx) =
+        async_channel::bounded::<wacore::voip::VideoFrame>(VIDEO_OUT_CHANNEL_CAP);
+    if let Some(video) = ctx.video {
+        let sink = video.sink.playout();
+        client.runtime.spawn_detached(Box::pin(async move {
+            while let Ok(mut frame) = video_out_rx.recv().await {
+                frame.generation = generation;
+                // Loss tolerant: a stalled sink sheds frames rather than back-pressuring the loop.
+                let _ = sink.try_send(frame);
+            }
+        }));
+        client.runtime.spawn_detached(Box::pin(
+            SourceFeed {
+                source: video.source,
+                out_legacy: video_in_tx,
+                out_timed: timed_video_in_tx,
+            }
+            .run(),
+        ));
+    } else {
+        drop(video_out_rx);
+        drop(video_in_tx);
+        drop(timed_video_in_tx);
+    }
+
+    Ok(CallChannels {
+        mic,
+        speaker,
+        encoded_audio_in,
+        encoded_audio_out,
+        events: resident.event_sender(),
+        rekey: ctx.rekey,
+        video_in,
+        timed_video_in: Some(timed_video_in),
+        video_out,
+        video_ctl,
+        group_ctl,
+        media_stats,
+    })
+}
+
+/// Configures and runs the mic mute feed.
+struct MuteFeed {
+    src: async_channel::Receiver<Vec<i16>>,
+    out: async_channel::Sender<Vec<i16>>,
+    muted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl MuteFeed {
+    async fn run(self) {
+        use std::sync::atomic::Ordering;
+        while let Ok(mut frame) = self.src.recv().await {
+            if self.muted.load(Ordering::Relaxed) && frame.len() == WA_FRAME_SAMPLES {
+                frame.fill(0);
+            }
+            if self.out.send(frame).await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+/// Pumps a video source into the drive loop's legacy and (if present) timestamped inputs.
+struct SourceFeed {
+    source: Arc<dyn wacore::voip_control::VideoSource>,
+    out_legacy: async_channel::Sender<Vec<u8>>,
+    out_timed: async_channel::Sender<wacore::voip::VideoInput>,
+}
+
+impl SourceFeed {
+    async fn run(self) {
+        if let Some(timed) = self.source.timed_frames() {
+            while let Ok(frame) = timed.recv().await {
+                if self
+                    .out_timed
+                    .send(wacore::voip::VideoInput {
+                        data: frame.data,
+                        timestamp: frame.timestamp,
+                        generation: 0,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            return;
+        }
+        let legacy = self.source.frames();
+        while let Ok(au) = legacy.recv().await {
+            if self.out_legacy.send(au).await.is_err() {
+                break;
+            }
+        }
     }
 }
 
