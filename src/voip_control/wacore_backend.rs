@@ -21,8 +21,8 @@ use wacore::voip::media_stats::AudioSilenceReason;
 use wacore::voip::rtcp::{RtcpFeedback, RtcpReportBlock};
 use wacore::voip::transport::RelayEndpointParams;
 use wacore::voip_control::{
-    MediaAudioCodec, MediaAudioFormat, MediaAudioRtpProfile, MediaCodecDecisionSource,
-    MediaDirection, MediaEncodedFrame, MediaEvent, MediaGroupControlKind, MediaGroupSpec,
+    CallDirection, MediaAudioCodec, MediaAudioFormat, MediaAudioRtpProfile,
+    MediaCodecDecisionSource, MediaEncodedFrame, MediaEvent, MediaGroupControlKind, MediaGroupSpec,
     MediaSessionSpec, MediaSetupError, MediaSilenceReason, MediaVideoUpgradeToken,
     VoipMediaBackend, VoipMediaSession,
 };
@@ -412,7 +412,7 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
     fn reserve(
         &self,
         _key: &wacore::voip_control::MediaSessionKey,
-        _direction: MediaDirection,
+        _direction: CallDirection,
     ) -> Arc<dyn VoipMediaSession> {
         ResidentMediaSession::new()
     }
@@ -453,7 +453,7 @@ mod tests {
                     .generation(1)
                     .build(),
             )
-            .direction(MediaDirection::Incoming)
+            .direction(CallDirection::Incoming)
             .self_lid("1:0@lid".into())
             .peer_lid("2:0@lid".into())
             .call_key(vec![0u8; 32])
@@ -489,7 +489,7 @@ mod tests {
             .call_id("SEAM-1".into())
             .generation(2)
             .build();
-        let session = backend.reserve(&key, MediaDirection::Outgoing);
+        let session = backend.reserve(&key, CallDirection::Outgoing);
         assert_eq!(session.stats(), wacore::voip_control::MediaStats::default());
     }
 

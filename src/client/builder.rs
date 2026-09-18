@@ -87,6 +87,13 @@ pub enum ClientBuilderError {
     InvalidPluginTaskDrainTimeout,
     #[error("the configured backend does not support the inbound durability hook: {0}")]
     UnsupportedDurabilityBackend(String),
+    /// Two media backends were installed, or one was installed after assembly already bound the
+    /// registry's. Silently ignoring the requested backend would leave a caller running on one it
+    /// did not ask for, so the conflict is an error.
+    #[cfg(feature = "voip-runtime")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "voip-runtime")))]
+    #[error("a VoIP media backend is already installed on this client")]
+    VoipMediaBackendAlreadyInstalled,
     #[cfg(feature = "client-lifecycle")]
     #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
     #[error("client lifecycle installation failed: {0}")]
@@ -135,7 +142,7 @@ pub struct ClientBuilder {
     /// The media backend the call subsystem reserves sessions from, when the application wants a
     /// foreign implementation. `None` means "use whatever this build defaults to": the resident
     /// `WacoreVoipMediaBackend` on a `voip-engine-wacore` build, or none at all.
-    #[cfg(feature = "voip-control")]
+    #[cfg(feature = "voip-runtime")]
     voip_media_backend: Option<Arc<dyn wacore::voip_control::VoipMediaBackend>>,
 }
 
@@ -173,7 +180,7 @@ impl ClientBuilder {
             plugins: Vec::new(),
             #[cfg(feature = "plugins")]
             plugin_host_config: PluginHostConfig::default(),
-            #[cfg(feature = "voip-control")]
+            #[cfg(feature = "voip-runtime")]
             voip_media_backend: None,
         }
     }
@@ -234,7 +241,7 @@ impl ClientBuilder {
     /// `reserve` one session per call. Supplying one is what lets a caller run calls on a foreign
     /// engine instead of the resident one, and a `voip-control`-only build has no other way to get
     /// media at all.
-    #[cfg(feature = "voip-control")]
+    #[cfg(feature = "voip-runtime")]
     pub fn with_voip_media_backend<B>(mut self, backend: B) -> Self
     where
         B: wacore::voip_control::VoipMediaBackend + 'static,
@@ -244,7 +251,7 @@ impl ClientBuilder {
     }
 
     /// [`with_voip_media_backend`](Self::with_voip_media_backend) for an already-shared backend.
-    #[cfg(feature = "voip-control")]
+    #[cfg(feature = "voip-runtime")]
     pub fn with_voip_media_backend_arc(
         mut self,
         backend: Arc<dyn wacore::voip_control::VoipMediaBackend>,
@@ -614,8 +621,13 @@ impl ClientBuilder {
         );
         let client = assembly.client();
         #[cfg(feature = "voip-runtime")]
-        if let Some(backend) = self.voip_media_backend.clone() {
-            let _ = client.call_registry().install_backend(backend);
+        if let Some(backend) = self.voip_media_backend.clone()
+            && !client.call_registry().install_backend(backend)
+        {
+            // A caller that asked for a specific backend must never end up on another. The only
+            // way this fails is a second install, which is a programming error, not a runtime
+            // condition, so it is surfaced rather than dropped.
+            return Err(ClientBuilderError::VoipMediaBackendAlreadyInstalled);
         }
         #[cfg(feature = "client-lifecycle")]
         let mut construction = ClientConstructionGuard::new(Arc::clone(&client));

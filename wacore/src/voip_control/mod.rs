@@ -99,13 +99,8 @@ pub struct MediaSessionKey {
     pub generation: u64,
 }
 
-/// Call direction, without the engine's `CallDirection`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum MediaDirection {
-    Outgoing,
-    Incoming,
-}
+// `CallDirection` is gone: `signaling::CallDirection` is the one direction enum, and it lives on
+// the neutral side already, so a separate spelling would only be a second thing to keep in sync.
 
 /// Audio codec carried inside the RTP payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,7 +292,7 @@ pub struct MediaRtcpFeedback {
 pub struct MediaSessionSpec {
     /// The generational identity of this session, not a bare call-id.
     pub key: MediaSessionKey,
-    pub direction: MediaDirection,
+    pub direction: CallDirection,
     pub self_lid: String,
     pub peer_lid: String,
     /// The 32-byte callKey. Secret.
@@ -653,11 +648,8 @@ pub trait VoipMediaBackend: MaybeSendSync {
     /// step, or a command that arrives before the engine attaches from a superseded generation of
     /// the same call-id could reach the new session. [`MediaSessionSpec::key`] carries the same
     /// key for the `open` half.
-    fn reserve(
-        &self,
-        key: &MediaSessionKey,
-        direction: MediaDirection,
-    ) -> Arc<dyn VoipMediaSession>;
+    fn reserve(&self, key: &MediaSessionKey, direction: CallDirection)
+    -> Arc<dyn VoipMediaSession>;
 
     /// Build the engine for `spec`.
     ///
@@ -867,7 +859,7 @@ mod tests {
                     .generation(3)
                     .build(),
             )
-            .direction(MediaDirection::Incoming)
+            .direction(CallDirection::Incoming)
             .self_lid("1:0@lid".into())
             .peer_lid("2:0@lid".into())
             .call_key(vec![0xAB; 32])

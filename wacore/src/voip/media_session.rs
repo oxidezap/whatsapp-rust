@@ -31,7 +31,7 @@ use crate::voip::driver::{
 use crate::voip::media_stats::{CallMediaStats, MediaStatsCell};
 use crate::voip::registry::{DEFAULT_CALL_EVENT_QUEUE_CAPACITY, GroupControlQueue};
 use crate::voip_control::{
-    MediaAudioCodec, MediaCommand, MediaDirection, MediaEvent, MediaKeyframeUrgency,
+    CallDirection, MediaAudioCodec, MediaCommand, MediaEvent, MediaKeyframeUrgency,
     MediaSessionKey, MediaSessionSpec, MediaSetupError, MediaStats, VoipMediaBackend,
     VoipMediaSession,
 };
@@ -533,7 +533,7 @@ impl VoipMediaBackend for ResidentMediaBackend {
     fn reserve(
         &self,
         _key: &MediaSessionKey,
-        _direction: MediaDirection,
+        _direction: CallDirection,
     ) -> Arc<dyn VoipMediaSession> {
         ResidentMediaSession::new()
     }

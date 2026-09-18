@@ -29,9 +29,7 @@ use crate::voip::media_session::{
     ResidentMediaSession, codec_to_neutral, video_control_to_command,
 };
 use crate::voip::session::{CallPhase, CallSession};
-use crate::voip_control::{
-    MediaCommand, MediaDirection, MediaSessionKey, VoipMediaBackend, VoipMediaSession,
-};
+use crate::voip_control::{MediaCommand, MediaSessionKey, VoipMediaBackend, VoipMediaSession};
 use wacore_binary::Jid;
 
 const MAX_PENDING_INITIAL_GROUP_CONTROLS: usize = 64;
@@ -301,6 +299,9 @@ struct CallEntry {
     /// reaches media only through [`VoipMediaSession`]. Present from registration, before the
     /// engine exists, because commands can arrive during setup.
     media: Option<Arc<dyn VoipMediaSession>>,
+    /// Why this call's media is ending, recorded by the terminal path so the entry's `Drop` can
+    /// hand it to [`VoipMediaSession::close`]. `Local` (a hangup or terminate) by default.
+    close_reason: crate::voip_control::MediaCloseReason,
     media_task: Option<AbortHandle>,
     /// Media counters published by the drive loop, readable through the consumer's `CallHandle`.
     /// Installed when the engine attaches; absent before that, which reads as all-zero rather than
@@ -683,6 +684,16 @@ impl Drop for CallEntry {
         self.group_update_event.notify(usize::MAX);
         if let Some(teardown) = self.video_teardown.take() {
             teardown();
+        }
+        // Real close, through the neutral seam: every backend ends its own media here instead of
+        // the registry relying on a resident-only `media_task` abort. The reason is whatever the
+        // terminal path recorded, `Local` (a hangup/terminate) by default.
+        if let Some(media) = self.media.take() {
+            let reason = std::mem::replace(
+                &mut self.close_reason,
+                crate::voip_control::MediaCloseReason::Local,
+            );
+            media.close(reason);
         }
     }
 }
@@ -1830,10 +1841,9 @@ impl CallRegistry {
         force_group: bool,
         is_call_link: bool,
     ) -> CallEntry {
-        let direction = match session.direction {
-            crate::voip::session::CallDirection::Outgoing => MediaDirection::Outgoing,
-            crate::voip::session::CallDirection::Incoming => MediaDirection::Incoming,
-        };
+        // `CallSession.direction` is the neutral `CallDirection` already, so it moves straight
+        // through to the backend with no translation.
+        let direction = session.direction;
         // Reserved through the injected backend, so the registry never names a concrete media
         // implementation. The key carries the generation from the first step, so a command from a
         // superseded generation can never reach this session.
@@ -1861,6 +1871,7 @@ impl CallRegistry {
             peer_orientation_seq: 0,
             session,
             media: Some(media),
+            close_reason: crate::voip_control::MediaCloseReason::Local,
             media_task: None,
             media_stats: None,
             waiting_room_task: None,
@@ -3255,11 +3266,34 @@ impl CallRegistry {
         self.pending_controls().clear();
         let drained: Vec<CallEntry> = {
             let mut map = self.active_calls();
+            // The relay is gone, so every session ends for the same reason. Set before the entries
+            // drop, so `VoipMediaSession::close` receives it instead of the `Local` default.
+            for entry in map.values_mut() {
+                entry.close_reason = crate::voip_control::MediaCloseReason::RelayDisconnected;
+            }
             map.drain().map(|(_, entry)| entry).collect()
         };
         let n = drained.len();
-        // `drained` drops here, off-lock: every entry aborts its media task and fires on_terminal.
+        // `drained` drops here, off-lock: every entry closes its media, aborts its media task and
+        // fires on_terminal.
         n
+    }
+
+    /// Record why a call generation's media is ending, so the entry's `Drop` hands the reason to
+    /// [`VoipMediaSession::close`]. Generation-guarded and ignored for an unknown call.
+    pub fn set_close_reason(
+        &self,
+        call_id: &str,
+        generation: u64,
+        reason: crate::voip_control::MediaCloseReason,
+    ) {
+        if let Some(entry) = self
+            .active_calls()
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        {
+            entry.close_reason = reason;
+        }
     }
 }
 
@@ -3399,6 +3433,51 @@ mod tests {
                 .any(|(c, _)| matches!(c, MediaCommand::ApplyGroupEpoch { .. })),
             "the live generation receives its own command"
         );
+    }
+
+    #[test]
+    fn dropping_a_call_closes_its_session_through_the_seam() {
+        use crate::voip_control::fake_backend::FakeMediaBackend;
+        use crate::voip_control::{MediaCloseReason, MediaSessionKey};
+
+        // Gate 6: `close()` really ends the media. The registry never names the backend's session
+        // type; it drops the entry and the session observes the call.
+        let backend = Arc::new(FakeMediaBackend::new());
+        let registry = CallRegistry::with_backend(backend.clone());
+        let generation = registry.insert(session("CLOSE-CALL"));
+        let media = backend
+            .session(&MediaSessionKey {
+                call_id: "CLOSE-CALL".to_string(),
+                generation,
+            })
+            .expect("reserved");
+
+        // A disconnect records the reason before the entries drop.
+        assert_eq!(registry.abort_all(), 1);
+        assert_eq!(
+            media.record().closed,
+            Some(MediaCloseReason::RelayDisconnected)
+        );
+    }
+
+    #[test]
+    fn a_superseded_generation_is_closed_with_the_local_reason() {
+        use crate::voip_control::fake_backend::FakeMediaBackend;
+        use crate::voip_control::{MediaCloseReason, MediaSessionKey};
+
+        let backend = Arc::new(FakeMediaBackend::new());
+        let registry = CallRegistry::with_backend(backend.clone());
+        let first = registry.insert(session("X"));
+        let first_media = backend
+            .session(&MediaSessionKey {
+                call_id: "X".to_string(),
+                generation: first,
+            })
+            .expect("reserved");
+
+        // Replacing the same call-id drops the old entry, which closes its session.
+        let _second = registry.insert(session("X"));
+        assert_eq!(first_media.record().closed, Some(MediaCloseReason::Local));
     }
 
     fn group_update(transaction_id: u32) -> GroupCallUpdate {

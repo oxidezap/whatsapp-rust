@@ -11,8 +11,8 @@
 //! types have to move.
 
 pub use wacore::voip_control::{
-    MediaAudioCodec, MediaAudioFormat, MediaAudioIo, MediaAudioRtpProfile, MediaAudioSpec,
-    MediaCloseReason, MediaCodecDecisionSource, MediaCommand, MediaDirectPeer, MediaDirection,
+    CallDirection, MediaAudioCodec, MediaAudioFormat, MediaAudioIo, MediaAudioRtpProfile,
+    MediaAudioSpec, MediaCloseReason, MediaCodecDecisionSource, MediaCommand, MediaDirectPeer,
     MediaEncodedFrame, MediaEvent, MediaGroupControlKind, MediaGroupSpec, MediaGroupTransition,
     MediaKeyframeUrgency, MediaRtcpFeedback, MediaRtcpReportBlock, MediaSessionKey,
     MediaSessionSpec, MediaSetupError, MediaSilenceReason, MediaStats, MediaVideoUpgradeToken,

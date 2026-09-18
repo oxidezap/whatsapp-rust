@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::types::group_call::GroupCallUpdate;
 use crate::voip_control::{
-    MediaCloseReason, MediaCommand, MediaDirection, MediaEvent, MediaGroupEpoch, MediaSessionKey,
+    CallDirection, MediaCloseReason, MediaCommand, MediaEvent, MediaGroupEpoch, MediaSessionKey,
     MediaSessionSpec, MediaSetupError, MediaStats, VoipMediaBackend, VoipMediaSession,
 };
 
@@ -155,7 +155,7 @@ impl VoipMediaBackend for FakeMediaBackend {
     fn reserve(
         &self,
         key: &MediaSessionKey,
-        _direction: MediaDirection,
+        _direction: CallDirection,
     ) -> Arc<dyn VoipMediaSession> {
         let (session, _rx) = FakeMediaSession::new_with_key(key.clone());
         self.sessions

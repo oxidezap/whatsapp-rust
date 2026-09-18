@@ -12,11 +12,10 @@
 
 use crate::voip::audio::AudioConfig;
 use crate::voip::engine::CallConfig;
-use crate::voip::session::CallDirection;
-use crate::voip_control::{
-    MediaDirection, MediaGroupSpec, MediaSessionKey, MediaSessionSpec, MediaSetupError,
-};
+use crate::voip_control::{MediaGroupSpec, MediaSessionKey, MediaSessionSpec, MediaSetupError};
 
+/// `CallConfig.direction` is the neutral `CallDirection` (the engine's session module re-exports
+/// it), so the projection is now a move rather than an enum translation.
 impl TryFrom<(CallConfig, u64)> for MediaSessionSpec {
     type Error = MediaSetupError;
 
@@ -26,18 +25,12 @@ impl TryFrom<(CallConfig, u64)> for MediaSessionSpec {
     /// [`CallConfig`]: it names *this* session among same-call-id replacements, so it rides the
     /// neutral [`MediaSessionKey`] rather than the engine config.
     fn try_from((config, generation): (CallConfig, u64)) -> Result<Self, Self::Error> {
-        // Exhaustive on purpose: this lives in `wacore`, the enum's own crate, so a new direction
-        // fails to compile here rather than being silently projected onto the wrong side.
-        let direction = match config.direction {
-            CallDirection::Outgoing => MediaDirection::Outgoing,
-            CallDirection::Incoming => MediaDirection::Incoming,
-        };
         Ok(Self {
             key: MediaSessionKey {
                 call_id: config.call_id,
                 generation,
             },
-            direction,
+            direction: config.direction,
             self_lid: config.self_lid,
             peer_lid: config.peer_lid,
             call_key: config.call_key,
@@ -108,12 +101,8 @@ pub fn into_engine_parts(spec: MediaSessionSpec) -> Result<EngineParts, MediaSet
     } = spec;
     let config = CallConfig {
         call_id: key.call_id.clone(),
-        // Exhaustive on purpose: a new direction fails to compile here rather than being silently
-        // dialed as the wrong side.
-        direction: match direction {
-            MediaDirection::Outgoing => CallDirection::Outgoing,
-            MediaDirection::Incoming => CallDirection::Incoming,
-        },
+        // The engine's `CallConfig.direction` is this same neutral enum, so no translation.
+        direction,
         self_lid,
         peer_lid,
         call_key,
@@ -136,6 +125,7 @@ pub fn into_engine_parts(spec: MediaSessionSpec) -> Result<EngineParts, MediaSet
 mod tests {
     use super::*;
     use crate::voip::relay_parse::{RelayAddress, RelayData, RelayEndpoint};
+    use crate::voip_control::CallDirection;
 
     fn relay() -> RelayData {
         RelayData {
