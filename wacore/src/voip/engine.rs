@@ -796,18 +796,10 @@ struct VideoPlaneState {
 /// a force flag that skips the throttle outright, because the interval is
 /// measured for bursts of gaps and a decoder that has already failed is not one
 /// of those.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyframeUrgency {
-    /// A gap noticed in the stream. Subject to the throttle, so calling on
-    /// every lost unit costs one request per interval.
-    Coalesced,
-    /// A decoder that has failed and reset. Its reference chain is gone *now*,
-    /// and waiting out an interval sized for coalescing a burst costs the whole
-    /// gap, so this skips that interval -- for a much shorter floor, not for
-    /// none, because the path is public and its answer is the peer's largest
-    /// frame.
-    Immediate,
-}
+///
+/// The neutral [`MediaKeyframeUrgency`](crate::voip_control::MediaKeyframeUrgency) is the one
+/// definition; re-exported here so the engine and the control plane share it.
+pub use crate::voip_control::MediaKeyframeUrgency as KeyframeUrgency;
 
 fn requests_keyframe(feedback: &[RtcpFeedback], video_ssrc: u32) -> bool {
     let target = video_ssrc.to_be_bytes();

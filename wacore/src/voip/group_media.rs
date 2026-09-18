@@ -4,7 +4,7 @@
 //! keygen-v2 epoch is then derived with the authenticated sender's device id;
 //! keys are never tried across participants.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use subtle::ConstantTimeEq;
 use wacore_binary::{Jid, JidExt};
@@ -21,8 +21,8 @@ use crate::voip::session::{
     MediaPipeline, MediaPipelineParams, VideoPipeline, VideoPipelineParams,
 };
 use crate::voip::ssrc::{
-    APP_DATA_SSRC_SLOT_WORD, VIDEO_SSRC_SLOT_WORD, derive_video_participant_ssrc,
-    derive_wasm_participant_ssrc, format_e2e_srtp_participant_id,
+    APP_DATA_SSRC_SLOT_WORD, derive_video_participant_ssrc, derive_wasm_participant_ssrc,
+    format_e2e_srtp_participant_id,
 };
 
 const MAX_BUFFERED_EPOCHS: usize = 8;
@@ -812,6 +812,7 @@ fn active_devices<'a>(
 mod tests {
     use super::*;
     use crate::voip::rtp::VIDEO_TS_STRIDE_15FPS;
+    use crate::voip::ssrc::VIDEO_SSRC_SLOT_WORD;
     use crate::voip::warp::WARP_MI_TAG_LEN;
     use wacore_binary::Server;
 

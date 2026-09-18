@@ -63,6 +63,9 @@ pub mod ssrc;
 // Group-call membership/control state, engine-free: the server owns the roster and this is the
 // transaction-ordered client view of it.
 pub mod group;
+// The control vocabulary a call sends into its media plane: group roster/epoch transitions,
+// video-plane controls, and the recv-rekey answer, with the mailbox types that carry them.
+pub mod control;
 
 // Per-call media counters and the audio-health watchdog. Neutral: the counters are the seam's
 // [`MediaStats`], and the watchdog reads a clock the shell supplies. `crate::voip::media_stats`
