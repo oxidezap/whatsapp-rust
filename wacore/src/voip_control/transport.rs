@@ -145,6 +145,25 @@ pub struct RelayEndpointParams {
     pub ice_pwd: String,
 }
 
+impl RelayEndpointParams {
+    /// Build the dial parameters from a session spec.
+    ///
+    /// `ice_ufrag` is `token_to_ice_ufrag` of the selected endpoint's `<auth_token>`, and `ice_pwd`
+    /// is the relay `<key>` in the ASCII base64 form it arrived in, lossy-decoded because a call is
+    /// not worth failing over a non-UTF-8 byte. A native dialer ignores both; a browser cannot build
+    /// an `RTCPeerConnection` without them.
+    pub fn from_spec(spec: &super::MediaSessionSpec) -> Option<Self> {
+        let addr = format!("{}:{}", spec.relay_ip, spec.relay_port)
+            .parse()
+            .ok()?;
+        Some(Self {
+            addr,
+            ice_ufrag: super::relay_parse::token_to_ice_ufrag(&spec.auth_token),
+            ice_pwd: String::from_utf8_lossy(&spec.integrity_key).into_owned(),
+        })
+    }
+}
+
 // Manual Debug: `ice_pwd` is the relay key, and this struct is the kind of thing a `{:?}` in a
 // transport implementation reaches for. Matches the redaction `RelayData` and `CallConfig` apply.
 impl core::fmt::Debug for RelayEndpointParams {
