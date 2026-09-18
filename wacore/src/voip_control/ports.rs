@@ -6,6 +6,8 @@
 //! ports the facade already collects. The `voip` crate re-exports every one under its historical
 //! `whatsapp_rust::voip::*` path.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 
 use super::MediaEncodedFrame;
@@ -88,6 +90,45 @@ pub trait VideoSource: Send + Sync + 'static {
 /// A video sink for a call: reassembled peer access units with keyframe/orientation metadata.
 pub trait VideoSink: Send + Sync + 'static {
     fn playout(&self) -> async_channel::Sender<VideoFrame>;
+}
+
+/// The audio ports a session reads and writes, selected by the negotiated I/O mode.
+pub enum MediaAudioPorts {
+    /// PCM frames in and out: a microphone source and a speaker sink.
+    Pcm {
+        source: Arc<dyn AudioSource>,
+        sink: Arc<dyn AudioSink>,
+    },
+    /// Codec payloads in and out, transcoded nowhere.
+    Encoded {
+        source: Arc<dyn EncodedAudioSource>,
+        sink: Arc<dyn EncodedAudioSink>,
+    },
+}
+
+/// The optional video ports a session reads and writes.
+pub struct MediaVideoPorts {
+    pub source: Arc<dyn VideoSource>,
+    pub sink: Arc<dyn VideoSink>,
+}
+
+/// Everything a backend needs to bring a reserved session operational, besides the spec.
+///
+/// This is the neutral opening context: the platform's endpoints, the public event sink, and the
+/// one-shot recv-rekey source. The executor and the relay transport are deliberately absent -- they
+/// are Rust trait objects that cannot cross a process boundary, so they are constructor state of
+/// the backend, never context (F9).
+///
+/// A backend's [`open`](super::VoipMediaBackend::open) owns the rest of the lifecycle: it builds
+/// its media, wires the session's own mailboxes, and starts driving. The control plane never hands
+/// a backend its internal mailboxes through the contract.
+pub struct MediaOpenContext {
+    pub audio: MediaAudioPorts,
+    pub video: Option<MediaVideoPorts>,
+    /// The public, ordered call event sink the handle reads.
+    pub events: async_channel::Sender<super::CallEvent>,
+    /// The caller-only recv-rekey receiver; `None` on the callee side.
+    pub rekey: Option<async_channel::Receiver<super::control::PeerAnswer>>,
 }
 
 // Blanket impls so a bare `async_channel` endpoint is usable directly as a source/sink, matching the
