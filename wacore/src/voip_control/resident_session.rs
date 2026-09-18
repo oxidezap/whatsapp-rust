@@ -212,14 +212,20 @@ impl ResidentMediaSession {
     }
 
     /// Create and install this session's group-control mailbox, returning the drive-loop half.
+    ///
+    /// The committed roster and any retained epoch are replayed when the sender is installed, and a
+    /// `warp_mi_tag_len` that changed under an established relay is refused (`None`), the same policy
+    /// the registry's attach-time replay applied.
     #[must_use]
-    pub fn install_group_channel(&self) -> async_channel::Receiver<GroupControl> {
-        // The committed roster and any retained epoch are replayed when the sender is installed; a
-        // fresh rekey channel is empty here, so pass `None` for both and let `deliver_group_*`
-        // retain anything that arrived earlier.
+    pub fn install_group_channel(
+        &self,
+        warp_mi_tag_len: Option<usize>,
+        committed: Option<GroupCallUpdate>,
+        established_warp_mi_tag_len: Option<usize>,
+    ) -> Option<async_channel::Receiver<GroupControl>> {
         let (tx, rx) = async_channel::bounded(DEFAULT_CALL_EVENT_QUEUE_CAPACITY);
-        let _ = self.set_group_sender(tx, None, None, None);
-        rx
+        self.set_group_sender(tx, warp_mi_tag_len, committed, established_warp_mi_tag_len)
+            .then_some(rx)
     }
 
     /// Create and install this session's recv-rekey mailbox, returning the drive-loop half.

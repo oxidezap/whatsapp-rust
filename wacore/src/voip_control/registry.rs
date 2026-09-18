@@ -1269,6 +1269,32 @@ impl CallRegistry {
             .and_then(|entry| entry.group.clone())
     }
 
+    /// The committed roster and the WARP tag width already established for a call, so a backend's
+    /// `open` can replay them into the group mailbox it installs. `None` when the call is gone.
+    #[must_use]
+    pub fn group_attach_replay(
+        &self,
+        call_id: &str,
+        generation: u64,
+    ) -> Option<(Option<GroupCallUpdate>, Option<usize>)> {
+        let map = self.active_calls();
+        let entry = map
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)?;
+        let committed = entry
+            .group
+            .as_ref()
+            .and_then(GroupCallState::snapshot)
+            .cloned();
+        let established = entry
+            .group
+            .as_ref()
+            .and_then(GroupCallState::snapshot)
+            .and_then(|snapshot| snapshot.relay.as_ref())
+            .map(|relay| relay.warp_mi_tag_len.unwrap_or(4) as usize);
+        Some((committed, established))
+    }
+
     /// Whether one exact active group generation carries the supplied signaling creator.
     pub fn group_creator_matches_if_current(
         &self,

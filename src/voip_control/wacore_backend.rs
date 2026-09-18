@@ -489,6 +489,7 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
 
         let endpoint = RelayEndpointParams::from_spec(&spec).ok_or(MediaSetupError::BadEndpoint)?;
         let engine = build_engine(spec, Box::new(crate::voip::driver::RandTxIds))?;
+        let warp_mi_tag_len = engine.media_warp_mi_tag_len();
 
         let factory = client
             .relay_transport_factory(&endpoint)
@@ -501,7 +502,18 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
 
         let stats = resident.install_fresh_stats_cell();
         let video_ctl = resident.install_video_channel();
-        let group_ctl = Some(resident.install_group_channel());
+        // Replay the committed roster and reject a changed WARP tag width, exactly as the registry's
+        // attach-time group wiring did; a refusal is the typed setup failure the facade reported.
+        let (committed, established) = client
+            .call_registry()
+            .group_attach_replay(&key.call_id, key.generation)
+            .unwrap_or((None, None));
+        let group_ctl = resident.install_group_channel(warp_mi_tag_len, committed, established);
+        let group_ctl = Some(group_ctl.ok_or_else(|| {
+            MediaSetupError::Backend(
+                "group relay WARP tag length changed during media attachment".into(),
+            )
+        })?);
         let channels = build_channels(&client, ctx, stats, video_ctl, group_ctl, key.generation)?;
 
         let runtime = Arc::clone(&self.runtime);
