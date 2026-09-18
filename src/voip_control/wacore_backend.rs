@@ -464,10 +464,7 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         // backend whose client is gone is a client that has been dropped, so this is the typed
         // refusal rather than a panic. The drive loop and mailbox wiring move here with the full
         // lifecycle, at which point this owns the task internally.
-        let _client = self
-            .client
-            .upgrade()
-            .ok_or(MediaSetupError::NoBackend)?;
+        let _client = self.client.upgrade().ok_or(MediaSetupError::NoBackend)?;
         let engine = build_engine(spec, Box::new(wacore::voip::engine::SequentialTxIds::new()))?;
         drop(engine);
         let _ = session;
