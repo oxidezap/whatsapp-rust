@@ -1865,6 +1865,20 @@ impl CallRegistry {
             .unwrap_or_default()
     }
 
+    /// The media session for one call generation, so a consumer can hold it and read live counters
+    /// through [`VoipMediaSession::stats`] even after the registry entry is gone.
+    #[must_use]
+    pub fn media_session(
+        &self,
+        call_id: &str,
+        generation: u64,
+    ) -> Option<Arc<dyn VoipMediaSession>> {
+        self.active_calls()
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+            .and_then(|entry| entry.media.clone())
+    }
+
     /// Attach (or replace) the media task for the call registered under `generation`. If the call
     /// was removed or superseded by a newer generation, the handle is aborted immediately so its
     /// task can't outlive the call.

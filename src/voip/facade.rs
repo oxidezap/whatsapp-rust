@@ -2020,18 +2020,18 @@ async fn place_call(
     spawn_outgoing_relay_waiter(client, call_id.clone(), generation, offer_stanza_id, ack_rx);
 
     Ok(CallHandle {
-        call_id,
+        call_id: call_id.clone(),
         generation,
         peer_jid: peer.clone(),
         call_creator: call_creator.clone(),
-        client_registry: registry,
+        client_registry: registry.clone(),
         pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
         client: client_weak(client),
         muted,
         video: video_shared,
         events: ev_rx,
         ended,
-        media_stats,
+        media: registry.media_session(&call_id, generation),
     })
 }
 
@@ -2958,7 +2958,9 @@ async fn spawn_registered_call(
         video: video_shared,
         events: ev_rx,
         ended: registration.ended.clone(),
-        media_stats,
+        media: client
+            .call_registry()
+            .media_session(&registration.call_id, registration.generation),
     })
 }
 
@@ -3697,10 +3699,10 @@ pub struct CallHandle {
     video: Arc<VideoShared>,
     events: async_channel::Receiver<CallEvent>,
     ended: Arc<EndedFlag>,
-    /// The same cell the drive loop publishes into. Held here rather than looked up by call id: the
-    /// registry entry is gone by the time `wait_ended()` returns, and the counters of a call that
-    /// just failed are the ones most worth reading.
-    media_stats: Arc<wacore::voip::MediaStatsCell>,
+    /// The media session this call reserved. Held so counters are read through the seam
+    /// (`VoipMediaSession::stats`) rather than a parallel cell, and so the handle can steer video
+    /// without reaching into a backend.
+    media: Option<Arc<dyn wacore::voip_control::VoipMediaSession>>,
 }
 
 fn ensure_group_invite_capacity(
@@ -3830,7 +3832,10 @@ impl CallHandle {
     /// that carried nothing -- right after [`wait_ended`](Self::wait_ended) -- returns the final
     /// counters rather than zeroes.
     pub fn media_stats(&self) -> wacore::voip::CallMediaStats {
-        self.media_stats.snapshot()
+        self.media
+            .as_ref()
+            .map(|media| media.stats())
+            .unwrap_or_default()
     }
 
     /// The peer captured when this handle was created.
@@ -6574,7 +6579,7 @@ mod tests {
             video: Arc::new(VideoShared::new()),
             events: ev_rx,
             ended: Arc::new(EndedFlag::default()),
-            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
+            media: None,
         };
         assert_eq!(handle.peer_jid(), caller(), "bare peer before any accept");
         let device = caller().with_device(2);
@@ -7296,7 +7301,7 @@ mod tests {
             video: Arc::new(VideoShared::new()),
             events: ev_rx,
             ended: Arc::new(EndedFlag::default()),
-            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
+            media: None,
         }
     }
 
@@ -7305,10 +7310,12 @@ mod tests {
     // gone. A handle that looked its stats up by call id answered that question with zeroes.
     #[tokio::test]
     async fn media_stats_survive_the_end_of_the_call() {
+        use wacore::voip_control::fake_backend::FakeMediaBackend;
+        let backend = Arc::new(FakeMediaBackend::new());
         let client = make_client().await;
+        client.call_registry().install_backend(backend.clone());
         let generation = client.call_registry().insert(mk_session());
         let (_ev_tx, ev_rx) = async_channel::unbounded::<CallEvent>();
-        let media_stats = Arc::new(wacore::voip::MediaStatsCell::default());
         let handle = CallHandle {
             call_id: "CID-FACADE".into(),
             generation,
@@ -7321,14 +7328,29 @@ mod tests {
             video: Arc::new(VideoShared::new()),
             events: ev_rx,
             ended: Arc::new(EndedFlag::default()),
-            media_stats: media_stats.clone(),
+            media: client
+                .call_registry()
+                .media_session("CID-FACADE", generation),
         };
+        let session = backend
+            .session(
+                &wacore::voip_control::MediaSessionKey::builder()
+                    .call_id("CID-FACADE".into())
+                    .generation(generation)
+                    .build(),
+            )
+            .expect("the fake backend reserved this call's session");
         // What the drive loop publishes on its way out: a call that heard nothing and said why.
-        let mut final_stats = wacore::voip::CallMediaStats::default();
-        assert_eq!(handle.media_stats(), final_stats, "nothing published yet");
-        final_stats.rtp_received = 120;
-        final_stats.audio_frames_without_decoder = 120;
-        media_stats.publish(final_stats);
+        assert_eq!(
+            handle.media_stats(),
+            wacore::voip::CallMediaStats::default()
+        );
+        session.set_stats(
+            wacore::voip_control::MediaStats::builder()
+                .rtp_received(120)
+                .audio_frames_without_decoder(120)
+                .build(),
+        );
         client
             .call_registry()
             .remove_if_current("CID-FACADE", generation);
@@ -7336,7 +7358,7 @@ mod tests {
         assert_eq!(
             (stats.rtp_received, stats.audio_frames_without_decoder),
             (120, 120),
-            "the final counters must outlive the registry entry"
+            "the final counters must outlive the registry entry, read through the seam"
         );
     }
 
@@ -9468,7 +9490,7 @@ mod tests {
             video: Arc::new(VideoShared::new()),
             events: ev_rx,
             ended: ended.clone(),
-            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
+            media: None,
         };
 
         // Drive attach_engine in the background; it parks in the gated connect.
@@ -11520,7 +11542,7 @@ mod tests {
             video: video_shared.clone(),
             events: ev_rx,
             ended: Arc::new(EndedFlag::default()),
-            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
+            media: None,
         };
 
         let (vsrc, vsink) = video_endpoints();
@@ -11601,7 +11623,7 @@ mod tests {
             video: video.clone(),
             events,
             ended: Arc::new(EndedFlag::default()),
-            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
+            media: None,
         };
 
         let request = peer_upgrade_request(&handle).await;
@@ -11692,7 +11714,7 @@ mod tests {
             video: video.clone(),
             events,
             ended: Arc::new(EndedFlag::default()),
-            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
+            media: None,
         };
 
         let drops = Arc::new(AtomicUsize::new(0));
@@ -11826,7 +11848,7 @@ mod tests {
             video: video.clone(),
             events,
             ended: Arc::new(EndedFlag::default()),
-            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
+            media: None,
         };
 
         let drops = Arc::new(AtomicUsize::new(0));
@@ -12064,7 +12086,7 @@ mod tests {
             video: video.clone(),
             events,
             ended: Arc::new(EndedFlag::default()),
-            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
+            media: None,
         };
         assert!(registry.stop_local_video("CID-FACADE", generation));
         {
