@@ -3,7 +3,8 @@
 //! This is the other half of the seam. `wacore::voip_control` declares
 //! [`VoipMediaBackend`]/[`VoipMediaSession`] with no engine type in the API; this module implements
 //! them on top of [`wacore::voip::CallEngine`], translating the flat [`MediaSessionSpec`] into the
-//! engine's [`CallConfig`] and the engine's [`CallEvent`]s back into neutral [`MediaEvent`]s.
+//! engine's [`CallConfig`]. Events need no translation: [`MediaEvent`] is the engine's
+//! [`CallEvent`] under its seam name, so the drive loop publishes it directly.
 //!
 //! The executor and the relay transport are constructor state here, never fields of the spec:
 //! they are trait objects that cannot cross a process boundary, which is why the neutral contract
@@ -14,18 +15,11 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use wacore::voip::audio::{AudioCodec, AudioFormat, AudioRtpProfile};
-use wacore::voip::engine::{
-    CallConfig, CallEngine, CallEvent, CodecDecisionSource, GroupControlKind,
-};
-use wacore::voip::media_session::{ResidentMediaSession, stats_to_neutral};
-use wacore::voip::media_stats::AudioSilenceReason;
-use wacore::voip::rtcp::{RtcpFeedback, RtcpReportBlock};
+use wacore::voip::engine::{CallConfig, CallEngine, CodecDecisionSource};
+use wacore::voip::media_session::ResidentMediaSession;
 use wacore::voip::transport::RelayEndpointParams;
 use wacore::voip_control::{
-    CallDirection, MediaAudioCodec, MediaAudioFormat, MediaAudioRtpProfile,
-    MediaCodecDecisionSource, MediaCommand, MediaEncodedFrame, MediaEvent, MediaGroupControlKind,
-    MediaGroupSpec, MediaSessionSpec, MediaSetupError, MediaSilenceReason, MediaVideoUpgradeToken,
+    CallDirection, MediaCommand, MediaEvent, MediaGroupSpec, MediaSessionSpec, MediaSetupError,
     VoipMediaBackend, VoipMediaSession,
 };
 
@@ -120,279 +114,6 @@ pub fn build_engine(
         })
         .map_err(|error| MediaSetupError::Backend(error.to_string()))?;
     Ok(engine)
-}
-
-/// Translate an engine codec, or `None` when the neutral seam does not name it.
-///
-/// Both enums are `#[non_exhaustive]`. A codec added upstream has no neutral spelling, and picking
-/// the nearest one would claim a decode the seam cannot describe; refusing lets the caller drop the
-/// event instead.
-fn codec_to_neutral(codec: AudioCodec) -> Option<MediaAudioCodec> {
-    match codec {
-        AudioCodec::Mlow => Some(MediaAudioCodec::Mlow),
-        AudioCodec::Opus => Some(MediaAudioCodec::Opus),
-        _ => None,
-    }
-}
-
-fn rtp_profile_to_neutral(profile: AudioRtpProfile) -> Option<MediaAudioRtpProfile> {
-    match profile {
-        AudioRtpProfile::Mlow => Some(MediaAudioRtpProfile::Mlow),
-        AudioRtpProfile::StandardOpus => Some(MediaAudioRtpProfile::StandardOpus),
-        _ => None,
-    }
-}
-
-fn format_to_neutral(format: AudioFormat) -> Option<MediaAudioFormat> {
-    Some(
-        MediaAudioFormat::builder()
-            .codec(codec_to_neutral(format.codec)?)
-            .rtp_profile(rtp_profile_to_neutral(format.rtp_profile)?)
-            .signaling_rate(format.signaling_rate)
-            .sample_rate(format.sample_rate)
-            .channels(format.channels)
-            .samples_per_frame(format.samples_per_frame)
-            .rtp_clock_rate(format.rtp_clock_rate)
-            .rtp_timestamp_step(format.rtp_timestamp_step)
-            .rtp_payload_type(format.rtp_payload_type)
-            .build(),
-    )
-}
-
-fn decision_to_neutral(source: CodecDecisionSource) -> Option<MediaCodecDecisionSource> {
-    match source {
-        CodecDecisionSource::Negotiated => Some(MediaCodecDecisionSource::Negotiated),
-        CodecDecisionSource::Content => Some(MediaCodecDecisionSource::Content),
-        _ => None,
-    }
-}
-
-fn silence_to_neutral(reason: AudioSilenceReason) -> Option<MediaSilenceReason> {
-    match reason {
-        AudioSilenceReason::NoDecoderForNegotiatedCodec => {
-            Some(MediaSilenceReason::NoDecoderForNegotiatedCodec)
-        }
-        AudioSilenceReason::AuthenticationFailing => {
-            Some(MediaSilenceReason::AuthenticationFailing)
-        }
-        AudioSilenceReason::UnexpectedPayloadType => {
-            Some(MediaSilenceReason::UnexpectedPayloadType)
-        }
-        AudioSilenceReason::CodecRejectingFrames => Some(MediaSilenceReason::CodecRejectingFrames),
-        AudioSilenceReason::CodecFlapping => Some(MediaSilenceReason::CodecFlapping),
-        AudioSilenceReason::Unknown => Some(MediaSilenceReason::Unknown),
-        _ => None,
-    }
-}
-
-fn group_kind_to_neutral(control: GroupControlKind) -> Option<MediaGroupControlKind> {
-    match control {
-        GroupControlKind::Update => Some(MediaGroupControlKind::Update),
-        GroupControlKind::Epoch => Some(MediaGroupControlKind::Epoch),
-        GroupControlKind::Reaction => Some(MediaGroupControlKind::Reaction),
-        _ => None,
-    }
-}
-
-fn rtcp_block_to_neutral(block: RtcpReportBlock) -> wacore::voip_control::MediaRtcpReportBlock {
-    wacore::voip_control::MediaRtcpReportBlock::builder()
-        .ssrc(block.ssrc)
-        .fraction_lost(block.fraction_lost)
-        .cumulative_lost(block.cumulative_lost)
-        .extended_highest_sequence(block.extended_highest_sequence)
-        .jitter(block.jitter)
-        .last_sender_report(block.last_sender_report)
-        .delay_since_last_sender_report(block.delay_since_last_sender_report)
-        .profile_extension(block.profile_extension)
-        .build()
-}
-
-fn rtcp_feedback_to_neutral(feedback: RtcpFeedback) -> wacore::voip_control::MediaRtcpFeedback {
-    wacore::voip_control::MediaRtcpFeedback::builder()
-        .packet_type(feedback.packet_type)
-        .fmt(feedback.fmt)
-        .sender_ssrc(feedback.sender_ssrc)
-        .media_ssrc(feedback.media_ssrc)
-        .fci(feedback.fci)
-        .build()
-}
-
-fn frame_to_neutral(frame: wacore::voip::EncodedAudioFrame) -> Option<MediaEncodedFrame> {
-    Some(
-        MediaEncodedFrame::builder()
-            .format(format_to_neutral(frame.format)?)
-            .codec(codec_to_neutral(frame.codec)?)
-            .data(frame.data)
-            .payload_type(frame.payload_type)
-            .sequence_number(frame.sequence_number)
-            .timestamp(frame.timestamp)
-            .marker(frame.marker)
-            .maybe_sender(frame.sender)
-            .maybe_device(frame.device)
-            .maybe_pid(frame.pid)
-            .build(),
-    )
-}
-
-/// Translate an engine event into the neutral one, or `None` when the seam does not carry it.
-///
-/// The engine enum is `#[non_exhaustive]`, so a trailing arm is required by the compiler even with
-/// every current variant handled. Three things return `None`, and none is fatal to a healthy call:
-///
-/// - A future variant the compiler has not seen. Logged and dropped, never surfaced as a terminal
-///   `Closed`, because an event the adapter does not model is not a reason to tear down media.
-/// - A known variant whose payload names a known-unknown enum value (a codec, silence reason, or
-///   group-control kind added upstream). Inventing the nearest neutral spelling would claim a fact
-///   the seam cannot describe, so the event is dropped.
-/// - The compatibility spelling `VideoStateChanged`, which the seam deliberately does not carry.
-pub fn translate_event(event: CallEvent) -> Option<MediaEvent> {
-    let neutral = match event {
-        CallEvent::RelayAllocated => MediaEvent::RelayAllocated,
-        CallEvent::RelayAllocateFailed(code) => MediaEvent::RelayAllocateFailed(code),
-        CallEvent::RelayAllocateTimedOut => MediaEvent::RelayAllocateTimedOut,
-        CallEvent::RelayReconnectTimedOut => MediaEvent::RelayReconnectTimedOut,
-        CallEvent::MediaSetupFailed(reason) => MediaEvent::MediaSetupFailed(reason),
-        CallEvent::AudioSilent {
-            silent_for_ms,
-            rtp_received,
-            frames_produced,
-            dominant_reason,
-        } => MediaEvent::AudioSilent {
-            silent_for_ms,
-            rtp_received,
-            frames_produced,
-            dominant_reason: silence_to_neutral(dominant_reason)?,
-        },
-        CallEvent::AudioReceptionStalled { silent_for_ms } => {
-            MediaEvent::AudioReceptionStalled { silent_for_ms }
-        }
-        CallEvent::AudioCodecSwitched {
-            from,
-            to,
-            source,
-            packets_observed,
-        } => MediaEvent::AudioCodecSwitched {
-            from: codec_to_neutral(from)?,
-            to: codec_to_neutral(to)?,
-            source: decision_to_neutral(source)?,
-            packets_observed,
-        },
-        CallEvent::AudioCodecSourceIsFixed {
-            sending,
-            peer_expects,
-            source,
-        } => MediaEvent::AudioCodecSourceIsFixed {
-            sending: codec_to_neutral(sending)?,
-            peer_expects: codec_to_neutral(peer_expects)?,
-            source: decision_to_neutral(source)?,
-        },
-        CallEvent::AudioFormatMismatch {
-            expected_rate,
-            received_rates,
-        } => MediaEvent::AudioFormatMismatch {
-            expected_rate,
-            received_rates,
-        },
-        CallEvent::OutboundMediaDropped {
-            video_access_units,
-            packets,
-        } => MediaEvent::OutboundMediaDropped {
-            video_access_units,
-            packets,
-        },
-        CallEvent::VideoKeyframeNeeded => MediaEvent::VideoKeyframeNeeded,
-        CallEvent::RtcpReceived {
-            packet_types,
-            sender_ssrc,
-            referenced_ssrcs,
-            reports_audio,
-            reports_video,
-            report_blocks,
-            feedback,
-        } => MediaEvent::RtcpReceived {
-            packet_types,
-            sender_ssrc,
-            referenced_ssrcs,
-            reports_audio,
-            reports_video,
-            report_blocks: report_blocks
-                .into_iter()
-                .map(rtcp_block_to_neutral)
-                .collect(),
-            feedback: feedback.into_iter().map(rtcp_feedback_to_neutral).collect(),
-        },
-        CallEvent::ForeignAudio(data) => MediaEvent::ForeignAudio(data),
-        CallEvent::ForeignGroupAudio(frame) => {
-            MediaEvent::ForeignGroupAudio(frame_to_neutral(frame)?)
-        }
-        CallEvent::PeerVideoStateChanged {
-            source,
-            call_creator,
-            state,
-            orientation,
-            upgrade_token,
-        } => MediaEvent::PeerVideoStateChanged {
-            source,
-            call_creator,
-            state,
-            orientation,
-            // `epoch` is what distinguishes two requests in one generation, and
-            // [`VideoUpgradeToken::epoch`] is now public, so the neutral token is complete.
-            upgrade_token: upgrade_token.map(|token| {
-                MediaVideoUpgradeToken::builder()
-                    .generation(token.generation())
-                    .epoch(token.epoch())
-                    .build()
-            }),
-        },
-        CallEvent::GroupUpdated(update) => MediaEvent::GroupUpdated(update),
-        CallEvent::WaitingRoomUpdated(room) => MediaEvent::WaitingRoomUpdated(room),
-        CallEvent::WaitingRoomHeartbeatFailed => MediaEvent::WaitingRoomHeartbeatFailed,
-        CallEvent::GroupControlRejected { control } => MediaEvent::GroupControlRejected {
-            control: group_kind_to_neutral(control)?,
-        },
-        CallEvent::GroupRekeyFailed => MediaEvent::GroupRekeyFailed,
-        CallEvent::HandRaised {
-            participant,
-            raised,
-        } => MediaEvent::HandRaised {
-            participant,
-            raised,
-        },
-        CallEvent::ScreenShareChanged {
-            participant,
-            screen_share,
-        } => MediaEvent::ScreenShareChanged {
-            participant,
-            screen_share,
-        },
-        CallEvent::Reaction {
-            participant,
-            device,
-            pid,
-            emoji,
-            removed,
-        } => MediaEvent::Reaction {
-            participant,
-            device,
-            pid,
-            emoji,
-            removed,
-        },
-        // The compatibility spelling of `PeerVideoStateChanged`. The neutral seam carries only the
-        // identity-aware event, so this one is dropped rather than mapped onto something else.
-        // Mapping it to `VideoKeyframeNeeded` (as an earlier draft did) fabricates an outbound IDR
-        // request from a peer-state notification, which are unrelated facts: the peer toggling
-        // video is not our encoder needing a keyframe.
-        CallEvent::VideoStateChanged { .. } => return None,
-        other => {
-            // `#[non_exhaustive]`: an engine event the seam does not model yet. Log it and drop it;
-            // never end a healthy call because the adapter is behind the engine.
-            log::debug!("voip: engine event has no neutral spelling, ignored: {other:?}");
-            return None;
-        }
-    };
-    Some(neutral)
 }
 
 /// The resident backend.
@@ -776,18 +497,10 @@ impl SourceFeed {
     }
 }
 
-/// The neutral counters for an engine snapshot, re-exported so the facade can publish them.
-#[must_use]
-pub fn neutral_stats(
-    stats: wacore::voip_control::media_stats::CallMediaStats,
-) -> wacore::voip_control::MediaStats {
-    stats_to_neutral(stats)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wacore::voip_control::{MediaAudioIo, MediaAudioSpec, MediaSessionKey};
+    use wacore::voip_control::{MediaAudioFormat, MediaAudioIo, MediaAudioSpec, MediaSessionKey};
 
     fn spec() -> MediaSessionSpec {
         MediaSessionSpec::builder()
@@ -1049,51 +762,6 @@ mod tests {
         assert_eq!(
             build_engine(bad, tx_ids()).err(),
             Some(MediaSetupError::BadAudioFormat)
-        );
-    }
-
-    #[test]
-    fn every_engine_event_shape_translates() {
-        // A representative from each shape the engine emits.
-        assert_eq!(
-            translate_event(CallEvent::RelayAllocated),
-            Some(MediaEvent::RelayAllocated)
-        );
-        assert_eq!(
-            translate_event(CallEvent::AudioSilent {
-                silent_for_ms: 1,
-                rtp_received: 2,
-                frames_produced: 3,
-                dominant_reason: AudioSilenceReason::Unknown,
-            }),
-            Some(MediaEvent::AudioSilent {
-                silent_for_ms: 1,
-                rtp_received: 2,
-                frames_produced: 3,
-                dominant_reason: MediaSilenceReason::Unknown,
-            })
-        );
-        assert!(matches!(
-            translate_event(CallEvent::RelayAllocateFailed(486)),
-            Some(MediaEvent::RelayAllocateFailed(486))
-        ));
-        assert_eq!(
-            translate_event(CallEvent::VideoKeyframeNeeded),
-            Some(MediaEvent::VideoKeyframeNeeded)
-        );
-    }
-
-    #[test]
-    fn the_video_state_compatibility_event_is_dropped_not_mapped_to_a_keyframe() {
-        // A peer toggling video is not our encoder needing an IDR. The seam carries only the
-        // identity-aware `PeerVideoStateChanged`, so the compatibility spelling is dropped.
-        assert_eq!(
-            translate_event(CallEvent::VideoStateChanged {
-                state: wacore::types::call::VideoState::Enabled,
-                orientation: None,
-                upgrade_token: None,
-            }),
-            None
         );
     }
 }
