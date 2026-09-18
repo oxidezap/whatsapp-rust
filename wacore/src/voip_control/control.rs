@@ -100,6 +100,9 @@ impl GroupRawEpoch {
         }
     }
 
+    /// Raw key bytes for the engine's `apply_group_raw_epoch`. Engine-side: absent in a
+    /// control-only build, where nothing consumes key material.
+    #[cfg(feature = "voip")]
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.raw_epoch
     }

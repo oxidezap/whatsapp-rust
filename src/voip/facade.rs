@@ -6923,6 +6923,7 @@ mod tests {
     /// is what makes "the browser transport is used" a fact this test suite can hold, since the
     /// browser half itself cannot run in this test suite at all.
     #[tokio::test]
+    #[cfg(feature = "voip-engine-wacore")]
     async fn an_installed_relay_transport_provider_is_what_dials() {
         let client = make_client().await;
         let asked = Arc::new(Mutex::new(Vec::new()));
@@ -7294,6 +7295,7 @@ mod tests {
     /// it is awaited -- so a hangup can no longer find the call to end it, and `wait_ended()` would
     /// wait on the provider rather than on the call.
     #[tokio::test(start_paused = true)]
+    #[cfg(feature = "voip-engine-wacore")]
     async fn a_provider_that_never_answers_does_not_park_the_call() {
         struct NeverAnswers;
         #[async_trait]
@@ -7328,6 +7330,7 @@ mod tests {
     /// the platform may not have. A browser with no `RTCPeerConnection` is exactly this case, and
     /// the reason is the only thing a person ever sees of it.
     #[tokio::test]
+    #[cfg(feature = "voip-engine-wacore")]
     async fn a_refusing_provider_fails_the_call_with_its_reason() {
         struct Refuses;
         #[async_trait]

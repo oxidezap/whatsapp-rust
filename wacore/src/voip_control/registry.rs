@@ -4245,6 +4245,9 @@ mod tests {
             GroupControl::Transition { update, epoch } => {
                 assert_eq!(update.transaction_id, 2);
                 assert_eq!(epoch.transaction_id, 3);
+                // Raw key bytes exist only with the engine: without `voip` the identity
+                // assertion above is the whole check.
+                #[cfg(feature = "voip")]
                 assert_eq!(
                     epoch.as_bytes(),
                     [3; 32],

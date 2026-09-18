@@ -64,6 +64,7 @@ impl MediaStatsCell {
 /// name, one definition so the engine and a foreign backend name the same reasons.
 pub use super::MediaSilenceReason as AudioSilenceReason;
 
+#[cfg(feature = "voip")]
 /// What the watchdog decided on one evaluation.
 ///
 /// Kept separate from `CallEvent` so this module does not depend on the engine's event enum; the
@@ -83,11 +84,14 @@ pub(crate) enum AudioHealthAlarm {
     Stalled { silent_for_ms: Millis },
 }
 
+#[cfg(feature = "voip")]
 /// Evaluation cadence. Fine enough to catch the 2s window promptly, coarse enough that a call with
 /// healthy audio pays one comparison per second.
 const HEALTH_TICK_MS: Millis = 500;
+#[cfg(feature = "voip")]
 /// Sliding window over which "packets in, no audio out" is judged.
 const SILENT_WINDOW_MS: Millis = 2_000;
+#[cfg(feature = "voip")]
 /// Packets that must land inside the window before silence is diagnosable; below this it is jitter,
 /// not a diagnosis.
 ///
@@ -97,12 +101,15 @@ const SILENT_WINDOW_MS: Millis = 2_000;
 /// ever producing an alarm. Twelve is 1.44 s of media at 120 ms and 0.72 s at 60 ms: still most of
 /// the window in both, and still far above a jitter burst.
 const SILENT_WINDOW_MIN_PACKETS: u32 = 12;
+#[cfg(feature = "voip")]
 /// No audio RTP at all for this long -- since media came up, or since the last packet -- is a
 /// stalled reception.
 const STALL_AFTER_MS: Millis = 3_000;
+#[cfg(feature = "voip")]
 /// Re-alarm cadence while the condition persists, so a truncated log still catches it.
 const REALARM_MS: Millis = 10_000;
 
+#[cfg(feature = "voip")]
 /// Watches one call's audio for "connected but carrying nothing".
 #[derive(Debug)]
 pub(crate) struct AudioHealthWatch {
@@ -135,6 +142,7 @@ pub(crate) struct AudioHealthWatch {
     stall_reported: bool,
 }
 
+#[cfg(feature = "voip")]
 impl Default for AudioHealthWatch {
     fn default() -> Self {
         Self {
@@ -153,6 +161,7 @@ impl Default for AudioHealthWatch {
     }
 }
 
+#[cfg(feature = "voip")]
 impl AudioHealthWatch {
     /// Arm the watchdog. Called when the relay accepts the allocate, which is the first moment
     /// inbound media is even possible.
@@ -258,6 +267,7 @@ impl AudioHealthWatch {
     }
 }
 
+#[cfg(feature = "voip")]
 /// What moved between the start of a window and its end.
 ///
 /// Every field is monotonic, so a saturating subtraction is the whole story. Taking the delta is
@@ -326,6 +336,7 @@ fn window_delta(now: &CallMediaStats, then: &CallMediaStats) -> CallMediaStats {
     }
 }
 
+#[cfg(feature = "voip")]
 /// Pick the most specific explanation the counters support.
 ///
 /// Order matters and is not by magnitude: a build with no decoder explains everything downstream of
@@ -365,11 +376,12 @@ fn dominant_reason(stats: &CallMediaStats) -> AudioSilenceReason {
     AudioSilenceReason::Unknown
 }
 
+#[cfg(feature = "voip")]
 /// Switches past this in one call mean the evidence is contradicting itself; the probe latches and
 /// the watchdog says so rather than letting the codec thrash for the whole call.
 pub(crate) const CODEC_FLAP_LIMIT: u16 = 4;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "voip"))]
 mod tests {
     use super::*;
 

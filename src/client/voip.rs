@@ -54,7 +54,10 @@ const CALL_SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Generous, because building one may involve a real device or a permission prompt, and short
 /// enough that a provider which never answers fails the call instead of parking its setup task
 /// forever.
-#[cfg(feature = "voip-control")]
+///
+/// Engine-side: only the resident backend dials through this, so it exists exactly when the
+/// engine does.
+#[cfg(feature = "voip-engine-wacore")]
 const RELAY_PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(feature = "voip-control")]
 const WAITING_ROOM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -443,7 +446,10 @@ impl Client {
     /// build has no way onto the media wire" is a fact about a deployment: a page that has not
     /// installed a provider yet is in exactly the state a page with no `RTCPeerConnection` is in
     /// permanently, and both deserve a sentence rather than a crash.
-    #[cfg(feature = "voip-control")]
+    ///
+    /// Engine-side: the sole caller is the resident backend, so this exists exactly when the
+    /// engine does. A foreign backend dials its own transport.
+    #[cfg(feature = "voip-engine-wacore")]
     pub(crate) async fn relay_transport_factory(
         &self,
         relay: &wacore::voip_control::transport::RelayEndpointParams,
@@ -2065,7 +2071,8 @@ impl Voip<'_> {
                 .await
                 .1;
         }
-        #[cfg(not(feature = "voip-runtime"))]
+        // Without the control plane there is no registry to pin against: terminate blind.
+        #[cfg(not(feature = "voip-control"))]
         self.terminate_inner(call_id, std::slice::from_ref(peer), call_creator, None)
             .await
             .1
