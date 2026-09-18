@@ -23,4 +23,5 @@ pub use crate::voip::driver::RandTxIds;
 // First-byte relay-packet demux, in the portable core; re-exported so the existing
 // `whatsapp_rust::voip::transport::{classify_relay_packet, RelayPacketKind}` paths stay stable on
 // every build that has ever had them.
+#[cfg(feature = "voip-engine-wacore")]
 pub use wacore::voip::demux::{RelayPacketKind, classify_relay_packet};

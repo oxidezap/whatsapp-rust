@@ -52,20 +52,27 @@ pub use facade::{
 };
 pub use video::{TimedVideoFrame, VideoFrame, VideoSink, VideoSource};
 // Surface core types carried by the facade next to the builders and handle that expose them.
+// The audio format types and the encoded payload live in the neutral contract now; the engine-only
+// aliases come from `wacore::voip` and are gated with it.
+#[cfg(feature = "voip-engine-wacore")]
 pub use wacore::voip::{
-    AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,
-    OpusMlowPacketError, depacketize_opus_from_mlow, packetize_opus_for_mlow,
+    AudioConfig, OpusMlowPacketError, depacketize_opus_from_mlow, packetize_opus_for_mlow,
+};
+pub use wacore::voip_control::{
+    MediaAudioCodec as AudioCodec, MediaAudioFormat as AudioFormat, MediaAudioIo as AudioIo,
+    MediaAudioRtpProfile as AudioRtpProfile, MediaEncodedFrame as EncodedAudioFrame,
 };
 // `KeyframeUrgency` is a parameter of `CallHandle::request_peer_keyframe`, so a consumer
 // cannot call it without naming the type.
-pub use wacore::voip::{
-    CallEvent, GroupCallState, GroupStateApply, KeyframeUrgency, VideoUpgradeToken,
+pub use wacore::voip_control::group::{GroupCallState, GroupStateApply};
+pub use wacore::voip_control::{
+    CallEvent, MediaKeyframeUrgency as KeyframeUrgency, MediaVideoUpgradeToken as VideoUpgradeToken,
 };
 // The platform transport seam, beside the facade that consults it: a consumer installing one
 // through `Client::set_relay_transport_provider` reaches for the whole set below, and having to
 // name `wacore` for them while naming `whatsapp_rust` for the call is a paper cut on the one path
 // this crate now asks a platform to implement.
-pub use wacore::voip::{
+pub use wacore::voip_control::transport::{
     RelayEndpointParams, RelayTransport, RelayTransportEvent, RelayTransportFactory,
     RelayTransportProvider,
 };

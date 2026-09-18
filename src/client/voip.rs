@@ -46,7 +46,7 @@ use super::{Client, ClientError};
 
 #[cfg(feature = "voip-runtime")]
 const CALL_SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long an installed [`RelayTransportProvider`](wacore::voip::RelayTransportProvider) has to
+/// How long an installed [`RelayTransportProvider`](wacore::voip_control::transport::RelayTransportProvider) has to
 /// hand back a factory before the call gives up on it.
 ///
 /// Generous, because building one may involve a real device or a permission prompt, and short
@@ -74,7 +74,7 @@ pub struct Voip<'a> {
 #[cfg(feature = "voip-runtime")]
 struct CallLinkRegistrationGuard {
     client: std::sync::Weak<Client>,
-    registry: Arc<wacore::voip::CallRegistry>,
+    registry: Arc<wacore::voip_control::registry::CallRegistry>,
     call_id: String,
     call_creator: Jid,
     generation: u64,
@@ -335,7 +335,7 @@ impl Drop for PendingCallLinkJoinGuard {
 impl CallLinkRegistrationGuard {
     fn new(
         client: &Client,
-        registry: Arc<wacore::voip::CallRegistry>,
+        registry: Arc<wacore::voip_control::registry::CallRegistry>,
         call_id: &str,
         call_creator: Jid,
         generation: u64,
@@ -407,7 +407,7 @@ impl Client {
     /// The per-call media registry the `voip` facade registers active calls in. `pub(crate)` so the
     /// facade and the connection-cleanup teardown share one instance.
     #[cfg(feature = "voip-runtime")]
-    pub(crate) fn call_registry(&self) -> Arc<wacore::voip::CallRegistry> {
+    pub(crate) fn call_registry(&self) -> Arc<wacore::voip_control::registry::CallRegistry> {
         self.voip_state().call_registry.clone()
     }
 
@@ -426,7 +426,7 @@ impl Client {
     #[cfg(feature = "voip-runtime")]
     pub fn set_relay_transport_provider(
         &self,
-        provider: Arc<dyn wacore::voip::RelayTransportProvider>,
+        provider: Arc<dyn wacore::voip_control::transport::RelayTransportProvider>,
     ) {
         *self
             .voip_state()
@@ -444,8 +444,8 @@ impl Client {
     #[cfg(feature = "voip-runtime")]
     pub(crate) async fn relay_transport_factory(
         &self,
-        relay: &wacore::voip::RelayEndpointParams,
-    ) -> Result<Arc<dyn wacore::voip::RelayTransportFactory>, CallError> {
+        relay: &wacore::voip_control::transport::RelayEndpointParams,
+    ) -> Result<Arc<dyn wacore::voip_control::transport::RelayTransportFactory>, CallError> {
         let addr = relay.addr;
         let installed = self
             .voip_state()
@@ -837,7 +837,7 @@ impl Client {
         waiting_room: Option<WaitingRoom>,
         expected_media: CallLinkMedia,
         expected_token: &str,
-    ) -> Result<u64, wacore::voip::GroupStateApply> {
+    ) -> Result<u64, wacore::voip_control::group::GroupStateApply> {
         let voip = self.voip_state();
         let call_id = session.call_id.clone();
         let call_creator = session.call_creator.clone();
@@ -858,7 +858,7 @@ impl Client {
         let saturated = state.is_saturated(&call_id);
         let staged = state.transitions.remove(&call_id).unwrap_or_default();
         if saturated {
-            return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
+            return Err(wacore::voip_control::group::GroupStateApply::InvalidSnapshot);
         }
         let generation = self
             .voip_state()
@@ -869,7 +869,7 @@ impl Client {
                 .voip_state()
                 .call_registry
                 .apply_waiting_room_if_current(room, generation);
-            if applied != wacore::voip::GroupStateApply::Applied {
+            if applied != wacore::voip_control::group::GroupStateApply::Applied {
                 voip.call_registry.remove_if_current(&call_id, generation);
                 return Err(applied);
             }
@@ -884,10 +884,10 @@ impl Client {
                     update.rekey_requested |= rekey_pending;
                     let staged_rekey = update.rekey_requested;
                     match self.apply_pending_call_link_update(update, generation) {
-                        wacore::voip::GroupStateApply::Applied => {
+                        wacore::voip_control::group::GroupStateApply::Applied => {
                             rekey_pending = staged_rekey;
                         }
-                        wacore::voip::GroupStateApply::Stale => {}
+                        wacore::voip_control::group::GroupStateApply::Stale => {}
                         rejected => {
                             voip.call_registry.remove_if_current(&call_id, generation);
                             return Err(rejected);
@@ -905,8 +905,8 @@ impl Client {
                         .apply_waiting_room_if_current(room, generation);
                     if !matches!(
                         applied,
-                        wacore::voip::GroupStateApply::Applied
-                            | wacore::voip::GroupStateApply::Stale
+                        wacore::voip_control::group::GroupStateApply::Applied
+                            | wacore::voip_control::group::GroupStateApply::Stale
                     ) {
                         voip.call_registry.remove_if_current(&call_id, generation);
                         return Err(applied);
@@ -937,7 +937,7 @@ impl Client {
                         raw_epoch.to_vec(),
                     ) {
                         voip.call_registry.remove_if_current(&call_id, generation);
-                        return Err(wacore::voip::GroupStateApply::UnknownCall);
+                        return Err(wacore::voip_control::group::GroupStateApply::UnknownCall);
                     }
                 }
                 PendingCallLinkTransition::Terminated {
@@ -957,11 +957,11 @@ impl Client {
                         continue;
                     }
                     voip.call_registry.remove_if_current(&call_id, generation);
-                    return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
+                    return Err(wacore::voip_control::group::GroupStateApply::InvalidSnapshot);
                 }
                 PendingCallLinkTransition::Saturated => {
                     voip.call_registry.remove_if_current(&call_id, generation);
-                    return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
+                    return Err(wacore::voip_control::group::GroupStateApply::InvalidSnapshot);
                 }
                 _ => {}
             }
@@ -974,7 +974,7 @@ impl Client {
         &self,
         update: GroupCallUpdate,
         generation: u64,
-    ) -> wacore::voip::GroupStateApply {
+    ) -> wacore::voip_control::group::GroupStateApply {
         self.voip_state()
             .call_registry
             .apply_group_update_if_current(update, generation)
@@ -2614,7 +2614,7 @@ mod tests {
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn terminate_aborts_the_local_call() {
-        use wacore::voip::CallSession;
+        use wacore::voip_control::CallSession;
         let (client, _count) = make_client_with_count().await;
         let reg = client.call_registry();
         reg.insert(CallSession::new_outgoing(
@@ -2638,7 +2638,7 @@ mod tests {
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn terminate_tears_down_local_even_when_send_fails() {
-        use wacore::voip::CallSession;
+        use wacore::voip_control::CallSession;
         let client = make_client_failing().await;
         let reg = client.call_registry();
         reg.insert(CallSession::new_outgoing(
@@ -2810,7 +2810,7 @@ mod tests {
         audio_only.media = "audio".to_string();
         assert_eq!(
             registry.apply_group_update_if_current(audio_only, generation),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert!(
             client
@@ -3205,7 +3205,7 @@ mod tests {
             .expect("admitted group snapshot");
         assert_eq!(
             client.call_registry().apply_group_update(update),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert_eq!(
             client.call_registry().phase("TEST-CALL-ID"),
@@ -3341,7 +3341,7 @@ mod tests {
                     .users(Vec::new())
                     .build(),
             ),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
 
         let sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
@@ -3419,7 +3419,7 @@ mod tests {
         };
         assert_eq!(
             registry.apply_waiting_room(room(1, false)),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         let transition_lock = registry
             .group_transition_lock(call_id, generation)
@@ -3467,7 +3467,7 @@ mod tests {
         toggle.await.expect("toggle task").expect("toggle response");
         assert_eq!(
             authoritative.await.expect("authoritative update task"),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert!(
             registry
@@ -3511,7 +3511,7 @@ mod tests {
                         .users(Vec::new())
                         .build(),
                 ),
-                wacore::voip::GroupStateApply::Applied
+                wacore::voip_control::group::GroupStateApply::Applied
             );
 
             let sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
@@ -3692,7 +3692,7 @@ mod tests {
             client
                 .register_call_link_session(session, None, CallLinkMedia::Audio, "TEST-CALL-LINK")
                 .await,
-            Err(wacore::voip::GroupStateApply::InvalidSnapshot)
+            Err(wacore::voip_control::group::GroupStateApply::InvalidSnapshot)
         );
         assert_eq!(
             client.call_registry().generation_of(call_id),
@@ -4133,7 +4133,7 @@ mod tests {
             client
                 .register_call_link_session(session, None, CallLinkMedia::Audio, "TEST-CALL-LINK",)
                 .await,
-            Err(wacore::voip::GroupStateApply::InvalidSnapshot),
+            Err(wacore::voip_control::group::GroupStateApply::InvalidSnapshot),
             "a saturated join must fail rather than wait forever for a discarded admission"
         );
         assert_eq!(client.call_registry().generation_of(call_id), None);
@@ -4190,7 +4190,7 @@ mod tests {
             client
                 .register_call_link_session(session, None, CallLinkMedia::Audio, "TEST-CALL-LINK",)
                 .await,
-            Err(wacore::voip::GroupStateApply::InvalidSnapshot),
+            Err(wacore::voip_control::group::GroupStateApply::InvalidSnapshot),
             "binding the ACK must retain the exact overflow identity outside the full payload map"
         );
         assert_eq!(client.call_registry().generation_of(call_id), None);
@@ -4713,7 +4713,7 @@ mod tests {
             client
                 .call_registry()
                 .apply_group_update_if_current(current, generation),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         let mut join = wacore::types::group_call::CallLinkJoin::builder()
             .token("TEST-CALL-LINK".to_string())
@@ -4775,7 +4775,7 @@ mod tests {
             client
                 .register_call_link_session(session, None, CallLinkMedia::Audio, "TEST-CALL-LINK",)
                 .await,
-            Err(wacore::voip::GroupStateApply::InvalidSnapshot)
+            Err(wacore::voip_control::group::GroupStateApply::InvalidSnapshot)
         );
         assert_eq!(client.call_registry().generation_of(call_id), None);
     }
@@ -4817,7 +4817,7 @@ mod tests {
         assert_ne!(stale, replacement);
         assert_eq!(
             client.apply_pending_call_link_update(update, stale),
-            wacore::voip::GroupStateApply::UnknownCall
+            wacore::voip_control::group::GroupStateApply::UnknownCall
         );
         assert!(
             registry
@@ -4858,7 +4858,7 @@ mod tests {
 
         assert_eq!(
             registry.apply_waiting_room_if_current(room, stale),
-            wacore::voip::GroupStateApply::UnknownCall
+            wacore::voip_control::group::GroupStateApply::UnknownCall
         );
         assert!(
             registry
@@ -5384,7 +5384,7 @@ mod tests {
         let transition_guard = transition_lock.lock().await;
         assert_eq!(
             registry.apply_group_update_if_current(admitted, generation),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert_eq!(
             registry.phase_if_current("ADMISSION-RACE-CALL", generation),

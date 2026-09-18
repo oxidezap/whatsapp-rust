@@ -5,16 +5,36 @@
 #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 use std::sync::Arc;
 
-#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "voip-engine-wacore",
+    feature = "tokio-runtime",
+    not(target_arch = "wasm32")
+))]
 use wacore::runtime::Runtime;
-#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "voip-engine-wacore",
+    feature = "tokio-runtime",
+    not(target_arch = "wasm32")
+))]
 use wacore::voip::engine::CallEngine;
-#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "voip-engine-wacore",
+    feature = "tokio-runtime",
+    not(target_arch = "wasm32")
+))]
 use wacore::voip::transport::{RelayTransport, RelayTransportEvent};
-#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "voip-engine-wacore",
+    feature = "tokio-runtime",
+    not(target_arch = "wasm32")
+))]
 use wacore::voip::{CallChannels, run_call};
 
-#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "voip-engine-wacore",
+    feature = "tokio-runtime",
+    not(target_arch = "wasm32")
+))]
 use crate::runtime_impl::TokioRuntime;
 
 /// OS-RNG-backed STUN transaction ids for production calls. The core's `SequentialTxIds` is
@@ -26,6 +46,7 @@ use crate::runtime_impl::TokioRuntime;
 #[derive(Default)]
 pub struct RandTxIds;
 
+#[cfg(feature = "voip-engine-wacore")]
 impl wacore::voip::engine::TxIdSource for RandTxIds {
     fn next_tx_id(&mut self) -> [u8; 12] {
         rand::random()
@@ -41,7 +62,11 @@ impl wacore::voip::engine::TxIdSource for RandTxIds {
 /// has a Tokio runtime and would rather not name one. Absent where `TokioRuntime` is: it spawns
 /// through `tokio::spawn`, which on wasm32 compiles and then panics, and a function that is only
 /// there to trap is worse than one that is not there.
-#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "voip-engine-wacore",
+    feature = "tokio-runtime",
+    not(target_arch = "wasm32")
+))]
 pub async fn run_call_tokio(
     transport: Arc<dyn RelayTransport>,
     relay_events: async_channel::Receiver<RelayTransportEvent>,

@@ -34,16 +34,21 @@ use wacore::types::group_call::{
     CallLinkMedia, GROUP_CALL_MAX_PARTICIPANTS, GROUP_CALL_MAX_REMOTE_PARTICIPANTS,
     GroupCallDevice, GroupCallParticipant, GroupCallUpdate, ScreenShareState,
 };
-use wacore::voip::relay_parse::RelayData;
 #[cfg(test)]
 use wacore::voip::transport::RelayTransportFactory;
-use wacore::voip::{
-    AudioCodec, AudioConfig, AudioFormat, AudioRtpProfile, CallDirection, CallEvent, CallPhase,
-    KeyframeUrgency, VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame,
-    VideoInput, VideoUpgradeToken, video_control_channel,
-};
+#[cfg(test)]
 #[cfg(test)]
 use wacore::voip::{CallChannels, CallConfig, CallEngine, EncodedAudioFrame, run_call};
+use wacore::voip_control::control::{
+    VideoControl, VideoControlReceiver, VideoControlSender, video_control_channel,
+};
+use wacore::voip_control::relay_parse::RelayData;
+use wacore::voip_control::{
+    CallDirection, CallEvent, CallPhase, MediaAudioCodec as AudioCodec,
+    MediaAudioFormat as AudioFormat, MediaAudioRtpProfile as AudioRtpProfile,
+    MediaKeyframeUrgency as KeyframeUrgency, MediaVideoUpgradeToken as VideoUpgradeToken,
+    VideoFrame, VideoInput,
+};
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
 use zeroize::{Zeroize, Zeroizing};
@@ -70,10 +75,16 @@ enum AudioEndpoints {
 }
 
 impl AudioEndpoints {
-    fn config(&self) -> AudioConfig {
+    fn config(&self) -> wacore::voip_control::MediaAudioSpec {
         match self {
-            Self::Pcm { .. } => AudioConfig::MLOW_PCM,
-            Self::Encoded { format, .. } => AudioConfig::encoded(*format),
+            Self::Pcm { .. } => wacore::voip_control::MediaAudioSpec::builder()
+                .format(wacore::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS)
+                .io(wacore::voip_control::MediaAudioIo::Pcm)
+                .build(),
+            Self::Encoded { format, .. } => wacore::voip_control::MediaAudioSpec::builder()
+                .format(*format)
+                .io(wacore::voip_control::MediaAudioIo::Encoded)
+                .build(),
         }
     }
 
@@ -124,8 +135,8 @@ macro_rules! impl_media_builder_methods {
         /// cannot re-point it. The frames it keeps producing are dropped and counted in
         /// `outbound_frames_without_encoder` rather than sent under a profile that would accept
         /// them and leave the peer hearing noise. Both events fire, in this order:
-        /// [`AudioCodecSwitched`](wacore::voip::CallEvent::AudioCodecSwitched) and
-        /// [`AudioCodecSourceIsFixed`](wacore::voip::CallEvent::AudioCodecSourceIsFixed). Recovery
+        /// [`AudioCodecSwitched`](wacore::voip_control::CallEvent::AudioCodecSwitched) and
+        /// [`AudioCodecSourceIsFixed`](wacore::voip_control::CallEvent::AudioCodecSourceIsFixed). Recovery
         /// is to end this call and place a new one on the codec the peer named -- re-encoding in
         /// place does not resume the outbound audio, since the format this call was built with is
         /// what the engine compares against for its lifetime.
@@ -166,7 +177,7 @@ pub struct AcceptCall<'a> {
 }
 
 async fn wait_for_group_relay(
-    registry: &wacore::voip::CallRegistry,
+    registry: &wacore::voip_control::registry::CallRegistry,
     call_id: &str,
     generation: u64,
 ) -> Result<GroupCallUpdate, CallError> {
@@ -336,8 +347,11 @@ impl<'a> AcceptCall<'a> {
         } else {
             self.incoming.from.clone()
         };
-        let mut session =
-            wacore::voip::CallSession::new_incoming(call_id, peer_jid, call_creator.clone());
+        let mut session = wacore::voip_control::CallSession::new_incoming(
+            call_id,
+            peer_jid,
+            call_creator.clone(),
+        );
         session.audio_format = Some(wire_format);
         session.is_video = has_video;
         // Why this has to survive registration: `CallEntry::peer_video_orientations`.
@@ -442,7 +456,7 @@ impl<'a> AcceptCall<'a> {
     async fn build_spec(
         &self,
         enable_video: bool,
-        audio: AudioConfig,
+        audio: wacore::voip_control::MediaAudioSpec,
         group: Option<GroupCallUpdate>,
         generation: u64,
     ) -> Result<(wacore::voip_control::MediaSessionSpec, String), CallError> {
@@ -477,7 +491,7 @@ impl<'a> AcceptCall<'a> {
                 relay,
             )
             .map_err(|error| CallError::Setup(error.to_string()))?;
-            spec.audio = audio.to_neutral();
+            spec.audio = audio;
             spec.enable_video = enable_video;
             spec.group = Some(
                 crate::voip_control::MediaGroupSpec::builder()
@@ -533,7 +547,7 @@ impl<'a> AcceptCall<'a> {
             relay,
         )
         .map_err(|e| CallError::Setup(e.to_string()))?;
-        spec.audio = audio.to_neutral();
+        spec.audio = audio;
         spec.enable_video = enable_video;
         Ok((spec, call_id.clone()))
     }
@@ -871,7 +885,7 @@ impl<'a> OutgoingGroupCall<'a> {
             request_id.clone(),
             cleanup_generation,
         );
-        let mut session = wacore::voip::CallSession::new_outgoing(
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
             &call_id,
             Jid::new(&call_id, Server::Call),
             own_lid.clone(),
@@ -925,7 +939,8 @@ impl<'a> OutgoingGroupCall<'a> {
             registry.apply_group_update_if_current(ack_update.clone(), registration.generation);
         if !matches!(
             applied,
-            wacore::voip::GroupStateApply::Applied | wacore::voip::GroupStateApply::Stale
+            wacore::voip_control::group::GroupStateApply::Applied
+                | wacore::voip_control::group::GroupStateApply::Stale
         ) {
             return Err(CallError::Response(
                 "group offer ack snapshot was rejected".to_string(),
@@ -1332,7 +1347,7 @@ fn peer_selected_codec_from_offer(
     format: AudioFormat,
 ) -> Option<AudioCodec> {
     use wacore::stanza::call::{CAPABILITY_INDEX_MLOW_V1, CapabilityBit, capability_bit};
-    use wacore::voip::{AudioCodec, AudioFormat};
+    use wacore::voip_control::{MediaAudioCodec as AudioCodec, MediaAudioFormat as AudioFormat};
 
     // 1:1 only, and the guard lives here rather than at the call site because the question itself
     // does not have a call-wide answer for a group. A group offer carries the capability of the ONE
@@ -1952,8 +1967,11 @@ async fn place_call(
     // incoming register-before-connect ordering. The handle starts dormant; the ack-waiter task
     // attaches the media engine once the relay arrives.
     let registry = client.call_registry();
-    let mut session =
-        wacore::voip::CallSession::new_outgoing(&call_id, peer.clone(), call_creator.clone());
+    let mut session = wacore::voip_control::CallSession::new_outgoing(
+        &call_id,
+        peer.clone(),
+        call_creator.clone(),
+    );
     session.audio_format = Some(audio.config().format);
     session.is_video = video.is_some();
     // The rung device set lives on the session so an inbound <accept>/<reject> from one callee device
@@ -2129,7 +2147,7 @@ fn spawn_outgoing_relay_waiter(
                     // The ack node re-encoded as OwnedNodeRef; find its <relay> child and parse it (same
                     // path the incoming offer uses). handle_ack_response already removed our waiter entry.
                     Ok(Ok(ack)) => wacore::stanza::call::find_relay(ack.get())
-                        .and_then(wacore::voip::relay_parse::parse_relay_data)
+                        .and_then(wacore::voip_control::relay_parse::parse_relay_data)
                         .ok_or("the server acked the offer but carried no relay"),
                     // Sender dropped (disconnect cleared the waiter map) or the timeout elapsed:
                     // handle_ack_response never ran, so our still-registered waiter entry must be dropped
@@ -2275,7 +2293,7 @@ impl SetupStop {
 async fn relay_factory_or_ended(
     client: &Client,
     registration: &RegisteredCall,
-    endpoint: &wacore::voip::RelayEndpointParams,
+    endpoint: &wacore::voip_control::transport::RelayEndpointParams,
 ) -> Result<Arc<dyn RelayTransportFactory>, CallError> {
     match futures::future::select(
         std::pin::pin!(client.relay_transport_factory(endpoint)),
@@ -2433,10 +2451,10 @@ fn socket_addr_from_config(config: &CallConfig) -> Result<SocketAddr, CallError>
 #[cfg(test)]
 fn relay_endpoint_from_config(
     config: &CallConfig,
-) -> Result<wacore::voip::RelayEndpointParams, CallError> {
-    Ok(wacore::voip::RelayEndpointParams {
+) -> Result<wacore::voip_control::transport::RelayEndpointParams, CallError> {
+    Ok(wacore::voip_control::transport::RelayEndpointParams {
         addr: socket_addr_from_config(config)?,
-        ice_ufrag: wacore::voip::relay_parse::token_to_ice_ufrag(&config.auth_token),
+        ice_ufrag: wacore::voip_control::relay_parse::token_to_ice_ufrag(&config.auth_token),
         // Lossy rather than fallible: the relay key is base64 text in every offer that has one, and
         // a call is not worth failing over a byte that is not. A relay that then refuses the
         // credential says so in the ICE check, which is a far more legible failure than "the
@@ -2496,7 +2514,7 @@ pub(crate) async fn attach_outgoing_relay(
             relay,
         )
         .map_err(|e| SetupStop::Failed(CallError::Setup(e.to_string())))?;
-        spec.audio = pending.audio.config().to_neutral();
+        spec.audio = pending.audio.config();
         spec.enable_video = pending.video.is_some();
 
         let session = client
@@ -2585,7 +2603,7 @@ pub(crate) async fn attach_outgoing_relay(
 /// guard removes only its own generation, so setup/signaling errors cannot leak a task-less registry
 /// entry or reap a same-call-id replacement.
 struct RegisteredCall {
-    registry: Arc<wacore::voip::CallRegistry>,
+    registry: Arc<wacore::voip_control::registry::CallRegistry>,
     call_id: String,
     peer_jid: Jid,
     call_creator: Jid,
@@ -2595,17 +2613,17 @@ struct RegisteredCall {
 }
 
 impl RegisteredCall {
-    async fn new(client: &Client, session: wacore::voip::CallSession) -> Self {
+    async fn new(client: &Client, session: wacore::voip_control::CallSession) -> Self {
         Self::new_inner(client, session, false).await
     }
 
-    async fn new_group(client: &Client, session: wacore::voip::CallSession) -> Self {
+    async fn new_group(client: &Client, session: wacore::voip_control::CallSession) -> Self {
         Self::new_inner(client, session, true).await
     }
 
     async fn new_inner(
         client: &Client,
-        session: wacore::voip::CallSession,
+        session: wacore::voip_control::CallSession,
         force_group: bool,
     ) -> Self {
         let registry = client.call_registry();
@@ -2691,7 +2709,7 @@ impl Drop for RegisteredCall {
 /// superseding same-call-id offer cannot be installed in the removal-before-send window.
 struct AnswerTeardown {
     client: std::sync::Weak<Client>,
-    registry: Arc<wacore::voip::CallRegistry>,
+    registry: Arc<wacore::voip_control::registry::CallRegistry>,
     call_id: String,
     peer_jid: Jid,
     call_creator: Jid,
@@ -2703,7 +2721,7 @@ struct AnswerTeardown {
 
 struct GroupOfferTeardown {
     client: std::sync::Weak<Client>,
-    registry: Arc<wacore::voip::CallRegistry>,
+    registry: Arc<wacore::voip_control::registry::CallRegistry>,
     call_id: String,
     call_creator: Jid,
     generation: u64,
@@ -2956,7 +2974,7 @@ pub(crate) async fn send_answer_terminate(
 #[cfg(test)]
 async fn spawn_call(
     client: &Client,
-    session: wacore::voip::CallSession,
+    session: wacore::voip_control::CallSession,
     engine: CallEngine,
     factory: &dyn RelayTransportFactory,
     audio: AudioEndpoints,
@@ -3042,7 +3060,7 @@ async fn open_registered_media(
     mut spec: wacore::voip_control::MediaSessionSpec,
     audio: AudioEndpoints,
     video: Option<VideoEndpoints>,
-    rekey_rx: Option<async_channel::Receiver<wacore::voip::driver::PeerAnswer>>,
+    rekey_rx: Option<async_channel::Receiver<wacore::voip_control::control::PeerAnswer>>,
     group_epoch: Option<(u32, Vec<u8>)>,
     initial_codec: Option<AudioCodec>,
 ) -> Result<CallHandle, CallError> {
@@ -3074,7 +3092,7 @@ async fn open_registered_media(
         video_shared.send_control(VideoControl::Enable);
     }
 
-    spec.audio = audio.config().to_neutral();
+    spec.audio = audio.config();
     spec.enable_video = video.is_some();
 
     let ctx = wacore::voip_control::MediaOpenContext {
@@ -3180,7 +3198,7 @@ async fn attach_engine(
     ev_tx: async_channel::Sender<CallEvent>,
     // Caller-only recv-rekey receiver; `None` for an incoming call (the callee keys recv on its own
     // self LID and never rekeys).
-    rekey_rx: Option<async_channel::Receiver<wacore::voip::driver::PeerAnswer>>,
+    rekey_rx: Option<async_channel::Receiver<wacore::voip_control::control::PeerAnswer>>,
     media_stats: Arc<wacore::voip::MediaStatsCell>,
 ) -> Result<(), CallError> {
     let (group_tx, group_rx) = async_channel::bounded(GROUP_CONTROL_CHANNEL_CAPACITY);
@@ -3655,7 +3673,7 @@ fn release_local_video_source(
 }
 
 fn release_video_endpoints(
-    registry: &wacore::voip::CallRegistry,
+    registry: &wacore::voip_control::registry::CallRegistry,
     pending_outgoing_calls: &std::sync::Mutex<std::collections::HashMap<String, PendingOutgoing>>,
     video: &VideoShared,
     call_id: &str,
@@ -3859,7 +3877,7 @@ pub struct CallHandle {
     /// offer rang; `peer_jid()` upgrades it to the answering device once an `<accept>` arrives.
     peer_jid: Jid,
     call_creator: Jid,
-    client_registry: Arc<wacore::voip::CallRegistry>,
+    client_registry: Arc<wacore::voip_control::registry::CallRegistry>,
     /// The same map `voip().call()` parked this call's relay-attach material in. A dormant outgoing
     /// hangup (engine not yet attached) must drop its entry here AND notify `ended` itself, since no
     /// engine task exists yet to fire the drop-guard.
@@ -3916,7 +3934,7 @@ fn group_invite_target_matches(
 }
 
 fn current_group_invite_offer_context(
-    registry: &wacore::voip::CallRegistry,
+    registry: &wacore::voip_control::registry::CallRegistry,
     call_id: &str,
     generation: u64,
     target: &Jid,
@@ -3977,7 +3995,7 @@ fn current_group_invite_offer_context(
     Ok((participants, session.is_video))
 }
 
-fn group_video_upgrade_allowed(group: &wacore::voip::GroupCallState) -> bool {
+fn group_video_upgrade_allowed(group: &wacore::voip_control::group::GroupCallState) -> bool {
     !group
         .waiting_room()
         .is_some_and(|room| room.media == CallLinkMedia::Audio)
@@ -3995,7 +4013,7 @@ impl CallHandle {
     /// Media counters for this call: what arrived, what was discarded, and where.
     ///
     /// All-zero until the media plane attaches, and additive after that; sample twice and subtract
-    /// for a rate. Pair it with [`wacore::voip::CallEvent::AudioSilent`], which fires on its own
+    /// for a rate. Pair it with [`wacore::voip_control::CallEvent::AudioSilent`], which fires on its own
     /// when packets keep arriving and none of them becomes sound: the event says a call is silent
     /// and these counters say why.
     ///
@@ -4003,7 +4021,7 @@ impl CallHandle {
     /// its way out, and this handle holds the cell itself, so the natural moment to inspect a call
     /// that carried nothing -- right after [`wait_ended`](Self::wait_ended) -- returns the final
     /// counters rather than zeroes.
-    pub fn media_stats(&self) -> wacore::voip::CallMediaStats {
+    pub fn media_stats(&self) -> wacore::voip_control::media_stats::CallMediaStats {
         self.media
             .as_ref()
             .map(|media| media.stats())
@@ -4070,7 +4088,7 @@ impl CallHandle {
     }
 
     /// Latest transaction-ordered group state, including waiting-room and participant controls.
-    pub fn group_state(&self) -> Option<wacore::voip::GroupCallState> {
+    pub fn group_state(&self) -> Option<wacore::voip_control::group::GroupCallState> {
         self.client_registry
             .group_state_if_current(&self.call_id, self.generation)
     }
@@ -5137,8 +5155,8 @@ mod tests {
     use bytes::Bytes;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
-    use wacore::voip::relay_parse::{RelayAddress, RelayData, RelayEndpoint};
     use wacore::voip::transport::{RelayDisconnectReason, RelayTransport, RelayTransportEvent};
+    use wacore::voip_control::relay_parse::{RelayAddress, RelayData, RelayEndpoint};
     use wacore_binary::{Jid, Server};
 
     use crate::store::persistence_manager::PersistenceManager;
@@ -5275,8 +5293,8 @@ mod tests {
             .build()
     }
 
-    fn mk_session() -> wacore::voip::CallSession {
-        wacore::voip::CallSession::new_incoming("CID-FACADE", caller(), caller())
+    fn mk_session() -> wacore::voip_control::CallSession {
+        wacore::voip_control::CallSession::new_incoming("CID-FACADE", caller(), caller())
     }
 
     fn rekey_update(client: &Client, recipients: &[Jid]) -> GroupCallUpdate {
@@ -5309,7 +5327,7 @@ mod tests {
     }
 
     fn register_group_update(client: &Client, update: &GroupCallUpdate) -> u64 {
-        let mut session = wacore::voip::CallSession::new_incoming(
+        let mut session = wacore::voip_control::CallSession::new_incoming(
             &update.call_id,
             update.call_creator.clone(),
             update.call_creator.clone(),
@@ -5517,11 +5535,11 @@ mod tests {
 
     #[test]
     fn group_invite_context_revalidates_the_latest_roster_and_media() {
-        let registry = wacore::voip::CallRegistry::new();
+        let registry = wacore::voip_control::registry::CallRegistry::new();
         let creator = Jid::new("111111111111111", Server::Lid);
         let target = Jid::new("222222222222222", Server::Lid);
         let connected = Jid::new("333333333333333", Server::Lid);
-        let generation = registry.insert_group(wacore::voip::CallSession::new_outgoing(
+        let generation = registry.insert_group(wacore::voip_control::CallSession::new_outgoing(
             "GROUP-CALL",
             Jid::new("GROUP-CALL", Server::Call),
             creator.clone(),
@@ -5551,7 +5569,7 @@ mod tests {
         assert_eq!(
             registry
                 .apply_group_update_if_current(update(1, "audio", "disconnected", 32), generation,),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert!(
             !current_group_invite_offer_context(
@@ -5569,7 +5587,7 @@ mod tests {
         assert_eq!(
             registry
                 .apply_group_update_if_current(update(2, "video", "disconnected", 32), generation,),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert!(
             current_group_invite_offer_context(
@@ -5588,7 +5606,7 @@ mod tests {
         assert_eq!(
             registry
                 .apply_group_update_if_current(update(3, "video", "connected", 32), generation,),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert!(matches!(
             current_group_invite_offer_context(
@@ -5605,7 +5623,7 @@ mod tests {
         assert_eq!(
             registry
                 .apply_group_update_if_current(update(4, "video", "disconnected", 1), generation,),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert!(matches!(
             current_group_invite_offer_context(
@@ -5625,12 +5643,12 @@ mod tests {
 
     #[test]
     fn new_group_invite_context_excludes_disconnected_members() {
-        let registry = wacore::voip::CallRegistry::new();
+        let registry = wacore::voip_control::registry::CallRegistry::new();
         let creator = Jid::new("111111111111111", Server::Lid);
         let connected = Jid::new("222222222222222", Server::Lid);
         let disconnected = Jid::new("333333333333333", Server::Lid);
         let target = Jid::new("444444444444444", Server::Lid);
-        let generation = registry.insert_group(wacore::voip::CallSession::new_outgoing(
+        let generation = registry.insert_group(wacore::voip_control::CallSession::new_outgoing(
             "GROUP-CALL",
             Jid::new("GROUP-CALL", Server::Call),
             creator.clone(),
@@ -5656,7 +5674,7 @@ mod tests {
             .build();
         assert_eq!(
             registry.apply_group_update_if_current(snapshot, generation),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
 
         let (participants, video) = current_group_invite_offer_context(
@@ -5675,12 +5693,12 @@ mod tests {
 
     #[test]
     fn group_invite_context_matches_pn_and_lid_roster_aliases() {
-        let registry = wacore::voip::CallRegistry::new();
+        let registry = wacore::voip_control::registry::CallRegistry::new();
         let creator = Jid::new("111111111111111", Server::Lid);
         let connected = Jid::new("222222222222222", Server::Lid);
         let target_lid = Jid::new("333333333333333", Server::Lid);
         let target_pn = Jid::new("12025550123", Server::Pn);
-        let generation = registry.insert_group(wacore::voip::CallSession::new_outgoing(
+        let generation = registry.insert_group(wacore::voip_control::CallSession::new_outgoing(
             "GROUP-CALL",
             Jid::new("GROUP-CALL", Server::Call),
             creator.clone(),
@@ -5709,7 +5727,7 @@ mod tests {
             .build();
         assert_eq!(
             registry.apply_group_update_if_current(snapshot, generation),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
 
         let (participants, video) = current_group_invite_offer_context(
@@ -5889,7 +5907,7 @@ mod tests {
     }
 
     async fn register_answer(client: &Client, incoming: &IncomingCall) -> RegisteredCall {
-        let mut session = wacore::voip::CallSession::new_incoming(
+        let mut session = wacore::voip_control::CallSession::new_incoming(
             incoming.action.call_id(),
             incoming.from.clone(),
             incoming.action.call_creator().clone(),
@@ -6176,7 +6194,7 @@ mod tests {
             .build();
         group.relay = Some(sample_group_relay(1));
         incoming.group = Some(Box::new(group));
-        let mut session = wacore::voip::CallSession::new_incoming(
+        let mut session = wacore::voip_control::CallSession::new_incoming(
             incoming.action.call_id(),
             incoming.from.clone(),
             incoming.action.call_creator().clone(),
@@ -6218,7 +6236,7 @@ mod tests {
         let incoming = incoming_offer(false);
         let call_id = incoming.action.call_id().to_string();
         let group_creator = Jid::new("15550003333", Server::Lid);
-        let mut group_session = wacore::voip::CallSession::new_incoming(
+        let mut group_session = wacore::voip_control::CallSession::new_incoming(
             &call_id,
             group_creator.clone(),
             group_creator.clone(),
@@ -6278,8 +6296,11 @@ mod tests {
         update.relay = Some(sample_group_relay(1));
         incoming.group = Some(Box::new(update.clone()));
 
-        let mut stale_session =
-            wacore::voip::CallSession::new_incoming(&call_id, creator.clone(), creator.clone());
+        let mut stale_session = wacore::voip_control::CallSession::new_incoming(
+            &call_id,
+            creator.clone(),
+            creator.clone(),
+        );
         stale_session.group = Some(update.clone());
         let stale = client
             .call_registry()
@@ -6289,7 +6310,7 @@ mod tests {
         incoming.set_ringing_generation(stale);
 
         let mut replacement_session =
-            wacore::voip::CallSession::new_incoming(&call_id, creator.clone(), creator);
+            wacore::voip_control::CallSession::new_incoming(&call_id, creator.clone(), creator);
         replacement_session.group = Some(update);
         let replacement = client
             .call_registry()
@@ -6313,7 +6334,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_group_invite_waits_for_its_usable_relay_snapshot() {
-        let registry = wacore::voip::CallRegistry::new();
+        let registry = wacore::voip_control::registry::CallRegistry::new();
         let call_id = "ACTIVE-GROUP-INVITE";
         let creator = caller();
         let update = GroupCallUpdate::builder()
@@ -6328,7 +6349,7 @@ mod tests {
             .participants(Vec::new())
             .build();
         let mut session =
-            wacore::voip::CallSession::new_incoming(call_id, creator.clone(), creator);
+            wacore::voip_control::CallSession::new_incoming(call_id, creator.clone(), creator);
         session.group = Some(update.clone());
         let generation = registry
             .insert_ringing_group_if_inactive(session)
@@ -6347,7 +6368,7 @@ mod tests {
         admitted.relay = Some(sample_group_relay(2));
         assert_eq!(
             registry.apply_group_update_if_current(admitted, generation),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert!(
             wait.await.expect("relay update").relay.is_some(),
@@ -6778,7 +6799,7 @@ mod tests {
             .build();
         assert_eq!(
             client.call_registry().apply_group_update(update),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert_eq!(
             handle.peer_jid(),
@@ -6842,10 +6863,10 @@ mod tests {
     }
 
     #[async_trait]
-    impl wacore::voip::RelayTransportProvider for RecordingProvider {
+    impl wacore::voip_control::transport::RelayTransportProvider for RecordingProvider {
         async fn factory(
             &self,
-            relay: &wacore::voip::RelayEndpointParams,
+            relay: &wacore::voip_control::transport::RelayEndpointParams,
         ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
             self.asked.lock().unwrap().push((
                 relay.addr,
@@ -6877,7 +6898,7 @@ mod tests {
         }));
 
         let addr: SocketAddr = "203.0.113.7:3478".parse().expect("addr");
-        let endpoint = wacore::voip::RelayEndpointParams {
+        let endpoint = wacore::voip_control::transport::RelayEndpointParams {
             addr,
             ice_ufrag: "UFRAG".to_string(),
             ice_pwd: "PWD".to_string(),
@@ -6920,12 +6941,12 @@ mod tests {
         assert_eq!(endpoint.addr.to_string(), "198.51.100.9:3480");
         assert_eq!(
             endpoint.ice_ufrag,
-            wacore::voip::relay_parse::token_to_ice_ufrag(&[0xaa, 0xbb, 0xcc]),
+            wacore::voip_control::relay_parse::token_to_ice_ufrag(&[0xaa, 0xbb, 0xcc]),
             "ice-ufrag is the endpoint's auth token, base64 -- not the allocate token beside it"
         );
         assert_ne!(
             endpoint.ice_ufrag,
-            wacore::voip::relay_parse::token_to_ice_ufrag(&[0x11, 0x22, 0x33]),
+            wacore::voip_control::relay_parse::token_to_ice_ufrag(&[0x11, 0x22, 0x33]),
             "and never the relay token"
         );
         assert_eq!(
@@ -6940,7 +6961,7 @@ mod tests {
     fn a_relay_endpoint_does_not_print_its_password() {
         let printed = format!(
             "{:?}",
-            wacore::voip::RelayEndpointParams {
+            wacore::voip_control::transport::RelayEndpointParams {
                 addr: "203.0.113.7:3480".parse().expect("addr"),
                 ice_ufrag: "UFRAG".to_string(),
                 ice_pwd: "SECRET-RELAY-KEY".to_string(),
@@ -7017,10 +7038,10 @@ mod tests {
             release: async_channel::Receiver<()>,
         }
         #[async_trait]
-        impl wacore::voip::RelayTransportProvider for Gated {
+        impl wacore::voip_control::transport::RelayTransportProvider for Gated {
             async fn factory(
                 &self,
-                _relay: &wacore::voip::RelayEndpointParams,
+                _relay: &wacore::voip_control::transport::RelayEndpointParams,
             ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
                 let _ = self.release.recv().await;
                 anyhow::bail!("released")
@@ -7066,10 +7087,10 @@ mod tests {
         /// Never answers, so the hangup is what ends the setup.
         struct NeverAnswers;
         #[async_trait]
-        impl wacore::voip::RelayTransportProvider for NeverAnswers {
+        impl wacore::voip_control::transport::RelayTransportProvider for NeverAnswers {
             async fn factory(
                 &self,
-                _relay: &wacore::voip::RelayEndpointParams,
+                _relay: &wacore::voip_control::transport::RelayEndpointParams,
             ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
                 std::future::pending().await
             }
@@ -7139,10 +7160,10 @@ mod tests {
         /// Hands back a factory promptly; it is the dial behind it that refuses.
         struct Hands;
         #[async_trait]
-        impl wacore::voip::RelayTransportProvider for Hands {
+        impl wacore::voip_control::transport::RelayTransportProvider for Hands {
             async fn factory(
                 &self,
-                _relay: &wacore::voip::RelayEndpointParams,
+                _relay: &wacore::voip_control::transport::RelayEndpointParams,
             ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
                 Ok(Arc::new(RefusesToConnect))
             }
@@ -7191,10 +7212,10 @@ mod tests {
     async fn a_peer_terminate_cancels_a_registered_call_s_provider_await() {
         struct NeverAnswers;
         #[async_trait]
-        impl wacore::voip::RelayTransportProvider for NeverAnswers {
+        impl wacore::voip_control::transport::RelayTransportProvider for NeverAnswers {
             async fn factory(
                 &self,
-                _relay: &wacore::voip::RelayEndpointParams,
+                _relay: &wacore::voip_control::transport::RelayEndpointParams,
             ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
                 std::future::pending().await
             }
@@ -7204,7 +7225,7 @@ mod tests {
         let incoming = incoming_offer(false);
         let registration = register_answer(&client, &incoming).await;
         client.set_relay_transport_provider(Arc::new(NeverAnswers));
-        let endpoint = wacore::voip::RelayEndpointParams {
+        let endpoint = wacore::voip_control::transport::RelayEndpointParams {
             addr: "203.0.113.9:3478".parse().expect("addr"),
             ice_ufrag: String::new(),
             ice_pwd: String::new(),
@@ -7244,10 +7265,10 @@ mod tests {
     async fn a_provider_that_never_answers_does_not_park_the_call() {
         struct NeverAnswers;
         #[async_trait]
-        impl wacore::voip::RelayTransportProvider for NeverAnswers {
+        impl wacore::voip_control::transport::RelayTransportProvider for NeverAnswers {
             async fn factory(
                 &self,
-                _relay: &wacore::voip::RelayEndpointParams,
+                _relay: &wacore::voip_control::transport::RelayEndpointParams,
             ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
                 std::future::pending().await
             }
@@ -7255,7 +7276,7 @@ mod tests {
 
         let client = make_client().await;
         client.set_relay_transport_provider(Arc::new(NeverAnswers));
-        let endpoint = wacore::voip::RelayEndpointParams {
+        let endpoint = wacore::voip_control::transport::RelayEndpointParams {
             addr: "203.0.113.7:3478".parse().expect("addr"),
             ice_ufrag: String::new(),
             ice_pwd: String::new(),
@@ -7278,10 +7299,10 @@ mod tests {
     async fn a_refusing_provider_fails_the_call_with_its_reason() {
         struct Refuses;
         #[async_trait]
-        impl wacore::voip::RelayTransportProvider for Refuses {
+        impl wacore::voip_control::transport::RelayTransportProvider for Refuses {
             async fn factory(
                 &self,
-                _relay: &wacore::voip::RelayEndpointParams,
+                _relay: &wacore::voip_control::transport::RelayEndpointParams,
             ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
                 anyhow::bail!("this browser has no WebRTC")
             }
@@ -7289,7 +7310,7 @@ mod tests {
 
         let client = make_client().await;
         client.set_relay_transport_provider(Arc::new(Refuses));
-        let endpoint = wacore::voip::RelayEndpointParams {
+        let endpoint = wacore::voip_control::transport::RelayEndpointParams {
             addr: "203.0.113.7:3478".parse().expect("addr"),
             ice_ufrag: String::new(),
             ice_pwd: String::new(),
@@ -7384,7 +7405,8 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
-        let mut session = wacore::voip::CallSession::new_outgoing("CID-FACADE", caller(), caller());
+        let mut session =
+            wacore::voip_control::CallSession::new_outgoing("CID-FACADE", caller(), caller());
         session.ring_devices = vec![caller().with_device(1), caller().with_device(2)];
 
         let handle = spawn_call(
@@ -7516,7 +7538,7 @@ mod tests {
         // What the drive loop publishes on its way out: a call that heard nothing and said why.
         assert_eq!(
             handle.media_stats(),
-            wacore::voip::CallMediaStats::default()
+            wacore::voip_control::media_stats::CallMediaStats::default()
         );
         session.set_stats(
             wacore::voip_control::MediaStats::builder()
@@ -7598,7 +7620,7 @@ mod tests {
             .build();
         assert_eq!(
             client.call_registry().apply_group_update(update),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
     }
 
@@ -7647,7 +7669,7 @@ mod tests {
     async fn muting_a_direct_call_announces_to_the_answering_device() {
         let (client, sends) = make_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_outgoing(
             "CID-FACADE",
             caller(),
             caller(),
@@ -7683,7 +7705,7 @@ mod tests {
         let (transport, entered, _release) = gated_send_transport(0, false);
         install_noise_transport(&client, transport).await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_outgoing(
             "CID-FACADE",
             caller(),
             caller(),
@@ -7712,7 +7734,7 @@ mod tests {
     async fn an_announced_unmute_opens_the_microphone() {
         let (client, sends) = make_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_outgoing(
             "CID-FACADE",
             caller(),
             caller(),
@@ -7744,7 +7766,7 @@ mod tests {
     async fn cancelling_a_mute_at_the_lane_leaves_both_sides_on_the_old_state() {
         let (client, sends) = make_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_outgoing(
             "CID-FACADE",
             caller(),
             caller(),
@@ -7793,7 +7815,7 @@ mod tests {
         ] {
             let (client, sends) = make_sending_client().await;
             let mut session =
-                wacore::voip::CallSession::new_outgoing("CID-FACADE", caller(), caller());
+                wacore::voip_control::CallSession::new_outgoing("CID-FACADE", caller(), caller());
             session.ring_devices = ring_devices;
             let generation = client.call_registry().insert(session);
             let handle = registry_handle(&client, generation);
@@ -7814,13 +7836,14 @@ mod tests {
     async fn muting_an_answered_incoming_call_announces_to_the_caller_device() {
         let (client, sends) = make_sending_client().await;
         let device = caller().with_device(5);
-        let generation = client
-            .call_registry()
-            .insert(wacore::voip::CallSession::new_incoming(
-                "CID-FACADE",
-                device.clone(),
-                caller(),
-            ));
+        let generation =
+            client
+                .call_registry()
+                .insert(wacore::voip_control::CallSession::new_incoming(
+                    "CID-FACADE",
+                    device.clone(),
+                    caller(),
+                ));
         let handle = registry_handle(&client, generation);
 
         let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
@@ -7849,7 +7872,8 @@ mod tests {
     async fn partly_delivered_terminate_reports_what_reached_the_wire() {
         // The second send fails, so the first device is told and the second is not.
         let (client, sends) = make_sending_client_with_failure_after(Some(1)).await;
-        let mut session = wacore::voip::CallSession::new_outgoing("CID-FACADE", caller(), caller());
+        let mut session =
+            wacore::voip_control::CallSession::new_outgoing("CID-FACADE", caller(), caller());
         session.ring_devices = vec![caller().with_device(1), caller().with_device(2)];
         let generation = client.call_registry().insert(session);
         let handle = registry_handle(&client, generation);
@@ -8014,7 +8038,7 @@ mod tests {
             .build();
         assert_eq!(
             registry.apply_group_update(update),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
 
         let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
@@ -8133,7 +8157,8 @@ mod tests {
         let (client, sends) = make_sending_client().await;
         let first = caller().with_device(1);
         let second = caller().with_device(2);
-        let mut session = wacore::voip::CallSession::new_outgoing("CID-FACADE", caller(), caller());
+        let mut session =
+            wacore::voip_control::CallSession::new_outgoing("CID-FACADE", caller(), caller());
         session.ring_devices = vec![first.clone(), second.clone()];
         let generation = client.call_registry().insert(session);
         let handle = registry_handle(&client, generation);
@@ -8963,7 +8988,7 @@ mod tests {
         seed_peer_session(&client, &recipient).await;
         let update = rekey_update(&client, &[recipient]);
         let stale_generation = register_group_update(&client, &update);
-        let mut replacement = wacore::voip::CallSession::new_incoming(
+        let mut replacement = wacore::voip_control::CallSession::new_incoming(
             &update.call_id,
             update.call_creator.clone(),
             update.call_creator.clone(),
@@ -9065,7 +9090,7 @@ mod tests {
             "the failed generation is claimed before its terminal send"
         );
 
-        let mut replacement_session = wacore::voip::CallSession::new_incoming(
+        let mut replacement_session = wacore::voip_control::CallSession::new_incoming(
             &update.call_id,
             update.call_creator.clone(),
             update.call_creator.clone(),
@@ -9113,7 +9138,7 @@ mod tests {
             .expect("second rekey send must block")
             .expect("send gate");
         let replacement_generation = {
-            let mut replacement = wacore::voip::CallSession::new_incoming(
+            let mut replacement = wacore::voip_control::CallSession::new_incoming(
                 &update.call_id,
                 update.call_creator.clone(),
                 update.call_creator.clone(),
@@ -9953,7 +9978,7 @@ mod tests {
         let (client, _sent_count) = make_sending_client().await;
         let call_id = "GROUP-OFFER-FAILED";
         let creator = Jid::new("111111111111111", Server::Lid);
-        let mut session = wacore::voip::CallSession::new_outgoing(
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
             call_id,
             Jid::new(call_id, Server::Call),
             creator,
@@ -10151,7 +10176,7 @@ mod tests {
                     .participants(vec![participant])
                     .build(),
             ),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         tokio::time::timeout(Duration::from_secs(2), async {
             while client.call_registry().phase_if_current(call_id, generation)
@@ -10205,7 +10230,7 @@ mod tests {
                     .participants(vec![participant])
                     .build(),
             ),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert_eq!(
             client.call_registry().phase_if_current(call_id, generation),
@@ -10402,7 +10427,7 @@ mod tests {
             client
                 .call_registry()
                 .apply_group_update_if_current(overtaking, generation,),
-            wacore::voip::GroupStateApply::Applied,
+            wacore::voip_control::group::GroupStateApply::Applied,
             "a group update that overtakes the ACK must be retained"
         );
 
@@ -10440,7 +10465,7 @@ mod tests {
                 .participants(Vec::new())
                 .build()
         };
-        let mut session = wacore::voip::CallSession::new_outgoing(
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
             call_id,
             Jid::new(call_id, Server::Call),
             creator.clone(),
@@ -10491,7 +10516,7 @@ mod tests {
             .rekey_requested(true)
             .participants(Vec::new())
             .build();
-        let mut session = wacore::voip::CallSession::new_outgoing(
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
             call_id,
             Jid::new(call_id, Server::Call),
             creator,
@@ -10813,10 +10838,10 @@ mod tests {
     async fn a_refused_transport_provider_reaches_the_handle() {
         struct Refuses;
         #[async_trait]
-        impl wacore::voip::RelayTransportProvider for Refuses {
+        impl wacore::voip_control::transport::RelayTransportProvider for Refuses {
             async fn factory(
                 &self,
-                _relay: &wacore::voip::RelayEndpointParams,
+                _relay: &wacore::voip_control::transport::RelayEndpointParams,
             ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
                 anyhow::bail!("this browser has no WebRTC")
             }
@@ -11579,7 +11604,7 @@ mod tests {
             .build();
         assert_eq!(
             client.call_registry().apply_group_update(update),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         let sent_before = sent_count.load(Ordering::SeqCst);
         let (source, sink) = video_endpoints();
@@ -11618,7 +11643,7 @@ mod tests {
             .build();
         assert_eq!(
             client.call_registry().apply_group_update(update.clone()),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         let group_transition_lock = client
             .call_registry()
@@ -11643,7 +11668,7 @@ mod tests {
         downgrade.media = "audio".to_string();
         assert_eq!(
             client.call_registry().apply_group_update(downgrade),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         drop(group_transition_guard);
 
@@ -11667,7 +11692,7 @@ mod tests {
 
     #[test]
     fn audio_call_links_are_not_video_upgradable() {
-        let mut group = wacore::voip::GroupCallState::new("CALL-LINK", caller());
+        let mut group = wacore::voip_control::group::GroupCallState::new("CALL-LINK", caller());
         assert_eq!(
             group.apply_waiting_room(
                 wacore::types::group_call::WaitingRoom::builder()
@@ -11681,7 +11706,7 @@ mod tests {
                     .users(Vec::new())
                     .build(),
             ),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert!(!group_video_upgrade_allowed(&group));
     }

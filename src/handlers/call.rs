@@ -22,9 +22,9 @@ use wacore::types::events::Event;
 #[cfg(feature = "voip-runtime")]
 use wacore::types::group_call::{GroupCallDevice, GroupCallEncRekey, ScreenShareState};
 #[cfg(feature = "voip-runtime")]
-use wacore::voip::GroupStateApply;
-#[cfg(feature = "voip-runtime")]
 use wacore::voip::{CallEvent, PeerVideoTransition, VideoControl};
+#[cfg(feature = "voip-runtime")]
+use wacore::voip_control::group::GroupStateApply;
 #[cfg(feature = "voip-runtime")]
 use wacore_binary::Jid;
 use wacore_binary::{OwnedNodeRef, Server};
@@ -218,7 +218,7 @@ impl StanzaHandler for CallHandler {
                     #[cfg(feature = "voip-runtime")]
                     if is_offer {
                         if let Some(group) = call.group.as_deref() {
-                            let mut session = wacore::voip::CallSession::new_incoming(
+                            let mut session = wacore::voip_control::CallSession::new_incoming(
                                 call.action.call_id(),
                                 call.from.clone(),
                                 call.action.call_creator().clone(),
@@ -434,7 +434,7 @@ impl StanzaHandler for CallHandler {
                             .peer_selected_audio_codec(call.action.call_id(), peer_mlow_bit);
                         client.call_registry().send_rekey(
                             call.action.call_id(),
-                            wacore::voip::driver::PeerAnswer {
+                            wacore::voip_control::control::PeerAnswer {
                                 answering_lid: sender.to_string(),
                                 audio_codec,
                             },
@@ -1648,7 +1648,7 @@ mod tests {
     #[tokio::test]
     async fn decrypted_epoch_is_committed_when_registration_overtakes_pending_buffering() {
         use wacore::types::group_call::GroupCallEncRekey;
-        use wacore::voip::CallSession;
+        use wacore::voip_control::CallSession;
 
         let client = make_client().await;
         let creator = fake_caller_lid();
@@ -1707,7 +1707,7 @@ mod tests {
         let call_id = "CALL-LINK-RACE";
         let registry = client.call_registry();
         let generation = registry
-            .insert_call_link_checked(wacore::voip::CallSession::new_outgoing(
+            .insert_call_link_checked(wacore::voip_control::CallSession::new_outgoing(
                 call_id,
                 Jid::new(call_id, Server::Call),
                 creator.clone(),
@@ -2378,7 +2378,7 @@ mod tests {
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn queued_group_transition_cannot_commit_to_a_replacement_generation() {
-        use wacore::voip::CallSession;
+        use wacore::voip_control::CallSession;
 
         let client = make_client().await;
         let call_id = "GROUP-LOCK-GENERATION";
@@ -2701,8 +2701,11 @@ mod tests {
             .participants(vec![creator_participant.clone()])
             .relay(relay.clone())
             .build();
-        let mut session =
-            wacore::voip::CallSession::new_outgoing(call_id, creator.clone(), creator.clone());
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
+            call_id,
+            creator.clone(),
+            creator.clone(),
+        );
         session.group = Some(initial);
         let generation = registry
             .insert_group_checked(session)
@@ -2888,10 +2891,10 @@ mod tests {
         client: &Client,
         ring_devices: Vec<Jid>,
     ) -> (async_channel::Receiver<CallEvent>, u64) {
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         let registry = client.call_registry();
-        let mut session = wacore::voip::CallSession::new_outgoing(
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -2922,7 +2925,7 @@ mod tests {
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn incompatible_audio_selection_emits_event_and_terminates_call() {
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         let (client, sends) = make_sending_client_with_failure_after(None).await;
         let accepting = fake_caller_lid();
@@ -3316,7 +3319,10 @@ mod tests {
     }
 
     #[cfg(feature = "voip-runtime")]
-    async fn begin_local_upgrade(registry: &wacore::voip::CallRegistry, generation: u64) {
+    async fn begin_local_upgrade(
+        registry: &wacore::voip_control::registry::CallRegistry,
+        generation: u64,
+    ) {
         let transition_lock = registry
             .video_transition_lock("CALL-ID-0001", generation)
             .expect("active call");
@@ -3333,11 +3339,11 @@ mod tests {
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn video_state_sends_typed_ack_and_cancels_generic() {
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         let client = make_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_incoming(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3374,11 +3380,11 @@ mod tests {
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn video_state_is_not_visible_before_typed_ack_completes() {
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         let (client, send_started, release_send) = make_blocking_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_incoming(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3430,11 +3436,11 @@ mod tests {
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn cancelled_peer_request_invalidates_its_acceptance_token() {
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         let client = make_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_incoming(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3493,11 +3499,11 @@ mod tests {
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn video_transition_stays_serialized_through_enabled_announcement() {
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         let (client, send_started, release_send) = make_blocking_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_incoming(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3550,7 +3556,7 @@ mod tests {
         let (global_handler, global_rx) = ChannelEventHandler::new();
         client.subscribe_handler(global_handler).detach();
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_outgoing(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3590,13 +3596,13 @@ mod tests {
     #[tokio::test]
     async fn video_state_does_not_mutate_a_same_id_replacement_after_ack_await() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         let (client, send_started, release_send) = make_blocking_sending_client().await;
         let (global_handler, global_rx) = ChannelEventHandler::new();
         client.subscribe_handler(global_handler).detach();
         let registry = client.call_registry();
-        let stale_generation = registry.insert(wacore::voip::CallSession::new_incoming(
+        let stale_generation = registry.insert(wacore::voip_control::CallSession::new_incoming(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3623,7 +3629,7 @@ mod tests {
                 _ = &mut handling => panic!("handler completed before the typed ack send"),
             }
 
-            let replacement = registry.insert(wacore::voip::CallSession::new_incoming(
+            let replacement = registry.insert(wacore::voip_control::CallSession::new_incoming(
                 "CALL-ID-0001",
                 fake_caller_lid(),
                 fake_caller_lid(),
@@ -3688,7 +3694,7 @@ mod tests {
         let (global_handler, global_rx) = ChannelEventHandler::new();
         client.subscribe_handler(global_handler).detach();
         let registry = client.call_registry();
-        let session = wacore::voip::CallSession::new_incoming(
+        let session = wacore::voip_control::CallSession::new_incoming(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3774,13 +3780,13 @@ mod tests {
     #[tokio::test]
     async fn refused_upgrade_runs_local_video_teardown() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         for state in ["5", "8"] {
             // 5 = UpgradeReject, 8 = UpgradeCancel.
             let client = make_sending_client().await;
             let registry = client.call_registry();
-            let session = wacore::voip::CallSession::new_outgoing(
+            let session = wacore::voip_control::CallSession::new_outgoing(
                 "CALL-ID-0001",
                 fake_caller_lid(),
                 fake_caller_lid(),
@@ -3816,11 +3822,11 @@ mod tests {
     #[tokio::test]
     async fn refused_upgrade_tears_down_when_typed_ack_send_fails() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         let client = make_client().await;
         let registry = client.call_registry();
-        let session = wacore::voip::CallSession::new_outgoing(
+        let session = wacore::voip_control::CallSession::new_outgoing(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3855,13 +3861,13 @@ mod tests {
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn unacked_video_state_is_not_dispatched_globally() {
-        use wacore::voip::CallEvent;
+        use wacore::voip_control::CallEvent;
 
         let client = make_client().await;
         let (global_handler, global_rx) = ChannelEventHandler::new();
         client.subscribe_handler(global_handler).detach();
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_incoming(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3896,7 +3902,7 @@ mod tests {
 
         let client = make_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_incoming(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_incoming(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
@@ -3955,7 +3961,7 @@ mod tests {
     #[tokio::test]
     async fn active_group_offer_registers_ringing_session_before_dispatch() {
         use std::sync::atomic::Ordering;
-        use wacore::voip::CallPhase;
+        use wacore::voip_control::CallPhase;
 
         let (client, sends) = make_sending_client_with_failure_after(None).await;
         let (event_handler, event_rx) = ChannelEventHandler::new();
@@ -4038,7 +4044,7 @@ mod tests {
     #[cfg(feature = "voip-runtime")]
     #[tokio::test]
     async fn duplicate_group_offer_preserves_an_active_generation() {
-        use wacore::voip::CallPhase;
+        use wacore::voip_control::CallPhase;
 
         let client = make_sending_client().await;
         let mut cancelled = false;
@@ -4198,8 +4204,11 @@ mod tests {
         let (sibling, accepting) = (peer.with_device(1), peer.with_device(2));
 
         // Register the outbound call with its rung device set on the session (as place_call does).
-        let mut session =
-            wacore::voip::CallSession::new_outgoing("CALL-ID-0001", peer.clone(), creator.clone());
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
+            "CALL-ID-0001",
+            peer.clone(),
+            creator.clone(),
+        );
         session.ring_devices = vec![sibling.clone(), accepting.clone()];
         client.call_registry().insert(session);
 
@@ -4271,8 +4280,11 @@ mod tests {
         let creator = Jid::new("111111111111111", Server::Lid);
         let (busy_device, other) = (peer.with_device(1), peer.with_device(2));
 
-        let mut session =
-            wacore::voip::CallSession::new_outgoing("CALL-ID-0001", peer.clone(), creator.clone());
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
+            "CALL-ID-0001",
+            peer.clone(),
+            creator.clone(),
+        );
         session.ring_devices = vec![busy_device.clone(), other.clone()];
         client.call_registry().insert(session);
 
@@ -4321,8 +4333,11 @@ mod tests {
         let creator = Jid::new("111111111111111", Server::Lid);
         let (stale_device, other) = (peer.with_device(75), peer.with_device(2));
 
-        let mut session =
-            wacore::voip::CallSession::new_outgoing("CALL-ID-0001", peer.clone(), creator.clone());
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
+            "CALL-ID-0001",
+            peer.clone(),
+            creator.clone(),
+        );
         session.ring_devices = vec![stale_device.clone(), other.clone()];
         client.call_registry().insert(session);
 
@@ -4375,8 +4390,11 @@ mod tests {
         let creator = Jid::new("111111111111111", Server::Lid);
         let declining = peer.with_device(1);
 
-        let session =
-            wacore::voip::CallSession::new_outgoing("CALL-ID-0001", peer.clone(), creator.clone());
+        let session = wacore::voip_control::CallSession::new_outgoing(
+            "CALL-ID-0001",
+            peer.clone(),
+            creator.clone(),
+        );
         client.call_registry().insert(session);
 
         let reject = NodeBuilder::new("call")
@@ -4412,7 +4430,7 @@ mod tests {
         let creator = Jid::new("111111111111111", Server::Lid);
         let participant = Jid::new("222222222222222", Server::Lid);
         let call_id = "GROUP-CALL";
-        let mut session = wacore::voip::CallSession::new_outgoing(
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
             call_id,
             Jid::new(call_id, Server::Call),
             creator.clone(),
@@ -4464,7 +4482,7 @@ mod tests {
         let creator = Jid::new("111111111111111", Server::Lid);
         let participant = Jid::new("222222222222222", Server::Lid);
         let call_id = "PRE-ACK-GROUP-CALL";
-        let session = wacore::voip::CallSession::new_outgoing(
+        let session = wacore::voip_control::CallSession::new_outgoing(
             call_id,
             Jid::new(call_id, Server::Call),
             creator.clone(),
@@ -4503,7 +4521,7 @@ mod tests {
         let creator = Jid::new("111111111111111", Server::Lid);
         let participant = Jid::new("222222222222222", Server::Lid).with_device(2);
         let call_id = "GROUP-CALL";
-        let mut session = wacore::voip::CallSession::new_outgoing(
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
             call_id,
             Jid::new(call_id, Server::Call),
             creator.clone(),
@@ -4582,8 +4600,11 @@ mod tests {
         let client = make_client().await;
         let peer = Jid::new("222222222222222", Server::Lid);
         let creator = Jid::new("111111111111111", Server::Lid);
-        let session =
-            wacore::voip::CallSession::new_outgoing("CALL-ID-0001", peer.clone(), creator.clone());
+        let session = wacore::voip_control::CallSession::new_outgoing(
+            "CALL-ID-0001",
+            peer.clone(),
+            creator.clone(),
+        );
         client.call_registry().insert(session);
         assert!(
             client
@@ -4754,7 +4775,7 @@ mod tests {
         let creator = Jid::new("111111111111111", Server::Lid); // us, the caller
         client
             .call_registry()
-            .insert(wacore::voip::CallSession::new_outgoing(
+            .insert(wacore::voip_control::CallSession::new_outgoing(
                 "CALL-ID-OUT",
                 peer.clone(),
                 creator.clone(),
@@ -4987,7 +5008,7 @@ mod tests {
         let creator = fake_caller_lid();
         client
             .call_registry()
-            .insert(wacore::voip::CallSession::new_incoming(
+            .insert(wacore::voip_control::CallSession::new_incoming(
                 "CALL-ID-0001",
                 peer,
                 creator.clone(),

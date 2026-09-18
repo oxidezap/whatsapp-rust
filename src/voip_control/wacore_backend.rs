@@ -46,7 +46,7 @@ pub fn relay_endpoint(config: &CallConfig) -> Result<RelayEndpointParams, MediaS
         .map_err(|_| MediaSetupError::BadEndpoint)?;
     Ok(RelayEndpointParams {
         addr,
-        ice_ufrag: wacore::voip::relay_parse::token_to_ice_ufrag(&config.auth_token),
+        ice_ufrag: wacore::voip_control::relay_parse::token_to_ice_ufrag(&config.auth_token),
         ice_pwd: String::from_utf8_lossy(&config.integrity_key).into_owned(),
     })
 }
@@ -570,7 +570,7 @@ fn build_channels(
     media_stats: Arc<wacore::voip_control::media_stats::MediaStatsCell>,
     group_ctl: Option<async_channel::Receiver<wacore::voip::GroupControl>>,
     generation: u64,
-    rekey: Option<async_channel::Receiver<wacore::voip::driver::PeerAnswer>>,
+    rekey: Option<async_channel::Receiver<wacore::voip_control::control::PeerAnswer>>,
 ) -> Result<wacore::voip::CallChannels, MediaSetupError> {
     use wacore::voip::CallChannels;
 
@@ -718,7 +718,9 @@ impl SourceFeed {
 
 /// The neutral counters for an engine snapshot, re-exported so the facade can publish them.
 #[must_use]
-pub fn neutral_stats(stats: wacore::voip::CallMediaStats) -> wacore::voip_control::MediaStats {
+pub fn neutral_stats(
+    stats: wacore::voip_control::media_stats::CallMediaStats,
+) -> wacore::voip_control::MediaStats {
     stats_to_neutral(stats)
 }
 

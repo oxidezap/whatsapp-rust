@@ -470,6 +470,17 @@ pub fn get_relay_key_for_sdp(relay_data: &RelayData) -> String {
     }
 }
 
+
+/// Find the first `<relay>` node anywhere in the subtree (the offer's relay may sit under `<call>`
+/// or `<offer>` depending on server framing). Pure node walking, so it lives with the relay parser
+/// and compiles without the engine.
+pub fn find_relay<'a, 'b>(nr: &'b NodeRef<'a>) -> Option<&'b NodeRef<'a>> {
+    if nr.tag.as_ref() == "relay" {
+        return Some(nr);
+    }
+    nr.children().and_then(|cs| cs.iter().find_map(find_relay))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

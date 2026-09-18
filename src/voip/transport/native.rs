@@ -38,10 +38,10 @@ use rtc_sctp::{
 };
 
 use wacore::runtime::{AbortHandle, Runtime};
-use wacore::voip::relay_parse::WEB_CLIENT_RELAY_PORT;
 use wacore::voip::transport::{
     RelayDisconnectReason, RelayTransport, RelayTransportEvent, RelayTransportFactory,
 };
+use wacore::voip_control::relay_parse::WEB_CLIENT_RELAY_PORT;
 
 /// DataChannel label WA Web uses (pre-negotiated, id=0).
 const DATA_CHANNEL_LABEL: &str = "pre-negotiated";
@@ -1729,8 +1729,9 @@ mod udp_relay_e2e {
     use std::time::Duration;
 
     use wacore::voip::engine::{CallConfig, CallEvent, SequentialTxIds};
-    use wacore::voip::session::{CallDirection, MediaPipeline, MediaPipelineParams};
+    use wacore::voip::session::{MediaPipeline, MediaPipelineParams};
     use wacore::voip::{CallChannels, CallEngine, video_control_channel};
+    use wacore::voip_control::CallDirection;
 
     use super::loopback_relay::{accept_relay, next_packet};
     use crate::voip::driver::run_call_tokio;

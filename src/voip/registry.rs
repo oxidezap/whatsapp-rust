@@ -2,4 +2,4 @@
 //! runtime-agnostic (it uses `wacore::runtime::AbortHandle`) and lives in `wacore::voip::registry`;
 //! this re-export keeps the `whatsapp_rust::voip::registry` path stable.
 
-pub use wacore::voip::registry::CallRegistry;
+pub use wacore::voip_control::registry::CallRegistry;

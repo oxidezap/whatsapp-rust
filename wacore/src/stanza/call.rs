@@ -216,13 +216,7 @@ fn parse_offer_enc(enc_node: &NodeRef<'_>) -> Option<crate::types::call::OfferEn
 
 /// Find the first `<relay>` node anywhere in the subtree (the offer's relay may sit under `<call>`
 /// or `<offer>` depending on server framing).
-#[cfg(feature = "voip")]
-pub fn find_relay<'a, 'b>(nr: &'b NodeRef<'a>) -> Option<&'b NodeRef<'a>> {
-    if nr.tag.as_ref() == "relay" {
-        return Some(nr);
-    }
-    nr.children().and_then(|cs| cs.iter().find_map(find_relay))
-}
+pub use crate::voip_control::relay_parse::find_relay;
 
 /// The `device_orientation` a `<video>` advertisement child carries, in quarter
 /// turns.

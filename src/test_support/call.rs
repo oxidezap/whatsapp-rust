@@ -230,7 +230,7 @@ impl CallFixture {
 
     /// Read the registered production session, including a winner selected before start returns.
     /// Mutating this detached snapshot cannot change the live call.
-    pub fn call_snapshot(&self, call_id: &str) -> Option<wacore::voip::CallSession> {
+    pub fn call_snapshot(&self, call_id: &str) -> Option<wacore::voip_control::CallSession> {
         self.client.call_registry().snapshot(call_id)
     }
 
@@ -306,11 +306,11 @@ impl HttpClient for NoHttp {
 
 struct NoRelay;
 #[async_trait]
-impl wacore::voip::RelayTransportProvider for NoRelay {
+impl wacore::voip_control::transport::RelayTransportProvider for NoRelay {
     async fn factory(
         &self,
-        _: &wacore::voip::RelayEndpointParams,
-    ) -> Result<Arc<dyn wacore::voip::RelayTransportFactory>> {
+        _: &wacore::voip_control::transport::RelayEndpointParams,
+    ) -> Result<Arc<dyn wacore::voip_control::transport::RelayTransportFactory>> {
         anyhow::bail!("call fixture has no media relay; install a synthetic RelayTransportProvider")
     }
 }

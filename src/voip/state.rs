@@ -94,7 +94,7 @@ impl Subsystem for Voip {
 /// Everything one client retains for VoIP.
 pub(crate) struct VoipState {
     /// Active calls and their media-task abort handles.
-    pub(crate) call_registry: Arc<wacore::voip::CallRegistry>,
+    pub(crate) call_registry: Arc<wacore::voip_control::registry::CallRegistry>,
     /// Admission snapshots that can race a call-link join ACK before its call id is registered.
     /// Kept client-side so `wacore` never has to authorize a call it does not know.
     pub(crate) pending_call_link_joins:
@@ -126,13 +126,13 @@ pub(crate) struct VoipState {
     /// assembly in every use anyone has, but making it a constructor argument would put a VoIP type
     /// in `ClientBuilder` for every consumer that never places a call.
     pub(crate) relay_transport_provider:
-        std::sync::Mutex<Option<Arc<dyn wacore::voip::RelayTransportProvider>>>,
+        std::sync::Mutex<Option<Arc<dyn wacore::voip_control::transport::RelayTransportProvider>>>,
 }
 
 impl Default for VoipState {
     fn default() -> Self {
         Self {
-            call_registry: Arc::new(wacore::voip::CallRegistry::new()),
+            call_registry: Arc::new(wacore::voip_control::registry::CallRegistry::new()),
             pending_call_link_joins: Arc::new(std::sync::Mutex::new(Default::default())),
             pending_call_link_join_lane: Mutex::new(()),
             answer_transition_locks: std::sync::OnceLock::new(),
