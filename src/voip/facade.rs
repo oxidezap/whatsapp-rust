@@ -12730,6 +12730,83 @@ mod control_only_tests {
         (client, backend)
     }
 
+    /// A sending client with the fake backend: the offer path needs our LID, an ADV account for
+    /// pkmsg devices, a NoiseSocket over an always-ok transport, and a seeded peer session —
+    /// the same recipe the engine-gated `make_sending_client` uses, minus the engine.
+    async fn sending_client_with_fake_backend() -> (Arc<Client>, Arc<FakeMediaBackend>) {
+        use wacore::handshake::NoiseCipher;
+
+        let (client, backend) = client_with_fake_backend().await;
+        let pm = client.persistence_manager();
+        pm.process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+            Jid::new("111111111111111", Server::Lid),
+        )))
+        .await;
+        pm.process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
+            wa::ADVSignedDeviceIdentity {
+                details: Some(vec![0u8; 32]),
+                account_signature_key: Some(vec![0u8; 32]),
+                account_signature: Some(vec![0u8; 64]),
+                device_signature: Some(vec![0u8; 64]),
+            },
+        )))
+        .await;
+        let peer = Jid::new("333333333333333", Server::Lid).with_device(0);
+        crate::test_utils::seed_peer_session(&client, &peer).await;
+        // Publish the peer's device list locally so the public `call()` builder resolves its
+        // devices from the registry instead of the network (which the mock never answers).
+        client
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: Arc::from("333333333333333"),
+                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)].into_boxed_slice(),
+                timestamp: wacore::time::now_utc().timestamp(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .expect("device list");
+        struct OkTransport;
+        #[async_trait::async_trait]
+        impl crate::transport::Transport for OkTransport {
+            async fn send(&self, _data: bytes::Bytes) -> Result<(), anyhow::Error> {
+                Ok(())
+            }
+            async fn disconnect(&self) {}
+        }
+        let key = [0u8; 32];
+        let noise_socket = crate::socket::NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            Arc::new(OkTransport),
+            NoiseCipher::new(&key).expect("key"),
+            NoiseCipher::new(&key).expect("key"),
+        );
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
+        (client, backend)
+    }
+
+    fn sample_relay() -> wacore::voip_control::relay_parse::RelayData {
+        use wacore::voip_control::relay_parse::{RelayAddress, RelayData, RelayEndpoint};
+        RelayData {
+            relay_key_ascii: Some(b"relay-key".to_vec()),
+            warp_mi_tag_len: Some(4),
+            relay_tokens: vec![vec![0xAB; 16]],
+            endpoints: vec![RelayEndpoint {
+                relay_id: 1,
+                relay_name: "gru1c02".into(),
+                token_id: 0,
+                auth_token_id: 1,
+                addresses: vec![RelayAddress {
+                    protocol: 0,
+                    ipv4: Some("203.0.113.7".into()),
+                    ipv6: None,
+                    port: 3478,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
     fn session(id: &str) -> wacore::voip_control::CallSession {
         wacore::voip_control::CallSession::new_outgoing(
             id,
@@ -12908,6 +12985,114 @@ mod control_only_tests {
                 )
                 .is_some(),
             "the old session is not confused with the live one"
+        );
+    }
+
+    /// A real outgoing call on the fake backend, engine off: `place_call` sends the offer,
+    /// `attach_outgoing_relay` opens the fake through the production path, and the dormant
+    /// handle then steers video, reads signaling events and stats, and tears down — proving the
+    /// whole control flow reaches the handle without ever naming the engine.
+    #[tokio::test]
+    async fn a_real_outgoing_call_runs_on_the_fake_backend_end_to_end() {
+        use wacore::types::call::VideoState;
+
+        let (client, backend) = sending_client_with_fake_backend().await;
+        let peer = Jid::new("333333333333333", Server::Lid);
+        let (_mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
+        let (spk_tx, _spk_rx) = async_channel::bounded::<Vec<i16>>(1);
+        let handle = client
+            .voip()
+            .call(&peer)
+            .audio(mic_rx, spk_tx)
+            .start()
+            .await
+            .expect("place_call sends the offer");
+        let call_id = handle.call_id.clone();
+        let generation = handle.generation;
+        assert!(
+            super::attach_outgoing_relay(&client, &call_id, &sample_relay())
+                .await
+                .expect("attach_outgoing_relay runs the production open"),
+            "the relay attaches through the production path"
+        );
+
+        // Steering video attaches the endpoints and asks the peer; the fake owns no video plane,
+        // so this only proves the dormant handle drives the flow without the engine present.
+        let (_video_tx, video_rx) = async_channel::bounded::<Vec<u8>>(1);
+        let (sink_tx, _sink_rx) = async_channel::bounded::<VideoFrame>(1);
+        handle
+            .start_video(video_rx, sink_tx)
+            .await
+            .expect("start_video steers the dormant call");
+        let key = MediaSessionKey::builder()
+            .call_id(call_id.clone())
+            .generation(generation)
+            .build();
+        let media = backend.session(&key).expect("the fake reserved a session");
+
+        // Commands cross through the registry's production translation — the same
+        // `send_video_ctl` the signaling handler calls once `voip-runtime` accepts the peer's
+        // upgrade (that handler path is covered by the fixture suite, which runs with the
+        // runtime on; here there is no runtime, only the seam).
+        client.call_registry().send_video_ctl(
+            &call_id,
+            generation,
+            wacore::voip_control::control::VideoControl::Enable,
+        );
+        assert!(
+            media
+                .record()
+                .commands
+                .iter()
+                .any(|(c, _)| matches!(c, MediaCommand::EnableVideo { .. })),
+            "a control-plane command crossed into the backend"
+        );
+
+        // Signaling published through the registry lands on the handle's own stream.
+        let peer_video = MediaEvent::PeerVideoStateChanged {
+            source: peer.clone().with_device(2),
+            call_creator: client.lid().expect("own lid"),
+            state: VideoState::Stopped,
+            orientation: None,
+            upgrade_token: None,
+        };
+        assert!(client.call_registry().send_call_event_if_current(
+            &call_id,
+            generation,
+            peer_video.clone()
+        ));
+        assert_eq!(handle.events().try_recv(), Ok(peer_video));
+
+        // Counters the backend sets are what the handle reports.
+        media.set_stats(
+            wacore::voip_control::MediaStats::builder()
+                .rtp_received(42)
+                .build(),
+        );
+        assert_eq!(handle.media_stats().rtp_received, 42);
+
+        // Terminal close records its reason on the session and ends the handle's stream, so a
+        // lingering `recv` ends instead of parking; the entry is gone afterwards.
+        handle.hangup_local().await;
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
+            .await
+            .expect("hangup resolves wait_ended");
+        assert_eq!(
+            media.record().closed,
+            Some(wacore::voip_control::MediaCloseReason::Local)
+        );
+        assert!(
+            matches!(
+                handle.events().try_recv(),
+                Err(async_channel::TryRecvError::Closed)
+            ),
+            "the closed stream ends the consumer instead of parking it"
+        );
+        assert!(
+            !client
+                .call_registry()
+                .send_call_event(&call_id, MediaEvent::RelayAllocated),
+            "a removed entry publishes nothing"
         );
     }
 }
