@@ -132,6 +132,10 @@ pub struct MediaOpenContext {
     /// The microphone mute flag, shared with the consumer's `CallHandle`. A backend that wraps a
     /// PCM source through its own feed zeroes frames while this is set.
     pub muted: Arc<std::sync::atomic::AtomicBool>,
+    /// A raw keygen-v2 epoch the caller already authenticated and fanned out, to install on the
+    /// engine before media starts. A group call that needed its initiator's epoch applied holds it
+    /// here rather than on the engine, because the backend builds the engine.
+    pub group_epoch: Option<(u32, super::MediaGroupEpoch)>,
 }
 
 impl MediaOpenContext {
@@ -155,6 +159,7 @@ impl MediaOpenContext {
             events,
             rekey: None,
             muted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            group_epoch: None,
         }
     }
 }

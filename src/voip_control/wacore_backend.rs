@@ -488,7 +488,14 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         let key = spec.key.clone();
 
         let endpoint = RelayEndpointParams::from_spec(&spec).ok_or(MediaSetupError::BadEndpoint)?;
-        let engine = build_engine(spec, Box::new(crate::voip::driver::RandTxIds))?;
+        let mut engine = build_engine(spec, Box::new(crate::voip::driver::RandTxIds))?;
+        // An epoch the caller already authenticated and fanned out is installed before media
+        // starts, so the first packet the engine emits is keyed under it.
+        if let Some((transaction_id, epoch)) = ctx.group_epoch.as_ref() {
+            engine
+                .apply_group_raw_epoch(*transaction_id, epoch.as_bytes())
+                .map_err(|e| MediaSetupError::Backend(e.to_string()))?;
+        }
         let warp_mi_tag_len = engine.media_warp_mi_tag_len();
 
         let factory = client
