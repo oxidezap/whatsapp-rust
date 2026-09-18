@@ -904,6 +904,64 @@ mod tests {
     }
 
     #[test]
+    fn group_relay_credentials_never_print() {
+        // `MediaGroupSpec` and `MediaSessionSpec` derive/format `Debug`, and a group roster carries
+        // a relay whose key, tokens and auth tokens are credentials. Those fields live on
+        // `GroupCallRelay`, which has its own redacting `Debug`; this test pins that the redaction
+        // survives the nesting so a `{:?}` of either public type cannot leak them.
+        use crate::types::group_call::{
+            GroupCallDevice, GroupCallParticipant, GroupCallRelay, GroupCallRelayEndpoint,
+            GroupCallUpdate,
+        };
+        let relay = GroupCallRelay::builder()
+            .uuid("uuid".to_string())
+            .participant_uuid("participant".to_string())
+            .attribute_padding(false)
+            .key(vec![0xAB; 8])
+            .tokens(vec![vec![0xCD; 8]])
+            .auth_tokens(vec![vec![0xEF; 8]])
+            .endpoints(vec![
+                GroupCallRelayEndpoint::builder()
+                    .relay_id(1)
+                    .token_id(0)
+                    .auth_token_id(0)
+                    .relay_name("relay".to_string())
+                    .is_fna(false)
+                    .build(),
+            ])
+            .build();
+        let jid = Jid::new("1", wacore_binary::Server::Lid);
+        let update = GroupCallUpdate::builder()
+            .call_id("cid".to_string())
+            .call_creator(jid.clone())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(vec![GroupCallParticipant::new(
+                jid.clone(),
+                vec![GroupCallDevice::new(jid.clone())],
+            )])
+            .relay(relay)
+            .build();
+        let group = MediaGroupSpec::builder()
+            .call_creator(jid.clone())
+            .self_jid(jid)
+            .initial_update(update)
+            .build();
+        let rendered = format!("{group:?}");
+        assert!(rendered.contains("[redacted]"));
+        for secret in ["171", "205", "239"] {
+            assert!(
+                !rendered.contains(secret),
+                "relay credential leaked: {secret}"
+            );
+        }
+    }
+
+    #[test]
     fn the_neutral_epoch_redacts_its_bytes() {
         // A decrypted group epoch is key material. It must not print, and it must not survive as a
         // plain `Vec<u8>` a log could reach; `MediaGroupEpoch` guarantees both.
