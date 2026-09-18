@@ -470,7 +470,6 @@ pub fn get_relay_key_for_sdp(relay_data: &RelayData) -> String {
     }
 }
 
-
 /// Find the first `<relay>` node anywhere in the subtree (the offer's relay may sit under `<call>`
 /// or `<offer>` depending on server framing). Pure node walking, so it lives with the relay parser
 /// and compiles without the engine.
