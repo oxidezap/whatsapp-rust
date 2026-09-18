@@ -181,10 +181,6 @@ struct CallEntry {
     /// Why this call's media is ending, recorded by the terminal path so the entry's `Drop` can
     /// hand it to [`VoipMediaSession::close`]. `Local` (a hangup or terminate) by default.
     close_reason: crate::voip_control::MediaCloseReason,
-    /// Media counters published by the drive loop, readable through the consumer's `CallHandle`.
-    /// Installed when the engine attaches; absent before that, which reads as all-zero rather than
-    /// as an error, because a call with no media plane genuinely has no media to count.
-    media_stats: Option<Arc<crate::voip_control::media_stats::MediaStatsCell>>,
     /// Keeps a pending call-link admission alive. Cleared on admission and aborted with the entry.
     waiting_room_task: Option<AbortHandle>,
     /// Monotonic token distinguishing this registration from a later same-call-id replacement, so a
@@ -461,15 +457,6 @@ impl CallEntry {
                 .iter()
                 .map(|entry| entry.announcer.heap_bytes())
                 .sum::<usize>()
-            + self
-                .media_stats
-                .as_ref()
-                // Fixed-size and behind one Arc: the counters are all integers, so the allocation
-                // is the whole cost. Counted anyway -- a per-call allocation that no report
-                // mentions is how an estimate drifts from the heap it claims to describe.
-                .map_or(0, |_| {
-                    size_of::<crate::voip_control::media_stats::MediaStatsCell>()
-                })
             + self
                 .peer_announced_capability
                 .capacity()
@@ -1739,7 +1726,6 @@ impl CallRegistry {
             session,
             media: Some(media),
             close_reason: crate::voip_control::MediaCloseReason::Local,
-            media_stats: None,
             waiting_room_task: None,
             generation,
             event_tx: None,
@@ -1845,9 +1831,8 @@ impl CallRegistry {
             // Through the neutral seam: the resident session stores the shared cell so its `stats`
             // reports the live call; a foreign backend keeps its own counters and refuses this.
             if let Some(media) = entry.media.as_ref() {
-                media.install_stats_cell(cell.clone());
+                media.install_stats_cell(cell);
             }
-            entry.media_stats = Some(cell);
         }
     }
 
