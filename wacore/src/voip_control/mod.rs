@@ -143,6 +143,8 @@ pub struct MediaAudioSpec {
 }
 
 /// Keyframe urgency for a peer-keyframe request.
+///
+/// The neutral vocabulary for what the engine calls `KeyframeUrgency`; the engine re-exports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MediaKeyframeUrgency {
