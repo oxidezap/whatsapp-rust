@@ -708,6 +708,14 @@ pub trait VoipMediaSession: MaybeSendSync + 'static {
         false
     }
 
+    /// Take ownership of the drive task's abort handle, so [`close`](Self::close) can end it.
+    ///
+    /// The control plane no longer keeps a parallel `media_task` abort: whichever backend drives
+    /// media owns its own teardown, and a foreign backend that keeps no such handle returns `false`.
+    fn install_media_task(&self, _handle: crate::runtime::AbortHandle) -> bool {
+        false
+    }
+
     /// Snapshot of the counters the control plane republishes for `CallHandle`.
     fn stats(&self) -> MediaStats;
 
@@ -773,6 +781,10 @@ impl<T: VoipMediaSession + ?Sized> VoipMediaSession for Arc<T> {
         established_warp_mi_tag_len: Option<usize>,
     ) -> bool {
         (**self).install_group_sender(tx, warp_mi_tag_len, committed, established_warp_mi_tag_len)
+    }
+
+    fn install_media_task(&self, handle: crate::runtime::AbortHandle) -> bool {
+        (**self).install_media_task(handle)
     }
 
     fn stats(&self) -> MediaStats {

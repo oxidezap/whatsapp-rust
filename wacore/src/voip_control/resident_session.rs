@@ -137,6 +137,9 @@ struct Mailboxes {
     video: Option<VideoControlSender>,
     group: Option<GroupControlQueue>,
     rekey: Option<async_channel::Sender<PeerAnswer>>,
+    // The drive task's abort handle, if this session was handed one. `close` aborts it so a
+    // terminal registry entry ends the media task without the registry holding a parallel handle.
+    media_task: Option<crate::runtime::AbortHandle>,
     /// A decrypted epoch that arrived before relay media attached. Replacing or dropping this
     /// erases its key bytes through [`GroupRawEpoch`]'s `Drop`.
     pending_group_epoch: Option<GroupRawEpoch>,
@@ -495,6 +498,11 @@ impl VoipMediaSession for ResidentMediaSession {
         self.set_group_sender(tx, warp_mi_tag_len, committed, established_warp_mi_tag_len)
     }
 
+    fn install_media_task(&self, handle: crate::runtime::AbortHandle) -> bool {
+        self.mailboxes().media_task = Some(handle);
+        true
+    }
+
     fn stats(&self) -> MediaStats {
         stats_to_neutral(self.stats_cell().snapshot())
     }
@@ -508,8 +516,10 @@ impl VoipMediaSession for ResidentMediaSession {
     }
 
     fn close(&self, _reason: crate::voip_control::MediaCloseReason) {
-        // The drive task owns teardown; dropping the session drops the mailboxes. The registry
-        // entry's media-task abort ends the call.
+        // Take and abort the drive task, off-lock: aborting drops the future, which drops the
+        // transport. Idempotent because the handle is taken once.
+        let task = self.mailboxes().media_task.take();
+        drop(task);
     }
 }
 

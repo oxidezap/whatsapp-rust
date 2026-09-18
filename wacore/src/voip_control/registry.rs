@@ -181,7 +181,6 @@ struct CallEntry {
     /// Why this call's media is ending, recorded by the terminal path so the entry's `Drop` can
     /// hand it to [`VoipMediaSession::close`]. `Local` (a hangup or terminate) by default.
     close_reason: crate::voip_control::MediaCloseReason,
-    media_task: Option<AbortHandle>,
     /// Media counters published by the drive loop, readable through the consumer's `CallHandle`.
     /// Installed when the engine attaches; absent before that, which reads as all-zero rather than
     /// as an error, because a call with no media plane genuinely has no media to count.
@@ -553,9 +552,9 @@ impl Drop for CallEntry {
         if let Some(teardown) = self.video_teardown.take() {
             teardown();
         }
-        // Real close, through the neutral seam: every backend ends its own media here instead of
-        // the registry relying on a resident-only `media_task` abort. The reason is whatever the
-        // terminal path recorded, `Local` (a hangup/terminate) by default.
+        // Real close, through the neutral seam: every backend ends its own media here, including
+        // aborting the drive task it owns. The reason is whatever the terminal path recorded,
+        // `Local` (a hangup/terminate) by default.
         if let Some(media) = self.media.take() {
             let reason = std::mem::replace(
                 &mut self.close_reason,
@@ -1740,7 +1739,6 @@ impl CallRegistry {
             session,
             media: Some(media),
             close_reason: crate::voip_control::MediaCloseReason::Local,
-            media_task: None,
             media_stats: None,
             waiting_room_task: None,
             generation,
@@ -1871,15 +1869,17 @@ impl CallRegistry {
     /// was removed or superseded by a newer generation, the handle is aborted immediately so its
     /// task can't outlive the call.
     pub fn set_media_task(&self, call_id: &str, generation: u64, handle: AbortHandle) {
-        let aborted = {
-            let mut map = self.active_calls();
-            match map.get_mut(call_id) {
-                Some(entry) if entry.generation == generation => entry.media_task.replace(handle),
-                _ => Some(handle),
-            }
-        };
-        // Both exits abort off-lock, for the reason spelled out at `insert_inner`.
-        drop(aborted);
+        // Cloned under the lock; installed outside it, so a handle whose abort re-enters the
+        // registry cannot deadlock. A backend that owns no comparable handle refuses, and the
+        // handle drops (aborts) right here.
+        let media = self
+            .active_calls()
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+            .and_then(|entry| entry.media.clone());
+        if let Some(media) = media {
+            media.install_media_task(handle);
+        }
     }
 
     /// Attach the repeating waiting-room heartbeat to one call generation.
