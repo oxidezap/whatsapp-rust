@@ -441,6 +441,19 @@ pub fn get_primary_ipv4_address(endpoint: &RelayEndpoint) -> Option<(String, u16
         .find_map(|a| a.ipv4.clone().map(|ip| (ip, a.port)))
 }
 
+/// The endpoint's `<auth_token>`, or empty when the relay carries no matching one.
+///
+/// No special case for id 0: it is an ordinary index that `auth_token_id` defaults to when the
+/// attribute is absent, so skipping it would blank the credential for the most common shape of
+/// offer. An empty or absent slot answers empty, the honest "there is no token here".
+pub fn select_auth_token(auth_tokens: &[Vec<u8>], auth_token_id: u32) -> Vec<u8> {
+    auth_tokens
+        .get(auth_token_id as usize)
+        .filter(|token| !token.is_empty())
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// ice-ufrag for the synthetic SDP: base64 of the raw auth_token bytes.
 pub fn token_to_ice_ufrag(token_bytes: &[u8]) -> String {
     if token_bytes.is_empty() {

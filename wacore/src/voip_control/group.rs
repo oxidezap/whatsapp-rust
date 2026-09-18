@@ -387,7 +387,7 @@ pub(crate) fn validate_group_relay_update(update: &GroupCallUpdate) -> Result<()
 mod tests {
     use super::*;
     use crate::types::group_call::{GroupCallDevice, GroupCallParticipant, GroupCallRelay};
-    use crate::voip::ssrc::{derive_wasm_participant_ssrc, format_e2e_srtp_participant_id};
+    use crate::voip_control::ssrc::{derive_wasm_participant_ssrc, format_e2e_srtp_participant_id};
     use wacore_binary::Server;
 
     fn creator() -> Jid {

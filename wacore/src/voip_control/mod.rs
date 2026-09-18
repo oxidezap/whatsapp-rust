@@ -50,6 +50,8 @@ pub use events::CallEvent;
 // The relay `<relay>` parser: pure signaling metadata (endpoints, tokens, keys) that the control
 // plane reads before any engine exists. Names only `NodeRef` and `base64`, so it belongs here.
 pub mod relay_parse;
+// Building a `MediaSessionSpec` from a parsed relay, so the facade needs no engine config type.
+pub mod spec_build;
 
 // Fundamental audio format types, moved out of the `voip`-gated audio module so the contract names
 // one type and the engine re-exports it. The `voip::audio` module keeps the payload-inspecting
@@ -471,6 +473,9 @@ pub enum MediaSetupError {
     UnsupportedPcmAudio,
     #[error("PCM MLOW audio requires the built-in codec")]
     MlowUnavailable,
+    /// The relay block could not supply a usable endpoint, token or integrity key.
+    #[error("relay setup failed: {0}")]
+    Relay(String),
     #[error("media session setup failed: {0}")]
     Backend(String),
     /// No media backend was injected. A `voip-control`-only build compiles the call flow but ships

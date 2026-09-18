@@ -46,10 +46,12 @@ pub fn format_e2e_srtp_participant_id(jid: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::voip::testkat::kats;
 
+    // The KAT vectors live with the engine's test scaffolding, so this one is gated on the engine.
+    #[cfg(feature = "voip")]
     #[test]
     fn ssrc_matches_kat() {
+        use crate::voip::testkat::kats;
         let k = kats();
         let call_id = k["inputs"]["callId"].as_str().unwrap();
         let lid = k["inputs"]["peerLid"].as_str().unwrap();
@@ -73,6 +75,7 @@ mod tests {
         assert_eq!(video, 0xf8d7_0484, "WhatsApp WASM video-slot KAT");
     }
 
+    #[cfg(feature = "voip")]
     #[test]
     fn relay_stream_bundle_uses_the_protocol_slot_order() {
         assert_eq!(
