@@ -24,8 +24,8 @@ use wacore::voip::rtcp::{RtcpFeedback, RtcpReportBlock};
 use wacore::voip::transport::RelayEndpointParams;
 use wacore::voip_control::{
     CallDirection, MediaAudioCodec, MediaAudioFormat, MediaAudioRtpProfile,
-    MediaCodecDecisionSource, MediaEncodedFrame, MediaEvent, MediaGroupControlKind, MediaGroupSpec,
-    MediaSessionSpec, MediaSetupError, MediaSilenceReason, MediaVideoUpgradeToken,
+    MediaCodecDecisionSource, MediaCommand, MediaEncodedFrame, MediaEvent, MediaGroupControlKind,
+    MediaGroupSpec, MediaSessionSpec, MediaSetupError, MediaSilenceReason, MediaVideoUpgradeToken,
     VoipMediaBackend, VoipMediaSession,
 };
 
@@ -491,6 +491,7 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
             .resident_session(&spec.key)
             .ok_or(MediaSetupError::NoBackend)?;
         let key = spec.key.clone();
+        let registry = client.call_registry();
 
         let endpoint = RelayEndpointParams::from_spec(&spec).ok_or(MediaSetupError::BadEndpoint)?;
         let mut engine = build_engine(spec, Box::new(crate::voip::driver::RandTxIds))?;
@@ -529,6 +530,17 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         if let Some(channels) = ctx.video_channels.as_ref() {
             resident.install_video_sender(channels.control_sender.clone());
         }
+        // Adopt the caller-held video state: replay the peer rotations the registry retained
+        // before media attached, and install the teardown hook on the entry. Both must happen
+        // before the drive loop starts, so the first frames are stamped and the call's drop
+        // releases the local source exactly once.
+        adopt_video_state(
+            &registry,
+            &key,
+            &resident,
+            ctx.video_teardown.take(),
+            std::mem::take(&mut ctx.peer_video_orientations),
+        );
         // Replay the committed roster and reject a changed WARP tag width, exactly as the registry's
         // attach-time group wiring did; a refusal is the typed setup failure the facade reported.
         let (committed, established) = client
@@ -558,7 +570,6 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         )?;
 
         let runtime = Arc::clone(&self.runtime);
-        let registry = client.call_registry();
         let registry_for_task = Arc::clone(&registry);
         let cid = key.call_id.clone();
         let generation = key.generation;
@@ -573,6 +584,31 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         // The session owns the task; `close` aborts it (F6/F14).
         resident.install_drive_task(task);
         Ok(())
+    }
+}
+
+/// Adopt the caller-held video state at open time, before the drive loop starts.
+///
+/// The retained peer rotations replay through the session's video sender, so the peer's first
+/// frames are stamped with the announced rotation; without pre-created plumbing there is no
+/// control sender and the replay is dropped with the video-less setup. The teardown hook is
+/// installed on the registry entry (generation-guarded) so the call's drop runs it exactly
+/// once; if the entry is already gone the call is dead and the hook is dropped with it.
+fn adopt_video_state(
+    registry: &wacore::voip_control::registry::CallRegistry,
+    key: &wacore::voip_control::MediaSessionKey,
+    session: &ResidentMediaSession,
+    teardown: Option<Box<dyn Fn() + Send + Sync>>,
+    orientations: Vec<(Option<wacore_binary::Jid>, u8)>,
+) {
+    for (participant, orientation) in orientations {
+        session.submit(MediaCommand::SetVideoOrientation {
+            participant,
+            orientation,
+        });
+    }
+    if let Some(teardown) = teardown {
+        registry.set_video_teardown(&key.call_id, key.generation, teardown);
     }
 }
 
@@ -834,6 +870,61 @@ mod tests {
             .build();
         let session = backend.reserve(&key, CallDirection::Outgoing);
         assert_eq!(session.stats(), wacore::voip_control::MediaStats::default());
+    }
+
+    #[test]
+    fn open_adopts_the_caller_held_video_state() {
+        // Item 4: the retained peer rotations replay through the session's video sender, and
+        // the teardown hook lands on the entry so the call's drop runs it exactly once.
+        use wacore::voip_control::control::VideoControl;
+        use wacore::voip_control::registry::CallRegistry;
+        use wacore::voip_control::resident_session::NoMediaBackend;
+
+        let registry = CallRegistry::with_backend(Arc::new(NoMediaBackend));
+        let generation = registry.insert(wacore::voip_control::CallSession::new_outgoing(
+            "SEAM-VIDEO",
+            wacore_binary::Jid::new("2", wacore_binary::Server::Lid),
+            wacore_binary::Jid::new("1", wacore_binary::Server::Lid),
+        ));
+        let key = MediaSessionKey::builder()
+            .call_id("SEAM-VIDEO".into())
+            .generation(generation)
+            .build();
+        let session = ResidentMediaSession::new();
+        let video_rx = session.install_video_channel();
+        let torn_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&torn_down);
+        adopt_video_state(
+            &registry,
+            &key,
+            &session,
+            Some(Box::new(move || {
+                flag.store(true, std::sync::atomic::Ordering::Release)
+            })),
+            vec![
+                (None, 1),
+                (
+                    Some(wacore_binary::Jid::new("2", wacore_binary::Server::Lid)),
+                    2,
+                ),
+            ],
+        );
+        // Self and participant rotations travel separate sub-channels, so their relative
+        // order is not significant; both must arrive.
+        let mut saw_self = false;
+        let mut saw_peer = false;
+        for _ in 0..2 {
+            match video_rx.try_recv() {
+                Ok(VideoControl::SetOrientation(1)) => saw_self = true,
+                Ok(VideoControl::SetParticipantOrientation { orientation: 2, .. }) => {
+                    saw_peer = true
+                }
+                other => panic!("unexpected video control: {other:?}"),
+            }
+        }
+        assert!(saw_self && saw_peer);
+        assert!(registry.run_video_teardown("SEAM-VIDEO", generation));
+        assert!(torn_down.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]

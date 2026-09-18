@@ -2016,9 +2016,6 @@ async fn place_call(
     // hook and any retained rotation travel through the open context now, not a registry setter.
     let video_shared = Arc::new(VideoShared::new());
     let video_teardown = video_teardown_hook(&video_shared);
-    let peer_video_orientations = registry
-        .peer_video_orientations(&call_id, generation)
-        .unwrap_or_default();
 
     // Park the material needed to spawn the engine once the relay arrives. Keyed by call-id.
     client
@@ -2037,7 +2034,6 @@ async fn place_call(
                 video,
                 video_shared: video_shared.clone(),
                 video_teardown,
-                peer_video_orientations,
                 muted: muted.clone(),
                 ended: ended.clone(),
                 media: media.clone(),
@@ -2392,8 +2388,6 @@ pub(crate) struct PendingOutgoing {
     video_shared: Arc<VideoShared>,
     /// Releases the local video endpoints on a terminal teardown or refused upgrade.
     video_teardown: Box<dyn Fn() + Send + Sync>,
-    /// Rotations the peer announced before media attached, replayed on attach.
-    peer_video_orientations: Vec<(Option<Jid>, u8)>,
     muted: Arc<AtomicBool>,
     ended: Arc<EndedFlag>,
     /// The reserved media session. Setup failures publish through it (it owns the public stream
@@ -2552,7 +2546,12 @@ pub(crate) async fn attach_outgoing_relay(
             video: None,
             video_channels: Some(video_channels),
             video_teardown: Some(pending.video_teardown),
-            peer_video_orientations: pending.peer_video_orientations.clone(),
+            // Re-read at open time, not parked at registration: a rotation the peer announced
+            // between the offer and the relay ack must still stamp the first frames.
+            peer_video_orientations: client
+                .call_registry()
+                .peer_video_orientations(call_id, pending.generation)
+                .unwrap_or_default(),
             // The recv-rekey receiver is session-owned; `open` takes it for the drive loop.
             rekey: None,
             group_epoch: None,
