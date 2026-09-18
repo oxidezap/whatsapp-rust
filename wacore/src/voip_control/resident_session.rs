@@ -149,6 +149,12 @@ struct Mailboxes {
 pub struct ResidentMediaSession {
     mailboxes: Mutex<Mailboxes>,
     stats: Mutex<Arc<MediaStatsCell>>,
+    /// The public event stream for this call. The drive loop publishes into `events_tx`; every
+    /// [`subscribe`](VoipMediaSession::subscribe) hands back a clone of `events_rx`, so one session
+    /// has one ordered stream a consumer (and the `CallHandle`) reads, whether it is the resident
+    /// engine or a foreign one.
+    events_tx: async_channel::Sender<MediaEvent>,
+    events_rx: async_channel::Receiver<MediaEvent>,
 }
 
 impl ResidentMediaSession {
@@ -161,10 +167,19 @@ impl ResidentMediaSession {
     /// A session that publishes through `stats`, shared with the `CallHandle`.
     #[must_use]
     pub fn with_stats(stats: Arc<MediaStatsCell>) -> Arc<Self> {
+        let (events_tx, events_rx) = async_channel::bounded(DEFAULT_CALL_EVENT_QUEUE_CAPACITY);
         Arc::new(Self {
             mailboxes: Mutex::new(Mailboxes::default()),
             stats: Mutex::new(stats),
+            events_tx,
+            events_rx,
         })
+    }
+
+    /// The event sender the drive loop publishes through.
+    #[must_use]
+    pub fn event_sender(&self) -> async_channel::Sender<MediaEvent> {
+        self.events_tx.clone()
     }
 
     fn mailboxes(&self) -> std::sync::MutexGuard<'_, Mailboxes> {
@@ -508,11 +523,9 @@ impl VoipMediaSession for ResidentMediaSession {
     }
 
     fn subscribe(&self) -> async_channel::Receiver<MediaEvent> {
-        // The resident session raises no events of its own: the drive loop publishes straight into
-        // the control plane's `CallEvent` queue, which is the public handle stream. A foreign
-        // backend that owns its engine raises `MediaEvent`s here.
-        let (_tx, rx) = async_channel::unbounded();
-        rx
+        // A clone over the same bounded stream: every subscriber sees the published events, and the
+        // drive loop publishes through `event_sender` into this one.
+        self.events_rx.clone()
     }
 
     fn close(&self, _reason: crate::voip_control::MediaCloseReason) {
@@ -606,6 +619,21 @@ mod tests {
                 .await,
             Err(MediaSetupError::NoBackend)
         );
+    }
+
+    #[test]
+    fn subscribe_delivers_events_published_on_the_same_session() {
+        // F7: the resident subscribe is a real stream, not a closed receiver. The drive loop holds
+        // the sender from `event_sender`; a consumer holding the receiver sees what it publishes.
+        let session = ResidentMediaSession::new();
+        let events = session.subscribe();
+        assert!(
+            session
+                .event_sender()
+                .try_send(MediaEvent::RelayAllocated)
+                .is_ok()
+        );
+        assert_eq!(events.try_recv(), Ok(MediaEvent::RelayAllocated));
     }
 
     #[test]
