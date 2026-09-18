@@ -32,7 +32,11 @@ pub use crate::voip_control::media_stats;
 pub mod mlow;
 pub mod opus_packet;
 pub mod registry;
-pub mod relay_parse;
+// Relay `<relay>` parsing belongs to the control plane, not the engine: a call's signaling reads it
+// to decide where media will go, and the registry needs `RelayData` without the engine. Moved to
+// `crate::voip_control::relay_parse`; re-exported so the historical `crate::voip::relay_parse` path
+// resolves.
+pub use crate::voip_control::relay_parse;
 pub mod rtcp;
 pub mod rtp;
 pub mod session;

@@ -15,8 +15,9 @@ use crate::voip::hkdf_sha256;
 
 const NULL_SALT_32: [u8; 32] = [0u8; 32];
 
-/// Relay-supplied SFU seed: 14B salt material followed by 16B key material.
-pub(crate) const HBH_KEY_LEN: usize = 30;
+/// Relay-supplied SFU seed: 14B salt material followed by 16B key material. The parser that
+/// validates the wire length owns the constant; this module reads it from there.
+pub(crate) use crate::voip_control::relay_parse::HBH_KEY_LEN;
 const HBH_SALT_SEED_LEN: usize = 14;
 
 /// HKDF `info` labels for the WA SFU HBH SRTCP key derivation (KAT-pinned wire values).

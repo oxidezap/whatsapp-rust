@@ -3,10 +3,13 @@
 //!
 //! wacrg spec: relay-candidates (REL-01), stun-relay (REL-02).
 
-use crate::voip::hbh_srtp::HBH_KEY_LEN;
 use base64::prelude::*;
 use std::collections::HashMap;
 use wacore_binary::NodeRef;
+
+/// Length of the `<hbh_key>` material: a 14-byte salt seed plus a 16-byte key seed. A wire constant,
+/// so it lives with the parser that validates it; the HBH SRTP module names it from here.
+pub(crate) const HBH_KEY_LEN: usize = 30;
 
 /// Default relay port from a te2 endpoint (0x0D96).
 pub const WHATSAPP_RELAY_PORT: u16 = 3478;

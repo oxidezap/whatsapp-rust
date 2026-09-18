@@ -43,6 +43,10 @@ pub mod fake_backend;
 // the call flow can name a session with the engine off. `crate::voip::session` re-exports these.
 pub mod signaling;
 
+// The relay `<relay>` parser: pure signaling metadata (endpoints, tokens, keys) that the control
+// plane reads before any engine exists. Names only `NodeRef` and `base64`, so it belongs here.
+pub mod relay_parse;
+
 // Fundamental audio format types, moved out of the `voip`-gated audio module so the contract names
 // one type and the engine re-exports it. The `voip::audio` module keeps the payload-inspecting
 // helpers as a second inherent impl on `AudioFormat`.
