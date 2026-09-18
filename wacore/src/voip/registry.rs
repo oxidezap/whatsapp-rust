@@ -40,8 +40,10 @@ const MAX_PENDING_INITIAL_GROUP_CONTROL_BYTES: usize = 1024 * 1024;
 /// global buffer indefinitely, while controls from an in-flight offer still survive reordering.
 const PENDING_INITIAL_GROUP_CONTROL_TTL: Duration = Duration::from_secs(10);
 const MAX_CALL_EVENT_QUEUE_BYTES: usize = 1024 * 1024;
-pub(crate) const MAX_GROUP_CONTROL_QUEUE_BYTES: usize = 1024 * 1024;
-pub(crate) const DEFAULT_CALL_EVENT_QUEUE_CAPACITY: usize = 64;
+pub(crate) use crate::voip_control::control::{
+    DEFAULT_CALL_EVENT_QUEUE_CAPACITY, GroupControlQueue, MAX_GROUP_CONTROL_QUEUE_BYTES,
+};
+
 /// Peer devices whose `<capability>` statement one call retains. A peer answers from one device;
 /// this is headroom for its siblings preaccepting first, and a bound on what an unsolicited stream
 /// of `<preaccept>`s can make this call allocate.
@@ -165,108 +167,6 @@ impl CallEventQueue {
         self.tx.len().saturating_mul(
             size_of::<CallEvent>().saturating_add(self.max_payload_bytes.load(Ordering::Relaxed)),
         )
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct GroupControlQueue {
-    tx: async_channel::Sender<GroupControl>,
-    max_payload_bytes: Arc<AtomicUsize>,
-}
-
-impl GroupControlQueue {
-    pub(crate) fn new(tx: async_channel::Sender<GroupControl>) -> Self {
-        Self {
-            tx,
-            max_payload_bytes: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    pub(crate) fn retained_bytes(&self) -> usize {
-        self.tx.len().saturating_mul(
-            size_of::<GroupControl>()
-                .saturating_add(self.max_payload_bytes.load(Ordering::Relaxed)),
-        )
-    }
-
-    pub(crate) fn accepts(&self, control: &GroupControl) -> bool {
-        Self::accepts_with_capacity(control, self.tx.capacity().unwrap_or(1))
-    }
-
-    pub(crate) fn accepts_with_capacity(control: &GroupControl, queue_capacity: usize) -> bool {
-        let queue_capacity = queue_capacity.max(1);
-        let max_control_bytes = MAX_GROUP_CONTROL_QUEUE_BYTES / queue_capacity;
-        size_of::<GroupControl>().saturating_add(control.heap_bytes()) <= max_control_bytes
-    }
-
-    pub(crate) fn try_send(&self, control: GroupControl) -> bool {
-        self.try_send_recover(control).is_ok()
-    }
-
-    pub(crate) fn try_send_recover(&self, control: GroupControl) -> Result<(), GroupControl> {
-        if !self.accepts(&control) {
-            return Err(control);
-        }
-        let payload_bytes = control.heap_bytes();
-        self.tx
-            .try_send(control)
-            .map_err(|error| error.into_inner())?;
-        self.max_payload_bytes
-            .fetch_max(payload_bytes, Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Enqueue `command`, shedding the oldest entry when full, but never losing the newest epoch
-    /// or the roster it pairs with.
-    pub(crate) fn force_send_preserving_epoch(&self, mut command: GroupControl) -> bool {
-        if !self.accepts(&command) {
-            return false;
-        }
-        let latest_update_transaction = match &command {
-            GroupControl::Update(update) | GroupControl::Transition { update, .. } => {
-                Some(update.transaction_id)
-            }
-            GroupControl::RawEpoch(_) | GroupControl::Reaction(_) => None,
-        };
-        loop {
-            let queued_epoch = command.epoch_transaction_id();
-            self.max_payload_bytes
-                .fetch_max(command.heap_bytes(), Ordering::Relaxed);
-            // Each retry keeps the newer of the queued and evicted epochs. If the rotation reaches
-            // the roster this delivery just inserted, put that roster back once and shed the next
-            // epoch instead. Existing Transition pairs remain indivisible, while an epoch-only full
-            // mailbox still reserves one slot for the newest authoritative snapshot.
-            match self.tx.force_send(command) {
-                Ok(Some(evicted)) => {
-                    let evicted_latest_update = latest_update_transaction.is_some_and(
-                        |latest_transaction| match &evicted {
-                            GroupControl::Update(update)
-                            | GroupControl::Transition { update, .. } => {
-                                update.transaction_id == latest_transaction
-                            }
-                            GroupControl::RawEpoch(_) | GroupControl::Reaction(_) => false,
-                        },
-                    );
-                    if evicted_latest_update {
-                        self.max_payload_bytes
-                            .fetch_max(evicted.heap_bytes(), Ordering::Relaxed);
-                        return self.tx.force_send(evicted).is_ok();
-                    }
-                    if evicted
-                        .epoch_transaction_id()
-                        .is_some_and(|evicted_transaction| {
-                            queued_epoch.is_none_or(|queued| evicted_transaction > queued)
-                        })
-                    {
-                        command = evicted;
-                    } else {
-                        return true;
-                    }
-                }
-                Ok(None) => return true,
-                Err(_) => return false,
-            }
-        }
     }
 }
 

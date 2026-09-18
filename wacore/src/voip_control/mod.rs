@@ -56,6 +56,9 @@ pub mod relay_parse;
 // helpers as a second inherent impl on `AudioFormat`.
 pub mod audio_format;
 
+// The resident media session: the neutral handle over a running call's command mailboxes. It names
+// no engine type, so registry-only builds store it as `Arc<dyn VoipMediaSession>`.
+pub mod resident_session;
 // The pure KDF/JID/varint helpers, moved here so the registry names them without the engine.
 pub(crate) mod kdf;
 // SSRC derivation and participant-id formatting, engine-free.

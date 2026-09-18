@@ -1,6 +1,6 @@
 //! The resident media session: the control plane's handle over one running call.
 //!
-//! `run_call` owns the [`CallEngine`](crate::voip::engine::CallEngine) for the life of a call, on
+//! `run_call` (in the engine half) owns the media engine for the life of a call, on
 //! one task, so the control plane never shares the engine. It holds bounded mailboxes into that
 //! task, and this type is the neutral front for them: it implements [`VoipMediaSession`] in terms
 //! of [`MediaCommand`] and
@@ -25,11 +25,11 @@ use std::mem::size_of;
 use std::sync::{Arc, Mutex};
 
 use crate::types::group_call::GroupCallUpdate;
-use crate::voip::driver::{
+use crate::voip_control::control::{DEFAULT_CALL_EVENT_QUEUE_CAPACITY, GroupControlQueue};
+use crate::voip_control::control::{
     GroupControl, GroupRawEpoch, PeerAnswer, VideoControl, VideoControlSender,
 };
-use crate::voip::media_stats::{CallMediaStats, MediaStatsCell};
-use crate::voip::registry::{DEFAULT_CALL_EVENT_QUEUE_CAPACITY, GroupControlQueue};
+use crate::voip_control::media_stats::{CallMediaStats, MediaStatsCell};
 use crate::voip_control::{
     CallDirection, MediaAudioCodec, MediaCommand, MediaEvent, MediaKeyframeUrgency,
     MediaSessionKey, MediaSessionSpec, MediaSetupError, MediaStats, VoipMediaBackend,
@@ -88,8 +88,8 @@ pub(crate) fn video_control_to_command(control: VideoControl) -> MediaCommand {
         VideoControl::RequireKeyframe => MediaCommand::RequireVideoKeyframe,
         VideoControl::RequestPeerKeyframe(urgency) => {
             MediaCommand::RequestPeerKeyframe(match urgency {
-                crate::voip::engine::KeyframeUrgency::Coalesced => MediaKeyframeUrgency::Coalesced,
-                crate::voip::engine::KeyframeUrgency::Immediate => MediaKeyframeUrgency::Immediate,
+                MediaKeyframeUrgency::Coalesced => MediaKeyframeUrgency::Coalesced,
+                MediaKeyframeUrgency::Immediate => MediaKeyframeUrgency::Immediate,
             })
         }
         VideoControl::SetOrientation(orientation) => MediaCommand::SetVideoOrientation {
@@ -108,26 +108,17 @@ pub(crate) fn video_control_to_command(control: VideoControl) -> MediaCommand {
     }
 }
 
-fn codec_to_core(codec: MediaAudioCodec) -> crate::voip::audio::AudioCodec {
-    match codec {
-        MediaAudioCodec::Mlow => crate::voip::audio::AudioCodec::Mlow,
-        MediaAudioCodec::Opus => crate::voip::audio::AudioCodec::Opus,
-    }
+fn codec_to_core(codec: MediaAudioCodec) -> MediaAudioCodec {
+    codec
 }
 
 /// The neutral codec for an engine one.
-pub(crate) fn codec_to_neutral(codec: crate::voip::audio::AudioCodec) -> MediaAudioCodec {
-    match codec {
-        crate::voip::audio::AudioCodec::Mlow => MediaAudioCodec::Mlow,
-        crate::voip::audio::AudioCodec::Opus => MediaAudioCodec::Opus,
-    }
+pub(crate) fn codec_to_neutral(codec: MediaAudioCodec) -> MediaAudioCodec {
+    codec
 }
 
-fn urgency_to_core(urgency: MediaKeyframeUrgency) -> crate::voip::engine::KeyframeUrgency {
-    match urgency {
-        MediaKeyframeUrgency::Coalesced => crate::voip::engine::KeyframeUrgency::Coalesced,
-        MediaKeyframeUrgency::Immediate => crate::voip::engine::KeyframeUrgency::Immediate,
-    }
+fn urgency_to_core(urgency: MediaKeyframeUrgency) -> MediaKeyframeUrgency {
+    urgency
 }
 
 /// The neutral counters for an engine snapshot.
@@ -537,7 +528,7 @@ impl VoipMediaBackend for ResidentMediaBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::voip::driver::video_control_channel;
+    use crate::voip_control::control::video_control_channel;
 
     #[test]
     fn a_video_command_lands_on_the_drive_mailbox() {

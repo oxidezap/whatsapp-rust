@@ -24,7 +24,10 @@ pub mod group_media;
 pub use crate::voip_control::group;
 pub mod h264;
 pub mod hbh_srtp;
-pub mod media_session;
+// The resident media session moved to the neutral contract (`crate::voip_control::resident_session`):
+// it holds only the neutral command mailboxes, so the registry can store it without the engine.
+// Re-exported for the historical `crate::voip::media_session` path.
+pub use crate::voip_control::resident_session as media_session;
 // The per-call counters and the audio-health watchdog now live in the neutral contract
 // (`crate::voip_control::media_stats`): `CallMediaStats` is the seam's `MediaStats`, so the engine
 // and a foreign backend count the same fields. Re-exported so the historical `crate::voip::*` paths
