@@ -177,19 +177,15 @@ session is a handle over its bounded mailboxes. That keeps the seam `Sync` witho
 putting a lock on the media path, and it is why `media_session.rs` carries no
 `Mutex<CallEngine>`.
 
-**Three openings in `wacore`, and no more.** A backend outside the crate could not
-build what the seam required, so exactly three APIs opened:
-
-- `AudioFormat::from_neutral` / `AudioConfig::from_neutral` (and their `to_neutral`
-  inverses). Both engine types are `#[non_exhaustive]`, so a backend could only
-  pick from the named constants until these constructors existed; a backend with
-  its own timing had no way to express it.
-- `VideoUpgradeToken::epoch()` and `from_parts`. The epoch distinguishes two
-  upgrade requests in one generation and was private, so accepting an upgrade
-  across the seam was ambiguous.
-- The `voip-control` feature itself, on `wacore` and `whatsapp-rust`.
-
-Nothing else in the engine's public surface changed.
+**Engine-specific public openings were kept minimal.** The public engine-specific
+additions are the video upgrade token accessors (`VideoUpgradeToken::epoch()`
+and `from_parts`: the epoch distinguishes two upgrade requests in one
+generation) and the `voip-control` feature boundary itself, on `wacore` and
+`whatsapp-rust`. Conversion from the neutral session spec into the resident
+`CallConfig` is internal adapter machinery (`engine_bridge`, `#[doc(hidden)]`)
+and is not part of the foreign-backend API: `AudioFormat::from_neutral` /
+`AudioConfig::from_neutral` are `pub(crate)`, their `to_neutral` inverses are
+gone, and `MediaVideoPorts` is test-only.
 
 **The byte cut is done.** `src/voip` (the facade, the registry, the signaling
 call state) now lives on the neutral contract and compiles under `voip-control`
