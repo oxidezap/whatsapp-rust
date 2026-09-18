@@ -501,6 +501,9 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
             .map_err(|e| MediaSetupError::Backend(e.to_string()))?;
 
         let stats = resident.install_fresh_stats_cell();
+        // Adopt the caller's public event sender so signaling events and media events share one
+        // ordered stream the `CallHandle` reads.
+        resident.install_event_sender(ctx.events.clone());
         let video_ctl = resident.install_video_channel();
         // Replay the committed roster and reject a changed WARP tag width, exactly as the registry's
         // attach-time group wiring did; a refusal is the typed setup failure the facade reported.
