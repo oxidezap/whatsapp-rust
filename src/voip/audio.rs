@@ -2,71 +2,15 @@
 
 #[cfg(feature = "voip-libopus")]
 use anyhow::{Result, anyhow, ensure};
-use bytes::Bytes;
 #[cfg(feature = "voip-libopus")]
 use opus::{Application, Bandwidth, Bitrate, Channels, Decoder, Encoder};
-use wacore::voip::EncodedAudioFrame;
 #[cfg(feature = "voip-libopus")]
 use wacore::voip::{ForeignCodecError, depacketize_opus_from_mlow, packetize_opus_for_mlow};
 
-/// A microphone source for a call: 60 ms / 960-sample mono i16 frames at 16 kHz. The media facade
-/// pulls frames from the returned channel and feeds them to the engine; a closed channel (e.g. the
-/// OS muted the device) does NOT end the call (the relay keepalive keeps running). The trait is a
-/// channel factory rather than an `async fn next_frame` so a producer can run on its own task and
-/// the facade can `select!` the receiver directly, matching the engine's drive loop; default
-/// methods can be added here without breaking implementors.
-///
-/// Frames MUST be exactly 960 samples; the engine drops any other length (no RTP sent).
-pub trait AudioSource: Send + Sync + 'static {
-    /// The channel the facade reads mic frames from. Called once when the call starts.
-    fn frames(&self) -> async_channel::Receiver<Vec<i16>>;
-}
-
-/// A speaker sink for a call: the facade pushes decoded 16 kHz mono i16 playout frames onto the
-/// returned channel. VoIP is loss tolerant, so the facade drops a frame if the sink can't keep up.
-/// Channel-factory shaped for the same reasons as [`AudioSource`]; default methods may be added.
-pub trait AudioSink: Send + Sync + 'static {
-    /// The channel the facade writes playout frames to. Called once when the call starts.
-    fn playout(&self) -> async_channel::Sender<Vec<i16>>;
-}
-
-/// Blanket impls so a bare `async_channel` endpoint is usable directly as a source/sink without a
-/// wrapper type: the common case is "I already have an mpsc of PCM frames".
-impl AudioSource for async_channel::Receiver<Vec<i16>> {
-    fn frames(&self) -> async_channel::Receiver<Vec<i16>> {
-        self.clone()
-    }
-}
-
-impl AudioSink for async_channel::Sender<Vec<i16>> {
-    fn playout(&self) -> async_channel::Sender<Vec<i16>> {
-        self.clone()
-    }
-}
-
-/// A source of complete codec payloads. Each item must be one raw MLOW or profile-compatible Opus
-/// packet; container framing such as Ogg pages is not accepted. The engine adds RTP/SRTP framing
-/// without transcoding.
-pub trait EncodedAudioSource: Send + Sync + 'static {
-    fn frames(&self) -> async_channel::Receiver<Bytes>;
-}
-
-/// A sink for decrypted codec payloads with their original RTP metadata.
-pub trait EncodedAudioSink: Send + Sync + 'static {
-    fn frames(&self) -> async_channel::Sender<EncodedAudioFrame>;
-}
-
-impl EncodedAudioSource for async_channel::Receiver<Bytes> {
-    fn frames(&self) -> async_channel::Receiver<Bytes> {
-        self.clone()
-    }
-}
-
-impl EncodedAudioSink for async_channel::Sender<EncodedAudioFrame> {
-    fn frames(&self) -> async_channel::Sender<EncodedAudioFrame> {
-        self.clone()
-    }
-}
+// The audio endpoint traits live in the neutral contract (`wacore::voip_control::ports`), so a
+// backend can be handed the platform's endpoints without the engine. Re-exported for the historical
+// `whatsapp_rust::voip::audio::*` paths.
+pub use wacore::voip_control::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
 
 pub const WA_SAMPLE_RATE: u32 = 16_000;
 /// 60 ms @ 16 kHz.

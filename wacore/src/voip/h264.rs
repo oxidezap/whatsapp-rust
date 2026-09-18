@@ -5,8 +5,6 @@
 //! The library never encodes or decodes pixels — callers hand us pre-encoded
 //! Annex-B access units and receive reassembled ones. Pure, no-Tokio, wasm-safe.
 
-use wacore_binary::Jid;
-
 /// Largest RTP payload we emit before fragmenting a NAL into FU-A units.
 /// Matches the reference relay MTU budget used by live WhatsApp interop.
 pub const H264_SINGLE_NAL_MAX: usize = 800;
@@ -26,28 +24,9 @@ const NAL_TYPE_FU_A: u8 = 28;
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
 /// One received access unit, reassembled back into Annex-B form.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct VideoFrame {
-    /// Annex-B access unit (`00 00 00 01` start codes included).
-    pub data: Vec<u8>,
-    /// The AU carries an IDR/SPS/PPS NAL — safe point to (re)start a decoder.
-    pub keyframe: bool,
-    /// Frame rotation bits (0..3) from RTP metadata, falling back to
-    /// `<video device_orientation>` when absent. Display turns clockwise are
-    /// respectively 0, 270, 180, and 90 degrees, as verified by the WASM oracle.
-    pub orientation: u8,
-    /// Group sender identity. Absent on 1:1 video.
-    pub sender: Option<Jid>,
-    /// Group sender device identity. Absent on 1:1 video.
-    pub device: Option<Jid>,
-    /// Relay participant id from the authoritative roster.
-    pub pid: Option<u32>,
-    /// RTP capture timestamp of the access unit (90 kHz video clock).
-    pub timestamp: u32,
-    /// Call media generation that produced this frame.
-    pub generation: u64,
-}
+/// One received access unit. The neutral [`VideoFrame`](crate::voip_control::VideoFrame) is the one
+/// definition, so the engine's reassembly and the public sink carry the same type.
+pub use crate::voip_control::VideoFrame;
 
 impl VideoFrame {
     pub fn new(data: Vec<u8>) -> Self {

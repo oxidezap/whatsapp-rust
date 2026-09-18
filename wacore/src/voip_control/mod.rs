@@ -62,6 +62,11 @@ pub mod resident_session;
 // The call registry: active calls, generations, and the media session behind each. Names no engine
 // type, so the call flow compiles with the engine off.
 pub mod registry;
+// The media endpoint ports (audio/video source and sink) and the video frame type, so a backend can
+// be handed the platform's endpoints without the engine.
+pub mod ports;
+pub use ports::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
+pub use ports::{TimedVideoFrame, VideoFrame, VideoSink, VideoSource};
 // RTC app-data payload encoding (reactions), pure and engine-free.
 pub mod app_data;
 // The pure KDF/JID/varint helpers, moved here so the registry names them without the engine.
