@@ -475,6 +475,13 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         ctx: wacore::voip_control::MediaOpenContext,
     ) -> Result<(), MediaSetupError> {
         let client = self.client.upgrade().ok_or(MediaSetupError::NoBackend)?;
+        // A call cannot start media over a dropped session. The facade checked this before the
+        // dial; `open` is the sole startup path now, so the check lives here.
+        if !client.is_connected() {
+            return Err(MediaSetupError::Backend(
+                "connection dropped during call setup".into(),
+            ));
+        }
         let resident = self
             .resident_session(&spec.key)
             .ok_or(MediaSetupError::NoBackend)?;
