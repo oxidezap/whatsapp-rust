@@ -328,9 +328,11 @@ pub fn translate_event(event: CallEvent) -> Option<MediaEvent> {
             orientation,
             // `epoch` is what distinguishes two requests in one generation, and
             // [`VideoUpgradeToken::epoch`] is now public, so the neutral token is complete.
-            upgrade_token: upgrade_token.map(|token| MediaVideoUpgradeToken {
-                generation: token.generation(),
-                epoch: token.epoch(),
+            upgrade_token: upgrade_token.map(|token| {
+                MediaVideoUpgradeToken::builder()
+                    .generation(token.generation())
+                    .epoch(token.epoch())
+                    .build()
             }),
         },
         CallEvent::GroupUpdated(update) => MediaEvent::GroupUpdated(update),

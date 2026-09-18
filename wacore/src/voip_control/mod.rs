@@ -176,7 +176,12 @@ pub enum MediaKeyframeUrgency {
 /// Identity of one peer video-upgrade request. Replaces the engine's `VideoUpgradeToken`, whose
 /// fields are private, by a neutral `(generation, epoch)` pair an implementation can build and
 /// compare. Both fields are needed: `epoch` is what distinguishes two requests in one generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// A payload of [`MediaEvent::PeerVideoStateChanged`], therefore sealed: `#[non_exhaustive]` plus a
+/// builder, so a later field does not break a consumer that destructures it. The fields stay public
+/// for reading; a consumer needs both to accept an upgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, bon::Builder)]
+#[non_exhaustive]
 pub struct MediaVideoUpgradeToken {
     pub generation: u64,
     pub epoch: u64,
@@ -185,7 +190,11 @@ pub struct MediaVideoUpgradeToken {
 /// A roster snapshot plus its decrypted epoch, kept indivisible. Replaces the engine's
 /// `GroupControl::Transition`, whose whole reason for existing is that the pair must not separate
 /// under mailbox backpressure. The epoch stays secret through [`MediaGroupEpoch`].
-#[derive(Debug, Clone, PartialEq)]
+///
+/// A payload of [`MediaCommand::ApplyGroupTransition`], therefore sealed like every other DTO here:
+/// `#[non_exhaustive]` plus a builder.
+#[derive(Debug, Clone, PartialEq, bon::Builder)]
+#[non_exhaustive]
 pub struct MediaGroupTransition {
     pub update: Box<GroupCallUpdate>,
     pub transaction_id: u32,
@@ -681,13 +690,13 @@ pub trait VoipMediaSession: MaybeSendSync + 'static {
         committed: Option<GroupCallUpdate>,
     ) -> bool {
         match committed {
-            Some(update) => {
-                self.submit_lossless(MediaCommand::ApplyGroupTransition(MediaGroupTransition {
-                    update: Box::new(update),
-                    transaction_id,
-                    raw_epoch,
-                }))
-            }
+            Some(update) => self.submit_lossless(MediaCommand::ApplyGroupTransition(
+                MediaGroupTransition::builder()
+                    .update(Box::new(update))
+                    .transaction_id(transaction_id)
+                    .raw_epoch(raw_epoch)
+                    .build(),
+            )),
             None => self.submit_lossless(MediaCommand::ApplyGroupEpoch {
                 transaction_id,
                 raw_epoch,
