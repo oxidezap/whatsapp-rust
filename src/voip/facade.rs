@@ -942,52 +942,57 @@ impl<'a> OutgoingGroupCall<'a> {
             .as_ref()
             .or(ack_update.relay.as_ref())
             .ok_or(CallError::Media("group offer ack has no relay"))?;
-        let mut config = CallConfig::for_group(
+        let key = wacore::voip_control::MediaSessionKey::builder()
+            .call_id(call_id.clone())
+            .generation(registration.generation)
+            .build();
+        let mut spec = wacore::voip_control::MediaSessionSpec::for_group(
             CallDirection::Outgoing,
-            &call_id,
+            key,
             &own_lid.to_string(),
             &own_lid.to_string(),
             relay,
         )
         .map_err(|error| CallError::Setup(error.to_string()))?;
-        config.audio = audio.config();
-        config.enable_video = video.is_some();
-        let relay_endpoint = relay_endpoint_from_config(&config)?;
-        let group_spec = crate::voip_control::MediaGroupSpec::builder()
-            .call_creator(own_lid.clone())
-            .self_jid(own_lid.clone())
-            .initial_update(update.clone())
-            .build();
-        let mut engine = crate::voip_control::wacore_backend::build_engine_from_config(
-            config,
-            registration.generation,
-            Some(group_spec),
-            Box::new(RandTxIds),
-        )
-        .map_err(|error| CallError::Setup(error.to_string()))?;
+        spec.group = Some(
+            crate::voip_control::MediaGroupSpec::builder()
+                .call_creator(own_lid.clone())
+                .self_jid(own_lid.clone())
+                .initial_update(update.clone())
+                .build(),
+        );
         // A newer pre-ACK update may have overtaken this ACK without requesting its own rekey.
         // Honor the ACK request unless the serialized signaling handler retained an equal/newer
         // epoch; fan out against the current roster so newly arrived participants receive it too.
         let retained_epoch =
             registry.pending_group_epoch_transaction_if_current(&call_id, registration.generation);
-        if let Some(rekey_update) = group_offer_epoch_update(&ack_update, &update, retained_epoch) {
-            fanout_group_epoch(self.client, rekey_update)
-                .await?
-                .commit(|epoch| {
-                    engine
-                        .apply_group_raw_epoch(rekey_update.transaction_id, epoch)
-                        .map_err(|error| CallError::Setup(error.to_string()))
-                })?;
-        }
+        let group_epoch = if let Some(rekey_update) =
+            group_offer_epoch_update(&ack_update, &update, retained_epoch)
+        {
+            let fanout = fanout_group_epoch(self.client, rekey_update).await?;
+            Some(
+                fanout
+                    .commit(|epoch| Ok(epoch.to_vec()))
+                    .map(|epoch| (rekey_update.transaction_id, epoch))?,
+            )
+        } else {
+            None
+        };
         drop(transition_guard);
 
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let factory = relay_factory_or_ended(self.client, &registration, &relay_endpoint).await?;
-        let handle =
-            spawn_registered_call(self.client, &registration, engine, &*factory, audio, video)
-                .await?;
+        let handle = open_registered_media(
+            self.client,
+            &registration,
+            spec,
+            audio,
+            video,
+            None,
+            group_epoch,
+        )
+        .await?;
         registration.disarm();
         teardown.disarm();
         Ok(handle)
@@ -2956,6 +2961,95 @@ async fn spawn_registered_call(
         media: client
             .call_registry()
             .media_session(&registration.call_id, registration.generation),
+    })
+}
+
+/// Attach media to an already-registered generation by driving the backend's `open`.
+///
+/// This is the modern path: the facade builds the neutral spec and opening context, hands its own
+/// video plumbing and event stream to the backend, and lets `open` own the engine and the drive
+/// loop. The `CallHandle` reads the session's stream and holds the session.
+#[allow(clippy::too_many_arguments)]
+async fn open_registered_media(
+    client: &Client,
+    registration: &RegisteredCall,
+    mut spec: wacore::voip_control::MediaSessionSpec,
+    audio: AudioEndpoints,
+    video: Option<VideoEndpoints>,
+    rekey_rx: Option<async_channel::Receiver<wacore::voip::driver::PeerAnswer>>,
+    group_epoch: Option<(u32, Vec<u8>)>,
+) -> Result<CallHandle, CallError> {
+    registration.ensure_current()?;
+    let registry = registration.registry.clone();
+    let muted = Arc::new(AtomicBool::new(false));
+    let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(CALL_EVENT_CHANNEL_CAPACITY);
+    let video_shared = Arc::new(VideoShared::new());
+    // The handle's video plumbing is created before media exists (so a dormant handle can steer),
+    // so its loop halves are taken here and handed to `open`, which must use them.
+    let (video_in, timed_video_in, video_ctl) = video_shared.take_receivers();
+    let (video_out, video_out_rx) = async_channel::bounded::<VideoFrame>(VIDEO_OUT_CHANNEL_CAP);
+    // Drain the loop's output into whatever sink is currently attached (swappable mid-call).
+    let sink_slot = video_shared.sink_slot.clone();
+    let generation = registration.generation;
+    client.runtime.spawn_detached(Box::pin(async move {
+        while let Ok(mut frame) = video_out_rx.recv().await {
+            frame.generation = generation;
+            let tx = sink_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(tx) = tx {
+                let _ = tx.try_send(frame);
+            }
+        }
+    }));
+    if let Some(v) = &video {
+        // `.video()` from the start: attach the endpoints now.
+        video_shared.attach_endpoints(client, &v.source, &v.sink, registration.ended.clone());
+        video_shared.send_control(VideoControl::Enable);
+    }
+
+    spec.audio = audio.config().to_neutral();
+    spec.enable_video = video.is_some();
+
+    let ctx = wacore::voip_control::MediaOpenContext {
+        audio: audio.into_ports(),
+        video: None,
+        video_channels: Some(wacore::voip_control::MediaVideoChannels {
+            control: video_ctl,
+            video_in,
+            timed_video_in: Some(timed_video_in),
+            video_out,
+        }),
+        events: ev_tx.clone(),
+        rekey: rekey_rx,
+        muted: muted.clone(),
+        group_epoch: group_epoch.map(|(transaction_id, epoch)| {
+            (
+                transaction_id,
+                wacore::voip_control::MediaGroupEpoch::new(epoch),
+            )
+        }),
+    };
+    let session = registry
+        .media_session(&registration.call_id, registration.generation)
+        .ok_or(CallError::CallEndedDuringSetup)?;
+    let backend = registry.backend();
+    backend
+        .open(&session, spec, ctx)
+        .await
+        .map_err(|error| CallError::Setup(error.to_string()))?;
+
+    Ok(CallHandle {
+        call_id: registration.call_id.clone(),
+        generation: registration.generation,
+        peer_jid: registration.peer_jid.clone(),
+        call_creator: registration.call_creator.clone(),
+        client_registry: client.call_registry(),
+        pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
+        client: client_weak(client),
+        muted,
+        video: video_shared,
+        events: ev_rx,
+        ended: registration.ended.clone(),
+        media: Some(session),
     })
 }
 
