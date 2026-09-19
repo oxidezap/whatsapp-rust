@@ -11,8 +11,8 @@
 //! would never reach the linked devices' quick-reply tables.
 
 use crate::appstate_sync::Mutation;
-use crate::client::AppStateDispatchOutcome;
 use crate::client::Client;
+use crate::client::{AppStateDispatchOutcome, fingerprint_id};
 use crate::features::chat_actions::AppStateError;
 use log::debug;
 use wacore::appstate::schemas;
@@ -116,8 +116,8 @@ impl<'a> QuickReplies<'a> {
                 "quick reply count cannot be negative".into(),
             ));
         }
-        // Don't log the shortcut or message (user content); the id is enough to trace.
-        debug!("Setting quick reply {id} (count={count})");
+        // Don't log the shortcut or message (user content); the fingerprinted id is enough to trace.
+        debug!("Setting quick reply {} (count={count})", fingerprint_id(id));
         // `associatedLabelIds` is left empty on purpose, not by omission: both of
         // WA Web's builders hardcode `associatedLabelIds: []`, and its receiving
         // side never reads the field. A repeated field left at its default
@@ -145,7 +145,7 @@ impl<'a> QuickReplies<'a> {
                 "quick reply id cannot be empty".into(),
             ));
         }
-        debug!("Deleting quick reply {id}");
+        debug!("Deleting quick reply {}", fingerprint_id(id));
         let value = quick_reply_value(wa::sync_action_value::QuickReplyAction {
             shortcut: Some(String::new()),
             message: Some(String::new()),

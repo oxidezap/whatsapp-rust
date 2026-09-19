@@ -14,7 +14,7 @@
 
 use crate::appstate_sync::Mutation;
 use crate::client::Client;
-use crate::client::{AppStateDispatchOutcome, fingerprint_id};
+use crate::client::{AppStateDispatchOutcome, fingerprint_id, redact_jid};
 use crate::features::chat_actions::AppStateError;
 use log::debug;
 use wacore::appstate::{schemas, schemas_unlisted};
@@ -178,9 +178,10 @@ impl<'a> Labels<'a> {
                 "label name cannot be empty".into(),
             ));
         }
-        // Don't log the label name (user content); the id/color are enough to trace.
+        // Don't log the label name (user content); the fingerprinted id/color are enough to trace.
         debug!(
-            "Setting label {label_id} (name_len={}, color={color})",
+            "Setting label {} (name_len={}, color={color})",
+            fingerprint_id(label_id),
             name.len()
         );
         let value = wa::SyncActionValue {
@@ -206,7 +207,7 @@ impl<'a> Labels<'a> {
                 "label_id cannot be empty".into(),
             ));
         }
-        debug!("Deleting label {label_id}");
+        debug!("Deleting label {}", fingerprint_id(label_id));
         let value = wa::SyncActionValue {
             label_edit_action: buffa::MessageField::some(wa::sync_action_value::LabelEditAction {
                 deleted: Some(true),
@@ -284,9 +285,11 @@ impl<'a> Labels<'a> {
             ));
         }
         debug!(
-            "{} label {label_id} {} chat {chat_jid}",
+            "{} label {} {} chat {}",
             if labeled { "Adding" } else { "Removing" },
+            fingerprint_id(label_id),
             if labeled { "to" } else { "from" },
+            redact_jid(chat_jid),
         );
         let chat = chat_jid.to_string();
         self.client
@@ -316,9 +319,12 @@ impl<'a> Labels<'a> {
             ));
         }
         debug!(
-            "{} label {label_id} {} message {message_id} in {chat_jid}",
+            "{} label {} {} message {} in {}",
             if labeled { "Adding" } else { "Removing" },
+            fingerprint_id(label_id),
             if labeled { "to" } else { "from" },
+            fingerprint_id(message_id),
+            redact_jid(chat_jid),
         );
         let chat = chat_jid.to_string();
         self.client

@@ -6,7 +6,7 @@
 
 use crate::appstate_sync::Mutation;
 use crate::client::Client;
-use crate::client::{AppStateDispatchOutcome, fingerprint_id};
+use crate::client::{AppStateDispatchOutcome, fingerprint_id, redact_jid};
 use anyhow::Result;
 use log::debug;
 use thiserror::Error;
@@ -501,7 +501,7 @@ impl<'a> ChatActions<'a> {
         jid: &Jid,
         message_range: Option<SyncActionMessageRange>,
     ) -> Result<(), AppStateError> {
-        debug!("Archiving chat {jid}");
+        debug!("Archiving chat {}", redact_jid(jid));
         self.send_archive_mutation(jid, true, message_range).await
     }
 
@@ -510,22 +510,22 @@ impl<'a> ChatActions<'a> {
         jid: &Jid,
         message_range: Option<SyncActionMessageRange>,
     ) -> Result<(), AppStateError> {
-        debug!("Unarchiving chat {jid}");
+        debug!("Unarchiving chat {}", redact_jid(jid));
         self.send_archive_mutation(jid, false, message_range).await
     }
 
     pub async fn pin_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
-        debug!("Pinning chat {jid}");
+        debug!("Pinning chat {}", redact_jid(jid));
         self.send_pin_mutation(jid, true).await
     }
 
     pub async fn unpin_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
-        debug!("Unpinning chat {jid}");
+        debug!("Unpinning chat {}", redact_jid(jid));
         self.send_pin_mutation(jid, false).await
     }
 
     pub async fn mute_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
-        debug!("Muting chat {jid} indefinitely");
+        debug!("Muting chat {} indefinitely", redact_jid(jid));
         self.send_mute_mutation(jid, true, MUTE_INDEFINITE).await
     }
 
@@ -546,25 +546,28 @@ impl<'a> ChatActions<'a> {
                 "mute_end_timestamp_ms is in the past ({mute_end_timestamp_ms} <= {now_ms})"
             )));
         }
-        debug!("Muting chat {jid} until {mute_end_timestamp_ms}");
+        debug!(
+            "Muting chat {} until {mute_end_timestamp_ms}",
+            redact_jid(jid)
+        );
         self.send_mute_mutation(jid, true, mute_end_timestamp_ms)
             .await
     }
 
     pub async fn unmute_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
-        debug!("Unmuting chat {jid}");
+        debug!("Unmuting chat {}", redact_jid(jid));
         self.send_mute_mutation(jid, false, 0).await
     }
 
     /// Chat lock: moves the chat into the account's "locked chats" folder.
     /// Only the lock state syncs; no message or key leaves the device.
     pub async fn lock_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
-        debug!("Locking chat {jid}");
+        debug!("Locking chat {}", redact_jid(jid));
         self.send_lock_mutation(jid, true).await
     }
 
     pub async fn unlock_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
-        debug!("Unlocking chat {jid}");
+        debug!("Unlocking chat {}", redact_jid(jid));
         self.send_lock_mutation(jid, false).await
     }
 
@@ -576,7 +579,11 @@ impl<'a> ChatActions<'a> {
         message_id: &str,
         from_me: bool,
     ) -> Result<(), AppStateError> {
-        debug!("Starring message {message_id} in {chat_jid}");
+        debug!(
+            "Starring message {} in {}",
+            fingerprint_id(message_id),
+            redact_jid(chat_jid)
+        );
         self.send_star_mutation(chat_jid, participant_jid, message_id, from_me, true)
             .await
     }
@@ -588,7 +595,11 @@ impl<'a> ChatActions<'a> {
         message_id: &str,
         from_me: bool,
     ) -> Result<(), AppStateError> {
-        debug!("Unstarring message {message_id} in {chat_jid}");
+        debug!(
+            "Unstarring message {} in {}",
+            fingerprint_id(message_id),
+            redact_jid(chat_jid)
+        );
         self.send_star_mutation(chat_jid, participant_jid, message_id, from_me, false)
             .await
     }
@@ -601,7 +612,8 @@ impl<'a> ChatActions<'a> {
         message_range: Option<SyncActionMessageRange>,
     ) -> Result<(), AppStateError> {
         debug!(
-            "Marking chat {jid} as {}",
+            "Marking chat {} as {}",
+            redact_jid(jid),
             if read { "read" } else { "unread" }
         );
         let value = wa::SyncActionValue {
@@ -626,7 +638,7 @@ impl<'a> ChatActions<'a> {
         delete_media: bool,
         message_range: Option<SyncActionMessageRange>,
     ) -> Result<(), AppStateError> {
-        debug!("Deleting chat {jid}");
+        debug!("Deleting chat {}", redact_jid(jid));
         let delete_media_str = if delete_media { "1" } else { "0" };
         let value = wa::SyncActionValue {
             delete_chat_action: buffa::MessageField::some(
@@ -658,7 +670,7 @@ impl<'a> ChatActions<'a> {
         delete_media: bool,
         message_range: Option<SyncActionMessageRange>,
     ) -> Result<(), AppStateError> {
-        debug!("Clearing chat {jid}");
+        debug!("Clearing chat {}", redact_jid(jid));
         // WA Web's $ClearChatSync$p_3 encodes both flags as "1"/"0".
         let delete_starred_str = if delete_starred { "1" } else { "0" };
         let delete_media_str = if delete_media { "1" } else { "0" };
@@ -682,7 +694,7 @@ impl<'a> ChatActions<'a> {
     /// Mute or unmute a contact/group/newsletter's status updates across devices
     /// (WA Web's userStatusMute). `muted = true` hides their status.
     pub async fn set_user_status_mute(&self, jid: &Jid, muted: bool) -> Result<(), AppStateError> {
-        debug!("Setting userStatusMute for {jid} -> {muted}");
+        debug!("Setting userStatusMute for {} -> {muted}", redact_jid(jid));
         let value = wa::SyncActionValue {
             user_status_mute_action: buffa::MessageField::some(
                 wa::sync_action_value::UserStatusMuteAction { muted: Some(muted) },
@@ -707,7 +719,11 @@ impl<'a> ChatActions<'a> {
         delete_media: bool,
         message_timestamp: Option<i64>,
     ) -> Result<(), AppStateError> {
-        debug!("Deleting message {message_id} for me in {chat_jid}");
+        debug!(
+            "Deleting message {} for me in {}",
+            fingerprint_id(message_id),
+            redact_jid(chat_jid)
+        );
         let (chat, participant) = message_key_owned(chat_jid, participant_jid, from_me)?;
         let value = wa::SyncActionValue {
             delete_message_for_me_action: buffa::MessageField::some(
@@ -755,7 +771,7 @@ impl<'a> ChatActions<'a> {
                 "save_contact: contact id must be a bare phone-number JID (not a LID, group, or device-specific JID)".into(),
             ));
         }
-        debug!("Saving contact {jid}");
+        debug!("Saving contact {}", redact_jid(jid));
         let value = wa::SyncActionValue {
             contact_action: buffa::MessageField::some(wa::sync_action_value::ContactAction {
                 full_name,
@@ -792,7 +808,7 @@ impl<'a> ChatActions<'a> {
                 "remove_contact: contact id must be a bare phone-number JID (not a LID, group, or device-specific JID)".into(),
             ));
         }
-        debug!("Removing contact {jid}");
+        debug!("Removing contact {}", redact_jid(jid));
         let value = wa::SyncActionValue {
             contact_action: buffa::MessageField::some(
                 wa::sync_action_value::ContactAction::default(),

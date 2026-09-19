@@ -43,33 +43,43 @@ impl<'a> MutationSummary<'a> {
     }
 }
 
-/// Cap a decoded command verb for logging: control characters become
-/// `U+FFFD` and the token is bounded, so a hostile verb can neither forge
-/// log lines nor blow up the aggregate. Kept next to the `Display` impl it
-/// protects — the summary below is the only writer.
+/// What counts as unsafe for a log line — anything that can break the
+/// line discipline or drive a terminal — in one place so this module and
+/// the client's `sanitize_command` can never disagree. See the client's
+/// `is_log_unsafe` for the set rationale; keep the two in sync — both are
+/// covered by the hostile-verb tests.
+fn is_log_unsafe(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0}'..='\u{1F}'
+            | '\u{7F}'..='\u{9F}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
 fn sanitize_command(command: &str) -> String {
     const MAX_COMMAND_CHARS: usize = 48;
-    const TAIL: usize = 8;
-    let sanitized: String = command
-        .chars()
-        .map(|c| {
-            if matches!(c, '\n' | '\r' | '\t' | '\u{0}'..='\u{1F}' | '\u{7F}') {
-                '\u{FFFD}'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let count = sanitized.chars().count();
-    if count <= MAX_COMMAND_CHARS {
-        return sanitized;
+    // Single-pass and bounded: sanitize and cap while iterating — memory
+    // O(48), CPU O(49) no matter how long the wire value is — stopping one
+    // char past the cap only to learn whether the ellipsis is needed.
+    // Materializing the whole wire string first would let a multi-MB verb
+    // dictate the allocation for a ~48-char log token. Kept next to the
+    // `Display` impl it protects — the summary below is the only writer.
+    let mut out = String::new();
+    let mut chars = command.chars();
+    for _ in 0..MAX_COMMAND_CHARS {
+        let Some(c) = chars.next() else {
+            return out;
+        };
+        out.push(if is_log_unsafe(c) { '\u{FFFD}' } else { c });
     }
-    let head: String = sanitized
-        .chars()
-        .take(MAX_COMMAND_CHARS.saturating_sub(TAIL + 1))
-        .collect();
-    let tail: String = sanitized.chars().skip(count - TAIL).collect();
-    format!("{head}…{tail}")
+    if chars.next().is_some() {
+        out.push('\u{2026}');
+    }
+    out
 }
 
 impl std::fmt::Display for MutationSummary<'_> {
@@ -2353,5 +2363,17 @@ mod tests {
         let summary = mutation_summary(&[summary_mutation(Some(&long), SET)]);
         assert!(summary.chars().count() < 200);
         assert!(summary.contains('…'));
+        // The full Unicode unsafe set is sanitized, not just C0 + DEL.
+        for c in ['\u{85}', '\u{9B}', '\u{2028}', '\u{2029}', '\u{202E}'] {
+            let verb = format!("archive{c}FORGED");
+            let summary = mutation_summary(&[summary_mutation(Some(&verb), SET)]);
+            assert!(!summary.contains(c), "verb must not carry {c:?}");
+            assert!(summary.contains('\u{FFFD}'));
+        }
+        // Bounded during processing, not just in the output: a hostile
+        // multi-KB verb costs O(48) chars in the aggregate, never O(input).
+        let huge = "a".repeat(20_000);
+        let summary = mutation_summary(&[summary_mutation(Some(&huge), SET)]);
+        assert!(summary.chars().count() <= 48 + "SET ".len() + 1);
     }
 }
