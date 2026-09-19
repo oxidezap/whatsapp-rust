@@ -677,7 +677,7 @@ mod tests {
 
     #[test]
     fn label_jid_with_malformed_chat_is_claimed_but_not_dispatched() {
-        // Claimed (returns true) so it isn't re-tried, but no event is emitted.
+        // Claimed (a non-`Unclaimed` outcome) so it isn't re-tried, but no event is emitted.
         let m = set_mutation(
             vec!["label_jid", "5", "not a jid"],
             wa::SyncActionValue {

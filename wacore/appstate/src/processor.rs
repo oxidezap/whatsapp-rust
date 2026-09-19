@@ -354,7 +354,8 @@ where
     }
 
     // A snapshot can carry thousands of mutations, so the per-mutation lines
-    // the live path emits stay at TRACE here; DEBUG gets only the aggregate.
+    // stay at TRACE (see `log_mutation_dispatched`); DEBUG gets only the
+    // aggregate below.
     if log_enabled!(target: "AppState", Level::Debug) {
         debug!(
             target: "AppState",
@@ -485,11 +486,6 @@ where
         hash_update_result.has_missing_remove
     );
 
-    // Semantic summary of what the patch carried: the command is index[0],
-    // already decoded above, so no extra crypto or parsing. Gated so a quiet
-    // logger pays for nothing — particularly on full-sync snapshots, where
-    // this would otherwise format thousands of entries per patch.
-
     // Validate MACs if requested
     if validate_macs && let Some(key_id) = patch.key_id.id.as_ref() {
         let keys = get_keys(key_id)?;
@@ -568,6 +564,10 @@ where
         }
     }
 
+    // Semantic summary of what the patch carried: the command is index[0],
+    // already decoded above, so no extra crypto or parsing. Gated so a quiet
+    // logger pays for nothing — particularly on full-sync snapshots, where
+    // this would otherwise format thousands of entries per patch.
     if log_enabled!(target: "AppState", Level::Debug) {
         debug!(
             target: "AppState",

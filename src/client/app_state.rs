@@ -3225,10 +3225,21 @@ impl Client {
                 // non-genesis first patch is refused here, with `Retry` set and
                 // the version untouched. Discarding it read that refusal as a
                 // clean apply.
-                Ok((mutations, _, list)) => {
+                Ok((mutations, new_state, list)) => {
                     wacore::telemetry::appstate_mutations(mutations.len() as u64);
-                    for mut m in mutations {
-                        self.dispatch_app_state_mutation(&mut m, false).await;
+                    // Same semantic context as the sync paths: the conflict
+                    // absorb runs through the processor, so `new_state` is
+                    // the post-apply cursor and `list.name` the collection —
+                    // without it these mutations would dispatch with `ctx`
+                    // unset and lose their per-mutation line entirely.
+                    let total = mutations.len();
+                    for (position, mut m) in mutations.into_iter().enumerate() {
+                        self.dispatch_app_state_mutation_in(
+                            &mut m,
+                            false,
+                            (list.name, new_state.version, position + 1, total),
+                        )
+                        .await;
                     }
                     if let Some(refused) = &list.error {
                         debug!(
@@ -3481,6 +3492,16 @@ impl Client {
         // objects that are neither on wasm.
         let live = Arc::clone(&self.connection_generation);
         let still_current = move || live.load(Ordering::Acquire) == generation;
+        // The recovery's own version, read before `apply_snapshot_recovery`
+        // moves `recovery`: it is the post-apply cursor for the semantic
+        // context below. `apply_snapshot_recovery` refuses a version-less
+        // recovery, so a missing version here means the apply below fails —
+        // defaulting to 0 keeps the log honest about what was observed.
+        let recovery_version = recovery
+            .version
+            .as_option()
+            .and_then(|v| v.version)
+            .unwrap_or(0);
         match proc
             .apply_snapshot_recovery(recovery, name, &still_current)
             .await
@@ -3499,8 +3520,20 @@ impl Client {
                 // would lose a mute or an archive for good. And what they
                 // describe is the account, not the session that learned it,
                 // which is why the ordinary sync path dispatches the same way.
-                for mut m in mutations {
-                    self.dispatch_app_state_mutation(&mut m, true).await;
+                // Contextual dispatch, like the sync paths: without it these
+                // mutations would lose their per-mutation line entirely and
+                // recreate the original gap ("N records, but which ones?")
+                // for exactly the recovery path that exists to unstick a
+                // collection. `full_sync = true`: a recovery replaces the
+                // whole collection, so per-mutation lines stay at TRACE.
+                let total = mutations.len();
+                for (position, mut m) in mutations.into_iter().enumerate() {
+                    self.dispatch_app_state_mutation_in(
+                        &mut m,
+                        true,
+                        (patch_name, recovery_version, position + 1, total),
+                    )
+                    .await;
                 }
             }
             Ok(wacore::appstate_sync::RecoveryOutcome::Retired) => {
@@ -3658,9 +3691,7 @@ impl AppStateDispatchOutcome {
 
 /// JIDs identify accounts, so even the semantic log redacts them: the user
 /// part keeps a short prefix and suffix (`5511…0042`), the server part stays
-/// whole so `s.whatsapp.net` vs `g.us` vs `lid` is still answerable. Anything
-/// that is not shaped like `user@server` (label ids, quick-reply ids, message
-/// ids) passes through untouched — it carries no account identity.
+/// whole so `s.whatsapp.net` vs `g.us` vs `lid` is still answerable.
 fn redact_index_arg(arg: &str) -> Cow<'_, str> {
     let Some((user, server)) = arg.split_once('@') else {
         return Cow::Borrowed(arg);
@@ -3683,14 +3714,89 @@ fn redact_index_arg(arg: &str) -> Cow<'_, str> {
     Cow::Owned(format!("{head}…{tail}@{server}"))
 }
 
-/// The redacted projection of the full index for TRACE: every element through
-/// [`redact_index_arg`]. JID-shaped elements keep `head…tail@server`; message
-/// ids, opaque ids and other non-JID elements pass through untouched (they
-/// carry no account identity). TRACE must never serialize `m.index` verbatim:
-/// past the target it can carry chat JIDs, message ids and participant JIDs,
-/// which would bypass the DEBUG-level redaction.
+/// A stable short fingerprint for an opaque identifier (message id, call id,
+/// label id, quick-reply id): first 4 + last 4 chars with the length, so two
+/// different ids never render the same and correlated mutations stay
+/// correlatable across lines, without printing the whole identifier.
+/// Character-safe: slices on char boundaries, never byte offsets.
+fn fingerprint_id(id: &str) -> Cow<'_, str> {
+    const HEAD_TAIL: usize = 4;
+    let count = id.chars().count();
+    if count <= HEAD_TAIL * 2 {
+        return Cow::Borrowed(id);
+    }
+    let head: String = id.chars().take(HEAD_TAIL).collect();
+    let tail: String = id.chars().skip(count - HEAD_TAIL).collect();
+    Cow::Owned(format!("{head}…{tail}#{count}"))
+}
+
+/// Command-aware semantic projection of the full index for TRACE.
+///
+/// Positional, because every command owns its index shape: `target` (index
+/// 1) is JID-redacted via [`redact_index_arg`], while opaque identifiers
+/// (message ids, call ids) render as stable fingerprints via
+/// [`fingerprint_id`] so correlated mutations stay correlatable without
+/// printing whole identifiers. Unknown commands are conservative: the verb
+/// plus redacted elements, with no positional labels invented for a shape
+/// nobody declared. TRACE must never serialize `m.index` verbatim: past the
+/// target it can carry chat JIDs, message ids and participant JIDs, which
+/// would bypass the DEBUG-level redaction.
 fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<Cow<'_, str>> {
-    m.index.iter().map(|arg| redact_index_arg(arg)).collect()
+    let command = m.index.first().map(String::as_str).unwrap_or("");
+    // (target_is_jid, extra labels by position, starting at index 2).
+    // Shapes mirror the dispatchers: chat message keys are
+    // `[cmd, chat, msg_id, from_me, participant]`; label_message is
+    // `[cmd, label_id, chat, msg_id, ...]`; call_log is
+    // `[cmd, creator, call_id, direction]`.
+    let (target_is_jid, extra): (bool, &[&str]) = match command {
+        "star" | "deleteMessageForMe" => (true, &["msg", "from_me", "participant"]),
+        "label_message" => (false, &["chat", "msg"]),
+        "label_jid" => (false, &["chat"]),
+        "call_log" => (true, &["call", "direction"]),
+        "mute" | "pin" | "pin_v1" | "archive" | "contact" | "mark_chat_as_read"
+        | "markChatAsRead" | "deleteChat" | "clearChat" | "lock" | "userStatusMute" => (true, &[]),
+        // Id-keyed or opaque single args: fingerprint, never verbatim.
+        "quick_reply"
+        | "label_edit"
+        | "nct_salt_sync"
+        | "setting_pushName"
+        | "setting_disableLinkPreviews" => (false, &["id"]),
+        // Unknown command: no shape declared, so no labels invented — but
+        // still redact every element rather than leak one verbatim. Position
+        // 1 goes through the JID redactor (a JID there is the common case
+        // for chat-adjacent commands); anything JID-shaped deeper is caught
+        // by the `contains('@')` fallback below.
+        _ => (true, &[]),
+    };
+    let mut out = Vec::with_capacity(m.index.len());
+    for (i, arg) in m.index.iter().enumerate() {
+        if i == 0 {
+            out.push(Cow::Borrowed(arg.as_str()));
+        } else if i == 1 {
+            out.push(if target_is_jid {
+                redact_index_arg(arg)
+            } else {
+                fingerprint_id(arg)
+            });
+        } else if let Some(label) = extra.get(i - 2) {
+            out.push(match *label {
+                // Known JID positions inside known shapes.
+                "chat" | "participant" => redact_index_arg(arg),
+                // `from_me` / `direction` / `deleted` flags are single chars;
+                // opaque ids fingerprint.
+                _ if arg.len() <= 1 => Cow::Borrowed(arg.as_str()),
+                _ => Cow::Owned(format!("{label}={}", fingerprint_id(arg))),
+            });
+        } else {
+            // Beyond the declared shape: fingerprint opaque, redact JID-like.
+            out.push(if arg.contains('@') {
+                redact_index_arg(arg)
+            } else {
+                fingerprint_id(arg)
+            });
+        }
+    }
+    out
 }
 
 /// Render the mutation's target for the semantic line: `index[1]` redacted
@@ -3917,8 +4023,10 @@ impl Client {
 
     /// [`Self::dispatch_app_state_mutation`] for a caller that owns the batch:
     /// `ctx` is `(collection, version, position, total)` and produces the
-    /// per-mutation DEBUG line (aggregate in full sync — see below). Returns
-    /// the outcome so tests can assert on it without parsing logs.
+    /// per-mutation record: DEBUG for live sync, TRACE for full sync (see
+    /// [`log_mutation_dispatched`]). The per-batch aggregate is separate and
+    /// is emitted by the processor, not here. Returns the outcome so tests
+    /// can assert on it without parsing logs.
     pub(crate) async fn dispatch_app_state_mutation_in(
         &self,
         m: &mut crate::appstate_sync::Mutation,
@@ -4229,6 +4337,28 @@ mod tests {
     /// the tail of `star` / `deleteMessageForMe` / `label_message` indexes can
     /// hold chat JIDs, message ids and participant JIDs.
     #[test]
+    /// Message/call ids stay correlatable without printing whole: stable
+    /// `head…tail#len` fingerprints keep two different ids distinct across
+    /// lines while leaking no full identifier.
+    #[test]
+    fn fingerprint_id_is_stable_short_and_bounded() {
+        assert_eq!(fingerprint_id("MSGID123"), "MSGID123");
+        assert_eq!(fingerprint_id("3EB0284A7C9112345678"), "3EB0…5678#20");
+        assert_eq!(
+            fingerprint_id("3EB0284A7C9112345678"),
+            fingerprint_id("3EB0284A7C9112345678")
+        );
+        assert_ne!(
+            fingerprint_id("3EB0284A7C9112345678"),
+            fingerprint_id("3EB0284A7C9199999999")
+        );
+        // Multibyte-safe: slices on char boundaries, never byte offsets.
+        assert_eq!(
+            fingerprint_id("a\u{1F600}bcdefghij"),
+            "a\u{1F600}bc…ghij#11"
+        );
+    }
+
     fn redacted_index_redacts_every_jid_shaped_element() {
         use crate::appstate_sync::Mutation;
 
@@ -4236,7 +4366,7 @@ mod tests {
             index: vec![
                 "star".to_string(),
                 "120363000000000042@g.us".to_string(),
-                "MSGID123".to_string(),
+                "3EB0284A7C9112345678".to_string(),
                 "1".to_string(),
                 "5511999990042@s.whatsapp.net".to_string(),
             ],
@@ -4249,16 +4379,39 @@ mod tests {
             vec![
                 "star",
                 "1203…0042@g.us",
-                "MSGID123",
+                "msg=3EB0…5678#20",
                 "1",
                 "5511…0042@s.whatsapp.net",
             ]
         );
-        // No verbatim account survives the projection.
+        // No verbatim account or message id survives the projection.
         for element in &redacted {
             assert!(!element.contains("120363000000000042"));
             assert!(!element.contains("5511999990042"));
+            assert!(!element.contains("3EB0284A7C9112345678"));
         }
+    }
+
+    /// Unknown commands get no positional labels invented — but every element
+    /// is still redacted or fingerprinted, never verbatim.
+    #[test]
+    fn redacted_index_is_conservative_on_unknown_commands() {
+        use crate::appstate_sync::Mutation;
+
+        let m = Mutation {
+            index: vec![
+                "some_new_whatsapp_action".to_string(),
+                "120363000000000042@g.us".to_string(),
+                "3EB0284A7C9112345678".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        let redacted = redacted_index(&m);
+        assert_eq!(
+            redacted.iter().map(|c| c.as_ref()).collect::<Vec<_>>(),
+            vec!["some_new_whatsapp_action", "1203…0042@g.us", "3EB0…5678#20",]
+        );
     }
 
     /// Dispatched and not-dispatched must read differently: a malformed
