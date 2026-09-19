@@ -1930,19 +1930,15 @@ mod tests {
     #[test]
     fn mutation_mac_entry_layout_is_smaller_without_capacity_words() {
         // The old entry had three growable containers (String + two Vecs). The
-        // compact entry has three boxed DST pointers and no spare-capacity
-        // words. Keep this relational so it remains valid on 32- and 64-bit
-        // targets without prescribing a pointer width.
-        assert_eq!(
-            size_of::<MutationMacKey>(),
-            size_of::<(Box<str>, Box<[u8]>)>()
-        );
-        assert_eq!(
-            size_of::<(MutationMacKey, Box<[u8]>)>(),
-            size_of::<(Box<str>, Box<[u8]>, Box<[u8]>)>()
-        );
+        // compact entry has boxed DST pointers and no spare-capacity words.
+        // Compare the actual entry types, rather than assuming that a private
+        // struct has the same layout as an equivalent tuple. The relational
+        // budget remains valid on 32- and 64-bit targets without prescribing a
+        // pointer width or relying on unspecified field ordering.
+        let compact = size_of::<(MutationMacKey, Box<[u8]>)>();
+        let previous = size_of::<((String, Vec<u8>), Vec<u8>)>();
         assert!(
-            size_of::<(MutationMacKey, Box<[u8]>)>() < size_of::<((String, Vec<u8>), Vec<u8>)>(),
+            previous - compact >= size_of::<usize>(),
             "boxed mutation-MAC entries must retain fewer capacity fields"
         );
     }
