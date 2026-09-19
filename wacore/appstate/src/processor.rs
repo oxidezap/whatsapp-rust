@@ -25,7 +25,7 @@ use waproto::whatsapp as wa;
 ///
 /// Crate-private: the only consumer is the `Decoded …` aggregate logged a few
 /// functions below, and the PR body promises no public-API change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct MutationSummary<'a> {
     operation: &'static str,
     command: &'a str,
@@ -112,24 +112,29 @@ const MUTATION_SUMMARY_ENTRY_CAP: usize = 12;
 fn mutation_summary(mutations: &[Mutation]) -> String {
     use std::fmt::Write;
 
-    // Small-vector discipline: distinct commands per batch are few (a dozen
-    // at most in practice), so a sorted `Vec` beats a `HashMap` import here.
-    let mut counts: Vec<(MutationSummary<'_>, usize)> = Vec::new();
-    for m in mutations {
+    // Counted in a `HashMap` so `n` distinct verbs cost O(n), not the
+    // O(n²) of a linear scan per mutation. Snapshots can carry
+    // hundreds/thousands of mutations and this whole pass exists only
+    // for observability, so the aggregation must not dominate the
+    // decode it describes. The value is `(count, first_position)`: the
+    // sort below orders most frequent first with first appearance as
+    // the deterministic tiebreak (the old stable-sort order).
+    let mut counts: HashMap<MutationSummary<'_>, (usize, usize)> =
+        HashMap::with_capacity(mutations.len().min(64));
+    for (position, m) in mutations.iter().enumerate() {
         let summary = MutationSummary::of(m);
-        if let Some(entry) = counts.iter_mut().find(|(s, _)| *s == summary) {
-            entry.1 += 1;
-        } else {
-            counts.push((summary, 1));
-        }
+        let entry = counts.entry(summary).or_insert((0, position));
+        entry.0 += 1;
     }
     // Most frequent first: the dominant command of a snapshot reads before
     // the tail, and the cap below drops the least interesting entries.
-    counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    // `k log k` over distinct commands only, not over mutations.
+    let mut counts: Vec<_> = counts.into_iter().collect();
+    counts.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.1.1.cmp(&b.1.1)));
 
     let mut out = String::new();
     let shown = counts.len().min(MUTATION_SUMMARY_ENTRY_CAP);
-    for (i, (summary, count)) in counts[..shown].iter().enumerate() {
+    for (i, (summary, (count, _))) in counts[..shown].iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
@@ -138,7 +143,7 @@ fn mutation_summary(mutations: &[Mutation]) -> String {
             let _ = write!(out, "×{count}");
         }
     }
-    let hidden: usize = counts[shown..].iter().map(|(_, c)| c).sum();
+    let hidden: usize = counts[shown..].iter().map(|(_, (c, _))| c).sum();
     if hidden > 0 {
         if !out.is_empty() {
             out.push_str(", ");
@@ -2334,6 +2339,33 @@ mod tests {
             summary.matches("SET cmd").count(),
             MUTATION_SUMMARY_ENTRY_CAP
         );
+    }
+
+    /// Thousands of distinct verbs still aggregate in linear time and stay
+    /// one line: the count is O(n) in a `HashMap`, the sort is over
+    /// distinct commands only, and the entry cap plus tail count bound the
+    /// output. Ties keep first-appearance order deterministically.
+    #[test]
+    fn mutation_summary_scales_to_thousands_of_distinct_commands() {
+        use wa::syncd_mutation::SyncdOperation::SET;
+        let verbs: Vec<String> = (0..2_000).map(|i| format!("cmd{i:04}")).collect();
+        let mutations: Vec<Mutation> = verbs
+            .iter()
+            .map(|v| summary_mutation(Some(v), SET))
+            .collect();
+        let summary = mutation_summary(&mutations);
+        // One line, capped: 12 entries plus the folded tail.
+        assert_eq!(
+            summary.matches("SET cmd").count(),
+            MUTATION_SUMMARY_ENTRY_CAP
+        );
+        assert!(
+            summary.contains(&format!("… +{} more", 2_000 - MUTATION_SUMMARY_ENTRY_CAP)),
+            "tail folded: {summary}"
+        );
+        // Deterministic: ties (all ×1) keep first-appearance order, so the
+        // head of the line is the head of the batch.
+        assert!(summary.starts_with("SET cmd0000, SET cmd0001"), "{summary}");
     }
 
     /// An empty index has no command to name; it must still appear (no handler
