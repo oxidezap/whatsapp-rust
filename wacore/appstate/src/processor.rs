@@ -53,10 +53,13 @@ fn is_log_unsafe(c: char) -> bool {
         c,
         '\u{0}'..='\u{1F}'
             | '\u{7F}'..='\u{9F}'
+            | '\u{061C}'
+            | '\u{200E}'
+            | '\u{200F}'
             | '\u{2028}'
             | '\u{2029}'
             | '\u{202A}'..='\u{202E}'
-            | '\u{2066}'..='\u{2069}'
+            | '\u{2066}'..='\u{206F}'
     )
 }
 
@@ -2396,7 +2399,10 @@ mod tests {
         assert!(summary.chars().count() < 200);
         assert!(summary.contains('…'));
         // The full Unicode unsafe set is sanitized, not just C0 + DEL.
-        for c in ['\u{85}', '\u{9B}', '\u{2028}', '\u{2029}', '\u{202E}'] {
+        for c in [
+            '\u{85}', '\u{9B}', '\u{2028}', '\u{2029}', '\u{202E}', '\u{061C}', '\u{200E}',
+            '\u{200F}', '\u{2067}', '\u{206A}',
+        ] {
             let verb = format!("archive{c}FORGED");
             let summary = mutation_summary(&[summary_mutation(Some(&verb), SET)]);
             assert!(!summary.contains(c), "verb must not carry {c:?}");

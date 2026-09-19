@@ -3703,7 +3703,10 @@ impl AppStateDispatchOutcome {
 /// - the Unicode line/paragraph separators (`U+2028`/`U+2029`),
 /// - the bidirectional embedding/override controls
 ///   (`U+202A..=U+202E`, `U+2066..=U+2069`), which reorder rendered text and
-///   are a classic log-spoofing vector.
+///   are a classic log-spoofing vector,
+/// - the invisible direction marks (`U+061C`, `U+200E`, `U+200F`) plus the
+///   deprecated bidi/format controls (`U+206A..=U+206F`), which alter visual
+///   order/direction without showing as characters.
 ///
 /// Plain `char::is_control` would also strip `\u{200B}`-style formatting
 /// characters that are harmless in a log; matching the
@@ -3715,10 +3718,13 @@ fn is_log_unsafe(c: char) -> bool {
         c,
         '\u{0}'..='\u{1F}'
             | '\u{7F}'..='\u{9F}'
+            | '\u{061C}'
+            | '\u{200E}'
+            | '\u{200F}'
             | '\u{2028}'
             | '\u{2029}'
             | '\u{202A}'..='\u{202E}'
-            | '\u{2066}'..='\u{2069}'
+            | '\u{2066}'..='\u{206F}'
     )
 }
 
@@ -3876,7 +3882,9 @@ fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<String> {
     // The schema shape per command, as kinds from index 1 on. Shapes mirror
     // the dispatchers: chat message keys are `[cmd, chat, msg_id, from_me,
     // participant]`; label_message is `[cmd, label_id, chat, msg_id, ...]`;
-    // call_log is `[cmd, creator, call_id, direction]`. Unknown commands
+    // call_log is `[cmd, creator, call_id, direction]`; deleteChat is
+    // `[cmd, chat, deleteMedia]` and clearChat is
+    // `[cmd, chat, deleteStarred, deleteMedia]`. Unknown commands
     // declare nothing and fall back to per-element classification below, so
     // no shape is ever guessed from the value's content.
     let shape: &[IndexLogKind] = match command {
@@ -3884,8 +3892,18 @@ fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<String> {
         "label_message" => &[Opaque, Jid, Opaque],
         "label_jid" => &[Opaque, Jid],
         "call_log" => &[Jid, Opaque, Flag],
+        // `deleteChat`/`clearChat` carry their destructive flags in the
+        // index tail (see the schemas and the dispatcher below):
+        // `[cmd, chat, deleteMedia]` and
+        // `[cmd, chat, deleteStarred, deleteMedia]`. Declared as `Flag`
+        // so TRACE renders `delete_media=1` instead of fingerprinting
+        // `"1"` while `"0"` passes through — the old `&[Jid]` shape
+        // left `"1"` to the fallback and read `false`/`true` as
+        // `"0"`/`id#…`, which is semantically backwards.
+        "deleteChat" => &[Jid, Flag],
+        "clearChat" => &[Jid, Flag, Flag],
         "mute" | "pin" | "pin_v1" | "archive" | "contact" | "mark_chat_as_read"
-        | "markChatAsRead" | "deleteChat" | "clearChat" | "lock" | "userStatusMute" => &[Jid],
+        | "markChatAsRead" | "lock" | "userStatusMute" => &[Jid],
         "quick_reply"
         | "label_edit"
         | "nct_salt_sync"
@@ -3894,13 +3912,17 @@ fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<String> {
         _ => &[],
     };
     // Positional labels for the fingerprinted slots, for readability
-    // (`msg=id#…` rather than a bare hash). JID and flag slots need none:
-    // JIDs render as `…@server`, flags pass through as-is.
+    // (`msg=id#…` rather than a bare hash). Flags with labels render as
+    // `delete_media=1` / `from_me=0` instead of a bare `1`/`0`, so the
+    // TRACE line names what the flag decided; JID slots need no label
+    // (`…@server` is self-describing).
     let labels: &[&str] = match command {
         "star" | "deleteMessageForMe" => &["", "msg", "from_me", ""],
         "label_message" => &["label", "chat", "msg"],
         "label_jid" => &["label", "chat"],
         "call_log" => &["", "call", "direction"],
+        "deleteChat" => &["", "delete_media"],
+        "clearChat" => &["", "delete_starred", "delete_media"],
         "quick_reply" => &["id"],
         "label_edit" => &["label"],
         "nct_salt_sync" => &["salt"],
@@ -3911,7 +3933,18 @@ fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<String> {
     fn render(kind: IndexLogKind, label: &str, arg: &str) -> String {
         match kind {
             Jid => redact_jid_or_fingerprint(arg),
-            Flag if matches!(arg, "0" | "1") => arg.to_string(),
+            // A declared `"0"`/`"1"` wire flag: with a label it names
+            // the decision (`delete_media=1`), without one (star's
+            // participant-absent tail, unknown tail shapes) it passes
+            // through bare. Anything else in a flag slot is opaque wire
+            // data, not a flag, so it fingerprints.
+            Flag if matches!(arg, "0" | "1") => {
+                if label.is_empty() {
+                    arg.to_string()
+                } else {
+                    format!("{label}={arg}")
+                }
+            }
             Flag => fingerprint_id(arg),
             Opaque if label.is_empty() => fingerprint_id(arg),
             Opaque => format!("{label}={}", fingerprint_id(arg)),
@@ -4016,6 +4049,10 @@ fn mutation_target(m: &crate::appstate_sync::Mutation) -> Option<String> {
 enum MutationEffectDetail {
     Bool(&'static str, bool),
     BoolUntil(&'static str, bool, i64),
+    /// Two destructive flags carried in the index tail rather than the
+    /// proto (see `deleteChat`/`clearChat` below): rendered as
+    /// `delete_starred=false delete_media=true` on the DEBUG line.
+    TwoBools(&'static str, bool, &'static str, bool),
 }
 
 impl MutationEffectDetail {
@@ -4027,6 +4064,9 @@ impl MutationEffectDetail {
             }
             Self::BoolUntil(name, b, until) => {
                 let _ = write!(out, "{name}={b} until={until}");
+            }
+            Self::TwoBools(n1, b1, n2, b2) => {
+                let _ = write!(out, "{n1}={b1} {n2}={b2}");
             }
         }
     }
@@ -4069,6 +4109,23 @@ fn mutation_effect_detail(m: &crate::appstate_sync::Mutation) -> Option<Mutation
             .as_option()
             .and_then(|a| a.locked)
             .map(|b| MutationEffectDetail::Bool("locked", b)),
+        // The destructive flags live in the index tail, not the proto
+        // (schemas `DELETE_CHAT`/`CLEAR_CHAT`, dispatcher reads them the
+        // same way): the DEBUG line must answer "what was actually
+        // deleted", not just which chat. Missing element means the
+        // sender omitted it — same defaults as dispatch (`deleteChat`
+        // defaults media to true, `clearChat` defaults both to false).
+        "deleteChat" => v.delete_chat_action.as_option().map(|_| {
+            MutationEffectDetail::Bool("delete_media", m.index.get(2).is_none_or(|f| f != "0"))
+        }),
+        "clearChat" => v.clear_chat_action.as_option().map(|_| {
+            MutationEffectDetail::TwoBools(
+                "delete_starred",
+                m.index.get(2).is_some_and(|f| f == "1"),
+                "delete_media",
+                m.index.get(3).is_some_and(|f| f == "1"),
+            )
+        }),
         "userStatusMute" => v
             .user_status_mute_action
             .as_option()
@@ -4607,7 +4664,7 @@ mod tests {
                 "star".to_string(),
                 "…@g.us".to_string(),
                 format!("msg={}", fingerprint_id(msg_id)),
-                "1".to_string(),
+                "from_me=1".to_string(),
                 "…@s.whatsapp.net".to_string(),
             ]
         );
@@ -4662,7 +4719,7 @@ mod tests {
             action_value: None,
         };
         let redacted = redacted_index(&flags);
-        assert_eq!(redacted[3], "1");
+        assert_eq!(redacted[3], "from_me=1");
         // The `"0"` participant sentinel means "no participant" and
         // passes through untouched.
         assert_eq!(redacted[4], "0");
@@ -4691,6 +4748,55 @@ mod tests {
         for element in &redacted {
             assert!(!element.contains("pad-"));
         }
+    }
+
+    /// `deleteChat`/`clearChat` carry their destructive flags in the index
+    /// tail, so TRACE must name them: `delete_media=1` instead of a bare
+    /// `id#…` (the old `&[Jid]` shape left `"1"` to the JID-or-fingerprint
+    /// fallback, which reads `false`/`true` as `"0"`/`id#…` — backwards).
+    /// Labeled `"0"`/`"1"` flags (`from_me`, `direction`) render labeled
+    /// too; anything else in a flag slot is opaque wire data and
+    /// fingerprints.
+    #[test]
+    fn redacted_index_names_delete_and_clear_flags() {
+        use crate::appstate_sync::Mutation;
+
+        let m = Mutation {
+            index: vec![
+                "deleteChat".to_string(),
+                "120363000000000042@g.us".to_string(),
+                "1".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        assert_eq!(
+            redacted_index(&m),
+            vec![
+                "deleteChat".to_string(),
+                "…@g.us".to_string(),
+                "delete_media=1".to_string(),
+            ]
+        );
+        let m = Mutation {
+            index: vec![
+                "clearChat".to_string(),
+                "120363000000000042@g.us".to_string(),
+                "0".to_string(),
+                "1".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        assert_eq!(
+            redacted_index(&m),
+            vec![
+                "clearChat".to_string(),
+                "…@g.us".to_string(),
+                "delete_starred=0".to_string(),
+                "delete_media=1".to_string(),
+            ]
+        );
     }
 
     /// Unknown commands get no positional labels invented and no assumption
@@ -4873,6 +4979,75 @@ mod tests {
         assert_eq!(mutation_effect_detail(&unknown), None);
     }
 
+    /// `deleteChat`/`clearChat` answer "what was actually deleted" on the
+    /// DEBUG line: the flags live in the index tail (same defaults as
+    /// dispatch), not the proto. Missing elements keep the dispatch
+    /// defaults (`deleteChat` media defaults true, `clearChat` both false).
+    #[test]
+    fn mutation_effect_detail_reports_delete_and_clear_flags() {
+        use crate::appstate_sync::Mutation;
+
+        let scalar = |index: &[&str], value: wa::SyncActionValue| Mutation {
+            index: index.iter().map(|s| s.to_string()).collect(),
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: Some(value),
+        };
+        let delete_chat = || wa::SyncActionValue {
+            delete_chat_action: buffa::MessageField::some(
+                wa::sync_action_value::DeleteChatAction::default(),
+            ),
+            ..Default::default()
+        };
+        let clear_chat = || wa::SyncActionValue {
+            clear_chat_action: buffa::MessageField::some(
+                wa::sync_action_value::ClearChatAction::default(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            mutation_effect_detail(&scalar(
+                &["deleteChat", "120363000000000042@g.us", "1"],
+                delete_chat()
+            )),
+            Some(MutationEffectDetail::Bool("delete_media", true))
+        );
+        assert_eq!(
+            mutation_effect_detail(&scalar(
+                &["deleteChat", "120363000000000042@g.us", "0"],
+                delete_chat()
+            )),
+            Some(MutationEffectDetail::Bool("delete_media", false))
+        );
+        assert_eq!(
+            mutation_effect_detail(&scalar(
+                &["clearChat", "120363000000000042@g.us", "0", "1"],
+                clear_chat()
+            )),
+            Some(MutationEffectDetail::TwoBools(
+                "delete_starred",
+                false,
+                "delete_media",
+                true
+            ))
+        );
+        let mut rendered = String::new();
+        mutation_effect_detail(&scalar(
+            &["clearChat", "120363000000000042@g.us", "1", "1"],
+            clear_chat(),
+        ))
+        .expect("clear detail")
+        .render(&mut rendered);
+        assert_eq!(rendered, "delete_starred=true delete_media=true");
+        // Absent payload means no scalar, even with flags present.
+        assert_eq!(
+            mutation_effect_detail(&scalar(
+                &["deleteChat", "120363000000000042@g.us", "1"],
+                wa::SyncActionValue::default()
+            )),
+            None
+        );
+    }
+
     /// A hostile verb renders sanitized on the line: no newlines, no
     /// escapes, bounded length — while routing still keys on the raw verb.
     #[test]
@@ -4884,7 +5059,10 @@ mod tests {
         assert!(forged.starts_with("archive"));
         assert!(forged.contains('\u{FFFD}'));
         // The full Unicode unsafe set, not just C0 + DEL.
-        for c in ['\u{85}', '\u{9B}', '\u{2028}', '\u{2029}', '\u{202E}'] {
+        for c in [
+            '\u{85}', '\u{9B}', '\u{2028}', '\u{2029}', '\u{202E}', '\u{061C}', '\u{200E}',
+            '\u{200F}', '\u{2067}', '\u{206A}',
+        ] {
             let rendered = sanitize_command(&format!("archive{c}FORGED"));
             assert!(!rendered.contains(c), "verb must not carry {c:?}");
             assert!(rendered.contains('\u{FFFD}'));
