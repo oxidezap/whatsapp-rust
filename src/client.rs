@@ -2,7 +2,8 @@ mod accessors;
 mod adapters;
 mod app_state;
 pub(crate) use app_state::{
-    BatchedSyncOutcome, BatchedSyncRequest, CriticalSyncPlan, SyncScope, SyncSettles,
+    AppStateDispatchOutcome, BatchedSyncOutcome, BatchedSyncRequest, CriticalSyncPlan, SyncScope,
+    SyncSettles,
 };
 #[cfg(test)]
 pub(crate) use app_state::{SyncHolder, batched_sync_outcome_tests::batch_result};

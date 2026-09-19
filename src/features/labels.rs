@@ -13,6 +13,7 @@
 //! [`schemas_unlisted::LABEL_MESSAGE`](wacore::appstate::schemas_unlisted::LABEL_MESSAGE).
 
 use crate::appstate_sync::Mutation;
+use crate::client::AppStateDispatchOutcome;
 use crate::client::Client;
 use crate::features::chat_actions::AppStateError;
 use log::debug;
@@ -23,45 +24,21 @@ use wacore::types::events::{
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 
-/// What one label mutation did. Same contract as
-/// [`crate::features::chat_actions::ChatDispatchOutcome`]: `Event` names the
-/// dispatched event, `Malformed` a known command whose payload was absent,
-/// `Skipped` a claimed-but-unusable index, `Unclaimed` anything that is not a
-/// label command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LabelDispatchOutcome {
-    Event(&'static str),
-    Malformed(&'static str),
-    Skipped(&'static str),
-    Unclaimed,
-}
-
-/// Dispatch inbound label mutations synced from a linked device.
-/// Returns `true` if handled, `false` if the mutation is not a label kind.
-/// Kept for the unit tests below, which assert the bool contract directly.
-#[allow(dead_code)]
-pub(crate) fn dispatch_label_mutation(
-    event_bus: &wacore::types::events::CoreEventBus,
-    m: &mut Mutation,
-    full_sync: bool,
-) -> bool {
-    dispatch_label_mutation_outcome(event_bus, m, full_sync) != LabelDispatchOutcome::Unclaimed
-}
-
-/// [`dispatch_label_mutation`] with the outcome preserved, for the semantic
-/// per-mutation log line. Same contract; only the return type differs.
+/// Dispatch inbound label mutations synced from a linked device, returning the
+/// [`crate::client::AppStateDispatchOutcome`] for the semantic per-mutation
+/// log line.
 pub(crate) fn dispatch_label_mutation_outcome(
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     full_sync: bool,
-) -> LabelDispatchOutcome {
+) -> AppStateDispatchOutcome {
     if m.operation != wa::syncd_mutation::SyncdOperation::Set || m.index.is_empty() {
-        return LabelDispatchOutcome::Unclaimed;
+        return AppStateDispatchOutcome::Unclaimed;
     }
 
     let kind = m.index[0].as_str();
     if !matches!(kind, "label_edit" | "label_jid" | "label_message") {
-        return LabelDispatchOutcome::Unclaimed;
+        return AppStateDispatchOutcome::Unclaimed;
     }
 
     let ts = m
@@ -73,7 +50,7 @@ pub(crate) fn dispatch_label_mutation_outcome(
 
     let Some(label_id) = m.index.get(1).cloned() else {
         log::warn!("Skipping label mutation '{kind}': missing label id in index");
-        return LabelDispatchOutcome::Skipped("missing-label-id");
+        return AppStateDispatchOutcome::Skipped("missing-label-id");
     };
 
     match kind {
@@ -89,21 +66,21 @@ pub(crate) fn dispatch_label_mutation_outcome(
                         .from_full_sync(full_sync)
                         .build(),
                 ));
-                LabelDispatchOutcome::Event("LabelEditUpdate")
+                AppStateDispatchOutcome::Event("LabelEditUpdate")
             } else {
-                LabelDispatchOutcome::Malformed("LabelEditUpdate")
+                AppStateDispatchOutcome::Malformed("LabelEditUpdate")
             }
         }
         "label_message" => {
             let Some(chat_jid) = parse_association_chat_jid(kind, &m.index) else {
-                return LabelDispatchOutcome::Skipped("bad-chat-jid");
+                return AppStateDispatchOutcome::Skipped("bad-chat-jid");
             };
             // Empty is as unusable as absent: the id is what the association
             // hangs off, and an event carrying "" points at no message. The
             // outbound side rejects it for the same reason.
             let Some(message_id) = m.index.get(3).filter(|id| !id.is_empty()).cloned() else {
                 log::warn!("Skipping label_message mutation: missing or empty message id in index");
-                return LabelDispatchOutcome::Skipped("missing-message-id");
+                return AppStateDispatchOutcome::Skipped("missing-message-id");
             };
             if let Some(val) = &mut m.action_value
                 && let Some(act) = val.label_association_action.take()
@@ -118,14 +95,14 @@ pub(crate) fn dispatch_label_mutation_outcome(
                         .from_full_sync(full_sync)
                         .build(),
                 ));
-                LabelDispatchOutcome::Event("MessageLabelAssociationUpdate")
+                AppStateDispatchOutcome::Event("MessageLabelAssociationUpdate")
             } else {
-                LabelDispatchOutcome::Malformed("MessageLabelAssociationUpdate")
+                AppStateDispatchOutcome::Malformed("MessageLabelAssociationUpdate")
             }
         }
         "label_jid" => {
             let Some(chat_jid) = parse_association_chat_jid(kind, &m.index) else {
-                return LabelDispatchOutcome::Skipped("bad-chat-jid");
+                return AppStateDispatchOutcome::Skipped("bad-chat-jid");
             };
             if let Some(val) = &mut m.action_value
                 && let Some(act) = val.label_association_action.take()
@@ -139,12 +116,12 @@ pub(crate) fn dispatch_label_mutation_outcome(
                         .from_full_sync(full_sync)
                         .build(),
                 ));
-                LabelDispatchOutcome::Event("LabelAssociationUpdate")
+                AppStateDispatchOutcome::Event("LabelAssociationUpdate")
             } else {
-                LabelDispatchOutcome::Malformed("LabelAssociationUpdate")
+                AppStateDispatchOutcome::Malformed("LabelAssociationUpdate")
             }
         }
-        _ => LabelDispatchOutcome::Unclaimed,
+        _ => AppStateDispatchOutcome::Unclaimed,
     }
 }
 
@@ -403,13 +380,13 @@ mod tests {
         }
     }
 
-    fn run(m: &Mutation) -> (bool, Vec<Arc<Event>>) {
+    fn run(m: &Mutation) -> (AppStateDispatchOutcome, Vec<Arc<Event>>) {
         let bus = CoreEventBus::new();
         let rec = Arc::new(Recorder::default());
         bus.subscribe_handler(rec.clone()).detach();
-        let handled = dispatch_label_mutation(&bus, &mut m.clone(), false);
+        let outcome = dispatch_label_mutation_outcome(&bus, &mut m.clone(), false);
         let events = rec.events.lock().unwrap().clone();
-        (handled, events)
+        (outcome, events)
     }
 
     #[test]
@@ -429,8 +406,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (handled, events) = run(&m);
-        assert!(handled);
+        let (outcome, events) = run(&m);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert_eq!(events.len(), 1);
         match &*events[0] {
             Event::LabelEditUpdate(u) => {
@@ -458,8 +435,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (handled, events) = run(&m);
-        assert!(handled);
+        let (outcome, events) = run(&m);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert_eq!(events.len(), 1);
         match &*events[0] {
             Event::LabelAssociationUpdate(u) => {
@@ -582,8 +559,8 @@ mod tests {
         )
         .await;
 
-        let (handled, events) = run(&mutation);
-        assert!(handled);
+        let (outcome, events) = run(&mutation);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert_eq!(events.len(), 1);
         match &*events[0] {
             Event::MessageLabelAssociationUpdate(u) => {
@@ -677,8 +654,11 @@ mod tests {
                     ..Default::default()
                 },
             );
-            let (handled, events) = run(&m);
-            assert!(handled, "{index:?} must not be retried by another handler");
+            let (outcome, events) = run(&m);
+            assert!(
+                outcome != AppStateDispatchOutcome::Unclaimed,
+                "{index:?} must not be retried by another handler"
+            );
             assert!(events.is_empty(), "{index:?} must not emit a partial event");
         }
     }
@@ -690,8 +670,8 @@ mod tests {
             vec!["mute", "12025550111@s.whatsapp.net"],
             wa::SyncActionValue::default(),
         );
-        let (handled, events) = run(&m);
-        assert!(!handled);
+        let (outcome, events) = run(&m);
+        assert_eq!(outcome, AppStateDispatchOutcome::Unclaimed);
         assert!(events.is_empty());
     }
 
@@ -710,8 +690,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (handled, events) = run(&m);
-        assert!(handled);
+        let (outcome, events) = run(&m);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert!(events.is_empty());
     }
 }

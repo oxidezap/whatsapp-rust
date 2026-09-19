@@ -11,6 +11,7 @@
 //! would never reach the linked devices' quick-reply tables.
 
 use crate::appstate_sync::Mutation;
+use crate::client::AppStateDispatchOutcome;
 use crate::client::Client;
 use crate::features::chat_actions::AppStateError;
 use log::debug;
@@ -18,45 +19,23 @@ use wacore::appstate::schemas;
 use wacore::types::events::{Event, QuickReplyUpdate};
 use waproto::whatsapp as wa;
 
-/// What one quick-reply mutation did. Same contract as
-/// [`crate::features::chat_actions::ChatDispatchOutcome`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QuickReplyDispatchOutcome {
-    Event(&'static str),
-    Malformed(&'static str),
-    Skipped(&'static str),
-    Unclaimed,
-}
-
-/// Dispatch inbound quick-reply mutations synced from a linked device.
-/// Returns `true` if handled, `false` if the mutation is not a quick reply.
-/// Kept for the unit tests below, which assert the bool contract directly.
-#[allow(dead_code)]
-pub(crate) fn dispatch_quick_reply_mutation(
-    event_bus: &wacore::types::events::CoreEventBus,
-    m: &mut Mutation,
-    full_sync: bool,
-) -> bool {
-    dispatch_quick_reply_mutation_outcome(event_bus, m, full_sync)
-        != QuickReplyDispatchOutcome::Unclaimed
-}
-
-/// [`dispatch_quick_reply_mutation`] with the outcome preserved, for the
-/// semantic per-mutation log line. Same contract; only the return type differs.
+/// Dispatch inbound quick-reply mutations synced from a linked device,
+/// returning the [`crate::client::AppStateDispatchOutcome`] for the semantic
+/// per-mutation log line.
 pub(crate) fn dispatch_quick_reply_mutation_outcome(
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     full_sync: bool,
-) -> QuickReplyDispatchOutcome {
+) -> AppStateDispatchOutcome {
     if m.operation != wa::syncd_mutation::SyncdOperation::Set
         || m.index.first().map(String::as_str) != Some(schemas::QUICK_REPLY.name)
     {
-        return QuickReplyDispatchOutcome::Unclaimed;
+        return AppStateDispatchOutcome::Unclaimed;
     }
 
     let Some(id) = m.index.get(1).cloned() else {
         log::warn!("Skipping quick_reply mutation: missing id in index");
-        return QuickReplyDispatchOutcome::Skipped("missing-id");
+        return AppStateDispatchOutcome::Skipped("missing-id");
     };
 
     let ts = m
@@ -77,13 +56,13 @@ pub(crate) fn dispatch_quick_reply_mutation_outcome(
                 .from_full_sync(full_sync)
                 .build(),
         ));
-        QuickReplyDispatchOutcome::Event("QuickReplyUpdate")
+        AppStateDispatchOutcome::Event("QuickReplyUpdate")
     } else {
         // Claimed but undeliverable. WA Web counts the same shape as a
-        // malformed action value and logs it; without this the mutation would
-        // vanish with no signal at all. The id is opaque, not user content.
-        log::warn!("Skipping quick_reply mutation {id}: missing quickReplyAction value");
-        QuickReplyDispatchOutcome::Malformed("QuickReplyUpdate")
+        // malformed action value; the central `report` warns once with the
+        // command and the outcome, so nothing is logged here. The id is
+        // opaque, not user content.
+        AppStateDispatchOutcome::Malformed("QuickReplyUpdate")
     }
 }
 
@@ -217,13 +196,13 @@ mod tests {
         }
     }
 
-    fn run(m: &Mutation) -> (bool, Vec<Arc<Event>>) {
+    fn run(m: &Mutation) -> (AppStateDispatchOutcome, Vec<Arc<Event>>) {
         let bus = CoreEventBus::new();
         let rec = Arc::new(Recorder::default());
         bus.subscribe_handler(rec.clone()).detach();
-        let handled = dispatch_quick_reply_mutation(&bus, &mut m.clone(), false);
+        let outcome = dispatch_quick_reply_mutation_outcome(&bus, &mut m.clone(), false);
         let events = rec.events.lock().unwrap().clone();
-        (handled, events)
+        (outcome, events)
     }
 
     #[test]
@@ -353,8 +332,8 @@ mod tests {
         )
         .await;
 
-        let (handled, events) = run(&mutation);
-        assert!(handled);
+        let (outcome, events) = run(&mutation);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert_eq!(events.len(), 1);
         match &*events[0] {
             Event::QuickReplyUpdate(u) => {
@@ -378,8 +357,8 @@ mod tests {
                 ..Default::default()
             })),
         };
-        let (handled, events) = run(&m);
-        assert!(handled);
+        let (outcome, events) = run(&m);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert_eq!(events.len(), 1);
         match &*events[0] {
             Event::QuickReplyUpdate(u) => {
@@ -401,8 +380,8 @@ mod tests {
                 ..Default::default()
             })),
         };
-        let (handled, events) = run(&m);
-        assert!(handled);
+        let (outcome, events) = run(&m);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         match &*events[0] {
             Event::QuickReplyUpdate(u) => assert_eq!(u.action.deleted, Some(true)),
             other => panic!("expected QuickReplyUpdate, got {other:?}"),
@@ -416,8 +395,8 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::Set,
             action_value: Some(wa::SyncActionValue::default()),
         };
-        let (handled, events) = run(&m);
-        assert!(handled);
+        let (outcome, events) = run(&m);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert!(events.is_empty());
     }
 
@@ -433,8 +412,8 @@ mod tests {
                 operation: wa::syncd_mutation::SyncdOperation::Set,
                 action_value,
             };
-            let (handled, events) = run(&m);
-            assert!(handled);
+            let (outcome, events) = run(&m);
+            assert!(outcome != AppStateDispatchOutcome::Unclaimed);
             assert!(events.is_empty());
         }
     }
@@ -446,8 +425,8 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::Set,
             action_value: Some(wa::SyncActionValue::default()),
         };
-        let (handled, events) = run(&m);
-        assert!(!handled);
+        let (outcome, events) = run(&m);
+        assert_eq!(outcome, AppStateDispatchOutcome::Unclaimed);
         assert!(events.is_empty());
     }
 

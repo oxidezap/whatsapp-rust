@@ -22,14 +22,17 @@ use waproto::whatsapp as wa;
 /// the same case the patch log already uses. No payload, no index tail, no
 /// `SyncActionValue`: the whole point is a line a consumer can paste into an
 /// issue without leaking key material, salts, names or message text.
+///
+/// Crate-private: the only consumer is the `Decoded …` aggregate logged a few
+/// functions below, and the PR body promises no public-API change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MutationSummary<'a> {
-    pub operation: &'static str,
-    pub command: &'a str,
+struct MutationSummary<'a> {
+    operation: &'static str,
+    command: &'a str,
 }
 
 impl<'a> MutationSummary<'a> {
-    pub fn of(m: &'a Mutation) -> Self {
+    fn of(m: &'a Mutation) -> Self {
         Self {
             operation: match m.operation {
                 wa::syncd_mutation::SyncdOperation::SET => "SET",
@@ -50,34 +53,58 @@ impl std::fmt::Display for MutationSummary<'_> {
     }
 }
 
+/// How many distinct `(operation, command)` entries the aggregate line keeps
+/// before folding the long tail into `… +N more`. A full sync can interleave
+/// hundreds of commands (`contact, archive, contact, archive, …`), where
+/// adjacent-run compression shows every entry and the line grows without
+/// bound; global aggregation keeps it one line no matter the order.
+const MUTATION_SUMMARY_ENTRY_CAP: usize = 12;
+
 /// Render a decoded mutation batch as a compact semantic summary.
 ///
 /// The integrity line above answers "did the hash hold"; this answers the
 /// question consumers actually ask — "which app state commands did the server
 /// send" — without dumping the IQ payload `node_io` deliberately hides.
-/// Repeated commands collapse (`archive×2`); an empty index, which no handler
-/// can dispatch, shows as `<no-command>` rather than vanishing. Pure and
-/// allocation-light; callers must still gate on `log_enabled!(Debug)`.
-pub fn mutation_summary(mutations: &[Mutation]) -> String {
+/// Counts aggregate globally per `(operation, command)` (`contact×721`), so
+/// interleaved batches compress as well as adjacent runs do; an empty index,
+/// which no handler can dispatch, shows as `<no-command>` rather than
+/// vanishing. Pure; callers must still gate on `log_enabled!(Debug)`.
+/// Crate-private, like [`MutationSummary`]: called only from this module.
+fn mutation_summary(mutations: &[Mutation]) -> String {
     use std::fmt::Write;
 
-    let mut out = String::new();
-    let mut first = true;
-    let mut iter = mutations.iter().map(MutationSummary::of).peekable();
-    while let Some(cur) = iter.next() {
-        let mut run = 1usize;
-        while iter.peek().is_some_and(|next| *next == cur) {
-            iter.next();
-            run += 1;
+    // Small-vector discipline: distinct commands per batch are few (a dozen
+    // at most in practice), so a sorted `Vec` beats a `HashMap` import here.
+    let mut counts: Vec<(MutationSummary<'_>, usize)> = Vec::new();
+    for m in mutations {
+        let summary = MutationSummary::of(m);
+        if let Some(entry) = counts.iter_mut().find(|(s, _)| *s == summary) {
+            entry.1 += 1;
+        } else {
+            counts.push((summary, 1));
         }
-        if !first {
+    }
+    // Most frequent first: the dominant command of a snapshot reads before
+    // the tail, and the cap below drops the least interesting entries.
+    counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+
+    let mut out = String::new();
+    let shown = counts.len().min(MUTATION_SUMMARY_ENTRY_CAP);
+    for (i, (summary, count)) in counts[..shown].iter().enumerate() {
+        if i > 0 {
             out.push_str(", ");
         }
-        first = false;
-        let _ = write!(out, "{cur}");
-        if run > 1 {
-            let _ = write!(out, "×{run}");
+        let _ = write!(out, "{summary}");
+        if *count > 1 {
+            let _ = write!(out, "×{count}");
         }
+    }
+    let hidden: usize = counts[shown..].iter().map(|(_, c)| c).sum();
+    if hidden > 0 {
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "… +{hidden} more");
     }
     out
 }
@@ -2219,7 +2246,7 @@ mod tests {
 
     /// The complaint that motivated this: a patch decodes 4 mutations and the
     /// log names none of them. The summary names every command with its
-    /// operation, in order.
+    /// operation, most frequent first.
     #[test]
     fn mutation_summary_names_each_command_with_its_operation() {
         use wa::syncd_mutation::SyncdOperation::{REMOVE, SET};
@@ -2236,16 +2263,38 @@ mod tests {
         );
     }
 
-    /// Adjacent repeats collapse so a 12-mutation patch still fits on one line.
+    /// Repeats collapse so a 12-mutation patch still fits on one line —
+    /// including interleaved ones, which adjacent-run compression would miss.
     #[test]
-    fn mutation_summary_collapses_adjacent_repeats() {
+    fn mutation_summary_aggregates_repeats_globally() {
         use wa::syncd_mutation::SyncdOperation::SET;
         let mutations = vec![
+            summary_mutation(Some("contact"), SET),
             summary_mutation(Some("archive"), SET),
+            summary_mutation(Some("contact"), SET),
             summary_mutation(Some("archive"), SET),
             summary_mutation(Some("pin"), SET),
         ];
-        assert_eq!(mutation_summary(&mutations), "SET archive×2, SET pin");
+        assert_eq!(
+            mutation_summary(&mutations),
+            "SET contact×2, SET archive×2, SET pin"
+        );
+    }
+
+    /// Past the entry cap the long tail folds into `… +N more`, so a snapshot
+    /// with hundreds of distinct commands is still one line.
+    #[test]
+    fn mutation_summary_caps_entries_and_counts_the_tail() {
+        use wa::syncd_mutation::SyncdOperation::SET;
+        let mutations: Vec<Mutation> = (0..(MUTATION_SUMMARY_ENTRY_CAP + 3))
+            .map(|i| summary_mutation(Some(&format!("cmd{i}")), SET))
+            .collect();
+        let summary = mutation_summary(&mutations);
+        assert!(summary.contains("… +3 more"), "tail folded: {summary}");
+        assert_eq!(
+            summary.matches("SET cmd").count(),
+            MUTATION_SUMMARY_ENTRY_CAP
+        );
     }
 
     /// An empty index has no command to name; it must still appear (no handler

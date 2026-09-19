@@ -41,63 +41,36 @@
 //! index: it is what the direction is computed from.
 
 use crate::appstate_sync::Mutation;
+use crate::client::AppStateDispatchOutcome;
 use wacore::appstate::schemas;
 use wacore::types::events::{CallLogSync, Event};
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 
-/// Dispatch inbound call-log mutations synced from the primary device.
-/// What one call-log mutation did. Same contract as
-/// [`crate::features::chat_actions::ChatDispatchOutcome`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CallLogDispatchOutcome {
-    Event(&'static str),
-    Malformed(&'static str),
-    Skipped(&'static str),
-    Unclaimed,
-}
-
-/// Dispatch inbound call-log mutations synced from the primary device.
-/// Returns `true` if handled, `false` if the mutation is not a call log.
-///
-/// `is_own_jid` decides the call's direction and is consulted only once the
-/// mutation is known to be a call log, so the app-state path pays nothing for
-/// it on the mutations it is not.
-/// Kept for the unit tests below, which assert the bool contract directly.
-#[allow(dead_code)]
-pub(crate) fn dispatch_call_log_mutation(
-    event_bus: &wacore::types::events::CoreEventBus,
-    m: &mut Mutation,
-    full_sync: bool,
-    is_own_jid: impl FnOnce(&Jid) -> bool,
-) -> bool {
-    dispatch_call_log_mutation_outcome(event_bus, m, full_sync, is_own_jid)
-        != CallLogDispatchOutcome::Unclaimed
-}
-
-/// [`dispatch_call_log_mutation`] with the outcome preserved, for the semantic
-/// per-mutation log line. Same contract; only the return type differs.
+/// Dispatch inbound call-log mutations synced from the primary device,
+/// returning the [`crate::client::AppStateDispatchOutcome`] for the semantic
+/// per-mutation log line.
 pub(crate) fn dispatch_call_log_mutation_outcome(
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     full_sync: bool,
     is_own_jid: impl FnOnce(&Jid) -> bool,
-) -> CallLogDispatchOutcome {
+) -> AppStateDispatchOutcome {
     if m.operation != wa::syncd_mutation::SyncdOperation::Set
         || m.index.first().map(String::as_str) != Some(schemas::CALL_LOG.name)
     {
-        return CallLogDispatchOutcome::Unclaimed;
+        return AppStateDispatchOutcome::Unclaimed;
     }
 
     // Claimed from here on: the mutation is ours whether or not it is one we can
     // read, so returning `Unclaimed` would only hand a malformed call log to
     // dispatchers that key on other indexes.
     let Some(call_creator_jid) = parse_call_creator_jid(&m.index) else {
-        return CallLogDispatchOutcome::Skipped("bad-creator-jid");
+        return AppStateDispatchOutcome::Skipped("bad-creator-jid");
     };
     let Some(call_id) = m.index.get(2).cloned() else {
         log::warn!("Skipping call_log mutation: missing call id in index");
-        return CallLogDispatchOutcome::Skipped("missing-call-id");
+        return AppStateDispatchOutcome::Skipped("missing-call-id");
     };
     // Direction comes from the creator; see the module docs for why not from
     // either field that claims to carry it.
@@ -122,8 +95,8 @@ pub(crate) fn dispatch_call_log_mutation_outcome(
         .and_then(|value| value.call_log_action.as_option_mut())
         .and_then(|action| action.call_log_record.take())
     else {
-        log::warn!("Skipping call_log mutation for {call_id}: missing record in action value");
-        return CallLogDispatchOutcome::Malformed("CallLogSync");
+        // Warned once centrally by `report`; see quick_replies for the policy.
+        return AppStateDispatchOutcome::Malformed("CallLogSync");
     };
 
     event_bus.dispatch(Event::CallLogSync(
@@ -137,7 +110,7 @@ pub(crate) fn dispatch_call_log_mutation_outcome(
             .build(),
     ));
 
-    CallLogDispatchOutcome::Event("CallLogSync")
+    AppStateDispatchOutcome::Event("CallLogSync")
 }
 
 fn parse_call_creator_jid(index: &[String]) -> Option<Jid> {
@@ -192,7 +165,10 @@ mod tests {
         matches!(jid.user.as_str(), "5511888880000" | "111122223333444")
     }
 
-    fn dispatch(mutation: &Mutation, full_sync: bool) -> (bool, Vec<Arc<Event>>) {
+    fn dispatch(
+        mutation: &Mutation,
+        full_sync: bool,
+    ) -> (AppStateDispatchOutcome, Vec<Arc<Event>>) {
         dispatch_as(mutation, full_sync, is_own)
     }
 
@@ -200,14 +176,14 @@ mod tests {
         mutation: &Mutation,
         full_sync: bool,
         is_own_jid: impl FnOnce(&Jid) -> bool,
-    ) -> (bool, Vec<Arc<Event>>) {
+    ) -> (AppStateDispatchOutcome, Vec<Arc<Event>>) {
         let bus = CoreEventBus::new();
         let recorder = Arc::new(Recorder::default());
         bus.subscribe_handler(recorder.clone()).detach();
-        let handled =
-            dispatch_call_log_mutation(&bus, &mut mutation.clone(), full_sync, is_own_jid);
+        let outcome =
+            dispatch_call_log_mutation_outcome(&bus, &mut mutation.clone(), full_sync, is_own_jid);
         let events = recorder.events.lock().unwrap().clone();
-        (handled, events)
+        (outcome, events)
     }
 
     /// The shape WA Web sends: `["call_log", callCreatorJid, callId, fromMe]`.
@@ -242,9 +218,9 @@ mod tests {
             is_video: Some(true),
             ..Default::default()
         };
-        let (handled, events) = dispatch(&call_log_mutation(&full_index(), Some(record)), true);
+        let (outcome, events) = dispatch(&call_log_mutation(&full_index(), Some(record)), true);
 
-        assert!(handled);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert_eq!(events.len(), 1);
         let Event::CallLogSync(update) = events[0].as_ref() else {
             panic!("expected CallLogSync event");
@@ -261,12 +237,12 @@ mod tests {
     #[test]
     fn carries_the_identity_the_index_holds() {
         // A record with none of it, which is what an outbound call can arrive as.
-        let (handled, events) = dispatch(
+        let (outcome, events) = dispatch(
             &call_log_mutation(&full_index(), Some(wa::CallLogRecord::default())),
             false,
         );
 
-        assert!(handled);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         let Event::CallLogSync(update) = events[0].as_ref() else {
             panic!("expected CallLogSync event");
         };
@@ -335,12 +311,12 @@ mod tests {
             ["call_log", OWN_PN, "call-42", "yes"],
             ["call_log", OWN_PN, "call-42", ""],
         ] {
-            let (handled, events) = dispatch(
+            let (outcome, events) = dispatch(
                 &call_log_mutation(&index, Some(wa::CallLogRecord::default())),
                 false,
             );
 
-            assert!(handled);
+            assert!(outcome != AppStateDispatchOutcome::Unclaimed);
             assert_eq!(events.len(), 1, "{index:?} is still a usable call log");
             let Event::CallLogSync(update) = events[0].as_ref() else {
                 panic!("expected CallLogSync event");
@@ -351,9 +327,9 @@ mod tests {
 
     #[test]
     fn missing_record_is_claimed_without_event() {
-        let (handled, events) = dispatch(&call_log_mutation(&full_index(), None), false);
+        let (outcome, events) = dispatch(&call_log_mutation(&full_index(), None), false);
 
-        assert!(handled);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert!(events.is_empty());
     }
 
@@ -368,12 +344,15 @@ mod tests {
             &["call_log", PEER][..],
             &["call_log", "not a jid", "call-42", "1"][..],
         ] {
-            let (handled, events) = dispatch(
+            let (outcome, events) = dispatch(
                 &call_log_mutation(index, Some(wa::CallLogRecord::default())),
                 false,
             );
 
-            assert!(handled, "{index:?} is a call_log mutation");
+            assert!(
+                outcome != AppStateDispatchOutcome::Unclaimed,
+                "{index:?} is a call_log mutation"
+            );
             assert!(
                 events.is_empty(),
                 "{index:?} must not become an event a consumer would misread"
@@ -388,9 +367,9 @@ mod tests {
             index: vec!["setting_pushName".into()],
             action_value: Some(wa::SyncActionValue::default()),
         };
-        let (handled, events) = dispatch(&mutation, false);
+        let (outcome, events) = dispatch(&mutation, false);
 
-        assert!(!handled);
+        assert_eq!(outcome, AppStateDispatchOutcome::Unclaimed);
         assert!(events.is_empty());
     }
 }
