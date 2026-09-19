@@ -39,18 +39,16 @@ struct PreKeyEntry {
 
 /// Key for the mutation-MAC store: `(collection_name, index_mac)`.
 ///
-/// `Box` slices, not `Vec`/`String`: these buffers are inserted, looked up
-/// and removed whole, never grown in place, so paying a capacity word per
-/// buffer bought nothing. `Box<[u8]>` still holds any length — "fixed" here
-/// means no reserved growth, not a 32-byte assumption.
+/// These buffers never grow in place, so boxed storage avoids a capacity
+/// word per buffer while preserving arbitrary byte lengths.
 #[derive(Eq, Hash, PartialEq)]
 struct MutationMacKey {
     collection: Box<str>,
     index_mac: Box<[u8]>,
 }
 
-/// Borrowed lookup key: hashes and compares exactly like [`MutationMacKey`]
-/// (the [`Equivalent`] contract), so reads and removals pay no allocation.
+/// Hashes and compares exactly like [`MutationMacKey`] to satisfy
+/// [`Equivalent`]. Lookups and removals allocate no temporary key.
 #[derive(Hash)]
 struct MutationMacKeyRef<'a> {
     collection: &'a str,
@@ -163,7 +161,7 @@ struct InMemoryState {
     sync_keys: HashMap<Vec<u8>, AppStateSyncKey>,
     latest_sync_key_id: Option<Vec<u8>>,
     versions: HashMap<String, HashState>,
-    /// `(collection_name, hex(index_mac))` -> `value_mac`
+    /// Raw value MACs indexed by [`MutationMacKey`].
     mutation_macs: MutationMacMap,
 
     // --- Protocol ---
@@ -1939,18 +1937,8 @@ mod tests {
                 .unwrap();
         }
         backend.delete_base_key("a", "bc").await.unwrap();
-        assert!(
-            !backend
-                .has_same_base_key("a", "bc", b"key")
-                .await
-                .unwrap()
-        );
-        assert!(
-            backend
-                .has_same_base_key("ab", "c", b"key")
-                .await
-                .unwrap()
-        );
+        assert!(!backend.has_same_base_key("a", "bc", b"key").await.unwrap());
+        assert!(backend.has_same_base_key("ab", "c", b"key").await.unwrap());
         assert_eq!(backend.delete_expired_base_keys(i64::MIN).await.unwrap(), 0);
         assert_eq!(backend.resource_report().await.pages, Some(3));
         assert_eq!(backend.delete_expired_base_keys(i64::MAX).await.unwrap(), 3);
