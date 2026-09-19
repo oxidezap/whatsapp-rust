@@ -3886,7 +3886,8 @@ fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<String> {
     let command = m.index.first().map(String::as_str).unwrap_or("");
     // The schema shape per command, as kinds from index 1 on. Shapes mirror
     // the dispatchers: chat message keys are `[cmd, chat, msg_id, from_me,
-    // participant]`; label_message is `[cmd, label_id, chat, msg_id, ...]`;
+    // participant]`; label_message is `[cmd, label_id, chat, msg_id,
+    // from_me, participant]` (same message-key tail, see `LABEL_MESSAGE`);
     // call_log is `[cmd, creator, call_id, direction]`; deleteChat is
     // `[cmd, chat, deleteMedia]` and clearChat is
     // `[cmd, chat, deleteStarred, deleteMedia]`. Unknown commands
@@ -3894,7 +3895,12 @@ fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<String> {
     // no shape is ever guessed from the value's content.
     let shape: &[IndexLogKind] = match command {
         "star" | "deleteMessageForMe" => &[Jid, Opaque, Flag, Jid],
-        "label_message" => &[Opaque, Jid, Opaque],
+        // Full message-key tail: `from_me` is a declared `Flag` (renders
+        // `from_me=1`, never a fingerprint), `participant` a `Jid` (the
+        // `"0"` absent-participant sentinel passes through). Truncating
+        // here would leave `"1"` to the fallback and read the same slot
+        // as `"0"`/`id#…` depending on its value — semantically backwards.
+        "label_message" => &[Opaque, Jid, Opaque, Flag, Jid],
         "label_jid" => &[Opaque, Jid],
         "call_log" => &[Jid, Opaque, Flag],
         // `deleteChat`/`clearChat` carry their destructive flags in the
@@ -3923,7 +3929,7 @@ fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<String> {
     // (`…@server` is self-describing).
     let labels: &[&str] = match command {
         "star" | "deleteMessageForMe" => &["", "msg", "from_me", ""],
-        "label_message" => &["label", "chat", "msg"],
+        "label_message" => &["label", "chat", "msg", "from_me", ""],
         "label_jid" => &["label", "chat"],
         "call_log" => &["", "call", "direction"],
         "deleteChat" => &["", "delete_media"],
@@ -4114,6 +4120,17 @@ fn mutation_effect_detail(m: &crate::appstate_sync::Mutation) -> Option<Mutation
             .as_option()
             .and_then(|a| a.locked)
             .map(|b| MutationEffectDetail::Bool("locked", b)),
+        // `delete_media` lives in the proto here (unlike
+        // `deleteChat`/`clearChat`, whose flags are index-tail): the DEBUG
+        // line names the destructive choice the dispatcher applied, so
+        // media-preserving and media-deleting replays read differently.
+        // Absent field (None) means the sender omitted it — reported as
+        // false, matching the protobuf default.
+        "deleteMessageForMe" => v
+            .delete_message_for_me_action
+            .as_option()
+            .and_then(|a| a.delete_media)
+            .map(|b| MutationEffectDetail::Bool("delete_media", b)),
         // The destructive flags live in the index tail, not the proto
         // (schemas `DELETE_CHAT`/`CLEAR_CHAT`, dispatcher reads them the
         // same way): the DEBUG line must answer "what was actually
@@ -4874,6 +4891,45 @@ mod tests {
         assert_eq!(redacted_index(&opaque_case)[1], fingerprint_id(opaque));
     }
 
+    /// `label_message` carries the full message-key tail (`from_me`,
+    /// `participant`) after the label/chat/msg triple: `from_me` is a
+    /// declared flag rendering `from_me=1` (never a fingerprint), the
+    /// participant redacts as a JID with the `"0"` sentinel passing
+    /// through — the same positions star already models.
+    #[test]
+    fn redacted_index_models_label_message_tail() {
+        use crate::appstate_sync::Mutation;
+
+        let m = Mutation {
+            index: vec![
+                "label_message".to_string(),
+                "5".to_string(),
+                "120363000000000042@g.us".to_string(),
+                "3EB0284A7C9112345678".to_string(),
+                "1".to_string(),
+                "5511999990042@s.whatsapp.net".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        let msg_id = "3EB0284A7C9112345678";
+        assert_eq!(
+            redacted_index(&m),
+            vec![
+                "label_message".to_string(),
+                format!("label={}", fingerprint_id("5")),
+                "…@g.us".to_string(),
+                format!("msg={}", fingerprint_id(msg_id)),
+                "from_me=1".to_string(),
+                "…@s.whatsapp.net".to_string(),
+            ]
+        );
+        // The `"0"` absent-participant sentinel passes through bare.
+        let mut absent = m.clone();
+        absent.index[5] = "0".to_string();
+        assert_eq!(redacted_index(&absent)[5], "0");
+    }
+
     /// The line renders `cursor=`, not `@`: the version is the page end
     /// cursor (snapshot + patches concatenate), never each mutation's birth
     /// version — per-patch `Decoded … vN` lines keep that granularity.
@@ -5083,6 +5139,44 @@ mod tests {
             )),
             None
         );
+    }
+
+    /// `deleteMessageForMe.delete_media` is applied by the dispatcher from
+    /// the proto (not the index tail): DEBUG must distinguish a
+    /// media-preserving replay from a media-deleting one.
+    #[test]
+    fn mutation_effect_detail_reports_delete_for_me_media() {
+        use crate::appstate_sync::Mutation;
+
+        let scalar = |delete_media: Option<bool>| Mutation {
+            index: vec![
+                "deleteMessageForMe".to_string(),
+                "120363000000000042@g.us".to_string(),
+                "3EB0284A7C9112345678".to_string(),
+                "1".to_string(),
+                "0".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: Some(wa::SyncActionValue {
+                delete_message_for_me_action: buffa::MessageField::some(
+                    wa::sync_action_value::DeleteMessageForMeAction {
+                        delete_media,
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(
+            mutation_effect_detail(&scalar(Some(true))),
+            Some(MutationEffectDetail::Bool("delete_media", true))
+        );
+        assert_eq!(
+            mutation_effect_detail(&scalar(Some(false))),
+            Some(MutationEffectDetail::Bool("delete_media", false))
+        );
+        // Omitted field: no scalar rather than a guessed default.
+        assert_eq!(mutation_effect_detail(&scalar(None)), None);
     }
 
     /// A hostile verb renders sanitized on the line: no newlines, no
