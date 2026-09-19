@@ -39,17 +39,15 @@ struct DeviceWarmState {
 #[derive(Debug)]
 pub(crate) struct SenderKeyDeviceMap {
     /// user → its devices, sorted by device id.
-    devices: HashMap<Arc<str>, Box<[DeviceWarmState]>>,
+    ///
+    /// Plain `Box<str>` keys: the sharing this map needs lives one level up
+    /// (`Arc<SenderKeyDeviceMap>` in the cache), so per-user reference counts
+    /// would buy nothing.
+    devices: HashMap<Box<str>, Box<[DeviceWarmState]>>,
     /// Bumped on every in-place warm-state change. Same freshness contract the
     /// device-registry generation gives membership.
     generation: AtomicU64,
 }
-
-/// The two reference counts an `Arc` allocation carries ahead of its payload.
-/// A user key is one `Arc<str>` per user, so leaving this out understated a
-/// 1024-user map by 16 KiB — and a report that understates what grows is the
-/// one thing `HeapSize` says these figures must not do.
-const ARC_HEADER: usize = 2 * size_of::<usize>();
 
 /// The state of `device_id` within one user's devices.
 ///
@@ -79,14 +77,14 @@ impl SenderKeyDeviceMap {
         // Deliberately unsized: `rows` counts devices, not users, so reserving
         // by it over-allocates the outer table by however many devices a user
         // averages — three, in a group whose members carry companions.
-        let mut by_user: HashMap<Arc<str>, Vec<DeviceWarmState>> = HashMap::new();
+        let mut by_user: HashMap<Box<str>, Vec<DeviceWarmState>> = HashMap::new();
 
         for (jid_str, has_key) in rows {
             match jid_str.parse::<Jid>() {
                 Ok(jid) => {
-                    // `Arc<str>: Borrow<str>`, so the repeat rows of a user
+                    // `Box<str>: Borrow<str>`, so the repeat rows of a user
                     // that already has an entry cost a lookup instead of a
-                    // fresh `Arc` allocation per device.
+                    // fresh allocation per device.
                     match by_user.get_mut(jid.user.as_str()) {
                         Some(states) => match device_state(states, jid.device) {
                             // Two rows can collapse onto one (user, device):
@@ -114,7 +112,7 @@ impl SenderKeyDeviceMap {
                         },
                         None => {
                             by_user.insert(
-                                Arc::from(jid.user.as_str()),
+                                Box::from(jid.user.as_str()),
                                 vec![DeviceWarmState {
                                     device_id: jid.device,
                                     has_key: AtomicBool::new(*has_key),
@@ -200,13 +198,11 @@ impl SenderKeyDeviceMap {
         // iteration.
         hash_table_bytes(
             self.devices.capacity(),
-            size_of::<(Arc<str>, Box<[DeviceWarmState]>)>(),
+            size_of::<(Box<str>, Box<[DeviceWarmState]>)>(),
         ) + self
             .devices
             .iter()
-            .map(|(user, states)| {
-                ARC_HEADER + user.len() + states.len() * size_of::<DeviceWarmState>()
-            })
+            .map(|(user, states)| user.len() + states.len() * size_of::<DeviceWarmState>())
             .sum::<usize>()
     }
 }
