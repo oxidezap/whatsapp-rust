@@ -184,8 +184,8 @@ impl SenderKeyDeviceMap {
                     .is_some_and(|state| state.has_key.load(Ordering::Relaxed)))
     }
 
-    /// Bytes this map retains beyond its own struct: the tables it owns plus
-    /// the user strings it keys on.
+    /// Estimated bytes retained beyond this struct, including the hash table,
+    /// boxed user strings, and device slices.
     ///
     /// One definition, shared by the cache's `memory_stats` and by the test
     /// that pins the per-device bound — a second copy would let the report and

@@ -44,6 +44,9 @@ Exact, kept exact:
 - The four-word saving in `wacore/libsignal/src/protocol/sender_keys.rs`.
   Stated as `Vec + MessageField == 4 * size_of::<usize>()`, width
   independent. This is the pin that matters there.
+- Compact mutation-MAC entries in `wacore/src/store/in_memory.rs`.
+  See `mutation_mac_entry_layout_is_smaller_without_capacity_words` for
+  the compositional and relative bounds, independent of pointer width.
 
 Budgets, asserted with `<=`:
 
