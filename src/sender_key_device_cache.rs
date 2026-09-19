@@ -545,6 +545,19 @@ mod tests {
             }
         }
         let map = SenderKeyDeviceMap::from_db_rows(&rows);
+        let expected = hash_table_bytes(
+            map.devices.capacity(),
+            size_of::<(Box<str>, Box<[DeviceWarmState]>)>(),
+        ) + map
+            .devices
+            .iter()
+            .map(|(user, states)| user.len() + states.len() * size_of::<DeviceWarmState>())
+            .sum::<usize>();
+        assert_eq!(
+            map.retained_bytes(),
+            expected,
+            "sender-key accounting must not retain the removed Arc headers"
+        );
 
         let per_device =
             (size_of::<SenderKeyDeviceMap>() + map.retained_bytes()) / (USERS * DEVICES_PER_USER);

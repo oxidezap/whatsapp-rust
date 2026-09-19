@@ -1927,6 +1927,59 @@ mod tests {
         assert_eq!(backend.resource_report().await.pages, Some(12));
     }
 
+    #[test]
+    fn mutation_mac_entry_layout_is_smaller_without_capacity_words() {
+        // The old entry had three growable containers (String + two Vecs). The
+        // compact entry has three boxed DST pointers and no spare-capacity
+        // words. Keep this relational so it remains valid on 32- and 64-bit
+        // targets without prescribing a pointer width.
+        assert_eq!(
+            size_of::<MutationMacKey>(),
+            size_of::<(Box<str>, Box<[u8]>)>()
+        );
+        assert_eq!(
+            size_of::<(MutationMacKey, Box<[u8]>)>(),
+            size_of::<(Box<str>, Box<[u8]>, Box<[u8]>)>()
+        );
+        assert!(
+            size_of::<(MutationMacKey, Box<[u8]>)>() < size_of::<((String, Vec<u8>), Vec<u8>)>(),
+            "boxed mutation-MAC entries must retain fewer capacity fields"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_mac_report_accounts_table_keys_and_payloads() {
+        let backend = InMemoryBackend::new();
+        let name = "regular";
+        let index_mac = vec![1, 2, 3, 4, 5];
+        let value_mac = vec![6, 7, 8];
+        backend
+            .put_mutation_macs(
+                name,
+                1,
+                &[AppStateMutationMAC {
+                    index_mac: index_mac.clone(),
+                    value_mac: value_mac.clone(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let expected = {
+            let state = backend.state.lock().await;
+            let table = hb_table_bytes(&state.mutation_macs);
+            let payload = state
+                .mutation_macs
+                .iter()
+                .map(|(key, value)| key.collection.len() + key.index_mac.len() + value.len())
+                .sum::<usize>();
+            table + payload
+        };
+        let report = backend.resource_report().await;
+        assert_eq!(report.pages, Some(1));
+        assert_eq!(report.memory_bytes, Some(expected as u64));
+    }
+
     #[tokio::test]
     async fn base_key_fields_and_retention_remain_independent() {
         let backend = InMemoryBackend::new();
