@@ -3232,11 +3232,16 @@ impl Client {
                     // the post-apply cursor and `list.name` the collection —
                     // without it these mutations would dispatch with `ctx`
                     // unset and lose their per-mutation line entirely.
+                    // A 409 absorb replays what the server sent, snapshot
+                    // included (inline or via `snapshot_ref`, inlined before
+                    // processing): like any full replay, per-mutation lines
+                    // stay at TRACE (the processor aggregate keeps DEBUG).
+                    let replaying_snapshot = list.snapshot.is_some() || list.snapshot_ref.is_some();
                     let total = mutations.len();
                     for (position, mut m) in mutations.into_iter().enumerate() {
                         self.dispatch_app_state_mutation(
                             &mut m,
-                            false,
+                            replaying_snapshot,
                             (list.name, new_state.version, position + 1, total),
                         )
                         .await;
@@ -3689,29 +3694,35 @@ impl AppStateDispatchOutcome {
     }
 }
 
-/// Sanitize an arbitrary string for a log line: control characters become
-/// `U+FFFD`, so a decoded wire value can neither forge extra log lines nor
-/// emit terminal escapes. DEL is included: it is a control character, not
-/// printable text. Plain `char::is_control` would also strip `\u{200B}`-style
-/// formatting characters that are harmless in a log; matching explicitly on
-/// `\n\r\t`, C0 and DEL keeps the predicate to what actually breaks lines
-/// or terminals.
+/// Sanitize an arbitrary string for a log line: anything that can break the
+/// line discipline or drive a terminal becomes `U+FFFD`, so a decoded wire
+/// value can neither forge extra log lines nor emit escapes. That is C0 +
+/// DEL (which covers `\n\r\t`), C1 (`U+0080..=U+009F`, including the
+/// SS2/CSI-adjacent controls), the Unicode line/paragraph separators
+/// (`U+2028`/`U+2029`), and the bidirectional embedding/override controls
+/// (`U+202A..=U+202E`, `U+2066..=U+2069`), which reorder rendered text and
+/// are a classic log-spoofing vector. Plain `char::is_control` would also
+/// strip `\u{200B}`-style formatting characters that are harmless in a log;
+/// matching the line/terminal-affecting set explicitly keeps zero-width text
+/// intact while closing the spoofing surface.
 fn sanitize_for_log(s: &str) -> Cow<'_, str> {
-    if !s
-        .chars()
-        .any(|c| matches!(c, '\n' | '\r' | '\t' | '\u{0}'..='\u{1F}' | '\u{7F}'))
-    {
+    fn is_log_unsafe(c: char) -> bool {
+        matches!(
+            c,
+            '\u{0}'..='\u{1F}'
+                | '\u{7F}'..='\u{9F}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+        )
+    }
+    if !s.chars().any(is_log_unsafe) {
         return Cow::Borrowed(s);
     }
     Cow::Owned(
         s.chars()
-            .map(|c| {
-                if matches!(c, '\n' | '\r' | '\t' | '\u{0}'..='\u{1F}' | '\u{7F}') {
-                    '\u{FFFD}'
-                } else {
-                    c
-                }
-            })
+            .map(|c| if is_log_unsafe(c) { '\u{FFFD}' } else { c })
             .collect(),
     )
 }
@@ -3749,6 +3760,7 @@ fn sanitize_command(command: &str) -> String {
 /// is not a JID at all and fingerprints whole instead of leaking the suffix
 /// verbatim. Control characters are sanitized on both halves first, so a
 /// retained server can neither forge lines nor emit escapes.
+#[cfg_attr(not(test), allow(dead_code))]
 fn redact_index_arg(arg: &str) -> Cow<'_, str> {
     let Some((user, server)) = arg.split_once('@') else {
         return Cow::Borrowed(arg);
@@ -3770,36 +3782,74 @@ fn redact_index_arg(arg: &str) -> Cow<'_, str> {
 /// bytes of SHA-256 hex (`id#<16 hex chars>`), so short ids (`call-42`,
 /// `MSGID123`, `label123`) are masked exactly like long ones and no
 /// prefix/suffix of the real identifier leaks. Same input renders the same
-/// output within and across processes (plain hash, no random seed); 64 bits
+/// output within and across processes for a given build (see below); 64 bits
 /// make accidental collision insignificant for log correlation. Computed only
 /// behind the DEBUG/TRACE gate, like every other projection here.
+///
+/// Keyed by a process-local secret: low-entropy ids (numeric label ids,
+/// timestamp-like quick-reply ids) are enumerable offline, so a plain hash
+/// would let an observer precompute candidates and match logged prefixes.
+/// The key is generated once per process from OS randomness, so fingerprints
+/// correlate within one run's logs but are meaningless across runs — which is
+/// exactly the window correlation needs. (Cross-run correlation would require
+/// a persisted secret; deliberately not done: it would turn the log into a
+/// long-lived join key for guessable ids.)
 ///
 /// Module-private like every other projection here — except the
 /// sub-dispatchers reuse it for their own WARNs (see the re-export through
 /// `crate::client`): a malformed wire value must never reach the log
 /// verbatim either.
 pub(crate) fn fingerprint_id(id: &str) -> String {
-    use sha2::{Digest, Sha256};
+    use hmac::Mac;
+    use hmac::digest::KeyInit;
+    use std::sync::OnceLock;
 
-    let digest = Sha256::digest(id.as_bytes());
+    static FINGERPRINT_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    let key = FINGERPRINT_KEY.get_or_init(|| {
+        use rand::RngExt;
+        rand::make_rng::<rand::rngs::StdRng>().random()
+    });
+
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key).expect("any key length is valid");
+    mac.update(id.as_bytes());
+    let digest = mac.finalize().into_bytes();
     format!(
         "id#{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
     )
 }
 
+/// The kind a single index element has for logging: either a JID-shaped
+/// account reference or an opaque identifier. Decided by schema position,
+/// never by sniffing the value for `@` — an opaque id may legally contain
+/// one (e.g. a caller-provided label id).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexLogKind {
+    Jid,
+    Opaque,
+    /// A wire flag that is exactly `"0"` / `"1"` (`from_me`, `direction`,
+    /// the `"0"` participant sentinel). Anything else in such a slot is an
+    /// opaque value, not a flag.
+    Flag,
+}
+
 /// Redact a value sitting in a position the schema declares as a JID:
-/// a well-formed `user@server` redacts to `…@server`, anything else (corrupt
-/// wire data, a future shape, an opaque value where a JID was expected)
-/// fingerprints instead of leaking verbatim. The `"0"` participant
-/// sentinel passes through: it means "no participant", not an identifier.
+/// a value that parses as a JID with a known server redacts to
+/// `…@server`, anything else (corrupt wire data, a future shape, an opaque
+/// value where a JID was expected) fingerprints instead of leaking verbatim.
+/// Parsing — not `contains('@')` — is the trust boundary: `x@CUSTOMER_ID`
+/// has an `@` but is not a JID, and must never keep its suffix. The `"0"`
+/// participant sentinel passes through: it means "no participant", not an
+/// identifier.
 ///
 /// Module-private: all JID-declared positions route through it.
 fn redact_jid_or_fingerprint(arg: &str) -> String {
-    if arg == "0" || arg.contains('@') {
-        redact_index_arg(arg).into_owned()
-    } else {
-        fingerprint_id(arg)
+    if arg == "0" {
+        return "0".to_string();
+    }
+    match wacore_binary::jid::parse_jid_ref(arg) {
+        Some(jid) => format!("…@{}", jid.server.as_str()),
+        None => fingerprint_id(arg),
     }
 }
 
@@ -3821,39 +3871,67 @@ fn redact_jid_or_fingerprint(arg: &str) -> String {
 /// message ids and participant JIDs, which would bypass the DEBUG-level
 /// redaction.
 fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<String> {
+    use IndexLogKind::{Flag, Jid, Opaque};
+
     let command = m.index.first().map(String::as_str).unwrap_or("");
-    // Extra labels by position, starting at index 2. Shapes mirror the
-    // dispatchers: chat message keys are `[cmd, chat, msg_id, from_me,
+    // The schema shape per command, as kinds from index 1 on. Shapes mirror
+    // the dispatchers: chat message keys are `[cmd, chat, msg_id, from_me,
     // participant]`; label_message is `[cmd, label_id, chat, msg_id, ...]`;
-    // call_log is `[cmd, creator, call_id, direction]`. Position 1 always
-    // routes through [`redact_jid_or_fingerprint`] — JID-shaped redacts,
-    // anything else fingerprints — so unknown commands assume nothing about
-    // `index[1]` and still leak nothing verbatim.
-    let extra: &[&str] = match command {
-        "star" | "deleteMessageForMe" => &["msg", "from_me", "participant"],
-        "label_message" => &["chat", "msg"],
-        "label_jid" => &["chat"],
-        "call_log" => &["call", "direction"],
+    // call_log is `[cmd, creator, call_id, direction]`. Unknown commands
+    // declare nothing and fall back to per-element classification below, so
+    // no shape is ever guessed from the value's content.
+    let shape: &[IndexLogKind] = match command {
+        "star" | "deleteMessageForMe" => &[Jid, Opaque, Flag, Jid],
+        "label_message" => &[Opaque, Jid, Opaque],
+        "label_jid" => &[Opaque, Jid],
+        "call_log" => &[Jid, Opaque, Flag],
+        "mute" | "pin" | "pin_v1" | "archive" | "contact" | "mark_chat_as_read"
+        | "markChatAsRead" | "deleteChat" | "clearChat" | "lock" | "userStatusMute" => &[Jid],
+        "quick_reply"
+        | "label_edit"
+        | "nct_salt_sync"
+        | "setting_pushName"
+        | "setting_disableLinkPreviews" => &[Opaque],
         _ => &[],
     };
+    // Positional labels for the fingerprinted slots, for readability
+    // (`msg=id#…` rather than a bare hash). JID and flag slots need none:
+    // JIDs render as `…@server`, flags pass through as-is.
+    let labels: &[&str] = match command {
+        "star" | "deleteMessageForMe" => &["", "msg", "from_me", ""],
+        "label_message" => &["label", "chat", "msg"],
+        "label_jid" => &["label", "chat"],
+        "call_log" => &["", "call", "direction"],
+        "quick_reply" => &["id"],
+        "label_edit" => &["label"],
+        "nct_salt_sync" => &["salt"],
+        "setting_pushName" => &["push_name"],
+        "setting_disableLinkPreviews" => &["setting"],
+        _ => &[],
+    };
+    fn render(kind: IndexLogKind, label: &str, arg: &str) -> String {
+        match kind {
+            Jid => redact_jid_or_fingerprint(arg),
+            Flag if matches!(arg, "0" | "1") => arg.to_string(),
+            Flag => fingerprint_id(arg),
+            Opaque if label.is_empty() => fingerprint_id(arg),
+            Opaque => format!("{label}={}", fingerprint_id(arg)),
+        }
+    }
     let mut out = Vec::with_capacity(m.index.len());
     for (i, arg) in m.index.iter().enumerate() {
         if i == 0 {
-            out.push(arg.clone());
-        } else if i == 1 {
-            out.push(redact_jid_or_fingerprint(arg));
-        } else if let Some(label) = extra.get(i - 2) {
-            out.push(match *label {
-                // Known JID positions inside known shapes — via the shared
-                // helper so a malformed value fingerprints instead of
-                // leaking verbatim.
-                "chat" | "participant" => redact_jid_or_fingerprint(arg),
-                // `from_me` / `direction` are exactly `"0"` / `"1"`;
-                // anything else in that slot is an opaque value, not a flag.
-                "from_me" | "direction" if matches!(arg.as_str(), "0" | "1") => arg.clone(),
-                _ => format!("{label}={}", fingerprint_id(arg)),
-            });
+            // The verb renders sanitized (see `log_mutation_dispatched`):
+            // never verbatim wire text.
+            out.push(sanitize_command(arg));
+        } else if let Some((kind, label)) =
+            shape.get(i - 1).copied().zip(labels.get(i - 1).copied())
+        {
+            out.push(render(kind, label, arg));
         } else {
+            // Beyond the declared shape (or an unknown command): classify by
+            // element — JID-parsable redacts, anything else fingerprints —
+            // so a future shape leaks nothing either way.
             out.push(redact_jid_or_fingerprint(arg));
         }
     }
@@ -4444,21 +4522,18 @@ mod tests {
     /// lines and processes (plain hash, no random seed).
     #[test]
     fn fingerprint_id_masks_short_and_long_ids_stably() {
-        use sha2::{Digest, Sha256};
-
-        let expect = |id: &str| {
-            let d = Sha256::digest(id.as_bytes());
-            format!(
-                "id#{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
-            )
-        };
-        // Short ids are masked too — never verbatim.
-        assert_eq!(fingerprint_id("MSGID123"), expect("MSGID123"));
-        assert_eq!(fingerprint_id("call-42"), expect("call-42"));
-        assert!(fingerprint_id("MSGID123").starts_with("id#"));
-        assert_eq!(fingerprint_id("MSGID123").len(), 3 + 16);
-        // Stable within and across calls; distinct inputs diverge.
+        // Keyed by a process-local secret: stable within this run (so lines
+        // correlate), meaningless across runs (so offline enumeration of
+        // low-entropy ids buys nothing). Assert shape + stability + masking,
+        // never a fixed digest — the key is random per process.
+        for id in ["MSGID123", "call-42", "abc"] {
+            let fp = fingerprint_id(id);
+            assert!(fp.starts_with("id#"), "{id} fingerprints, got {fp}");
+            assert_eq!(fp.len(), 3 + 16);
+            assert!(!fp.contains(id));
+        }
+        // Stable within the process; distinct inputs diverge (including the
+        // old head/tail-collision pair, which a prefix scheme conflated).
         assert_eq!(fingerprint_id("abc"), fingerprint_id("abc"));
         assert_ne!(
             fingerprint_id("ABCD1111WXYZ"),
