@@ -464,8 +464,8 @@ what a component can introspect — absent means "not reported", not zero):
   `VACUUM` returns to the filesystem), and the `-wal` sidecar's size on disk.
   Remote backends report
   `memory_bytes: Some(0)`. `InMemoryBackend` sums its own maps (table
-  allocations plus the heap its keys and values own), which is exact rather
-  than a cap, because every byte it holds is this process's heap.
+  allocations plus the heap its keys and values own). This is a retained-byte
+  estimate under the `HeapSize` accounting rules above, not an RSS measurement.
 - **Transport** — `Transport::resource_report() -> Option<TransportResourceReport>`,
   a defaulted method (clean here — `Transport` isn't blanket-impl'd). The Tokio
   WebSocket transport fills best-effort static estimates (tokio-websockets and
