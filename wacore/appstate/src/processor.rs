@@ -43,12 +43,41 @@ impl<'a> MutationSummary<'a> {
     }
 }
 
+/// Cap a decoded command verb for logging: control characters become
+/// `U+FFFD` and the token is bounded, so a hostile verb can neither forge
+/// log lines nor blow up the aggregate. Kept next to the `Display` impl it
+/// protects — the summary below is the only writer.
+fn sanitize_command(command: &str) -> String {
+    const MAX_COMMAND_CHARS: usize = 48;
+    const TAIL: usize = 8;
+    let sanitized: String = command
+        .chars()
+        .map(|c| {
+            if matches!(c, '\n' | '\r' | '\t' | '\u{0}'..='\u{1F}' | '\u{7F}') {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let count = sanitized.chars().count();
+    if count <= MAX_COMMAND_CHARS {
+        return sanitized;
+    }
+    let head: String = sanitized
+        .chars()
+        .take(MAX_COMMAND_CHARS.saturating_sub(TAIL + 1))
+        .collect();
+    let tail: String = sanitized.chars().skip(count - TAIL).collect();
+    format!("{head}…{tail}")
+}
+
 impl std::fmt::Display for MutationSummary<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.command.is_empty() {
             write!(f, "{} <no-command>", self.operation)
         } else {
-            write!(f, "{} {}", self.operation, self.command)
+            write!(f, "{} {}", self.operation, sanitize_command(self.command))
         }
     }
 }
@@ -2308,5 +2337,21 @@ mod tests {
             "SET <no-command>"
         );
         assert_eq!(mutation_summary(&[]), "");
+    }
+
+    /// A hostile verb can neither forge log lines nor blow up the aggregate:
+    /// control characters render as `U+FFFD` and the token is bounded.
+    #[test]
+    fn mutation_summary_sanitizes_hostile_commands() {
+        use wa::syncd_mutation::SyncdOperation::SET;
+        let forged = "archive\nFORGED: yes\u{1B}[2J";
+        let summary = mutation_summary(&[summary_mutation(Some(forged), SET)]);
+        assert!(!summary.contains('\n'));
+        assert!(!summary.contains('\u{1B}'));
+        assert!(summary.starts_with("SET archive"));
+        let long = "a".repeat(200);
+        let summary = mutation_summary(&[summary_mutation(Some(&long), SET)]);
+        assert!(summary.chars().count() < 200);
+        assert!(summary.contains('…'));
     }
 }

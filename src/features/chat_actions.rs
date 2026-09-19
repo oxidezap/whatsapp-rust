@@ -99,10 +99,13 @@ pub(crate) fn dispatch_chat_mutation_outcome(
     // `contact` is the one chat action whose deletion arrives as a syncd
     // `Remove` (WAWebContactSync branches on `operation === "remove"`); every
     // other kind here encodes its "off" state inside a `Set` value, so a
-    // non-`Set` operation on one of them is not ours to interpret.
-    let is_contact_remove = m.operation == wa::syncd_mutation::SyncdOperation::REMOVE
-        && kind == "contact"
-        && m.index.len() > 1;
+    // non-`Set` operation on one of them is not ours to interpret. The
+    // operation gates the claim — not the index length: a `REMOVE contact`
+    // with no JID is still a contact removal, and the missing-JID branch
+    // below reports it as `Skipped` rather than misrouting it to `Unclaimed`
+    // (no other dispatcher owns contact removals).
+    let is_contact_remove =
+        m.operation == wa::syncd_mutation::SyncdOperation::REMOVE && kind == "contact";
     if m.operation != wa::syncd_mutation::SyncdOperation::SET && !is_contact_remove {
         return AppStateDispatchOutcome::Unclaimed;
     }
@@ -1355,6 +1358,23 @@ mod registry_tests {
         let (outcome, events) = dispatch_outcome_into_recorder(&m);
         assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert!(matches!(&*events[0], Event::ContactUpdate(_)));
+    }
+
+    #[test]
+    fn a_contact_remove_without_jid_is_skipped_not_unclaimed() {
+        // `contact` owns the Remove operation regardless of index length:
+        // a bare `REMOVE contact` is a malformed contact mutation (the
+        // missing-JID branch reports `Skipped`), never an unknown command.
+        // No other dispatcher owns contact removals, so `Unclaimed` here
+        // would misroute it and mute the specific warning.
+        let m = Mutation {
+            index: vec!["contact".into()],
+            operation: wa::syncd_mutation::SyncdOperation::REMOVE,
+            action_value: Some(wa::SyncActionValue::default()),
+        };
+        let (outcome, events) = dispatch_outcome_into_recorder(&m);
+        assert_eq!(outcome, AppStateDispatchOutcome::Skipped("missing-jid"));
+        assert!(events.is_empty());
     }
 
     #[test]

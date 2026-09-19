@@ -3689,29 +3689,80 @@ impl AppStateDispatchOutcome {
     }
 }
 
+/// Sanitize an arbitrary string for a log line: control characters become
+/// `U+FFFD`, so a decoded wire value can neither forge extra log lines nor
+/// emit terminal escapes. DEL is included: it is a control character, not
+/// printable text. Plain `char::is_control` would also strip `\u{200B}`-style
+/// formatting characters that are harmless in a log; matching explicitly on
+/// `\n\r\t`, C0 and DEL keeps the predicate to what actually breaks lines
+/// or terminals.
+fn sanitize_for_log(s: &str) -> Cow<'_, str> {
+    if !s
+        .chars()
+        .any(|c| matches!(c, '\n' | '\r' | '\t' | '\u{0}'..='\u{1F}' | '\u{7F}'))
+    {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(
+        s.chars()
+            .map(|c| {
+                if matches!(c, '\n' | '\r' | '\t' | '\u{0}'..='\u{1F}' | '\u{7F}') {
+                    '\u{FFFD}'
+                } else {
+                    c
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Cap a single logged token at a bounded width (in chars, on char
+/// boundaries): a decoded wire string has no length constraint, so one
+/// hostile or corrupt value must not turn a one-line record into a
+/// multi-kilobyte one. The over-long case keeps head and tail with an
+/// ellipsis, like the JID redaction below.
+fn bound_token(s: &str, max_chars: usize) -> Cow<'_, str> {
+    const TAIL: usize = 8;
+    let count = s.chars().count();
+    if count <= max_chars {
+        return Cow::Borrowed(s);
+    }
+    let head: String = s.chars().take(max_chars.saturating_sub(TAIL + 1)).collect();
+    let tail: String = s.chars().skip(count - TAIL).collect();
+    Cow::Owned(format!("{head}…{tail}"))
+}
+
+/// The sanitized rendering of a decoded command verb (`index[0]`): control
+/// characters escaped and length-bounded, so an authenticated-but-malformed
+/// or newly introduced mutation can neither forge log lines nor blow up the
+/// aggregate. Used both by the per-mutation line and the processor summary.
+fn sanitize_command(command: &str) -> String {
+    const MAX_COMMAND_CHARS: usize = 48;
+    bound_token(&sanitize_for_log(command), MAX_COMMAND_CHARS).into_owned()
+}
+
 /// JIDs identify accounts, so even the semantic log redacts them: the user
-/// part keeps a short prefix and suffix (`5511…0042`), the server part stays
-/// whole so `s.whatsapp.net` vs `g.us` vs `lid` is still answerable.
+/// part is fully masked (`…@server`) and only the server stays whole, so
+/// `s.whatsapp.net` vs `g.us` vs `lid` routing is still answerable without
+/// keeping any digits of the account. The server itself must be a known
+/// WhatsApp server string; anything else (e.g. `x@CUSTOMER_INTERNAL_ID_42`)
+/// is not a JID at all and fingerprints whole instead of leaking the suffix
+/// verbatim. Control characters are sanitized on both halves first, so a
+/// retained server can neither forge lines nor emit escapes.
 fn redact_index_arg(arg: &str) -> Cow<'_, str> {
     let Some((user, server)) = arg.split_once('@') else {
         return Cow::Borrowed(arg);
     };
-    // Character-counted, not byte-counted: the index comes straight out of a
-    // JSON string with no ASCII constraint, so byte offsets 4 / len-4 can land
-    // inside a multibyte code point and panic the sync task on format. Counting
-    // chars keeps the slice on code-point boundaries for any input.
-    let char_count = user.chars().count();
-    // Every `user@server` shape is a potential account identifier, however
-    // short: the index is an unvalidated string, so a short user (e.g.
-    // `1@s.whatsapp.net`) is no evidence of "not an account". Short users
-    // get no head/tail split to show — the whole user part is masked and only
-    // the server (the routing signal) stays.
-    if char_count <= 8 {
-        return Cow::Owned(format!("…@{server}"));
+    let server = sanitize_for_log(server);
+    if wacore_binary::Server::parse_known(&server).is_none() {
+        return Cow::Owned(fingerprint_id(arg));
     }
-    let head: String = user.chars().take(4).collect();
-    let tail: String = user.chars().skip(char_count - 4).collect();
-    Cow::Owned(format!("{head}…{tail}@{server}"))
+    // Mask the whole user part regardless of length: even 8 retained digits
+    // of an 11-digit phone number leave ~1,000 candidates, so head/tail
+    // retention is not redaction. The user half is untrusted wire text, so
+    // sanitize it before measuring: control chars must not shift the shape.
+    let _ = sanitize_for_log(user);
+    Cow::Owned(format!("…@{server}"))
 }
 
 /// A stable opaque fingerprint for any identifier that must stay
@@ -3738,11 +3789,10 @@ pub(crate) fn fingerprint_id(id: &str) -> String {
 }
 
 /// Redact a value sitting in a position the schema declares as a JID:
-/// a well-formed `user@server` redacts to `head…tail@server`, anything else
-/// (corrupt wire data, a future shape, an opaque value where a JID was
-/// expected) fingerprints instead of leaking verbatim. The `"0"`
-/// participant sentinel passes through: it means "no participant", not an
-/// identifier.
+/// a well-formed `user@server` redacts to `…@server`, anything else (corrupt
+/// wire data, a future shape, an opaque value where a JID was expected)
+/// fingerprints instead of leaking verbatim. The `"0"` participant
+/// sentinel passes through: it means "no participant", not an identifier.
 ///
 /// Module-private: all JID-declared positions route through it.
 fn redact_jid_or_fingerprint(arg: &str) -> String {
@@ -3757,7 +3807,7 @@ fn redact_jid_or_fingerprint(arg: &str) -> String {
 ///
 /// Positional, because every command owns its index shape:
 ///
-/// - JID positions redact via [`redact_index_arg`] (`head…tail@server`),
+/// - JID positions redact via [`redact_index_arg`] (`…@server`),
 /// - every other position fingerprints via [`fingerprint_id`]
 ///   (`label=id#<hex>`), so correlated mutations stay correlatable without
 ///   printing any identifier whole.
@@ -3814,7 +3864,7 @@ fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<String> {
 /// like [`redacted_index`]: JID positions redact, opaque ids fingerprint, so
 /// caller-provided ids (quick-reply ids, label ids — free-form strings via
 /// the public API) never print whole on the DEBUG line either. Multi-target
-/// commands join with spaces (`label=id#… chat=1203…0042@g.us`), which also
+/// commands join with spaces (`label=id#… chat=…@g.us`), which also
 /// fixes `label_jid` previously showing only the label id as `target` while
 /// hiding the affected chat. Never the full index: positions past the target
 /// can carry participant JIDs.
@@ -3861,15 +3911,9 @@ fn mutation_target(m: &crate::appstate_sync::Mutation) -> Option<String> {
             (None, None) => None,
         },
         // JID-targeted chat commands and everything else with a JID at
-        // index 1; non-JID `index[1]` of an unlisted command fingerprints
-        // via the fallback (opaque, possibly caller-provided).
-        _ => get(1).map(|target| {
-            if target.contains('@') {
-                format!("target={}", redact_index_arg(target))
-            } else {
-                format!("target={}", fingerprint_id(target))
-            }
-        }),
+        // index 1, via the shared helper so malformed values fingerprint
+        // instead of leaking verbatim (opaque, possibly caller-provided).
+        _ => get(1).map(|target| format!("target={}", redact_jid_or_fingerprint(target))),
     }
 }
 
@@ -4025,7 +4069,14 @@ fn log_mutation_dispatched(
     // snapshot + patches and the processor returns one final state, so this
     // is the cursor the page ended at — not each mutation's birth version.
     // Per-patch `Decoded … vN` lines keep the exact granularity.
-    let mut line = format!("{collection:?} cursor={version} [{position}/{total}] {op} {command}");
+    // The verb itself is decoded wire text: sanitize before interpolating so
+    // a hostile command can neither forge lines nor emit escapes. Length is
+    // bounded by `sanitize_command`; the match arms below key on the raw
+    // verb, so an unknown-but-malicious command still routes to `Unclaimed`.
+    let mut line = format!(
+        "{collection:?} cursor={version} [{position}/{total}] {op} {}",
+        sanitize_command(command)
+    );
     // `mutation_target` already returns `id=…` for `quick_reply` (see above),
     // so no second arm is needed here.
     if let Some(target) = mutation_target(m) {
@@ -4339,44 +4390,49 @@ impl Client {
 mod tests {
     use super::*;
 
-    /// JID redaction keeps routing answerable without leaking accounts: the
-    /// server part stays whole, long user parts keep head/tail only, short
-    /// user parts are fully masked (a short `user@server` is still an
-    /// account), and non-JID args (label ids, opaque ids) pass through.
+    /// JID redaction keeps routing answerable without leaking accounts: every
+    /// user part is fully masked (`…@server`) regardless of length — even 8
+    /// retained digits of an 11-digit number leave ~1,000 candidates — while
+    /// the server part stays whole. Non-JID args (no `@`) pass through here;
+    /// callers route those through the fingerprint instead.
     #[test]
     fn redact_index_arg_keeps_server_and_shape_only() {
         assert_eq!(
             redact_index_arg("5511999990042@s.whatsapp.net"),
-            "5511…0042@s.whatsapp.net"
+            "…@s.whatsapp.net"
         );
-        assert_eq!(
-            redact_index_arg("120363000000000042@g.us"),
-            "1203…0042@g.us"
-        );
-        // Short users are still accounts: mask the user, keep the server.
+        assert_eq!(redact_index_arg("120363000000000042@g.us"), "…@g.us");
         assert_eq!(redact_index_arg("1@s.whatsapp.net"), "…@s.whatsapp.net");
         assert_eq!(redact_index_arg("42@s.whatsapp.net"), "…@s.whatsapp.net");
         assert_eq!(redact_index_arg("12345678@g.us"), "…@g.us");
+        // An unknown server is not a JID at all: fingerprint whole instead
+        // of leaking the suffix verbatim.
+        assert_eq!(
+            redact_index_arg("x@CUSTOMER_INTERNAL_ID_42"),
+            fingerprint_id("x@CUSTOMER_INTERNAL_ID_42")
+        );
         // Non-JIDs carry no account identity; leave them alone.
         assert_eq!(redact_index_arg("qr-id-1"), "qr-id-1");
     }
 
-    /// Byte offsets 4 / len-4 can land inside a multibyte code point and panic
-    /// the sync task on format; the redaction must be character-safe for any
-    /// (unvalidated, JSON-decoded) input.
+    /// Control characters can neither panic the formatter (old byte slicing)
+    /// nor forge log lines / terminal escapes through a retained server.
+    /// The redaction must be character-safe for any (unvalidated,
+    /// JSON-decoded) input.
     #[test]
     fn redact_index_arg_never_panics_on_multibyte_users() {
-        // 'a' + emoji (4 bytes, 1 char) + padding: byte offset 4 is inside the
-        // emoji, and the tail offset lands mid-string the same way. Would have
-        // panicked under byte slicing; must redact on char boundaries instead.
-        // 10 chars (> 8): head = a, emoji, f, o; tail = oooo.
+        // A multibyte user masks whole, so slicing can never land inside a
+        // code point the way byte offsets 4 / len-4 once did.
         let redacted = redact_index_arg("a\u{1F600}foooooooo@s.whatsapp.net");
-        assert_eq!(redacted, "a\u{1F600}fo…oooo@s.whatsapp.net");
-        // Short multibyte users are masked whole, never sliced at all.
+        assert_eq!(redacted, "…@s.whatsapp.net");
         assert_eq!(
             redact_index_arg("\u{00E9}b@s.whatsapp.net"),
             "…@s.whatsapp.net"
         );
+        // A newline smuggled into the server is sanitized, not copied.
+        let poisoned = redact_index_arg("user@s.whatsapp.net\nFORGED: yes");
+        assert_eq!(poisoned, fingerprint_id("user@s.whatsapp.net\nFORGED: yes"));
+        assert!(!poisoned.contains('\n'));
     }
 
     /// TRACE must carry the redacted projection, never `m.index` verbatim:
@@ -4437,10 +4493,10 @@ mod tests {
             redacted,
             vec![
                 "star".to_string(),
-                "1203…0042@g.us".to_string(),
+                "…@g.us".to_string(),
                 format!("msg={}", fingerprint_id(msg_id)),
                 "1".to_string(),
-                "5511…0042@s.whatsapp.net".to_string(),
+                "…@s.whatsapp.net".to_string(),
             ]
         );
         // No verbatim account or message id survives the projection.
@@ -4537,7 +4593,7 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::SET,
             action_value: None,
         };
-        assert_eq!(redacted_index(&jid_case)[1], "1203…0042@g.us");
+        assert_eq!(redacted_index(&jid_case)[1], "…@g.us");
         let opaque_case = Mutation {
             index: vec!["some_new_whatsapp_action".to_string(), opaque.to_string()],
             operation: wa::syncd_mutation::SyncdOperation::SET,
@@ -4669,7 +4725,7 @@ mod tests {
         assert_eq!(mutation_effect_detail(&contact), None);
         assert_eq!(
             mutation_target(&contact),
-            Some("target=5511…0042@s.whatsapp.net".to_string())
+            Some("target=…@s.whatsapp.net".to_string())
         );
 
         // Unknown commands and missing payloads have no scalar to report.
@@ -4678,6 +4734,22 @@ mod tests {
             wa::SyncActionValue::default(),
         );
         assert_eq!(mutation_effect_detail(&unknown), None);
+    }
+
+    /// A hostile verb renders sanitized on the line: no newlines, no
+    /// escapes, bounded length — while routing still keys on the raw verb.
+    #[test]
+    fn sanitize_command_escapes_and_bounds_hostile_verbs() {
+        assert_eq!(sanitize_command("archive"), "archive");
+        let forged = sanitize_command("archive\nFORGED: yes\u{1B}[2J");
+        assert!(!forged.contains('\n'));
+        assert!(!forged.contains('\u{1B}'));
+        assert!(forged.starts_with("archive"));
+        assert!(forged.contains('\u{FFFD}'));
+        let long = "a".repeat(200);
+        let bounded = sanitize_command(&long);
+        assert!(bounded.chars().count() < 200);
+        assert!(bounded.contains('…'));
     }
 
     /// DEBUG targets are command-aware too: quick-reply and label ids are
@@ -4708,15 +4780,12 @@ mod tests {
         let chat = "120363000000000042@g.us";
         assert_eq!(
             target_of(&["label_jid", label, chat]),
-            Some(format!(
-                "label={} chat=1203…0042@g.us",
-                fingerprint_id(label)
-            ))
+            Some(format!("label={} chat=…@g.us", fingerprint_id(label)))
         );
         // JID-targeted commands keep the redacted target.
         assert_eq!(
             target_of(&["archive", chat]),
-            Some("target=1203…0042@g.us".to_string())
+            Some("target=…@g.us".to_string())
         );
         // No verbatim caller-provided id survives any of these.
         for target in [
@@ -4728,6 +4797,12 @@ mod tests {
             assert!(!target.contains(qr_id));
             assert!(!target.contains(label));
         }
+        // A malformed chat where a JID belongs fingerprints instead of
+        // leaking verbatim on the DEBUG line.
+        let evil = "CUSTOMER_SECRET_VALUE";
+        let target = target_of(&["label_jid", label, evil]).expect("target present");
+        assert!(!target.contains(evil));
+        assert!(target.contains(&fingerprint_id(evil)));
     }
 
     /// Neither retry scheduler may keep the client alive while it sleeps.
