@@ -2362,6 +2362,17 @@ impl Client {
                 // the set, which is what keeps it from reading as a full sync.
                 let full_sync = replaying_snapshot.contains(&name);
                 wacore::telemetry::appstate_mutations(mutations.len() as u64);
+                // `new_state.version` is the version *after* this page: a page
+                // can carry a snapshot plus several patches, so mutations
+                // from the earlier pieces did not arrive at this version.
+                // They still share one per-mutation version rather than one
+                // each, because `process_patch_list` concatenates them and
+                // returns only the final state — tracking the originating
+                // version per mutation would thread a parallel `Vec<u64>`
+                // through the processor, the telemetry and every dispatch
+                // caller for a distinction the per-patch `Decoded … vN`
+                // lines already draw. The version below is therefore the
+                // page's end cursor, not each mutation's birth version.
                 let total = mutations.len();
                 for (position, mut m) in mutations.into_iter().enumerate() {
                     self.dispatch_app_state_mutation_in(
@@ -4139,7 +4150,10 @@ impl Client {
                     AppStateDispatchOutcome::Event("SelfPushNameUpdated")
                 } else {
                     debug!(target: "Client/AppState", "Push name mutation received but name unchanged");
-                    AppStateDispatchOutcome::Event("SelfPushNameUnchanged")
+                    // No event dispatched, nothing persisted: a no-op. `Event`
+                    // would report a `SelfPushNameUpdated` that never existed;
+                    // `Skipped` says exactly what happened.
+                    AppStateDispatchOutcome::Skipped("unchanged-push-name")
                 };
                 // `report` borrows `m` while the outcome is already owned;
                 // hoist the return out of the `if let` so the borrow ends first.
