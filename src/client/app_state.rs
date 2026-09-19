@@ -3,6 +3,7 @@
 use super::*;
 use crate::features::{AppStateError, AppStateResyncMode, AppStateResyncReport};
 use crate::request::DEFAULT_IQ_TIMEOUT;
+use std::borrow::Cow;
 
 /// Concurrency cap for pre-downloading app-state external blobs (independent CDN
 /// GETs, keyed by directPath — LTHash ordering is in patch application, not blob
@@ -2361,8 +2362,25 @@ impl Client {
                 // the set, which is what keeps it from reading as a full sync.
                 let full_sync = replaying_snapshot.contains(&name);
                 wacore::telemetry::appstate_mutations(mutations.len() as u64);
-                for mut m in mutations {
-                    self.dispatch_app_state_mutation(&mut m, full_sync).await;
+                // `new_state.version` is the version *after* this page: a page
+                // can carry a snapshot plus several patches, so mutations
+                // from the earlier pieces did not arrive at this version.
+                // They still share one per-mutation version rather than one
+                // each, because `process_patch_list` concatenates them and
+                // returns only the final state — tracking the originating
+                // version per mutation would thread a parallel `Vec<u64>`
+                // through the processor, the telemetry and every dispatch
+                // caller for a distinction the per-patch `Decoded … vN`
+                // lines already draw. The version below is therefore the
+                // page's end cursor, not each mutation's birth version.
+                let total = mutations.len();
+                for (position, mut m) in mutations.into_iter().enumerate() {
+                    self.dispatch_app_state_mutation_in(
+                        &mut m,
+                        full_sync,
+                        (name, new_state.version, position + 1, total),
+                    )
+                    .await;
                 }
 
                 // No version write here. `process_one_patch_list` already
@@ -2615,9 +2633,19 @@ impl Client {
                 .await;
 
             wacore::telemetry::appstate_mutations(mutations.len() as u64);
-            for mut m in mutations {
-                debug!(target: "Client/AppState", "Dispatching mutation kind={} index_len={} full_sync={}", m.index.first().map(|s| s.as_str()).unwrap_or(""), m.index.len(), full_sync);
-                self.dispatch_app_state_mutation(&mut m, full_sync).await;
+            let total = mutations.len();
+            for (position, mut m) in mutations.into_iter().enumerate() {
+                // `new_state`, not `state`: the page just applied produced
+                // this version, and `state` still holds the pre-page cursor
+                // until the assignment below. Logging the old version would
+                // attribute the fresh mutations to the cursor they replaced —
+                // the batched path already reports `new_state.version`.
+                self.dispatch_app_state_mutation_in(
+                    &mut m,
+                    full_sync,
+                    (name, new_state.version, position + 1, total),
+                )
+                .await;
             }
 
             // A collection the server refused advances nothing: the processor
@@ -3585,135 +3613,560 @@ impl Client {
             );
         }
     }
+}
 
+/// What one app-state mutation did, as a value rather than a bare bool.
+///
+/// Private and zero-allocation: every variant borrows nothing and carries only
+/// a `&'static str` — the event it dispatched, or why nothing was emitted.
+/// This is the single vocabulary for the whole dispatch chain: the
+/// sub-dispatchers in `crate::features` return it directly, and the top-level
+/// `dispatch_app_state_mutation` logs it per mutation.
+///
+/// `Event` means an event (or a persisted internal effect) was applied.
+/// `Malformed` means the command is known but its action payload was absent,
+/// so no event was emitted — still claimed, since no other dispatcher owns
+/// the command. `Skipped` means claimed without an effect for a benign reason
+/// (bad index, redundant state). `Unclaimed` means no dispatcher recognized
+/// the command; the next one should try. `EmptyIndex` is the degenerate case
+/// the top-level dispatcher reports when the mutation carries no index at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppStateDispatchOutcome {
+    Event(&'static str),
+    Malformed(&'static str),
+    Skipped(&'static str),
+    Unclaimed,
+    EmptyIndex,
+}
+
+impl AppStateDispatchOutcome {
+    /// The rendering of the mutation's effect. Dispatched and not-dispatched
+    /// are visibly different: a known command whose payload was absent
+    /// (`Malformed`) or a claim without an effect (`Skipped`) must never read
+    /// as a bare event name, or a drifted mutation is indistinguishable from
+    /// a working one. The caller owns the `SET archive target=…` half.
+    fn effect(self) -> Cow<'static, str> {
+        match self {
+            Self::Event(name) => Cow::Borrowed(name),
+            Self::Malformed(name) => Cow::Owned(format!("{name} (malformed: no event)")),
+            Self::Skipped(name) => Cow::Owned(format!("{name} (skipped: no event)")),
+            Self::Unclaimed => Cow::Borrowed("unclaimed"),
+            Self::EmptyIndex => Cow::Borrowed("empty-index"),
+        }
+    }
+}
+
+/// JIDs identify accounts, so even the semantic log redacts them: the user
+/// part keeps a short prefix and suffix (`5511…0042`), the server part stays
+/// whole so `s.whatsapp.net` vs `g.us` vs `lid` is still answerable. Anything
+/// that is not shaped like `user@server` (label ids, quick-reply ids, message
+/// ids) passes through untouched — it carries no account identity.
+fn redact_index_arg(arg: &str) -> Cow<'_, str> {
+    let Some((user, server)) = arg.split_once('@') else {
+        return Cow::Borrowed(arg);
+    };
+    // Character-counted, not byte-counted: the index comes straight out of a
+    // JSON string with no ASCII constraint, so byte offsets 4 / len-4 can land
+    // inside a multibyte code point and panic the sync task on format. Counting
+    // chars keeps the slice on code-point boundaries for any input.
+    let char_count = user.chars().count();
+    // Every `user@server` shape is a potential account identifier, however
+    // short: the index is an unvalidated string, so a short user (e.g.
+    // `1@s.whatsapp.net`) is no evidence of "not an account". Short users
+    // get no head/tail split to show — the whole user part is masked and only
+    // the server (the routing signal) stays.
+    if char_count <= 8 {
+        return Cow::Owned(format!("…@{server}"));
+    }
+    let head: String = user.chars().take(4).collect();
+    let tail: String = user.chars().skip(char_count - 4).collect();
+    Cow::Owned(format!("{head}…{tail}@{server}"))
+}
+
+/// The redacted projection of the full index for TRACE: every element through
+/// [`redact_index_arg`]. JID-shaped elements keep `head…tail@server`; message
+/// ids, opaque ids and other non-JID elements pass through untouched (they
+/// carry no account identity). TRACE must never serialize `m.index` verbatim:
+/// past the target it can carry chat JIDs, message ids and participant JIDs,
+/// which would bypass the DEBUG-level redaction.
+fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<Cow<'_, str>> {
+    m.index.iter().map(|arg| redact_index_arg(arg)).collect()
+}
+
+/// Render the mutation's target for the semantic line: `index[1]` redacted
+/// when present, `id=<…>` for the id-keyed commands (quick reply), nothing
+/// otherwise. Never the full index: positions past the target can carry
+/// message ids and participant JIDs.
+fn mutation_target(m: &crate::appstate_sync::Mutation) -> Option<String> {
+    let command = m.index.first().map(String::as_str).unwrap_or("");
+    // `quick_reply` is keyed by an opaque id, not a JID: report `id=…`, never
+    // `target=…`. Checked before the generic `index[1]` arm, which would
+    // otherwise label the same element `target=` and the id arm below would
+    // print it a second time as `id=`.
+    if command == "quick_reply" {
+        return m.index.get(1).map(|id| format!("id={id}"));
+    }
+    if let Some(target) = m.index.get(1) {
+        return Some(format!("target={}", redact_index_arg(target)));
+    }
+    None
+}
+
+/// The effect half of the per-mutation line that depends on the action payload
+/// but must never leak it: booleans and counters only.
+///
+/// A `Copy` enum, formatted only at the log site: building the `String` up
+/// front would allocate on every mutation even when no per-mutation record
+/// can be emitted (logging off, or a cursor-less caller). `None` means the
+/// command has no scalar worth reporting (or its payload was absent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationEffectDetail {
+    Bool(&'static str, bool),
+    BoolUntil(&'static str, bool, i64),
+}
+
+impl MutationEffectDetail {
+    fn render(self, out: &mut String) {
+        use std::fmt::Write;
+        match self {
+            Self::Bool(name, b) => {
+                let _ = write!(out, "{name}={b}");
+            }
+            Self::BoolUntil(name, b, until) => {
+                let _ = write!(out, "{name}={b} until={until}");
+            }
+        }
+    }
+}
+
+fn mutation_effect_detail(m: &crate::appstate_sync::Mutation) -> Option<MutationEffectDetail> {
+    let command = m.index.first().map(String::as_str).unwrap_or("");
+    let v = m.action_value.as_ref()?;
+    match command {
+        "archive" => v
+            .archive_chat_action
+            .as_option()
+            .and_then(|a| a.archived)
+            .map(|b| MutationEffectDetail::Bool("archived", b)),
+        "pin" | "pin_v1" => v
+            .pin_action
+            .as_option()
+            .and_then(|a| a.pinned)
+            .map(|b| MutationEffectDetail::Bool("pinned", b)),
+        "mute" => {
+            let a = v.mute_action.as_option()?;
+            let muted = a.muted?;
+            Some(match a.mute_end_timestamp {
+                Some(until) => MutationEffectDetail::BoolUntil("muted", muted, until),
+                None => MutationEffectDetail::Bool("muted", muted),
+            })
+        }
+        "mark_chat_as_read" | "markChatAsRead" => v
+            .mark_chat_as_read_action
+            .as_option()
+            .and_then(|a| a.read)
+            .map(|b| MutationEffectDetail::Bool("read", b)),
+        "star" => v
+            .star_action
+            .as_option()
+            .and_then(|a| a.starred)
+            .map(|b| MutationEffectDetail::Bool("starred", b)),
+        "lock" => v
+            .lock_chat_action
+            .as_option()
+            .and_then(|a| a.locked)
+            .map(|b| MutationEffectDetail::Bool("locked", b)),
+        "userStatusMute" => v
+            .user_status_mute_action
+            .as_option()
+            .and_then(|a| a.muted)
+            .map(|b| MutationEffectDetail::Bool("muted", b)),
+        "quick_reply" => v
+            .quick_reply_action
+            .as_option()
+            .and_then(|a| a.deleted)
+            .map(|b| MutationEffectDetail::Bool("deleted", b)),
+        "setting_disableLinkPreviews" => v
+            .privacy_setting_disable_link_previews_action
+            .as_option()
+            .and_then(|a| a.is_previews_disabled)
+            .map(|b| MutationEffectDetail::Bool("disabled", b)),
+        "label_edit" => v
+            .label_edit_action
+            .as_option()
+            .and_then(|a| a.deleted)
+            .map(|b| MutationEffectDetail::Bool("deleted", b)),
+        "label_jid" | "label_message" => v
+            .label_association_action
+            .as_option()
+            .and_then(|a| a.labeled)
+            .map(|b| MutationEffectDetail::Bool("labeled", b)),
+        _ => None,
+    }
+}
+
+/// Emit the semantic per-mutation line.
+///
+/// DEBUG carries collection, version/cursor, operation, command, redacted
+/// target, scalar effect and outcome — everything the consumer asked for.
+/// TRACE adds the full index, ordinal, timestamp and handler. WARN is reserved
+/// for a known command whose expected payload is absent (protocol drift), and
+/// is emitted by the caller when the outcome is `Malformed`. Never the
+/// `SyncActionValue`, the NCT salt, a push name, quick-reply text or key
+/// material: the detail helpers above project only booleans and counters.
+/// `MutationLine` exists only to keep [`log_mutation_dispatched`] at seven
+/// args: the batch cursor (collection/version/position/total) travels as one.
+struct MutationLine {
+    collection: WAPatchName,
+    version: u64,
+    position: usize,
+    total: usize,
+}
+
+fn log_mutation_dispatched(
+    cursor: MutationLine,
+    full_sync: bool,
+    handler: &'static str,
+    m: &crate::appstate_sync::Mutation,
+    outcome: AppStateDispatchOutcome,
+    effect_detail: Option<MutationEffectDetail>,
+) {
+    use log::{Level, log_enabled};
+
+    // Exactly one record per mutation, at exactly one level. Live sync reports
+    // at DEBUG (the processor aggregate plus one line per mutation); full sync
+    // replays whole collections, so the aggregate stays DEBUG and each
+    // mutation drops to TRACE. Every path — including empty-index — routes
+    // through here, so the policy holds everywhere by construction.
+    if full_sync {
+        if !log_enabled!(target: "Client/AppState", Level::Trace) {
+            return;
+        }
+    } else if !log_enabled!(target: "Client/AppState", Level::Debug) {
+        return;
+    }
+    let MutationLine {
+        collection,
+        version,
+        position,
+        total,
+    } = cursor;
+    let op = match m.operation {
+        wa::syncd_mutation::SyncdOperation::SET => "SET",
+        wa::syncd_mutation::SyncdOperation::REMOVE => "REMOVE",
+    };
+    let command = m
+        .index
+        .first()
+        .map(String::as_str)
+        .unwrap_or("<no-command>");
+    let mut line = format!("{collection:?}@{version} [{position}/{total}] {op} {command}");
+    // `mutation_target` already returns `id=…` for `quick_reply` (see above),
+    // so no second arm is needed here.
+    if let Some(target) = mutation_target(m) {
+        line.push(' ');
+        line.push_str(&target);
+    }
+    // Pre-captured before dispatch: the sub-dispatchers move the action out of
+    // the mutation with `take()`, so reading it here would see an empty field
+    // on every successful mutation and drop the advertised scalar. Rendered
+    // here, at the log site, so no `String` exists until a record is emitted.
+    if let Some(detail) = effect_detail {
+        line.push(' ');
+        detail.render(&mut line);
+    }
+    line.push_str(&format!(" -> {}", outcome.effect()));
+    // One record, one level: DEBUG for live, TRACE for full sync (see the gate
+    // at the top of this function). TRACE carries the redacted projection of
+    // the index — never `m.index` verbatim, whose tail can hold chat JIDs,
+    // message ids and participant JIDs — and the DEBUG record carries no index
+    // at all, so enabling TRACE never duplicates a mutation's line at two
+    // levels and never bypasses the redaction.
+    if full_sync {
+        // Timestamps route ordering questions.
+        let ts = m.action_value.as_ref().and_then(|v| v.timestamp);
+        trace!(
+            target: "Client/AppState",
+            "{line} (ordinal={position}/{total} index={:?} timestamp={ts:?} \
+             full_sync={full_sync} handler={handler})",
+            redacted_index(m)
+        );
+    } else {
+        debug!(target: "Client/AppState", "{line}");
+    }
+}
+
+impl Client {
     /// `&mut` so a dispatcher can move the action out of the mutation into
     /// its event instead of deep-cloning it: a full sync dispatches every
     /// mutation of every collection through here.
+    ///
+    /// The outcome-returning sibling does the work; this one stays because
+    /// the recovery and conflict paths dispatch one mutation at a time with no
+    /// collection cursor to report (there `collection`/`version`/`position`
+    /// would be invented, not observed). Callers that own the batch use
+    /// [`Self::dispatch_app_state_mutation_in`] so the line carries it.
     pub(crate) async fn dispatch_app_state_mutation(
         &self,
         m: &mut crate::appstate_sync::Mutation,
         full_sync: bool,
     ) {
+        self.dispatch_app_state_mutation_inner(m, full_sync, None)
+            .await;
+    }
+
+    /// [`Self::dispatch_app_state_mutation`] for a caller that owns the batch:
+    /// `ctx` is `(collection, version, position, total)` and produces the
+    /// per-mutation DEBUG line (aggregate in full sync — see below). Returns
+    /// the outcome so tests can assert on it without parsing logs.
+    pub(crate) async fn dispatch_app_state_mutation_in(
+        &self,
+        m: &mut crate::appstate_sync::Mutation,
+        full_sync: bool,
+        ctx: (WAPatchName, u64, usize, usize),
+    ) -> AppStateDispatchOutcome {
+        self.dispatch_app_state_mutation_inner(m, full_sync, Some(ctx))
+            .await
+    }
+
+    async fn dispatch_app_state_mutation_inner(
+        &self,
+        m: &mut crate::appstate_sync::Mutation,
+        full_sync: bool,
+        ctx: Option<(WAPatchName, u64, usize, usize)>,
+    ) -> AppStateDispatchOutcome {
+        use crate::client::AppStateDispatchOutcome;
         use wacore::types::events::Event;
 
+        // Whether any per-mutation record can be emitted at all: without a
+        // cursor there is no line to write, and without the level there is no
+        // reader. Computed once, before dispatch, so the scalar capture below
+        // and the `format!`s inside the logger cost nothing when observability
+        // is off — a full-sync snapshot can carry thousands of mutations.
+        let wants_semantic_log = ctx.is_some()
+            && if full_sync {
+                log::log_enabled!(target: "Client/AppState", log::Level::Trace)
+            } else {
+                log::log_enabled!(target: "Client/AppState", log::Level::Debug)
+            };
+        // Capture the scalar detail BEFORE dispatch: the sub-dispatchers move
+        // the action out of the mutation with `take()`, so reading it inside
+        // the report closure would see an empty field on every successful
+        // mutation and drop the advertised `archived=`/`pinned=`/`read=`….
+        // A `Copy` enum rendered at the log site: no `String` is allocated
+        // unless a record is actually emitted.
+        let effect_detail = wants_semantic_log
+            .then(|| mutation_effect_detail(m))
+            .flatten();
+        // One small helper so every arm logs the same line shape. `handler`
+        // names the dispatcher that claimed the mutation.
+        let report = |handler: &'static str,
+                      m: &crate::appstate_sync::Mutation,
+                      outcome: AppStateDispatchOutcome,
+                      effect_detail: Option<MutationEffectDetail>| {
+            if let Some((collection, version, position, total)) = ctx {
+                let cursor = MutationLine {
+                    collection,
+                    version,
+                    position,
+                    total,
+                };
+                // The level policy lives in `log_mutation_dispatched`: DEBUG
+                // per mutation for live sync, TRACE for full sync (DEBUG keeps
+                // only the processor aggregate). No gate here, so the helper
+                // cannot disagree with its caller about what "lowered to
+                // TRACE" means.
+                log_mutation_dispatched(cursor, full_sync, handler, m, outcome, effect_detail);
+            }
+            // A recognized command whose payload is missing is protocol drift,
+            // not noise: WARN names the command, DEBUG already showed the line.
+            if let AppStateDispatchOutcome::Malformed(event) = outcome {
+                let command = m
+                    .index
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("<no-command>");
+                warn!(
+                    target: "Client/AppState",
+                    "{command} mutation missing {event} payload; index has {} element(s)",
+                    m.index.len()
+                );
+            }
+            outcome
+        };
+
         if m.index.is_empty() {
-            return;
+            // No command to name and no dispatcher to try; still reported so
+            // the batch position is accounted for. Routes through the same
+            // level policy as every other mutation (TRACE in full sync).
+            if let Some((collection, version, position, total)) = ctx {
+                log_mutation_dispatched(
+                    MutationLine {
+                        collection,
+                        version,
+                        position,
+                        total,
+                    },
+                    full_sync,
+                    "none",
+                    m,
+                    AppStateDispatchOutcome::EmptyIndex,
+                    None,
+                );
+            }
+            return AppStateDispatchOutcome::EmptyIndex;
         }
 
         // NCT salt sync — handles both "set" (store salt) and "remove" (clear salt).
         // Source: WAWebNctSaltSync, syncd collection RegularHigh, action "nct_salt_sync".
+        // Only the byte count reaches the log; the salt itself never does.
         if m.index[0] == "nct_salt_sync" {
-            if m.operation == wa::syncd_mutation::SyncdOperation::Remove {
+            let outcome = if m.operation == wa::syncd_mutation::SyncdOperation::Remove {
                 debug!(target: "Client/AppState", "Removing NCT salt via app state sync");
                 self.persistence_manager
                     .process_command(DeviceCommand::SetNctSalt(None))
                     .await;
+                AppStateDispatchOutcome::Event("NctSaltCleared")
             } else if let Some(val) = &m.action_value
                 && let Some(act) = val.nct_salt_sync_action.as_option()
                 && let Some(salt) = &act.salt
             {
                 if salt.is_empty() {
                     warn!(target: "Client/AppState", "nct_salt_sync mutation has empty salt, ignoring");
+                    AppStateDispatchOutcome::Skipped("empty-salt")
                 } else {
                     debug!(target: "Client/AppState", "Stored NCT salt via app state sync ({} bytes)", salt.len());
                     self.persistence_manager
                         .process_command(DeviceCommand::SetNctSalt(Some(salt.clone())))
                         .await;
+                    AppStateDispatchOutcome::Event("NctSaltStored")
                 }
             } else {
-                warn!(target: "Client/AppState", "nct_salt_sync mutation missing salt in action value");
-            }
-            return;
+                // Warned once centrally by `report` (Malformed authority).
+                AppStateDispatchOutcome::Malformed("NctSaltStored")
+            };
+            return report("nct_salt", m, outcome, effect_detail);
         }
 
         // Delegate chat-related mutations (mute, pin, archive, star, contact, etc.).
         // Runs before the Set-only gate below because contact deletion arrives as
         // a `Remove`; the handler claims nothing else on that operation.
-        if crate::features::chat_actions::dispatch_chat_mutation(&self.core.event_bus, m, full_sync)
-        {
-            return;
+        let chat_outcome = crate::features::chat_actions::dispatch_chat_mutation_outcome(
+            &self.core.event_bus,
+            m,
+            full_sync,
+        );
+        if chat_outcome != AppStateDispatchOutcome::Unclaimed {
+            return report("chat_actions", m, chat_outcome, effect_detail);
         }
 
         // All remaining mutations only care about Set operations
         if m.operation != wa::syncd_mutation::SyncdOperation::Set {
-            return;
+            return report("none", m, AppStateDispatchOutcome::Unclaimed, effect_detail);
         }
 
         // A call's direction is its creator compared against this account; the
         // predicate is only consulted once the mutation is known to be a call
         // log, so the other mutation kinds do not pay for the snapshot.
-        if crate::features::call_log::dispatch_call_log_mutation(
+        let outcome = crate::features::call_log::dispatch_call_log_mutation_outcome(
             &self.core.event_bus,
             m,
             full_sync,
             |jid| self.is_own_jid(jid),
-        ) {
-            return;
+        );
+        if outcome != AppStateDispatchOutcome::Unclaimed {
+            return report("call_log", m, outcome, effect_detail);
         }
 
         // Label mutations have their own index shape (labelId, not a chat JID at
         // index[1]), so they are dispatched separately from chat actions.
-        if crate::features::labels::dispatch_label_mutation(&self.core.event_bus, m, full_sync) {
-            return;
+        let outcome = crate::features::labels::dispatch_label_mutation_outcome(
+            &self.core.event_bus,
+            m,
+            full_sync,
+        );
+        if outcome != AppStateDispatchOutcome::Unclaimed {
+            return report("labels", m, outcome, effect_detail);
         }
 
         // Quick replies and account-level syncd settings key on their own index
         // shapes (an opaque id, or no argument at all).
-        if crate::features::quick_replies::dispatch_quick_reply_mutation(
+        let outcome = crate::features::quick_replies::dispatch_quick_reply_mutation_outcome(
             &self.core.event_bus,
             m,
             full_sync,
-        ) {
-            return;
+        );
+        if outcome != AppStateDispatchOutcome::Unclaimed {
+            return report("quick_replies", m, outcome, effect_detail);
         }
-        if crate::features::app_state_settings::dispatch_app_state_setting_mutation(
-            &self.core.event_bus,
-            m,
-            full_sync,
-        ) {
-            return;
+        let outcome =
+            crate::features::app_state_settings::dispatch_app_state_setting_mutation_outcome(
+                &self.core.event_bus,
+                m,
+                full_sync,
+            );
+        if outcome != AppStateDispatchOutcome::Unclaimed {
+            return report("app_state_settings", m, outcome, effect_detail);
         }
 
-        // Handle client-internal mutations that need persistence/presence access
-        if m.index[0] == "setting_pushName"
-            && let Some(val) = &m.action_value
-            && let Some(act) = val.push_name_setting.as_option()
-            && let Some(new_name) = &act.name
-        {
-            let new_name = new_name.clone();
-            let bus = self.core.event_bus.clone();
+        // Handle client-internal mutations that need persistence/presence access.
+        // The name itself never reaches the log: it is account PII, and the
+        // pre-existing DEBUG lines below already say only whether it changed.
+        if m.index[0] == "setting_pushName" {
+            let outcome = if let Some(val) = &m.action_value
+                && let Some(act) = val.push_name_setting.as_option()
+                && let Some(new_name) = &act.name
+            {
+                let new_name = new_name.clone();
+                let bus = self.core.event_bus.clone();
 
-            let snapshot = self.persistence_manager.get_device_snapshot();
-            let old = snapshot.push_name.clone();
-            if old != new_name {
-                debug!(target: "Client/AppState", "Persisting changed push name from app state mutation");
-                self.persistence_manager
-                    .process_command(DeviceCommand::SetPushName(new_name.clone()))
-                    .await;
-                bus.dispatch(Event::SelfPushNameUpdated(
-                    crate::types::events::SelfPushNameUpdated::builder()
-                        .from_server(true)
-                        .old_name(old.clone())
-                        .new_name(new_name.clone())
-                        .build(),
-                ));
+                let snapshot = self.persistence_manager.get_device_snapshot();
+                let old = snapshot.push_name.clone();
+                let outcome = if old != new_name {
+                    debug!(target: "Client/AppState", "Persisting changed push name from app state mutation");
+                    self.persistence_manager
+                        .process_command(DeviceCommand::SetPushName(new_name.clone()))
+                        .await;
+                    bus.dispatch(Event::SelfPushNameUpdated(
+                        crate::types::events::SelfPushNameUpdated::builder()
+                            .from_server(true)
+                            .old_name(old.clone())
+                            .new_name(new_name.clone())
+                            .build(),
+                    ));
 
-                // WhatsApp Web sends presence immediately when receiving pushname
-                if old.is_empty() && !new_name.is_empty() {
-                    match self.send_automatic_available().await {
-                        Ok(true) => {
-                            debug!(target: "Client/AppState", "Sent presence after receiving initial pushname from app state sync");
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            warn!(target: "Client/AppState", "Failed to send presence after pushname sync: {e:?}");
+                    // WhatsApp Web sends presence immediately when receiving pushname
+                    if old.is_empty() && !new_name.is_empty() {
+                        match self.send_automatic_available().await {
+                            Ok(true) => {
+                                debug!(target: "Client/AppState", "Sent presence after receiving initial pushname from app state sync");
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                warn!(target: "Client/AppState", "Failed to send presence after pushname sync: {e:?}");
+                            }
                         }
                     }
-                }
+                    AppStateDispatchOutcome::Event("SelfPushNameUpdated")
+                } else {
+                    debug!(target: "Client/AppState", "Push name mutation received but name unchanged");
+                    // No event dispatched, nothing persisted: a no-op. `Event`
+                    // would report a `SelfPushNameUpdated` that never existed;
+                    // `Skipped` says exactly what happened.
+                    AppStateDispatchOutcome::Skipped("unchanged-push-name")
+                };
+                // `report` borrows `m` while the outcome is already owned;
+                // hoist the return out of the `if let` so the borrow ends first.
+                let owned = outcome;
+                return report("push_name", m, owned, effect_detail);
             } else {
-                debug!(target: "Client/AppState", "Push name mutation received but name unchanged");
-            }
+                // Warned once centrally by `report` (Malformed authority).
+                AppStateDispatchOutcome::Malformed("SelfPushNameUpdated")
+            };
+            return report("push_name", m, outcome, effect_detail);
         }
+
+        report("none", m, AppStateDispatchOutcome::Unclaimed, effect_detail)
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.clean_dirty", level = "debug", skip_all, fields(bit = ?bit), err(Debug)))]
@@ -3731,6 +4184,198 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// JID redaction keeps routing answerable without leaking accounts: the
+    /// server part stays whole, long user parts keep head/tail only, short
+    /// user parts are fully masked (a short `user@server` is still an
+    /// account), and non-JID args (label ids, opaque ids) pass through.
+    #[test]
+    fn redact_index_arg_keeps_server_and_shape_only() {
+        assert_eq!(
+            redact_index_arg("5511999990042@s.whatsapp.net"),
+            "5511…0042@s.whatsapp.net"
+        );
+        assert_eq!(
+            redact_index_arg("120363000000000042@g.us"),
+            "1203…0042@g.us"
+        );
+        // Short users are still accounts: mask the user, keep the server.
+        assert_eq!(redact_index_arg("1@s.whatsapp.net"), "…@s.whatsapp.net");
+        assert_eq!(redact_index_arg("42@s.whatsapp.net"), "…@s.whatsapp.net");
+        assert_eq!(redact_index_arg("12345678@g.us"), "…@g.us");
+        // Non-JIDs carry no account identity; leave them alone.
+        assert_eq!(redact_index_arg("qr-id-1"), "qr-id-1");
+    }
+
+    /// Byte offsets 4 / len-4 can land inside a multibyte code point and panic
+    /// the sync task on format; the redaction must be character-safe for any
+    /// (unvalidated, JSON-decoded) input.
+    #[test]
+    fn redact_index_arg_never_panics_on_multibyte_users() {
+        // 'a' + emoji (4 bytes, 1 char) + padding: byte offset 4 is inside the
+        // emoji, and the tail offset lands mid-string the same way. Would have
+        // panicked under byte slicing; must redact on char boundaries instead.
+        // 10 chars (> 8): head = a, emoji, f, o; tail = oooo.
+        let redacted = redact_index_arg("a\u{1F600}foooooooo@s.whatsapp.net");
+        assert_eq!(redacted, "a\u{1F600}fo…oooo@s.whatsapp.net");
+        // Short multibyte users are masked whole, never sliced at all.
+        assert_eq!(
+            redact_index_arg("\u{00E9}b@s.whatsapp.net"),
+            "…@s.whatsapp.net"
+        );
+    }
+
+    /// TRACE must carry the redacted projection, never `m.index` verbatim:
+    /// the tail of `star` / `deleteMessageForMe` / `label_message` indexes can
+    /// hold chat JIDs, message ids and participant JIDs.
+    #[test]
+    fn redacted_index_redacts_every_jid_shaped_element() {
+        use crate::appstate_sync::Mutation;
+
+        let m = Mutation {
+            index: vec![
+                "star".to_string(),
+                "120363000000000042@g.us".to_string(),
+                "MSGID123".to_string(),
+                "1".to_string(),
+                "5511999990042@s.whatsapp.net".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        let redacted = redacted_index(&m);
+        assert_eq!(
+            redacted.iter().map(|c| c.as_ref()).collect::<Vec<_>>(),
+            vec![
+                "star",
+                "1203…0042@g.us",
+                "MSGID123",
+                "1",
+                "5511…0042@s.whatsapp.net",
+            ]
+        );
+        // No verbatim account survives the projection.
+        for element in &redacted {
+            assert!(!element.contains("120363000000000042"));
+            assert!(!element.contains("5511999990042"));
+        }
+    }
+
+    /// Dispatched and not-dispatched must read differently: a malformed
+    /// `archive` (known command, payload absent) renders `ArchiveUpdate
+    /// (malformed: no event)`, never the bare event name a success produces.
+    #[test]
+    fn outcome_effect_distinguishes_malformed_from_applied() {
+        assert_eq!(
+            AppStateDispatchOutcome::Event("ArchiveUpdate")
+                .effect()
+                .as_ref(),
+            "ArchiveUpdate"
+        );
+        assert_eq!(
+            AppStateDispatchOutcome::Malformed("ArchiveUpdate")
+                .effect()
+                .as_ref(),
+            "ArchiveUpdate (malformed: no event)"
+        );
+        assert_eq!(
+            AppStateDispatchOutcome::Skipped("empty-salt")
+                .effect()
+                .as_ref(),
+            "empty-salt (skipped: no event)"
+        );
+        assert_eq!(
+            AppStateDispatchOutcome::Unclaimed.effect().as_ref(),
+            "unclaimed"
+        );
+    }
+
+    /// `mutation_effect_detail` projects booleans/counters only: archived,
+    /// pinned, mute-until, read, starred, locked. Contact names, push names,
+    /// quick-reply text, salts and full action values must never appear.
+    #[test]
+    fn mutation_effect_detail_reports_scalars_not_payloads() {
+        use crate::appstate_sync::Mutation;
+
+        let scalar = |index: &[&str], value: wa::SyncActionValue| Mutation {
+            index: index.iter().map(|s| s.to_string()).collect(),
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: Some(value),
+        };
+        let archived = scalar(
+            &["archive", "120363000000000042@g.us"],
+            wa::SyncActionValue {
+                archive_chat_action: buffa::MessageField::some(
+                    wa::sync_action_value::ArchiveChatAction {
+                        archived: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            mutation_effect_detail(&archived),
+            Some(MutationEffectDetail::Bool("archived", true))
+        );
+
+        let muted = scalar(
+            &["mute", "5511999990042@s.whatsapp.net"],
+            wa::SyncActionValue {
+                mute_action: buffa::MessageField::some(wa::sync_action_value::MuteAction {
+                    muted: Some(true),
+                    mute_end_timestamp: Some(1_789_834_000_000),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            mutation_effect_detail(&muted),
+            Some(MutationEffectDetail::BoolUntil(
+                "muted",
+                true,
+                1_789_834_000_000
+            ))
+        );
+        // The enum renders at the log site, with no intermediate `String`.
+        let mut rendered = String::new();
+        mutation_effect_detail(&archived)
+            .expect("archived detail")
+            .render(&mut rendered);
+        assert_eq!(rendered, "archived=true");
+        rendered.clear();
+        mutation_effect_detail(&muted)
+            .expect("mute detail")
+            .render(&mut rendered);
+        assert_eq!(rendered, "muted=true until=1789834000000");
+
+        // Contact carries names: the detail is None, so the log line shows the
+        // redacted target and the event name but no PII.
+        let contact = scalar(
+            &["contact", "5511999990042@s.whatsapp.net"],
+            wa::SyncActionValue {
+                contact_action: buffa::MessageField::some(wa::sync_action_value::ContactAction {
+                    full_name: Some("Alex Doe".to_string()),
+                    first_name: Some("Alex".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(mutation_effect_detail(&contact), None);
+        assert_eq!(
+            mutation_target(&contact),
+            Some("target=5511…0042@s.whatsapp.net".to_string())
+        );
+
+        // Unknown commands and missing payloads have no scalar to report.
+        let unknown = scalar(
+            &["some_new_whatsapp_action"],
+            wa::SyncActionValue::default(),
+        );
+        assert_eq!(mutation_effect_detail(&unknown), None);
+    }
 
     /// Neither retry scheduler may keep the client alive while it sleeps.
     ///

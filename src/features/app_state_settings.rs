@@ -8,6 +8,7 @@
 //!   `regular`) -> `PrivacySettingDisableLinkPreviewsAction`
 
 use crate::appstate_sync::Mutation;
+use crate::client::AppStateDispatchOutcome;
 use crate::client::Client;
 use crate::features::chat_actions::AppStateError;
 use log::debug;
@@ -15,17 +16,18 @@ use wacore::appstate::schemas;
 use wacore::types::events::{DisableLinkPreviewsUpdate, Event};
 use waproto::whatsapp as wa;
 
-/// Dispatch inbound syncd setting mutations synced from a linked device.
-/// Returns `true` if handled, `false` if the mutation is not one of them.
-pub(crate) fn dispatch_app_state_setting_mutation(
+/// Dispatch inbound syncd setting mutations synced from a linked device,
+/// returning the [`crate::client::AppStateDispatchOutcome`] for the semantic
+/// per-mutation log line.
+pub(crate) fn dispatch_app_state_setting_mutation_outcome(
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     full_sync: bool,
-) -> bool {
+) -> AppStateDispatchOutcome {
     if m.operation != wa::syncd_mutation::SyncdOperation::Set
         || m.index.first().map(String::as_str) != Some(schemas::DISABLE_LINK_PREVIEWS.name)
     {
-        return false;
+        return AppStateDispatchOutcome::Unclaimed;
     }
 
     let ts = m
@@ -49,12 +51,12 @@ pub(crate) fn dispatch_app_state_setting_mutation(
                 .from_full_sync(full_sync)
                 .build(),
         ));
+        AppStateDispatchOutcome::Event("DisableLinkPreviewsUpdate")
     } else {
-        log::warn!(
-            "Skipping setting_disableLinkPreviews mutation: missing isPreviewsDisabled flag"
-        );
+        // Warned once centrally by `report` (see above); logging here too
+        // would emit the same fact twice.
+        AppStateDispatchOutcome::Malformed("DisableLinkPreviewsUpdate")
     }
-    true
 }
 
 /// Access via `client.app_state_settings()`.
@@ -121,13 +123,13 @@ mod tests {
         }
     }
 
-    fn run(m: &Mutation) -> (bool, Vec<Arc<Event>>) {
+    fn run(m: &Mutation) -> (AppStateDispatchOutcome, Vec<Arc<Event>>) {
         let bus = CoreEventBus::new();
         let rec = Arc::new(Recorder::default());
         bus.subscribe_handler(rec.clone()).detach();
-        let handled = dispatch_app_state_setting_mutation(&bus, &mut m.clone(), false);
+        let outcome = dispatch_app_state_setting_mutation_outcome(&bus, &mut m.clone(), false);
         let events = rec.events.lock().unwrap().clone();
-        (handled, events)
+        (outcome, events)
     }
 
     fn set_mutation(value: wa::SyncActionValue) -> Mutation {
@@ -189,8 +191,8 @@ mod tests {
             );
 
             // What we emit, a linked device must be able to hand back.
-            let (handled, events) = run(&mutation);
-            assert!(handled);
+            let (outcome, events) = run(&mutation);
+            assert!(outcome != AppStateDispatchOutcome::Unclaimed);
             assert_eq!(events.len(), 1);
             match &*events[0] {
                 Event::DisableLinkPreviewsUpdate(u) => assert_eq!(u.previews_disabled, disabled),
@@ -211,8 +213,8 @@ mod tests {
                 timestamp: Some(1000),
                 ..Default::default()
             });
-            let (handled, events) = run(&m);
-            assert!(handled);
+            let (outcome, events) = run(&m);
+            assert!(outcome != AppStateDispatchOutcome::Unclaimed);
             assert_eq!(events.len(), 1);
             match &*events[0] {
                 Event::DisableLinkPreviewsUpdate(u) => {
@@ -236,8 +238,8 @@ mod tests {
             ),
             ..Default::default()
         });
-        let (handled, events) = run(&m);
-        assert!(handled);
+        let (outcome, events) = run(&m);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert!(events.is_empty());
     }
 
@@ -248,8 +250,8 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::Set,
             action_value: Some(wa::SyncActionValue::default()),
         };
-        let (handled, events) = run(&m);
-        assert!(!handled);
+        let (outcome, events) = run(&m);
+        assert_eq!(outcome, AppStateDispatchOutcome::Unclaimed);
         assert!(events.is_empty());
     }
 }
