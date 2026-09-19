@@ -22,7 +22,7 @@ use waproto::whatsapp as wa;
 pub(crate) fn dispatch_app_state_setting_mutation_outcome(
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
-    full_sync: bool,
+    event_full_sync: bool,
 ) -> AppStateDispatchOutcome {
     if m.operation != wa::syncd_mutation::SyncdOperation::Set
         || m.index.first().map(String::as_str) != Some(schemas::DISABLE_LINK_PREVIEWS.name)
@@ -48,7 +48,7 @@ pub(crate) fn dispatch_app_state_setting_mutation_outcome(
                 .previews_disabled(disabled)
                 .timestamp(time)
                 .action(Box::new(act))
-                .from_full_sync(full_sync)
+                .from_full_sync(event_full_sync)
                 .build(),
         ));
         AppStateDispatchOutcome::Event("DisableLinkPreviewsUpdate")

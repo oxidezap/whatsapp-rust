@@ -30,7 +30,7 @@ use waproto::whatsapp as wa;
 pub(crate) fn dispatch_label_mutation_outcome(
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
-    full_sync: bool,
+    event_full_sync: bool,
 ) -> AppStateDispatchOutcome {
     if m.operation != wa::syncd_mutation::SyncdOperation::Set || m.index.is_empty() {
         return AppStateDispatchOutcome::Unclaimed;
@@ -63,7 +63,7 @@ pub(crate) fn dispatch_label_mutation_outcome(
                         .label_id(label_id)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
                 AppStateDispatchOutcome::Event("LabelEditUpdate")
@@ -92,7 +92,7 @@ pub(crate) fn dispatch_label_mutation_outcome(
                         .message_id(message_id)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
                 AppStateDispatchOutcome::Event("MessageLabelAssociationUpdate")
@@ -113,7 +113,7 @@ pub(crate) fn dispatch_label_mutation_outcome(
                         .chat_jid(chat_jid)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
                 AppStateDispatchOutcome::Event("LabelAssociationUpdate")

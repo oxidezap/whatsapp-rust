@@ -3236,13 +3236,18 @@ impl Client {
                     // included (inline or via `snapshot_ref`, inlined before
                     // processing): like any full replay, per-mutation lines
                     // stay at TRACE (the processor aggregate keeps DEBUG).
+                    // That is logging volume only: events keep
+                    // `event_full_sync=false` (the base passed `false`
+                    // here unconditionally), so the split args below must
+                    // not be reunited into one `full_sync`.
                     let replaying_snapshot = list.snapshot.is_some() || list.snapshot_ref.is_some();
                     let total = mutations.len();
                     for (position, mut m) in mutations.into_iter().enumerate() {
-                        self.dispatch_app_state_mutation(
+                        self.dispatch_app_state_mutation_inner(
                             &mut m,
-                            replaying_snapshot,
-                            (list.name, new_state.version, position + 1, total),
+                            false, // event provenance: a conflict absorb is not a full sync
+                            replaying_snapshot, // logging mode: snapshot replays stay at TRACE
+                            Some((list.name, new_state.version, position + 1, total)),
                         )
                         .await;
                     }
@@ -4175,7 +4180,7 @@ struct MutationLine {
 
 fn log_mutation_dispatched(
     cursor: MutationLine,
-    full_sync: bool,
+    log_full_sync: bool,
     handler: &'static str,
     m: &crate::appstate_sync::Mutation,
     outcome: AppStateDispatchOutcome,
@@ -4188,7 +4193,10 @@ fn log_mutation_dispatched(
     // replays whole collections, so the aggregate stays DEBUG and each
     // mutation drops to TRACE. Every path — including empty-index — routes
     // through here, so the policy holds everywhere by construction.
-    if full_sync {
+    // `log_full_sync` is the *logging* mode only: event provenance travels
+    // separately (see `dispatch_app_state_mutation_inner`), so a snapshot
+    // replayed for log-volume reasons never rewrites what the event claims.
+    if log_full_sync {
         if !log_enabled!(target: "Client/AppState", Level::Trace) {
             return;
         }
@@ -4242,14 +4250,16 @@ fn log_mutation_dispatched(
     // the index — never `m.index` verbatim, whose tail can hold chat JIDs,
     // message ids and participant JIDs — and the DEBUG record carries no index
     // at all, so enabling TRACE never duplicates a mutation's line at two
-    // levels and never bypasses the redaction.
-    if full_sync {
+    // levels and never bypasses the redaction. `log_full_sync` reports the
+    // logging mode, not event provenance: a snapshot replayed at TRACE is
+    // still `event_full_sync=false` on the event itself.
+    if log_full_sync {
         // Timestamps route ordering questions.
         let ts = m.action_value.as_ref().and_then(|v| v.timestamp);
         trace!(
             target: "Client/AppState",
             "{line} (ordinal={position}/{total} index={:?} timestamp={ts:?} \
-             full_sync={full_sync} handler={handler})",
+             log_full_sync={log_full_sync} handler={handler})",
             redacted_index(m)
         );
     } else {
@@ -4269,20 +4279,34 @@ impl Client {
     /// [`log_mutation_dispatched`]). The per-batch aggregate is separate and
     /// is emitted by the processor, not here. Returns the outcome so tests
     /// can assert on it without parsing logs.
+    ///
+    /// The normal path: event provenance and logging mode agree. The 409
+    /// conflict absorb is the exception — it replays a snapshot at TRACE
+    /// while keeping `event_full_sync=false` — and calls
+    /// `dispatch_app_state_mutation_inner` directly for that.
     pub(crate) async fn dispatch_app_state_mutation(
         &self,
         m: &mut crate::appstate_sync::Mutation,
         full_sync: bool,
         ctx: (WAPatchName, u64, usize, usize),
     ) -> AppStateDispatchOutcome {
-        self.dispatch_app_state_mutation_inner(m, full_sync, Some(ctx))
+        self.dispatch_app_state_mutation_inner(m, full_sync, full_sync, Some(ctx))
             .await
     }
 
+    /// Split dispatch: `event_full_sync` is public event provenance (lands
+    /// on `*.from_full_sync` in every emitted event) while `log_full_sync`
+    /// only selects the per-mutation log level (DEBUG vs TRACE). They agree
+    /// on every path except the 409 conflict absorb, which replays a
+    /// snapshot's worth of mutations at TRACE volume without claiming the
+    /// events came from a full sync — the base passed `false` there, and
+    /// this PR is observability-only, so the events must keep saying
+    /// `false` too. Separate names so the two can never be confused again.
     async fn dispatch_app_state_mutation_inner(
         &self,
         m: &mut crate::appstate_sync::Mutation,
-        full_sync: bool,
+        event_full_sync: bool,
+        log_full_sync: bool,
         ctx: Option<(WAPatchName, u64, usize, usize)>,
     ) -> AppStateDispatchOutcome {
         use crate::client::AppStateDispatchOutcome;
@@ -4293,8 +4317,10 @@ impl Client {
         // reader. Computed once, before dispatch, so the scalar capture below
         // and the `format!`s inside the logger cost nothing when observability
         // is off — a full-sync snapshot can carry thousands of mutations.
+        // Gated on the *logging* mode: a snapshot replayed at TRACE volume
+        // still carries `event_full_sync=false` on the event.
         let wants_semantic_log = ctx.is_some()
-            && if full_sync {
+            && if log_full_sync {
                 log::log_enabled!(target: "Client/AppState", log::Level::Trace)
             } else {
                 log::log_enabled!(target: "Client/AppState", log::Level::Debug)
@@ -4325,8 +4351,8 @@ impl Client {
                 // per mutation for live sync, TRACE for full sync (DEBUG keeps
                 // only the processor aggregate). No gate here, so the helper
                 // cannot disagree with its caller about what "lowered to
-                // TRACE" means.
-                log_mutation_dispatched(cursor, full_sync, handler, m, outcome, effect_detail);
+                // TRACE" means. Logging mode, not event provenance.
+                log_mutation_dispatched(cursor, log_full_sync, handler, m, outcome, effect_detail);
             }
             // A recognized command whose payload is missing is protocol drift,
             // not noise: WARN names the command, DEBUG already showed the line.
@@ -4357,7 +4383,7 @@ impl Client {
                         position,
                         total,
                     },
-                    full_sync,
+                    log_full_sync,
                     "none",
                     m,
                     AppStateDispatchOutcome::EmptyIndex,
@@ -4401,10 +4427,13 @@ impl Client {
         // Delegate chat-related mutations (mute, pin, archive, star, contact, etc.).
         // Runs before the Set-only gate below because contact deletion arrives as
         // a `Remove`; the handler claims nothing else on that operation.
+        // Event provenance, never the logging mode: what the event claims
+        // about `from_full_sync` must not change because the replay was
+        // logged at TRACE volume.
         let chat_outcome = crate::features::chat_actions::dispatch_chat_mutation_outcome(
             &self.core.event_bus,
             m,
-            full_sync,
+            event_full_sync,
         );
         if chat_outcome != AppStateDispatchOutcome::Unclaimed {
             return report("chat_actions", m, chat_outcome, effect_detail);
@@ -4421,7 +4450,7 @@ impl Client {
         let outcome = crate::features::call_log::dispatch_call_log_mutation_outcome(
             &self.core.event_bus,
             m,
-            full_sync,
+            event_full_sync,
             |jid| self.is_own_jid(jid),
         );
         if outcome != AppStateDispatchOutcome::Unclaimed {
@@ -4433,7 +4462,7 @@ impl Client {
         let outcome = crate::features::labels::dispatch_label_mutation_outcome(
             &self.core.event_bus,
             m,
-            full_sync,
+            event_full_sync,
         );
         if outcome != AppStateDispatchOutcome::Unclaimed {
             return report("labels", m, outcome, effect_detail);
@@ -4444,7 +4473,7 @@ impl Client {
         let outcome = crate::features::quick_replies::dispatch_quick_reply_mutation_outcome(
             &self.core.event_bus,
             m,
-            full_sync,
+            event_full_sync,
         );
         if outcome != AppStateDispatchOutcome::Unclaimed {
             return report("quick_replies", m, outcome, effect_detail);
@@ -4453,7 +4482,7 @@ impl Client {
             crate::features::app_state_settings::dispatch_app_state_setting_mutation_outcome(
                 &self.core.event_bus,
                 m,
-                full_sync,
+                event_full_sync,
             );
         if outcome != AppStateDispatchOutcome::Unclaimed {
             return report("app_state_settings", m, outcome, effect_detail);
@@ -4983,6 +5012,14 @@ mod tests {
     /// DEBUG line: the flags live in the index tail (same defaults as
     /// dispatch), not the proto. Missing elements keep the dispatch
     /// defaults (`deleteChat` media defaults true, `clearChat` both false).
+    ///
+    /// The split-dispatch contract behind this: `event_full_sync=false` +
+    /// `log_full_sync=true` (the 409 snapshot-absorb combination) must keep
+    /// `ArchiveUpdate.from_full_sync == false` — logging volume never
+    /// rewrites event provenance. Covered by
+    /// `snapshot_conflict_logging_does_not_change_event_full_sync_provenance`
+    /// at the bottom of this module, which drives
+    /// `dispatch_app_state_mutation_inner` directly.
     #[test]
     fn mutation_effect_detail_reports_delete_and_clear_flags() {
         use crate::appstate_sync::Mutation;
@@ -8346,5 +8383,71 @@ mod critical_bootstrap_tests {
             client.needs_initial_full_sync.is_armed(),
             "and the replacement inherits the work through the gate"
         );
+    }
+
+    /// A 409 conflict absorb replays a snapshot's worth of mutations at TRACE
+    /// volume — but the events it emits are conflict resolutions, not a full
+    /// sync. The base passed `event_full_sync=false` here unconditionally,
+    /// and this PR is observability-only, so the split dispatch must keep
+    /// `ArchiveUpdate.from_full_sync == false` while `log_full_sync=true`.
+    /// Guards the `event_full_sync`/`log_full_sync` split in
+    /// `dispatch_app_state_mutation_inner` against reunification.
+    #[tokio::test]
+    async fn snapshot_conflict_logging_does_not_change_event_full_sync_provenance() {
+        use std::sync::{Arc, Mutex};
+        use wacore::types::events::{Event, EventHandler, EventInterest};
+
+        struct Recorder(Mutex<Vec<Arc<Event>>>);
+        impl EventHandler for Recorder {
+            fn handle_event(&self, event: Arc<Event>) {
+                self.0.lock().expect("recorder mutex").push(event);
+            }
+            fn interest(&self) -> EventInterest {
+                EventInterest::ALL
+            }
+        }
+
+        let client =
+            crate::test_utils::create_test_client_with_name("appstate_conflict_provenance").await;
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        // `subscribe_handler` registers the handler's `ALL` interest;
+        // `_subscription` holds the lease alive for the dispatch below.
+        let _subscription = client
+            .core
+            .event_bus
+            .subscribe_handler(Arc::clone(&recorder) as _);
+
+        let mut m = crate::appstate_sync::Mutation {
+            index: vec!["archive".to_string(), "120363000000000042@g.us".to_string()],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: Some(wa::SyncActionValue {
+                archive_chat_action: buffa::MessageField::some(
+                    wa::sync_action_value::ArchiveChatAction {
+                        archived: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                timestamp: Some(1_700_000_000_000),
+                ..Default::default()
+            }),
+        };
+        let outcome = client
+            .dispatch_app_state_mutation_inner(
+                &mut m,
+                false, // event provenance: a conflict absorb is not a full sync
+                true,  // logging mode: snapshot replays stay at TRACE
+                Some((WAPatchName::RegularLow, 42, 1, 1)),
+            )
+            .await;
+        assert_eq!(outcome, AppStateDispatchOutcome::Event("ArchiveUpdate"));
+        let events = recorder.0.lock().expect("recorder mutex").clone();
+        assert_eq!(events.len(), 1, "one archive mutation emits one event");
+        match &*events[0] {
+            Event::ArchiveUpdate(update) => assert!(
+                !update.from_full_sync,
+                "conflict-absorb replay must not claim from_full_sync"
+            ),
+            other => panic!("expected ArchiveUpdate, got {other:?}"),
+        }
     }
 }

@@ -85,10 +85,14 @@ pub fn message_key(
 /// through every handler shows up as `Unclaimed` instead of vanishing
 /// silently. Never log a `SyncActionValue` through this: it can carry names,
 /// message text, contacts and salts.
+///
+/// `event_full_sync` is public event provenance (lands on
+/// `*.from_full_sync`); it is never a logging level (see
+/// `dispatch_app_state_mutation_inner`).
 pub(crate) fn dispatch_chat_mutation_outcome(
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
-    full_sync: bool,
+    event_full_sync: bool,
 ) -> AppStateDispatchOutcome {
     if m.index.is_empty() {
         return AppStateDispatchOutcome::Unclaimed;
@@ -165,7 +169,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                         .jid(jid)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
                 AppStateDispatchOutcome::Event("MuteUpdate")
@@ -182,7 +186,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                         .jid(jid)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
                 AppStateDispatchOutcome::Event("PinUpdate")
@@ -199,7 +203,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                         .jid(jid)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
                 AppStateDispatchOutcome::Event("ArchiveUpdate")
@@ -228,7 +232,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                         .from_me(from_me)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
                 AppStateDispatchOutcome::Event("StarUpdate")
@@ -241,7 +245,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                 ContactRemoved::builder()
                     .jid(jid)
                     .timestamp(time)
-                    .from_full_sync(full_sync)
+                    .from_full_sync(event_full_sync)
                     .build(),
             ));
             AppStateDispatchOutcome::Event("ContactRemoved")
@@ -255,7 +259,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                         .jid(jid)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
                 AppStateDispatchOutcome::Event("ContactUpdate")
@@ -272,7 +276,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                         .jid(jid)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
                 AppStateDispatchOutcome::Event("MarkChatAsReadUpdate")
@@ -292,7 +296,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                         .delete_media(delete_media)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
                 AppStateDispatchOutcome::Event("DeleteChatUpdate")
@@ -316,7 +320,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                         .delete_media(delete_media)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
                 AppStateDispatchOutcome::Event("ClearChatUpdate")
@@ -333,7 +337,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                         .jid(jid)
                         .timestamp(time)
                         .action(Box::new(act.clone()))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
                 AppStateDispatchOutcome::Event("LockChatUpdate")
@@ -351,7 +355,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                         .muted(act.muted.unwrap_or(false))
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
                 AppStateDispatchOutcome::Event("UserStatusMuteUpdate")
@@ -378,7 +382,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                         .from_me(from_me)
                         .timestamp(time)
                         .action(Box::new(act))
-                        .from_full_sync(full_sync)
+                        .from_full_sync(event_full_sync)
                         .build(),
                 ));
                 AppStateDispatchOutcome::Event("DeleteMessageForMeUpdate")

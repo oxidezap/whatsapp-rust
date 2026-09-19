@@ -50,10 +50,13 @@ use waproto::whatsapp as wa;
 /// Dispatch inbound call-log mutations synced from the primary device,
 /// returning the [`crate::client::AppStateDispatchOutcome`] for the semantic
 /// per-mutation log line.
+///
+/// `event_full_sync` is public event provenance (lands on
+/// `CallLogSync::from_full_sync`), never a logging level.
 pub(crate) fn dispatch_call_log_mutation_outcome(
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
-    full_sync: bool,
+    event_full_sync: bool,
     is_own_jid: impl FnOnce(&Jid) -> bool,
 ) -> AppStateDispatchOutcome {
     if m.operation != wa::syncd_mutation::SyncdOperation::Set
@@ -106,7 +109,7 @@ pub(crate) fn dispatch_call_log_mutation_outcome(
             .from_me(from_me)
             .timestamp(timestamp)
             .record(Box::new(record))
-            .from_full_sync(full_sync)
+            .from_full_sync(event_full_sync)
             .build(),
     ));
 
