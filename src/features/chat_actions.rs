@@ -5,8 +5,8 @@
 //! - `regular_high`: mute, star, deleteChat, deleteMessageForMe
 
 use crate::appstate_sync::Mutation;
-use crate::client::AppStateDispatchOutcome;
 use crate::client::Client;
+use crate::client::{AppStateDispatchOutcome, fingerprint_id};
 use anyhow::Result;
 use log::debug;
 use thiserror::Error;
@@ -136,10 +136,13 @@ pub(crate) fn dispatch_chat_mutation_outcome(
         match m.index[1].parse() {
             Ok(j) => j,
             Err(_) => {
+                // Fingerprinted: the wire value failed validation, so it is
+                // untrusted input — never logged verbatim. The semantic line
+                // already carries the protected target.
                 log::warn!(
-                    "Skipping chat mutation '{}': malformed JID '{}'",
+                    "Skipping chat mutation '{}': malformed JID ({})",
                     kind,
-                    m.index[1]
+                    fingerprint_id(&m.index[1])
                 );
                 return AppStateDispatchOutcome::Skipped("malformed-jid");
             }
@@ -401,8 +404,8 @@ fn parse_message_key_fields(kind: &str, index: &[String]) -> Option<(String, boo
             Ok(j) => Some(j),
             Err(_) => {
                 log::warn!(
-                    "Skipping {kind} mutation: malformed participant JID '{}'",
-                    index[4]
+                    "Skipping {kind} mutation: malformed participant JID ({})",
+                    fingerprint_id(&index[4])
                 );
                 return None;
             }

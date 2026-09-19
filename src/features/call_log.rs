@@ -41,7 +41,7 @@
 //! index: it is what the direction is computed from.
 
 use crate::appstate_sync::Mutation;
-use crate::client::AppStateDispatchOutcome;
+use crate::client::{AppStateDispatchOutcome, fingerprint_id};
 use wacore::appstate::schemas;
 use wacore::types::events::{CallLogSync, Event};
 use wacore_binary::Jid;
@@ -118,7 +118,12 @@ fn parse_call_creator_jid(index: &[String]) -> Option<Jid> {
         Some(s) => match s.parse() {
             Ok(jid) => Some(jid),
             Err(_) => {
-                log::warn!("Skipping call_log mutation: malformed call creator JID '{s}'");
+                // Fingerprinted: `s` failed JID validation, so it is
+                // untrusted wire input — never logged verbatim.
+                log::warn!(
+                    "Skipping call_log mutation: malformed call creator JID ({})",
+                    fingerprint_id(s)
+                );
                 None
             }
         },

@@ -13,8 +13,8 @@
 //! [`schemas_unlisted::LABEL_MESSAGE`](wacore::appstate::schemas_unlisted::LABEL_MESSAGE).
 
 use crate::appstate_sync::Mutation;
-use crate::client::AppStateDispatchOutcome;
 use crate::client::Client;
+use crate::client::{AppStateDispatchOutcome, fingerprint_id};
 use crate::features::chat_actions::AppStateError;
 use log::debug;
 use wacore::appstate::{schemas, schemas_unlisted};
@@ -133,7 +133,12 @@ fn parse_association_chat_jid(kind: &str, index: &[String]) -> Option<Jid> {
         Some(s) => match s.parse() {
             Ok(jid) => Some(jid),
             Err(_) => {
-                log::warn!("Skipping {kind} mutation: malformed chat JID '{s}'");
+                // Fingerprinted: `s` failed JID validation, so it is
+                // untrusted wire input — never logged verbatim.
+                log::warn!(
+                    "Skipping {kind} mutation: malformed chat JID ({})",
+                    fingerprint_id(s)
+                );
                 None
             }
         },

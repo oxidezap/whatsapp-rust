@@ -3722,7 +3722,12 @@ fn redact_index_arg(arg: &str) -> Cow<'_, str> {
 /// output within and across processes (plain hash, no random seed); 64 bits
 /// make accidental collision insignificant for log correlation. Computed only
 /// behind the DEBUG/TRACE gate, like every other projection here.
-fn fingerprint_id(id: &str) -> String {
+///
+/// Module-private like every other projection here — except the
+/// sub-dispatchers reuse it for their own WARNs (see the re-export through
+/// `crate::client`): a malformed wire value must never reach the log
+/// verbatim either.
+pub(crate) fn fingerprint_id(id: &str) -> String {
     use sha2::{Digest, Sha256};
 
     let digest = Sha256::digest(id.as_bytes());
@@ -3730,6 +3735,22 @@ fn fingerprint_id(id: &str) -> String {
         "id#{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
     )
+}
+
+/// Redact a value sitting in a position the schema declares as a JID:
+/// a well-formed `user@server` redacts to `head…tail@server`, anything else
+/// (corrupt wire data, a future shape, an opaque value where a JID was
+/// expected) fingerprints instead of leaking verbatim. The `"0"`
+/// participant sentinel passes through: it means "no participant", not an
+/// identifier.
+///
+/// Module-private: all JID-declared positions route through it.
+fn redact_jid_or_fingerprint(arg: &str) -> String {
+    if arg == "0" || arg.contains('@') {
+        redact_index_arg(arg).into_owned()
+    } else {
+        fingerprint_id(arg)
+    }
 }
 
 /// Command-aware semantic projection of the full index for TRACE.
@@ -3751,60 +3772,39 @@ fn fingerprint_id(id: &str) -> String {
 /// redaction.
 fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<String> {
     let command = m.index.first().map(String::as_str).unwrap_or("");
-    // (target_is_jid, extra labels by position, starting at index 2).
-    // Shapes mirror the dispatchers: chat message keys are
-    // `[cmd, chat, msg_id, from_me, participant]`; label_message is
-    // `[cmd, label_id, chat, msg_id, ...]`; call_log is
-    // `[cmd, creator, call_id, direction]`.
-    let (target_is_jid, extra): (bool, &[&str]) = match command {
-        "star" | "deleteMessageForMe" => (true, &["msg", "from_me", "participant"]),
-        "label_message" => (false, &["chat", "msg"]),
-        "label_jid" => (false, &["chat"]),
-        "call_log" => (true, &["call", "direction"]),
-        "mute" | "pin" | "pin_v1" | "archive" | "contact" | "mark_chat_as_read"
-        | "markChatAsRead" | "deleteChat" | "clearChat" | "lock" | "userStatusMute" => (true, &[]),
-        // Id-keyed or opaque single args: fingerprint, never verbatim.
-        "quick_reply"
-        | "label_edit"
-        | "nct_salt_sync"
-        | "setting_pushName"
-        | "setting_disableLinkPreviews" => (false, &["id"]),
-        // Unknown command: no shape declared and no assumption that
-        // `index[1]` is a JID — every non-JID element fingerprints.
-        _ => (false, &[]),
+    // Extra labels by position, starting at index 2. Shapes mirror the
+    // dispatchers: chat message keys are `[cmd, chat, msg_id, from_me,
+    // participant]`; label_message is `[cmd, label_id, chat, msg_id, ...]`;
+    // call_log is `[cmd, creator, call_id, direction]`. Position 1 always
+    // routes through [`redact_jid_or_fingerprint`] — JID-shaped redacts,
+    // anything else fingerprints — so unknown commands assume nothing about
+    // `index[1]` and still leak nothing verbatim.
+    let extra: &[&str] = match command {
+        "star" | "deleteMessageForMe" => &["msg", "from_me", "participant"],
+        "label_message" => &["chat", "msg"],
+        "label_jid" => &["chat"],
+        "call_log" => &["call", "direction"],
+        _ => &[],
     };
-    // One rule for every non-verb position without a declared JID shape:
-    // JID-shaped redacts, anything else fingerprints. Used for `index[1]` of
-    // unknown commands, for declared opaque positions, and beyond the
-    // declared shape.
-    fn fingerprint_unless_jid(arg: &str) -> String {
-        if arg.contains('@') {
-            redact_index_arg(arg).into_owned()
-        } else {
-            fingerprint_id(arg)
-        }
-    }
     let mut out = Vec::with_capacity(m.index.len());
     for (i, arg) in m.index.iter().enumerate() {
         if i == 0 {
             out.push(arg.clone());
         } else if i == 1 {
-            out.push(if target_is_jid {
-                redact_index_arg(arg).into_owned()
-            } else {
-                fingerprint_unless_jid(arg)
-            });
+            out.push(redact_jid_or_fingerprint(arg));
         } else if let Some(label) = extra.get(i - 2) {
             out.push(match *label {
-                // Known JID positions inside known shapes.
-                "chat" | "participant" => redact_index_arg(arg).into_owned(),
-                // `from_me` / `direction` flags are single chars;
-                // opaque ids fingerprint.
-                _ if arg.len() <= 1 => arg.clone(),
+                // Known JID positions inside known shapes — via the shared
+                // helper so a malformed value fingerprints instead of
+                // leaking verbatim.
+                "chat" | "participant" => redact_jid_or_fingerprint(arg),
+                // `from_me` / `direction` are exactly `"0"` / `"1"`;
+                // anything else in that slot is an opaque value, not a flag.
+                "from_me" | "direction" if matches!(arg.as_str(), "0" | "1") => arg.clone(),
                 _ => format!("{label}={}", fingerprint_id(arg)),
             });
         } else {
-            out.push(fingerprint_unless_jid(arg));
+            out.push(redact_jid_or_fingerprint(arg));
         }
     }
     out
@@ -3821,7 +3821,9 @@ fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<String> {
 fn mutation_target(m: &crate::appstate_sync::Mutation) -> Option<String> {
     let command = m.index.first().map(String::as_str).unwrap_or("");
     let get = |i: usize| m.index.get(i);
-    let jid = |i: usize| get(i).map(|j| redact_index_arg(j).into_owned());
+    // Declared-JID positions go through the shared helper so a malformed
+    // value (no `@`) fingerprints instead of leaking verbatim.
+    let jid = |i: usize| get(i).map(|j| redact_jid_or_fingerprint(j));
     let fp = |label: &str, i: usize| get(i).map(|id| format!("{label}={}", fingerprint_id(id)));
     match command {
         // Opaque single-arg commands: fingerprint, never `target=`.
@@ -4447,6 +4449,55 @@ mod tests {
             assert!(!element.contains("5511999990042"));
             assert!(!element.contains(msg_id));
         }
+    }
+
+    /// Single-char opaque values fingerprint too: the length of the value
+    /// must never decide its visibility — only declared `from_me` /
+    /// `direction` flags (`"0"` / `"1"`) pass through.
+    #[test]
+    fn redacted_index_fingerprints_single_char_ids() {
+        use crate::appstate_sync::Mutation;
+
+        for (command, index) in [
+            (
+                "star",
+                vec!["star", "120363000000000042@g.us", "X", "1", "0"],
+            ),
+            (
+                "call_log",
+                vec!["call_log", "5511999990042@s.whatsapp.net", "A", "0"],
+            ),
+        ] {
+            let m = Mutation {
+                index: index.into_iter().map(str::to_string).collect(),
+                operation: wa::syncd_mutation::SyncdOperation::SET,
+                action_value: None,
+            };
+            let redacted = redacted_index(&m);
+            assert!(
+                redacted[2].starts_with("msg=id#") || redacted[2].starts_with("call=id#"),
+                "{command}: single-char id must fingerprint, got {}",
+                redacted[2]
+            );
+            assert!(!redacted[2].ends_with("=X") && !redacted[2].ends_with("=A"));
+        }
+        // …while the real flags still pass through untouched.
+        let flags = Mutation {
+            index: vec![
+                "star".to_string(),
+                "120363000000000042@g.us".to_string(),
+                "3EB0284A7C9112345678".to_string(),
+                "1".to_string(),
+                "0".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        let redacted = redacted_index(&flags);
+        assert_eq!(redacted[3], "1");
+        // The `"0"` participant sentinel means "no participant" and
+        // passes through untouched.
+        assert_eq!(redacted[4], "0");
     }
 
     /// Unknown commands get no positional labels invented and no assumption
