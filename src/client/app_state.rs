@@ -4031,7 +4031,7 @@ impl Client {
                     AppStateDispatchOutcome::Event("NctSaltStored")
                 }
             } else {
-                warn!(target: "Client/AppState", "nct_salt_sync mutation missing salt in action value");
+                // Warned once centrally by `report` (Malformed authority).
                 AppStateDispatchOutcome::Malformed("NctSaltStored")
             };
             return report("nct_salt", m, outcome, effect_detail);
@@ -4146,10 +4146,7 @@ impl Client {
                 let owned = outcome;
                 return report("push_name", m, owned, effect_detail);
             } else {
-                warn!(
-                    target: "Client/AppState",
-                    "setting_pushName mutation missing pushNameSetting value"
-                );
+                // Warned once centrally by `report` (Malformed authority).
                 AppStateDispatchOutcome::Malformed("SelfPushNameUpdated")
             };
             return report("push_name", m, outcome, effect_detail);
