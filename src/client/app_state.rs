@@ -3714,37 +3714,42 @@ fn redact_index_arg(arg: &str) -> Cow<'_, str> {
     Cow::Owned(format!("{head}…{tail}@{server}"))
 }
 
-/// A stable short fingerprint for an opaque identifier (message id, call id,
-/// label id, quick-reply id): first 4 + last 4 chars with the length, so two
-/// different ids never render the same and correlated mutations stay
-/// correlatable across lines, without printing the whole identifier.
-/// Character-safe: slices on char boundaries, never byte offsets.
-fn fingerprint_id(id: &str) -> Cow<'_, str> {
-    const HEAD_TAIL: usize = 4;
-    let count = id.chars().count();
-    if count <= HEAD_TAIL * 2 {
-        return Cow::Borrowed(id);
-    }
-    let head: String = id.chars().take(HEAD_TAIL).collect();
-    let tail: String = id.chars().skip(count - HEAD_TAIL).collect();
-    Cow::Owned(format!("{head}…{tail}#{count}"))
+/// A stable opaque fingerprint for any identifier that must stay
+/// correlatable across log lines without ever printing whole: the first 8
+/// bytes of SHA-256 hex (`id#<16 hex chars>`), so short ids (`call-42`,
+/// `MSGID123`, `label123`) are masked exactly like long ones and no
+/// prefix/suffix of the real identifier leaks. Same input renders the same
+/// output within and across processes (plain hash, no random seed); 64 bits
+/// make accidental collision insignificant for log correlation. Computed only
+/// behind the DEBUG/TRACE gate, like every other projection here.
+fn fingerprint_id(id: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(id.as_bytes());
+    format!(
+        "id#{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    )
 }
 
 /// Command-aware semantic projection of the full index for TRACE.
 ///
 /// Positional, because every command owns its index shape:
 ///
-/// - `target` (index 1) is JID-redacted via [`redact_index_arg`],
-/// - opaque identifiers (message ids, call ids) render as stable
-///   fingerprints via [`fingerprint_id`] so correlated mutations stay
-///   correlatable without printing whole identifiers.
+/// - JID positions redact via [`redact_index_arg`] (`head…tail@server`),
+/// - every other position fingerprints via [`fingerprint_id`]
+///   (`label=id#<hex>`), so correlated mutations stay correlatable without
+///   printing any identifier whole.
 ///
-/// Unknown commands are conservative: the verb plus redacted elements, with
-/// no positional labels invented for a shape nobody declared. TRACE must
-/// never serialize `m.index` verbatim: past the target it can carry chat
-/// JIDs, message ids and participant JIDs, which would bypass the
-/// DEBUG-level redaction.
-fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<Cow<'_, str>> {
+/// Unknown commands are conservative: the verb plus redacted/fingerprinted
+/// elements, with no positional labels invented for a shape nobody declared
+/// and — critically — no assumption that `index[1]` is a JID. Any element
+/// that is not JID-shaped fingerprints, so an opaque
+/// `CUSTOMER_INTERNAL_ID_42` never renders verbatim. TRACE must never
+/// serialize `m.index` verbatim: past the target it can carry chat JIDs,
+/// message ids and participant JIDs, which would bypass the DEBUG-level
+/// redaction.
+fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<String> {
     let command = m.index.first().map(String::as_str).unwrap_or("");
     // (target_is_jid, extra labels by position, starting at index 2).
     // Shapes mirror the dispatchers: chat message keys are
@@ -3764,61 +3769,106 @@ fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<Cow<'_, str>> {
         | "nct_salt_sync"
         | "setting_pushName"
         | "setting_disableLinkPreviews" => (false, &["id"]),
-        // Unknown command: no shape declared, so no labels invented — but
-        // still redact every element rather than leak one verbatim. Position
-        // 1 goes through the JID redactor (a JID there is the common case
-        // for chat-adjacent commands); anything JID-shaped deeper is caught
-        // by the `contains('@')` fallback below.
-        _ => (true, &[]),
+        // Unknown command: no shape declared and no assumption that
+        // `index[1]` is a JID — every non-JID element fingerprints.
+        _ => (false, &[]),
     };
+    // One rule for every non-verb position without a declared JID shape:
+    // JID-shaped redacts, anything else fingerprints. Used for `index[1]` of
+    // unknown commands, for declared opaque positions, and beyond the
+    // declared shape.
+    fn fingerprint_unless_jid(arg: &str) -> String {
+        if arg.contains('@') {
+            redact_index_arg(arg).into_owned()
+        } else {
+            fingerprint_id(arg)
+        }
+    }
     let mut out = Vec::with_capacity(m.index.len());
     for (i, arg) in m.index.iter().enumerate() {
         if i == 0 {
-            out.push(Cow::Borrowed(arg.as_str()));
+            out.push(arg.clone());
         } else if i == 1 {
             out.push(if target_is_jid {
-                redact_index_arg(arg)
+                redact_index_arg(arg).into_owned()
             } else {
-                fingerprint_id(arg)
+                fingerprint_unless_jid(arg)
             });
         } else if let Some(label) = extra.get(i - 2) {
             out.push(match *label {
                 // Known JID positions inside known shapes.
-                "chat" | "participant" => redact_index_arg(arg),
-                // `from_me` / `direction` / `deleted` flags are single chars;
+                "chat" | "participant" => redact_index_arg(arg).into_owned(),
+                // `from_me` / `direction` flags are single chars;
                 // opaque ids fingerprint.
-                _ if arg.len() <= 1 => Cow::Borrowed(arg.as_str()),
-                _ => Cow::Owned(format!("{label}={}", fingerprint_id(arg))),
+                _ if arg.len() <= 1 => arg.clone(),
+                _ => format!("{label}={}", fingerprint_id(arg)),
             });
         } else {
-            // Beyond the declared shape: fingerprint opaque, redact JID-like.
-            out.push(if arg.contains('@') {
-                redact_index_arg(arg)
-            } else {
-                fingerprint_id(arg)
-            });
+            out.push(fingerprint_unless_jid(arg));
         }
     }
     out
 }
 
-/// Render the mutation's target for the semantic line: `index[1]` redacted
-/// when present, `id=<…>` for the id-keyed commands (quick reply), nothing
-/// otherwise. Never the full index: positions past the target can carry
-/// message ids and participant JIDs.
+/// Render the mutation's routing targets for the semantic line, command-aware
+/// like [`redacted_index`]: JID positions redact, opaque ids fingerprint, so
+/// caller-provided ids (quick-reply ids, label ids — free-form strings via
+/// the public API) never print whole on the DEBUG line either. Multi-target
+/// commands join with spaces (`label=id#… chat=1203…0042@g.us`), which also
+/// fixes `label_jid` previously showing only the label id as `target` while
+/// hiding the affected chat. Never the full index: positions past the target
+/// can carry participant JIDs.
 fn mutation_target(m: &crate::appstate_sync::Mutation) -> Option<String> {
     let command = m.index.first().map(String::as_str).unwrap_or("");
-    // `quick_reply` is keyed by an opaque id, not a JID: report `id=…`, never
-    // `target=…`. Checked before the generic `index[1]` arm, which would
-    // otherwise label the same element `target=` and the id arm below would
-    // print it a second time as `id=`.
-    if command == "quick_reply" {
-        return m.index.get(1).map(|id| format!("id={id}"));
+    let get = |i: usize| m.index.get(i);
+    let jid = |i: usize| get(i).map(|j| redact_index_arg(j).into_owned());
+    let fp = |label: &str, i: usize| get(i).map(|id| format!("{label}={}", fingerprint_id(id)));
+    match command {
+        // Opaque single-arg commands: fingerprint, never `target=`.
+        "quick_reply" => fp("id", 1),
+        "label_edit" => fp("label", 1),
+        "star" | "deleteMessageForMe" => match (jid(1), fp("msg", 2)) {
+            (Some(chat), Some(msg)) => Some(format!("chat={chat} {msg}")),
+            (Some(chat), None) => Some(format!("chat={chat}")),
+            (None, Some(msg)) => Some(msg),
+            (None, None) => None,
+        },
+        "label_jid" => match (fp("label", 1), jid(2)) {
+            (Some(label), Some(chat)) => Some(format!("{label} chat={chat}")),
+            (Some(label), None) => Some(label),
+            (None, Some(chat)) => Some(format!("chat={chat}")),
+            (None, None) => None,
+        },
+        "label_message" => {
+            let mut parts = Vec::with_capacity(3);
+            if let Some(label) = fp("label", 1) {
+                parts.push(label);
+            }
+            if let Some(chat) = jid(2) {
+                parts.push(format!("chat={chat}"));
+            }
+            if let Some(msg) = fp("msg", 3) {
+                parts.push(msg);
+            }
+            (!parts.is_empty()).then(|| parts.join(" "))
+        }
+        "call_log" => match (jid(1), fp("call", 2)) {
+            (Some(creator), Some(call)) => Some(format!("creator={creator} {call}")),
+            (Some(creator), None) => Some(format!("creator={creator}")),
+            (None, Some(call)) => Some(call),
+            (None, None) => None,
+        },
+        // JID-targeted chat commands and everything else with a JID at
+        // index 1; non-JID `index[1]` of an unlisted command fingerprints
+        // via the fallback (opaque, possibly caller-provided).
+        _ => get(1).map(|target| {
+            if target.contains('@') {
+                format!("target={}", redact_index_arg(target))
+            } else {
+                format!("target={}", fingerprint_id(target))
+            }
+        }),
     }
-    if let Some(target) = m.index.get(1) {
-        return Some(format!("target={}", redact_index_arg(target)));
-    }
-    None
 }
 
 /// The effect half of the per-mutation line that depends on the action payload
@@ -4331,37 +4381,49 @@ mod tests {
     /// the tail of `star` / `deleteMessageForMe` / `label_message` indexes can
     /// hold chat JIDs, message ids and participant JIDs.
     ///
-    /// Message/call ids stay correlatable without printing whole: stable
-    /// `head…tail#len` fingerprints keep two different ids distinct across
-    /// lines while leaking no full identifier.
+    /// Fingerprints are opaque SHA-256 prefixes: nothing of the input leaks —
+    /// not even for short ids — while the same id stays correlatable across
+    /// lines and processes (plain hash, no random seed).
     #[test]
-    fn fingerprint_id_is_stable_short_and_bounded() {
-        assert_eq!(fingerprint_id("MSGID123"), "MSGID123");
-        assert_eq!(fingerprint_id("3EB0284A7C9112345678"), "3EB0…5678#20");
-        assert_eq!(
-            fingerprint_id("3EB0284A7C9112345678"),
-            fingerprint_id("3EB0284A7C9112345678")
-        );
+    fn fingerprint_id_masks_short_and_long_ids_stably() {
+        use sha2::{Digest, Sha256};
+
+        let expect = |id: &str| {
+            let d = Sha256::digest(id.as_bytes());
+            format!(
+                "id#{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
+            )
+        };
+        // Short ids are masked too — never verbatim.
+        assert_eq!(fingerprint_id("MSGID123"), expect("MSGID123"));
+        assert_eq!(fingerprint_id("call-42"), expect("call-42"));
+        assert!(fingerprint_id("MSGID123").starts_with("id#"));
+        assert_eq!(fingerprint_id("MSGID123").len(), 3 + 16);
+        // Stable within and across calls; distinct inputs diverge.
+        assert_eq!(fingerprint_id("abc"), fingerprint_id("abc"));
         assert_ne!(
-            fingerprint_id("3EB0284A7C9112345678"),
-            fingerprint_id("3EB0284A7C9199999999")
+            fingerprint_id("ABCD1111WXYZ"),
+            fingerprint_id("ABCD2222WXYZ")
         );
-        // Multibyte-safe: slices on char boundaries, never byte offsets.
-        assert_eq!(
-            fingerprint_id("a\u{1F600}bcdefghij"),
-            "a\u{1F600}bc…ghij#11"
-        );
+        // No byte of the input survives, whatever its length or charset.
+        for id in ["MSGID123", "3EB0284A7C9112345678", "a\u{1F600}bcdefghij"] {
+            let fp = fingerprint_id(id);
+            assert!(!fp.contains(id));
+            assert!(fp.starts_with("id#"));
+        }
     }
 
     #[test]
     fn redacted_index_redacts_every_jid_shaped_element() {
         use crate::appstate_sync::Mutation;
 
+        let msg_id = "3EB0284A7C9112345678";
         let m = Mutation {
             index: vec![
                 "star".to_string(),
                 "120363000000000042@g.us".to_string(),
-                "3EB0284A7C9112345678".to_string(),
+                msg_id.to_string(),
                 "1".to_string(),
                 "5511999990042@s.whatsapp.net".to_string(),
             ],
@@ -4370,43 +4432,67 @@ mod tests {
         };
         let redacted = redacted_index(&m);
         assert_eq!(
-            redacted.iter().map(|c| c.as_ref()).collect::<Vec<_>>(),
+            redacted,
             vec![
-                "star",
-                "1203…0042@g.us",
-                "msg=3EB0…5678#20",
-                "1",
-                "5511…0042@s.whatsapp.net",
+                "star".to_string(),
+                "1203…0042@g.us".to_string(),
+                format!("msg={}", fingerprint_id(msg_id)),
+                "1".to_string(),
+                "5511…0042@s.whatsapp.net".to_string(),
             ]
         );
         // No verbatim account or message id survives the projection.
         for element in &redacted {
             assert!(!element.contains("120363000000000042"));
             assert!(!element.contains("5511999990042"));
-            assert!(!element.contains("3EB0284A7C9112345678"));
+            assert!(!element.contains(msg_id));
         }
     }
 
-    /// Unknown commands get no positional labels invented — but every element
-    /// is still redacted or fingerprinted, never verbatim.
+    /// Unknown commands get no positional labels invented and no assumption
+    /// that `index[1]` is a JID: an opaque `index[1]` fingerprints instead of
+    /// rendering verbatim.
     #[test]
     fn redacted_index_is_conservative_on_unknown_commands() {
         use crate::appstate_sync::Mutation;
 
-        let m = Mutation {
-            index: vec![
+        let opaque = "CUSTOMER_INTERNAL_ID_42";
+        for index in [
+            vec![
                 "some_new_whatsapp_action".to_string(),
                 "120363000000000042@g.us".to_string(),
                 "3EB0284A7C9112345678".to_string(),
             ],
+            vec!["some_new_whatsapp_action".to_string(), opaque.to_string()],
+        ] {
+            let m = Mutation {
+                index,
+                operation: wa::syncd_mutation::SyncdOperation::SET,
+                action_value: None,
+            };
+            let redacted = redacted_index(&m);
+            for element in redacted.iter().skip(1) {
+                assert!(!element.contains("120363000000000042"));
+                assert!(!element.contains("3EB0284A7C9112345678"));
+                assert!(!element.contains(opaque));
+            }
+        }
+        // The JID case keeps its redaction; the opaque case fingerprints.
+        let jid_case = Mutation {
+            index: vec![
+                "some_new_whatsapp_action".to_string(),
+                "120363000000000042@g.us".to_string(),
+            ],
             operation: wa::syncd_mutation::SyncdOperation::SET,
             action_value: None,
         };
-        let redacted = redacted_index(&m);
-        assert_eq!(
-            redacted.iter().map(|c| c.as_ref()).collect::<Vec<_>>(),
-            vec!["some_new_whatsapp_action", "1203…0042@g.us", "3EB0…5678#20",]
-        );
+        assert_eq!(redacted_index(&jid_case)[1], "1203…0042@g.us");
+        let opaque_case = Mutation {
+            index: vec!["some_new_whatsapp_action".to_string(), opaque.to_string()],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        assert_eq!(redacted_index(&opaque_case)[1], fingerprint_id(opaque));
     }
 
     /// The line renders `cursor=`, not `@`: the version is the page end
@@ -4541,6 +4627,56 @@ mod tests {
             wa::SyncActionValue::default(),
         );
         assert_eq!(mutation_effect_detail(&unknown), None);
+    }
+
+    /// DEBUG targets are command-aware too: quick-reply and label ids are
+    /// caller-provided free-form strings, so they fingerprint instead of
+    /// printing whole; `label_jid` additionally names the affected chat,
+    /// which the old `target=<label id>` rendering hid.
+    #[test]
+    fn mutation_target_fingerprints_caller_provided_ids() {
+        use crate::appstate_sync::Mutation;
+
+        let target_of = |index: &[&str]| {
+            mutation_target(&Mutation {
+                index: index.iter().map(|s| s.to_string()).collect(),
+                operation: wa::syncd_mutation::SyncdOperation::SET,
+                action_value: None,
+            })
+        };
+        let qr_id = "my-quick-reply";
+        assert_eq!(
+            target_of(&["quick_reply", qr_id]),
+            Some(format!("id={}", fingerprint_id(qr_id)))
+        );
+        let label = "my-label";
+        assert_eq!(
+            target_of(&["label_edit", label]),
+            Some(format!("label={}", fingerprint_id(label)))
+        );
+        let chat = "120363000000000042@g.us";
+        assert_eq!(
+            target_of(&["label_jid", label, chat]),
+            Some(format!(
+                "label={} chat=1203…0042@g.us",
+                fingerprint_id(label)
+            ))
+        );
+        // JID-targeted commands keep the redacted target.
+        assert_eq!(
+            target_of(&["archive", chat]),
+            Some("target=1203…0042@g.us".to_string())
+        );
+        // No verbatim caller-provided id survives any of these.
+        for target in [
+            target_of(&["quick_reply", qr_id]),
+            target_of(&["label_edit", label]),
+            target_of(&["label_jid", label, chat]),
+        ] {
+            let target = target.expect("target present");
+            assert!(!target.contains(qr_id));
+            assert!(!target.contains(label));
+        }
     }
 
     /// Neither retry scheduler may keep the client alive while it sleeps.
