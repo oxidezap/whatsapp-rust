@@ -3648,8 +3648,8 @@ impl AppStateDispatchOutcome {
 /// JIDs identify accounts, so even the semantic log redacts them: the user
 /// part keeps a short prefix and suffix (`5511…0042`), the server part stays
 /// whole so `s.whatsapp.net` vs `g.us` vs `lid` is still answerable. Anything
-/// that is not shaped like `user@server` (label ids, quick-reply ids) passes
-/// through untouched — it carries no account identity.
+/// that is not shaped like `user@server` (label ids, quick-reply ids, message
+/// ids) passes through untouched — it carries no account identity.
 fn redact_index_arg(arg: &str) -> Cow<'_, str> {
     let Some((user, server)) = arg.split_once('@') else {
         return Cow::Borrowed(arg);
@@ -3659,8 +3659,13 @@ fn redact_index_arg(arg: &str) -> Cow<'_, str> {
     // inside a multibyte code point and panic the sync task on format. Counting
     // chars keeps the slice on code-point boundaries for any input.
     let char_count = user.chars().count();
+    // Every `user@server` shape is a potential account identifier, however
+    // short: the index is an unvalidated string, so a short user (e.g.
+    // `1@s.whatsapp.net`) is no evidence of "not an account". Short users
+    // get no head/tail split to show — the whole user part is masked and only
+    // the server (the routing signal) stays.
     if char_count <= 8 {
-        return Cow::Borrowed(arg);
+        return Cow::Owned(format!("…@{server}"));
     }
     let head: String = user.chars().take(4).collect();
     let tail: String = user.chars().skip(char_count - 4).collect();
@@ -4255,8 +4260,9 @@ mod tests {
     use super::*;
 
     /// JID redaction keeps routing answerable without leaking accounts: the
-    /// server part stays whole, the user part keeps head/tail only, and
-    /// non-JID args (label ids, opaque ids) pass through.
+    /// server part stays whole, long user parts keep head/tail only, short
+    /// user parts are fully masked (a short `user@server` is still an
+    /// account), and non-JID args (label ids, opaque ids) pass through.
     #[test]
     fn redact_index_arg_keeps_server_and_shape_only() {
         assert_eq!(
@@ -4267,8 +4273,11 @@ mod tests {
             redact_index_arg("120363000000000042@g.us"),
             "1203…0042@g.us"
         );
-        // Short users and non-JIDs are not accounts; leave them alone.
-        assert_eq!(redact_index_arg("42@s.whatsapp.net"), "42@s.whatsapp.net");
+        // Short users are still accounts: mask the user, keep the server.
+        assert_eq!(redact_index_arg("1@s.whatsapp.net"), "…@s.whatsapp.net");
+        assert_eq!(redact_index_arg("42@s.whatsapp.net"), "…@s.whatsapp.net");
+        assert_eq!(redact_index_arg("12345678@g.us"), "…@g.us");
+        // Non-JIDs carry no account identity; leave them alone.
         assert_eq!(redact_index_arg("qr-id-1"), "qr-id-1");
     }
 
@@ -4283,10 +4292,10 @@ mod tests {
         // 10 chars (> 8): head = a, emoji, f, o; tail = oooo.
         let redacted = redact_index_arg("a\u{1F600}foooooooo@s.whatsapp.net");
         assert_eq!(redacted, "a\u{1F600}fo…oooo@s.whatsapp.net");
-        // Short multibyte users stay borrowed, never sliced at all.
+        // Short multibyte users are masked whole, never sliced at all.
         assert_eq!(
             redact_index_arg("\u{00E9}b@s.whatsapp.net"),
-            "\u{00E9}b@s.whatsapp.net"
+            "…@s.whatsapp.net"
         );
     }
 
