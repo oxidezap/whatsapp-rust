@@ -1873,6 +1873,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mutation_macs_preserve_variable_lengths_and_isolate_collections() {
+        let backend = InMemoryBackend::new();
+        for len in [0, 1, 31, 32, 33, 257] {
+            let index = vec![7; len];
+            let value = vec![9; len + 3];
+            for name in ["", "regular", "regular\0", "同步"] {
+                let mutation = AppStateMutationMAC {
+                    index_mac: index.clone(),
+                    value_mac: value.clone(),
+                };
+                backend
+                    .put_mutation_macs(name, 1, &[mutation])
+                    .await
+                    .unwrap();
+                let mut returned: Vec<u8> = backend
+                    .get_mutation_mac(name, &index)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(returned, value);
+                returned.clear();
+                assert_eq!(
+                    backend.get_mutation_mac(name, &index).await.unwrap(),
+                    Some(value.clone())
+                );
+            }
+            backend
+                .delete_mutation_macs("regular", std::slice::from_ref(&index))
+                .await
+                .unwrap();
+            assert_eq!(
+                backend.get_mutation_mac("regular", &index).await.unwrap(),
+                None
+            );
+            assert_eq!(
+                backend.get_mutation_mac("regular\0", &index).await.unwrap(),
+                Some(value)
+            );
+            let replacement = AppStateMutationMAC {
+                index_mac: index.clone(),
+                value_mac: vec![],
+            };
+            backend
+                .put_mutation_macs("同步", 2, &[replacement])
+                .await
+                .unwrap();
+            assert_eq!(
+                backend.get_mutation_mac("同步", &index).await.unwrap(),
+                Some(vec![])
+            );
+        }
+        assert_eq!(backend.resource_report().await.pages, Some(18));
+        backend.clear_mutation_macs("同步").await.unwrap();
+        assert_eq!(backend.resource_report().await.pages, Some(12));
+    }
+
+    #[tokio::test]
+    async fn base_key_fields_and_retention_remain_independent() {
+        let backend = InMemoryBackend::new();
+        for (address, message_id) in [("a", "bc"), ("ab", "c"), ("", ""), ("用户", "消息")] {
+            backend
+                .save_base_key(address, message_id, b"key")
+                .await
+                .unwrap();
+        }
+        backend.delete_base_key("a", "bc").await.unwrap();
+        assert!(
+            !backend
+                .has_same_base_key("a", "bc", b"key")
+                .await
+                .unwrap()
+        );
+        assert!(
+            backend
+                .has_same_base_key("ab", "c", b"key")
+                .await
+                .unwrap()
+        );
+        assert_eq!(backend.delete_expired_base_keys(i64::MIN).await.unwrap(), 0);
+        assert_eq!(backend.resource_report().await.pages, Some(3));
+        assert_eq!(backend.delete_expired_base_keys(i64::MAX).await.unwrap(), 3);
+        assert_eq!(backend.resource_report().await.pages, Some(0));
+    }
+
+    #[tokio::test]
     async fn base_key_borrowed_lookups_preserve_exact_key_matching() {
         use crate::store::traits::ProtocolStore;
         let backend = InMemoryBackend::new();
