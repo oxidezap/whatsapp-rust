@@ -47,32 +47,57 @@ use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 
 /// Dispatch inbound call-log mutations synced from the primary device.
+/// What one call-log mutation did. Same contract as
+/// [`crate::features::chat_actions::ChatDispatchOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallLogDispatchOutcome {
+    Event(&'static str),
+    Malformed(&'static str),
+    Skipped(&'static str),
+    Unclaimed,
+}
+
+/// Dispatch inbound call-log mutations synced from the primary device.
 /// Returns `true` if handled, `false` if the mutation is not a call log.
 ///
 /// `is_own_jid` decides the call's direction and is consulted only once the
 /// mutation is known to be a call log, so the app-state path pays nothing for
 /// it on the mutations it is not.
+/// Kept for the unit tests below, which assert the bool contract directly.
+#[allow(dead_code)]
 pub(crate) fn dispatch_call_log_mutation(
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     full_sync: bool,
     is_own_jid: impl FnOnce(&Jid) -> bool,
 ) -> bool {
+    dispatch_call_log_mutation_outcome(event_bus, m, full_sync, is_own_jid)
+        != CallLogDispatchOutcome::Unclaimed
+}
+
+/// [`dispatch_call_log_mutation`] with the outcome preserved, for the semantic
+/// per-mutation log line. Same contract; only the return type differs.
+pub(crate) fn dispatch_call_log_mutation_outcome(
+    event_bus: &wacore::types::events::CoreEventBus,
+    m: &mut Mutation,
+    full_sync: bool,
+    is_own_jid: impl FnOnce(&Jid) -> bool,
+) -> CallLogDispatchOutcome {
     if m.operation != wa::syncd_mutation::SyncdOperation::Set
         || m.index.first().map(String::as_str) != Some(schemas::CALL_LOG.name)
     {
-        return false;
+        return CallLogDispatchOutcome::Unclaimed;
     }
 
     // Claimed from here on: the mutation is ours whether or not it is one we can
-    // read, so returning `false` would only hand a malformed call log to
+    // read, so returning `Unclaimed` would only hand a malformed call log to
     // dispatchers that key on other indexes.
     let Some(call_creator_jid) = parse_call_creator_jid(&m.index) else {
-        return true;
+        return CallLogDispatchOutcome::Skipped("bad-creator-jid");
     };
     let Some(call_id) = m.index.get(2).cloned() else {
         log::warn!("Skipping call_log mutation: missing call id in index");
-        return true;
+        return CallLogDispatchOutcome::Skipped("missing-call-id");
     };
     // Direction comes from the creator; see the module docs for why not from
     // either field that claims to carry it.
@@ -98,7 +123,7 @@ pub(crate) fn dispatch_call_log_mutation(
         .and_then(|action| action.call_log_record.take())
     else {
         log::warn!("Skipping call_log mutation for {call_id}: missing record in action value");
-        return true;
+        return CallLogDispatchOutcome::Malformed("CallLogSync");
     };
 
     event_bus.dispatch(Event::CallLogSync(
@@ -112,7 +137,7 @@ pub(crate) fn dispatch_call_log_mutation(
             .build(),
     ));
 
-    true
+    CallLogDispatchOutcome::Event("CallLogSync")
 }
 
 fn parse_call_creator_jid(index: &[String]) -> Option<Jid> {

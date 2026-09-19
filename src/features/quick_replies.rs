@@ -18,22 +18,45 @@ use wacore::appstate::schemas;
 use wacore::types::events::{Event, QuickReplyUpdate};
 use waproto::whatsapp as wa;
 
+/// What one quick-reply mutation did. Same contract as
+/// [`crate::features::chat_actions::ChatDispatchOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuickReplyDispatchOutcome {
+    Event(&'static str),
+    Malformed(&'static str),
+    Skipped(&'static str),
+    Unclaimed,
+}
+
 /// Dispatch inbound quick-reply mutations synced from a linked device.
 /// Returns `true` if handled, `false` if the mutation is not a quick reply.
+/// Kept for the unit tests below, which assert the bool contract directly.
+#[allow(dead_code)]
 pub(crate) fn dispatch_quick_reply_mutation(
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     full_sync: bool,
 ) -> bool {
+    dispatch_quick_reply_mutation_outcome(event_bus, m, full_sync)
+        != QuickReplyDispatchOutcome::Unclaimed
+}
+
+/// [`dispatch_quick_reply_mutation`] with the outcome preserved, for the
+/// semantic per-mutation log line. Same contract; only the return type differs.
+pub(crate) fn dispatch_quick_reply_mutation_outcome(
+    event_bus: &wacore::types::events::CoreEventBus,
+    m: &mut Mutation,
+    full_sync: bool,
+) -> QuickReplyDispatchOutcome {
     if m.operation != wa::syncd_mutation::SyncdOperation::Set
         || m.index.first().map(String::as_str) != Some(schemas::QUICK_REPLY.name)
     {
-        return false;
+        return QuickReplyDispatchOutcome::Unclaimed;
     }
 
     let Some(id) = m.index.get(1).cloned() else {
         log::warn!("Skipping quick_reply mutation: missing id in index");
-        return true;
+        return QuickReplyDispatchOutcome::Skipped("missing-id");
     };
 
     let ts = m
@@ -54,13 +77,14 @@ pub(crate) fn dispatch_quick_reply_mutation(
                 .from_full_sync(full_sync)
                 .build(),
         ));
+        QuickReplyDispatchOutcome::Event("QuickReplyUpdate")
     } else {
         // Claimed but undeliverable. WA Web counts the same shape as a
         // malformed action value and logs it; without this the mutation would
         // vanish with no signal at all. The id is opaque, not user content.
         log::warn!("Skipping quick_reply mutation {id}: missing quickReplyAction value");
+        QuickReplyDispatchOutcome::Malformed("QuickReplyUpdate")
     }
-    true
 }
 
 /// Access via `client.quick_replies()`.

@@ -7,7 +7,7 @@
 use crate::appstate_sync::Mutation;
 use crate::client::Client;
 use anyhow::Result;
-use log::debug;
+use log::{debug, log_enabled};
 use thiserror::Error;
 use wacore::appstate::patch_decode::WAPatchName;
 use wacore::appstate::schemas::{self, IndexPart, Schema};
@@ -79,14 +79,49 @@ pub fn message_key(
     }
 }
 
+/// What one app-state mutation did, as a value rather than a bare "handled".
+///
+/// Private and zero-allocation: every variant borrows nothing and carries only
+/// a `&'static str` naming the event or the reason nothing was emitted. The
+/// `Client/AppState` dispatcher turns it into the per-mutation DEBUG line (and
+/// the WARN for a known command whose expected payload is absent), so a new
+/// WhatsApp command that falls through every handler shows up as `Unhandled`
+/// instead of vanishing silently. Never log a `SyncActionValue` through this:
+/// it can carry names, message text, contacts and salts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatDispatchOutcome {
+    /// An event was dispatched; the strut names it (`"ArchiveUpdate"`).
+    Event(&'static str),
+    /// The command is known but its action payload was absent or unusable, so
+    /// no event was emitted (still "handled": no other dispatcher owns it).
+    Malformed(&'static str),
+    /// Claimed without an event for a benign reason (bad JID, redundant
+    /// state); the reason is already logged at WARN by the handler itself.
+    Skipped(&'static str),
+    /// Not a chat command; the next dispatcher should try.
+    Unclaimed,
+}
+
 /// Returns `true` if handled, `false` if unknown (so other handlers can try).
+/// Kept for the unit tests below, which assert the bool contract directly.
+#[allow(dead_code)]
 pub(crate) fn dispatch_chat_mutation(
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     full_sync: bool,
 ) -> bool {
+    dispatch_chat_mutation_outcome(event_bus, m, full_sync) != ChatDispatchOutcome::Unclaimed
+}
+
+/// [`dispatch_chat_mutation`] with the outcome preserved, for the semantic
+/// per-mutation log line. Same contract; only the return type differs.
+pub(crate) fn dispatch_chat_mutation_outcome(
+    event_bus: &wacore::types::events::CoreEventBus,
+    m: &mut Mutation,
+    full_sync: bool,
+) -> ChatDispatchOutcome {
     if m.index.is_empty() {
-        return false;
+        return ChatDispatchOutcome::Unclaimed;
     }
 
     let kind = &m.index[0];
@@ -99,7 +134,7 @@ pub(crate) fn dispatch_chat_mutation(
         && kind == "contact"
         && m.index.len() > 1;
     if m.operation != wa::syncd_mutation::SyncdOperation::SET && !is_contact_remove {
-        return false;
+        return ChatDispatchOutcome::Unclaimed;
     }
 
     if !matches!(
@@ -118,7 +153,7 @@ pub(crate) fn dispatch_chat_mutation(
             | "userStatusMute"
             | "deleteMessageForMe"
     ) {
-        return false;
+        return ChatDispatchOutcome::Unclaimed;
     }
 
     let ts = m
@@ -136,12 +171,12 @@ pub(crate) fn dispatch_chat_mutation(
                     kind,
                     m.index[1]
                 );
-                return true;
+                return ChatDispatchOutcome::Skipped("malformed-jid");
             }
         }
     } else {
         log::warn!("Skipping chat mutation '{}': missing JID in index", kind);
-        return true;
+        return ChatDispatchOutcome::Skipped("missing-jid");
     };
 
     match kind.as_str() {
@@ -157,8 +192,10 @@ pub(crate) fn dispatch_chat_mutation(
                         .from_full_sync(full_sync)
                         .build(),
                 ));
+                ChatDispatchOutcome::Event("MuteUpdate")
+            } else {
+                ChatDispatchOutcome::Malformed("MuteUpdate")
             }
-            true
         }
         "pin" | "pin_v1" => {
             if let Some(val) = &mut m.action_value
@@ -172,8 +209,10 @@ pub(crate) fn dispatch_chat_mutation(
                         .from_full_sync(full_sync)
                         .build(),
                 ));
+                ChatDispatchOutcome::Event("PinUpdate")
+            } else {
+                ChatDispatchOutcome::Malformed("PinUpdate")
             }
-            true
         }
         "archive" => {
             if let Some(val) = &mut m.action_value
@@ -187,8 +226,10 @@ pub(crate) fn dispatch_chat_mutation(
                         .from_full_sync(full_sync)
                         .build(),
                 ));
+                ChatDispatchOutcome::Event("ArchiveUpdate")
+            } else {
+                ChatDispatchOutcome::Malformed("ArchiveUpdate")
             }
-            true
         }
         "star" => {
             if let Some(val) = &mut m.action_value
@@ -207,8 +248,21 @@ pub(crate) fn dispatch_chat_mutation(
                         .from_full_sync(full_sync)
                         .build(),
                 ));
+                ChatDispatchOutcome::Event("StarUpdate")
+            } else {
+                // `parse_message_key_fields` already warned about a short index
+                // or a bad participant; absence of the action itself warns here
+                // so both halves of a malformed star are visible.
+                if m.action_value
+                    .as_ref()
+                    .and_then(|v| v.star_action.as_option())
+                    .is_none()
+                    && log_enabled!(log::Level::Warn)
+                {
+                    log::warn!("Skipping star mutation: missing starAction value");
+                }
+                ChatDispatchOutcome::Malformed("StarUpdate")
             }
-            true
         }
         "contact" if is_contact_remove => {
             event_bus.dispatch(Event::ContactRemoved(
@@ -218,7 +272,7 @@ pub(crate) fn dispatch_chat_mutation(
                     .from_full_sync(full_sync)
                     .build(),
             ));
-            true
+            ChatDispatchOutcome::Event("ContactRemoved")
         }
         "contact" => {
             if let Some(val) = &mut m.action_value
@@ -232,8 +286,10 @@ pub(crate) fn dispatch_chat_mutation(
                         .from_full_sync(full_sync)
                         .build(),
                 ));
+                ChatDispatchOutcome::Event("ContactUpdate")
+            } else {
+                ChatDispatchOutcome::Malformed("ContactUpdate")
             }
-            true
         }
         "mark_chat_as_read" | "markChatAsRead" => {
             if let Some(val) = &mut m.action_value
@@ -247,8 +303,10 @@ pub(crate) fn dispatch_chat_mutation(
                         .from_full_sync(full_sync)
                         .build(),
                 ));
+                ChatDispatchOutcome::Event("MarkChatAsReadUpdate")
+            } else {
+                ChatDispatchOutcome::Malformed("MarkChatAsReadUpdate")
             }
-            true
         }
         "deleteChat" => {
             if let Some(val) = &mut m.action_value
@@ -265,8 +323,10 @@ pub(crate) fn dispatch_chat_mutation(
                         .from_full_sync(full_sync)
                         .build(),
                 ));
+                ChatDispatchOutcome::Event("DeleteChatUpdate")
+            } else {
+                ChatDispatchOutcome::Malformed("DeleteChatUpdate")
             }
-            true
         }
         "clearChat" => {
             if let Some(val) = &mut m.action_value
@@ -287,8 +347,10 @@ pub(crate) fn dispatch_chat_mutation(
                         .from_full_sync(full_sync)
                         .build(),
                 ));
+                ChatDispatchOutcome::Event("ClearChatUpdate")
+            } else {
+                ChatDispatchOutcome::Malformed("ClearChatUpdate")
             }
-            true
         }
         "lock" => {
             if let Some(val) = &m.action_value
@@ -302,8 +364,10 @@ pub(crate) fn dispatch_chat_mutation(
                         .from_full_sync(full_sync)
                         .build(),
                 ));
+                ChatDispatchOutcome::Event("LockChatUpdate")
+            } else {
+                ChatDispatchOutcome::Malformed("LockChatUpdate")
             }
-            true
         }
         "userStatusMute" => {
             if let Some(val) = &mut m.action_value
@@ -318,8 +382,10 @@ pub(crate) fn dispatch_chat_mutation(
                         .from_full_sync(full_sync)
                         .build(),
                 ));
+                ChatDispatchOutcome::Event("UserStatusMuteUpdate")
+            } else {
+                ChatDispatchOutcome::Malformed("UserStatusMuteUpdate")
             }
-            true
         }
         "deleteMessageForMe" => {
             if let Some(val) = &mut m.action_value
@@ -338,10 +404,22 @@ pub(crate) fn dispatch_chat_mutation(
                         .from_full_sync(full_sync)
                         .build(),
                 ));
+                ChatDispatchOutcome::Event("DeleteMessageForMeUpdate")
+            } else {
+                if m.action_value
+                    .as_ref()
+                    .and_then(|v| v.delete_message_for_me_action.as_option())
+                    .is_none()
+                    && log_enabled!(log::Level::Warn)
+                {
+                    log::warn!(
+                        "Skipping deleteMessageForMe mutation: missing deleteMessageForMeAction value"
+                    );
+                }
+                ChatDispatchOutcome::Malformed("DeleteMessageForMeUpdate")
             }
-            true
         }
-        _ => false,
+        _ => ChatDispatchOutcome::Unclaimed,
     }
 }
 
@@ -1405,6 +1483,88 @@ mod registry_tests {
 
     fn dispatch_into_recorder(m: &Mutation) -> (bool, Vec<std::sync::Arc<Event>>) {
         dispatch_into_recorder_with(m, false)
+    }
+
+    /// Outcome-level dispatch for the tests below: the bool contract above
+    /// cannot tell "event emitted" from "known command, payload absent".
+    fn dispatch_outcome_into_recorder(
+        m: &Mutation,
+    ) -> (ChatDispatchOutcome, Vec<std::sync::Arc<Event>>) {
+        use std::sync::{Arc, Mutex};
+        use wacore::types::events::{CoreEventBus, EventHandler, EventInterest};
+
+        struct Recorder(Arc<Mutex<Vec<Arc<Event>>>>);
+        impl EventHandler for Recorder {
+            fn handle_event(&self, event: Arc<Event>) {
+                self.0.lock().unwrap().push(event);
+            }
+            fn interest(&self) -> EventInterest {
+                EventInterest::ALL
+            }
+        }
+
+        let bus = CoreEventBus::new();
+        let seen: Arc<Mutex<Vec<Arc<Event>>>> = Arc::new(Mutex::new(Vec::new()));
+        bus.subscribe_handler(Arc::new(Recorder(seen.clone())))
+            .detach();
+        let outcome = dispatch_chat_mutation_outcome(&bus, &mut m.clone(), false);
+        let events = seen.lock().unwrap().clone();
+        (outcome, events)
+    }
+
+    /// `handled=true` used to mean "an event was created"; a known command
+    /// with its action missing took the same path. The outcome tells them
+    /// apart: the mutation is still claimed (no other dispatcher owns
+    /// `archive`), but no event exists.
+    #[test]
+    fn known_command_with_missing_action_is_malformed_not_an_event() {
+        let m = Mutation {
+            index: vec!["archive".to_string(), "120363000000000042@g.us".to_string()],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: Some(wa::SyncActionValue {
+                timestamp: Some(1_700_000_000_000),
+                ..Default::default()
+            }),
+        };
+        let (outcome, events) = dispatch_outcome_into_recorder(&m);
+        assert_eq!(outcome, ChatDispatchOutcome::Malformed("ArchiveUpdate"));
+        assert!(events.is_empty());
+        // …while the bool contract still claims it, so dispatch keeps routing.
+        let (handled, _) = dispatch_into_recorder(&m);
+        assert!(handled);
+    }
+
+    /// An unknown command is unclaimed: the dispatcher below must still get
+    /// its turn. This is what makes a new WhatsApp mutation visible as
+    /// `unhandled` instead of silently absorbed.
+    #[test]
+    fn unknown_command_is_unclaimed() {
+        let m = Mutation {
+            index: vec![
+                "some_new_whatsapp_action".to_string(),
+                "120363000000000042@g.us".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: Some(wa::SyncActionValue {
+                timestamp: Some(1_700_000_000_000),
+                ..Default::default()
+            }),
+        };
+        let (outcome, events) = dispatch_outcome_into_recorder(&m);
+        assert_eq!(outcome, ChatDispatchOutcome::Unclaimed);
+        assert!(events.is_empty());
+    }
+
+    /// An empty index names no command; nothing can route it.
+    #[test]
+    fn empty_index_is_unclaimed() {
+        let m = Mutation {
+            index: vec![],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        let (outcome, _) = dispatch_outcome_into_recorder(&m);
+        assert_eq!(outcome, ChatDispatchOutcome::Unclaimed);
     }
 
     fn dispatch_into_recorder_with(

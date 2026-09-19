@@ -14,6 +14,74 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use waproto::whatsapp as wa;
 
+/// A semantic summary of one decoded mutation, for logs.
+///
+/// `command` is the mutation's verb (`index[0]`), which is what the consumer
+/// asked for: `archive`, `pin`, `contact`, ... An empty index has no verb and
+/// is reported as `""`. `operation` is the syncd `SET`/`REMOVE` rendered in
+/// the same case the patch log already uses. No payload, no index tail, no
+/// `SyncActionValue`: the whole point is a line a consumer can paste into an
+/// issue without leaking key material, salts, names or message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MutationSummary<'a> {
+    pub operation: &'static str,
+    pub command: &'a str,
+}
+
+impl<'a> MutationSummary<'a> {
+    pub fn of(m: &'a Mutation) -> Self {
+        Self {
+            operation: match m.operation {
+                wa::syncd_mutation::SyncdOperation::SET => "SET",
+                wa::syncd_mutation::SyncdOperation::REMOVE => "REMOVE",
+            },
+            command: m.index.first().map(String::as_str).unwrap_or(""),
+        }
+    }
+}
+
+impl std::fmt::Display for MutationSummary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.command.is_empty() {
+            write!(f, "{} <no-command>", self.operation)
+        } else {
+            write!(f, "{} {}", self.operation, self.command)
+        }
+    }
+}
+
+/// Render a decoded mutation batch as a compact semantic summary.
+///
+/// The integrity line above answers "did the hash hold"; this answers the
+/// question consumers actually ask — "which app state commands did the server
+/// send" — without dumping the IQ payload `node_io` deliberately hides.
+/// Repeated commands collapse (`archive×2`); an empty index, which no handler
+/// can dispatch, shows as `<no-command>` rather than vanishing. Pure and
+/// allocation-light; callers must still gate on `log_enabled!(Debug)`.
+pub fn mutation_summary(mutations: &[Mutation]) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let mut first = true;
+    let mut iter = mutations.iter().map(MutationSummary::of).peekable();
+    while let Some(cur) = iter.next() {
+        let mut run = 1usize;
+        while iter.peek().is_some_and(|next| *next == cur) {
+            iter.next();
+            run += 1;
+        }
+        if !first {
+            out.push_str(", ");
+        }
+        first = false;
+        let _ = write!(out, "{cur}");
+        if run > 1 {
+            let _ = write!(out, "×{run}");
+        }
+    }
+    out
+}
+
 /// Resolve a mutation's operation to the closed Rust enum. Absent defaults
 /// to SET (proto2 enum default); an unknown wire value is a typed error so
 /// standalone callers stay safe even without process_patch's up-front guard.
@@ -258,6 +326,19 @@ where
         mutations.push(mutation);
     }
 
+    // A snapshot can carry thousands of mutations, so the per-mutation lines
+    // the live path emits stay at TRACE here; DEBUG gets only the aggregate.
+    if log_enabled!(target: "AppState", Level::Debug) {
+        debug!(
+            target: "AppState",
+            "Decoded {} v{} snapshot: {} mutations [{}]",
+            collection_name,
+            version,
+            mutations.len(),
+            mutation_summary(&mutations)
+        );
+    }
+
     Ok(ProcessedSnapshot {
         state: initial_state.clone(),
         mutations,
@@ -377,6 +458,11 @@ where
         hash_update_result.has_missing_remove
     );
 
+    // Semantic summary of what the patch carried: the command is index[0],
+    // already decoded above, so no extra crypto or parsing. Gated so a quiet
+    // logger pays for nothing — particularly on full-sync snapshots, where
+    // this would otherwise format thousands of entries per patch.
+
     // Validate MACs if requested
     if validate_macs && let Some(key_id) = patch.key_id.id.as_ref() {
         let keys = get_keys(key_id)?;
@@ -453,6 +539,17 @@ where
 
             mutations.push(mutation);
         }
+    }
+
+    if log_enabled!(target: "AppState", Level::Debug) {
+        debug!(
+            target: "AppState",
+            "Decoded {} v{}: {} mutations [{}]",
+            collection_name,
+            state.version,
+            mutations.len(),
+            mutation_summary(&mutations)
+        );
     }
 
     Ok(PatchProcessingResult {
@@ -2110,5 +2207,57 @@ mod tests {
         let result = process_patch(&patch, &mut state, get_keys, get_prev, false, "regular")
             .expect("no-prior-state should skip version check");
         assert_eq!(result.state.version, 42);
+    }
+
+    fn summary_mutation(command: Option<&str>, op: wa::syncd_mutation::SyncdOperation) -> Mutation {
+        Mutation {
+            action_value: None,
+            index: command.map(|c| vec![c.to_string()]).unwrap_or_default(),
+            operation: op,
+        }
+    }
+
+    /// The complaint that motivated this: a patch decodes 4 mutations and the
+    /// log names none of them. The summary names every command with its
+    /// operation, in order.
+    #[test]
+    fn mutation_summary_names_each_command_with_its_operation() {
+        use wa::syncd_mutation::SyncdOperation::{REMOVE, SET};
+        let mutations = vec![
+            summary_mutation(Some("archive"), SET),
+            summary_mutation(Some("mark_chat_as_read"), SET),
+            summary_mutation(Some("pin"), SET),
+            summary_mutation(Some("contact"), SET),
+            summary_mutation(Some("contact"), REMOVE),
+        ];
+        assert_eq!(
+            mutation_summary(&mutations),
+            "SET archive, SET mark_chat_as_read, SET pin, SET contact, REMOVE contact"
+        );
+    }
+
+    /// Adjacent repeats collapse so a 12-mutation patch still fits on one line.
+    #[test]
+    fn mutation_summary_collapses_adjacent_repeats() {
+        use wa::syncd_mutation::SyncdOperation::SET;
+        let mutations = vec![
+            summary_mutation(Some("archive"), SET),
+            summary_mutation(Some("archive"), SET),
+            summary_mutation(Some("pin"), SET),
+        ];
+        assert_eq!(mutation_summary(&mutations), "SET archive×2, SET pin");
+    }
+
+    /// An empty index has no command to name; it must still appear (no handler
+    /// can dispatch it, so vanishing would hide exactly the mutation worth
+    /// noticing), and an empty batch renders as an empty string.
+    #[test]
+    fn mutation_summary_marks_empty_index_and_empty_batch() {
+        use wa::syncd_mutation::SyncdOperation::SET;
+        assert_eq!(
+            mutation_summary(&[summary_mutation(None, SET)]),
+            "SET <no-command>"
+        );
+        assert_eq!(mutation_summary(&[]), "");
     }
 }

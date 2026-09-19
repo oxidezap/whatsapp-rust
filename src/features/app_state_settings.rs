@@ -15,17 +15,41 @@ use wacore::appstate::schemas;
 use wacore::types::events::{DisableLinkPreviewsUpdate, Event};
 use waproto::whatsapp as wa;
 
+/// What one link-previews setting mutation did. Same contract as
+/// [`crate::features::chat_actions::ChatDispatchOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingDispatchOutcome {
+    Event(&'static str),
+    Malformed(&'static str),
+    #[allow(dead_code)]
+    Skipped(&'static str),
+    Unclaimed,
+}
+
 /// Dispatch inbound syncd setting mutations synced from a linked device.
 /// Returns `true` if handled, `false` if the mutation is not one of them.
+/// Kept for the unit tests below, which assert the bool contract directly.
+#[allow(dead_code)]
 pub(crate) fn dispatch_app_state_setting_mutation(
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     full_sync: bool,
 ) -> bool {
+    dispatch_app_state_setting_mutation_outcome(event_bus, m, full_sync)
+        != SettingDispatchOutcome::Unclaimed
+}
+
+/// [`dispatch_app_state_setting_mutation`] with the outcome preserved, for the
+/// semantic per-mutation log line. Same contract; only the return type differs.
+pub(crate) fn dispatch_app_state_setting_mutation_outcome(
+    event_bus: &wacore::types::events::CoreEventBus,
+    m: &mut Mutation,
+    full_sync: bool,
+) -> SettingDispatchOutcome {
     if m.operation != wa::syncd_mutation::SyncdOperation::Set
         || m.index.first().map(String::as_str) != Some(schemas::DISABLE_LINK_PREVIEWS.name)
     {
-        return false;
+        return SettingDispatchOutcome::Unclaimed;
     }
 
     let ts = m
@@ -49,12 +73,13 @@ pub(crate) fn dispatch_app_state_setting_mutation(
                 .from_full_sync(full_sync)
                 .build(),
         ));
+        SettingDispatchOutcome::Event("DisableLinkPreviewsUpdate")
     } else {
         log::warn!(
             "Skipping setting_disableLinkPreviews mutation: missing isPreviewsDisabled flag"
         );
+        SettingDispatchOutcome::Malformed("DisableLinkPreviewsUpdate")
     }
-    true
 }
 
 /// Access via `client.app_state_settings()`.
