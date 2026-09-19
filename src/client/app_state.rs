@@ -2375,7 +2375,7 @@ impl Client {
                 // page's end cursor, not each mutation's birth version.
                 let total = mutations.len();
                 for (position, mut m) in mutations.into_iter().enumerate() {
-                    self.dispatch_app_state_mutation_in(
+                    self.dispatch_app_state_mutation(
                         &mut m,
                         full_sync,
                         (name, new_state.version, position + 1, total),
@@ -2640,7 +2640,7 @@ impl Client {
                 // until the assignment below. Logging the old version would
                 // attribute the fresh mutations to the cursor they replaced —
                 // the batched path already reports `new_state.version`.
-                self.dispatch_app_state_mutation_in(
+                self.dispatch_app_state_mutation(
                     &mut m,
                     full_sync,
                     (name, new_state.version, position + 1, total),
@@ -3234,7 +3234,7 @@ impl Client {
                     // unset and lose their per-mutation line entirely.
                     let total = mutations.len();
                     for (position, mut m) in mutations.into_iter().enumerate() {
-                        self.dispatch_app_state_mutation_in(
+                        self.dispatch_app_state_mutation(
                             &mut m,
                             false,
                             (list.name, new_state.version, position + 1, total),
@@ -3528,7 +3528,7 @@ impl Client {
                 // whole collection, so per-mutation lines stay at TRACE.
                 let total = mutations.len();
                 for (position, mut m) in mutations.into_iter().enumerate() {
-                    self.dispatch_app_state_mutation_in(
+                    self.dispatch_app_state_mutation(
                         &mut m,
                         true,
                         (patch_name, recovery_version, position + 1, total),
@@ -3732,15 +3732,18 @@ fn fingerprint_id(id: &str) -> Cow<'_, str> {
 
 /// Command-aware semantic projection of the full index for TRACE.
 ///
-/// Positional, because every command owns its index shape: `target` (index
-/// 1) is JID-redacted via [`redact_index_arg`], while opaque identifiers
-/// (message ids, call ids) render as stable fingerprints via
-/// [`fingerprint_id`] so correlated mutations stay correlatable without
-/// printing whole identifiers. Unknown commands are conservative: the verb
-/// plus redacted elements, with no positional labels invented for a shape
-/// nobody declared. TRACE must never serialize `m.index` verbatim: past the
-/// target it can carry chat JIDs, message ids and participant JIDs, which
-/// would bypass the DEBUG-level redaction.
+/// Positional, because every command owns its index shape:
+///
+/// - `target` (index 1) is JID-redacted via [`redact_index_arg`],
+/// - opaque identifiers (message ids, call ids) render as stable
+///   fingerprints via [`fingerprint_id`] so correlated mutations stay
+///   correlatable without printing whole identifiers.
+///
+/// Unknown commands are conservative: the verb plus redacted elements, with
+/// no positional labels invented for a shape nobody declared. TRACE must
+/// never serialize `m.index` verbatim: past the target it can carry chat
+/// JIDs, message ids and participant JIDs, which would bypass the
+/// DEBUG-level redaction.
 fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<Cow<'_, str>> {
     let command = m.index.first().map(String::as_str).unwrap_or("");
     // (target_is_jid, extra labels by position, starting at index 2).
@@ -3966,7 +3969,11 @@ fn log_mutation_dispatched(
         .first()
         .map(String::as_str)
         .unwrap_or("<no-command>");
-    let mut line = format!("{collection:?}@{version} [{position}/{total}] {op} {command}");
+    // `cursor=` names the page end cursor explicitly: the page concatenates
+    // snapshot + patches and the processor returns one final state, so this
+    // is the cursor the page ended at — not each mutation's birth version.
+    // Per-patch `Decoded … vN` lines keep the exact granularity.
+    let mut line = format!("{collection:?} cursor={version} [{position}/{total}] {op} {command}");
     // `mutation_target` already returns `id=…` for `quick_reply` (see above),
     // so no second arm is needed here.
     if let Some(target) = mutation_target(m) {
@@ -4003,31 +4010,18 @@ fn log_mutation_dispatched(
 }
 
 impl Client {
+    /// Dispatch one app-state mutation, returning its [`AppStateDispatchOutcome`].
+    ///
     /// `&mut` so a dispatcher can move the action out of the mutation into
     /// its event instead of deep-cloning it: a full sync dispatches every
     /// mutation of every collection through here.
     ///
-    /// The outcome-returning sibling does the work; this one stays because
-    /// the recovery and conflict paths dispatch one mutation at a time with no
-    /// collection cursor to report (there `collection`/`version`/`position`
-    /// would be invented, not observed). Callers that own the batch use
-    /// [`Self::dispatch_app_state_mutation_in`] so the line carries it.
-    pub(crate) async fn dispatch_app_state_mutation(
-        &self,
-        m: &mut crate::appstate_sync::Mutation,
-        full_sync: bool,
-    ) {
-        self.dispatch_app_state_mutation_inner(m, full_sync, None)
-            .await;
-    }
-
-    /// [`Self::dispatch_app_state_mutation`] for a caller that owns the batch:
     /// `ctx` is `(collection, version, position, total)` and produces the
     /// per-mutation record: DEBUG for live sync, TRACE for full sync (see
     /// [`log_mutation_dispatched`]). The per-batch aggregate is separate and
     /// is emitted by the processor, not here. Returns the outcome so tests
     /// can assert on it without parsing logs.
-    pub(crate) async fn dispatch_app_state_mutation_in(
+    pub(crate) async fn dispatch_app_state_mutation(
         &self,
         m: &mut crate::appstate_sync::Mutation,
         full_sync: bool,
@@ -4336,7 +4330,7 @@ mod tests {
     /// TRACE must carry the redacted projection, never `m.index` verbatim:
     /// the tail of `star` / `deleteMessageForMe` / `label_message` indexes can
     /// hold chat JIDs, message ids and participant JIDs.
-    #[test]
+    ///
     /// Message/call ids stay correlatable without printing whole: stable
     /// `head…tail#len` fingerprints keep two different ids distinct across
     /// lines while leaking no full identifier.
@@ -4359,6 +4353,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn redacted_index_redacts_every_jid_shaped_element() {
         use crate::appstate_sync::Mutation;
 
@@ -4412,6 +4407,24 @@ mod tests {
             redacted.iter().map(|c| c.as_ref()).collect::<Vec<_>>(),
             vec!["some_new_whatsapp_action", "1203…0042@g.us", "3EB0…5678#20",]
         );
+    }
+
+    /// The line renders `cursor=`, not `@`: the version is the page end
+    /// cursor (snapshot + patches concatenate), never each mutation's birth
+    /// version — per-patch `Decoded … vN` lines keep that granularity.
+    #[test]
+    fn mutation_line_names_the_page_end_cursor() {
+        let cursor = MutationLine {
+            collection: WAPatchName::RegularLow,
+            version: 365,
+            position: 1,
+            total: 20,
+        };
+        let rendered = format!(
+            "{:?} cursor={} [{}/{}]",
+            cursor.collection, cursor.version, cursor.position, cursor.total
+        );
+        assert_eq!(rendered, "RegularLow cursor=365 [1/20]");
     }
 
     /// Dispatched and not-dispatched must read differently: a malformed
