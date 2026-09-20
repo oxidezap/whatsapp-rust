@@ -1501,7 +1501,13 @@ impl ProtocolNode for GroupOverviewData {
         let is_parent_group = node.get_optional_child_by_tag(&["parent"]).is_some();
         let parent_group_jid = node
             .get_optional_child_by_tag(&["linked_parent"])
-            .and_then(|n| n.attrs().optional_jid("jid"));
+            .map(|linked_parent| -> Result<Jid> {
+                let mut attrs = linked_parent.attrs();
+                let jid = attrs.required_jid("jid")?;
+                attrs.finish()?;
+                Ok(jid)
+            })
+            .transpose()?;
         let is_default_sub_group = node
             .get_optional_child_by_tag(&["default_sub_group"])
             .is_some();
@@ -5381,6 +5387,25 @@ mod tests {
         let full = GroupParticipatingRequest::new().into_node();
         assert!(full.get_optional_child("participants").is_some());
         assert!(full.get_optional_child("description").is_some());
+    }
+
+    #[test]
+    fn overview_parser_rejects_malformed_linked_parent() {
+        for linked_parent in [
+            NodeBuilder::new("linked_parent").build(),
+            NodeBuilder::new("linked_parent")
+                .attr("jid", "not-a-jid")
+                .build(),
+        ] {
+            let node = NodeBuilder::new("group")
+                .attr("id", "120363000000000041@g.us")
+                .children([linked_parent])
+                .build();
+            assert!(
+                GroupOverviewData::try_from_node(&node).is_err(),
+                "malformed linked_parent must not be treated as standalone"
+            );
+        }
     }
 
     #[test]
