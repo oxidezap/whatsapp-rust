@@ -2360,11 +2360,24 @@ mod tests {
     #[test]
     fn mutation_summary_caps_entries_and_counts_the_tail() {
         use wa::syncd_mutation::SyncdOperation::SET;
-        let known: Vec<String> = crate::schemas::WIRE_NAMES
-            .iter()
-            .take(MUTATION_SUMMARY_ENTRY_CAP + 3)
-            .map(|s| s.to_string())
-            .collect();
+        let known = [
+            "archive",
+            "pin_v1",
+            "mute",
+            "contact",
+            "star",
+            "call_log",
+            "label_edit",
+            "quick_reply",
+            "clearChat",
+            "deleteChat",
+            "lock",
+            "markChatAsRead",
+            "deleteMessageForMe",
+            "nct_salt_sync",
+            "userStatusMute",
+        ];
+        debug_assert!(known.iter().all(|c| crate::schemas::is_known_wire_name(c)));
         let mutations: Vec<Mutation> = known
             .iter()
             .map(|c| summary_mutation(Some(c), SET))

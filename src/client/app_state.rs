@@ -3733,18 +3733,15 @@ fn is_log_unsafe(c: char) -> bool {
     )
 }
 
-/// Renders `index[0]` for a log line. The outcome decides: anything no
-/// dispatcher claimed renders as `unknown=<fingerprint>`; claimed commands
-/// render sanitized and bounded. Routing keys on the raw verb, so unknown
-/// commands still reach `Unclaimed`.
+/// Renders `index[0]` for a log line. Empty renders `<no-command>`;
+/// anything no dispatcher claimed renders as `unknown=<fingerprint>`;
+/// claimed commands render sanitized and bounded. Routing keys on the raw
+/// verb, so unknown commands still reach `Unclaimed`.
 fn render_command(command: &str, outcome: AppStateDispatchOutcome) -> String {
     if command.is_empty() {
         return "<no-command>".to_string();
     }
-    if matches!(
-        outcome,
-        AppStateDispatchOutcome::Unclaimed | AppStateDispatchOutcome::EmptyIndex
-    ) {
+    if matches!(outcome, AppStateDispatchOutcome::Unclaimed) {
         return format!("unknown={}", fingerprint_id(command));
     }
     sanitize_command(command)
@@ -4237,11 +4234,7 @@ fn log_mutation_dispatched(
         wa::syncd_mutation::SyncdOperation::SET => "SET",
         wa::syncd_mutation::SyncdOperation::REMOVE => "REMOVE",
     };
-    let command = m
-        .index
-        .first()
-        .map(String::as_str)
-        .unwrap_or("<no-command>");
+    let command = m.index.first().map(String::as_str).unwrap_or("");
     // `cursor=` names the page end cursor explicitly: the page concatenates
     // snapshot + patches and the processor returns one final state, so this
     // is the cursor the page ended at — not each mutation's birth version.
@@ -5237,10 +5230,11 @@ mod tests {
     /// Unknown verbs fingerprint, never render.
     #[test]
     fn render_command_never_prints_unknown_verbs() {
-        use AppStateDispatchOutcome::{Event, Unclaimed};
+        use AppStateDispatchOutcome::{EmptyIndex, Event, Unclaimed};
 
         assert_eq!(render_command("archive", Event("ArchiveUpdate")), "archive");
         assert_eq!(render_command("", Event("test")), "<no-command>");
+        assert_eq!(render_command("", EmptyIndex), "<no-command>");
         // Claimed verbs render even when hostile-looking: dispatch proved
         // the command exists, `sanitize_command` handles the controls.
         assert!(render_command("archive\nFORGED", Event("ArchiveUpdate")).starts_with("archive"));
