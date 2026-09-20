@@ -189,13 +189,10 @@ pub fn generate(ir: &AppstateIr) -> Result<Generated> {
 
 /// The root crate's own log-gating copy: same arms as [`log_gate_matcher`],
 /// wrapped as a standalone generated module so `whatsapp-rust` gates on the
-/// same set without referencing `Schema` records. Handled aliases
-/// (`pin`/`mark_chat_as_read`, unlisted `label_message`) live at the call
-/// site, not here — the IR only knows declared verbs.
-///
-/// Built from the `Generated.known_verbs` of the same IR pass in `main.rs`
-/// (not called twice); kept as a separate fn so tests can build it from a
-/// fixture without going through the full registry.
+/// same set without referencing `Schema` records. `main.rs` builds it from
+/// `Generated.known_verbs` (same IR pass as schemas); this fn exists so
+/// tests can build it from a fixture without the full registry.
+#[cfg(test)]
 pub fn known_verbs_module(ir: &AppstateIr, wa_version: &str) -> Result<String> {
     Ok(format!(
         "{}\n{}\n",

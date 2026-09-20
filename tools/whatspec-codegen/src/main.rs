@@ -269,22 +269,13 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
     let wam = emit::wam::generate(&wam, wa_version)?;
 
     let appstate_generated = emit::appstate::generate(&appstate)?;
-    // Same IR pass as schemas (see `Generated.known_verbs`): the compact
-    // copy must be byte-identical to the one `generate` built alongside
-    // the registry, or one verb set updated without the other.
-    let appstate_known_verbs =
-        emit::appstate::known_verbs_module(&appstate, wa_version).map(|module| {
-            debug_assert_eq!(
-                module,
-                format!(
-                    "{}\n{}\n",
-                    emit::header("AppState known verbs (log gating)", wa_version),
-                    appstate_generated.known_verbs
-                ),
-                "known_verbs_module drifted from generate's copy"
-            );
-            module
-        })?;
+    // Same `Generated` as schemas: both artifacts come from one IR pass,
+    // so one verb set cannot update without the other.
+    let appstate_known_verbs = format!(
+        "{}\n{}\n",
+        emit::header("AppState known verbs (log gating)", wa_version),
+        appstate_generated.known_verbs
+    );
 
     Ok(vec![
         Artifact {
