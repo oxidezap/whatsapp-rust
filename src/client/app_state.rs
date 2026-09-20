@@ -3733,13 +3733,30 @@ fn is_log_unsafe(c: char) -> bool {
     )
 }
 
-/// The sanitized rendering of a decoded command verb (`index[0]`):
-/// anything that can break the line discipline or drive a terminal becomes
-/// `U+FFFD` and the token is bounded to `MAX_COMMAND_CHARS` chars in a
-/// single pass — memory O(48), CPU O(49) no matter how long the wire value
-/// is — so an authenticated-but-malformed or newly introduced mutation can
-/// neither forge log lines nor blow up the aggregate. Used both by the
-/// per-mutation line and the TRACE index projection below.
+/// Renders `index[0]` for a log line. Only declared protocol verbs render
+/// (sanitized, bounded); anything else becomes `unknown=<fingerprint>`.
+/// Routing keys on the raw verb, so unknown commands still reach `Unclaimed`.
+fn render_command(command: &str) -> String {
+    if command.is_empty() {
+        return "<no-command>".to_string();
+    }
+    if !is_known_app_state_command(command) {
+        return format!("unknown={}", fingerprint_id(command));
+    }
+    sanitize_command(command)
+}
+
+/// Declared protocol verbs: every `schemas::ALL` entry, unlisted
+/// `label_message`, legacy `pin`/`mark_chat_as_read` aliases. Anything else
+/// in the verb slot is untrusted wire text — never rendered verbatim.
+fn is_known_app_state_command(command: &str) -> bool {
+    use wacore::appstate::{schemas, schemas_unlisted};
+
+    command == schemas_unlisted::LABEL_MESSAGE.name
+        || matches!(command, "pin" | "mark_chat_as_read")
+        || schemas::ALL.iter().any(|schema| schema.name == command)
+}
+
 fn sanitize_command(command: &str) -> String {
     const MAX_COMMAND_CHARS: usize = 48;
     // Single-pass and bounded: sanitize and cap while iterating — memory
@@ -3812,7 +3829,7 @@ pub(crate) fn fingerprint_id(id: &str) -> String {
 enum IndexLogKind {
     Jid,
     Opaque,
-    /// A wire flag that is exactly `"0"` / `"1"` (`from_me`, `direction`,
+    /// A wire flag that is exactly `"0"` / `"1"` (`from_me`, `writer_flag`,
     /// the `"0"` participant sentinel). Anything else in such a slot is an
     /// opaque value, not a flag.
     Flag,
@@ -3888,7 +3905,7 @@ fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<String> {
     // the dispatchers: chat message keys are `[cmd, chat, msg_id, from_me,
     // participant]`; label_message is `[cmd, label_id, chat, msg_id,
     // from_me, participant]` (same message-key tail, see `LABEL_MESSAGE`);
-    // call_log is `[cmd, creator, call_id, direction]`; deleteChat is
+    // call_log is `[cmd, creator, call_id, writer_flag]`; deleteChat is
     // `[cmd, chat, deleteMedia]` and clearChat is
     // `[cmd, chat, deleteStarred, deleteMedia]`. Unknown commands
     // declare nothing and fall back to per-element classification below, so
@@ -3931,7 +3948,7 @@ fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<String> {
         "star" | "deleteMessageForMe" => &["", "msg", "from_me", ""],
         "label_message" => &["label", "chat", "msg", "from_me", ""],
         "label_jid" => &["label", "chat"],
-        "call_log" => &["", "call", "direction"],
+        "call_log" => &["", "call", "writer_flag"],
         "deleteChat" => &["", "delete_media"],
         "clearChat" => &["", "delete_starred", "delete_media"],
         "quick_reply" => &["id"],
@@ -3972,9 +3989,7 @@ fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<String> {
     let mut out = Vec::with_capacity(shown_parts + 2);
     for (i, arg) in m.index.iter().take(shown_parts + 1).enumerate() {
         if i == 0 {
-            // The verb renders sanitized (see `log_mutation_dispatched`):
-            // never verbatim wire text.
-            out.push(sanitize_command(arg));
+            out.push(render_command(arg));
         } else if let Some((kind, label)) =
             shape.get(i - 1).copied().zip(labels.get(i - 1).copied())
         {
@@ -4121,16 +4136,12 @@ fn mutation_effect_detail(m: &crate::appstate_sync::Mutation) -> Option<Mutation
             .and_then(|a| a.locked)
             .map(|b| MutationEffectDetail::Bool("locked", b)),
         // `delete_media` lives in the proto here (unlike
-        // `deleteChat`/`clearChat`, whose flags are index-tail): the DEBUG
-        // line names the destructive choice the dispatcher applied, so
-        // media-preserving and media-deleting replays read differently.
-        // Absent field (None) means the sender omitted it — reported as
-        // false, matching the protobuf default.
+        // `deleteChat`/`clearChat`, whose flags are index-tail). Absent
+        // field reads as false, the protobuf default.
         "deleteMessageForMe" => v
             .delete_message_for_me_action
             .as_option()
-            .and_then(|a| a.delete_media)
-            .map(|b| MutationEffectDetail::Bool("delete_media", b)),
+            .map(|a| MutationEffectDetail::Bool("delete_media", a.delete_media.unwrap_or(false))),
         // The destructive flags live in the index tail, not the proto
         // (schemas `DELETE_CHAT`/`CLEAR_CHAT`, dispatcher reads them the
         // same way): the DEBUG line must answer "what was actually
@@ -4239,13 +4250,11 @@ fn log_mutation_dispatched(
     // snapshot + patches and the processor returns one final state, so this
     // is the cursor the page ended at — not each mutation's birth version.
     // Per-patch `Decoded … vN` lines keep the exact granularity.
-    // The verb itself is decoded wire text: sanitize before interpolating so
-    // a hostile command can neither forge lines nor emit escapes. Length is
-    // bounded by `sanitize_command`; the match arms below key on the raw
-    // verb, so an unknown-but-malicious command still routes to `Unclaimed`.
+    // Untrusted verb slot: declared commands render, anything else becomes
+    // `unknown=id#…`. Routing keys on the raw verb (`Unclaimed`).
     let mut line = format!(
         "{collection:?} cursor={version} [{position}/{total}] {op} {}",
-        sanitize_command(command)
+        render_command(command)
     );
     // `mutation_target` already returns `id=…` for `quick_reply` (see above),
     // so no second arm is needed here.
@@ -4371,17 +4380,13 @@ impl Client {
                 // TRACE" means. Logging mode, not event provenance.
                 log_mutation_dispatched(cursor, log_full_sync, handler, m, outcome, effect_detail);
             }
-            // A recognized command whose payload is missing is protocol drift,
-            // not noise: WARN names the command, DEBUG already showed the line.
+            // Protocol drift: WARN names the command, DEBUG showed the line.
             if let AppStateDispatchOutcome::Malformed(event) = outcome {
-                let command = m
-                    .index
-                    .first()
-                    .map(String::as_str)
-                    .unwrap_or("<no-command>");
+                let command = m.index.first().map(String::as_str).unwrap_or("");
                 warn!(
                     target: "Client/AppState",
-                    "{command} mutation missing {event} payload; index has {} element(s)",
+                    "{} mutation missing {event} payload; index has {} element(s)",
+                    render_command(command),
                     m.index.len()
                 );
             }
@@ -4723,8 +4728,7 @@ mod tests {
     }
 
     /// Single-char opaque values fingerprint too: the length of the value
-    /// must never decide its visibility — only declared `from_me` /
-    /// `direction` flags (`"0"` / `"1"`) pass through.
+    /// Only declared `from_me`/`writer_flag` slots pass through.
     #[test]
     fn redacted_index_fingerprints_single_char_ids() {
         use crate::appstate_sync::Mutation;
@@ -4800,7 +4804,7 @@ mod tests {
     /// tail, so TRACE must name them: `delete_media=1` instead of a bare
     /// `id#…` (the old `&[Jid]` shape left `"1"` to the JID-or-fingerprint
     /// fallback, which reads `false`/`true` as `"0"`/`id#…` — backwards).
-    /// Labeled `"0"`/`"1"` flags (`from_me`, `direction`) render labeled
+    /// Labeled `"0"`/`"1"` flags (`from_me`, `writer_flag`) render labeled
     /// too; anything else in a flag slot is opaque wire data and
     /// fingerprints.
     #[test]
@@ -4845,9 +4849,7 @@ mod tests {
         );
     }
 
-    /// Unknown commands get no positional labels invented and no assumption
-    /// that `index[1]` is a JID: an opaque `index[1]` fingerprints instead of
-    /// rendering verbatim.
+    /// Unknown commands: verb renders as `unknown=id#…`.
     #[test]
     fn redacted_index_is_conservative_on_unknown_commands() {
         use crate::appstate_sync::Mutation;
@@ -4889,6 +4891,19 @@ mod tests {
             action_value: None,
         };
         assert_eq!(redacted_index(&opaque_case)[1], fingerprint_id(opaque));
+        // The verb never renders verbatim: a JID or message id smuggled
+        // into `index[0]` becomes `unknown=id#…`.
+        let smuggled = Mutation {
+            index: vec!["5511999999999@s.whatsapp.net".to_string()],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        let verb = &redacted_index(&smuggled)[0];
+        assert!(
+            verb.starts_with("unknown=id#"),
+            "smuggled verb must fingerprint, got {verb}"
+        );
+        assert!(!verb.contains("5511999999999"));
     }
 
     /// `label_message` carries the full message-key tail (`from_me`,
@@ -5175,12 +5190,33 @@ mod tests {
             mutation_effect_detail(&scalar(Some(false))),
             Some(MutationEffectDetail::Bool("delete_media", false))
         );
-        // Omitted field: no scalar rather than a guessed default.
-        assert_eq!(mutation_effect_detail(&scalar(None)), None);
+        // Omitted field reads as false, the protobuf default.
+        assert_eq!(
+            mutation_effect_detail(&scalar(None)),
+            Some(MutationEffectDetail::Bool("delete_media", false))
+        );
     }
 
-    /// A hostile verb renders sanitized on the line: no newlines, no
-    /// escapes, bounded length — while routing still keys on the raw verb.
+    /// Unknown verbs fingerprint, never render.
+    #[test]
+    fn render_command_never_prints_unknown_verbs() {
+        assert_eq!(render_command("archive"), "archive");
+        assert_eq!(render_command(""), "<no-command>");
+        for hostile in [
+            "archive\nFORGED: yes\u{1B}[2J".to_string(),
+            "5511999999999@s.whatsapp.net".to_string(),
+            "CUSTOMER_SECRET_MESSAGE_ID".to_string(),
+            "a".repeat(2_000_000),
+        ] {
+            let rendered = render_command(&hostile);
+            assert!(
+                rendered.starts_with("unknown=id#"),
+                "{hostile:?} must fingerprint, got {rendered}"
+            );
+            assert!(!rendered.contains(&hostile[..hostile.len().min(8)]));
+        }
+    }
+
     #[test]
     fn sanitize_command_escapes_and_bounds_hostile_verbs() {
         assert_eq!(sanitize_command("archive"), "archive");

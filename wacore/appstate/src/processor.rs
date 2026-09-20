@@ -14,21 +14,49 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use waproto::whatsapp as wa;
 
-/// A semantic summary of one decoded mutation, for logs.
-///
-/// `command` is the mutation's verb (`index[0]`), which is what the consumer
-/// asked for: `archive`, `pin`, `contact`, ... An empty index has no verb and
-/// is reported as `""`. `operation` is the syncd `SET`/`REMOVE` rendered in
-/// the same case the patch log already uses. No payload, no index tail, no
-/// `SyncActionValue`: the whole point is a line a consumer can paste into an
+/// `command` is the mutation's verb (`index[0]`): `archive`, `pin`,
+/// `contact`, ... Untrusted wire text — only declared verbs (see
+/// `is_known_app_state_command`) render; anything else aggregates as
+/// `<unknown-command>`, which also keeps a multi-MB hostile verb out of
+/// the `HashMap` key. `operation` is syncd `SET`/`REMOVE`. No payload, no
+/// index tail, no `SyncActionValue`: a line a consumer can paste into an
 /// issue without leaking key material, salts, names or message text.
 ///
 /// Crate-private: the only consumer is the `Decoded …` aggregate logged a few
 /// functions below, and the PR body promises no public-API change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CommandSummary<'a> {
+    Known(&'a str),
+    Unknown,
+    Empty,
+}
+
+impl<'a> CommandSummary<'a> {
+    fn of(raw: &'a str) -> Self {
+        if raw.is_empty() {
+            Self::Empty
+        } else if is_known_app_state_command(raw) {
+            Self::Known(raw)
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+/// Declared protocol verbs: every `schemas::ALL` entry, unlisted
+/// `label_message`, legacy `pin`/`mark_chat_as_read` aliases.
+fn is_known_app_state_command(command: &str) -> bool {
+    command == crate::schemas_unlisted::LABEL_MESSAGE.name
+        || matches!(command, "pin" | "mark_chat_as_read")
+        || crate::schemas::ALL
+            .iter()
+            .any(|schema| schema.name == command)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct MutationSummary<'a> {
     operation: &'static str,
-    command: &'a str,
+    command: CommandSummary<'a>,
 }
 
 impl<'a> MutationSummary<'a> {
@@ -38,7 +66,7 @@ impl<'a> MutationSummary<'a> {
                 wa::syncd_mutation::SyncdOperation::SET => "SET",
                 wa::syncd_mutation::SyncdOperation::REMOVE => "REMOVE",
             },
-            command: m.index.first().map(String::as_str).unwrap_or(""),
+            command: CommandSummary::of(m.index.first().map(String::as_str).unwrap_or("")),
         }
     }
 }
@@ -87,10 +115,12 @@ fn sanitize_command(command: &str) -> String {
 
 impl std::fmt::Display for MutationSummary<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.command.is_empty() {
-            write!(f, "{} <no-command>", self.operation)
-        } else {
-            write!(f, "{} {}", self.operation, sanitize_command(self.command))
+        match self.command {
+            CommandSummary::Empty => write!(f, "{} <no-command>", self.operation),
+            CommandSummary::Unknown => write!(f, "{} <unknown-command>", self.operation),
+            CommandSummary::Known(command) => {
+                write!(f, "{} {}", self.operation, sanitize_command(command))
+            }
         }
     }
 }
@@ -2328,26 +2358,25 @@ mod tests {
         );
     }
 
-    /// Past the entry cap the long tail folds into `… +N more`, so a snapshot
-    /// with hundreds of distinct commands is still one line.
+    /// Past the entry cap the tail folds into `… +N more`.
     #[test]
     fn mutation_summary_caps_entries_and_counts_the_tail() {
         use wa::syncd_mutation::SyncdOperation::SET;
-        let mutations: Vec<Mutation> = (0..(MUTATION_SUMMARY_ENTRY_CAP + 3))
-            .map(|i| summary_mutation(Some(&format!("cmd{i}")), SET))
+        let known: Vec<String> = crate::schemas::ALL
+            .iter()
+            .take(MUTATION_SUMMARY_ENTRY_CAP + 3)
+            .map(|s| s.name.to_string())
+            .collect();
+        let mutations: Vec<Mutation> = known
+            .iter()
+            .map(|c| summary_mutation(Some(c), SET))
             .collect();
         let summary = mutation_summary(&mutations);
         assert!(summary.contains("… +3 more"), "tail folded: {summary}");
-        assert_eq!(
-            summary.matches("SET cmd").count(),
-            MUTATION_SUMMARY_ENTRY_CAP
-        );
+        assert_eq!(summary.matches("SET ").count(), MUTATION_SUMMARY_ENTRY_CAP);
     }
 
-    /// Thousands of distinct verbs still aggregate in linear time and stay
-    /// one line: the count is O(n) in a `HashMap`, the sort is over
-    /// distinct commands only, and the entry cap plus tail count bound the
-    /// output. Ties keep first-appearance order deterministically.
+    /// Thousands of distinct unknown verbs collapse into one bucket.
     #[test]
     fn mutation_summary_scales_to_thousands_of_distinct_commands() {
         use wa::syncd_mutation::SyncdOperation::SET;
@@ -2357,18 +2386,22 @@ mod tests {
             .map(|v| summary_mutation(Some(v), SET))
             .collect();
         let summary = mutation_summary(&mutations);
-        // One line, capped: 12 entries plus the folded tail.
-        assert_eq!(
-            summary.matches("SET cmd").count(),
-            MUTATION_SUMMARY_ENTRY_CAP
-        );
-        assert!(
-            summary.contains(&format!("… +{} more", 2_000 - MUTATION_SUMMARY_ENTRY_CAP)),
-            "tail folded: {summary}"
-        );
-        // Deterministic: ties (all ×1) keep first-appearance order, so the
-        // head of the line is the head of the batch.
-        assert!(summary.starts_with("SET cmd0000, SET cmd0001"), "{summary}");
+        assert_eq!(summary, "SET <unknown-command>×2000");
+    }
+
+    /// Unknown verbs aggregate without printing.
+    #[test]
+    fn mutation_summary_never_renders_unknown_verbs() {
+        use wa::syncd_mutation::SyncdOperation::SET;
+        let summary = mutation_summary(&[
+            summary_mutation(Some("5511999999999@s.whatsapp.net"), SET),
+            summary_mutation(Some("CUSTOMER_SECRET_MESSAGE_ID"), SET),
+            summary_mutation(Some("archive"), SET),
+        ]);
+        assert!(!summary.contains("5511999999999"), "{summary}");
+        assert!(!summary.contains("CUSTOMER_SECRET"), "{summary}");
+        assert!(summary.contains("SET <unknown-command>×2"), "{summary}");
+        assert!(summary.contains("SET archive"), "{summary}");
     }
 
     /// An empty index has no command to name; it must still appear (no handler
@@ -2384,21 +2417,23 @@ mod tests {
         assert_eq!(mutation_summary(&[]), "");
     }
 
-    /// A hostile verb can neither forge log lines nor blow up the aggregate:
-    /// control characters render as `U+FFFD` and the token is bounded.
+    /// Unknown verbs aggregate as `<unknown-command>`, never verbatim.
     #[test]
     fn mutation_summary_sanitizes_hostile_commands() {
         use wa::syncd_mutation::SyncdOperation::SET;
-        let forged = "archive\nFORGED: yes\u{1B}[2J";
-        let summary = mutation_summary(&[summary_mutation(Some(forged), SET)]);
-        assert!(!summary.contains('\n'));
-        assert!(!summary.contains('\u{1B}'));
-        assert!(summary.starts_with("SET archive"));
-        let long = "a".repeat(200);
-        let summary = mutation_summary(&[summary_mutation(Some(&long), SET)]);
-        assert!(summary.chars().count() < 200);
-        assert!(summary.contains('…'));
-        // The full Unicode unsafe set is sanitized, not just C0 + DEL.
+        assert_eq!(
+            mutation_summary(&[summary_mutation(Some("archive"), SET)]),
+            "SET archive"
+        );
+        for hostile in [
+            "archive\nFORGED: yes\u{1B}[2J".to_string(),
+            "a".repeat(200),
+            "a".repeat(20_000),
+            "5511999999999@s.whatsapp.net".to_string(),
+        ] {
+            let summary = mutation_summary(&[summary_mutation(Some(&hostile), SET)]);
+            assert_eq!(summary, "SET <unknown-command>", "{hostile:?}");
+        }
         for c in [
             '\u{85}', '\u{9B}', '\u{2028}', '\u{2029}', '\u{202E}', '\u{061C}', '\u{200E}',
             '\u{200F}', '\u{2067}', '\u{206A}',
@@ -2406,12 +2441,22 @@ mod tests {
             let verb = format!("archive{c}FORGED");
             let summary = mutation_summary(&[summary_mutation(Some(&verb), SET)]);
             assert!(!summary.contains(c), "verb must not carry {c:?}");
-            assert!(summary.contains('\u{FFFD}'));
+            assert_eq!(summary, "SET <unknown-command>");
         }
-        // Bounded during processing, not just in the output: a hostile
-        // multi-KB verb costs O(48) chars in the aggregate, never O(input).
-        let huge = "a".repeat(20_000);
-        let summary = mutation_summary(&[summary_mutation(Some(&huge), SET)]);
-        assert!(summary.chars().count() <= 48 + "SET ".len() + 1);
+    }
+
+    /// `sanitize_command` replaces the unsafe set and bounds in one pass.
+    #[test]
+    fn sanitize_command_replaces_unsafe_set_and_bounds() {
+        for c in [
+            '\n', '\u{1B}', '\u{85}', '\u{9B}', '\u{2028}', '\u{2029}', '\u{202E}', '\u{061C}',
+            '\u{200E}', '\u{200F}', '\u{2067}', '\u{206A}',
+        ] {
+            let rendered = sanitize_command(&format!("archive{c}FORGED"));
+            assert!(!rendered.contains(c), "must not carry {c:?}");
+            assert!(rendered.contains('\u{FFFD}'));
+        }
+        let bounded = sanitize_command(&"a".repeat(20_000));
+        assert!(bounded.chars().count() <= 48 + 1);
     }
 }
