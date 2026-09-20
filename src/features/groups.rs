@@ -26,7 +26,7 @@ use wacore::iq::mex_operations::update_group_property;
 use wacore::types::message::AddressingMode;
 use wacore_binary::{Jid, JidExt as _};
 
-use wacore::iq::groups::BatchGroupInfoResult as RawBatchResult;
+use wacore::iq::groups::BatchGroupMetadataResult as RawBatchResult;
 use wacore::iq::groups::BatchGroupOverviewResult as RawOverviewBatchResult;
 pub use wacore::iq::groups::{
     GroupAppealStatus, GroupCreateOptions, GroupDescription, GroupEphemeralSettings,
@@ -184,11 +184,12 @@ pub enum SubgroupKind {
 /// [`Groups::list_participating`] (every group the account is in) or
 /// [`Groups::fetch_overviews`] (a chosen subset); both always hit the
 /// network and never backfill LID/PN mappings.
+/// `subject` is optional because the protocol can explicitly omit it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct GroupOverview {
     pub id: Jid,
-    pub subject: String,
+    pub subject: Option<String>,
     pub hierarchy: GroupHierarchy,
     /// Total participant count (`size` attribute), when the server sent one.
     pub participant_count: Option<u32>,
@@ -216,7 +217,10 @@ impl GroupOverview {
     pub(crate) fn from_response_for_tests(group: &GroupMetadataResponse) -> Self {
         Self::from_parts(
             group.id.clone(),
-            group.subject.as_str().to_string(),
+            group
+                .subject
+                .as_ref()
+                .map(|subject| subject.as_str().to_string()),
             group.size,
             OverviewFlags {
                 is_parent_group: group.is_parent_group,
@@ -247,7 +251,12 @@ impl GroupOverview {
         )
     }
 
-    fn from_parts(id: Jid, subject: String, size: Option<u32>, flags: OverviewFlags) -> Self {
+    fn from_parts(
+        id: Jid,
+        subject: Option<String>,
+        size: Option<u32>,
+        flags: OverviewFlags,
+    ) -> Self {
         Self {
             id,
             subject,
@@ -350,7 +359,7 @@ pub enum GroupOverviewResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GroupMetadata {
     pub id: Jid,
-    pub subject: String,
+    pub subject: Option<String>,
     pub notify: Option<String>,
     pub participants: Vec<GroupParticipant>,
     pub addressing_mode: AddressingMode,
@@ -473,7 +482,7 @@ impl From<GroupMetadataResponse> for GroupMetadata {
     fn from(group: GroupMetadataResponse) -> Self {
         Self {
             id: group.id,
-            subject: group.subject.into_string(),
+            subject: group.subject.map(GroupSubject::into_string),
             notify: group.notify,
             participants: group.participants.into_iter().map(Into::into).collect(),
             addressing_mode: group.addressing_mode,
@@ -2392,7 +2401,7 @@ mod tests {
 
         let metadata = GroupMetadata {
             id: jid.clone(),
-            subject: "Test Group".to_string(),
+            subject: Some("Test Group".to_string()),
             participants: vec![GroupParticipant {
                 jid: participant_jid,
                 phone_number: None,
@@ -2404,7 +2413,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(metadata.subject, "Test Group");
+        assert_eq!(metadata.subject.as_deref(), Some("Test Group"));
         assert_eq!(metadata.participants.len(), 1);
         assert!(metadata.participants[0].is_admin());
         assert!(!metadata.participants[0].is_super_admin());
@@ -3843,7 +3852,7 @@ mod tests {
             .build();
         let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         let overview = GroupOverview::from_response_for_tests(&response);
-        assert_eq!(overview.subject, "Standalone");
+        assert_eq!(overview.subject, Some("Standalone".to_string()));
         assert_eq!(overview.hierarchy, GroupHierarchy::Standalone);
         assert_eq!(overview.participant_count, Some(7));
         assert!(!overview.is_parent_group());
@@ -3932,19 +3941,18 @@ mod tests {
     }
 
     #[test]
-    fn group_overview_defaults_absent_subject() {
+    fn group_overview_preserves_absent_subject_as_none() {
         use wacore::iq::groups::GroupOverviewData;
         use wacore::protocol::ProtocolNode;
         use wacore_binary::builder::NodeBuilder;
 
-        // The protocol parser defaults an absent subject to the empty string,
-        // preserving the pre-redesign display contract.
+        // An omitted subject remains distinguishable from an empty subject.
         let node = NodeBuilder::new("group")
             .attr("id", "120363000000000015@g.us")
             .build();
         let data = GroupOverviewData::try_from_node(&node).unwrap();
         let overview = GroupOverview::from_overview_data(&data);
-        assert_eq!(overview.subject, "");
+        assert_eq!(overview.subject, None);
     }
 
     #[test]
@@ -4067,7 +4075,7 @@ mod tests {
         match &results[0] {
             GroupOverviewResult::Found(overview) => {
                 assert_eq!(overview.id, found);
-                assert_eq!(overview.subject, "Found");
+                assert_eq!(overview.subject, Some("Found".to_string()));
                 assert_eq!(overview.participant_count, Some(42));
                 assert_eq!(overview.hierarchy, GroupHierarchy::Standalone);
             }
@@ -4168,7 +4176,7 @@ mod tests {
         let overviews = query.await.unwrap().unwrap();
         assert_eq!(overviews.len(), 1);
         assert_eq!(overviews[0].id, group);
-        assert_eq!(overviews[0].subject, "Participating");
+        assert_eq!(overviews[0].subject, Some("Participating".to_string()));
         assert_eq!(overviews[0].hierarchy, GroupHierarchy::Community);
         assert_eq!(overviews[0].participant_count, Some(3));
     }
@@ -4207,7 +4215,7 @@ mod tests {
         match &results[0] {
             GroupOverviewResult::Found(overview) => {
                 assert_eq!(overview.id, found);
-                assert_eq!(overview.subject, "Found");
+                assert_eq!(overview.subject, Some("Found".to_string()));
                 assert_eq!(overview.participant_count, Some(5));
             }
             other => panic!("expected Found, got {other:?}"),

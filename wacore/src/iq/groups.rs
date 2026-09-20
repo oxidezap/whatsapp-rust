@@ -720,12 +720,13 @@ impl ProtocolNode for GroupEphemeralSettings {
 }
 
 /// Response from a group info query.
-
+///
+/// `subject` is optional because the protocol can explicitly omit it.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct GroupMetadataResponse {
     pub id: Jid,
-    pub subject: GroupSubject,
+    pub subject: Option<GroupSubject>,
     /// Optional display notification string (from `notify`).
     pub notify: Option<String>,
     pub addressing_mode: AddressingMode,
@@ -1020,8 +1021,11 @@ impl ProtocolNode for GroupMetadataResponse {
 
         let mut builder = NodeBuilder::new("group")
             .attr("id", self.id)
-            .attr("subject", self.subject.as_str())
             .attr("addressing_mode", self.addressing_mode.as_str());
+
+        if let Some(subject) = self.subject {
+            builder = builder.attr("subject", subject.as_str());
+        }
 
         if let Some(notify) = self.notify {
             builder = builder.attr("notify", notify);
@@ -1088,12 +1092,9 @@ impl ProtocolNode for GroupMetadataResponse {
             Jid::group(id_str.as_ref())
         };
 
-        let subject = GroupSubject::new_unchecked(
-            attrs
-                .optional_string("subject")
-                .as_deref()
-                .unwrap_or_default(),
-        );
+        let subject = attrs
+            .optional_string("subject")
+            .map(|value| GroupSubject::new_unchecked(value.as_ref()));
         let notify = attrs
             .optional_string("notify")
             .map(|value| value.into_owned());
@@ -1423,11 +1424,13 @@ impl ProtocolNode for GroupParticipatingRequest {
 /// `<participant>` (e.g. missing `jid`) still parses as an overview; the
 /// full [`GroupMetadataResponse`] parser rejects it.
 ///
+/// The protocol has an explicit unnamed-subject shape, so absence is
+/// distinct from an empty subject.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct GroupOverviewData {
     pub id: Jid,
-    pub subject: String,
+    pub subject: Option<String>,
     pub size: Option<u32>,
     pub is_parent_group: bool,
     pub parent_group_jid: Option<Jid>,
@@ -1442,7 +1445,9 @@ impl ProtocolNode for GroupOverviewData {
 
     fn into_node(self) -> Node {
         let mut builder = NodeBuilder::new("group").attr("id", self.id);
-        builder = builder.attr("subject", self.subject);
+        if let Some(subject) = self.subject {
+            builder = builder.attr("subject", subject);
+        }
         if let Some(size) = self.size {
             builder = builder.attr("size", size);
         }
@@ -1484,8 +1489,7 @@ impl ProtocolNode for GroupOverviewData {
         };
         let subject = attrs
             .optional_string("subject")
-            .map(|value| value.into_owned())
-            .unwrap_or_default();
+            .map(|value| value.into_owned());
         attrs.finish()?;
         let size = optional_bounded_u32_attr(node, "size", GROUP_INFO_PARTICIPANT_LIMIT)?;
         let is_parent_group = node.get_optional_child_by_tag(&["parent"]).is_some();
@@ -3655,7 +3659,7 @@ fn parse_batch_group_refusal(group_node: &NodeRef<'_>, code: &str) -> Result<Bat
 
 /// Result for a single group in a batch query.
 #[derive(Debug, Clone)]
-pub enum BatchGroupInfoResult {
+pub enum BatchGroupMetadataResult {
     Full(Box<GroupMetadataResponse>),
     /// Truncated response (only id and required size available).
     Truncated {
@@ -3705,7 +3709,7 @@ impl BatchGetGroupInfoIq {
 }
 
 impl IqSpec for BatchGetGroupInfoIq {
-    type Response = Vec<BatchGroupInfoResult>;
+    type Response = Vec<BatchGroupMetadataResult>;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let children: Vec<Node> = self
@@ -3735,10 +3739,10 @@ impl IqSpec for BatchGetGroupInfoIq {
             if let Some(error_code) = attrs.optional_string("error") {
                 match parse_batch_group_refusal(group_node, error_code.as_ref())? {
                     BatchGroupRefusal::Forbidden(id) => {
-                        results.push(BatchGroupInfoResult::Forbidden(id))
+                        results.push(BatchGroupMetadataResult::Forbidden(id))
                     }
                     BatchGroupRefusal::NotFound(id) => {
-                        results.push(BatchGroupInfoResult::NotFound(id))
+                        results.push(BatchGroupMetadataResult::NotFound(id))
                     }
                 };
                 continue;
@@ -3764,10 +3768,10 @@ impl IqSpec for BatchGetGroupInfoIq {
                         .ok_or_else(|| {
                             anyhow!("missing required attribute size on truncated group")
                         })?;
-                results.push(BatchGroupInfoResult::Truncated { id, size });
+                results.push(BatchGroupMetadataResult::Truncated { id, size });
             } else {
                 let info = GroupMetadataResponse::try_from_node_ref(group_node)?;
-                results.push(BatchGroupInfoResult::Full(Box::new(info)));
+                results.push(BatchGroupMetadataResult::Full(Box::new(info)));
             }
         }
 
@@ -4589,9 +4593,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(groups.groups.len(), 1);
-        assert_eq!(groups.groups[0].subject.as_str(), "Regular group");
+        assert_eq!(
+            groups.groups[0].subject.as_ref().map(GroupSubject::as_str),
+            Some("Regular group")
+        );
         assert_eq!(communities.groups.len(), 1);
-        assert_eq!(communities.groups[0].subject.as_str(), "Parent group");
+        assert_eq!(
+            communities.groups[0]
+                .subject
+                .as_ref()
+                .map(GroupSubject::as_str),
+            Some("Parent group")
+        );
         assert!(communities.groups[0].is_parent_group);
     }
 
@@ -4642,7 +4655,13 @@ mod tests {
 
         assert_eq!(groups.groups.len(), 2);
         assert_eq!(communities.groups.len(), 1);
-        assert_eq!(communities.groups[0].subject.as_str(), "Parent group");
+        assert_eq!(
+            communities.groups[0]
+                .subject
+                .as_ref()
+                .map(GroupSubject::as_str),
+            Some("Parent group")
+        );
     }
 
     #[test]
@@ -5423,7 +5442,7 @@ mod tests {
             .children([NodeBuilder::new("participant").build()])
             .build();
         let overview = GroupOverviewData::try_from_node(&node).unwrap();
-        assert_eq!(overview.subject, "Overview probe");
+        assert_eq!(overview.subject.as_deref(), Some("Overview probe"));
         let full_err = GroupMetadataResponse::try_from_node(&node).unwrap_err();
         assert!(full_err.to_string().contains("jid"));
     }
@@ -5453,9 +5472,9 @@ mod tests {
             .unwrap()
             .groups;
         assert_eq!(overviews.len(), 2);
-        assert_eq!(overviews[0].subject, "Regular group");
+        assert_eq!(overviews[0].subject.as_deref(), Some("Regular group"));
         assert!(!overviews[0].is_parent_group);
-        assert_eq!(overviews[1].subject, "Parent group");
+        assert_eq!(overviews[1].subject.as_deref(), Some("Parent group"));
         assert!(overviews[1].is_parent_group);
     }
 
@@ -5540,7 +5559,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         match &results[0] {
             BatchGroupOverviewResult::Full(info) => {
-                assert_eq!(info.subject, "Batch probe");
+                assert_eq!(info.subject.as_deref(), Some("Batch probe"));
                 assert_eq!(info.size, Some(5));
             }
             other => panic!("expected Full, got {other:?}"),
@@ -6100,15 +6119,14 @@ mod tests {
         let absent = GroupMetadataResponse::try_from_node(&absent).unwrap();
         let empty = GroupMetadataResponse::try_from_node(&empty).unwrap();
 
-        assert_eq!(absent.subject.as_str(), "");
-        assert_eq!(empty.subject.as_str(), "");
-        assert_eq!(
+        assert!(absent.subject.is_none());
+        assert_eq!(empty.subject.as_ref().map(GroupSubject::as_str), Some(""));
+        assert!(
             absent
                 .into_node()
                 .attrs()
                 .optional_string("subject")
-                .as_deref(),
-            Some("")
+                .is_none()
         );
         assert_eq!(
             empty
@@ -6484,7 +6502,10 @@ mod tests {
         let response = GroupMetadataResponse::try_from_node(&node).unwrap();
 
         assert_eq!(response.id.to_string(), "120363000000000001@g.us");
-        assert_eq!(response.subject.as_str(), "test");
+        assert_eq!(
+            response.subject.as_ref().map(GroupSubject::as_str),
+            Some("test")
+        );
         assert_eq!(response.addressing_mode, AddressingMode::Lid);
         assert_eq!(response.creation_time, Some(1700000000));
         assert_eq!(response.subject_time, Some(1700000000));

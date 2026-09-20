@@ -360,7 +360,7 @@ async fn test_community_query_linked_group() -> anyhow::Result<()> {
         .await?;
 
     assert_eq!(metadata.id, group.metadata.id, "metadata JID should match");
-    assert_eq!(metadata.subject, "Queryable Sub");
+    assert_eq!(metadata.subject.as_deref(), Some("Queryable Sub"));
 
     info!(
         "Queried linked group: {} (subject={:?})",
