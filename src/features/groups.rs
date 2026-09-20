@@ -939,7 +939,7 @@ impl<'a> Groups<'a> {
     /// user-facing fields (subject, description, admin roles, group settings)
     /// use [`Groups::fetch_metadata`], and to control staleness explicitly use
     /// [`Groups::routing_info_with_freshness`].
-    pub(crate) async fn routing_info(
+    pub async fn routing_info(
         &self,
         jid: &Jid,
     ) -> Result<Arc<GroupRoutingInfo>, GroupError> {
