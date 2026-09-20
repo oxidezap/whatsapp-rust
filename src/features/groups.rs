@@ -936,9 +936,8 @@ impl<'a> Groups<'a> {
     ///
     /// This may be cache-preferred; the cost does not read at the callsite.
     /// This is the right call for routing and encrypting a message. For the
-    /// user-facing fields (subject, description, admin roles, group settings)
-    /// use [`Groups::fetch_metadata`], and to control staleness explicitly use
-    /// [`Groups::routing_info_with_freshness`].
+    /// user-facing fields (subject, description, admin roles, group settings),
+    /// use [`Groups::fetch_metadata`].
     pub async fn routing_info(&self, jid: &Jid) -> Result<Arc<GroupRoutingInfo>, GroupError> {
         self.routing_info_with_freshness(jid, crate::cache::Freshness::CachePreferred)
             .await
