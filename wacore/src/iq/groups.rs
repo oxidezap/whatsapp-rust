@@ -3748,11 +3748,10 @@ impl IqSpec for BatchGetGroupInfoIq {
                 continue;
             }
 
-            let is_truncated = attrs
-                .optional_string("truncated")
-                .is_some_and(|s| s == "true");
+            let is_truncated = attrs.optional_bool_value("truncated");
+            attrs.finish()?;
 
-            if is_truncated {
+            if is_truncated == Some(true) {
                 let id_str = required_attr(group_node, "id")?;
                 let id = parse_group_id(&id_str)?;
                 let size = attrs.optional_string("size").and_then(|s| s.parse().ok());
@@ -3814,11 +3813,10 @@ impl IqSpec for BatchGetGroupOverviewIq {
                 continue;
             }
 
-            let is_truncated = attrs
-                .optional_string("truncated")
-                .is_some_and(|s| s == "true");
+            let is_truncated = attrs.optional_bool_value("truncated");
+            attrs.finish()?;
 
-            if is_truncated {
+            if is_truncated == Some(true) {
                 let id_str = required_attr(group_node, "id")?;
                 let id = parse_group_id(&id_str)?;
                 let size = attrs.optional_string("size").and_then(|s| s.parse().ok());
@@ -5458,6 +5456,28 @@ mod tests {
                 .to_string()
                 .contains("unexpected batch group error code '500'")
         );
+    }
+
+    #[test]
+    fn overview_batch_parses_protocol_truncated_boolean() {
+        let parse = |truncated: &str| {
+            let response = NodeBuilder::new("iq")
+                .children([NodeBuilder::new("groups")
+                    .children([NodeBuilder::new("group")
+                        .attr("id", "120363000000000042@g.us")
+                        .attr("truncated", truncated)
+                        .build()])
+                    .build()])
+                .build();
+            BatchGetGroupOverviewIq::new(&[]).parse_response(&response.as_node_ref())
+        };
+
+        let results = parse("1").unwrap();
+        assert!(matches!(
+            results.as_slice(),
+            [BatchGroupOverviewResult::Truncated { size: None, .. }]
+        ));
+        assert!(parse("not-a-boolean").is_err());
     }
 
     #[test]

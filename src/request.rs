@@ -444,10 +444,17 @@ impl Client {
     /// # Example
     ///
     /// ```ignore
-    /// use wacore::iq::groups::GroupQueryIq;
+    /// use wacore::iq::groups::{GroupInfoOutcome, GroupQueryIq};
     ///
     /// let group_info = client.execute(GroupQueryIq::new(&group_jid)).await?;
-    /// println!("Group subject: {:?}", group_info.subject);
+    /// match group_info {
+    ///     GroupInfoOutcome::Full(metadata) => {
+    ///         println!("Group subject: {:?}", metadata.subject);
+    ///     }
+    ///     GroupInfoOutcome::NotModified => {
+    ///         println!("Group metadata was not modified");
+    ///     }
+    /// }
     /// ```
     pub async fn execute<S>(&self, spec: S) -> Result<S::Response, IqError>
     where
