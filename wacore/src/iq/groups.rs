@@ -1705,8 +1705,25 @@ impl IqSpec for GroupParticipatingOverviewIq {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+        // A response can carry BOTH `<groups>` and `<communities>` (the
+        // shape `participating_iqs_select_their_own_container` covers):
+        // combine both containers instead of returning after the first, or
+        // every parent community would be silently dropped from a list that
+        // promises every group. `<communities>` entries are marked as
+        // parent groups, matching the full parser's overlay.
+        let mut groups = Vec::new();
+        let mut seen_groups_shape = false;
         if has_participating_shape(response, "groups", "group") {
-            return parse_participating_overview_response(response, "groups", "group");
+            groups
+                .extend(parse_participating_overview_response(response, "groups", "group")?.groups);
+            seen_groups_shape = true;
+        }
+        if has_participating_shape(response, "communities", "community") {
+            groups.extend(parse_community_participating_overview_response(response)?.groups);
+            seen_groups_shape = true;
+        }
+        if seen_groups_shape {
+            return Ok(GroupParticipatingOverviewResponse { groups });
         }
         parse_community_participating_overview_response(response)
     }
@@ -5328,6 +5345,37 @@ mod tests {
         assert_eq!(overview.subject.as_deref(), Some("Overview probe"));
         let full_err = GroupMetadataResponse::try_from_node(&node).unwrap_err();
         assert!(full_err.to_string().contains("jid"));
+    }
+
+    #[test]
+    fn overview_participating_combines_groups_and_communities() {
+        // Both containers present: the overview list must contain both,
+        // with `<communities>` entries marked as parent groups.
+        let response = NodeBuilder::new("iq")
+            .children([
+                NodeBuilder::new("groups")
+                    .children([NodeBuilder::new("group")
+                        .attr("id", "120363000000000041@g.us")
+                        .attr("subject", "Regular group")
+                        .build()])
+                    .build(),
+                NodeBuilder::new("communities")
+                    .children([NodeBuilder::new("community")
+                        .attr("id", "120363000000000042@g.us")
+                        .attr("subject", "Parent group")
+                        .build()])
+                    .build(),
+            ])
+            .build();
+        let overviews = GroupParticipatingOverviewIq::new()
+            .parse_response(&response.as_node_ref())
+            .unwrap()
+            .groups;
+        assert_eq!(overviews.len(), 2);
+        assert_eq!(overviews[0].subject.as_deref(), Some("Regular group"));
+        assert!(!overviews[0].is_parent_group);
+        assert_eq!(overviews[1].subject.as_deref(), Some("Parent group"));
+        assert!(overviews[1].is_parent_group);
     }
 
     #[test]
