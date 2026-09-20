@@ -720,11 +720,15 @@ impl ProtocolNode for GroupEphemeralSettings {
 }
 
 /// Response from a group info query.
+///
+/// `subject` is `Option`: the protocol has an explicit unnamed-subject
+/// shape, so an absent subject is legitimate state (`None`), distinct from
+/// an empty one (`Some("")`).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct GroupMetadataResponse {
     pub id: Jid,
-    pub subject: GroupSubject,
+    pub subject: Option<GroupSubject>,
     /// Optional display notification string (from `notify`).
     pub notify: Option<String>,
     pub addressing_mode: AddressingMode,
@@ -1019,8 +1023,11 @@ impl ProtocolNode for GroupMetadataResponse {
 
         let mut builder = NodeBuilder::new("group")
             .attr("id", self.id)
-            .attr("subject", self.subject.as_str())
             .attr("addressing_mode", self.addressing_mode.as_str());
+
+        if let Some(subject) = self.subject {
+            builder = builder.attr("subject", subject.as_str());
+        }
 
         if let Some(notify) = self.notify {
             builder = builder.attr("notify", notify);
@@ -1087,12 +1094,11 @@ impl ProtocolNode for GroupMetadataResponse {
             Jid::group(id_str.as_ref())
         };
 
-        let subject = GroupSubject::new_unchecked(
-            attrs
-                .optional_string("subject")
-                .as_deref()
-                .unwrap_or_default(),
-        );
+        // Absent subject is the protocol's UnnamedSubjectFallback shape —
+        // legitimate state, not an empty name.
+        let subject = attrs
+            .optional_string("subject")
+            .map(|value| GroupSubject::new_unchecked(value.as_ref()));
 
         let notify = attrs
             .optional_string("notify")
@@ -3621,6 +3627,36 @@ impl IqSpec for AcknowledgeGroupIq {
 // Batch get group info
 // ---------------------------------------------------------------------------
 
+/// Which refusal a batch `<group error=".."/>` node carries.
+///
+/// The official response union has exactly two closed discriminators —
+/// `GroupForbidden` (`error="403"`) and `GroupNotExist` (`error="404"`) —
+/// so any other code is not a documented shape and must not be silently
+/// mapped onto one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BatchGroupRefusal {
+    Forbidden(Jid),
+    NotFound(Jid),
+}
+
+/// Classify a batch `<group>` refusal, shared by the metadata and overview
+/// batch parsers so their error handling cannot drift.
+///
+/// An unrecognized `error` code is an error rather than a `NotFound`: mapping
+/// it to `NotFound` would report a group as nonexistent when the server said
+/// something else entirely.
+fn parse_batch_group_refusal(group_node: &NodeRef<'_>, code: &str) -> Result<BatchGroupRefusal> {
+    let id_str = required_attr(group_node, "id")?;
+    let id = parse_group_id(&id_str)?;
+    match code {
+        "403" => Ok(BatchGroupRefusal::Forbidden(id)),
+        "404" => Ok(BatchGroupRefusal::NotFound(id)),
+        other => Err(anyhow!(
+            "unexpected batch group error code '{other}' (expected 403 or 404)"
+        )),
+    }
+}
+
 /// Result for a single group in a batch query.
 #[derive(Debug, Clone)]
 pub enum BatchGroupInfoResult {
@@ -3698,13 +3734,16 @@ impl IqSpec for BatchGetGroupInfoIq {
         for group_node in groups_node.get_children_by_tag("group") {
             let mut attrs = group_node.attrs();
 
-            // Check error attribute first (403=forbidden, 404=not found)
+            // A refusal is one of the union's closed discriminators; an
+            // unrecognized code is an error, not a NotFound.
             if let Some(error_code) = attrs.optional_string("error") {
-                let id_str = required_attr(group_node, "id")?;
-                let id = parse_group_id(&id_str)?;
-                match error_code.as_ref() {
-                    "403" => results.push(BatchGroupInfoResult::Forbidden(id)),
-                    _ => results.push(BatchGroupInfoResult::NotFound(id)),
+                match parse_batch_group_refusal(group_node, error_code.as_ref())? {
+                    BatchGroupRefusal::Forbidden(id) => {
+                        results.push(BatchGroupInfoResult::Forbidden(id))
+                    }
+                    BatchGroupRefusal::NotFound(id) => {
+                        results.push(BatchGroupInfoResult::NotFound(id))
+                    }
                 };
                 continue;
             }
@@ -3761,13 +3800,16 @@ impl IqSpec for BatchGetGroupOverviewIq {
         for group_node in groups_node.get_children_by_tag("group") {
             let mut attrs = group_node.attrs();
 
-            // Check error attribute first (403=forbidden, 404=not found)
+            // Same refusal classification as the metadata batch, so the two
+            // cannot drift on what an unexpected code means.
             if let Some(error_code) = attrs.optional_string("error") {
-                let id_str = required_attr(group_node, "id")?;
-                let id = parse_group_id(&id_str)?;
-                match error_code.as_ref() {
-                    "403" => results.push(BatchGroupOverviewResult::Forbidden(id)),
-                    _ => results.push(BatchGroupOverviewResult::NotFound(id)),
+                match parse_batch_group_refusal(group_node, error_code.as_ref())? {
+                    BatchGroupRefusal::Forbidden(id) => {
+                        results.push(BatchGroupOverviewResult::Forbidden(id))
+                    }
+                    BatchGroupRefusal::NotFound(id) => {
+                        results.push(BatchGroupOverviewResult::NotFound(id))
+                    }
                 };
                 continue;
             }
@@ -4527,9 +4569,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(groups.groups.len(), 1);
-        assert_eq!(groups.groups[0].subject.as_str(), "Regular group");
+        assert_eq!(
+            groups.groups[0].subject.as_ref().map(|s| s.as_str()),
+            Some("Regular group")
+        );
         assert_eq!(communities.groups.len(), 1);
-        assert_eq!(communities.groups[0].subject.as_str(), "Parent group");
+        assert_eq!(
+            communities.groups[0].subject.as_ref().map(|s| s.as_str()),
+            Some("Parent group")
+        );
         assert!(communities.groups[0].is_parent_group);
     }
 
@@ -4580,7 +4628,10 @@ mod tests {
 
         assert_eq!(groups.groups.len(), 2);
         assert_eq!(communities.groups.len(), 1);
-        assert_eq!(communities.groups[0].subject.as_str(), "Parent group");
+        assert_eq!(
+            communities.groups[0].subject.as_ref().map(|s| s.as_str()),
+            Some("Parent group")
+        );
     }
 
     #[test]
@@ -5379,6 +5430,37 @@ mod tests {
     }
 
     #[test]
+    fn batch_group_parsers_reject_unexpected_error_codes() {
+        let response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("groups")
+                .children([NodeBuilder::new("group")
+                    .attr("id", "120363000000000041@g.us")
+                    .attr("error", "500")
+                    .build()])
+                .build()])
+            .build();
+        let response = response.as_node_ref();
+
+        let metadata_error = BatchGetGroupInfoIq::new(&[])
+            .parse_response(&response)
+            .unwrap_err();
+        assert!(
+            metadata_error
+                .to_string()
+                .contains("unexpected batch group error code '500'")
+        );
+
+        let overview_error = BatchGetGroupOverviewIq::new(&[])
+            .parse_response(&response)
+            .unwrap_err();
+        assert!(
+            overview_error
+                .to_string()
+                .contains("unexpected batch group error code '500'")
+        );
+    }
+
+    #[test]
     fn overview_batch_parses_slim_without_participants() {
         let response = NodeBuilder::new("iq")
             .children([NodeBuilder::new("groups")
@@ -5944,6 +6026,38 @@ mod tests {
     }
 
     #[test]
+    fn test_group_info_response_preserves_absent_subject() {
+        let absent = NodeBuilder::new("group")
+            .attr("id", "120363000000000025@g.us")
+            .build();
+        let empty = NodeBuilder::new("group")
+            .attr("id", "120363000000000026@g.us")
+            .attr("subject", "")
+            .build();
+
+        let absent = GroupMetadataResponse::try_from_node(&absent).unwrap();
+        let empty = GroupMetadataResponse::try_from_node(&empty).unwrap();
+
+        assert!(absent.subject.is_none());
+        assert_eq!(empty.subject.as_ref().map(GroupSubject::as_str), Some(""));
+        assert!(
+            absent
+                .into_node()
+                .attrs()
+                .optional_string("subject")
+                .is_none()
+        );
+        assert_eq!(
+            empty
+                .into_node()
+                .attrs()
+                .optional_string("subject")
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
     fn test_group_info_response_distinguishes_absent_and_empty_ephemeral_nodes() {
         let without_ephemeral = NodeBuilder::new("group")
             .attr("id", "120363000000000020@g.us")
@@ -6307,7 +6421,7 @@ mod tests {
         let response = GroupMetadataResponse::try_from_node(&node).unwrap();
 
         assert_eq!(response.id.to_string(), "120363000000000001@g.us");
-        assert_eq!(response.subject.as_str(), "test");
+        assert_eq!(response.subject.as_ref().map(|s| s.as_str()), Some("test"));
         assert_eq!(response.addressing_mode, AddressingMode::Lid);
         assert_eq!(response.creation_time, Some(1700000000));
         assert_eq!(response.subject_time, Some(1700000000));

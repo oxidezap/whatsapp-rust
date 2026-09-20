@@ -139,26 +139,20 @@ pub fn group_type(metadata: &GroupMetadata) -> GroupType {
     // from_metadata is the canonical normalizer; match on its output rather
     // than re-reading the flags so precedence lives in exactly one place.
     let hierarchy = crate::features::groups::GroupHierarchy::from_metadata(metadata);
+    // Exhaustive on purpose: this match lives in the crate that defines the
+    // enums, so `#[non_exhaustive]` does not require a wildcard here. Leaving
+    // one out means a future `GroupHierarchy`/`SubgroupKind` variant forces a
+    // classification decision instead of silently defaulting.
     match hierarchy {
         crate::features::groups::GroupHierarchy::Standalone => GroupType::Default,
         crate::features::groups::GroupHierarchy::Community => GroupType::Community,
-        crate::features::groups::GroupHierarchy::Subgroup { kind, .. } => {
-            match kind {
-                crate::features::groups::SubgroupKind::Announcement => {
-                    GroupType::LinkedAnnouncementGroup
-                }
-                crate::features::groups::SubgroupKind::General => GroupType::LinkedGeneralGroup,
-                // Regular today; non-exhaustive future kinds degrade to the
-                // plain subgroup bucket rather than misclassifying.
-                _ => GroupType::LinkedSubgroup,
+        crate::features::groups::GroupHierarchy::Subgroup { kind, .. } => match kind {
+            crate::features::groups::SubgroupKind::Announcement => {
+                GroupType::LinkedAnnouncementGroup
             }
-        }
-        // GroupHierarchy is #[non_exhaustive]: a future variant added in a
-        // semver-compatible release falls here and reads as standalone.
-        // The wildcard is load-bearing, not dead code — silence the
-        // `unreachable_patterns` lint rather than deleting the arm.
-        #[allow(unreachable_patterns)]
-        _ => GroupType::Default,
+            crate::features::groups::SubgroupKind::General => GroupType::LinkedGeneralGroup,
+            crate::features::groups::SubgroupKind::Regular => GroupType::LinkedSubgroup,
+        },
     }
 }
 

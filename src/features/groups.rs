@@ -221,7 +221,10 @@ impl GroupOverview {
     pub(crate) fn from_response_for_tests(group: &GroupMetadataResponse) -> Self {
         Self::from_parts(
             group.id.clone(),
-            Some(group.subject.as_str().to_string()),
+            group
+                .subject
+                .as_ref()
+                .map(|subject| subject.as_str().to_string()),
             group.size,
             OverviewFlags {
                 is_parent_group: group.is_parent_group,
@@ -234,7 +237,11 @@ impl GroupOverview {
 
     /// Build an overview from the slim wire projection, without ever
     /// collecting participants.
-    pub fn from_overview_data(group: &wacore::iq::groups::GroupOverviewData) -> Self {
+    ///
+    /// Crate-internal: `GroupOverviewData` is a wire representation the
+    /// public API deliberately hides. Callers spell their intent as
+    /// `list_participating` / `fetch_overviews` instead.
+    pub(crate) fn from_overview_data(group: &wacore::iq::groups::GroupOverviewData) -> Self {
         Self::from_parts(
             group.id.clone(),
             group.subject.clone(),
@@ -356,7 +363,10 @@ pub enum GroupOverviewResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GroupMetadata {
     pub id: Jid,
-    pub subject: String,
+    /// The group's subject, or `None` when the server sent none. The protocol
+    /// has an explicit unnamed-subject shape, so absence is legitimate state
+    /// and is preserved rather than collapsed to `""`.
+    pub subject: Option<String>,
     pub notify: Option<String>,
     pub participants: Vec<GroupParticipant>,
     pub addressing_mode: AddressingMode,
@@ -479,7 +489,7 @@ impl From<GroupMetadataResponse> for GroupMetadata {
     fn from(group: GroupMetadataResponse) -> Self {
         Self {
             id: group.id,
-            subject: group.subject.into_string(),
+            subject: group.subject.map(GroupSubject::into_string),
             notify: group.notify,
             participants: group.participants.into_iter().map(Into::into).collect(),
             addressing_mode: group.addressing_mode,
@@ -1947,10 +1957,17 @@ impl<'a> Groups<'a> {
     /// (max 10,000). Always hits the network; no LID/PN backfill — call
     /// [`Groups::resolve_participant_addresses`] per result when PN-keyed
     /// display data is needed.
+    ///
+    /// An empty `jids` answers an empty list without a round trip: the wire
+    /// request requires at least one `<group>` child (`repeatMin: 1`), so an
+    /// empty query would be malformed.
     pub async fn fetch_metadata_batch(
         &self,
         jids: &[Jid],
     ) -> Result<Vec<GroupMetadataResult>, GroupError> {
+        if jids.is_empty() {
+            return Ok(Vec::new());
+        }
         if jids.len() > wacore::iq::groups::BATCH_GROUP_INFO_LIMIT {
             return Err(GroupError::InvalidRequest(format!(
                 "fetch_metadata_batch: {} groups exceeds limit of {}",
@@ -1981,10 +1998,16 @@ impl<'a> Groups<'a> {
     /// `<group>` node is parsed with the slim overview parser — id, subject,
     /// hierarchy flags, size only; participants are never collected. Always
     /// hits the network; never backfills LID/PN mappings.
+    ///
+    /// An empty `jids` answers an empty list without a round trip, for the
+    /// same reason as [`fetch_metadata_batch`](Groups::fetch_metadata_batch).
     pub async fn fetch_overviews(
         &self,
         jids: &[Jid],
     ) -> Result<Vec<GroupOverviewResult>, GroupError> {
+        if jids.is_empty() {
+            return Ok(Vec::new());
+        }
         if jids.len() > wacore::iq::groups::BATCH_GROUP_INFO_LIMIT {
             return Err(GroupError::InvalidRequest(format!(
                 "fetch_overviews: {} groups exceeds limit of {}",
@@ -2385,7 +2408,7 @@ mod tests {
 
         let metadata = GroupMetadata {
             id: jid.clone(),
-            subject: "Test Group".to_string(),
+            subject: Some("Test Group".to_string()),
             participants: vec![GroupParticipant {
                 jid: participant_jid,
                 phone_number: None,
@@ -2397,7 +2420,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(metadata.subject, "Test Group");
+        assert_eq!(metadata.subject.as_deref(), Some("Test Group"));
         assert_eq!(metadata.participants.len(), 1);
         assert!(metadata.participants[0].is_admin());
         assert!(!metadata.participants[0].is_super_admin());

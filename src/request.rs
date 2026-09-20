@@ -447,7 +447,7 @@ impl Client {
     /// use wacore::iq::groups::GroupQueryIq;
     ///
     /// let group_info = client.execute(GroupQueryIq::new(&group_jid)).await?;
-    /// println!("Group subject: {}", group_info.subject);
+    /// println!("Group subject: {:?}", group_info.subject);
     /// ```
     pub async fn execute<S>(&self, spec: S) -> Result<S::Response, IqError>
     where

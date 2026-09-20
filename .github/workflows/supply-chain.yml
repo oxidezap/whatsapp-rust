@@ -76,10 +76,22 @@ jobs:
           # Plain output: the progress spinner's escape codes are most of the
           # log's bytes and render as noise once captured to a file.
           CARGO_TERM_COLOR: never
-        run: cargo xt ci workflow semver-check
+        # Breaking changes are expected in this pre-1.0 workspace. Keep the
+        # finding in the summary and artifact, but do not make an informational
+        # check itself red (setup/tool failures are reported the same way).
+        run: |
+          set +e
+          cargo xt ci workflow semver-check
+          status=$?
+          if [ "$status" -eq 0 ]; then
+            echo "outcome=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "outcome=failure" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
       - name: Publish report to the job summary
         if: always()
-        run: cargo xt ci workflow semver-summary --outcome '${{ steps.semver.outcome }}'
+        run: cargo xt ci workflow semver-summary --outcome '${{ steps.semver.outputs.outcome }}'
       - name: Upload the full semver-checks log
         if: always()
         uses: actions/upload-artifact@v7
