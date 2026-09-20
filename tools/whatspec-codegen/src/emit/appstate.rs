@@ -67,6 +67,9 @@ pub struct Schema {
 /// The two files `generate` produces: the full registry and the compact
 /// log-gating copy. Splitting them keeps the root crate's logger off the
 /// `Schema` records: it embeds only match arms over string literals.
+/// `known_verbs` is consumed by `main.rs` as the second artifact; building
+/// it here (not via a second call) keeps both files from one IR pass.
+#[derive(Debug)]
 pub struct Generated {
     pub schemas: String,
     pub known_verbs: String,
@@ -444,14 +447,17 @@ mod tests {
 
     #[test]
     fn known_verbs_module_shares_the_same_arms() {
-        let ir = ir(vec![(
+        let fixture = ir(vec![(
             "Agent",
             action("deviceAgent", "account", Some("regular")),
         )]);
-        let module = known_verbs_module(&ir, "2.3000.1").expect("known verbs");
+        let module = known_verbs_module(&fixture, "2.3000.1").expect("known verbs");
         assert!(module.contains("\"deviceAgent\" => true,"), "{module}");
-        assert!(!module.contains("Schema"), "{module}");
+        assert!(!module.contains("struct Schema"), "{module}");
+        // "Schema" appears in the doc comment pointing at the registry;
+        // what must not appear is a reference to a record.
         assert!(!module.contains(".name"), "{module}");
+        assert!(!module.contains("ALL"), "{module}");
     }
 
     #[test]

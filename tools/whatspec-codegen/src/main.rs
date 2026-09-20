@@ -306,7 +306,14 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
         },
         Artifact {
             path: "wacore/appstate/src/schemas.rs",
-            content: emit::appstate::generate(&appstate)?.schemas,
+            content: {
+                let generated = emit::appstate::generate(&appstate)?;
+                debug_assert!(
+                    !generated.known_verbs.is_empty(),
+                    "the compact copy must exist if schemas do"
+                );
+                generated.schemas
+            },
             rust: true,
         },
         Artifact {
