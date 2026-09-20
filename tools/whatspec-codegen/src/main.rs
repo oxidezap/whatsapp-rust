@@ -268,6 +268,24 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
         serde_json::from_str(&ir.text("wam/index.json")?).context("parsing the WAM IR")?;
     let wam = emit::wam::generate(&wam, wa_version)?;
 
+    let appstate_generated = emit::appstate::generate(&appstate)?;
+    // Same IR pass as schemas (see `Generated.known_verbs`): the compact
+    // copy must be byte-identical to the one `generate` built alongside
+    // the registry, or one verb set updated without the other.
+    let appstate_known_verbs =
+        emit::appstate::known_verbs_module(&appstate, wa_version).map(|module| {
+            debug_assert_eq!(
+                module,
+                format!(
+                    "{}\n{}\n",
+                    emit::header("AppState known verbs (log gating)", wa_version),
+                    appstate_generated.known_verbs
+                ),
+                "known_verbs_module drifted from generate's copy"
+            );
+            module
+        })?;
+
     Ok(vec![
         Artifact {
             path: "wacore/src/version/generated.rs",
@@ -306,19 +324,12 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
         },
         Artifact {
             path: "wacore/appstate/src/schemas.rs",
-            content: {
-                let generated = emit::appstate::generate(&appstate)?;
-                debug_assert!(
-                    !generated.known_verbs.is_empty(),
-                    "the compact copy must exist if schemas do"
-                );
-                generated.schemas
-            },
+            content: appstate_generated.schemas,
             rust: true,
         },
         Artifact {
             path: "src/appstate_known_verbs.rs",
-            content: emit::appstate::known_verbs_module(&appstate, wa_version)?,
+            content: appstate_known_verbs,
             rust: true,
         },
         Artifact {

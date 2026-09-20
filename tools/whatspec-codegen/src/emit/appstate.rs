@@ -64,11 +64,10 @@ pub struct Schema {
 
 ";
 
-/// The two files `generate` produces: the full registry and the compact
-/// log-gating copy. Splitting them keeps the root crate's logger off the
-/// `Schema` records: it embeds only match arms over string literals.
-/// `known_verbs` is consumed by `main.rs` as the second artifact; building
-/// it here (not via a second call) keeps both files from one IR pass.
+/// What `generate` returns: the full registry plus the compact log-gating
+/// copy. Both come from one IR pass so the two files cannot drift: the
+/// root crate's logger embeds only match arms over string literals, never
+/// `Schema` records.
 #[derive(Debug)]
 pub struct Generated {
     pub schemas: String,
@@ -193,6 +192,10 @@ pub fn generate(ir: &AppstateIr) -> Result<Generated> {
 /// same set without referencing `Schema` records. Handled aliases
 /// (`pin`/`mark_chat_as_read`, unlisted `label_message`) live at the call
 /// site, not here — the IR only knows declared verbs.
+///
+/// Built from the `Generated.known_verbs` of the same IR pass in `main.rs`
+/// (not called twice); kept as a separate fn so tests can build it from a
+/// fixture without going through the full registry.
 pub fn known_verbs_module(ir: &AppstateIr, wa_version: &str) -> Result<String> {
     Ok(format!(
         "{}\n{}\n",
