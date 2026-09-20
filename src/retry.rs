@@ -71,7 +71,7 @@ pub(crate) struct PreparedRetransmission {
     pub(crate) message_id: String,
     pub(crate) retry_count: u8,
     pub(crate) recipient: Option<Jid>,
-    pub(crate) group_info: Option<Arc<wacore::client::context::GroupInfo>>,
+    pub(crate) group_info: Option<Arc<wacore::client::context::GroupRoutingInfo>>,
     /// Canonical unpadded protobuf bytes shared with the recent-message cache.
     /// Public retransmissions provide them; the automatic path may fall back
     /// to its already-decoded message when the cache bytes are unavailable.
@@ -372,7 +372,7 @@ impl Client {
         let group_info = if matches!(route, RetransmissionRoute::Group) {
             Some(
                 self.groups()
-                    .query_info_with_freshness(&request.chat, request.group_metadata_freshness)
+                    .routing_info_with_freshness(&request.chat, request.group_metadata_freshness)
                     .await?,
             )
         } else {
@@ -654,7 +654,7 @@ impl Client {
         // Fetch group info (cache-first, server on miss) — used for SKDM rotation + addressing_mode.
         // Without this, a cold cache would silently default to PN semantics for LID groups.
         let cached_group_info = if info.chat.is_group() {
-            match self.groups().query_info(&info.chat).await {
+            match self.groups().routing_info(&info.chat).await {
                 Ok(gi) => Some(gi),
                 Err(e) => {
                     log::warn!(
@@ -945,7 +945,7 @@ impl Client {
         let chat_key = chat.to_string();
         let distribution_guard = self.group_distribution_lock(&chat).await;
         let topology_generation = self.device_topology.current();
-        let group_info = wacore::client::context::GroupInfo::new(
+        let group_info = wacore::client::context::GroupRoutingInfo::new(
             Vec::new(),
             wacore::types::message::AddressingMode::Lid,
         );

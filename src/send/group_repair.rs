@@ -278,7 +278,7 @@ impl Client {
                 }
                 let info = client
                     .groups()
-                    .query_info_with_freshness(&group, Freshness::Refresh)
+                    .routing_info_with_freshness(&group, Freshness::Refresh)
                     .await?;
                 let snapshot = client.persistence_manager.get_device_snapshot();
                 let own = match info.addressing_mode {
@@ -343,7 +343,7 @@ impl Client {
         let addressed = sent.devices;
         // Membership refresh must not add recipients to a message already
         // sent, but the resolve must keep the refreshed LID→PN maps: a bare
-        // GroupInfo has an empty map, so LID members would be queried by raw
+        // GroupRoutingInfo has an empty map, so LID members would be queried by raw
         // LID and PN-keyed answers could not convert back, emptying the delta.
         let users: std::collections::HashSet<_> =
             addressed.devices().iter().map(Jid::to_non_ad).collect();
@@ -357,7 +357,7 @@ impl Client {
         };
         // The refresh above just published, so this is a cache hit for the
         // membership the server returned, maps included.
-        let fresh_info = self.groups().query_info(group).await?;
+        let fresh_info = self.groups().routing_info(group).await?;
         let mut old_group = (*fresh_info).clone();
         let departed: Vec<wacore_binary::CompactString> = old_group
             .participants
@@ -726,7 +726,7 @@ mod tests {
     async fn historical_repair_emits_only_for_a_continuous_account() {
         use crate::store::commands::DeviceCommand;
         use crate::test_utils::{create_iq_test_client, decode_sent_iq, seed_peer_session};
-        use wacore::client::context::GroupInfo;
+        use wacore::client::context::GroupRoutingInfo;
         use wacore::store::traits::{DeviceInfo, DeviceListRecord};
         use wacore::types::jid::JidExt;
 
@@ -775,7 +775,7 @@ mod tests {
                 .get_group_cache()
                 .insert(
                     group.clone(),
-                    Arc::new(GroupInfo::new(
+                    Arc::new(GroupRoutingInfo::new(
                         vec![primary.clone(), stable.clone()],
                         AddressingMode::Pn,
                     )),

@@ -1013,7 +1013,7 @@ impl Client {
     pub(crate) async fn addon_self_jid_for_chat(&self, chat: &Jid) -> Option<Jid> {
         use wacore_binary::JidExt;
         if chat.is_group() {
-            let lid_mode = match self.groups().query_info(chat).await {
+            let lid_mode = match self.groups().routing_info(chat).await {
                 Ok(info) => info.addressing_mode == wacore::types::message::AddressingMode::Lid,
                 Err(e) => {
                     log::warn!("addon self identity: group info lookup failed: {e:?}");

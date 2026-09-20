@@ -9,7 +9,7 @@ use wacore_binary::Jid;
 /// One LID→PN mapping. Kept as `(lid, phone jid)` rather than `(lid, phone
 /// user + server)` because `Jid` is 32 bytes and a `CompactString` plus a
 /// `Server` pads to the same 32: storing the whole JID costs nothing and lets
-/// [`GroupInfo::phone_jid_for_lid_user`] keep handing out a borrow. The server
+/// [`GroupRoutingInfo::phone_jid_for_lid_user`] keep handing out a borrow. The server
 /// is not assumed to be `Pn` — a malformed response can map a LID to another
 /// LID, and callers such as `collect_stale_device_users` check for that.
 type LidPnPair = (CompactString, Jid);
@@ -153,8 +153,8 @@ fn serialize_lid_pn<S: serde::Serializer>(
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(from = "GroupInfoDe")]
-pub struct GroupInfo {
+#[serde(from = "GroupRoutingInfoDe")]
+pub struct GroupRoutingInfo {
     pub participants: Vec<Jid>,
     pub addressing_mode: AddressingMode,
     /// Whether this group is a Community Announcement Group (WA Web `isCag`,
@@ -186,7 +186,7 @@ pub struct GroupInfo {
 /// carrying the previously-persisted `pn_to_lid_map` field still decode —
 /// serde_json ignores unknown fields.
 #[derive(serde::Deserialize)]
-struct GroupInfoDe {
+struct GroupRoutingInfoDe {
     participants: Vec<Jid>,
     addressing_mode: AddressingMode,
     #[serde(default)]
@@ -195,19 +195,19 @@ struct GroupInfoDe {
     lid_to_pn_map: HashMap<CompactString, Jid>,
 }
 
-impl From<GroupInfoDe> for GroupInfo {
-    fn from(d: GroupInfoDe) -> Self {
+impl From<GroupRoutingInfoDe> for GroupRoutingInfo {
+    fn from(d: GroupRoutingInfoDe) -> Self {
         let mut info = Self::with_lid_to_pn_map(d.participants, d.addressing_mode, d.lid_to_pn_map);
         info.is_community_announce = d.is_community_announce;
         info
     }
 }
 
-impl GroupInfo {
-    /// Create a [`GroupInfo`] with the provided participants and addressing mode.
+impl GroupRoutingInfo {
+    /// Create a [`GroupRoutingInfo`] with the provided participants and addressing mode.
     ///
     /// The LID-to-phone mapping defaults to empty. Call
-    /// [`GroupInfo::set_lid_to_pn_map`] or [`GroupInfo::with_lid_to_pn_map`] to
+    /// [`GroupRoutingInfo::set_lid_to_pn_map`] or [`GroupRoutingInfo::with_lid_to_pn_map`] to
     /// populate it when a mapping is available.
     pub fn new(participants: Vec<Jid>, addressing_mode: AddressingMode) -> Self {
         Self {
@@ -219,7 +219,7 @@ impl GroupInfo {
         }
     }
 
-    /// Create a [`GroupInfo`] and populate the LID-to-phone mapping.
+    /// Create a [`GroupRoutingInfo`] and populate the LID-to-phone mapping.
     pub fn with_lid_to_pn_map(
         participants: Vec<Jid>,
         addressing_mode: AddressingMode,
@@ -374,7 +374,7 @@ impl GroupInfo {
     }
 }
 
-impl crate::stats::HeapSize for GroupInfo {
+impl crate::stats::HeapSize for GroupRoutingInfo {
     fn heap_bytes(&self) -> usize {
         let participants = self.participants.capacity() * size_of::<Jid>()
             + self
@@ -433,7 +433,7 @@ pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
         jids: &[Jid],
     ) -> Result<crate::prekeys::PreKeyFetchOutcome, anyhow::Error>;
 
-    async fn resolve_group_info(&self, jid: &Jid) -> Result<Arc<GroupInfo>, anyhow::Error>;
+    async fn resolve_group_info(&self, jid: &Jid) -> Result<Arc<GroupRoutingInfo>, anyhow::Error>;
 
     /// Get the LID (Linked ID) for a phone number, if known.
     /// This is used to find existing sessions that were established under a LID address
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn add_participants_pn_mode() {
-        let mut info = GroupInfo::new(vec![pn("alice")], AddressingMode::Pn);
+        let mut info = GroupRoutingInfo::new(vec![pn("alice")], AddressingMode::Pn);
         let bob = pn("bob");
         let carol = pn("carol");
         info.add_participants([(&bob, None), (&carol, None)]);
@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn fill_missing_lid_mappings_preserves_membership_and_existing_pairs() {
-        let mut info = GroupInfo::with_lid_to_pn_map(
+        let mut info = GroupRoutingInfo::with_lid_to_pn_map(
             vec![lid("100000000000101"), lid("100000000000102")],
             AddressingMode::Lid,
             HashMap::from([
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn add_participants_deduplicates() {
-        let mut info = GroupInfo::new(vec![pn("alice"), pn("bob")], AddressingMode::Pn);
+        let mut info = GroupRoutingInfo::new(vec![pn("alice"), pn("bob")], AddressingMode::Pn);
         let bob = pn("bob");
         let carol = pn("carol");
         info.add_participants([(&bob, None), (&carol, None)]);
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn add_participants_lid_mode_updates_maps() {
-        let mut info = GroupInfo::new(vec![lid("lid_alice")], AddressingMode::Lid);
+        let mut info = GroupRoutingInfo::new(vec![lid("lid_alice")], AddressingMode::Lid);
         let bob_lid = lid("lid_bob");
         let bob_pn = pn("bob_pn");
         info.add_participants([(&bob_lid, Some(&bob_pn))]);
@@ -580,7 +580,7 @@ mod tests {
 
     #[test]
     fn remove_participants_basic() {
-        let mut info = GroupInfo::new(
+        let mut info = GroupRoutingInfo::new(
             vec![pn("alice"), pn("bob"), pn("carol")],
             AddressingMode::Pn,
         );
@@ -595,7 +595,7 @@ mod tests {
             (CompactString::from("lid_alice"), pn("alice_pn")),
             (CompactString::from("lid_bob"), pn("bob_pn")),
         ]);
-        let mut info = GroupInfo::with_lid_to_pn_map(
+        let mut info = GroupRoutingInfo::with_lid_to_pn_map(
             vec![lid("lid_alice"), lid("lid_bob")],
             AddressingMode::Lid,
             lid_to_pn,
@@ -614,14 +614,14 @@ mod tests {
 
     #[test]
     fn remove_nonexistent_is_noop() {
-        let mut info = GroupInfo::new(vec![pn("alice")], AddressingMode::Pn);
+        let mut info = GroupRoutingInfo::new(vec![pn("alice")], AddressingMode::Pn);
         info.remove_participants(&["nobody"]);
         assert_eq!(info.participants.len(), 1);
     }
 
     #[test]
     fn add_participants_backfills_lid_map_for_existing() {
-        let mut info = GroupInfo::new(vec![lid("lid_bob")], AddressingMode::Lid);
+        let mut info = GroupRoutingInfo::new(vec![lid("lid_bob")], AddressingMode::Lid);
         // First add without phone_number (simulates client-initiated add)
         let bob_lid = lid("lid_bob");
         let bob_pn = pn("bob_pn");
@@ -650,7 +650,8 @@ mod tests {
     fn serde_reverse_index_is_derived_not_persisted() {
         let mut map = HashMap::new();
         map.insert(CompactString::from("lid_bob"), pn("bob_pn"));
-        let info = GroupInfo::with_lid_to_pn_map(vec![lid("lid_bob")], AddressingMode::Lid, map);
+        let info =
+            GroupRoutingInfo::with_lid_to_pn_map(vec![lid("lid_bob")], AddressingMode::Lid, map);
 
         let json = serde_json::to_string(&info).expect("serialize");
         assert!(
@@ -658,7 +659,7 @@ mod tests {
             "derived index must not be persisted: {json}"
         );
 
-        let round: GroupInfo = serde_json::from_str(&json).expect("deserialize new format");
+        let round: GroupRoutingInfo = serde_json::from_str(&json).expect("deserialize new format");
         assert_eq!(
             round.lid_user_for_phone_user("bob_pn").map(|u| u.as_str()),
             Some("lid_bob")
@@ -670,7 +671,8 @@ mod tests {
         legacy_json["pn_to_lid_map"] = serde_json::json!({ "bob_pn": "lid_bob@lid" });
         // Jid's Deserialize borrows from the input, so go through a string.
         let legacy_str = serde_json::to_string(&legacy_json).expect("legacy json");
-        let legacy: GroupInfo = serde_json::from_str(&legacy_str).expect("deserialize old format");
+        let legacy: GroupRoutingInfo =
+            serde_json::from_str(&legacy_str).expect("deserialize old format");
         assert_eq!(
             legacy.lid_user_for_phone_user("bob_pn").map(|u| u.as_str()),
             Some("lid_bob")
@@ -719,7 +721,7 @@ mod tests {
     /// against a `HashMap` oracle and checks the invariants after each step.
     #[test]
     fn pair_slices_stay_consistent_with_a_map_oracle() {
-        let mut info = GroupInfo::new(Vec::new(), AddressingMode::Lid);
+        let mut info = GroupRoutingInfo::new(Vec::new(), AddressingMode::Lid);
         let mut oracle: HashMap<CompactString, Jid> = HashMap::new();
 
         // A deterministic walk that mixes fresh adds, re-adds that remap an
@@ -802,8 +804,11 @@ mod tests {
     #[test]
     fn remove_by_phone_side_drops_the_mapping() {
         let lid_to_pn = HashMap::from([(CompactString::from("lid_bob"), pn("bob_pn"))]);
-        let mut info =
-            GroupInfo::with_lid_to_pn_map(vec![lid("lid_bob")], AddressingMode::Lid, lid_to_pn);
+        let mut info = GroupRoutingInfo::with_lid_to_pn_map(
+            vec![lid("lid_bob")],
+            AddressingMode::Lid,
+            lid_to_pn,
+        );
 
         info.remove_participants(&["bob_pn"]);
 
@@ -820,7 +825,7 @@ mod tests {
             CompactString::from("100000000000007"),
             Jid::lid("100000000000099"),
         )]);
-        let info = GroupInfo::with_lid_to_pn_map(Vec::new(), AddressingMode::Lid, lid_to_pn);
+        let info = GroupRoutingInfo::with_lid_to_pn_map(Vec::new(), AddressingMode::Lid, lid_to_pn);
 
         let mapped = info
             .phone_jid_for_lid_user("100000000000007")
@@ -842,7 +847,7 @@ mod tests {
             (CompactString::from("lid_aaa"), shared.clone()),
             (CompactString::from("lid_zzz"), shared.clone()),
         ]);
-        let mut info = GroupInfo::with_lid_to_pn_map(
+        let mut info = GroupRoutingInfo::with_lid_to_pn_map(
             vec![lid("lid_aaa"), lid("lid_zzz")],
             AddressingMode::Lid,
             lid_to_pn,
@@ -890,9 +895,10 @@ mod tests {
             participants.push(Jid::lid(lid_user.clone()));
             lid_to_pn.insert(lid_user, Jid::pn(pn_user));
         }
-        let info = GroupInfo::with_lid_to_pn_map(participants, AddressingMode::Lid, lid_to_pn);
+        let info =
+            GroupRoutingInfo::with_lid_to_pn_map(participants, AddressingMode::Lid, lid_to_pn);
 
-        let per_participant = (size_of::<GroupInfo>() + info.heap_bytes()) / N;
+        let per_participant = (size_of::<GroupRoutingInfo>() + info.heap_bytes()) / N;
         assert!(
             per_participant <= 92,
             "a resident LID group must stay within 92 B/participant, got {per_participant}"

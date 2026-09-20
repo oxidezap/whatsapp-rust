@@ -1044,7 +1044,7 @@ impl<'a> GroupBoundCall<'a> {
         let info = self
             .client
             .groups()
-            .query_info(self.group_jid)
+            .routing_info(self.group_jid)
             .await
             .map_err(|error| CallError::Setup(error.to_string()))?;
         OutgoingGroupCall {
@@ -4934,7 +4934,7 @@ mod tests {
 
     #[tokio::test]
     async fn group_call_by_id_uses_cached_roster_and_excludes_every_local_identity() {
-        use wacore::client::context::GroupInfo;
+        use wacore::client::context::GroupRoutingInfo;
         use wacore::store::traits::{DeviceInfo, DeviceListRecord};
         use wacore::types::message::AddressingMode;
 
@@ -4966,7 +4966,7 @@ mod tests {
             .get_group_cache()
             .insert(
                 group.clone(),
-                Arc::new(GroupInfo::new(
+                Arc::new(GroupRoutingInfo::new(
                     vec![own_pn, own_lid.to_non_ad(), peer_a.clone(), peer_b.clone()],
                     AddressingMode::Lid,
                 )),

@@ -243,7 +243,7 @@ impl Client {
         response: &DeviceListResponse,
         guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
     ) -> Result<(), anyhow::Error> {
-        // Learn LID↔PN mappings via the same batched, guarded learner query_info
+        // Learn LID↔PN mappings via the same batched, guarded learner routing_info
         // uses (one detached transaction, skipping already-durable pairs), so
         // per-mapping DB writes stay off the send's critical path. Client
         // construction always installs `self_weak`; failing the impossible
@@ -255,7 +255,7 @@ impl Client {
         // contact with prior PN Signal state encrypt before the PN-wins migration
         // runs — but the per-address session_lock_for both take is the real
         // barrier (they can't interleave). The group-send path is unchanged:
-        // query_info already learns these same pairs detached upstream.
+        // routing_info already learns these same pairs detached upstream.
         if response.lid_mappings.is_empty() {
             return Ok(());
         }

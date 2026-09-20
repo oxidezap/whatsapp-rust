@@ -352,7 +352,7 @@ impl Client {
         // `get()`, not `get_group_cache()`: a report must not be what builds the
         // cache, so an un-warmed client still reports zero entries.
         let group_cache = match self.group_cache.get() {
-            // Arc<T>'s HeapSize already includes size_of::<GroupInfo>().
+            // Arc<T>'s HeapSize already includes size_of::<GroupRoutingInfo>().
             Some(cache) => {
                 cache
                     .memory_stats(|k, v| k.heap_bytes() + v.heap_bytes())
@@ -677,7 +677,7 @@ impl Client {
 
         let addressing_mode = self
             .groups()
-            .query_info(group_jid)
+            .routing_info(group_jid)
             .await
             .map(|info| info.addressing_mode)
             .unwrap_or(crate::types::message::AddressingMode::Pn);

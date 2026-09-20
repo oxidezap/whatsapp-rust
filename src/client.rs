@@ -349,12 +349,12 @@ use std::time::Duration;
 use thiserror::Error;
 
 use wacore::appstate::patch_decode::WAPatchName;
-use wacore::client::context::GroupInfo;
+use wacore::client::context::GroupRoutingInfo;
 
-/// Group metadata cache. Values are `Arc`-wrapped so a warm `query_info` hit
+/// Group metadata cache. Values are `Arc`-wrapped so a warm `routing_info` hit
 /// shares the metadata (refcount bump) instead of deep-cloning the participant
 /// list and LID/PN maps on every group send.
-type GroupCache = TypedCache<Jid, Arc<GroupInfo>>;
+type GroupCache = TypedCache<Jid, Arc<GroupRoutingInfo>>;
 
 /// Memoized SKDM warm state per group: the `(devices, sender-key map)` Weak
 /// pair + map generation it was computed against, the exact sending identity
@@ -1618,7 +1618,7 @@ pub struct Client {
 
     /// Group-metadata queries in flight, so a burst of callers for one group
     /// shares a single round trip. See [`GroupMetadataRegistry`] for why only
-    /// `get_metadata` needs it.
+    /// `fetch_metadata` needs it.
     ///
     /// [`GroupMetadataRegistry`]: crate::features::GroupMetadataRegistry
     pub(crate) group_metadata_inflight: Arc<crate::features::GroupMetadataRegistry>,
@@ -1976,7 +1976,7 @@ pub struct Client {
     /// topology tracker cannot observe).
     pub(crate) device_memos_enabled: bool,
     /// Per-group memo of the fully resolved (LID-converted) device list,
-    /// validated by GroupInfo identity + the device topology. Serves the
+    /// validated by GroupRoutingInfo identity + the device topology. Serves the
     /// per-send full-set resolution in `resolve_skdm_targets` so a warm
     /// repeat send skips the per-member cache fan-out.
     pub(crate) group_devices_memo: Cache<Jid, Arc<device_registry::GroupDevicesMemo>>,

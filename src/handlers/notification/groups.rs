@@ -319,7 +319,7 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
 ///
 /// It goes through `lock_group_metadata` rather than dropping the cache entry
 /// directly, because that lane *is* the invalidation protocol. A cold
-/// `query_info` holds the guard across its IQ precisely so an invalidation
+/// `routing_info` holds the guard across its IQ precisely so an invalidation
 /// cannot be lost against it — with no cached `Arc` to compare, the lane is
 /// the only thing that distinguishes "still absent" from "a notification
 /// invalidated an already-absent snapshot", and it publishes its result

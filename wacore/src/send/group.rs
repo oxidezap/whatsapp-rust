@@ -79,7 +79,7 @@ pub enum SenderKeyDistributionPolicy {
 }
 
 pub struct GroupStanzaRequest<'a> {
-    pub group: &'a GroupInfo,
+    pub group: &'a GroupRoutingInfo,
     pub own_jid: &'a Jid,
     pub own_lid: &'a Jid,
     pub account: Option<&'a wa::ADVSignedDeviceIdentity>,
@@ -663,7 +663,7 @@ pub(crate) fn stale_users_for(
     rejected_devices: &[Jid],
     distribution_list: Option<&[Jid]>,
     encrypted_devices: &[Jid],
-    group_info: &GroupInfo,
+    group_info: &GroupRoutingInfo,
 ) -> Vec<String> {
     if !had_unregistered_device {
         return Vec::new();
@@ -677,7 +677,7 @@ pub(crate) fn stale_users_for(
 pub(crate) fn collect_stale_device_users(
     distribution_list: Option<&[Jid]>,
     skdm_encrypted_devices: &[Jid],
-    group_info: &GroupInfo,
+    group_info: &GroupRoutingInfo,
 ) -> Vec<String> {
     let Some(dist) = distribution_list else {
         return Vec::new();

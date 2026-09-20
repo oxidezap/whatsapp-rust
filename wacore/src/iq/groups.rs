@@ -722,7 +722,7 @@ impl ProtocolNode for GroupEphemeralSettings {
 /// Response from a group info query.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct GroupInfoResponse {
+pub struct GroupMetadataResponse {
     pub id: Jid,
     pub subject: GroupSubject,
     /// Optional display notification string (from `notify`).
@@ -833,7 +833,7 @@ pub struct GroupInfoResponse {
     pub limit_sharing_trigger: Option<u32>,
 }
 
-impl ProtocolNode for GroupInfoResponse {
+impl ProtocolNode for GroupMetadataResponse {
     fn tag(&self) -> &'static str {
         "group"
     }
@@ -1407,7 +1407,7 @@ impl ProtocolNode for GroupParticipatingRequest {
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct GroupParticipatingResponse {
-    pub groups: Vec<GroupInfoResponse>,
+    pub groups: Vec<GroupMetadataResponse>,
 }
 
 impl ProtocolNode for GroupParticipatingResponse {
@@ -1431,7 +1431,7 @@ impl ProtocolNode for GroupParticipatingResponse {
                 ));
             }
         };
-        let groups = collect_children::<GroupInfoResponse>(node, child_tag)?;
+        let groups = collect_children::<GroupMetadataResponse>(node, child_tag)?;
 
         Ok(Self { groups })
     }
@@ -1441,7 +1441,7 @@ impl ProtocolNode for GroupParticipatingResponse {
 /// queryGroup phash skip) — the caller should reuse its cached metadata.
 #[derive(Debug, Clone)]
 pub enum GroupInfoOutcome {
-    Full(Box<GroupInfoResponse>),
+    Full(Box<GroupMetadataResponse>),
     NotModified,
 }
 
@@ -1500,7 +1500,7 @@ impl IqSpec for GroupQueryIq {
             .or_else(|| response.get_optional_child("community"))
         {
             Some(group_node) => Ok(GroupInfoOutcome::Full(Box::new(
-                GroupInfoResponse::try_from_node_ref(group_node)?,
+                GroupMetadataResponse::try_from_node_ref(group_node)?,
             ))),
             None => Ok(GroupInfoOutcome::NotModified),
         }
@@ -1604,7 +1604,7 @@ fn parse_participating_response(
         return GroupParticipatingResponse::try_from_node_ref(container);
     }
 
-    let groups = collect_children::<GroupInfoResponse>(response, child_tag)?;
+    let groups = collect_children::<GroupMetadataResponse>(response, child_tag)?;
     if groups.is_empty() {
         return Err(anyhow!(
             "missing <{container_tag}> or direct <{child_tag}> participating result"
@@ -1628,7 +1628,7 @@ impl GroupCreateIq {
 impl IqSpec for GroupCreateIq {
     // Server's `<create>` reply carries the full `<group>` node, so callers
     // can skip a follow-up `get_metadata` IQ. Mirrors WA Web's CreateJob.
-    type Response = GroupInfoResponse;
+    type Response = GroupMetadataResponse;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::set(
@@ -1645,7 +1645,7 @@ impl IqSpec for GroupCreateIq {
             .get_optional_child("group")
             .or_else(|| response.get_optional_child("community"))
             .ok_or_else(|| anyhow!("missing group or community create result"))?;
-        let mut info = GroupInfoResponse::try_from_node_ref(group_node)?;
+        let mut info = GroupMetadataResponse::try_from_node_ref(group_node)?;
 
         // Server may omit `<parent>` from a community-create reply; overlay
         // request flags so `group_type()` classifies without a follow-up query.
@@ -2754,7 +2754,7 @@ impl QueryLinkedGroupIq {
 }
 
 impl IqSpec for QueryLinkedGroupIq {
-    type Response = GroupInfoResponse;
+    type Response = GroupMetadataResponse;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let query_node = NodeBuilder::new("query_linked")
@@ -2772,7 +2772,7 @@ impl IqSpec for QueryLinkedGroupIq {
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
         let linked_node = required_child(response, "linked_group")?;
         let group_node = required_child(linked_node, "group")?;
-        GroupInfoResponse::try_from_node_ref(group_node)
+        GroupMetadataResponse::try_from_node_ref(group_node)
     }
 }
 
@@ -3076,7 +3076,7 @@ impl GetGroupInviteInfoIq {
 }
 
 impl IqSpec for GetGroupInviteInfoIq {
-    type Response = GroupInfoResponse;
+    type Response = GroupMetadataResponse;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let to = Jid::new("", Server::Group);
@@ -3094,7 +3094,7 @@ impl IqSpec for GetGroupInviteInfoIq {
             .get_optional_child("group")
             .or_else(|| response.get_optional_child("community"))
             .ok_or_else(|| anyhow!("missing group or community invite result"))?;
-        GroupInfoResponse::try_from_node_ref(group_node)
+        GroupMetadataResponse::try_from_node_ref(group_node)
     }
 }
 
@@ -3362,7 +3362,7 @@ impl IqSpec for AcknowledgeGroupIq {
 /// Result for a single group in a batch query.
 #[derive(Debug, Clone)]
 pub enum BatchGroupInfoResult {
-    Full(Box<GroupInfoResponse>),
+    Full(Box<GroupMetadataResponse>),
     /// Truncated response (only id and size available).
     Truncated {
         id: Jid,
@@ -3442,7 +3442,7 @@ impl IqSpec for BatchGetGroupInfoIq {
                 let size = attrs.optional_string("size").and_then(|s| s.parse().ok());
                 results.push(BatchGroupInfoResult::Truncated { id, size });
             } else {
-                let info = GroupInfoResponse::try_from_node_ref(group_node)?;
+                let info = GroupMetadataResponse::try_from_node_ref(group_node)?;
                 results.push(BatchGroupInfoResult::Full(Box::new(info)));
             }
         }
@@ -5229,7 +5229,7 @@ mod tests {
             ])
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         assert!(response.is_parent_group);
         assert!(response.allow_non_admin_sub_group_creation);
         assert!(response.parent_group_jid.is_none());
@@ -5251,7 +5251,7 @@ mod tests {
             ])
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         assert!(!response.is_parent_group);
         assert!(response.is_default_sub_group);
         assert_eq!(response.parent_group_jid, Some(parent_jid.parse().unwrap()));
@@ -5272,7 +5272,7 @@ mod tests {
                 .build()])
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         assert_eq!(response.description.as_deref(), Some("Hello world"));
         assert_eq!(response.description_id.as_deref(), Some("desc123"));
         assert_eq!(
@@ -5360,7 +5360,7 @@ mod tests {
             ])
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         assert_eq!(response.notify.as_deref(), Some("Fixture notification"));
         assert_eq!(
             response.creator_pn,
@@ -5451,7 +5451,7 @@ mod tests {
             Some("fixture.fallback")
         );
 
-        let round_trip = GroupInfoResponse::try_from_node(&response.into_node()).unwrap();
+        let round_trip = GroupMetadataResponse::try_from_node(&response.into_node()).unwrap();
         assert_eq!(round_trip.ephemeral.unwrap().expiration, Some(0));
         assert_eq!(
             round_trip.description_owner_username.as_deref(),
@@ -5481,7 +5481,7 @@ mod tests {
                 .build()])
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         assert!(response.is_parent_group);
         assert!(!response.parent_membership_approval_required);
     }
@@ -5517,7 +5517,7 @@ mod tests {
                 .build()])
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         assert!(response.is_suspended);
         assert!(!response.suspension_can_auto_file);
     }
@@ -5534,8 +5534,8 @@ mod tests {
             .children([NodeBuilder::new("ephemeral").build()])
             .build();
 
-        let absent = GroupInfoResponse::try_from_node(&without_ephemeral).unwrap();
-        let empty = GroupInfoResponse::try_from_node(&with_empty_ephemeral).unwrap();
+        let absent = GroupMetadataResponse::try_from_node(&without_ephemeral).unwrap();
+        let empty = GroupMetadataResponse::try_from_node(&with_empty_ephemeral).unwrap();
 
         assert!(absent.ephemeral.is_none());
         assert_eq!(empty.ephemeral, Some(GroupEphemeralSettings::default()));
@@ -5577,7 +5577,7 @@ mod tests {
 
         for fixture in fixtures {
             assert!(
-                GroupInfoResponse::try_from_node(&fixture).is_err(),
+                GroupMetadataResponse::try_from_node(&fixture).is_err(),
                 "out-of-range group metadata must be rejected: {fixture:?}"
             );
         }
@@ -5594,7 +5594,7 @@ mod tests {
                 .build()])
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         let serialized = response.into_node();
         let description = serialized
             .get_optional_child("description")
@@ -5883,7 +5883,7 @@ mod tests {
             ])
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
 
         assert_eq!(response.id.to_string(), "120363000000000001@g.us");
         assert_eq!(response.subject.as_str(), "test");
@@ -5912,7 +5912,7 @@ mod tests {
             .attr("subject", "Test Group")
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         assert!(response.description.is_none());
         assert!(response.description_id.is_none());
         assert!(response.description_owner.is_none());

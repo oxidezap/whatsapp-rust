@@ -59,10 +59,19 @@ impl Client {
         &self,
         chat: &Jid,
     ) -> Result<bool, crate::features::GroupError> {
-        if let Some(flag) = self.groups().query_info(chat).await?.is_community_announce {
+        if let Some(flag) = self
+            .groups()
+            .routing_info(chat)
+            .await?
+            .is_community_announce
+        {
             return Ok(flag);
         }
-        Ok(self.groups().get_metadata(chat).await?.is_default_sub_group)
+        Ok(self
+            .groups()
+            .fetch_metadata(chat)
+            .await?
+            .is_default_sub_group)
     }
 
     async fn send_enc_reaction(

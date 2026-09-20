@@ -2,7 +2,7 @@ use crate::client::Client;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
-use wacore::client::context::{GroupInfo, SendContextResolver};
+use wacore::client::context::{GroupRoutingInfo, SendContextResolver};
 use wacore::iq::prekeys::PreKeyFetchReason;
 use wacore::libsignal::protocol::PreKeyBundle;
 use wacore_binary::Jid;
@@ -50,8 +50,8 @@ impl SendContextResolver for Client {
             })
     }
 
-    async fn resolve_group_info(&self, jid: &Jid) -> Result<Arc<GroupInfo>, anyhow::Error> {
-        Ok(self.groups().query_info(jid).await?)
+    async fn resolve_group_info(&self, jid: &Jid) -> Result<Arc<GroupRoutingInfo>, anyhow::Error> {
+        Ok(self.groups().routing_info(jid).await?)
     }
 
     async fn get_lid_for_phone(&self, phone_user: &str) -> Option<wacore_binary::CompactString> {

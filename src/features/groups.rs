@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
-use wacore::client::context::GroupInfo;
+use wacore::client::context::GroupRoutingInfo;
 pub use wacore::iq::contacts::ProfilePictureLookup;
 pub use wacore::iq::contacts::SetProfilePictureResponse;
 use wacore::iq::contacts::SetProfilePictureSpec;
@@ -14,7 +14,7 @@ use wacore::iq::groups::{
     AcceptGroupInviteIq, AcceptGroupInviteV4Iq, AcknowledgeGroupIq, AddParticipantsIq,
     BatchGetGroupInfoIq, CancelMembershipRequestsIq, DemoteParticipantsIq, GetGroupInviteInfoIq,
     GetGroupInviteLinkIq, GetGroupProfilePicturesIq, GetMembershipRequestsIq,
-    GetReportedGroupMessagesIq, GroupCreateIq, GroupInfoOutcome, GroupInfoResponse,
+    GetReportedGroupMessagesIq, GroupCreateIq, GroupInfoOutcome, GroupMetadataResponse,
     GroupParticipantResponse, GroupParticipatingIq, GroupQueryIq, LeaveGroupIq,
     MembershipRequestActionIq, PromoteParticipantsIq, RemoveParticipantsIncludingLinkedGroupsIq,
     RemoveParticipantsIq, ReportGroupMessagesIq, RevokeRequestCodeIq, SetAllowAdminReportsIq,
@@ -83,7 +83,7 @@ pub enum PreviousDescription<'a> {
     /// token is sent.
     Absent,
     /// A description id the caller already holds, typically
-    /// [`GroupMetadata::description_id`] from a recent [`Groups::get_metadata`].
+    /// [`GroupMetadata::description_id`] from a recent [`Groups::fetch_metadata`].
     Id(&'a str),
 }
 
@@ -132,7 +132,7 @@ struct UpdateGroupPropertyVars {
     update: GroupPropertyUpdate,
 }
 
-/// Result for a single group in a batch query.
+/// Result for a single group in a batch metadata query.
 #[derive(Debug, Clone)]
 pub enum BatchGroupResult {
     Full(Box<GroupMetadata>),
@@ -140,6 +140,142 @@ pub enum BatchGroupResult {
     Truncated {
         id: Jid,
         size: Option<u32>,
+    },
+    Forbidden(Jid),
+    NotFound(Jid),
+}
+
+/// Where a group sits in the community hierarchy, derived from the
+/// community flags the wire already carries (`<parent>`, `<linked_parent>`,
+/// `<default_sub_group>`, `<general_chat>`).
+///
+/// Replaces the bool-soup (`is_parent_group` / `is_default_sub_group` /
+/// `is_general_chat` read in combination) for high-level callers.
+/// [`GroupMetadata`] keeps the raw flags for callers that need them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GroupHierarchy {
+    /// An ordinary group: not a community, not a subgroup.
+    Standalone,
+    /// A community parent group (`<parent>`).
+    Community,
+    /// A subgroup of a community (`<linked_parent jid=...>`).
+    Subgroup { parent: Jid, kind: SubgroupKind },
+}
+
+/// Which subgroup role a community subgroup plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubgroupKind {
+    /// An ordinary subgroup.
+    Regular,
+    /// The community's default announcement subgroup (`<default_sub_group>`).
+    Announcement,
+    /// The community's general chat (`<general_chat>`).
+    General,
+}
+
+/// Slim, display-oriented view of one group: identity, subject, hierarchy,
+/// and membership size — no participants, no settings.
+///
+/// This is the canonical source of subject, community hierarchy, parent,
+/// subgroup kind, and participant count for high-level callers. Fetch it with
+/// [`Groups::list_participating`] (every group the account is in) or
+/// [`Groups::fetch_overviews`] (a chosen subset); both always hit the
+/// network and never backfill LID/PN mappings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct GroupOverview {
+    pub id: Jid,
+    pub subject: String,
+    pub hierarchy: GroupHierarchy,
+    /// Total participant count (`size` attribute), when the server sent one.
+    pub participant_count: Option<u32>,
+}
+
+impl GroupOverview {
+    /// Build the overview subset of a full wire response.
+    ///
+    /// Skips participants by construction: the response is borrowed, so a
+    /// caller that only holds an overview never paid to collect the member
+    /// list.
+    pub fn from_response(group: &GroupMetadataResponse) -> Self {
+        Self {
+            id: group.id.clone(),
+            subject: group.subject.as_str().to_string(),
+            hierarchy: GroupHierarchy::from_response(group),
+            participant_count: group.size.or_else(|| {
+                (!group.participants.is_empty()).then_some(group.participants.len() as u32)
+            }),
+        }
+    }
+
+    /// Whether this group is a community parent group.
+    pub fn is_parent_group(&self) -> bool {
+        matches!(self.hierarchy, GroupHierarchy::Community)
+    }
+
+    /// JID of the parent community, for subgroups.
+    pub fn parent_group_jid(&self) -> Option<&Jid> {
+        match &self.hierarchy {
+            GroupHierarchy::Subgroup { parent, .. } => Some(parent),
+            _ => None,
+        }
+    }
+
+    /// Whether this is the default announcement subgroup of a community.
+    pub fn is_default_sub_group(&self) -> bool {
+        matches!(
+            self.hierarchy,
+            GroupHierarchy::Subgroup {
+                kind: SubgroupKind::Announcement,
+                ..
+            }
+        )
+    }
+
+    /// Whether this is the general chat subgroup of a community.
+    pub fn is_general_chat(&self) -> bool {
+        matches!(
+            self.hierarchy,
+            GroupHierarchy::Subgroup {
+                kind: SubgroupKind::General,
+                ..
+            }
+        )
+    }
+}
+
+impl GroupHierarchy {
+    fn from_response(group: &GroupMetadataResponse) -> Self {
+        if group.is_parent_group {
+            return Self::Community;
+        }
+        match group.parent_group_jid.clone() {
+            Some(parent) => {
+                let kind = if group.is_default_sub_group {
+                    SubgroupKind::Announcement
+                } else if group.is_general_chat {
+                    SubgroupKind::General
+                } else {
+                    SubgroupKind::Regular
+                };
+                Self::Subgroup { parent, kind }
+            }
+            None => Self::Standalone,
+        }
+    }
+}
+
+/// Result for a single group in a [`Groups::fetch_overviews`] batch query.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum GroupOverviewResult {
+    Found(GroupOverview),
+    /// Server returned truncated info (only id and size).
+    Truncated {
+        id: Jid,
+        participant_count: Option<u32>,
     },
     Forbidden(Jid),
     NotFound(Jid),
@@ -267,8 +403,8 @@ impl From<GroupParticipantResponse> for GroupParticipant {
     }
 }
 
-impl From<GroupInfoResponse> for GroupMetadata {
-    fn from(group: GroupInfoResponse) -> Self {
+impl From<GroupMetadataResponse> for GroupMetadata {
+    fn from(group: GroupMetadataResponse) -> Self {
         Self {
             id: group.id,
             subject: group.subject.into_string(),
@@ -343,7 +479,7 @@ pub struct Groups<'a> {
 /// Metadata queries in flight, so a burst of callers for one group shares a
 /// single round trip instead of sending one query each.
 ///
-/// Only [`Groups::get_metadata`] needs this: every other read goes through the
+/// Only [`Groups::fetch_metadata`] needs this: every other read goes through the
 /// group cache, whose cold path is already serialized by the per-group lock.
 #[derive(Default)]
 pub(crate) struct GroupMetadataRegistry {
@@ -642,18 +778,18 @@ pub(crate) struct GroupMetadataGuard<'a> {
 }
 
 impl GroupMetadataGuard<'_> {
-    pub(crate) async fn current(&self) -> Option<Arc<GroupInfo>> {
+    pub(crate) async fn current(&self) -> Option<Arc<GroupRoutingInfo>> {
         self.client.get_group_cache().get(self.jid).await
     }
 
-    async fn cache(&self, info: Arc<GroupInfo>) {
+    async fn cache(&self, info: Arc<GroupRoutingInfo>) {
         self.client
             .get_group_cache()
             .insert(self.jid.clone(), info)
             .await;
     }
 
-    pub(crate) async fn publish(&self, info: Arc<GroupInfo>) {
+    pub(crate) async fn publish(&self, info: Arc<GroupRoutingInfo>) {
         let jid = self.jid.to_string();
         match serde_json::to_vec(info.as_ref()) {
             Ok(blob) => {
@@ -713,33 +849,38 @@ impl<'a> Groups<'a> {
         Self { client }
     }
 
-    /// Query the cached, send-oriented view of a group.
+    /// Cached, send-oriented routing view of a group.
     ///
-    /// Returns the slim [`GroupInfo`] the encryption path needs: participant
-    /// JIDs, the group's addressing mode, the LID/PN mapping, and whether it is
-    /// a community announcement group. A cached entry is returned as-is, so a
-    /// repeated call is free. Only a cache miss goes to the network, and it
-    /// sends the persisted participant phash, so an unchanged group costs a
-    /// `not-modified` answer instead of a full metadata download.
+    /// Returns the slim [`GroupRoutingInfo`] the encryption path needs:
+    /// participant JIDs, the group's addressing mode, the LID/PN mapping, and
+    /// whether it is a community announcement group. A cached entry is
+    /// returned as-is, so a repeated call is free. Only a cache miss goes to
+    /// the network, and it sends the persisted participant phash, so an
+    /// unchanged group costs a `not-modified` answer instead of a full
+    /// metadata download.
     ///
+    /// This may be cache-preferred; the cost does not read at the callsite.
     /// This is the right call for routing and encrypting a message. For the
     /// user-facing fields (subject, description, admin roles, group settings)
-    /// use [`Groups::get_metadata`], and to control staleness explicitly use
-    /// [`Groups::query_info_with_freshness`].
-    pub async fn query_info(&self, jid: &Jid) -> Result<Arc<GroupInfo>, GroupError> {
-        self.query_info_with_freshness(jid, crate::cache::Freshness::CachePreferred)
+    /// use [`Groups::fetch_metadata`], and to control staleness explicitly use
+    /// [`Groups::routing_info_with_freshness`].
+    pub(crate) async fn routing_info(
+        &self,
+        jid: &Jid,
+    ) -> Result<Arc<GroupRoutingInfo>, GroupError> {
+        self.routing_info_with_freshness(jid, crate::cache::Freshness::CachePreferred)
             .await
     }
 
-    /// Query group metadata using the requested cache freshness policy.
+    /// Routing view of a group using the requested cache freshness policy.
     ///
     /// A refresh leaves the current snapshot readable while the network request
     /// is in flight, then atomically replaces it after a successful response.
-    pub async fn query_info_with_freshness(
+    pub(crate) async fn routing_info_with_freshness(
         &self,
         jid: &Jid,
         freshness: crate::cache::Freshness,
-    ) -> Result<Arc<GroupInfo>, GroupError> {
+    ) -> Result<Arc<GroupRoutingInfo>, GroupError> {
         let cache = self.client.get_group_cache();
         let mut cached = cache.get(jid).await;
         if freshness == crate::cache::Freshness::CachePreferred
@@ -748,21 +889,21 @@ impl<'a> Groups<'a> {
             return Ok(cached);
         }
 
-        self.query_info_from_source(jid, cached).await
+        self.routing_info_from_source(jid, cached).await
     }
 
     #[expect(
         clippy::manual_async_fn,
         reason = "the explicit async block keeps the network-bound state machine out of line"
     )]
-    fn query_info_from_source<'b>(
+    fn routing_info_from_source<'b>(
         &'b self,
         jid: &'b Jid,
-        mut cached: Option<Arc<GroupInfo>>,
-    ) -> impl Future<Output = Result<Arc<GroupInfo>, GroupError>> + 'b {
+        mut cached: Option<Arc<GroupRoutingInfo>>,
+    ) -> impl Future<Output = Result<Arc<GroupRoutingInfo>, GroupError>> + 'b {
         // Keep the large, network-bound state machine shared between refresh
         // and cache-miss callers. The cache-hit fast path stays in
-        // `query_info_with_freshness`, while this boundary prevents LTO from
+        // `routing_info_with_freshness`, while this boundary prevents LTO from
         // cloning the slow path for each statically known freshness policy.
         #[inline(never)]
         async move {
@@ -898,7 +1039,7 @@ impl<'a> Groups<'a> {
                         .await;
                 }
 
-                let mut info = GroupInfo::new(participants, group.addressing_mode);
+                let mut info = GroupRoutingInfo::new(participants, group.addressing_mode);
                 info.is_community_announce = Some(group.is_default_sub_group);
                 if !lid_to_pn_map.is_empty() {
                     info.set_lid_to_pn_map(lid_to_pn_map);
@@ -936,7 +1077,7 @@ impl<'a> Groups<'a> {
         }
     }
 
-    async fn fill_group_info_pns(&self, info: &mut GroupInfo) {
+    async fn fill_group_info_pns(&self, info: &mut GroupRoutingInfo) {
         if info.addressing_mode != AddressingMode::Lid {
             return;
         }
@@ -1015,34 +1156,34 @@ impl<'a> Groups<'a> {
         }
     }
 
-    pub async fn get_participating(&self) -> Result<HashMap<Jid, GroupMetadata>, GroupError> {
+    /// List every group the account participates in as slim overviews.
+    ///
+    /// Always hits the network (one `participating` IQ) and parses only
+    /// id, subject, size, and the community-hierarchy flags from each
+    /// `<group>` node — participants are skipped even though the wire payload
+    /// is unchanged. Never backfills LID/PN mappings and never fans out per
+    /// group, so this stays one round trip no matter how many groups come
+    /// back. For the full user-facing object use [`Groups::fetch_metadata`].
+    pub async fn list_participating(&self) -> Result<Vec<GroupOverview>, GroupError> {
         let response = self.client.execute(GroupParticipatingIq::new()).await?;
 
-        let mut result: HashMap<Jid, GroupMetadata> = response
+        Ok(response
             .groups
-            .into_iter()
-            .map(|group| {
-                let key = group.id.clone();
-                (key, GroupMetadata::from(group))
-            })
-            .collect();
-
-        for meta in result.values_mut() {
-            self.fill_participant_pns(meta).await;
-        }
-
-        Ok(result)
+            .iter()
+            .map(GroupOverview::from_response)
+            .collect())
     }
 
     /// Fetch the complete, user-facing metadata of a group.
     ///
     /// Returns an owned [`GroupMetadata`]: subject, description, creator,
-    /// per-participant admin roles, and ephemeral and membership settings. In a
-    /// LID-addressed group, participant phone numbers the server left out are
-    /// backfilled from known LID/PN mappings on a best-effort basis; a
-    /// participant with no known mapping keeps `phone_number: None`. The query
-    /// hits the network (no phash is sent, so the server never answers
+    /// per-participant admin roles, and ephemeral and membership settings. The
+    /// query hits the network (no phash is sent, so the server never answers
     /// `not-modified`) and the result does not populate the group cache.
+    /// Protocol data only: participant phone numbers the server left out are
+    /// NOT backfilled here. When PN-keyed display data is needed, call
+    /// [`Groups::resolve_participant_addresses`] explicitly after this
+    /// returns, so the extra cache/database cost reads at the callsite.
     ///
     /// **Concurrent calls for one group share a round trip.** A call that
     /// arrives while another is in flight is answered by that one instead of
@@ -1055,8 +1196,8 @@ impl<'a> Groups<'a> {
     ///
     /// This is the right call for displaying or auditing a group. When you only
     /// need the participant list to send a message, prefer the cached
-    /// [`Groups::query_info`].
-    pub async fn get_metadata(&self, jid: &Jid) -> Result<GroupMetadata, GroupError> {
+    /// [`Groups::routing_info`] (crate-internal)..
+    pub async fn fetch_metadata(&self, jid: &Jid) -> Result<GroupMetadata, GroupError> {
         // Coalesced, because this is the one metadata entry point with no cache
         // in front of it: an offline-sync drain puts a burst of callers on the
         // same group at once, and each would otherwise send its own query. WA
@@ -1120,18 +1261,37 @@ impl<'a> Groups<'a> {
     }
 
     /// The query itself, with no coalescing. Only a leader reaches it.
+    ///
+    /// Protocol data only: no LID/PN backfill. Call
+    /// [`Groups::resolve_participant_addresses`] after this returns when
+    /// PN-keyed display data is needed.
     async fn query_metadata_uncoalesced(&self, jid: &Jid) -> Result<GroupMetadata, GroupError> {
         // No phash is sent, so the server always returns the full group.
         match self.client.execute(GroupQueryIq::new(jid)).await? {
-            GroupInfoOutcome::Full(group) => {
-                let mut meta = GroupMetadata::from(*group);
-                self.fill_participant_pns(&mut meta).await;
-                Ok(meta)
-            }
+            GroupInfoOutcome::Full(group) => Ok(GroupMetadata::from(*group)),
             GroupInfoOutcome::NotModified => Err(GroupError::InvalidRequest(
                 "group query returned not-modified without a phash".into(),
             )),
         }
+    }
+
+    /// Opt-in enrichment of [`Groups::fetch_metadata`] output: backfills each
+    /// LID participant's `phone_number` from the client's LID-PN cache
+    /// (`get_lid_pn_entry`, same warm-cache + backend path `create_group`
+    /// uses). The server often omits the attribute on `<participant>` nodes of
+    /// LID-addressed groups, so consumers keying data by PN would treat current
+    /// members as absent without it.
+    ///
+    /// Kept separate from `fetch_metadata` (rather than a combined
+    /// `fetch_metadata_resolved`) so the extra cache/database cost reads at
+    /// the callsite. No-op outside LID-addressed groups or when the PN is
+    /// already present; unknown mappings leave the participant untouched.
+    ///
+    /// Prefer calling this over `fetch_metadata` alone when rendering
+    /// participant phone numbers; prefer bare `fetch_metadata` when only
+    /// protocol data (subject, roles, settings) is needed.
+    pub async fn resolve_participant_addresses(&self, meta: &mut GroupMetadata) {
+        self.fill_participant_pns(meta).await;
     }
 
     pub async fn create_group(
@@ -1707,14 +1867,17 @@ impl<'a> Groups<'a> {
         Ok(self.client.execute(AcknowledgeGroupIq::new(jid)).await?)
     }
 
-    /// Batch query group info for multiple groups at once (max 10,000).
-    pub async fn batch_get_info(
+    /// Batch fetch complete, user-facing metadata for multiple groups at once
+    /// (max 10,000). Always hits the network; no LID/PN backfill — call
+    /// [`Groups::resolve_participant_addresses`] per result when PN-keyed
+    /// display data is needed.
+    pub async fn fetch_metadata_batch(
         &self,
         jids: Vec<Jid>,
     ) -> Result<Vec<BatchGroupResult>, GroupError> {
         if jids.len() > wacore::iq::groups::BATCH_GROUP_INFO_LIMIT {
             return Err(GroupError::InvalidRequest(format!(
-                "batch_get_info: {} groups exceeds limit of {}",
+                "fetch_metadata_batch: {} groups exceeds limit of {}",
                 jids.len(),
                 wacore::iq::groups::BATCH_GROUP_INFO_LIMIT,
             )));
@@ -1729,6 +1892,40 @@ impl<'a> Groups<'a> {
                 RawBatchResult::Truncated { id, size } => BatchGroupResult::Truncated { id, size },
                 RawBatchResult::Forbidden(id) => BatchGroupResult::Forbidden(id),
                 RawBatchResult::NotFound(id) => BatchGroupResult::NotFound(id),
+            })
+            .collect())
+    }
+
+    /// Batch fetch slim overviews for a chosen subset of groups (max 10,000).
+    ///
+    /// Reuses [`BatchGetGroupInfoIq`] but parses only the overview subset
+    /// (id, subject, hierarchy flags, size) from each full `<group>` node —
+    /// participants are never collected. Always hits the network; never
+    /// backfills LID/PN mappings.
+    pub async fn fetch_overviews(
+        &self,
+        jids: &[Jid],
+    ) -> Result<Vec<GroupOverviewResult>, GroupError> {
+        if jids.len() > wacore::iq::groups::BATCH_GROUP_INFO_LIMIT {
+            return Err(GroupError::InvalidRequest(format!(
+                "fetch_overviews: {} groups exceeds limit of {}",
+                jids.len(),
+                wacore::iq::groups::BATCH_GROUP_INFO_LIMIT,
+            )));
+        }
+        let raw = self.client.execute(BatchGetGroupInfoIq::new(jids)).await?;
+        Ok(raw
+            .into_iter()
+            .map(|r| match r {
+                RawBatchResult::Full(info) => {
+                    GroupOverviewResult::Found(GroupOverview::from_response(&info))
+                }
+                RawBatchResult::Truncated { id, size } => GroupOverviewResult::Truncated {
+                    id,
+                    participant_count: size,
+                },
+                RawBatchResult::Forbidden(id) => GroupOverviewResult::Forbidden(id),
+                RawBatchResult::NotFound(id) => GroupOverviewResult::NotFound(id),
             })
             .collect())
     }
@@ -2184,7 +2381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_info_backfills_known_pns_without_overriding_response() {
+    async fn routing_info_backfills_known_pns_without_overriding_response() {
         use crate::lid_pn_cache::{LearningSource, LidPnEntry};
         use wacore::store::traits::LidPnMappingEntry;
         use wacore_binary::builder::NodeBuilder;
@@ -2220,7 +2417,7 @@ mod tests {
         let query = {
             let client = client.clone();
             let group = group.clone();
-            tokio::spawn(async move { client.groups().query_info(&group).await })
+            tokio::spawn(async move { client.groups().routing_info(&group).await })
         };
         let id = pending_group_query(&transport, 0).await;
         let response = NodeBuilder::new("iq")
@@ -2255,7 +2452,7 @@ mod tests {
             );
         }
         assert!(info.phone_jid_for_lid_user(&participants[3].user).is_none());
-        let persisted: GroupInfo = serde_json::from_slice(
+        let persisted: GroupRoutingInfo = serde_json::from_slice(
             &client
                 .persistence_manager
                 .backend()
@@ -2271,7 +2468,7 @@ mod tests {
         );
         assert!(Arc::ptr_eq(
             &info,
-            &client.groups().query_info(&group).await.unwrap()
+            &client.groups().routing_info(&group).await.unwrap()
         ));
         let reconcile = crate::test_utils::decode_sent_iq(&transport, 1).await;
         let reconcile_node = reconcile.get();
@@ -2390,12 +2587,13 @@ mod tests {
 
         let client = crate::test_utils::create_test_client().await;
         let groups = client.groups();
-        let mut info = GroupInfo::new(vec![Jid::lid("100000000000101")], AddressingMode::Lid);
+        let mut info =
+            GroupRoutingInfo::new(vec![Jid::lid("100000000000101")], AddressingMode::Lid);
         assert_send(groups.fill_group_info_pns(&mut info));
     }
 
     #[tokio::test]
-    async fn query_info_not_modified_backfills_persisted_pns() {
+    async fn routing_info_not_modified_backfills_persisted_pns() {
         use crate::lid_pn_cache::{LearningSource, LidPnEntry};
 
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
@@ -2405,7 +2603,7 @@ mod tests {
             Jid::lid("100000000000102"),
             Jid::lid("100000000000103"),
         ];
-        let mut persisted = GroupInfo::with_lid_to_pn_map(
+        let mut persisted = GroupRoutingInfo::with_lid_to_pn_map(
             participants.clone(),
             AddressingMode::Lid,
             HashMap::from([(participants[1].user.clone(), Jid::pn("15555550199"))]),
@@ -2430,7 +2628,7 @@ mod tests {
         let query = {
             let client = client.clone();
             let group = group.clone();
-            tokio::spawn(async move { client.groups().query_info(&group).await })
+            tokio::spawn(async move { client.groups().routing_info(&group).await })
         };
         let id = pending_group_query(&transport, 0).await;
         let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
@@ -2466,7 +2664,7 @@ mod tests {
         assert!(info.phone_jid_for_lid_user(&participants[2].user).is_none());
         assert!(Arc::ptr_eq(
             &info,
-            &client.groups().query_info(&group).await.unwrap()
+            &client.groups().routing_info(&group).await.unwrap()
         ));
         assert_eq!(transport.sent().len(), 1);
     }
@@ -2475,7 +2673,7 @@ mod tests {
     /// A Refresh that the server answers with not-modified must enrich its
     /// copy from the mapping cache rather than serve stale LIDs.
     #[tokio::test]
-    async fn query_info_not_modified_enriches_warm_snapshot() {
+    async fn routing_info_not_modified_enriches_warm_snapshot() {
         use crate::lid_pn_cache::{LearningSource, LidPnEntry};
 
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
@@ -2485,7 +2683,10 @@ mod tests {
             .get_group_cache()
             .insert(
                 group.clone(),
-                Arc::new(GroupInfo::new(participants.clone(), AddressingMode::Lid)),
+                Arc::new(GroupRoutingInfo::new(
+                    participants.clone(),
+                    AddressingMode::Lid,
+                )),
             )
             .await;
         // Learned after the snapshot was published, e.g. from an inbound
@@ -2504,7 +2705,7 @@ mod tests {
             tokio::spawn(async move {
                 client
                     .groups()
-                    .query_info_with_freshness(&group, crate::cache::Freshness::Refresh)
+                    .routing_info_with_freshness(&group, crate::cache::Freshness::Refresh)
                     .await
             })
         };
@@ -2519,12 +2720,12 @@ mod tests {
         assert!(info.phone_jid_for_lid_user(&participants[1].user).is_none());
         assert!(Arc::ptr_eq(
             &info,
-            &client.groups().query_info(&group).await.unwrap()
+            &client.groups().routing_info(&group).await.unwrap()
         ));
     }
 
     #[tokio::test]
-    async fn query_info_pn_group_does_not_backfill_lid_aliases() {
+    async fn routing_info_pn_group_does_not_backfill_lid_aliases() {
         use crate::lid_pn_cache::{LearningSource, LidPnEntry};
         use wacore_binary::builder::NodeBuilder;
 
@@ -2542,7 +2743,7 @@ mod tests {
         let query = {
             let client = client.clone();
             let group = group.clone();
-            tokio::spawn(async move { client.groups().query_info(&group).await })
+            tokio::spawn(async move { client.groups().routing_info(&group).await })
         };
         let id = pending_group_query(&transport, 0).await;
         let response = NodeBuilder::new("iq")
@@ -2637,13 +2838,13 @@ mod tests {
 
     #[tokio::test]
     async fn warm_group_cache_hit_shares_arc_not_deep_clone() {
-        use wacore::client::context::GroupInfo;
+        use wacore::client::context::GroupRoutingInfo;
         use wacore::types::message::AddressingMode;
 
         let client = crate::test_utils::create_test_client().await;
         let group_jid: Jid = "123456789@g.us".parse().unwrap();
 
-        let info = GroupInfo::new(
+        let info = GroupRoutingInfo::new(
             vec![
                 "111111111111@s.whatsapp.net".parse().unwrap(),
                 "222222222222@s.whatsapp.net".parse().unwrap(),
@@ -2666,7 +2867,7 @@ mod tests {
     async fn refresh_keeps_the_previous_group_snapshot_on_source_failure() {
         let client = crate::test_utils::create_test_client().await;
         let group: Jid = "120363000000000099@g.us".parse().unwrap();
-        let previous = Arc::new(GroupInfo::new(
+        let previous = Arc::new(GroupRoutingInfo::new(
             vec!["12025550101@s.whatsapp.net".parse().unwrap()],
             AddressingMode::Pn,
         ));
@@ -2675,7 +2876,7 @@ mod tests {
 
         let result = client
             .groups()
-            .query_info_with_freshness(&group, crate::cache::Freshness::Refresh)
+            .routing_info_with_freshness(&group, crate::cache::Freshness::Refresh)
             .await;
         assert!(
             result.is_err(),
@@ -2703,7 +2904,10 @@ mod tests {
             cache
                 .insert(
                     jid.clone(),
-                    Arc::new(GroupInfo::new(vec![removed.clone()], AddressingMode::Pn)),
+                    Arc::new(GroupRoutingInfo::new(
+                        vec![removed.clone()],
+                        AddressingMode::Pn,
+                    )),
                 )
                 .await;
         }
@@ -3285,9 +3489,9 @@ mod tests {
         );
     }
 
-    /// Concurrent `get_metadata` for one group must reach the server once.
+    /// Concurrent `fetch_metadata` for one group must reach the server once.
     #[tokio::test]
-    async fn concurrent_get_metadata_queries_the_group_once() {
+    async fn concurrent_fetch_metadata_queries_the_group_once() {
         const CONCURRENT_CALLS: usize = 6;
 
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
@@ -3300,7 +3504,7 @@ mod tests {
             let group = group.clone();
             let done = done.clone();
             tasks.push(tokio::spawn(async move {
-                let result = client.groups().get_metadata(&group).await;
+                let result = client.groups().fetch_metadata(&group).await;
                 done.fetch_add(1, std::sync::atomic::Ordering::Release);
                 result
             }));
@@ -3381,7 +3585,7 @@ mod tests {
         let leader = {
             let client = client.clone();
             let group = group.clone();
-            tokio::spawn(async move { client.groups().get_metadata(&group).await })
+            tokio::spawn(async move { client.groups().fetch_metadata(&group).await })
         };
         let first_id = pending_group_query(&transport, 0).await;
 
@@ -3390,7 +3594,7 @@ mod tests {
             let client = client.clone();
             let group = group.clone();
             waiters.push(tokio::spawn(async move {
-                client.groups().get_metadata(&group).await
+                client.groups().fetch_metadata(&group).await
             }));
         }
         wait_for_joiners(&client, &group, WAITERS).await;
@@ -3432,7 +3636,7 @@ mod tests {
         let leader = {
             let client = client.clone();
             let group = group.clone();
-            tokio::spawn(async move { client.groups().get_metadata(&group).await })
+            tokio::spawn(async move { client.groups().fetch_metadata(&group).await })
         };
         pending_group_query(&transport, 0).await;
 
@@ -3441,7 +3645,7 @@ mod tests {
             let client = client.clone();
             let group = group.clone();
             waiters.push(tokio::spawn(async move {
-                client.groups().get_metadata(&group).await
+                client.groups().fetch_metadata(&group).await
             }));
         }
         wait_for_joiners(&client, &group, WAITERS).await;
@@ -3480,7 +3684,7 @@ mod tests {
         let leader = {
             let client = client.clone();
             let group = group.clone();
-            tokio::spawn(async move { client.groups().get_metadata(&group).await })
+            tokio::spawn(async move { client.groups().fetch_metadata(&group).await })
         };
         pending_group_query(&transport, 0).await;
         leader.abort();
@@ -3489,7 +3693,7 @@ mod tests {
         let next = {
             let client = client.clone();
             let group = group.clone();
-            tokio::spawn(async move { client.groups().get_metadata(&group).await })
+            tokio::spawn(async move { client.groups().fetch_metadata(&group).await })
         };
         let next_id = pending_group_query(&transport, 1).await;
         let response = group_result_with_description(&next_id, &group, None);
@@ -3536,6 +3740,294 @@ mod tests {
             .to_string()
     }
 
+    #[test]
+    fn group_overview_derives_hierarchy_from_community_flags() {
+        use wacore::iq::groups::GroupMetadataResponse;
+        use wacore::protocol::ProtocolNode;
+        use wacore_binary::builder::NodeBuilder;
+
+        // Standalone group: no community markers.
+        let node = NodeBuilder::new("group")
+            .attr("id", "120363000000000010@g.us")
+            .attr("subject", "Standalone")
+            .attr("size", "7")
+            .build();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
+        let overview = GroupOverview::from_response(&response);
+        assert_eq!(overview.subject, "Standalone");
+        assert_eq!(overview.hierarchy, GroupHierarchy::Standalone);
+        assert_eq!(overview.participant_count, Some(7));
+        assert!(!overview.is_parent_group());
+        assert_eq!(overview.parent_group_jid(), None);
+        assert!(!overview.is_default_sub_group());
+        assert!(!overview.is_general_chat());
+
+        // Community parent: `<parent>`.
+        let node = NodeBuilder::new("group")
+            .attr("id", "120363000000000011@g.us")
+            .attr("subject", "Community")
+            .children([NodeBuilder::new("parent").build()])
+            .build();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
+        let overview = GroupOverview::from_response(&response);
+        assert_eq!(overview.hierarchy, GroupHierarchy::Community);
+        assert!(overview.is_parent_group());
+        assert_eq!(overview.participant_count, None);
+
+        // Announcement subgroup: linked parent + default marker.
+        let parent: Jid = "120363000000000011@g.us".parse().unwrap();
+        let node = NodeBuilder::new("group")
+            .attr("id", "120363000000000012@g.us")
+            .attr("subject", "Announcements")
+            .attr("size", "150")
+            .children([
+                NodeBuilder::new("linked_parent")
+                    .attr("jid", parent.to_string())
+                    .build(),
+                NodeBuilder::new("default_sub_group").build(),
+            ])
+            .build();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
+        let overview = GroupOverview::from_response(&response);
+        assert_eq!(
+            overview.hierarchy,
+            GroupHierarchy::Subgroup {
+                parent: parent.clone(),
+                kind: SubgroupKind::Announcement,
+            }
+        );
+        assert_eq!(overview.parent_group_jid(), Some(&parent));
+        assert!(overview.is_default_sub_group());
+        assert!(!overview.is_general_chat());
+        assert_eq!(overview.participant_count, Some(150));
+
+        // General chat: linked parent + general marker.
+        let node = NodeBuilder::new("group")
+            .attr("id", "120363000000000013@g.us")
+            .attr("subject", "General")
+            .children([
+                NodeBuilder::new("linked_parent")
+                    .attr("jid", parent.to_string())
+                    .build(),
+                NodeBuilder::new("general_chat").build(),
+            ])
+            .build();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
+        let overview = GroupOverview::from_response(&response);
+        assert_eq!(
+            overview.hierarchy,
+            GroupHierarchy::Subgroup {
+                parent: parent.clone(),
+                kind: SubgroupKind::General,
+            }
+        );
+        assert!(overview.is_general_chat());
+
+        // Regular subgroup: linked parent, no role marker.
+        let node = NodeBuilder::new("group")
+            .attr("id", "120363000000000014@g.us")
+            .attr("subject", "Off-topic")
+            .children([NodeBuilder::new("linked_parent")
+                .attr("jid", parent.to_string())
+                .build()])
+            .build();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
+        let overview = GroupOverview::from_response(&response);
+        assert_eq!(
+            overview.hierarchy,
+            GroupHierarchy::Subgroup {
+                parent,
+                kind: SubgroupKind::Regular,
+            }
+        );
+    }
+
+    #[test]
+    #[allow(unused_qualifications)]
+    fn renamed_overview_surface_is_reachable_from_the_crate_root() {
+        // Rename coverage: the new public names resolve where downstream
+        // callers import them from.
+        fn assert_public<T>() {}
+        assert_public::<crate::GroupOverview>();
+        assert_public::<crate::GroupHierarchy>();
+        assert_public::<crate::SubgroupKind>();
+        assert_public::<crate::GroupOverviewResult>();
+    }
+
+    #[tokio::test]
+    async fn fetch_metadata_returns_protocol_data_without_enrichment_by_default() {
+        use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+        use wacore_binary::builder::NodeBuilder;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+        let lid: Jid = Jid::lid("100000000000109");
+        // A known mapping the server does not echo: enrichment would fill it.
+        client
+            .lid_pn_cache
+            .add(&LidPnEntry::new(
+                "100000000000109".to_string(),
+                "15555550109".to_string(),
+                LearningSource::Usync,
+            ))
+            .await;
+
+        let query = {
+            let client = client.clone();
+            let group = group.clone();
+            tokio::spawn(async move { client.groups().fetch_metadata(&group).await })
+        };
+        let id = pending_group_query(&transport, 0).await;
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", &id)
+            .attr("from", &group)
+            .children([NodeBuilder::new("group")
+                .attr("id", group.to_string())
+                .attr("subject", "Enrichment probe")
+                .attr("addressing_mode", "lid")
+                .children([NodeBuilder::new("participant").attr("jid", &lid).build()])
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &id, &response).await;
+        let mut meta = query.await.unwrap().unwrap();
+        assert_eq!(
+            meta.participants[0].phone_number, None,
+            "fetch_metadata must not backfill LID/PN mappings by default"
+        );
+
+        // The opt-in path fills the same mapping on demand.
+        client
+            .groups()
+            .resolve_participant_addresses(&mut meta)
+            .await;
+        assert_eq!(
+            meta.participants[0].phone_number,
+            Some(Jid::pn("15555550109")),
+            "resolve_participant_addresses must backfill from the warm cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_overviews_covers_found_truncated_forbidden_and_not_found() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let found: Jid = "120363000000000021@g.us".parse().unwrap();
+        let truncated: Jid = "120363000000000022@g.us".parse().unwrap();
+        let forbidden: Jid = "120363000000000023@g.us".parse().unwrap();
+        let missing: Jid = "120363000000000024@g.us".parse().unwrap();
+        let jids = vec![
+            found.clone(),
+            truncated.clone(),
+            forbidden.clone(),
+            missing.clone(),
+        ];
+
+        let query = {
+            let client = client.clone();
+            let jids = jids.clone();
+            tokio::spawn(async move { client.groups().fetch_overviews(&jids).await })
+        };
+        let id = pending_group_query(&transport, 0).await;
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", &id)
+            .children([NodeBuilder::new("groups")
+                .children([
+                    NodeBuilder::new("group")
+                        .attr("id", found.to_string())
+                        .attr("subject", "Found")
+                        .attr("size", "42")
+                        .build(),
+                    NodeBuilder::new("group")
+                        .attr("id", truncated.to_string())
+                        .attr("truncated", "true")
+                        .attr("size", "900")
+                        .build(),
+                    NodeBuilder::new("group")
+                        .attr("id", forbidden.to_string())
+                        .attr("error", "403")
+                        .build(),
+                    NodeBuilder::new("group")
+                        .attr("id", missing.to_string())
+                        .attr("error", "404")
+                        .build(),
+                ])
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &id, &response).await;
+        let results = query.await.unwrap().unwrap();
+        assert_eq!(results.len(), 4);
+        match &results[0] {
+            GroupOverviewResult::Found(overview) => {
+                assert_eq!(overview.id, found);
+                assert_eq!(overview.subject, "Found");
+                assert_eq!(overview.participant_count, Some(42));
+                assert_eq!(overview.hierarchy, GroupHierarchy::Standalone);
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+        match &results[1] {
+            GroupOverviewResult::Truncated {
+                id,
+                participant_count,
+            } => {
+                assert_eq!(id, &truncated);
+                assert_eq!(*participant_count, Some(900));
+            }
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+        match &results[2] {
+            GroupOverviewResult::Forbidden(id) => assert_eq!(id, &forbidden),
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+        match &results[3] {
+            GroupOverviewResult::NotFound(id) => assert_eq!(id, &missing),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_participating_returns_overviews_without_participants() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group: Jid = "120363000000000031@g.us".parse().unwrap();
+        let member: Jid = Jid::lid("100000000000131");
+
+        let query = {
+            let client = client.clone();
+            tokio::spawn(async move { client.groups().list_participating().await })
+        };
+        let id = pending_group_query(&transport, 0).await;
+        // The wire payload still carries participants; the overview parse
+        // must skip them rather than collect them.
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", &id)
+            .children([NodeBuilder::new("groups")
+                .children([NodeBuilder::new("group")
+                    .attr("id", group.to_string())
+                    .attr("subject", "Participating")
+                    .attr("addressing_mode", "lid")
+                    .attr("size", "3")
+                    .children([
+                        NodeBuilder::new("participant").attr("jid", &member).build(),
+                        NodeBuilder::new("parent").build(),
+                    ])
+                    .build()])
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &id, &response).await;
+        let overviews = query.await.unwrap().unwrap();
+        assert_eq!(overviews.len(), 1);
+        assert_eq!(overviews[0].id, group);
+        assert_eq!(overviews[0].subject, "Participating");
+        assert_eq!(overviews[0].hierarchy, GroupHierarchy::Community);
+        assert_eq!(overviews[0].participant_count, Some(3));
+    }
+
     /// A caller that joined a successful flight is answered by it.
     ///
     /// Holds down the observable half of publishing under the registry lock —
@@ -3555,14 +4047,14 @@ mod tests {
         let leader = {
             let client = client.clone();
             let group = group.clone();
-            tokio::spawn(async move { client.groups().get_metadata(&group).await })
+            tokio::spawn(async move { client.groups().fetch_metadata(&group).await })
         };
         let request_id = pending_group_query(&transport, 0).await;
 
         let joiner = {
             let client = client.clone();
             let group = group.clone();
-            tokio::spawn(async move { client.groups().get_metadata(&group).await })
+            tokio::spawn(async move { client.groups().fetch_metadata(&group).await })
         };
         wait_for_joiners(&client, &group, 1).await;
 

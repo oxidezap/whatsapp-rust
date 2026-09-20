@@ -249,7 +249,7 @@ mod tests {
 
     #[tokio::test]
     async fn groups_dirty_invalidates_the_named_groups_and_names_no_group_update() {
-        use wacore::client::context::GroupInfo;
+        use wacore::client::context::GroupRoutingInfo;
         use wacore::types::message::AddressingMode;
 
         let (client, collector) = client_with_collector().await;
@@ -270,7 +270,7 @@ mod tests {
             cache
                 .insert(
                     jid.clone(),
-                    Arc::new(GroupInfo::new(
+                    Arc::new(GroupRoutingInfo::new(
                         vec!["12025550101@s.whatsapp.net".parse().unwrap()],
                         AddressingMode::Pn,
                     )),

@@ -15,14 +15,14 @@ use super::member_index::MemberIndex;
 const SIGNAL_NAMESPACE_COUNT: usize = 4;
 
 /// Per-group device-list snapshot for `resolve_group_devices_memoized`.
-/// Valid while the producing `GroupInfo` Arc is still the cached one AND the
+/// Valid while the producing `GroupRoutingInfo` Arc is still the cached one AND the
 /// device-topology generation is unchanged.
 pub(crate) struct GroupDevicesMemo {
-    /// Weak identity of the producing GroupInfo: pointer equality is ABA-safe
+    /// Weak identity of the producing GroupRoutingInfo: pointer equality is ABA-safe
     /// because the Weak keeps the allocation alive, while the heavy data
     /// (participants, maps) is freed as soon as the metadata cache drops its
-    /// Arc — the memo retains a struct-sized header, not the whole GroupInfo.
-    pub(crate) group_info: std::sync::Weak<wacore::client::context::GroupInfo>,
+    /// Arc — the memo retains a struct-sized header, not the whole GroupRoutingInfo.
+    pub(crate) group_info: std::sync::Weak<wacore::client::context::GroupRoutingInfo>,
     pub(crate) generation: u64,
     /// Member identifiers in BOTH namespaces (participant users, their mapped
     /// counterparts, resolved device users): the scoped-invalidation check
@@ -33,7 +33,7 @@ pub(crate) struct GroupDevicesMemo {
 
 impl wacore::stats::HeapSize for GroupDevicesMemo {
     fn heap_bytes(&self) -> usize {
-        // The Weak keeps only the GroupInfo allocation header alive; the memo
+        // The Weak keeps only the GroupRoutingInfo allocation header alive; the memo
         // does not retain its payload.
         self.members.heap_bytes() + self.devices.heap_bytes()
     }
@@ -144,7 +144,7 @@ impl Client {
     ///
     /// The input set is a pure function of `group_info` (participants + LID
     /// normalization), so the memo is valid exactly while BOTH hold:
-    /// the same `GroupInfo` snapshot (`Arc` identity — any metadata refresh or
+    /// the same `GroupRoutingInfo` snapshot (`Arc` identity — any metadata refresh or
     /// membership change produces a new `Arc`) and an unchanged
     /// `device_topology_generation` (any registry/mapping write bumps it).
     /// On a warm repeat send this turns the per-member cache fan-out
@@ -152,7 +152,7 @@ impl Client {
     pub(crate) async fn resolve_group_devices_memoized(
         &self,
         group: &Jid,
-        group_info: &Arc<wacore::client::context::GroupInfo>,
+        group_info: &Arc<wacore::client::context::GroupRoutingInfo>,
         own_sending_jid: &Jid,
     ) -> Result<Arc<wacore::send::ResolvedGroupDevices>, anyhow::Error> {
         use crate::client::GroupDevicesMemoOutcome as Outcome;
@@ -277,7 +277,7 @@ impl Client {
     /// memo off the pre-ensure Arc stays equivalent) and resolve it.
     pub(crate) async fn resolve_group_devices_uncached(
         &self,
-        group_info: &wacore::client::context::GroupInfo,
+        group_info: &wacore::client::context::GroupRoutingInfo,
         own_sending_jid: &Jid,
         freshness: crate::cache::Freshness,
     ) -> Result<Vec<Jid>, anyhow::Error> {
@@ -1691,12 +1691,12 @@ mod tests {
     }
 
     /// Locks the three validity gates of the group-devices memo: a repeat
-    /// resolve with the same GroupInfo Arc + generation is a memo hit (proved
+    /// resolve with the same GroupRoutingInfo Arc + generation is a memo hit (proved
     /// by serving a raw cache change STALE), any topology bump recomputes,
-    /// and a refreshed GroupInfo (new Arc, same content) recomputes.
+    /// and a refreshed GroupRoutingInfo (new Arc, same content) recomputes.
     #[tokio::test]
     async fn group_devices_memo_hits_and_invalidates() {
-        use wacore::client::context::GroupInfo;
+        use wacore::client::context::GroupRoutingInfo;
         use wacore::types::message::AddressingMode;
 
         let client = create_test_client().await;
@@ -1706,7 +1706,7 @@ mod tests {
         setup_device_record(&client, user_a, &[0, 5]).await;
         setup_device_record(&client, user_b, &[0]).await;
 
-        let group_info = Arc::new(GroupInfo::new(
+        let group_info = Arc::new(GroupRoutingInfo::new(
             vec![Jid::pn(user_a), Jid::pn(user_b)],
             AddressingMode::Pn,
         ));
@@ -1743,10 +1743,10 @@ mod tests {
             "post-bump resolve must see the raw change"
         );
 
-        // A refreshed GroupInfo (new Arc, identical content) must recompute
+        // A refreshed GroupRoutingInfo (new Arc, identical content) must recompute
         // even with an unchanged generation.
         setup_device_record(&client, user_b, &[0, 9]).await;
-        let refreshed_info = Arc::new(GroupInfo::new(
+        let refreshed_info = Arc::new(GroupRoutingInfo::new(
             vec![Jid::pn(user_a), Jid::pn(user_b)],
             AddressingMode::Pn,
         ));
@@ -1761,7 +1761,7 @@ mod tests {
         assert_eq!(
             after_refresh.devices().len(),
             3,
-            "a new GroupInfo Arc must invalidate the memo by identity"
+            "a new GroupRoutingInfo Arc must invalidate the memo by identity"
         );
     }
 
@@ -1770,14 +1770,17 @@ mod tests {
     /// and the doubt fallbacks (global event, log overflow) recompute.
     #[tokio::test]
     async fn group_devices_memo_scoped_invalidation() {
-        use wacore::client::context::GroupInfo;
+        use wacore::client::context::GroupRoutingInfo;
         use wacore::types::message::AddressingMode;
 
         let client = create_test_client().await;
         let group: Jid = "120363000000000077@g.us".parse().expect("group jid");
         let user_a = "5511999990011";
         setup_device_record(&client, user_a, &[0, 5]).await;
-        let group_info = Arc::new(GroupInfo::new(vec![Jid::pn(user_a)], AddressingMode::Pn));
+        let group_info = Arc::new(GroupRoutingInfo::new(
+            vec![Jid::pn(user_a)],
+            AddressingMode::Pn,
+        ));
 
         let first = client
             .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
@@ -1845,14 +1848,14 @@ mod tests {
     /// must invalidate even when the group only knows one namespace.
     #[tokio::test]
     async fn group_devices_memo_invalidated_by_member_mapping_change() {
-        use wacore::client::context::GroupInfo;
+        use wacore::client::context::GroupRoutingInfo;
         use wacore::types::message::AddressingMode;
 
         let client = create_test_client().await;
         let group: Jid = "120363000000000078@g.us".parse().expect("group jid");
         let pn = "5511999990012";
         setup_device_record(&client, pn, &[0]).await;
-        let group_info = Arc::new(GroupInfo::new(vec![Jid::pn(pn)], AddressingMode::Pn));
+        let group_info = Arc::new(GroupRoutingInfo::new(vec![Jid::pn(pn)], AddressingMode::Pn));
 
         let first = client
             .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
@@ -1885,7 +1888,7 @@ mod tests {
     /// self inside the derivation keeps the identity stable.
     #[tokio::test]
     async fn memo_hits_when_self_missing_from_group_snapshot() {
-        use wacore::client::context::GroupInfo;
+        use wacore::client::context::GroupRoutingInfo;
         use wacore::types::message::AddressingMode;
 
         let client = create_test_client().await;
@@ -1896,7 +1899,10 @@ mod tests {
         setup_device_record(&client, "5511999990015", &[0, 3]).await;
 
         // Self deliberately absent from the snapshot.
-        let group_info = Arc::new(GroupInfo::new(vec![Jid::pn(member)], AddressingMode::Pn));
+        let group_info = Arc::new(GroupRoutingInfo::new(
+            vec![Jid::pn(member)],
+            AddressingMode::Pn,
+        ));
 
         let first = client
             .resolve_group_devices_memoized(&group, &group_info, &own)
@@ -1919,13 +1925,13 @@ mod tests {
     }
 
     /// Codex P2 regression: a PN-addressed group's memo only knows the PN
-    /// side of a member when the cached GroupInfo carries no LID map, but a
+    /// side of a member when the cached GroupRoutingInfo carries no LID map, but a
     /// later usync update can arrive keyed by the LID (canonical == original).
     /// The write must record every lookup alias so the memo recomputes
     /// instead of re-stamping stale.
     #[tokio::test]
     async fn lid_keyed_update_invalidates_pn_group_memo() {
-        use wacore::client::context::GroupInfo;
+        use wacore::client::context::GroupRoutingInfo;
         use wacore::types::message::AddressingMode;
 
         let client = create_test_client().await;
@@ -1950,7 +1956,7 @@ mod tests {
             .await
             .expect("seed record");
 
-        let group_info = Arc::new(GroupInfo::new(vec![Jid::pn(pn)], AddressingMode::Pn));
+        let group_info = Arc::new(GroupRoutingInfo::new(vec![Jid::pn(pn)], AddressingMode::Pn));
         let first = client
             .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
@@ -4280,7 +4286,7 @@ mod tests {
     /// resolved devices in both namespaces — the shape a community group
     /// actually parks in the cache for the life of the connection.
     fn group_memo_fixture(members: usize, devices_per_user: usize) -> GroupDevicesMemo {
-        use wacore::client::context::GroupInfo;
+        use wacore::client::context::GroupRoutingInfo;
         use wacore::types::message::AddressingMode;
 
         let mut participants = Vec::with_capacity(members);
@@ -4291,7 +4297,7 @@ mod tests {
             participants.push(Jid::lid(lid_user.clone()));
             lid_to_pn.insert(lid_user, Jid::pn(pn_user));
         }
-        let group_info = Arc::new(GroupInfo::with_lid_to_pn_map(
+        let group_info = Arc::new(GroupRoutingInfo::with_lid_to_pn_map(
             participants.clone(),
             AddressingMode::Lid,
             lid_to_pn.clone(),

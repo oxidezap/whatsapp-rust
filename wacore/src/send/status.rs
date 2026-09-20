@@ -9,7 +9,7 @@ use super::*;
 /// (already in `<participants>`) uses device JIDs with `<enc>` children.
 ///
 /// This is a pure function (no runtime or client dependencies).
-pub fn ensure_status_participants(mut stanza: Node, group_info: &GroupInfo) -> Node {
+pub fn ensure_status_participants(mut stanza: Node, group_info: &GroupRoutingInfo) -> Node {
     use wacore_binary::NodeContent;
     use wacore_binary::builder::NodeBuilder;
 

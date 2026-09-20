@@ -1831,7 +1831,7 @@ async fn test_parse_message_info_sender_alt_extraction() {
 #[test]
 fn test_lid_to_phone_mapping_for_device_queries() {
     use std::collections::HashMap;
-    use wacore::client::context::GroupInfo;
+    use wacore::client::context::GroupRoutingInfo;
     use wacore::types::message::AddressingMode;
     use wacore_binary::Jid;
 
@@ -1850,7 +1850,7 @@ fn test_lid_to_phone_mapping_for_device_queries() {
             .expect("test JID should be valid"),
     );
 
-    let mut group_info = GroupInfo::new(
+    let mut group_info = GroupRoutingInfo::new(
         vec![
             "100000000000001.1:75@lid"
                 .parse()
@@ -1899,7 +1899,7 @@ fn test_lid_to_phone_mapping_for_device_queries() {
 #[test]
 fn test_mixed_lid_and_phone_participants() {
     use std::collections::HashMap;
-    use wacore::client::context::GroupInfo;
+    use wacore::client::context::GroupRoutingInfo;
     use wacore::types::message::AddressingMode;
     use wacore_binary::Jid;
 
@@ -1911,7 +1911,7 @@ fn test_mixed_lid_and_phone_participants() {
             .expect("test JID should be valid"),
     );
 
-    let mut group_info = GroupInfo::new(
+    let mut group_info = GroupRoutingInfo::new(
         vec![
             "100000000000001.1:75@lid"
                 .parse()

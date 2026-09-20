@@ -102,7 +102,7 @@ impl SendError {
             Ok(rejected) => return SendError::PrimaryDeviceRejected(rejected),
             Err(other) => other,
         };
-        // A group-metadata IQ in the send path (e.g. query_info) bubbles up as
+        // A group-metadata IQ in the send path (e.g. routing_info) bubbles up as
         // `GroupError`; flatten it before the `ClientError` check so an IQ
         // failure surfaces as `SendError::Iq`, not the `Internal` catch-all.
         let err = match err.downcast::<GroupError>() {
@@ -145,13 +145,13 @@ impl From<GroupError> for SendError {
     }
 }
 
-/// Returns a `GroupInfo` whose participant list is guaranteed to contain our own
+/// Returns a `GroupRoutingInfo` whose participant list is guaranteed to contain our own
 /// sending JID, without deep-cloning the shared (cached) metadata in the common
 /// case where the server's participant list already includes us.
 fn ensure_self_in_group(
-    info: std::sync::Arc<wacore::client::context::GroupInfo>,
+    info: std::sync::Arc<wacore::client::context::GroupRoutingInfo>,
     own_sending_jid: &Jid,
-) -> std::sync::Arc<wacore::client::context::GroupInfo> {
+) -> std::sync::Arc<wacore::client::context::GroupRoutingInfo> {
     if info
         .participants
         .iter()
@@ -209,7 +209,7 @@ pub(crate) fn skdm_memo_entry_stale_term(
 /// after server ACK.
 struct SkdmUpdate {
     topology_generation: u64,
-    group_info: std::sync::Arc<wacore::client::context::GroupInfo>,
+    group_info: std::sync::Arc<wacore::client::context::GroupRoutingInfo>,
     to_str: String,
     devices: Vec<Jid>,
     stale_users: Vec<String>,
@@ -1240,7 +1240,7 @@ impl Client {
     /// Status uses LID addressing (matches `WAWebEncryptAndSendStatusMsg`):
     /// LID recipients pass through, PN recipients are resolved to LID via
     /// `Client::get_lid_pn_entry` (cache-aside), and unresolvable recipients
-    /// are skipped silently. The resulting `GroupInfo` carries
+    /// are skipped silently. The resulting `GroupRoutingInfo` carries
     /// `AddressingMode::Lid`; `prepare_group_stanza` signs with `own_lid`
     /// and emits `addressing_mode="lid"` on the stanza. Errors only if no
     /// recipient could be resolved.
@@ -1251,7 +1251,7 @@ impl Client {
         recipients: &[Jid],
         mut options: crate::features::status::StatusSendOptions,
     ) -> Result<SendResult, SendError> {
-        use wacore::client::context::GroupInfo;
+        use wacore::client::context::GroupRoutingInfo;
         use wacore_binary::builder::NodeBuilder;
         let topology_generation = self.device_topology.current();
 
@@ -1328,7 +1328,7 @@ impl Client {
 
         let participants = wacore::send::assemble_status_participants(resolved, own_lid)?;
         let mut group_info =
-            GroupInfo::with_lid_to_pn_map(participants, AddressingMode::Lid, lid_to_pn_map);
+            GroupRoutingInfo::with_lid_to_pn_map(participants, AddressingMode::Lid, lid_to_pn_map);
 
         // One encode feeds retry cache and wire; mci-hoist re-encodes (folded context).
         let shared_content = message
@@ -1596,13 +1596,13 @@ impl Client {
         needs_skdm
     }
 
-    /// SKDM target resolution for the status path, whose `GroupInfo` is built
+    /// SKDM target resolution for the status path, whose `GroupRoutingInfo` is built
     /// fresh per send (no stable identity to memoize against).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets", level = "debug", skip_all, fields(group = %wacore_binary::jid::observe_str(group_jid))))]
     async fn resolve_status_skdm_targets(
         &self,
         group_jid: &str,
-        group_info: &wacore::client::context::GroupInfo,
+        group_info: &wacore::client::context::GroupRoutingInfo,
         own_sending_jid: &Jid,
         freshness: crate::cache::Freshness,
         force_distribution: bool,
@@ -1678,7 +1678,7 @@ impl Client {
         &self,
         group: &Jid,
         group_jid: &str,
-        group_info: &std::sync::Arc<wacore::client::context::GroupInfo>,
+        group_info: &std::sync::Arc<wacore::client::context::GroupRoutingInfo>,
         own_sending_jid: &Jid,
     ) -> Option<(std::sync::Arc<wacore::send::ResolvedGroupDevices>, Vec<Jid>)> {
         use crate::client::SkdmTargetsMemoOutcome as Outcome;
@@ -1836,7 +1836,7 @@ impl Client {
         group_jid: &str,
         devices: &[Jid],
         topology_generation: u64,
-        group_info: Option<&wacore::client::context::GroupInfo>,
+        group_info: Option<&wacore::client::context::GroupRoutingInfo>,
     ) {
         if devices.is_empty() {
             return;
@@ -2109,7 +2109,7 @@ impl Client {
     async fn ensure_status_participants(
         &self,
         stanza: Node,
-        group_info: &wacore::client::context::GroupInfo,
+        group_info: &wacore::client::context::GroupRoutingInfo,
     ) -> Result<Node, anyhow::Error> {
         Ok(wacore::send::ensure_status_participants(stanza, group_info))
     }
@@ -2518,7 +2518,7 @@ impl Client {
             // sender-key chain advance per (group, sender) at the cipher.
             let group_info = self
                 .groups()
-                .query_info_with_freshness(&to, group_metadata_freshness)
+                .routing_info_with_freshness(&to, group_metadata_freshness)
                 .await?;
 
             // Borrow from the held snapshot: no field clones, the Arc keeps it alive.
@@ -2555,7 +2555,7 @@ impl Client {
             };
 
             // Memo identity must be the CACHED Arc: ensure_self_in_group clones
-            // a fresh GroupInfo whenever self is absent from the snapshot, which
+            // a fresh GroupRoutingInfo whenever self is absent from the snapshot, which
             // would make the memo miss on every send to such groups. The memoized
             // resolver applies the same self-append internally.
             let group_info_for_memo = std::sync::Arc::clone(&group_info);
@@ -3352,7 +3352,7 @@ mod tests {
 
     #[test]
     fn ensure_self_in_group_shares_when_present_and_appends_when_absent() {
-        use wacore::client::context::GroupInfo;
+        use wacore::client::context::GroupRoutingInfo;
         use wacore::types::message::AddressingMode;
 
         let own: Jid = "999999999999@s.whatsapp.net".parse().unwrap();
@@ -3360,15 +3360,18 @@ mod tests {
 
         // Self already a member (the common case): the shared Arc passes through
         // untouched, with no deep clone of the participant list.
-        let with_self = Arc::new(GroupInfo::new(
+        let with_self = Arc::new(GroupRoutingInfo::new(
             vec![other.to_non_ad(), own.to_non_ad()],
             AddressingMode::Pn,
         ));
         let out = ensure_self_in_group(with_self.clone(), &own);
         assert!(Arc::ptr_eq(&with_self, &out));
 
-        // Self missing: a fresh GroupInfo is built with self appended.
-        let without_self = Arc::new(GroupInfo::new(vec![other.to_non_ad()], AddressingMode::Pn));
+        // Self missing: a fresh GroupRoutingInfo is built with self appended.
+        let without_self = Arc::new(GroupRoutingInfo::new(
+            vec![other.to_non_ad()],
+            AddressingMode::Pn,
+        ));
         let out = ensure_self_in_group(without_self.clone(), &own);
         assert!(!Arc::ptr_eq(&without_self, &out));
         assert_eq!(out.participants.len(), 2);
@@ -3695,7 +3698,7 @@ mod tests {
         /// cache — the state a client that has already synced the group is in.
         ///
         /// Not a cosmetic variant of the PN fixture: LID mode is what puts
-        /// `GroupInfo::phone_jid_for_lid_user` on the resolve path (once per
+        /// `GroupRoutingInfo::phone_jid_for_lid_user` on the resolve path (once per
         /// participant, on the way in and on the way back), so it is the mode
         /// where a device-memo miss is most expensive. PR #1283 named it as
         /// the largest gap in its own coverage.
@@ -3704,7 +3707,7 @@ mod tests {
         }
 
         async fn with_addressing(addressing_mode: AddressingMode, member_count: usize) -> Self {
-            use wacore::client::context::GroupInfo;
+            use wacore::client::context::GroupRoutingInfo;
             use wacore::store::traits::{DeviceInfo, DeviceListRecord};
 
             let is_lid = addressing_mode == AddressingMode::Lid;
@@ -3802,9 +3805,13 @@ mod tests {
                     )
                     .await
                     .expect("seeding our own lid-pn pair must succeed");
-                GroupInfo::with_lid_to_pn_map(participants.clone(), addressing_mode, lid_to_pn)
+                GroupRoutingInfo::with_lid_to_pn_map(
+                    participants.clone(),
+                    addressing_mode,
+                    lid_to_pn,
+                )
             } else {
-                GroupInfo::new(participants.clone(), addressing_mode)
+                GroupRoutingInfo::new(participants.clone(), addressing_mode)
             };
 
             let group = Jid::from_str("120363000000000042@g.us").unwrap();
@@ -4198,7 +4205,7 @@ mod tests {
     /// profile ran, and the one PR #1283's PN fixture could not reach.
     ///
     /// It matters beyond coverage: LID mode is what puts
-    /// `GroupInfo::phone_jid_for_lid_user` on the resolve path, once per
+    /// `GroupRoutingInfo::phone_jid_for_lid_user` on the resolve path, once per
     /// participant mapping in and once per resolved device mapping back. That
     /// function only ever runs inside the uncached resolve, so it is a cost
     /// the memo either pays in full or removes entirely — never something in
@@ -4412,7 +4419,7 @@ mod tests {
     /// whole point of the instrumentation is telling them apart.
     #[tokio::test]
     async fn each_miss_term_is_reported_as_itself() {
-        use wacore::client::context::GroupInfo;
+        use wacore::client::context::GroupRoutingInfo;
 
         let fixture = GroupSendFixture::new().await;
         fixture.add_own_companion(1).await;
@@ -4461,14 +4468,14 @@ mod tests {
             .get_group_cache()
             .insert(
                 fixture.group.clone(),
-                Arc::new(GroupInfo::new(participants, AddressingMode::Pn)),
+                Arc::new(GroupRoutingInfo::new(participants, AddressingMode::Pn)),
             )
             .await;
         fixture.send_text("after a metadata refresh").await;
         let window = fixture.client.device_memo_stats().since(&before);
         assert_eq!(
             window.group_devices.miss_group_info, 1,
-            "a fresh GroupInfo Arc is the identity term: {window}"
+            "a fresh GroupRoutingInfo Arc is the identity term: {window}"
         );
         assert_eq!(
             window.skdm_targets.miss_devices, 1,
@@ -4587,7 +4594,7 @@ mod tests {
     /// which is what "she sent a message, or even just a reaction" produces.
     #[tokio::test]
     async fn a_send_that_distributed_nothing_reports_nobody_as_keyed() {
-        use wacore::client::context::GroupInfo;
+        use wacore::client::context::GroupRoutingInfo;
         use wacore::store::traits::{DeviceInfo, DeviceListRecord};
 
         let client = crate::test_utils::create_test_client_with_name("unkeyed_group").await;
@@ -4630,7 +4637,10 @@ mod tests {
 
         let group = Jid::from_str("120363000000000077@g.us").unwrap();
         let group_str = group.to_string();
-        let group_info = Arc::new(GroupInfo::new(participants.clone(), AddressingMode::Pn));
+        let group_info = Arc::new(GroupRoutingInfo::new(
+            participants.clone(),
+            AddressingMode::Pn,
+        ));
         client
             .get_group_cache()
             .insert(group.clone(), Arc::clone(&group_info))
@@ -4920,7 +4930,7 @@ mod tests {
     async fn a_lid_group_repair_finds_a_missed_device_through_the_maps() {
         use buffa::Message as _;
         use std::collections::HashMap;
-        use wacore::client::context::GroupInfo;
+        use wacore::client::context::GroupRoutingInfo;
         use wacore::store::traits::{DeviceInfo, DeviceListRecord};
         use wacore_binary::builder::NodeBuilder;
 
@@ -4946,7 +4956,7 @@ mod tests {
             .get_group_cache()
             .insert(
                 group.clone(),
-                Arc::new(GroupInfo::with_lid_to_pn_map(
+                Arc::new(GroupRoutingInfo::with_lid_to_pn_map(
                     vec![member.clone()],
                     AddressingMode::Lid,
                     HashMap::from([(member.user.clone(), member_pn.clone())]),
@@ -5808,7 +5818,7 @@ mod tests {
     /// Fails if the empty-cache early-exit is reintroduced.
     #[tokio::test]
     async fn resolve_skdm_targets_distributes_when_cache_empty_but_devices_known() {
-        use wacore::client::context::GroupInfo;
+        use wacore::client::context::GroupRoutingInfo;
         use wacore::store::traits::{DeviceInfo, DeviceListRecord};
         use wacore::types::message::AddressingMode;
 
@@ -5838,7 +5848,7 @@ mod tests {
             .map(|u| Jid::from_str(&format!("{u}@lid")).unwrap())
             .collect();
 
-        let group_info = GroupInfo::new(participants.clone(), AddressingMode::Lid);
+        let group_info = GroupRoutingInfo::new(participants.clone(), AddressingMode::Lid);
 
         let needs_skdm = client
             .resolve_status_skdm_targets(
@@ -9230,7 +9240,7 @@ mod tests {
         let group: Jid = "120363000000000001@g.us".parse().unwrap();
         let lid: Jid = "100000000000001@lid".parse().unwrap();
         let pn: Jid = "155500000001@s.whatsapp.net".parse().unwrap();
-        let info = wacore::client::context::GroupInfo::with_lid_to_pn_map(
+        let info = wacore::client::context::GroupRoutingInfo::with_lid_to_pn_map(
             vec![lid.clone()],
             AddressingMode::Lid,
             [(lid.user.clone(), pn.clone())].into_iter().collect(),

@@ -33,7 +33,7 @@ use super::Client;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 pub(crate) enum GroupDevicesMemoOutcome {
-    /// Entry present, `GroupInfo` identity matched, generation unchanged.
+    /// Entry present, `GroupRoutingInfo` identity matched, generation unchanged.
     Hit,
     /// Generation had moved, but every change since provably missed this
     /// group's member set, so the entry was re-stamped instead of recomputed.
@@ -42,7 +42,7 @@ pub(crate) enum GroupDevicesMemoOutcome {
     Restamp,
     /// No entry for this group: first send, or a capacity/TTL eviction.
     MissAbsent,
-    /// An entry existed but was built from a different `Arc<GroupInfo>`.
+    /// An entry existed but was built from a different `Arc<GroupRoutingInfo>`.
     /// Either the group metadata was genuinely refreshed, or a caller handed
     /// the resolver an `Arc` that is not the cached one.
     MissGroupInfo,
@@ -247,7 +247,7 @@ pub struct GroupDevicesMemoStats {
     /// recently used evicted first, so a client active in more than that
     /// reports its eviction rate here.
     pub miss_absent: u64,
-    /// An entry existed, built from a different `Arc<GroupInfo>`.
+    /// An entry existed, built from a different `Arc<GroupRoutingInfo>`.
     pub miss_group_info: u64,
     /// The device topology changed in a way that could have touched this group.
     pub miss_topology: u64,

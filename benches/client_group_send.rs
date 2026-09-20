@@ -15,7 +15,7 @@
 //!   so each of its "messages" includes decoding an inbound stanza as well as
 //!   producing the outbound one. Everything below is send-only.
 //! - **LID addressing.** The fixture is PN-addressed, so
-//!   `GroupInfo::phone_jid_for_lid_user` is never reached. A LID sweep needs a
+//!   `GroupRoutingInfo::phone_jid_for_lid_user` is never reached. A LID sweep needs a
 //!   registry seeded with LID↔PN mappings, which is a different fixture rather
 //!   than a parameter on this one. The *hit-rate* question is covered for LID
 //!   groups by `repeat_lid_group_sends_hit_both_device_memos_on_every_send`

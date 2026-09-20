@@ -10,7 +10,7 @@
 
 use divan::black_box;
 use std::collections::HashMap;
-use wacore::client::context::GroupInfo;
+use wacore::client::context::GroupRoutingInfo;
 use wacore::types::message::AddressingMode;
 use wacore_binary::CompactString;
 use wacore_binary::jid::{Jid, Server};
@@ -42,7 +42,7 @@ fn group_info_build(bencher: divan::Bencher, n: usize) {
     bencher
         .with_inputs(|| (participants.clone(), lid_to_pn.clone()))
         .bench_values(|(participants, lid_to_pn)| {
-            GroupInfo::with_lid_to_pn_map(participants, AddressingMode::Lid, lid_to_pn)
+            GroupRoutingInfo::with_lid_to_pn_map(participants, AddressingMode::Lid, lid_to_pn)
         });
 }
 
@@ -52,7 +52,7 @@ fn group_info_build(bencher: divan::Bencher, n: usize) {
 fn group_info_lookup_forward(bencher: divan::Bencher, n: usize) {
     let (participants, lid_to_pn) = lid_group(n);
     let users: Vec<CompactString> = participants.iter().map(|j| j.user.clone()).collect();
-    let info = GroupInfo::with_lid_to_pn_map(participants, AddressingMode::Lid, lid_to_pn);
+    let info = GroupRoutingInfo::with_lid_to_pn_map(participants, AddressingMode::Lid, lid_to_pn);
     bencher.bench(|| {
         for user in &users {
             black_box(info.phone_jid_for_lid_user(user));
@@ -66,7 +66,7 @@ fn group_info_lookup_forward(bencher: divan::Bencher, n: usize) {
 fn group_info_lookup_reverse(bencher: divan::Bencher, n: usize) {
     let (participants, lid_to_pn) = lid_group(n);
     let phone_users: Vec<CompactString> = lid_to_pn.values().map(|j| j.user.clone()).collect();
-    let info = GroupInfo::with_lid_to_pn_map(participants, AddressingMode::Lid, lid_to_pn);
+    let info = GroupRoutingInfo::with_lid_to_pn_map(participants, AddressingMode::Lid, lid_to_pn);
     bencher.bench(|| {
         for user in &phone_users {
             black_box(info.lid_user_for_phone_user(user));
@@ -79,7 +79,7 @@ fn group_info_lookup_reverse(bencher: divan::Bencher, n: usize) {
 #[divan::bench(args = [64, 256, 1024])]
 fn group_info_add_participants(bencher: divan::Bencher, n: usize) {
     let (participants, lid_to_pn) = lid_group(n);
-    let info = GroupInfo::with_lid_to_pn_map(participants, AddressingMode::Lid, lid_to_pn);
+    let info = GroupRoutingInfo::with_lid_to_pn_map(participants, AddressingMode::Lid, lid_to_pn);
     let new_lid = Jid::lid("100000099999999");
     let new_pn = Jid::pn("5511999999999");
     bencher

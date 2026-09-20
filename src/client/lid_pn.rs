@@ -278,7 +278,7 @@ impl Client {
     /// Mirrors WA Web's `createLidPnMappings({ mappings, flushImmediately, learningSource })`
     /// call shape: one backend write for N participants instead of N detached
     /// tasks racing each other. The savings are linear in batch size and
-    /// matter most on first `query_info` of large groups.
+    /// matter most on first `routing_info` of large groups.
     ///
     /// `is_offline` mirrors the single-entry path: skip the persist task for
     /// offline replays; mappings are re-learned from the next live event.

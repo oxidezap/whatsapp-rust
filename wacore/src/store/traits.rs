@@ -969,7 +969,7 @@ pub trait ProtocolStore: Send + Sync {
     // --- Group Metadata Cache (WA Web participant-phash re-query skip) ---
 
     /// Get the persisted, opaque serialized group metadata blob for `group_jid`.
-    /// The blob is a caller-serialized GroupInfo snapshot; backends without group
+    /// The blob is a caller-serialized GroupRoutingInfo snapshot; backends without group
     /// persistence return `None` (the group is then re-queried in full).
     async fn get_group_metadata(&self, _group_jid: &str) -> Result<Option<Vec<u8>>> {
         Ok(None)

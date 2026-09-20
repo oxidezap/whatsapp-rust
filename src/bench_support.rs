@@ -16,10 +16,10 @@
 //!   group-info IQ is issued, which is also why no IQ response has to be faked.
 //!
 //! Everything a real client resolves once and holds across sends — the
-//! `Arc<GroupInfo>`, the resolved device set, the sender key, the warm marks —
+//! `Arc<GroupRoutingInfo>`, the resolved device set, the sender key, the warm marks —
 //! is established in [`GroupSendHarness::new`](crate::bench_support::GroupSendHarness::new),
 //! outside anything a benchmark measures. That is deliberate: PR #1279 found that building an N-participant
-//! `GroupInfo` *inside* the measured body was the entirety of the apparent
+//! `GroupRoutingInfo` *inside* the measured body was the entirety of the apparent
 //! per-member growth in the `wacore` benchmark. A fixture that scales with the
 //! sweep parameter measures the fixture.
 //!
@@ -34,7 +34,7 @@ use crate::http::{HttpClient, HttpRequest, HttpResponse};
 use crate::runtime_impl::TokioRuntime;
 use crate::store::persistence_manager::PersistenceManager;
 use crate::transport::{Transport, TransportEvent, TransportFactory};
-use wacore::client::context::GroupInfo;
+use wacore::client::context::GroupRoutingInfo;
 use wacore::proto_helpers::MessageBuilderExt;
 use wacore::store::InMemoryBackend;
 use wacore::store::commands::DeviceCommand;
@@ -116,7 +116,7 @@ pub struct GroupSendHarness {
     group_jid_str: String,
     /// The very `Arc` the group cache serves the send path, so the harness can
     /// call the memoized resolver with the identity the memo is keyed on.
-    group_info: Arc<GroupInfo>,
+    group_info: Arc<GroupRoutingInfo>,
     own_sending_jid: Jid,
 }
 
@@ -212,7 +212,7 @@ impl GroupSendHarness {
 struct Fixture {
     client: Arc<Client>,
     group: Jid,
-    group_info: Arc<GroupInfo>,
+    group_info: Arc<GroupRoutingInfo>,
     own_sending_jid: Jid,
 }
 
@@ -280,7 +280,7 @@ async fn build_fixture(group_size: usize) -> Fixture {
     // Self is in the participant list, as the server's group metadata has it —
     // you are a member of the group you send to. Leaving it out is not a
     // harmless simplification: `ensure_self_in_group` runs per send and CLONES
-    // the whole `GroupInfo` when self is absent, so a self-less fixture charges
+    // the whole `GroupRoutingInfo` when self is absent, so a self-less fixture charges
     // every send an N-participant copy no real send performs. Measured both
     // ways at 512 members, that artifact alone is 22,836 instructions per send
     // (525,989 self-absent vs 503,153 self-present) — 45 instructions per
@@ -288,7 +288,7 @@ async fn build_fixture(group_size: usize) -> Fixture {
     // reports. Same class of error as the one PR #1279 removed from the
     // `wacore` sweep.
     participants.push(own_pn.to_non_ad());
-    let group_info = Arc::new(GroupInfo::new(participants, AddressingMode::Pn));
+    let group_info = Arc::new(GroupRoutingInfo::new(participants, AddressingMode::Pn));
     client
         .get_group_cache()
         .insert(group.clone(), Arc::clone(&group_info))
@@ -1573,7 +1573,7 @@ pub const SCALE_GROUP_MEMBERS: usize = 64;
 pub struct GroupScaleHarness {
     runtime: tokio::runtime::Runtime,
     client: Arc<Client>,
-    groups: Vec<(Jid, Arc<GroupInfo>)>,
+    groups: Vec<(Jid, Arc<GroupRoutingInfo>)>,
     own_sending_jid: Jid,
 }
 
@@ -1685,7 +1685,7 @@ impl GroupScaleHarness {
 async fn build_scale_fixture(
     groups: usize,
     members: usize,
-) -> (Arc<Client>, Vec<(Jid, Arc<GroupInfo>)>, Jid) {
+) -> (Arc<Client>, Vec<(Jid, Arc<GroupRoutingInfo>)>, Jid) {
     let backend = Arc::new(InMemoryBackend::new());
     let pm = Arc::new(
         PersistenceManager::new(backend)
@@ -1752,7 +1752,7 @@ async fn build_scale_fixture(
             participants.push(Jid::new(lid.as_str(), Server::Lid));
         }
         participants.push(own_pn.to_non_ad());
-        let info = Arc::new(GroupInfo::new(participants, AddressingMode::Lid));
+        let info = Arc::new(GroupRoutingInfo::new(participants, AddressingMode::Lid));
         let group: Jid = format!("12036300000000{g:04}@g.us")
             .parse()
             .expect("group jid");

@@ -162,7 +162,7 @@ figures come from the `wacore::stats::HeapSize` trait:
   message keys by roughly 5x: the encoded form omits both the `Option` slots a
   seed-only `MessageKey` leaves empty and the `Vec` capacity behind the
   backlog. Size computation only — no encode buffer is allocated.
-- Collections sum key/payload capacities (`GroupInfo`, `DeviceListRecord`,
+- Collections sum key/payload capacities (`GroupRoutingInfo`, `DeviceListRecord`,
   `LidPnEntry`, `ResolvedGroupDevices`, ...). Where a report charges for a hash
   table's slots it should go through `wacore::stats::hash_table_bytes`, which
   converts a `capacity()` into the buckets hashbrown actually owns: it rounds to
@@ -238,7 +238,7 @@ group send depends on, `resolve_group_devices_memoized` and
 `DeviceMemoStats::since` subtracts an earlier snapshot to scope a workload.
 
 The reason it is per-term rather than a hit/miss pair: the group memo has three
-validity terms (entry present, `GroupInfo` `Arc` identity, topology generation
+validity terms (entry present, `GroupRoutingInfo` `Arc` identity, topology generation
 — with a scoped re-stamp between the last two) and the SKDM memo has four stale
 terms (device `Arc`, sender-key-map `Arc`, map generation, sending identity)
 plus the entry-absent condition, which is why it reports five miss counters. An

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 type DetState = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
 type DetHashMap<K, V> = HashMap<K, V, DetState>;
 use std::hint::black_box;
-use wacore::client::context::{GroupInfo, SendContextResolver};
+use wacore::client::context::{GroupRoutingInfo, SendContextResolver};
 use wacore::messages::MessageUtils;
 use wacore::runtime::{AbortHandle, Runtime};
 use wacore::send::{
@@ -456,8 +456,8 @@ impl SendContextResolver for MockResolver {
     async fn resolve_group_info(
         &self,
         _: &Jid,
-    ) -> Result<std::sync::Arc<GroupInfo>, anyhow::Error> {
-        Ok(std::sync::Arc::new(GroupInfo::new(
+    ) -> Result<std::sync::Arc<GroupRoutingInfo>, anyhow::Error> {
+        Ok(std::sync::Arc::new(GroupRoutingInfo::new(
             self.0.clone(),
             AddressingMode::Pn,
         )))
@@ -664,7 +664,7 @@ struct GrpSendData {
     /// instructions at 512 members, and the entire reason this benchmark
     /// appeared to scale with group size while `prepare_group_stanza` itself is
     /// flat (334.0K at 8 members, 334.1K at 512).
-    group_info: GroupInfo,
+    group_info: GroupRoutingInfo,
     /// Warm-send fixture: the resolved set with its phash memo pre-warmed in
     /// setup, like the per-group device memo serves production repeat sends.
     resolved_for_phash: Option<std::sync::Arc<wacore::send::ResolvedGroupDevices>>,
@@ -720,7 +720,7 @@ fn setup_group_send(n: usize) -> GrpSendData {
     if !participants.iter().any(|p| p.is_same_user_as(&own_base)) {
         participants.push(own_base);
     }
-    let group_info = GroupInfo::new(participants, AddressingMode::Pn);
+    let group_info = GroupRoutingInfo::new(participants, AddressingMode::Pn);
 
     GrpSendData {
         alice,
@@ -797,7 +797,8 @@ fn setup_group_recv() -> GrpRecvData {
     // (server strips <participants> before forwarding to recipients)
     let resolver = MockResolver(vec![bob.jid.clone()]);
     let own_jid = alice.jid.clone();
-    let group_info = GroupInfo::new(vec![bob.jid.clone(), alice.jid.clone()], AddressingMode::Pn);
+    let group_info =
+        GroupRoutingInfo::new(vec![bob.jid.clone(), alice.jid.clone()], AddressingMode::Pn);
 
     let mut stores = SignalStores {
         sender_key_store: &mut alice.sender_keys,
