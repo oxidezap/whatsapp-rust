@@ -939,10 +939,7 @@ impl<'a> Groups<'a> {
     /// user-facing fields (subject, description, admin roles, group settings)
     /// use [`Groups::fetch_metadata`], and to control staleness explicitly use
     /// [`Groups::routing_info_with_freshness`].
-    pub async fn routing_info(
-        &self,
-        jid: &Jid,
-    ) -> Result<Arc<GroupRoutingInfo>, GroupError> {
+    pub async fn routing_info(&self, jid: &Jid) -> Result<Arc<GroupRoutingInfo>, GroupError> {
         self.routing_info_with_freshness(jid, crate::cache::Freshness::CachePreferred)
             .await
     }
