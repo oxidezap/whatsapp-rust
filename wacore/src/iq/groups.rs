@@ -1627,7 +1627,7 @@ impl GroupCreateIq {
 
 impl IqSpec for GroupCreateIq {
     // Server's `<create>` reply carries the full `<group>` node, so callers
-    // can skip a follow-up `get_metadata` IQ. Mirrors WA Web's CreateJob.
+    // can skip a follow-up `fetch_metadata` IQ. Mirrors WA Web's CreateJob.
     type Response = GroupMetadataResponse;
 
     fn build_iq(&self) -> InfoQuery<'static> {
