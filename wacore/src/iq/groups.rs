@@ -720,15 +720,12 @@ impl ProtocolNode for GroupEphemeralSettings {
 }
 
 /// Response from a group info query.
-///
-/// `subject` is `Option`: the protocol has an explicit unnamed-subject
-/// shape, so an absent subject is legitimate state (`None`), distinct from
-/// an empty one (`Some("")`).
+
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct GroupMetadataResponse {
     pub id: Jid,
-    pub subject: Option<GroupSubject>,
+    pub subject: GroupSubject,
     /// Optional display notification string (from `notify`).
     pub notify: Option<String>,
     pub addressing_mode: AddressingMode,
@@ -1023,11 +1020,8 @@ impl ProtocolNode for GroupMetadataResponse {
 
         let mut builder = NodeBuilder::new("group")
             .attr("id", self.id)
+            .attr("subject", self.subject.as_str())
             .attr("addressing_mode", self.addressing_mode.as_str());
-
-        if let Some(subject) = self.subject {
-            builder = builder.attr("subject", subject.as_str());
-        }
 
         if let Some(notify) = self.notify {
             builder = builder.attr("notify", notify);
@@ -1094,12 +1088,12 @@ impl ProtocolNode for GroupMetadataResponse {
             Jid::group(id_str.as_ref())
         };
 
-        // Absent subject is the protocol's UnnamedSubjectFallback shape —
-        // legitimate state, not an empty name.
-        let subject = attrs
-            .optional_string("subject")
-            .map(|value| GroupSubject::new_unchecked(value.as_ref()));
-
+        let subject = GroupSubject::new_unchecked(
+            attrs
+                .optional_string("subject")
+                .as_deref()
+                .unwrap_or_default(),
+        );
         let notify = attrs
             .optional_string("notify")
             .map(|value| value.into_owned());
@@ -1429,14 +1423,11 @@ impl ProtocolNode for GroupParticipatingRequest {
 /// `<participant>` (e.g. missing `jid`) still parses as an overview; the
 /// full [`GroupMetadataResponse`] parser rejects it.
 ///
-/// `subject` stays `Option`: the protocol has an explicit
-/// `UnnamedSubjectFallback` shape, so an absent subject is legitimate state
-/// (`None`), distinct from an empty one (`Some("")`).
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct GroupOverviewData {
     pub id: Jid,
-    pub subject: Option<String>,
+    pub subject: String,
     pub size: Option<u32>,
     pub is_parent_group: bool,
     pub parent_group_jid: Option<Jid>,
@@ -1451,9 +1442,7 @@ impl ProtocolNode for GroupOverviewData {
 
     fn into_node(self) -> Node {
         let mut builder = NodeBuilder::new("group").attr("id", self.id);
-        if let Some(subject) = self.subject {
-            builder = builder.attr("subject", subject);
-        }
+        builder = builder.attr("subject", self.subject);
         if let Some(size) = self.size {
             builder = builder.attr("size", size);
         }
@@ -1495,7 +1484,8 @@ impl ProtocolNode for GroupOverviewData {
         };
         let subject = attrs
             .optional_string("subject")
-            .map(|value| value.into_owned());
+            .map(|value| value.into_owned())
+            .unwrap_or_default();
         attrs.finish()?;
         let size = optional_bounded_u32_attr(node, "size", GROUP_INFO_PARTICIPANT_LIMIT)?;
         let is_parent_group = node.get_optional_child_by_tag(&["parent"]).is_some();
@@ -1594,7 +1584,7 @@ impl ProtocolNode for GroupParticipatingResponse {
 /// participant `phash` that matched the server's, so it omitted `<group>` (WA Web
 /// queryGroup phash skip) — the caller should reuse its cached metadata.
 #[derive(Debug, Clone)]
-pub enum GroupInfoOutcome {
+pub enum GroupMetadataOutcome {
     Full(Box<GroupMetadataResponse>),
     NotModified,
 }
@@ -1603,7 +1593,7 @@ pub enum GroupInfoOutcome {
 ///
 /// When `phash` is set, the query carries `<query request="interactive"
 /// phash="2:.."/>` so an unchanged group is answered with an absent `<group>`
-/// ([`GroupInfoOutcome::NotModified`]).
+/// ([`GroupMetadataOutcome::NotModified`]).
 #[derive(Debug, Clone)]
 pub struct GroupQueryIq {
     pub group_jid: Jid,
@@ -1634,7 +1624,7 @@ impl GroupQueryIq {
 }
 
 impl IqSpec for GroupQueryIq {
-    type Response = GroupInfoOutcome;
+    type Response = GroupMetadataOutcome;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let mut query = GroupQueryRequest::default().into_node();
@@ -1653,10 +1643,10 @@ impl IqSpec for GroupQueryIq {
             .get_optional_child("group")
             .or_else(|| response.get_optional_child("community"))
         {
-            Some(group_node) => Ok(GroupInfoOutcome::Full(Box::new(
+            Some(group_node) => Ok(GroupMetadataOutcome::Full(Box::new(
                 GroupMetadataResponse::try_from_node_ref(group_node)?,
             ))),
-            None => Ok(GroupInfoOutcome::NotModified),
+            None => Ok(GroupMetadataOutcome::NotModified),
         }
     }
 }
@@ -3667,10 +3657,10 @@ fn parse_batch_group_refusal(group_node: &NodeRef<'_>, code: &str) -> Result<Bat
 #[derive(Debug, Clone)]
 pub enum BatchGroupInfoResult {
     Full(Box<GroupMetadataResponse>),
-    /// Truncated response (only id and size available).
+    /// Truncated response (only id and required size available).
     Truncated {
         id: Jid,
-        size: Option<u32>,
+        size: u32,
     },
     Forbidden(Jid),
     NotFound(Jid),
@@ -3682,10 +3672,10 @@ pub enum BatchGroupInfoResult {
 #[derive(Debug, Clone)]
 pub enum BatchGroupOverviewResult {
     Full(Box<GroupOverviewData>),
-    /// Truncated response (only id and size available).
+    /// Truncated response (only id and required size available).
     Truncated {
         id: Jid,
-        size: Option<u32>,
+        size: u32,
     },
     Forbidden(Jid),
     NotFound(Jid),
@@ -3754,14 +3744,26 @@ impl IqSpec for BatchGetGroupInfoIq {
                 continue;
             }
 
-            let is_truncated = attrs.optional_bool_value("truncated");
+            let is_truncated = match attrs.optional_string("truncated") {
+                Some(value) if value.as_ref() == "true" => true,
+                Some(value) => {
+                    return Err(anyhow!(
+                        "invalid truncated value '{}' (expected 'true')",
+                        value
+                    ));
+                }
+                None => false,
+            };
             attrs.finish()?;
 
-            if is_truncated == Some(true) {
+            if is_truncated {
                 let id_str = required_attr(group_node, "id")?;
                 let id = parse_group_id(&id_str)?;
                 let size =
-                    optional_bounded_u32_attr(group_node, "size", GROUP_INFO_PARTICIPANT_LIMIT)?;
+                    optional_bounded_u32_attr(group_node, "size", GROUP_INFO_PARTICIPANT_LIMIT)?
+                        .ok_or_else(|| {
+                            anyhow!("missing required attribute size on truncated group")
+                        })?;
                 results.push(BatchGroupInfoResult::Truncated { id, size });
             } else {
                 let info = GroupMetadataResponse::try_from_node_ref(group_node)?;
@@ -3820,14 +3822,26 @@ impl IqSpec for BatchGetGroupOverviewIq {
                 continue;
             }
 
-            let is_truncated = attrs.optional_bool_value("truncated");
+            let is_truncated = match attrs.optional_string("truncated") {
+                Some(value) if value.as_ref() == "true" => true,
+                Some(value) => {
+                    return Err(anyhow!(
+                        "invalid truncated value '{}' (expected 'true')",
+                        value
+                    ));
+                }
+                None => false,
+            };
             attrs.finish()?;
 
-            if is_truncated == Some(true) {
+            if is_truncated {
                 let id_str = required_attr(group_node, "id")?;
                 let id = parse_group_id(&id_str)?;
                 let size =
-                    optional_bounded_u32_attr(group_node, "size", GROUP_INFO_PARTICIPANT_LIMIT)?;
+                    optional_bounded_u32_attr(group_node, "size", GROUP_INFO_PARTICIPANT_LIMIT)?
+                        .ok_or_else(|| {
+                            anyhow!("missing required attribute size on truncated group")
+                        })?;
                 results.push(BatchGroupOverviewResult::Truncated { id, size });
             } else {
                 let info = GroupOverviewData::try_from_node_ref(group_node)?;
@@ -4537,14 +4551,14 @@ mod tests {
             .build();
         assert!(matches!(
             spec.parse_response(&full.as_node_ref()).unwrap(),
-            GroupInfoOutcome::Full(_)
+            GroupMetadataOutcome::Full(_)
         ));
 
         // Absent <group> → NotModified (server confirmed the phash matched).
         let nm = NodeBuilder::new("iq").build();
         assert!(matches!(
             spec.parse_response(&nm.as_node_ref()).unwrap(),
-            GroupInfoOutcome::NotModified
+            GroupMetadataOutcome::NotModified
         ));
     }
 
@@ -4575,15 +4589,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(groups.groups.len(), 1);
-        assert_eq!(
-            groups.groups[0].subject.as_ref().map(|s| s.as_str()),
-            Some("Regular group")
-        );
+        assert_eq!(groups.groups[0].subject.as_str(), "Regular group");
         assert_eq!(communities.groups.len(), 1);
-        assert_eq!(
-            communities.groups[0].subject.as_ref().map(|s| s.as_str()),
-            Some("Parent group")
-        );
+        assert_eq!(communities.groups[0].subject.as_str(), "Parent group");
         assert!(communities.groups[0].is_parent_group);
     }
 
@@ -4634,10 +4642,7 @@ mod tests {
 
         assert_eq!(groups.groups.len(), 2);
         assert_eq!(communities.groups.len(), 1);
-        assert_eq!(
-            communities.groups[0].subject.as_ref().map(|s| s.as_str()),
-            Some("Parent group")
-        );
+        assert_eq!(communities.groups[0].subject.as_str(), "Parent group");
     }
 
     #[test]
@@ -5418,7 +5423,7 @@ mod tests {
             .children([NodeBuilder::new("participant").build()])
             .build();
         let overview = GroupOverviewData::try_from_node(&node).unwrap();
-        assert_eq!(overview.subject.as_deref(), Some("Overview probe"));
+        assert_eq!(overview.subject, "Overview probe");
         let full_err = GroupMetadataResponse::try_from_node(&node).unwrap_err();
         assert!(full_err.to_string().contains("jid"));
     }
@@ -5448,9 +5453,9 @@ mod tests {
             .unwrap()
             .groups;
         assert_eq!(overviews.len(), 2);
-        assert_eq!(overviews[0].subject.as_deref(), Some("Regular group"));
+        assert_eq!(overviews[0].subject, "Regular group");
         assert!(!overviews[0].is_parent_group);
-        assert_eq!(overviews[1].subject.as_deref(), Some("Parent group"));
+        assert_eq!(overviews[1].subject, "Parent group");
         assert!(overviews[1].is_parent_group);
     }
 
@@ -5486,7 +5491,7 @@ mod tests {
     }
 
     #[test]
-    fn overview_batch_parses_protocol_truncated_boolean_and_bounded_size() {
+    fn overview_batch_requires_protocol_truncated_size() {
         let parse = |truncated: &str, size: Option<&str>| {
             let mut group = NodeBuilder::new("group")
                 .attr("id", "120363000000000042@g.us")
@@ -5500,15 +5505,21 @@ mod tests {
             BatchGetGroupOverviewIq::new(&[]).parse_response(&response.as_node_ref())
         };
 
-        let results = parse("1", Some("42")).unwrap();
+        let results = parse("true", Some("42")).unwrap();
         assert!(matches!(
             results.as_slice(),
-            [BatchGroupOverviewResult::Truncated { size: Some(42), .. }]
+            [BatchGroupOverviewResult::Truncated { size: 42, .. }]
         ));
-        assert!(parse("1", None).is_ok());
+        assert!(parse("true", None).is_err());
         assert!(parse("not-a-boolean", None).is_err());
-        assert!(parse("1", Some("not-a-number")).is_err());
-        assert!(parse("1", Some(&(GROUP_INFO_PARTICIPANT_LIMIT + 1).to_string())).is_err());
+        assert!(parse("true", Some("not-a-number")).is_err());
+        assert!(
+            parse(
+                "true",
+                Some(&(GROUP_INFO_PARTICIPANT_LIMIT + 1).to_string())
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -5529,7 +5540,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         match &results[0] {
             BatchGroupOverviewResult::Full(info) => {
-                assert_eq!(info.subject.as_deref(), Some("Batch probe"));
+                assert_eq!(info.subject, "Batch probe");
                 assert_eq!(info.size, Some(5));
             }
             other => panic!("expected Full, got {other:?}"),
@@ -6077,7 +6088,7 @@ mod tests {
     }
 
     #[test]
-    fn test_group_info_response_preserves_absent_subject() {
+    fn test_group_info_response_defaults_absent_subject() {
         let absent = NodeBuilder::new("group")
             .attr("id", "120363000000000025@g.us")
             .build();
@@ -6089,14 +6100,15 @@ mod tests {
         let absent = GroupMetadataResponse::try_from_node(&absent).unwrap();
         let empty = GroupMetadataResponse::try_from_node(&empty).unwrap();
 
-        assert!(absent.subject.is_none());
-        assert_eq!(empty.subject.as_ref().map(GroupSubject::as_str), Some(""));
-        assert!(
+        assert_eq!(absent.subject.as_str(), "");
+        assert_eq!(empty.subject.as_str(), "");
+        assert_eq!(
             absent
                 .into_node()
                 .attrs()
                 .optional_string("subject")
-                .is_none()
+                .as_deref(),
+            Some("")
         );
         assert_eq!(
             empty
@@ -6472,7 +6484,7 @@ mod tests {
         let response = GroupMetadataResponse::try_from_node(&node).unwrap();
 
         assert_eq!(response.id.to_string(), "120363000000000001@g.us");
-        assert_eq!(response.subject.as_ref().map(|s| s.as_str()), Some("test"));
+        assert_eq!(response.subject.as_str(), "test");
         assert_eq!(response.addressing_mode, AddressingMode::Lid);
         assert_eq!(response.creation_time, Some(1700000000));
         assert_eq!(response.subject_time, Some(1700000000));

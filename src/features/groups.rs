@@ -14,7 +14,7 @@ use wacore::iq::groups::{
     AcceptGroupInviteIq, AcceptGroupInviteV4Iq, AcknowledgeGroupIq, AddParticipantsIq,
     BatchGetGroupInfoIq, BatchGetGroupOverviewIq, CancelMembershipRequestsIq, DemoteParticipantsIq,
     GetGroupInviteInfoIq, GetGroupInviteLinkIq, GetGroupProfilePicturesIq, GetMembershipRequestsIq,
-    GetReportedGroupMessagesIq, GroupCreateIq, GroupInfoOutcome, GroupMetadataResponse,
+    GetReportedGroupMessagesIq, GroupCreateIq, GroupMetadataOutcome, GroupMetadataResponse,
     GroupParticipantResponse, GroupParticipatingOverviewIq, GroupQueryIq, LeaveGroupIq,
     MembershipRequestActionIq, PromoteParticipantsIq, RemoveParticipantsIncludingLinkedGroupsIq,
     RemoveParticipantsIq, ReportGroupMessagesIq, RevokeRequestCodeIq, SetAllowAdminReportsIq,
@@ -140,7 +140,7 @@ pub enum GroupMetadataResult {
     /// Server returned truncated info (only id and size).
     Truncated {
         id: Jid,
-        size: Option<u32>,
+        size: u32,
     },
     Forbidden(Jid),
     NotFound(Jid),
@@ -184,16 +184,11 @@ pub enum SubgroupKind {
 /// [`Groups::list_participating`] (every group the account is in) or
 /// [`Groups::fetch_overviews`] (a chosen subset); both always hit the
 /// network and never backfill LID/PN mappings.
-///
-/// `subject` is `Option`: the protocol has an explicit unnamed-subject shape,
-/// so an absent subject is legitimate state (`None`), distinct from an empty
-/// one (`Some("")`). A consumer that persists display names should keep its
-/// existing name on `None` rather than storing `""`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct GroupOverview {
     pub id: Jid,
-    pub subject: Option<String>,
+    pub subject: String,
     pub hierarchy: GroupHierarchy,
     /// Total participant count (`size` attribute), when the server sent one.
     pub participant_count: Option<u32>,
@@ -221,10 +216,7 @@ impl GroupOverview {
     pub(crate) fn from_response_for_tests(group: &GroupMetadataResponse) -> Self {
         Self::from_parts(
             group.id.clone(),
-            group
-                .subject
-                .as_ref()
-                .map(|subject| subject.as_str().to_string()),
+            group.subject.as_str().to_string(),
             group.size,
             OverviewFlags {
                 is_parent_group: group.is_parent_group,
@@ -255,12 +247,7 @@ impl GroupOverview {
         )
     }
 
-    fn from_parts(
-        id: Jid,
-        subject: Option<String>,
-        size: Option<u32>,
-        flags: OverviewFlags,
-    ) -> Self {
+    fn from_parts(id: Jid, subject: String, size: Option<u32>, flags: OverviewFlags) -> Self {
         Self {
             id,
             subject,
@@ -354,7 +341,7 @@ pub enum GroupOverviewResult {
     /// Server returned truncated info (only id and size).
     Truncated {
         id: Jid,
-        participant_count: Option<u32>,
+        participant_count: u32,
     },
     Forbidden(Jid),
     NotFound(Jid),
@@ -363,10 +350,7 @@ pub enum GroupOverviewResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GroupMetadata {
     pub id: Jid,
-    /// The group's subject, or `None` when the server sent none. The protocol
-    /// has an explicit unnamed-subject shape, so absence is legitimate state
-    /// and is preserved rather than collapsed to `""`.
-    pub subject: Option<String>,
+    pub subject: String,
     pub notify: Option<String>,
     pub participants: Vec<GroupParticipant>,
     pub addressing_mode: AddressingMode,
@@ -489,7 +473,7 @@ impl From<GroupMetadataResponse> for GroupMetadata {
     fn from(group: GroupMetadataResponse) -> Self {
         Self {
             id: group.id,
-            subject: group.subject.map(GroupSubject::into_string),
+            subject: group.subject.into_string(),
             notify: group.notify,
             participants: group.participants.into_iter().map(Into::into).collect(),
             addressing_mode: group.addressing_mode,
@@ -1021,7 +1005,7 @@ impl<'a> Groups<'a> {
                     .execute(GroupQueryIq::with_phash(jid, phash))
                     .await?
                 {
-                    GroupInfoOutcome::NotModified => {
+                    GroupMetadataOutcome::NotModified => {
                         if let Some(metadata) = cold_metadata.take() {
                             let mut info = persisted.ok_or_else(|| {
                                 GroupError::InvalidRequest(
@@ -1081,7 +1065,7 @@ impl<'a> Groups<'a> {
                         cached = None;
                         continue;
                     }
-                    GroupInfoOutcome::Full(group) => *group,
+                    GroupMetadataOutcome::Full(group) => *group,
                 };
 
                 // Single pass: move participants out and build lid_to_pn_map alongside.
@@ -1354,8 +1338,8 @@ impl<'a> Groups<'a> {
     async fn query_metadata_uncoalesced(&self, jid: &Jid) -> Result<GroupMetadata, GroupError> {
         // No phash is sent, so the server always returns the full group.
         match self.client.execute(GroupQueryIq::new(jid)).await? {
-            GroupInfoOutcome::Full(group) => Ok(GroupMetadata::from(*group)),
-            GroupInfoOutcome::NotModified => Err(GroupError::InvalidRequest(
+            GroupMetadataOutcome::Full(group) => Ok(GroupMetadata::from(*group)),
+            GroupMetadataOutcome::NotModified => Err(GroupError::InvalidRequest(
                 "group query returned not-modified without a phash".into(),
             )),
         }
@@ -1492,8 +1476,8 @@ impl<'a> Groups<'a> {
     /// offers no narrower read, so the cost is the price of a correct token.
     async fn query_description_id(&self, jid: &Jid) -> Result<Option<String>, GroupError> {
         match self.client.execute(GroupQueryIq::new(jid)).await? {
-            GroupInfoOutcome::Full(group) => Ok(group.description_id),
-            GroupInfoOutcome::NotModified => Err(GroupError::InvalidRequest(
+            GroupMetadataOutcome::Full(group) => Ok(group.description_id),
+            GroupMetadataOutcome::NotModified => Err(GroupError::InvalidRequest(
                 "group query returned not-modified without a phash".into(),
             )),
         }
@@ -2408,7 +2392,7 @@ mod tests {
 
         let metadata = GroupMetadata {
             id: jid.clone(),
-            subject: Some("Test Group".to_string()),
+            subject: "Test Group".to_string(),
             participants: vec![GroupParticipant {
                 jid: participant_jid,
                 phone_number: None,
@@ -2420,7 +2404,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(metadata.subject.as_deref(), Some("Test Group"));
+        assert_eq!(metadata.subject, "Test Group");
         assert_eq!(metadata.participants.len(), 1);
         assert!(metadata.participants[0].is_admin());
         assert!(!metadata.participants[0].is_super_admin());
@@ -3859,7 +3843,7 @@ mod tests {
             .build();
         let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         let overview = GroupOverview::from_response_for_tests(&response);
-        assert_eq!(overview.subject, Some("Standalone".to_string()));
+        assert_eq!(overview.subject, "Standalone");
         assert_eq!(overview.hierarchy, GroupHierarchy::Standalone);
         assert_eq!(overview.participant_count, Some(7));
         assert!(!overview.is_parent_group());
@@ -3948,19 +3932,19 @@ mod tests {
     }
 
     #[test]
-    fn group_overview_preserves_absent_subject_as_none() {
+    fn group_overview_defaults_absent_subject() {
         use wacore::iq::groups::GroupOverviewData;
         use wacore::protocol::ProtocolNode;
         use wacore_binary::builder::NodeBuilder;
 
-        // The protocol's UnnamedSubjectFallback shape: no `subject` attr is
-        // legitimate state, distinct from an empty subject.
+        // The protocol parser defaults an absent subject to the empty string,
+        // preserving the pre-redesign display contract.
         let node = NodeBuilder::new("group")
             .attr("id", "120363000000000015@g.us")
             .build();
         let data = GroupOverviewData::try_from_node(&node).unwrap();
         let overview = GroupOverview::from_overview_data(&data);
-        assert_eq!(overview.subject, None);
+        assert_eq!(overview.subject, "");
     }
 
     #[test]
@@ -4083,7 +4067,7 @@ mod tests {
         match &results[0] {
             GroupOverviewResult::Found(overview) => {
                 assert_eq!(overview.id, found);
-                assert_eq!(overview.subject, Some("Found".to_string()));
+                assert_eq!(overview.subject, "Found");
                 assert_eq!(overview.participant_count, Some(42));
                 assert_eq!(overview.hierarchy, GroupHierarchy::Standalone);
             }
@@ -4095,7 +4079,7 @@ mod tests {
                 participant_count,
             } => {
                 assert_eq!(id, &truncated);
-                assert_eq!(*participant_count, Some(900));
+                assert_eq!(*participant_count, 900);
             }
             other => panic!("expected Truncated, got {other:?}"),
         }
@@ -4184,7 +4168,7 @@ mod tests {
         let overviews = query.await.unwrap().unwrap();
         assert_eq!(overviews.len(), 1);
         assert_eq!(overviews[0].id, group);
-        assert_eq!(overviews[0].subject, Some("Participating".to_string()));
+        assert_eq!(overviews[0].subject, "Participating");
         assert_eq!(overviews[0].hierarchy, GroupHierarchy::Community);
         assert_eq!(overviews[0].participant_count, Some(3));
     }
@@ -4223,7 +4207,7 @@ mod tests {
         match &results[0] {
             GroupOverviewResult::Found(overview) => {
                 assert_eq!(overview.id, found);
-                assert_eq!(overview.subject, Some("Found".to_string()));
+                assert_eq!(overview.subject, "Found");
                 assert_eq!(overview.participant_count, Some(5));
             }
             other => panic!("expected Found, got {other:?}"),

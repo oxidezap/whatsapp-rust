@@ -444,14 +444,14 @@ impl Client {
     /// # Example
     ///
     /// ```ignore
-    /// use wacore::iq::groups::{GroupInfoOutcome, GroupQueryIq};
+    /// use wacore::iq::groups::{GroupMetadataOutcome, GroupQueryIq};
     ///
     /// let group_info = client.execute(GroupQueryIq::new(&group_jid)).await?;
     /// match group_info {
-    ///     GroupInfoOutcome::Full(metadata) => {
+    ///     GroupMetadataOutcome::Full(metadata) => {
     ///         println!("Group subject: {:?}", metadata.subject);
     ///     }
-    ///     GroupInfoOutcome::NotModified => {
+    ///     GroupMetadataOutcome::NotModified => {
     ///         println!("Group metadata was not modified");
     ///     }
     /// }
