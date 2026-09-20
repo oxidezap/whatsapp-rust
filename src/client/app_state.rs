@@ -3733,15 +3733,21 @@ fn is_log_unsafe(c: char) -> bool {
     )
 }
 
-/// Renders `index[0]` for a log line. Empty renders `<no-command>`;
-/// anything no dispatcher claimed renders as `unknown=<fingerprint>`;
-/// claimed commands render sanitized and bounded. Routing keys on the raw
-/// verb, so unknown commands still reach `Unclaimed`.
+/// Renders `index[0]` for a log line. Empty renders `<no-command>`. A verb
+/// no dispatcher claimed renders verbatim only if the protocol declares it
+/// (protocol-known but unhandled, e.g. `settings_sync` — worth naming so
+/// the gap is visible); anything else becomes `unknown=<fingerprint>`.
+/// Routing keys on the raw verb, so unknown commands still reach `Unclaimed`.
 fn render_command(command: &str, outcome: AppStateDispatchOutcome) -> String {
     if command.is_empty() {
         return "<no-command>".to_string();
     }
-    if matches!(outcome, AppStateDispatchOutcome::Unclaimed) {
+    if matches!(outcome, AppStateDispatchOutcome::Unclaimed)
+        && !crate::appstate_known_verbs::is_known_wire_name(command)
+        && command != "pin"
+        && command != "mark_chat_as_read"
+        && command != wacore::appstate::schemas_unlisted::LABEL_MESSAGE.name
+    {
         return format!("unknown={}", fingerprint_id(command));
     }
     sanitize_command(command)
@@ -5227,7 +5233,8 @@ mod tests {
         );
     }
 
-    /// Unknown verbs fingerprint, never render.
+    /// Unknown verbs fingerprint, never render. Protocol-known but
+    /// unhandled verbs render verbatim so the gap stays visible.
     #[test]
     fn render_command_never_prints_unknown_verbs() {
         use AppStateDispatchOutcome::{EmptyIndex, Event, Unclaimed};
@@ -5235,6 +5242,7 @@ mod tests {
         assert_eq!(render_command("archive", Event("ArchiveUpdate")), "archive");
         assert_eq!(render_command("", Event("test")), "<no-command>");
         assert_eq!(render_command("", EmptyIndex), "<no-command>");
+        assert_eq!(render_command("settings_sync", Unclaimed), "settings_sync");
         // Claimed verbs render even when hostile-looking: dispatch proved
         // the command exists, `sanitize_command` handles the controls.
         assert!(render_command("archive\nFORGED", Event("ArchiveUpdate")).starts_with("archive"));

@@ -306,7 +306,12 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
         },
         Artifact {
             path: "wacore/appstate/src/schemas.rs",
-            content: emit::appstate::generate(&appstate)?,
+            content: emit::appstate::generate(&appstate)?.schemas,
+            rust: true,
+        },
+        Artifact {
+            path: "src/appstate_known_verbs.rs",
+            content: emit::appstate::known_verbs_module(&appstate, wa_version)?,
             rust: true,
         },
         Artifact {

@@ -1467,7 +1467,7 @@ pub const ALL: &[Schema] = &[
 ];
 
 /// Whether `name` is an on-wire action name. Log gating only: a
-/// `matches!` over string literals, so referencing a name keeps just
+/// `match` over string literals, so referencing a name keeps just
 /// the compared bytes, never the full `Schema` record.
 pub(crate) fn is_known_wire_name(name: &str) -> bool {
     match name {

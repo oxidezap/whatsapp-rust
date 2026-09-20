@@ -309,6 +309,9 @@ pub mod appstate_sync;
 pub mod history_sync;
 pub mod usync;
 
+/// Declared syncd action names for log gating (generated, no `Schema` records).
+pub(crate) mod appstate_known_verbs;
+
 pub mod features;
 pub use features::{
     AppStateError, AppStateResyncMode, AppStateResyncReport, AppStateSettings,
