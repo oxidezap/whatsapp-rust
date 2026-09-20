@@ -4800,6 +4800,35 @@ mod tests {
         }
     }
 
+    /// `call_log`'s fourth element is a writer flag with disputed meaning
+    /// (see `call_log.rs`): TRACE reports it as `writer_flag=`, asserting
+    /// the wire value without claiming the semantics.
+    #[test]
+    fn redacted_index_reports_call_log_writer_flag() {
+        use crate::appstate_sync::Mutation;
+
+        let call_id = "3EB0284A7C9112345678";
+        let m = Mutation {
+            index: vec![
+                "call_log".to_string(),
+                "5511999990042@s.whatsapp.net".to_string(),
+                call_id.to_string(),
+                "0".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        assert_eq!(
+            redacted_index(&m),
+            vec![
+                "call_log".to_string(),
+                "…@s.whatsapp.net".to_string(),
+                format!("call={}", fingerprint_id(call_id)),
+                "writer_flag=0".to_string(),
+            ]
+        );
+    }
+
     /// `deleteChat`/`clearChat` carry their destructive flags in the index
     /// tail, so TRACE must name them: `delete_media=1` instead of a bare
     /// `id#…` (the old `&[Jid]` shape left `"1"` to the JID-or-fingerprint
