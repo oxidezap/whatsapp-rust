@@ -3754,7 +3754,8 @@ impl IqSpec for BatchGetGroupInfoIq {
             if is_truncated == Some(true) {
                 let id_str = required_attr(group_node, "id")?;
                 let id = parse_group_id(&id_str)?;
-                let size = attrs.optional_string("size").and_then(|s| s.parse().ok());
+                let size =
+                    optional_bounded_u32_attr(group_node, "size", GROUP_INFO_PARTICIPANT_LIMIT)?;
                 results.push(BatchGroupInfoResult::Truncated { id, size });
             } else {
                 let info = GroupMetadataResponse::try_from_node_ref(group_node)?;
@@ -3819,7 +3820,8 @@ impl IqSpec for BatchGetGroupOverviewIq {
             if is_truncated == Some(true) {
                 let id_str = required_attr(group_node, "id")?;
                 let id = parse_group_id(&id_str)?;
-                let size = attrs.optional_string("size").and_then(|s| s.parse().ok());
+                let size =
+                    optional_bounded_u32_attr(group_node, "size", GROUP_INFO_PARTICIPANT_LIMIT)?;
                 results.push(BatchGroupOverviewResult::Truncated { id, size });
             } else {
                 let info = GroupOverviewData::try_from_node_ref(group_node)?;
@@ -5459,25 +5461,29 @@ mod tests {
     }
 
     #[test]
-    fn overview_batch_parses_protocol_truncated_boolean() {
-        let parse = |truncated: &str| {
+    fn overview_batch_parses_protocol_truncated_boolean_and_bounded_size() {
+        let parse = |truncated: &str, size: Option<&str>| {
+            let mut group = NodeBuilder::new("group")
+                .attr("id", "120363000000000042@g.us")
+                .attr("truncated", truncated);
+            if let Some(size) = size {
+                group = group.attr("size", size);
+            }
             let response = NodeBuilder::new("iq")
-                .children([NodeBuilder::new("groups")
-                    .children([NodeBuilder::new("group")
-                        .attr("id", "120363000000000042@g.us")
-                        .attr("truncated", truncated)
-                        .build()])
-                    .build()])
+                .children([NodeBuilder::new("groups").children([group.build()]).build()])
                 .build();
             BatchGetGroupOverviewIq::new(&[]).parse_response(&response.as_node_ref())
         };
 
-        let results = parse("1").unwrap();
+        let results = parse("1", Some("42")).unwrap();
         assert!(matches!(
             results.as_slice(),
-            [BatchGroupOverviewResult::Truncated { size: None, .. }]
+            [BatchGroupOverviewResult::Truncated { size: Some(42), .. }]
         ));
-        assert!(parse("not-a-boolean").is_err());
+        assert!(parse("1", None).is_ok());
+        assert!(parse("not-a-boolean", None).is_err());
+        assert!(parse("1", Some("not-a-number")).is_err());
+        assert!(parse("1", Some(&(GROUP_INFO_PARTICIPANT_LIMIT + 1).to_string())).is_err());
     }
 
     #[test]
