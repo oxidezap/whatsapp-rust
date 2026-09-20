@@ -1466,6 +1466,82 @@ pub const ALL: &[Schema] = &[
     WASA_ROOT_SECRET,
 ];
 
+/// Every on-wire action name, sorted. Log gating only: referencing
+/// a name here keeps just the string, never the full `Schema` record.
+pub(crate) const WIRE_NAMES: &[&str] = &[
+    "agentChatAssignment",
+    "agentChatAssignmentOpenedStatus",
+    "ai_thread_delete",
+    "ai_thread_rename",
+    "android_unsupported_actions",
+    "archive",
+    "avatar_updated_action",
+    "biz_ai_settings_nudge",
+    "bot_welcome_request",
+    "business_broadcast_campaign",
+    "business_broadcast_insights_sync",
+    "business_broadcast_list",
+    "call_log",
+    "clearChat",
+    "contact",
+    "ctwaPerCustomerDataSharing",
+    "custom_payment_methods",
+    "customer_data",
+    "deleteChat",
+    "deleteMessageForMe",
+    "detected_outcomes_status_action",
+    "deviceAgent",
+    "external_web_beta",
+    "favoriteSticker",
+    "favorites",
+    "interactive_message_action",
+    "label_edit",
+    "label_jid",
+    "label_reordering",
+    "label_sublist",
+    "lid_contact",
+    "lock",
+    "markChatAsRead",
+    "marketingMessage",
+    "marketingMessageBroadcast",
+    "merchant_payment_partner",
+    "mute",
+    "nct_salt_sync",
+    "note_edit",
+    "nux",
+    "out_contact",
+    "payment_info",
+    "payment_tos",
+    "pin_v1",
+    "pnForLidChat",
+    "primary_feature",
+    "primary_version",
+    "quick_reply",
+    "removeRecentSticker",
+    "sentinel",
+    "setting_chatLock",
+    "setting_disableLinkPreviews",
+    "setting_locale",
+    "setting_pushName",
+    "setting_relayAllCalls",
+    "setting_unarchiveChats",
+    "settings_sync",
+    "shareOwnPn",
+    "star",
+    "status_privacy",
+    "subscriptions_sync_v2",
+    "thread_pin",
+    "time_format",
+    "userStatusMute",
+    "waffle_account_link_state",
+    "wasa_root_secret",
+];
+
+/// Whether `name` is an on-wire action name. Log gating only — see
+/// `WIRE_NAMES`.
+pub(crate) fn is_known_wire_name(name: &str) -> bool {
+    WIRE_NAMES.iter().any(|candidate| *candidate == name)
+}
 /// Look up a schema by its action key (the registry key, e.g. `"Agent"`).
 pub fn by_name(key: &str) -> Option<&'static Schema> {
     ALL.iter().find(|s| s.key == key)

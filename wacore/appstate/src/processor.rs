@@ -43,14 +43,12 @@ impl<'a> CommandSummary<'a> {
     }
 }
 
-/// Declared protocol verbs: every `schemas::ALL` entry, unlisted
+/// Declared protocol verbs: every `is_known_wire_name` entry, unlisted
 /// `label_message`, legacy `pin`/`mark_chat_as_read` aliases.
 fn is_known_app_state_command(command: &str) -> bool {
     command == crate::schemas_unlisted::LABEL_MESSAGE.name
         || matches!(command, "pin" | "mark_chat_as_read")
-        || crate::schemas::ALL
-            .iter()
-            .any(|schema| schema.name == command)
+        || crate::schemas::is_known_wire_name(command)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2362,10 +2360,10 @@ mod tests {
     #[test]
     fn mutation_summary_caps_entries_and_counts_the_tail() {
         use wa::syncd_mutation::SyncdOperation::SET;
-        let known: Vec<String> = crate::schemas::ALL
+        let known: Vec<String> = crate::schemas::WIRE_NAMES
             .iter()
             .take(MUTATION_SUMMARY_ENTRY_CAP + 3)
-            .map(|s| s.name.to_string())
+            .map(|s| s.to_string())
             .collect();
         let mutations: Vec<Mutation> = known
             .iter()

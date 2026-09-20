@@ -165,6 +165,26 @@ pub fn generate(ir: &AppstateIr) -> Result<String> {
         out.push_str(&format!("    {name},\n"));
     }
     out.push_str("];\n\n");
+    // Log-gating wire names only: string literals straight from the IR, so
+    // referencing them can never pull the full `Schema` records (with their
+    // module names, proto paths and index-part tables) into the binary.
+    // `processor::is_known_app_state_command` is the only consumer; the
+    // client decides unknown vs claimed from its dispatch outcome instead.
+    let mut wire_names: Vec<&str> = ir.actions.values().map(|a| a.name.as_str()).collect();
+    wire_names.sort_unstable();
+    out.push_str(
+        "/// Every on-wire action name, sorted. Log gating only: referencing\n/// a name here keeps just the string, never the full `Schema` record.\n\
+         pub(crate) const WIRE_NAMES: &[&str] = &[\n",
+    );
+    for name in &wire_names {
+        out.push_str(&format!("    {},\n", rust_lit(name)));
+    }
+    out.push_str("];\n\n");
+    out.push_str(
+        "/// Whether `name` is an on-wire action name. Log gating only — see\n\
+         /// `WIRE_NAMES`.\npub(crate) fn is_known_wire_name(name: &str) -> bool {\n\
+         \x20   WIRE_NAMES.iter().any(|candidate| *candidate == name)\n}\n",
+    );
     out.push_str(
         "/// Look up a schema by its action key (the registry key, e.g. `\"Agent\"`).\n\
          pub fn by_name(key: &str) -> Option<&'static Schema> {\n\
@@ -370,6 +390,16 @@ mod tests {
             "index_parts: &[IndexPart::Literal { value: \"deviceAgent\" }, IndexPart::StringPart { name: \"agentId\" }],"
         ));
         assert!(code.contains("pub const ALL: &[Schema] = &[\n    AGENT,\n];"));
+        // Log-gating registry: literals from the IR, never `X.name`
+        // references that could keep full `Schema` records reachable.
+        assert!(
+            code.contains("pub(crate) const WIRE_NAMES: &[&str] = &[\n    \"deviceAgent\",\n];")
+        );
+        assert!(code.contains("pub(crate) fn is_known_wire_name(name: &str) -> bool"));
+        assert!(
+            !code.contains("WIRE_NAMES: &[&str] = &[\n    AGENT"),
+            "{code}"
+        );
     }
 
     #[test]

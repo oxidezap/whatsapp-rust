@@ -3733,28 +3733,21 @@ fn is_log_unsafe(c: char) -> bool {
     )
 }
 
-/// Renders `index[0]` for a log line. Only declared protocol verbs render
-/// (sanitized, bounded); anything else becomes `unknown=<fingerprint>`.
-/// Routing keys on the raw verb, so unknown commands still reach `Unclaimed`.
-fn render_command(command: &str) -> String {
+/// Renders `index[0]` for a log line. The outcome decides: anything no
+/// dispatcher claimed renders as `unknown=<fingerprint>`; claimed commands
+/// render sanitized and bounded. Routing keys on the raw verb, so unknown
+/// commands still reach `Unclaimed`.
+fn render_command(command: &str, outcome: AppStateDispatchOutcome) -> String {
     if command.is_empty() {
         return "<no-command>".to_string();
     }
-    if !is_known_app_state_command(command) {
+    if matches!(
+        outcome,
+        AppStateDispatchOutcome::Unclaimed | AppStateDispatchOutcome::EmptyIndex
+    ) {
         return format!("unknown={}", fingerprint_id(command));
     }
     sanitize_command(command)
-}
-
-/// Declared protocol verbs: every `schemas::ALL` entry, unlisted
-/// `label_message`, legacy `pin`/`mark_chat_as_read` aliases. Anything else
-/// in the verb slot is untrusted wire text — never rendered verbatim.
-fn is_known_app_state_command(command: &str) -> bool {
-    use wacore::appstate::{schemas, schemas_unlisted};
-
-    command == schemas_unlisted::LABEL_MESSAGE.name
-        || matches!(command, "pin" | "mark_chat_as_read")
-        || schemas::ALL.iter().any(|schema| schema.name == command)
 }
 
 fn sanitize_command(command: &str) -> String {
@@ -3897,7 +3890,10 @@ fn redact_jid_or_fingerprint(arg: &str) -> String {
 /// [`MAX_LOG_INDEX_PARTS`] elements past the verb (see below), so a
 /// malformed index with tens of thousands of elements costs one short
 /// line, not a `Vec<String>` plus an HMAC per element.
-fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<String> {
+fn redacted_index(
+    m: &crate::appstate_sync::Mutation,
+    outcome: AppStateDispatchOutcome,
+) -> Vec<String> {
     use IndexLogKind::{Flag, Jid, Opaque};
 
     let command = m.index.first().map(String::as_str).unwrap_or("");
@@ -3989,7 +3985,7 @@ fn redacted_index(m: &crate::appstate_sync::Mutation) -> Vec<String> {
     let mut out = Vec::with_capacity(shown_parts + 2);
     for (i, arg) in m.index.iter().take(shown_parts + 1).enumerate() {
         if i == 0 {
-            out.push(render_command(arg));
+            out.push(render_command(arg, outcome));
         } else if let Some((kind, label)) =
             shape.get(i - 1).copied().zip(labels.get(i - 1).copied())
         {
@@ -4250,11 +4246,11 @@ fn log_mutation_dispatched(
     // snapshot + patches and the processor returns one final state, so this
     // is the cursor the page ended at — not each mutation's birth version.
     // Per-patch `Decoded … vN` lines keep the exact granularity.
-    // Untrusted verb slot: declared commands render, anything else becomes
-    // `unknown=id#…`. Routing keys on the raw verb (`Unclaimed`).
+    // Untrusted verb slot: claimed commands render, anything unclaimed
+    // becomes `unknown=id#…`. Routing keys on the raw verb (`Unclaimed`).
     let mut line = format!(
         "{collection:?} cursor={version} [{position}/{total}] {op} {}",
-        render_command(command)
+        render_command(command, outcome)
     );
     // `mutation_target` already returns `id=…` for `quick_reply` (see above),
     // so no second arm is needed here.
@@ -4286,7 +4282,7 @@ fn log_mutation_dispatched(
             target: "Client/AppState",
             "{line} (ordinal={position}/{total} index={:?} timestamp={ts:?} \
              log_full_sync={log_full_sync} handler={handler})",
-            redacted_index(m)
+            redacted_index(m, outcome)
         );
     } else {
         debug!(target: "Client/AppState", "{line}");
@@ -4386,7 +4382,7 @@ impl Client {
                 warn!(
                     target: "Client/AppState",
                     "{} mutation missing {event} payload; index has {} element(s)",
-                    render_command(command),
+                    render_command(command, outcome),
                     m.index.len()
                 );
             }
@@ -4708,7 +4704,7 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::SET,
             action_value: None,
         };
-        let redacted = redacted_index(&m);
+        let redacted = redacted_index(&m, AppStateDispatchOutcome::Event("StarUpdate"));
         assert_eq!(
             redacted,
             vec![
@@ -4748,7 +4744,7 @@ mod tests {
                 operation: wa::syncd_mutation::SyncdOperation::SET,
                 action_value: None,
             };
-            let redacted = redacted_index(&m);
+            let redacted = redacted_index(&m, AppStateDispatchOutcome::Event("test"));
             assert!(
                 redacted[2].starts_with("msg=id#") || redacted[2].starts_with("call=id#"),
                 "{command}: single-char id must fingerprint, got {}",
@@ -4768,7 +4764,7 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::SET,
             action_value: None,
         };
-        let redacted = redacted_index(&flags);
+        let redacted = redacted_index(&flags, AppStateDispatchOutcome::Event("StarUpdate"));
         assert_eq!(redacted[3], "from_me=1");
         // The `"0"` participant sentinel means "no participant" and
         // passes through untouched.
@@ -4790,7 +4786,7 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::SET,
             action_value: None,
         };
-        let redacted = redacted_index(&m);
+        let redacted = redacted_index(&m, AppStateDispatchOutcome::Event("StarUpdate"));
         // Verb + 8 parts + tail count.
         assert_eq!(redacted.len(), 10);
         assert_eq!(redacted[1], "…@g.us");
@@ -4819,7 +4815,7 @@ mod tests {
             action_value: None,
         };
         assert_eq!(
-            redacted_index(&m),
+            redacted_index(&m, AppStateDispatchOutcome::Event("CallLogSync")),
             vec![
                 "call_log".to_string(),
                 "…@s.whatsapp.net".to_string(),
@@ -4850,7 +4846,7 @@ mod tests {
             action_value: None,
         };
         assert_eq!(
-            redacted_index(&m),
+            redacted_index(&m, AppStateDispatchOutcome::Event("DeleteChatUpdate")),
             vec![
                 "deleteChat".to_string(),
                 "…@g.us".to_string(),
@@ -4868,7 +4864,7 @@ mod tests {
             action_value: None,
         };
         assert_eq!(
-            redacted_index(&m),
+            redacted_index(&m, AppStateDispatchOutcome::Event("ClearChatUpdate")),
             vec![
                 "clearChat".to_string(),
                 "…@g.us".to_string(),
@@ -4897,7 +4893,7 @@ mod tests {
                 operation: wa::syncd_mutation::SyncdOperation::SET,
                 action_value: None,
             };
-            let redacted = redacted_index(&m);
+            let redacted = redacted_index(&m, AppStateDispatchOutcome::Unclaimed);
             for element in redacted.iter().skip(1) {
                 assert!(!element.contains("120363000000000042"));
                 assert!(!element.contains("3EB0284A7C9112345678"));
@@ -4913,13 +4909,19 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::SET,
             action_value: None,
         };
-        assert_eq!(redacted_index(&jid_case)[1], "…@g.us");
+        assert_eq!(
+            redacted_index(&jid_case, AppStateDispatchOutcome::Unclaimed)[1],
+            "…@g.us"
+        );
         let opaque_case = Mutation {
             index: vec!["some_new_whatsapp_action".to_string(), opaque.to_string()],
             operation: wa::syncd_mutation::SyncdOperation::SET,
             action_value: None,
         };
-        assert_eq!(redacted_index(&opaque_case)[1], fingerprint_id(opaque));
+        assert_eq!(
+            redacted_index(&opaque_case, AppStateDispatchOutcome::Unclaimed)[1],
+            fingerprint_id(opaque)
+        );
         // The verb never renders verbatim: a JID or message id smuggled
         // into `index[0]` becomes `unknown=id#…`.
         let smuggled = Mutation {
@@ -4927,7 +4929,7 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::SET,
             action_value: None,
         };
-        let verb = &redacted_index(&smuggled)[0];
+        let verb = &redacted_index(&smuggled, AppStateDispatchOutcome::Unclaimed)[0];
         assert!(
             verb.starts_with("unknown=id#"),
             "smuggled verb must fingerprint, got {verb}"
@@ -4958,7 +4960,10 @@ mod tests {
         };
         let msg_id = "3EB0284A7C9112345678";
         assert_eq!(
-            redacted_index(&m),
+            redacted_index(
+                &m,
+                AppStateDispatchOutcome::Event("MessageLabelAssociationUpdate")
+            ),
             vec![
                 "label_message".to_string(),
                 format!("label={}", fingerprint_id("5")),
@@ -4971,7 +4976,10 @@ mod tests {
         // The `"0"` absent-participant sentinel passes through bare.
         let mut absent = m.clone();
         absent.index[5] = "0".to_string();
-        assert_eq!(redacted_index(&absent)[5], "0");
+        assert_eq!(
+            redacted_index(&absent, AppStateDispatchOutcome::Event("test"))[5],
+            "0"
+        );
     }
 
     /// The line renders `cursor=`, not `@`: the version is the page end
@@ -5229,15 +5237,19 @@ mod tests {
     /// Unknown verbs fingerprint, never render.
     #[test]
     fn render_command_never_prints_unknown_verbs() {
-        assert_eq!(render_command("archive"), "archive");
-        assert_eq!(render_command(""), "<no-command>");
+        use AppStateDispatchOutcome::{Event, Unclaimed};
+
+        assert_eq!(render_command("archive", Event("ArchiveUpdate")), "archive");
+        assert_eq!(render_command("", Event("test")), "<no-command>");
+        // Claimed verbs render even when hostile-looking: dispatch proved
+        // the command exists, `sanitize_command` handles the controls.
+        assert!(render_command("archive\nFORGED", Event("ArchiveUpdate")).starts_with("archive"));
         for hostile in [
-            "archive\nFORGED: yes\u{1B}[2J".to_string(),
             "5511999999999@s.whatsapp.net".to_string(),
             "CUSTOMER_SECRET_MESSAGE_ID".to_string(),
             "a".repeat(2_000_000),
         ] {
-            let rendered = render_command(&hostile);
+            let rendered = render_command(&hostile, Unclaimed);
             assert!(
                 rendered.starts_with("unknown=id#"),
                 "{hostile:?} must fingerprint, got {rendered}"
