@@ -554,8 +554,11 @@ impl SendContextResolver for MockSendContextResolver {
         })
     }
 
-    async fn resolve_group_info(&self, _jid: &Jid) -> Result<std::sync::Arc<GroupRoutingInfo>> {
-        unimplemented!("resolve_group_info not needed for send.rs tests")
+    async fn resolve_group_routing_info(
+        &self,
+        _jid: &Jid,
+    ) -> Result<std::sync::Arc<GroupRoutingInfo>> {
+        unimplemented!("resolve_group_routing_info not needed for send.rs tests")
     }
 
     async fn get_lid_for_phone(&self, phone_user: &str) -> Option<CompactString> {

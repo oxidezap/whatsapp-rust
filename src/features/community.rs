@@ -15,8 +15,9 @@ use crate::request::IqError;
 use log::warn;
 use thiserror::Error;
 use wacore::iq::groups::{
-    CommunityParticipatingIq, DeleteCommunityIq, GetLinkedGroupsParticipantsIq, GroupCreateOptions,
-    JoinGroupResult, JoinLinkedGroupIq, LinkSubgroupsIq, QueryLinkedGroupIq, UnlinkSubgroupsIq,
+    CommunityParticipatingIq, CommunityParticipatingOverviewIq, DeleteCommunityIq,
+    GetLinkedGroupsParticipantsIq, GroupCreateOptions, JoinGroupResult, JoinLinkedGroupIq,
+    LinkSubgroupsIq, QueryLinkedGroupIq, UnlinkSubgroupsIq,
 };
 use wacore::iq::mex_operations::{fetch_all_subgroups, query_subgroup_participant_count};
 use wacore_binary::Jid;
@@ -129,17 +130,38 @@ pub struct UnlinkSubgroupsResult {
 }
 
 /// Determine the group type from metadata fields.
+///
+/// A pure projection of [`GroupHierarchy`]: the classification runs through
+/// the single canonical normalizer, so this and overview hierarchies agree
+/// by construction instead of reimplementing flag precedence.
+///
+/// [`GroupHierarchy::from_metadata`](crate::features::groups::GroupHierarchy)
+/// is crate-visible only; this projection is the public read of the same
+/// value for callers that already hold full metadata.
 pub fn group_type(metadata: &GroupMetadata) -> GroupType {
-    if metadata.is_default_sub_group {
-        GroupType::LinkedAnnouncementGroup
-    } else if metadata.is_general_chat {
-        GroupType::LinkedGeneralGroup
-    } else if metadata.parent_group_jid.is_some() {
-        GroupType::LinkedSubgroup
-    } else if metadata.is_parent_group {
-        GroupType::Community
-    } else {
-        GroupType::Default
+    // from_metadata is the canonical normalizer; match on its output rather
+    // than re-reading the flags so precedence lives in exactly one place.
+    let hierarchy = crate::features::groups::GroupHierarchy::from_metadata(metadata);
+    match hierarchy {
+        crate::features::groups::GroupHierarchy::Standalone => GroupType::Default,
+        crate::features::groups::GroupHierarchy::Community => GroupType::Community,
+        crate::features::groups::GroupHierarchy::Subgroup { kind, .. } => {
+            match kind {
+                crate::features::groups::SubgroupKind::Announcement => {
+                    GroupType::LinkedAnnouncementGroup
+                }
+                crate::features::groups::SubgroupKind::General => GroupType::LinkedGeneralGroup,
+                // Regular today; non-exhaustive future kinds degrade to the
+                // plain subgroup bucket rather than misclassifying.
+                _ => GroupType::LinkedSubgroup,
+            }
+        }
+        // GroupHierarchy is #[non_exhaustive]: a future variant added in a
+        // semver-compatible release falls here and reads as standalone.
+        // The wildcard is load-bearing, not dead code — silence the
+        // `unreachable_patterns` lint rather than deleting the arm.
+        #[allow(unreachable_patterns)]
+        _ => GroupType::Default,
     }
 }
 
@@ -350,12 +372,36 @@ impl<'a> Community<'a> {
         Ok(subgroups)
     }
 
-    /// Fetch all parent groups the account currently participates in.
-    pub async fn get_participating(
+    /// List every parent community the account participates in as slim overviews.
+    ///
+    /// Always hits the network (one `participating` IQ sent as the overview
+    /// projection: no `<participants>` / `<description>` children requested)
+    /// and parses only id, subject, size, and the community-hierarchy flags
+    /// per community — participants are never collected. For full metadata use
+    /// [`Community::fetch_participating_metadata`].
+    pub async fn list_participating(
+        &self,
+    ) -> Result<Vec<crate::features::groups::GroupOverview>, CommunityError> {
+        let response = self
+            .client
+            .execute(CommunityParticipatingOverviewIq::new())
+            .await?;
+        Ok(response
+            .groups
+            .iter()
+            .map(crate::features::groups::GroupOverview::from_overview_data)
+            .collect())
+    }
+
+    /// Fetch full metadata for every parent community the account participates
+    /// in. Always hits the network; protocol data only, no LID/PN backfill —
+    /// call [`Groups::resolve_participant_addresses`](crate::features::groups::Groups::resolve_participant_addresses)
+    /// per result when PN-keyed display data is needed.
+    pub async fn fetch_participating_metadata(
         &self,
     ) -> Result<std::collections::HashMap<Jid, GroupMetadata>, CommunityError> {
         let response = self.client.execute(CommunityParticipatingIq::new()).await?;
-        let mut result: std::collections::HashMap<Jid, GroupMetadata> = response
+        let result: std::collections::HashMap<Jid, GroupMetadata> = response
             .groups
             .into_iter()
             .map(|community| {
@@ -363,10 +409,6 @@ impl<'a> Community<'a> {
                 (id, GroupMetadata::from(community))
             })
             .collect();
-
-        for metadata in result.values_mut() {
-            self.client.groups().fill_participant_pns(metadata).await;
-        }
 
         Ok(result)
     }

@@ -12,10 +12,10 @@ use wacore::iq::contacts::SetProfilePictureSpec;
 use wacore::iq::contacts::{ProfilePictureSpec, ProfilePictureType as ContactPictureType};
 use wacore::iq::groups::{
     AcceptGroupInviteIq, AcceptGroupInviteV4Iq, AcknowledgeGroupIq, AddParticipantsIq,
-    BatchGetGroupInfoIq, CancelMembershipRequestsIq, DemoteParticipantsIq, GetGroupInviteInfoIq,
-    GetGroupInviteLinkIq, GetGroupProfilePicturesIq, GetMembershipRequestsIq,
+    BatchGetGroupInfoIq, BatchGetGroupOverviewIq, CancelMembershipRequestsIq, DemoteParticipantsIq,
+    GetGroupInviteInfoIq, GetGroupInviteLinkIq, GetGroupProfilePicturesIq, GetMembershipRequestsIq,
     GetReportedGroupMessagesIq, GroupCreateIq, GroupInfoOutcome, GroupMetadataResponse,
-    GroupParticipantResponse, GroupParticipatingIq, GroupQueryIq, LeaveGroupIq,
+    GroupParticipantResponse, GroupParticipatingOverviewIq, GroupQueryIq, LeaveGroupIq,
     MembershipRequestActionIq, PromoteParticipantsIq, RemoveParticipantsIncludingLinkedGroupsIq,
     RemoveParticipantsIq, ReportGroupMessagesIq, RevokeRequestCodeIq, SetAllowAdminReportsIq,
     SetGroupAnnouncementIq, SetGroupDescriptionIq, SetGroupEphemeralIq, SetGroupHistoryIq,
@@ -27,6 +27,7 @@ use wacore::types::message::AddressingMode;
 use wacore_binary::{Jid, JidExt as _};
 
 use wacore::iq::groups::BatchGroupInfoResult as RawBatchResult;
+use wacore::iq::groups::BatchGroupOverviewResult as RawOverviewBatchResult;
 pub use wacore::iq::groups::{
     GroupAppealStatus, GroupCreateOptions, GroupDescription, GroupEphemeralSettings,
     GroupJoinError, GroupMessageReporter, GroupParticipantDetails, GroupParticipantOptions,
@@ -134,7 +135,7 @@ struct UpdateGroupPropertyVars {
 
 /// Result for a single group in a batch metadata query.
 #[derive(Debug, Clone)]
-pub enum BatchGroupResult {
+pub enum GroupMetadataResult {
     Full(Box<GroupMetadata>),
     /// Server returned truncated info (only id and size).
     Truncated {
@@ -183,30 +184,84 @@ pub enum SubgroupKind {
 /// [`Groups::list_participating`] (every group the account is in) or
 /// [`Groups::fetch_overviews`] (a chosen subset); both always hit the
 /// network and never backfill LID/PN mappings.
+///
+/// `subject` is `Option`: the protocol has an explicit unnamed-subject shape,
+/// so an absent subject is legitimate state (`None`), distinct from an empty
+/// one (`Some("")`). A consumer that persists display names should keep its
+/// existing name on `None` rather than storing `""`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct GroupOverview {
     pub id: Jid,
-    pub subject: String,
+    pub subject: Option<String>,
     pub hierarchy: GroupHierarchy,
     /// Total participant count (`size` attribute), when the server sent one.
     pub participant_count: Option<u32>,
 }
 
+/// Wire-level overview flags shared by every overview source (`participating`
+/// and batch responses). One normalizer so [`GroupHierarchy`] and the
+/// community classifier cannot drift: precedence is an API decision (an
+/// explicit `<linked_parent>` names a subgroup, so it wins over a bare
+/// `<parent>` marker), not a protocol rule — the server sends the flags
+/// independently with no XOR between them.
+#[derive(Debug, Clone)]
+struct OverviewFlags {
+    is_parent_group: bool,
+    parent_group_jid: Option<Jid>,
+    is_default_sub_group: bool,
+    is_general_chat: bool,
+}
+
 impl GroupOverview {
     /// Build the overview subset of a full wire response.
     ///
-    /// Skips participants by construction: the response is borrowed, so a
-    /// caller that only holds an overview never paid to collect the member
-    /// list.
-    pub fn from_response(group: &GroupMetadataResponse) -> Self {
+    /// Takes the already-parsed metadata response; prefer the slim
+    /// [`GroupParticipatingOverviewIq`](wacore::iq::groups::GroupParticipatingOverviewIq)
+    /// / [`BatchGetGroupOverviewIq`](wacore::iq::groups::BatchGetGroupOverviewIq)
+    /// paths, which never materialize participants at all.
+    #[cfg(test)]
+    pub(crate) fn from_response(group: &GroupMetadataResponse) -> Self {
+        Self::from_parts(
+            group.id.clone(),
+            Some(group.subject.as_str().to_string()),
+            group.size,
+            OverviewFlags {
+                is_parent_group: group.is_parent_group,
+                parent_group_jid: group.parent_group_jid.clone(),
+                is_default_sub_group: group.is_default_sub_group,
+                is_general_chat: group.is_general_chat,
+            },
+        )
+    }
+
+    /// Build an overview from the slim wire projection, without ever
+    /// collecting participants.
+    pub fn from_overview_data(group: &wacore::iq::groups::GroupOverviewData) -> Self {
+        Self::from_parts(
+            group.id.clone(),
+            group.subject.clone(),
+            group.size,
+            OverviewFlags {
+                is_parent_group: group.is_parent_group,
+                parent_group_jid: group.parent_group_jid.clone(),
+                is_default_sub_group: group.is_default_sub_group,
+                is_general_chat: group.is_general_chat,
+            },
+        )
+    }
+
+    fn from_parts(
+        id: Jid,
+        subject: Option<String>,
+        size: Option<u32>,
+        flags: OverviewFlags,
+    ) -> Self {
         Self {
-            id: group.id.clone(),
-            subject: group.subject.as_str().to_string(),
-            hierarchy: GroupHierarchy::from_response(group),
-            participant_count: group.size.or_else(|| {
-                (!group.participants.is_empty()).then_some(group.participants.len() as u32)
-            }),
+            id,
+            subject,
+            hierarchy: GroupHierarchy::from_flags(&flags),
+            participant_count: size,
         }
     }
 
@@ -247,23 +302,53 @@ impl GroupOverview {
 }
 
 impl GroupHierarchy {
-    fn from_response(group: &GroupMetadataResponse) -> Self {
-        if group.is_parent_group {
-            return Self::Community;
-        }
-        match group.parent_group_jid.clone() {
+    /// Canonical hierarchy normalizer: every overview source funnels through
+    /// here, so there is exactly one place where flag combinations become a
+    /// hierarchy value.
+    fn from_flags(flags: &OverviewFlags) -> Self {
+        // An explicit linked parent names a subgroup, so it wins over a bare
+        // `<parent>` marker when both arrive together.
+        match flags.parent_group_jid.clone() {
             Some(parent) => {
-                let kind = if group.is_default_sub_group {
+                let kind = if flags.is_default_sub_group {
                     SubgroupKind::Announcement
-                } else if group.is_general_chat {
+                } else if flags.is_general_chat {
                     SubgroupKind::General
                 } else {
                     SubgroupKind::Regular
                 };
                 Self::Subgroup { parent, kind }
             }
-            None => Self::Standalone,
+            None => {
+                if flags.is_parent_group {
+                    Self::Community
+                } else {
+                    Self::Standalone
+                }
+            }
         }
+    }
+
+    /// Canonical hierarchy of a full metadata object: the same normalizer
+    /// every overview source uses, so [`group_type`](crate::features::community::group_type)
+    /// is a pure projection of this value and the two can never disagree.
+    pub fn from_metadata(meta: &GroupMetadata) -> Self {
+        Self::from_flags(&OverviewFlags {
+            is_parent_group: meta.is_parent_group,
+            parent_group_jid: meta.parent_group_jid.clone(),
+            is_default_sub_group: meta.is_default_sub_group,
+            is_general_chat: meta.is_general_chat,
+        })
+    }
+
+    #[cfg(test)]
+    fn from_response(group: &GroupMetadataResponse) -> Self {
+        Self::from_flags(&OverviewFlags {
+            is_parent_group: group.is_parent_group,
+            parent_group_jid: group.parent_group_jid.clone(),
+            is_default_sub_group: group.is_default_sub_group,
+            is_general_chat: group.is_general_chat,
+        })
     }
 }
 
@@ -1158,19 +1243,23 @@ impl<'a> Groups<'a> {
 
     /// List every group the account participates in as slim overviews.
     ///
-    /// Always hits the network (one `participating` IQ) and parses only
-    /// id, subject, size, and the community-hierarchy flags from each
-    /// `<group>` node — participants are skipped even though the wire payload
-    /// is unchanged. Never backfills LID/PN mappings and never fans out per
-    /// group, so this stays one round trip no matter how many groups come
-    /// back. For the full user-facing object use [`Groups::fetch_metadata`].
+    /// Always hits the network (one `participating` IQ sent as the overview
+    /// projection: no `<participants>` / `<description>` children requested)
+    /// and parses only id, subject, size, and the community-hierarchy flags
+    /// from each `<group>` node — participants are never collected. Never
+    /// backfills LID/PN mappings and never fans out per group, so this stays
+    /// one round trip no matter how many groups come back. For the full
+    /// user-facing object use [`Groups::fetch_metadata`].
     pub async fn list_participating(&self) -> Result<Vec<GroupOverview>, GroupError> {
-        let response = self.client.execute(GroupParticipatingIq::new()).await?;
+        let response = self
+            .client
+            .execute(GroupParticipatingOverviewIq::new())
+            .await?;
 
         Ok(response
             .groups
             .iter()
-            .map(GroupOverview::from_response)
+            .map(GroupOverview::from_overview_data)
             .collect())
     }
 
@@ -1873,8 +1962,8 @@ impl<'a> Groups<'a> {
     /// display data is needed.
     pub async fn fetch_metadata_batch(
         &self,
-        jids: Vec<Jid>,
-    ) -> Result<Vec<BatchGroupResult>, GroupError> {
+        jids: &[Jid],
+    ) -> Result<Vec<GroupMetadataResult>, GroupError> {
         if jids.len() > wacore::iq::groups::BATCH_GROUP_INFO_LIMIT {
             return Err(GroupError::InvalidRequest(format!(
                 "fetch_metadata_batch: {} groups exceeds limit of {}",
@@ -1882,26 +1971,29 @@ impl<'a> Groups<'a> {
                 wacore::iq::groups::BATCH_GROUP_INFO_LIMIT,
             )));
         }
-        let raw = self.client.execute(BatchGetGroupInfoIq::new(&jids)).await?;
+        let raw = self.client.execute(BatchGetGroupInfoIq::new(jids)).await?;
         Ok(raw
             .into_iter()
             .map(|r| match r {
                 RawBatchResult::Full(info) => {
-                    BatchGroupResult::Full(Box::new(GroupMetadata::from(*info)))
+                    GroupMetadataResult::Full(Box::new(GroupMetadata::from(*info)))
                 }
-                RawBatchResult::Truncated { id, size } => BatchGroupResult::Truncated { id, size },
-                RawBatchResult::Forbidden(id) => BatchGroupResult::Forbidden(id),
-                RawBatchResult::NotFound(id) => BatchGroupResult::NotFound(id),
+                RawBatchResult::Truncated { id, size } => {
+                    GroupMetadataResult::Truncated { id, size }
+                }
+                RawBatchResult::Forbidden(id) => GroupMetadataResult::Forbidden(id),
+                RawBatchResult::NotFound(id) => GroupMetadataResult::NotFound(id),
             })
             .collect())
     }
 
     /// Batch fetch slim overviews for a chosen subset of groups (max 10,000).
     ///
-    /// Reuses [`BatchGetGroupInfoIq`] but parses only the overview subset
-    /// (id, subject, hierarchy flags, size) from each full `<group>` node —
-    /// participants are never collected. Always hits the network; never
-    /// backfills LID/PN mappings.
+    /// Same wire shape as [`fetch_metadata_batch`](Groups::fetch_metadata_batch)
+    /// (the batch request carries no overview projection flags) but each
+    /// `<group>` node is parsed with the slim overview parser — id, subject,
+    /// hierarchy flags, size only; participants are never collected. Always
+    /// hits the network; never backfills LID/PN mappings.
     pub async fn fetch_overviews(
         &self,
         jids: &[Jid],
@@ -1913,19 +2005,22 @@ impl<'a> Groups<'a> {
                 wacore::iq::groups::BATCH_GROUP_INFO_LIMIT,
             )));
         }
-        let raw = self.client.execute(BatchGetGroupInfoIq::new(jids)).await?;
+        let raw = self
+            .client
+            .execute(BatchGetGroupOverviewIq::new(jids))
+            .await?;
         Ok(raw
             .into_iter()
             .map(|r| match r {
-                RawBatchResult::Full(info) => {
-                    GroupOverviewResult::Found(GroupOverview::from_response(&info))
+                RawOverviewBatchResult::Full(info) => {
+                    GroupOverviewResult::Found(GroupOverview::from_overview_data(&info))
                 }
-                RawBatchResult::Truncated { id, size } => GroupOverviewResult::Truncated {
+                RawOverviewBatchResult::Truncated { id, size } => GroupOverviewResult::Truncated {
                     id,
                     participant_count: size,
                 },
-                RawBatchResult::Forbidden(id) => GroupOverviewResult::Forbidden(id),
-                RawBatchResult::NotFound(id) => GroupOverviewResult::NotFound(id),
+                RawOverviewBatchResult::Forbidden(id) => GroupOverviewResult::Forbidden(id),
+                RawOverviewBatchResult::NotFound(id) => GroupOverviewResult::NotFound(id),
             })
             .collect())
     }
@@ -3754,7 +3849,7 @@ mod tests {
             .build();
         let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         let overview = GroupOverview::from_response(&response);
-        assert_eq!(overview.subject, "Standalone");
+        assert_eq!(overview.subject, Some("Standalone".to_string()));
         assert_eq!(overview.hierarchy, GroupHierarchy::Standalone);
         assert_eq!(overview.participant_count, Some(7));
         assert!(!overview.is_parent_group());
@@ -3840,6 +3935,22 @@ mod tests {
                 kind: SubgroupKind::Regular,
             }
         );
+    }
+
+    #[test]
+    fn group_overview_preserves_absent_subject_as_none() {
+        use wacore::iq::groups::GroupOverviewData;
+        use wacore::protocol::ProtocolNode;
+        use wacore_binary::builder::NodeBuilder;
+
+        // The protocol's UnnamedSubjectFallback shape: no `subject` attr is
+        // legitimate state, distinct from an empty subject.
+        let node = NodeBuilder::new("group")
+            .attr("id", "120363000000000015@g.us")
+            .build();
+        let data = GroupOverviewData::try_from_node(&node).unwrap();
+        let overview = GroupOverview::from_overview_data(&data);
+        assert_eq!(overview.subject, None);
     }
 
     #[test]
@@ -3962,7 +4073,7 @@ mod tests {
         match &results[0] {
             GroupOverviewResult::Found(overview) => {
                 assert_eq!(overview.id, found);
-                assert_eq!(overview.subject, "Found");
+                assert_eq!(overview.subject, Some("Found".to_string()));
                 assert_eq!(overview.participant_count, Some(42));
                 assert_eq!(overview.hierarchy, GroupHierarchy::Standalone);
             }
@@ -3989,20 +4100,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_participating_sends_the_overview_projection() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+
+        let query = {
+            let client = client.clone();
+            tokio::spawn(async move { client.groups().list_participating().await })
+        };
+        let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let sent_ref = sent.get();
+        let participating = sent_ref
+            .get_optional_child("participating")
+            .expect("participating request must carry <participating>");
+        assert!(
+            participating.get_optional_child("participants").is_none(),
+            "overview projection must not request <participants>"
+        );
+        assert!(
+            participating.get_optional_child("description").is_none(),
+            "overview projection must not request <description>"
+        );
+        // Answer an empty list so the spawned query can finish.
+        let id = sent_ref
+            .attrs()
+            .optional_string("id")
+            .expect("an IQ carries an id")
+            .to_string();
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", &id)
+            .children([NodeBuilder::new("groups").build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &id, &response).await;
+        let overviews = query.await.unwrap().unwrap();
+        assert!(overviews.is_empty());
+    }
+
+    #[tokio::test]
     async fn list_participating_returns_overviews_without_participants() {
         use wacore_binary::builder::NodeBuilder;
 
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         let group: Jid = "120363000000000031@g.us".parse().unwrap();
-        let member: Jid = Jid::lid("100000000000131");
 
         let query = {
             let client = client.clone();
             tokio::spawn(async move { client.groups().list_participating().await })
         };
         let id = pending_group_query(&transport, 0).await;
-        // The wire payload still carries participants; the overview parse
-        // must skip them rather than collect them.
+        // A `<participant>` without `jid` is rejected by the full metadata
+        // parser; the slim overview parser must skip it and still succeed.
+        // (The live overview request would not ask for participants at all;
+        // this proves the parse path no longer depends on them.)
         let response = NodeBuilder::new("iq")
             .attr("type", "result")
             .attr("id", &id)
@@ -4013,7 +4164,7 @@ mod tests {
                     .attr("addressing_mode", "lid")
                     .attr("size", "3")
                     .children([
-                        NodeBuilder::new("participant").attr("jid", &member).build(),
+                        NodeBuilder::new("participant").build(),
                         NodeBuilder::new("parent").build(),
                     ])
                     .build()])
@@ -4023,9 +4174,50 @@ mod tests {
         let overviews = query.await.unwrap().unwrap();
         assert_eq!(overviews.len(), 1);
         assert_eq!(overviews[0].id, group);
-        assert_eq!(overviews[0].subject, "Participating");
+        assert_eq!(overviews[0].subject, Some("Participating".to_string()));
         assert_eq!(overviews[0].hierarchy, GroupHierarchy::Community);
         assert_eq!(overviews[0].participant_count, Some(3));
+    }
+
+    #[tokio::test]
+    async fn fetch_overviews_skips_malformed_participants() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let found: Jid = "120363000000000041@g.us".parse().unwrap();
+        let jids = vec![found.clone()];
+
+        let query = {
+            let client = client.clone();
+            let jids = jids.clone();
+            tokio::spawn(async move { client.groups().fetch_overviews(&jids).await })
+        };
+        let id = pending_group_query(&transport, 0).await;
+        // Same malformed-participant probe through the batch path: the full
+        // parser would reject this node, the overview parser skips it.
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", &id)
+            .children([NodeBuilder::new("groups")
+                .children([NodeBuilder::new("group")
+                    .attr("id", found.to_string())
+                    .attr("subject", "Found")
+                    .attr("size", "5")
+                    .children([NodeBuilder::new("participant").build()])
+                    .build()])
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &id, &response).await;
+        let results = query.await.unwrap().unwrap();
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            GroupOverviewResult::Found(overview) => {
+                assert_eq!(overview.id, found);
+                assert_eq!(overview.subject, Some("Found".to_string()));
+                assert_eq!(overview.participant_count, Some(5));
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
     }
 
     /// A caller that joined a successful flight is answered by it.

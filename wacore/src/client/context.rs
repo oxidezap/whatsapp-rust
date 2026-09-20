@@ -433,7 +433,10 @@ pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
         jids: &[Jid],
     ) -> Result<crate::prekeys::PreKeyFetchOutcome, anyhow::Error>;
 
-    async fn resolve_group_info(&self, jid: &Jid) -> Result<Arc<GroupRoutingInfo>, anyhow::Error>;
+    async fn resolve_group_routing_info(
+        &self,
+        jid: &Jid,
+    ) -> Result<Arc<GroupRoutingInfo>, anyhow::Error>;
 
     /// Get the LID (Linked ID) for a phone number, if known.
     /// This is used to find existing sessions that were established under a LID address

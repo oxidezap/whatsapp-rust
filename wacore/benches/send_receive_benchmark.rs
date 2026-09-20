@@ -453,7 +453,7 @@ impl SendContextResolver for MockResolver {
     ) -> Result<wacore::prekeys::PreKeyFetchOutcome, anyhow::Error> {
         Ok(wacore::prekeys::PreKeyFetchOutcome::default())
     }
-    async fn resolve_group_info(
+    async fn resolve_group_routing_info(
         &self,
         _: &Jid,
     ) -> Result<std::sync::Arc<GroupRoutingInfo>, anyhow::Error> {

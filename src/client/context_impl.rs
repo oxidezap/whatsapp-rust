@@ -50,7 +50,10 @@ impl SendContextResolver for Client {
             })
     }
 
-    async fn resolve_group_info(&self, jid: &Jid) -> Result<Arc<GroupRoutingInfo>, anyhow::Error> {
+    async fn resolve_group_routing_info(
+        &self,
+        jid: &Jid,
+    ) -> Result<Arc<GroupRoutingInfo>, anyhow::Error> {
         Ok(self.groups().routing_info(jid).await?)
     }
 
