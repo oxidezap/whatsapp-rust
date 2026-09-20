@@ -131,13 +131,10 @@ pub struct UnlinkSubgroupsResult {
 
 /// Determine the group type from metadata fields.
 ///
-/// A pure projection of [`GroupHierarchy`]: the classification runs through
-/// the single canonical normalizer, so this and overview hierarchies agree
-/// by construction instead of reimplementing flag precedence.
-///
-/// [`GroupHierarchy::from_metadata`](crate::features::groups::GroupHierarchy)
-/// is crate-visible only; this projection is the public read of the same
-/// value for callers that already hold full metadata.
+/// A pure projection of [`GroupHierarchy`](crate::GroupHierarchy):
+/// the classification runs through the single canonical normalizer, so this
+/// and overview hierarchies agree by construction instead of reimplementing
+/// flag precedence.
 pub fn group_type(metadata: &GroupMetadata) -> GroupType {
     // from_metadata is the canonical normalizer; match on its output rather
     // than re-reading the flags so precedence lives in exactly one place.

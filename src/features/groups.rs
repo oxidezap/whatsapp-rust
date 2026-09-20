@@ -214,14 +214,11 @@ struct OverviewFlags {
 }
 
 impl GroupOverview {
-    /// Build the overview subset of a full wire response.
-    ///
-    /// Takes the already-parsed metadata response; prefer the slim
-    /// [`GroupParticipatingOverviewIq`](wacore::iq::groups::GroupParticipatingOverviewIq)
-    /// / [`BatchGetGroupOverviewIq`](wacore::iq::groups::BatchGetGroupOverviewIq)
-    /// paths, which never materialize participants at all.
+    /// Test-only bridge over an already-parsed full response. Production
+    /// overview paths go through [`GroupOverview::from_overview_data`], which
+    /// never materializes participants.
     #[cfg(test)]
-    pub(crate) fn from_response(group: &GroupMetadataResponse) -> Self {
+    pub(crate) fn from_response_for_tests(group: &GroupMetadataResponse) -> Self {
         Self::from_parts(
             group.id.clone(),
             Some(group.subject.as_str().to_string()),
@@ -330,7 +327,7 @@ impl GroupHierarchy {
     }
 
     /// Canonical hierarchy of a full metadata object: the same normalizer
-    /// every overview source uses, so [`group_type`](crate::features::community::group_type)
+    /// every overview source uses, so `group_type` in the community feature
     /// is a pure projection of this value and the two can never disagree.
     pub fn from_metadata(meta: &GroupMetadata) -> Self {
         Self::from_flags(&OverviewFlags {
@@ -338,16 +335,6 @@ impl GroupHierarchy {
             parent_group_jid: meta.parent_group_jid.clone(),
             is_default_sub_group: meta.is_default_sub_group,
             is_general_chat: meta.is_general_chat,
-        })
-    }
-
-    #[cfg(test)]
-    fn from_response(group: &GroupMetadataResponse) -> Self {
-        Self::from_flags(&OverviewFlags {
-            is_parent_group: group.is_parent_group,
-            parent_group_jid: group.parent_group_jid.clone(),
-            is_default_sub_group: group.is_default_sub_group,
-            is_general_chat: group.is_general_chat,
         })
     }
 }
@@ -1283,9 +1270,9 @@ impl<'a> Groups<'a> {
     /// you asked, wait for the outstanding call rather than issuing a second
     /// one alongside it.
     ///
-    /// This is the right call for displaying or auditing a group. When you only
-    /// need the participant list to send a message, prefer the cached
-    /// [`Groups::routing_info`] (crate-internal)..
+    /// This is the right call for displaying or auditing a group. When you
+    /// only need the participant list to send a message, the send path uses
+    /// the crate-internal cached routing view instead.
     pub async fn fetch_metadata(&self, jid: &Jid) -> Result<GroupMetadata, GroupError> {
         // Coalesced, because this is the one metadata entry point with no cache
         // in front of it: an offline-sync drain puts a burst of callers on the
@@ -3848,7 +3835,7 @@ mod tests {
             .attr("size", "7")
             .build();
         let response = GroupMetadataResponse::try_from_node(&node).unwrap();
-        let overview = GroupOverview::from_response(&response);
+        let overview = GroupOverview::from_response_for_tests(&response);
         assert_eq!(overview.subject, Some("Standalone".to_string()));
         assert_eq!(overview.hierarchy, GroupHierarchy::Standalone);
         assert_eq!(overview.participant_count, Some(7));
@@ -3864,7 +3851,7 @@ mod tests {
             .children([NodeBuilder::new("parent").build()])
             .build();
         let response = GroupMetadataResponse::try_from_node(&node).unwrap();
-        let overview = GroupOverview::from_response(&response);
+        let overview = GroupOverview::from_response_for_tests(&response);
         assert_eq!(overview.hierarchy, GroupHierarchy::Community);
         assert!(overview.is_parent_group());
         assert_eq!(overview.participant_count, None);
@@ -3883,7 +3870,7 @@ mod tests {
             ])
             .build();
         let response = GroupMetadataResponse::try_from_node(&node).unwrap();
-        let overview = GroupOverview::from_response(&response);
+        let overview = GroupOverview::from_response_for_tests(&response);
         assert_eq!(
             overview.hierarchy,
             GroupHierarchy::Subgroup {
@@ -3908,7 +3895,7 @@ mod tests {
             ])
             .build();
         let response = GroupMetadataResponse::try_from_node(&node).unwrap();
-        let overview = GroupOverview::from_response(&response);
+        let overview = GroupOverview::from_response_for_tests(&response);
         assert_eq!(
             overview.hierarchy,
             GroupHierarchy::Subgroup {
@@ -3927,7 +3914,7 @@ mod tests {
                 .build()])
             .build();
         let response = GroupMetadataResponse::try_from_node(&node).unwrap();
-        let overview = GroupOverview::from_response(&response);
+        let overview = GroupOverview::from_response_for_tests(&response);
         assert_eq!(
             overview.hierarchy,
             GroupHierarchy::Subgroup {
