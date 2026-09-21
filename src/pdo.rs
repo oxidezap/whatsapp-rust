@@ -823,7 +823,19 @@ impl Client {
             }
         };
 
-        let pending = self.pdo_pending_requests.remove(&cache_key).await;
+        // The response's namespace can differ from the one used when the
+        // request was cached: a migrated 1:1 request may cross the PN/LID
+        // boundary between these two legs. Keep the response key primary, and
+        // only spend one alias lookup after that direct key misses. Groups do
+        // not have a PN/LID namespace and must never take this path.
+        let mut pending = self.pdo_pending_requests.remove(&cache_key).await;
+        if pending.is_none()
+            && !cache_key.chat.is_group()
+            && let Some(alias) = self.swap_pn_lid_namespace(&cache_key.chat).await
+        {
+            let alias_key = ChatMessageId::new(alias, msg_id.into());
+            pending = self.pdo_pending_requests.remove(&alias_key).await;
+        }
 
         // The pending map is keyed by `(chat, id)`, which does not name a
         // sender, and the slot expires and can be evicted while a request is
@@ -1183,6 +1195,46 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    fn make_placeholder_response(
+        remote_jid: &str,
+        from_me: bool,
+        id: &str,
+        participant: Option<&str>,
+    ) -> waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse
+    {
+        use buffa::Message as _;
+        let mut web_msg = make_web_msg(remote_jid, from_me, id, participant);
+        web_msg.message = buffa::MessageField::some(waproto::whatsapp::Message {
+            conversation: Some("recovered by the phone".to_owned()),
+            ..Default::default()
+        });
+        waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
+        }
+    }
+
+    fn make_dm_pending_info(
+        chat: &str,
+        sender_alt: &str,
+        id: &str,
+        addressing_mode: wacore::types::message::AddressingMode,
+    ) -> std::sync::Arc<wacore::types::message::MessageInfo> {
+        use wacore::types::message::{MessageInfo, MessageSource};
+        let chat: Jid = chat.parse().expect("chat jid");
+        std::sync::Arc::new(MessageInfo {
+            id: id.into(),
+            push_name: "pending metadata".into(),
+            source: MessageSource {
+                chat: chat.clone(),
+                sender: chat,
+                addressing_mode: Some(addressing_mode),
+                sender_alt: Some(sender_alt.parse().expect("sender alt jid")),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
     }
 
     /// The reconstruction path preserves the real author for status
@@ -1638,6 +1690,269 @@ mod tests {
             Some(wacore::types::message::AddressingMode::Lid),
             "keeping the entry keeps the addressing mode the delivery carried"
         );
+    }
+
+    /// A response in PN can recover a request cached in LID after migration.
+    /// The pending MessageInfo, including its addressing metadata, must win over
+    /// lossy reconstruction from the response.
+    #[tokio::test]
+    async fn a_pn_response_retries_the_lid_pending_key() {
+        use wacore::types::events::ChannelEventHandler;
+        use wacore::types::message::ChatMessageId;
+
+        let client = setup_reconstruct_client().await;
+        let pn = "5511999998888@s.whatsapp.net";
+        let lid = "236395184570386@lid";
+        let msg_id = "PDO_DM_PN_FROM_LID";
+        client
+            .lid_pn_cache
+            .add(&wacore::types::lid_pn::LidPnEntry {
+                lid: "236395184570386".into(),
+                phone_number: "5511999998888".into(),
+                created_at: 0,
+                learning_source: wacore::types::lid_pn::LearningSource::Usync,
+            })
+            .await;
+        let pending =
+            make_dm_pending_info(lid, pn, msg_id, wacore::types::message::AddressingMode::Lid);
+        client
+            .pdo_pending_requests
+            .insert(
+                ChatMessageId::new(lid.parse().expect("lid"), msg_id.into()),
+                super::PendingPdoRequest {
+                    message_info: pending,
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+        let response = make_placeholder_response(pn, false, msg_id, None);
+        client
+            .handle_placeholder_resend_response(&response, "req-pn-alias")
+            .await;
+
+        assert!(
+            client
+                .pdo_pending_requests
+                .get(&ChatMessageId::new(lid.parse().unwrap(), msg_id.into()))
+                .await
+                .is_none()
+        );
+        let mut infos = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            infos.extend(event.messages().map(|message| message.info.clone()));
+        }
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].source.chat.to_string(), lid);
+        assert_eq!(
+            infos[0].source.addressing_mode,
+            Some(wacore::types::message::AddressingMode::Lid)
+        );
+        assert_eq!(infos[0].source.sender_alt.as_ref().unwrap().to_string(), pn);
+        assert_eq!(infos[0].push_name, "pending metadata");
+    }
+
+    /// The reverse migration spelling is also recovered, but only after the
+    /// response's direct key misses.
+    #[tokio::test]
+    async fn a_lid_response_retries_the_pn_pending_key() {
+        use wacore::types::events::ChannelEventHandler;
+        use wacore::types::message::ChatMessageId;
+
+        let client = setup_reconstruct_client().await;
+        let pn = "5511999998888@s.whatsapp.net";
+        let lid = "236395184570386@lid";
+        let msg_id = "PDO_DM_LID_FROM_PN";
+        client
+            .lid_pn_cache
+            .add(&wacore::types::lid_pn::LidPnEntry {
+                lid: "236395184570386".into(),
+                phone_number: "5511999998888".into(),
+                created_at: 0,
+                learning_source: wacore::types::lid_pn::LearningSource::Usync,
+            })
+            .await;
+        client
+            .pdo_pending_requests
+            .insert(
+                ChatMessageId::new(pn.parse().expect("pn"), msg_id.into()),
+                super::PendingPdoRequest {
+                    message_info: make_dm_pending_info(
+                        pn,
+                        lid,
+                        msg_id,
+                        wacore::types::message::AddressingMode::Pn,
+                    ),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+        let response = make_placeholder_response(lid, false, msg_id, None);
+        client
+            .handle_placeholder_resend_response(&response, "req-lid-alias")
+            .await;
+
+        assert!(
+            client
+                .pdo_pending_requests
+                .get(&ChatMessageId::new(pn.parse().unwrap(), msg_id.into()))
+                .await
+                .is_none()
+        );
+        let mut infos = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            infos.extend(event.messages().map(|message| message.info.clone()));
+        }
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].source.chat.to_string(), pn);
+        assert_eq!(
+            infos[0].source.addressing_mode,
+            Some(wacore::types::message::AddressingMode::Pn)
+        );
+        assert_eq!(
+            infos[0].source.sender_alt.as_ref().unwrap().to_string(),
+            lid
+        );
+        assert_eq!(infos[0].push_name, "pending metadata");
+    }
+
+    /// A direct hit remains primary: an alias entry is not consumed or allowed
+    /// to replace the metadata belonging to the response's direct key.
+    #[tokio::test]
+    async fn pdo_direct_pending_hit_does_not_consume_alias() {
+        use wacore::types::events::ChannelEventHandler;
+        use wacore::types::message::ChatMessageId;
+
+        let client = setup_reconstruct_client().await;
+        let pn = "5511999998888@s.whatsapp.net";
+        let lid = "236395184570386@lid";
+        let msg_id = "PDO_DM_DIRECT";
+        client
+            .lid_pn_cache
+            .add(&wacore::types::lid_pn::LidPnEntry {
+                lid: "236395184570386".into(),
+                phone_number: "5511999998888".into(),
+                created_at: 0,
+                learning_source: wacore::types::lid_pn::LearningSource::Usync,
+            })
+            .await;
+        client
+            .pdo_pending_requests
+            .insert(
+                ChatMessageId::new(pn.parse().unwrap(), msg_id.into()),
+                super::PendingPdoRequest {
+                    message_info: make_dm_pending_info(
+                        pn,
+                        lid,
+                        msg_id,
+                        wacore::types::message::AddressingMode::Pn,
+                    ),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+        client
+            .pdo_pending_requests
+            .insert(
+                ChatMessageId::new(lid.parse().unwrap(), msg_id.into()),
+                super::PendingPdoRequest {
+                    message_info: make_dm_pending_info(
+                        lid,
+                        pn,
+                        msg_id,
+                        wacore::types::message::AddressingMode::Lid,
+                    ),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+        let response = make_placeholder_response(pn, false, msg_id, None);
+        client
+            .handle_placeholder_resend_response(&response, "req-direct")
+            .await;
+
+        assert!(
+            client
+                .pdo_pending_requests
+                .get(&ChatMessageId::new(pn.parse().unwrap(), msg_id.into()))
+                .await
+                .is_none()
+        );
+        assert!(
+            client
+                .pdo_pending_requests
+                .get(&ChatMessageId::new(lid.parse().unwrap(), msg_id.into()))
+                .await
+                .is_some()
+        );
+        let mut infos = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            infos.extend(event.messages().map(|message| message.info.clone()));
+        }
+        assert_eq!(infos.len(), 1);
+        assert_eq!(
+            infos[0].source.addressing_mode,
+            Some(wacore::types::message::AddressingMode::Pn)
+        );
+    }
+
+    /// Without a mapping, a namespace mismatch still takes the existing
+    /// reconstruction path instead of guessing an alias.
+    #[tokio::test]
+    async fn pdo_alias_miss_without_mapping_reconstructs_response() {
+        use wacore::types::events::ChannelEventHandler;
+        use wacore::types::message::ChatMessageId;
+
+        let client = setup_reconstruct_client().await;
+        let pn = "5511999998888@s.whatsapp.net";
+        let lid = "236395184570386@lid";
+        let msg_id = "PDO_DM_NO_MAPPING";
+        client
+            .pdo_pending_requests
+            .insert(
+                ChatMessageId::new(pn.parse().unwrap(), msg_id.into()),
+                super::PendingPdoRequest {
+                    message_info: make_dm_pending_info(
+                        pn,
+                        lid,
+                        msg_id,
+                        wacore::types::message::AddressingMode::Pn,
+                    ),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+        let response = make_placeholder_response(lid, false, msg_id, None);
+        client
+            .handle_placeholder_resend_response(&response, "req-no-mapping")
+            .await;
+
+        assert!(
+            client
+                .pdo_pending_requests
+                .get(&ChatMessageId::new(pn.parse().unwrap(), msg_id.into()))
+                .await
+                .is_some()
+        );
+        let mut infos = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            infos.extend(event.messages().map(|message| message.info.clone()));
+        }
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].source.chat.to_string(), lid);
+        assert_eq!(infos[0].source.sender.to_string(), lid);
+        assert_eq!(infos[0].push_name, "");
     }
 
     /// Two directions of one DM can share an id, and both their responses omit
