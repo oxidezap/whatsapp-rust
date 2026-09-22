@@ -121,6 +121,7 @@ pub struct CreateSubgroupOptions {
 }
 
 impl CreateSubgroupOptions {
+    /// Create visible-by-default subgroup options.
     pub fn new(name: impl Into<String>, participants: &[Jid], parent_jid: impl Into<Jid>) -> Self {
         Self {
             name: name.into(),
@@ -130,6 +131,7 @@ impl CreateSubgroupOptions {
         }
     }
 
+    /// Set the visibility selected at subgroup creation time.
     pub fn with_visibility(mut self, visibility: SubgroupVisibility) -> Self {
         self.visibility = visibility;
         self
@@ -145,6 +147,7 @@ pub struct LinkSubgroupOptions {
 }
 
 impl LinkSubgroupOptions {
+    /// Create link options for one group.
     pub fn new(jid: impl Into<Jid>, visibility: SubgroupVisibility) -> Self {
         Self {
             jid: jid.into(),

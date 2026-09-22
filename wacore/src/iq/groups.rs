@@ -2823,6 +2823,7 @@ pub struct LinkSubgroup {
 }
 
 impl LinkSubgroup {
+    /// Create a visible link entry.
     pub fn visible(jid: Jid) -> Self {
         Self {
             jid,
@@ -2830,6 +2831,7 @@ impl LinkSubgroup {
         }
     }
 
+    /// Create a hidden link entry.
     pub fn hidden(jid: Jid) -> Self {
         Self {
             jid,
@@ -2881,6 +2883,7 @@ impl LinkSubgroupsIq {
         )
     }
 
+    /// Build a link request with per-group visibility.
     pub fn new_with_groups(parent_jid: &Jid, groups: &[LinkSubgroup]) -> Self {
         Self {
             parent_jid: parent_jid.clone(),
