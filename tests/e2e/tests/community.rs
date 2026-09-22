@@ -1,7 +1,10 @@
 use e2e_tests::TestClient;
 use log::info;
 use whatsapp_rust::GroupType;
-use whatsapp_rust::features::{CreateCommunityOptions, GroupCreateOptions, group_type};
+use whatsapp_rust::features::{
+    CreateCommunityOptions, CreateSubgroupOptions, GroupCreateOptions, LinkSubgroupOptions,
+    SubgroupVisibility, group_type,
+};
 
 #[tokio::test]
 async fn test_community_create() -> anyhow::Result<()> {
@@ -139,6 +142,98 @@ async fn test_community_get_subgroups() -> anyhow::Result<()> {
         "Community {} has {} subgroup(s)",
         result.metadata.id,
         subgroups.len()
+    );
+
+    client.disconnect().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_community_hidden_subgroups_at_create_and_link() -> anyhow::Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let client = TestClient::connect("e2e_community_hidden_subgroups").await?;
+    let community = client
+        .client
+        .community()
+        .create(CreateCommunityOptions::new("Hidden Subgroups Test"))
+        .await?;
+
+    let hidden_options = CreateSubgroupOptions::new(
+        "Hidden Created Subgroup",
+        &[],
+        community.metadata.id.clone(),
+    )
+    .with_visibility(SubgroupVisibility::Hidden);
+    let hidden = client
+        .client
+        .community()
+        .create_subgroup_with_options(hidden_options)
+        .await?;
+    assert!(hidden.metadata.is_hidden_group);
+
+    let fetched = client
+        .client
+        .groups()
+        .fetch_metadata(&hidden.metadata.id)
+        .await?;
+    assert!(fetched.is_hidden_group);
+    let queried = client
+        .client
+        .community()
+        .query_linked_group(&community.metadata.id, &hidden.metadata.id)
+        .await?;
+    assert!(queried.is_hidden_group);
+
+    let visible_group = client
+        .client
+        .groups()
+        .create_group(GroupCreateOptions::new("Visible Linked Subgroup"))
+        .await?;
+    let hidden_group = client
+        .client
+        .groups()
+        .create_group(GroupCreateOptions::new("Hidden Linked Subgroup"))
+        .await?;
+    let linked = client
+        .client
+        .community()
+        .link_subgroups_with_options(
+            &community.metadata.id,
+            &[
+                LinkSubgroupOptions::new(
+                    visible_group.metadata.id.clone(),
+                    SubgroupVisibility::Visible,
+                ),
+                LinkSubgroupOptions::new(
+                    hidden_group.metadata.id.clone(),
+                    SubgroupVisibility::Hidden,
+                ),
+            ],
+        )
+        .await?;
+    assert!(linked.failed_groups.is_empty());
+
+    let linked_hidden = client
+        .client
+        .groups()
+        .fetch_metadata(&hidden_group.metadata.id)
+        .await?;
+    assert!(linked_hidden.is_hidden_group);
+    let subgroups = client
+        .client
+        .community()
+        .get_subgroups(&community.metadata.id)
+        .await?;
+    assert!(
+        subgroups
+            .iter()
+            .any(|subgroup| subgroup.id == hidden.metadata.id && subgroup.is_hidden_group)
+    );
+    assert!(
+        subgroups
+            .iter()
+            .any(|subgroup| subgroup.id == hidden_group.metadata.id && subgroup.is_hidden_group)
     );
 
     client.disconnect().await;

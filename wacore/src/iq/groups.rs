@@ -288,6 +288,11 @@ pub struct GroupCreateOptions {
     /// creating then linking; mutually exclusive with `is_parent`.
     #[builder(into)]
     pub linked_parent: Option<Jid>,
+    /// Whether this subgroup is hidden from the community's subgroup list.
+    /// Visibility is fixed when the subgroup is created or linked; this is not
+    /// a post-creation group property.
+    #[builder(default)]
+    pub hidden_group: bool,
     /// Inline description carried on the create stanza; avoids a follow-up
     /// SetGroupDescription IQ. Validation (length cap) goes through
     /// [`GroupDescription`] so both create paths share the same contract.
@@ -351,6 +356,7 @@ impl Default for GroupCreateOptions {
             allow_non_admin_sub_group_creation: false,
             create_general_chat: false,
             linked_parent: None,
+            hidden_group: false,
             description: None,
         }
     }
@@ -484,6 +490,9 @@ pub fn build_create_group_node(options: &GroupCreateOptions) -> Node {
         if options.create_general_chat {
             children.push(NodeBuilder::new("create_general_chat").build());
         }
+    }
+    if options.hidden_group {
+        children.push(NodeBuilder::new("hidden_group").build());
     }
 
     // Inline description: WA Web emits `<description id="<token>"><body>{text}</body></description>`.
@@ -1927,6 +1936,7 @@ impl IqSpec for GroupCreateIq {
             info.allow_non_admin_sub_group_creation |=
                 self.options.allow_non_admin_sub_group_creation;
         }
+        info.is_hidden_group |= self.options.hidden_group;
 
         Ok(info)
     }
@@ -2804,6 +2814,30 @@ pub struct LinkedGroupResult {
     pub error: Option<u32>,
 }
 
+/// A group and its visibility when it is linked to a community.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSubgroup {
+    pub jid: Jid,
+    /// Emit `<hidden_group/>` inside this group's link node.
+    pub hidden_group: bool,
+}
+
+impl LinkSubgroup {
+    pub fn visible(jid: Jid) -> Self {
+        Self {
+            jid,
+            hidden_group: false,
+        }
+    }
+
+    pub fn hidden(jid: Jid) -> Self {
+        Self {
+            jid,
+            hidden_group: true,
+        }
+    }
+}
+
 /// Response from linking subgroups to a community.
 #[derive(Debug, Clone)]
 pub struct LinkSubgroupsResponse {
@@ -2831,14 +2865,26 @@ pub struct UnlinkSubgroupsResponse {
 #[derive(Debug, Clone)]
 pub struct LinkSubgroupsIq {
     pub parent_jid: Jid,
-    pub subgroup_jids: Vec<Jid>,
+    pub groups: Vec<LinkSubgroup>,
 }
 
 impl LinkSubgroupsIq {
+    /// Build a visible-only link request for backwards compatibility.
     pub fn new(parent_jid: &Jid, subgroup_jids: &[Jid]) -> Self {
+        Self::new_with_groups(
+            parent_jid,
+            &subgroup_jids
+                .iter()
+                .cloned()
+                .map(LinkSubgroup::visible)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    pub fn new_with_groups(parent_jid: &Jid, groups: &[LinkSubgroup]) -> Self {
         Self {
             parent_jid: parent_jid.clone(),
-            subgroup_jids: subgroup_jids.to_vec(),
+            groups: groups.to_vec(),
         }
     }
 }
@@ -2848,9 +2894,15 @@ impl IqSpec for LinkSubgroupsIq {
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let group_nodes: Vec<Node> = self
-            .subgroup_jids
+            .groups
             .iter()
-            .map(|jid| NodeBuilder::new("group").attr("jid", jid).build())
+            .map(|group| {
+                let mut builder = NodeBuilder::new("group").attr("jid", &group.jid);
+                if group.hidden_group {
+                    builder = builder.children([NodeBuilder::new("hidden_group").build()]);
+                }
+                builder.build()
+            })
             .collect();
 
         let link_node = NodeBuilder::new("link")
@@ -4802,6 +4854,27 @@ mod tests {
     }
 
     #[test]
+    fn test_create_group_hidden_presence_is_direct_child() {
+        let visible = build_create_group_node(&GroupCreateOptions::new("Visible"));
+        assert!(
+            visible
+                .get_optional_child_by_tag(&["hidden_group"])
+                .is_none()
+        );
+
+        let parent: Jid = "120363000000000001@g.us".parse().unwrap();
+        let hidden = GroupCreateOptions {
+            linked_parent: Some(parent.clone()),
+            hidden_group: true,
+            ..GroupCreateOptions::new("Hidden")
+        };
+        let node = build_create_group_node(&hidden);
+        assert!(node.get_optional_child_by_tag(&["linked_parent"]).is_some());
+        assert!(node.get_optional_child_by_tag(&["hidden_group"]).is_some());
+        assert_eq!(node.get_children_by_tag("hidden_group").count(), 1);
+    }
+
+    #[test]
     fn test_typed_builder() {
         let options: GroupCreateOptions = GroupCreateOptions::builder()
             .subject("My Group")
@@ -5659,6 +5732,40 @@ mod tests {
         } else {
             panic!("expected nodes content");
         }
+    }
+
+    #[test]
+    fn test_link_subgroups_iq_build_mixes_visibility_per_group() {
+        let parent: Jid = "120363000000000001@g.us".parse().unwrap();
+        let visible: Jid = "120363000000000002@g.us".parse().unwrap();
+        let hidden: Jid = "120363000000000003@g.us".parse().unwrap();
+        let spec = LinkSubgroupsIq::new_with_groups(
+            &parent,
+            &[
+                LinkSubgroup::visible(visible.clone()),
+                LinkSubgroup::hidden(hidden.clone()),
+            ],
+        );
+        let iq = spec.build_iq();
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected nodes content");
+        };
+        let link = nodes[0].get_children_by_tag("link").next().unwrap();
+        let mut groups = link.get_children_by_tag("group");
+        let visible_node = groups.next().unwrap();
+        let hidden_node = groups.next().unwrap();
+        assert_eq!(visible_node.attrs().optional_jid("jid"), Some(visible));
+        assert!(
+            visible_node
+                .get_optional_child_by_tag(&["hidden_group"])
+                .is_none()
+        );
+        assert_eq!(hidden_node.attrs().optional_jid("jid"), Some(hidden));
+        assert!(
+            hidden_node
+                .get_optional_child_by_tag(&["hidden_group"])
+                .is_some()
+        );
     }
 
     #[test]

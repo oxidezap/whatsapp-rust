@@ -17,7 +17,7 @@ use thiserror::Error;
 use wacore::iq::groups::{
     CommunityParticipatingIq, CommunityParticipatingOverviewIq, DeleteCommunityIq,
     GetLinkedGroupsParticipantsIq, GroupCreateOptions, JoinGroupResult, JoinLinkedGroupIq,
-    LinkSubgroupsIq, QueryLinkedGroupIq, UnlinkSubgroupsIq,
+    LinkSubgroup, LinkSubgroupsIq, QueryLinkedGroupIq, UnlinkSubgroupsIq,
 };
 use wacore::iq::mex_operations::{fetch_all_subgroups, query_subgroup_participant_count};
 use wacore_binary::Jid;
@@ -98,6 +98,61 @@ pub struct CreateCommunityResult {
     pub metadata: GroupMetadata,
 }
 
+/// Visibility selected when a subgroup is created or linked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SubgroupVisibility {
+    /// The subgroup appears in the community's subgroup list.
+    #[default]
+    Visible,
+    /// The subgroup is omitted from the community's subgroup list for users
+    /// who are not members. Visibility cannot be changed after linking.
+    Hidden,
+}
+
+/// Options for creating a subgroup already linked to a community.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CreateSubgroupOptions {
+    pub name: String,
+    pub participants: Vec<Jid>,
+    pub parent_jid: Jid,
+    pub visibility: SubgroupVisibility,
+}
+
+impl CreateSubgroupOptions {
+    pub fn new(name: impl Into<String>, participants: &[Jid], parent_jid: impl Into<Jid>) -> Self {
+        Self {
+            name: name.into(),
+            participants: participants.to_vec(),
+            parent_jid: parent_jid.into(),
+            visibility: SubgroupVisibility::Visible,
+        }
+    }
+
+    pub fn with_visibility(mut self, visibility: SubgroupVisibility) -> Self {
+        self.visibility = visibility;
+        self
+    }
+}
+
+/// Options for linking one existing group to a community.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LinkSubgroupOptions {
+    pub jid: Jid,
+    pub visibility: SubgroupVisibility,
+}
+
+impl LinkSubgroupOptions {
+    pub fn new(jid: impl Into<Jid>, visibility: SubgroupVisibility) -> Self {
+        Self {
+            jid: jid.into(),
+            visibility,
+        }
+    }
+}
+
 /// A subgroup within a community.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -111,6 +166,8 @@ pub struct CommunitySubgroup {
     pub owner: Option<Jid>,
     pub is_default_sub_group: bool,
     pub is_general_chat: bool,
+    /// Whether this subgroup is hidden from non-members in the community.
+    pub is_hidden_group: bool,
 }
 
 /// Result of linking subgroups to a community.
@@ -215,17 +272,37 @@ impl<'a> Community<'a> {
         participants: &[Jid],
         parent_jid: impl Into<Jid>,
     ) -> Result<CreateCommunityResult, CommunityError> {
-        let options = GroupCreateOptions {
-            subject: name.into(),
-            participants: participants
+        self.create_subgroup_with_options(CreateSubgroupOptions::new(
+            name,
+            participants,
+            parent_jid,
+        ))
+        .await
+    }
+
+    /// Create a subgroup with an explicit add-time visibility.
+    pub async fn create_subgroup_with_options(
+        &self,
+        options: CreateSubgroupOptions,
+    ) -> Result<CreateCommunityResult, CommunityError> {
+        let create_options = GroupCreateOptions {
+            subject: options.name,
+            participants: options
+                .participants
                 .iter()
                 .cloned()
                 .map(GroupParticipantOptions::new)
                 .collect(),
-            linked_parent: Some(parent_jid.into()),
+            linked_parent: Some(options.parent_jid),
+            hidden_group: options.visibility == SubgroupVisibility::Hidden,
             ..Default::default()
         };
-        let metadata = self.client.groups().create_group(options).await?.metadata;
+        let metadata = self
+            .client
+            .groups()
+            .create_group(create_options)
+            .await?
+            .metadata;
         Ok(CreateCommunityResult { metadata })
     }
 
@@ -257,10 +334,33 @@ impl<'a> Community<'a> {
         community_jid: impl Into<Jid>,
         subgroup_jids: &[Jid],
     ) -> Result<LinkSubgroupsResult, CommunityError> {
+        let options = subgroup_jids
+            .iter()
+            .cloned()
+            .map(|jid| LinkSubgroupOptions::new(jid, SubgroupVisibility::Visible))
+            .collect::<Vec<_>>();
+        self.link_subgroups_with_options(community_jid, &options)
+            .await
+    }
+
+    /// Link existing groups with an explicit visibility for each group.
+    /// A single request may mix visible and hidden groups.
+    pub async fn link_subgroups_with_options(
+        &self,
+        community_jid: impl Into<Jid>,
+        subgroup_options: &[LinkSubgroupOptions],
+    ) -> Result<LinkSubgroupsResult, CommunityError> {
         let community_jid = &community_jid.into();
+        let groups = subgroup_options
+            .iter()
+            .map(|option| LinkSubgroup {
+                jid: option.jid.clone(),
+                hidden_group: option.visibility == SubgroupVisibility::Hidden,
+            })
+            .collect::<Vec<_>>();
         let response = self
             .client
-            .execute(LinkSubgroupsIq::new(community_jid, subgroup_jids))
+            .execute(LinkSubgroupsIq::new_with_groups(community_jid, &groups))
             .await?;
 
         let mut linked_jids = Vec::with_capacity(response.groups.len());
@@ -576,6 +676,11 @@ fn parse_subgroup_node(node: &serde_json::Value, is_default: bool) -> Option<Com
         .and_then(|p| p.get("general_chat"))
         .and_then(json_bool)
         .unwrap_or(false);
+    let is_hidden_group = node
+        .get("properties")
+        .and_then(|p| p.get("hidden_group"))
+        .and_then(json_bool)
+        .unwrap_or(false);
 
     Some(CommunitySubgroup {
         id: jid,
@@ -585,6 +690,7 @@ fn parse_subgroup_node(node: &serde_json::Value, is_default: bool) -> Option<Com
         owner,
         is_default_sub_group: is_default,
         is_general_chat: is_general_from_props,
+        is_hidden_group,
     })
 }
 
@@ -668,7 +774,7 @@ mod tests {
                 "pn": "15550000002@s.whatsapp.net"
             },
             "total_participants_count": 42,
-            "properties": { "general_chat": "1" }
+            "properties": { "general_chat": "1", "hidden_group": "1" }
         });
 
         let subgroup = parse_subgroup_node(&node, false).expect("valid subgroup");
@@ -677,6 +783,7 @@ mod tests {
         assert_eq!(subgroup.participant_count, Some(42));
         assert_eq!(subgroup.owner, Some("100000000000002@lid".parse().unwrap()));
         assert!(subgroup.is_general_chat);
+        assert!(subgroup.is_hidden_group);
         assert!(!subgroup.is_default_sub_group);
     }
 
@@ -687,7 +794,7 @@ mod tests {
             "subject": "Legacy subgroup",
             "creation": 1700000024,
             "owner": "15550000003@s.whatsapp.net",
-            "properties": { "general_chat": false }
+            "properties": { "general_chat": false, "hidden_group": false }
         });
 
         let subgroup = parse_subgroup_node(&node, true).expect("valid subgroup");
@@ -697,6 +804,19 @@ mod tests {
             Some("15550000003@s.whatsapp.net".parse().unwrap())
         );
         assert!(!subgroup.is_general_chat);
+        assert!(!subgroup.is_hidden_group);
         assert!(subgroup.is_default_sub_group);
+    }
+
+    #[test]
+    fn subgroup_parser_accepts_boolean_hidden_metadata() {
+        let node = serde_json::json!({
+            "id": "120363000000000004@g.us",
+            "subject": "Boolean hidden subgroup",
+            "properties": { "hidden_group": true }
+        });
+
+        let subgroup = parse_subgroup_node(&node, false).expect("valid subgroup");
+        assert!(subgroup.is_hidden_group);
     }
 }
