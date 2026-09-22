@@ -899,20 +899,40 @@ impl<'a> Newsletter<'a> {
         before: Option<u64>,
     ) -> Result<Vec<NewsletterMessage>, NewsletterError> {
         let jid = &jid.into();
-        let mut messages_node = NodeBuilder::new("messages").attr("count", count);
-        if let Some(before_id) = before {
-            messages_node = messages_node.attr("before", before_id);
-        }
-
-        let iq = InfoQuery::get(
-            NEWSLETTER_XMLNS,
-            jid.clone(),
-            Some(NodeContent::Nodes(vec![messages_node.build()])),
-        );
-
-        let response = self.client.send_iq(iq).await?;
+        let response = self
+            .client
+            .send_iq(build_newsletter_messages_iq(jid, count, before))
+            .await?;
         parse_newsletter_messages_response(response.get())
     }
+}
+
+/// Build the history IQ.
+///
+/// History is the one `newsletter` request addressed to the server rather than
+/// to the channel: `to` picks the server-side handler, and the server-scoped
+/// handler has to be told which thread, hence `type="jid" jid="…"` on the node.
+/// The thread-scoped requests (`live_updates`, `message_updates`) keep
+/// `to = jid` and name nothing inside. Both halves are load-bearing — sending
+/// `<messages>` to the channel, or to the server without naming the channel,
+/// draws no stanza back at all, not even an error, and the pending IQ then
+/// suppresses the keepalive ping until the dead-socket watchdog reconnects.
+/// `makeGetNewsletterMessagesRequest` in the IR pins the server target as a
+/// constant, unlike the sibling requests that take theirs as an argument.
+fn build_newsletter_messages_iq(jid: &Jid, count: u32, before: Option<u64>) -> InfoQuery<'static> {
+    let mut messages_node = NodeBuilder::new("messages")
+        .attr("type", "jid")
+        .attr("jid", jid.clone())
+        .attr("count", count);
+    if let Some(before_id) = before {
+        messages_node = messages_node.attr("before", before_id);
+    }
+
+    InfoQuery::get(
+        NEWSLETTER_XMLNS,
+        crate::jid_utils::server_jid().clone(),
+        Some(NodeContent::Nodes(vec![messages_node.build()])),
+    )
 }
 
 impl Client {
@@ -1568,6 +1588,115 @@ mod tests {
 
     fn newsletter_jid() -> Jid {
         "120363000000000001@newsletter".parse().expect("jid")
+    }
+
+    /// The two halves of the history request are load-bearing in opposite
+    /// ways: addressed to the channel, or sent to the server without naming
+    /// the channel, the server answers nothing at all — no `<iq type="error">`,
+    /// no `<stream:error>`. The silent IQ then holds the keepalive ping back
+    /// until the dead-socket watchdog reconnects the account, so a wrong shape
+    /// here costs far more than a failed call.
+    #[test]
+    fn history_request_goes_to_the_server_and_names_the_channel() {
+        let query = build_newsletter_messages_iq(&newsletter_jid(), 20, Some(777));
+
+        assert_eq!(&query.to, crate::jid_utils::server_jid());
+        let Some(NodeContent::Nodes(children)) = &query.content else {
+            panic!("the query carries a <messages> child");
+        };
+        let node = children[0].as_node_ref();
+        assert_eq!(node.tag.as_ref(), "messages");
+        assert!(node.get_attr("type").is_some_and(|v| v == "jid"));
+        assert!(
+            node.get_attr("jid")
+                .is_some_and(|v| v == newsletter_jid().to_string().as_str())
+        );
+        assert!(node.get_attr("count").is_some_and(|v| v == "20"));
+        assert!(node.get_attr("before").is_some_and(|v| v == "777"));
+    }
+
+    /// `before` is a cursor into a previous page, so the first page omits it
+    /// rather than sending a sentinel.
+    #[test]
+    fn history_request_omits_an_absent_cursor() {
+        let query = build_newsletter_messages_iq(&newsletter_jid(), 5, None);
+
+        let Some(NodeContent::Nodes(children)) = &query.content else {
+            panic!("the query carries a <messages> child");
+        };
+        assert!(children[0].as_node_ref().get_attr("before").is_none());
+    }
+
+    /// `Some(0)` is a cursor like any other, not an absent one: a server_id of
+    /// zero would be dropped by a builder that tested the number instead of the
+    /// `Option`, and the caller would silently get the newest page back.
+    #[test]
+    fn history_request_keeps_a_zero_cursor() {
+        let query = build_newsletter_messages_iq(&newsletter_jid(), 5, Some(0));
+
+        let Some(NodeContent::Nodes(children)) = &query.content else {
+            panic!("the query carries a <messages> child");
+        };
+        assert!(
+            children[0]
+                .as_node_ref()
+                .get_attr("before")
+                .is_some_and(|v| v == "0")
+        );
+    }
+
+    /// Counts and cursors go on the wire as decimal text, so the extremes of
+    /// both integer types have to survive the trip without a cast narrowing
+    /// them.
+    #[test]
+    fn history_request_renders_its_bounds_as_decimal_text() {
+        for (count, before, expected_count, expected_before) in [
+            (0u32, u64::MAX, "0", "18446744073709551615"),
+            (u32::MAX, 1u64, "4294967295", "1"),
+        ] {
+            let query = build_newsletter_messages_iq(&newsletter_jid(), count, Some(before));
+
+            let Some(NodeContent::Nodes(children)) = &query.content else {
+                panic!("the query carries a <messages> child");
+            };
+            let node = children[0].as_node_ref();
+            assert!(node.get_attr("count").is_some_and(|v| v == expected_count));
+            assert!(
+                node.get_attr("before")
+                    .is_some_and(|v| v == expected_before)
+            );
+        }
+    }
+
+    /// The channel is named by the node's `jid` attribute, never by the IQ's
+    /// own `target`: those are two different addressing mechanisms, and the
+    /// server-scoped handler reads the first one.
+    #[test]
+    fn history_request_is_a_newsletter_get_with_no_iq_target() {
+        let query = build_newsletter_messages_iq(&newsletter_jid(), 10, None);
+
+        assert_eq!(query.namespace, NEWSLETTER_XMLNS);
+        assert_eq!(query.query_type, wacore::request::InfoQueryType::Get);
+        assert!(query.target.is_none());
+    }
+
+    /// A result that answers with some other child is a protocol error, not an
+    /// empty page — the same way a body-less result is. `<live_updates>` is the
+    /// shape the thread-scoped handler answers, so it is exactly what a request
+    /// misrouted back to the channel would be most likely to bring.
+    #[test]
+    fn a_response_carrying_another_child_is_an_error() {
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("live_updates")
+                .attr("duration", "90")
+                .build()])
+            .build();
+
+        assert!(matches!(
+            parse_newsletter_messages_response(&response.as_node_ref()),
+            Err(NewsletterError::InvalidRequest(_))
+        ));
     }
 
     fn user_lid() -> Jid {
