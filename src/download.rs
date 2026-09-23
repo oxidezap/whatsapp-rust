@@ -85,6 +85,27 @@ impl Downloadable for DownloadParams {
     }
 }
 
+/// Keep integrity metadata beside the public request, without changing the
+/// fields consumers construct or match in MediaDecryption / DownloadRequest.
+#[derive(Default)]
+struct ExpectedMediaHashes {
+    encrypted: Option<Vec<u8>>,
+    plaintext: Option<Vec<u8>>,
+}
+
+impl ExpectedMediaHashes {
+    fn from_downloadable(downloadable: &dyn Downloadable) -> Self {
+        if downloadable.is_encrypted() {
+            Self {
+                encrypted: downloadable.file_enc_sha256().map(<[u8]>::to_vec),
+                plaintext: downloadable.file_sha256().map(<[u8]>::to_vec),
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
+
 /// Why a media download failed, for callers that have no session to refresh.
 ///
 /// [`Client`] downloads keep returning [`anyhow::Error`]: a refresh is tried
@@ -215,13 +236,20 @@ fn validate_download_status(status_code: u16) -> std::result::Result<(), Downloa
 fn decrypt_or_validate_buffered_body(
     body: &mut Vec<u8>,
     decryption: &MediaDecryption,
+    hashes: &ExpectedMediaHashes,
 ) -> std::result::Result<(), DownloadRequestError> {
     match decryption {
         MediaDecryption::Encrypted {
             media_key,
             media_type,
-        } => DownloadUtils::verify_and_decrypt_in_place(body, media_key, *media_type)
-            .map_err(DownloadRequestError::other),
+        } => DownloadUtils::verify_and_decrypt_in_place_with_hashes(
+            body,
+            media_key,
+            *media_type,
+            hashes.encrypted.as_deref(),
+            hashes.plaintext.as_deref(),
+        )
+        .map_err(DownloadRequestError::other),
         MediaDecryption::Plaintext { file_sha256 } => {
             DownloadUtils::validate_plaintext_sha256(body, file_sha256)
                 .map_err(DownloadRequestError::other)
@@ -394,17 +422,18 @@ async fn execute_request_into_memory(
     http_client: &Arc<dyn HttpClient>,
     runtime: &Arc<dyn Runtime>,
     request: &wacore::download::DownloadRequest,
+    hashes: ExpectedMediaHashes,
     capacity: usize,
 ) -> std::result::Result<Vec<u8>, DownloadRequestError> {
     if http_client.supports_streaming() {
         let writer = std::io::Cursor::new(Vec::with_capacity(capacity));
-        match streaming_download_and_decrypt(http_client, runtime, request, writer).await {
+        match streaming_download_and_decrypt(http_client, runtime, request, hashes, writer).await {
             Ok((writer, Ok(()))) => Ok(writer.into_inner()),
             Ok((_, Err(e))) => Err(e),
             Err(e) => Err(DownloadRequestError::other(e)),
         }
     } else {
-        buffered_download_to_vec(http_client, runtime, request).await
+        buffered_download_to_vec(http_client, runtime, request, hashes).await
     }
 }
 
@@ -478,8 +507,14 @@ impl MediaDownloader {
             |_force| async { DownloadUtils::prepare_download_requests(downloadable, &self.route) },
             || async {},
             |request| async move {
-                execute_request_into_memory(&self.http_client, &self.runtime, &request, capacity)
-                    .await
+                execute_request_into_memory(
+                    &self.http_client,
+                    &self.runtime,
+                    &request,
+                    ExpectedMediaHashes::from_downloadable(downloadable),
+                    capacity,
+                )
+                .await
             },
         )
         .await
@@ -509,8 +544,14 @@ impl MediaDownloader {
             |_force| async { DownloadUtils::prepare_download_requests(downloadable, &self.route) },
             || async {},
             |request, writer| async move {
-                streaming_download_and_decrypt(&self.http_client, &self.runtime, &request, writer)
-                    .await
+                streaming_download_and_decrypt(
+                    &self.http_client,
+                    &self.runtime,
+                    &request,
+                    ExpectedMediaHashes::from_downloadable(downloadable),
+                    writer,
+                )
+                .await
             },
         )
         .await
@@ -540,8 +581,14 @@ impl Client {
             |force| self.prepare_requests(downloadable, force),
             || async { self.invalidate_media_conn().await },
             |request| async move {
-                execute_request_into_memory(&self.http_client, &self.runtime, &request, capacity)
-                    .await
+                execute_request_into_memory(
+                    &self.http_client,
+                    &self.runtime,
+                    &request,
+                    ExpectedMediaHashes::from_downloadable(downloadable),
+                    capacity,
+                )
+                .await
             },
         )
         .await
@@ -641,8 +688,14 @@ impl Client {
             |force| self.prepare_requests(downloadable, force),
             || async { self.invalidate_media_conn().await },
             |request, writer| async move {
-                streaming_download_and_decrypt(&self.http_client, &self.runtime, &request, writer)
-                    .await
+                streaming_download_and_decrypt(
+                    &self.http_client,
+                    &self.runtime,
+                    &request,
+                    ExpectedMediaHashes::from_downloadable(downloadable),
+                    writer,
+                )
+                .await
             },
         )
         .await
@@ -718,10 +771,11 @@ async fn streaming_download_and_decrypt<W: DownloadWriter + Send + 'static>(
     http_client: &Arc<dyn HttpClient>,
     runtime: &Arc<dyn Runtime>,
     request: &wacore::download::DownloadRequest,
+    hashes: ExpectedMediaHashes,
     writer: W,
 ) -> Result<(W, std::result::Result<(), DownloadRequestError>)> {
     if !http_client.supports_streaming() {
-        return buffered_download_and_decrypt(http_client, runtime, request, writer).await;
+        return buffered_download_and_decrypt(http_client, runtime, request, hashes, writer).await;
     }
 
     let http_client = http_client.clone();
@@ -748,10 +802,12 @@ async fn streaming_download_and_decrypt<W: DownloadWriter + Send + 'static>(
                     media_key,
                     media_type,
                 } => {
-                    DownloadUtils::decrypt_stream_to_writer(
+                    DownloadUtils::decrypt_stream_to_writer_with_hashes(
                         resp.body,
                         media_key,
                         *media_type,
+                        hashes.encrypted.as_deref(),
+                        hashes.plaintext.as_deref(),
                         &mut writer,
                     )
                     .map_err(DownloadRequestError::other)?;
@@ -778,6 +834,7 @@ async fn buffered_download_and_decrypt<W: DownloadWriter + Send + 'static>(
     http_client: &Arc<dyn HttpClient>,
     runtime: &Arc<dyn Runtime>,
     request: &wacore::download::DownloadRequest,
+    hashes: ExpectedMediaHashes,
     writer: W,
 ) -> Result<(W, std::result::Result<(), DownloadRequestError>)> {
     let mut body = match buffered_download_body(http_client, request).await {
@@ -791,7 +848,7 @@ async fn buffered_download_and_decrypt<W: DownloadWriter + Send + 'static>(
     Ok(wacore::runtime::blocking(&**runtime, move || {
         let mut writer = writer;
         let result = (|| {
-            decrypt_or_validate_buffered_body(&mut body, &decryption)?;
+            decrypt_or_validate_buffered_body(&mut body, &decryption, &hashes)?;
             clear_writer(&mut writer).map_err(DownloadRequestError::other)?;
             writer
                 .write_all(&body)
@@ -824,11 +881,12 @@ async fn buffered_download_to_vec(
     http_client: &Arc<dyn HttpClient>,
     runtime: &Arc<dyn Runtime>,
     request: &wacore::download::DownloadRequest,
+    hashes: ExpectedMediaHashes,
 ) -> std::result::Result<Vec<u8>, DownloadRequestError> {
     let mut body = buffered_download_body(http_client, request).await?;
     let decryption = request.decryption.clone();
     wacore::runtime::blocking(&**runtime, move || {
-        decrypt_or_validate_buffered_body(&mut body, &decryption)?;
+        decrypt_or_validate_buffered_body(&mut body, &decryption, &hashes)?;
         Ok(body)
     })
     .await
@@ -967,6 +1025,7 @@ mod tests {
                 &client.http_client,
                 &client.runtime,
                 &plaintext_request(url),
+                ExpectedMediaHashes::default(),
                 Cursor::new(Vec::new()),
             )
             .await
@@ -1048,6 +1107,7 @@ mod tests {
                         &client.http_client,
                         &client.runtime,
                         &request,
+                        ExpectedMediaHashes::default(),
                         Cursor::new(Vec::new()),
                     )
                     .await
@@ -1123,6 +1183,7 @@ mod tests {
                             &client.http_client,
                             &client.runtime,
                             &request,
+                            ExpectedMediaHashes::default(),
                             Cursor::new(Vec::new()),
                         )
                         .await
@@ -1177,6 +1238,7 @@ mod tests {
                         &client.http_client,
                         &client.runtime,
                         &request,
+                        ExpectedMediaHashes::default(),
                         Cursor::new(Vec::new()),
                     )
                     .await
@@ -1216,6 +1278,10 @@ mod tests {
             &MediaDecryption::Encrypted {
                 media_key: enc.media_key.to_vec(),
                 media_type: MediaType::Video,
+            },
+            &ExpectedMediaHashes {
+                encrypted: Some(enc.file_enc_sha256.to_vec()),
+                plaintext: Some(enc.file_sha256.to_vec()),
             },
         )
         .expect("decryption should succeed");
@@ -1687,6 +1753,169 @@ mod tests {
             MediaType::Image,
         );
         (params, enc.data_to_upload)
+    }
+
+    async fn reject_declared_hash_mismatch(streaming: bool, to_writer: bool) {
+        // More than one streaming buffer, plus a partial final AES block.
+        let original = vec![0x36; 32 * 1024 + 13];
+        for corrupt_encrypted_hash in [true, false] {
+            for malformed_length in [false, true] {
+                let (mut params, encrypted) = encrypted_params(&original);
+                let hash = if corrupt_encrypted_hash {
+                    params.file_enc_sha256.as_mut().unwrap()
+                } else {
+                    &mut params.file_sha256
+                };
+                if malformed_length {
+                    hash.clear();
+                } else {
+                    hash[0] ^= 1;
+                }
+                let http = if streaming {
+                    RoutedHttpClient::streaming(Vec::new(), (200, encrypted))
+                } else {
+                    RoutedHttpClient::new(Vec::new(), (200, encrypted))
+                };
+                let dl = downloader(http, &["cdn.example.com"]);
+                let error = if to_writer {
+                    let sink = SharedWriter::new();
+                    sink.with(|w| w.write_all(b"old destination contents").unwrap());
+                    let result = dl.download_to_writer(&params, sink.clone()).await;
+                    assert!(
+                        result.is_err(),
+                        "valid HMAC must not excuse a declared hash mismatch: streaming={streaming}, encrypted_hash={corrupt_encrypted_hash}, malformed={malformed_length}"
+                    );
+                    assert!(
+                        sink.contents().is_empty(),
+                        "failed output must be discarded"
+                    );
+                    result.unwrap_err()
+                } else {
+                    dl.download(&params)
+                        .await
+                        .expect_err("valid HMAC must not excuse a declared hash mismatch")
+                };
+                assert!(matches!(error, MediaDownloadError::HostsUnreachable(_)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn encrypted_hashes_are_checked_for_buffered_memory_downloads() {
+        reject_declared_hash_mismatch(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn encrypted_hashes_are_checked_for_streaming_memory_downloads() {
+        reject_declared_hash_mismatch(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn encrypted_hashes_are_checked_for_buffered_writer_downloads() {
+        reject_declared_hash_mismatch(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn encrypted_hashes_are_checked_for_streaming_writer_downloads() {
+        reject_declared_hash_mismatch(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn client_downloads_check_declared_hashes_too() {
+        for streaming in [false, true] {
+            for to_writer in [false, true] {
+                for corrupt_encrypted_hash in [false, true] {
+                    let enc = wacore::upload::encrypt_media(
+                        &vec![0x58; 32 * 1024 + 13],
+                        MediaType::Image,
+                    )
+                    .unwrap();
+                    let mut message = waproto::whatsapp::message::ImageMessage {
+                        media_key: Some(enc.media_key.to_vec()),
+                        file_enc_sha256: Some(enc.file_enc_sha256.to_vec()),
+                        file_sha256: Some(enc.file_sha256.to_vec()),
+                        static_url: Some("https://cdn.example.com/p1-fixture".to_owned()),
+                        ..Default::default()
+                    };
+                    if corrupt_encrypted_hash {
+                        message.file_enc_sha256.as_mut().unwrap()[0] ^= 1;
+                    } else {
+                        message.file_sha256.as_mut().unwrap()[0] ^= 1;
+                    }
+                    let http = if streaming {
+                        RoutedHttpClient::streaming(Vec::new(), (200, enc.data_to_upload))
+                    } else {
+                        RoutedHttpClient::new(Vec::new(), (200, enc.data_to_upload))
+                    };
+                    let client =
+                        crate::test_utils::create_test_client_with_http("p1-hashes", http).await;
+                    let error = if to_writer {
+                        let sink = SharedWriter::new();
+                        let error = client
+                            .download_to_writer(&message, sink.clone())
+                            .await
+                            .unwrap_err();
+                        assert!(sink.contents().is_empty());
+                        error
+                    } else {
+                        let result = client.download(&message).await;
+                        assert!(result.is_err());
+                        result.unwrap_err()
+                    };
+                    assert!(matches!(
+                        (
+                            corrupt_encrypted_hash,
+                            error.downcast_ref::<MediaDecryptionError>()
+                        ),
+                        (true, Some(MediaDecryptionError::EncryptedSha256Mismatch))
+                            | (false, Some(MediaDecryptionError::PlaintextSha256Mismatch))
+                    ));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn encrypted_hash_mismatch_can_recover_on_another_host() {
+        let original = b"the requested file";
+        for streaming in [false, true] {
+            for to_writer in [false, true] {
+                let (params, good) = encrypted_params(original);
+                let media_key: [u8; 32] = params.media_key.as_deref().unwrap().try_into().unwrap();
+                // A different object under the same key still has a valid MAC.
+                // Its presence on one host does not prove every host is wrong.
+                let wrong = wacore::upload::encrypt_media_with_key(
+                    &vec![0x47; 32 * 1024 + 13],
+                    MediaType::Image,
+                    Some(&media_key),
+                )
+                .unwrap()
+                .data_to_upload;
+                let routes = vec![("bad-host", 200, wrong), ("good-host", 200, good)];
+                let http = if streaming {
+                    RoutedHttpClient::streaming(routes, (500, Vec::new()))
+                } else {
+                    RoutedHttpClient::new(routes, (500, Vec::new()))
+                };
+                let dl = downloader(
+                    http.clone(),
+                    &["bad-host.example.com", "good-host.example.com"],
+                );
+                let actual = if to_writer {
+                    dl.download_to_writer(&params, Cursor::new(Vec::new()))
+                        .await
+                        .unwrap()
+                        .into_inner()
+                } else {
+                    dl.download(&params).await.unwrap()
+                };
+                assert_eq!(
+                    actual, original,
+                    "only the body matching the declared hashes may succeed"
+                );
+                assert_eq!(http.urls().len(), 2);
+            }
+        }
     }
 
     /// A body encrypted under `media_key` that decrypts to `plaintext` and only

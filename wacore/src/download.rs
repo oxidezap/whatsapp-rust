@@ -28,6 +28,10 @@ pub enum MediaDecryptionError {
     PayloadTooShort,
     #[error("invalid MAC signature")]
     InvalidMac,
+    #[error("SHA-256 mismatch for encrypted media bytes")]
+    EncryptedSha256Mismatch,
+    #[error("SHA-256 mismatch for decrypted media bytes")]
+    PlaintextSha256Mismatch,
     #[error("AES-CBC decryption failed")]
     Decryption(#[source] AesCbcDecryptionError),
     #[error("HMAC initialization failed")]
@@ -519,13 +523,32 @@ impl DownloadUtils {
     /// covers the last 10 bytes of the stream). Callers should discard the writer
     /// contents on error.
     pub fn decrypt_stream_to_writer<R: std::io::Read, W: std::io::Write>(
-        mut reader: R,
+        reader: R,
         media_key: &[u8],
         app_info: MediaType,
         writer: &mut W,
     ) -> Result<u64> {
+        Self::decrypt_stream_to_writer_with_hashes(reader, media_key, app_info, None, None, writer)
+    }
+
+    /// Authenticate and decrypt, checking each declared hash when present.
+    /// The encrypted hash covers ciphertext plus its trailing MAC; the plaintext
+    /// hash excludes padding. Uses constant memory. As with the MAC-only helper,
+    /// callers must discard writer contents on any error.
+    pub fn decrypt_stream_to_writer_with_hashes<R: std::io::Read, W: std::io::Write>(
+        mut reader: R,
+        media_key: &[u8],
+        app_info: MediaType,
+        expected_enc_sha256: Option<&[u8]>,
+        expected_sha256: Option<&[u8]>,
+        writer: &mut W,
+    ) -> Result<u64> {
         use aes::Aes256;
         use aes::cipher::{KeyInit, KeyIvInit};
+        use sha2::Digest;
+
+        let mut encrypted_hasher = expected_enc_sha256.map(|_| Sha256::new());
+        let mut plaintext_hasher = expected_sha256.map(|_| Sha256::new());
 
         let (iv, cipher_key, mac_key) = Self::get_media_keys(media_key, app_info)?;
 
@@ -554,6 +577,10 @@ impl DownloadUtils {
             if n == 0 {
                 break;
             }
+            if let Some(hasher) = &mut encrypted_hasher {
+                // Only new bytes: the carry was hashed before it was moved.
+                hasher.update(&buf[filled..filled + n]);
+            }
             filled += n;
 
             // The trailing `WITHHELD` bytes can't be processed yet: until EOF we
@@ -569,6 +596,9 @@ impl DownloadUtils {
             // MAC covers ciphertext, so hash before decrypting over it in place.
             hmac.update(&buf[..processable]);
             cbc_decrypt_blocks(&mut cbc, &mut buf[..processable]);
+            if let Some(hasher) = &mut plaintext_hasher {
+                hasher.update(&buf[..processable]);
+            }
             writer.write_all(&buf[..processable])?;
             bytes_written += processable as u64;
 
@@ -590,6 +620,11 @@ impl DownloadUtils {
         if subtle::ConstantTimeEq::ct_eq(&*mac_bytes, expected_mac).unwrap_u8() == 0 {
             return Err(anyhow!("MAC mismatch"));
         }
+        if let Some((hasher, expected)) = encrypted_hasher.zip(expected_enc_sha256)
+            && hasher.finalize().as_slice() != expected
+        {
+            return Err(MediaDecryptionError::EncryptedSha256Mismatch.into());
+        }
 
         cbc_decrypt_blocks(&mut cbc, final_ciphertext);
         let pad_len = match final_ciphertext.last() {
@@ -606,8 +641,17 @@ impl DownloadUtils {
             return Err(anyhow!("Bad PKCS7 padding bytes"));
         }
         let final_plain = &final_ciphertext[..final_ciphertext.len() - pad_len];
+        if let Some(hasher) = &mut plaintext_hasher {
+            hasher.update(final_plain);
+        }
         writer.write_all(final_plain)?;
         bytes_written += final_plain.len() as u64;
+
+        if let Some((hasher, expected)) = plaintext_hasher.zip(expected_sha256)
+            && hasher.finalize().as_slice() != expected
+        {
+            return Err(MediaDecryptionError::PlaintextSha256Mismatch.into());
+        }
 
         Ok(bytes_written)
     }
@@ -702,11 +746,206 @@ impl DownloadUtils {
         aes_256_cbc_decrypt_in_place(encrypted_payload, &cipher_key, &iv)
             .map_err(MediaDecryptionError::Decryption)
     }
+
+    /// Authenticate and decrypt in the same allocation, then verify the declared
+    /// ciphertext and plaintext hashes when present. The encrypted digest must
+    /// be computed before decryption removes the MAC and overwrites ciphertext.
+    /// On any error the caller must discard the buffer, which may be mutated.
+    pub fn verify_and_decrypt_in_place_with_hashes(
+        encrypted_payload: &mut Vec<u8>,
+        media_key: &[u8],
+        media_type: MediaType,
+        expected_enc_sha256: Option<&[u8]>,
+        expected_sha256: Option<&[u8]>,
+    ) -> std::result::Result<(), MediaDecryptionError> {
+        use sha2::Digest;
+        let encrypted_digest = expected_enc_sha256.map(|_| Sha256::digest(&*encrypted_payload));
+        Self::verify_and_decrypt_in_place(encrypted_payload, media_key, media_type)?;
+        if let Some((actual, expected)) = encrypted_digest.zip(expected_enc_sha256)
+            && actual.as_slice() != expected
+        {
+            return Err(MediaDecryptionError::EncryptedSha256Mismatch);
+        }
+        if let Some(expected) = expected_sha256
+            && Sha256::digest(encrypted_payload).as_slice() != expected
+        {
+            return Err(MediaDecryptionError::PlaintextSha256Mismatch);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hash_checked_decryption_covers_padding_and_short_reads() {
+        use std::io::{Cursor, Read};
+        struct ShortReads<'a> {
+            remaining: &'a [u8],
+            chunk: usize,
+        }
+        impl Read for ShortReads<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let n = out.len().min(self.chunk).min(self.remaining.len());
+                out[..n].copy_from_slice(&self.remaining[..n]);
+                self.remaining = &self.remaining[n..];
+                Ok(n)
+            }
+        }
+
+        for len in [0, 1, 15, 16, 17, 8191, 8192, 8193, 32781] {
+            let plaintext = vec![0x59; len];
+            let enc = crate::upload::encrypt_media(&plaintext, MediaType::Image).unwrap();
+            for chunk in [1, 7, 10, 16, 31, 8192] {
+                let mut output = Cursor::new(Vec::new());
+                let written = DownloadUtils::decrypt_stream_to_writer_with_hashes(
+                    ShortReads {
+                        remaining: &enc.data_to_upload,
+                        chunk,
+                    },
+                    &enc.media_key,
+                    MediaType::Image,
+                    Some(&enc.file_enc_sha256),
+                    Some(&enc.file_sha256),
+                    &mut output,
+                )
+                .unwrap();
+                assert_eq!(written, len as u64);
+                assert_eq!(output.into_inner(), plaintext);
+            }
+            let mut buffered = enc.data_to_upload.clone();
+            DownloadUtils::verify_and_decrypt_in_place_with_hashes(
+                &mut buffered,
+                &enc.media_key,
+                MediaType::Image,
+                Some(&enc.file_enc_sha256),
+                Some(&enc.file_sha256),
+            )
+            .unwrap();
+            assert_eq!(buffered, plaintext);
+        }
+    }
+
+    #[test]
+    fn hash_checked_decryption_still_rejects_bad_mac_and_padding() {
+        use hmac::KeyInit;
+        use sha2::Digest;
+
+        let plaintext = b"authenticated fixture";
+        let media_key = [0x4A; 32];
+        let mut bad_mac = encrypted_media_fixture(plaintext, &media_key, MediaType::Image);
+        let bad_mac_len = bad_mac.len() - 1;
+        bad_mac[bad_mac_len] ^= 1;
+        let expected_bad_mac_hash = Sha256::digest(&bad_mac);
+
+        let mut bad_padding = encrypted_media_fixture(&[0x62; 16], &media_key, MediaType::Image);
+        let ciphertext_len = bad_padding.len() - MEDIA_MAC_SIZE;
+        // Alter the previous CBC block so the final PKCS#7 byte becomes 17,
+        // then authenticate the malformed ciphertext with the synthetic key.
+        bad_padding[ciphertext_len - AES_BLOCK_SIZE - 1] ^= 1;
+        let (iv, _, mac_key) = DownloadUtils::get_media_keys(&media_key, MediaType::Image).unwrap();
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&mac_key).unwrap();
+        mac.update(&iv);
+        mac.update(&bad_padding[..ciphertext_len]);
+        let tag = mac.finalize().into_bytes();
+        bad_padding[ciphertext_len..].copy_from_slice(&tag[..MEDIA_MAC_SIZE]);
+        let expected_bad_padding_hash = Sha256::digest(&bad_padding);
+
+        for (payload, encrypted_hash) in [
+            (&bad_mac, expected_bad_mac_hash.as_slice()),
+            (&bad_padding, expected_bad_padding_hash.as_slice()),
+        ] {
+            let mut output = Vec::new();
+            assert!(
+                DownloadUtils::decrypt_stream_to_writer_with_hashes(
+                    payload.as_slice(),
+                    &media_key,
+                    MediaType::Image,
+                    Some(encrypted_hash),
+                    Some(Sha256::digest(plaintext).as_slice()),
+                    &mut output,
+                )
+                .is_err()
+            );
+
+            let mut buffered = payload.clone();
+            assert!(
+                DownloadUtils::verify_and_decrypt_in_place_with_hashes(
+                    &mut buffered,
+                    &media_key,
+                    MediaType::Image,
+                    Some(encrypted_hash),
+                    Some(Sha256::digest(plaintext).as_slice()),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn hash_checked_decryption_distinguishes_absent_and_incorrect_hashes() {
+        let plaintext = b"independent hash checks";
+        let enc = crate::upload::encrypt_media(plaintext, MediaType::Image).unwrap();
+        for (encrypted, decrypted) in [
+            (None, None),
+            (Some(enc.file_enc_sha256.as_slice()), None),
+            (None, Some(enc.file_sha256.as_slice())),
+        ] {
+            let mut output = Vec::new();
+            DownloadUtils::decrypt_stream_to_writer_with_hashes(
+                enc.data_to_upload.as_slice(),
+                &enc.media_key,
+                MediaType::Image,
+                encrypted,
+                decrypted,
+                &mut output,
+            )
+            .unwrap();
+            assert_eq!(output, plaintext);
+            let mut buffered = enc.data_to_upload.clone();
+            DownloadUtils::verify_and_decrypt_in_place_with_hashes(
+                &mut buffered,
+                &enc.media_key,
+                MediaType::Image,
+                encrypted,
+                decrypted,
+            )
+            .unwrap();
+            assert_eq!(buffered, plaintext);
+        }
+        let mut wrong = enc.file_sha256;
+        wrong[0] ^= 1;
+        for bad in [&wrong[..], &[][..]] {
+            let mut output = Vec::new();
+            let error = DownloadUtils::decrypt_stream_to_writer_with_hashes(
+                enc.data_to_upload.as_slice(),
+                &enc.media_key,
+                MediaType::Image,
+                Some(&enc.file_enc_sha256),
+                Some(bad),
+                &mut output,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<MediaDecryptionError>(),
+                Some(MediaDecryptionError::PlaintextSha256Mismatch)
+            ));
+            let error = DownloadUtils::verify_and_decrypt_in_place_with_hashes(
+                &mut enc.data_to_upload.clone(),
+                &enc.media_key,
+                MediaType::Image,
+                Some(&enc.file_enc_sha256),
+                Some(bad),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                MediaDecryptionError::PlaintextSha256Mismatch
+            ));
+        }
+    }
 
     struct MockDownloadable {
         direct_path: Option<String>,
