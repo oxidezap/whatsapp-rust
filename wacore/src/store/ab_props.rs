@@ -6,9 +6,10 @@
 //!
 //! Not persisted — props are fetched on every connect.
 
+use portable_atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use async_lock::RwLock;
 use wacore_binary::CompactString;
