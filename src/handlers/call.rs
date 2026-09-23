@@ -269,7 +269,7 @@ impl StanzaHandler for CallHandler {
                     if is_offer && let Err(e) = send_offer_ack_receipt(&client, &call).await {
                         warn!("call: failed to send offer ack receipt: {e}");
                     }
-                    let identity_ready = learn_offer_identity(&client, &call).await;
+                    learn_offer_identity(&client, &call).await;
                     #[cfg(feature = "voip-control")]
                     if let CallAction::PreAccept { audio, .. } | CallAction::Accept { audio, .. } =
                         &call.action
@@ -1047,7 +1047,7 @@ impl StanzaHandler for CallHandler {
                     if is_offer && !client.call_registry().is_ringing(call.action.call_id()) {
                         dispatch_call = false;
                     }
-                    if dispatch_call && identity_ready {
+                    if dispatch_call {
                         client
                             .core
                             .event_bus
@@ -1588,7 +1588,7 @@ fn same_device(a: &Jid, b: &Jid) -> bool {
 /// WAWebVoipLidUtils associates caller_pn with peer_jid (the outer `from`),
 /// independently of call-creator. Learn before online/offline event dispatch;
 /// the shared fast path owns persistence, migration, and conflict reconciliation.
-async fn learn_offer_identity(client: &Arc<Client>, call: &IncomingCall) -> bool {
+async fn learn_offer_identity(client: &Arc<Client>, call: &IncomingCall) {
     use crate::lid_pn_cache::LearningSource;
     use wacore::iq::abprops::web;
 
@@ -1597,7 +1597,7 @@ async fn learn_offer_identity(client: &Arc<Client>, call: &IncomingCall) -> bool
         ..
     } = &call.action
     else {
-        return true;
+        return;
     };
     let peer = &call.from;
     if !peer.server.is_lid_family()
@@ -1605,7 +1605,7 @@ async fn learn_offer_identity(client: &Arc<Client>, call: &IncomingCall) -> bool
         || peer.user.is_empty()
         || pn.user.is_empty()
     {
-        return true;
+        return;
     }
 
     // The linked-device client has no guest-viewer mode. For authenticated
@@ -1624,7 +1624,7 @@ async fn learn_offer_identity(client: &Arc<Client>, call: &IncomingCall) -> bool
             || (privacy.is_enabled(web::USERNAME_CONTACT_DISPLAY)
                 && privacy.is_enabled(web::ENABLE_CALLING_PHONE_NUMBER_PRIVACY))
         {
-            return true;
+            return;
         }
     }
 
@@ -1646,9 +1646,7 @@ async fn learn_offer_identity(client: &Arc<Client>, call: &IncomingCall) -> bool
     };
     if let Err(error) = result {
         warn!("call: failed to persist/migrate caller LID-PN mapping: {error}");
-        return false;
     }
-    true
 }
 
 #[cfg(test)]

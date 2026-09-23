@@ -357,10 +357,22 @@ async fn reconnect_and_disabled_fetch_respect_cached_privacy() {
     );
 
     client.set_ab_props_fetch(true);
+    client
+        .ab_props
+        .apply_props(
+            false,
+            [
+                (web::USERNAME_CONTACT_DISPLAY.code, "0".into()),
+                (web::ENABLE_CALLING_PHONE_NUMBER_PRIVACY.code, "0".into()),
+            ]
+            .into_iter(),
+        )
+        .await;
     client.ab_props.begin_generation(1).await;
     let privacy = client.ab_props.snapshot().await;
     assert!(privacy.is_seeded());
     assert!(!privacy.applied_in_generation());
+    assert!(!privacy.is_enabled(web::ENABLE_CALLING_PHONE_NUMBER_PRIVACY));
     deliver(
         &client,
         &offer(
@@ -379,6 +391,25 @@ async fn reconnect_and_disabled_fetch_respect_cached_privacy() {
             .unwrap()
             .is_none()
     );
+    assert!(
+        client
+            .ab_props
+            .apply_props_for_generation(1, true, std::iter::empty())
+            .await
+            .is_some()
+    );
+    deliver(
+        &client,
+        &offer(
+            Jid::lid(LID),
+            Jid::lid(LID),
+            Some(Jid::pn(PN)),
+            Some("user"),
+            true,
+        ),
+    )
+    .await;
+    assert_learned(&client, LID, PN).await;
 }
 
 #[tokio::test]
