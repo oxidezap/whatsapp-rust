@@ -154,7 +154,7 @@ impl Client {
             let watchdog_expired =
                 is_dead_socket_at(self.stats.first_send_since_recv(), last_recv, now);
             let silent_too_long = elapsed_since_at(last_recv, now)
-                .map_or(true, |elapsed| elapsed >= KEEP_ALIVE_INTERVAL_MAX);
+                .is_none_or(|elapsed| elapsed >= KEEP_ALIVE_INTERVAL_MAX);
             if !watchdog_expired && !silent_too_long {
                 debug!(target: "Client/Keepalive", "Skipping routine ping: responses pending");
                 return KeepaliveResult::Skipped;

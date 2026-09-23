@@ -6,7 +6,6 @@ use crate::test_utils::{MockHttpClient, create_test_backend, log_capture};
 use crate::transport::{DisconnectReason, Transport, TransportEvent, TransportFactory};
 use crate::waproto::whatsapp as wa;
 use async_trait::async_trait;
-use buffa::Message;
 use bytes::Bytes;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -106,11 +105,11 @@ impl TransportFactory for LoopbackTcpFactory {
 
 const TIME_SCALE: u32 = 10;
 
-struct TestClock(std::time::Instant);
+struct TestClock(tokio::time::Instant);
 
 impl MonotonicProvider for TestClock {
     fn now_nanos(&self) -> u64 {
-        std::time::Instant::now()
+        tokio::time::Instant::now()
             .saturating_duration_since(self.0)
             .as_nanos()
             .saturating_mul(TIME_SCALE.into())
@@ -151,7 +150,7 @@ fn isolate(test_name: &str) -> bool {
     if log_capture::delegated_to_child(test_name) {
         return true;
     }
-    set_monotonic_provider(TestClock(std::time::Instant::now()))
+    set_monotonic_provider(TestClock(tokio::time::Instant::now()))
         .expect("the isolated test installs its clock before building a client");
     false
 }
@@ -220,7 +219,7 @@ async fn serve_noise_handshake(
     wacore::handshake::NoiseCipher,
     wacore::handshake::NoiseCipher,
 )> {
-    let client_hello = wa::HandshakeMessage::decode_from_slice(&read_frame(stream, true).await?)?;
+    let client_hello = waproto::codec::handshake_message_decode(&read_frame(stream, true).await?)?;
     let client_eph: [u8; 32] = client_hello
         .client_hello
         .into_option()
@@ -260,9 +259,14 @@ async fn serve_noise_handshake(
         }),
         ..Default::default()
     };
-    write_frame(stream, &server_hello.encode_to_vec()).await?;
+    write_frame(
+        stream,
+        &waproto::codec::handshake_message_to_vec(&server_hello),
+    )
+    .await?;
 
-    let client_finish = wa::HandshakeMessage::decode_from_slice(&read_frame(stream, false).await?)?;
+    let client_finish =
+        waproto::codec::handshake_message_decode(&read_frame(stream, false).await?)?;
     let finish = client_finish
         .client_finish
         .into_option()
