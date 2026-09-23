@@ -316,6 +316,11 @@ pub struct IncomingCall {
     pub timestamp: DateTime<Utc>,
     pub offline: bool,
     pub action: CallAction,
+    /// The offer's `username` attribute, used to enforce calling phone-number
+    /// privacy before learning a LID/PN mapping. Kept on this extensible payload
+    /// rather than adding a field to the public `CallAction::Offer` variant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_username: Option<String>,
     /// The rotation the sending device announced on this stanza's `<video>`
     /// child, in `0..=3`. Only an `<offer>` and an `<accept>` carry one; `None`
     /// everywhere else, and for a stanza whose value was out of range.

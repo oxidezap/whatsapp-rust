@@ -42,8 +42,11 @@ use crate::client::Client;
 use super::traits::StanzaHandler;
 use wacore::stanza::wire_tags::StanzaTag;
 
-/// Router sends the generic `<ack>` via `should_ack`, so this handler only
-/// parses and dispatches. On `Offer` it also emits the `<receipt><offer/></receipt>`
+#[cfg(test)]
+mod identity_tests;
+
+/// Router sends the generic `<ack>` via `should_ack`; this handler parses,
+/// learns caller identity and dispatches. On `Offer` it emits the `<receipt><offer/></receipt>`
 /// ack-of-offer so the caller's signaling layer knows the device received the ring.
 #[derive(Default)]
 pub struct CallHandler;
@@ -194,6 +197,7 @@ impl StanzaHandler for CallHandler {
                 let is_offer = matches!(call.action, CallAction::Offer { .. });
                 let is_offer_notice = matches!(call.action, CallAction::OfferNotice { .. });
                 if (is_offer || is_offer_notice) && call.offline {
+                    learn_offer_identity(&client, &call).await;
                     // Offline-queue replay (an offer or a group-call offer_notice): the call is long
                     // dead (no relay, not connectable). Don't ack or ring it -- surface a non-ringing
                     // missed-call so a consumer can't auto-accept it (WA Web drops the stale notice
@@ -212,9 +216,10 @@ impl StanzaHandler for CallHandler {
                     // surfaces a missed call; an answered, outgoing, or duplicate terminate must not.
                     // Mirrors WA Web's _ringingCalls. The offline branch above already surfaced its
                     // own missed-offline, so it is intentionally not marked here. Mark BEFORE the
-                    // offer-ack await: <call> stanzas are processed concurrently, so a fast <terminate>
-                    // for this offer racing the await must see the ringing flag (else its missed-call
-                    // is lost and we'd set a stale flag after the call already ended).
+                    // identity-learning and offer-ack awaits: <call> stanzas are processed
+                    // concurrently, so a fast <terminate> racing the await must see the
+                    // ringing flag (else its missed-call is lost and we'd set a stale flag
+                    // after the call already ended).
                     #[cfg(feature = "voip-control")]
                     let mut duplicate_active_group_offer = false;
                     #[cfg(feature = "voip-control")]
@@ -261,6 +266,7 @@ impl StanzaHandler for CallHandler {
                                 .mark_incoming_ringing(call.action.call_id());
                         }
                     }
+                    learn_offer_identity(&client, &call).await;
                     if is_offer && let Err(e) = send_offer_ack_receipt(&client, &call).await {
                         warn!("call: failed to send offer ack receipt: {e}");
                     }
@@ -1573,6 +1579,57 @@ async fn dismiss_incompatible_group_invitee(client: &Client, call: &IncomingCall
 #[cfg(feature = "voip-control")]
 fn same_device(a: &Jid, b: &Jid) -> bool {
     a.user == b.user && a.server == b.server && a.device == b.device
+}
+
+/// WAWebVoipLidUtils associates caller_pn with peer_jid (the outer `from`),
+/// independently of call-creator. Learn before online/offline event dispatch;
+/// the shared fast path owns persistence, migration, and conflict reconciliation.
+async fn learn_offer_identity(client: &Arc<Client>, call: &IncomingCall) {
+    use crate::lid_pn_cache::LearningSource;
+    use wacore::iq::abprops::web;
+
+    let CallAction::Offer {
+        caller_pn: Some(pn),
+        ..
+    } = &call.action
+    else {
+        return;
+    };
+    let peer = &call.from;
+    if !peer.server.is_lid_family()
+        || !pn.server.is_pn_family()
+        || peer.user.is_empty()
+        || pn.user.is_empty()
+    {
+        return;
+    }
+
+    // The linked-device client has no guest-viewer mode. For authenticated
+    // viewers, WA Web skips this mapping when a nonempty username is supplied
+    // and both display and calling-PN-privacy gates are enabled. Its
+    // asMaybeUsername is a presence check, not full username validation.
+    if call
+        .caller_username
+        .as_deref()
+        .is_some_and(|u| !u.is_empty())
+        && client
+            .ab_props
+            .is_enabled(web::USERNAME_CONTACT_DISPLAY)
+            .await
+        && client
+            .ab_props
+            .is_enabled(web::ENABLE_CALLING_PHONE_NUMBER_PRIVACY)
+            .await
+    {
+        return;
+    }
+
+    // WA Web's "voip-lid" takes createLidPnMappings' default policy: seed
+    // unknown LIDs, and reconcile known conflicts via usync instead of replacing
+    // them. Other supplies that policy without extending the public source enum.
+    client
+        .learn_lid_pn_mapping_fast(&peer.user, &pn.user, LearningSource::Other, call.offline)
+        .await;
 }
 
 #[cfg(test)]

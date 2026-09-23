@@ -60,6 +60,14 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
     attrs.finish().map_err(|e| anyhow!("<call> attrs: {e}"))?;
 
     let is_offer = action_tag == CallActionTag::Offer;
+    let caller_username = if is_offer {
+        child
+            .attrs()
+            .optional_string("username")
+            .map(|s| s.into_owned())
+    } else {
+        None
+    };
     // Read before `parse_action` consumes the child: an <offer> and an <accept>
     // are the only actions whose <video> child announces the sending device's
     // camera rotation, and the value belongs on the payload rather than in
@@ -94,6 +102,7 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
         .timestamp(timestamp)
         .offline(offline)
         .action(action)
+        .maybe_caller_username(caller_username)
         .maybe_video_orientation(video_orientation)
         .maybe_group(group);
     let call = call.build();
