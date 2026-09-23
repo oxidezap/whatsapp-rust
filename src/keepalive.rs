@@ -12,6 +12,9 @@ use wacore::protocol::keepalive::{
     elapsed_since_at, is_dead_socket_at,
 };
 
+#[cfg(test)]
+mod silent_iq_tests;
+
 /// Keepalive ticks between two mid-session maintenance passes (~6 h).
 ///
 /// The tick interval is drawn uniformly from
@@ -43,6 +46,8 @@ const fn ticks_for(period_secs: u64) -> u32 {
 enum KeepaliveResult {
     /// Server responded to the ping.
     Ok,
+    /// Pending responses postponed the ping; no liveness evidence was obtained.
+    Skipped,
     /// Ping failed but the connection may recover (e.g. timeout, server error).
     TransientFailure,
     /// Connection is dead — loop should exit immediately.
@@ -136,12 +141,22 @@ impl Client {
             return KeepaliveResult::FatalFailure;
         }
 
-        // WA Web: skip ping if there are pending IQs
-        // (`activePing || ackHandlers.length || pendingIqs.size`)
+        // WA Web's maybeScheduleHealthCheck defers routine pings while responses
+        // are pending; sendPing itself permits an explicit probe. Our periodic
+        // watchdog deliberately probes before reconnecting: an ignored IQ alone
+        // must not tear down a connection that still answers keepalives.
         let has_pending = !self.response_waiters_guard().is_empty();
         if has_pending {
-            debug!(target: "Client/Keepalive", "Skipping ping: IQ responses pending");
-            return KeepaliveResult::Ok;
+            let watchdog_expired = is_dead_socket_at(
+                self.stats.first_send_since_recv(),
+                self.stats.last_data_received(),
+                wacore::time::Instant::now(),
+            );
+            if !watchdog_expired {
+                debug!(target: "Client/Keepalive", "Skipping routine ping: responses pending");
+                return KeepaliveResult::Skipped;
+            }
+            debug!(target: "Client/Keepalive", "Watchdog expired with responses pending; probing before reconnect");
         }
 
         debug!(target: "Client/Keepalive", "Sending keepalive ping");
@@ -301,6 +316,10 @@ impl Client {
                     // cancelled on any receive; our periodic loop needs to send the
                     // ping first to give the server a chance to prove it is alive.
                     match self.send_keepalive().await {
+                        // A skipped ping neither restores health nor authorizes
+                        // a teardown if the deadline crosses during this tick.
+                        // The next tick must run the bounded probe first.
+                        KeepaliveResult::Skipped => continue,
                         KeepaliveResult::Ok => {
                             if error_count > 0 {
                                 debug!(target: "Client/Keepalive", "Keepalive restored after {error_count} failure(s).");
@@ -327,19 +346,20 @@ impl Client {
 
                     // WA Web: deadSocketTimer is an independent 20s watchdog armed on
                     // the FIRST send after a receive (onOrBefore keeps the earliest
-                    // deadline) and cancelled on every receive. We approximate this by
-                    // checking is_dead_socket on EVERY keepalive tick — not just after
-                    // a failed ping. This catches scenarios where pending IQs caused
-                    // the ping to be skipped, or where the ping "succeeded" but the
-                    // connection died immediately after.
+                    // deadline) and cancelled on every receive. Unlike Web's
+                    // independent timer, this periodic watchdog gives an idle
+                    // connection one bounded ping attempt before tearing it down,
+                    // including when an application IQ is still pending. Re-read
+                    // activity after that attempt: any receive cancels the watchdog.
                     let first_send = self.stats.first_send_since_recv();
                     let last_recv = self.stats.last_data_received();
                     let now = wacore::time::Instant::now();
                     if is_dead_socket_at(first_send, last_recv, now) {
                         let elapsed = elapsed_since_at(first_send, now).unwrap_or_default();
+                        let pending = self.response_waiters_guard().len();
                         warn!(
                             target: "Client/Keepalive",
-                            "No data received for {:.1}s after send (dead socket), forcing reconnect.",
+                            "No inbound data for {:.1}s after first send; pending response waiters: {pending}; watchdog expired after keepalive attempt, forcing reconnect.",
                             elapsed.as_secs_f64()
                         );
                         self.reconnect_immediately().await;

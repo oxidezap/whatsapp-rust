@@ -496,6 +496,7 @@ pub mod log_capture {
     /// so [`Session::records_for`] would report it as silent — add it before
     /// asserting on it.
     const CAPTURED_TARGETS: &[&str] = &[
+        "Client/Keepalive",
         "whatsapp_rust::client::lifecycle",
         "whatsapp_rust::message::receive",
     ];

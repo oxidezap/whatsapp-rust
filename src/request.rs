@@ -51,9 +51,9 @@ type IqOnSent<'a> = Box<dyn FnOnce() + 'a>;
 /// `futures::try_join!` is dropped the instant its sibling errors. Without this
 /// guard the registered waiter would linger in the map: the explicit cleanups
 /// only fired on the send-fail / timeout / shutdown paths, never on
-/// cancellation-via-drop, and a lingering waiter suppresses keepalives for the
-/// life of the connection. Dropping the guard removes the entry on every exit
-/// path; on success `resolve_waiters` already removed it, so it's a no-op.
+/// cancellation-via-drop, and a lingering waiter suppresses routine keepalives
+/// until the watchdog requires a probe. Dropping the guard removes the entry on
+/// every exit path; on success `resolve_waiters` already removed it, so it's a no-op.
 pub(crate) struct ResponseWaiterGuard {
     waiters: Arc<std::sync::Mutex<crate::client::ResponseWaiterMap>>,
     req_id: String,
@@ -1027,7 +1027,7 @@ mod tests {
 
     // Cancellation cleanup: dropping a `send_and_wait_iq` future mid-await (e.g.
     // the loser of a `try_join!`) must remove its still-pending waiter, or a
-    // leaked entry suppresses keepalives for the life of the connection.
+    // leaked entry suppresses routine keepalives until a watchdog probe is due.
     #[test]
     fn waiter_guard_removes_pending_entry_on_drop() {
         let waiters: Arc<Mutex<ResponseWaiterMap>> =
