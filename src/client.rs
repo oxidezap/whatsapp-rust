@@ -530,6 +530,8 @@ pub struct MemoryReport {
     /// Groups with a metadata query in flight; normally zero.
     pub group_metadata_inflight: u64,
     pub chat_lanes: u64,
+    /// Incoming offers still inside the handler, awaiting signaling or identity work.
+    pub pending_call_offers: u64,
     /// Inbound messages queued behind their chat's lane worker, summed over
     /// every lane. The lanes are capacity-bounded; their queues are not, and
     /// each queued message retains its whole frame, so a worker that is stuck
@@ -816,6 +818,7 @@ impl std::fmt::Display for MemoryReport {
             self.group_metadata_inflight
         )?;
         writeln!(f, "  chat_lanes:             {}", self.chat_lanes)?;
+        writeln!(f, "  pending_call_offers:    {}", self.pending_call_offers)?;
         writeln!(
             f,
             "  group_dist_locks:       {} (evicted: {}, blocked: {})",
@@ -1627,6 +1630,7 @@ pub struct Client {
     /// Per-chat lane combining enqueue lock + message queue into a single cached entry.
     /// One cache lookup instead of two per incoming message.
     pub(crate) chat_lanes: Cache<Jid, ChatLane>,
+    pub(crate) pending_call_offers: crate::handlers::call::pending_offers::PendingOffers,
 
     /// Cache for LID to Phone Number mappings (bidirectional).
     /// When we receive a message with sender_lid/sender_pn attributes, we store the mapping here.

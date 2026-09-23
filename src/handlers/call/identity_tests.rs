@@ -413,6 +413,49 @@ async fn reconnect_and_disabled_fetch_respect_cached_privacy() {
 }
 
 #[tokio::test]
+async fn terminate_cancels_an_offer_waiting_on_identity() {
+    let client = create_test_client().await;
+    let (handler, events) = ChannelEventHandler::new();
+    let _subscription = client.subscribe_handler(handler);
+    let guard = client.lid_pn_cache.lock_mutation().await;
+    let node = node_to_owned_ref(&offer(
+        Jid::lid(LID),
+        Jid::lid(LID),
+        Some(Jid::pn(PN)),
+        None,
+        false,
+    ));
+    let mut cancelled = false;
+    let mut handling = Box::pin(CallHandler.handle(client.clone(), node, &mut cancelled));
+    assert!(futures::poll!(handling.as_mut()).is_pending());
+    assert_eq!(client.memory_report().await.pending_call_offers, 1);
+
+    let terminate = NodeBuilder::new("call")
+        .attr("from", Jid::lid(LID))
+        .attr("id", "STANZA-IDENTITY-TERMINATE")
+        .attr("t", "1766847152")
+        .children([NodeBuilder::new("terminate")
+            .attr("call-id", "CALL-IDENTITY-TEST")
+            .attr("call-creator", Jid::lid(LID))
+            .attr("reason", "timeout")
+            .build()])
+        .build();
+    deliver(&client, &terminate).await;
+    assert!(
+        events.try_recv().is_ok(),
+        "terminate must reach subscribers"
+    );
+    while events.try_recv().is_ok() {}
+    drop(guard);
+    assert!(handling.await);
+    assert!(
+        events.try_recv().is_err(),
+        "terminated offer must not ring after identity learning resumes"
+    );
+    assert_eq!(client.memory_report().await.pending_call_offers, 0);
+}
+
+#[tokio::test]
 async fn non_offer_does_not_learn_an_unmodeled_caller_pn() {
     let client = create_test_client().await;
     let node = NodeBuilder::new("call")

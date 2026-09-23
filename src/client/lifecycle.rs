@@ -561,6 +561,7 @@ impl Client {
                 &cache_config.lid_pn_cache,
                 cache_config.cache_stores.lid_pn_cache.clone(),
             )),
+            pending_call_offers: crate::handlers::call::pending_offers::PendingOffers::default(),
             ab_props: Arc::new(wacore::store::ab_props::AbPropsCache::new()),
             group_cache: std::sync::OnceLock::new(),
 

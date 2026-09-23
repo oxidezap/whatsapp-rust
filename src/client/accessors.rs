@@ -515,6 +515,7 @@ impl Client {
             ensure_inflight: self.ensure_inflight.len() as u64,
             group_metadata_inflight: self.group_metadata_inflight.len() as u64,
             chat_lanes,
+            pending_call_offers: self.pending_call_offers.len() as u64,
             chat_lane_backlog,
             group_distribution_locks: group_distribution_locks.entries,
             group_distribution_lock_evictions: group_distribution_locks.evictions,

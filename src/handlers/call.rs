@@ -44,6 +44,7 @@ use wacore::stanza::wire_tags::StanzaTag;
 
 #[cfg(test)]
 mod identity_tests;
+pub(crate) mod pending_offers;
 
 /// Router sends the generic `<ack>` via `should_ack`; this handler parses,
 /// learns caller identity and dispatches. On `Offer` it emits the `<receipt><offer/></receipt>`
@@ -212,6 +213,14 @@ impl StanzaHandler for CallHandler {
                             MissedReason::Offline,
                         )));
                 } else {
+                    // Signal-only clients have no VoIP registry; keep the offer's
+                    // liveness through the receipt and identity-learning awaits.
+                    // The guard also removes an offer if its handler is cancelled.
+                    let pending_offer = is_offer
+                        .then(|| client.pending_call_offers.register(call.action.call_id()));
+                    if matches!(call.action, CallAction::Terminate { .. }) {
+                        client.pending_call_offers.terminate(call.action.call_id());
+                    }
                     // Track an incoming offer as ringing so only an UNANSWERED <terminate> later
                     // surfaces a missed call; an answered, outgoing, or duplicate terminate must not.
                     // Mirrors WA Web's _ringingCalls. The offline branch above already surfaced its
@@ -1047,7 +1056,8 @@ impl StanzaHandler for CallHandler {
                     if is_offer && !client.call_registry().is_ringing(call.action.call_id()) {
                         dispatch_call = false;
                     }
-                    if dispatch_call {
+                    if dispatch_call && pending_offer.as_ref().is_none_or(|offer| offer.is_alive())
+                    {
                         client
                             .core
                             .event_bus
