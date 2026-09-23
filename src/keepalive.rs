@@ -14,6 +14,8 @@ use wacore::protocol::keepalive::{
 
 #[cfg(test)]
 mod silent_iq_tests;
+#[cfg(test)]
+mod tcp_e2e_tests;
 
 /// Keepalive ticks between two mid-session maintenance passes (~6 h).
 ///
@@ -147,12 +149,13 @@ impl Client {
         // must not tear down a connection that still answers keepalives.
         let has_pending = !self.response_waiters_guard().is_empty();
         if has_pending {
-            let watchdog_expired = is_dead_socket_at(
-                self.stats.first_send_since_recv(),
-                self.stats.last_data_received(),
-                wacore::time::Instant::now(),
-            );
-            if !watchdog_expired {
+            let now = wacore::time::Instant::now();
+            let last_recv = self.stats.last_data_received();
+            let watchdog_expired =
+                is_dead_socket_at(self.stats.first_send_since_recv(), last_recv, now);
+            let silent_too_long = elapsed_since_at(last_recv, now)
+                .map_or(true, |elapsed| elapsed >= KEEP_ALIVE_INTERVAL_MAX);
+            if !watchdog_expired && !silent_too_long {
                 debug!(target: "Client/Keepalive", "Skipping routine ping: responses pending");
                 return KeepaliveResult::Skipped;
             }
