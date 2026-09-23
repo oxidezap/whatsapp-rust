@@ -571,21 +571,18 @@ impl Client {
             learning_source: entry.learning_source.as_str().to_string(),
         };
 
-        let persist_result = self
-            .persistence_manager
+        // Migration deletes PN-keyed durable state. Keep it intact if the
+        // mapping write fails, so a restarted client can still find that state
+        // by PN; the in-memory pair stays unmarked and a later live learn retries.
+        self.persistence_manager
             .backend()
             .put_lid_mapping(&storage_entry)
             .await
-            .map_err(|e| anyhow!("persisting LID-PN mapping: {e}"));
+            .map_err(|e| anyhow!("persisting LID-PN mapping: {e}"))?;
 
-        // Leave a failed write un-marked for retry, but migrate anyway: the
-        // in-memory mapping already resolves this peer to LID, so a PN-keyed
-        // session must not be stranded just because the mapping write failed.
-        if persist_result.is_ok() {
-            self.lid_pn_cache
-                .mark_persisted(&entry.phone_number, &entry.lid)
-                .await;
-        }
+        self.lid_pn_cache
+            .mark_persisted(&entry.phone_number, &entry.lid)
+            .await;
 
         if needs_migration {
             self.migrate_device_registry_on_lid_discovery(
@@ -600,7 +597,7 @@ impl Client {
             .await;
         }
 
-        persist_result
+        Ok(())
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.persist_migrate_lid_pn_batch", level = "debug", skip_all, fields(count = entries.len()), err(Debug)))]
