@@ -278,6 +278,31 @@ async fn offer_respects_username_privacy_flags_from_server_props() {
             "display={display}, privacy={privacy}, username={username:?}"
         );
     }
+
+    let client = create_test_client().await;
+    deliver(
+        &client,
+        &offer(
+            Jid::lid(LID),
+            Jid::lid(LID),
+            Some(Jid::pn(PN)),
+            Some("sample_user"),
+            true,
+        ),
+    )
+    .await;
+    assert!(
+        !client.ab_props.is_seeded(),
+        "this case models queued offers arriving before the initial props fetch"
+    );
+    assert!(
+        client
+            .get_lid_pn_entry(&Jid::lid(LID))
+            .await
+            .unwrap()
+            .is_none(),
+        "an unknown privacy gate must not expose the offered phone number"
+    );
 }
 
 #[tokio::test]
@@ -340,6 +365,81 @@ async fn identity_is_available_inside_the_call_event_callback() {
     .await;
     assert_eq!(events.len(), 1);
     assert!(matches!(&*events[0], Event::MissedCall(_)));
+}
+
+#[tokio::test]
+async fn session_migration_finishes_before_offer_event_dispatch() {
+    use futures::FutureExt;
+    use wacore::libsignal::protocol::{SessionRecord, SessionState};
+    use wacore::types::events::EventHandler;
+    use wacore::types::jid::JidExt;
+    use waproto::whatsapp::SessionStructure;
+
+    struct CheckMigrationAtDispatch {
+        client: std::sync::Weak<Client>,
+        pn_addr: wacore::libsignal::protocol::ProtocolAddress,
+        lid_addr: wacore::libsignal::protocol::ProtocolAddress,
+    }
+
+    impl EventHandler for CheckMigrationAtDispatch {
+        fn handle_event(&self, event: Arc<Event>) {
+            if matches!(&*event, Event::IncomingCall(_)) {
+                let client = self.client.upgrade().unwrap();
+                let backend = client.persistence_manager.backend();
+                let pn = client
+                    .signal_cache
+                    .get_session(&self.pn_addr, backend.as_ref())
+                    .now_or_never()
+                    .expect("cached session lookup should not block event dispatch")
+                    .unwrap();
+                let lid = client
+                    .signal_cache
+                    .get_session(&self.lid_addr, backend.as_ref())
+                    .now_or_never()
+                    .expect("cached session lookup should not block event dispatch")
+                    .unwrap();
+                assert!(pn.is_none(), "PN session must be migrated before dispatch");
+                assert!(lid.is_some(), "LID session must be ready before dispatch");
+            }
+        }
+    }
+
+    let client = create_test_client().await;
+    let pn_addr = Jid::pn_device(PN.to_string(), 0).to_protocol_address();
+    let lid_addr = Jid::lid_device(LID.to_string(), 0).to_protocol_address();
+    let state = SessionState::from_session_structure(SessionStructure {
+        session_version: Some(3),
+        local_identity_public: None,
+        remote_identity_public: None,
+        root_key: None,
+        previous_counter: Some(0),
+        sender_chain: buffa::MessageField::none(),
+        receiver_chains: vec![],
+        pending_pre_key: buffa::MessageField::none(),
+        remote_registration_id: Some(123),
+        local_registration_id: Some(0),
+        alice_base_key: Some(vec![]),
+        needs_refresh: None,
+        pending_key_exchange: buffa::MessageField::none(),
+    });
+    client
+        .signal_cache
+        .put_session(&pn_addr, SessionRecord::new(state))
+        .await;
+    let backend = client.persistence_manager.backend();
+    client.signal_cache.flush(backend.as_ref()).await.unwrap();
+
+    let _subscription = client.subscribe_handler(Arc::new(CheckMigrationAtDispatch {
+        client: Arc::downgrade(&client),
+        pn_addr,
+        lid_addr,
+    }));
+    let events = deliver(
+        &client,
+        &offer(Jid::lid(LID), Jid::lid(LID), Some(Jid::pn(PN)), None, false),
+    )
+    .await;
+    assert!(matches!(&*events[0], Event::IncomingCall(_)));
 }
 
 #[cfg(feature = "voip-control")]

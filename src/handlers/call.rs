@@ -266,10 +266,10 @@ impl StanzaHandler for CallHandler {
                                 .mark_incoming_ringing(call.action.call_id());
                         }
                     }
-                    learn_offer_identity(&client, &call).await;
                     if is_offer && let Err(e) = send_offer_ack_receipt(&client, &call).await {
                         warn!("call: failed to send offer ack receipt: {e}");
                     }
+                    learn_offer_identity(&client, &call).await;
                     #[cfg(feature = "voip-control")]
                     if let CallAction::PreAccept { audio, .. } | CallAction::Accept { audio, .. } =
                         &call.action
@@ -1608,28 +1608,46 @@ async fn learn_offer_identity(client: &Arc<Client>, call: &IncomingCall) {
     // viewers, WA Web skips this mapping when a nonempty username is supplied
     // and both display and calling-PN-privacy gates are enabled. Its
     // asMaybeUsername is a presence check, not full username validation.
-    if call
+    let has_username = call
         .caller_username
         .as_deref()
-        .is_some_and(|u| !u.is_empty())
-        && client
-            .ab_props
-            .is_enabled(web::USERNAME_CONTACT_DISPLAY)
-            .await
-        && client
-            .ab_props
-            .is_enabled(web::ENABLE_CALLING_PHONE_NUMBER_PRIVACY)
-            .await
+        .is_some_and(|username| !username.is_empty());
+    if has_username
+        && (!client.ab_props.is_seeded()
+            || (client
+                .ab_props
+                .is_enabled(web::USERNAME_CONTACT_DISPLAY)
+                .await
+                && client
+                    .ab_props
+                    .is_enabled(web::ENABLE_CALLING_PHONE_NUMBER_PRIVACY)
+                    .await))
     {
+        // Before the first full props response, the default for calling-PN
+        // privacy is false. Do not disclose an offered number until the initial
+        // props response lets the handler evaluate the actual privacy gates.
         return;
     }
 
     // WA Web's "voip-lid" takes createLidPnMappings' default policy: seed
     // unknown LIDs, and reconcile known conflicts via usync instead of replacing
     // them. Other supplies that policy without extending the public source enum.
-    client
-        .learn_lid_pn_mapping_fast(&peer.user, &pn.user, LearningSource::Other, call.offline)
-        .await;
+    // Offline replay retains cache-only semantics. For a live offer, wait until
+    // the shared path persists the pair and completes PN-keyed Signal/session
+    // migrations before dispatch can trigger decryption through the new LID.
+    let result = if call.offline {
+        client
+            .learn_lid_pn_mapping_fast(&peer.user, &pn.user, LearningSource::Other, true)
+            .await;
+        Ok(())
+    } else {
+        client
+            .add_lid_pn_mapping(&peer.user, &pn.user, LearningSource::Other)
+            .await
+    };
+    if let Err(error) = result {
+        warn!("call: failed to persist/migrate caller LID-PN mapping: {error}");
+    }
 }
 
 #[cfg(test)]
@@ -4239,6 +4257,51 @@ mod tests {
             count.load(Ordering::SeqCst) >= 1,
             "handler must invoke the outbound send path for offer ack receipts"
         );
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn offer_receipt_is_sent_before_waiting_for_identity_learning() {
+        let (client, started, release) = make_blocking_sending_client().await;
+        let guard = client.lid_pn_cache.lock_mutation().await;
+        let node = node_to_owned_ref(
+            &NodeBuilder::new("call")
+                .attr("from", fake_caller_lid())
+                .attr("id", "OFFER-IDENTITY-ACK-ORDER")
+                .attr("t", "1766847151")
+                .children([NodeBuilder::new("offer")
+                    .attr("call-id", "CALL-IDENTITY-ACK-ORDER")
+                    .attr("call-creator", fake_caller_lid())
+                    .attr("caller_pn", Jid::pn("15550000001"))
+                    .build()])
+                .build(),
+        );
+        let handling_client = client.clone();
+        let handling = tokio::spawn(async move {
+            let mut cancelled = false;
+            CallHandler
+                .handle(handling_client, node, &mut cancelled)
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.recv())
+            .await
+            .expect("offer receipt send must start before identity learning waits")
+            .expect("blocking transport stays connected");
+        assert!(
+            client
+                .call_registry()
+                .take_ringing("CALL-IDENTITY-ACK-ORDER")
+        );
+        release.send(()).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !handling.is_finished(),
+            "after the receipt send, identity learning may wait for the mutation lock"
+        );
+
+        drop(guard);
+        assert!(handling.await.unwrap());
     }
 
     #[tokio::test]
