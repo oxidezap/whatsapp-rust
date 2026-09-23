@@ -135,9 +135,8 @@ pub struct PollVoteCiphertext<'a> {
 ///
 /// The creator and voter JIDs key the derivation, so a vote authored under LID
 /// only opens under LID. As contacts migrate to LID a vote can arrive in a
-/// different namespace than the parent poll was learned in, so `fallback`
-/// retries with both JIDs swapped together (never mixed), matching WA Web
-/// `WAWebAddonEncryption.decryptAddOn`.
+/// different namespace than the parent poll was learned in. The caller chooses
+/// this single fallback; resolving multiple PN/LID aliases is its responsibility.
 pub fn decrypt_poll_vote_with_fallback(
     ciphertext: PollVoteCiphertext<'_>,
     message_secret: &[u8],
