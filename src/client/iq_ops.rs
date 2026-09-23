@@ -12,6 +12,7 @@ impl Client {
         use wacore::iq::props::PropsSpec;
         use wacore::store::commands::DeviceCommand;
 
+        let generation = self.connection_generation.load(Ordering::Acquire);
         let stored_hash = self
             .persistence_manager
             .get_device_snapshot()
@@ -52,9 +53,18 @@ impl Client {
             );
         }
 
-        self.ab_props
-            .apply_props(response.delta_update, response.experiment_props.into_iter())
-            .await;
+        if !self
+            .ab_props
+            .apply_props_for_generation(
+                generation,
+                response.delta_update,
+                response.experiment_props.into_iter(),
+            )
+            .await
+        {
+            debug!("Discarding stale props response from connection generation {generation}");
+            return Ok(());
+        }
         self.latch_lid_migrated_from_props().await;
 
         if let Some(new_hash) = response.hash {

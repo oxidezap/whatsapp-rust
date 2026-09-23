@@ -216,6 +216,27 @@ pub async fn create_test_client() -> Arc<Client> {
 }
 
 #[cfg(test)]
+pub(crate) async fn create_test_client_with_ab_props_fetch(enabled: bool) -> Arc<Client> {
+    let pm = Arc::new(
+        PersistenceManager::new(create_test_backend().await)
+            .await
+            .expect("persistence manager should initialize"),
+    );
+    let build = Client::builder()
+        .with_runtime(TokioRuntime)
+        .with_persistence_manager(pm)
+        .with_transport_factory(MockTransportFactory::new())
+        .with_http_client(MockHttpClient)
+        .with_ab_props_fetch(enabled)
+        .build()
+        .await
+        .expect("client builder should initialize");
+    let (client, _) = build.into_parts();
+    client.enter_live_mode_for_tests();
+    client
+}
+
+#[cfg(test)]
 pub(crate) async fn create_test_client_with_sync_receiver_and_admission(
     admission: Arc<dyn crate::HistorySyncAdmission>,
 ) -> (

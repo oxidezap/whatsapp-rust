@@ -178,9 +178,11 @@ fn watched() -> Vec<u32> {
 /// current bundle no longer ships (`props::stale`), which the catalog the
 /// fixture is built from does not have.
 fn watched_in_catalog() -> usize {
-    let catalog: std::collections::HashSet<u32> =
-        ALL.iter().flat_map(|g| g.iter()).map(|p| p.code).collect();
-    watched().iter().filter(|c| catalog.contains(c)).count()
+    let watched: std::collections::HashSet<u32> = watched().into_iter().collect();
+    ALL.iter()
+        .flat_map(|group| group.iter())
+        .filter(|prop| watched.contains(&prop.code))
+        .count()
 }
 
 /// What the read loop does with the frame, from the decrypted payload on.

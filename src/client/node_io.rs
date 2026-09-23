@@ -1146,6 +1146,10 @@ impl Client {
         #[cfg(feature = "client-lifecycle")]
         drop(login_transition);
 
+        // Offline delivery is drained before fresh props are fetched. Invalidate
+        // old props now so privacy-sensitive learning cannot use prior-session gates.
+        self.ab_props.begin_generation(current_generation).await;
+
         info!(
             "Successfully authenticated with WhatsApp servers! (gen={})",
             current_generation

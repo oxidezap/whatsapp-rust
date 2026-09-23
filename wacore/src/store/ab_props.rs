@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_lock::RwLock;
 use wacore_binary::CompactString;
@@ -23,6 +23,7 @@ pub struct AbPropsCache {
     props: RwLock<HashMap<u32, CompactString>>,
     interest: RwLock<HashSet<u32>>,
     seeded: AtomicBool,
+    generation: AtomicU64,
 }
 
 impl AbPropsCache {
@@ -31,6 +32,7 @@ impl AbPropsCache {
             props: RwLock::new(HashMap::new()),
             interest: RwLock::new(WATCHED.iter().map(|p| p.code).collect()),
             seeded: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -46,6 +48,15 @@ impl AbPropsCache {
             .write()
             .await
             .extend(props.iter().map(|p| p.code));
+    }
+
+    /// Start a connection generation with no current-server props. A full
+    /// response from an older connection cannot seed this generation.
+    pub async fn begin_generation(&self, generation: u64) {
+        let mut props = self.props.write().await;
+        props.clear();
+        self.generation.store(generation, Ordering::Release);
+        self.seeded.store(false, Ordering::Release);
     }
 
     /// The codes a fetch has to keep: a snapshot of the interest set, taken at
@@ -68,17 +79,43 @@ impl AbPropsCache {
     ) {
         let interest = self.interest.read().await;
         let mut map = self.props.write().await;
+        self.apply_props_locked(delta_update, props, &interest, &mut map);
+    }
 
+    /// Apply a response only if it belongs to the connection generation that
+    /// is still current. The generation check and mutation share the props lock
+    /// with [`begin_generation`](Self::begin_generation), so a late response
+    /// cannot reseed a newer connection.
+    pub async fn apply_props_for_generation(
+        &self,
+        generation: u64,
+        delta_update: bool,
+        props: impl Iterator<Item = (u32, CompactString)>,
+    ) -> bool {
+        let interest = self.interest.read().await;
+        let mut map = self.props.write().await;
+        if self.generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        self.apply_props_locked(delta_update, props, &interest, &mut map);
+        true
+    }
+
+    fn apply_props_locked(
+        &self,
+        delta_update: bool,
+        props: impl Iterator<Item = (u32, CompactString)>,
+        interest: &HashSet<u32>,
+        map: &mut HashMap<u32, CompactString>,
+    ) {
         if !delta_update {
             map.clear();
         }
-
         for (code, value) in props {
             if interest.contains(&code) {
                 map.insert(code, value);
             }
         }
-
         if !delta_update {
             self.seeded.store(true, Ordering::Release);
         }
@@ -244,6 +281,42 @@ mod tests {
         assert_eq!(cache.get_bool(on_by_default).await, None);
         // Sent but not watched: discarded on apply, so also absent.
         assert_eq!(cache.get_bool(flag(4)).await, None);
+    }
+
+    #[tokio::test]
+    async fn new_generation_clears_props_and_rejects_stale_responses() {
+        let cache = AbPropsCache::new();
+        cache.watch(flag(100)).await;
+        cache
+            .apply_props(false, [(100, CompactString::from("1"))].into_iter())
+            .await;
+        assert!(cache.is_seeded());
+
+        cache.begin_generation(1).await;
+        assert!(!cache.is_seeded());
+        assert_eq!(cache.get(flag(100)).await, None);
+        assert!(
+            !cache
+                .apply_props_for_generation(
+                    0,
+                    false,
+                    [(100, CompactString::from("1"))].into_iter(),
+                )
+                .await,
+            "a late full response from the retired connection must be discarded"
+        );
+        assert!(!cache.is_seeded());
+        assert!(
+            cache
+                .apply_props_for_generation(
+                    1,
+                    false,
+                    [(100, CompactString::from("0"))].into_iter(),
+                )
+                .await
+        );
+        assert!(cache.is_seeded());
+        assert_eq!(cache.get_bool(flag(100)).await, Some(false));
     }
 
     #[tokio::test]

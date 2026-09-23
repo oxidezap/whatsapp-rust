@@ -1,6 +1,8 @@
 use super::*;
 use crate::lid_pn_cache::LearningSource;
-use crate::test_utils::{create_test_client, node_to_owned_ref};
+use crate::test_utils::{
+    create_test_client, create_test_client_with_ab_props_fetch, node_to_owned_ref,
+};
 use wacore::iq::abprops::web;
 use wacore::types::events::ChannelEventHandler;
 use wacore_binary::builder::NodeBuilder;
@@ -303,6 +305,21 @@ async fn offer_respects_username_privacy_flags_from_server_props() {
             .is_none(),
         "an unknown privacy gate must not expose the offered phone number"
     );
+
+    let client = create_test_client_with_ab_props_fetch(false).await;
+    deliver(
+        &client,
+        &offer(
+            Jid::lid(LID),
+            Jid::lid(LID),
+            Some(Jid::pn(PN)),
+            Some("sample_user"),
+            true,
+        ),
+    )
+    .await;
+    assert!(!client.ab_props.is_seeded());
+    assert_learned(&client, LID, PN).await;
 }
 
 #[tokio::test]
@@ -440,32 +457,4 @@ async fn session_migration_finishes_before_offer_event_dispatch() {
     )
     .await;
     assert!(matches!(&*events[0], Event::IncomingCall(_)));
-}
-
-#[cfg(feature = "voip-control")]
-#[tokio::test]
-async fn ringing_is_registered_before_identity_learning_can_suspend() {
-    let client = create_test_client().await;
-    let guard = client.lid_pn_cache.lock_mutation().await;
-    let node = node_to_owned_ref(&offer(
-        Jid::lid(LID),
-        Jid::lid(LID),
-        Some(Jid::pn(PN)),
-        None,
-        false,
-    ));
-    let mut cancelled = false;
-    let mut handling = Box::pin(CallHandler.handle(client.clone(), node, &mut cancelled));
-    assert!(futures::poll!(handling.as_mut()).is_pending());
-    assert!(
-        client.call_registry().take_ringing("CALL-IDENTITY-TEST"),
-        "a racing terminate must already see the unanswered offer while identity learning waits"
-    );
-    drop(guard);
-    assert!(handling.await);
-    assert!(
-        !client.call_registry().take_ringing("CALL-IDENTITY-TEST"),
-        "resuming identity learning must not recreate a ringing flag consumed by terminate"
-    );
-    assert_learned(&client, LID, PN).await;
 }

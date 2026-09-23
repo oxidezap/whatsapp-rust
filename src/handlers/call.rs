@@ -1043,6 +1043,10 @@ impl StanzaHandler for CallHandler {
                         // Keep the transition serialized through every committed side effect.
                         drop(event_permit);
                     }
+                    #[cfg(feature = "voip-control")]
+                    if is_offer && !client.call_registry().is_ringing(call.action.call_id()) {
+                        dispatch_call = false;
+                    }
                     if dispatch_call {
                         client
                             .core
@@ -1606,13 +1610,16 @@ async fn learn_offer_identity(client: &Arc<Client>, call: &IncomingCall) {
 
     // The linked-device client has no guest-viewer mode. For authenticated
     // viewers, WA Web skips this mapping when a nonempty username is supplied
-    // and both display and calling-PN-privacy gates are enabled. Its
-    // asMaybeUsername is a presence check, not full username validation.
+    // and both display and calling-PN-privacy gates are enabled. When fetching
+    // is disabled, WA Web's catalog defaults apply; while an enabled fetch is
+    // pending, wait rather than treating its defaults as the server's values.
+    // Its asMaybeUsername is a presence check, not full username validation.
     let has_username = call
         .caller_username
         .as_deref()
         .is_some_and(|username| !username.is_empty());
     if has_username
+        && client.ab_props_fetch_enabled()
         && (!client.ab_props.is_seeded()
             || (client
                 .ab_props
@@ -4302,6 +4309,43 @@ mod tests {
 
         drop(guard);
         assert!(handling.await.unwrap());
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn terminated_offer_is_not_dispatched_after_identity_learning_waits() {
+        let client = make_client().await;
+        let (handler, events) = ChannelEventHandler::new();
+        let _subscription = client.subscribe_handler(handler);
+        let guard = client.lid_pn_cache.lock_mutation().await;
+        let node = node_to_owned_ref(
+            &NodeBuilder::new("call")
+                .attr("from", fake_caller_lid())
+                .attr("id", "OFFER-IDENTITY-TERMINATE-RACE")
+                .attr("t", "1766847151")
+                .children([NodeBuilder::new("offer")
+                    .attr("call-id", "CALL-IDENTITY-TERMINATE-RACE")
+                    .attr("call-creator", fake_caller_lid())
+                    .attr("caller_pn", Jid::pn("15550000001"))
+                    .build()])
+                .build(),
+        );
+        let mut cancelled = false;
+        let mut handling = Box::pin(CallHandler.handle(client.clone(), node, &mut cancelled));
+        assert!(futures::poll!(handling.as_mut()).is_pending());
+        assert!(
+            client
+                .call_registry()
+                .take_ringing("CALL-IDENTITY-TERMINATE-RACE"),
+            "a racing terminate must see the offer as ringing before identity learning waits"
+        );
+
+        drop(guard);
+        assert!(handling.await);
+        assert!(
+            events.try_recv().is_err(),
+            "an offer terminated while identity learning waited must not be dispatched"
+        );
     }
 
     #[tokio::test]

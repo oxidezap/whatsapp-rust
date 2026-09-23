@@ -3120,6 +3120,11 @@ impl CallRegistry {
         self.ringing_calls().insert(call_id.to_string());
     }
 
+    /// Whether a pending incoming-offer marker still exists for `call_id`.
+    pub fn is_ringing(&self, call_id: &str) -> bool {
+        self.ringing_calls().contains(call_id)
+    }
+
     /// Consume the ringing flag for `call_id`, returning whether it was still ringing. True means a
     /// genuine missed call (an unanswered incoming offer the peer gave up on); false means the call
     /// was answered, was outgoing, or was already resolved (so a duplicate `<terminate>` is ended,
