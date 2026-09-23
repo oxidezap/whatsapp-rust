@@ -292,6 +292,8 @@ pub enum EventKind {
     ClientExpirationChanged,
     OfflineSyncInterrupted,
     LockChatUpdate,
+    FavoriteStickerUpdate,
+    RemoveRecentStickerUpdate,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -305,7 +307,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::LockChatUpdate as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::RemoveRecentStickerUpdate as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -1204,10 +1206,18 @@ pub enum Event {
 
     /// A chat was locked or unlocked on a linked device (`lock` syncd
     /// mutation, `LockChatAction.locked`).
+    LockChatUpdate(LockChatUpdate),
+
+    /// A sticker was added to or removed from favorites on a linked device
+    /// (`favoriteSticker` syncd mutation, `StickerAction.isFavorite`).
+    FavoriteStickerUpdate(FavoriteStickerUpdate),
+
+    /// A sticker was removed from the recent-stickers list on a linked device
+    /// (`removeRecentSticker` syncd mutation).
     ///
     /// Last, like every new variant: a binary `Serialize` format writes the
     /// variant index, so inserting in the middle renumbers everything after it.
-    LockChatUpdate(LockChatUpdate),
+    RemoveRecentStickerUpdate(RemoveRecentStickerUpdate),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1305,6 +1315,8 @@ impl Event {
             Event::ClientExpirationChanged(_) => EventKind::ClientExpirationChanged,
             Event::OfflineSyncInterrupted(_) => EventKind::OfflineSyncInterrupted,
             Event::LockChatUpdate(_) => EventKind::LockChatUpdate,
+            Event::FavoriteStickerUpdate(_) => EventKind::FavoriteStickerUpdate,
+            Event::RemoveRecentStickerUpdate(_) => EventKind::RemoveRecentStickerUpdate,
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
@@ -2656,6 +2668,38 @@ pub struct QuickReplyUpdate {
     pub from_full_sync: bool,
 }
 
+/// A sticker was favorited or unfavorited on a linked device
+/// (`favoriteSticker`). Unfavoriting is the same `Set` with
+/// `action.is_favorite == Some(false)`; the event is only emitted when the
+/// flag is present.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct FavoriteStickerUpdate {
+    /// WA Web's sticker `filehash` (the index key): the base64 SHA-256 of the
+    /// decrypted sticker file.
+    pub filehash: String,
+    pub timestamp: DateTime<Utc>,
+    /// `is_favorite` plus the media fields (`direct_path`, `media_key`,
+    /// `file_enc_sha256`, `mimetype`, `width`, `height`) needed to download a
+    /// newly favorited sticker.
+    pub action: Box<wa::sync_action_value::StickerAction>,
+    pub from_full_sync: bool,
+}
+
+/// A sticker was removed from the recent-stickers list on a linked device
+/// (`removeRecentSticker`).
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct RemoveRecentStickerUpdate {
+    /// WA Web's sticker `filehash` (the index key).
+    pub filehash: String,
+    pub timestamp: DateTime<Utc>,
+    /// `last_sticker_sent_ts`: WA Web drops its recent entry only when that
+    /// entry is not newer than this, and unconditionally when it is `None`.
+    pub action: Box<wa::sync_action_value::RemoveRecentStickerAction>,
+    pub from_full_sync: bool,
+}
+
 /// The account-wide "disable link previews" privacy setting changed on a linked
 /// device (`setting_disableLinkPreviews`).
 #[derive(Debug, Clone, Serialize, bon::Builder)]
@@ -2759,6 +2803,8 @@ mod tests {
         assert_eq!(EventKind::ClientExpirationChanged as u8, 69);
         assert_eq!(EventKind::OfflineSyncInterrupted as u8, 70);
         assert_eq!(EventKind::LockChatUpdate as u8, 71);
+        assert_eq!(EventKind::FavoriteStickerUpdate as u8, 72);
+        assert_eq!(EventKind::RemoveRecentStickerUpdate as u8, 73);
     }
 
     /// Every rejection a consumer can be handed must survive being persisted

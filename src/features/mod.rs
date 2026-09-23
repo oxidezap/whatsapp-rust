@@ -26,6 +26,7 @@ mod rotate_key;
 mod signal;
 mod stanza;
 pub(crate) mod status;
+pub(crate) mod stickers;
 mod tctoken;
 
 pub use app_state_resync::{AppStateResyncMode, AppStateResyncReport};

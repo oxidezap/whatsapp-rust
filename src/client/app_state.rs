@@ -3935,7 +3935,9 @@ fn redacted_index(
         | "label_edit"
         | "nct_salt_sync"
         | "setting_pushName"
-        | "setting_disableLinkPreviews" => &[Opaque],
+        | "setting_disableLinkPreviews"
+        | "favoriteSticker"
+        | "removeRecentSticker" => &[Opaque],
         _ => &[],
     };
     // Positional labels for the fingerprinted slots, for readability
@@ -3951,6 +3953,7 @@ fn redacted_index(
         "deleteChat" => &["", "delete_media"],
         "clearChat" => &["", "delete_starred", "delete_media"],
         "quick_reply" => &["id"],
+        "favoriteSticker" | "removeRecentSticker" => &["filehash"],
         "label_edit" => &["label"],
         "nct_salt_sync" => &["salt"],
         "setting_pushName" => &["push_name"],
@@ -4024,6 +4027,7 @@ fn mutation_target(m: &crate::appstate_sync::Mutation) -> Option<String> {
     match command {
         // Opaque single-arg commands: fingerprint, never `target=`.
         "quick_reply" => fp("id", 1),
+        "favoriteSticker" | "removeRecentSticker" => fp("filehash", 1),
         "label_edit" => fp("label", 1),
         "star" | "deleteMessageForMe" => match (jid(1), fp("msg", 2)) {
             (Some(chat), Some(msg)) => Some(format!("chat={chat} {msg}")),
@@ -4168,6 +4172,11 @@ fn mutation_effect_detail(m: &crate::appstate_sync::Mutation) -> Option<Mutation
             .as_option()
             .and_then(|a| a.deleted)
             .map(|b| MutationEffectDetail::Bool("deleted", b)),
+        "favoriteSticker" => v
+            .sticker_action
+            .as_option()
+            .and_then(|a| a.is_favorite)
+            .map(|b| MutationEffectDetail::Bool("favorite", b)),
         "setting_disableLinkPreviews" => v
             .privacy_setting_disable_link_previews_action
             .as_option()
@@ -4494,6 +4503,14 @@ impl Client {
         );
         if outcome != AppStateDispatchOutcome::Unclaimed {
             return report("quick_replies", m, outcome, effect_detail);
+        }
+        let outcome = crate::features::stickers::dispatch_sticker_mutation_outcome(
+            &self.core.event_bus,
+            m,
+            event_full_sync,
+        );
+        if outcome != AppStateDispatchOutcome::Unclaimed {
+            return report("stickers", m, outcome, effect_detail);
         }
         let outcome =
             crate::features::app_state_settings::dispatch_app_state_setting_mutation_outcome(
