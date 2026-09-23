@@ -248,6 +248,13 @@ pub struct NewsletterMetadata {
     pub invite_code: Option<String>,
     pub role: Option<NewsletterRole>,
     pub creation_time: Option<u64>,
+    /// Whether the viewer has muted the channel's updates (WA Web's
+    /// `MUTE_ADMIN_ACTIVITY`, the "Mute" a follower toggles). `None` when the
+    /// server sent no setting for it, which is what a non-follower sees.
+    pub muted: Option<bool>,
+    /// Whether the viewer has muted follower-activity notifications (WA Web's
+    /// `MUTE_FOLLOWER_ACTIVITY`). Only admins and owners receive these.
+    pub follower_activity_muted: Option<bool>,
 }
 
 /// An admin's public profile within a newsletter.
@@ -709,13 +716,16 @@ impl<'a> Newsletter<'a> {
 
     /// Mute or unmute a newsletter's follower-activity notifications
     /// (WA Web's `MUTE_FOLLOWER_ACTIVITY`). `muted = true` silences them.
+    /// Only meaningful for owners/admins: WA Web offers it behind its
+    /// admin-notifications gate.
     pub async fn set_follower_mute(&self, jid: &Jid, muted: bool) -> Result<(), NewsletterError> {
         self.set_user_setting_mute(jid, "MUTE_FOLLOWER_ACTIVITY", muted)
             .await
     }
 
-    /// Mute or unmute a newsletter's admin-activity notifications
-    /// (WA Web's `MUTE_ADMIN_ACTIVITY`). Only meaningful for owners/admins.
+    /// Mute or unmute a newsletter's admin-activity notifications (WA Web's
+    /// `MUTE_ADMIN_ACTIVITY`): the channel's own updates, so this is the
+    /// "Mute" a follower toggles. WA Web stores it as the chat's mute state.
     pub async fn set_admin_mute(&self, jid: &Jid, muted: bool) -> Result<(), NewsletterError> {
         self.set_user_setting_mute(jid, "MUTE_ADMIN_ACTIVITY", muted)
             .await
@@ -1095,6 +1105,10 @@ fn parse_newsletter_metadata(
         .as_str()
         .and_then(parse_newsletter_role);
 
+    let settings = &value["viewer_metadata"]["settings"];
+    let muted = parse_viewer_mute_setting(settings, "MUTE_ADMIN_ACTIVITY");
+    let follower_activity_muted = parse_viewer_mute_setting(settings, "MUTE_FOLLOWER_ACTIVITY");
+
     Ok(NewsletterMetadata {
         jid,
         name,
@@ -1107,7 +1121,24 @@ fn parse_newsletter_metadata(
         invite_code,
         role,
         creation_time,
+        muted,
+        follower_activity_muted,
     })
+}
+
+/// Read one mute setting from `viewer_metadata.settings`, a list of
+/// `{ type, value }` pairs. Like WA Web (`WAWebNewsletterModelUtils`), only
+/// `ON`/`OFF` count; anything else leaves the state unknown.
+fn parse_viewer_mute_setting(settings: &serde_json::Value, mute_type: &str) -> Option<bool> {
+    let setting = settings
+        .as_array()?
+        .iter()
+        .find(|s| s["type"].as_str() == Some(mute_type))?;
+    match setting["value"].as_str()? {
+        "ON" => Some(true),
+        "OFF" => Some(false),
+        _ => None,
+    }
 }
 
 // ─── Shared parsing helpers ────────────────────────────────────────────
@@ -2001,6 +2032,43 @@ mod tests {
         assert_eq!(parse_newsletter_role("admin"), Some(NewsletterRole::Admin));
         assert_eq!(parse_newsletter_role("GUEST"), Some(NewsletterRole::Guest));
         assert_eq!(parse_newsletter_role("unknown"), None);
+    }
+
+    #[test]
+    fn viewer_mute_settings_are_parsed_from_viewer_metadata() {
+        let metadata = parse_newsletter_metadata(&json!({
+            "id": "120363000000000001@newsletter",
+            "thread_metadata": { "name": { "text": "Test Channel" } },
+            "viewer_metadata": {
+                "role": "admin",
+                "settings": [
+                    { "type": "MUTE_ADMIN_ACTIVITY", "value": "ON" },
+                    { "type": "MUTE_FOLLOWER_ACTIVITY", "value": "OFF" }
+                ]
+            }
+        }))
+        .expect("metadata");
+        assert_eq!(metadata.role, Some(NewsletterRole::Admin));
+        assert_eq!(metadata.muted, Some(true));
+        assert_eq!(metadata.follower_activity_muted, Some(false));
+
+        // A missing list, a missing entry and an unknown value all leave the
+        // state unknown rather than guessing "unmuted".
+        let unknown = parse_newsletter_metadata(&json!({
+            "id": "120363000000000001@newsletter",
+            "viewer_metadata": {
+                "settings": [{ "type": "MUTE_ADMIN_ACTIVITY", "value": "SOMETIMES" }]
+            }
+        }))
+        .expect("metadata");
+        assert_eq!(unknown.muted, None);
+        assert_eq!(unknown.follower_activity_muted, None);
+
+        let absent = parse_newsletter_metadata(&json!({
+            "id": "120363000000000001@newsletter"
+        }))
+        .expect("metadata");
+        assert_eq!(absent.muted, None);
     }
 
     #[test]
