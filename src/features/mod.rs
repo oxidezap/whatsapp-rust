@@ -10,6 +10,7 @@ mod comments;
 mod community;
 mod contacts;
 mod events;
+pub(crate) mod favorites;
 mod groups;
 pub(crate) use groups::GroupMetadataRegistry;
 pub(crate) mod labels;

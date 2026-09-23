@@ -4082,6 +4082,9 @@ enum MutationEffectDetail {
     /// proto (see `deleteChat`/`clearChat` below): rendered as
     /// `delete_starred=false delete_media=true` on the DEBUG line.
     TwoBools(&'static str, bool, &'static str, bool),
+    /// A list's length, for actions whose payload is the list itself and
+    /// whose entries (chat JIDs for `favorites`) must stay off the line.
+    Count(&'static str, usize),
 }
 
 impl MutationEffectDetail {
@@ -4096,6 +4099,9 @@ impl MutationEffectDetail {
             }
             Self::TwoBools(n1, b1, n2, b2) => {
                 let _ = write!(out, "{n1}={b1} {n2}={b2}");
+            }
+            Self::Count(name, n) => {
+                let _ = write!(out, "{name}={n}");
             }
         }
     }
@@ -4177,6 +4183,10 @@ fn mutation_effect_detail(m: &crate::appstate_sync::Mutation) -> Option<Mutation
             .as_option()
             .and_then(|a| a.is_favorite)
             .map(|b| MutationEffectDetail::Bool("favorite", b)),
+        "favorites" => v
+            .favorites_action
+            .as_option()
+            .map(|a| MutationEffectDetail::Count("favorites", a.favorites.len())),
         "setting_disableLinkPreviews" => v
             .privacy_setting_disable_link_previews_action
             .as_option()
@@ -4511,6 +4521,14 @@ impl Client {
         );
         if outcome != AppStateDispatchOutcome::Unclaimed {
             return report("stickers", m, outcome, effect_detail);
+        }
+        let outcome = crate::features::favorites::dispatch_favorites_mutation_outcome(
+            &self.core.event_bus,
+            m,
+            event_full_sync,
+        );
+        if outcome != AppStateDispatchOutcome::Unclaimed {
+            return report("favorites", m, outcome, effect_detail);
         }
         let outcome =
             crate::features::app_state_settings::dispatch_app_state_setting_mutation_outcome(
@@ -5212,6 +5230,41 @@ mod tests {
     /// `deleteMessageForMe.delete_media` is applied by the dispatcher from
     /// the proto (not the index tail): DEBUG must distinguish a
     /// media-preserving replay from a media-deleting one.
+    #[test]
+    fn mutation_effect_detail_counts_favorites_without_their_jids() {
+        use crate::appstate_sync::Mutation;
+
+        let favorites = |ids: &[&str]| Mutation {
+            index: vec!["favorites".to_string()],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: Some(wa::SyncActionValue {
+                favorites_action: buffa::MessageField::some(
+                    wa::sync_action_value::FavoritesAction {
+                        favorites: ids
+                            .iter()
+                            .map(|id| wa::sync_action_value::favorites_action::Favorite {
+                                id: Some((*id).to_string()),
+                            })
+                            .collect(),
+                    },
+                ),
+                ..Default::default()
+            }),
+        };
+        let detail = mutation_effect_detail(&favorites(&[
+            "15550000002@s.whatsapp.net",
+            "120363000000000042@g.us",
+        ]));
+        assert_eq!(detail, Some(MutationEffectDetail::Count("favorites", 2)));
+        let mut rendered = String::new();
+        detail.unwrap().render(&mut rendered);
+        assert_eq!(rendered, "favorites=2");
+        assert_eq!(
+            mutation_effect_detail(&favorites(&[])),
+            Some(MutationEffectDetail::Count("favorites", 0))
+        );
+    }
+
     #[test]
     fn mutation_effect_detail_reports_delete_for_me_media() {
         use crate::appstate_sync::Mutation;

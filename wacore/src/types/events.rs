@@ -294,6 +294,7 @@ pub enum EventKind {
     LockChatUpdate,
     FavoriteStickerUpdate,
     RemoveRecentStickerUpdate,
+    FavoritesUpdate,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -307,7 +308,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::RemoveRecentStickerUpdate as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::FavoritesUpdate as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -1214,10 +1215,14 @@ pub enum Event {
 
     /// A sticker was removed from the recent-stickers list on a linked device
     /// (`removeRecentSticker` syncd mutation).
+    RemoveRecentStickerUpdate(RemoveRecentStickerUpdate),
+
+    /// The favorite chats list changed on a linked device (`favorites` syncd
+    /// mutation, `FavoritesAction.favorites`).
     ///
     /// Last, like every new variant: a binary `Serialize` format writes the
     /// variant index, so inserting in the middle renumbers everything after it.
-    RemoveRecentStickerUpdate(RemoveRecentStickerUpdate),
+    FavoritesUpdate(FavoritesUpdate),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1317,6 +1322,7 @@ impl Event {
             Event::LockChatUpdate(_) => EventKind::LockChatUpdate,
             Event::FavoriteStickerUpdate(_) => EventKind::FavoriteStickerUpdate,
             Event::RemoveRecentStickerUpdate(_) => EventKind::RemoveRecentStickerUpdate,
+            Event::FavoritesUpdate(_) => EventKind::FavoritesUpdate,
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
@@ -2700,6 +2706,20 @@ pub struct RemoveRecentStickerUpdate {
     pub from_full_sync: bool,
 }
 
+/// The favorite chats list changed on a linked device (`favorites`).
+///
+/// Each mutation carries the whole list, not a delta: it replaces whatever
+/// the application held before, and an empty list means no favorites.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct FavoritesUpdate {
+    pub timestamp: DateTime<Utc>,
+    /// `favorites`, in the order the phone shows them; each entry's `id` is
+    /// a chat JID string.
+    pub action: Box<wa::sync_action_value::FavoritesAction>,
+    pub from_full_sync: bool,
+}
+
 /// The account-wide "disable link previews" privacy setting changed on a linked
 /// device (`setting_disableLinkPreviews`).
 #[derive(Debug, Clone, Serialize, bon::Builder)]
@@ -2805,6 +2825,7 @@ mod tests {
         assert_eq!(EventKind::LockChatUpdate as u8, 71);
         assert_eq!(EventKind::FavoriteStickerUpdate as u8, 72);
         assert_eq!(EventKind::RemoveRecentStickerUpdate as u8, 73);
+        assert_eq!(EventKind::FavoritesUpdate as u8, 74);
     }
 
     /// Every rejection a consumer can be handed must survive being persisted
