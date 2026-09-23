@@ -121,14 +121,22 @@ impl AbPropsCache {
     /// it. The registry is the single source of truth for the default.
     pub async fn is_enabled(&self, prop: AbProp) -> bool {
         self.debug_assert_watched(prop).await;
-        match self.props.read().await.get(&prop.code) {
-            Some(value) => {
-                value == "1"
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("enabled")
-            }
-            None => matches!(prop.default, AbDefault::Bool(true)),
-        }
+        self.get_bool(prop)
+            .await
+            .unwrap_or(matches!(prop.default, AbDefault::Bool(true)))
+    }
+
+    /// The server's value for `prop` read as a boolean, with the same truthy
+    /// set as [`is_enabled`](Self::is_enabled), or `None` when no value is
+    /// cached: the prop is not watched, props have not been fetched yet, or
+    /// the server did not send it. Unlike `is_enabled` it substitutes no
+    /// default, so it does not assert that `prop` is watched.
+    pub async fn get_bool(&self, prop: AbProp) -> Option<bool> {
+        self.props.read().await.get(&prop.code).map(|value| {
+            value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("enabled")
+        })
     }
 
     /// The cached int value, falling back to the flag's registry default when
@@ -211,6 +219,31 @@ mod tests {
         assert!(!cache.is_enabled(flag(4)).await);
         assert!(!cache.is_enabled(flag(5)).await);
         assert!(!cache.is_enabled(flag(999)).await); // absent
+    }
+
+    #[tokio::test]
+    async fn get_bool_reports_absence_instead_of_a_default() {
+        let cache = AbPropsCache::new();
+        let on_by_default = AbProp {
+            default: AbDefault::Bool(true),
+            ..flag(3)
+        };
+        cache.watch_many(&[flag(1), flag(2), on_by_default]).await;
+        assert_eq!(cache.get_bool(flag(1)).await, None); // not fetched yet
+
+        let props = vec![
+            (1u32, CompactString::from("true")),
+            (2, CompactString::from("0")),
+            (4, CompactString::from("1")),
+        ];
+        cache.apply_props(false, props.into_iter()).await;
+
+        assert_eq!(cache.get_bool(flag(1)).await, Some(true));
+        assert_eq!(cache.get_bool(flag(2)).await, Some(false));
+        // Watched but not sent: absent, even though its default is `true`.
+        assert_eq!(cache.get_bool(on_by_default).await, None);
+        // Sent but not watched: discarded on apply, so also absent.
+        assert_eq!(cache.get_bool(flag(4)).await, None);
     }
 
     #[tokio::test]

@@ -70,6 +70,17 @@ impl Client {
         &self.ab_props
     }
 
+    /// The server's value for a boolean A/B prop, or `None` when the client
+    /// holds none: the prop is not watched (see
+    /// [`ClientBuilder::with_watched_ab_props`](crate::ClientBuilder::with_watched_ab_props)),
+    /// the catalog has not been fetched yet (it is on every connect, unless
+    /// [`with_ab_props_fetch`](crate::ClientBuilder::with_ab_props_fetch)
+    /// turned that off), or the server did not send it. WA Web falls back to
+    /// the registry default in that case, which is `prop.default`.
+    pub async fn ab_prop_enabled(&self, prop: wacore::iq::abprops::AbProp) -> Option<bool> {
+        self.ab_props.get_bool(prop).await
+    }
+
     pub async fn fetch_privacy_settings(
         &self,
     ) -> Result<wacore::iq::privacy::PrivacySettingsResponse, crate::request::IqError> {

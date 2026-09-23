@@ -721,6 +721,7 @@ pub struct BotBuilder<
     pair_code_options: Option<PairCodeOptions>,
     skip_history_sync: bool,
     ab_props_fetch: bool,
+    watched_ab_props: Vec<wacore::iq::abprops::AbProp>,
     presence_policy: PresencePolicy,
     noise_cert_policy: NoiseCertPolicy,
     initial_push_name: Option<String>,
@@ -754,6 +755,7 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             pair_code_options: None,
             skip_history_sync: false,
             ab_props_fetch: true,
+            watched_ab_props: Vec::new(),
             presence_policy: PresencePolicy::default(),
             noise_cert_policy: NoiseCertPolicy::default(),
             initial_push_name: None,
@@ -791,6 +793,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             pair_code_options: self.pair_code_options,
             skip_history_sync: self.skip_history_sync,
             ab_props_fetch: self.ab_props_fetch,
+            watched_ab_props: self.watched_ab_props,
             presence_policy: self.presence_policy,
             noise_cert_policy: self.noise_cert_policy,
             initial_push_name: self.initial_push_name,
@@ -1422,6 +1425,17 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
+    /// A/B props the application wants to read with
+    /// [`Client::ab_prop_enabled`](crate::Client::ab_prop_enabled); see
+    /// [`ClientBuilder::with_watched_ab_props`](crate::client::ClientBuilder::with_watched_ab_props).
+    pub fn with_watched_ab_props(
+        mut self,
+        props: impl IntoIterator<Item = wacore::iq::abprops::AbProp>,
+    ) -> Self {
+        self.watched_ab_props.extend(props);
+        self
+    }
+
     /// Choose who announces the account's own `available` presence.
     ///
     /// Default: [`PresencePolicy::Automatic`], which matches WhatsApp Web. See
@@ -1588,6 +1602,7 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
             .with_custom_enc_handlers(self.custom_enc_handlers)
             .with_skip_history_sync(self.skip_history_sync)
             .with_ab_props_fetch(self.ab_props_fetch)
+            .with_watched_ab_props(self.watched_ab_props)
             .with_presence_policy(self.presence_policy)
             .with_background_saver_interval(std::time::Duration::from_secs(30));
         #[cfg(feature = "plugins")]

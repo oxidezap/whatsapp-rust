@@ -23,6 +23,7 @@ use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
 use crate::types::history_sync_admission::HistorySyncAdmission;
 use wacore::handshake::NoiseCertPolicy;
+use wacore::iq::abprops::AbProp;
 use wacore::runtime::Runtime;
 
 /// Result of constructing a [`Client`].
@@ -126,6 +127,7 @@ pub struct ClientBuilder {
     history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
     skip_history_sync: bool,
     ab_props_fetch: bool,
+    watched_ab_props: Vec<AbProp>,
     presence_policy: PresencePolicy,
     noise_cert_policy: NoiseCertPolicy,
     wanted_pre_key_count: Option<usize>,
@@ -167,6 +169,7 @@ impl ClientBuilder {
             history_sync_admission: None,
             skip_history_sync: false,
             ab_props_fetch: true,
+            watched_ab_props: Vec::new(),
             presence_policy: PresencePolicy::default(),
             noise_cert_policy: NoiseCertPolicy::default(),
             wanted_pre_key_count: None,
@@ -359,6 +362,16 @@ impl ClientBuilder {
     /// privacy-token and trusted-contact-token gates run on their defaults.
     pub fn with_ab_props_fetch(mut self, enabled: bool) -> Self {
         self.ab_props_fetch = enabled;
+        self
+    }
+
+    /// A/B props to keep from the server's catalog, on top of the ones the
+    /// library reads itself, so the application can read them with
+    /// [`Client::ab_prop_enabled`]. The client discards every prop it does not
+    /// watch while the catalog streams in, so the set is fixed here, before
+    /// the first fetch. Accumulates across calls.
+    pub fn with_watched_ab_props(mut self, props: impl IntoIterator<Item = AbProp>) -> Self {
+        self.watched_ab_props.extend(props);
         self
     }
 
@@ -662,6 +675,9 @@ impl ClientBuilder {
         }
         if !self.ab_props_fetch {
             client.set_ab_props_fetch(false);
+        }
+        if !self.watched_ab_props.is_empty() {
+            client.ab_props.watch_many(&self.watched_ab_props).await;
         }
         client.set_presence_policy(self.presence_policy);
         if let Some(count) = self.wanted_pre_key_count {
@@ -1137,6 +1153,52 @@ mod tests {
             NoiseCertPolicy::DangerSkipCertChainVerify
         );
         bypass.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn watched_ab_props_are_kept_and_readable() {
+        use wacore::iq::abprops::web::{
+            AURA_PINNED_CHATS_BENEFIT_ACTIVE, AURA_PINNED_CHATS_ENABLED,
+        };
+
+        let client = complete_builder()
+            .await
+            .with_watched_ab_props([AURA_PINNED_CHATS_BENEFIT_ACTIVE])
+            .build()
+            .await
+            .expect("build")
+            .into_client();
+        // Nothing fetched yet: absent, not the registry default.
+        assert_eq!(
+            client
+                .ab_prop_enabled(AURA_PINNED_CHATS_BENEFIT_ACTIVE)
+                .await,
+            None
+        );
+
+        client
+            .ab_props()
+            .apply_props(
+                false,
+                [
+                    (AURA_PINNED_CHATS_BENEFIT_ACTIVE.code, "1".into()),
+                    (AURA_PINNED_CHATS_ENABLED.code, "1".into()),
+                ]
+                .into_iter(),
+            )
+            .await;
+        assert_eq!(
+            client
+                .ab_prop_enabled(AURA_PINNED_CHATS_BENEFIT_ACTIVE)
+                .await,
+            Some(true)
+        );
+        // Sent by the server but never watched, so discarded on arrival.
+        assert_eq!(
+            client.ab_prop_enabled(AURA_PINNED_CHATS_ENABLED).await,
+            None
+        );
+        client.signal_shutdown_sync();
     }
 
     #[tokio::test]
