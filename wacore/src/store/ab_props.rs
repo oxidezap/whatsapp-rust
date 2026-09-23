@@ -6,7 +6,6 @@
 //!
 //! Not persisted — props are fetched on every connect.
 
-use portable_atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
@@ -21,19 +20,57 @@ use crate::iq::props::WATCHED;
 /// Only materializes props whose code is in the interest set.
 /// Pre-populated with the `WATCHED` flags; extend via `watch()`.
 pub struct AbPropsCache {
-    props: RwLock<HashMap<u32, CompactString>>,
+    state: RwLock<PropsState>,
     interest: RwLock<HashSet<u32>>,
     seeded: AtomicBool,
-    generation: AtomicU64,
+}
+
+#[derive(Default)]
+struct PropsState {
+    props: HashMap<u32, CompactString>,
+    seeded: bool,
+    generation: u64,
+    applied_in_generation: bool,
+}
+
+/// Consistent view of cached props and connection-generation readiness.
+#[derive(Clone)]
+pub struct AbPropsSnapshot {
+    props: HashMap<u32, CompactString>,
+    seeded: bool,
+    applied_in_generation: bool,
+}
+
+impl AbPropsSnapshot {
+    /// True after a full response has seeded the delta-fetch cache.
+    pub fn is_seeded(&self) -> bool {
+        self.seeded
+    }
+
+    /// True after any accepted response has applied in the current connection.
+    pub fn applied_in_generation(&self) -> bool {
+        self.applied_in_generation
+    }
+
+    /// Read a boolean prop with the registry default as fallback.
+    pub fn is_enabled(&self, prop: AbProp) -> bool {
+        self.props
+            .get(&prop.code)
+            .map(|value| {
+                value == "1"
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("enabled")
+            })
+            .unwrap_or(matches!(prop.default, AbDefault::Bool(true)))
+    }
 }
 
 impl AbPropsCache {
     pub fn new() -> Self {
         Self {
-            props: RwLock::new(HashMap::new()),
+            state: RwLock::new(PropsState::default()),
             interest: RwLock::new(WATCHED.iter().map(|p| p.code).collect()),
             seeded: AtomicBool::new(false),
-            generation: AtomicU64::new(0),
         }
     }
 
@@ -51,13 +88,13 @@ impl AbPropsCache {
             .extend(props.iter().map(|p| p.code));
     }
 
-    /// Start a connection generation with no current-server props. A full
-    /// response from an older connection cannot seed this generation.
+    /// Mark the start of a connection generation without discarding cached props.
+    /// Retaining values supports reconnect work while the server delta is pending;
+    /// generation-local readiness keeps privacy-sensitive decisions conservative.
     pub async fn begin_generation(&self, generation: u64) {
-        let mut props = self.props.write().await;
-        props.clear();
-        self.generation.store(generation, Ordering::Release);
-        self.seeded.store(false, Ordering::Release);
+        let mut state = self.state.write().await;
+        state.generation = generation;
+        state.applied_in_generation = false;
     }
 
     /// The codes a fetch has to keep: a snapshot of the interest set, taken at
@@ -69,7 +106,21 @@ impl AbPropsCache {
 
     /// True after the first full (non-delta) update.
     pub fn is_seeded(&self) -> bool {
-        self.seeded.load(Ordering::Acquire)
+        self.seeded.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Return cached values and readiness from one lock-protected state.
+    pub async fn snapshot(&self) -> AbPropsSnapshot {
+        let state = self.state.read().await;
+        Self::snapshot_locked(&state)
+    }
+
+    fn snapshot_locked(state: &PropsState) -> AbPropsSnapshot {
+        AbPropsSnapshot {
+            props: state.props.clone(),
+            seeded: state.seeded,
+            applied_in_generation: state.applied_in_generation,
+        }
     }
 
     /// Apply a props response, retaining only watched flag codes.
@@ -79,27 +130,30 @@ impl AbPropsCache {
         props: impl Iterator<Item = (u32, CompactString)>,
     ) {
         let interest = self.interest.read().await;
-        let mut map = self.props.write().await;
-        self.apply_props_locked(delta_update, props, &interest, &mut map);
+        let mut state = self.state.write().await;
+        self.apply_props_locked(delta_update, props, &interest, &mut state);
+        state.applied_in_generation = true;
     }
 
     /// Apply a response only if it belongs to the connection generation that
-    /// is still current. The generation check and mutation share the props lock
-    /// with [`begin_generation`](Self::begin_generation), so a late response
-    /// cannot reseed a newer connection.
+    /// is still current. The generation check and mutation share the state lock
+    /// with [`begin_generation`](Self::begin_generation), so late responses cannot
+    /// overwrite a newer generation. Returns a snapshot of the accepted response
+    /// for post-fetch side effects that must use that exact observation.
     pub async fn apply_props_for_generation(
         &self,
         generation: u64,
         delta_update: bool,
         props: impl Iterator<Item = (u32, CompactString)>,
-    ) -> bool {
+    ) -> Option<AbPropsSnapshot> {
         let interest = self.interest.read().await;
-        let mut map = self.props.write().await;
-        if self.generation.load(Ordering::Acquire) != generation {
-            return false;
+        let mut state = self.state.write().await;
+        if state.generation != generation {
+            return None;
         }
-        self.apply_props_locked(delta_update, props, &interest, &mut map);
-        true
+        self.apply_props_locked(delta_update, props, &interest, &mut state);
+        state.applied_in_generation = true;
+        Some(Self::snapshot_locked(&state))
     }
 
     fn apply_props_locked(
@@ -107,18 +161,20 @@ impl AbPropsCache {
         delta_update: bool,
         props: impl Iterator<Item = (u32, CompactString)>,
         interest: &HashSet<u32>,
-        map: &mut HashMap<u32, CompactString>,
+        state: &mut PropsState,
     ) {
         if !delta_update {
-            map.clear();
+            state.props.clear();
         }
         for (code, value) in props {
             if interest.contains(&code) {
-                map.insert(code, value);
+                state.props.insert(code, value);
             }
         }
         if !delta_update {
-            self.seeded.store(true, Ordering::Release);
+            state.seeded = true;
+            self.seeded
+                .store(true, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -151,7 +207,7 @@ impl AbPropsCache {
     async fn debug_assert_watched(&self, _prop: AbProp) {}
 
     pub async fn get(&self, prop: AbProp) -> Option<CompactString> {
-        self.props.read().await.get(&prop.code).cloned()
+        self.state.read().await.props.get(&prop.code).cloned()
     }
 
     /// True when the cached value is truthy (`"1"`, `"true"`, or `"enabled"`),
@@ -170,7 +226,7 @@ impl AbPropsCache {
     /// the server did not send it. Unlike `is_enabled` it substitutes no
     /// default, so it does not assert that `prop` is watched.
     pub async fn get_bool(&self, prop: AbProp) -> Option<bool> {
-        self.props.read().await.get(&prop.code).map(|value| {
+        self.state.read().await.props.get(&prop.code).map(|value| {
             value == "1"
                 || value.eq_ignore_ascii_case("true")
                 || value.eq_ignore_ascii_case("enabled")
@@ -185,7 +241,7 @@ impl AbPropsCache {
             AbDefault::Int(n) => n,
             _ => 0,
         };
-        match self.props.read().await.get(&prop.code) {
+        match self.state.read().await.props.get(&prop.code) {
             Some(value) => value.parse().unwrap_or(fallback),
             None => fallback,
         }
@@ -285,7 +341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_generation_clears_props_and_rejects_stale_responses() {
+    async fn new_generation_keeps_props_and_rejects_stale_responses() {
         let cache = AbPropsCache::new();
         cache.watch(flag(100)).await;
         cache
@@ -294,28 +350,27 @@ mod tests {
         assert!(cache.is_seeded());
 
         cache.begin_generation(1).await;
-        assert!(!cache.is_seeded());
-        assert_eq!(cache.get(flag(100)).await, None);
-        assert!(
-            !cache
-                .apply_props_for_generation(
-                    0,
-                    false,
-                    [(100, CompactString::from("1"))].into_iter(),
-                )
-                .await,
-            "a late full response from the retired connection must be discarded"
-        );
-        assert!(!cache.is_seeded());
+        assert!(cache.is_seeded());
+        assert!(!cache.snapshot().await.applied_in_generation());
+        assert_eq!(cache.get(flag(100)).await.as_deref(), Some("1"));
         assert!(
             cache
                 .apply_props_for_generation(
-                    1,
+                    0,
                     false,
                     [(100, CompactString::from("0"))].into_iter(),
                 )
-                .await
+                .await.is_none(),
+            "a late full response from the retired connection must be discarded"
         );
+        assert!(!cache.snapshot().await.applied_in_generation());
+        assert!(
+            cache
+                .apply_props_for_generation(1, true, [(100, CompactString::from("0"))].into_iter(),)
+                .await
+                .is_some()
+        );
+        assert!(cache.snapshot().await.applied_in_generation());
         assert!(cache.is_seeded());
         assert_eq!(cache.get_bool(flag(100)).await, Some(false));
     }

@@ -323,6 +323,65 @@ async fn offer_respects_username_privacy_flags_from_server_props() {
 }
 
 #[tokio::test]
+async fn reconnect_and_disabled_fetch_respect_cached_privacy() {
+    let client = create_test_client().await;
+    client
+        .ab_props
+        .apply_props(
+            false,
+            [
+                (web::USERNAME_CONTACT_DISPLAY.code, "1".into()),
+                (web::ENABLE_CALLING_PHONE_NUMBER_PRIVACY.code, "1".into()),
+            ]
+            .into_iter(),
+        )
+        .await;
+    client.set_ab_props_fetch(false);
+    deliver(
+        &client,
+        &offer(
+            Jid::lid(LID),
+            Jid::lid(LID),
+            Some(Jid::pn(PN)),
+            Some("user"),
+            true,
+        ),
+    )
+    .await;
+    assert!(
+        client
+            .get_lid_pn_entry(&Jid::lid(LID))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    client.set_ab_props_fetch(true);
+    client.ab_props.begin_generation(1).await;
+    let privacy = client.ab_props.snapshot().await;
+    assert!(privacy.is_seeded());
+    assert!(!privacy.applied_in_generation());
+    deliver(
+        &client,
+        &offer(
+            Jid::lid(LID),
+            Jid::lid(LID),
+            Some(Jid::pn(PN)),
+            Some("user"),
+            true,
+        ),
+    )
+    .await;
+    assert!(
+        client
+            .get_lid_pn_entry(&Jid::lid(LID))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn non_offer_does_not_learn_an_unmodeled_caller_pn() {
     let client = create_test_client().await;
     let node = NodeBuilder::new("call")

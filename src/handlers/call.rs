@@ -269,7 +269,7 @@ impl StanzaHandler for CallHandler {
                     if is_offer && let Err(e) = send_offer_ack_receipt(&client, &call).await {
                         warn!("call: failed to send offer ack receipt: {e}");
                     }
-                    learn_offer_identity(&client, &call).await;
+                    let identity_ready = learn_offer_identity(&client, &call).await;
                     #[cfg(feature = "voip-control")]
                     if let CallAction::PreAccept { audio, .. } | CallAction::Accept { audio, .. } =
                         &call.action
@@ -1047,7 +1047,7 @@ impl StanzaHandler for CallHandler {
                     if is_offer && !client.call_registry().is_ringing(call.action.call_id()) {
                         dispatch_call = false;
                     }
-                    if dispatch_call {
+                    if dispatch_call && identity_ready {
                         client
                             .core
                             .event_bus
@@ -1588,7 +1588,7 @@ fn same_device(a: &Jid, b: &Jid) -> bool {
 /// WAWebVoipLidUtils associates caller_pn with peer_jid (the outer `from`),
 /// independently of call-creator. Learn before online/offline event dispatch;
 /// the shared fast path owns persistence, migration, and conflict reconciliation.
-async fn learn_offer_identity(client: &Arc<Client>, call: &IncomingCall) {
+async fn learn_offer_identity(client: &Arc<Client>, call: &IncomingCall) -> bool {
     use crate::lid_pn_cache::LearningSource;
     use wacore::iq::abprops::web;
 
@@ -1597,7 +1597,7 @@ async fn learn_offer_identity(client: &Arc<Client>, call: &IncomingCall) {
         ..
     } = &call.action
     else {
-        return;
+        return true;
     };
     let peer = &call.from;
     if !peer.server.is_lid_family()
@@ -1605,35 +1605,27 @@ async fn learn_offer_identity(client: &Arc<Client>, call: &IncomingCall) {
         || peer.user.is_empty()
         || pn.user.is_empty()
     {
-        return;
+        return true;
     }
 
     // The linked-device client has no guest-viewer mode. For authenticated
     // viewers, WA Web skips this mapping when a nonempty username is supplied
-    // and both display and calling-PN-privacy gates are enabled. When fetching
-    // is disabled, WA Web's catalog defaults apply; while an enabled fetch is
-    // pending, wait rather than treating its defaults as the server's values.
+    // and both display and calling-PN-privacy gates are enabled. An enabled
+    // fetch must have applied in this connection before disclosing a username
+    // offer; disabling fetches preserves any already-cached server values.
     // Its asMaybeUsername is a presence check, not full username validation.
     let has_username = call
         .caller_username
         .as_deref()
         .is_some_and(|username| !username.is_empty());
-    if has_username
-        && client.ab_props_fetch_enabled()
-        && (!client.ab_props.is_seeded()
-            || (client
-                .ab_props
-                .is_enabled(web::USERNAME_CONTACT_DISPLAY)
-                .await
-                && client
-                    .ab_props
-                    .is_enabled(web::ENABLE_CALLING_PHONE_NUMBER_PRIVACY)
-                    .await))
-    {
-        // Before the first full props response, the default for calling-PN
-        // privacy is false. Do not disclose an offered number until the initial
-        // props response lets the handler evaluate the actual privacy gates.
-        return;
+    if has_username {
+        let privacy = client.ab_props.snapshot().await;
+        if (client.ab_props_fetch_enabled() && !privacy.applied_in_generation())
+            || (privacy.is_enabled(web::USERNAME_CONTACT_DISPLAY)
+                && privacy.is_enabled(web::ENABLE_CALLING_PHONE_NUMBER_PRIVACY))
+        {
+            return true;
+        }
     }
 
     // WA Web's "voip-lid" takes createLidPnMappings' default policy: seed
@@ -1654,7 +1646,9 @@ async fn learn_offer_identity(client: &Arc<Client>, call: &IncomingCall) {
     };
     if let Err(error) = result {
         warn!("call: failed to persist/migrate caller LID-PN mapping: {error}");
+        return false;
     }
+    true
 }
 
 #[cfg(test)]
