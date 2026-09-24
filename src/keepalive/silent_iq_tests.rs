@@ -258,3 +258,84 @@ async fn short_request_timeout_does_not_wait_for_the_watchdog_or_a_probe() {
     client.notify_connection_shutdown();
     keepalive.await.unwrap();
 }
+
+/// A client whose socket takes writes and never finishes them: established,
+/// but no longer draining, as a TCP connection is after the laptop under it
+/// resumed from suspend with its route gone.
+async fn wedged_client() -> (
+    Arc<Client>,
+    Arc<crate::transport::mock::StallingMockTransport>,
+) {
+    use wacore::handshake::NoiseCipher;
+
+    let client = crate::test_utils::create_test_client().await;
+    let transport = Arc::new(crate::transport::mock::StallingMockTransport::new());
+    let noise_socket = crate::socket::NoiseSocket::with_observers(
+        client.runtime.clone(),
+        transport.clone() as Arc<dyn crate::transport::Transport>,
+        NoiseCipher::new(&[0u8; 32]).expect("32-byte key"),
+        NoiseCipher::new(&[0u8; 32]).expect("32-byte key"),
+        crate::socket::noise_socket::SendObservers::with_stats(client.stats.clone()),
+    );
+    *client.transport.lock().await =
+        Some(transport.clone() as Arc<dyn crate::transport::Transport>);
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
+    client.set_connected_for_test(true);
+    client.is_running.store(true, Ordering::Release);
+    // The link carried traffic until the write wedged.
+    client.stats.mark_recv_activity();
+    (client, transport)
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_iq_whose_write_never_completes_times_out() {
+    if isolate(concat!(
+        module_path!(),
+        "::an_iq_whose_write_never_completes_times_out"
+    )) {
+        return;
+    }
+    let (client, transport) = wedged_client().await;
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(300),
+        request(&client, "WEDGED", Some(Duration::from_secs(20))),
+    )
+    .await
+    .expect("the IQ deadline must cover a write that never completes")
+    .unwrap();
+    assert!(transport.sends_started() >= 1);
+    assert!(
+        matches!(result, Err(IqError::Timeout)),
+        "a wedged write must surface as the IQ's timeout, got {result:?}"
+    );
+    assert!(started.elapsed() <= Duration::from_secs(21));
+}
+
+#[tokio::test(start_paused = true)]
+async fn keepalive_reconnects_when_its_ping_write_never_completes() {
+    if isolate(concat!(
+        module_path!(),
+        "::keepalive_reconnects_when_its_ping_write_never_completes"
+    )) {
+        return;
+    }
+    let (client, transport) = wedged_client().await;
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(600), start_keepalive(&client))
+        .await
+        .expect("the keepalive must give up on a ping it cannot even write")
+        .unwrap();
+    assert!(
+        transport.disconnects_started() >= 1,
+        "the keepalive must have torn the wedged connection down"
+    );
+    // Armed when the first ping entered the transport, the dead-socket
+    // watchdog fires on the tick after that ping's deadline: at most two
+    // intervals and two answer deadlines, not three unanswered pings.
+    assert!(
+        started.elapsed() <= 2 * (KEEP_ALIVE_INTERVAL_MAX + KEEP_ALIVE_RESPONSE_DEADLINE),
+        "took {:?}",
+        started.elapsed()
+    );
+}

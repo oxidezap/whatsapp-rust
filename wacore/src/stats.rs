@@ -250,6 +250,20 @@ impl SessionStats {
         self.bytes_sent
             .fetch_add(wire_bytes as u64, Ordering::Relaxed);
         self.frames_sent.fetch_add(1, Ordering::Relaxed);
+        self.arm_dead_socket_deadline();
+    }
+
+    /// Arm the dead-socket deadline for a write that is starting, before it
+    /// completes.
+    ///
+    /// WA Web arms at the send call, not when the bytes leave. Arming only
+    /// after a completed write misses the write that never completes: a socket
+    /// that stays established but no longer drains (after a suspend, or a
+    /// network change) takes a few frames into its buffer and then blocks the
+    /// next write for good, and a deadline that waits for it is never armed.
+    /// Idempotent with the arm in [`Self::record_frame_sent`].
+    #[inline]
+    pub fn arm_dead_socket_deadline(&self) {
         // Arm the dead-socket deadline on the FIRST send after a receive (WA Web
         // `onOrBefore` keeps the earliest deadline; later sends must not push it out).
         // Re-arm when the anchor is unset OR stale, i.e. a receive landed after it was

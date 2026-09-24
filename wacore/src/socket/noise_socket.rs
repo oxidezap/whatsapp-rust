@@ -376,6 +376,9 @@ impl NoiseSocket {
                 // frames without copying, leaving `out_buf` empty with its
                 // capacity intact for the next batch.
                 let payload = out_buf.split().freeze();
+                if let Some(stats) = &stats {
+                    stats.arm_dead_socket_deadline();
+                }
                 transport.send(payload).await
             } else {
                 Ok(())

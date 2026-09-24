@@ -650,17 +650,23 @@ impl Client {
         // a reconnect aborts them (sender retries on the new connection).
         // Subscribed before the send so a shutdown during it is not missed.
         let shutdown = wacore::runtime::wait_for_shutdown(&self.connection_shutdown_signal());
-        let _waiter_guard = self
-            .register_and_send(req_id, send_fn, on_sent, waiter)
-            .await?;
+        // The deadline covers the send as well as the answer. A write into a
+        // socket that stays established but no longer drains (a laptop that
+        // resumed from suspend, a network that changed underneath it) never
+        // completes and never errors; a deadline that only started after the
+        // write left every IQ, the keepalive ping among them, waiting forever,
+        // and the keepalive's dead-socket watchdog with it. Dropping the
+        // exchange mid-send is safe: the waiter guard deregisters on drop.
+        let exchange = async {
+            let _waiter_guard = self
+                .register_and_send(req_id, send_fn, on_sent, waiter)
+                .await?;
+            rx.await.map_err(|_| IqError::InternalChannelClosed)
+        };
 
         futures::select! {
-            result = rt_timeout(&*self.runtime, timeout, rx).fuse() => {
-                match result {
-                    Ok(Ok(delivered)) => Ok(delivered),
-                    Ok(Err(_)) => Err(IqError::InternalChannelClosed),
-                    Err(_) => Err(IqError::Timeout),
-                }
+            result = rt_timeout(&*self.runtime, timeout, exchange).fuse() => {
+                result.unwrap_or(Err(IqError::Timeout))
             }
             _ = shutdown.fuse() => Err(IqError::NotConnected),
         }
