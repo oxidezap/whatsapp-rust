@@ -48,7 +48,6 @@ pub enum MediaType {
     Audio,
     Document,
     History,
-    GroupHistory,
     AppState,
     Sticker,
     StickerPack,
@@ -57,6 +56,7 @@ pub enum MediaType {
     /// Product catalog image — unencrypted, uploads to `/product/image`.
     /// WA Web: CreateMediaKeys.js throws for this type (no encryption).
     ProductCatalogImage,
+    GroupHistory,
 }
 
 impl MediaType {
@@ -782,6 +782,25 @@ impl DownloadUtils {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_media_type_numeric_casts_remain_stable() {
+        for (media_type, expected) in [
+            (MediaType::Image, 0),
+            (MediaType::Video, 1),
+            (MediaType::Audio, 2),
+            (MediaType::Document, 3),
+            (MediaType::History, 4),
+            (MediaType::AppState, 5),
+            (MediaType::Sticker, 6),
+            (MediaType::StickerPack, 7),
+            (MediaType::StickerPackThumbnail, 8),
+            (MediaType::LinkThumbnail, 9),
+            (MediaType::ProductCatalogImage, 10),
+        ] {
+            assert_eq!(media_type as isize, expected, "{media_type:?}");
+        }
+    }
 
     #[test]
     fn group_history_uses_its_own_media_path_and_key_derivation_context() {
