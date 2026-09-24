@@ -48,6 +48,7 @@ pub enum MediaType {
     Audio,
     Document,
     History,
+    GroupHistory,
     AppState,
     Sticker,
     StickerPack,
@@ -66,6 +67,7 @@ impl MediaType {
             MediaType::Audio => "WhatsApp Audio Keys",
             MediaType::Document => "WhatsApp Document Keys",
             MediaType::History => "WhatsApp History Keys",
+            MediaType::GroupHistory => "WhatsApp Group History Keys",
             MediaType::AppState => "WhatsApp App State Keys",
             MediaType::Sticker => "WhatsApp Image Keys",
             MediaType::StickerPack => "WhatsApp Sticker Pack Keys",
@@ -85,6 +87,7 @@ impl MediaType {
             MediaType::Audio => "audio",
             MediaType::Document => "document",
             MediaType::History => "md-msg-hist",
+            MediaType::GroupHistory => "group-history",
             MediaType::AppState => "md-app-state",
             MediaType::StickerPack => "sticker-pack",
             MediaType::StickerPackThumbnail => "thumbnail-sticker-pack",
@@ -101,6 +104,7 @@ impl MediaType {
             MediaType::Audio => "/mms/audio",
             MediaType::Document => "/mms/document",
             MediaType::History => "/mms/md-msg-hist",
+            MediaType::GroupHistory => "/mms/group-history",
             MediaType::AppState => "/mms/md-app-state",
             MediaType::StickerPack => "/mms/sticker-pack",
             MediaType::StickerPackThumbnail => "/mms/thumbnail-sticker-pack",
@@ -780,6 +784,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn group_history_uses_its_own_media_path_and_key_derivation_context() {
+        assert_eq!(MediaType::GroupHistory.mms_type(), "group-history");
+        assert_eq!(MediaType::GroupHistory.upload_path(), "/mms/group-history");
+        assert_ne!(
+            MediaType::GroupHistory.app_info(),
+            MediaType::History.app_info()
+        );
+
+        let media_key = [0x5A; 32];
+        let group_history_keys = DownloadUtils::get_media_keys(&media_key, MediaType::GroupHistory)
+            .expect("group history media keys");
+        let history_keys = DownloadUtils::get_media_keys(&media_key, MediaType::History)
+            .expect("history media keys");
+        assert_ne!(group_history_keys, history_keys);
+    }
+
+    #[test]
     fn hash_checked_decryption_covers_padding_and_short_reads() {
         use std::io::{Cursor, Read};
         struct ShortReads<'a> {
@@ -994,12 +1015,13 @@ mod tests {
     /// Every variant. The exhaustive match in
     /// `every_media_type_builds_urls_for_both_route_kinds` is what forces a new
     /// one to be named here instead of silently skipping the URL assertions.
-    const ALL_MEDIA_TYPES: [MediaType; 11] = [
+    const ALL_MEDIA_TYPES: [MediaType; 12] = [
         MediaType::Image,
         MediaType::Video,
         MediaType::Audio,
         MediaType::Document,
         MediaType::History,
+        MediaType::GroupHistory,
         MediaType::AppState,
         MediaType::Sticker,
         MediaType::StickerPack,
@@ -1282,6 +1304,7 @@ mod tests {
                 | MediaType::Audio
                 | MediaType::Document
                 | MediaType::History
+                | MediaType::GroupHistory
                 | MediaType::AppState
                 | MediaType::Sticker
                 | MediaType::StickerPack

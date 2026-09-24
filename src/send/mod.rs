@@ -15,9 +15,9 @@ use wacore::types::jid::JidExt;
 use wacore::types::message::AddressingMode;
 #[cfg(test)]
 use wacore_binary::DeviceKey;
-use wacore_binary::Node;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, JidExt as _, Server};
+use wacore_binary::{Node, NodeContent};
 use waproto::whatsapp as wa;
 
 use crate::client::ClientError;
@@ -148,6 +148,32 @@ impl From<GroupError> for SendError {
 /// Returns a `GroupRoutingInfo` whose participant list is guaranteed to contain our own
 /// sending JID, without deep-cloning the shared (cached) metadata in the common
 /// case where the server's participant list already includes us.
+fn same_group_user(
+    left: &Jid,
+    right: &Jid,
+    info: &wacore::client::context::GroupRoutingInfo,
+) -> bool {
+    if left.user == right.user && left.server == right.server {
+        return true;
+    }
+    (left.is_lid()
+        && info
+            .phone_jid_for_lid_user(&left.user)
+            .is_some_and(|phone| phone.user == right.user && right.is_pn()))
+        || (right.is_lid()
+            && info
+                .phone_jid_for_lid_user(&right.user)
+                .is_some_and(|phone| phone.user == left.user && left.is_pn()))
+        || (left.is_pn()
+            && info
+                .lid_user_for_phone_user(&left.user)
+                .is_some_and(|lid_user| right.is_lid() && lid_user == right.user))
+        || (right.is_pn()
+            && info
+                .lid_user_for_phone_user(&right.user)
+                .is_some_and(|lid_user| left.is_lid() && lid_user == left.user))
+}
+
 fn ensure_self_in_group(
     info: std::sync::Arc<wacore::client::context::GroupRoutingInfo>,
     own_sending_jid: &Jid,
@@ -241,6 +267,9 @@ struct SendBranchOutput {
     /// entry it came from. Handed to the phash waiter as its exclude list.
     dm_devices: Option<std::sync::Arc<wacore::send::ResolvedDmDevices>>,
     group_devices: Option<std::sync::Arc<wacore::send::ResolvedGroupDevices>>,
+    /// Pairwise group-direct sends refresh the group/device topology too, so
+    /// they must not cross a connection generation while preparing encryption.
+    requires_connection_generation_check: bool,
     /// Of those, the ones that produced no `<enc>`. Empty on a complete fan-out.
     dm_unreached: Vec<Jid>,
 }
@@ -266,6 +295,13 @@ struct DmBranchRequest<'a> {
     is_status_addon: bool,
     device_freshness: crate::cache::Freshness,
     borrowed_message_id: bool,
+}
+
+struct GroupDirectBranchRequest<'a> {
+    to: Jid,
+    message: &'a wa::Message,
+    request_id: &'a str,
+    recipients: &'a [Jid],
 }
 
 enum GroupDeviceSnapshot {
@@ -366,6 +402,7 @@ impl SendBranchOutput {
             recipient_fanout: None,
             dm_devices: None,
             group_devices: None,
+            requires_connection_generation_check: false,
             dm_unreached: Vec::new(),
         }
     }
@@ -502,6 +539,186 @@ impl SendInstant {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GroupDirectAcknowledgement {
+    Accepted,
+    Rejected {
+        error: Option<String>,
+        code: Option<String>,
+    },
+    /// The ACK timed out, was malformed, or did not match this exact stanza.
+    /// The server may still have accepted the message; callers must not send a
+    /// follow-up notice on this outcome.
+    Indeterminate,
+}
+
+#[derive(Debug)]
+pub(crate) enum GroupDirectSendError {
+    /// Another send with this message ID already owns the ACK waiter; it may
+    /// still be in flight, so the result is indeterminate rather than unsent.
+    AckAlreadyPending,
+    Send(SendError),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GroupDirectSendOutcome {
+    /// For group-direct sends, counts both opted-in receivers and the sender's
+    /// relevant companion devices (the sender's active device is excluded).
+    pub recipient_fanout: Option<RecipientFanout>,
+    pub acknowledgement: GroupDirectAcknowledgement,
+}
+
+fn parse_group_direct_ack(
+    ack: &wacore_binary::OwnedNodeRef,
+    message_id: &str,
+    group: &Jid,
+) -> GroupDirectAcknowledgement {
+    let node = ack.get();
+    let group = group.to_string();
+    if node.tag != "ack"
+        || node
+            .get_attr("id")
+            .is_none_or(|value| value.as_str() != message_id)
+        || node
+            .get_attr("class")
+            .is_none_or(|value| value.as_str() != "message")
+        || node
+            .get_attr("from")
+            .is_none_or(|value| value.as_str() != group)
+    {
+        return GroupDirectAcknowledgement::Indeterminate;
+    }
+
+    let error = node.get_attr("error").map(|value| value.to_string());
+    let code = node.get_attr("code").map(|value| value.to_string());
+    if error.is_some() || code.is_some() {
+        GroupDirectAcknowledgement::Rejected { error, code }
+    } else {
+        GroupDirectAcknowledgement::Accepted
+    }
+}
+
+#[cfg(test)]
+mod group_direct_tests {
+    use super::*;
+    use wacore_binary::builder::NodeBuilder;
+
+    fn owned_node(node: Node) -> wacore_binary::OwnedNodeRef {
+        let packed = wacore_binary::marshal::marshal_ref(&node.as_node_ref()).expect("marshal");
+        wacore_binary::OwnedNodeRef::new(
+            wacore_binary::util::unpack(&packed)
+                .expect("unpack")
+                .into_owned(),
+        )
+        .expect("owned protocol node")
+    }
+
+    #[test]
+    fn group_direct_ack_requires_matching_class_id_and_group() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let accepted = owned_node(
+            NodeBuilder::new("ack")
+                .attr("id", "SYNTHETIC-ID")
+                .attr("class", "message")
+                .attr("from", &group)
+                .build(),
+        );
+        assert_eq!(
+            parse_group_direct_ack(&accepted, "SYNTHETIC-ID", &group),
+            GroupDirectAcknowledgement::Accepted
+        );
+
+        for (id, class, from) in [
+            ("OTHER-ID", "message", group.to_string()),
+            ("SYNTHETIC-ID", "receipt", group.to_string()),
+            (
+                "SYNTHETIC-ID",
+                "message",
+                "120363000000000002@g.us".to_string(),
+            ),
+        ] {
+            let malformed = owned_node(
+                NodeBuilder::new("ack")
+                    .attr("id", id)
+                    .attr("class", class)
+                    .attr("from", from)
+                    .build(),
+            );
+            assert_eq!(
+                parse_group_direct_ack(&malformed, "SYNTHETIC-ID", &group),
+                GroupDirectAcknowledgement::Indeterminate
+            );
+        }
+
+        let rejected = owned_node(
+            NodeBuilder::new("ack")
+                .attr("id", "SYNTHETIC-ID")
+                .attr("class", "message")
+                .attr("from", &group)
+                .attr("error", "500")
+                .attr("code", "500")
+                .build(),
+        );
+        assert_eq!(
+            parse_group_direct_ack(&rejected, "SYNTHETIC-ID", &group),
+            GroupDirectAcknowledgement::Rejected {
+                error: Some("500".into()),
+                code: Some("500".into()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn group_direct_ack_waiters_do_not_replace_or_remove_a_newer_retry() {
+        let client = crate::test_utils::create_test_client().await;
+        let (first_receiver, first_generation) = client
+            .try_register_ack_waiter("SYNTHETIC-ID")
+            .expect("first ACK waiter");
+        assert!(client.try_register_ack_waiter("SYNTHETIC-ID").is_none());
+
+        drop(first_receiver);
+        client.response_waiters_guard().remove("SYNTHETIC-ID");
+        let (second_receiver, second_generation) = client
+            .try_register_ack_waiter("SYNTHETIC-ID")
+            .expect("retry waiter after the first ACK was consumed");
+        assert_ne!(first_generation, second_generation);
+        client
+            .response_waiters_guard()
+            .remove_guarded("SYNTHETIC-ID", first_generation);
+        assert!(client.response_waiters_guard().contains_key("SYNTHETIC-ID"));
+        client
+            .response_waiters_guard()
+            .remove_guarded("SYNTHETIC-ID", second_generation);
+        drop(second_receiver);
+    }
+
+    #[tokio::test]
+    async fn group_direct_send_rejects_empty_or_non_user_audiences() {
+        let client = crate::test_utils::create_test_client().await;
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let message = wa::Message {
+            conversation: Some("synthetic history test".into()),
+            ..Default::default()
+        };
+        let invalid_group_recipient = [group.clone()];
+
+        for recipients in [&[][..], &invalid_group_recipient[..]] {
+            let result = client
+                .send_group_direct_branch(GroupDirectBranchRequest {
+                    to: group.clone(),
+                    message: &message,
+                    request_id: "SYNTHETIC-ID",
+                    recipients,
+                })
+                .await;
+            let Err(error) = result else {
+                panic!("invalid pairwise audience must be rejected before sending");
+            };
+            assert!(error.to_string().contains("group-direct"));
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct SendPipelineOptions<'a> {
     /// Instant this operation is stamped with, when the caller already sampled
@@ -523,6 +740,9 @@ pub(crate) struct SendPipelineOptions<'a> {
     /// Without this, the borrowed id clobbers the original message's retry
     /// content and outbound secret.
     pub(crate) borrowed_message_id: bool,
+    /// Internal pairwise group audience used only by the group-history bundle
+    /// and notice flow. Ordinary sends must continue through sender-key fanout.
+    pub(crate) group_direct_recipients: Option<&'a [Jid]>,
 }
 
 /// The devices a freshly resolved fan-out holds that the sent stanza did not.
@@ -2114,14 +2334,68 @@ impl Client {
         Ok(wacore::send::ensure_status_participants(stanza, group_info))
     }
 
-    /// Send a message this crate built on the caller's behalf (an edit, a
-    /// revoke, a pin) under an explicit stanza `edit` attribute, and hand back
-    /// the same [`SendResult`] a caller-built send gets, message included: the
-    /// only way a caller can see what those sends put in the chat.
-    ///
-    /// `borrowed_stanza_id` names the outer stanza after another message (see
-    /// [`EditOptions::stanza_id`]), so the pipeline binds no id-keyed state to
-    /// it. `None` names the send with a fresh id, like every other send.
+    /// Pairwise-encrypt a group-history message for an explicit group-member
+    /// audience and await its correlated server ACK. The audience is rechecked
+    /// against fresh group routing data by the send branch; ordinary group
+    /// messages continue through sender-key fanout.
+    pub(crate) async fn send_group_direct_message(
+        &self,
+        to: &Jid,
+        recipients: &[Jid],
+        message: &wa::Message,
+        message_id: Option<&str>,
+    ) -> Result<GroupDirectSendOutcome, GroupDirectSendError> {
+        if !to.is_group() || recipients.is_empty() {
+            return Err(GroupDirectSendError::Send(SendError::InvalidRequest(
+                "group-direct send requires a group and at least one recipient".into(),
+            )));
+        }
+        let sent_at = SendInstant::now();
+        let request_id = message_id
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| self.generate_message_id_at(sent_at.unix_secs_u64()));
+        let Some((ack_receiver, ack_generation)) = self.try_register_ack_waiter(&request_id) else {
+            return Err(GroupDirectSendError::AckAlreadyPending);
+        };
+        let recipient_fanout = match self
+            .send_message_impl(
+                to.clone(),
+                message,
+                SendPipelineOptions {
+                    sent_at: Some(sent_at),
+                    request_id: Some(&request_id),
+                    group_direct_recipients: Some(recipients),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(fanout) => fanout,
+            Err(error) => {
+                self.response_waiters_guard()
+                    .remove_guarded(&request_id, ack_generation);
+                return Err(GroupDirectSendError::Send(SendError::from_anyhow(error)));
+            }
+        };
+
+        let ack_result = wacore::runtime::timeout(
+            &*self.runtime,
+            std::time::Duration::from_secs(30),
+            ack_receiver,
+        )
+        .await;
+        self.response_waiters_guard()
+            .remove_guarded(&request_id, ack_generation);
+        let acknowledgement = match ack_result {
+            Ok(Ok(ack)) => parse_group_direct_ack(&ack, &request_id, to),
+            Ok(Err(_)) | Err(_) => GroupDirectAcknowledgement::Indeterminate,
+        };
+        Ok(GroupDirectSendOutcome {
+            recipient_fanout,
+            acknowledgement,
+        })
+    }
+
     pub(crate) async fn send_built_message(
         &self,
         to: Jid,
@@ -2177,6 +2451,7 @@ impl Client {
             group_metadata_freshness,
             device_freshness,
             borrowed_message_id,
+            group_direct_recipients,
         } = options;
         // Callers that already stamped their message hand the instant down; the
         // rest sample here so the pipeline below still has exactly one.
@@ -2268,9 +2543,24 @@ impl Client {
             recipient_fanout,
             dm_devices: covered_dm_devices,
             group_devices,
+            requires_connection_generation_check,
             dm_unreached,
         } = if peer && !to.is_group() {
             box_send_branch(self.send_peer_branch(to, message, request_id)).await?
+        } else if let Some(recipients) = group_direct_recipients {
+            if !to.is_group() {
+                return Err(SendError::InvalidRequest(
+                    "group-direct fanout requires a group JID".into(),
+                )
+                .into());
+            }
+            box_send_branch(self.send_group_direct_branch(GroupDirectBranchRequest {
+                to,
+                message,
+                request_id,
+                recipients,
+            }))
+            .await?
         } else if to.is_group() {
             box_send_branch(self.send_group_branch(GroupBranchRequest {
                 to,
@@ -2322,7 +2612,7 @@ impl Client {
             Some(request_id),
             "branch stanza must carry the id this send was named with"
         );
-        if group_devices.is_some()
+        if (group_devices.is_some() || requires_connection_generation_check)
             && self
                 .connection_generation
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -2909,6 +3199,7 @@ impl Client {
             issue_tc_token_after_send: false,
             ack_phash: group_ack_phash,
             group_devices,
+            requires_connection_generation_check: false,
             recipient_fanout: None,
             dm_devices: None,
             dm_unreached: Vec::new(),
@@ -3099,11 +3390,186 @@ impl Client {
             recipient_fanout: (!is_status_addon).then_some(prepared.recipient_fanout),
             dm_devices: (!is_status_addon).then_some(dm_devices),
             group_devices: None,
+            requires_connection_generation_check: false,
             dm_unreached: if is_status_addon {
                 Vec::new()
             } else {
                 prepared.unreached_devices
             },
+        })
+    }
+
+    /// Pairwise fanout for group-history bundle/notice messages. Unlike an
+    /// ordinary group message this never advances a sender key: it resolves
+    /// devices only for the supplied, current group members and our own
+    /// account, then uses the DM Signal path inside a group-addressed stanza.
+    async fn send_group_direct_branch(
+        &self,
+        request: GroupDirectBranchRequest<'_>,
+    ) -> Result<SendBranchOutput, anyhow::Error> {
+        let GroupDirectBranchRequest {
+            to,
+            message,
+            request_id,
+            recipients,
+        } = request;
+        if recipients.is_empty()
+            || recipients
+                .iter()
+                .any(|jid| !matches!(jid.server, Server::Pn | Server::Lid))
+        {
+            anyhow::bail!("group-direct audience must contain user JIDs");
+        }
+
+        let group_info = self
+            .groups()
+            .routing_info_with_freshness(&to, crate::cache::Freshness::Refresh)
+            .await?;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        let own_jid = device_snapshot
+            .pn
+            .as_ref()
+            .ok_or(ClientError::NotLoggedIn)?;
+        let own_lid = device_snapshot
+            .lid
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("LID not set, cannot send to group"))?;
+
+        let mut group_recipients = Vec::with_capacity(recipients.len());
+        for requested in recipients {
+            let Some(member) = group_info
+                .participants
+                .iter()
+                .find(|member| same_group_user(member, requested, &group_info))
+            else {
+                anyhow::bail!("group-direct recipient is no longer a group member");
+            };
+            if !group_recipients
+                .iter()
+                .any(|jid: &Jid| same_group_user(jid, member, &group_info))
+            {
+                group_recipients.push(member.to_non_ad());
+            }
+        }
+        if group_recipients.is_empty() {
+            anyhow::bail!("group-direct audience became empty");
+        }
+
+        let mut device_queries = Vec::with_capacity(group_recipients.len() + 1);
+        for recipient in &group_recipients {
+            device_queries.push(
+                if recipient.is_lid()
+                    && let Some(phone) = group_info.phone_jid_for_lid_user(&recipient.user)
+                {
+                    phone.to_non_ad()
+                } else {
+                    recipient.to_non_ad()
+                },
+            );
+        }
+        device_queries.push(own_jid.to_non_ad());
+        wacore::types::jid::sort_dedup_by_user(&mut device_queries);
+
+        let mut devices = self.get_user_devices(&device_queries).await?;
+        if group_info.addressing_mode == AddressingMode::Lid {
+            devices = devices
+                .into_iter()
+                .map(|device| group_info.phone_device_jid_into_lid(device))
+                .collect();
+        }
+        devices.retain(|device| !device.is_hosted());
+        wacore::types::jid::sort_dedup_by_device(&mut devices);
+        let dm_devices = std::sync::Arc::new(wacore::send::ResolvedDmDevices::new(
+            devices,
+            own_jid,
+            Some(own_lid),
+        ));
+
+        let resolved_here;
+        let addressing = match dm_devices.signal_addressing() {
+            Some(addressing) => addressing,
+            None => {
+                let encryption = self.resolve_encryption_jids(dm_devices.devices()).await;
+                let mut lock_keys = encryption.clone();
+                sort_session_lock_keys(&mut lock_keys);
+                let built = wacore::send::DmSignalAddressing::new(encryption, lock_keys);
+                match dm_devices.signal_addressing_or_init(built) {
+                    Ok(addressing) => addressing,
+                    Err(refused) => {
+                        resolved_here = refused;
+                        &resolved_here
+                    }
+                }
+            }
+        };
+        self.ensure_e2e_sessions_resolved(addressing.encryption())
+            .await?;
+        let _session_guards = self.session_guards_for(addressing.lock_keys()).await;
+
+        let shared_content = message
+            .message_context_info
+            .is_unset()
+            .then(|| std::sync::Arc::new(waproto::codec::message_to_vec(message)));
+        self.add_recent_message(&to, request_id, message, shared_content.clone())
+            .await;
+        let mut store_adapter = self.signal_adapter();
+        let mut stores = store_adapter.as_signal_stores();
+        let mut prepared = wacore::send::prepare_dm_stanza(
+            &*self.runtime,
+            &mut stores,
+            self,
+            wacore::send::DmStanzaRequest {
+                own_jid,
+                own_lid: Some(own_lid),
+                account: device_snapshot.account.as_deref(),
+                to: &to,
+                message,
+                message_id: request_id,
+                edit: None,
+                extra_nodes: &[],
+                devices: &dm_devices,
+                pre_encoded: shared_content.as_deref().map(Vec::as_slice),
+            },
+        )
+        .await?;
+
+        prepared
+            .node
+            .attrs
+            .insert("addressing_mode", group_info.addressing_mode.as_str());
+        let mut marker = NodeBuilder::new("enc").attr("v", "2").attr("type", "skmsg");
+        if let Some(media_type) = wacore::send::media_type_from_message(message) {
+            marker = marker.attr("mediatype", media_type);
+        }
+        match prepared.node.content.as_mut() {
+            Some(NodeContent::Nodes(children)) => children.push(marker.build()),
+            _ => anyhow::bail!("group-direct message lost its participant fanout"),
+        }
+
+        let sender_identity = match group_info.addressing_mode {
+            AddressingMode::Lid => own_lid.clone(),
+            AddressingMode::Pn => own_jid.clone(),
+        };
+        let mut direct_fanout = prepared.recipient_fanout;
+        direct_fanout.addressed = dm_devices.devices().len();
+        direct_fanout.encrypted = direct_fanout
+            .addressed
+            .saturating_sub(prepared.unreached_devices.len());
+        Ok(SendBranchOutput {
+            node: prepared.node,
+            msg_secret: prepared.message_secret,
+            group_sender_identity: Some(sender_identity),
+            skdm_update: None,
+            distribution_guard: None,
+            issue_tc_token_after_send: false,
+            // Group-direct ACKs are awaited by this operation. The ordinary
+            // group phash repair path is sender-key-specific and must not run.
+            ack_phash: None,
+            recipient_fanout: Some(direct_fanout),
+            dm_devices: None,
+            group_devices: None,
+            requires_connection_generation_check: true,
+            dm_unreached: prepared.unreached_devices,
         })
     }
 
@@ -7921,7 +8387,7 @@ mod tests {
             "a text edit must not carry a mediatype attr"
         );
         let bytes = match pt.content.as_ref() {
-            Some(wacore_binary::NodeContent::Bytes(b)) => b.clone(),
+            Some(NodeContent::Bytes(b)) => b.clone(),
             other => panic!("expected plaintext bytes, got {other:?}"),
         };
         let decoded = wa::Message::decode_from_slice(bytes.as_slice()).expect("decode plaintext");
@@ -7974,7 +8440,7 @@ mod tests {
             .expect("plaintext child");
         let empty = match pt.content.as_ref() {
             None => true,
-            Some(wacore_binary::NodeContent::Bytes(b)) => b.is_empty(),
+            Some(NodeContent::Bytes(b)) => b.is_empty(),
             _ => false,
         };
         assert!(empty, "revoke must carry an empty plaintext");

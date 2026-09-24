@@ -11,6 +11,7 @@ mod community;
 mod contacts;
 mod events;
 pub(crate) mod favorites;
+mod group_history;
 mod groups;
 pub(crate) use groups::GroupMetadataRegistry;
 pub(crate) mod labels;
@@ -72,15 +73,17 @@ pub use contacts::{
 
 pub use events::{EventCreationParams, EventResponseType, Events};
 
+pub use group_history::{GroupHistoryRetryToken, GroupHistoryShareOutcome, GroupHistorySkipReason};
+
 pub use groups::{
     CreateGroupResult, GroupAppealStatus, GroupCreateOptions, GroupDescription,
-    GroupEphemeralSettings, GroupError, GroupHierarchy, GroupJoinError, GroupMessageReporter,
-    GroupMetadata, GroupMetadataResult, GroupOverview, GroupOverviewResult, GroupParticipant,
-    GroupParticipantDetails, GroupParticipantOptions, GroupPictureEntry, GroupProfilePicture,
-    GroupProfilePictureOutcome, GroupSubject, Groups, GrowthLockInfo, InviteInfoError,
-    JoinGroupResult, MemberAddMode, MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode,
-    MembershipRequest, ParticipantChangeResponse, ParticipantType, PictureType,
-    PreviousDescription, ReportedGroupMessage, ReportedGroupMessages, SubgroupKind,
+    GroupEphemeralSettings, GroupError, GroupHierarchy, GroupHistoryAddResult, GroupJoinError,
+    GroupMessageReporter, GroupMetadata, GroupMetadataResult, GroupOverview, GroupOverviewResult,
+    GroupParticipant, GroupParticipantDetails, GroupParticipantOptions, GroupPictureEntry,
+    GroupProfilePicture, GroupProfilePictureOutcome, GroupSubject, Groups, GrowthLockInfo,
+    InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode, MemberShareHistoryMode,
+    MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse, ParticipantType,
+    PictureType, PreviousDescription, ReportedGroupMessage, ReportedGroupMessages, SubgroupKind,
 };
 
 pub use labels::Labels;

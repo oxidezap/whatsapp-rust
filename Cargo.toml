@@ -280,6 +280,7 @@ bytes = { workspace = true }
 chrono = { workspace = true, features = ["now"] }
 event-listener = { workspace = true }
 futures = { workspace = true, features = ["std"] }
+flate2 = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 smallvec = { workspace = true }
@@ -347,7 +348,6 @@ env_logger = { workspace = true }
 http = "1"
 # `total_listeners()` (how tests observe that a waiter parked) is std-gated.
 event-listener = { workspace = true, features = ["std"] }
-flate2 = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
 # Raises real SIGINT/SIGTERM at the current process in the shutdown-signal test.

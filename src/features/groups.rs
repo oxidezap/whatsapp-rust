@@ -1,11 +1,18 @@
 use crate::client::Client;
+use crate::features::group_history::{
+    GroupHistoryLimits, GroupHistoryPolicyError, GroupHistoryRetryToken, GroupHistoryShareOutcome,
+    GroupHistorySkipReason, can_current_user_share_history, resolve_group_history_limits,
+    select_group_history_messages,
+};
 use crate::features::mex::{MexError, mex_request};
 use crate::request::{IqError, RejectionStanza};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
 use thiserror::Error;
 use wacore::client::context::GroupRoutingInfo;
+use wacore::download::MediaType;
 pub use wacore::iq::contacts::ProfilePictureLookup;
 pub use wacore::iq::contacts::SetProfilePictureResponse;
 use wacore::iq::contacts::SetProfilePictureSpec;
@@ -23,8 +30,13 @@ use wacore::iq::groups::{
     SetNoFrequentlyForwardedIq, normalize_participants,
 };
 use wacore::iq::mex_operations::update_group_property;
+use wacore::iq::props::GroupPropsSpec;
 use wacore::types::message::AddressingMode;
 use wacore_binary::{Jid, JidExt as _};
+use waproto::whatsapp as wa;
+
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
 
 use wacore::iq::groups::BatchGroupMetadataResult as RawBatchResult;
 use wacore::iq::groups::BatchGroupOverviewResult as RawOverviewBatchResult;
@@ -62,6 +74,112 @@ pub enum GroupError {
     /// send path behind `update_member_label`, cache plumbing).
     #[error("{0}")]
     Internal(#[from] anyhow::Error),
+}
+
+/// Outcome of adding group members and optionally sharing consumer-provided
+/// group history with the successful, explicitly opted-in receivers.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct GroupHistoryAddResult {
+    /// Per-participant outcomes from the normal add operation.
+    pub participants: Vec<ParticipantChangeResponse>,
+    /// Truthful status for history sharing, independent from add success.
+    pub history_share: GroupHistoryShareOutcome,
+}
+
+fn same_participant_jid(left: &Jid, right: &Jid) -> bool {
+    left.user == right.user && left.server == right.server
+}
+
+fn group_participant_matches_jid(participant: &GroupParticipant, jid: &Jid) -> bool {
+    same_participant_jid(&participant.jid, jid)
+        || participant
+            .phone_number
+            .as_ref()
+            .is_some_and(|phone| same_participant_jid(phone, jid))
+        || participant
+            .lid
+            .as_ref()
+            .is_some_and(|lid| same_participant_jid(lid, jid))
+}
+
+fn group_participant_matches_change(
+    participant: &GroupParticipant,
+    change: &ParticipantChangeResponse,
+) -> bool {
+    group_participant_matches_jid(participant, &change.jid)
+        || change
+            .phone_number
+            .as_ref()
+            .is_some_and(|phone| group_participant_matches_jid(participant, phone))
+}
+
+fn select_group_history_recipients<'a>(
+    participants: &'a [GroupParticipant],
+    add_results: &[ParticipantChangeResponse],
+    opted_in_receivers: &[Jid],
+) -> (Vec<&'a GroupParticipant>, Vec<&'a GroupParticipant>) {
+    let added_members: Vec<_> = participants
+        .iter()
+        .filter(|member| {
+            add_results
+                .iter()
+                .filter(|result| result.is_ok())
+                .any(|result| group_participant_matches_change(member, result))
+        })
+        .collect();
+    let history_members = added_members
+        .iter()
+        .filter(|member| {
+            member
+                .details
+                .as_ref()
+                .is_none_or(|details| details.group_history_sent != Some(true))
+                && opted_in_receivers
+                    .iter()
+                    .any(|receiver| group_participant_matches_jid(member, receiver))
+        })
+        .copied()
+        .collect();
+    (added_members, history_members)
+}
+
+fn compress_group_history(messages: Vec<wa::WebMessageInfo>) -> Result<Vec<u8>, std::io::Error> {
+    let history = wa::GroupHistory {
+        messages,
+        ..Default::default()
+    };
+    let encoded = waproto::codec::group_history_to_vec(&history);
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&encoded)?;
+    encoder.finish()
+}
+
+fn group_history_policy_skip_reason(error: GroupHistoryPolicyError) -> GroupHistorySkipReason {
+    match error {
+        GroupHistoryPolicyError::AccountPropsUnavailable => {
+            GroupHistorySkipReason::AccountPropsUnavailable
+        }
+        GroupHistoryPolicyError::GroupPropsUnavailable => {
+            GroupHistorySkipReason::GroupPropsUnavailable
+        }
+        GroupHistoryPolicyError::SharingDisabled => GroupHistorySkipReason::SharingDisabled,
+        GroupHistoryPolicyError::InvalidAccountProp(_)
+        | GroupHistoryPolicyError::InvalidGroupProp(_)
+        | GroupHistoryPolicyError::InvalidLimit(_) => GroupHistorySkipReason::InvalidProperties,
+    }
+}
+
+fn send_error_may_have_reached_server(error: &crate::send::SendError) -> bool {
+    matches!(error, crate::send::SendError::Client(_))
+}
+
+fn participant_change_matches_jid(change: &ParticipantChangeResponse, jid: &Jid) -> bool {
+    same_participant_jid(&change.jid, jid)
+        || change
+            .phone_number
+            .as_ref()
+            .is_some_and(|phone| same_participant_jid(phone, jid))
 }
 
 /// The description a [`Groups::set_description`] call expects to replace.
@@ -1537,6 +1655,586 @@ impl<'a> Groups<'a> {
         Ok(result)
     }
 
+    async fn group_history_context(
+        &self,
+        jid: &Jid,
+    ) -> Result<(GroupMetadata, GroupHistoryLimits), GroupHistorySkipReason> {
+        let metadata = self.fetch_metadata(jid).await.map_err(|error| {
+            log::warn!("Could not verify group history sharing metadata: {error}");
+            GroupHistorySkipReason::GroupMetadataUnavailable
+        })?;
+        if metadata.has_capi || metadata.is_parent_group {
+            return Err(GroupHistorySkipReason::UnsupportedGroup);
+        }
+
+        let device_snapshot = self.client.persistence_manager.get_device_snapshot();
+        let own_participant = metadata.participants.iter().find(|member| {
+            device_snapshot
+                .pn
+                .as_ref()
+                .is_some_and(|jid| group_participant_matches_jid(member, jid))
+                || device_snapshot
+                    .lid
+                    .as_ref()
+                    .is_some_and(|jid| group_participant_matches_jid(member, jid))
+        });
+        let Some(own_participant) = own_participant else {
+            return Err(GroupHistorySkipReason::SenderNotAuthorized);
+        };
+        if !can_current_user_share_history(
+            own_participant.is_admin(),
+            own_participant.is_super_admin(),
+            metadata.member_share_history_mode,
+        ) {
+            return Err(GroupHistorySkipReason::SenderNotAuthorized);
+        }
+
+        let account_props = self.client.ab_props().snapshot().await;
+        let group_props = self
+            .client
+            .execute(GroupPropsSpec::new(jid))
+            .await
+            .map_err(|error| {
+                log::warn!("Could not verify group history AB properties: {error}");
+                GroupHistorySkipReason::GroupPropsUnavailable
+            })?;
+        let limits = resolve_group_history_limits(&account_props, &group_props)
+            .map_err(group_history_policy_skip_reason)?;
+        Ok((metadata, limits))
+    }
+
+    /// Add group members and optionally send each explicitly opted-in,
+    /// successfully added receiver a consumer-supplied recent history bundle.
+    ///
+    /// The existing [`Groups::add_participants`] API remains the simple path.
+    /// This method never reads or persists the caller's history; it filters the
+    /// supplied protobuf messages by group, effective account/group AB-prop
+    /// window, and message-count limit. Group history is pairwise-encrypted to
+    /// only the opted-in successful additions and this account's own devices.
+    ///
+    /// Authorization uncertainty skips history sharing but does not undo an
+    /// otherwise successful add. A notice is sent only after a correlated
+    /// bundle ACK and complete pairwise device fanout.
+    pub async fn add_participants_with_history(
+        &self,
+        jid: impl Into<Jid>,
+        participants: &[Jid],
+        opted_in_receivers: &[Jid],
+        history_messages: &[wa::WebMessageInfo],
+    ) -> Result<GroupHistoryAddResult, GroupError> {
+        let jid = jid.into();
+        let participant_results = self.add_participants(jid.clone(), participants).await?;
+        if opted_in_receivers.is_empty() {
+            return Ok(GroupHistoryAddResult {
+                participants: participant_results,
+                history_share: GroupHistoryShareOutcome::NotRequested,
+            });
+        }
+
+        let successful_additions: Vec<_> = participant_results
+            .iter()
+            .filter(|result| result.is_ok())
+            .collect();
+        if !opted_in_receivers.iter().any(|receiver| {
+            successful_additions
+                .iter()
+                .any(|added| participant_change_matches_jid(added, receiver))
+        }) {
+            return Ok(GroupHistoryAddResult {
+                participants: participant_results,
+                history_share: GroupHistoryShareOutcome::Skipped(
+                    GroupHistorySkipReason::NoOptedInSuccessfulRecipients,
+                ),
+            });
+        }
+
+        let (metadata, limits) = match self.group_history_context(&jid).await {
+            Ok(context) => context,
+            Err(reason) => {
+                return Ok(GroupHistoryAddResult {
+                    participants: participant_results,
+                    history_share: GroupHistoryShareOutcome::Skipped(reason),
+                });
+            }
+        };
+
+        let (added_members, history_members) = select_group_history_recipients(
+            &metadata.participants,
+            &participant_results,
+            opted_in_receivers,
+        );
+        if history_members.is_empty() {
+            return Ok(GroupHistoryAddResult {
+                participants: participant_results,
+                history_share: GroupHistoryShareOutcome::Skipped(
+                    GroupHistorySkipReason::NoOptedInSuccessfulRecipients,
+                ),
+            });
+        }
+
+        let now = wacore::time::now_secs().max(0) as u64;
+        let Some(selected) = select_group_history_messages(&jid, history_messages, now, limits)
+        else {
+            return Ok(GroupHistoryAddResult {
+                participants: participant_results,
+                history_share: GroupHistoryShareOutcome::Skipped(
+                    GroupHistorySkipReason::NoEligibleMessages,
+                ),
+            });
+        };
+        let message_count = selected.messages.len();
+        let history_receivers: Vec<Jid> = history_members
+            .iter()
+            .map(|member| member.jid.to_non_ad())
+            .collect();
+        let non_history_receivers: Vec<String> = added_members
+            .iter()
+            .filter(|member| {
+                !history_receivers
+                    .iter()
+                    .any(|receiver| group_participant_matches_jid(member, receiver))
+            })
+            .map(|member| member.jid.to_non_ad().to_string())
+            .collect();
+        let history_metadata = wa::message::MessageHistoryMetadata {
+            history_receivers: history_receivers.iter().map(ToString::to_string).collect(),
+            oldest_message_timestamp_in_window: Some(
+                now.saturating_sub(limits.time_window_seconds) as i64,
+            ),
+            message_count: Some(selected.messages.len() as i64),
+            non_history_receivers,
+            oldest_message_timestamp_in_bundle: Some(selected.oldest_timestamp as i64),
+        };
+
+        let messages = selected.messages;
+        let compressed = wacore::runtime::blocking(&*self.client.runtime, move || {
+            compress_group_history(messages)
+        })
+        .await;
+        let compressed = match compressed {
+            Ok(compressed) => compressed,
+            Err(error) => {
+                return Ok(GroupHistoryAddResult {
+                    participants: participant_results,
+                    history_share: GroupHistoryShareOutcome::PreparationFailed {
+                        error: error.to_string(),
+                    },
+                });
+            }
+        };
+        let upload = match self
+            .client
+            .upload(
+                compressed,
+                MediaType::GroupHistory,
+                crate::upload::UploadOptions::default(),
+            )
+            .await
+        {
+            Ok(upload) => upload,
+            Err(error) => {
+                return Ok(GroupHistoryAddResult {
+                    participants: participant_results,
+                    history_share: GroupHistoryShareOutcome::UploadFailed {
+                        error: error.to_string(),
+                    },
+                });
+            }
+        };
+
+        let (_, current_limits) = match self.group_history_context(&jid).await {
+            Ok(context) => context,
+            Err(reason) => {
+                return Ok(GroupHistoryAddResult {
+                    participants: participant_results,
+                    history_share: GroupHistoryShareOutcome::Skipped(reason),
+                });
+            }
+        };
+        if current_limits != limits {
+            return Ok(GroupHistoryAddResult {
+                participants: participant_results,
+                history_share: GroupHistoryShareOutcome::Skipped(
+                    GroupHistorySkipReason::InvalidProperties,
+                ),
+            });
+        }
+
+        let bundle_message = Arc::new(wa::Message {
+            message_history_bundle: buffa::MessageField::some(wa::message::MessageHistoryBundle {
+                mimetype: Some("application/x-protobuf".into()),
+                file_sha256: Some(upload.file_sha256.to_vec()),
+                media_key: Some(upload.media_key.to_vec()),
+                file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                direct_path: Some(upload.direct_path),
+                media_key_timestamp: Some(upload.media_key_timestamp),
+                message_history_metadata: buffa::MessageField::some(history_metadata.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let notice_message = Arc::new(wa::Message {
+            message_history_notice: buffa::MessageField::some(wa::message::MessageHistoryNotice {
+                message_history_metadata: buffa::MessageField::some(history_metadata),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let bundle_message_id = self
+            .client
+            .generate_message_id_at(wacore::time::now_secs_u64());
+        let notice_message_id = self
+            .client
+            .generate_message_id_at(wacore::time::now_secs_u64());
+        let retry = GroupHistoryRetryToken::bundle(
+            &jid,
+            &history_receivers,
+            Arc::clone(&bundle_message),
+            Arc::clone(&notice_message),
+            bundle_message_id.clone(),
+            notice_message_id.clone(),
+            message_count,
+        );
+        let bundle_send = self
+            .client
+            .send_group_direct_message(
+                &jid,
+                &history_receivers,
+                bundle_message.as_ref(),
+                Some(&bundle_message_id),
+            )
+            .await;
+        let bundle_send = match bundle_send {
+            Ok(send) => send,
+            Err(error) => {
+                let (may_have_reached_server, error_message) = match error {
+                    crate::send::GroupDirectSendError::AckAlreadyPending => (
+                        true,
+                        "another send with this message ID already has an ACK waiter".to_owned(),
+                    ),
+                    crate::send::GroupDirectSendError::Send(error) => (
+                        send_error_may_have_reached_server(&error),
+                        error.to_string(),
+                    ),
+                };
+                let history_share = if may_have_reached_server {
+                    log::warn!(
+                        "Group history bundle send outcome is indeterminate: {error_message}"
+                    );
+                    GroupHistoryShareOutcome::BundleIndeterminate {
+                        bundle_message_id,
+                        retry: retry.clone(),
+                    }
+                } else {
+                    GroupHistoryShareOutcome::BundleNotSent {
+                        bundle_message_id,
+                        error: error_message,
+                        retry: retry.clone(),
+                    }
+                };
+                return Ok(GroupHistoryAddResult {
+                    participants: participant_results,
+                    history_share,
+                });
+            }
+        };
+        match bundle_send.acknowledgement {
+            crate::send::GroupDirectAcknowledgement::Rejected { error, code } => {
+                return Ok(GroupHistoryAddResult {
+                    participants: participant_results,
+                    history_share: GroupHistoryShareOutcome::BundleRejected {
+                        bundle_message_id,
+                        error,
+                        code,
+                    },
+                });
+            }
+            crate::send::GroupDirectAcknowledgement::Indeterminate => {
+                return Ok(GroupHistoryAddResult {
+                    participants: participant_results,
+                    history_share: GroupHistoryShareOutcome::BundleIndeterminate {
+                        bundle_message_id,
+                        retry: retry.clone(),
+                    },
+                });
+            }
+            crate::send::GroupDirectAcknowledgement::Accepted => {}
+        }
+        let Some(bundle_fanout) = bundle_send.recipient_fanout else {
+            return Ok(GroupHistoryAddResult {
+                participants: participant_results,
+                history_share: GroupHistoryShareOutcome::BundleIndeterminate {
+                    bundle_message_id,
+                    retry: retry.clone(),
+                },
+            });
+        };
+        if bundle_fanout.is_partial() {
+            return Ok(GroupHistoryAddResult {
+                participants: participant_results,
+                history_share: GroupHistoryShareOutcome::BundlePartialFanout {
+                    bundle_message_id,
+                    encrypted_devices: bundle_fanout.encrypted,
+                    addressed_devices: bundle_fanout.addressed,
+                    retry: retry.clone(),
+                },
+            });
+        }
+
+        let notice_retry = retry.for_notice();
+        let notice_send = self
+            .client
+            .send_group_direct_message(
+                &jid,
+                &history_receivers,
+                notice_message.as_ref(),
+                Some(&notice_message_id),
+            )
+            .await;
+        let notice_send = match notice_send {
+            Ok(send) => send,
+            Err(error) => {
+                let (may_have_reached_server, error_message) = match error {
+                    crate::send::GroupDirectSendError::AckAlreadyPending => (
+                        true,
+                        "another send with this message ID already has an ACK waiter".to_owned(),
+                    ),
+                    crate::send::GroupDirectSendError::Send(error) => (
+                        send_error_may_have_reached_server(&error),
+                        error.to_string(),
+                    ),
+                };
+                let history_share = if may_have_reached_server {
+                    log::warn!(
+                        "Group history notice send outcome is indeterminate: {error_message}"
+                    );
+                    GroupHistoryShareOutcome::NoticeIndeterminate {
+                        bundle_message_id,
+                        notice_message_id,
+                        retry: notice_retry.clone(),
+                    }
+                } else {
+                    GroupHistoryShareOutcome::NoticeNotSent {
+                        bundle_message_id,
+                        notice_message_id,
+                        error: error_message,
+                        retry: notice_retry.clone(),
+                    }
+                };
+                return Ok(GroupHistoryAddResult {
+                    participants: participant_results,
+                    history_share,
+                });
+            }
+        };
+        match notice_send.acknowledgement {
+            crate::send::GroupDirectAcknowledgement::Rejected { error, code } => {
+                Ok(GroupHistoryAddResult {
+                    participants: participant_results,
+                    history_share: GroupHistoryShareOutcome::NoticeRejected {
+                        bundle_message_id,
+                        notice_message_id,
+                        error,
+                        code,
+                    },
+                })
+            }
+            crate::send::GroupDirectAcknowledgement::Indeterminate => Ok(GroupHistoryAddResult {
+                participants: participant_results,
+                history_share: GroupHistoryShareOutcome::NoticeIndeterminate {
+                    bundle_message_id,
+                    notice_message_id,
+                    retry: notice_retry.clone(),
+                },
+            }),
+            crate::send::GroupDirectAcknowledgement::Accepted => {
+                match notice_send.recipient_fanout {
+                    Some(fanout) if fanout.is_partial() => Ok(GroupHistoryAddResult {
+                        participants: participant_results,
+                        history_share: GroupHistoryShareOutcome::NoticePartialFanout {
+                            bundle_message_id,
+                            notice_message_id,
+                            encrypted_devices: fanout.encrypted,
+                            addressed_devices: fanout.addressed,
+                            retry: notice_retry.clone(),
+                        },
+                    }),
+                    Some(_) => Ok(GroupHistoryAddResult {
+                        participants: participant_results,
+                        history_share: GroupHistoryShareOutcome::Shared {
+                            bundle_message_id,
+                            notice_message_id,
+                            message_count,
+                        },
+                    }),
+                    None => Ok(GroupHistoryAddResult {
+                        participants: participant_results,
+                        history_share: GroupHistoryShareOutcome::NoticeIndeterminate {
+                            bundle_message_id,
+                            notice_message_id,
+                            retry: notice_retry,
+                        },
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Retry an indeterminate or partially delivered history operation using
+    /// the exact uploaded bundle, message IDs, and pairwise audience from its
+    /// [`GroupHistoryRetryToken`]. Bundle retries keep the notice behind a new
+    /// correlated bundle ACK; notice retries never retransmit the bundle.
+    /// Current account/group policy and sender permission are rechecked first.
+    pub async fn retry_group_history(
+        &self,
+        retry: &GroupHistoryRetryToken,
+    ) -> GroupHistoryShareOutcome {
+        if let Err(reason) = self.group_history_context(&retry.group).await {
+            return GroupHistoryShareOutcome::Skipped(reason);
+        }
+
+        let mut notice_stage = retry.is_notice_stage();
+        loop {
+            let active_retry = if notice_stage {
+                retry.for_notice()
+            } else {
+                retry.clone()
+            };
+            let (message, message_id) = if notice_stage {
+                (&retry.notice_message, &retry.notice_message_id)
+            } else {
+                (&retry.bundle_message, &retry.bundle_message_id)
+            };
+            let send = self
+                .client
+                .send_group_direct_message(
+                    &retry.group,
+                    &retry.recipients,
+                    message.as_ref(),
+                    Some(message_id),
+                )
+                .await;
+            let send = match send {
+                Ok(send) => send,
+                Err(error) => {
+                    let (may_have_reached_server, error_message) = match error {
+                        crate::send::GroupDirectSendError::AckAlreadyPending => (
+                            true,
+                            "another send with this message ID already has an ACK waiter"
+                                .to_owned(),
+                        ),
+                        crate::send::GroupDirectSendError::Send(error) => (
+                            send_error_may_have_reached_server(&error),
+                            error.to_string(),
+                        ),
+                    };
+                    if may_have_reached_server {
+                        log::warn!("Group history retry outcome is indeterminate: {error_message}");
+                        return if notice_stage {
+                            GroupHistoryShareOutcome::NoticeIndeterminate {
+                                bundle_message_id: retry.bundle_message_id.clone(),
+                                notice_message_id: retry.notice_message_id.clone(),
+                                retry: active_retry,
+                            }
+                        } else {
+                            GroupHistoryShareOutcome::BundleIndeterminate {
+                                bundle_message_id: retry.bundle_message_id.clone(),
+                                retry: active_retry,
+                            }
+                        };
+                    }
+                    return if notice_stage {
+                        GroupHistoryShareOutcome::NoticeNotSent {
+                            bundle_message_id: retry.bundle_message_id.clone(),
+                            notice_message_id: retry.notice_message_id.clone(),
+                            error: error_message,
+                            retry: active_retry,
+                        }
+                    } else {
+                        GroupHistoryShareOutcome::BundleNotSent {
+                            bundle_message_id: retry.bundle_message_id.clone(),
+                            error: error_message,
+                            retry: active_retry,
+                        }
+                    };
+                }
+            };
+            match send.acknowledgement {
+                crate::send::GroupDirectAcknowledgement::Rejected { error, code } => {
+                    return if notice_stage {
+                        GroupHistoryShareOutcome::NoticeRejected {
+                            bundle_message_id: retry.bundle_message_id.clone(),
+                            notice_message_id: retry.notice_message_id.clone(),
+                            error,
+                            code,
+                        }
+                    } else {
+                        GroupHistoryShareOutcome::BundleRejected {
+                            bundle_message_id: retry.bundle_message_id.clone(),
+                            error,
+                            code,
+                        }
+                    };
+                }
+                crate::send::GroupDirectAcknowledgement::Indeterminate => {
+                    return if notice_stage {
+                        GroupHistoryShareOutcome::NoticeIndeterminate {
+                            bundle_message_id: retry.bundle_message_id.clone(),
+                            notice_message_id: retry.notice_message_id.clone(),
+                            retry: active_retry,
+                        }
+                    } else {
+                        GroupHistoryShareOutcome::BundleIndeterminate {
+                            bundle_message_id: retry.bundle_message_id.clone(),
+                            retry: active_retry,
+                        }
+                    };
+                }
+                crate::send::GroupDirectAcknowledgement::Accepted => {}
+            }
+            let Some(fanout) = send.recipient_fanout else {
+                return if notice_stage {
+                    GroupHistoryShareOutcome::NoticeIndeterminate {
+                        bundle_message_id: retry.bundle_message_id.clone(),
+                        notice_message_id: retry.notice_message_id.clone(),
+                        retry: active_retry,
+                    }
+                } else {
+                    GroupHistoryShareOutcome::BundleIndeterminate {
+                        bundle_message_id: retry.bundle_message_id.clone(),
+                        retry: active_retry,
+                    }
+                };
+            };
+            if fanout.is_partial() {
+                return if notice_stage {
+                    GroupHistoryShareOutcome::NoticePartialFanout {
+                        bundle_message_id: retry.bundle_message_id.clone(),
+                        notice_message_id: retry.notice_message_id.clone(),
+                        encrypted_devices: fanout.encrypted,
+                        addressed_devices: fanout.addressed,
+                        retry: active_retry,
+                    }
+                } else {
+                    GroupHistoryShareOutcome::BundlePartialFanout {
+                        bundle_message_id: retry.bundle_message_id.clone(),
+                        encrypted_devices: fanout.encrypted,
+                        addressed_devices: fanout.addressed,
+                        retry: active_retry,
+                    }
+                };
+            }
+            if notice_stage {
+                return GroupHistoryShareOutcome::Shared {
+                    bundle_message_id: retry.bundle_message_id.clone(),
+                    notice_message_id: retry.notice_message_id.clone(),
+                    message_count: retry.message_count,
+                };
+            }
+            notice_stage = true;
+        }
+    }
+
     pub async fn remove_participants(
         &self,
         jid: impl Into<Jid>,
@@ -2385,6 +3083,103 @@ fn extract_code_param(input: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_history_bundle_is_zlib_wrapped_group_history_protobuf() {
+        use std::io::Read as _;
+        use waproto::whatsapp as wa;
+
+        let source = wa::WebMessageInfo {
+            key: buffa::MessageField::some(wa::MessageKey {
+                remote_jid: Some("120363000000000001@g.us".into()),
+                id: Some("SYNTHETIC-HISTORY-ID".into()),
+                ..Default::default()
+            }),
+            message: buffa::MessageField::some(wa::Message {
+                conversation: Some("synthetic history payload".into()),
+                ..Default::default()
+            }),
+            message_timestamp: Some(1_700_000_000),
+            ..Default::default()
+        };
+        let compressed = compress_group_history(vec![source]).expect("compress history");
+        let mut decoder = flate2::read::ZlibDecoder::new(compressed.as_slice());
+        let mut protobuf = Vec::new();
+        decoder
+            .read_to_end(&mut protobuf)
+            .expect("decompress history");
+        let decoded = waproto::codec::group_history_decode(&protobuf).expect("decode protobuf");
+
+        assert_eq!(decoded.messages.len(), 1);
+        assert_eq!(
+            decoded.messages[0]
+                .key
+                .as_option()
+                .and_then(|key| key.id.as_deref()),
+            Some("SYNTHETIC-HISTORY-ID")
+        );
+    }
+
+    #[test]
+    fn group_history_audience_requires_opt_in_success_and_unshared_membership() {
+        use wacore::protocol::ProtocolNode;
+        use wacore_binary::builder::NodeBuilder;
+
+        let mut members: Vec<_> = [
+            ("111111111111", None),
+            ("222222222222", None),
+            ("333333333333", None),
+            ("444444444444", Some(true)),
+        ]
+        .into_iter()
+        .map(|(user, already_shared)| {
+            let mut details = GroupParticipantDetails::default();
+            details.group_history_sent = already_shared;
+            GroupParticipant {
+                jid: Jid::pn(user),
+                phone_number: None,
+                lid: None,
+                username: None,
+                participant_type: ParticipantType::Member,
+                details: already_shared.map(|_| Box::new(details)),
+            }
+        })
+        .collect();
+        members[0].jid = Jid::new("111111111111", wacore_binary::Server::Lid);
+        members[0].phone_number = Some(Jid::pn("111111111111"));
+        let add_results: Vec<_> = [
+            ("111111111111", None),
+            ("222222222222", None),
+            ("333333333333", Some("403")),
+            ("444444444444", None),
+        ]
+        .into_iter()
+        .map(|(user, error)| {
+            let mut builder = NodeBuilder::new("participant").attr("jid", Jid::pn(user));
+            if let Some(error) = error {
+                builder = builder.attr("error", error);
+            }
+            let node = builder.build();
+            ParticipantChangeResponse::try_from_node_ref(&node.as_node_ref())
+                .expect("synthetic participant result")
+        })
+        .collect();
+        let opted_in = [
+            Jid::pn("111111111111"),
+            Jid::pn("333333333333"),
+            Jid::pn("444444444444"),
+        ];
+
+        let (added, share) = select_group_history_recipients(&members, &add_results, &opted_in);
+        assert_eq!(added.len(), 3, "failed additions are not eligible");
+        assert_eq!(
+            share.len(),
+            1,
+            "only explicit, successful, unshared opt-ins"
+        );
+        assert_eq!(share[0].jid.user.as_str(), "111111111111");
+        assert!(share[0].jid.is_lid());
+    }
 
     #[test]
     fn test_group_metadata_struct() {
