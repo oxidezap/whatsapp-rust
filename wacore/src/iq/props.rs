@@ -491,9 +491,9 @@ pub struct GroupPropsResponse {
     pub experiment_props: Vec<(u32, CompactString)>,
 }
 
-/// Fetch one group's AB properties. Callers that do not own a current group
-/// prop hash should request the full set rather than applying an unrelated
-/// group's or a stale persisted snapshot.
+/// Fetch one group's full AB-property set without a request-side hash.
+/// The response hash lets callers verify that the server returned a versioned
+/// configuration rather than treating an unavailable configuration as defaults.
 #[derive(Debug, Clone)]
 pub struct GroupPropsSpec {
     group: Jid,

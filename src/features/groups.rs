@@ -1707,14 +1707,27 @@ impl<'a> Groups<'a> {
     /// successfully added receiver a consumer-supplied recent history bundle.
     ///
     /// The existing [`Groups::add_participants`] API remains the simple path.
-    /// This method never reads or persists the caller's history; it filters the
-    /// supplied protobuf messages by group, effective account/group AB-prop
+    /// This method does not access the caller's history storage. It filters
+    /// the supplied protobuf messages by group, effective account/group AB-prop
     /// window, and message-count limit. Group history is pairwise-encrypted to
     /// only the opted-in successful additions and this account's own devices.
     ///
     /// Authorization uncertainty skips history sharing but does not undo an
     /// otherwise successful add. A notice is sent only after a correlated
     /// bundle ACK and complete pairwise device fanout.
+    ///
+    /// Pass the members to add in `participants`, the subset who consented to
+    /// history sharing in `opted_in_receivers`, and messages from your storage
+    /// in `history_messages`. An empty opt-in list performs only the add.
+    /// Messages need a nonempty ID, this group's remote JID, a payload, and a
+    /// timestamp within the effective window. Duplicate IDs are omitted and
+    /// the newest eligible messages are kept up to the count limit.
+    ///
+    /// Inspect `participants` and `history_share` in the result separately.
+    /// See [`GroupHistoryShareOutcome`] for ACK and fanout semantics, and pass
+    /// any returned retry token to [`Groups::retry_group_history`] rather than
+    /// repeating the add. This API covers direct additions only, not invite,
+    /// QR, or post-join sharing. Live interoperability has not been verified.
     pub async fn add_participants_with_history(
         &self,
         jid: impl Into<Jid>,
@@ -2085,6 +2098,9 @@ impl<'a> Groups<'a> {
     /// [`GroupHistoryRetryToken`]. Bundle retries keep the notice behind a new
     /// correlated bundle ACK; notice retries never retransmit the bundle.
     /// Current account/group policy and sender permission are rechecked first.
+    /// A retained bundle must still fit the current count and time-window
+    /// limits, otherwise the retry returns `Skipped(NoEligibleMessages)`.
+    /// Notice-only retries do not revalidate the bundle's count or age.
     pub async fn retry_group_history(
         &self,
         retry: &GroupHistoryRetryToken,

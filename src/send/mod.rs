@@ -2406,6 +2406,11 @@ impl Client {
         })
     }
 
+    /// Send a message built by this crate with an explicit stanza `edit`
+    /// attribute and return the message in its [`SendResult`].
+    ///
+    /// `borrowed_stanza_id` names the outer stanza after another message, so
+    /// the pipeline binds no ID-keyed state to it. `None` uses a fresh ID.
     pub(crate) async fn send_built_message(
         &self,
         to: Jid,
