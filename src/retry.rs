@@ -62,6 +62,98 @@ fn is_own_account_jid(jid: &Jid, own_pn: Option<&Jid>, own_lid: Option<&Jid>) ->
         || own_lid.is_some_and(|lid| jid.is_same_user_as(lid))
 }
 
+#[cfg(test)]
+#[test]
+fn group_history_retry_audience_requires_opt_in_and_membership() {
+    let opted: Jid = "10001@s.whatsapp.net".parse().unwrap();
+    let other: Jid = "10002@s.whatsapp.net".parse().unwrap();
+    let own: Jid = "10003:1@s.whatsapp.net".parse().unwrap();
+    let peer: Jid = "10003:2@s.whatsapp.net".parse().unwrap();
+    let metadata = wa::message::MessageHistoryMetadata {
+        history_receivers: vec![opted.to_string()],
+        ..Default::default()
+    };
+    let mut group = wacore::client::context::GroupRoutingInfo::new(
+        vec![opted.clone(), other.clone(), own.to_non_ad()],
+        wacore::types::message::AddressingMode::Pn,
+    );
+    assert!(history_retry_recipient_allowed(
+        &metadata,
+        &opted,
+        &group,
+        Some(&own),
+        None
+    ));
+    assert!(!history_retry_recipient_allowed(
+        &metadata,
+        &other,
+        &group,
+        Some(&own),
+        None
+    ));
+    assert!(history_retry_recipient_allowed(
+        &metadata,
+        &peer,
+        &group,
+        Some(&own),
+        None
+    ));
+    assert!(!history_retry_recipient_allowed(
+        &metadata,
+        &own,
+        &group,
+        Some(&own),
+        None
+    ));
+    group.participants.clear();
+    assert!(!history_retry_recipient_allowed(
+        &metadata,
+        &opted,
+        &group,
+        Some(&own),
+        None
+    ));
+    assert!(!history_retry_recipient_allowed(
+        &metadata,
+        &peer,
+        &group,
+        Some(&own),
+        None
+    ));
+}
+
+fn history_retry_recipient_allowed(
+    metadata: &wa::message::MessageHistoryMetadata,
+    requester: &Jid,
+    group: &wacore::client::context::GroupRoutingInfo,
+    own_pn: Option<&Jid>,
+    own_lid: Option<&Jid>,
+) -> bool {
+    let is_member = |jid: &Jid| {
+        group
+            .participants
+            .iter()
+            .any(|member| crate::send::same_group_user(member, jid, group))
+    };
+    if requester.is_hosted()
+        || !is_member(requester)
+        || !own_pn.into_iter().chain(own_lid).any(is_member)
+    {
+        return false;
+    }
+    if is_own_account_jid(requester, own_pn, own_lid) {
+        return !own_pn
+            .into_iter()
+            .chain(own_lid)
+            .any(|own| requester.is_same_user_as(own) && requester.device == own.device);
+    }
+    metadata.history_receivers.iter().any(|receiver| {
+        receiver
+            .parse::<Jid>()
+            .is_ok_and(|receiver| crate::send::same_group_user(&receiver, requester, group))
+    })
+}
+
 pub(crate) struct PreparedRetransmission {
     pub(crate) route: RetransmissionRoute,
     pub(crate) chat: Jid,
@@ -844,6 +936,48 @@ impl Client {
             group_info,
             pre_encoded,
         } = request;
+
+        if !message.message_history_bundle.is_unset() || !message.message_history_notice.is_unset()
+        {
+            if !matches!(route, RetransmissionRoute::Group) || !chat.is_group() {
+                anyhow::bail!("history retransmission requires its group route");
+            }
+            let current_group = self
+                .groups()
+                .routing_info_with_freshness(&chat, crate::cache::Freshness::Refresh)
+                .await?;
+            let own = self.persistence_manager.get_device_snapshot();
+            let bundle = message
+                .message_history_bundle
+                .as_option()
+                .map(|bundle| bundle.message_history_metadata.as_option());
+            let notice = message
+                .message_history_notice
+                .as_option()
+                .map(|notice| notice.message_history_metadata.as_option());
+            for metadata in bundle.into_iter().chain(notice) {
+                let Some(metadata) = metadata else {
+                    anyhow::bail!("history retransmission lacks audience metadata");
+                };
+                if !history_retry_recipient_allowed(
+                    metadata,
+                    &wire_requester,
+                    &current_group,
+                    own.pn.as_ref(),
+                    own.lid.as_ref(),
+                ) || !history_retry_recipient_allowed(
+                    metadata,
+                    &encryption_jid,
+                    &current_group,
+                    own.pn.as_ref(),
+                    own.lid.as_ref(),
+                ) {
+                    anyhow::bail!(
+                        "history retransmission requester is outside the authorized audience"
+                    );
+                }
+            }
+        }
 
         if matches!(route, RetransmissionRoute::Status) {
             return self

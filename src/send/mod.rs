@@ -148,7 +148,7 @@ impl From<GroupError> for SendError {
 /// Returns a `GroupRoutingInfo` whose participant list is guaranteed to contain our own
 /// sending JID, without deep-cloning the shared (cached) metadata in the common
 /// case where the server's participant list already includes us.
-fn same_group_user(
+pub(crate) fn same_group_user(
     left: &Jid,
     right: &Jid,
     info: &wacore::client::context::GroupRoutingInfo,
@@ -172,6 +172,17 @@ fn same_group_user(
             && info
                 .lid_user_for_phone_user(&right.user)
                 .is_some_and(|lid_user| left.is_lid() && lid_user == left.user))
+}
+
+fn require_history_device_coverage(requested: &[Jid], devices: &[Jid]) -> anyhow::Result<()> {
+    if requested.iter().any(|user| {
+        !devices.iter().any(|device| {
+            !device.is_hosted() && device.user == user.user && device.server == user.server
+        })
+    }) {
+        anyhow::bail!("group history device resolution omitted a requested identity");
+    }
+    Ok(())
 }
 
 fn ensure_self_in_group(
@@ -2343,7 +2354,7 @@ impl Client {
         to: &Jid,
         recipients: &[Jid],
         message: &wa::Message,
-        message_id: Option<&str>,
+        message_id: &str,
     ) -> Result<GroupDirectSendOutcome, GroupDirectSendError> {
         if !to.is_group() || recipients.is_empty() {
             return Err(GroupDirectSendError::Send(SendError::InvalidRequest(
@@ -2351,12 +2362,15 @@ impl Client {
             )));
         }
         let sent_at = SendInstant::now();
-        let request_id = message_id
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| self.generate_message_id_at(sent_at.unix_secs_u64()));
+        let request_id = message_id.to_owned();
         let Some((ack_receiver, ack_generation)) = self.try_register_ack_waiter(&request_id) else {
             return Err(GroupDirectSendError::AckAlreadyPending);
         };
+        let _ack_guard = crate::request::ResponseWaiterGuard::new(
+            self.response_waiters.clone(),
+            request_id.clone(),
+            ack_generation,
+        );
         let recipient_fanout = match self
             .send_message_impl(
                 to.clone(),
@@ -2372,8 +2386,6 @@ impl Client {
         {
             Ok(fanout) => fanout,
             Err(error) => {
-                self.response_waiters_guard()
-                    .remove_guarded(&request_id, ack_generation);
                 return Err(GroupDirectSendError::Send(SendError::from_anyhow(error)));
             }
         };
@@ -2384,8 +2396,6 @@ impl Client {
             ack_receiver,
         )
         .await;
-        self.response_waiters_guard()
-            .remove_guarded(&request_id, ack_generation);
         let acknowledgement = match ack_result {
             Ok(Ok(ack)) => parse_group_direct_ack(&ack, &request_id, to),
             Ok(Err(_)) | Err(_) => GroupDirectAcknowledgement::Indeterminate,
@@ -3471,6 +3481,7 @@ impl Client {
         wacore::types::jid::sort_dedup_by_user(&mut device_queries);
 
         let mut devices = self.get_user_devices(&device_queries).await?;
+        require_history_device_coverage(&device_queries, &devices)?;
         if group_info.addressing_mode == AddressingMode::Lid {
             devices = devices
                 .into_iter()
@@ -3739,6 +3750,41 @@ mod tests {
     use crate::test_utils::wait_for_lock_waiter;
     use std::str::FromStr;
     use wacore::proto_helpers::MessageBuilderExt;
+
+    #[test]
+    fn group_history_device_coverage_rejects_omitted_users_and_own_account() {
+        let a: Jid = "10001@s.whatsapp.net".parse().unwrap();
+        let b: Jid = "10002@s.whatsapp.net".parse().unwrap();
+        let own: Jid = "10003@s.whatsapp.net".parse().unwrap();
+        let requested = vec![a.clone(), b.clone(), own.clone()];
+        assert!(
+            require_history_device_coverage(&requested, &[a.clone(), b.clone(), own.clone()])
+                .is_ok()
+        );
+        assert!(require_history_device_coverage(&requested, &[a.clone(), own]).is_err());
+        assert!(require_history_device_coverage(&requested, &[a, b]).is_err());
+        assert!(require_history_device_coverage(&requested, &[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn group_history_ack_waiter_is_removed_on_cancellation() {
+        let client =
+            crate::test_utils::create_test_client_with_failing_http("history_cancel").await;
+        let (receiver, generation) = client.try_register_ack_waiter("history-id").unwrap();
+        let guard = crate::request::ResponseWaiterGuard::new(
+            client.response_waiters.clone(),
+            "history-id".into(),
+            generation,
+        );
+        let pending = async move {
+            let _guard = guard;
+            let _ = receiver.await;
+        };
+        let mut pending = Box::pin(pending);
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        drop(pending);
+        assert!(client.try_register_ack_waiter("history-id").is_some());
+    }
 
     #[test]
     fn status_revoke_requires_a_distinct_outer_stanza_id() {

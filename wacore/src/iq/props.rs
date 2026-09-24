@@ -497,21 +497,13 @@ pub struct GroupPropsResponse {
 #[derive(Debug, Clone)]
 pub struct GroupPropsSpec {
     group: Jid,
-    hash: Option<String>,
 }
 
 impl GroupPropsSpec {
     pub fn new(group: &Jid) -> Self {
         Self {
             group: group.clone(),
-            hash: None,
         }
-    }
-
-    /// Request a delta only when the caller owns the hash for this same group.
-    pub fn with_hash(mut self, hash: impl Into<String>) -> Self {
-        self.hash = Some(hash.into());
-        self
     }
 }
 
@@ -519,10 +511,7 @@ impl IqSpec for GroupPropsSpec {
     type Response = GroupPropsResponse;
 
     fn build_iq(&self) -> InfoQuery<'static> {
-        let mut props = NodeBuilder::new("props").attr("group", &self.group);
-        if let Some(hash) = &self.hash {
-            props = props.attr("hash", hash.as_str());
-        }
+        let props = NodeBuilder::new("props").attr("group", &self.group);
         InfoQuery::get(
             PROPS_NAMESPACE,
             Jid::new("", Server::Pn),
@@ -576,17 +565,6 @@ mod tests {
                 .is_some_and(|value| value == group_string.as_str())
         );
         assert!(nodes[0].attrs.get("hash").is_none());
-
-        let delta = GroupPropsSpec::new(&group).with_hash("group-hash");
-        let Some(NodeContent::Nodes(nodes)) = delta.build_iq().content else {
-            panic!("expected <props> child");
-        };
-        assert!(
-            nodes[0]
-                .attrs
-                .get("hash")
-                .is_some_and(|value| value == "group-hash")
-        );
     }
 
     #[test]

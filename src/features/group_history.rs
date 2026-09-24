@@ -76,6 +76,16 @@ impl GroupHistoryRetryToken {
         }
     }
 
+    pub(crate) fn fits_current_limits(&self, limits: GroupHistoryLimits, now: u64) -> bool {
+        let Some(bundle) = self.bundle_message.message_history_bundle.as_option() else {
+            return false;
+        };
+        let Some(metadata) = bundle.message_history_metadata.as_option() else {
+            return false;
+        };
+        retained_history_fits_limits(metadata, limits, now)
+    }
+
     pub(crate) fn is_notice_stage(&self) -> bool {
         self.stage == GroupHistoryRetryStage::Notice
     }
@@ -85,6 +95,23 @@ impl GroupHistoryRetryToken {
         retry.stage = GroupHistoryRetryStage::Notice;
         retry
     }
+}
+
+fn retained_history_fits_limits(
+    metadata: &waproto::whatsapp::message::MessageHistoryMetadata,
+    limits: GroupHistoryLimits,
+    now: u64,
+) -> bool {
+    let count = metadata
+        .message_count
+        .and_then(|value| usize::try_from(value).ok());
+    let oldest = metadata
+        .oldest_message_timestamp_in_bundle
+        .and_then(|value| u64::try_from(value).ok());
+    count.is_some_and(|count| count > 0 && count <= limits.max_messages)
+        && oldest.is_some_and(|oldest| {
+            oldest >= now.saturating_sub(limits.time_window_seconds) && oldest <= now
+        })
 }
 
 impl PartialEq for GroupHistoryRetryToken {
@@ -374,6 +401,42 @@ mod tests {
     use super::*;
     use wacore::store::ab_props::AbPropsCache;
     use wacore_binary::CompactString;
+
+    #[test]
+    fn group_history_retry_checks_current_count_and_window() {
+        let metadata = waproto::whatsapp::message::MessageHistoryMetadata {
+            message_count: Some(100),
+            oldest_message_timestamp_in_bundle: Some(800),
+            ..Default::default()
+        };
+        let limits = GroupHistoryLimits {
+            max_messages: 100,
+            time_window_seconds: 200,
+        };
+        assert!(retained_history_fits_limits(&metadata, limits, 1000));
+        assert!(!retained_history_fits_limits(
+            &metadata,
+            GroupHistoryLimits {
+                max_messages: 0,
+                ..limits
+            },
+            1000
+        ));
+        assert!(!retained_history_fits_limits(
+            &metadata,
+            GroupHistoryLimits {
+                time_window_seconds: 199,
+                ..limits
+            },
+            1000
+        ));
+        assert!(!retained_history_fits_limits(&metadata, limits, 1001));
+        assert!(!retained_history_fits_limits(
+            &Default::default(),
+            limits,
+            1000
+        ));
+    }
 
     async fn account_snapshot(props: &[(u32, &str)]) -> AbPropsSnapshot {
         let cache = AbPropsCache::new();

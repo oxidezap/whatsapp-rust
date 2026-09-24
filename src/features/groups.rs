@@ -1901,7 +1901,7 @@ impl<'a> Groups<'a> {
                 &jid,
                 &history_receivers,
                 bundle_message.as_ref(),
-                Some(&bundle_message_id),
+                &bundle_message_id,
             )
             .await;
         let bundle_send = match bundle_send {
@@ -1988,7 +1988,7 @@ impl<'a> Groups<'a> {
                 &jid,
                 &history_receivers,
                 notice_message.as_ref(),
-                Some(&notice_message_id),
+                &notice_message_id,
             )
             .await;
         let notice_send = match notice_send {
@@ -2089,8 +2089,14 @@ impl<'a> Groups<'a> {
         &self,
         retry: &GroupHistoryRetryToken,
     ) -> GroupHistoryShareOutcome {
-        if let Err(reason) = self.group_history_context(&retry.group).await {
-            return GroupHistoryShareOutcome::Skipped(reason);
+        let limits = match self.group_history_context(&retry.group).await {
+            Ok((_, limits)) => limits,
+            Err(reason) => return GroupHistoryShareOutcome::Skipped(reason),
+        };
+        if !retry.is_notice_stage()
+            && !retry.fits_current_limits(limits, wacore::time::now_secs_u64())
+        {
+            return GroupHistoryShareOutcome::Skipped(GroupHistorySkipReason::NoEligibleMessages);
         }
 
         let mut notice_stage = retry.is_notice_stage();
@@ -2111,7 +2117,7 @@ impl<'a> Groups<'a> {
                     &retry.group,
                     &retry.recipients,
                     message.as_ref(),
-                    Some(message_id),
+                    message_id,
                 )
                 .await;
             let send = match send {
