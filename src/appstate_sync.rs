@@ -43,6 +43,9 @@ mod tests {
         // Counts key reads, so a test can tell "before the recovery started"
         // from "part-way through it".
         sync_key_calls: Arc<portable_atomic::AtomicU64>,
+        // Counts version writes, so a test can tell a sync that recorded
+        // something from one that had nothing to record.
+        set_version_calls: Arc<portable_atomic::AtomicU64>,
     }
 
     // Implement SignalStore - Signal protocol cryptographic operations
@@ -127,6 +130,8 @@ mod tests {
             Ok(())
         }
         async fn set_version(&self, name: &str, state: HashState) -> StoreResult<()> {
+            self.set_version_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.versions.lock().await.insert(name.to_string(), state);
             Ok(())
         }
@@ -1852,6 +1857,188 @@ mod tests {
                 .version,
             11,
             "the collection must pass the cut, or every later sync repeats the snapshot"
+        );
+    }
+
+    /// What the server sends a collection already at its head: no patches, no
+    /// snapshot, nothing more to come.
+    fn tip_answer(name: WAPatchName) -> PatchList {
+        PatchList {
+            name,
+            has_more_patches: false,
+            patches: Vec::new(),
+            snapshot: None,
+            snapshot_ref: None,
+            error: None,
+        }
+    }
+
+    /// A baseline that never recorded finishing its bootstrap: a row written
+    /// before the flag existed, or one a migration reset.
+    async fn seed_unmarked_baseline(backend: &MockBackend, name: WAPatchName) -> HashState {
+        let mut hash = [0u8; 128];
+        hash[0] = 0x5A;
+        let state = HashState {
+            version: 1399,
+            hash,
+            bootstrapped: false,
+            ..Default::default()
+        };
+        backend
+            .set_version(name.as_str(), state.clone())
+            .await
+            .expect("test backend should accept a version");
+        state
+    }
+
+    /// Production symptom: after an upgrade reset the flag, every chat-action
+    /// write was refused with "its bootstrap has not completed". The send
+    /// guard syncs first, but the collection was already at the head, so the
+    /// sync applied nothing and recorded nothing, and a quiet collection never
+    /// receives the incoming patch that would have set the flag.
+    #[tokio::test]
+    async fn an_unmarked_baseline_at_the_head_records_its_bootstrap() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let name = WAPatchName::RegularLow;
+        let seeded = seed_unmarked_baseline(&backend, name).await;
+
+        let (mutations, state, _) = processor
+            .process_patch_list(tip_answer(name), true)
+            .await
+            .expect("an empty answer processes");
+
+        assert!(mutations.is_empty());
+        let stored = backend
+            .get_version(name.as_str())
+            .await
+            .expect("version readable")
+            .expect("the record is still there");
+        assert!(
+            stored.bootstrapped,
+            "a final empty answer over a baseline says the collection is at the head"
+        );
+        assert!(state.bootstrapped, "the caller sees what was persisted");
+        assert_eq!(stored.version, seeded.version, "nothing was applied");
+        assert_eq!(stored.hash, seeded.hash, "nothing was applied");
+    }
+
+    /// Each of these says the answer is a page, or no answer at all, so the
+    /// collection may still be short of the head -- the partial bootstrap the
+    /// send guard exists to refuse.
+    #[tokio::test]
+    async fn an_unmarked_baseline_stays_unmarked_on_anything_but_a_final_empty_answer() {
+        let name = WAPatchName::RegularLow;
+        let cases = [
+            (
+                "more patches to come",
+                PatchList {
+                    has_more_patches: true,
+                    ..tip_answer(name)
+                },
+            ),
+            (
+                "a snapshot still to download",
+                PatchList {
+                    snapshot_ref: Some(wa::ExternalBlobReference::default()),
+                    ..tip_answer(name)
+                },
+            ),
+            (
+                "a collection error",
+                PatchList {
+                    error: Some(CollectionSyncError::Retry {
+                        code: 500,
+                        text: String::new(),
+                    }),
+                    ..tip_answer(name)
+                },
+            ),
+        ];
+        for (what, answer) in cases {
+            let backend = Arc::new(MockBackend::default());
+            let processor = AppStateProcessor::new(
+                backend.clone(),
+                Arc::new(crate::runtime_impl::TokioRuntime),
+            );
+            seed_unmarked_baseline(&backend, name).await;
+
+            processor
+                .process_patch_list(answer, true)
+                .await
+                .unwrap_or_else(|e| panic!("{what}: the answer processes: {e:#}"));
+
+            assert!(
+                !backend
+                    .get_version(name.as_str())
+                    .await
+                    .expect("version readable")
+                    .expect("the record is still there")
+                    .bootstrapped,
+                "{what}: the collection may be short of the head"
+            );
+        }
+    }
+
+    /// The case the branch was written for: a bootstrap the server answered
+    /// with nothing records a synced, empty collection.
+    #[tokio::test]
+    async fn an_empty_bootstrap_records_an_empty_collection() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let name = WAPatchName::Regular;
+
+        processor
+            .process_patch_list(tip_answer(name), true)
+            .await
+            .expect("an empty answer processes");
+
+        let stored = backend
+            .get_version(name.as_str())
+            .await
+            .expect("version readable")
+            .expect("an empty bootstrap leaves a record");
+        assert!(stored.bootstrapped);
+        assert_eq!(stored.version, 0);
+        assert_eq!(stored.hash, [0u8; 128]);
+    }
+
+    /// Every sync of a quiet collection gets this answer, so recording it
+    /// again would be a write per collection per sync for nothing.
+    #[tokio::test]
+    async fn a_marked_collection_at_the_head_writes_nothing() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let name = WAPatchName::RegularLow;
+        backend
+            .set_version(
+                name.as_str(),
+                HashState {
+                    version: 339,
+                    bootstrapped: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept a version");
+        let writes = backend
+            .set_version_calls
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        processor
+            .process_patch_list(tip_answer(name), true)
+            .await
+            .expect("an empty answer processes");
+
+        assert_eq!(
+            backend
+                .set_version_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            writes,
+            "a collection already marked has nothing to record"
         );
     }
 }

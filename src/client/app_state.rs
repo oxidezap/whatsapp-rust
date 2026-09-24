@@ -3035,7 +3035,7 @@ impl Client {
             {
                 debug!(
                     target: "Client/AppState",
-                    "{collection_name} has never synced; syncing before building a patch on it"
+                    "{collection_name} has not completed a bootstrap; syncing before building a patch on it"
                 );
                 // A record is not enough: a bootstrap that persisted some pages
                 // and then deferred leaves one behind while the collection is
@@ -5900,14 +5900,63 @@ mod send_patch_response_tests {
     /// patch because initial full sync is incomplete").
     #[tokio::test]
     async fn a_collection_that_never_synced_is_synced_before_it_is_patched() {
+        // Deliberately no version: the collection has never synced, which is
+        // (0, all-zero ltHash).
+        let (result, first_iq_carried_a_patch, patch_attempts) =
+            send_after_an_empty_sync(None).await;
+
+        result.expect("the bootstrap sync lifts the collection out of never-synced");
+        assert!(
+            !first_iq_carried_a_patch,
+            "the first thing on the wire must be the bootstrap sync, not a patch built \
+             on an empty ltHash"
+        );
+        assert!(
+            patch_attempts >= 1,
+            "once the collection has a record the patch is legitimate and must be sent"
+        );
+    }
+
+    /// Production symptom: an upgrade reset the flag on every stored
+    /// collection, and every chat action after it was refused with "its
+    /// bootstrap has not completed". The guard's sync found the collection
+    /// already at the head, applied nothing, and so recorded nothing -- on
+    /// every attempt, since only an incoming patch would have set the flag
+    /// and a quiet collection never gets one.
+    #[tokio::test]
+    async fn an_unmarked_baseline_at_the_head_is_patched_after_one_sync() {
+        let (result, first_iq_carried_a_patch, patch_attempts) =
+            send_after_an_empty_sync(Some(wacore::appstate::hash::HashState {
+                version: 1399,
+                bootstrapped: false,
+                ..Default::default()
+            }))
+            .await;
+
+        result.expect("a sync that finds the head completes the bootstrap");
+        assert!(
+            !first_iq_carried_a_patch,
+            "a base that never recorded finishing its bootstrap is synced first"
+        );
+        assert!(
+            patch_attempts >= 1,
+            "the sync proved the base is at the head, so the patch must be sent"
+        );
+    }
+
+    /// Send a patch on `COLLECTION`, seeded with `version` (or no record), to a
+    /// server that answers every IQ with a clean, empty collection. Returns the
+    /// send's result, whether the very first IQ already carried a patch, and
+    /// how many IQs did.
+    async fn send_after_an_empty_sync(
+        version: Option<wacore::appstate::hash::HashState>,
+    ) -> (Result<()>, bool, usize) {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         client.is_logged_in.store(true, Ordering::Relaxed);
         client.authenticated_generation.store(
             client.connection_generation.load(Ordering::SeqCst),
             Ordering::SeqCst,
         );
-        // A sync key, but deliberately no version: the collection has never
-        // synced, which is (0, all-zero ltHash).
         let backend = client.persistence_manager.backend();
         backend
             .set_sync_key(
@@ -5919,6 +5968,12 @@ mod send_patch_response_tests {
             )
             .await
             .expect("test backend should accept a sync key");
+        if let Some(version) = version {
+            backend
+                .set_version(COLLECTION, version)
+                .await
+                .expect("test backend should accept a version");
+        }
 
         let patch_attempts = Arc::new(AtomicUsize::new(0));
         let first_iq_carried_a_patch = Arc::new(AtomicUsize::new(0));
@@ -5957,8 +6012,9 @@ mod send_patch_response_tests {
                         }
                     }
                     // An empty result is what the server sends a bootstrap with
-                    // nothing in it: WA Web writes version 0 with an empty
-                    // ltHash and the collection is synced from then on.
+                    // nothing in it -- WA Web writes version 0 with an empty
+                    // ltHash and the collection is synced from then on -- and
+                    // what it sends a collection already at its head.
                     let response = empty_sync_result(&id, COLLECTION);
                     crate::test_utils::answer_iq(&client, &id, &response).await;
                     frame += 1;
@@ -5970,18 +6026,11 @@ mod send_patch_response_tests {
             result = (&mut send).fuse() => result.expect("the send task should not panic"),
             () = server.fuse() => unreachable!("the server loop never returns"),
         };
-
-        result.expect("the bootstrap sync lifts the collection out of never-synced");
-        assert_eq!(
-            first_iq_carried_a_patch.load(Ordering::Relaxed),
-            0,
-            "the first thing on the wire must be the bootstrap sync, not a patch built \
-             on an empty ltHash"
-        );
-        assert!(
-            patch_attempts.load(Ordering::Relaxed) >= 1,
-            "once the collection has a record the patch is legitimate and must be sent"
-        );
+        (
+            result,
+            first_iq_carried_a_patch.load(Ordering::Relaxed) != 0,
+            patch_attempts.load(Ordering::Relaxed),
+        )
     }
 
     /// A conflict the server says has nothing more coming is not a recovery

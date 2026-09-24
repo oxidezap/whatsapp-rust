@@ -820,9 +820,11 @@ impl AppStateProcessor {
         // Arc so each blocking closure's handoff is a refcount bump, not a map copy.
         let keys_map = Arc::new(self.prefetch_keys(&pl).await?);
 
-        let stored = self.backend.get_version(pl.name.as_str()).await?;
-        let had_baseline = stored.as_ref().is_some_and(|s| s.has_baseline());
-        let mut state = stored.unwrap_or_default();
+        let mut state = self
+            .backend
+            .get_version(pl.name.as_str())
+            .await?
+            .unwrap_or_default();
         let mut new_mutations: Vec<Mutation> = Vec::new();
         let collection_name = pl.name.as_str();
 
@@ -1018,22 +1020,36 @@ impl AppStateProcessor {
         } else if pl.patches.is_empty()
             && !pl.has_more_patches
             && pl.snapshot_ref.is_none()
-            && !had_baseline
+            && !state.bootstrapped
             && pl.error.is_none()
         {
-            // A bootstrap the server answered with nothing to apply, and nothing
-            // still to come. WA Web records it -- `if (isBootstrap(v))
-            // updateCollectionVersionAndLtHash(0, EMPTY_LT_HASH)` on its "sync X
-            // but there are no updates" branch -- and the record is what stops
-            // the next sync asking for the snapshot again. Without it an account
-            // whose collection is legitimately empty re-requests one forever.
+            // The server answered with nothing to apply and nothing still to
+            // come, so the collection is at its head, and that finishes a
+            // bootstrap whether or not there was a baseline under it.
+            //
+            // Without one, this is WA Web's "sync X but there are no updates"
+            // branch -- `if (isBootstrap(v)) updateCollectionVersionAndLtHash(0,
+            // EMPTY_LT_HASH)` -- and the record is what stops the next sync
+            // asking for the snapshot again. Without it an account whose
+            // collection is legitimately empty re-requests one forever.
+            //
+            // With one, the version is already recorded and only the flag is
+            // missing: a row written before it existed, or one a migration
+            // reset. Nothing else would set it -- only an incoming patch does,
+            // and a quiet collection never gets one -- while the patch send
+            // refuses to build on a base that lacks it, so every write to the
+            // collection failed for good.
             //
             // `has_more_patches` and an undownloaded `snapshot_ref` both mean this
             // is a page rather than the whole answer. Recording zero for either
             // would end the bootstrap early: the collection would never ask for a
             // snapshot again, and a non-genesis patch over its empty ltHash is
-            // refused for good.
-            state.bootstrapped |= !pl.has_more_patches;
+            // refused for good. Marking a baseline on one would let a patch be
+            // built on a base still short of the head.
+            //
+            // A collection already marked is skipped: every sync of a quiet one
+            // ends here, and has nothing to record.
+            state.bootstrapped = true;
             self.backend
                 .set_version(collection_name, state.clone())
                 .await?;
