@@ -1726,8 +1726,7 @@ impl<'a> Groups<'a> {
     /// The existing [`Groups::add_participants`] API remains the simple path.
     /// This method does not access the caller's history storage. It filters
     /// the supplied protobuf messages by group, effective account/group AB-prop
-    /// window, and message-count limit. Until richer send/expiry/media state is
-    /// part of the input contract, only acknowledged plain text without ephemeral metadata is
+    /// window, and message-count limit. Only acknowledged plain text is
     /// eligible. The bundle is pairwise-encrypted only to opted-in successful
     /// additions and own devices; the notice goes to the whole group.
     ///
@@ -1740,9 +1739,14 @@ impl<'a> Groups<'a> {
     /// in `history_messages`. An empty opt-in list performs only the add.
     /// Messages need a nonempty ID, this group's remote JID, an ACKed plain-text
     /// payload, and a timestamp within the effective window. Other payload
-    /// types (including older bundles), unverified status, and expiring content
-    /// without a trustworthy expiry are omitted. Duplicate IDs are omitted and
-    /// the newest eligible messages are kept up to the count limit.
+    /// types (including older bundles) and unverified status are omitted.
+    /// All records with ephemeral metadata are excluded, even before expiry,
+    /// because immutable retries cannot revoke content from the uploaded bundle.
+    /// Each selected record retains only its message key, plain-text payload,
+    /// timestamp, acknowledged status, and participant. Account-local metadata,
+    /// including stars, labels, receipts, and message secrets, is omitted.
+    /// Duplicate IDs are omitted and the newest eligible messages are kept up
+    /// to the count limit.
     ///
     /// Inspect `participants` and `history_share` in the result separately.
     /// See [`GroupHistoryShareOutcome`] for ACK and fanout semantics, and pass
