@@ -1462,8 +1462,8 @@ impl<'a> IntoIterator for &'a MessageBatch {
     }
 }
 
-/// A newsletter live update notification, typically containing updated
-/// reaction counts for one or more messages.
+/// A newsletter live update notification: the current counters (reactions,
+/// forwards, poll tallies) of one or more messages.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct NewsletterLiveUpdate {
@@ -1474,15 +1474,21 @@ pub struct NewsletterLiveUpdate {
 
 /// A single message entry in a newsletter live update.
 ///
-/// The notification IR confirms this handler but does not expose a structured
-/// child shape. Until a sanitized capture or bundle evidence establishes more,
-/// this event retains the reaction data supported before history expansion;
-/// history counters and poll tallies must not be inferred as live fields.
+/// Carries the children a captured `<live_updates>` notification showed on a
+/// `<message>`: `<forwards_count>` and `<reactions>` on every one, `<votes>`
+/// on polls only, and never `<meta>` or `<plaintext>`. The other history
+/// counters (views, responses) were not seen live and are not modelled here.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct NewsletterLiveUpdateMessage {
     pub server_id: u64,
     pub reactions: Vec<NewsletterLiveUpdateReaction>,
+    /// Per-option poll tallies. Empty on a message that is not a poll.
+    #[builder(default)]
+    pub votes: Vec<NewsletterLiveUpdatePollVote>,
+    /// How many times the message was forwarded. `None` when the node is
+    /// absent, which is not the same as a count of zero.
+    pub forwards_count: Option<u64>,
 }
 
 /// A reaction count in a newsletter live update.
@@ -1490,6 +1496,16 @@ pub struct NewsletterLiveUpdateMessage {
 #[non_exhaustive]
 pub struct NewsletterLiveUpdateReaction {
     pub code: String,
+    pub count: u64,
+}
+
+/// A poll option's tally in a newsletter live update, keyed the same way as
+/// the history tallies: by the SHA-256 of the option name
+/// ([`crate::poll::compute_option_hash`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct NewsletterLiveUpdatePollVote {
+    pub option_hash: [u8; 32],
     pub count: u64,
 }
 
