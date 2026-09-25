@@ -57,6 +57,10 @@ pub fn contains_group_history_payload(msg: &wa::Message) -> bool {
         newsletter_admin_profile_message_v2,
         poll_creation_message_v4,
         bot_forwarded_message,
+        edited_message,
+        bot_task_message,
+        newsletter_admin_profile_status_message,
+        bot_platform_registration_success_message,
     );
     msg.device_sent_message.as_option().is_some_and(|wrapper| {
         wrapper

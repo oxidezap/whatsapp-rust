@@ -801,6 +801,46 @@ mod group_direct_tests {
                 }),
                 ..Default::default()
             },
+            wa::Message {
+                edited_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                    message: buffa::MessageField::some(wa::Message {
+                        message_history_bundle: buffa::MessageField::some(Default::default()),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            },
+            wa::Message {
+                bot_task_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                    message: buffa::MessageField::some(wa::Message {
+                        message_history_bundle: buffa::MessageField::some(Default::default()),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            },
+            wa::Message {
+                newsletter_admin_profile_status_message: buffa::MessageField::some(
+                    wa::message::FutureProofMessage {
+                        message: buffa::MessageField::some(wa::Message {
+                            message_history_bundle: buffa::MessageField::some(Default::default()),
+                            ..Default::default()
+                        }),
+                    },
+                ),
+                ..Default::default()
+            },
+            wa::Message {
+                bot_platform_registration_success_message: buffa::MessageField::some(
+                    wa::message::FutureProofMessage {
+                        message: buffa::MessageField::some(wa::Message {
+                            message_history_bundle: buffa::MessageField::some(Default::default()),
+                            ..Default::default()
+                        }),
+                    },
+                ),
+                ..Default::default()
+            },
         ] {
             let error = client
                 .send_message_impl(group.clone(), &message, SendPipelineOptions::default())
