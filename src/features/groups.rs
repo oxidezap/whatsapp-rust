@@ -1772,14 +1772,19 @@ impl<'a> Groups<'a> {
     /// `reporting_token_version` is accepted but stripped; other context and
     /// nested content make the record ineligible. Account-local outer metadata,
     /// including stars, labels, receipts, message secrets, and addons, is omitted.
-    /// Duplicate IDs are omitted and the newest eligible messages are kept up
-    /// to the count limit.
+    /// For duplicate IDs, only the first eligible record in input order is
+    /// considered. The newest eligible messages are kept up to the count
+    /// limit; later input records win ties in timestamp.
     ///
     /// Inspect `participants` and `history_share` in the result separately.
     /// See [`GroupHistoryShareOutcome`] for ACK and fanout semantics, and pass
     /// any returned retry token to [`Groups::retry_group_history`] rather than
     /// repeating the add. This API covers direct additions only, not invite,
     /// QR, or post-join sharing. Live interoperability has not been verified.
+    ///
+    /// Cancelling this future does not undo completed member additions or
+    /// history sends. No result or retry token is returned on cancellation,
+    /// so the caller cannot resume this share through the retry API.
     pub async fn add_participants_with_history(
         &self,
         jid: impl Into<Jid>,
