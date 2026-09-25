@@ -1225,7 +1225,7 @@ impl Client {
     }
 
     /// WA Web's `markForgetSenderKey` (`Update/LocalSignalSession.js` L33-38),
-    /// kept in the caller so it runs before the recent-message lookup. Rust
+    /// called only after the cached message establishes a sender-key route. Rust
     /// unifies group and status under one storage keyed by the chat JID, so both
     /// `@g.us` and `status@broadcast` pass through as an opaque group_jid.
     async fn mark_requester_for_fresh_skdm(&self, info: &RetryChatInfo, resolved_jid: &Jid) {
@@ -3378,14 +3378,26 @@ mod tests {
         }
     }
 
-    /// A send marks its whole distribution list warm, so a device whose SKDM
-    /// never encrypted is only ever repaired by this cold mark. Gate the mark
-    /// behind the recent-message lookup and an expired message (default TTL is
-    /// two hours) makes the warm mark absorbing: no future send distributes to
-    /// the device, and no later retry can undo it either.
     #[tokio::test]
-    async fn group_retry_un_warms_the_device_even_without_the_cached_message() {
-        for cached in [true, false] {
+    async fn group_retry_repairs_sender_key_only_for_cached_sender_key_messages() {
+        for (message, stays_warm) in [
+            (None, true),
+            (Some(hello()), false),
+            (
+                Some(wa::Message {
+                    message_history_bundle: Some(Default::default()).into(),
+                    ..Default::default()
+                }),
+                true,
+            ),
+            (
+                Some(wa::Message {
+                    message_history_notice: Some(Default::default()).into(),
+                    ..Default::default()
+                }),
+                false,
+            ),
+        ] {
             let client = retry_repair_client("retry_repair_cache_miss").await;
             let group: Jid = "120363021033254951@g.us".parse().unwrap();
             let group_key = group.to_string();
@@ -3397,9 +3409,9 @@ mod tests {
                 .set_sender_key_status(&group_key, &[(participant, true)])
                 .await
                 .unwrap();
-            if cached {
+            if let Some(message) = message {
                 client
-                    .add_recent_message(&group, msg_id, &hello(), None)
+                    .add_recent_message(&group, msg_id, &message, None)
                     .await;
             }
 
@@ -3411,17 +3423,14 @@ mod tests {
                     .get_sender_key_devices(&group_key)
                     .await
                     .unwrap(),
-                vec![(participant.to_string(), false)],
-                "cached={cached}: the retrying device must end up keyless either way"
+                vec![(participant.to_string(), stays_warm)],
+                "only a cached sender-key message may mark the device cold"
             );
         }
     }
 
-    /// The symptom the report describes: every message from the bot stuck on
-    /// "waiting for this message" for one member, across restarts. Repairing on a
-    /// cache miss is what puts the device back in the next send's SKDM set.
     #[tokio::test]
-    async fn repaired_device_returns_to_the_skdm_target_set_after_a_cache_miss() {
+    async fn repaired_device_returns_to_the_skdm_target_set_after_a_cached_retry() {
         use crate::sender_key_device_cache::SenderKeyDeviceMap;
 
         let client = retry_repair_client("retry_repair_skdm_targets").await;
@@ -3450,7 +3459,9 @@ mod tests {
             "a warm device is excluded from SKDM, which is what makes a missed repair absorbing"
         );
 
-        // No add_recent_message: the retry arrives after the message expired.
+        client
+            .add_recent_message(&group, "SKDMTARGET001", &hello(), None)
+            .await;
         drive_group_retry(&client, &group, participant, "SKDMTARGET001", false).await;
 
         let repaired = SenderKeyDeviceMap::from_db_rows(
@@ -3477,6 +3488,10 @@ mod tests {
         let group: Jid = "120363021033254954@g.us".parse().unwrap();
         let group_key = group.to_string();
         let participant = "555000555@lid";
+
+        client
+            .add_recent_message(&group, "LOCKED001", &hello(), None)
+            .await;
 
         client
             .persistence_manager
@@ -3744,6 +3759,10 @@ mod tests {
         let group: Jid = "120363021033254961@g.us".parse().unwrap();
         let group_key = group.to_string();
         let participant: Jid = "555003333@lid".parse().unwrap();
+
+        client
+            .add_recent_message(&group, "MARKORDER001", &hello(), None)
+            .await;
 
         client
             .persistence_manager
