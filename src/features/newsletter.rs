@@ -323,6 +323,47 @@ pub struct NewsletterPollVote {
     pub count: u64,
 }
 
+/// This account's own add-ons (its reaction and its poll vote) on one
+/// newsletter message, as [`Newsletter::get_my_addons`] reads them.
+///
+/// The public tallies cannot answer whether this account's vote landed: they
+/// are counts across every follower. This is the server's record of the
+/// account's own choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NewsletterMyAddOns {
+    /// The message's server-assigned id.
+    pub server_id: u64,
+    /// This account's reaction, `None` when it has none on this message.
+    pub reaction: Option<NewsletterMyReaction>,
+    /// This account's poll vote, `None` when it never voted on this message.
+    /// A vote that was removed is still `Some`, with no option hashes: the
+    /// server keeps the removal as a dated, empty selection.
+    pub poll_vote: Option<NewsletterMyPollVote>,
+}
+
+/// This account's own reaction on a newsletter message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NewsletterMyReaction {
+    /// The reaction emoji.
+    pub code: String,
+    /// When it was set (Unix seconds).
+    pub timestamp: u64,
+}
+
+/// This account's own vote on a newsletter poll.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NewsletterMyPollVote {
+    /// When the selection was last sent (Unix seconds). This is the `t` of the
+    /// server's ack to that vote.
+    pub timestamp: u64,
+    /// The selected options, keyed like [`NewsletterPollVote::option_hash`].
+    /// Empty after the vote was removed.
+    pub option_hashes: Vec<[u8; 32]>,
+}
+
 /// A message from a newsletter's history.
 ///
 /// `#[non_exhaustive]` because the server keeps adding children to
@@ -947,6 +988,25 @@ impl<'a> Newsletter<'a> {
             .await?;
         parse_newsletter_messages_response(response.get())
     }
+
+    /// Read this account's own reactions and poll votes on a newsletter's
+    /// recent messages.
+    ///
+    /// Only messages the account has an add-on on are returned, up to `limit`
+    /// of them.
+    pub async fn get_my_addons(
+        &self,
+        jid: &Jid,
+        limit: u32,
+    ) -> Result<Vec<NewsletterMyAddOns>, NewsletterError> {
+        if !jid.is_newsletter() {
+            return Err(NewsletterError::InvalidRequest(
+                "get_my_addons is only valid for newsletter (channel) JIDs".into(),
+            ));
+        }
+        let response = self.client.send_iq(build_my_addons_iq(jid, limit)).await?;
+        parse_my_addons_response(response.get(), jid)
+    }
 }
 
 /// The most `<vote>` children one vote may carry, from the
@@ -1027,6 +1087,25 @@ fn build_newsletter_messages_iq(jid: &Jid, count: u32, before: Option<u64>) -> I
         NEWSLETTER_XMLNS,
         crate::jid_utils::server_jid().clone(),
         Some(NodeContent::Nodes(vec![messages_node.build()])),
+    )
+}
+
+/// Build the own-add-ons IQ.
+///
+/// Addressed to the server like the history IQ, naming the channel in the
+/// node's `jid` attribute. `makeMyAddOnsRequest` makes that attribute
+/// optional, but what the server answers without it has not been observed,
+/// so the API always names one channel.
+fn build_my_addons_iq(jid: &Jid, limit: u32) -> InfoQuery<'static> {
+    InfoQuery::get(
+        NEWSLETTER_XMLNS,
+        crate::jid_utils::server_jid().clone(),
+        Some(NodeContent::Nodes(vec![
+            NodeBuilder::new("my_addons")
+                .attr("limit", limit)
+                .attr("jid", jid.clone())
+                .build(),
+        ])),
     )
 }
 
@@ -1462,6 +1541,93 @@ struct MessageMeta {
     admin_profile: Option<NewsletterAdminProfile>,
 }
 
+/// Parse the own-add-ons IQ response.
+///
+/// ```xml
+/// <my_addons>
+///   <messages jid="NL_JID">
+///     <message server_id="777">
+///       <reaction code="👍" t="TS"/>
+///       <votes t="TS"><vote>…32-byte option hash…</vote></votes>
+///     </message>
+///   </messages>
+/// </my_addons>
+/// ```
+///
+/// Read as strictly as `WASmaxInNewslettersMyAddOnsResponseSuccess` reads it:
+/// a response that parser would reject is an error here, not a shorter list.
+/// Unlike the history tallies, this is the account's own selection, and a
+/// vote read with one hash dropped is a different vote, not an approximate
+/// one. `<messages>` groups for another channel are ignored, since a
+/// `server_id` only identifies a message within its channel.
+fn parse_my_addons_response(
+    response: &NodeRef<'_>,
+    jid: &Jid,
+) -> Result<Vec<NewsletterMyAddOns>, NewsletterError> {
+    let invalid =
+        |what: &str| NewsletterError::InvalidRequest(format!("my_addons response: {what}"));
+    let my_addons = response
+        .get_optional_child("my_addons")
+        .ok_or_else(|| invalid("missing <my_addons>"))?;
+
+    let mut result = Vec::new();
+    for group in my_addons.get_children_by_tag("messages") {
+        if group.attrs().optional_jid("jid").as_ref() != Some(jid) {
+            continue;
+        }
+        for msg_node in group.get_children_by_tag("message") {
+            let server_id = msg_node
+                .attrs()
+                .optional_u64("server_id")
+                .ok_or_else(|| invalid("a <message> without a server_id"))?;
+
+            let reaction = match msg_node.get_optional_child("reaction") {
+                Some(node) => {
+                    let mut attrs = node.attrs();
+                    let code = attrs
+                        .optional_string("code")
+                        .ok_or_else(|| invalid("a <reaction> without a code"))?
+                        .into_owned();
+                    let timestamp = attrs
+                        .optional_u64("t")
+                        .ok_or_else(|| invalid("a <reaction> without a t"))?;
+                    Some(NewsletterMyReaction { code, timestamp })
+                }
+                None => None,
+            };
+
+            let poll_vote = match msg_node.get_optional_child("votes") {
+                Some(node) => {
+                    let timestamp = node
+                        .attrs()
+                        .optional_u64("t")
+                        .ok_or_else(|| invalid("a <votes> without a t"))?;
+                    let option_hashes = node
+                        .get_children_by_tag("vote")
+                        .map(|vote| {
+                            vote.content_bytes()
+                                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                                .ok_or_else(|| invalid("a <vote> that is not a 32-byte hash"))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    Some(NewsletterMyPollVote {
+                        timestamp,
+                        option_hashes,
+                    })
+                }
+                None => None,
+            };
+
+            result.push(NewsletterMyAddOns {
+                server_id,
+                reaction,
+                poll_vote,
+            });
+        }
+    }
+    Ok(result)
+}
+
 fn parse_message_meta(msg_node: &NodeRef<'_>, message_type: &NewsletterMessageType) -> MessageMeta {
     let Some(meta_node) = msg_node.get_optional_child("meta") else {
         return MessageMeta::default();
@@ -1703,6 +1869,289 @@ mod tests {
 
     fn newsletter_jid() -> Jid {
         "120363000000000001@newsletter".parse().expect("jid")
+    }
+
+    mod my_addons {
+        use super::*;
+
+        const GOOD_MORNING_HASH: &str =
+            "2e090fda1d75dab720e00f72f5b06d88020d56c637d25a5d64529b51faeb6acf";
+        const MONDAYS_HASH: &str =
+            "ea53ff01672231aa49905b2a74164330b2a006d6f731d1227171fd92d3779322";
+
+        fn hash(hex_digest: &str) -> [u8; 32] {
+            hex::decode(hex_digest)
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes")
+        }
+
+        fn vote(bytes: &[u8]) -> wacore_binary::Node {
+            NodeBuilder::new("vote").bytes(bytes).build()
+        }
+
+        fn votes(t: u64, hashes: &[[u8; 32]]) -> wacore_binary::Node {
+            NodeBuilder::new("votes")
+                .attr("t", t)
+                .children(hashes.iter().map(|h| vote(h)))
+                .build()
+        }
+
+        fn message(server_id: u64, children: Vec<wacore_binary::Node>) -> wacore_binary::Node {
+            NodeBuilder::new("message")
+                .attr("server_id", server_id)
+                .children(children)
+                .build()
+        }
+
+        fn response_for(jid: &Jid, messages: Vec<wacore_binary::Node>) -> wacore_binary::Node {
+            NodeBuilder::new("iq")
+                .attr("type", "result")
+                .children([NodeBuilder::new("my_addons")
+                    .children([NodeBuilder::new("messages")
+                        .attr("jid", jid.clone())
+                        .children(messages)
+                        .build()])
+                    .build()])
+                .build()
+        }
+
+        fn parse(
+            response: &wacore_binary::Node,
+        ) -> Result<Vec<NewsletterMyAddOns>, NewsletterError> {
+            parse_my_addons_response(&response.as_node_ref(), &newsletter_jid())
+        }
+
+        /// `<iq to="s.whatsapp.net" xmlns="newsletter" type="get"><my_addons
+        /// limit jid/></iq>`, as WA Web sent it: addressed to the server, the
+        /// channel named on the node.
+        #[test]
+        fn request_goes_to_the_server_and_names_the_channel() {
+            let query = build_my_addons_iq(&newsletter_jid(), 20);
+
+            assert_eq!(query.namespace, NEWSLETTER_XMLNS);
+            assert_eq!(query.query_type, wacore::request::InfoQueryType::Get);
+            assert_eq!(&query.to, crate::jid_utils::server_jid());
+            assert!(query.target.is_none());
+
+            let Some(NodeContent::Nodes(children)) = query.content.as_ref() else {
+                panic!("my_addons carries one child node");
+            };
+            assert_eq!(children.len(), 1);
+            let node = &children[0];
+            assert_eq!(node.tag, "my_addons");
+            let mut attrs = node.attrs();
+            assert_eq!(attrs.optional_u64("limit"), Some(20));
+            assert_eq!(attrs.optional_jid("jid"), Some(newsletter_jid()));
+            assert_eq!(node.attrs.len(), 2);
+            assert!(node.content.is_none());
+        }
+
+        /// The captured answer after voting for two options.
+        #[test]
+        fn a_vote_is_read_with_its_time_and_every_option() {
+            let hashes = [hash(GOOD_MORNING_HASH), hash(MONDAYS_HASH)];
+            let response = response_for(
+                &newsletter_jid(),
+                vec![message(777, vec![votes(1790340039, &hashes)])],
+            );
+
+            let addons = parse(&response).expect("valid response");
+
+            assert_eq!(addons.len(), 1);
+            assert_eq!(addons[0].server_id, 777);
+            assert_eq!(addons[0].reaction, None);
+            let vote = addons[0].poll_vote.as_ref().expect("a vote");
+            assert_eq!(vote.timestamp, 1790340039);
+            assert_eq!(vote.option_hashes, hashes);
+        }
+
+        /// A removed vote stays on the server as a dated empty `<votes t/>`,
+        /// which is not the same fact as never having voted.
+        #[test]
+        fn a_removed_vote_is_an_empty_selection_not_an_absent_one() {
+            let response = response_for(
+                &newsletter_jid(),
+                vec![
+                    message(777, vec![votes(1790340162, &[])]),
+                    message(
+                        778,
+                        vec![
+                            NodeBuilder::new("reaction")
+                                .attr("code", "👍")
+                                .attr("t", 1790340200u64)
+                                .build(),
+                        ],
+                    ),
+                ],
+            );
+
+            let addons = parse(&response).expect("valid response");
+
+            let removed = addons[0]
+                .poll_vote
+                .as_ref()
+                .expect("a removed vote is kept");
+            assert_eq!(removed.timestamp, 1790340162);
+            assert!(removed.option_hashes.is_empty());
+            assert_eq!(addons[1].poll_vote, None, "no <votes> means never voted");
+        }
+
+        /// The reaction shape comes from `newsletterMyReactionMixin` in
+        /// the IR: `<reaction code t/>` on the same `<message>` as the vote.
+        #[test]
+        fn a_reaction_is_read_beside_a_vote() {
+            let response = response_for(
+                &newsletter_jid(),
+                vec![message(
+                    777,
+                    vec![
+                        NodeBuilder::new("reaction")
+                            .attr("code", "❤️")
+                            .attr("t", 1790340100u64)
+                            .build(),
+                        votes(1790340039, &[hash(MONDAYS_HASH)]),
+                    ],
+                )],
+            );
+
+            let addons = parse(&response).expect("valid response");
+
+            assert_eq!(
+                addons[0].reaction,
+                Some(NewsletterMyReaction {
+                    code: "❤️".into(),
+                    timestamp: 1790340100,
+                })
+            );
+            assert_eq!(
+                addons[0]
+                    .poll_vote
+                    .as_ref()
+                    .map(|v| v.option_hashes.clone()),
+                Some(vec![hash(MONDAYS_HASH)])
+            );
+        }
+
+        #[test]
+        fn an_answer_with_no_messages_is_an_empty_list() {
+            let response = NodeBuilder::new("iq")
+                .attr("type", "result")
+                .children([NodeBuilder::new("my_addons").build()])
+                .build();
+
+            assert_eq!(parse(&response).expect("valid response"), []);
+        }
+
+        /// A `server_id` only means something within its channel, so a group
+        /// for another channel is not read into this one's add-ons.
+        #[test]
+        fn a_group_for_another_channel_is_ignored() {
+            let other: Jid = "120363000000000009@newsletter".parse().expect("jid");
+            let response = response_for(&other, vec![message(777, vec![votes(1, &[])])]);
+
+            assert_eq!(parse(&response).expect("valid response"), []);
+        }
+
+        /// Every node WA Web's parser requires is required here too: a partly
+        /// read selection would misstate the account's own vote.
+        #[test]
+        fn a_response_wa_web_would_reject_is_an_error() {
+            let short_hash = NodeBuilder::new("votes")
+                .attr("t", 1u64)
+                .children([vote(&[0u8; 31])])
+                .build();
+            let untimed_votes = NodeBuilder::new("votes")
+                .children([vote(&hash(MONDAYS_HASH))])
+                .build();
+            let untimed_reaction = NodeBuilder::new("reaction").attr("code", "👍").build();
+            let codeless_reaction = NodeBuilder::new("reaction").attr("t", 1u64).build();
+
+            for (what, messages) in [
+                ("a <vote> of 31 bytes", vec![message(777, vec![short_hash])]),
+                (
+                    "a <votes> with no t",
+                    vec![message(777, vec![untimed_votes])],
+                ),
+                (
+                    "a <reaction> with no t",
+                    vec![message(777, vec![untimed_reaction])],
+                ),
+                (
+                    "a <reaction> with no code",
+                    vec![message(777, vec![codeless_reaction])],
+                ),
+                (
+                    "a <message> with no server_id",
+                    vec![
+                        NodeBuilder::new("message")
+                            .children([votes(1, &[])])
+                            .build(),
+                    ],
+                ),
+            ] {
+                assert!(
+                    matches!(
+                        parse(&response_for(&newsletter_jid(), messages)),
+                        Err(NewsletterError::InvalidRequest(_))
+                    ),
+                    "{what}"
+                );
+            }
+
+            let no_my_addons = NodeBuilder::new("iq").attr("type", "result").build();
+            assert!(matches!(
+                parse(&no_my_addons),
+                Err(NewsletterError::InvalidRequest(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn get_my_addons_sends_the_query_and_reads_the_answer() {
+            let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            let jid = newsletter_jid();
+
+            let request = {
+                let client = client.clone();
+                let jid = jid.clone();
+                tokio::spawn(async move { client.newsletter().get_my_addons(&jid, 20).await })
+            };
+
+            let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+            let sent = sent.get();
+            let my_addons = sent
+                .get_optional_child("my_addons")
+                .expect("my_addons query");
+            assert_eq!(my_addons.attrs().optional_jid("jid"), Some(jid.clone()));
+            let id = sent
+                .attrs()
+                .optional_string("id")
+                .expect("iq id")
+                .into_owned();
+
+            let mut response = response_for(&jid, vec![message(777, vec![votes(5, &[])])]);
+            response.attrs.insert(
+                std::borrow::Cow::Borrowed("id"),
+                wacore_binary::NodeValue::from(id.clone()),
+            );
+            crate::test_utils::answer_iq(&client, &id, &response).await;
+
+            let addons = request.await.expect("task").expect("answered");
+            assert_eq!(addons.len(), 1);
+            assert_eq!(addons[0].server_id, 777);
+        }
+
+        #[tokio::test]
+        async fn get_my_addons_refuses_a_non_newsletter_jid() {
+            let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            let group: Jid = "120363000000000002@g.us".parse().expect("jid");
+
+            assert!(matches!(
+                client.newsletter().get_my_addons(&group, 20).await,
+                Err(NewsletterError::InvalidRequest(_))
+            ));
+            assert_eq!(transport.sent_count(), 0);
+        }
     }
 
     /// The two halves of the history request are load-bearing in opposite
