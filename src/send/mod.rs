@@ -2546,6 +2546,46 @@ impl Client {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.impl", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
+    // Keep the policy IQ and metadata future out of the ordinary DM/group
+    // send frame: all normal sends share send_message_impl's boxed future.
+    async fn validate_history_publication(
+        &self,
+        group: &Jid,
+        message: &wa::Message,
+        recipients: Option<&[Jid]>,
+    ) -> Result<(), SendError> {
+        let (metadata, limits) = crate::features::Groups::new(self)
+            .group_history_context(group)
+            .await
+            .map_err(|_| {
+                SendError::InvalidRequest(
+                    "group history authorization changed before publication".into(),
+                )
+            })?;
+        if !message.message_history_bundle.is_unset() {
+            if !recipients.is_some_and(|recipients| {
+                crate::features::group_history_audience_is_current(
+                    &metadata.participants,
+                    recipients,
+                )
+            }) {
+                return Err(SendError::InvalidRequest(
+                    "group history recipient is no longer a group member".into(),
+                ));
+            }
+            if !crate::features::group_history_bundle_fits_current_limits(
+                message,
+                limits,
+                wacore::time::now_secs_u64(),
+            ) {
+                return Err(SendError::InvalidRequest(
+                    "group history expired before publication".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn send_message_impl(
         &self,
         to: Jid,
@@ -2736,39 +2776,12 @@ impl Client {
         );
         if !message.message_history_bundle.is_unset() || !message.message_history_notice.is_unset()
         {
-            let (metadata, limits) = crate::features::Groups::new(self)
-                .group_history_context(&tc_issue_target)
-                .await
-                .map_err(|_| {
-                    SendError::InvalidRequest(
-                        "group history authorization changed before publication".into(),
-                    )
-                })?;
-            if !message.message_history_bundle.is_unset()
-                && !group_direct_recipients.is_some_and(|recipients| {
-                    crate::features::group_history_audience_is_current(
-                        &metadata.participants,
-                        recipients,
-                    )
-                })
-            {
-                return Err(SendError::InvalidRequest(
-                    "group history recipient is no longer a group member".into(),
-                )
-                .into());
-            }
-            if !message.message_history_bundle.is_unset()
-                && !crate::features::group_history_bundle_fits_current_limits(
-                    message,
-                    limits,
-                    wacore::time::now_secs_u64(),
-                )
-            {
-                return Err(SendError::InvalidRequest(
-                    "group history expired before publication".into(),
-                )
-                .into());
-            }
+            Box::pin(self.validate_history_publication(
+                &tc_issue_target,
+                message,
+                group_direct_recipients,
+            ))
+            .await?;
         }
         if (group_devices.is_some() || requires_connection_generation_check)
             && self
