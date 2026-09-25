@@ -2545,7 +2545,6 @@ impl Client {
         })
     }
 
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.impl", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     // Keep the policy IQ and metadata future out of the ordinary DM/group
     // send frame: all normal sends share send_message_impl's boxed future.
     async fn validate_history_publication(
@@ -2586,6 +2585,7 @@ impl Client {
         Ok(())
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.impl", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub(crate) async fn send_message_impl(
         &self,
         to: Jid,
