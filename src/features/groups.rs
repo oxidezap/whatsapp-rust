@@ -186,6 +186,13 @@ fn compress_group_history(messages: Vec<wa::WebMessageInfo>) -> Result<Vec<u8>, 
     encoder.finish()
 }
 
+fn retryable_history_rejection(code: &str) -> bool {
+    code == "429"
+        || code
+            .parse::<u16>()
+            .is_ok_and(|code| (500..=599).contains(&code))
+}
+
 fn group_history_policy_skip_reason(error: GroupHistoryPolicyError) -> GroupHistorySkipReason {
     match error {
         GroupHistoryPolicyError::AccountPropsUnavailable => {
@@ -1695,6 +1702,9 @@ impl<'a> Groups<'a> {
         if metadata.has_capi || metadata.is_parent_group {
             return Err(GroupHistorySkipReason::UnsupportedGroup);
         }
+        if !metadata.has_group_history {
+            return Err(GroupHistorySkipReason::SharingDisabled);
+        }
 
         let device_snapshot = self.client.persistence_manager.get_device_snapshot();
         let own_participant = metadata.participants.iter().find(|member| {
@@ -1903,7 +1913,7 @@ impl<'a> Groups<'a> {
             }
         };
 
-        let (_, current_limits) = match self.group_history_context(&jid).await {
+        let (current_metadata, current_limits) = match self.group_history_context(&jid).await {
             Ok(context) => context,
             Err(reason) => {
                 return Ok(GroupHistoryAddResult {
@@ -1912,16 +1922,25 @@ impl<'a> Groups<'a> {
                 });
             }
         };
-        if current_limits != limits {
+        if history_receivers.iter().any(|recipient| {
+            !current_metadata.participants.iter().any(|member| {
+                group_participant_matches_jid(member, recipient)
+                    && member
+                        .details
+                        .as_ref()
+                        .is_none_or(|details| details.group_history_sent != Some(true))
+            })
+        }) {
             return Ok(GroupHistoryAddResult {
                 participants: participant_results,
                 history_share: GroupHistoryShareOutcome::Skipped(
-                    GroupHistorySkipReason::InvalidProperties,
+                    GroupHistorySkipReason::NoOptedInSuccessfulRecipients,
                 ),
             });
         }
-        if selected.oldest_timestamp
-            < wacore::time::now_secs_u64().saturating_sub(current_limits.time_window_seconds)
+        if message_count > current_limits.max_messages
+            || selected.oldest_timestamp
+                < wacore::time::now_secs_u64().saturating_sub(current_limits.time_window_seconds)
         {
             return Ok(GroupHistoryAddResult {
                 participants: participant_results,
@@ -1986,13 +2005,25 @@ impl<'a> Groups<'a> {
         };
         match bundle_send.acknowledgement {
             crate::send::GroupDirectAcknowledgement::Rejected { error, code } => {
-                return Ok(GroupHistoryAddResult {
-                    participants: participant_results,
-                    history_share: GroupHistoryShareOutcome::BundleRejected {
+                let history_share = if let Some(ref retry_code) = code
+                    && retryable_history_rejection(retry_code)
+                {
+                    GroupHistoryShareOutcome::BundleRetryableRejection {
+                        bundle_message_id,
+                        error,
+                        code: retry_code.clone(),
+                        retry,
+                    }
+                } else {
+                    GroupHistoryShareOutcome::BundleRejected {
                         bundle_message_id,
                         error,
                         code,
-                    },
+                    }
+                };
+                return Ok(GroupHistoryAddResult {
+                    participants: participant_results,
+                    history_share,
                 });
             }
             crate::send::GroupDirectAcknowledgement::Indeterminate => {
@@ -2070,14 +2101,27 @@ impl<'a> Groups<'a> {
         };
         match notice_send.acknowledgement {
             crate::send::GroupDirectAcknowledgement::Rejected { error, code } => {
-                Ok(GroupHistoryAddResult {
-                    participants: participant_results,
-                    history_share: GroupHistoryShareOutcome::NoticeRejected {
+                let history_share = if let Some(ref retry_code) = code
+                    && retryable_history_rejection(retry_code)
+                {
+                    GroupHistoryShareOutcome::NoticeRetryableRejection {
+                        bundle_message_id,
+                        notice_message_id,
+                        error,
+                        code: retry_code.clone(),
+                        retry: notice_retry,
+                    }
+                } else {
+                    GroupHistoryShareOutcome::NoticeRejected {
                         bundle_message_id,
                         notice_message_id,
                         error,
                         code,
-                    },
+                    }
+                };
+                Ok(GroupHistoryAddResult {
+                    participants: participant_results,
+                    history_share,
                 })
             }
             crate::send::GroupDirectAcknowledgement::Indeterminate => Ok(GroupHistoryAddResult {
@@ -2258,7 +2302,26 @@ impl<'a> Groups<'a> {
             };
             match send.acknowledgement {
                 crate::send::GroupDirectAcknowledgement::Rejected { error, code } => {
-                    return if notice_stage {
+                    return if let Some(ref retry_code) = code
+                        && retryable_history_rejection(retry_code)
+                    {
+                        if notice_stage {
+                            GroupHistoryShareOutcome::NoticeRetryableRejection {
+                                bundle_message_id: retry.bundle_message_id.clone(),
+                                notice_message_id: retry.notice_message_id.clone(),
+                                error,
+                                code: retry_code.clone(),
+                                retry: active_retry,
+                            }
+                        } else {
+                            GroupHistoryShareOutcome::BundleRetryableRejection {
+                                bundle_message_id: retry.bundle_message_id.clone(),
+                                error,
+                                code: retry_code.clone(),
+                                retry: active_retry,
+                            }
+                        }
+                    } else if notice_stage {
                         GroupHistoryShareOutcome::NoticeRejected {
                             bundle_message_id: retry.bundle_message_id.clone(),
                             notice_message_id: retry.notice_message_id.clone(),
@@ -3194,6 +3257,16 @@ mod tests {
             Some(upload.file_sha256.as_slice())
         );
         assert_eq!(bundle.message_history_metadata.as_option(), Some(&metadata));
+    }
+
+    #[test]
+    fn history_rejections_only_retain_retries_for_transient_codes() {
+        for code in ["429", "500", "503", "599"] {
+            assert!(retryable_history_rejection(code));
+        }
+        for code in ["", "400", "401", "403", "404", "600", "not-a-code"] {
+            assert!(!retryable_history_rejection(code));
+        }
     }
 
     #[test]

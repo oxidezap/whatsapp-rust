@@ -15,6 +15,57 @@ pub fn extract_ciphertext(msg: CiphertextMessage) -> Option<(&'static str, bool,
     }
 }
 
+/// Reject history media keys hidden in any recognized message wrapper, not
+/// only the first wrapper the stanza classifier happens to unwrap.
+pub fn contains_group_history_payload(msg: &wa::Message) -> bool {
+    if msg.message_history_bundle.is_set() || msg.message_history_notice.is_set() {
+        return true;
+    }
+    macro_rules! check_wrappers {
+        ($($field:ident),+ $(,)?) => {
+            $(
+                if msg.$field.as_option().is_some_and(|wrapper| {
+                    wrapper.message.as_option().is_some_and(contains_group_history_payload)
+                }) {
+                    return true;
+                }
+            )+
+        };
+    }
+    check_wrappers!(
+        ephemeral_message,
+        view_once_message,
+        view_once_message_v2,
+        view_once_message_v2_extension,
+        document_with_caption_message,
+        group_mentioned_message,
+        bot_invoke_message,
+        associated_child_message,
+        poll_creation_option_image_message,
+        event_cover_image,
+        group_status_message,
+        group_status_message_v2,
+        group_status_mention_message,
+        status_add_yours,
+        status_mention_message,
+        question_message,
+        question_reply_message,
+        spoiler_message,
+        lottie_sticker_message,
+        limit_sharing_message,
+        newsletter_admin_profile_message,
+        newsletter_admin_profile_message_v2,
+        poll_creation_message_v4,
+        bot_forwarded_message,
+    );
+    msg.device_sent_message.as_option().is_some_and(|wrapper| {
+        wrapper
+            .message
+            .as_option()
+            .is_some_and(contains_group_history_payload)
+    })
+}
+
 /// Unwrap wrapper message types to reach the inner message.
 /// Matches WA Web's getUnwrappedProtobufMessage. Does not unwrap
 /// `edited_message`; that field is itself a signal callers may need.

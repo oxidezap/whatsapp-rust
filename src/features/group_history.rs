@@ -216,6 +216,14 @@ pub enum GroupHistoryShareOutcome {
         error: Option<String>,
         code: Option<String>,
     },
+    /// The server explicitly rejected a retryable request; retry under the
+    /// same message ID after current policy has been verified again.
+    BundleRetryableRejection {
+        bundle_message_id: String,
+        error: Option<String>,
+        code: String,
+        retry: GroupHistoryRetryToken,
+    },
     /// No trustworthy correlated ACK was observed; the server may have accepted it.
     BundleIndeterminate {
         bundle_message_id: String,
@@ -244,6 +252,14 @@ pub enum GroupHistoryShareOutcome {
         notice_message_id: String,
         error: Option<String>,
         code: Option<String>,
+    },
+    /// Retry only the notice; the bundle was already ACKed.
+    NoticeRetryableRejection {
+        bundle_message_id: String,
+        notice_message_id: String,
+        error: Option<String>,
+        code: String,
+        retry: GroupHistoryRetryToken,
     },
     /// The bundle was ACKed, but no trustworthy correlated notice ACK was observed.
     NoticeIndeterminate {
@@ -303,9 +319,14 @@ pub(crate) fn select_group_history_messages(
 ) -> Option<SelectedGroupHistory> {
     let window_start = now.saturating_sub(limits.time_window_seconds);
     let group = group.to_string();
-    let mut selected = Vec::new();
+    if limits.max_messages == 0 {
+        return None;
+    }
+    // Only retain references to the newest permitted records; projecting every
+    // eligible protobuf from an unbounded consumer archive wastes memory.
+    let mut newest = std::collections::BinaryHeap::new();
     let mut seen_ids = std::collections::HashSet::new();
-    for message in messages {
+    for (index, message) in messages.iter().enumerate() {
         let Some(key) = message.key.as_option() else {
             continue;
         };
@@ -326,10 +347,6 @@ pub(crate) fn select_group_history_messages(
         other_content.conversation = None;
         // The per-message secret is protocol context for ordinary text, not
         // another payload. Do not forward unrelated context or nested content.
-        let secret = content
-            .message_context_info
-            .as_option()
-            .and_then(|context| context.message_secret.clone());
         if let Some(context) = other_content.message_context_info.as_option_mut() {
             context.message_secret = None;
             context.reporting_token_version = None;
@@ -367,41 +384,50 @@ pub(crate) fn select_group_history_messages(
         {
             continue;
         }
-        // A history recipient needs the original identity, author, time and
-        // text, not the sender's account-local labels, stars, receipts,
-        // message secrets or other fields on the stored envelope.
-        let projected_content = waproto::whatsapp::Message {
-            conversation: content.conversation.clone(),
-            message_context_info: secret.map_or_else(buffa::MessageField::none, |message_secret| {
-                buffa::MessageField::some(waproto::whatsapp::MessageContextInfo {
-                    message_secret: Some(message_secret),
-                    ..Default::default()
+        let entry = std::cmp::Reverse((timestamp, index));
+        if newest.len() < limits.max_messages {
+            newest.push(entry);
+        } else if newest.peek().is_some_and(|oldest| entry < *oldest) {
+            newest.pop();
+            newest.push(entry);
+        }
+    }
+    let mut selected = newest.into_vec();
+    selected.sort_by_key(|std::cmp::Reverse((timestamp, index))| (*timestamp, *index));
+    let oldest_timestamp = selected.first()?.0.0;
+    let messages = selected
+        .into_iter()
+        .map(|std::cmp::Reverse((timestamp, index))| {
+            let source = &messages[index];
+            let content = source.message.as_option()?;
+            let context = content
+                .message_context_info
+                .as_option()
+                .and_then(|context| {
+                    context.message_secret.clone().map(|message_secret| {
+                        buffa::MessageField::some(waproto::whatsapp::MessageContextInfo {
+                            message_secret: Some(message_secret),
+                            ..Default::default()
+                        })
+                    })
                 })
-            }),
-            ..Default::default()
-        };
-        selected.push((
-            timestamp,
-            waproto::whatsapp::WebMessageInfo {
-                key: message.key.clone(),
-                message: buffa::MessageField::some(projected_content),
+                .unwrap_or_default();
+            Some(waproto::whatsapp::WebMessageInfo {
+                key: source.key.clone(),
+                message: buffa::MessageField::some(waproto::whatsapp::Message {
+                    conversation: content.conversation.clone(),
+                    message_context_info: context,
+                    ..Default::default()
+                }),
                 message_timestamp: Some(timestamp),
-                status: message.status,
-                participant: message.participant.clone(),
+                status: source.status,
+                participant: source.participant.clone(),
                 ..Default::default()
-            },
-        ));
-    }
-    selected.sort_by_key(|(timestamp, _)| *timestamp);
-    if limits.max_messages == 0 || selected.is_empty() {
-        return None;
-    }
-    if selected.len() > limits.max_messages {
-        selected.drain(..selected.len() - limits.max_messages);
-    }
-    let oldest_timestamp = selected.first()?.0;
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
     Some(SelectedGroupHistory {
-        messages: selected.into_iter().map(|(_, message)| message).collect(),
+        messages,
         oldest_timestamp,
     })
 }

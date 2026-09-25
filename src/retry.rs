@@ -476,7 +476,7 @@ impl Client {
             .resolve_retransmission_encryption_jid(route, &request.requester)
             .await
             .map_err(SendError::from_anyhow)?;
-        if route.uses_sender_key() {
+        if route.uses_sender_key() && request.message.message_history_bundle.is_unset() {
             let chat_key = request.chat.to_string();
             self.mark_forget_sender_key(&chat_key, std::slice::from_ref(&encryption_jid))
                 .await
@@ -667,12 +667,9 @@ impl Client {
             return Ok(());
         }
 
-        // Direct is the only route the lookup can still re-address, through the
-        // alternate PN/LID rewrite below. Every other route's encryption JID is
-        // settled here, so its repair need not wait for a message that may be
-        // gone: a send marks its whole distribution list warm, so the cold mark
-        // is the only way back, and the receipt's own bundle is the only
-        // recovery for a device the server has no prekeys for.
+        // Direct is the only route the lookup can still re-address. Install
+        // the retry keys here, but defer sender-key repair until after reading
+        // the cached message: history bundles were sent pairwise.
         let settled_jid = if matches!(route, RetransmissionRoute::Direct) {
             None
         } else {
@@ -684,14 +681,6 @@ impl Client {
                 .await
             {
                 return Ok(());
-            }
-            // The cold mark goes last, and under the distribution guard, so a
-            // device is only ever published as cold once its session can carry
-            // the SKDM. A send that took the guard first sees it still warm and
-            // skips it, rather than distributing to a device it cannot encrypt
-            // for and marking the whole list warm again on the way out.
-            if uses_sender_key {
-                self.mark_requester_for_fresh_skdm(&info, &jid).await;
             }
             Some(jid)
         };
@@ -744,6 +733,12 @@ impl Client {
                 .await?
         };
 
+        let is_history_bundle = !original_msg.message_history_bundle.is_unset();
+        if uses_sender_key && !is_history_bundle {
+            self.mark_requester_for_fresh_skdm(&info, &resolved_jid)
+                .await;
+        }
+
         // Fetch group info (cache-first, server on miss) — used for SKDM rotation + addressing_mode.
         // Without this, a cold cache would silently default to PN semantics for LID groups.
         let cached_group_info = if info.chat.is_group() {
@@ -766,7 +761,10 @@ impl Client {
         // force full sender key rotation by clearing all sender key device tracking.
         // This is separate from updateLocalSignalSession and specific to group retries.
         let mut rotated_sender_key = false;
-        if matches!(route, RetransmissionRoute::Group) && !info.requester.is_lid() {
+        if matches!(route, RetransmissionRoute::Group)
+            && !is_history_bundle
+            && !info.requester.is_lid()
+        {
             let group_jid = info.chat.to_string();
             let is_known_participant = cached_group_info
                 .as_ref()
@@ -939,6 +937,7 @@ impl Client {
         } = request;
         let history = !message.message_history_bundle.is_unset()
             || !message.message_history_notice.is_unset();
+        let history_recipients = history.then(|| (wire_requester.clone(), encryption_jid.clone()));
         let history_generation = self
             .connection_generation
             .load(std::sync::atomic::Ordering::Acquire);
@@ -1087,13 +1086,24 @@ impl Client {
         if history {
             self.persist_signal_state_pre_wire().await?;
             let groups = self.groups();
-            let (_, current_limits) =
+            let (metadata, current_limits) =
                 groups
                     .group_history_context(&chat)
                     .await
                     .map_err(|reason| {
                         anyhow::anyhow!("history retransmission policy changed: {reason:?}")
                     })?;
+            if !history_recipients
+                .as_ref()
+                .is_some_and(|(wire, encryption)| {
+                    crate::features::group_history_audience_is_current(
+                        &metadata.participants,
+                        &[wire.clone(), encryption.clone()],
+                    )
+                })
+            {
+                anyhow::bail!("history retransmission recipient left the group");
+            }
             if !message.message_history_bundle.is_unset()
                 && !crate::features::group_history_bundle_fits_current_limits(
                     &message,

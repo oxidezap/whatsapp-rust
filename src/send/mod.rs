@@ -751,6 +751,16 @@ mod group_direct_tests {
                 message_history_notice: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             },
+            wa::Message {
+                ephemeral_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                    message: buffa::MessageField::some(wa::Message {
+                        message_history_bundle: buffa::MessageField::some(Default::default()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
         ] {
             let error = client
                 .send_message_impl(group.clone(), &message, SendPipelineOptions::default())
@@ -2621,7 +2631,10 @@ impl Client {
         if request_id_override.is_some_and(str::is_empty) {
             return Err(SendError::InvalidRequest("message ID must not be empty".into()).into());
         }
-        if (!message.message_history_bundle.is_unset() && group_direct_recipients.is_none())
+        if (wacore::send::contains_group_history_payload(message)
+            && message.message_history_bundle.is_unset()
+            && message.message_history_notice.is_unset())
+            || (!message.message_history_bundle.is_unset() && group_direct_recipients.is_none())
             || (!message.message_history_notice.is_unset() && !group_history_notice)
         {
             return Err(SendError::InvalidRequest(
@@ -3653,7 +3666,13 @@ impl Client {
         if group_info.addressing_mode == AddressingMode::Lid {
             devices = devices
                 .into_iter()
-                .map(|device| group_info.phone_device_jid_into_lid(device))
+                .map(|device| {
+                    if device.is_pn() && device.user == own_jid.user {
+                        own_lid.with_device(device.device)
+                    } else {
+                        group_info.phone_device_jid_into_lid(device)
+                    }
+                })
                 .collect();
         }
         devices.retain(|device| !device.is_hosted());
