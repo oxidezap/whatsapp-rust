@@ -13,7 +13,7 @@ mod events;
 pub(crate) mod favorites;
 mod group_history;
 mod groups;
-pub(crate) use groups::GroupMetadataRegistry;
+pub(crate) use groups::{GroupMetadataRegistry, group_history_audience_is_current};
 pub(crate) mod labels;
 mod media_reupload;
 pub mod message_edit;

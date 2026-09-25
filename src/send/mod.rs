@@ -2735,7 +2735,7 @@ impl Client {
             "branch stanza must carry the id this send was named with"
         );
         if !message.message_history_bundle.is_unset() {
-            let (_, limits) = crate::features::Groups::new(self)
+            let (metadata, limits) = crate::features::Groups::new(self)
                 .group_history_context(&tc_issue_target)
                 .await
                 .map_err(|_| {
@@ -2743,6 +2743,17 @@ impl Client {
                         "group history authorization changed before publication".into(),
                     )
                 })?;
+            if !group_direct_recipients.is_some_and(|recipients| {
+                crate::features::group_history_audience_is_current(
+                    &metadata.participants,
+                    recipients,
+                )
+            }) {
+                return Err(SendError::InvalidRequest(
+                    "group history recipient is no longer a group member".into(),
+                )
+                .into());
+            }
             if !crate::features::group_history_bundle_fits_current_limits(
                 message,
                 limits,

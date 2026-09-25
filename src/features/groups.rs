@@ -103,6 +103,18 @@ fn group_participant_matches_jid(participant: &GroupParticipant, jid: &Jid) -> b
             .is_some_and(|lid| same_participant_jid(lid, jid))
 }
 
+pub(crate) fn group_history_audience_is_current(
+    participants: &[GroupParticipant],
+    recipients: &[Jid],
+) -> bool {
+    !recipients.is_empty()
+        && recipients.iter().all(|recipient| {
+            participants
+                .iter()
+                .any(|member| group_participant_matches_jid(member, recipient))
+        })
+}
+
 fn group_participant_matches_change(
     participant: &GroupParticipant,
     change: &ParticipantChangeResponse,
@@ -3224,6 +3236,37 @@ mod tests {
                 .and_then(|key| key.id.as_deref()),
             Some("SYNTHETIC-HISTORY-ID")
         );
+    }
+
+    #[test]
+    fn group_history_publication_rejects_removed_recipients() {
+        let pn = Jid::pn("10001");
+        let lid = Jid::new("20001", wacore_binary::Server::Lid);
+        for primary in [pn.clone(), lid.clone()] {
+            let mut members = vec![GroupParticipant {
+                jid: primary,
+                phone_number: Some(pn.clone()),
+                lid: Some(lid.clone()),
+                username: None,
+                participant_type: ParticipantType::Member,
+                details: None,
+            }];
+            for recipient in [pn.clone(), lid.clone()] {
+                assert!(group_history_audience_is_current(
+                    &members,
+                    std::slice::from_ref(&recipient)
+                ));
+                assert!(!group_history_audience_is_current(
+                    &members,
+                    &[recipient, Jid::pn("10002")]
+                ));
+            }
+            assert!(!group_history_audience_is_current(&members, &[]));
+            members.clear();
+            for recipient in [pn.clone(), lid.clone()] {
+                assert!(!group_history_audience_is_current(&members, &[recipient]));
+            }
+        }
     }
 
     #[test]
