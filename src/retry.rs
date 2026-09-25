@@ -700,6 +700,11 @@ impl Client {
                     result
                 }
                 None => {
+                    if uses_sender_key
+                        && let Some(jid) = settled_jid.as_ref()
+                    {
+                        self.mark_requester_for_fresh_skdm(&info, jid).await;
+                    }
                     log::debug!(
                         "Ignoring retry for message {message_id}: already handled or not found in cache."
                     );
@@ -1225,7 +1230,7 @@ impl Client {
     }
 
     /// WA Web's `markForgetSenderKey` (`Update/LocalSignalSession.js` L33-38),
-    /// called only after the cached message establishes a sender-key route. Rust
+    /// kept in the caller so it runs before the recent-message lookup. Rust
     /// unifies group and status under one storage keyed by the chat JID, so both
     /// `@g.us` and `status@broadcast` pass through as an opaque group_jid.
     async fn mark_requester_for_fresh_skdm(&self, info: &RetryChatInfo, resolved_jid: &Jid) {
@@ -3381,7 +3386,7 @@ mod tests {
     #[tokio::test]
     async fn group_retry_repairs_sender_key_only_for_cached_sender_key_messages() {
         for (message, stays_warm) in [
-            (None, true),
+            (None, false),
             (Some(hello()), false),
             (
                 Some(wa::Message {
@@ -3424,7 +3429,7 @@ mod tests {
                     .await
                     .unwrap(),
                 vec![(participant.to_string(), stays_warm)],
-                "only a cached sender-key message may mark the device cold"
+                "a missing or sender-key message must mark the device cold"
             );
         }
     }
