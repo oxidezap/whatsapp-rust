@@ -2734,6 +2734,26 @@ impl Client {
             Some(request_id),
             "branch stanza must carry the id this send was named with"
         );
+        if !message.message_history_bundle.is_unset() {
+            let (_, limits) = crate::features::Groups::new(self)
+                .group_history_context(&tc_issue_target)
+                .await
+                .map_err(|_| {
+                    SendError::InvalidRequest(
+                        "group history authorization changed before publication".into(),
+                    )
+                })?;
+            if !crate::features::group_history_bundle_fits_current_limits(
+                message,
+                limits,
+                wacore::time::now_secs_u64(),
+            ) {
+                return Err(SendError::InvalidRequest(
+                    "group history expired before publication".into(),
+                )
+                .into());
+            }
+        }
         if (group_devices.is_some() || requires_connection_generation_check)
             && self
                 .connection_generation
@@ -2807,26 +2827,6 @@ impl Client {
             stanza_to_send.attrs.insert("type", t.as_wire());
         }
 
-        if !message.message_history_bundle.is_unset() {
-            let (_, limits) = crate::features::Groups::new(self)
-                .group_history_context(&tc_issue_target)
-                .await
-                .map_err(|_| {
-                    SendError::InvalidRequest(
-                        "group history authorization changed before publication".into(),
-                    )
-                })?;
-            if !crate::features::group_history_bundle_fits_current_limits(
-                message,
-                limits,
-                wacore::time::now_secs_u64(),
-            ) {
-                return Err(SendError::InvalidRequest(
-                    "group history expired before publication".into(),
-                )
-                .into());
-            }
-        }
         if let Err(e) = self.send_node(stanza_to_send).await {
             if let Some(msg_id) = ack_message_id {
                 self.response_waiters_guard().remove(msg_id);
