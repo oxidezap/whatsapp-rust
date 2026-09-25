@@ -9,17 +9,28 @@ use wacore::{
     store::ab_props::AbPropsSnapshot,
 };
 
+/// Why history sharing was skipped. The member add itself still stands;
+/// only the history share is withheld.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GroupHistorySkipReason {
+    /// No explicitly opted-in receiver among the successful adds.
     NoOptedInSuccessfulRecipients,
+    /// The caller is not a group member or lacks history-sharing permission.
     SenderNotAuthorized,
+    /// CAPI-backed or parent/community groups cannot receive history.
     UnsupportedGroup,
+    /// Account AB properties have not been applied in this connection.
     AccountPropsUnavailable,
+    /// Post-add group metadata could not be verified.
     GroupMetadataUnavailable,
+    /// Group-scoped AB properties are not a complete, versioned response.
     GroupPropsUnavailable,
+    /// A history AB property carries an invalid or unsupported limit.
     InvalidProperties,
+    /// History sharing is disabled by account and group AB properties.
     SharingDisabled,
+    /// Selection yielded no eligible messages.
     NoEligibleMessages,
 }
 

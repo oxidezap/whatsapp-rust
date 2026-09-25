@@ -56,6 +56,8 @@ pub enum MediaType {
     /// Product catalog image — unencrypted, uploads to `/product/image`.
     /// WA Web: CreateMediaKeys.js throws for this type (no encryption).
     ProductCatalogImage,
+    /// Opt-in group-history bundle shared on direct member adds.
+    /// WA Web derives its media keys under the `Group History` HKDF context.
     GroupHistory,
 }
 
