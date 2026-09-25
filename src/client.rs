@@ -566,10 +566,10 @@ pub struct MemoryReport {
     /// number of distinct peers acked at once; a value that stays high
     /// means refreshes are not completing, not that many were requested.
     pub pending_lid_refreshes: usize,
-    /// Sent group-history message IDs by payload kind. Capped at
-    /// [`crate::retry::HistoryPayloadRegistry::CAPACITY`] short-ID entries,
-    /// so a value pinned at the cap means steady history traffic, not a
-    /// leak; ID bytes are bounded by the cap and need no byte counter.
+    /// Sent group-history message IDs by payload kind. Capped at 1024
+    /// short-ID entries, so a value pinned at the cap means steady history
+    /// traffic, not a leak; ID bytes are bounded by the cap and need no
+    /// byte counter.
     pub history_payload_ids: u64,
     pub presence_subscriptions: usize,
     pub app_state_key_requests: usize,
