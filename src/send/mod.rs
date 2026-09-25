@@ -2734,7 +2734,7 @@ impl Client {
             Some(request_id),
             "branch stanza must carry the id this send was named with"
         );
-        if !message.message_history_bundle.is_unset() {
+        if !message.message_history_bundle.is_unset() || !message.message_history_notice.is_unset() {
             let (metadata, limits) = crate::features::Groups::new(self)
                 .group_history_context(&tc_issue_target)
                 .await
@@ -2743,22 +2743,26 @@ impl Client {
                         "group history authorization changed before publication".into(),
                     )
                 })?;
-            if !group_direct_recipients.is_some_and(|recipients| {
-                crate::features::group_history_audience_is_current(
-                    &metadata.participants,
-                    recipients,
-                )
-            }) {
+            if !message.message_history_bundle.is_unset()
+                && !group_direct_recipients.is_some_and(|recipients| {
+                    crate::features::group_history_audience_is_current(
+                        &metadata.participants,
+                        recipients,
+                    )
+                })
+            {
                 return Err(SendError::InvalidRequest(
                     "group history recipient is no longer a group member".into(),
                 )
                 .into());
             }
-            if !crate::features::group_history_bundle_fits_current_limits(
-                message,
-                limits,
-                wacore::time::now_secs_u64(),
-            ) {
+            if !message.message_history_bundle.is_unset()
+                && !crate::features::group_history_bundle_fits_current_limits(
+                    message,
+                    limits,
+                    wacore::time::now_secs_u64(),
+                )
+            {
                 return Err(SendError::InvalidRequest(
                     "group history expired before publication".into(),
                 )
