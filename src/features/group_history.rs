@@ -496,8 +496,14 @@ pub(crate) fn select_group_history_messages(
     }
     // Only retain references to the newest permitted records; projecting every
     // eligible protobuf from an unbounded consumer archive wastes memory.
+    // The dedup set tracks exactly the IDs currently in the heap, so both
+    // stay bounded by `max_messages`: evicting an entry releases its ID, and
+    // a later duplicate of an evicted ID is admitted as if new. Same ID
+    // means the same logical message, so the relaxation is unobservable in
+    // practice while memory stays proportional to the policy limit instead
+    // of the archive.
     let mut newest = std::collections::BinaryHeap::new();
-    let mut seen_ids = std::collections::HashSet::new();
+    let mut heap_ids = std::collections::HashSet::new();
     for (index, message) in messages.iter().enumerate() {
         let Some(key) = message.key.as_option() else {
             continue;
@@ -537,15 +543,25 @@ pub(crate) fn select_group_history_messages(
         let Some(content) = message.message.as_option() else {
             continue;
         };
-        if !is_shareable_history_text(content) || !seen_ids.insert(id) {
+        if !is_shareable_history_text(content) || !heap_ids.insert(id) {
             continue;
         }
         let entry = std::cmp::Reverse((timestamp, index));
         if newest.len() < limits.max_messages {
             newest.push(entry);
         } else if newest.peek().is_some_and(|oldest| entry < *oldest) {
-            newest.pop();
+            if let Some(evicted) = newest.pop() {
+                if let Some(evicted_id) = messages[evicted.0.1]
+                    .key
+                    .as_option()
+                    .and_then(|key| key.id.as_deref())
+                {
+                    heap_ids.remove(evicted_id);
+                }
+            }
             newest.push(entry);
+        } else {
+            heap_ids.remove(id);
         }
     }
     let mut selected = newest.into_vec();
@@ -993,6 +1009,59 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn selection_dedup_state_stays_within_the_policy_limit() {
+        use waproto::whatsapp as wa;
+
+        let group = wacore_binary::Jid::new("120363000000000001", wacore_binary::Server::Group);
+        let make_message = |id: &str, timestamp| wa::WebMessageInfo {
+            key: buffa::MessageField::some(wa::MessageKey {
+                remote_jid: Some(group.to_string()),
+                id: Some(id.into()),
+                ..Default::default()
+            }),
+            message: buffa::MessageField::some(wa::Message {
+                conversation: Some("synthetic text".into()),
+                ..Default::default()
+            }),
+            message_timestamp: Some(timestamp),
+            status: Some(wa::web_message_info::Status::SERVER_ACK),
+            ..Default::default()
+        };
+        // More unique eligible IDs than the limit: only the newest two
+        // survive, and a duplicate of an evicted ID is admitted as new
+        // (same ID means the same logical message).
+        let messages = vec![
+            make_message("evicted", 800),
+            make_message("kept-1", 900),
+            make_message("kept-2", 950),
+            make_message("evicted", 960),
+        ];
+        let selected = select_group_history_messages(
+            &group,
+            &messages,
+            1000,
+            GroupHistoryLimits {
+                max_messages: 2,
+                time_window_seconds: 200,
+            },
+        )
+        .unwrap();
+        let ids: Vec<_> = selected
+            .messages
+            .iter()
+            .map(|message| {
+                message
+                    .key
+                    .as_option()
+                    .and_then(|key| key.id.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(ids, vec!["kept-2", "evicted"]);
+        assert_eq!(selected.oldest_timestamp, 950);
     }
 
     #[test]
