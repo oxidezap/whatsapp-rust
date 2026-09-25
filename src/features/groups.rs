@@ -1843,6 +1843,28 @@ impl<'a> Groups<'a> {
                 });
             }
         };
+        let notice_message = Arc::new(wa::Message {
+            message_history_notice: buffa::MessageField::some(wa::message::MessageHistoryNotice {
+                message_history_metadata: buffa::MessageField::some(history_metadata.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let bundle_message_id = self
+            .client
+            .generate_message_id_at(wacore::time::now_secs_u64());
+        let notice_message_id = self
+            .client
+            .generate_message_id_at(wacore::time::now_secs_u64());
+        let upload_retry = GroupHistoryRetryToken::upload(
+            &jid,
+            &history_receivers,
+            compressed.clone(),
+            Arc::clone(&notice_message),
+            bundle_message_id.clone(),
+            notice_message_id.clone(),
+            message_count,
+        );
         let upload = match self
             .client
             .upload(
@@ -1858,6 +1880,7 @@ impl<'a> Groups<'a> {
                     participants: participant_results,
                     history_share: GroupHistoryShareOutcome::UploadFailed {
                         error: error.to_string(),
+                        retry: upload_retry,
                     },
                 });
             }
@@ -1892,19 +1915,6 @@ impl<'a> Groups<'a> {
         }
 
         let bundle_message = Arc::new(group_history_bundle_message(&upload, &history_metadata));
-        let notice_message = Arc::new(wa::Message {
-            message_history_notice: buffa::MessageField::some(wa::message::MessageHistoryNotice {
-                message_history_metadata: buffa::MessageField::some(history_metadata),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        let bundle_message_id = self
-            .client
-            .generate_message_id_at(wacore::time::now_secs_u64());
-        let notice_message_id = self
-            .client
-            .generate_message_id_at(wacore::time::now_secs_u64());
         let retry = GroupHistoryRetryToken::bundle(
             &jid,
             &history_receivers,
@@ -2096,6 +2106,58 @@ impl<'a> Groups<'a> {
             return GroupHistoryShareOutcome::Skipped(GroupHistorySkipReason::NoEligibleMessages);
         }
 
+        let prepared_retry;
+        let retry = if retry.is_upload_stage() {
+            let Some(compressed) = retry.prepared_upload() else {
+                return GroupHistoryShareOutcome::Skipped(
+                    GroupHistorySkipReason::NoEligibleMessages,
+                );
+            };
+            let upload = match self
+                .client
+                .upload(
+                    compressed.to_vec(),
+                    MediaType::GroupHistory,
+                    crate::upload::UploadOptions::default(),
+                )
+                .await
+            {
+                Ok(upload) => upload,
+                Err(error) => {
+                    return GroupHistoryShareOutcome::UploadFailed {
+                        error: error.to_string(),
+                        retry: retry.clone(),
+                    };
+                }
+            };
+            if !retry.fits_current_limits(limits, wacore::time::now_secs_u64()) {
+                return GroupHistoryShareOutcome::Skipped(
+                    GroupHistorySkipReason::NoEligibleMessages,
+                );
+            }
+            let Some(metadata) = retry
+                .notice_message
+                .message_history_notice
+                .as_option()
+                .and_then(|notice| notice.message_history_metadata.as_option())
+            else {
+                return GroupHistoryShareOutcome::Skipped(
+                    GroupHistorySkipReason::NoEligibleMessages,
+                );
+            };
+            prepared_retry = GroupHistoryRetryToken::bundle(
+                &retry.group,
+                &retry.recipients,
+                Arc::new(group_history_bundle_message(&upload, metadata)),
+                Arc::clone(&retry.notice_message),
+                retry.bundle_message_id.clone(),
+                retry.notice_message_id.clone(),
+                retry.message_count,
+            );
+            &prepared_retry
+        } else {
+            retry
+        };
         let mut notice_stage = retry.is_notice_stage();
         loop {
             if !notice_stage && !retry.fits_current_limits(limits, wacore::time::now_secs_u64()) {
@@ -3128,9 +3190,23 @@ mod tests {
                 ..Default::default()
             }),
             message_timestamp: Some(1_700_000_000),
+            status: Some(wa::web_message_info::Status::SERVER_ACK),
+            starred: Some(true),
+            message_add_ons: vec![wa::MessageAddOn::default()],
             ..Default::default()
         };
-        let compressed = compress_group_history(vec![source]).expect("compress history");
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let selected = select_group_history_messages(
+            &group,
+            &[source],
+            1_700_000_010,
+            GroupHistoryLimits {
+                max_messages: 1,
+                time_window_seconds: 60,
+            },
+        )
+        .unwrap();
+        let compressed = compress_group_history(selected.messages).expect("compress history");
         let mut decoder = flate2::read::ZlibDecoder::new(compressed.as_slice());
         let mut protobuf = Vec::new();
         decoder
@@ -3139,6 +3215,8 @@ mod tests {
         let decoded = waproto::codec::group_history_decode(&protobuf).expect("decode protobuf");
 
         assert_eq!(decoded.messages.len(), 1);
+        assert_eq!(decoded.messages[0].starred, None);
+        assert!(decoded.messages[0].message_add_ons.is_empty());
         assert_eq!(
             decoded.messages[0]
                 .key

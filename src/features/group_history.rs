@@ -31,8 +31,10 @@ pub(crate) struct GroupHistoryLimits {
 
 /// Opaque in-memory retry state for an indeterminate or partial share.
 ///
-/// It retains the exact encrypted-upload reference and message IDs so retrying
-/// does not repackage history or change its pairwise audience. Treat it as
+/// Before upload it retains the compressed, selected protobuf and audience so
+/// upload can be retried without adding members again. Afterwards it retains
+/// the exact encrypted-upload reference and message IDs so retransmission does
+/// not repackage history or change its pairwise audience. Treat it as
 /// sensitive; its `Debug` output deliberately omits message keys and contents.
 /// Pass it to [`crate::features::Groups::retry_group_history`] rather than
 /// constructing or inspecting it. It is not a persistence format.
@@ -45,11 +47,13 @@ pub struct GroupHistoryRetryToken {
     pub(crate) bundle_message_id: String,
     pub(crate) notice_message_id: String,
     pub(crate) message_count: usize,
+    pub(crate) prepared_upload: Option<Arc<Vec<u8>>>,
     stage: GroupHistoryRetryStage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GroupHistoryRetryStage {
+    Upload,
     Bundle,
     Notice,
 }
@@ -72,12 +76,51 @@ impl GroupHistoryRetryToken {
             bundle_message_id,
             notice_message_id,
             message_count,
+            prepared_upload: None,
             stage: GroupHistoryRetryStage::Bundle,
         }
     }
 
+    pub(crate) fn upload(
+        group: &wacore_binary::Jid,
+        recipients: &[wacore_binary::Jid],
+        compressed: Vec<u8>,
+        notice_message: Arc<waproto::whatsapp::Message>,
+        bundle_message_id: String,
+        notice_message_id: String,
+        message_count: usize,
+    ) -> Self {
+        Self {
+            group: group.clone(),
+            recipients: recipients.to_vec(),
+            bundle_message: Arc::new(waproto::whatsapp::Message::default()),
+            notice_message,
+            bundle_message_id,
+            notice_message_id,
+            message_count,
+            prepared_upload: Some(Arc::new(compressed)),
+            stage: GroupHistoryRetryStage::Upload,
+        }
+    }
+
+    pub(crate) fn prepared_upload(&self) -> Option<&[u8]> {
+        self.prepared_upload.as_deref().map(Vec::as_slice)
+    }
+
     pub(crate) fn fits_current_limits(&self, limits: GroupHistoryLimits, now: u64) -> bool {
+        if self.stage == GroupHistoryRetryStage::Upload {
+            return self
+                .notice_message
+                .message_history_notice
+                .as_option()
+                .and_then(|notice| notice.message_history_metadata.as_option())
+                .is_some_and(|metadata| retained_history_fits_limits(metadata, limits, now));
+        }
         group_history_bundle_fits_current_limits(&self.bundle_message, limits, now)
+    }
+
+    pub(crate) fn is_upload_stage(&self) -> bool {
+        self.stage == GroupHistoryRetryStage::Upload
     }
 
     pub(crate) fn is_notice_stage(&self) -> bool {
@@ -158,6 +201,8 @@ pub enum GroupHistoryShareOutcome {
     },
     UploadFailed {
         error: String,
+        /// Resume the prepared share without re-adding participants.
+        retry: GroupHistoryRetryToken,
     },
     /// A local/typed failure occurred before the bundle stanza was sent.
     BundleNotSent {
@@ -279,6 +324,18 @@ pub(crate) fn select_group_history_messages(
         // media key), expired media, or an unsent own message.
         let mut other_content = content.clone();
         other_content.conversation = None;
+        // The per-message secret is protocol context for ordinary text, not
+        // another payload. Do not forward unrelated context or nested content.
+        let secret = content
+            .message_context_info
+            .as_option()
+            .and_then(|context| context.message_secret.clone());
+        if let Some(context) = other_content.message_context_info.as_option_mut() {
+            context.message_secret = None;
+            if *context == waproto::whatsapp::MessageContextInfo::default() {
+                other_content.message_context_info = buffa::MessageField::none();
+            }
+        }
         if content.conversation.as_deref().is_none_or(str::is_empty)
             || other_content != waproto::whatsapp::Message::default()
             || !matches!(
@@ -312,11 +369,21 @@ pub(crate) fn select_group_history_messages(
         // A history recipient needs the original identity, author, time and
         // text, not the sender's account-local labels, stars, receipts,
         // message secrets or other fields on the stored envelope.
+        let projected_content = waproto::whatsapp::Message {
+            conversation: content.conversation.clone(),
+            message_context_info: secret.map_or_else(buffa::MessageField::none, |message_secret| {
+                buffa::MessageField::some(waproto::whatsapp::MessageContextInfo {
+                    message_secret: Some(message_secret),
+                    ..Default::default()
+                })
+            }),
+            ..Default::default()
+        };
         selected.push((
             timestamp,
             waproto::whatsapp::WebMessageInfo {
                 key: message.key.clone(),
-                message: message.message.clone(),
+                message: buffa::MessageField::some(projected_content),
                 message_timestamp: Some(timestamp),
                 status: message.status,
                 participant: message.participant.clone(),
@@ -541,6 +608,51 @@ mod tests {
         let debug = format!("{token:?}");
         assert!(!debug.contains("SYNTHETIC-MEDIA-KEY"));
         assert!(!debug.contains("SYNTHETIC-BUNDLE-ID"));
+
+        let upload_token = GroupHistoryRetryToken::upload(
+            &group,
+            std::slice::from_ref(&receiver),
+            b"synthetic-compressed-history".to_vec(),
+            Arc::new(wa::Message {
+                message_history_notice: buffa::MessageField::some(
+                    wa::message::MessageHistoryNotice {
+                        message_history_metadata: buffa::MessageField::some(
+                            wa::message::MessageHistoryMetadata {
+                                message_count: Some(1),
+                                oldest_message_timestamp_in_bundle: Some(900),
+                                ..Default::default()
+                            },
+                        ),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            }),
+            "SYNTHETIC-BUNDLE-ID".into(),
+            "SYNTHETIC-NOTICE-ID".into(),
+            1,
+        );
+        assert!(upload_token.is_upload_stage());
+        assert_eq!(
+            upload_token.prepared_upload(),
+            Some(b"synthetic-compressed-history".as_slice())
+        );
+        assert_eq!(upload_token.recipients, vec![receiver]);
+        assert!(upload_token.fits_current_limits(
+            GroupHistoryLimits {
+                max_messages: 1,
+                time_window_seconds: 200
+            },
+            1000
+        ));
+        assert!(!upload_token.fits_current_limits(
+            GroupHistoryLimits {
+                max_messages: 1,
+                time_window_seconds: 200
+            },
+            1101
+        ));
+        assert!(!format!("{upload_token:?}").contains("synthetic-compressed-history"));
     }
 
     #[test]
@@ -626,9 +738,18 @@ mod tests {
             ..Default::default()
         };
         let mut private = make_message("latest", &group, 950);
+        private
+            .message
+            .as_option_mut()
+            .unwrap()
+            .message_context_info = buffa::MessageField::some(wa::MessageContextInfo {
+            message_secret: Some(b"synthetic-secret".to_vec()),
+            ..Default::default()
+        });
         private.starred = Some(true);
         private.labels = vec!["private-label".into()];
         private.message_secret = Some(b"private-secret".to_vec());
+        private.message_add_ons.push(wa::MessageAddOn::default());
         let messages = vec![
             make_message("old", &group, 799),
             make_message("oldest-in-window", &group, 800),
@@ -667,6 +788,15 @@ mod tests {
         assert_eq!(selected.messages[1].starred, None);
         assert!(selected.messages[1].labels.is_empty());
         assert_eq!(selected.messages[1].message_secret, None);
+        assert!(selected.messages[1].message_add_ons.is_empty());
+        assert_eq!(
+            selected.messages[1]
+                .message
+                .as_option()
+                .and_then(|message| message.message_context_info.as_option())
+                .and_then(|context| context.message_secret.as_deref()),
+            Some(b"synthetic-secret".as_slice())
+        );
         assert!(
             select_group_history_messages(
                 &group,
