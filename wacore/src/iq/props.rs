@@ -527,15 +527,21 @@ impl IqSpec for GroupPropsSpec {
             hash: optional_attr(props, "hash").map(|value| value.into_owned()),
             experiment_props: Vec::new(),
         };
+        let mut values = std::collections::HashMap::new();
         for child in props.get_children_by_tag("prop") {
-            if let Some(code) = optional_attr(child, "config_code")
-                && let Ok(code) = code.parse::<u32>()
-                && code > 0
-                && let Some(value) = optional_attr(child, "config_value")
-            {
-                parsed
-                    .experiment_props
-                    .push((code, CompactString::from(value.as_ref())));
+            let code = optional_attr(child, "config_code");
+            let value = optional_attr(child, "config_value");
+            let (code, value) = match (code, value) {
+                (None, None) => continue,
+                (Some(code), Some(value)) => (code.parse::<u32>()?, value),
+                _ => anyhow::bail!("incomplete group experiment property"),
+            };
+            anyhow::ensure!(code > 0, "invalid group experiment code");
+            let value = CompactString::from(value.as_ref());
+            if let Some(previous) = values.insert(code, value.clone()) {
+                anyhow::ensure!(previous == value, "conflicting group experiment values");
+            } else {
+                parsed.experiment_props.push((code, value));
             }
         }
         Ok(parsed)
@@ -592,6 +598,46 @@ mod tests {
         assert_eq!(result.experiment_props.len(), 1);
         assert_eq!(result.experiment_props[0].0, 23245);
         assert_eq!(result.experiment_props[0].1.as_str(), "1");
+    }
+
+    #[test]
+    fn group_props_rejects_malformed_experiments() {
+        let spec = GroupPropsSpec::new(&Jid::new("120363000000000001", Server::Group));
+        for (code, value) in [
+            (Some("26270"), None),
+            (None, Some("1")),
+            (Some("invalid"), Some("1")),
+            (Some("0"), Some("1")),
+        ] {
+            let mut prop = NodeBuilder::new("prop");
+            if let Some(code) = code {
+                prop = prop.attr("config_code", code);
+            }
+            if let Some(value) = value {
+                prop = prop.attr("config_value", value);
+            }
+            let response = NodeBuilder::new("iq")
+                .children([NodeBuilder::new("props")
+                    .attr("hash", "synthetic")
+                    .children([prop.build()])
+                    .build()])
+                .build();
+            assert!(spec.parse_response(&response.as_node_ref()).is_err());
+        }
+        for (second_value, valid) in [("1", true), ("0", false)] {
+            let response = NodeBuilder::new("iq")
+                .children([NodeBuilder::new("props")
+                    .attr("hash", "synthetic")
+                    .children(["1", second_value].map(|value| {
+                        NodeBuilder::new("prop")
+                            .attr("config_code", "26270")
+                            .attr("config_value", value)
+                            .build()
+                    }))
+                    .build()])
+                .build();
+            assert_eq!(spec.parse_response(&response.as_node_ref()).is_ok(), valid);
+        }
     }
 
     #[test]

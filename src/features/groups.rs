@@ -1727,7 +1727,7 @@ impl<'a> Groups<'a> {
     /// This method does not access the caller's history storage. It filters
     /// the supplied protobuf messages by group, effective account/group AB-prop
     /// window, and message-count limit. Until richer send/expiry/media state is
-    /// part of the input contract, only acknowledged, unexpired plain text is
+    /// part of the input contract, only acknowledged plain text without ephemeral metadata is
     /// eligible. The bundle is pairwise-encrypted only to opted-in successful
     /// additions and own devices; the notice goes to the whole group.
     ///

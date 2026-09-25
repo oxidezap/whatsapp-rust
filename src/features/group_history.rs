@@ -296,15 +296,12 @@ pub(crate) fn select_group_history_messages(
         let Some(timestamp) = message.message_timestamp else {
             continue;
         };
-        let expired = message
-            .ephemeral_expiration_timestamp
-            .is_some_and(|end| end <= now)
-            || message.ephemeral_duration.is_some_and(|duration| {
-                message
-                    .ephemeral_start_timestamp
-                    .is_none_or(|start| start.saturating_add(u64::from(duration)) <= now)
-            });
-        if expired || timestamp < window_start || timestamp > now || !seen_ids.insert(id.to_owned())
+        if message.ephemeral_expiration_timestamp.is_some()
+            || message.ephemeral_duration.is_some()
+            || message.ephemeral_start_timestamp.is_some()
+            || timestamp < window_start
+            || timestamp > now
+            || !seen_ids.insert(id.to_owned())
         {
             continue;
         }
@@ -339,11 +336,16 @@ pub(crate) fn resolve_group_history_limits(
         return Err(GroupHistoryPolicyError::GroupPropsUnavailable);
     }
 
-    let group_values = group
-        .experiment_props
-        .iter()
-        .map(|(code, value)| (*code, value.as_str()))
-        .collect::<HashMap<_, _>>();
+    let mut group_values = HashMap::new();
+    for (code, value) in &group.experiment_props {
+        if *code == 0
+            || group_values
+                .insert(*code, value.as_str())
+                .is_some_and(|previous| previous != value.as_str())
+        {
+            return Err(GroupHistoryPolicyError::GroupPropsUnavailable);
+        }
+    }
 
     let account_enabled = account.get_bool(abprops::web::GROUP_HISTORY_SEND).ok_or(
         GroupHistoryPolicyError::InvalidAccountProp("group_history_send"),
@@ -689,6 +691,13 @@ mod tests {
         failed.status = Some(wa::web_message_info::Status::ERROR);
         let mut expired = make_message("expired");
         expired.ephemeral_expiration_timestamp = Some(999);
+        let mut expiring = make_message("expiring");
+        expiring.ephemeral_expiration_timestamp = Some(1010);
+        let mut timed = make_message("timed");
+        timed.ephemeral_start_timestamp = Some(1000);
+        timed.ephemeral_duration = Some(10);
+        let mut incomplete = make_message("incomplete");
+        incomplete.ephemeral_start_timestamp = Some(1000);
         let mut unknown = make_message("unknown-status");
         unknown.status = None;
         let selected = select_group_history_messages(
@@ -698,6 +707,9 @@ mod tests {
                 pending,
                 failed,
                 expired,
+                expiring,
+                timed,
+                incomplete,
                 unknown,
                 make_message("safe"),
             ],
@@ -713,6 +725,16 @@ mod tests {
             selected.messages[0].key.as_option().unwrap().id.as_deref(),
             Some("safe")
         );
+    }
+
+    #[tokio::test]
+    async fn group_history_policy_rejects_conflicting_duplicate_properties() {
+        let account = account_snapshot(&[]).await;
+        let code = abprops::group::GROUP_HISTORY_SEND_GROUP_LEVEL.code;
+        let conflicting = group_props(&[(code, "0"), (code, "1")]);
+        assert!(resolve_group_history_limits(&account, &conflicting).is_err());
+        let identical = group_props(&[(code, "1"), (code, "1")]);
+        assert!(resolve_group_history_limits(&account, &identical).is_ok());
     }
 
     #[tokio::test]

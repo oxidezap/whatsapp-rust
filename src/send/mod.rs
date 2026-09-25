@@ -3599,7 +3599,7 @@ impl Client {
         device_queries.push(own_jid.to_non_ad());
         wacore::types::jid::sort_dedup_by_user(&mut device_queries);
 
-        let mut devices = self.get_user_devices(&device_queries).await?;
+        let mut devices = self.refresh_user_devices(device_queries.clone()).await?;
         require_history_device_coverage(&device_queries, &devices)?;
         if group_info.addressing_mode == AddressingMode::Lid {
             devices = devices
