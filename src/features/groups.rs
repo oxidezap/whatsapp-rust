@@ -1876,6 +1876,16 @@ impl<'a> Groups<'a> {
                 ),
             });
         }
+        if selected.oldest_timestamp
+            < wacore::time::now_secs_u64().saturating_sub(current_limits.time_window_seconds)
+        {
+            return Ok(GroupHistoryAddResult {
+                participants: participant_results,
+                history_share: GroupHistoryShareOutcome::Skipped(
+                    GroupHistorySkipReason::NoEligibleMessages,
+                ),
+            });
+        }
 
         let bundle_message = Arc::new(group_history_bundle_message(&upload, &history_metadata));
         let notice_message = Arc::new(wa::Message {
@@ -2084,6 +2094,11 @@ impl<'a> Groups<'a> {
 
         let mut notice_stage = retry.is_notice_stage();
         loop {
+            if !notice_stage && !retry.fits_current_limits(limits, wacore::time::now_secs_u64()) {
+                return GroupHistoryShareOutcome::Skipped(
+                    GroupHistorySkipReason::NoEligibleMessages,
+                );
+            }
             let active_retry = if notice_stage {
                 retry.for_notice()
             } else {

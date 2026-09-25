@@ -296,6 +296,10 @@ pub(crate) fn select_group_history_messages(
         let Some(timestamp) = message.message_timestamp else {
             continue;
         };
+        // Retry tokens retain an immutable compressed upload, so an ephemeral
+        // record could expire after upload without a way to remove it. Until
+        // expiry metadata is retained for every retransmission boundary,
+        // deliberately exclude even not-yet-expired ephemeral records.
         if message.ephemeral_expiration_timestamp.is_some()
             || message.ephemeral_duration.is_some()
             || message.ephemeral_start_timestamp.is_some()
@@ -305,7 +309,20 @@ pub(crate) fn select_group_history_messages(
         {
             continue;
         }
-        selected.push((timestamp, message.clone()));
+        // A history recipient needs the original identity, author, time and
+        // text, not the sender's account-local labels, stars, receipts,
+        // message secrets or other fields on the stored envelope.
+        selected.push((
+            timestamp,
+            waproto::whatsapp::WebMessageInfo {
+                key: message.key.clone(),
+                message: message.message.clone(),
+                message_timestamp: Some(timestamp),
+                status: message.status,
+                participant: message.participant.clone(),
+                ..Default::default()
+            },
+        ));
     }
     selected.sort_by_key(|(timestamp, _)| *timestamp);
     if limits.max_messages == 0 || selected.is_empty() {
@@ -608,11 +625,15 @@ mod tests {
             status: Some(wa::web_message_info::Status::SERVER_ACK),
             ..Default::default()
         };
+        let mut private = make_message("latest", &group, 950);
+        private.starred = Some(true);
+        private.labels = vec!["private-label".into()];
+        private.message_secret = Some(b"private-secret".to_vec());
         let messages = vec![
             make_message("old", &group, 799),
             make_message("oldest-in-window", &group, 800),
             make_message("newer", &group, 900),
-            make_message("latest", &group, 950),
+            private,
             make_message("future", &group, 1001),
             make_message("other-group", &other_group, 999),
         ];
@@ -643,6 +664,9 @@ mod tests {
                 .and_then(|key| key.id.as_deref()),
             Some("latest")
         );
+        assert_eq!(selected.messages[1].starred, None);
+        assert!(selected.messages[1].labels.is_empty());
+        assert_eq!(selected.messages[1].message_secret, None);
         assert!(
             select_group_history_messages(
                 &group,
