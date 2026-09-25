@@ -550,14 +550,13 @@ pub(crate) fn select_group_history_messages(
         if newest.len() < limits.max_messages {
             newest.push(entry);
         } else if newest.peek().is_some_and(|oldest| entry < *oldest) {
-            if let Some(evicted) = newest.pop() {
-                if let Some(evicted_id) = messages[evicted.0.1]
+            if let Some(evicted) = newest.pop()
+                && let Some(evicted_id) = messages[evicted.0.1]
                     .key
                     .as_option()
                     .and_then(|key| key.id.as_deref())
-                {
-                    heap_ids.remove(evicted_id);
-                }
+            {
+                heap_ids.remove(evicted_id);
             }
             newest.push(entry);
         } else {

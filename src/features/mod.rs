@@ -82,9 +82,10 @@ pub use groups::{
     GroupMessageReporter, GroupMetadata, GroupMetadataResult, GroupOverview, GroupOverviewResult,
     GroupParticipant, GroupParticipantDetails, GroupParticipantOptions, GroupPictureEntry,
     GroupProfilePicture, GroupProfilePictureOutcome, GroupSubject, Groups, GrowthLockInfo,
-    InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode, MemberShareHistoryMode,
-    MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse, ParticipantType,
-    PictureType, PreviousDescription, ReportedGroupMessage, ReportedGroupMessages, SubgroupKind,
+    HistorySharePreparation, InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode,
+    MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
+    ParticipantType, PictureType, PreparedGroupHistoryShare, PreviousDescription,
+    ReportedGroupMessage, ReportedGroupMessages, SubgroupKind,
 };
 
 pub use labels::Labels;
