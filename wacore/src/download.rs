@@ -230,6 +230,40 @@ impl_downloadable!(
 impl_downloadable!(ExternalBlobReference, MediaType::AppState, file_size_bytes);
 impl_downloadable!(HistorySyncNotification, MediaType::History, file_length);
 
+/// A received group-history bundle carries the same download references as
+/// other media (direct path, media key, hashes) but no declared plaintext
+/// length, so only the capacity hint is absent. This lets the typed download
+/// path (`prepare_download_requests` + `MediaDecryption::Encrypted` with
+/// `MediaType::GroupHistory`) handle these bytes instead of each caller
+/// re-deriving the `Group History` HKDF context and `/mms/group-history`
+/// URL shape by hand. Building `messageHistoryBundle` and choosing
+/// `historyReceivers` stays with the caller.
+impl Downloadable for wa::message::MessageHistoryBundle {
+    fn direct_path(&self) -> Option<&str> {
+        self.direct_path.as_deref()
+    }
+
+    fn media_key(&self) -> Option<&[u8]> {
+        self.media_key.as_deref()
+    }
+
+    fn file_enc_sha256(&self) -> Option<&[u8]> {
+        self.file_enc_sha256.as_deref()
+    }
+
+    fn file_sha256(&self) -> Option<&[u8]> {
+        self.file_sha256.as_deref()
+    }
+
+    fn file_length(&self) -> Option<u64> {
+        None
+    }
+
+    fn app_info(&self) -> MediaType {
+        MediaType::GroupHistory
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DownloadRequest {
     pub url: String,
@@ -827,6 +861,39 @@ mod tests {
                 0xbe, 0x19
             ]
         );
+    }
+
+    #[test]
+    fn group_history_bundle_downloads_through_the_typed_media_path() {
+        let plaintext = b"synthetic group history bundle bytes";
+        let enc = crate::upload::encrypt_media(plaintext, MediaType::GroupHistory)
+            .expect("encrypt group history fixture");
+        let bundle = wa::message::MessageHistoryBundle {
+            mimetype: Some("application/protobuf".into()),
+            file_sha256: Some(enc.file_sha256.to_vec()),
+            media_key: Some(enc.media_key.to_vec()),
+            file_enc_sha256: Some(enc.file_enc_sha256.to_vec()),
+            direct_path: Some("/v/synthetic-group-history.enc".into()),
+            ..Default::default()
+        };
+        assert!(bundle.file_length().is_none());
+        assert_eq!(bundle.app_info(), MediaType::GroupHistory);
+
+        let requests = DownloadUtils::prepare_download_requests(&bundle, &authenticated_route())
+            .expect("bundle download requests");
+        assert!(!requests.is_empty());
+        let MediaDecryption::Encrypted {
+            media_key,
+            media_type,
+        } = &requests[0].decryption
+        else {
+            panic!("group history bundle must decrypt as E2E media");
+        };
+        assert_eq!(*media_type, MediaType::GroupHistory);
+        let decrypted =
+            DownloadUtils::verify_and_decrypt(&enc.data_to_upload, media_key, *media_type)
+                .expect("decrypt group history fixture");
+        assert_eq!(decrypted, plaintext);
     }
 
     #[test]
