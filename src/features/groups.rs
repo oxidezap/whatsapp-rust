@@ -1755,8 +1755,10 @@ impl<'a> Groups<'a> {
     /// All records with ephemeral metadata are excluded, even before expiry,
     /// because immutable retries cannot revoke content from the uploaded bundle.
     /// Each selected record retains only its message key, plain-text payload,
-    /// timestamp, acknowledged status, and participant. Account-local metadata,
-    /// including stars, labels, receipts, and message secrets, is omitted.
+    /// timestamp, acknowledged status, and participant. The payload may retain
+    /// `message_context_info.message_secret`; other context and nested content
+    /// make the record ineligible. Account-local outer metadata, including
+    /// stars, labels, receipts, message secrets, and addons, is omitted.
     /// Duplicate IDs are omitted and the newest eligible messages are kept up
     /// to the count limit.
     ///
@@ -2096,11 +2098,14 @@ impl<'a> Groups<'a> {
         }
     }
 
-    /// Retry an indeterminate or partially delivered history operation using
-    /// the exact uploaded bundle, message IDs, and pairwise audience from its
-    /// [`GroupHistoryRetryToken`]. Bundle retries keep the notice behind a new
-    /// correlated bundle ACK; notice retries never retransmit the bundle.
+    /// Resume a failed upload or an indeterminate or partially delivered share
+    /// using its [`GroupHistoryRetryToken`], without adding members again.
+    /// See the token's documentation for the retained content and audience.
+    /// Bundle retries keep the notice behind a new correlated bundle ACK;
+    /// notice retries never retransmit the bundle.
     /// Current account/group policy and sender permission are rechecked first.
+    /// Bundle publication also rechecks that every retained recipient is still
+    /// a member of the group.
     /// A retained bundle must still fit the current count and time-window
     /// limits, otherwise the retry returns `Skipped(NoEligibleMessages)`.
     /// Notice-only retries do not revalidate the bundle's count or age.

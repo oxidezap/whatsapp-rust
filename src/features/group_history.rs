@@ -29,7 +29,7 @@ pub(crate) struct GroupHistoryLimits {
     pub time_window_seconds: u64,
 }
 
-/// Opaque in-memory retry state for an indeterminate or partial share.
+/// Opaque in-memory retry state for a failed upload or incomplete share.
 ///
 /// Before upload it retains the compressed, selected protobuf and audience so
 /// upload can be retried without adding members again. Afterwards it retains
