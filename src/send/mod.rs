@@ -2535,6 +2535,16 @@ impl Client {
                 "group-direct send requires a group and at least one recipient".into(),
             )));
         }
+        // Record the payload kind before any await: a later retry receipt
+        // on a cache miss must still know bundles are pairwise.
+        self.note_history_payload(
+            message_id.to_owned(),
+            if message.message_history_bundle.is_unset() {
+                crate::retry::HistoryPayloadKind::Notice
+            } else {
+                crate::retry::HistoryPayloadKind::Bundle
+            },
+        );
         let sent_at = SendInstant::now();
         let request_id = message_id.to_owned();
         let Some((ack_receiver, ack_generation)) = self.try_register_ack_waiter(&request_id) else {

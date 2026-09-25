@@ -155,6 +155,53 @@ fn history_retry_recipient_allowed(
     })
 }
 
+/// Minimal classification of a sent history payload by its stanza message
+/// ID, so retry handling can tell pairwise bundles from sender-key traffic
+/// without the cached message bytes. A history bundle is pairwise
+/// encrypted and must never trigger sender-key repair; a history notice
+/// travels the normal group sender-key path and keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryPayloadKind {
+    Bundle,
+    Notice,
+}
+
+/// Bounded registry of sent history message IDs. Entries are small
+/// (one ID plus a tag each) and history shares are rare, so a fixed cap
+/// with oldest-first eviction bounds memory without new cache plumbing.
+/// A missing entry fails closed toward the ordinary path: the retry is
+/// treated as a normal sender-key message, which is the safe direction
+/// for an unknown payload.
+#[derive(Debug, Default)]
+pub(crate) struct HistoryPayloadRegistry {
+    kinds: std::collections::HashMap<String, HistoryPayloadKind>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl HistoryPayloadRegistry {
+    pub(crate) const CAPACITY: usize = 1024;
+
+    pub(crate) fn insert(&mut self, id: String, kind: HistoryPayloadKind) {
+        if self.kinds.insert(id.clone(), kind).is_none() {
+            self.order.push_back(id);
+            while self.order.len() > Self::CAPACITY {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.kinds.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn kind_of(&self, id: &str) -> Option<HistoryPayloadKind> {
+        self.kinds.get(id).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.kinds.len()
+    }
+}
+
 pub(crate) struct PreparedRetransmission {
     pub(crate) route: RetransmissionRoute,
     pub(crate) chat: Jid,
@@ -391,6 +438,19 @@ fn build_retry_processing_key(chat: &Jid, message_id: &str, participant_jid: &Ji
 }
 
 impl Client {
+    pub(crate) fn history_payload_kind(&self, message_id: &str) -> Option<HistoryPayloadKind> {
+        self.history_payload_ids
+            .lock()
+            .ok()
+            .and_then(|registry| registry.kind_of(message_id))
+    }
+
+    pub(crate) fn note_history_payload(&self, message_id: String, kind: HistoryPayloadKind) {
+        if let Ok(mut registry) = self.history_payload_ids.lock() {
+            registry.insert(message_id, kind);
+        }
+    }
+
     async fn resolve_retransmission_encryption_jid(
         &self,
         route: RetransmissionRoute,
@@ -700,7 +760,16 @@ impl Client {
                     result
                 }
                 None => {
-                    if uses_sender_key && let Some(jid) = settled_jid.as_ref() {
+                    // The cache cannot say whether this ID was a pairwise
+                    // history bundle, so consult the ID registry: bundles
+                    // must never trigger sender-key repair, while unknown
+                    // IDs fail closed toward the ordinary repair path.
+                    let is_history_bundle =
+                        self.history_payload_kind(&message_id) == Some(HistoryPayloadKind::Bundle);
+                    if !is_history_bundle
+                        && uses_sender_key
+                        && let Some(jid) = settled_jid.as_ref()
+                    {
                         self.mark_requester_for_fresh_skdm(&info, jid).await;
                     }
                     log::debug!(
@@ -3428,6 +3497,64 @@ mod tests {
                     .unwrap(),
                 vec![(participant.to_string(), stays_warm)],
                 "a missing or sender-key message must mark the device cold"
+            );
+        }
+    }
+
+    #[test]
+    fn history_payload_registry_borrows_nothing_and_evicts_oldest_first() {
+        let mut registry = HistoryPayloadRegistry::default();
+        assert_eq!(registry.kind_of("unknown"), None);
+        registry.insert("bundle-1".into(), HistoryPayloadKind::Bundle);
+        registry.insert("notice-1".into(), HistoryPayloadKind::Notice);
+        assert_eq!(
+            registry.kind_of("bundle-1"),
+            Some(HistoryPayloadKind::Bundle)
+        );
+        assert_eq!(
+            registry.kind_of("notice-1"),
+            Some(HistoryPayloadKind::Notice)
+        );
+        for index in 0..HistoryPayloadRegistry::CAPACITY {
+            registry.insert(format!("filler-{index}"), HistoryPayloadKind::Notice);
+        }
+        assert_eq!(registry.len(), HistoryPayloadRegistry::CAPACITY);
+        assert_eq!(registry.kind_of("bundle-1"), None);
+        assert_eq!(registry.kind_of("notice-1"), None);
+    }
+
+    #[tokio::test]
+    async fn group_retry_cache_miss_skips_repair_for_known_history_bundles() {
+        for (kind, stays_warm) in [
+            (Some(HistoryPayloadKind::Bundle), true),
+            (Some(HistoryPayloadKind::Notice), false),
+            (None, false),
+        ] {
+            let client = retry_repair_client("retry_repair_history_miss").await;
+            let group: Jid = "120363021033254952@g.us".parse().unwrap();
+            let group_key = group.to_string();
+            let participant = "555000222@lid";
+            let msg_id = "HISTORYMISS001";
+
+            client
+                .persistence_manager
+                .set_sender_key_status(&group_key, &[(participant, true)])
+                .await
+                .unwrap();
+            if let Some(kind) = kind {
+                client.note_history_payload(msg_id.into(), kind);
+            }
+
+            drive_group_retry(&client, &group, participant, msg_id, false).await;
+
+            assert_eq!(
+                client
+                    .persistence_manager
+                    .get_sender_key_devices(&group_key)
+                    .await
+                    .unwrap(),
+                vec![(participant.to_string(), stays_warm)],
+                "cache miss with {kind:?} must skip sender-key repair only for bundles"
             );
         }
     }

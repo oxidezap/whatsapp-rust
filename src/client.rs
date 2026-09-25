@@ -1674,6 +1674,12 @@ pub struct Client {
 
     pub(crate) pending_retries: Arc<std::sync::Mutex<HashSet<String>>>,
 
+    /// Message IDs of sent group-history bundles and notices with their
+    /// payload kind (see [`crate::retry::HistoryPayloadRegistry`}). Lets
+    /// retry handling skip sender-key repair for pairwise bundles even on
+    /// a recent-message cache miss, without loading message contents.
+    pub(crate) history_payload_ids: Arc<std::sync::Mutex<crate::retry::HistoryPayloadRegistry>>,
+
     /// Identities with a `refresh_lid` re-resolve in flight, keyed by
     /// `(connection_generation, PN-side JID)`. A burst of sends to one stale
     /// peer is acked one message at a time, and every one of those acks carries
