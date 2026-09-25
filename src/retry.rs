@@ -700,9 +700,7 @@ impl Client {
                     result
                 }
                 None => {
-                    if uses_sender_key
-                        && let Some(jid) = settled_jid.as_ref()
-                    {
+                    if uses_sender_key && let Some(jid) = settled_jid.as_ref() {
                         self.mark_requester_for_fresh_skdm(&info, jid).await;
                     }
                     log::debug!(
