@@ -9,6 +9,7 @@
 /// IQ namespace for newsletter operations (message history, reactions, live updates).
 pub const NEWSLETTER_XMLNS: &str = "newsletter";
 
+use crate::iq::node::{optional_child, required_attr, required_child};
 use crate::iq::spec::IqSpec;
 use crate::request::InfoQuery;
 use anyhow::{Result, anyhow};
@@ -115,16 +116,13 @@ impl IqSpec for MyAddOnsSpec {
     /// group whose channel cannot be read is an error: skipping it would pass
     /// off its add-ons as absent.
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
-        let my_addons = response
-            .get_optional_child("my_addons")
-            .ok_or_else(|| anyhow!("my_addons response: missing <my_addons>"))?;
+        let my_addons = required_child(response, "my_addons")?;
 
         let mut result = Vec::new();
         for group in my_addons.get_children_by_tag("messages") {
-            let channel = group
-                .attrs()
-                .optional_jid("jid")
-                .ok_or_else(|| anyhow!("my_addons response: a <messages> without a valid jid"))?;
+            let channel: Jid = required_attr(group, "jid")?
+                .parse()
+                .map_err(|e| anyhow!("invalid attribute jid: {e}"))?;
             if channel != self.jid {
                 continue;
             }
@@ -136,41 +134,34 @@ impl IqSpec for MyAddOnsSpec {
     }
 }
 
-fn parse_my_addons_message(msg_node: &NodeRef<'_>) -> Result<NewsletterMyAddOns> {
-    let server_id = msg_node
-        .attrs()
-        .optional_u64("server_id")
-        .ok_or_else(|| anyhow!("my_addons response: a <message> without a server_id"))?;
+/// A required integer attribute, on top of [`required_attr`] so a missing
+/// one reads like every other missing attribute.
+fn required_u64(node: &NodeRef<'_>, key: &str) -> Result<u64> {
+    required_attr(node, key)?
+        .parse()
+        .map_err(|e| anyhow!("invalid attribute {key}: {e}"))
+}
 
-    let reaction = match msg_node.get_optional_child("reaction") {
-        Some(node) => {
-            let mut attrs = node.attrs();
-            let code = attrs
-                .optional_string("code")
-                .ok_or_else(|| anyhow!("my_addons response: a <reaction> without a code"))?
-                .into_owned();
-            let timestamp = attrs
-                .optional_u64("t")
-                .ok_or_else(|| anyhow!("my_addons response: a <reaction> without a t"))?;
-            Some(NewsletterMyReaction { code, timestamp })
-        }
+fn parse_my_addons_message(msg_node: &NodeRef<'_>) -> Result<NewsletterMyAddOns> {
+    let server_id = required_u64(msg_node, "server_id")?;
+
+    let reaction = match optional_child(msg_node, "reaction") {
+        Some(node) => Some(NewsletterMyReaction {
+            code: required_attr(node, "code")?,
+            timestamp: required_u64(node, "t")?,
+        }),
         None => None,
     };
 
-    let poll_vote = match msg_node.get_optional_child("votes") {
+    let poll_vote = match optional_child(msg_node, "votes") {
         Some(node) => {
-            let timestamp = node
-                .attrs()
-                .optional_u64("t")
-                .ok_or_else(|| anyhow!("my_addons response: a <votes> without a t"))?;
+            let timestamp = required_u64(node, "t")?;
             let option_hashes = node
                 .get_children_by_tag("vote")
                 .map(|vote| {
                     vote.content_bytes()
                         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-                        .ok_or_else(|| {
-                            anyhow!("my_addons response: a <vote> that is not a 32-byte hash")
-                        })
+                        .ok_or_else(|| anyhow!("<vote> is not a 32-byte option hash"))
                 })
                 .collect::<Result<_>>()?;
             Some(NewsletterMyPollVote {

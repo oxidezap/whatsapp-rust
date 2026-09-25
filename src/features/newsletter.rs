@@ -953,7 +953,8 @@ impl<'a> Newsletter<'a> {
     /// recent messages.
     ///
     /// Only messages the account has an add-on on are returned, up to `limit`
-    /// of them.
+    /// of them. A response WA Web's parser would reject is
+    /// [`NewsletterError::InvalidRequest`] rather than a shorter list.
     pub async fn get_my_addons(
         &self,
         jid: &Jid,
@@ -964,7 +965,15 @@ impl<'a> Newsletter<'a> {
                 "get_my_addons is only valid for newsletter (channel) JIDs".into(),
             ));
         }
-        Ok(self.client.execute(MyAddOnsSpec::new(jid, limit)).await?)
+        self.client
+            .execute(MyAddOnsSpec::new(jid, limit))
+            .await
+            .map_err(|err| match err {
+                // A malformed server response is `InvalidRequest` across
+                // `NewsletterError`, as the history parser reports it.
+                IqError::ParseError(err) => NewsletterError::InvalidRequest(err.to_string()),
+                other => other.into(),
+            })
     }
 }
 
@@ -1772,6 +1781,38 @@ mod tests {
             let addons = request.await.expect("task").expect("answered");
             assert_eq!(addons.len(), 1);
             assert_eq!(addons[0].server_id, 777);
+        }
+
+        /// A malformed answer is `InvalidRequest`, the variant `NewsletterError`
+        /// files a bad server response under, not the IQ layer's parse error.
+        #[tokio::test]
+        async fn a_malformed_answer_is_an_invalid_request() {
+            let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            let jid = newsletter_jid();
+
+            let request = {
+                let client = client.clone();
+                let jid = jid.clone();
+                tokio::spawn(async move { client.newsletter().get_my_addons(&jid, 20).await })
+            };
+
+            let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+            let id = sent
+                .get()
+                .attrs()
+                .optional_string("id")
+                .expect("iq id")
+                .into_owned();
+            let without_my_addons = NodeBuilder::new("iq")
+                .attr("type", "result")
+                .attr("id", id.as_str())
+                .build();
+            crate::test_utils::answer_iq(&client, &id, &without_my_addons).await;
+
+            assert!(matches!(
+                request.await.expect("task"),
+                Err(NewsletterError::InvalidRequest(_))
+            ));
         }
 
         #[tokio::test]
