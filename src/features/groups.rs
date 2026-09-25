@@ -1745,6 +1745,8 @@ impl<'a> Groups<'a> {
     /// Authorization uncertainty skips history sharing but does not undo an
     /// otherwise successful add. A notice is sent only after a correlated
     /// bundle ACK and complete pairwise device fanout.
+    /// Both bundle and notice publication recheck current account/group policy
+    /// and sender permission after send preparation.
     ///
     /// Pass the members to add in `participants`, the subset who consented to
     /// history sharing in `opted_in_receivers`, and messages from your storage
@@ -1756,9 +1758,10 @@ impl<'a> Groups<'a> {
     /// because immutable retries cannot revoke content from the uploaded bundle.
     /// Each selected record retains only its message key, plain-text payload,
     /// timestamp, acknowledged status, and participant. The payload may retain
-    /// `message_context_info.message_secret`; other context and nested content
-    /// make the record ineligible. Account-local outer metadata, including
-    /// stars, labels, receipts, message secrets, and addons, is omitted.
+    /// `message_context_info.message_secret`. The context's
+    /// `reporting_token_version` is accepted but stripped; other context and
+    /// nested content make the record ineligible. Account-local outer metadata,
+    /// including stars, labels, receipts, message secrets, and addons, is omitted.
     /// Duplicate IDs are omitted and the newest eligible messages are kept up
     /// to the count limit.
     ///
@@ -2103,7 +2106,9 @@ impl<'a> Groups<'a> {
     /// See the token's documentation for the retained content and audience.
     /// Bundle retries keep the notice behind a new correlated bundle ACK;
     /// notice retries never retransmit the bundle.
-    /// Current account/group policy and sender permission are rechecked first.
+    /// Current account/group policy and sender permission follow the publication
+    /// checks documented on [`Groups::add_participants_with_history`], with an
+    /// additional check before retry preparation.
     /// Bundle publication also rechecks that every retained recipient is still
     /// a member of the group.
     /// A retained bundle must still fit the current count and time-window

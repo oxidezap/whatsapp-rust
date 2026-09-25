@@ -2734,7 +2734,8 @@ impl Client {
             Some(request_id),
             "branch stanza must carry the id this send was named with"
         );
-        if !message.message_history_bundle.is_unset() || !message.message_history_notice.is_unset() {
+        if !message.message_history_bundle.is_unset() || !message.message_history_notice.is_unset()
+        {
             let (metadata, limits) = crate::features::Groups::new(self)
                 .group_history_context(&tc_issue_target)
                 .await
