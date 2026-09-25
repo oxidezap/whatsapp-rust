@@ -212,6 +212,21 @@ fn send_error_may_have_reached_server(error: &crate::send::SendError) -> bool {
     matches!(error, crate::send::SendError::Client(_))
 }
 
+/// Classify a group-direct send failure once, for every stage of history
+/// delivery: an ACK race means the server may already hold the stanza.
+fn classify_group_direct_error(error: crate::send::GroupDirectSendError) -> (bool, String) {
+    match error {
+        crate::send::GroupDirectSendError::AckAlreadyPending => (
+            true,
+            "another send with this message ID already has an ACK waiter".to_owned(),
+        ),
+        crate::send::GroupDirectSendError::Send(error) => (
+            send_error_may_have_reached_server(&error),
+            error.to_string(),
+        ),
+    }
+}
+
 /// The description a [`Groups::set_description`] call expects to replace.
 ///
 /// The server takes the `prev` attribute as an optimistic-concurrency token: it
@@ -1965,189 +1980,13 @@ impl<'a> Groups<'a> {
             notice_message_id.clone(),
             message_count,
         );
-        let bundle_send = self
-            .client
-            .send_group_direct_message(
-                &jid,
-                &history_receivers,
-                bundle_message.as_ref(),
-                &bundle_message_id,
-            )
+        let history_share = self
+            .drive_group_history_delivery(&jid, &retry, current_limits, false)
             .await;
-        let bundle_send = match bundle_send {
-            Ok(send) => send,
-            Err(error) => {
-                let (may_have_reached_server, error_message) = match error {
-                    crate::send::GroupDirectSendError::AckAlreadyPending => (
-                        true,
-                        "another send with this message ID already has an ACK waiter".to_owned(),
-                    ),
-                    crate::send::GroupDirectSendError::Send(error) => (
-                        send_error_may_have_reached_server(&error),
-                        error.to_string(),
-                    ),
-                };
-                let history_share = if may_have_reached_server {
-                    log::warn!(
-                        "Group history bundle send outcome is indeterminate: {error_message}"
-                    );
-                    GroupHistoryShareOutcome::BundleIndeterminate {
-                        bundle_message_id,
-                        retry: retry.clone(),
-                    }
-                } else {
-                    GroupHistoryShareOutcome::BundleNotSent {
-                        bundle_message_id,
-                        error: error_message,
-                        retry: retry.clone(),
-                    }
-                };
-                return Ok(GroupHistoryAddResult {
-                    participants: participant_results,
-                    history_share,
-                });
-            }
-        };
-        match bundle_send.acknowledgement {
-            crate::send::GroupDirectAcknowledgement::Rejected { error, code } => {
-                let history_share = if let Some(ref retry_code) = code
-                    && retryable_history_rejection(retry_code)
-                {
-                    GroupHistoryShareOutcome::BundleRetryableRejection {
-                        bundle_message_id,
-                        error,
-                        code: retry_code.clone(),
-                        retry,
-                    }
-                } else {
-                    GroupHistoryShareOutcome::BundleRejected {
-                        bundle_message_id,
-                        error,
-                        code,
-                    }
-                };
-                return Ok(GroupHistoryAddResult {
-                    participants: participant_results,
-                    history_share,
-                });
-            }
-            crate::send::GroupDirectAcknowledgement::Indeterminate => {
-                return Ok(GroupHistoryAddResult {
-                    participants: participant_results,
-                    history_share: GroupHistoryShareOutcome::BundleIndeterminate {
-                        bundle_message_id,
-                        retry: retry.clone(),
-                    },
-                });
-            }
-            crate::send::GroupDirectAcknowledgement::Accepted => {}
-        }
-        let Some(bundle_fanout) = bundle_send.recipient_fanout else {
-            return Ok(GroupHistoryAddResult {
-                participants: participant_results,
-                history_share: GroupHistoryShareOutcome::BundleIndeterminate {
-                    bundle_message_id,
-                    retry: retry.clone(),
-                },
-            });
-        };
-        if bundle_fanout.is_partial() {
-            return Ok(GroupHistoryAddResult {
-                participants: participant_results,
-                history_share: GroupHistoryShareOutcome::BundlePartialFanout {
-                    bundle_message_id,
-                    encrypted_devices: bundle_fanout.encrypted,
-                    addressed_devices: bundle_fanout.addressed,
-                    retry: retry.clone(),
-                },
-            });
-        }
-
-        let notice_retry = retry.for_notice();
-        let notice_send = self
-            .client
-            .send_group_history_notice(&jid, notice_message.as_ref(), &notice_message_id)
-            .await;
-        let notice_send = match notice_send {
-            Ok(send) => send,
-            Err(error) => {
-                let (may_have_reached_server, error_message) = match error {
-                    crate::send::GroupDirectSendError::AckAlreadyPending => (
-                        true,
-                        "another send with this message ID already has an ACK waiter".to_owned(),
-                    ),
-                    crate::send::GroupDirectSendError::Send(error) => (
-                        send_error_may_have_reached_server(&error),
-                        error.to_string(),
-                    ),
-                };
-                let history_share = if may_have_reached_server {
-                    log::warn!(
-                        "Group history notice send outcome is indeterminate: {error_message}"
-                    );
-                    GroupHistoryShareOutcome::NoticeIndeterminate {
-                        bundle_message_id,
-                        notice_message_id,
-                        retry: notice_retry.clone(),
-                    }
-                } else {
-                    GroupHistoryShareOutcome::NoticeNotSent {
-                        bundle_message_id,
-                        notice_message_id,
-                        error: error_message,
-                        retry: notice_retry.clone(),
-                    }
-                };
-                return Ok(GroupHistoryAddResult {
-                    participants: participant_results,
-                    history_share,
-                });
-            }
-        };
-        match notice_send.acknowledgement {
-            crate::send::GroupDirectAcknowledgement::Rejected { error, code } => {
-                let history_share = if let Some(ref retry_code) = code
-                    && retryable_history_rejection(retry_code)
-                {
-                    GroupHistoryShareOutcome::NoticeRetryableRejection {
-                        bundle_message_id,
-                        notice_message_id,
-                        error,
-                        code: retry_code.clone(),
-                        retry: notice_retry,
-                    }
-                } else {
-                    GroupHistoryShareOutcome::NoticeRejected {
-                        bundle_message_id,
-                        notice_message_id,
-                        error,
-                        code,
-                    }
-                };
-                Ok(GroupHistoryAddResult {
-                    participants: participant_results,
-                    history_share,
-                })
-            }
-            crate::send::GroupDirectAcknowledgement::Indeterminate => Ok(GroupHistoryAddResult {
-                participants: participant_results,
-                history_share: GroupHistoryShareOutcome::NoticeIndeterminate {
-                    bundle_message_id,
-                    notice_message_id,
-                    retry: notice_retry.clone(),
-                },
-            }),
-            // The normal group sender-key path has no pairwise fanout count;
-            // the correlated ACK confirms server acceptance, not delivery.
-            crate::send::GroupDirectAcknowledgement::Accepted => Ok(GroupHistoryAddResult {
-                participants: participant_results,
-                history_share: GroupHistoryShareOutcome::Shared {
-                    bundle_message_id,
-                    notice_message_id,
-                    message_count,
-                },
-            }),
-        }
+        Ok(GroupHistoryAddResult {
+            participants: participant_results,
+            history_share,
+        })
     }
 
     /// Resume a failed upload or an indeterminate or partially delivered share
@@ -2163,73 +2002,20 @@ impl<'a> Groups<'a> {
     /// A retained bundle must still fit the current count and time-window
     /// limits, otherwise the retry returns `Skipped(NoEligibleMessages)`.
     /// Notice-only retries do not revalidate the bundle's count or age.
-    pub async fn retry_group_history(
+    /// Shared bundle→notice delivery state machine. The initial send and
+    /// `retry_group_history` both drive delivery through here after their
+    /// own authorization checks, so ACK semantics stay identical: the notice
+    /// goes out only after a correlated bundle ACK with complete pairwise
+    /// fanout, and every indeterminate or partial outcome retains the same
+    /// message IDs and audience for a later retry.
+    async fn drive_group_history_delivery(
         &self,
+        group: &Jid,
         retry: &GroupHistoryRetryToken,
+        limits: GroupHistoryLimits,
+        start_at_notice: bool,
     ) -> GroupHistoryShareOutcome {
-        let limits = match self.group_history_context(&retry.group).await {
-            Ok((_, limits)) => limits,
-            Err(reason) => return GroupHistoryShareOutcome::Skipped(reason),
-        };
-        if !retry.is_notice_stage()
-            && !retry.fits_current_limits(limits, wacore::time::now_secs_u64())
-        {
-            return GroupHistoryShareOutcome::Skipped(GroupHistorySkipReason::NoEligibleMessages);
-        }
-
-        let prepared_retry;
-        let retry = if retry.is_upload_stage() {
-            let Some(compressed) = retry.prepared_upload() else {
-                return GroupHistoryShareOutcome::Skipped(
-                    GroupHistorySkipReason::NoEligibleMessages,
-                );
-            };
-            let upload = match self
-                .client
-                .upload(
-                    compressed.to_vec(),
-                    MediaType::GroupHistory,
-                    crate::upload::UploadOptions::default(),
-                )
-                .await
-            {
-                Ok(upload) => upload,
-                Err(error) => {
-                    return GroupHistoryShareOutcome::UploadFailed {
-                        error: error.to_string(),
-                        retry: retry.clone(),
-                    };
-                }
-            };
-            if !retry.fits_current_limits(limits, wacore::time::now_secs_u64()) {
-                return GroupHistoryShareOutcome::Skipped(
-                    GroupHistorySkipReason::NoEligibleMessages,
-                );
-            }
-            let Some(metadata) = retry
-                .notice_message
-                .message_history_notice
-                .as_option()
-                .and_then(|notice| notice.message_history_metadata.as_option())
-            else {
-                return GroupHistoryShareOutcome::Skipped(
-                    GroupHistorySkipReason::NoEligibleMessages,
-                );
-            };
-            prepared_retry = GroupHistoryRetryToken::bundle(
-                &retry.group,
-                &retry.recipients,
-                Arc::new(group_history_bundle_message(&upload, metadata)),
-                Arc::clone(&retry.notice_message),
-                retry.bundle_message_id.clone(),
-                retry.notice_message_id.clone(),
-                retry.message_count,
-            );
-            &prepared_retry
-        } else {
-            retry
-        };
-        let mut notice_stage = retry.is_notice_stage();
+        let mut notice_stage = start_at_notice;
         loop {
             if !notice_stage && !retry.fits_current_limits(limits, wacore::time::now_secs_u64()) {
                 return GroupHistoryShareOutcome::Skipped(
@@ -2248,12 +2034,12 @@ impl<'a> Groups<'a> {
             };
             let send = if notice_stage {
                 self.client
-                    .send_group_history_notice(&retry.group, message.as_ref(), message_id)
+                    .send_group_history_notice(group, message.as_ref(), message_id)
                     .await
             } else {
                 self.client
                     .send_group_direct_message(
-                        &retry.group,
+                        group,
                         &retry.recipients,
                         message.as_ref(),
                         message_id,
@@ -2263,19 +2049,10 @@ impl<'a> Groups<'a> {
             let send = match send {
                 Ok(send) => send,
                 Err(error) => {
-                    let (may_have_reached_server, error_message) = match error {
-                        crate::send::GroupDirectSendError::AckAlreadyPending => (
-                            true,
-                            "another send with this message ID already has an ACK waiter"
-                                .to_owned(),
-                        ),
-                        crate::send::GroupDirectSendError::Send(error) => (
-                            send_error_may_have_reached_server(&error),
-                            error.to_string(),
-                        ),
-                    };
+                    let (may_have_reached_server, error_message) =
+                        classify_group_direct_error(error);
                     if may_have_reached_server {
-                        log::warn!("Group history retry outcome is indeterminate: {error_message}");
+                        log::warn!("Group history send outcome is indeterminate: {error_message}");
                         return if notice_stage {
                             GroupHistoryShareOutcome::NoticeIndeterminate {
                                 bundle_message_id: retry.bundle_message_id.clone(),
@@ -2382,6 +2159,75 @@ impl<'a> Groups<'a> {
         }
     }
 
+    pub async fn retry_group_history(
+        &self,
+        retry: &GroupHistoryRetryToken,
+    ) -> GroupHistoryShareOutcome {
+        let limits = match self.group_history_context(&retry.group).await {
+            Ok((_, limits)) => limits,
+            Err(reason) => return GroupHistoryShareOutcome::Skipped(reason),
+        };
+        if !retry.is_notice_stage()
+            && !retry.fits_current_limits(limits, wacore::time::now_secs_u64())
+        {
+            return GroupHistoryShareOutcome::Skipped(GroupHistorySkipReason::NoEligibleMessages);
+        }
+
+        let prepared_retry;
+        let retry = if retry.is_upload_stage() {
+            let Some(compressed) = retry.prepared_upload() else {
+                return GroupHistoryShareOutcome::Skipped(
+                    GroupHistorySkipReason::NoEligibleMessages,
+                );
+            };
+            let upload = match self
+                .client
+                .upload(
+                    compressed.to_vec(),
+                    MediaType::GroupHistory,
+                    crate::upload::UploadOptions::default(),
+                )
+                .await
+            {
+                Ok(upload) => upload,
+                Err(error) => {
+                    return GroupHistoryShareOutcome::UploadFailed {
+                        error: error.to_string(),
+                        retry: retry.clone(),
+                    };
+                }
+            };
+            if !retry.fits_current_limits(limits, wacore::time::now_secs_u64()) {
+                return GroupHistoryShareOutcome::Skipped(
+                    GroupHistorySkipReason::NoEligibleMessages,
+                );
+            }
+            let Some(metadata) = retry
+                .notice_message
+                .message_history_notice
+                .as_option()
+                .and_then(|notice| notice.message_history_metadata.as_option())
+            else {
+                return GroupHistoryShareOutcome::Skipped(
+                    GroupHistorySkipReason::NoEligibleMessages,
+                );
+            };
+            prepared_retry = GroupHistoryRetryToken::bundle(
+                &retry.group,
+                &retry.recipients,
+                Arc::new(group_history_bundle_message(&upload, metadata)),
+                Arc::clone(&retry.notice_message),
+                retry.bundle_message_id.clone(),
+                retry.notice_message_id.clone(),
+                retry.message_count,
+            );
+            &prepared_retry
+        } else {
+            retry
+        };
+        self.drive_group_history_delivery(&retry.group, retry, limits, retry.is_notice_stage())
+            .await
+    }
     pub async fn remove_participants(
         &self,
         jid: impl Into<Jid>,
