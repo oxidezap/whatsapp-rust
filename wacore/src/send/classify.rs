@@ -15,111 +15,125 @@ pub fn extract_ciphertext(msg: CiphertextMessage) -> Option<(&'static str, bool,
     }
 }
 
+/// The `FutureProofMessage` wrappers WA Web's `getUnwrappedProtobufMessage`
+/// traverses for classification. Single definition: [`unwrap_message`] and
+/// [`contains_group_history_payload`] both expand from here, so the two
+/// traversals cannot silently diverge.
+macro_rules! for_each_classified_fp_wrapper {
+    ($callback:ident) => {
+        $callback!(ephemeral_message);
+        $callback!(view_once_message);
+        $callback!(view_once_message_v2);
+        $callback!(view_once_message_v2_extension);
+        $callback!(document_with_caption_message);
+        $callback!(group_mentioned_message);
+        $callback!(bot_invoke_message);
+        $callback!(associated_child_message);
+        $callback!(poll_creation_option_image_message);
+        $callback!(event_cover_image);
+        $callback!(group_status_message);
+        $callback!(group_status_message_v2);
+        $callback!(group_status_mention_message);
+        $callback!(status_add_yours);
+        $callback!(status_mention_message);
+        $callback!(question_message);
+        $callback!(question_reply_message);
+        $callback!(spoiler_message);
+        $callback!(lottie_sticker_message);
+        $callback!(limit_sharing_message);
+        $callback!(newsletter_admin_profile_message);
+        $callback!(newsletter_admin_profile_message_v2);
+        $callback!(poll_creation_message_v4);
+        $callback!(bot_forwarded_message);
+    };
+}
+
+/// Every `FutureProofMessage` wrapper the current schema can nest a message
+/// in: the classification subset above plus the wrappers WA Web
+/// deliberately does not unwrap (`edited_message` is itself a signal
+/// callers may need). History detection traverses the full set: for the
+/// audience gate the safe direction is the superset. Adding a wrapper to
+/// the schema means adding its field to one of these two lists.
+macro_rules! for_each_fp_wrapper {
+    ($callback:ident) => {
+        for_each_classified_fp_wrapper!($callback);
+        $callback!(edited_message);
+        $callback!(bot_task_message);
+        $callback!(newsletter_admin_profile_status_message);
+        $callback!(bot_platform_registration_success_message);
+    };
+}
+
 /// Reject history media keys hidden in any recognized message wrapper, not
 /// only the first wrapper the stanza classifier happens to unwrap.
+///
+/// Unlike [`unwrap_message`], which follows WA Web's
+/// `getUnwrappedProtobufMessage` subset for classification, this traverses
+/// every wrapper above plus `device_sent_message` and `comment_message`:
+/// for the audience gate the safe direction is the superset, so a bundle
+/// nested anywhere a `Message` can hide never reaches the sender-key
+/// broadcast path. `template_message` needs no traversal: its subtree
+/// carries only highly-structured template content, never a full nested
+/// `Message`. `message_add_ons` needs none either: addons live on
+/// `WebMessageInfo`, while this gate inspects the `Message` payload the
+/// send funnel carries, and history selection projects shared records
+/// without addons.
 pub fn contains_group_history_payload(msg: &wa::Message) -> bool {
     if msg.message_history_bundle.is_set() || msg.message_history_notice.is_set() {
         return true;
     }
-    macro_rules! check_wrappers {
-        ($($field:ident),+ $(,)?) => {
-            $(
-                if msg.$field.as_option().is_some_and(|wrapper| {
-                    wrapper.message.as_option().is_some_and(contains_group_history_payload)
-                }) {
-                    return true;
-                }
-            )+
+    macro_rules! check_fp_wrapper {
+        ($field:ident) => {
+            if msg.$field.as_option().is_some_and(|wrapper| {
+                wrapper
+                    .message
+                    .as_option()
+                    .is_some_and(contains_group_history_payload)
+            }) {
+                return true;
+            }
         };
     }
-    check_wrappers!(
-        ephemeral_message,
-        view_once_message,
-        view_once_message_v2,
-        view_once_message_v2_extension,
-        document_with_caption_message,
-        group_mentioned_message,
-        bot_invoke_message,
-        associated_child_message,
-        poll_creation_option_image_message,
-        event_cover_image,
-        group_status_message,
-        group_status_message_v2,
-        group_status_mention_message,
-        status_add_yours,
-        status_mention_message,
-        question_message,
-        question_reply_message,
-        spoiler_message,
-        lottie_sticker_message,
-        limit_sharing_message,
-        newsletter_admin_profile_message,
-        newsletter_admin_profile_message_v2,
-        poll_creation_message_v4,
-        bot_forwarded_message,
-        edited_message,
-        bot_task_message,
-        newsletter_admin_profile_status_message,
-        bot_platform_registration_success_message,
-    );
-    msg.device_sent_message.as_option().is_some_and(|wrapper| {
+    for_each_fp_wrapper!(check_fp_wrapper);
+    if msg.device_sent_message.as_option().is_some_and(|wrapper| {
         wrapper
             .message
             .as_option()
             .is_some_and(contains_group_history_payload)
-    })
+    }) || msg.comment_message.as_option().is_some_and(|wrapper| {
+        wrapper
+            .message
+            .as_option()
+            .is_some_and(contains_group_history_payload)
+    }) {
+        return true;
+    }
+    false
 }
 
 /// Unwrap wrapper message types to reach the inner message.
 /// Matches WA Web's getUnwrappedProtobufMessage. Does not unwrap
 /// `edited_message`; that field is itself a signal callers may need.
 pub(crate) fn unwrap_message(msg: &wa::Message) -> &wa::Message {
-    macro_rules! try_unwrap {
-        ($($field:ident),+ $(,)?) => {
-            $(
-                if let Some(w) = msg.$field.as_option() {
-                    if let Some(inner) = w.message.as_option() {
-                        return unwrap_message(inner);
-                    }
+    macro_rules! try_unwrap_one {
+        ($field:ident) => {
+            if let Some(w) = msg.$field.as_option() {
+                if let Some(inner) = w.message.as_option() {
+                    return unwrap_message(inner);
                 }
-            )+
+            }
         };
     }
-    try_unwrap!(
-        ephemeral_message,
-        view_once_message,
-        view_once_message_v2,
-        view_once_message_v2_extension,
-        document_with_caption_message,
-        group_mentioned_message,
-        bot_invoke_message,
-        associated_child_message,
-        poll_creation_option_image_message,
-        // Remaining FutureProofMessage wrappers from WA Web's
-        // getUnwrappedProtobufMessage list; classify by the inner message.
-        event_cover_image,
-        group_status_message,
-        group_status_message_v2,
-        group_status_mention_message,
-        status_add_yours,
-        status_mention_message,
-        question_message,
-        question_reply_message,
-        spoiler_message,
-        lottie_sticker_message,
-        limit_sharing_message,
-        newsletter_admin_profile_message,
-        newsletter_admin_profile_message_v2,
-        poll_creation_message_v4,
-        // WA Web's typeAttributeFromProtobuf re-checks this wrapper rather than
-        // classifying it, so the inner message decides the type — a
-        // botForwardedMessage carrying an imageMessage is type="media", not
-        // "text". Unwrapping here also reaches `mediaTypeFromProtobuf`, whose
-        // own list omits the wrapper: the same deliberate divergence #692 made
-        // for group_status_message_v2, and the one that delivers, because
-        // `media` with a mediatype renders and `media` without one does not.
-        bot_forwarded_message,
-    );
+    // Remaining FutureProofMessage wrappers from WA Web's
+    // getUnwrappedProtobufMessage list; classify by the inner message.
+    // WA Web's typeAttributeFromProtobuf re-checks bot_forwarded_message
+    // rather than classifying it, so the inner message decides the type — a
+    // botForwardedMessage carrying an imageMessage is type="media", not
+    // "text". Unwrapping here also reaches `mediaTypeFromProtobuf`, whose
+    // own list omits the wrapper: the same deliberate divergence #692 made
+    // for group_status_message_v2, and the one that delivers, because
+    // `media` with a mediatype renders and `media` without one does not.
+    for_each_classified_fp_wrapper!(try_unwrap_one);
     if let Some(dsm) = msg.device_sent_message.as_option()
         && let Some(inner) = dsm.message.as_option()
     {
@@ -394,4 +408,243 @@ pub fn should_hide_decrypt_fail(msg: &wa::Message) -> bool {
                     || t == ProtocolType::GroupMemberLabelChange
             ) || p.edited_message.is_set()
         })
+}
+
+#[cfg(test)]
+mod history_wrapper_tests {
+    use super::*;
+
+    fn fp_wrapped(
+        inner: wa::Message,
+        wrap: fn(wa::message::FutureProofMessage) -> wa::Message,
+    ) -> wa::Message {
+        wrap(wa::message::FutureProofMessage {
+            message: buffa::MessageField::some(inner),
+            ..Default::default()
+        })
+    }
+
+    fn history_bundle() -> wa::Message {
+        wa::Message {
+            message_history_bundle: buffa::MessageField::some(Default::default()),
+            ..Default::default()
+        }
+    }
+
+    fn history_notice() -> wa::Message {
+        wa::Message {
+            message_history_notice: buffa::MessageField::some(Default::default()),
+            ..Default::default()
+        }
+    }
+
+    /// Every wrapper in [`for_each_fp_wrapper`] plus the non-`FutureProof`
+    /// carriers must trip history detection, singly and doubly nested.
+    /// The table mirrors the production traversal one entry per wrapper:
+    /// adding a wrapper to the macro without a row here leaves the new
+    /// traversal unproven, removing a row breaks the assertion below.
+    #[test]
+    fn every_wrapper_routes_history_detection() {
+        let wrappers: &[(&str, fn(wa::Message) -> wa::Message)] = &[
+            ("ephemeral_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    ephemeral_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("view_once_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    view_once_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("view_once_message_v2", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    view_once_message_v2: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("view_once_message_v2_extension", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    view_once_message_v2_extension: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("document_with_caption_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    document_with_caption_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("group_mentioned_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    group_mentioned_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("bot_invoke_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    bot_invoke_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("associated_child_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    associated_child_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("poll_creation_option_image_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    poll_creation_option_image_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("event_cover_image", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    event_cover_image: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("group_status_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    group_status_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("group_status_message_v2", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    group_status_message_v2: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("group_status_mention_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    group_status_mention_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("status_add_yours", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    status_add_yours: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("status_mention_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    status_mention_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("question_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    question_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("question_reply_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    question_reply_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("spoiler_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    spoiler_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("lottie_sticker_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    lottie_sticker_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("limit_sharing_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    limit_sharing_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("newsletter_admin_profile_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    newsletter_admin_profile_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("newsletter_admin_profile_message_v2", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    newsletter_admin_profile_message_v2: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("poll_creation_message_v4", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    poll_creation_message_v4: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("bot_forwarded_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    bot_forwarded_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("edited_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    edited_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("bot_task_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    bot_task_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("newsletter_admin_profile_status_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    newsletter_admin_profile_status_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("bot_platform_registration_success_message", |m| {
+                fp_wrapped(m, |w| wa::Message {
+                    bot_platform_registration_success_message: buffa::MessageField::some(w),
+                    ..Default::default()
+                })
+            }),
+            ("device_sent_message", |m| wa::Message {
+                device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
+                    message: buffa::MessageField::some(m),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ("comment_message", |m| wa::Message {
+                comment_message: buffa::MessageField::some(wa::message::CommentMessage {
+                    message: buffa::MessageField::some(m),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        ];
+        assert_eq!(wrappers.len(), 30, "one row per traversed wrapper");
+        for (name, wrap) in wrappers {
+            for payload in [history_bundle(), history_notice()] {
+                assert!(
+                    contains_group_history_payload(&wrap(payload.clone())),
+                    "{name} must trip history detection"
+                );
+                assert!(
+                    contains_group_history_payload(&wrap(wrap(payload))),
+                    "{name} doubly nested must trip history detection"
+                );
+            }
+        }
+        assert!(!contains_group_history_payload(&wa::Message {
+            conversation: Some("plain".into()),
+            ..Default::default()
+        }));
+    }
 }
