@@ -332,6 +332,7 @@ pub(crate) fn select_group_history_messages(
             .and_then(|context| context.message_secret.clone());
         if let Some(context) = other_content.message_context_info.as_option_mut() {
             context.message_secret = None;
+            context.reporting_token_version = None;
             if *context == waproto::whatsapp::MessageContextInfo::default() {
                 other_content.message_context_info = buffa::MessageField::none();
             }
@@ -744,6 +745,7 @@ mod tests {
             .unwrap()
             .message_context_info = buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(b"synthetic-secret".to_vec()),
+            reporting_token_version: Some(1),
             ..Default::default()
         });
         private.starred = Some(true);

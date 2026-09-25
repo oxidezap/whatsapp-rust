@@ -113,7 +113,7 @@ fn group_history_retry_audience_requires_opt_in_and_membership() {
         Some(&own),
         None
     ));
-    assert!(!history_retry_recipient_allowed(
+    assert!(history_retry_recipient_allowed(
         &metadata,
         &peer,
         &group,
@@ -135,9 +135,10 @@ fn history_retry_recipient_allowed(
             .iter()
             .any(|member| crate::send::same_group_user(member, jid, group))
     };
+    // The sender's membership is verified from full metadata by the current
+    // policy gate; the routing participant list may omit the sender itself.
     if requester.is_hosted()
-        || !is_member(requester)
-        || !own_pn.into_iter().chain(own_lid).any(is_member)
+        || (!is_member(requester) && !is_own_account_jid(requester, own_pn, own_lid))
     {
         return false;
     }
@@ -933,12 +934,16 @@ impl Client {
             message_id,
             retry_count,
             recipient,
-            group_info,
+            mut group_info,
             pre_encoded,
         } = request;
+        let history = !message.message_history_bundle.is_unset()
+            || !message.message_history_notice.is_unset();
+        let history_generation = self
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
 
-        if !message.message_history_bundle.is_unset() || !message.message_history_notice.is_unset()
-        {
+        if history {
             if !matches!(route, RetransmissionRoute::Group) || !chat.is_group() {
                 anyhow::bail!("history retransmission requires its group route");
             }
@@ -966,6 +971,7 @@ impl Client {
             let current_group = groups
                 .routing_info_with_freshness(&chat, crate::cache::Freshness::Refresh)
                 .await?;
+            group_info = Some(Arc::clone(&current_group));
             let own = self.persistence_manager.get_device_snapshot();
             let bundle = message
                 .message_history_bundle
@@ -1045,14 +1051,14 @@ impl Client {
                     .map(|info| info.addressing_mode)
                     .unwrap_or_default();
                 wacore::send::PairwiseRetryDestination::Participant {
-                    to: chat,
+                    to: chat.clone(),
                     participant: wire_requester,
                     addressing_mode: Some(addressing_mode),
                 }
             }
             RetransmissionRoute::BroadcastList => {
                 wacore::send::PairwiseRetryDestination::Participant {
-                    to: chat,
+                    to: chat.clone(),
                     participant: wire_requester,
                     addressing_mode: None,
                 }
@@ -1078,6 +1084,34 @@ impl Client {
         // Persistence may need the processing permit, whose holder may in turn
         // need this session lock. Release it before the durability gate.
         drop(session_guard);
+        if history {
+            self.persist_signal_state_pre_wire().await?;
+            let groups = self.groups();
+            let (_, current_limits) =
+                groups
+                    .group_history_context(&chat)
+                    .await
+                    .map_err(|reason| {
+                        anyhow::anyhow!("history retransmission policy changed: {reason:?}")
+                    })?;
+            if !message.message_history_bundle.is_unset()
+                && !crate::features::group_history_bundle_fits_current_limits(
+                    &message,
+                    current_limits,
+                    wacore::time::now_secs_u64(),
+                )
+            {
+                anyhow::bail!("history bundle expired before retransmission");
+            }
+            if self
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != history_generation
+            {
+                anyhow::bail!("connection changed while preparing history retransmission");
+            }
+            return self.send_node(stanza).await.map_err(Into::into);
+        }
         self.send_retry_stanza(stanza).await
     }
 
