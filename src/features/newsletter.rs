@@ -839,6 +839,39 @@ impl<'a> Newsletter<'a> {
         Ok(())
     }
 
+    /// Vote in a newsletter poll.
+    ///
+    /// `server_id` is the poll's. `option_hashes` is the whole selection, one
+    /// [`wacore::poll::compute_option_hash`] per chosen option, the same key
+    /// [`NewsletterPollVote::option_hash`] tallies by. Hash the option name
+    /// exactly as the poll payload carries it: names hold variation selectors
+    /// and ZWJ sequences, and a retyped or normalized name hashes to an option
+    /// the server does not know.
+    ///
+    /// Every send replaces the previous selection on the server, so changing a
+    /// vote is a send with the new list and an empty slice removes it.
+    ///
+    /// Returns the stanza id. The server's ack carries the same id and the
+    /// poll's `server_id`, arriving as [`wacore::types::events::Event::ServerAck`].
+    pub async fn send_poll_vote(
+        &self,
+        jid: &Jid,
+        server_id: u64,
+        option_hashes: &[[u8; 32]],
+    ) -> Result<String, NewsletterError> {
+        if !jid.is_newsletter() {
+            return Err(NewsletterError::InvalidRequest(
+                "send_poll_vote is only valid for newsletter (channel) JIDs".into(),
+            ));
+        }
+        validate_poll_vote(option_hashes)?;
+        let id = self.client.generate_message_id();
+        self.client
+            .send_node(build_poll_vote_node(jid, &id, server_id, option_hashes))
+            .await?;
+        Ok(id)
+    }
+
     /// Edit a message in a newsletter (channel). Channels are plaintext (not E2E).
     ///
     /// `message_id` is the target message's id (the `message_id` from
@@ -915,6 +948,59 @@ impl<'a> Newsletter<'a> {
             .await?;
         parse_newsletter_messages_response(response.get())
     }
+}
+
+/// The most `<vote>` children one vote may carry, from the
+/// `REPEATED_CHILD(<vote>, 0, 1000)` in WA Web's
+/// `WASmaxOutMessagePublishNewsletterPollVoteMixin`.
+const MAX_POLL_VOTE_OPTIONS: usize = 1000;
+
+/// Refuse a selection WA Web could never send. Its UI produces a set of at
+/// most [`MAX_POLL_VOTE_OPTIONS`] distinct options, and how the server answers
+/// anything else has not been observed, so neither is left for it to decide.
+fn validate_poll_vote(option_hashes: &[[u8; 32]]) -> Result<(), NewsletterError> {
+    if option_hashes.len() > MAX_POLL_VOTE_OPTIONS {
+        return Err(NewsletterError::InvalidRequest(format!(
+            "a poll vote carries at most {MAX_POLL_VOTE_OPTIONS} options, got {}",
+            option_hashes.len()
+        )));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(option_hashes.len());
+    if option_hashes.iter().any(|hash| !seen.insert(hash)) {
+        return Err(NewsletterError::InvalidRequest(
+            "a poll vote names each option at most once".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Build a newsletter poll vote.
+///
+/// The reaction envelope of `send_server_reaction`, typed `poll`, with
+/// `server_id` naming the poll rather than a message of its own. `<meta>`
+/// comes before `<votes>` because that is the order WA Web sends; whether the
+/// server requires it is unknown. `<meta>` never carries `contenttype` on a
+/// vote: `WAWebNewsletterSendMessageQueryJob` does not pass one on that path.
+/// Nothing is encrypted, since a channel has no key.
+fn build_poll_vote_node(
+    jid: &Jid,
+    id: &str,
+    server_id: u64,
+    option_hashes: &[[u8; 32]],
+) -> wacore_binary::Node {
+    let votes = option_hashes
+        .iter()
+        .map(|hash| NodeBuilder::new("vote").bytes(hash.as_slice()).build());
+    NodeBuilder::new("message")
+        .attr("to", jid)
+        .attr("id", id)
+        .attr("server_id", server_id)
+        .attr("type", "poll")
+        .children([
+            NodeBuilder::new("meta").attr("polltype", "vote").build(),
+            NodeBuilder::new("votes").children(votes).build(),
+        ])
+        .build()
 }
 
 /// Build the history IQ.
@@ -2805,5 +2891,207 @@ mod tests {
             msg.poll_type, None,
             "the poll stage is read for poll envelopes only"
         );
+    }
+
+    /// Option hashes of a real channel poll, with the name each was taken
+    /// over. The names carry a variation selector and a ZWJ sequence, the
+    /// bytes a retyped name loses.
+    const JUST_THIS: &str = "🫠 Just this.";
+    const JUST_THIS_HASH: &str = "107f7671b96fcff7c2524b29a031dfb5c0c6ea19c9cba6e47de723e5c6983c83";
+    const GOOD_MORNING: &str = "☀️ GOOD MORNING EVERYONE LET'S GO!!!";
+    const GOOD_MORNING_HASH: &str =
+        "2e090fda1d75dab720e00f72f5b06d88020d56c637d25a5d64529b51faeb6acf";
+    const MONDAYS: &str = "😶‍🌫️ Mondays should be illegal.";
+    const MONDAYS_HASH: &str = "ea53ff01672231aa49905b2a74164330b2a006d6f731d1227171fd92d3779322";
+
+    fn option_hash(hex_digest: &str) -> [u8; 32] {
+        hex::decode(hex_digest)
+            .expect("hex")
+            .try_into()
+            .expect("32 bytes")
+    }
+
+    fn vote_bytes(node: &wacore_binary::Node) -> Vec<Vec<u8>> {
+        let votes = node.get_optional_child("votes").expect("votes child");
+        votes
+            .children()
+            .unwrap_or_default()
+            .iter()
+            .map(|vote| {
+                assert_eq!(vote.tag, "vote");
+                assert!(vote.attrs.is_empty(), "a sent <vote> carries no attrs");
+                match vote.content.as_ref() {
+                    Some(NodeContent::Bytes(bytes)) => bytes.clone(),
+                    other => panic!("a <vote> holds the raw digest, got {other:?}"),
+                }
+            })
+            .collect()
+    }
+
+    /// The hash a vote sends is `compute_option_hash` over the option name,
+    /// byte for byte: these are the digests the server tallied and acked.
+    #[test]
+    fn poll_vote_hashes_are_the_option_name_digests() {
+        for (name, digest) in [
+            (JUST_THIS, JUST_THIS_HASH),
+            (GOOD_MORNING, GOOD_MORNING_HASH),
+            (MONDAYS, MONDAYS_HASH),
+        ] {
+            assert_eq!(
+                wacore::poll::compute_option_hash(name),
+                option_hash(digest),
+                "{name}"
+            );
+        }
+    }
+
+    /// The shape WA Web sent for one option: a plaintext `<message
+    /// type="poll">` whose `server_id` is the poll's, `<meta polltype="vote">`
+    /// with no `contenttype`, then `<votes>` with one bare `<vote>` digest.
+    #[test]
+    fn poll_vote_node_matches_the_wa_web_stanza() {
+        let jid = newsletter_jid();
+        let node = build_poll_vote_node(
+            &jid,
+            "3EB0000000000000000001",
+            777,
+            &[option_hash(JUST_THIS_HASH)],
+        );
+
+        assert_eq!(node.tag, "message");
+        let mut attrs = node.attrs();
+        assert_eq!(attrs.jid("to"), jid);
+        assert_eq!(
+            attrs.optional_string("id").unwrap(),
+            "3EB0000000000000000001"
+        );
+        assert_eq!(attrs.optional_u64("server_id"), Some(777));
+        assert_eq!(attrs.optional_string("type").unwrap(), "poll");
+        assert_eq!(
+            node.attrs.len(),
+            4,
+            "no attribute beyond the four WA Web sends"
+        );
+
+        let tags: Vec<_> = node
+            .children()
+            .expect("children")
+            .iter()
+            .map(|child| child.tag.as_ref())
+            .collect();
+        assert_eq!(
+            tags,
+            ["meta", "votes"],
+            "meta precedes votes, as WA Web sends it"
+        );
+
+        let meta = node.get_optional_child("meta").expect("meta child");
+        assert_eq!(meta.attrs().optional_string("polltype").unwrap(), "vote");
+        assert_eq!(meta.attrs.len(), 1, "a vote's meta carries no contenttype");
+        assert!(meta.content.is_none());
+
+        assert_eq!(vote_bytes(&node), [option_hash(JUST_THIS_HASH).to_vec()]);
+    }
+
+    /// A multi-select vote is one stanza with a `<vote>` per option, in the
+    /// order the caller gave them.
+    #[test]
+    fn poll_vote_node_sends_every_option_in_the_given_order() {
+        for order in [
+            [GOOD_MORNING_HASH, MONDAYS_HASH],
+            [MONDAYS_HASH, GOOD_MORNING_HASH],
+        ] {
+            let hashes = order.map(option_hash);
+            let node = build_poll_vote_node(&newsletter_jid(), "3EB0", 777, &hashes);
+            assert_eq!(
+                vote_bytes(&node),
+                hashes.iter().map(|hash| hash.to_vec()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Removing a vote is the same stanza with an empty `<votes>`: there is no
+    /// separate revoke type or attribute.
+    #[test]
+    fn an_empty_poll_vote_removes_the_vote() {
+        let node = build_poll_vote_node(&newsletter_jid(), "3EB0", 777, &[]);
+
+        assert_eq!(node.attrs().optional_string("type").unwrap(), "poll");
+        assert!(
+            node.get_optional_child("meta").is_some(),
+            "meta stays on a removal"
+        );
+        assert!(vote_bytes(&node).is_empty());
+    }
+
+    #[test]
+    fn a_poll_vote_is_refused_past_the_option_cap_or_with_a_repeat() {
+        let distinct: Vec<[u8; 32]> = (0..=MAX_POLL_VOTE_OPTIONS)
+            .map(|i| wacore::poll::compute_option_hash(&i.to_string()))
+            .collect();
+
+        assert!(validate_poll_vote(&[]).is_ok());
+        assert!(validate_poll_vote(&distinct[..MAX_POLL_VOTE_OPTIONS]).is_ok());
+        assert!(matches!(
+            validate_poll_vote(&distinct),
+            Err(NewsletterError::InvalidRequest(_))
+        ));
+
+        let repeated = [
+            option_hash(GOOD_MORNING_HASH),
+            option_hash(MONDAYS_HASH),
+            option_hash(GOOD_MORNING_HASH),
+        ];
+        assert!(matches!(
+            validate_poll_vote(&repeated),
+            Err(NewsletterError::InvalidRequest(_))
+        ));
+    }
+
+    /// The id handed back is the one on the wire, since it is the caller's
+    /// only way to match the server's ack to this vote.
+    #[tokio::test]
+    async fn send_poll_vote_returns_the_id_it_sent() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let jid = newsletter_jid();
+
+        let id = client
+            .newsletter()
+            .send_poll_vote(&jid, 777, &[option_hash(JUST_THIS_HASH)])
+            .await
+            .expect("vote is sent");
+
+        let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let sent = sent.get();
+        assert_eq!(sent.tag.as_ref(), "message");
+        let mut attrs = sent.attrs();
+        assert_eq!(attrs.optional_string("id").unwrap(), id.as_str());
+        assert_eq!(attrs.optional_u64("server_id"), Some(777));
+        assert_eq!(attrs.jid("to"), jid);
+    }
+
+    /// A refused vote puts nothing on the wire.
+    #[tokio::test]
+    async fn send_poll_vote_refuses_a_non_newsletter_jid_or_a_bad_selection() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group: Jid = "120363000000000002@g.us".parse().expect("jid");
+        let hash = option_hash(JUST_THIS_HASH);
+
+        let not_a_channel = client
+            .newsletter()
+            .send_poll_vote(&group, 777, &[hash])
+            .await;
+        assert!(matches!(
+            not_a_channel,
+            Err(NewsletterError::InvalidRequest(_))
+        ));
+
+        let repeated = client
+            .newsletter()
+            .send_poll_vote(&newsletter_jid(), 777, &[hash, hash])
+            .await;
+        assert!(matches!(repeated, Err(NewsletterError::InvalidRequest(_))));
+
+        assert_eq!(transport.sent_count(), 0);
     }
 }
