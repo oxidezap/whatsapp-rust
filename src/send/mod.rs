@@ -602,7 +602,15 @@ fn parse_group_direct_ack(
     }
 
     let error = node.get_attr("error").map(|value| value.to_string());
-    let code = node.get_attr("code").map(|value| value.to_string());
+    let code = node
+        .get_attr("code")
+        .map(|value| value.to_string())
+        .or_else(|| {
+            error
+                .as_ref()
+                .filter(|value| value.parse::<u16>().is_ok())
+                .cloned()
+        });
     if error.is_some() || code.is_some() {
         GroupDirectAcknowledgement::Rejected { error, code }
     } else if node
@@ -712,6 +720,39 @@ mod group_direct_tests {
                 code: Some("500".into()),
             }
         );
+    }
+
+    #[test]
+    fn group_history_ack_normalizes_numeric_rejection_codes() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        for (error, code, expected) in [
+            (Some("503"), None, Some("503")),
+            (Some("429"), None, Some("429")),
+            (Some("403"), None, Some("403")),
+            (Some("unavailable"), None, None),
+            (None, Some("503"), Some("503")),
+            (Some("unavailable"), Some("503"), Some("503")),
+            (Some("503"), Some("403"), Some("403")),
+        ] {
+            let mut ack = NodeBuilder::new("ack")
+                .attr("id", "SYNTHETIC-ID")
+                .attr("class", "message")
+                .attr("from", &group);
+            if let Some(error) = error {
+                ack = ack.attr("error", error);
+            }
+            if let Some(code) = code {
+                ack = ack.attr("code", code);
+            }
+            let ack = owned_node(ack.build());
+            assert_eq!(
+                parse_group_direct_ack(&ack, "SYNTHETIC-ID", &group, None),
+                GroupDirectAcknowledgement::Rejected {
+                    error: error.map(str::to_owned),
+                    code: expected.map(str::to_owned),
+                }
+            );
+        }
     }
 
     #[tokio::test]

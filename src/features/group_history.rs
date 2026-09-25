@@ -303,6 +303,167 @@ pub(crate) fn can_current_user_share_history(
     is_admin || is_super_admin || mode == Some(MemberShareHistoryMode::AllMemberShare)
 }
 
+fn is_shareable_history_text(content: &waproto::whatsapp::Message) -> bool {
+    use waproto::whatsapp::{Message, MessageContextInfo};
+
+    macro_rules! remaining_fields_are_empty {
+        ($value:expr, $ty:ident, [$($allowed:ident),*], [$($field:ident => $empty:ident),* $(,)?]) => {{
+            let $ty { $($allowed: _,)* $($field,)* } = $value;
+            $($field.$empty())&&*
+        }};
+    }
+
+    content
+        .conversation
+        .as_deref()
+        .is_some_and(|text| !text.is_empty())
+        && remaining_fields_are_empty!(
+            content,
+            Message,
+            [conversation, message_context_info],
+            [
+                sender_key_distribution_message => is_unset,
+                image_message => is_unset,
+                contact_message => is_unset,
+                location_message => is_unset,
+                extended_text_message => is_unset,
+                document_message => is_unset,
+                audio_message => is_unset,
+                video_message => is_unset,
+                call => is_unset,
+                chat => is_unset,
+                protocol_message => is_unset,
+                contacts_array_message => is_unset,
+                highly_structured_message => is_unset,
+                fast_ratchet_key_sender_key_distribution_message => is_unset,
+                send_payment_message => is_unset,
+                live_location_message => is_unset,
+                request_payment_message => is_unset,
+                decline_payment_request_message => is_unset,
+                cancel_payment_request_message => is_unset,
+                template_message => is_unset,
+                sticker_message => is_unset,
+                group_invite_message => is_unset,
+                template_button_reply_message => is_unset,
+                product_message => is_unset,
+                device_sent_message => is_unset,
+                list_message => is_unset,
+                view_once_message => is_unset,
+                order_message => is_unset,
+                list_response_message => is_unset,
+                ephemeral_message => is_unset,
+                invoice_message => is_unset,
+                buttons_message => is_unset,
+                buttons_response_message => is_unset,
+                payment_invite_message => is_unset,
+                interactive_message => is_unset,
+                reaction_message => is_unset,
+                sticker_sync_rmr_message => is_unset,
+                interactive_response_message => is_unset,
+                poll_creation_message => is_unset,
+                poll_update_message => is_unset,
+                keep_in_chat_message => is_unset,
+                document_with_caption_message => is_unset,
+                request_phone_number_message => is_unset,
+                view_once_message_v2 => is_unset,
+                enc_reaction_message => is_unset,
+                edited_message => is_unset,
+                view_once_message_v2_extension => is_unset,
+                poll_creation_message_v2 => is_unset,
+                scheduled_call_creation_message => is_unset,
+                group_mentioned_message => is_unset,
+                pin_in_chat_message => is_unset,
+                poll_creation_message_v3 => is_unset,
+                scheduled_call_edit_message => is_unset,
+                ptv_message => is_unset,
+                bot_invoke_message => is_unset,
+                call_log_messsage => is_unset,
+                message_history_bundle => is_unset,
+                enc_comment_message => is_unset,
+                bcall_message => is_unset,
+                lottie_sticker_message => is_unset,
+                event_message => is_unset,
+                enc_event_response_message => is_unset,
+                comment_message => is_unset,
+                newsletter_admin_invite_message => is_unset,
+                placeholder_message => is_unset,
+                secret_encrypted_message => is_unset,
+                album_message => is_unset,
+                event_cover_image => is_unset,
+                sticker_pack_message => is_unset,
+                status_mention_message => is_unset,
+                poll_result_snapshot_message => is_unset,
+                poll_creation_option_image_message => is_unset,
+                associated_child_message => is_unset,
+                group_status_mention_message => is_unset,
+                poll_creation_message_v4 => is_unset,
+                status_add_yours => is_unset,
+                group_status_message => is_unset,
+                rich_response_message => is_unset,
+                status_notification_message => is_unset,
+                limit_sharing_message => is_unset,
+                bot_task_message => is_unset,
+                question_message => is_unset,
+                message_history_notice => is_unset,
+                group_status_message_v2 => is_unset,
+                bot_forwarded_message => is_unset,
+                status_question_answer_message => is_unset,
+                question_reply_message => is_unset,
+                question_response_message => is_unset,
+                status_quoted_message => is_unset,
+                status_sticker_interaction_message => is_unset,
+                poll_creation_message_v5 => is_unset,
+                newsletter_follower_invite_message_v2 => is_unset,
+                poll_result_snapshot_message_v3 => is_unset,
+                newsletter_admin_profile_message => is_unset,
+                newsletter_admin_profile_message_v2 => is_unset,
+                spoiler_message => is_unset,
+                poll_creation_message_v6 => is_unset,
+                conditional_reveal_message => is_unset,
+                poll_add_option_message => is_unset,
+                event_invite_message => is_unset,
+                group_root_key_share => is_unset,
+                payment_reminder_message => is_unset,
+                split_payment_message => is_unset,
+                newsletter_admin_profile_status_message => is_unset,
+                root_secret_distribute_message => is_unset,
+                split_payment_update_message => is_unset,
+                music_message => is_unset,
+                status_link_preview_metadata => is_unset,
+                bot_platform_registration_success_message => is_unset,
+            ]
+        )
+        && content
+            .message_context_info
+            .as_option()
+            .is_none_or(|context| {
+                remaining_fields_are_empty!(
+                    context,
+                    MessageContextInfo,
+                    [message_secret, reporting_token_version],
+                    [
+                        device_list_metadata => is_unset,
+                        device_list_metadata_version => is_none,
+                        padding_bytes => is_none,
+                        message_add_on_duration_in_secs => is_none,
+                        bot_message_secret => is_none,
+                        bot_metadata => is_unset,
+                        message_add_on_expiry_type => is_none,
+                        message_association => is_unset,
+                        capi_created_group => is_none,
+                        support_payload => is_none,
+                        limit_sharing => is_unset,
+                        limit_sharing_v2 => is_unset,
+                        thread_id => is_empty,
+                        weblink_render_config => is_none,
+                        tee_bot_metadata => is_none,
+                        account_encryption_attestation => is_unset,
+                        associated_primary_identity_key => is_none,
+                    ]
+                )
+            })
+}
+
 pub(crate) struct SelectedGroupHistory {
     pub messages: Vec<waproto::whatsapp::WebMessageInfo>,
     pub oldest_timestamp: u64,
@@ -336,36 +497,15 @@ pub(crate) fn select_group_history_messages(
         if key.remote_jid.as_deref() != Some(group.as_str()) || !message.message.is_set() {
             continue;
         }
-        let Some(content) = message.message.as_option() else {
-            continue;
-        };
-        // Until the caller supplies complete send/expiry/media state, accept
-        // only acknowledged plain text. Cloning arbitrary protobuf content
-        // could forward a nested history bundle (including another audience's
-        // media key), expired media, or an unsent own message.
-        let mut other_content = content.clone();
-        other_content.conversation = None;
-        // The per-message secret is protocol context for ordinary text, not
-        // another payload. Do not forward unrelated context or nested content.
-        if let Some(context) = other_content.message_context_info.as_option_mut() {
-            context.message_secret = None;
-            context.reporting_token_version = None;
-            if *context == waproto::whatsapp::MessageContextInfo::default() {
-                other_content.message_context_info = buffa::MessageField::none();
-            }
-        }
-        if content.conversation.as_deref().is_none_or(str::is_empty)
-            || other_content != waproto::whatsapp::Message::default()
-            || !matches!(
-                message.status,
-                Some(
-                    waproto::whatsapp::web_message_info::Status::SERVER_ACK
-                        | waproto::whatsapp::web_message_info::Status::DELIVERY_ACK
-                        | waproto::whatsapp::web_message_info::Status::READ
-                        | waproto::whatsapp::web_message_info::Status::PLAYED
-                )
+        if !matches!(
+            message.status,
+            Some(
+                waproto::whatsapp::web_message_info::Status::SERVER_ACK
+                    | waproto::whatsapp::web_message_info::Status::DELIVERY_ACK
+                    | waproto::whatsapp::web_message_info::Status::READ
+                    | waproto::whatsapp::web_message_info::Status::PLAYED
             )
-        {
+        ) {
             continue;
         }
         let Some(timestamp) = message.message_timestamp else {
@@ -380,8 +520,13 @@ pub(crate) fn select_group_history_messages(
             || message.ephemeral_start_timestamp.is_some()
             || timestamp < window_start
             || timestamp > now
-            || !seen_ids.insert(id.to_owned())
         {
+            continue;
+        }
+        let Some(content) = message.message.as_option() else {
+            continue;
+        };
+        if !is_shareable_history_text(content) || !seen_ids.insert(id) {
             continue;
         }
         let entry = std::cmp::Reverse((timestamp, index));
@@ -837,6 +982,112 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn history_text_admission_checks_borrowed_payload_and_context() {
+        use waproto::whatsapp as wa;
+
+        let mut content = wa::Message {
+            conversation: Some("synthetic text".into()),
+            ..Default::default()
+        };
+        assert!(is_shareable_history_text(&content));
+        for context in [
+            wa::MessageContextInfo::default(),
+            wa::MessageContextInfo {
+                message_secret: Some(vec![7; 32]),
+                reporting_token_version: Some(1),
+                ..Default::default()
+            },
+        ] {
+            content.message_context_info = buffa::MessageField::some(context);
+            assert!(is_shareable_history_text(&content));
+        }
+        for context in [
+            wa::MessageContextInfo {
+                padding_bytes: Some(Vec::new()),
+                ..Default::default()
+            },
+            wa::MessageContextInfo {
+                support_payload: Some("private".into()),
+                ..Default::default()
+            },
+            wa::MessageContextInfo {
+                limit_sharing: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            },
+        ] {
+            content.message_context_info = buffa::MessageField::some(context);
+            assert!(!is_shareable_history_text(&content));
+        }
+        content.message_context_info = buffa::MessageField::none();
+        content.ephemeral_message = buffa::MessageField::some(Default::default());
+        assert!(!is_shareable_history_text(&content));
+        content.ephemeral_message = buffa::MessageField::some(wa::message::FutureProofMessage {
+            message: buffa::MessageField::some(wa::Message {
+                conversation: Some("private nested text".repeat(4096)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(!is_shareable_history_text(&content));
+        content.ephemeral_message = buffa::MessageField::none();
+        content.conversation = Some(String::new());
+        assert!(!is_shareable_history_text(&content));
+    }
+
+    #[test]
+    fn selection_preserves_first_eligible_duplicate_and_newest_ties() {
+        use waproto::whatsapp as wa;
+
+        let group = wacore_binary::Jid::new("120363000000000001", wacore_binary::Server::Group);
+        let make_message = |id: &str, timestamp| wa::WebMessageInfo {
+            key: buffa::MessageField::some(wa::MessageKey {
+                remote_jid: Some(group.to_string()),
+                id: Some(id.into()),
+                ..Default::default()
+            }),
+            message: buffa::MessageField::some(wa::Message {
+                conversation: Some(id.into()),
+                ..Default::default()
+            }),
+            message_timestamp: Some(timestamp),
+            status: Some(wa::web_message_info::Status::SERVER_ACK),
+            ..Default::default()
+        };
+        let archive = [
+            make_message("duplicate", 799),
+            make_message("duplicate", 950),
+            make_message("duplicate", 999),
+            make_message("earlier-tie", 950),
+            make_message("later-tie", 950),
+        ];
+        let selected = select_group_history_messages(
+            &group,
+            &archive,
+            1000,
+            GroupHistoryLimits {
+                max_messages: 3,
+                time_window_seconds: 200,
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.oldest_timestamp, 950);
+        assert_eq!(selected.messages.len(), 3);
+        assert_eq!(selected.messages[0].message_timestamp, Some(950));
+        assert_eq!(selected.messages[0].key, archive[1].key);
+        let selected = select_group_history_messages(
+            &group,
+            &archive,
+            1000,
+            GroupHistoryLimits {
+                max_messages: 1,
+                time_window_seconds: 200,
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.messages[0].key, archive[4].key);
     }
 
     #[test]
