@@ -145,9 +145,6 @@ impl From<GroupError> for SendError {
     }
 }
 
-/// Returns a `GroupRoutingInfo` whose participant list is guaranteed to contain our own
-/// sending JID, without deep-cloning the shared (cached) metadata in the common
-/// case where the server's participant list already includes us.
 pub(crate) fn same_group_user(
     left: &Jid,
     right: &Jid,
@@ -185,6 +182,9 @@ fn require_history_device_coverage(requested: &[Jid], devices: &[Jid]) -> anyhow
     Ok(())
 }
 
+/// Returns a `GroupRoutingInfo` whose participant list is guaranteed to contain our own
+/// sending JID, without deep-cloning the shared (cached) metadata in the common
+/// case where the server's participant list already includes us.
 fn ensure_self_in_group(
     info: std::sync::Arc<wacore::client::context::GroupRoutingInfo>,
     own_sending_jid: &Jid,
@@ -3528,10 +3528,10 @@ impl Client {
         })
     }
 
-    /// Pairwise fanout for group-history bundle/notice messages. Unlike an
-    /// ordinary group message this never advances a sender key: it resolves
-    /// devices only for the supplied, current group members and our own
-    /// account, then uses the DM Signal path inside a group-addressed stanza.
+    /// Pairwise fanout for group-history bundles. This never advances a sender
+    /// key. It refreshes devices only for the supplied, current group members
+    /// and our own account, then uses the DM Signal path inside a
+    /// group-addressed stanza. Notices use [`Self::send_group_history_notice`].
     async fn send_group_direct_branch(
         &self,
         request: GroupDirectBranchRequest<'_>,
