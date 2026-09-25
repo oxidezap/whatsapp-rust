@@ -942,8 +942,28 @@ impl Client {
             if !matches!(route, RetransmissionRoute::Group) || !chat.is_group() {
                 anyhow::bail!("history retransmission requires its group route");
             }
-            let current_group = self
-                .groups()
+            let groups = self.groups();
+            let (_, current_limits) =
+                groups
+                    .group_history_context(&chat)
+                    .await
+                    .map_err(|reason| {
+                        anyhow::anyhow!(
+                            "group history retransmission is no longer authorized: {reason:?}"
+                        )
+                    })?;
+            if !message.message_history_bundle.is_unset()
+                && !crate::features::group_history_bundle_fits_current_limits(
+                    &message,
+                    current_limits,
+                    wacore::time::now_secs().max(0) as u64,
+                )
+            {
+                anyhow::bail!(
+                    "group history bundle no longer fits current count and time-window limits"
+                );
+            }
+            let current_group = groups
                 .routing_info_with_freshness(&chat, crate::cache::Freshness::Refresh)
                 .await?;
             let own = self.persistence_manager.get_device_snapshot();
@@ -955,7 +975,7 @@ impl Client {
                 .message_history_notice
                 .as_option()
                 .map(|notice| notice.message_history_metadata.as_option());
-            for metadata in bundle.into_iter().chain(notice) {
+            if let Some(metadata) = bundle {
                 let Some(metadata) = metadata else {
                     anyhow::bail!("history retransmission lacks audience metadata");
                 };
@@ -976,6 +996,18 @@ impl Client {
                         "history retransmission requester is outside the authorized audience"
                     );
                 }
+            }
+            if let Some(metadata) = notice
+                && (metadata.is_none()
+                    || ![&wire_requester, &encryption_jid]
+                        .into_iter()
+                        .all(|requester| {
+                            current_group.participants.iter().any(|member| {
+                                crate::send::same_group_user(member, requester, &current_group)
+                            })
+                        }))
+            {
+                anyhow::bail!("history notice retransmission requires current group members");
             }
         }
 

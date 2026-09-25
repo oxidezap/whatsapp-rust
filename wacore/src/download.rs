@@ -67,7 +67,7 @@ impl MediaType {
             MediaType::Audio => "WhatsApp Audio Keys",
             MediaType::Document => "WhatsApp Document Keys",
             MediaType::History => "WhatsApp History Keys",
-            MediaType::GroupHistory => "WhatsApp Group History Keys",
+            MediaType::GroupHistory => "Group History",
             MediaType::AppState => "WhatsApp App State Keys",
             MediaType::Sticker => "WhatsApp Image Keys",
             MediaType::StickerPack => "WhatsApp Sticker Pack Keys",
@@ -804,6 +804,7 @@ mod tests {
 
     #[test]
     fn group_history_uses_its_own_media_path_and_key_derivation_context() {
+        assert_eq!(MediaType::GroupHistory.app_info(), "Group History");
         assert_eq!(MediaType::GroupHistory.mms_type(), "group-history");
         assert_eq!(MediaType::GroupHistory.upload_path(), "/mms/group-history");
         assert_ne!(
@@ -817,6 +818,15 @@ mod tests {
         let history_keys = DownloadUtils::get_media_keys(&media_key, MediaType::History)
             .expect("history media keys");
         assert_ne!(group_history_keys, history_keys);
+        // Independent Node.js hkdfSync('sha256', [0x5a; 32], empty salt,
+        // 'Group History', 112) fixture from the pinned WA Web media info.
+        assert_eq!(
+            group_history_keys.0,
+            [
+                0x71, 0xba, 0xe6, 0x97, 0x44, 0x61, 0xbf, 0x53, 0xab, 0xc8, 0x9a, 0xcd, 0xf9, 0xca,
+                0xbe, 0x19
+            ]
+        );
     }
 
     #[test]

@@ -77,13 +77,7 @@ impl GroupHistoryRetryToken {
     }
 
     pub(crate) fn fits_current_limits(&self, limits: GroupHistoryLimits, now: u64) -> bool {
-        let Some(bundle) = self.bundle_message.message_history_bundle.as_option() else {
-            return false;
-        };
-        let Some(metadata) = bundle.message_history_metadata.as_option() else {
-            return false;
-        };
-        retained_history_fits_limits(metadata, limits, now)
+        group_history_bundle_fits_current_limits(&self.bundle_message, limits, now)
     }
 
     pub(crate) fn is_notice_stage(&self) -> bool {
@@ -95,6 +89,20 @@ impl GroupHistoryRetryToken {
         retry.stage = GroupHistoryRetryStage::Notice;
         retry
     }
+}
+
+pub(crate) fn group_history_bundle_fits_current_limits(
+    message: &waproto::whatsapp::Message,
+    limits: GroupHistoryLimits,
+    now: u64,
+) -> bool {
+    let Some(bundle) = message.message_history_bundle.as_option() else {
+        return false;
+    };
+    let Some(metadata) = bundle.message_history_metadata.as_option() else {
+        return false;
+    };
+    retained_history_fits_limits(metadata, limits, now)
 }
 
 fn retained_history_fits_limits(
@@ -198,19 +206,9 @@ pub enum GroupHistoryShareOutcome {
         notice_message_id: String,
         retry: GroupHistoryRetryToken,
     },
-    /// The notice was ACKed, but local encryption missed one or more devices.
-    /// This does not claim recipient receipt; the retry token reuses the same ID.
-    NoticePartialFanout {
-        bundle_message_id: String,
-        notice_message_id: String,
-        /// Devices that produced encrypted fanout nodes.
-        encrypted_devices: usize,
-        /// Opted-in receivers plus own companion devices; excludes this device.
-        addressed_devices: usize,
-        retry: GroupHistoryRetryToken,
-    },
-    /// Bundle and notice ACKs were correlated, with complete local device fanout.
-    /// This is server acceptance, not a read or receipt confirmation.
+    /// Bundle and notice ACKs were correlated, with complete pairwise bundle
+    /// fanout. The group-wide notice uses sender-key routing, so this proves
+    /// server acceptance, not individual delivery or a read receipt.
     Shared {
         bundle_message_id: String,
         notice_message_id: String,
@@ -272,10 +270,42 @@ pub(crate) fn select_group_history_messages(
         if key.remote_jid.as_deref() != Some(group.as_str()) || !message.message.is_set() {
             continue;
         }
+        let Some(content) = message.message.as_option() else {
+            continue;
+        };
+        // Until the caller supplies complete send/expiry/media state, accept
+        // only acknowledged plain text. Cloning arbitrary protobuf content
+        // could forward a nested history bundle (including another audience's
+        // media key), expired media, or an unsent own message.
+        let mut other_content = content.clone();
+        other_content.conversation = None;
+        if content.conversation.as_deref().is_none_or(str::is_empty)
+            || other_content != waproto::whatsapp::Message::default()
+            || !matches!(
+                message.status,
+                Some(
+                    waproto::whatsapp::web_message_info::Status::SERVER_ACK
+                        | waproto::whatsapp::web_message_info::Status::DELIVERY_ACK
+                        | waproto::whatsapp::web_message_info::Status::READ
+                        | waproto::whatsapp::web_message_info::Status::PLAYED
+                )
+            )
+        {
+            continue;
+        }
         let Some(timestamp) = message.message_timestamp else {
             continue;
         };
-        if timestamp < window_start || timestamp > now || !seen_ids.insert(id.to_owned()) {
+        let expired = message
+            .ephemeral_expiration_timestamp
+            .is_some_and(|end| end <= now)
+            || message.ephemeral_duration.is_some_and(|duration| {
+                message
+                    .ephemeral_start_timestamp
+                    .is_none_or(|start| start.saturating_add(u64::from(duration)) <= now)
+            });
+        if expired || timestamp < window_start || timestamp > now || !seen_ids.insert(id.to_owned())
+        {
             continue;
         }
         selected.push((timestamp, message.clone()));
@@ -495,6 +525,50 @@ mod tests {
     }
 
     #[test]
+    fn retransmitted_bundle_must_fit_current_count_and_time_window() {
+        use waproto::whatsapp as wa;
+
+        let make_bundle = |count: Option<i64>, oldest: Option<i64>| wa::Message {
+            message_history_bundle: buffa::MessageField::some(wa::message::MessageHistoryBundle {
+                message_history_metadata: buffa::MessageField::some(
+                    wa::message::MessageHistoryMetadata {
+                        message_count: count,
+                        oldest_message_timestamp_in_bundle: oldest,
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let limits = GroupHistoryLimits {
+            max_messages: 2,
+            time_window_seconds: 200,
+        };
+
+        assert!(group_history_bundle_fits_current_limits(
+            &make_bundle(Some(2), Some(900)),
+            limits,
+            1000,
+        ));
+        assert!(!group_history_bundle_fits_current_limits(
+            &make_bundle(Some(3), Some(900)),
+            limits,
+            1000,
+        ));
+        assert!(!group_history_bundle_fits_current_limits(
+            &make_bundle(Some(2), Some(799)),
+            limits,
+            1000,
+        ));
+        assert!(!group_history_bundle_fits_current_limits(
+            &make_bundle(Some(2), None),
+            limits,
+            1000,
+        ));
+    }
+
+    #[test]
     fn history_permission_matches_wa_web_role_and_member_mode_gate() {
         assert!(can_current_user_share_history(true, false, None));
         assert!(can_current_user_share_history(false, true, None));
@@ -529,6 +603,7 @@ mod tests {
                 ..Default::default()
             }),
             message_timestamp: Some(timestamp),
+            status: Some(wa::web_message_info::Status::SERVER_ACK),
             ..Default::default()
         };
         let messages = vec![
@@ -577,6 +652,66 @@ mod tests {
                 },
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn selection_refuses_nested_bundles_unsent_messages_and_expired_content() {
+        use waproto::whatsapp as wa;
+        let group = wacore_binary::Jid::new("120363000000000001", wacore_binary::Server::Group);
+        let make_message = |id: &str| wa::WebMessageInfo {
+            key: buffa::MessageField::some(wa::MessageKey {
+                remote_jid: Some(group.to_string()),
+                id: Some(id.into()),
+                from_me: Some(true),
+                ..Default::default()
+            }),
+            message: buffa::MessageField::some(wa::Message {
+                conversation: Some("synthetic text".into()),
+                ..Default::default()
+            }),
+            message_timestamp: Some(950),
+            status: Some(wa::web_message_info::Status::SERVER_ACK),
+            ..Default::default()
+        };
+        let mut nested = make_message("nested");
+        nested.message = buffa::MessageField::some(wa::Message {
+            conversation: Some("synthetic text".into()),
+            message_history_bundle: buffa::MessageField::some(wa::message::MessageHistoryBundle {
+                media_key: Some(b"SYNTHETIC-OTHER-KEY".to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut pending = make_message("pending");
+        pending.status = Some(wa::web_message_info::Status::PENDING);
+        let mut failed = make_message("failed");
+        failed.status = Some(wa::web_message_info::Status::ERROR);
+        let mut expired = make_message("expired");
+        expired.ephemeral_expiration_timestamp = Some(999);
+        let mut unknown = make_message("unknown-status");
+        unknown.status = None;
+        let selected = select_group_history_messages(
+            &group,
+            &[
+                nested,
+                pending,
+                failed,
+                expired,
+                unknown,
+                make_message("safe"),
+            ],
+            1000,
+            GroupHistoryLimits {
+                max_messages: 100,
+                time_window_seconds: 200,
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.messages.len(), 1);
+        assert_eq!(
+            selected.messages[0].key.as_option().unwrap().id.as_deref(),
+            Some("safe")
         );
     }
 

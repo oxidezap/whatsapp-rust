@@ -583,6 +583,7 @@ fn parse_group_direct_ack(
     ack: &wacore_binary::OwnedNodeRef,
     message_id: &str,
     group: &Jid,
+    expected_phash: Option<&str>,
 ) -> GroupDirectAcknowledgement {
     let node = ack.get();
     let group = group.to_string();
@@ -604,6 +605,13 @@ fn parse_group_direct_ack(
     let code = node.get_attr("code").map(|value| value.to_string());
     if error.is_some() || code.is_some() {
         GroupDirectAcknowledgement::Rejected { error, code }
+    } else if node
+        .get_attr("phash")
+        .is_some_and(|server| expected_phash.is_none_or(|ours| ours != server.as_str()))
+    {
+        // A device added after resolution cannot be declared covered. A retry
+        // refreshes only the same authorized audience, with the same ID.
+        GroupDirectAcknowledgement::Indeterminate
     } else {
         GroupDirectAcknowledgement::Accepted
     }
@@ -635,7 +643,7 @@ mod group_direct_tests {
                 .build(),
         );
         assert_eq!(
-            parse_group_direct_ack(&accepted, "SYNTHETIC-ID", &group),
+            parse_group_direct_ack(&accepted, "SYNTHETIC-ID", &group, None),
             GroupDirectAcknowledgement::Accepted
         );
 
@@ -656,10 +664,37 @@ mod group_direct_tests {
                     .build(),
             );
             assert_eq!(
-                parse_group_direct_ack(&malformed, "SYNTHETIC-ID", &group),
+                parse_group_direct_ack(&malformed, "SYNTHETIC-ID", &group, None),
                 GroupDirectAcknowledgement::Indeterminate
             );
         }
+
+        let mismatched_phash = owned_node(
+            NodeBuilder::new("ack")
+                .attr("id", "SYNTHETIC-ID")
+                .attr("class", "message")
+                .attr("from", &group)
+                .attr("phash", "server-devices")
+                .build(),
+        );
+        assert_eq!(
+            parse_group_direct_ack(
+                &mismatched_phash,
+                "SYNTHETIC-ID",
+                &group,
+                Some("sent-devices")
+            ),
+            GroupDirectAcknowledgement::Indeterminate
+        );
+        assert_eq!(
+            parse_group_direct_ack(
+                &mismatched_phash,
+                "SYNTHETIC-ID",
+                &group,
+                Some("server-devices")
+            ),
+            GroupDirectAcknowledgement::Accepted
+        );
 
         let rejected = owned_node(
             NodeBuilder::new("ack")
@@ -671,7 +706,7 @@ mod group_direct_tests {
                 .build(),
         );
         assert_eq!(
-            parse_group_direct_ack(&rejected, "SYNTHETIC-ID", &group),
+            parse_group_direct_ack(&rejected, "SYNTHETIC-ID", &group, None),
             GroupDirectAcknowledgement::Rejected {
                 error: Some("500".into()),
                 code: Some("500".into()),
@@ -701,6 +736,28 @@ mod group_direct_tests {
             .response_waiters_guard()
             .remove_guarded("SYNTHETIC-ID", second_generation);
         drop(second_receiver);
+    }
+
+    #[tokio::test]
+    async fn raw_group_history_cannot_fall_through_to_sender_key_broadcast() {
+        let client = crate::test_utils::create_test_client().await;
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        for message in [
+            wa::Message {
+                message_history_bundle: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            },
+            wa::Message {
+                message_history_notice: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            },
+        ] {
+            let error = client
+                .send_message_impl(group.clone(), &message, SendPipelineOptions::default())
+                .await
+                .expect_err("raw group send must not broadcast history");
+            assert!(error.to_string().contains("add-with-history"));
+        }
     }
 
     #[tokio::test]
@@ -751,9 +808,13 @@ pub(crate) struct SendPipelineOptions<'a> {
     /// Without this, the borrowed id clobbers the original message's retry
     /// content and outbound secret.
     pub(crate) borrowed_message_id: bool,
-    /// Internal pairwise group audience used only by the group-history bundle
-    /// and notice flow. Ordinary sends must continue through sender-key fanout.
+    /// Internal pairwise audience for group-history bundles. Ordinary sends
+    /// continue through sender-key fanout.
     pub(crate) group_direct_recipients: Option<&'a [Jid]>,
+    /// An ACK-gated, group-wide notice sent after its bundle was accepted.
+    pub(crate) group_history_notice: bool,
+    /// Capture the exact fanout phash before registering an ACK waiter.
+    pub(crate) history_expected_phash: Option<&'a mut Option<wacore_binary::CompactString>>,
 }
 
 /// The devices a freshly resolved fan-out holds that the sent stanza did not.
@@ -2356,7 +2417,30 @@ impl Client {
         message: &wa::Message,
         message_id: &str,
     ) -> Result<GroupDirectSendOutcome, GroupDirectSendError> {
-        if !to.is_group() || recipients.is_empty() {
+        self.send_group_history_message(to, Some(recipients), message, message_id)
+            .await
+    }
+
+    /// Notices contain no media key and must use the normal group sender-key
+    /// path so existing members see the announcement too.
+    pub(crate) async fn send_group_history_notice(
+        &self,
+        to: &Jid,
+        message: &wa::Message,
+        message_id: &str,
+    ) -> Result<GroupDirectSendOutcome, GroupDirectSendError> {
+        self.send_group_history_message(to, None, message, message_id)
+            .await
+    }
+
+    async fn send_group_history_message(
+        &self,
+        to: &Jid,
+        recipients: Option<&[Jid]>,
+        message: &wa::Message,
+        message_id: &str,
+    ) -> Result<GroupDirectSendOutcome, GroupDirectSendError> {
+        if !to.is_group() || recipients.is_some_and(|recipients| recipients.is_empty()) {
             return Err(GroupDirectSendError::Send(SendError::InvalidRequest(
                 "group-direct send requires a group and at least one recipient".into(),
             )));
@@ -2371,6 +2455,7 @@ impl Client {
             request_id.clone(),
             ack_generation,
         );
+        let mut expected_phash = None;
         let recipient_fanout = match self
             .send_message_impl(
                 to.clone(),
@@ -2378,7 +2463,13 @@ impl Client {
                 SendPipelineOptions {
                     sent_at: Some(sent_at),
                     request_id: Some(&request_id),
-                    group_direct_recipients: Some(recipients),
+                    group_direct_recipients: recipients,
+                    // The normal group branch also computes a phash; the
+                    // ACK-capture path below must not replace our waiter.
+                    group_history_notice: recipients.is_none(),
+                    history_expected_phash: Some(&mut expected_phash),
+                    group_metadata_freshness: crate::cache::Freshness::Refresh,
+                    device_freshness: crate::cache::Freshness::Refresh,
                     ..Default::default()
                 },
             )
@@ -2397,7 +2488,12 @@ impl Client {
         )
         .await;
         let acknowledgement = match ack_result {
-            Ok(Ok(ack)) => parse_group_direct_ack(&ack, &request_id, to),
+            Ok(Ok(ack)) => parse_group_direct_ack(
+                &ack,
+                &request_id,
+                to,
+                expected_phash.as_ref().map(|phash| phash.as_str()),
+            ),
             Ok(Err(_)) | Err(_) => GroupDirectAcknowledgement::Indeterminate,
         };
         Ok(GroupDirectSendOutcome {
@@ -2467,6 +2563,8 @@ impl Client {
             device_freshness,
             borrowed_message_id,
             group_direct_recipients,
+            group_history_notice,
+            history_expected_phash,
         } = options;
         // Callers that already stamped their message hand the instant down; the
         // rest sample here so the pipeline below still has exactly one.
@@ -2482,6 +2580,15 @@ impl Client {
         validate_extra_stanza_nodes(&extra_stanza_nodes)?;
         if request_id_override.is_some_and(str::is_empty) {
             return Err(SendError::InvalidRequest("message ID must not be empty".into()).into());
+        }
+        if (!message.message_history_bundle.is_unset() && group_direct_recipients.is_none())
+            || (!message.message_history_notice.is_unset() && !group_history_notice)
+        {
+            return Err(SendError::InvalidRequest(
+                "group history requires the add-with-history API and its authorized audience"
+                    .into(),
+            )
+            .into());
         }
         if to.is_group()
             && let Some(protocol) = message.protocol_message.as_option()
@@ -2635,7 +2742,14 @@ impl Client {
         {
             anyhow::bail!("connection changed while preparing group message");
         }
-        let ack_message_id = if !borrowed_message_id && let Some(phash) = ack_phash {
+        let awaiting_history_ack = history_expected_phash.is_some();
+        if let Some(slot) = history_expected_phash {
+            *slot = ack_phash.clone();
+        }
+        let ack_message_id = if !borrowed_message_id
+            && !awaiting_history_ack
+            && let Some(phash) = ack_phash
+        {
             // Group refresh and message resend have separate lifetimes.
             let invalidate_group = tc_issue_target.is_group();
             if let Some(devices) = group_devices {
@@ -3580,7 +3694,7 @@ impl Client {
             issue_tc_token_after_send: false,
             // Group-direct ACKs are awaited by this operation. The ordinary
             // group phash repair path is sender-key-specific and must not run.
-            ack_phash: None,
+            ack_phash: prepared.phash,
             recipient_fanout: Some(direct_fanout),
             dm_devices: None,
             group_devices: None,

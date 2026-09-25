@@ -73,6 +73,7 @@ pub use contacts::{
 
 pub use events::{EventCreationParams, EventResponseType, Events};
 
+pub(crate) use group_history::group_history_bundle_fits_current_limits;
 pub use group_history::{GroupHistoryRetryToken, GroupHistoryShareOutcome, GroupHistorySkipReason};
 
 pub use groups::{
