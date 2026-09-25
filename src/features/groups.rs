@@ -95,8 +95,10 @@ pub struct GroupHistoryAddResult {
 /// (borrowed, so the prepared share survives the delivery future too)
 /// or [`Groups::retry_group_history`] without adding members again.
 /// Treat it as opaque: construct it only through
-/// [`Groups::prepare_group_history_share`].
-#[derive(Debug, Clone)]
+/// [`Groups::prepare_group_history_share`]. Its `Debug` output redacts
+/// the upload's media key, like [`GroupHistoryRetryToken`]: logging a
+/// prepared share must never expose the key that decrypts the bundle.
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct PreparedGroupHistoryShare {
     /// Per-participant outcomes from the add step, as in
@@ -110,6 +112,16 @@ pub struct PreparedGroupHistoryShare {
     pub(crate) notice_message_id: String,
     pub(crate) message_count: usize,
     pub(crate) oldest_timestamp: u64,
+}
+
+impl std::fmt::Debug for PreparedGroupHistoryShare {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedGroupHistoryShare")
+            .field("recipient_count", &self.recipients.len())
+            .field("message_count", &self.message_count)
+            .field("media_keys", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Outcome of [`Groups::prepare_group_history_share`]: either ready to
@@ -3297,6 +3309,41 @@ mod tests {
                 .and_then(|key| key.id.as_deref()),
             Some("SYNTHETIC-HISTORY-ID")
         );
+    }
+
+    #[test]
+    fn prepared_share_debug_redacts_the_media_key() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let prepared = PreparedGroupHistoryShare {
+            participants: Vec::new(),
+            group,
+            recipients: Vec::new(),
+            upload: crate::upload::UploadResponse {
+                url: "https://cdn.example.invalid/x".into(),
+                direct_path: "/v/synthetic.enc".into(),
+                media_key: [0x5A; 32],
+                file_enc_sha256: [0x51; 32],
+                file_sha256: [0x52; 32],
+                file_length: 7,
+                media_key_timestamp: 1_700_000_000,
+                streaming_sidecar: None,
+            },
+            notice_message: Arc::new(wa::Message::default()),
+            bundle_message_id: "SYNTHETIC-BUNDLE-ID".into(),
+            notice_message_id: "SYNTHETIC-NOTICE-ID".into(),
+            message_count: 1,
+            oldest_timestamp: 1_700_000_000,
+        };
+        let debug = format!("{prepared:?}");
+        // `[u8; 32]` debugs as decimal bytes: `[90, 90, ...]`.
+        assert!(!debug.contains("90, 90"), "media key bytes leaked: {debug}");
+        assert!(
+            debug.contains("<redacted>"),
+            "redaction marker missing: {debug}"
+        );
+        // The wrapping preparation result must not leak it either.
+        let wrapped = HistorySharePreparation::Ready(prepared);
+        assert!(!format!("{wrapped:?}").contains("90, 90"));
     }
 
     #[test]

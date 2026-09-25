@@ -67,7 +67,7 @@ macro_rules! for_each_fp_wrapper {
 /// Reject history media keys hidden in any recognized message wrapper, not
 /// only the first wrapper the stanza classifier happens to unwrap.
 ///
-/// Unlike [`unwrap_message`], which follows WA Web's
+/// Unlike `unwrap_message`, which follows WA Web's
 /// `getUnwrappedProtobufMessage` subset for classification, this traverses
 /// every wrapper above plus `device_sent_message` and `comment_message`:
 /// for the audience gate the safe direction is the superset, so a bundle
@@ -420,7 +420,6 @@ mod history_wrapper_tests {
     ) -> wa::Message {
         wrap(wa::message::FutureProofMessage {
             message: buffa::MessageField::some(inner),
-            ..Default::default()
         })
     }
 
@@ -443,9 +442,13 @@ mod history_wrapper_tests {
     /// The table mirrors the production traversal one entry per wrapper:
     /// adding a wrapper to the macro without a row here leaves the new
     /// traversal unproven, removing a row breaks the assertion below.
+    /// One table row per traversed wrapper: name plus a constructor that
+    /// nests a payload one level deep in that wrapper.
+    type WrapperCase = (&'static str, fn(wa::Message) -> wa::Message);
+
     #[test]
     fn every_wrapper_routes_history_detection() {
-        let wrappers: &[(&str, fn(wa::Message) -> wa::Message)] = &[
+        let wrappers: &[WrapperCase] = &[
             ("ephemeral_message", |m| {
                 fp_wrapped(m, |w| wa::Message {
                     ephemeral_message: buffa::MessageField::some(w),
