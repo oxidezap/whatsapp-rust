@@ -851,8 +851,10 @@ impl<'a> Newsletter<'a> {
     /// Every send replaces the previous selection on the server, so changing a
     /// vote is a send with the new list and an empty slice removes it.
     ///
-    /// Returns the stanza id. The server's ack carries the same id and the
-    /// poll's `server_id`, arriving as [`wacore::types::events::Event::ServerAck`].
+    /// Returns the stanza id. Match it against the `id` of the server's ack,
+    /// which arrives as [`wacore::types::events::Event::ServerAck`]; the ack
+    /// also names the poll's `server_id` on the wire, but that event does not
+    /// carry it.
     pub async fn send_poll_vote(
         &self,
         jid: &Jid,
