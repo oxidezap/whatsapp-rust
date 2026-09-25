@@ -566,6 +566,11 @@ pub struct MemoryReport {
     /// number of distinct peers acked at once; a value that stays high
     /// means refreshes are not completing, not that many were requested.
     pub pending_lid_refreshes: usize,
+    /// Sent group-history message IDs by payload kind. Capped at
+    /// [`crate::retry::HistoryPayloadRegistry::CAPACITY`] short-ID entries,
+    /// so a value pinned at the cap means steady history traffic, not a
+    /// leak; ID bytes are bounded by the cap and need no byte counter.
+    pub history_payload_ids: u64,
     pub presence_subscriptions: usize,
     pub app_state_key_requests: usize,
     /// Expanded app-state keys the processor holds in memory. No capacity cap
@@ -849,6 +854,7 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "  node_waiters:           {}", self.node_waiters)?;
         writeln!(f, "  sent_node_waiters:      {}", self.sent_node_waiters)?;
         writeln!(f, "  pending_retries:        {}", self.pending_retries)?;
+        writeln!(f, "  history_payload_ids:    {}", self.history_payload_ids)?;
         writeln!(
             f,
             "  pending_lid_refreshes:  {}",

@@ -348,6 +348,11 @@ impl Client {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .len();
+        let history_payload_ids = self
+            .history_payload_ids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len() as u64;
 
         // `get()`, not `get_group_cache()`: a report must not be what builds the
         // cache, so an un-warmed client still reports zero entries.
@@ -530,6 +535,7 @@ impl Client {
             sent_node_waiters: self.sent_node_waiter_count.load(Ordering::Relaxed),
             pending_retries: pending_retries_count,
             pending_lid_refreshes: pending_lid_refreshes_count,
+            history_payload_ids,
             presence_subscriptions,
             app_state_key_requests,
             app_state_key_cache,

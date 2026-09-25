@@ -196,7 +196,6 @@ impl HistoryPayloadRegistry {
         self.kinds.get(id).copied()
     }
 
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.kinds.len()
     }
