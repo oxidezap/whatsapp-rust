@@ -798,7 +798,6 @@ mod group_direct_tests {
                         message_history_bundle: buffa::MessageField::some(Default::default()),
                         ..Default::default()
                     }),
-                    ..Default::default()
                 }),
                 ..Default::default()
             },

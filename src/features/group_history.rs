@@ -1029,7 +1029,6 @@ mod tests {
                 conversation: Some("private nested text".repeat(4096)),
                 ..Default::default()
             }),
-            ..Default::default()
         });
         assert!(!is_shareable_history_text(&content));
         content.ephemeral_message = buffa::MessageField::none();
