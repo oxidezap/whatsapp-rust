@@ -16,7 +16,8 @@ use wacore::iq::mex_operations::{
     fetch_newsletter_followers, join_newsletter, leave_newsletter, update_newsletter,
     update_newsletter_user_setting,
 };
-use wacore::iq::newsletter::NEWSLETTER_XMLNS;
+use wacore::iq::newsletter::{MyAddOnsSpec, NEWSLETTER_XMLNS};
+pub use wacore::iq::newsletter::{NewsletterMyAddOns, NewsletterMyPollVote, NewsletterMyReaction};
 use wacore::request::InfoQuery;
 use wacore::types::message::{EditAttribute, PollType};
 use wacore_binary::Jid;
@@ -947,6 +948,33 @@ impl<'a> Newsletter<'a> {
             .await?;
         parse_newsletter_messages_response(response.get())
     }
+
+    /// Read this account's own reactions and poll votes on a newsletter's
+    /// recent messages.
+    ///
+    /// Only messages the account has an add-on on are returned, up to `limit`
+    /// of them. A response WA Web's parser would reject is
+    /// [`NewsletterError::InvalidRequest`] rather than a shorter list.
+    pub async fn get_my_addons(
+        &self,
+        jid: &Jid,
+        limit: u32,
+    ) -> Result<Vec<NewsletterMyAddOns>, NewsletterError> {
+        if !jid.is_newsletter() {
+            return Err(NewsletterError::InvalidRequest(
+                "get_my_addons is only valid for newsletter (channel) JIDs".into(),
+            ));
+        }
+        self.client
+            .execute(MyAddOnsSpec::new(jid, limit))
+            .await
+            .map_err(|err| match err {
+                // A malformed server response is `InvalidRequest` across
+                // `NewsletterError`, as the history parser reports it.
+                IqError::ParseError(err) => NewsletterError::InvalidRequest(err.to_string()),
+                other => other.into(),
+            })
+    }
 }
 
 /// The most `<vote>` children one vote may carry, from the
@@ -1703,6 +1731,101 @@ mod tests {
 
     fn newsletter_jid() -> Jid {
         "120363000000000001@newsletter".parse().expect("jid")
+    }
+
+    mod my_addons {
+        use super::*;
+
+        fn response_for(jid: &Jid, id: &str) -> wacore_binary::Node {
+            NodeBuilder::new("iq")
+                .attr("type", "result")
+                .attr("id", id)
+                .children([NodeBuilder::new("my_addons")
+                    .children([NodeBuilder::new("messages")
+                        .attr("jid", jid.clone())
+                        .children([NodeBuilder::new("message")
+                            .attr("server_id", 777u64)
+                            .children([NodeBuilder::new("votes").attr("t", 5u64).build()])
+                            .build()])
+                        .build()])
+                    .build()])
+                .build()
+        }
+
+        #[tokio::test]
+        async fn get_my_addons_sends_the_query_and_reads_the_answer() {
+            let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            let jid = newsletter_jid();
+
+            let request = {
+                let client = client.clone();
+                let jid = jid.clone();
+                tokio::spawn(async move { client.newsletter().get_my_addons(&jid, 20).await })
+            };
+
+            let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+            let sent = sent.get();
+            let my_addons = sent
+                .get_optional_child("my_addons")
+                .expect("my_addons query");
+            assert_eq!(my_addons.attrs().optional_jid("jid"), Some(jid.clone()));
+            let id = sent
+                .attrs()
+                .optional_string("id")
+                .expect("iq id")
+                .into_owned();
+
+            let response = response_for(&jid, &id);
+            crate::test_utils::answer_iq(&client, &id, &response).await;
+
+            let addons = request.await.expect("task").expect("answered");
+            assert_eq!(addons.len(), 1);
+            assert_eq!(addons[0].server_id, 777);
+        }
+
+        /// A malformed answer is `InvalidRequest`, the variant `NewsletterError`
+        /// files a bad server response under, not the IQ layer's parse error.
+        #[tokio::test]
+        async fn a_malformed_answer_is_an_invalid_request() {
+            let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            let jid = newsletter_jid();
+
+            let request = {
+                let client = client.clone();
+                let jid = jid.clone();
+                tokio::spawn(async move { client.newsletter().get_my_addons(&jid, 20).await })
+            };
+
+            let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+            let id = sent
+                .get()
+                .attrs()
+                .optional_string("id")
+                .expect("iq id")
+                .into_owned();
+            let without_my_addons = NodeBuilder::new("iq")
+                .attr("type", "result")
+                .attr("id", id.as_str())
+                .build();
+            crate::test_utils::answer_iq(&client, &id, &without_my_addons).await;
+
+            assert!(matches!(
+                request.await.expect("task"),
+                Err(NewsletterError::InvalidRequest(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn get_my_addons_refuses_a_non_newsletter_jid() {
+            let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            let group: Jid = "120363000000000002@g.us".parse().expect("jid");
+
+            assert!(matches!(
+                client.newsletter().get_my_addons(&group, 20).await,
+                Err(NewsletterError::InvalidRequest(_))
+            ));
+            assert_eq!(transport.sent_count(), 0);
+        }
     }
 
     /// The two halves of the history request are load-bearing in opposite
