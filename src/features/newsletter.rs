@@ -786,13 +786,10 @@ impl<'a> Newsletter<'a> {
 
     // ─── Live updates ───────────────────────────────────────────────────
 
-    /// Subscribe to live reaction-count updates for a newsletter.
+    /// Subscribe to live counter updates for a newsletter: reactions, forwards
+    /// and poll tallies per message, delivered as
+    /// [`wacore::types::events::Event::NewsletterLiveUpdate`].
     ///
-    /// The pinned and latest notif IR confirm the notification type and
-    /// handler, but do not expose structured `<live_updates>` fields. This API
-    /// therefore makes no claim about history counters or poll tallies in live
-    /// notifications until a sanitized capture or bundle evidence establishes
-    /// those children.
     /// Returns the subscription duration in seconds, after which it has to be
     /// renewed. The server sets this; 90 seconds is what it answered in a real
     /// session, and the 300 below is only the fallback for a response that
@@ -1262,9 +1259,8 @@ pub(crate) fn parse_reaction_counts(node: &NodeRef<'_>) -> Vec<NewsletterReactio
 ///
 /// Not gated on the message's `type`: history responses can carry `<votes>`
 /// on a poll envelope whose type is missing or is not yet known, so gating
-/// here would make the parser brittle as the wire grows. Live notifications
-/// are deliberately not parsed by this helper: their child shape is not
-/// established by the available notif IR evidence.
+/// here would make the parser brittle as the wire grows. Live updates carry
+/// `<votes>` in the same shape and are read by this helper too.
 ///
 /// A `<vote>` whose content is not a 32-byte digest is skipped rather than
 /// truncated or padded — the hash is the only handle on which option was
