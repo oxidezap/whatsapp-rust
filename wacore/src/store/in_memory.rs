@@ -1179,7 +1179,8 @@ impl MsgSecretStore for InMemoryBackend {
         // set from a `HashMap`, so the aliases it queued back to back reach the
         // store scattered. In place, so this costs no allocation on the one
         // path -- a history-sync seed -- that is ever long enough to reach it.
-        if stored > MAX_MSG_SECRETS / 4 {
+        // The gate matches the chunk size below.
+        if stored > MAX_MSG_SECRETS / 8 {
             entries.sort_unstable_by(|a, b| {
                 (a.chat.as_ref(), a.msg_id.as_ref()).cmp(&(b.chat.as_ref(), b.msg_id.as_ref()))
             });
@@ -1214,7 +1215,11 @@ impl MsgSecretStore for InMemoryBackend {
                 // reintroduced one level up. The sort above put a message's rows
                 // next to each other, so holding the chunk open while the next
                 // entry names the same message is enough.
-                let boundary_group = (inserted >= MAX_MSG_SECRETS / 4)
+                // Chunks are capped at a eighth of the cap: a quarter-cap burst
+                // inserted after `retain` shrank the table's headroom forces two
+                // doublings where trickling one row at a time forces one, so one
+                // oversized batch peaked at twice the trickled table.
+                let boundary_group = (inserted >= MAX_MSG_SECRETS / 8)
                     .then(|| (Arc::clone(&entry.chat), Arc::clone(&entry.msg_id)));
                 let key = MsgSecretKey {
                     chat: entry.chat,

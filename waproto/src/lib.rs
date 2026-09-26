@@ -222,6 +222,20 @@ pub mod codec {
         msg.encode_to_vec()
     }
 
+    /// Keep the GroupHistory protobuf encoder in this crate so its nested
+    /// WebMessageInfo encode tree is not instantiated by each caller.
+    #[inline(never)]
+    pub fn group_history_to_vec(history: &whatsapp::GroupHistory) -> Vec<u8> {
+        history.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn group_history_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::GroupHistory, buffa::DecodeError> {
+        whatsapp::GroupHistory::decode_from_slice(bytes)
+    }
+
     /// History-sync streaming decodes individual `HistorySyncMsg`/`Conversation`
     /// records; pinning them here keeps their nested `WebMessageInfo`/`Message`
     /// decode tree from being re-instantiated in the calling crate.

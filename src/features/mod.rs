@@ -11,8 +11,9 @@ mod community;
 mod contacts;
 mod events;
 pub(crate) mod favorites;
+mod group_history;
 mod groups;
-pub(crate) use groups::GroupMetadataRegistry;
+pub(crate) use groups::{GroupMetadataRegistry, group_history_audience_is_current};
 pub(crate) mod labels;
 mod media_reupload;
 pub mod message_edit;
@@ -72,15 +73,19 @@ pub use contacts::{
 
 pub use events::{EventCreationParams, EventResponseType, Events};
 
+pub(crate) use group_history::group_history_bundle_fits_current_limits;
+pub use group_history::{GroupHistoryRetryToken, GroupHistoryShareOutcome, GroupHistorySkipReason};
+
 pub use groups::{
     CreateGroupResult, GroupAppealStatus, GroupCreateOptions, GroupDescription,
-    GroupEphemeralSettings, GroupError, GroupHierarchy, GroupJoinError, GroupMessageReporter,
-    GroupMetadata, GroupMetadataResult, GroupOverview, GroupOverviewResult, GroupParticipant,
-    GroupParticipantDetails, GroupParticipantOptions, GroupPictureEntry, GroupProfilePicture,
-    GroupProfilePictureOutcome, GroupSubject, Groups, GrowthLockInfo, InviteInfoError,
-    JoinGroupResult, MemberAddMode, MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode,
-    MembershipRequest, ParticipantChangeResponse, ParticipantType, PictureType,
-    PreviousDescription, ReportedGroupMessage, ReportedGroupMessages, SubgroupKind,
+    GroupEphemeralSettings, GroupError, GroupHierarchy, GroupHistoryAddResult, GroupJoinError,
+    GroupMessageReporter, GroupMetadata, GroupMetadataResult, GroupOverview, GroupOverviewResult,
+    GroupParticipant, GroupParticipantDetails, GroupParticipantOptions, GroupPictureEntry,
+    GroupProfilePicture, GroupProfilePictureOutcome, GroupSubject, Groups, GrowthLockInfo,
+    HistorySharePreparation, InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode,
+    MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
+    ParticipantType, PictureType, PreparedGroupHistoryShare, PreviousDescription,
+    ReportedGroupMessage, ReportedGroupMessages, SubgroupKind,
 };
 
 pub use labels::Labels;

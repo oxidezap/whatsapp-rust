@@ -584,6 +584,10 @@ impl Client {
 
             pending_retries: Arc::new(std::sync::Mutex::new(HashSet::new())),
 
+            history_payload_ids: Arc::new(std::sync::Mutex::new(
+                crate::retry::HistoryPayloadRegistry::default(),
+            )),
+
             pending_lid_refreshes: Arc::new(std::sync::Mutex::new(HashSet::new())),
 
             message_retry_counts: cache_config.message_retry_counts.build_with_ttl(),

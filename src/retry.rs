@@ -62,6 +62,145 @@ fn is_own_account_jid(jid: &Jid, own_pn: Option<&Jid>, own_lid: Option<&Jid>) ->
         || own_lid.is_some_and(|lid| jid.is_same_user_as(lid))
 }
 
+#[cfg(test)]
+#[test]
+fn group_history_retry_audience_requires_opt_in_and_membership() {
+    let opted: Jid = "10001@s.whatsapp.net".parse().unwrap();
+    let other: Jid = "10002@s.whatsapp.net".parse().unwrap();
+    let own: Jid = "10003:1@s.whatsapp.net".parse().unwrap();
+    let peer: Jid = "10003:2@s.whatsapp.net".parse().unwrap();
+    let metadata = wa::message::MessageHistoryMetadata {
+        history_receivers: vec![opted.to_string()],
+        ..Default::default()
+    };
+    let mut group = wacore::client::context::GroupRoutingInfo::new(
+        vec![opted.clone(), other.clone(), own.to_non_ad()],
+        wacore::types::message::AddressingMode::Pn,
+    );
+    assert!(history_retry_recipient_allowed(
+        &metadata,
+        &opted,
+        &group,
+        Some(&own),
+        None
+    ));
+    assert!(!history_retry_recipient_allowed(
+        &metadata,
+        &other,
+        &group,
+        Some(&own),
+        None
+    ));
+    assert!(history_retry_recipient_allowed(
+        &metadata,
+        &peer,
+        &group,
+        Some(&own),
+        None
+    ));
+    assert!(!history_retry_recipient_allowed(
+        &metadata,
+        &own,
+        &group,
+        Some(&own),
+        None
+    ));
+    group.participants.clear();
+    assert!(!history_retry_recipient_allowed(
+        &metadata,
+        &opted,
+        &group,
+        Some(&own),
+        None
+    ));
+    assert!(history_retry_recipient_allowed(
+        &metadata,
+        &peer,
+        &group,
+        Some(&own),
+        None
+    ));
+}
+
+fn history_retry_recipient_allowed(
+    metadata: &wa::message::MessageHistoryMetadata,
+    requester: &Jid,
+    group: &wacore::client::context::GroupRoutingInfo,
+    own_pn: Option<&Jid>,
+    own_lid: Option<&Jid>,
+) -> bool {
+    let is_member = |jid: &Jid| {
+        group
+            .participants
+            .iter()
+            .any(|member| crate::send::same_group_user(member, jid, group))
+    };
+    // The sender's membership is verified from full metadata by the current
+    // policy gate; the routing participant list may omit the sender itself.
+    if requester.is_hosted()
+        || (!is_member(requester) && !is_own_account_jid(requester, own_pn, own_lid))
+    {
+        return false;
+    }
+    if is_own_account_jid(requester, own_pn, own_lid) {
+        return !own_pn
+            .into_iter()
+            .chain(own_lid)
+            .any(|own| requester.is_same_user_as(own) && requester.device == own.device);
+    }
+    metadata.history_receivers.iter().any(|receiver| {
+        receiver
+            .parse::<Jid>()
+            .is_ok_and(|receiver| crate::send::same_group_user(&receiver, requester, group))
+    })
+}
+
+/// Minimal classification of a sent history payload by its stanza message
+/// ID, so retry handling can tell pairwise bundles from sender-key traffic
+/// without the cached message bytes. A history bundle is pairwise
+/// encrypted and must never trigger sender-key repair; a history notice
+/// travels the normal group sender-key path and keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryPayloadKind {
+    Bundle,
+    Notice,
+}
+
+/// Bounded registry of sent history message IDs. Entries are small
+/// (one ID plus a tag each) and history shares are rare, so a fixed cap
+/// with oldest-first eviction bounds memory without new cache plumbing.
+/// A missing entry fails closed toward the ordinary path: the retry is
+/// treated as a normal sender-key message, which is the safe direction
+/// for an unknown payload.
+#[derive(Debug, Default)]
+pub(crate) struct HistoryPayloadRegistry {
+    kinds: std::collections::HashMap<String, HistoryPayloadKind>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl HistoryPayloadRegistry {
+    pub(crate) const CAPACITY: usize = 1024;
+
+    pub(crate) fn insert(&mut self, id: String, kind: HistoryPayloadKind) {
+        if self.kinds.insert(id.clone(), kind).is_none() {
+            self.order.push_back(id);
+            while self.order.len() > Self::CAPACITY {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.kinds.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn kind_of(&self, id: &str) -> Option<HistoryPayloadKind> {
+        self.kinds.get(id).copied()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.kinds.len()
+    }
+}
+
 pub(crate) struct PreparedRetransmission {
     pub(crate) route: RetransmissionRoute,
     pub(crate) chat: Jid,
@@ -298,6 +437,19 @@ fn build_retry_processing_key(chat: &Jid, message_id: &str, participant_jid: &Ji
 }
 
 impl Client {
+    pub(crate) fn history_payload_kind(&self, message_id: &str) -> Option<HistoryPayloadKind> {
+        self.history_payload_ids
+            .lock()
+            .ok()
+            .and_then(|registry| registry.kind_of(message_id))
+    }
+
+    pub(crate) fn note_history_payload(&self, message_id: String, kind: HistoryPayloadKind) {
+        if let Ok(mut registry) = self.history_payload_ids.lock() {
+            registry.insert(message_id, kind);
+        }
+    }
+
     async fn resolve_retransmission_encryption_jid(
         &self,
         route: RetransmissionRoute,
@@ -383,7 +535,7 @@ impl Client {
             .resolve_retransmission_encryption_jid(route, &request.requester)
             .await
             .map_err(SendError::from_anyhow)?;
-        if route.uses_sender_key() {
+        if route.uses_sender_key() && request.message.message_history_bundle.is_unset() {
             let chat_key = request.chat.to_string();
             self.mark_forget_sender_key(&chat_key, std::slice::from_ref(&encryption_jid))
                 .await
@@ -574,12 +726,9 @@ impl Client {
             return Ok(());
         }
 
-        // Direct is the only route the lookup can still re-address, through the
-        // alternate PN/LID rewrite below. Every other route's encryption JID is
-        // settled here, so its repair need not wait for a message that may be
-        // gone: a send marks its whole distribution list warm, so the cold mark
-        // is the only way back, and the receipt's own bundle is the only
-        // recovery for a device the server has no prekeys for.
+        // Direct is the only route the lookup can still re-address. Install
+        // the retry keys here, but defer sender-key repair until after reading
+        // the cached message: history bundles were sent pairwise.
         let settled_jid = if matches!(route, RetransmissionRoute::Direct) {
             None
         } else {
@@ -591,14 +740,6 @@ impl Client {
                 .await
             {
                 return Ok(());
-            }
-            // The cold mark goes last, and under the distribution guard, so a
-            // device is only ever published as cold once its session can carry
-            // the SKDM. A send that took the guard first sees it still warm and
-            // skips it, rather than distributing to a device it cannot encrypt
-            // for and marking the whole list warm again on the way out.
-            if uses_sender_key {
-                self.mark_requester_for_fresh_skdm(&info, &jid).await;
             }
             Some(jid)
         };
@@ -618,6 +759,18 @@ impl Client {
                     result
                 }
                 None => {
+                    // The cache cannot say whether this ID was a pairwise
+                    // history bundle, so consult the ID registry: bundles
+                    // must never trigger sender-key repair, while unknown
+                    // IDs fail closed toward the ordinary repair path.
+                    let is_history_bundle =
+                        self.history_payload_kind(&message_id) == Some(HistoryPayloadKind::Bundle);
+                    if !is_history_bundle
+                        && uses_sender_key
+                        && let Some(jid) = settled_jid.as_ref()
+                    {
+                        self.mark_requester_for_fresh_skdm(&info, jid).await;
+                    }
                     log::debug!(
                         "Ignoring retry for message {message_id}: already handled or not found in cache."
                     );
@@ -651,6 +804,12 @@ impl Client {
                 .await?
         };
 
+        let is_history_bundle = !original_msg.message_history_bundle.is_unset();
+        if uses_sender_key && !is_history_bundle {
+            self.mark_requester_for_fresh_skdm(&info, &resolved_jid)
+                .await;
+        }
+
         // Fetch group info (cache-first, server on miss) — used for SKDM rotation + addressing_mode.
         // Without this, a cold cache would silently default to PN semantics for LID groups.
         let cached_group_info = if info.chat.is_group() {
@@ -673,7 +832,10 @@ impl Client {
         // force full sender key rotation by clearing all sender key device tracking.
         // This is separate from updateLocalSignalSession and specific to group retries.
         let mut rotated_sender_key = false;
-        if matches!(route, RetransmissionRoute::Group) && !info.requester.is_lid() {
+        if matches!(route, RetransmissionRoute::Group)
+            && !is_history_bundle
+            && !info.requester.is_lid()
+        {
             let group_jid = info.chat.to_string();
             let is_known_participant = cached_group_info
                 .as_ref()
@@ -841,9 +1003,89 @@ impl Client {
             message_id,
             retry_count,
             recipient,
-            group_info,
+            mut group_info,
             pre_encoded,
         } = request;
+        let history = !message.message_history_bundle.is_unset()
+            || !message.message_history_notice.is_unset();
+        let history_recipients = history.then(|| (wire_requester.clone(), encryption_jid.clone()));
+        let history_generation = self
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        if history {
+            if !matches!(route, RetransmissionRoute::Group) || !chat.is_group() {
+                anyhow::bail!("history retransmission requires its group route");
+            }
+            let groups = self.groups();
+            let (_, current_limits) =
+                groups
+                    .group_history_context(&chat)
+                    .await
+                    .map_err(|reason| {
+                        anyhow::anyhow!(
+                            "group history retransmission is no longer authorized: {reason:?}"
+                        )
+                    })?;
+            if !message.message_history_bundle.is_unset()
+                && !crate::features::group_history_bundle_fits_current_limits(
+                    &message,
+                    current_limits,
+                    wacore::time::now_secs().max(0) as u64,
+                )
+            {
+                anyhow::bail!(
+                    "group history bundle no longer fits current count and time-window limits"
+                );
+            }
+            let current_group = groups
+                .routing_info_with_freshness(&chat, crate::cache::Freshness::Refresh)
+                .await?;
+            group_info = Some(Arc::clone(&current_group));
+            let own = self.persistence_manager.get_device_snapshot();
+            let bundle = message
+                .message_history_bundle
+                .as_option()
+                .map(|bundle| bundle.message_history_metadata.as_option());
+            let notice = message
+                .message_history_notice
+                .as_option()
+                .map(|notice| notice.message_history_metadata.as_option());
+            if let Some(metadata) = bundle {
+                let Some(metadata) = metadata else {
+                    anyhow::bail!("history retransmission lacks audience metadata");
+                };
+                if !history_retry_recipient_allowed(
+                    metadata,
+                    &wire_requester,
+                    &current_group,
+                    own.pn.as_ref(),
+                    own.lid.as_ref(),
+                ) || !history_retry_recipient_allowed(
+                    metadata,
+                    &encryption_jid,
+                    &current_group,
+                    own.pn.as_ref(),
+                    own.lid.as_ref(),
+                ) {
+                    anyhow::bail!(
+                        "history retransmission requester is outside the authorized audience"
+                    );
+                }
+            }
+            if let Some(metadata) = notice
+                && (metadata.is_none()
+                    || ![&wire_requester, &encryption_jid]
+                        .into_iter()
+                        .all(|requester| {
+                            current_group.participants.iter().any(|member| {
+                                crate::send::same_group_user(member, requester, &current_group)
+                            })
+                        }))
+            {
+                anyhow::bail!("history notice retransmission requires current group members");
+            }
+        }
 
         if matches!(route, RetransmissionRoute::Status) {
             return self
@@ -879,14 +1121,14 @@ impl Client {
                     .map(|info| info.addressing_mode)
                     .unwrap_or_default();
                 wacore::send::PairwiseRetryDestination::Participant {
-                    to: chat,
+                    to: chat.clone(),
                     participant: wire_requester,
                     addressing_mode: Some(addressing_mode),
                 }
             }
             RetransmissionRoute::BroadcastList => {
                 wacore::send::PairwiseRetryDestination::Participant {
-                    to: chat,
+                    to: chat.clone(),
                     participant: wire_requester,
                     addressing_mode: None,
                 }
@@ -912,6 +1154,45 @@ impl Client {
         // Persistence may need the processing permit, whose holder may in turn
         // need this session lock. Release it before the durability gate.
         drop(session_guard);
+        if history {
+            self.persist_signal_state_pre_wire().await?;
+            let groups = self.groups();
+            let (metadata, current_limits) =
+                groups
+                    .group_history_context(&chat)
+                    .await
+                    .map_err(|reason| {
+                        anyhow::anyhow!("history retransmission policy changed: {reason:?}")
+                    })?;
+            if !history_recipients
+                .as_ref()
+                .is_some_and(|(wire, encryption)| {
+                    crate::features::group_history_audience_is_current(
+                        &metadata.participants,
+                        &[wire.clone(), encryption.clone()],
+                    )
+                })
+            {
+                anyhow::bail!("history retransmission recipient left the group");
+            }
+            if !message.message_history_bundle.is_unset()
+                && !crate::features::group_history_bundle_fits_current_limits(
+                    &message,
+                    current_limits,
+                    wacore::time::now_secs_u64(),
+                )
+            {
+                anyhow::bail!("history bundle expired before retransmission");
+            }
+            if self
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != history_generation
+            {
+                anyhow::bail!("connection changed while preparing history retransmission");
+            }
+            return self.send_node(stanza).await.map_err(Into::into);
+        }
         self.send_retry_stanza(stanza).await
     }
 
@@ -3168,14 +3449,26 @@ mod tests {
         }
     }
 
-    /// A send marks its whole distribution list warm, so a device whose SKDM
-    /// never encrypted is only ever repaired by this cold mark. Gate the mark
-    /// behind the recent-message lookup and an expired message (default TTL is
-    /// two hours) makes the warm mark absorbing: no future send distributes to
-    /// the device, and no later retry can undo it either.
     #[tokio::test]
-    async fn group_retry_un_warms_the_device_even_without_the_cached_message() {
-        for cached in [true, false] {
+    async fn group_retry_repairs_sender_key_only_for_cached_sender_key_messages() {
+        for (message, stays_warm) in [
+            (None, false),
+            (Some(hello()), false),
+            (
+                Some(wa::Message {
+                    message_history_bundle: Some(Default::default()).into(),
+                    ..Default::default()
+                }),
+                true,
+            ),
+            (
+                Some(wa::Message {
+                    message_history_notice: Some(Default::default()).into(),
+                    ..Default::default()
+                }),
+                false,
+            ),
+        ] {
             let client = retry_repair_client("retry_repair_cache_miss").await;
             let group: Jid = "120363021033254951@g.us".parse().unwrap();
             let group_key = group.to_string();
@@ -3187,9 +3480,9 @@ mod tests {
                 .set_sender_key_status(&group_key, &[(participant, true)])
                 .await
                 .unwrap();
-            if cached {
+            if let Some(message) = message {
                 client
-                    .add_recent_message(&group, msg_id, &hello(), None)
+                    .add_recent_message(&group, msg_id, &message, None)
                     .await;
             }
 
@@ -3201,17 +3494,72 @@ mod tests {
                     .get_sender_key_devices(&group_key)
                     .await
                     .unwrap(),
-                vec![(participant.to_string(), false)],
-                "cached={cached}: the retrying device must end up keyless either way"
+                vec![(participant.to_string(), stays_warm)],
+                "a missing or sender-key message must mark the device cold"
             );
         }
     }
 
-    /// The symptom the report describes: every message from the bot stuck on
-    /// "waiting for this message" for one member, across restarts. Repairing on a
-    /// cache miss is what puts the device back in the next send's SKDM set.
+    #[test]
+    fn history_payload_registry_borrows_nothing_and_evicts_oldest_first() {
+        let mut registry = HistoryPayloadRegistry::default();
+        assert_eq!(registry.kind_of("unknown"), None);
+        registry.insert("bundle-1".into(), HistoryPayloadKind::Bundle);
+        registry.insert("notice-1".into(), HistoryPayloadKind::Notice);
+        assert_eq!(
+            registry.kind_of("bundle-1"),
+            Some(HistoryPayloadKind::Bundle)
+        );
+        assert_eq!(
+            registry.kind_of("notice-1"),
+            Some(HistoryPayloadKind::Notice)
+        );
+        for index in 0..HistoryPayloadRegistry::CAPACITY {
+            registry.insert(format!("filler-{index}"), HistoryPayloadKind::Notice);
+        }
+        assert_eq!(registry.len(), HistoryPayloadRegistry::CAPACITY);
+        assert_eq!(registry.kind_of("bundle-1"), None);
+        assert_eq!(registry.kind_of("notice-1"), None);
+    }
+
     #[tokio::test]
-    async fn repaired_device_returns_to_the_skdm_target_set_after_a_cache_miss() {
+    async fn group_retry_cache_miss_skips_repair_for_known_history_bundles() {
+        for (kind, stays_warm) in [
+            (Some(HistoryPayloadKind::Bundle), true),
+            (Some(HistoryPayloadKind::Notice), false),
+            (None, false),
+        ] {
+            let client = retry_repair_client("retry_repair_history_miss").await;
+            let group: Jid = "120363021033254952@g.us".parse().unwrap();
+            let group_key = group.to_string();
+            let participant = "555000222@lid";
+            let msg_id = "HISTORYMISS001";
+
+            client
+                .persistence_manager
+                .set_sender_key_status(&group_key, &[(participant, true)])
+                .await
+                .unwrap();
+            if let Some(kind) = kind {
+                client.note_history_payload(msg_id.into(), kind);
+            }
+
+            drive_group_retry(&client, &group, participant, msg_id, false).await;
+
+            assert_eq!(
+                client
+                    .persistence_manager
+                    .get_sender_key_devices(&group_key)
+                    .await
+                    .unwrap(),
+                vec![(participant.to_string(), stays_warm)],
+                "cache miss with {kind:?} must skip sender-key repair only for bundles"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repaired_device_returns_to_the_skdm_target_set_after_a_cached_retry() {
         use crate::sender_key_device_cache::SenderKeyDeviceMap;
 
         let client = retry_repair_client("retry_repair_skdm_targets").await;
@@ -3240,7 +3588,9 @@ mod tests {
             "a warm device is excluded from SKDM, which is what makes a missed repair absorbing"
         );
 
-        // No add_recent_message: the retry arrives after the message expired.
+        client
+            .add_recent_message(&group, "SKDMTARGET001", &hello(), None)
+            .await;
         drive_group_retry(&client, &group, participant, "SKDMTARGET001", false).await;
 
         let repaired = SenderKeyDeviceMap::from_db_rows(
@@ -3267,6 +3617,10 @@ mod tests {
         let group: Jid = "120363021033254954@g.us".parse().unwrap();
         let group_key = group.to_string();
         let participant = "555000555@lid";
+
+        client
+            .add_recent_message(&group, "LOCKED001", &hello(), None)
+            .await;
 
         client
             .persistence_manager
@@ -3534,6 +3888,10 @@ mod tests {
         let group: Jid = "120363021033254961@g.us".parse().unwrap();
         let group_key = group.to_string();
         let participant: Jid = "555003333@lid".parse().unwrap();
+
+        client
+            .add_recent_message(&group, "MARKORDER001", &hello(), None)
+            .await;
 
         client
             .persistence_manager

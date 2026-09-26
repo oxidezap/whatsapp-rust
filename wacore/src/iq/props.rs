@@ -86,6 +86,9 @@ pub const WATCHED: &[abprops::AbProp] = &[
     abprops::web::SNAPSHOT_RECOVERY_MAX_MUTATIONS_COUNT_ALLOWED,
     abprops::web::USERNAME_CONTACT_DISPLAY,
     abprops::web::ENABLE_CALLING_PHONE_NUMBER_PRIVACY,
+    abprops::web::GROUP_HISTORY_MESSAGE_COUNT_LIMIT,
+    abprops::web::GROUP_HISTORY_MESSAGES_TIME_LIMIT_SECS,
+    abprops::web::GROUP_HISTORY_SEND,
     stale::PRIVACY_TOKEN_ONLY_CHECK_LID,
     stale::PROFILE_PIC_PRIVACY_TOKEN,
 ];
@@ -478,9 +481,164 @@ impl IqSpec for PropsSpec {
     }
 }
 
+/// Full group-scoped AB-property response. Unlike account props, these are
+/// keyed by a group JID and need a separate `abt` request per group.
+#[derive(Debug, Clone, Default)]
+pub struct GroupPropsResponse {
+    /// Present when the server returned a versioned group configuration set.
+    pub hash: Option<String>,
+    /// Experiment values only; sampling configurations do not gate features.
+    pub experiment_props: Vec<(u32, CompactString)>,
+}
+
+/// Fetch one group's full AB-property set without a request-side hash.
+/// The response hash lets callers verify that the server returned a versioned
+/// configuration rather than treating an unavailable configuration as defaults.
+#[derive(Debug, Clone)]
+pub struct GroupPropsSpec {
+    group: Jid,
+}
+
+impl GroupPropsSpec {
+    pub fn new(group: &Jid) -> Self {
+        Self {
+            group: group.clone(),
+        }
+    }
+}
+
+impl IqSpec for GroupPropsSpec {
+    type Response = GroupPropsResponse;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        let props = NodeBuilder::new("props").attr("group", &self.group);
+        InfoQuery::get(
+            PROPS_NAMESPACE,
+            Jid::new("", Server::Pn),
+            Some(NodeContent::Nodes(vec![props.build()])),
+        )
+    }
+
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+        use crate::iq::node::{optional_attr, required_child};
+
+        let props = required_child(response, "props")?;
+        let mut parsed = GroupPropsResponse {
+            hash: optional_attr(props, "hash").map(|value| value.into_owned()),
+            experiment_props: Vec::new(),
+        };
+        let mut values = std::collections::HashMap::new();
+        for child in props.get_children_by_tag("prop") {
+            let code = optional_attr(child, "config_code");
+            let value = optional_attr(child, "config_value");
+            let (code, value) = match (code, value) {
+                (None, None) => continue,
+                (Some(code), Some(value)) => (code.parse::<u32>()?, value),
+                _ => anyhow::bail!("incomplete group experiment property"),
+            };
+            anyhow::ensure!(code > 0, "invalid group experiment code");
+            let value = CompactString::from(value.as_ref());
+            if let Some(previous) = values.insert(code, value.clone()) {
+                anyhow::ensure!(previous == value, "conflicting group experiment values");
+            } else {
+                parsed.experiment_props.push((code, value));
+            }
+        }
+        Ok(parsed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_props_request_uses_group_and_optional_hash_attributes() {
+        let group = Jid::new("120363000000000001", Server::Group);
+        let group_string = group.to_string();
+        let spec = GroupPropsSpec::new(&group);
+        let iq = spec.build_iq();
+        assert_eq!(iq.namespace, PROPS_NAMESPACE);
+        assert_eq!(iq.query_type, crate::request::InfoQueryType::Get);
+
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected <props> child");
+        };
+        assert!(
+            nodes[0]
+                .attrs
+                .get("group")
+                .is_some_and(|value| value == group_string.as_str())
+        );
+        assert!(nodes[0].attrs.get("hash").is_none());
+    }
+
+    #[test]
+    fn group_props_response_keeps_experiments_and_ignores_sampling() {
+        let spec = GroupPropsSpec::new(&Jid::new("120363000000000001", Server::Group));
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("props")
+                .attr("hash", "group-hash")
+                .children([
+                    NodeBuilder::new("prop")
+                        .attr("config_code", 23245)
+                        .attr("config_value", "1")
+                        .build(),
+                    NodeBuilder::new("prop")
+                        .attr("event_code", 5138)
+                        .attr("sampling_weight", -1)
+                        .build(),
+                ])
+                .build()])
+            .build();
+
+        let result = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(result.hash.as_deref(), Some("group-hash"));
+        assert_eq!(result.experiment_props.len(), 1);
+        assert_eq!(result.experiment_props[0].0, 23245);
+        assert_eq!(result.experiment_props[0].1.as_str(), "1");
+    }
+
+    #[test]
+    fn group_props_rejects_malformed_experiments() {
+        let spec = GroupPropsSpec::new(&Jid::new("120363000000000001", Server::Group));
+        for (code, value) in [
+            (Some("26270"), None),
+            (None, Some("1")),
+            (Some("invalid"), Some("1")),
+            (Some("0"), Some("1")),
+        ] {
+            let mut prop = NodeBuilder::new("prop");
+            if let Some(code) = code {
+                prop = prop.attr("config_code", code);
+            }
+            if let Some(value) = value {
+                prop = prop.attr("config_value", value);
+            }
+            let response = NodeBuilder::new("iq")
+                .children([NodeBuilder::new("props")
+                    .attr("hash", "synthetic")
+                    .children([prop.build()])
+                    .build()])
+                .build();
+            assert!(spec.parse_response(&response.as_node_ref()).is_err());
+        }
+        for (second_value, valid) in [("1", true), ("0", false)] {
+            let response = NodeBuilder::new("iq")
+                .children([NodeBuilder::new("props")
+                    .attr("hash", "synthetic")
+                    .children(["1", second_value].map(|value| {
+                        NodeBuilder::new("prop")
+                            .attr("config_code", "26270")
+                            .attr("config_value", value)
+                            .build()
+                    }))
+                    .build()])
+                .build();
+            assert_eq!(spec.parse_response(&response.as_node_ref()).is_ok(), valid);
+        }
+    }
 
     #[test]
     fn test_props_spec_build_iq_no_params() {

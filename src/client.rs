@@ -566,6 +566,11 @@ pub struct MemoryReport {
     /// number of distinct peers acked at once; a value that stays high
     /// means refreshes are not completing, not that many were requested.
     pub pending_lid_refreshes: usize,
+    /// Sent group-history message IDs by payload kind. Capped at 1024
+    /// short-ID entries, so a value pinned at the cap means steady history
+    /// traffic, not a leak; ID bytes are bounded by the cap and need no
+    /// byte counter.
+    pub history_payload_ids: u64,
     pub presence_subscriptions: usize,
     pub app_state_key_requests: usize,
     /// Expanded app-state keys the processor holds in memory. No capacity cap
@@ -849,6 +854,7 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "  node_waiters:           {}", self.node_waiters)?;
         writeln!(f, "  sent_node_waiters:      {}", self.sent_node_waiters)?;
         writeln!(f, "  pending_retries:        {}", self.pending_retries)?;
+        writeln!(f, "  history_payload_ids:    {}", self.history_payload_ids)?;
         writeln!(
             f,
             "  pending_lid_refreshes:  {}",
@@ -1673,6 +1679,12 @@ pub struct Client {
     pub(crate) fail_next_device_list_write: AtomicBool,
 
     pub(crate) pending_retries: Arc<std::sync::Mutex<HashSet<String>>>,
+
+    /// Message IDs of sent group-history bundles and notices with their
+    /// payload kind (see [`crate::retry::HistoryPayloadRegistry`}). Lets
+    /// retry handling skip sender-key repair for pairwise bundles even on
+    /// a recent-message cache miss, without loading message contents.
+    pub(crate) history_payload_ids: Arc<std::sync::Mutex<crate::retry::HistoryPayloadRegistry>>,
 
     /// Identities with a `refresh_lid` re-resolve in flight, keyed by
     /// `(connection_generation, PN-side JID)`. A burst of sends to one stale

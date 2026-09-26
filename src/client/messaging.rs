@@ -372,10 +372,10 @@ impl Client {
     /// Sync: registration is just a `std::sync::Mutex` insert (no await).
     /// Register a waiter that receives the ack node itself.
     ///
-    /// Used where the caller needs the response: the VoIP offer reads the relay
-    /// out of its ack. A phash check does not, which is why that path uses
-    /// [`Self::register_phash_waiter`] and pays no channel per message. Gated on
-    /// the only consumer's feature, or it is dead code in a default build.
+    /// VoIP reads the relay from its ACK. Group-history uses the guarded,
+    /// non-replacing variant below so concurrent retries cannot steal waiters.
+    /// A phash check does not need the node, which is why ordinary sends use
+    /// [`Self::register_phash_waiter`].
     #[cfg(feature = "voip-control")]
     pub(crate) fn register_ack_waiter(
         &self,
@@ -385,6 +385,23 @@ impl Client {
         self.response_waiters_guard()
             .insert(message_id.to_string(), ResponseWaiter::Iq(tx));
         rx
+    }
+
+    /// Register an ACK waiter only if this message ID is not already pending.
+    /// Returns the entry generation so timeout cleanup cannot remove a newer
+    /// waiter that reuses the same ID after this one was consumed.
+    pub(crate) fn try_register_ack_waiter(
+        &self,
+        message_id: &str,
+    ) -> Option<(
+        futures::channel::oneshot::Receiver<Arc<wacore_binary::OwnedNodeRef>>,
+        NonZeroU64,
+    )> {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let generation = self
+            .response_waiters_guard()
+            .try_insert_guarded(message_id.to_string(), ResponseWaiter::Iq(tx))?;
+        Some((rx, generation))
     }
 
     /// Register the phash the server is expected to echo for this send.

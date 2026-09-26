@@ -3698,7 +3698,8 @@ fn client_size_pins_runtime_cache_config_saving() {
     // move trips the assert.
     let mut expected = 4312
         + size_of::<subsystem::Subsystems>()
-        + size_of::<crate::handlers::call::pending_offers::PendingOffers>();
+        + size_of::<crate::handlers::call::pending_offers::PendingOffers>()
+        + size_of::<Arc<std::sync::Mutex<crate::retry::HistoryPayloadRegistry>>>();
     if cfg!(feature = "client-lifecycle") {
         expected += size_of::<std::sync::Mutex<()>>() + size_of::<Option<Arc<()>>>();
     }

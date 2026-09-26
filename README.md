@@ -13,7 +13,11 @@ A high-performance, async Rust library for the WhatsApp Web API. Inspired by [wh
 - **Media** — Upload/download images, videos, documents, GIFs, audio with automatic encryption
 - **Voice calls** — 1:1 VoIP audio calls with built-in MLOW or external encoded Opus/MLOW; see the
   [codec boundary and production profiles](agent_docs/voip_audio_codecs.md)
-- **Groups & Communities** — Create, manage, invite, membership approval, subgroup linking
+- **Groups & Communities** — Create, manage, invite, membership approval, subgroup linking,
+  and opt-in, acknowledged plain-text history on direct member additions.
+  Pinned history and media are not supported; this is a subset of
+  [#1549](https://github.com/oxidezap/whatsapp-rust/issues/1549). See
+  [`Groups::add_participants_with_history`](src/features/groups.rs) for the API contract.
 - **Newsletters** — Create, join, send messages, reactions
 - **Status** — Text, image, and video status posts with privacy controls
 - **Contacts** — Phone number lookup, profile pictures, user info, business profiles

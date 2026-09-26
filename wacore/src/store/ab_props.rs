@@ -63,6 +63,46 @@ impl AbPropsSnapshot {
             })
             .unwrap_or(matches!(prop.default, AbDefault::Bool(true)))
     }
+
+    /// Read a boolean from this same configuration snapshot, preserving the
+    /// registry default when the server omitted the property. Invalid server
+    /// values stay unknown so privacy-sensitive callers can fail closed.
+    pub fn get_bool(&self, prop: AbProp) -> Option<bool> {
+        match self.props.get(&prop.code) {
+            Some(value)
+                if value == "1"
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("enabled") =>
+            {
+                Some(true)
+            }
+            Some(value)
+                if value == "0"
+                    || value.eq_ignore_ascii_case("false")
+                    || value.eq_ignore_ascii_case("disabled") =>
+            {
+                Some(false)
+            }
+            Some(_) => None,
+            None => match prop.default {
+                AbDefault::Bool(value) => Some(value),
+                _ => None,
+            },
+        }
+    }
+
+    /// Read an integer from this same configuration snapshot, preserving the
+    /// registry default when the server omitted the property. Invalid server
+    /// values stay unknown so privacy-sensitive callers can fail closed.
+    pub fn get_int(&self, prop: AbProp) -> Option<i64> {
+        match self.props.get(&prop.code) {
+            Some(value) => value.parse().ok(),
+            None => match prop.default {
+                AbDefault::Int(value) => Some(value),
+                _ => None,
+            },
+        }
+    }
 }
 
 impl AbPropsCache {
