@@ -1022,65 +1022,10 @@ pub enum RevokeType {
 /// `polltype=vote` meta; an event edit sets both `event_type=edit` meta and
 /// `edit="1"` attribute).
 pub(crate) fn infer_stanza_metadata(msg: &wa::Message) -> (Option<EditAttribute>, Option<Node>) {
-    use wacore::proto_helpers::MessageExt;
-    let edit = EditAttribute::infer_from_message(msg);
-
-    // genMetaNode builds a single <meta> carrying every applicable attr together,
-    // so accumulate onto one node instead of emitting at most one attr.
-    let mut meta = NodeBuilder::new("meta");
-    let mut has_attr = false;
-
-    if msg.poll_creation_message.is_set()
-        || msg.poll_creation_message_v2.is_set()
-        || msg.poll_creation_message_v3.is_set()
-    {
-        meta = meta.attr("polltype", "creation");
-        has_attr = true;
-    } else if let Some(poll_update) = msg.poll_update_message.as_option()
-        && poll_update.vote.is_set()
-    {
-        meta = meta.attr("polltype", "vote");
-        has_attr = true;
-        // TODO: polltype="result_snapshot" for poll_result_snapshot_message (gated behind AB flag)
-    } else if msg.event_message.is_set() {
-        meta = meta.attr("event_type", "creation");
-        has_attr = true;
-    } else if msg.enc_event_response_message.is_set() {
-        meta = meta.attr("event_type", "response");
-        has_attr = true;
-    } else if let Some(sec) = msg.secret_encrypted_message.as_option()
-        && sec.secret_enc_type
-            == Some(wa::message::secret_encrypted_message::SecretEncType::EventEdit)
-    {
-        meta = meta.attr("event_type", "edit");
-        has_attr = true;
-    } else if let Some(ml) = msg
-        .protocol_message
-        .as_option()
-        .and_then(|pm| pm.member_label.as_option())
-    {
-        // genMetaNode (MsgMetaNode `d`/`p`): a member_label protocol message carries
-        // appdata="member_tag" and tag_reason="user_delete" when the label is cleared
-        // (empty/absent), "user_update" otherwise.
-        let tag_reason = if ml.label.as_deref().unwrap_or("").is_empty() {
-            "user_delete"
-        } else {
-            "user_update"
-        };
-        meta = meta
-            .attr("appdata", "member_tag")
-            .attr("tag_reason", tag_reason);
-        has_attr = true;
-    }
-
-    // genMetaNode: `view_once="true"` whenever the media is view-once (wrapper or
-    // inline flag). Detection covers both via MessageExt::is_view_once.
-    if msg.is_view_once() {
-        meta = meta.attr("view_once", "true");
-        has_attr = true;
-    }
-
-    (edit, has_attr.then(|| meta.build()))
+    (
+        EditAttribute::infer_from_message(msg),
+        wacore::send::message_meta_from_message(msg),
+    )
 }
 
 fn validate_status_message_id(
@@ -4760,6 +4705,142 @@ mod tests {
         /// measured in.
         fn frame_len(&self, index: usize) -> usize {
             self.transport.sent()[index].len()
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_group_and_retry_preserve_content_meta_without_copying_user_nodes() {
+        for fixture in [
+            GroupSendFixture::new().await,
+            GroupSendFixture::new_lid(2).await,
+        ] {
+            let message = wa::Message {
+                view_once_message_v2_extension: Some(wa::message::FutureProofMessage {
+                    message: Some(wa::Message {
+                        audio_message: Some(wa::message::AudioMessage {
+                            ptt: Some(true),
+                            view_once: Some(true),
+                            ..Default::default()
+                        })
+                        .into(),
+                        ..Default::default()
+                    })
+                    .into(),
+                })
+                .into(),
+                ..Default::default()
+            };
+            let id = "GROUP_VIEW_ONCE_META";
+            fixture
+                .client
+                .send_message_with_options(
+                    fixture.group.clone(),
+                    message.clone(),
+                    SendOptions::default()
+                        .with_message_id(id)
+                        .with_extra_stanza_nodes(vec![
+                            NodeBuilder::new("meta").attr("origin", "synthetic").build(),
+                        ]),
+                )
+                .await
+                .unwrap();
+            let normal = fixture.stanza(0).await;
+            let normal = normal.get();
+            assert_eq!(
+                normal.get_children_by_tag("meta").count(),
+                2,
+                "legitimate extra meta is not deduplicated"
+            );
+            assert_eq!(
+                normal
+                    .get_optional_child("meta")
+                    .unwrap()
+                    .attrs()
+                    .required_string("view_once")
+                    .unwrap(),
+                "true"
+            );
+            assert_eq!(
+                normal
+                    .get_optional_child("enc")
+                    .unwrap()
+                    .attrs()
+                    .required_string("mediatype")
+                    .unwrap(),
+                "ptt"
+            );
+            assert_eq!(
+                normal
+                    .get_optional_child("enc")
+                    .unwrap()
+                    .attrs()
+                    .required_string("type")
+                    .unwrap(),
+                "skmsg"
+            );
+
+            // Exercise the public API, then the automatic receipt path against
+            // the same cached semantic content and group addressing mode.
+            fixture
+                .client
+                .retransmit_message(crate::features::MessageRetransmission::new(
+                    fixture.group.clone(),
+                    fixture.member.clone(),
+                    message.clone(),
+                    id.into(),
+                    1,
+                ))
+                .await
+                .unwrap();
+            let receipt = wacore::types::events::Receipt::builder()
+                .source(crate::types::message::MessageSource {
+                    chat: fixture.group.clone(),
+                    sender: fixture.member.clone(),
+                    is_group: true,
+                    ..Default::default()
+                })
+                .message_ids(vec![id.into()])
+                .timestamp(wacore::time::now_utc())
+                .r#type(wacore::types::presence::ReceiptType::Retry)
+                .offline(false)
+                .build();
+            let node = NodeBuilder::new("receipt")
+                .attr("participant", &fixture.member)
+                .children([NodeBuilder::new("retry")
+                    .attr("id", id)
+                    .attr("count", "1")
+                    .build()])
+                .build();
+            fixture
+                .client
+                .handle_retry_receipt(&receipt, &crate::test_utils::node_to_owned_ref(&node))
+                .await
+                .unwrap();
+            for index in [1, 2] {
+                let retried = fixture.stanza(index).await;
+                let retried = retried.get();
+                assert_eq!(retried.get_children_by_tag("meta").count(), 1);
+                let meta = retried.get_optional_child("meta").unwrap();
+                assert_eq!(meta.attrs().required_string("view_once").unwrap(), "true");
+                assert!(
+                    meta.attrs().optional_string("origin").is_none(),
+                    "do not replay consumer/context nodes"
+                );
+                assert!(retried.get_optional_child("participants").is_none());
+                assert_eq!(
+                    retried.attrs().required_jid("participant").unwrap(),
+                    fixture.member
+                );
+                assert_eq!(retried.attrs().required_jid("to").unwrap(), fixture.group);
+                assert_eq!(
+                    retried.attrs().optional_string("addressing_mode"),
+                    normal.attrs().optional_string("addressing_mode")
+                );
+                let enc = retried.get_optional_child("enc").unwrap();
+                assert_eq!(enc.attrs().required_string("mediatype").unwrap(), "ptt");
+                assert_eq!(enc.attrs().required_string("count").unwrap(), "1");
+                assert!(enc.attrs().required_string("type").unwrap() != "skmsg");
+            }
         }
     }
 

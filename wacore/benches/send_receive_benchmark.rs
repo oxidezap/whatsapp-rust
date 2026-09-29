@@ -973,6 +973,46 @@ fn bench_dm_send(bencher: divan::Bencher) {
         .bench_refs(run_dm_fanout);
 }
 
+/// One addressed retry using the same synthetic, acknowledged-session fixture
+/// as the normal send benchmarks. Includes padding, encryption and wire encoding.
+#[divan::bench(args = [false, true])]
+fn bench_pairwise_retry(bencher: divan::Bencher, view_once: bool) {
+    bencher
+        .with_inputs(|| {
+            let mut data = setup_dm_send();
+            data.msg = wa::Message {
+                image_message: Some(wa::message::ImageMessage {
+                    view_once: Some(view_once),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            };
+            data
+        })
+        .bench_refs(|data| {
+            let node = futures::executor::block_on(wacore::send::prepare_pairwise_retry_stanza(
+                &mut data.alice.sessions,
+                &mut data.alice.identity,
+                wacore::send::PairwiseRetryRequest {
+                    destination: wacore::send::PairwiseRetryDestination::Direct {
+                        to: data.bob_jid.clone(),
+                        recipient: None,
+                    },
+                    encryption_jid: data.bob_jid.clone(),
+                    message: &data.msg,
+                    message_id: "b-retry".into(),
+                    retry_count: 1,
+                    account: Some(&data.account),
+                    edit: None,
+                    pre_encoded: None,
+                },
+            ))
+            .unwrap();
+            black_box(marshal(&node).unwrap());
+        });
+}
+
 /// Multi-device recipient: the shape that actually spawns encrypt tasks.
 /// Named for the total fan-out — four recipient devices plus one own companion,
 /// so five pairwise encryptions.

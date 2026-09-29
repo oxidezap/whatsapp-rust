@@ -2184,6 +2184,265 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_metadata_reaches_transport_and_matches_decrypted_payload() {
+        use crate::store::commands::DeviceCommand;
+        use wacore::libsignal::protocol::{
+            PreKeyBundle, PreKeySignalMessage, SessionStore, SignalMessage, UsePQRatchet,
+            message_decrypt_prekey, message_decrypt_signal, process_prekey_bundle,
+        };
+
+        let client = retry_repair_client("retry_metadata_sender").await;
+        let receiver = retry_repair_client("retry_metadata_receiver").await;
+        attach_mock_noise_socket(&client).await;
+        let sender: Jid = "15550000001:1@s.whatsapp.net".parse().unwrap();
+        let requester: Jid = "15550000002@s.whatsapp.net".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(sender.clone())))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetAccount(Some(
+                wa::ADVSignedDeviceIdentity {
+                    details: Some(vec![0; 32]),
+                    account_signature_key: Some(vec![0; 32]),
+                    account_signature: Some(vec![0; 64]),
+                    device_signature: Some(vec![0; 64]),
+                },
+            )))
+            .await;
+        let (prekey_id, prekey) = receiver.get_or_gen_single_pre_key().await.unwrap();
+        let snapshot = receiver.persistence_manager.get_device_snapshot();
+        let bundle = PreKeyBundle::new(
+            snapshot.registration_id,
+            1u32.into(),
+            Some((prekey_id.into(), prekey)),
+            snapshot.signed_pre_key_id.into(),
+            snapshot.signed_pre_key.public_key,
+            snapshot.signed_pre_key_signature.to_vec(),
+            wacore::libsignal::protocol::IdentityKey::new(snapshot.identity_key.public_key),
+        )
+        .unwrap();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut adapter = client.signal_adapter();
+        process_prekey_bundle(
+            &requester.to_protocol_address(),
+            &mut adapter.session_store,
+            &mut adapter.identity_store,
+            &bundle,
+            &mut rng,
+            UsePQRatchet::No,
+        )
+        .await
+        .unwrap();
+        drop(adapter);
+        let image = wa::Message {
+            image_message: Some(wa::message::ImageMessage {
+                view_once: Some(true),
+                caption: Some("synthetic view-once retry".into()),
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+
+        // The public API supplies canonical bytes; the receipt path has only the
+        // cached semantic message. Both must meet the same publication boundary.
+        for automatic in [false, true] {
+            let id = if automatic {
+                "AUTO_META"
+            } else {
+                "PUBLIC_META"
+            };
+            if automatic {
+                let address = requester.to_protocol_address();
+                let mut adapter = client.signal_adapter();
+                let mut session = adapter
+                    .session_store
+                    .load_session(&address)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                session
+                    .session_state_mut()
+                    .unwrap()
+                    .clear_unacknowledged_pre_key_message();
+                adapter
+                    .session_store
+                    .store_session(&address, session)
+                    .await
+                    .unwrap();
+                client
+                    .add_recent_message(&requester, id, &image, None)
+                    .await;
+            }
+            let waiter =
+                client.wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", id));
+            if automatic {
+                drive_retry(&client, &requester, None, id, "1", false, [])
+                    .await
+                    .unwrap();
+            } else {
+                client
+                    .retransmit_message(MessageRetransmission::new(
+                        requester.clone(),
+                        requester.clone(),
+                        image.clone(),
+                        id.to_string(),
+                        1,
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let sent = waiter.await.unwrap();
+            let node = sent.as_node_ref();
+            assert_eq!(node.get_children_by_tag("meta").count(), 1);
+            assert_eq!(
+                node.get_optional_child("meta")
+                    .unwrap()
+                    .attrs()
+                    .required_string("view_once")
+                    .unwrap(),
+                "true"
+            );
+            assert!(node.get_optional_child("participants").is_none());
+            assert_eq!(node.attrs().required_jid("to").unwrap(), requester);
+            let enc = node.get_optional_child("enc").unwrap();
+            assert_eq!(enc.attrs().required_string("mediatype").unwrap(), "image");
+            assert_eq!(enc.attrs().required_string("count").unwrap(), "1");
+            assert_eq!(
+                node.get_optional_child("device-identity").is_some(),
+                !automatic
+            );
+            let bytes = enc.content_bytes().unwrap();
+            let mut adapter = receiver.signal_adapter();
+            let address = sender.to_protocol_address();
+            let plaintext = if automatic {
+                message_decrypt_signal(
+                    &SignalMessage::try_from(bytes).unwrap(),
+                    &address,
+                    &mut adapter.session_store,
+                    &mut adapter.identity_store,
+                    &mut rng,
+                )
+                .await
+                .unwrap()
+                .plaintext
+            } else {
+                message_decrypt_prekey(
+                    &PreKeySignalMessage::try_from(bytes).unwrap(),
+                    &address,
+                    &mut adapter.session_store,
+                    &mut adapter.identity_store,
+                    &mut adapter.pre_key_store,
+                    &adapter.signed_pre_key_store,
+                    &mut rng,
+                    UsePQRatchet::No,
+                )
+                .await
+                .unwrap()
+                .plaintext
+            };
+            assert_eq!(
+                wacore::messages::decode_plaintext(&plaintext, 2).unwrap(),
+                image
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn self_device_retry_classifies_dsm_content_without_changing_routing() {
+        use crate::store::commands::DeviceCommand;
+        let client = retry_repair_client("self_device_meta").await;
+        attach_mock_noise_socket(&client).await;
+        let own: Jid = "15550000001:1@s.whatsapp.net".parse().unwrap();
+        let requester = own.with_device(7);
+        let chat: Jid = "15550000002@s.whatsapp.net".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(own)))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetAccount(Some(
+                wa::ADVSignedDeviceIdentity {
+                    details: Some(vec![0; 32]),
+                    account_signature_key: Some(vec![0; 32]),
+                    account_signature: Some(vec![0; 64]),
+                    device_signature: Some(vec![0; 64]),
+                },
+            )))
+            .await;
+        crate::test_utils::seed_peer_session(&client, &requester).await;
+        let message = wa::Message {
+            device_sent_message: Some(wa::message::DeviceSentMessage {
+                destination_jid: Some(chat.to_string()),
+                message: Some(wa::Message {
+                    ephemeral_message: Some(wa::message::FutureProofMessage {
+                        message: Some(wa::Message {
+                            view_once_message_v2: Some(wa::message::FutureProofMessage {
+                                message: Some(wa::Message {
+                                    video_message: Some(Default::default()).into(),
+                                    ..Default::default()
+                                })
+                                .into(),
+                            })
+                            .into(),
+                            ..Default::default()
+                        })
+                        .into(),
+                    })
+                    .into(),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        let id = "SELF_DSM_META";
+        let waiter =
+            client.wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", id));
+        client
+            .retransmit_message(
+                MessageRetransmission::new(chat.clone(), requester.clone(), message, id.into(), 1)
+                    .with_recipient(chat.clone()),
+            )
+            .await
+            .unwrap();
+        let sent = waiter.await.unwrap();
+        assert_eq!(sent.attrs().required_jid("to").unwrap(), requester);
+        assert_eq!(sent.attrs().required_jid("recipient").unwrap(), chat);
+        assert!(sent.get_optional_child("participants").is_none());
+        assert_eq!(sent.get_children_by_tag("meta").count(), 1);
+        assert_eq!(
+            sent.get_optional_child("meta")
+                .unwrap()
+                .attrs()
+                .required_string("view_once")
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            sent.get_optional_child("enc")
+                .unwrap()
+                .attrs()
+                .required_string("mediatype")
+                .unwrap(),
+            "video"
+        );
+        assert_eq!(
+            sent.get_optional_child("enc")
+                .unwrap()
+                .attrs()
+                .required_string("count")
+                .unwrap(),
+            "1"
+        );
+    }
+
+    #[tokio::test]
     async fn recent_message_cache_insert_and_take() {
         let _ = env_logger::builder().is_test(true).try_init();
 

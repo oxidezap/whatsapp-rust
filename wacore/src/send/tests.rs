@@ -1249,6 +1249,267 @@ fn lid_prekey_bundle_is_found_without_normalising_the_lookup_key() {
     );
 }
 
+mod metadata {
+    use super::*;
+
+    pub(super) fn fixtures() -> Vec<serde_json::Value> {
+        serde_json::from_str(include_str!("../../tests/fixtures/retry_metadata.json")).unwrap()
+    }
+
+    pub(super) fn message(case: &serde_json::Value) -> wa::Message {
+        let flag = case["flag"].as_bool();
+        let mut msg = match case["kind"].as_str().unwrap() {
+            "image" => wa::Message {
+                image_message: Some(wa::message::ImageMessage {
+                    view_once: flag,
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            },
+            "video" => wa::Message {
+                video_message: Some(wa::message::VideoMessage {
+                    view_once: flag,
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            },
+            "audio" => wa::Message {
+                audio_message: Some(wa::message::AudioMessage {
+                    view_once: flag,
+                    ptt: Some(true),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            },
+            "ptv" => wa::Message {
+                ptv_message: Some(wa::message::VideoMessage {
+                    view_once: flag,
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            },
+            "text" => wa::Message {
+                conversation: Some("synthetic".into()),
+                ..Default::default()
+            },
+            "extended_text" => wa::Message {
+                extended_text_message: Some(wa::message::ExtendedTextMessage {
+                    view_once: flag,
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            },
+            "buttons" => wa::Message {
+                buttons_message: Some(Default::default()).into(),
+                ..Default::default()
+            },
+            "interactive" => wa::Message {
+                interactive_message: Some(wa::message::InteractiveMessage {
+                    header: Some(wa::message::interactive_message::Header {
+                        media: Some(
+                            wa::message::interactive_message::header::Media::ImageMessage(
+                                wa::message::ImageMessage {
+                                    view_once: Some(true),
+                                    ..Default::default()
+                                }
+                                .into(),
+                            ),
+                        ),
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            },
+            "quoted" => wa::Message {
+                image_message: Some(wa::message::ImageMessage {
+                    context_info: Some(wa::ContextInfo {
+                        quoted_message: Some(wa::Message {
+                            view_once_message: Some(wa::message::FutureProofMessage {
+                                message: Some(wa::Message {
+                                    image_message: Some(Default::default()).into(),
+                                    ..Default::default()
+                                })
+                                .into(),
+                            })
+                            .into(),
+                            ..Default::default()
+                        })
+                        .into(),
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            },
+            "poll_v1" => wa::Message {
+                poll_creation_message: Some(Default::default()).into(),
+                ..Default::default()
+            },
+            "poll_v2" => wa::Message {
+                poll_creation_message_v2: Some(Default::default()).into(),
+                ..Default::default()
+            },
+            "poll_v3" => wa::Message {
+                poll_creation_message_v3: Some(Default::default()).into(),
+                ..Default::default()
+            },
+            "poll_vote" => wa::Message {
+                poll_update_message: Some(wa::message::PollUpdateMessage {
+                    vote: Some(Default::default()).into(),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            },
+            "poll_empty_vote" => wa::Message {
+                poll_update_message: Some(Default::default()).into(),
+                ..Default::default()
+            },
+            "poll_snapshot" => wa::Message {
+                poll_result_snapshot_message: Some(Default::default()).into(),
+                ..Default::default()
+            },
+            "event" => wa::Message {
+                event_message: Some(Default::default()).into(),
+                ..Default::default()
+            },
+            "event_response" => wa::Message {
+                enc_event_response_message: Some(Default::default()).into(),
+                ..Default::default()
+            },
+            "event_edit" => wa::Message {
+                secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+                    secret_enc_type: Some(
+                        wa::message::secret_encrypted_message::SecretEncType::EventEdit,
+                    ),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            },
+            "member_label" => build_member_label_message(
+                if flag == Some(true) {
+                    "synthetic".into()
+                } else {
+                    String::new()
+                },
+                1_700_000_000,
+            ),
+            "empty" => wa::Message::default(),
+            kind => panic!("unknown oracle fixture {kind}"),
+        };
+        for wrapper in case["wrappers"].as_array().unwrap().iter().rev() {
+            let inner = (case["kind"] != "empty").then_some(msg);
+            msg = if wrapper == "dsm" {
+                wa::Message {
+                    device_sent_message: Some(wa::message::DeviceSentMessage {
+                        message: inner.into(),
+                        destination_jid: Some("15550000002@s.whatsapp.net".into()),
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                }
+            } else {
+                let fp = Some(wa::message::FutureProofMessage {
+                    message: inner.into(),
+                })
+                .into();
+                match wrapper.as_str().unwrap() {
+                    "ephemeral" => wa::Message {
+                        ephemeral_message: fp,
+                        ..Default::default()
+                    },
+                    "v1" => wa::Message {
+                        view_once_message: fp,
+                        ..Default::default()
+                    },
+                    "v2" => wa::Message {
+                        view_once_message_v2: fp,
+                        ..Default::default()
+                    },
+                    "v2ext" => wa::Message {
+                        view_once_message_v2_extension: fp,
+                        ..Default::default()
+                    },
+                    other => panic!("unknown fixture wrapper {other}"),
+                }
+            };
+        }
+        msg
+    }
+
+    pub(super) fn assert_meta(node: Option<&Node>, case: &serde_json::Value) {
+        let expected = case["expected"].as_object().unwrap();
+        if expected.is_empty() {
+            assert!(node.is_none(), "{case}");
+        } else {
+            let node = node.unwrap_or_else(|| panic!("missing meta: {case}"));
+            assert_eq!(node.attrs.len(), expected.len(), "{case}");
+            for (key, value) in expected {
+                assert_eq!(
+                    node.attrs().optional_string(key).unwrap().as_ref(),
+                    value.as_str().unwrap(),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_matches_archived_js_oracle() {
+        for case in fixtures() {
+            assert_meta(message_meta_from_message(&message(&case)).as_ref(), &case);
+        }
+    }
+
+    #[test]
+    fn metadata_traversal_is_bounded_without_changing_general_view_once_detection() {
+        use crate::proto_helpers::MessageExt;
+        let text = wa::Message {
+            extended_text_message: Some(wa::message::ExtendedTextMessage {
+                view_once: Some(true),
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        assert!(
+            text.is_view_once(),
+            "the general predicate's contract is unchanged"
+        );
+        assert!(message_meta_from_message(&text).is_none());
+        let mut nested = wa::Message {
+            image_message: Some(wa::message::ImageMessage {
+                view_once: Some(true),
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        for _ in 0..buffa::RECURSION_LIMIT {
+            nested = wa::Message {
+                ephemeral_message: Some(wa::message::FutureProofMessage {
+                    message: Some(nested).into(),
+                })
+                .into(),
+                ..Default::default()
+            };
+        }
+        assert!(message_meta_from_message(&nested).is_none());
+    }
+}
+
 mod group_retry {
     use super::*;
     use crate::libsignal::protocol::{
@@ -1360,6 +1621,184 @@ mod group_retry {
         .await
         .unwrap();
         (ss, is, jid)
+    }
+
+    #[tokio::test]
+    async fn pairwise_retry_preserves_view_once_metadata_and_media_routing() {
+        for route in 0..3 {
+            for (pre_encoded, established) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let (mut ss, mut is, jid) = setup_session().await;
+                if established {
+                    let address = jid.to_protocol_address();
+                    let mut session = ss.load_session(&address).await.unwrap().unwrap();
+                    session
+                        .session_state_mut()
+                        .unwrap()
+                        .clear_unacknowledged_pre_key_message();
+                    ss.store_session(&address, session).await.unwrap();
+                }
+                let account = pkmsg_account_proto();
+                let message = wa::Message {
+                    view_once_message: Some(wa::message::FutureProofMessage {
+                        message: Some(wa::Message {
+                            image_message: Some(wa::message::ImageMessage::default()).into(),
+                            ..Default::default()
+                        })
+                        .into(),
+                    })
+                    .into(),
+                    ..Default::default()
+                };
+                let bytes = waproto::codec::message_to_vec(&message);
+                let to: Jid = match route {
+                    0 => jid.clone(),
+                    1 => "120363000000001@g.us".parse().unwrap(),
+                    _ => "1234567890@broadcast".parse().unwrap(),
+                };
+                let destination = match route {
+                    0 => PairwiseRetryDestination::Direct {
+                        to: to.clone(),
+                        recipient: Some("15550000002@s.whatsapp.net".parse().unwrap()),
+                    },
+                    _ => PairwiseRetryDestination::Participant {
+                        to: to.clone(),
+                        participant: jid.clone(),
+                        addressing_mode: (route == 1).then_some(AddressingMode::Pn),
+                    },
+                };
+                let node = prepare_pairwise_retry_stanza(
+                    &mut ss,
+                    &mut is,
+                    PairwiseRetryRequest {
+                        destination,
+                        encryption_jid: jid.clone(),
+                        message: &message,
+                        message_id: "RETRY_META".into(),
+                        retry_count: 2,
+                        account: Some(&account),
+                        edit: None,
+                        pre_encoded: pre_encoded.then_some(bytes.as_slice()),
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    node.attrs().optional_string("to").unwrap().as_ref(),
+                    to.to_string()
+                );
+                assert_eq!(
+                    node.attrs().optional_string("type").unwrap().as_ref(),
+                    "media"
+                );
+                assert!(node.get_optional_child("participants").is_none());
+                assert_eq!(
+                    node.attrs().optional_string("participant").is_some(),
+                    route != 0
+                );
+                assert_eq!(
+                    node.attrs().optional_string("addressing_mode").is_some(),
+                    route == 1
+                );
+                let enc = node.get_optional_child("enc").unwrap();
+                assert_eq!(
+                    enc.attrs().optional_string("mediatype").unwrap().as_ref(),
+                    "image"
+                );
+                assert_eq!(enc.attrs().optional_string("count").unwrap().as_ref(), "2");
+                assert_eq!(
+                    enc.attrs().optional_string("type").unwrap().as_ref(),
+                    if established { "msg" } else { "pkmsg" }
+                );
+                assert_eq!(
+                    node.get_optional_child("device-identity").is_some(),
+                    !established
+                );
+                let meta = node
+                    .get_optional_child("meta")
+                    .expect("retry must retain the media's view-once metadata");
+                assert_eq!(
+                    meta.attrs().optional_string("view_once").unwrap().as_ref(),
+                    "true"
+                );
+                assert_eq!(
+                    node.children()
+                        .unwrap()
+                        .iter()
+                        .filter(|n| n.tag == "meta")
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pairwise_retry_metadata_matches_archived_js_oracle() {
+        let (mut ss, mut is, jid) = setup_session().await;
+        let account = pkmsg_account_proto();
+        for case in metadata::fixtures() {
+            let message = metadata::message(&case);
+            let node = prepare_pairwise_retry_stanza(
+                &mut ss,
+                &mut is,
+                PairwiseRetryRequest {
+                    destination: PairwiseRetryDestination::Direct {
+                        to: jid.clone(),
+                        recipient: None,
+                    },
+                    encryption_jid: jid.clone(),
+                    message: &message,
+                    message_id: "ORACLE_META".into(),
+                    retry_count: 1,
+                    account: Some(&account),
+                    edit: Some(crate::types::message::EditAttribute::AdminRevoke),
+                    pre_encoded: None,
+                },
+            )
+            .await
+            .unwrap();
+            metadata::assert_meta(node.get_optional_child("meta"), &case);
+            assert_eq!(
+                node.get_children_by_tag("meta").count(),
+                usize::from(!case["expected"].as_object().unwrap().is_empty())
+            );
+            assert_eq!(
+                node.attrs().optional_string("edit").unwrap().as_ref(),
+                "8",
+                "explicit admin revoke must not be overwritten by inference"
+            );
+            assert_eq!(
+                node.get_optional_child("enc")
+                    .unwrap()
+                    .attrs()
+                    .optional_string("mediatype")
+                    .map(|s| s.into_owned()),
+                match case["kind"].as_str().unwrap() {
+                    "image" | "quoted" => Some("image".to_owned()),
+                    "video" => Some("video".to_owned()),
+                    "audio" => Some("ptt".to_owned()),
+                    "ptv" => Some("ptv".to_owned()),
+                    _ => None,
+                }
+            );
+            // Explicit revoke edit does not itself request hiding, but the
+            // existing content classifier still hides infrastructure payloads.
+            let hide = matches!(
+                case["kind"].as_str(),
+                Some("poll_vote" | "event_response" | "event_edit" | "member_label")
+            );
+            assert_eq!(
+                node.get_optional_child("enc")
+                    .unwrap()
+                    .attrs()
+                    .optional_string("decrypt-fail")
+                    .as_deref(),
+                hide.then_some("hide"),
+                "{case}"
+            );
+        }
     }
 
     #[tokio::test]

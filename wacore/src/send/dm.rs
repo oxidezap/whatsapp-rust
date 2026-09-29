@@ -641,7 +641,9 @@ where
     }
     let enc_node = enc_builder.bytes(serialized).build();
 
-    let mut children = vec![enc_node];
+    let meta = message_meta_from_message(message);
+    let mut children = Vec::with_capacity(1 + usize::from(is_prekey) + usize::from(meta.is_some()));
+    children.push(enc_node);
     // Defense in depth: pre-flight should have caught a no-account pkmsg, but a
     // corrupt session that triggers a fresh pkmsg mid-call would slip past.
     if let Some(device_identity_bytes) = needs_device_identity(is_prekey, account)? {
@@ -651,6 +653,10 @@ where
                 .build(),
         );
     }
+
+    // Retry has no caller-provided extra nodes: this builder is the sole owner
+    // of derived meta insertion (WAWebSendMsgCreateDeviceStanza, see provenance).
+    children.extend(meta);
 
     let mut stanza_builder = NodeBuilder::new("message");
     match destination {

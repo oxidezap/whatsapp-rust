@@ -219,6 +219,120 @@ pub fn stanza_type_from_message(msg: &wa::Message) -> &'static str {
     stanza::MSG_TYPE_MEDIA
 }
 
+/// Content-derived `<meta>` shared by normal sends and pairwise retries.
+///
+/// This is only the protobuf-reconstructible subset of
+/// `WAWebSendMsgMetaNode.genMetaNode`, not record-dependent origin, reporting,
+/// status privacy or business nodes. Normal builders accept it in `extra_nodes`;
+/// the pairwise retry builder inserts it itself. No empty node is emitted.
+/// Protocol evidence and the media-record mapping: `agent_docs/retry_metadata.md`.
+/// Unlike `MessageExt::is_view_once`, this requires a media leaf: the mere
+/// presence of a future-proof wrapper does not create a media record.
+pub fn message_meta_from_message(msg: &wa::Message) -> Option<Node> {
+    let (msg, media, wrapped_view_once) = metadata_content(msg)?;
+    let mut meta = NodeBuilder::new("meta");
+    let mut has_attr = false;
+
+    if msg.poll_creation_message.is_set()
+        || msg.poll_creation_message_v2.is_set()
+        || msg.poll_creation_message_v3.is_set()
+    {
+        meta = meta.attr("polltype", "creation");
+        has_attr = true;
+    } else if let Some(poll_update) = msg.poll_update_message.as_option()
+        && poll_update.vote.is_set()
+    {
+        meta = meta.attr("polltype", "vote");
+        has_attr = true;
+        // Result snapshots require an envelope gate, not just a protobuf field.
+    } else if msg.event_message.is_set() {
+        meta = meta.attr("event_type", "creation");
+        has_attr = true;
+    } else if msg.enc_event_response_message.is_set() {
+        meta = meta.attr("event_type", "response");
+        has_attr = true;
+    } else if let Some(sec) = msg.secret_encrypted_message.as_option()
+        && sec.secret_enc_type
+            == Some(wa::message::secret_encrypted_message::SecretEncType::EventEdit)
+    {
+        meta = meta.attr("event_type", "edit");
+        has_attr = true;
+    } else if let Some(label) = msg
+        .protocol_message
+        .as_option()
+        .and_then(|pm| pm.member_label.as_option())
+    {
+        let tag_reason = if label.label.as_deref().unwrap_or("").is_empty() {
+            "user_delete"
+        } else {
+            "user_update"
+        };
+        meta = meta
+            .attr("appdata", "member_tag")
+            .attr("tag_reason", tag_reason);
+        has_attr = true;
+    }
+
+    // WA Web 2.3000.1047483476: genMetaNode reads mediaData.isViewOnce.
+    // Image/video/audio/PTV parsers populate that record from the inline flag;
+    // E2EProtoGenerator also preserves the semantic marker in view-once wrappers.
+    // Extended text and interactive headers are not media records.
+    let inline_view_once = if let Some(image) = media.image_message.as_option() {
+        image.view_once
+    } else if let Some(video) = media.video_message.as_option() {
+        video.view_once
+    } else if let Some(audio) = media.audio_message.as_option() {
+        audio.view_once
+    } else if let Some(ptv) = media.ptv_message.as_option() {
+        ptv.view_once
+    } else {
+        None
+    };
+    let has_media = media.image_message.is_set()
+        || media.video_message.is_set()
+        || media.audio_message.is_set()
+        || media.ptv_message.is_set();
+    if has_media && (wrapped_view_once || inline_view_once == Some(true)) {
+        meta = meta.attr("view_once", "true");
+        has_attr = true;
+    }
+    has_attr.then(|| meta.build())
+}
+
+/// Follow the same classification wrappers without losing the view-once marker.
+/// Only the current message is traversed, never quoted/context/reference content.
+/// Bound borrowed traversal by the protobuf decoder's existing recursion budget;
+/// an empty wrapper or an over-budget chain cannot yield derived metadata.
+fn metadata_content(mut msg: &wa::Message) -> Option<(&wa::Message, &wa::Message, bool)> {
+    // getUnwrappedProtobufMessage returns the first wrapped Message, not the
+    // deepest leaf. genMetaNode's poll/event branches use that object; its
+    // view-once branch instead uses the independently reconstructed media record.
+    let mut first_unwrapped = None;
+    let mut view_once = false;
+    'peel: for _ in 0..buffa::RECURSION_LIMIT {
+        view_once |= msg.view_once_message.is_set()
+            || msg.view_once_message_v2.is_set()
+            || msg.view_once_message_v2_extension.is_set();
+        if let Some(dsm) = msg.device_sent_message.as_option() {
+            msg = dsm.message.as_option()?;
+            first_unwrapped.get_or_insert(msg);
+            continue;
+        }
+        macro_rules! peel_one {
+            ($field:ident) => {
+                if let Some(wrapper) = msg.$field.as_option() {
+                    msg = wrapper.message.as_option()?;
+                    first_unwrapped.get_or_insert(msg);
+                    continue 'peel;
+                }
+            };
+        }
+        for_each_classified_fp_wrapper!(peel_one);
+        return Some((first_unwrapped.unwrap_or(msg), msg, view_once));
+    }
+    None
+}
+
 pub fn peer_message_options_from_message(msg: &wa::Message) -> PeerMessageOptions {
     use wa::message::PeerDataOperationRequestType as PdoType;
 

@@ -127,6 +127,10 @@ name = "send_receive_benchmark"
 harness = false
 
 [[bench]]
+name = "message_metadata_benchmark"
+harness = false
+
+[[bench]]
 name = "token_lookup_benchmark"
 harness = false
 
