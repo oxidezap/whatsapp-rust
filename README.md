@@ -1,37 +1,22 @@
 # whatsapp-rust
 
+[![crates.io](https://img.shields.io/crates/v/whatsapp-rust.svg)](https://crates.io/crates/whatsapp-rust)
+[![crates.io downloads](https://img.shields.io/crates/d/whatsapp-rust.svg)](https://crates.io/crates/whatsapp-rust)
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/oxidezap/whatsapp-rust?utm_source=badge)
 
-A high-performance, async Rust library for the WhatsApp Web API. Inspired by [whatsmeow](https://github.com/tulir/whatsmeow) (Go) and [Baileys](https://github.com/WhiskeySockets/Baileys) (TypeScript).
+An async Rust library for WhatsApp Web. Pair a device, send and receive end-to-end encrypted messages, and build on a modular protocol stack.
 
-**[Documentation](https://whatsapp-rust.jlucaso.com)** | [llms.txt](https://whatsapp-rust.jlucaso.com/llms.txt) | [llms-full.txt](https://whatsapp-rust.jlucaso.com/llms-full.txt)
+[Documentation](https://whatsapp-rust.jlucaso.com) · [llms.txt](https://whatsapp-rust.jlucaso.com/llms.txt) · [llms-full.txt](https://whatsapp-rust.jlucaso.com/llms-full.txt)
 
-## Features
+## Capabilities
 
-- **Authentication** — QR code pairing, pair code linking, persistent sessions
-- **Messaging** — E2E encrypted (Signal Protocol), 1-on-1 and group chats, editing, reactions, quoting, receipts
-- **Media** — Upload/download images, videos, documents, GIFs, audio with automatic encryption
-- **Voice calls** — 1:1 VoIP audio calls with built-in MLOW or external encoded Opus/MLOW; see the
-  [codec boundary and production profiles](agent_docs/voip_audio_codecs.md)
-- **Groups & Communities** — Create, manage, invite, membership approval, subgroup linking,
-  and opt-in, acknowledged plain-text history on direct member additions.
-  Pinned history and media are not supported; this is a subset of
-  [#1549](https://github.com/oxidezap/whatsapp-rust/issues/1549). See
-  [`Groups::add_participants_with_history`](src/features/groups.rs) for the API contract.
-- **Newsletters** — Create, join, send messages, reactions
-- **Status** — Text, image, and video status posts with privacy controls
-- **Contacts** — Phone number lookup, profile pictures, user info, business profiles
-- **Presence & Chat State** — Online/offline, typing indicators, blocking
-- **Chat Actions** — Archive, pin, mute, star messages
-- **Profile** — Set push name, status text, profile picture
-- **Privacy** — Fetch/set privacy settings, disappearing messages
-- **Modular** — Pluggable storage, transport, HTTP client, and async runtime; SQLite, Tokio WebSocket, and ureq ship as the defaults, swap any of them with `default-features = false`
-- **Native plugins** — Build-time, type-safe extensions with scoped capabilities and lifecycle ownership behind the `plugins` feature
-- **Runtime agnostic** — Bring your own async runtime via the `Runtime` trait (Tokio included by default)
+- QR and pairing-code authentication with persistent sessions.
+- End-to-end encrypted direct and group messaging, media, reactions, receipts, and history sync.
+- Groups, communities, newsletters, status, contacts, and privacy controls.
+- Audio and video calls, both 1:1 and group, plus call links and screen sharing. The optional `voip` feature provides native relay transport and MLOW/Opus audio. Video takes application-supplied H.264 frames ([media API and codec options](agent_docs/voip_audio_codecs.md)).
+- Replaceable storage, transport, HTTP client, and runtime. The default features include SQLite, Tokio WebSocket, ureq, and Tokio. Applications still choose a storage backend. Native plugins are [opt-in](agent_docs/plugin_architecture.md).
 
-For the full API reference and guides, see the **[documentation](https://whatsapp-rust.jlucaso.com)**.
-
-## Quick Start
+## Quick start
 
 ```toml
 [dependencies]
@@ -57,120 +42,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
-    // Runs until logout or shutdown; a single await.
     bot.run().await;
     Ok(())
 }
 ```
 
-The default cargo features wire up the Tokio WebSocket transport, the ureq HTTP client, the SQLite store, and the Tokio runtime; only the storage backend has to be chosen explicitly. Every piece is replaceable through the builder (`with_transport_factory`, `with_http_client`, `with_runtime`) for custom environments such as wasm or embedded targets.
-
-Native plugin APIs are opt-in: use `features = ["plugins"]` when implementing a
-plugin in the application. Published plugin crates can enable that feature in
-their own `whatsapp-rust` dependency, and Cargo feature unification activates it
-for the consumer. See [`agent_docs/plugin_architecture.md`](agent_docs/plugin_architecture.md)
-for the host contract and type-safe API example.
-
-### Codegen flags
-
-The crate sets no `target-feature`, because a published library cannot know
-which CPU it will run on and such a flag has no runtime fallback. A binary built
-with one dies with `SIGILL` on hardware that lacks the feature — and not
-necessarily at startup: `-C target-feature` emits no GNU ISA-needed property, so
-this configuration gives you no guaranteed load-time check, and it traps
-whenever execution first reaches an emitted instruction, which can be well into
-serving traffic. A clean startup is not a compatibility check.
-
-An application that *does* control its deployment target can take about a fifth
-of the per-message instruction count on the Signal paths by setting it itself:
-
-```toml
-# <your app>/.cargo/config.toml
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-Ctarget-feature=+bmi2,+avx2"]   # append to what this key holds
-```
-
-Cargo takes rustflags from exactly one source — `CARGO_ENCODED_RUSTFLAGS`, then
-`RUSTFLAGS`, then `target.<triple>.rustflags`, then `build.rustflags` — and they
-never combine, so setting `RUSTFLAGS` for any reason discards the entry above.
-
-Confirm every deployment target reports both features first, by feature check
-rather than by the CPU's year or its product name: the Silvermont, Goldmont,
-Jaguar and Puma cores have neither (Goldmont and Puma are outright later than
-Haswell), while other parts sold under the same Atom/Celeron/Pentium names do
-have both. Use an OS-filtered report such as `/proc/cpuinfo` — AVX2 also needs
-the OS to have enabled YMM state, which a raw CPUID feature bit does not tell
-you. The build machine needs both features too unless you pass an explicit
-`--target`, since without one cargo applies these flags to build scripts and
-proc macros as well.
-
-Measurements per flag, the CPU floor each one raises, why `+adx` and
-`-Ctarget-cpu=native` are not worth taking, and the `wasm32` equivalent are in
-[`agent_docs/build_flags.md`](agent_docs/build_flags.md).
-
-### One dependency is enough
-
-`whatsapp-rust` re-exports the whole stack, so you never need to declare the sibling crates (`wacore`, `wacore-binary`, `waproto`, `whatsapp-rust-tokio-transport`, `whatsapp-rust-ureq-http-client`, `whatsapp-rust-sqlite-storage`) yourself, including when pinning a git revision:
+The main crate re-exports the bundled stack. You do not need to add its sibling crates separately. To use a specific Git revision instead of crates.io:
 
 ```toml
 [dependencies]
 whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "<commit>" }
 ```
 
-- Protobuf types: `whatsapp_rust::waproto::whatsapp` (aliased as `wa` in the prelude)
-- Core protocol/types: `whatsapp_rust::wacore`, `whatsapp_rust::wacore_binary` (`Jid` is also at the crate root)
-- Bundled implementations: `whatsapp_rust::transport::TokioWebSocketTransportFactory`, `whatsapp_rust::http::UreqHttpClient`, `whatsapp_rust::store::SqliteStore`, each behind its default-on cargo feature (`tokio-transport`, `ureq-client`, `sqlite-storage`)
+See the [documentation](https://whatsapp-rust.jlucaso.com) for configuration, alternative backends, and API examples.
 
-With `default-features = false`, pick only what you need (e.g. `features = ["tokio-runtime", "tokio-transport", "ureq-client"]` for a custom store while keeping the bundled networking).
+## Related projects
 
-To run the bot in the background instead of blocking, use `spawn()` and keep the handle:
+- [oxidezap/client](https://github.com/oxidezap/client): desktop and browser client built on this library as a complete application.
+- [whatsapp-rust-esp32](https://github.com/oxidezap/whatsapp-rust-esp32): end-to-end-encrypted client on ESP32 microcontrollers, demonstrating the core on constrained hardware.
+- [whatsapp-rust-bridge](https://github.com/oxidezap/whatsapp-rust-bridge): Rust/WebAssembly utilities for JavaScript, including protocol, Signal, and media operations.
+- [baileyrs](https://github.com/oxidezap/baileyrs): JavaScript library backed by Rust/WASM with a Baileys-compatible API.
+- [whatspec](https://github.com/oxidezap/whatspec): extracts a language-neutral protocol specification from WhatsApp Web. Its IR supplies protocol definitions generated here.
 
-```rust,no_run
-use whatsapp_rust::prelude::*;
+## Used by
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let bot = Bot::builder()
-        .with_backend(SqliteStore::new("whatsapp.db").await?)
-        .build()
-        .await?;
-
-    let handle = bot.spawn(); // full Client API stays available via handle.client()
-
-    tokio::signal::ctrl_c().await?;
-    handle.shutdown().await; // graceful: flushes pending state, then stops
-    Ok(())
-}
-```
-
-Run the included demo bot:
-
-```bash
-cargo run --example demo                              # QR code only
-cargo run --example demo -- -p 15551234567            # Pair code + QR code
-cargo run --example demo -- -p 15551234567 -c MYCODE  # Custom pair code
-```
-
-## Project Structure
-
-```text
-whatsapp-rust/
-├── src/                    # Main client library
-├── wacore/                 # Platform-agnostic core (no runtime deps)
-│   ├── binary/             # WhatsApp binary protocol
-│   ├── libsignal/          # Signal Protocol implementation
-│   └── appstate/           # App state management
-├── waproto/                # Protocol Buffers definitions
-├── storages/sqlite-storage # SQLite backend
-├── transports/tokio-transport
-└── http_clients/ureq-client
-```
+Browse GitHub's indexed public dependents for the [crates.io package](https://github.com/oxidezap/whatsapp-rust/network/dependents?package_id=UGFja2FnZS02MTE0MTExMzY3) and the [repository entry](https://github.com/oxidezap/whatsapp-rust/network/dependents?package_id=UGFja2FnZS03MDY4Njk1OTE3). GitHub's lists are incomplete and exclude private repositories. A zero on the repository entry does not mean nobody uses the library via Git. The sidebar counter, when shown, covers only one package.
 
 ## Disclaimer
 
-This is an unofficial, open-source reimplementation. Using custom WhatsApp clients may violate Meta's Terms of Service and could result in account suspension. Use at your own risk.
+This is an unofficial client, not affiliated with WhatsApp or Meta. Using it may violate Meta's Terms of Service and could result in account suspension.
 
 ## Acknowledgements
 
-- [whatsmeow](https://github.com/tulir/whatsmeow) (Go)
-- [Baileys](https://github.com/WhiskeySockets/Baileys) (TypeScript)
+Inspired by [whatsmeow](https://github.com/tulir/whatsmeow) and [Baileys](https://github.com/WhiskeySockets/Baileys).

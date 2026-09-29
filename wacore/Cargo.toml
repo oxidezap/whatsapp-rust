@@ -5,7 +5,7 @@ edition = "2024"
 rust-version.workspace = true
 authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
-repository = "https://github.com/jlucaso1/whatsapp-rust"
+repository = "https://github.com/oxidezap/whatsapp-rust"
 description = "Core WhatsApp protocol implementation without runtime dependencies"
 # Only the explicit [[bench]] targets below are built; never auto-discover benches/*.rs, so a stray
 # untracked file on a reused CI runner can't get compiled as a phantom bench.

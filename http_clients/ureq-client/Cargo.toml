@@ -5,7 +5,7 @@ edition = "2024"
 rust-version.workspace = true
 authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
-repository = "https://github.com/jlucaso1/whatsapp-rust"
+repository = "https://github.com/oxidezap/whatsapp-rust"
 description = "Ureq-based HTTP client implementation for whatsapp-rust"
 
 [features]

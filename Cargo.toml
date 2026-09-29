@@ -6,7 +6,7 @@ edition = "2024"
 rust-version.workspace = true
 authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
-repository = "https://github.com/jlucaso1/whatsapp-rust"
+repository = "https://github.com/oxidezap/whatsapp-rust"
 readme = "README.md"
 description = "Rust client for WhatsApp Web"
 # Only the explicit [[bench]] targets below are built; never auto-discover
