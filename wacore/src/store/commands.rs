@@ -28,6 +28,7 @@ pub enum DeviceCommand {
     SetAdvSecretKey([u8; 32]),
     SetNctSalt(Option<Vec<u8>>),
     SetNctSaltFromHistorySync(Vec<u8>),
+    SetStatusPrivacy(wa::sync_action_value::StatusPrivacyAction),
     /// Cache the server cert chain extracted from a successful XX (or
     /// XX-fallback) handshake. Enables Noise IK on the next connect.
     SetServerCertChain(CachedServerCertChain),
@@ -89,6 +90,7 @@ impl std::fmt::Debug for DeviceCommand {
             Self::SetNctSaltFromHistorySync(v) => {
                 f.debug_tuple("SetNctSaltFromHistorySync").field(v).finish()
             }
+            Self::SetStatusPrivacy(_) => f.write_str("SetStatusPrivacy(..)"),
             Self::SetServerCertChain(v) => f.debug_tuple("SetServerCertChain").field(v).finish(),
             Self::ClearServerCertChain => f.write_str("ClearServerCertChain"),
             Self::IncrementLoginCounter => f.write_str("IncrementLoginCounter"),
@@ -165,6 +167,9 @@ pub fn apply_command_to_device(device: &mut Device, command: DeviceCommand) {
             if !salt.is_empty() && !device.nct_salt_sync_seen && device.nct_salt.is_none() {
                 device.nct_salt = Some(salt);
             }
+        }
+        DeviceCommand::SetStatusPrivacy(action) => {
+            device.status_privacy = Some(std::sync::Arc::new(action));
         }
         DeviceCommand::SetServerCertChain(chain) => {
             device.server_cert_chain = Some(chain);
@@ -402,6 +407,32 @@ mod tests {
 
         apply_command_to_device(&mut device, DeviceCommand::SetReadReceiptsDisabled(false));
         assert!(!device.read_receipts_disabled);
+    }
+
+    #[test]
+    fn status_privacy_survives_device_serde_and_legacy_records() {
+        use wa::sync_action_value::status_privacy_action::{CustomList, StatusDistributionMode};
+        use waproto::whatsapp as wa;
+
+        let mut device = Device::new();
+        let action = wa::sync_action_value::StatusPrivacyAction {
+            mode: Some(StatusDistributionMode::CUSTOM_LIST),
+            modes: vec![StatusDistributionMode::CLOSE_FRIENDS],
+            user_jid: vec!["120363000000000042@lid".into()],
+            custom_lists: vec![CustomList {
+                list_id: Some("friends".into()),
+                user_jid: vec!["120363000000000043@lid".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        apply_command_to_device(&mut device, DeviceCommand::SetStatusPrivacy(action.clone()));
+        let mut json = serde_json::to_value(&device).expect("serialize device");
+        let restored: Device = serde_json::from_value(json.clone()).expect("restore device");
+        assert_eq!(restored.status_privacy.as_deref(), Some(&action));
+        json.as_object_mut().unwrap().remove("status_privacy");
+        let legacy: Device = serde_json::from_value(json).expect("restore legacy device");
+        assert!(legacy.status_privacy.is_none());
     }
 
     #[test]

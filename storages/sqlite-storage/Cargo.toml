@@ -42,6 +42,7 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }
+waproto = { workspace = true }
 portable-atomic = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

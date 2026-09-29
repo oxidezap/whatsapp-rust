@@ -484,6 +484,20 @@ pub mod codec {
     }
 
     #[inline(never)]
+    pub fn status_privacy_action_to_vec(
+        action: &whatsapp::sync_action_value::StatusPrivacyAction,
+    ) -> Vec<u8> {
+        action.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn status_privacy_action_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::sync_action_value::StatusPrivacyAction, buffa::DecodeError> {
+        whatsapp::sync_action_value::StatusPrivacyAction::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
     pub fn adv_device_identity_decode(
         bytes: &[u8],
     ) -> Result<whatsapp::ADVDeviceIdentity, buffa::DecodeError> {

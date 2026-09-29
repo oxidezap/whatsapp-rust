@@ -42,6 +42,43 @@ pub mod account_serde {
     }
 }
 
+/// Preserve the full syncd action, including lists and future protobuf fields,
+/// without enabling generated-proto deserialization across the workspace.
+pub mod status_privacy_serde {
+    use waproto::whatsapp::sync_action_value::StatusPrivacyAction;
+
+    pub fn to_bytes(action: &StatusPrivacyAction) -> Vec<u8> {
+        waproto::codec::status_privacy_action_to_vec(action)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<StatusPrivacyAction, buffa::DecodeError> {
+        waproto::codec::status_privacy_action_decode(bytes)
+    }
+
+    pub fn serialize<S: serde::Serializer>(
+        value: &Option<std::sync::Arc<StatusPrivacyAction>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(action) => serializer.serialize_some(&to_bytes(action)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<std::sync::Arc<StatusPrivacyAction>>, D::Error> {
+        let bytes: Option<Vec<u8>> = serde::Deserialize::deserialize(deserializer)?;
+        bytes
+            .map(|bytes| {
+                from_bytes(&bytes)
+                    .map(std::sync::Arc::new)
+                    .map_err(serde::de::Error::custom)
+            })
+            .transpose()
+    }
+}
+
 pub mod key_pair_serde {
     use super::KeyPair;
     use crate::libsignal::protocol::{PrivateKey, PublicKey};
@@ -323,6 +360,11 @@ pub struct Device {
     /// This prevents stale history sync data from resurrecting a cleared salt.
     #[serde(skip)]
     pub nct_salt_sync_seen: bool,
+    /// Last authoritative status audience received from app-state sync. `None`
+    /// means unknown, not "all contacts". Keep the protobuf intact so newer
+    /// modes and custom lists are never silently widened to a default.
+    #[serde(with = "status_privacy_serde", default)]
+    pub status_privacy: Option<Arc<wa::sync_action_value::StatusPrivacyAction>>,
     /// Server cert chain cached from the last successful XX (or XX-fallback)
     /// handshake. Enables Noise IK on the next connect by exposing
     /// `leaf.key` as the server's static public key, and lets us reject
@@ -563,6 +605,7 @@ impl Device {
             server_has_prekeys: false,
             nct_salt: None,
             nct_salt_sync_seen: false,
+            status_privacy: None,
             server_cert_chain: None,
             login_counter: 0,
             lid_migrated: false,

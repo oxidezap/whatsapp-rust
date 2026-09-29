@@ -4480,6 +4480,43 @@ impl Client {
             return report("none", m, AppStateDispatchOutcome::Unclaimed, effect_detail);
         }
 
+        // WA Web's WAWebStatusPrivacySettingSync (whatspec .wa-cache,
+        // 1N0AcCuvvZU.js, build 2.3000.1044770897) applies only a single
+        // Set with a present mode. Keep the full action rather than guessing
+        // an audience from the three legacy status_setting wire values.
+        if m.index.len() == 1 && m.index[0] == wacore::appstate::schemas::STATUS_PRIVACY.name {
+            let outcome = if let Some(action) = m
+                .action_value
+                .as_ref()
+                .and_then(|v| v.status_privacy.as_option())
+                .filter(|action| action.mode.is_some())
+            {
+                let action = action.clone();
+                let action_timestamp = m
+                    .action_value
+                    .as_ref()
+                    .and_then(|v| v.timestamp)
+                    .and_then(chrono::DateTime::from_timestamp_millis);
+                self.persistence_manager
+                    .process_command(DeviceCommand::SetStatusPrivacy(action.clone()))
+                    .await;
+                self.core.event_bus.dispatch(Event::StatusPrivacyUpdate(
+                    wacore::types::events::StatusPrivacyUpdate::builder()
+                        .timestamp(action_timestamp.unwrap_or_else(|| {
+                            wacore::time::from_millis_or_now(wacore::time::now_millis())
+                        }))
+                        .maybe_action_timestamp(action_timestamp)
+                        .action(Box::new(action))
+                        .from_full_sync(event_full_sync)
+                        .build(),
+                ));
+                AppStateDispatchOutcome::Event("StatusPrivacyUpdate")
+            } else {
+                AppStateDispatchOutcome::Malformed("StatusPrivacyUpdate")
+            };
+            return report("status_privacy", m, outcome, effect_detail);
+        }
+
         // A call's direction is its creator compared against this account; the
         // predicate is only consulted once the mutation is known to be a call
         // log, so the other mutation kinds do not pay for the snapshot.
@@ -8675,6 +8712,95 @@ mod critical_bootstrap_tests {
             client.needs_initial_full_sync.is_armed(),
             "and the replacement inherits the work through the gate"
         );
+    }
+
+    #[tokio::test]
+    async fn status_privacy_sync_persists_and_emits_full_action() {
+        use std::sync::{Arc, Mutex};
+        use wa::sync_action_value::status_privacy_action::{
+            CustomList, StatusDistributionMode as Mode,
+        };
+        use wacore::types::events::{Event, EventHandler, EventInterest};
+
+        struct Recorder(Mutex<Vec<Arc<Event>>>);
+        impl EventHandler for Recorder {
+            fn handle_event(&self, event: Arc<Event>) {
+                self.0.lock().expect("recorder mutex").push(event);
+            }
+            fn interest(&self) -> EventInterest {
+                EventInterest::ALL
+            }
+        }
+
+        let client = crate::test_utils::create_test_client_with_name("status_privacy_sync").await;
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        let _subscription = client
+            .core
+            .event_bus
+            .subscribe_handler(Arc::clone(&recorder) as _);
+        assert!(client.status().audience().is_none());
+
+        let action = wa::sync_action_value::StatusPrivacyAction {
+            mode: Some(Mode::CUSTOM_LIST),
+            user_jid: vec!["120363000000000042@lid".into()],
+            custom_lists: vec![CustomList {
+                list_id: Some("friends".into()),
+                name: Some("Friends".into()),
+                user_jid: vec!["120363000000000043@lid".into()],
+                is_selected: Some(true),
+                ..Default::default()
+            }],
+            modes: vec![Mode::CLOSE_FRIENDS, Mode::CUSTOM_LIST],
+            share_to_fb: Some(false),
+            share_to_ig: Some(true),
+        };
+        let make_mutation =
+            |action: wa::sync_action_value::StatusPrivacyAction| crate::appstate_sync::Mutation {
+                index: vec!["status_privacy".into()],
+                operation: wa::syncd_mutation::SyncdOperation::Set,
+                action_value: Some(wa::SyncActionValue {
+                    status_privacy: buffa::MessageField::some(action),
+                    timestamp: Some(1_700_000_000_000),
+                    ..Default::default()
+                }),
+            };
+        let mut mutation = make_mutation(action.clone());
+        let outcome = client
+            .dispatch_app_state_mutation(&mut mutation, true, (WAPatchName::RegularHigh, 7, 1, 1))
+            .await;
+        assert_eq!(
+            outcome,
+            AppStateDispatchOutcome::Event("StatusPrivacyUpdate")
+        );
+        assert_eq!(client.status().audience().as_deref(), Some(&action));
+        {
+            let events = recorder.0.lock().expect("recorder mutex");
+            assert_eq!(events.len(), 1);
+            match &*events[0] {
+                Event::StatusPrivacyUpdate(update) => {
+                    assert_eq!(update.action.as_ref(), &action);
+                    assert!(update.from_full_sync);
+                }
+                other => panic!("expected StatusPrivacyUpdate, got {other:?}"),
+            }
+        }
+
+        let mut missing_mode = make_mutation(wa::sync_action_value::StatusPrivacyAction {
+            mode: None,
+            ..Default::default()
+        });
+        assert_eq!(
+            client
+                .dispatch_app_state_mutation(
+                    &mut missing_mode,
+                    false,
+                    (WAPatchName::RegularHigh, 8, 1, 1)
+                )
+                .await,
+            AppStateDispatchOutcome::Malformed("StatusPrivacyUpdate")
+        );
+        assert_eq!(client.status().audience().as_deref(), Some(&action));
+        assert_eq!(recorder.0.lock().expect("recorder mutex").len(), 1);
     }
 
     /// A 409 conflict absorb replays a snapshot's worth of mutations at TRACE

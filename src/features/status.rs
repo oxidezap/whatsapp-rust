@@ -26,6 +26,11 @@ pub enum StatusPrivacySetting {
 }
 
 /// Options for sending a status update.
+///
+/// The privacy mode only sets the stanza's `status_setting`. It does not
+/// filter `recipients`. Callers must check [`Status::audience`] and supply a
+/// compatible recipient list themselves. If the audience is unknown, do not
+/// infer that all contacts are allowed.
 #[derive(Debug, Clone, Default)]
 pub struct StatusSendOptions {
     /// Privacy setting for this status. Sent in the `<meta>` stanza node.
@@ -46,6 +51,19 @@ pub struct Status<'a> {
 impl<'a> Status<'a> {
     pub(crate) fn new(client: &'a Client) -> Self {
         Self { client }
+    }
+
+    /// Last status audience synced from the phone. `None` means no audience
+    /// has been observed yet, not that all contacts are allowed. The complete
+    /// action includes custom lists and cross-posting settings. This is a
+    /// snapshot, not a recipient calculation: sends still require an explicit
+    /// recipient list and do not automatically apply these settings.
+    pub fn audience(&self) -> Option<std::sync::Arc<wa::sync_action_value::StatusPrivacyAction>> {
+        self.client
+            .persistence_manager
+            .get_device_snapshot()
+            .status_privacy
+            .clone()
     }
 
     /// Send a text status update to the given recipients.

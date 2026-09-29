@@ -5765,6 +5765,7 @@ dependencies = [
  "tokio",
  "wacore",
  "wacore-binary",
+ "waproto",
 ]
 
 [[package]]

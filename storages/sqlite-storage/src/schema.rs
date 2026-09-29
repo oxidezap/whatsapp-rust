@@ -87,6 +87,7 @@ diesel::table! {
         last_signed_pre_key_rotation_ms -> BigInt,
         read_receipts_disabled -> Bool,
         server_client_expiration -> Nullable<Text>,
+        status_privacy -> Nullable<Binary>,
     }
 }
 

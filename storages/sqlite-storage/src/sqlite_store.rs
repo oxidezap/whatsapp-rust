@@ -107,6 +107,7 @@ struct DeviceRow {
     last_signed_pre_key_rotation_ms: i64,
     read_receipts_disabled: bool,
     server_client_expiration: Option<String>,
+    status_privacy: Option<Vec<u8>>,
 }
 
 /// One account in a database that holds several, as [`SqliteStore::list_devices`]
@@ -168,6 +169,7 @@ struct FreshDeviceRow {
     last_signed_pre_key_rotation_ms: i64,
     read_receipts_disabled: bool,
     server_client_expiration: Option<String>,
+    status_privacy: Option<Vec<u8>>,
 }
 
 impl FreshDeviceRow {
@@ -204,6 +206,7 @@ impl FreshDeviceRow {
             last_signed_pre_key_rotation_ms: device.last_signed_pre_key_rotation_ms,
             read_receipts_disabled: false,
             server_client_expiration: None,
+            status_privacy: None,
         })
     }
 
@@ -1554,6 +1557,11 @@ impl SqliteStore {
         let first_unupload_pre_key_id = device_data.first_unupload_pre_key_id as i32;
         let server_has_prekeys = device_data.server_has_prekeys;
         let nct_salt: Option<Arc<[u8]>> = device_data.nct_salt.as_deref().map(Arc::from);
+        let status_privacy: Option<Arc<[u8]>> = device_data.status_privacy.as_ref().map(|action| {
+            Arc::from(wacore::store::device::status_privacy_serde::to_bytes(
+                action,
+            ))
+        });
         let server_cert_chain: Option<Arc<[u8]>> = device_data
             .server_cert_chain
             .as_ref()
@@ -1591,6 +1599,7 @@ impl SqliteStore {
             let props_hash = props_hash.clone();
             let server_client_expiration = server_client_expiration.clone();
             let nct_salt = nct_salt.clone();
+            let status_privacy = status_privacy.clone();
             let server_cert_chain = server_cert_chain.clone();
             let new_lid = Arc::clone(&new_lid);
             let new_pn = Arc::clone(&new_pn);
@@ -1620,6 +1629,7 @@ impl SqliteStore {
                         device::first_unupload_pre_key_id.eq(first_unupload_pre_key_id),
                         device::server_has_prekeys.eq(server_has_prekeys),
                         device::nct_salt.eq(nct_salt.as_deref()),
+                        device::status_privacy.eq(status_privacy.as_deref()),
                         device::server_cert_chain.eq(server_cert_chain.as_deref()),
                         device::login_counter.eq(login_counter),
                         device::lid_migrated.eq(lid_migrated),
@@ -1654,6 +1664,7 @@ impl SqliteStore {
                             .eq(excluded(device::first_unupload_pre_key_id)),
                         device::server_has_prekeys.eq(excluded(device::server_has_prekeys)),
                         device::nct_salt.eq(excluded(device::nct_salt)),
+                        device::status_privacy.eq(excluded(device::status_privacy)),
                         device::server_cert_chain.eq(excluded(device::server_cert_chain)),
                         device::login_counter.eq(excluded(device::login_counter)),
                         device::lid_migrated.eq(excluded(device::lid_migrated)),
@@ -1726,6 +1737,7 @@ impl SqliteStore {
                         device::first_unupload_pre_key_id.eq(first_unupload_pre_key_id),
                         device::server_has_prekeys.eq(server_has_prekeys),
                         device::nct_salt.eq(None::<&[u8]>),
+                        device::status_privacy.eq(None::<&[u8]>),
                         device::server_cert_chain.eq(None::<&[u8]>),
                         device::login_counter.eq(0i32),
                         device::lid_migrated.eq(false),
@@ -2005,6 +2017,15 @@ impl SqliteStore {
                 server_has_prekeys: row.server_has_prekeys,
                 nct_salt: row.nct_salt,
                 nct_salt_sync_seen: false,
+                status_privacy: row
+                    .status_privacy
+                    .as_deref()
+                    .map(|bytes| {
+                        wacore::store::device::status_privacy_serde::from_bytes(bytes)
+                            .map(Arc::new)
+                            .map_err(|e| StoreError::Serialization(Box::new(e)))
+                    })
+                    .transpose()?,
                 server_cert_chain: row
                     .server_cert_chain
                     .as_deref()
@@ -6636,6 +6657,42 @@ mod tests {
             loaded.first_unupload_pre_key_id, 101,
             "first_unupload_pre_key_id must survive a save/load roundtrip"
         );
+    }
+
+    #[tokio::test]
+    async fn status_privacy_action_survives_device_save_load() {
+        use wacore::store::commands::{DeviceCommand, apply_command_to_device};
+
+        static NEXT_DB: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(1);
+        let db = format!(
+            "file:status_privacy_test_{}_{}?mode=memory&cache=shared",
+            std::process::id(),
+            NEXT_DB.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let store = SqliteStore::new_for_device(&db, 91).await.unwrap();
+        store.create_new_device().await.unwrap();
+        let mut device = store
+            .load_device_data_for_device(91)
+            .await
+            .unwrap()
+            .unwrap();
+        let action = waproto::whatsapp::sync_action_value::StatusPrivacyAction {
+            mode: Some(waproto::whatsapp::sync_action_value::status_privacy_action::StatusDistributionMode::DENY_LIST),
+            user_jid: vec!["120363000000000042@lid".into()],
+            ..Default::default()
+        };
+        apply_command_to_device(&mut device, DeviceCommand::SetStatusPrivacy(action.clone()));
+        store
+            .save_device_data_for_device(91, &device)
+            .await
+            .unwrap();
+        let reopened = SqliteStore::new_for_device(&db, 91).await.unwrap();
+        let loaded = reopened
+            .load_device_data_for_device(91)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.status_privacy.as_deref(), Some(&action));
     }
 
     /// Round-trips a `CachedServerCertChain` through the SQLite schema:
