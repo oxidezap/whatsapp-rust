@@ -62,3 +62,38 @@ fn open_field_deserializes_unknown_integer() {
     let absent: wa::SyncdMutation = serde_json::from_value(serde_json::json!({})).unwrap();
     assert_eq!(absent.operation, None);
 }
+
+#[test]
+fn status_privacy_unknown_modes_survive_wire_roundtrip() {
+    let action = waproto::codec::status_privacy_action_decode(&[0x08, 0x63, 0x30, 0x64])
+        .expect("decode status privacy action");
+
+    assert_eq!(action.mode, Some(buffa::EnumValue::Unknown(99)));
+    assert_eq!(action.modes, vec![buffa::EnumValue::Unknown(100)]);
+
+    let encoded = waproto::codec::status_privacy_action_to_vec(&action);
+    let restored =
+        waproto::codec::status_privacy_action_decode(&encoded).expect("restore status privacy");
+    assert_eq!(restored, action);
+}
+
+#[test]
+fn status_privacy_open_fields_keep_enum_serde_contract() {
+    let action = wa::sync_action_value::StatusPrivacyAction {
+        mode: Some(
+            wa::sync_action_value::status_privacy_action::StatusDistributionMode::CUSTOM_LIST
+                .into(),
+        ),
+        modes: vec![buffa::EnumValue::Unknown(99)],
+        ..Default::default()
+    };
+    let json = serde_json::to_value(action).unwrap();
+
+    #[cfg(feature = "serde-enum-repr")]
+    assert_eq!(json["mode"], serde_json::json!(4));
+
+    #[cfg(not(feature = "serde-enum-repr"))]
+    assert_eq!(json["mode"], serde_json::json!("CUSTOM_LIST"));
+
+    assert_eq!(json["modes"], serde_json::json!([99]));
+}

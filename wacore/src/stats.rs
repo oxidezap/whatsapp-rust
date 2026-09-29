@@ -536,6 +536,44 @@ impl HeapSize for wacore_binary::Jid {
     }
 }
 
+impl HeapSize for waproto::whatsapp::sync_action_value::status_privacy_action::CustomList {
+    fn heap_bytes(&self) -> usize {
+        self.list_id.as_ref().map_or(0, HeapSize::heap_bytes)
+            + self.name.as_ref().map_or(0, HeapSize::heap_bytes)
+            + self.emoji.as_ref().map_or(0, HeapSize::heap_bytes)
+            + self.user_jid.capacity() * size_of::<String>()
+            + self
+                .user_jid
+                .iter()
+                .map(HeapSize::heap_bytes)
+                .sum::<usize>()
+    }
+}
+
+impl HeapSize for waproto::whatsapp::sync_action_value::StatusPrivacyAction {
+    fn heap_bytes(&self) -> usize {
+        self.user_jid.capacity() * size_of::<String>()
+            + self
+                .user_jid
+                .iter()
+                .map(HeapSize::heap_bytes)
+                .sum::<usize>()
+            + self.custom_lists.capacity()
+                * size_of::<
+                    waproto::whatsapp::sync_action_value::status_privacy_action::CustomList,
+                >()
+            + self
+                .custom_lists
+                .iter()
+                .map(HeapSize::heap_bytes)
+                .sum::<usize>()
+            + self.modes.capacity()
+                * size_of::<buffa::EnumValue<
+                    waproto::whatsapp::sync_action_value::status_privacy_action::StatusDistributionMode,
+                >>()
+    }
+}
+
 /// Entry count plus estimated retained bytes for one internal collection.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CollectionStats {

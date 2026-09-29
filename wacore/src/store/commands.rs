@@ -416,8 +416,8 @@ mod tests {
 
         let mut device = Device::new();
         let action = wa::sync_action_value::StatusPrivacyAction {
-            mode: Some(StatusDistributionMode::CUSTOM_LIST),
-            modes: vec![StatusDistributionMode::CLOSE_FRIENDS],
+            mode: Some(StatusDistributionMode::CUSTOM_LIST.into()),
+            modes: vec![StatusDistributionMode::CLOSE_FRIENDS.into()],
             user_jid: vec!["120363000000000042@lid".into()],
             custom_lists: vec![CustomList {
                 list_id: Some("friends".into()),

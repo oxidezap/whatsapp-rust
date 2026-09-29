@@ -8741,7 +8741,7 @@ mod critical_bootstrap_tests {
         assert!(client.status().audience().is_none());
 
         let action = wa::sync_action_value::StatusPrivacyAction {
-            mode: Some(Mode::CUSTOM_LIST),
+            mode: Some(Mode::CUSTOM_LIST.into()),
             user_jid: vec!["120363000000000042@lid".into()],
             custom_lists: vec![CustomList {
                 list_id: Some("friends".into()),
@@ -8750,7 +8750,7 @@ mod critical_bootstrap_tests {
                 is_selected: Some(true),
                 ..Default::default()
             }],
-            modes: vec![Mode::CLOSE_FRIENDS, Mode::CUSTOM_LIST],
+            modes: vec![Mode::CLOSE_FRIENDS.into(), Mode::CUSTOM_LIST.into()],
             share_to_fb: Some(false),
             share_to_ig: Some(true),
         };
@@ -8773,6 +8773,16 @@ mod critical_bootstrap_tests {
             AppStateDispatchOutcome::Event("StatusPrivacyUpdate")
         );
         assert_eq!(client.status().audience().as_deref(), Some(&action));
+        let held_audience = client.status().audience().expect("stored audience");
+        let memory = client.memory_report().await;
+        assert_eq!(memory.status_privacy.entries, 3);
+        assert!(memory.status_privacy.bytes > 0);
+        assert_eq!(
+            client.memory_report().await.status_privacy.bytes,
+            memory.status_privacy.bytes,
+            "sharing the audience must not count its payload twice"
+        );
+        drop(held_audience);
         {
             let events = recorder.0.lock().expect("recorder mutex");
             assert_eq!(events.len(), 1);
@@ -8780,6 +8790,38 @@ mod critical_bootstrap_tests {
                 Event::StatusPrivacyUpdate(update) => {
                     assert_eq!(update.action.as_ref(), &action);
                     assert!(update.from_full_sync);
+                }
+                other => panic!("expected StatusPrivacyUpdate, got {other:?}"),
+            }
+        }
+
+        let unknown = waproto::codec::status_privacy_action_decode(&[0x08, 0x63])
+            .expect("decode unknown status privacy mode");
+        let mut unknown_mode = make_mutation(unknown.clone());
+        assert_eq!(
+            client
+                .dispatch_app_state_mutation(
+                    &mut unknown_mode,
+                    false,
+                    (WAPatchName::RegularHigh, 8, 1, 1)
+                )
+                .await,
+            AppStateDispatchOutcome::Event("StatusPrivacyUpdate")
+        );
+        assert_eq!(
+            client.status().audience().as_deref(),
+            Some(&unknown),
+            "unknown mode must replace the previous allowed audience"
+        );
+        let unknown_memory = client.memory_report().await.status_privacy;
+        assert_eq!(unknown_memory.entries, 0);
+        assert!(unknown_memory.bytes > 0);
+        {
+            let events = recorder.0.lock().expect("recorder mutex");
+            assert_eq!(events.len(), 2);
+            match &*events[1] {
+                Event::StatusPrivacyUpdate(update) => {
+                    assert_eq!(update.action.as_ref(), &unknown);
                 }
                 other => panic!("expected StatusPrivacyUpdate, got {other:?}"),
             }
@@ -8794,13 +8836,13 @@ mod critical_bootstrap_tests {
                 .dispatch_app_state_mutation(
                     &mut missing_mode,
                     false,
-                    (WAPatchName::RegularHigh, 8, 1, 1)
+                    (WAPatchName::RegularHigh, 9, 1, 1)
                 )
                 .await,
             AppStateDispatchOutcome::Malformed("StatusPrivacyUpdate")
         );
-        assert_eq!(client.status().audience().as_deref(), Some(&action));
-        assert_eq!(recorder.0.lock().expect("recorder mutex").len(), 1);
+        assert_eq!(client.status().audience().as_deref(), Some(&unknown));
+        assert_eq!(recorder.0.lock().expect("recorder mutex").len(), 2);
     }
 
     /// A 409 conflict absorb replays a snapshot's worth of mutations at TRACE

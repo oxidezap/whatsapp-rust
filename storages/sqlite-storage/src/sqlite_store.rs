@@ -6677,8 +6677,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let action = waproto::whatsapp::sync_action_value::StatusPrivacyAction {
-            mode: Some(waproto::whatsapp::sync_action_value::status_privacy_action::StatusDistributionMode::DENY_LIST),
+            mode: Some(buffa::EnumValue::Unknown(99)),
             user_jid: vec!["120363000000000042@lid".into()],
+            modes: vec![buffa::EnumValue::Unknown(100)],
             ..Default::default()
         };
         apply_command_to_device(&mut device, DeviceCommand::SetStatusPrivacy(action.clone()));

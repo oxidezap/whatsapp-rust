@@ -92,13 +92,11 @@ fn main() -> std::io::Result<()> {
         // docs); wire format and descriptor names are untouched.
         .idiomatic_field_names(true)
         // Open enum (buffa 0.9): unknown wire values surface as
-        // EnumValue::Unknown(n) instead of silently decoding as None (which
-        // the appstate LTHash path used to default to SET, corrupting the
-        // hash). Scoped to SyncdOperation only: opening an enum changes its
-        // serde shape (EnumValue serializes known values as proto names,
-        // unknown as numbers), so the message-level enums under the
-        // serde-enum-repr JS-bridge contract stay closed.
-        .open_enums_in(&[".whatsapp.SyncdMutation.SyncdOperation"])
+        // EnumValue::Unknown(n) instead of silently decoding as None.
+        .open_enums_in(&[
+            ".whatsapp.SyncdMutation.SyncdOperation",
+            ".whatsapp.SyncActionValue.StatusPrivacyAction.StatusDistributionMode",
+        ])
         // Keep the opened field on the closed-enum serde contracts
         // (serde-enum-repr numbers, serde-snake-case lowercase); see
         // crate::open_enum_serde.
@@ -109,6 +107,22 @@ fn main() -> std::io::Result<()> {
         .field_attribute(
             ".whatsapp.SyncdMutation.operation",
             "#[cfg_attr(feature = \"serde-deserialize\", serde(deserialize_with = \"crate::open_enum_serde::deserialize\"))]",
+        )
+        .field_attribute(
+            ".whatsapp.SyncActionValue.StatusPrivacyAction.mode",
+            "#[serde(serialize_with = \"crate::open_enum_serde::serialize\")]",
+        )
+        .field_attribute(
+            ".whatsapp.SyncActionValue.StatusPrivacyAction.mode",
+            "#[cfg_attr(feature = \"serde-deserialize\", serde(deserialize_with = \"crate::open_enum_serde::deserialize\"))]",
+        )
+        .field_attribute(
+            ".whatsapp.SyncActionValue.StatusPrivacyAction.modes",
+            "#[serde(serialize_with = \"crate::open_enum_serde::serialize_repeated\")]",
+        )
+        .field_attribute(
+            ".whatsapp.SyncActionValue.StatusPrivacyAction.modes",
+            "#[cfg_attr(feature = \"serde-deserialize\", serde(deserialize_with = \"crate::open_enum_serde::deserialize_repeated\"))]",
         )
         // Box every singular message field. buffa defaults them to inline; for
         // WhatsApp's deep, many-optional-field messages (every message variant
