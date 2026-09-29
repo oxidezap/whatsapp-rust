@@ -17,6 +17,7 @@ mod tests {
     use wacore::appstate::keys::{ExpandedAppStateKeys, expand_app_state_keys};
     use wacore::appstate::patch_decode::{CollectionSyncError, PatchList, WAPatchName};
     use wacore::appstate::processor::AppStateMutationMAC;
+    use wacore::appstate_sync::AppStateMutationPersistence;
     use wacore::appstate_sync::RecoveryOutcome;
     use wacore::libsignal::crypto::aes_256_cbc_encrypt_into;
     use wacore::store::error::Result as StoreResult;
@@ -46,6 +47,9 @@ mod tests {
         // Counts version writes, so a test can tell a sync that recorded
         // something from one that had nothing to record.
         set_version_calls: Arc<portable_atomic::AtomicU64>,
+        status_privacy: Arc<Mutex<Option<wa::sync_action_value::StatusPrivacyAction>>>,
+        status_privacy_versions: Arc<Mutex<Vec<Option<u64>>>>,
+        fail_status_privacy: Arc<Mutex<bool>>,
     }
 
     // Implement SignalStore - Signal protocol cryptographic operations
@@ -320,6 +324,31 @@ mod tests {
         }
     }
 
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AppStateMutationPersistence for MockBackend {
+        async fn persist_status_privacy(
+            &self,
+            action: &wa::sync_action_value::StatusPrivacyAction,
+        ) -> StoreResult<()> {
+            let version = self
+                .versions
+                .lock()
+                .await
+                .values()
+                .next()
+                .map(|state| state.version);
+            self.status_privacy_versions.lock().await.push(version);
+            if *self.fail_status_privacy.lock().await {
+                return Err(wacore::store::error::StoreError::Io(std::io::Error::other(
+                    "injected status privacy failure",
+                )));
+            }
+            *self.status_privacy.lock().await = Some(action.clone());
+            Ok(())
+        }
+    }
+
     fn create_encrypted_mutation(
         op: wa::syncd_mutation::SyncdOperation,
         index_mac: &[u8],
@@ -352,6 +381,192 @@ mod tests {
                 }),
             }),
         }
+    }
+
+    fn status_privacy_action() -> wa::sync_action_value::StatusPrivacyAction {
+        wa::sync_action_value::StatusPrivacyAction {
+            mode: Some(buffa::EnumValue::Unknown(99)),
+            user_jid: vec!["120363000000000042@lid".into()],
+            custom_lists: vec![wa::sync_action_value::status_privacy_action::CustomList {
+                list_id: Some("friends".into()),
+                user_jid: vec!["120363000000000043@lid".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    async fn status_privacy_patch_scenario(
+        snapshot: bool,
+    ) -> (
+        Arc<MockBackend>,
+        AppStateProcessor,
+        PatchList,
+        wa::sync_action_value::StatusPrivacyAction,
+    ) {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime))
+                .with_mutation_persistence(backend.clone());
+        let key_id = b"status_privacy_key".to_vec();
+        let master_key = [21u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        backend
+            .set_sync_key(
+                &key_id,
+                AppStateSyncKey {
+                    key_data: master_key.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        if snapshot {
+            backend
+                .set_version(
+                    WAPatchName::Regular.as_str(),
+                    HashState {
+                        version: 1,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let action = status_privacy_action();
+        let plaintext = wa::SyncActionData {
+            index: Some(br#"["status_privacy"]"#.to_vec()),
+            value: buffa::MessageField::some(wa::SyncActionValue {
+                status_privacy: buffa::MessageField::some(action.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mutation = create_encrypted_mutation(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &[0x31; 32],
+            &plaintext,
+            &keys,
+            &key_id,
+        );
+        let version = if snapshot { 2 } else { 1 };
+        let list = if snapshot {
+            PatchList {
+                name: WAPatchName::Regular,
+                has_more_patches: false,
+                patches: Vec::new(),
+                snapshot: Some(wa::SyncdSnapshot {
+                    version: buffa::MessageField::some(wa::SyncdVersion {
+                        version: Some(version),
+                    }),
+                    records: vec![mutation.record.expect("status record")],
+                    key_id: buffa::MessageField::some(wa::KeyId { id: Some(key_id) }),
+                    ..Default::default()
+                }),
+                snapshot_ref: None,
+                error: None,
+            }
+        } else {
+            PatchList {
+                name: WAPatchName::Regular,
+                has_more_patches: false,
+                patches: vec![wa::SyncdPatch {
+                    mutations: vec![mutation],
+                    version: buffa::MessageField::some(wa::SyncdVersion {
+                        version: Some(version),
+                    }),
+                    key_id: buffa::MessageField::some(wa::KeyId { id: Some(key_id) }),
+                    ..Default::default()
+                }],
+                snapshot: None,
+                snapshot_ref: None,
+                error: None,
+            }
+        };
+        (backend, processor, list, action)
+    }
+
+    #[tokio::test]
+    async fn status_privacy_patch_replays_after_a_failed_save() {
+        let (backend, processor, list, action) = status_privacy_patch_scenario(false).await;
+        *backend.fail_status_privacy.lock().await = true;
+        assert!(
+            processor
+                .process_patch_list(list.clone(), false)
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .get_version(WAPatchName::Regular.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(backend.status_privacy.lock().await.is_none());
+
+        *backend.fail_status_privacy.lock().await = false;
+        let restarted =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime))
+                .with_mutation_persistence(backend.clone());
+        restarted.process_patch_list(list, false).await.unwrap();
+        assert_eq!(backend.status_privacy.lock().await.as_ref(), Some(&action));
+        assert_eq!(
+            backend
+                .get_version(WAPatchName::Regular.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            1
+        );
+        assert_eq!(
+            &*backend.status_privacy_versions.lock().await,
+            &[None, None]
+        );
+    }
+
+    #[tokio::test]
+    async fn status_privacy_snapshot_replays_after_a_failed_save() {
+        let (backend, processor, list, action) = status_privacy_patch_scenario(true).await;
+        *backend.fail_status_privacy.lock().await = true;
+        assert!(
+            processor
+                .process_patch_list(list.clone(), false)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            backend
+                .get_version(WAPatchName::Regular.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            1
+        );
+
+        *backend.fail_status_privacy.lock().await = false;
+        let restarted =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime))
+                .with_mutation_persistence(backend.clone());
+        restarted.process_patch_list(list, false).await.unwrap();
+        assert_eq!(backend.status_privacy.lock().await.as_ref(), Some(&action));
+        assert_eq!(
+            backend
+                .get_version(WAPatchName::Regular.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            2
+        );
+        assert_eq!(
+            &*backend.status_privacy_versions.lock().await,
+            &[Some(1), Some(1)]
+        );
     }
 
     /// Builds the reply a primary device sends back, with one record per index.
@@ -394,6 +609,95 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[tokio::test]
+    async fn status_privacy_recovery_replays_after_a_failed_save() {
+        let backend = Arc::new(MockBackend::default());
+        let key_id = b"status_recovery_key".to_vec();
+        backend
+            .set_sync_key(
+                &key_id,
+                AppStateSyncKey {
+                    key_data: vec![17; 32],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        backend
+            .set_version(
+                WAPatchName::RegularLow.as_str(),
+                HashState {
+                    version: 0,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let action = status_privacy_action();
+        let mut recovery = recovery_of(
+            WAPatchName::RegularLow.as_str(),
+            253,
+            [0x5A; 128],
+            &key_id,
+            &[(r#"["status_privacy"]"#, [0x11; 32])],
+        );
+        let value = recovery.mutation_records[0]
+            .value
+            .as_option_mut()
+            .and_then(|data| data.value.as_option_mut())
+            .expect("status recovery value");
+        value.mute_action = buffa::MessageField::none();
+        value.status_privacy = buffa::MessageField::some(action.clone());
+
+        *backend.fail_status_privacy.lock().await = true;
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime))
+                .with_mutation_persistence(backend.clone());
+        assert!(
+            processor
+                .apply_snapshot_recovery(
+                    recovery.clone(),
+                    WAPatchName::RegularLow.as_str(),
+                    &|| true,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            backend
+                .get_version(WAPatchName::RegularLow.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            0
+        );
+
+        *backend.fail_status_privacy.lock().await = false;
+        let restarted =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime))
+                .with_mutation_persistence(backend.clone());
+        let outcome = restarted
+            .apply_snapshot_recovery(recovery, WAPatchName::RegularLow.as_str(), &|| true)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RecoveryOutcome::Applied(_)));
+        assert_eq!(backend.status_privacy.lock().await.as_ref(), Some(&action));
+        assert_eq!(
+            backend
+                .get_version(WAPatchName::RegularLow.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            253
+        );
+        assert_eq!(
+            &*backend.status_privacy_versions.lock().await,
+            &[Some(0), Some(0)]
+        );
     }
 
     /// The version and the ltHash are the primary's, written as given.

@@ -6703,6 +6703,24 @@ mod tests {
         assert_eq!(loaded.status_privacy.as_deref(), Some(&action));
 
         reopened
+            .with_retry("missing_status_privacy_mode", || {
+                Box::new(|conn: &mut SqliteConnection| {
+                    diesel::update(device::table.filter(device::id.eq(91)))
+                        .set(device::status_privacy.eq(Some(Vec::<u8>::new())))
+                        .execute(conn)?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        let loaded = reopened
+            .load_device_data_for_device(91)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(loaded.status_privacy.is_none());
+
+        reopened
             .with_retry("corrupt_status_privacy", || {
                 Box::new(|conn: &mut SqliteConnection| {
                     diesel::update(device::table.filter(device::id.eq(91)))

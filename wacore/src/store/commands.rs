@@ -430,6 +430,17 @@ mod tests {
         let mut json = serde_json::to_value(&device).expect("serialize device");
         let restored: Device = serde_json::from_value(json.clone()).expect("restore device");
         assert_eq!(restored.status_privacy.as_deref(), Some(&action));
+
+        json["status_privacy"] = serde_json::json!([]);
+        let missing_mode: Device =
+            serde_json::from_value(json.clone()).expect("ignore audience without mode");
+        assert!(missing_mode.status_privacy.is_none());
+
+        json["status_privacy"] = serde_json::json!([10, 255]);
+        let malformed: Device =
+            serde_json::from_value(json.clone()).expect("ignore malformed audience");
+        assert!(malformed.status_privacy.is_none());
+
         json.as_object_mut().unwrap().remove("status_privacy");
         let legacy: Device = serde_json::from_value(json).expect("restore legacy device");
         assert!(legacy.status_privacy.is_none());

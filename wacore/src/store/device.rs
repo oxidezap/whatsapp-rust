@@ -47,12 +47,24 @@ pub mod account_serde {
 pub mod status_privacy_serde {
     use waproto::whatsapp::sync_action_value::StatusPrivacyAction;
 
+    #[derive(Debug, thiserror::Error)]
+    pub enum DecodeError {
+        #[error(transparent)]
+        Protobuf(#[from] buffa::DecodeError),
+        #[error("status privacy action has no mode")]
+        MissingMode,
+    }
+
     pub fn to_bytes(action: &StatusPrivacyAction) -> Vec<u8> {
         waproto::codec::status_privacy_action_to_vec(action)
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<StatusPrivacyAction, buffa::DecodeError> {
-        waproto::codec::status_privacy_action_decode(bytes)
+    pub fn from_bytes(bytes: &[u8]) -> Result<StatusPrivacyAction, DecodeError> {
+        let action = waproto::codec::status_privacy_action_decode(bytes)?;
+        if action.mode.is_none() {
+            return Err(DecodeError::MissingMode);
+        }
+        Ok(action)
     }
 
     pub fn serialize<S: serde::Serializer>(
@@ -69,13 +81,9 @@ pub mod status_privacy_serde {
         deserializer: D,
     ) -> Result<Option<std::sync::Arc<StatusPrivacyAction>>, D::Error> {
         let bytes: Option<Vec<u8>> = serde::Deserialize::deserialize(deserializer)?;
-        bytes
-            .map(|bytes| {
-                from_bytes(&bytes)
-                    .map(std::sync::Arc::new)
-                    .map_err(serde::de::Error::custom)
-            })
-            .transpose()
+        Ok(bytes
+            .and_then(|bytes| from_bytes(&bytes).ok())
+            .map(std::sync::Arc::new))
     }
 }
 

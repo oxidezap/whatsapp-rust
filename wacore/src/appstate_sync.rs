@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use async_lock::Mutex;
+use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::appstate::hash::HashState;
@@ -18,6 +19,31 @@ use waproto::whatsapp as wa;
 
 // Re-export Mutation from appstate for convenience
 pub use crate::appstate::Mutation;
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait AppStateMutationPersistence: Send + Sync {
+    async fn persist_status_privacy(
+        &self,
+        action: &wa::sync_action_value::StatusPrivacyAction,
+    ) -> crate::store::error::Result<()>;
+}
+
+pub fn status_privacy_action(
+    mutation: &Mutation,
+) -> Option<&wa::sync_action_value::StatusPrivacyAction> {
+    if mutation.operation != wa::syncd_mutation::SyncdOperation::Set
+        || mutation.index.as_slice() != [crate::appstate::schemas::STATUS_PRIVACY.name]
+    {
+        return None;
+    }
+    mutation
+        .action_value
+        .as_ref()?
+        .status_privacy
+        .as_option()
+        .filter(|action| action.mode.is_some())
+}
 
 /// Index MAC carried by a mutation's record, if present.
 fn mutation_index_mac(m: &wa::SyncdMutation) -> Option<&[u8]> {
@@ -176,6 +202,7 @@ pub enum RecoveryOutcome {
 pub struct AppStateProcessor {
     pub backend: Arc<dyn Backend>,
     pub runtime: Arc<dyn crate::runtime::Runtime>,
+    mutation_persistence: Option<Arc<dyn AppStateMutationPersistence>>,
     /// Expanded app-state keys, keyed by the raw key id: the lookup runs once
     /// per mutation, and a base64 key meant encoding (and allocating) the id for
     /// every one of them.
@@ -238,9 +265,30 @@ impl AppStateProcessor {
         Self {
             runtime,
             backend,
+            mutation_persistence: None,
             key_cache: Arc::new(Mutex::new(KeyCache::default())),
             recovery_requested: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_mutation_persistence(
+        mut self,
+        persistence: Arc<dyn AppStateMutationPersistence>,
+    ) -> Self {
+        self.mutation_persistence = Some(persistence);
+        self
+    }
+
+    async fn persist_status_privacy(&self, mutations: &[Mutation]) -> Result<()> {
+        let Some(action) = mutations.iter().rev().find_map(status_privacy_action) else {
+            return Ok(());
+        };
+        let persistence = self
+            .mutation_persistence
+            .as_ref()
+            .ok_or_else(|| anyhow!("status privacy persistence is not configured"))?;
+        persistence.persist_status_privacy(action).await?;
+        Ok(())
     }
 
     /// How long one outstanding request suppresses another for the same
@@ -666,6 +714,7 @@ impl AppStateProcessor {
         if !macs.is_empty() {
             self.backend.put_mutation_macs(name, version, &macs).await?;
         }
+        self.persist_status_privacy(&mutations).await?;
         self.backend
             .set_version(
                 name,
@@ -876,15 +925,6 @@ impl AppStateProcessor {
             pl.snapshot = Some(snapshot);
             state = snapshot_state;
 
-            // Snapshot owns the whole collection: move its Vec into the empty
-            // accumulator rather than extend, which would allocate + copy a second
-            // collection-sized buffer at the memory peak. is_empty falls back to extend.
-            if new_mutations.is_empty() {
-                new_mutations = snapshot_result.mutations;
-            } else {
-                new_mutations.extend(snapshot_result.mutations);
-            }
-
             // A snapshot is a fresh baseline, so wipe the collection's prior mutation
             // MACs first (unconditionally, even if the snapshot has none) — leftover
             // index->value entries would corrupt the next patch's ltHash.
@@ -903,6 +943,16 @@ impl AppStateProcessor {
                     .await?;
             }
             state.bootstrapped |= !pl.has_more_patches;
+            self.persist_status_privacy(&snapshot_result.mutations)
+                .await?;
+            // Snapshot owns the whole collection: move its Vec into the empty
+            // accumulator rather than extend, which would allocate + copy a second
+            // collection-sized buffer at the memory peak. is_empty falls back to extend.
+            if new_mutations.is_empty() {
+                new_mutations = snapshot_result.mutations;
+            } else {
+                new_mutations.extend(snapshot_result.mutations);
+            }
             self.backend
                 .set_version(collection_name, state.clone())
                 .await?;
@@ -994,12 +1044,12 @@ impl AppStateProcessor {
             // Update local state with the result from the blocking task
             state = result.state;
 
-            new_mutations.extend(result.mutations);
-
             // Persist state and MACs: one backend call per patch, so a
             // transactional backend commits the version with the MACs it
             // pairs with instead of paying three round trips.
             state.bootstrapped |= !pl.has_more_patches;
+            self.persist_status_privacy(&result.mutations).await?;
+            new_mutations.extend(result.mutations);
             self.backend
                 .commit_patch(
                     collection_name,

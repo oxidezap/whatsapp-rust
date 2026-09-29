@@ -818,10 +818,10 @@ impl Client {
     pub(crate) fn get_app_state_processor(&self) -> &Arc<AppStateProcessor> {
         self.app_state_processor.get_or_init(|| {
             debug!("Initializing AppStateProcessor for the first time.");
-            Arc::new(AppStateProcessor::new(
-                self.persistence_manager.backend(),
-                self.runtime.clone(),
-            ))
+            Arc::new(
+                AppStateProcessor::new(self.persistence_manager.backend(), self.runtime.clone())
+                    .with_mutation_persistence(self.persistence_manager.clone()),
+            )
         })
     }
 
@@ -4485,27 +4485,17 @@ impl Client {
         // Set with a present mode. Keep the full action rather than guessing
         // an audience from the three legacy status_setting wire values.
         if m.index.len() == 1 && m.index[0] == wacore::appstate::schemas::STATUS_PRIVACY.name {
-            let outcome = if let Some(action) = m
-                .action_value
-                .as_ref()
-                .and_then(|v| v.status_privacy.as_option())
-                .filter(|action| action.mode.is_some())
-            {
-                let action = action.clone();
+            let outcome = if wacore::appstate_sync::status_privacy_action(m).is_some() {
                 let action_timestamp = m
                     .action_value
                     .as_ref()
                     .and_then(|v| v.timestamp)
                     .and_then(chrono::DateTime::from_timestamp_millis);
-                self.persistence_manager
-                    .process_command(DeviceCommand::SetStatusPrivacy(action.clone()))
-                    .await;
-                // The app-state processor has already committed its cursor. Do not
-                // leave this audience waiting for the periodic device saver before
-                // notifying consumers of the change.
-                if let Err(e) = self.persistence_manager.flush().await {
-                    warn!(target: "Client/AppState", "Failed to persist status privacy audience: {e}");
-                }
+                let action = m
+                    .action_value
+                    .as_mut()
+                    .and_then(|v| v.status_privacy.take())
+                    .expect("validated status privacy action");
                 self.core.event_bus.dispatch(Event::StatusPrivacyUpdate(
                     wacore::types::events::StatusPrivacyUpdate::builder()
                         .timestamp(action_timestamp.unwrap_or_else(|| {
@@ -8771,6 +8761,11 @@ mod critical_bootstrap_tests {
                 }),
             };
         let mut mutation = make_mutation(action.clone());
+        client
+            .persistence_manager
+            .persist_status_privacy(&action)
+            .await
+            .unwrap();
         let outcome = client
             .dispatch_app_state_mutation(&mut mutation, true, (WAPatchName::RegularHigh, 7, 1, 1))
             .await;
@@ -8804,6 +8799,11 @@ mod critical_bootstrap_tests {
         let unknown = waproto::codec::status_privacy_action_decode(&[0x08, 0x63])
             .expect("decode unknown status privacy mode");
         let mut unknown_mode = make_mutation(unknown.clone());
+        client
+            .persistence_manager
+            .persist_status_privacy(&unknown)
+            .await
+            .unwrap();
         assert_eq!(
             client
                 .dispatch_app_state_mutation(

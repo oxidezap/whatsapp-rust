@@ -8,6 +8,7 @@ use log::{debug, error};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use wacore::appstate_sync::AppStateMutationPersistence;
 use wacore::runtime::{AbortHandle, Runtime, ShutdownSignal, wait_for_shutdown};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -313,6 +314,26 @@ impl PersistenceManager {
         })
         .await;
     }
+
+    pub(crate) async fn persist_status_privacy(
+        &self,
+        action: &waproto::whatsapp::sync_action_value::StatusPrivacyAction,
+    ) -> Result<(), StoreError> {
+        self.process_command(DeviceCommand::SetStatusPrivacy(action.clone()))
+            .await;
+        self.flush().await
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl AppStateMutationPersistence for PersistenceManager {
+    async fn persist_status_privacy(
+        &self,
+        action: &waproto::whatsapp::sync_action_value::StatusPrivacyAction,
+    ) -> Result<(), StoreError> {
+        self.persist_status_privacy(action).await
+    }
 }
 
 impl PersistenceManager {
@@ -479,6 +500,24 @@ mod tests {
         assert!(pm.pending_save.lock().await.is_none());
         pm.flush().await.unwrap();
         assert_eq!(backend.load().await.unwrap().unwrap().push_name, "after");
+    }
+
+    #[tokio::test]
+    async fn status_privacy_persistence_survives_manager_restart() {
+        let backend = Arc::new(wacore::store::in_memory::InMemoryBackend::new());
+        let pm = PersistenceManager::new(backend.clone()).await.unwrap();
+        let action = waproto::whatsapp::sync_action_value::StatusPrivacyAction {
+            mode: Some(buffa::EnumValue::Unknown(99)),
+            user_jid: vec!["120363000000000042@lid".into()],
+            ..Default::default()
+        };
+        pm.persist_status_privacy(&action).await.unwrap();
+
+        let restarted = PersistenceManager::new(backend).await.unwrap();
+        assert_eq!(
+            restarted.get_device_snapshot().status_privacy.as_deref(),
+            Some(&action)
+        );
     }
 
     // Saver must observe shutdown.notify, run a final flush, and exit so the
