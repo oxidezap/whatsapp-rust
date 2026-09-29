@@ -50,8 +50,9 @@ pub mod status_privacy_serde {
     use waproto::whatsapp::sync_action_value::StatusPrivacyAction;
 
     #[derive(Debug, thiserror::Error)]
+    #[non_exhaustive]
     pub enum DecodeError {
-        #[error(transparent)]
+        #[error("{0}")]
         Protobuf(#[from] buffa::DecodeError),
         #[error("status privacy action has no mode")]
         MissingMode,

@@ -20,7 +20,7 @@ use waproto::whatsapp as wa;
 // Re-export Mutation from appstate for convenience
 pub use crate::appstate::Mutation;
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[error("{source}")]
 /// An error after earlier mutations in the same collection were committed.
 ///
@@ -34,6 +34,18 @@ pub struct CommittedMutationsError {
     source: anyhow::Error,
 }
 
+impl std::fmt::Debug for CommittedMutationsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommittedMutationsError")
+            .field("mutations", &self.mutations.len())
+            .field("state", &self.state)
+            .field("collection", &self.collection)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
 impl CommittedMutationsError {
     /// Split the committed work from the error that stopped the next patch.
     pub fn into_parts(self) -> (Vec<Mutation>, HashState, WAPatchName, anyhow::Error) {
@@ -41,7 +53,7 @@ impl CommittedMutationsError {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[error("{source}")]
 /// An error after earlier collections in a batch were committed.
 ///
@@ -51,6 +63,16 @@ pub struct CommittedPatchListsError {
     results: Vec<(Vec<Mutation>, HashState, PatchList)>,
     #[source]
     source: anyhow::Error,
+}
+
+impl std::fmt::Debug for CommittedPatchListsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommittedPatchListsError")
+            .field("results", &self.results.len())
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 impl CommittedPatchListsError {
