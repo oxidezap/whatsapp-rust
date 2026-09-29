@@ -2262,8 +2262,7 @@ impl Client {
                             target: "Client/AppState",
                             "Batched sync: apply failed for {name:?}: {e}"
                         );
-                        self.escalate_to_snapshot_recovery(name, &e).await;
-                        apply_error = Some(e);
+                        apply_error = Some((name, e));
                         break;
                     }
                 }
@@ -2435,8 +2434,13 @@ impl Client {
             // what the deferral buys is not a report but the dispatch itself:
             // mutations already persisted reach their consumer instead of being
             // stranded behind a cursor that has moved past them.
-            if let Some(e) = apply_error {
-                return Err(e);
+            if let Some((name, error)) = apply_error {
+                let full_sync = replaying_snapshot.contains(&name);
+                let error = self
+                    .dispatch_committed_mutations_from_error(error, full_sync, full_sync)
+                    .await;
+                self.escalate_to_snapshot_recovery(name, &error).await;
+                return Err(error);
             }
 
             pending = needs_refetch;
@@ -2608,13 +2612,16 @@ impl Client {
             let (mutations, new_state, list) =
                 match proc.process_parsed_patch_list(pl, &download, true).await {
                     Ok(applied) => applied,
-                    Err(e) => {
+                    Err(error) => {
                         // The single-collection path fails the same way the batched
                         // one does and deserves the same escalation; without it, a
                         // collection would recover only when its failure happened to
                         // arrive in a batch.
-                        self.escalate_to_snapshot_recovery(name, &e).await;
-                        return Err(e);
+                        let error = self
+                            .dispatch_committed_mutations_from_error(error, full_sync, full_sync)
+                            .await;
+                        self.escalate_to_snapshot_recovery(name, &error).await;
+                        return Err(error);
                     }
                 };
             let decode_elapsed = _decode_start.elapsed();
@@ -3218,6 +3225,7 @@ impl Client {
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("external blob not pre-downloaded: {path}"))
             };
+            let replaying_snapshot = list.snapshot.is_some() || list.snapshot_ref.is_some();
             let proc = self.get_app_state_processor();
             match proc.process_parsed_patch_list(list, &download, true).await {
                 // The third element is the processor's own verdict, and it is
@@ -3240,7 +3248,6 @@ impl Client {
                     // `event_full_sync=false` (the base passed `false`
                     // here unconditionally), so the split args below must
                     // not be reunited into one `full_sync`.
-                    let replaying_snapshot = list.snapshot.is_some() || list.snapshot_ref.is_some();
                     let total = mutations.len();
                     for (position, mut m) in mutations.into_iter().enumerate() {
                         self.dispatch_app_state_mutation_inner(
@@ -3262,10 +3269,13 @@ impl Client {
                         true
                     }
                 }
-                Err(e) => {
+                Err(error) => {
+                    let error = self
+                        .dispatch_committed_mutations_from_error(error, false, replaying_snapshot)
+                        .await;
                     warn!(
                         target: "Client/AppState",
-                        "Failed to apply the patches {collection_name} conflicted with: {e:#}"
+                        "Failed to apply the patches {collection_name} conflicted with: {error:#}"
                     );
                     false
                 }
@@ -4308,6 +4318,31 @@ fn log_mutation_dispatched(
 }
 
 impl Client {
+    async fn dispatch_committed_mutations_from_error(
+        &self,
+        error: anyhow::Error,
+        event_full_sync: bool,
+        log_full_sync: bool,
+    ) -> anyhow::Error {
+        let committed = match error.downcast::<wacore::appstate_sync::CommittedMutationsError>() {
+            Ok(committed) => committed,
+            Err(error) => return error,
+        };
+        let (mutations, state, collection, source) = committed.into_parts();
+        wacore::telemetry::appstate_mutations(mutations.len() as u64);
+        let total = mutations.len();
+        for (position, mut mutation) in mutations.into_iter().enumerate() {
+            self.dispatch_app_state_mutation_inner(
+                &mut mutation,
+                event_full_sync,
+                log_full_sync,
+                Some((collection, state.version, position + 1, total)),
+            )
+            .await;
+        }
+        source
+    }
+
     /// Dispatch one app-state mutation, returning its [`AppStateDispatchOutcome`].
     ///
     /// `&mut` so a dispatcher can move the action out of the mutation into

@@ -7,6 +7,51 @@ use futures::channel::oneshot;
 use wacore_binary::SERVER_JID;
 
 #[tokio::test]
+async fn replacing_status_privacy_releases_the_assembled_copy() {
+    let backend = crate::test_utils::create_test_backend().await;
+    let persistence_manager = Arc::new(
+        PersistenceManager::new(backend)
+            .await
+            .expect("persistence manager"),
+    );
+    let first = wa::sync_action_value::StatusPrivacyAction {
+        mode: Some(buffa::EnumValue::Unknown(99)),
+        user_jid: vec!["120363000000000042@lid".into()],
+        ..Default::default()
+    };
+    persistence_manager
+        .persist_status_privacy(&first)
+        .await
+        .unwrap();
+    let held = persistence_manager
+        .get_device_snapshot()
+        .status_privacy
+        .clone()
+        .expect("seeded audience");
+    let old_allocation = Arc::downgrade(&held);
+
+    let (_client, _rx) = Client::new(
+        Arc::new(crate::runtime_impl::TokioRuntime),
+        persistence_manager.clone(),
+        Arc::new(crate::transport::mock::MockTransportFactory::new()),
+        Arc::new(MockHttpClient),
+        None,
+    )
+    .await;
+
+    let second = wa::sync_action_value::StatusPrivacyAction {
+        mode: Some(buffa::EnumValue::Unknown(100)),
+        ..Default::default()
+    };
+    persistence_manager
+        .persist_status_privacy(&second)
+        .await
+        .unwrap();
+    drop(held);
+    assert!(old_allocation.upgrade().is_none());
+}
+
+#[tokio::test]
 async fn test_ack_behavior_for_incoming_stanzas() {
     let backend = crate::test_utils::create_test_backend().await;
     let pm = Arc::new(

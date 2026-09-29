@@ -488,6 +488,146 @@ mod tests {
         (backend, processor, list, action)
     }
 
+    async fn committed_before_status_privacy_scenario(
+        snapshot_first: bool,
+    ) -> (Arc<MockBackend>, AppStateProcessor, PatchList) {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime))
+                .with_mutation_persistence(backend.clone());
+        let key_id = b"partial_status_privacy_key".to_vec();
+        let master_key = [23u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        backend
+            .set_sync_key(
+                &key_id,
+                AppStateSyncKey {
+                    key_data: master_key.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let nct_plaintext = wa::SyncActionData {
+            index: Some(br#"["nct_salt_sync"]"#.to_vec()),
+            value: buffa::MessageField::some(wa::SyncActionValue {
+                nct_salt_sync_action: buffa::MessageField::some(
+                    wa::sync_action_value::NctSaltSyncAction {
+                        salt: Some(vec![1, 2, 3]),
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let nct = create_encrypted_mutation(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &[0x41; 32],
+            &nct_plaintext,
+            &keys,
+            &key_id,
+        );
+        let status_plaintext = wa::SyncActionData {
+            index: Some(br#"["status_privacy"]"#.to_vec()),
+            value: buffa::MessageField::some(wa::SyncActionValue {
+                status_privacy: buffa::MessageField::some(status_privacy_action()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let status = create_encrypted_mutation(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &[0x42; 32],
+            &status_plaintext,
+            &keys,
+            &key_id,
+        );
+        let status_patch = wa::SyncdPatch {
+            mutations: vec![status],
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(2) }),
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            ..Default::default()
+        };
+        let list = if snapshot_first {
+            PatchList {
+                name: WAPatchName::RegularHigh,
+                has_more_patches: false,
+                patches: vec![status_patch],
+                snapshot: Some(wa::SyncdSnapshot {
+                    version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+                    records: vec![nct.record.expect("nct snapshot record")],
+                    key_id: buffa::MessageField::some(wa::KeyId { id: Some(key_id) }),
+                    ..Default::default()
+                }),
+                snapshot_ref: None,
+                error: None,
+            }
+        } else {
+            PatchList {
+                name: WAPatchName::RegularHigh,
+                has_more_patches: false,
+                patches: vec![
+                    wa::SyncdPatch {
+                        mutations: vec![nct],
+                        version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+                        key_id: buffa::MessageField::some(wa::KeyId {
+                            id: Some(key_id.clone()),
+                        }),
+                        ..Default::default()
+                    },
+                    status_patch,
+                ],
+                snapshot: None,
+                snapshot_ref: None,
+                error: None,
+            }
+        };
+        *backend.fail_status_privacy.lock().await = true;
+        (backend, processor, list)
+    }
+
+    async fn assert_nct_commit_survives_later_status_failure(snapshot_first: bool) {
+        let (backend, processor, list) =
+            committed_before_status_privacy_scenario(snapshot_first).await;
+        let error = processor
+            .process_patch_list(list, false)
+            .await
+            .expect_err("status persistence should fail");
+        let committed = error
+            .downcast::<wacore::appstate_sync::CommittedMutationsError>()
+            .expect("committed mutations should travel with the error");
+        let (mutations, state, collection, source) = committed.into_parts();
+        assert_eq!(collection, WAPatchName::RegularHigh);
+        assert_eq!(state.version, 1);
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0].index, ["nct_salt_sync"]);
+        assert!(format!("{source:#}").contains("injected status privacy failure"));
+        assert_eq!(
+            backend
+                .get_version(WAPatchName::RegularHigh.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn earlier_patch_mutations_survive_a_later_status_save_failure() {
+        assert_nct_commit_survives_later_status_failure(false).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_mutations_survive_a_later_status_save_failure() {
+        assert_nct_commit_survives_later_status_failure(true).await;
+    }
+
     #[tokio::test]
     async fn status_privacy_patch_replays_after_a_failed_save() {
         let (backend, processor, list, action) = status_privacy_patch_scenario(false).await;
