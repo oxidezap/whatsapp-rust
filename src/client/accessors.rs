@@ -459,7 +459,13 @@ impl Client {
                         );
                     CollectionStats::new(
                         u64::try_from(entries).unwrap_or(u64::MAX),
-                        u64::try_from(action.heap_bytes()).unwrap_or(u64::MAX),
+                        // Charge the retained Arc allocation even for a mode-only action.
+                        u64::try_from(
+                            size_of::<waproto::whatsapp::sync_action_value::StatusPrivacyAction>()
+                                .saturating_add(2 * size_of::<usize>())
+                                .saturating_add(action.heap_bytes()),
+                        )
+                        .unwrap_or(u64::MAX),
                     )
                 });
         let subsystems = subsystem::memory(&self.subsystems);

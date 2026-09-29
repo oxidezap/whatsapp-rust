@@ -4500,6 +4500,12 @@ impl Client {
                 self.persistence_manager
                     .process_command(DeviceCommand::SetStatusPrivacy(action.clone()))
                     .await;
+                // The app-state processor has already committed its cursor. Do not
+                // leave this audience waiting for the periodic device saver before
+                // notifying consumers of the change.
+                if let Err(e) = self.persistence_manager.flush().await {
+                    warn!(target: "Client/AppState", "Failed to persist status privacy audience: {e}");
+                }
                 self.core.event_bus.dispatch(Event::StatusPrivacyUpdate(
                     wacore::types::events::StatusPrivacyUpdate::builder()
                         .timestamp(action_timestamp.unwrap_or_else(|| {

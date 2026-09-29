@@ -2017,15 +2017,22 @@ impl SqliteStore {
                 server_has_prekeys: row.server_has_prekeys,
                 nct_salt: row.nct_salt,
                 nct_salt_sync_seen: false,
-                status_privacy: row
-                    .status_privacy
-                    .as_deref()
-                    .map(|bytes| {
-                        wacore::store::device::status_privacy_serde::from_bytes(bytes)
-                            .map(Arc::new)
-                            .map_err(|e| StoreError::Serialization(Box::new(e)))
-                    })
-                    .transpose()?,
+                status_privacy: row.status_privacy.as_deref().and_then(|bytes| {
+                    match wacore::store::device::status_privacy_serde::from_bytes(bytes) {
+                        Ok(action) => Some(Arc::new(action)),
+                        Err(e) => {
+                            // The optional audience must not prevent account startup. Never
+                            // substitute an all-contacts audience for an undecodable value.
+                            log::warn!(
+                                "device {} status_privacy blob ({} bytes) failed to decode: {e}; \
+                                 treating audience as unknown",
+                                self.device_id,
+                                bytes.len(),
+                            );
+                            None
+                        }
+                    }
+                }),
                 server_cert_chain: row
                     .server_cert_chain
                     .as_deref()
@@ -6694,6 +6701,24 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded.status_privacy.as_deref(), Some(&action));
+
+        reopened
+            .with_retry("corrupt_status_privacy", || {
+                Box::new(|conn: &mut SqliteConnection| {
+                    diesel::update(device::table.filter(device::id.eq(91)))
+                        .set(device::status_privacy.eq(Some(vec![0x0a, 0xff])))
+                        .execute(conn)?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        let loaded = reopened
+            .load_device_data_for_device(91)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(loaded.status_privacy.is_none());
     }
 
     /// Round-trips a `CachedServerCertChain` through the SQLite schema:
