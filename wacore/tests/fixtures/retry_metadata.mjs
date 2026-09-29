@@ -72,7 +72,7 @@ const append = (kind, flag, wrappers = []) => {
     default: throw new Error(kind);
   }
   const keys = {dsm: 'deviceSentMessage', ephemeral: 'ephemeralMessage', v1: 'viewOnceMessage', v2: 'viewOnceMessageV2', v2ext: 'viewOnceMessageV2Extension'};
-  for (const w of wrappers.toReversed()) proto = {[keys[w]]: kind === 'empty' ? {} : {message: proto}};
+  for (const w of [...wrappers].reverse()) proto = {[keys[w]]: kind === 'empty' ? {} : {message: proto}};
   const data = {type: kind === 'member_label' ? 'protocol' : 'ordinary', mediaData};
   if (kind === 'member_label') Object.assign(data, {subtype: 'member_label', memberLabelData: {label: flag ? 'synthetic' : ''}});
   let meta, invalid = false;
