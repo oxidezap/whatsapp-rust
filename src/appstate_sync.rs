@@ -398,6 +398,7 @@ mod tests {
 
     async fn status_privacy_patch_scenario(
         snapshot: bool,
+        install_persistence: bool,
     ) -> (
         Arc<MockBackend>,
         AppStateProcessor,
@@ -406,8 +407,12 @@ mod tests {
     ) {
         let backend = Arc::new(MockBackend::default());
         let processor =
-            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime))
-                .with_mutation_persistence(backend.clone());
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let processor = if install_persistence {
+            processor.with_mutation_persistence(backend.clone())
+        } else {
+            processor
+        };
         let key_id = b"status_privacy_key".to_vec();
         let master_key = [21u8; 32];
         let keys = expand_app_state_keys(&master_key);
@@ -486,6 +491,31 @@ mod tests {
             }
         };
         (backend, processor, list, action)
+    }
+
+    #[tokio::test]
+    async fn public_processor_applies_status_privacy_without_a_persistence_hook() {
+        for snapshot in [false, true] {
+            let (backend, processor, list, action) =
+                status_privacy_patch_scenario(snapshot, false).await;
+            let (mutations, state, _) = processor.process_patch_list(list, false).await.unwrap();
+            assert_eq!(mutations.len(), 1);
+            assert_eq!(
+                wacore::appstate_sync::status_privacy_action(&mutations[0]),
+                Some(&action)
+            );
+            assert_eq!(state.version, if snapshot { 2 } else { 1 });
+            assert_eq!(
+                backend
+                    .get_version(WAPatchName::Regular.as_str())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .version,
+                state.version
+            );
+            assert!(backend.status_privacy.lock().await.is_none());
+        }
     }
 
     async fn committed_before_status_privacy_scenario(
@@ -630,7 +660,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_privacy_patch_replays_after_a_failed_save() {
-        let (backend, processor, list, action) = status_privacy_patch_scenario(false).await;
+        let (backend, processor, list, action) = status_privacy_patch_scenario(false, true).await;
         *backend.fail_status_privacy.lock().await = true;
         assert!(
             processor
@@ -670,7 +700,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_privacy_snapshot_replays_after_a_failed_save() {
-        let (backend, processor, list, action) = status_privacy_patch_scenario(true).await;
+        let (backend, processor, list, action) = status_privacy_patch_scenario(true, true).await;
         *backend.fail_status_privacy.lock().await = true;
         assert!(
             processor

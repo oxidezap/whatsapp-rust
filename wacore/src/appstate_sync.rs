@@ -318,10 +318,9 @@ impl AppStateProcessor {
         let Some(action) = mutations.iter().rev().find_map(status_privacy_action) else {
             return Ok(());
         };
-        let persistence = self
-            .mutation_persistence
-            .as_ref()
-            .ok_or_else(|| anyhow!("status privacy persistence is not configured"))?;
+        let Some(persistence) = self.mutation_persistence.as_ref() else {
+            return Ok(());
+        };
         persistence.persist_status_privacy(action).await?;
         Ok(())
     }
