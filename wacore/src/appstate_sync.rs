@@ -36,6 +36,20 @@ impl CommittedMutationsError {
     }
 }
 
+#[derive(Debug, Error)]
+#[error("{source}")]
+pub struct CommittedPatchListsError {
+    results: Vec<(Vec<Mutation>, HashState, PatchList)>,
+    #[source]
+    source: anyhow::Error,
+}
+
+impl CommittedPatchListsError {
+    pub fn into_parts(self) -> (Vec<(Vec<Mutation>, HashState, PatchList)>, anyhow::Error) {
+        (self.results, self.source)
+    }
+}
+
 fn committed_mutations_error(
     source: anyhow::Error,
     mutations: Vec<Mutation>,
@@ -843,10 +857,16 @@ impl AppStateProcessor {
         let mut results = Vec::with_capacity(patch_lists.len());
 
         for pl in patch_lists {
-            results.push(
-                self.process_one_patch_list(pl, download, validate_macs)
-                    .await?,
-            );
+            match self
+                .process_one_patch_list(pl, download, validate_macs)
+                .await
+            {
+                Ok(result) => results.push(result),
+                Err(source) if results.is_empty() => return Err(source),
+                Err(source) => {
+                    return Err(CommittedPatchListsError { results, source }.into());
+                }
+            }
         }
 
         Ok(results)

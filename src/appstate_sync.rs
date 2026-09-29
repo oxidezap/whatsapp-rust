@@ -649,6 +649,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_collection_error_preserves_prior_results() {
+        let (backend, processor, mut list) = committed_before_status_privacy_scenario(false).await;
+        let mut status_patch = list.patches.pop().expect("status patch");
+        let nct_patch = list.patches.pop().expect("nct patch");
+        status_patch.version = buffa::MessageField::some(wa::SyncdVersion { version: Some(1) });
+        let first = PatchList {
+            name: WAPatchName::RegularHigh,
+            patches: vec![nct_patch],
+            ..list.clone()
+        };
+        let second = PatchList {
+            name: WAPatchName::Regular,
+            patches: vec![status_patch],
+            ..list
+        };
+        let download = |_ext: &wa::ExternalBlobReference| -> anyhow::Result<bytes::Bytes> {
+            Err(anyhow::anyhow!("unexpected external blob"))
+        };
+
+        let error = processor
+            .process_patch_lists(vec![first, second], &download, false)
+            .await
+            .expect_err("second collection should fail status persistence");
+        let committed = error
+            .downcast::<wacore::appstate_sync::CommittedPatchListsError>()
+            .expect("prior collection results should travel with the error");
+        let (results, source) = committed.into_parts();
+        assert_eq!(results.len(), 1);
+        let (mutations, state, applied) = &results[0];
+        assert_eq!(applied.name, WAPatchName::RegularHigh);
+        assert_eq!(state.version, 1);
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0].index, ["nct_salt_sync"]);
+        assert!(format!("{source:#}").contains("injected status privacy failure"));
+        assert_eq!(
+            backend
+                .get_version(WAPatchName::RegularHigh.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            1
+        );
+        assert!(
+            backend
+                .get_version(WAPatchName::Regular.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn earlier_patch_mutations_survive_a_later_status_save_failure() {
         assert_nct_commit_survives_later_status_failure(false).await;
     }
