@@ -42,7 +42,7 @@ pub mod account_serde {
     }
 }
 
-/// Preserve the full syncd action, including lists and future protobuf fields,
+/// Preserve the full syncd action, including lists and unknown enum values,
 /// without enabling generated-proto deserialization across the workspace.
 pub mod status_privacy_serde {
     use waproto::whatsapp::sync_action_value::StatusPrivacyAction;

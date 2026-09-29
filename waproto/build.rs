@@ -97,7 +97,7 @@ fn main() -> std::io::Result<()> {
             ".whatsapp.SyncdMutation.SyncdOperation",
             ".whatsapp.SyncActionValue.StatusPrivacyAction.StatusDistributionMode",
         ])
-        // Keep the opened field on the closed-enum serde contracts
+        // Keep opened fields on the closed-enum serde contracts
         // (serde-enum-repr numbers, serde-snake-case lowercase); see
         // crate::open_enum_serde.
         .field_attribute(

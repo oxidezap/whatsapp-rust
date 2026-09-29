@@ -1,7 +1,7 @@
-//! The opened `SyncdMutation.operation` field must keep the closed-enum serde
-//! contract in every feature mode (see `waproto::open_enum_serde`): variant
-//! name / numeric repr / lowercase-name deserialize are all routed through the
-//! enum's own derived impls; only `Unknown` values add the raw-integer form.
+//! Opened enum fields must keep the closed-enum serde contract in every feature
+//! mode (see `waproto::open_enum_serde`). Variant names, numeric repr, and
+//! lowercase-name deserialization all use the enum's own derived impls. Only
+//! `Unknown` values add the raw-integer form.
 
 use waproto::whatsapp as wa;
 
