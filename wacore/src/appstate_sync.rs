@@ -22,6 +22,10 @@ pub use crate::appstate::Mutation;
 
 #[derive(Debug, Error)]
 #[error("{source}")]
+/// An error after earlier mutations in the same collection were committed.
+///
+/// Callers must dispatch the returned mutations even though a later patch
+/// failed. The state is the cursor that was committed with those mutations.
 pub struct CommittedMutationsError {
     mutations: Vec<Mutation>,
     state: HashState,
@@ -31,6 +35,7 @@ pub struct CommittedMutationsError {
 }
 
 impl CommittedMutationsError {
+    /// Split the committed work from the error that stopped the next patch.
     pub fn into_parts(self) -> (Vec<Mutation>, HashState, WAPatchName, anyhow::Error) {
         (self.mutations, self.state, self.collection, self.source)
     }
@@ -38,6 +43,10 @@ impl CommittedMutationsError {
 
 #[derive(Debug, Error)]
 #[error("{source}")]
+/// An error after earlier collections in a batch were committed.
+///
+/// Callers must consume the returned results even though a later collection
+/// failed. The source may itself be a [`CommittedMutationsError`].
 pub struct CommittedPatchListsError {
     results: Vec<(Vec<Mutation>, HashState, PatchList)>,
     #[source]
@@ -45,6 +54,7 @@ pub struct CommittedPatchListsError {
 }
 
 impl CommittedPatchListsError {
+    /// Split the committed collection results from the later error.
     pub fn into_parts(self) -> (Vec<(Vec<Mutation>, HashState, PatchList)>, anyhow::Error) {
         (self.results, self.source)
     }
@@ -71,13 +81,22 @@ fn committed_mutations_error(
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+/// Persists mutation-derived state that must not lag its app-state cursor.
+///
+/// The processor calls this hook before committing the cursor for a patch,
+/// snapshot, or snapshot recovery. A hook error leaves that cursor unchanged
+/// so the mutation can be replayed.
 pub trait AppStateMutationPersistence: Send + Sync {
+    /// Persist the complete status privacy action, including unknown modes.
     async fn persist_status_privacy(
         &self,
         action: &wa::sync_action_value::StatusPrivacyAction,
     ) -> crate::store::error::Result<()>;
 }
 
+/// Return a complete `status_privacy` SET action with a mode.
+///
+/// Missing modes and other mutation indexes are not valid audience updates.
 pub fn status_privacy_action(
     mutation: &Mutation,
 ) -> Option<&wa::sync_action_value::StatusPrivacyAction> {
@@ -310,6 +329,10 @@ impl KeyCache {
 }
 
 impl AppStateProcessor {
+    /// Create a processor without a mutation persistence hook.
+    ///
+    /// This preserves the original processor contract. Mutations are returned
+    /// to the caller, but mutation-derived state is not persisted separately.
     pub fn new(backend: Arc<dyn Backend>, runtime: Arc<dyn crate::runtime::Runtime>) -> Self {
         Self {
             runtime,
@@ -320,6 +343,11 @@ impl AppStateProcessor {
         }
     }
 
+    /// Install durable storage for mutation-derived state.
+    ///
+    /// Hook failures stop the affected cursor from advancing. Earlier work may
+    /// still be returned through [`CommittedMutationsError`] or
+    /// [`CommittedPatchListsError`].
     pub fn with_mutation_persistence(
         mut self,
         persistence: Arc<dyn AppStateMutationPersistence>,
@@ -830,9 +858,11 @@ impl AppStateProcessor {
         Ok(keys)
     }
 
-    /// Process an already-parsed single PatchList: download external blobs via
-    /// `download`, then decode + apply. Lets a caller that parsed the response for
-    /// pre-download avoid re-parsing it.
+    /// Process an already-parsed single PatchList by downloading external blobs,
+    /// then decoding and applying it.
+    ///
+    /// If a later patch fails after earlier mutations were committed, the error
+    /// downcasts to [`CommittedMutationsError`].
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_parsed", level = "debug", skip_all, fields(name = ?pl.name), err(Debug)))]
     pub async fn process_parsed_patch_list(
         &self,
@@ -844,9 +874,12 @@ impl AppStateProcessor {
         self.process_patch_list(pl, validate_macs).await
     }
 
-    /// Process already-parsed patch lists, downloading any external blobs via
-    /// `download`. Lets callers that already parsed the IQ response (e.g. to
-    /// pre-download blobs) avoid re-parsing it.
+    /// Process already-parsed patch lists and download any external blobs.
+    ///
+    /// If a later collection fails after earlier collections were committed,
+    /// the error downcasts to [`CommittedPatchListsError`]. Its results still
+    /// require dispatch. The source retains any [`CommittedMutationsError`]
+    /// raised within the failed collection.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_lists", level = "debug", skip_all, fields(count = patch_lists.len()), err(Debug)))]
     pub async fn process_patch_lists(
         &self,
@@ -914,6 +947,11 @@ impl AppStateProcessor {
         self.process_patch_list(pl, validate_macs).await
     }
 
+    /// Process one patch list whose external blobs have already been inlined.
+    ///
+    /// If a later patch fails after earlier mutations were committed, the error
+    /// downcasts to [`CommittedMutationsError`]. Its mutations still require
+    /// dispatch, and its state is the last committed cursor.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_list", level = "debug", skip_all, fields(name = ?pl.name), err(Debug)))]
     pub async fn process_patch_list(
         &self,

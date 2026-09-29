@@ -192,6 +192,10 @@ figures come from the `wacore::stats::HeapSize` trait:
 - In-flight history sync reports queued/running task count, retained compressed
   payload storage, and lifetime peaks. Inline payloads count while queued;
   external payloads contribute their `Vec` capacity once materialized.
+- Status privacy reports the top-level audience JIDs, custom-list records, and
+  JIDs inside those lists as entries. Its byte count charges the shared action
+  allocation once, including list metadata and string capacities, without
+  exposing the JIDs themselves.
 
 - Inflate state is not in the report: it is per thread, not per client.
   `wacore_binary::zlib_pool` parks one `zlib_rs::Inflate` (one ~47.5 KB block,
@@ -867,6 +871,7 @@ message can overshoot substantially on its own.
 | `SignalStoreCache::sender_key_locks` | 2 000, idle-only | nothing: only locks held solely by the map are dropped |
 | `inbound_commit_batch` | 400 messages / 4 MiB, checked after insert | commits early, no loss; overshoots by one message |
 | `msg_secret_buffer` | 4 096, except on cancellation | nothing: a producer that would exceed it parks on `capacity_available`, and a cancelled one force-buffers past the mark rather than losing captures |
+| `AppStateProcessor::key_cache` | 32 | one backend read and HKDF expansion when an evicted key is needed again |
 | device-topology changed-users log | 4 096 | a memo recompute; overflow can never serve stale data |
 | `AbPropsCache` | the compile-time `WATCHED` interest set | server props outside it are discarded at parse |
 | `CallRegistry` pre-offer controls / ringing group calls / event queues | 64 entries or 1 MiB each | fail-closed admission |
@@ -918,13 +923,9 @@ the bound is a drain or a lifecycle, so the count is the only warning available.
   per identifier and one per persisted pair. Their payload is the entry's own
   strings, so the report charges them table structure only; that structure is
   what grows with the contact list, ~10% on top of the entries themselves.
-- **`AppStateProcessor::key_cache`** — expanded app-state keys, one entry per
-  distinct key id the server's patches reference, with no cap and no TTL;
-  emptied only by `clear_key_cache` on reconnect. The backend stays
-  authoritative, so unlike the three above a cap here would be *safe* — nothing
-  has measured how many distinct keys a real account accumulates, which is why
-  it reports a count instead. It lives in `wacore`, which is why the coverage
-  guard now parses that crate too.
+- **`status_privacy`** — one synced action, but its top-level audience and
+  custom-list vectors have no local cap. Replacement drops the previous action.
+  `memory_report()` counts list records and JIDs without reporting their values.
 - **`pending_retries`** — held only for the duration of one retry receipt (a
   `scopeguard` removes it), so the bound is concurrent receipts.
 - **`presence_subscriptions`**, **`response_waiters`**, **`node_waiters`**,
@@ -933,13 +934,10 @@ the bound is a drain or a lifecycle, so the count is the only warning available.
 - **`transport_ack_queue`** / **`delivery_receipt_queue`** — unbounded
   `async_channel`s whose depth is a stalled-transport signal; capping them would
   drop acks the server is waiting for.
-- **`offline_receipt_buffer`** — drained at the end of every offline batch, and
-  one of two things here the report does *not* count: it is listed in
-  `report_coverage.rs`'s `EXEMPT` because its `MessageInfo` values are already
-  attributed where the batch owns them. Its depth during a drain is therefore
-  invisible; if that ever matters, it needs a field of its own rather than a cap.
-- **The drain commit's encode arena** — the other unreported one, and the only
-  entry on this list that is not a collection: a `Vec<u8>` reused across drain
+- **`offline_receipt_buffer`** — drained at the end of every offline batch.
+  `memory_report()` counts its depth and the retained `MessageInfo` allocations.
+- **The drain commit's encode arena** — the only unreported entry, and the only
+  item on this list that is not a collection: a `Vec<u8>` reused across drain
   commits. `commit_inbound_batch` clears it but keeps its capacity, so one
   oversized message leaves that capacity resident for the rest of the session.
   Unreported because sampling it means taking a lock a commit holds across its

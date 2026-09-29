@@ -44,6 +44,8 @@ pub mod account_serde {
 
 /// Preserve the full syncd action, including lists and unknown enum values,
 /// without enabling generated-proto deserialization across the workspace.
+/// Invalid bytes and actions without a mode deserialize as absent optional
+/// state instead of rejecting the rest of the device record.
 pub mod status_privacy_serde {
     use waproto::whatsapp::sync_action_value::StatusPrivacyAction;
 

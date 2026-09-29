@@ -13,14 +13,14 @@ use wacore_binary::Node;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
 #[non_exhaustive]
 pub enum StatusPrivacySetting {
-    /// Send to all contacts in address book.
+    /// Set `status_setting` to `contacts`.
     #[wire_default]
     #[wire = "contacts"]
     Contacts,
-    /// Send only to contacts in an allow list.
+    /// Set `status_setting` to `allowlist`.
     #[wire = "allowlist"]
     AllowList,
-    /// Send to all contacts except those in a deny list.
+    /// Set `status_setting` to `denylist`.
     #[wire = "denylist"]
     DenyList,
 }
@@ -55,9 +55,10 @@ impl<'a> Status<'a> {
 
     /// Last status audience synced from the phone. `None` means no audience
     /// has been observed yet, not that all contacts are allowed. The complete
-    /// action includes custom lists and cross-posting settings. This is a
-    /// snapshot, not a recipient calculation: sends still require an explicit
-    /// recipient list and do not automatically apply these settings.
+    /// action includes custom lists and cross-posting settings. Unknown numeric
+    /// modes remain present instead of decoding as absent. This is a snapshot,
+    /// not a recipient calculation: sends still require an explicit recipient
+    /// list and do not automatically apply these settings.
     pub fn audience(&self) -> Option<std::sync::Arc<wa::sync_action_value::StatusPrivacyAction>> {
         self.client
             .persistence_manager

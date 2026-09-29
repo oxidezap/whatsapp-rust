@@ -573,10 +573,10 @@ pub struct MemoryReport {
     pub history_payload_ids: u64,
     pub presence_subscriptions: usize,
     pub app_state_key_requests: usize,
-    /// Expanded app-state keys the processor holds in memory. No capacity cap
-    /// and no TTL — one entry per distinct key id the server's patches
-    /// reference, emptied only on reconnect. Zero until the first app-state
-    /// sync builds the processor.
+    /// Expanded app-state keys the processor holds in memory. Capped at 32
+    /// entries, with the oldest inserted key evicted first. The cache survives
+    /// reconnects and stays empty until the first app-state sync builds the
+    /// processor.
     pub app_state_key_cache: usize,
     /// Collections with an outstanding snapshot-recovery request.
     ///
@@ -584,8 +584,9 @@ pub struct MemoryReport {
     /// reply consumes the entry, so it is reported rather than assumed small.
     pub app_state_recovery_requests: usize,
     pub app_state_syncing: usize,
-    /// Synced audience JIDs and custom lists, with the shared action payload
-    /// attributed once.
+    /// Synced audience retention. `entries` counts top-level JIDs, custom-list
+    /// records, and JIDs inside those lists. `bytes` attributes the shared
+    /// action allocation once.
     pub status_privacy: CollectionStats,
     pub signal_sessions: CollectionStats,
     pub signal_identities: CollectionStats,
