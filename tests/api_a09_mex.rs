@@ -43,6 +43,17 @@ fn descriptor_binds_same_module_metadata_and_variables() {
 }
 
 #[test]
+fn macro_expansion_is_hygienic_through_a_renamed_crate_import() {
+    use whatsapp_rust as wa;
+    let op = wa::mex_operation!(wa::wacore::iq::mex_operations::join_newsletter);
+    let request = op.request(join_newsletter::Variables {
+        newsletter_id: None,
+    });
+    assert_eq!(request.doc().id, join_newsletter::DOC_ID);
+    assert_eq!(wire(&request), br#"{"variables":{}}"#);
+}
+
+#[test]
 fn optional_omission_remains_a_diagnostic_not_a_construction_error() {
     let request = mex_operation!(fetch_all_subgroups).request(fetch_all_subgroups::Variables {
         group_id: Some("123456789@g.us".into()),

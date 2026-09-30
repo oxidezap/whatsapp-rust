@@ -146,6 +146,13 @@ macro_rules! mex_operation {
 /// Prefer [`crate::mex_operation!`] followed by [`MexOperation::request`] or
 /// [`MexOperation::raw_request`]. Execution serializes directly to wire bytes;
 /// only the opt-in [`Self::missing_variables`] diagnostic builds a JSON value.
+///
+/// Metadata cannot be overwritten independently after construction:
+/// ```compile_fail
+/// use whatsapp_rust::{mex_operation, wacore::iq::mex_operations::join_newsletter};
+/// let mut request = mex_operation!(join_newsletter).request(join_newsletter::Variables { newsletter_id: None });
+/// request.doc.id = "another operation";
+/// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct MexRequest<V> {
@@ -210,11 +217,10 @@ impl<V: Serialize> MexRequest<V> {
 macro_rules! mex_request {
     ($op:path { $($body:tt)* }) => {{
         use $op as __mex_op;
-        $crate::mex_operation!(__mex_op).request(__mex_op::Variables { $($body)* })
+        $crate::mex_operation!($op).request(__mex_op::Variables { $($body)* })
     }};
     ($op:path, $vars:expr $(,)?) => {{
-        use $op as __mex_op;
-        $crate::mex_operation!(__mex_op).raw_request($vars)
+        $crate::mex_operation!($op).raw_request($vars)
     }};
 }
 pub(crate) use mex_request;
