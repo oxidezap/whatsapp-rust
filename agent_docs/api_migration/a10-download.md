@@ -36,8 +36,11 @@ The enum is non-exhaustive: include a wildcard arm. Existing `anyhow::Result`
 application functions can still use `?`; explicit assignments/returns of an
 `anyhow::Error` need `.into()` or `.map_err(Into::into)`. Instead of calling
 `downcast_ref` on the Client result, match the variant or inspect its source
-chain with `ErrorChainExt`. HTTP status, decryption failures and session IQ
-rejection metadata remain typed in that chain.
+chain with `ErrorChainExt`. HTTP status, existing typed decryption failures and
+session IQ rejection metadata remain recoverable in that chain. The existing
+streaming crypto path reports a MAC failure as an `anyhow` message cause, whereas
+buffered verification supplies `MediaDecryptionError::InvalidMac`; A10 preserves
+both without changing crypto or inventing a uniform typed integrity contract.
 
 `MediaDownloader` remains independent of Client sessions, returns
 `MediaDownloadError`, and never refreshes a session. Its existing variants are
