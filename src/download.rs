@@ -155,6 +155,10 @@ pub enum ClientDownloadError {
     /// The obtained route has no hosts. No HTTP request was executed.
     #[error("the media route names no hosts")]
     NoHosts,
+    /// A forced refresh after rejection yielded no hosts. The prior rejection
+    /// remains the source: unlike `NoHosts`, an HTTP exchange already occurred.
+    #[error("the refreshed media route names no hosts after CDN rejection: {0}")]
+    NoHostsAfterRefresh(#[source] anyhow::Error),
     /// Metadata could not be turned into a request.
     #[error("could not prepare the media reference: {0}")]
     Preparation(#[source] anyhow::Error),
@@ -186,6 +190,7 @@ impl From<DownloadRequestError> for ClientDownloadError {
             DownloadRequestError::Other(e) => Self::HostsUnreachable(e),
             DownloadRequestError::Prepare(e) => Self::Preparation(e),
             DownloadRequestError::NoHosts => Self::NoHosts,
+            DownloadRequestError::NoHostsAfterRefresh(e) => Self::NoHostsAfterRefresh(e),
             DownloadRequestError::Session {
                 force_refresh,
                 source,
@@ -211,6 +216,7 @@ impl From<DownloadRequestError> for MediaDownloadError {
             DownloadRequestError::Prepare(e) => Self::Other(e),
             DownloadRequestError::NoHosts => Self::NoHosts,
             DownloadRequestError::Session { source, .. } => Self::Other(source.into()),
+            DownloadRequestError::NoHostsAfterRefresh(e) => Self::Other(e),
             DownloadRequestError::Cleanup { failure, cleanup } => Self::WriterCleanup {
                 failure: Box::new((*failure).into()),
                 cleanup,
@@ -231,6 +237,7 @@ enum DownloadRequestError {
     Prepare(anyhow::Error),
     /// No request was ever executed: the route carried no hosts.
     NoHosts,
+    NoHostsAfterRefresh(anyhow::Error),
     Session {
         force_refresh: bool,
         source: crate::request::IqError,
@@ -294,11 +301,19 @@ impl DownloadRequestError {
         matches!(self, Self::NotFound(_))
     }
 
+    fn no_hosts(previous_rejection: Option<anyhow::Error>) -> Self {
+        match previous_rejection {
+            Some(cause) => Self::NoHostsAfterRefresh(cause),
+            None => Self::NoHosts,
+        }
+    }
+
     fn into_anyhow(self) -> anyhow::Error {
         match self {
             Self::Auth(err) | Self::NotFound(err) | Self::Other(err) | Self::Prepare(err) => err,
             Self::NoHosts => anyhow!("Failed to download from all available media hosts"),
             Self::Session { source, .. } => source.into(),
+            Self::NoHostsAfterRefresh(e) => ClientDownloadError::NoHostsAfterRefresh(e).into(),
             Self::Cleanup { failure, cleanup } => {
                 anyhow::Error::new(ClientDownloadError::WriterCleanup {
                     failure: Box::new((*failure).into()),
@@ -381,9 +396,13 @@ where
 {
     let mut force_refresh = false;
     let mut last_err: Option<anyhow::Error> = None;
+    let mut last_rejection = None;
 
     for attempt in 0..=max_refresh_attempts {
         let requests = prepare_requests(force_refresh).await?;
+        if requests.is_empty() {
+            return Err(DownloadRequestError::no_hosts(last_rejection));
+        }
         let mut retry_with_fresh_auth = false;
 
         for request in requests {
@@ -392,7 +411,9 @@ where
                 Err(err)
                     if (err.is_auth() || err.is_not_found()) && attempt < max_refresh_attempts =>
                 {
-                    // Auth error or 404/410 (expired URL): refresh media conn and re-derive URLs.
+                    // An empty refreshed route is not the same as never making
+                    // a request: retain the rejection that triggered this refresh.
+                    last_rejection = Some(err.into_anyhow());
                     invalidate_media_conn().await;
                     force_refresh = true;
                     retry_with_fresh_auth = true;
@@ -451,6 +472,7 @@ where
 {
     let mut force_refresh = false;
     let mut last_err: Option<anyhow::Error> = None;
+    let mut last_rejection = None;
 
     for attempt in 0..=max_refresh_attempts {
         let requests = match prepare_requests(force_refresh).await {
@@ -459,6 +481,10 @@ where
                 return Err(discard_failed_write(runtime, writer, err).await);
             }
         };
+        if requests.is_empty() {
+            let failure = DownloadRequestError::no_hosts(last_rejection);
+            return Err(discard_failed_write(runtime, writer, failure).await);
+        }
         let mut retry_with_fresh_auth = false;
 
         for request in requests {
@@ -475,6 +501,7 @@ where
                 Err(err)
                     if (err.is_auth() || err.is_not_found()) && attempt < max_refresh_attempts =>
                 {
+                    last_rejection = Some(err.into_anyhow());
                     invalidate_media_conn().await;
                     force_refresh = true;
                     retry_with_fresh_auth = true;
@@ -2646,6 +2673,93 @@ mod tests {
             assert_eq!(cause.http_status(), Some(410));
             assert_eq!(*calls.lock().unwrap(), vec![false, true]);
             assert_eq!(invalidations.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a10_empty_refreshed_route_keeps_the_prior_rejection_and_clears_writer() {
+        let (params, _) = encrypted_params(b"revoked");
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
+        for status in [403, 410] {
+            for streaming in [false, true] {
+                for to_writer in [false, true] {
+                    let http = if streaming {
+                        RoutedHttpClient::streaming(Vec::new(), (status, Vec::new()))
+                    } else {
+                        RoutedHttpClient::new(Vec::new(), (status, Vec::new()))
+                    };
+                    let calls = std::sync::Mutex::new(Vec::new());
+                    let prepare = |force| {
+                        calls.lock().unwrap().push(force);
+                        let hosts = if force {
+                            Vec::new()
+                        } else {
+                            vec![MediaHost::new("cdn.example.com")]
+                        };
+                        let requests = DownloadUtils::prepare_download_requests(
+                            &params,
+                            &MediaRoute::unauthenticated(hosts),
+                        )
+                        .map_err(DownloadRequestError::Prepare);
+                        async move { requests }
+                    };
+                    let sink = SharedWriter::new();
+                    sink.with(|w| w.write_all(b"old destination").unwrap());
+                    let error = if to_writer {
+                        let result = download_to_writer_with_retry(
+                            MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS,
+                            &runtime,
+                            sink.clone(),
+                            prepare,
+                            || async {},
+                            |request, writer| {
+                                let http: Arc<dyn HttpClient> = http.clone();
+                                let runtime = runtime.clone();
+                                async move {
+                                    streaming_download_and_decrypt(
+                                        &http,
+                                        &runtime,
+                                        &request,
+                                        ExpectedMediaHashes::default(),
+                                        writer,
+                                    )
+                                    .await
+                                }
+                            },
+                        )
+                        .await;
+                        assert!(sink.contents().is_empty());
+                        result.unwrap_err()
+                    } else {
+                        download_media_with_retry(
+                            MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS,
+                            prepare,
+                            || async {},
+                            |request| {
+                                let http: Arc<dyn HttpClient> = http.clone();
+                                let runtime = runtime.clone();
+                                async move {
+                                    execute_request_into_memory(
+                                        &http,
+                                        &runtime,
+                                        &request,
+                                        ExpectedMediaHashes::default(),
+                                        0,
+                                    )
+                                    .await
+                                }
+                            },
+                        )
+                        .await
+                        .unwrap_err()
+                    };
+                    let error = ClientDownloadError::from(error);
+                    assert!(matches!(error, ClientDownloadError::NoHostsAfterRefresh(_)));
+                    assert_eq!(error.http_status(), Some(status));
+                    assert_eq!(http.urls().len(), 1);
+                    assert_eq!(*calls.lock().unwrap(), vec![false, true]);
+                }
+            }
         }
     }
 

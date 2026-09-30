@@ -25,6 +25,9 @@ Client downloads (including the aliases) now return
 - `ReferenceRejected`: CDN rejection after the applicable refresh budget.
 - `HostsUnreachable`: all hosts failed; the last transport/status/integrity cause.
 - `NoHosts`: the route contained no hosts; no HTTP exchange took place.
+- `NoHostsAfterRefresh`: a CDN rejection triggered a forced refresh, but the
+  refreshed route contained no hosts. The prior rejection remains the source,
+  including its HTTP status; this is not mistaken for a never-attempted route.
 - `Preparation`: the reference could not be turned into a request.
 - `MediaSession { force_refresh, source }`: session acquisition (`false`) or
   refresh after rejection (`true`) failed, retaining the original `IqError`.
@@ -73,4 +76,12 @@ HTTP configuration, or host trait sealing change is part of A10.
 Tests: `src/download.rs` invariants plus `tests/api_a10_download.rs`. The same
 external API fixture is a standalone package at
 `tests/fixtures/api_a10_download`; it can be run from outside the workspace to
-avoid inheriting `.cargo/config.toml`.
+avoid inheriting `.cargo/config.toml`. Workspace CI covers the shared API test
+source, not this separate manifest. Validate the latter explicitly from outside
+the workspace, for example:
+
+```sh
+cd /tmp
+CARGO_TARGET_DIR=/path/to/task-target cargo test \
+  --manifest-path /path/to/whatsapp-rust/tests/fixtures/api_a10_download/Cargo.toml
+```
