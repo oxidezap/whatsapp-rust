@@ -1008,8 +1008,8 @@ fn bench_pairwise_retry(bencher: divan::Bencher, view_once: bool) {
                     pre_encoded: None,
                 },
             ))
-            .unwrap();
-            black_box(marshal(&node).unwrap());
+            .expect("synthetic acknowledged session must prepare a retry stanza");
+            black_box(marshal(&node).expect("synthetic retry stanza must encode"));
         });
 }
 
