@@ -1,3 +1,7 @@
+// Native filesystem fixtures and Tokio test runtime; the separate wasm timer
+// harness exercises the portable retry path without pretending to run SQLite VFS.
+#![cfg(not(target_family = "wasm"))]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
