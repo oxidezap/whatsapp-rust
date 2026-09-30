@@ -2493,9 +2493,14 @@ mod tests {
         let trickled = InMemoryBackend::new();
         for i in 0..total {
             trickled.put_msg_secrets(vec![row(i)]).await.unwrap();
+            let len = trickled.state.lock().await.msg_secrets.len();
             assert!(
-                trickled.state.lock().await.msg_secrets.len() <= MAX_MSG_SECRETS,
+                len <= MAX_MSG_SECRETS,
                 "trickled secrets exceeded the cap at insert {i}"
+            );
+            assert!(
+                len >= (i + 1).min(MAX_MSG_SECRETS * 3 / 4),
+                "trickled eviction overshot the low-water target at insert {i}"
             );
         }
 
