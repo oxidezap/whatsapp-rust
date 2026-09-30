@@ -1,6 +1,6 @@
 //! The public call event stream, owned by the control plane.
 //!
-//! This is the type a consumer reads from `CallHandle::events()` and a media backend raises through
+//! This is the type a consumer reads from `CallHandle::take_events()` and a media backend raises through
 //! [`VoipMediaSession::subscribe`](super::VoipMediaSession::subscribe). It used to be the engine's
 //! `CallEvent`, which meant the public API depended on the media engine's enum. It lives here now:
 //! neutral, engine-free, with every payload naming a neutral type. `crate::voip::CallEvent` is a

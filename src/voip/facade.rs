@@ -6519,7 +6519,7 @@ mod tests {
             client: std::sync::Weak::new(),
             muted: Arc::new(AtomicBool::new(false)),
             video: Arc::new(VideoShared::new()),
-            events: Arc::new(std::sync::Mutex::new(Some(ev_rx))),
+            events: Arc::new(Mutex::new(Some(ev_rx))),
             ended: Arc::new(EndedFlag::default()),
             media: None,
         };
@@ -7416,7 +7416,7 @@ mod tests {
             client: Arc::downgrade(client),
             muted: Arc::new(AtomicBool::new(false)),
             video: Arc::new(VideoShared::new()),
-            events: Arc::new(std::sync::Mutex::new(Some(ev_rx))),
+            events: Arc::new(Mutex::new(Some(ev_rx))),
             ended: Arc::new(EndedFlag::default()),
             media: None,
         }
@@ -7443,7 +7443,7 @@ mod tests {
             client: std::sync::Weak::new(),
             muted: Arc::new(AtomicBool::new(false)),
             video: Arc::new(VideoShared::new()),
-            events: Arc::new(std::sync::Mutex::new(Some(ev_rx))),
+            events: Arc::new(Mutex::new(Some(ev_rx))),
             ended: Arc::new(EndedFlag::default()),
             media: client
                 .call_registry()
@@ -11630,7 +11630,7 @@ mod tests {
             client: Arc::downgrade(&client),
             muted: Arc::new(AtomicBool::new(false)),
             video: video_shared.clone(),
-            events: Arc::new(std::sync::Mutex::new(Some(ev_rx))),
+            events: Arc::new(Mutex::new(Some(ev_rx))),
             ended: Arc::new(EndedFlag::default()),
             media: None,
         };
@@ -11711,7 +11711,7 @@ mod tests {
             client: Arc::downgrade(&client),
             muted: Arc::new(AtomicBool::new(false)),
             video: video.clone(),
-            events: Arc::new(std::sync::Mutex::new(Some(events))),
+            events: Arc::new(Mutex::new(Some(events))),
             ended: Arc::new(EndedFlag::default()),
             media: None,
         };
@@ -11802,7 +11802,7 @@ mod tests {
             client: Arc::downgrade(&client),
             muted: Arc::new(AtomicBool::new(false)),
             video: video.clone(),
-            events: Arc::new(std::sync::Mutex::new(Some(events))),
+            events: Arc::new(Mutex::new(Some(events))),
             ended: Arc::new(EndedFlag::default()),
             media: None,
         };
@@ -11936,7 +11936,7 @@ mod tests {
             client: Arc::downgrade(&client),
             muted: Arc::new(AtomicBool::new(false)),
             video: video.clone(),
-            events: Arc::new(std::sync::Mutex::new(Some(events))),
+            events: Arc::new(Mutex::new(Some(events))),
             ended: Arc::new(EndedFlag::default()),
             media: None,
         };
@@ -12174,7 +12174,7 @@ mod tests {
             client: Arc::downgrade(&client),
             muted: Arc::new(AtomicBool::new(false)),
             video: video.clone(),
-            events: Arc::new(std::sync::Mutex::new(Some(events))),
+            events: Arc::new(Mutex::new(Some(events))),
             ended: Arc::new(EndedFlag::default()),
             media: None,
         };
