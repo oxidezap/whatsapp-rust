@@ -7,5 +7,5 @@
 //! ```
 
 #[cfg(test)]
-#[path = "../../api_a01_config.rs"]
+#[path = "../../client_options.rs"]
 mod contract;

@@ -1563,7 +1563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a01_sync_receiver_has_one_owner_and_into_client_starts_one_worker() {
+    async fn sync_receiver_has_one_owner_and_into_client_starts_one_worker() {
         let spawns = Arc::new(AtomicUsize::new(0));
         let build = complete_builder()
             .await

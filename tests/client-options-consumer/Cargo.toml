@@ -1,6 +1,6 @@
 # Standalone host fixture: deliberately outside the workspace and its dependency aliases.
 [package]
-name = "api-a01-consumer"
+name = "client-options-consumer"
 version = "0.0.0"
 edition = "2024"
 publish = false
