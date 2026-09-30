@@ -355,6 +355,7 @@ pub use features::{
     UsernameLookupUser, UsyncSubprotocolError, VariantProperty, VerifiedName, group_type,
     message_key, message_range,
 };
+pub use features::{MexDoc, MexOperation};
 
 pub mod bot;
 pub mod lid_pn_cache;
