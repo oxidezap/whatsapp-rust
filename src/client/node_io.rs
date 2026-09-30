@@ -1,6 +1,6 @@
 //! Inbound node I/O: read loop, frame decryption, node routing, acks and stream errors.
 
-use super::lifecycle::ProtocolTerminalReason;
+use super::lifecycle::{ConflictKind, ProtocolTerminalReason};
 use super::*;
 use crate::client::{PhashWaiter, ResponseWaiter, StreamedResponse};
 use wacore::net::DisconnectReason;
@@ -2041,7 +2041,12 @@ impl Client {
         let mut should_disconnect = false;
 
         if !conflict_type.is_empty() {
-            self.record_protocol_terminal_reason(ProtocolTerminalReason::Conflict);
+            let kind = match conflict_type.as_str() {
+                "replaced" => ConflictKind::Replaced,
+                "device_removed" => ConflictKind::DeviceRemoved,
+                _ => ConflictKind::Unknown,
+            };
+            self.record_protocol_terminal_reason(ProtocolTerminalReason::Conflict(kind));
             info!(
                 "Got stream error indicating client was removed or replaced (conflict={}). Logging out.",
                 conflict_type
