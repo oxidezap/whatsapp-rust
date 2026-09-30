@@ -22,8 +22,7 @@ async fn dormant(fixture: &CallFixture) -> anyhow::Result<CallHandle> {
 }
 
 #[tokio::test]
-async fn a15_live_clones_share_acquisition_and_receiver_does_not_retain_client()
--> anyhow::Result<()> {
+async fn live_clones_share_acquisition_and_receiver_does_not_retain_client() -> anyhow::Result<()> {
     let fixture = CallFixture::new().await?;
     let client = Arc::downgrade(fixture.client());
     let call = dormant(&fixture).await?;
@@ -59,7 +58,7 @@ async fn a15_live_clones_share_acquisition_and_receiver_does_not_retain_client()
 }
 
 #[tokio::test]
-async fn a15_shutdown_before_first_acquisition_preserves_sticky_completion() -> anyhow::Result<()> {
+async fn shutdown_before_first_acquisition_preserves_sticky_completion() -> anyhow::Result<()> {
     let fixture = CallFixture::new().await?;
     let call = dormant(&fixture).await?;
     fixture.shutdown().await?;

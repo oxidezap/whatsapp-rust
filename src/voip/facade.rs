@@ -4762,7 +4762,7 @@ mod event_ownership_tests {
         let (sender, receiver) = async_channel::bounded(8);
         (
             CallHandle {
-                call_id: "A15-OWNERSHIP".into(),
+                call_id: "CALL-EVENT-OWNERSHIP".into(),
                 generation: 1,
                 peer_jid: Jid::lid("123456"),
                 call_creator: Jid::lid("654321"),
@@ -4780,7 +4780,7 @@ mod event_ownership_tests {
     }
 
     #[test]
-    fn a15_concurrent_handle_clones_acquire_only_one_receiver() {
+    fn concurrent_handle_clones_acquire_only_one_receiver() {
         let (handle, sender) = handle();
         sender.try_send(CallEvent::RelayAllocated).unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(8));
@@ -4805,7 +4805,7 @@ mod event_ownership_tests {
     }
 
     #[test]
-    fn a15_drop_does_not_restore_acquisition_or_retain_hidden_receiver() {
+    fn drop_does_not_restore_acquisition_or_retain_hidden_receiver() {
         let (handle, sender) = handle();
         let clone = handle.clone();
         let receiver = handle.take_events().unwrap();
@@ -4823,7 +4823,7 @@ mod event_ownership_tests {
     }
 
     #[test]
-    fn a15_host_receiver_clones_are_competitive_not_broadcast() {
+    fn host_receiver_clones_are_competitive_not_broadcast() {
         let (handle, sender) = handle();
         let receiver = handle.take_events().unwrap();
         let competitor = receiver.clone();
@@ -4839,7 +4839,7 @@ mod event_ownership_tests {
     }
 
     #[tokio::test]
-    async fn a15_cancelled_recv_does_not_restore_acquisition() {
+    async fn cancelled_recv_does_not_restore_acquisition() {
         let (handle, sender) = handle();
         let receiver = handle.take_events().unwrap();
         assert!(
@@ -4853,7 +4853,7 @@ mod event_ownership_tests {
     }
 
     #[tokio::test]
-    async fn a15_late_acquisition_and_wait_ended_are_independent_and_sticky() {
+    async fn late_acquisition_and_wait_ended_are_independent_and_sticky() {
         let (handle, sender) = handle();
         sender.try_send(CallEvent::RelayAllocated).unwrap();
         sender.close();
@@ -4877,7 +4877,7 @@ mod event_ownership_tests {
     }
 
     #[test]
-    fn a15_retained_receiver_does_not_retain_call_state() {
+    fn retained_receiver_does_not_retain_call_state() {
         let (handle, _sender) = handle();
         let slot = Arc::downgrade(&handle.events);
         let ended = Arc::downgrade(&handle.ended);
