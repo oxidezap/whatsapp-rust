@@ -699,8 +699,8 @@ where
 
     /// Release the slot table's buckets once it holds nothing.
     ///
-    /// Called only from the synchronous TTL cache (the dispatch-once dedup
-    /// table): hashbrown never shrinks on remove, so a burst that grew the
+    /// Used by synchronous TTL removal and async expiry maintenance:
+    /// hashbrown never shrinks on remove, so a burst that grew the
     /// table to thousands of buckets kept them with zero entries until the
     /// next burst. The threshold is empty, not a low-water mark: any
     /// non-empty table may regrow on the very next insert, paying a realloc
@@ -1734,7 +1734,6 @@ where
         }
     }
 
-    /// Evict expired entries and clean up unused init locks.
     /// Test-only read that leaves the second-chance bit alone, so a test can
     /// observe eviction order without feeding it.
     #[cfg(test)]
@@ -1750,6 +1749,8 @@ where
         }
     }
 
+    /// Evict expired entries, release empty expiring tables' buckets, and
+    /// clean up unused init locks. Nonempty tables keep their allocation.
     pub async fn run_pending_tasks(&self) {
         // Nothing can be expired without a TTL or TTI, so a cache configured
         // with neither (the coordination caches, the default LID/PN maps)
@@ -1762,6 +1763,7 @@ where
                 return;
             };
             managed.retain_unexpired(|entry| self.is_expired(entry, now));
+            managed.shrink_if_empty();
         }
 
         // Clean up init locks not actively held. `get()`, not `init_locks()`: a
@@ -3113,6 +3115,180 @@ mod tests {
         }
 
         assert_eq!(counter.load(Ordering::SeqCst), num_tasks);
+    }
+
+    async fn managed_footprint<S: BuildHasher>(
+        cache: &PortableCache<u32, u32, S>,
+    ) -> (usize, usize) {
+        let guard = cache.inner.read().await;
+        let Storage::Managed(inner) = &*guard else {
+            panic!("expected managed storage");
+        };
+        (inner.table.capacity(), inner.structural_bytes())
+    }
+
+    #[tokio::test]
+    async fn async_maintenance_releases_empty_buckets_and_refills() {
+        const BURST: u32 = 4_000;
+        let cache = PortableCache::builder()
+            .time_to_live(Duration::ZERO)
+            .build();
+        for _ in 0..3 {
+            for key in 0..BURST {
+                cache.insert(key, key).await;
+            }
+            assert!(managed_footprint(&cache).await.0 >= BURST as usize);
+            cache.run_pending_tasks().await;
+            assert_eq!(cache.entry_count(), 0);
+            assert_eq!(managed_footprint(&cache).await, (0, 0));
+            for _ in 0..10 {
+                cache.run_pending_tasks().await;
+                assert_eq!(managed_footprint(&cache).await, (0, 0));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn async_maintenance_keeps_nonempty_ttl_and_tti_tables() {
+        for idle in [false, true] {
+            let builder = PortableCache::builder();
+            // A positive renewal window keeps `get` from renewing the
+            // future-stamped survivor while we inspect it below.
+            let expiry = Duration::from_nanos(u64::from(TTI_RENEWAL_DIVISOR));
+            let cache = if idle {
+                builder.time_to_idle(expiry).build()
+            } else {
+                builder.time_to_live(expiry).build()
+            };
+            for key in 0..4_000 {
+                cache.insert(key, key).await;
+            }
+            // Deterministic expiry without sleeps or a process-wide test clock:
+            // age the burst to the origin, keep one entry beyond this test's run.
+            {
+                let mut guard = cache.inner.write().await;
+                let Storage::Managed(inner) = &mut *guard else {
+                    unreachable!();
+                };
+                let future = Instant::now() + Duration::from_secs(3600);
+                for slot in inner.table.iter_mut() {
+                    let stamp = if slot.key == 0 { future } else { Instant::ZERO };
+                    slot.inserted_at = stamp;
+                    slot.last_accessed_at = stamp;
+                }
+            }
+            let table_bytes =
+                |capacity| wacore::stats::hash_table_bytes(capacity, size_of::<Slot<u32, u32>>());
+            let before = table_bytes(managed_footprint(&cache).await.0);
+            cache.run_pending_tasks().await;
+            assert_eq!(cache.entry_count(), 1);
+            assert_eq!(cache.get(&0).await, Some(0));
+            let retained = managed_footprint(&cache).await;
+            // Removal can reduce usable capacity via tombstones; compare bucket
+            // bytes, independent of the order map's now-smaller estimate.
+            assert_eq!(table_bytes(retained.0), before);
+            for _ in 0..10 {
+                cache.run_pending_tasks().await;
+                assert_eq!(managed_footprint(&cache).await, retained);
+            }
+            cache.invalidate(&0).await;
+            cache.run_pending_tasks().await;
+            assert_eq!(managed_footprint(&cache).await, (0, 0));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_maintenance_serializes_with_refill() {
+        let cache = PortableCache::builder()
+            .time_to_live(Duration::from_secs(3600))
+            .build();
+        for round in 0..16 {
+            for key in 0..256 {
+                cache.insert(key, key).await;
+            }
+            cache.clear().await;
+            assert!(managed_footprint(&cache).await.0 > 0);
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let writer_cache = cache.clone();
+            let writer_barrier = barrier.clone();
+            let writer = tokio::spawn(async move {
+                writer_barrier.wait().await;
+                for key in 0..256 {
+                    writer_cache.insert(key, round).await;
+                    tokio::task::yield_now().await;
+                }
+            });
+            barrier.wait().await;
+            for _ in 0..256 {
+                cache.run_pending_tasks().await;
+                tokio::task::yield_now().await;
+            }
+            writer.await.unwrap();
+            assert_eq!(cache.entry_count(), 256);
+            for key in 0..256 {
+                assert_eq!(cache.get(&key).await, Some(round));
+            }
+        }
+    }
+
+    /// Run alone with `--ignored --nocapture --test-threads=1`: the allocation
+    /// counters are process-wide. Timing is walltime, not a CI performance gate.
+    #[tokio::test]
+    #[ignore = "manual retained-heap and maintenance/refill walltime measurement"]
+    async fn measure_async_empty_maintenance() {
+        use crate::test_alloc::{ALLOCS, LIVE_BYTES};
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::BuildHasherDefault;
+
+        const BURST: u32 = 4_000;
+        // Keep the monotonic provider's one-time allocation outside the cache
+        // windows so even the first sample measures only the burst.
+        let _ = Instant::now();
+        for sample in 0..21 {
+            let cache = PortableCache::builder()
+                .time_to_live(Duration::ZERO)
+                .hash_builder(BuildHasherDefault::<DefaultHasher>::default())
+                .build();
+            let base = LIVE_BYTES.load(Ordering::Relaxed);
+            let start = Instant::now();
+            for key in 0..BURST {
+                cache.insert(key, key).await;
+            }
+            let fill = start.elapsed();
+            let grown = managed_footprint(&cache).await;
+            let grown_heap = LIVE_BYTES.load(Ordering::Relaxed) - base;
+            let start = Instant::now();
+            cache.run_pending_tasks().await;
+            let maintenance = start.elapsed();
+            let empty = managed_footprint(&cache).await;
+            let empty_heap = LIVE_BYTES.load(Ordering::Relaxed) - base;
+            let allocs = ALLOCS.load(Ordering::Relaxed);
+            for _ in 0..10 {
+                cache.run_pending_tasks().await;
+            }
+            let empty_allocs = ALLOCS.load(Ordering::Relaxed) - allocs;
+            let refill_allocs_before = ALLOCS.load(Ordering::Relaxed);
+            let start = Instant::now();
+            for key in 0..BURST {
+                cache.insert(key, key).await;
+            }
+            let refill = start.elapsed();
+            let refill_allocs = ALLOCS.load(Ordering::Relaxed) - refill_allocs_before;
+            assert_eq!(cache.entry_count(), u64::from(BURST));
+            for key in 0..BURST {
+                assert_eq!(cache.get_no_touch(&key).await, Some(key));
+            }
+            eprintln!(
+                "sample={sample} grown_capacity={} grown_structural={} grown_heap={grown_heap} empty_capacity={} empty_structural={} empty_heap={empty_heap} repeated_empty_allocs={empty_allocs} refill_allocs={refill_allocs} fill_ns={} maintenance_ns={} refill_ns={}",
+                grown.0,
+                grown.1,
+                empty.0,
+                empty.1,
+                fill.as_nanos(),
+                maintenance.as_nanos(),
+                refill.as_nanos(),
+            );
+        }
     }
 
     #[tokio::test]
