@@ -109,7 +109,11 @@ async fn builder_returns_real_dormant_handle_only_after_offer_completion() -> Re
     assert_eq!(handle.call_id(), id);
     assert_eq!(handle.peer_jid(), *fixture.peer());
     assert!(
-        handle.events().try_recv().is_err(),
+        handle
+            .take_events()
+            .expect("first acquisition")
+            .try_recv()
+            .is_err(),
         "no relay or media readiness was invented"
     );
     fixture.shutdown().await?;
@@ -464,7 +468,7 @@ async fn peer_video_queue_keeps_sender_state_and_upgrade_token_in_order() -> Res
         .inject(video_stanza(&sibling, VideoState::Stopped, 0))
         .await?;
 
-    let events = handle.events();
+    let events = handle.take_events().expect("first acquisition");
     let queued: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
     assert_eq!(
         queued.len(),
@@ -580,7 +584,7 @@ async fn peer_video_metadata_reports_routed_sender_and_supplied_creator_without_
             .build()
     };
     fixture.inject(video(VideoState::Stopped)).await?;
-    let events = handle.events();
+    let events = handle.take_events().expect("first acquisition");
     assert_eq!(
         events.try_recv()?,
         CallEvent::PeerVideoStateChanged {

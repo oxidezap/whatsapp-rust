@@ -1281,7 +1281,10 @@ fn spawn_call_event_listener(
     auto_video: bool,
     state: Arc<Mutex<CallState>>,
 ) {
-    let events = handle.events();
+    let Some(events) = handle.take_events() else {
+        warn!("call event receiver already owned by another consumer");
+        return;
+    };
     #[cfg(feature = "voip-opus")]
     let fallback_opus_tx = spawn_fallback_opus_decoder(speaker.clone());
     tokio::spawn(async move {
