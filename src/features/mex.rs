@@ -525,7 +525,7 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn a09_execute_and_legacy_aliases_send_the_same_mutation() {
+    async fn execute_and_legacy_aliases_send_the_same_mutation() {
         use std::sync::Arc;
         use wacore::iq::mex_operations::join_newsletter as op;
         use wacore_binary::{NodeContentRef, builder::NodeBuilder};
@@ -577,7 +577,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a09_execute_accepts_an_omitted_optional_variable() {
+    async fn execute_accepts_an_omitted_optional_variable() {
         use std::sync::Arc;
         use wacore::iq::mex_operations::fetch_all_subgroups as op;
         use wacore_binary::builder::NodeBuilder;
@@ -614,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn a09_graphql_and_json_parse_errors_keep_their_iq_source_chain() {
+    fn graphql_and_json_parse_errors_keep_their_iq_source_chain() {
         use std::error::Error;
         use wacore::iq::spec::IqSpec;
         use wacore_binary::builder::NodeBuilder;

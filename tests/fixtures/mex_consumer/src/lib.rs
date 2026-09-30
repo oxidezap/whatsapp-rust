@@ -2,7 +2,7 @@
 extern crate wa as whatsapp_rust;
 
 #[cfg(test)]
-#[path = "../../../api_a09_mex.rs"]
+#[path = "../../../mex_public_api.rs"]
 mod contracts;
 
 /// The macro must bind the variables type even across a package boundary.
