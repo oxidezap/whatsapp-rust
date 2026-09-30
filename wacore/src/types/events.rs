@@ -296,6 +296,7 @@ pub enum EventKind {
     RemoveRecentStickerUpdate,
     FavoritesUpdate,
     StatusPrivacyUpdate,
+    ReachoutTimelockUpdate,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -309,7 +310,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::StatusPrivacyUpdate as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::ReachoutTimelockUpdate as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -1225,6 +1226,10 @@ pub enum Event {
     /// variant index, so inserting in the middle renumbers everything after it.
     FavoritesUpdate(FavoritesUpdate),
     StatusPrivacyUpdate(StatusPrivacyUpdate),
+
+    /// The server pushed account reachout restriction state. The raw
+    /// [`Event::MexNotification`] is also delivered to interested consumers.
+    ReachoutTimelockUpdate(ReachoutTimelockUpdate),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1264,6 +1269,30 @@ pub struct MexNotification {
     pub stanza_id: Option<String>,
     pub offline: Option<String>,
     pub payload: serde_json::Value,
+}
+
+/// The same concrete state returned by the typed account reachout query.
+/// Optional fields and unknown enforcement strings are preserved without
+/// normalizing the server's deadline or inventing defaults.
+pub use crate::iq::mex_operations::fetch_reachout_timelock::Xwa2FetchAccountReachoutTimelock as ReachoutTimelock;
+
+/// Payload for [`Event::ReachoutTimelockUpdate`].
+///
+/// Emitted for `NotificationUserReachoutTimelockUpdate`, before its raw MEX
+/// twin. This reports state, not an automatic outgoing-message enforcement
+/// policy. In particular, `state.is_active == Some(false)` reports a lifted
+/// restriction; `None` makes no assertion about whether it is active.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct ReachoutTimelockUpdate {
+    /// Decoded using the pull query's state type and deserializer.
+    pub state: ReachoutTimelock,
+    /// Source of the notification, if present.
+    pub from: Option<Jid>,
+    /// Transport stanza ID, if present.
+    pub stanza_id: Option<String>,
+    /// Verbatim backlog marker, if present; not coerced to a boolean.
+    pub offline: Option<String>,
 }
 
 impl Event {
@@ -1326,6 +1355,7 @@ impl Event {
             Event::RemoveRecentStickerUpdate(_) => EventKind::RemoveRecentStickerUpdate,
             Event::FavoritesUpdate(_) => EventKind::FavoritesUpdate,
             Event::StatusPrivacyUpdate(_) => EventKind::StatusPrivacyUpdate,
+            Event::ReachoutTimelockUpdate(_) => EventKind::ReachoutTimelockUpdate,
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
@@ -2914,6 +2944,7 @@ mod tests {
         assert_eq!(EventKind::RemoveRecentStickerUpdate as u8, 73);
         assert_eq!(EventKind::FavoritesUpdate as u8, 74);
         assert_eq!(EventKind::StatusPrivacyUpdate as u8, 75);
+        assert_eq!(EventKind::ReachoutTimelockUpdate as u8, 76);
     }
 
     /// Every rejection a consumer can be handed must survive being persisted
