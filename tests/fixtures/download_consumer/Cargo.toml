@@ -1,5 +1,5 @@
 [package]
-name = "api-a10-download-consumer"
+name = "download-consumer"
 version = "0.0.0"
 edition = "2024"
 publish = false

@@ -15,7 +15,7 @@ mod tests {
     use whatsapp_rust::wacore::store::in_memory::InMemoryBackend;
     use whatsapp_rust::{
         Client, ClientBuilder, ErrorChainExt, IqError, TokioRuntime, async_channel as channels,
-        async_trait, waproto as proto,
+        async_trait, wacore, waproto as proto,
     };
 
     struct Offline;
@@ -41,6 +41,10 @@ mod tests {
     }
 
     async fn client() -> Arc<Client> {
+        client_with_http(Rejected).await
+    }
+
+    async fn client_with_http(http: impl HttpClient + 'static) -> Arc<Client> {
         let pm = PersistenceManager::new(Arc::new(InMemoryBackend::new()))
             .await
             .unwrap();
@@ -48,7 +52,7 @@ mod tests {
             .with_runtime(TokioRuntime)
             .with_persistence_manager(Arc::new(pm))
             .with_transport_factory(Offline)
-            .with_http_client(Rejected)
+            .with_http_client(http)
             .build()
             .await
             .unwrap()
@@ -108,6 +112,94 @@ mod tests {
         assert!(matches!(independent_error, MediaDownloadError::NoHosts));
     }
 
+    struct AcceptedBody;
+    #[async_trait]
+    impl HttpClient for AcceptedBody {
+        async fn execute(&self, _: HttpRequest) -> Result<HttpResponse> {
+            Ok(HttpResponse {
+                status_code: 200,
+                body: b"external destination".to_vec(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct DestinationFault {
+        sink: HostWriter,
+        failed: bool,
+    }
+    impl std::io::Write for DestinationFault {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.sink.write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.sink.flush()
+        }
+    }
+    impl std::io::Seek for DestinationFault {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.sink.seek(pos)
+        }
+    }
+    impl DownloadWriter for DestinationFault {
+        fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+            if !self.failed {
+                self.failed = true;
+                return Err(std::io::Error::from_raw_os_error(28));
+            }
+            self.sink.truncate(len)
+        }
+    }
+
+    #[tokio::test]
+    async fn local_writer_failures_have_public_domain_types_and_original_io_sources() {
+        let encrypted =
+            wacore::upload::encrypt_media(b"external destination", MediaType::Image).unwrap();
+        let message = proto::whatsapp::message::ImageMessage {
+            static_url: Some("https://cdn.example.com/static".into()),
+            file_sha256: Some(encrypted.file_sha256.to_vec()),
+            ..Default::default()
+        };
+        let writer = || DestinationFault {
+            sink: HostWriter(Cursor::new(Vec::new())),
+            failed: false,
+        };
+        let client = client_with_http(AcceptedBody).await;
+        let error = client
+            .download_to_writer(&message, writer())
+            .await
+            .unwrap_err();
+        let ClientDownloadError::WriterIo(cause) = error else {
+            panic!("wrong destination classification: {error:?}");
+        };
+        assert_eq!(
+            cause
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(28)
+        );
+        let independent = MediaDownloader::new(
+            Arc::new(AcceptedBody),
+            Arc::new(TokioRuntime),
+            MediaRoute::unauthenticated(Vec::new()),
+        );
+        let error = independent
+            .download_to_writer(&message, writer())
+            .await
+            .unwrap_err();
+        let MediaDownloadError::WriterIo(cause) = error else {
+            panic!("wrong destination classification: {error:?}");
+        };
+        assert_eq!(
+            cause
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(28)
+        );
+    }
+
     // Intentional compatibility fixture only; the library tree uses canonical APIs.
     #[allow(deprecated)]
     #[tokio::test]
@@ -129,6 +221,7 @@ mod tests {
     }
 
     // Host traits remain implementable, not sealed by the API refactor.
+    #[derive(Debug)]
     struct HostWriter(Cursor<Vec<u8>>);
     impl std::io::Write for HostWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
