@@ -8,8 +8,8 @@ async fn dormant(fixture: &CallFixture) -> anyhow::Result<CallHandle> {
     let client = fixture.client().clone();
     let peer = fixture.peer().clone();
     let start = tokio::spawn(async move {
-        let (_microphone, microphone) = whatsapp_rust::async_channel::bounded::<Vec<i16>>(1);
-        let (speaker, _speaker) = whatsapp_rust::async_channel::bounded::<Vec<i16>>(1);
+        let (_microphone, microphone) = async_channel::bounded::<Vec<i16>>(1);
+        let (speaker, _speaker) = async_channel::bounded::<Vec<i16>>(1);
         client
             .voip()
             .call(&peer)
