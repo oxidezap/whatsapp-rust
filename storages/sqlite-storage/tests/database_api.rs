@@ -18,7 +18,7 @@ impl Fixture {
     fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         Self(std::env::temp_dir().join(format!(
-            "wa_api_a12_{}_{}.db",
+            "wa_database_api_{}_{}.db",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         )))

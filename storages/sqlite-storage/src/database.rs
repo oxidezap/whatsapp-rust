@@ -131,7 +131,7 @@ mod tests {
             }
         }
         let fixture = Fixture(std::env::temp_dir().join(format!(
-            "wa_a12_wal_{}_{}.db",
+            "wa_database_wal_{}_{}.db",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         )));
@@ -163,7 +163,7 @@ mod tests {
     async fn scopes_share_permits_and_memory_uri_declines_readers() {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let uri = format!(
-            "file:a12_scope_{}_{}?mode=memory&cache=shared",
+            "file:database_scope_{}_{}?mode=memory&cache=shared",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
