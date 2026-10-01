@@ -3135,11 +3135,15 @@ mod tests {
             for key in 0..BURST {
                 cache.insert(key, key).await;
             }
-            assert!(managed_footprint(&cache).await.0 >= BURST as usize);
+            let grown = managed_footprint(&cache).await;
+            assert!(grown.0 >= BURST as usize);
+            let table_bytes =
+                |capacity| wacore::stats::hash_table_bytes(capacity, size_of::<Slot<u32, u32>>());
             cache.run_pending_tasks().await;
             assert_eq!(cache.entry_count(), 0);
             let retained = managed_footprint(&cache).await;
-            assert!(retained.0 > 0);
+            // Tombstones can change usable capacity, but not allocated buckets.
+            assert_eq!(table_bytes(retained.0), table_bytes(grown.0));
             assert!(retained.1 > 0);
             for _ in 0..10 {
                 cache.run_pending_tasks().await;
