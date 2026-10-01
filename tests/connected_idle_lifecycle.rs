@@ -60,15 +60,26 @@ async fn shutdown_releases_active_workers_before_backend_cleanup() -> Result<()>
     #[cfg(not(feature = "sqlite-storage"))]
     let backends = [BackendFixture::memory()];
     for backend in backends {
-        let session = Session::connect(backend.backend()).await?;
-        let activity = session.prepare_activity().await?;
-        session.receive_activity(activity).await?;
-        ensure!(
-            session.checkpoint().await.running_workers > 0,
-            "test must disconnect before idle retirement"
-        );
-        session.shutdown().await?;
-        backend.cleanup()?;
+        let session = match Session::connect(backend.backend()).await {
+            Ok(session) => session,
+            Err(error) => {
+                let cleanup = backend.cleanup();
+                return Err::<(), _>(error).and(cleanup);
+            }
+        };
+        let activity_result = async {
+            let activity = session.prepare_activity().await?;
+            session.receive_activity(activity).await?;
+            ensure!(
+                session.checkpoint().await.running_workers > 0,
+                "test must disconnect before idle retirement"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        let shutdown = session.shutdown().await;
+        let cleanup = backend.cleanup();
+        activity_result.and(shutdown).and(cleanup)?;
     }
     Ok(())
 }

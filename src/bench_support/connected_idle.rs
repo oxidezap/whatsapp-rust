@@ -488,20 +488,26 @@ impl Session {
     pub async fn shutdown(mut self) -> Result<()> {
         let client = Arc::downgrade(&self.client);
         self.client.disconnect().await;
-        if let Some(mut reader) = self.reader.take() {
-            let result = tokio::time::timeout(DEADLINE, &mut reader).await;
-            if result.is_err() {
-                reader.abort();
-            }
-            result???;
-        }
+        let reader_result: Result<()> = match self.reader.take() {
+            Some(mut reader) => match tokio::time::timeout(DEADLINE, &mut reader).await {
+                Ok(joined) => joined
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result),
+                Err(elapsed) => {
+                    reader.abort();
+                    Err(anyhow::Error::from(elapsed).context("fixture reader did not stop"))
+                }
+            },
+            None => Ok(()),
+        };
         // Production disconnect closes lane channels, but their workers are
         // detached. Observe all client owners exiting before callers unlink an
         // SQLite database; do not keep the runtime parked behind a live worker.
         drop(self);
-        util::wait_until(DEADLINE, || client.strong_count() == 0)
+        let owners = util::wait_until(DEADLINE, || client.strong_count() == 0)
             .await
-            .context("fixture client owners did not finish after disconnect")
+            .context("fixture client owners did not finish after disconnect");
+        reader_result.and(owners)
     }
 }
 
