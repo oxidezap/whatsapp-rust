@@ -297,6 +297,7 @@ pub enum EventKind {
     FavoritesUpdate,
     StatusPrivacyUpdate,
     ReachoutTimelockUpdate,
+    CallLogHistory,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -310,7 +311,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::ReachoutTimelockUpdate as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::CallLogHistory as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -1242,6 +1243,10 @@ pub enum Event {
     /// The server pushed account reachout restriction state. The raw
     /// [`Event::MexNotification`] is also delivered to interested consumers.
     ReachoutTimelockUpdate(ReachoutTimelockUpdate),
+
+    /// One call record from a successfully processed pairing-history chunk.
+    /// Distinct from the app-state mutation envelope in [`Event::CallLogSync`].
+    CallLogHistory(CallLogHistory),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1360,6 +1365,7 @@ impl Event {
             Event::ContactRemoved(_) => EventKind::ContactRemoved,
             Event::EncDecryptFailed(_) => EventKind::EncDecryptFailed,
             Event::CallLogSync(_) => EventKind::CallLogSync,
+            Event::CallLogHistory(_) => EventKind::CallLogHistory,
             Event::ClientExpirationChanged(_) => EventKind::ClientExpirationChanged,
             Event::OfflineSyncInterrupted(_) => EventKind::OfflineSyncInterrupted,
             Event::LockChatUpdate(_) => EventKind::LockChatUpdate,
@@ -2878,8 +2884,8 @@ pub struct ContactRemoved {
 
 /// A call placed or received on the primary device, synced through app state.
 ///
-/// The only channel that carries a call the companion never saw signalling for:
-/// a call placed on the phone puts nothing on this socket, so
+/// Together with [`CallLogHistory`], carries calls the companion never saw
+/// signalling for: a call placed on the phone puts nothing on this socket, so
 /// [`Event::IncomingCall`] and friends cannot see it.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
@@ -2913,6 +2919,47 @@ pub struct CallLogSync {
     pub timestamp: DateTime<Utc>,
     pub record: Box<wa::CallLogRecord>,
     pub from_full_sync: bool,
+}
+
+/// A call record from the phone's pairing-time compressed history (field 13).
+///
+/// The record is shared with [`CallLogSync`], but history has no mutation index,
+/// mutation write time or app-state full-sync flag. This event is delivered in
+/// record wire order after the chunk's internal harvest, before its
+/// [`Event::HistorySync`]. It promises neither cross-chunk ordering nor dedup:
+/// replayed chunks can emit the same calls again. Consumers may upsert using
+/// the record's optional call identifier and creator.
+///
+/// ```
+/// use wacore::types::events::{Event, EventInterest, EventKind};
+/// let interest = EventInterest::of(&[EventKind::CallLogHistory]);
+/// assert!(interest.wants(EventKind::CallLogHistory));
+/// fn placed(event: &Event) -> Option<bool> {
+///     match event {
+///         Event::CallLogHistory(call) => call.from_me,
+///         _ => None,
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct CallLogHistory {
+    /// Who started the call, parsed only from `record.call_creator_jid`.
+    /// Absent or unparseable creators stay unknown; raw text stays in `record`.
+    pub call_creator_jid: Option<Jid>,
+    /// Whether this account placed the call, comparing the creator against
+    /// the account's canonical PN and LID. `None` for an unknown creator.
+    /// `record.is_incoming` is never used to invent a direction.
+    pub from_me: Option<bool>,
+    /// The call's own `record.start_time` (Unix seconds), not a mutation's
+    /// write time. `None` when absent or out of range, without a now fallback.
+    pub timestamp: Option<DateTime<Utc>>,
+    /// All observed optional fields, outcomes and participants, unmodified.
+    pub record: Box<wa::CallLogRecord>,
+    /// History notification's sync type, not app-state full-sync provenance.
+    pub sync_type: Option<i32>,
+    /// History notification's chunk order, if supplied by the phone.
+    pub chunk_order: Option<u32>,
 }
 
 #[cfg(test)]
@@ -2957,6 +3004,7 @@ mod tests {
         assert_eq!(EventKind::FavoritesUpdate as u8, 74);
         assert_eq!(EventKind::StatusPrivacyUpdate as u8, 75);
         assert_eq!(EventKind::ReachoutTimelockUpdate as u8, 76);
+        assert_eq!(EventKind::CallLogHistory as u8, 77);
     }
 
     /// Every rejection a consumer can be handed must survive being persisted

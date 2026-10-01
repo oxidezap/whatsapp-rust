@@ -1,3 +1,4 @@
+use buffa::Message as _;
 use bytes::Bytes;
 use compact_str::CompactString;
 use smallvec::SmallVec;
@@ -37,6 +38,10 @@ pub struct HistorySyncResult {
     /// Source: WAWeb/History/MsgHandlerAction.js:storeNctSaltFromHistorySync
     pub nct_salt: Option<Vec<u8>>,
     pub conversations_processed: usize,
+    /// Pairing-history call records (field 13), in wire order. Records are
+    /// decoded individually during the same inflate walk, never by reparsing
+    /// the whole chunk. Malformed framed entries are skipped.
+    pub call_log_records: Vec<wa::CallLogRecord>,
     /// Tctoken candidates extracted from 1:1 conversations during streaming.
     pub tc_token_candidates: Vec<TcTokenCandidate>,
     pub msg_secret_records: Vec<HistoryMsgSecretRecord>,
@@ -65,8 +70,9 @@ mod wire_type {
 /// Decompress and process a history sync blob.
 ///
 /// **Memory strategy**: always streams — inflates with a bounded window and
-/// extracts each top-level field as soon as its bytes are buffered, so peak
-/// memory is the largest single conversation, never the whole blob. With
+/// extracts each top-level field as soon as its bytes are buffered, so the
+/// inflate window holds at most the largest field, not the whole blob. The
+/// result separately retains harvested metadata, including call records. With
 /// `retain_blob`, the original compressed input is handed back in
 /// [`HistorySyncResult::compressed_bytes`] (a move, no copy and no second
 /// inflate) for on-demand consumer decoding via `LazyHistorySync`.
@@ -441,6 +447,7 @@ where
         own_pushname: None,
         nct_salt: None,
         conversations_processed: 0,
+        call_log_records: Vec::new(),
         tc_token_candidates: Vec::new(),
         // Starts empty and gets a one-shot density-based reserve once the
         // walk has seen RESERVE_SAMPLE_RECORDS (see below). A full pre-count
@@ -517,6 +524,14 @@ where
                     )
                     .entered();
                     record_sink.reserve(&mut result.msg_secret_records, additional);
+                }
+            }
+            tags::history_sync::CALL_LOG_RECORDS => {
+                // Like optional mappings, a corrupt record must not cost the
+                // other chunk harvest. Outer framing/zlib errors remain fatal.
+                match wa::CallLogRecord::decode_from_slice(value) {
+                    Ok(record) => result.call_log_records.push(record),
+                    Err(_) => log::warn!("Skipping undecodable history-sync call record"),
                 }
             }
             // pushnames (repeated) — only our own is needed
@@ -1041,6 +1056,7 @@ fn history_lid_mapping(
 // whatsapp.proto renumbers a field, compilation fails here instead of the
 // fast-path silently reading the wrong wire field.
 const _: () = {
+    assert!(tags::history_sync::CALL_LOG_RECORDS == 13);
     assert!(tags::history_sync::PHONE_NUMBER_TO_LID_MAPPINGS == 15);
     assert!(tags::phone_number_to_lid_mapping::PN_JID == 1);
     assert!(tags::phone_number_to_lid_mapping::LID_JID == 2);
@@ -2326,6 +2342,82 @@ mod tests {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&proto_bytes).unwrap();
         encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn call_records_are_harvested_in_wire_order_without_losing_other_fields() {
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            call_log_records: vec![
+                wa::CallLogRecord {
+                    call_id: Some("placed".into()),
+                    start_time: Some(1_700_000_000),
+                    ..Default::default()
+                },
+                wa::CallLogRecord::default(),
+                wa::CallLogRecord {
+                    call_id: Some("received".into()),
+                    ..Default::default()
+                },
+            ],
+            nct_salt: Some(vec![42; 32]),
+            conversations: vec![wa::Conversation {
+                id: "15550000002@s.whatsapp.net".into(),
+                ..Default::default()
+            }],
+            pushnames: vec![wa::Pushname {
+                id: Some("15550000001@s.whatsapp.net".into()),
+                pushname: Some("Synthetic".into()),
+            }],
+            ..Default::default()
+        };
+        let result =
+            process_history_sync(encode_and_compress(&hs), Some("15550000001"), true).unwrap();
+        assert_eq!(result.call_log_records, hs.call_log_records);
+        assert_eq!(result.nct_salt, hs.nct_salt);
+        assert_eq!(result.own_pushname.as_deref(), Some("Synthetic"));
+        assert_eq!(result.conversations_processed, 1);
+        let blob = result.compressed_bytes.unwrap();
+        let mut stream = HistorySyncStream::new(&blob, MAX_DECOMPRESSED);
+        assert!(stream.next_conversation().unwrap().is_some());
+        assert!(stream.next_conversation().unwrap().is_none());
+        assert_eq!(
+            stream.remainder().unwrap().call_log_records,
+            hs.call_log_records
+        );
+    }
+
+    fn compress_call_wire(raw: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(raw).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn malformed_call_entry_does_not_drop_later_records_or_salt() {
+        // Field13 is framed, but its embedded string is truncated. Followed
+        // by an empty (valid, optional-fields-only) record and NCT salt.
+        let raw = [0x6a, 3, 0x62, 2, b'x', 0x6a, 0, 0x9a, 1, 1, 42];
+        let result = process_history_sync(compress_call_wire(&raw), None, false).unwrap();
+        assert_eq!(result.call_log_records, vec![wa::CallLogRecord::default()]);
+        assert_eq!(result.nct_salt, Some(vec![42]));
+        assert!(result.compressed_bytes.is_none());
+        // A known field with an unrelated wire type is safely skipped.
+        let result =
+            process_history_sync(compress_call_wire(&[0x68, 1, 0x6a, 0]), None, false).unwrap();
+        assert_eq!(result.call_log_records.len(), 1);
+    }
+
+    #[test]
+    fn truncated_call_framing_and_zlib_are_fatal_without_partial_result() {
+        for raw in [&[0x6a, 0, 0x6a, 4, 0x62][..], &[0x6a, 0x80][..]] {
+            assert!(process_history_sync(compress_call_wire(raw), None, false).is_err());
+        }
+        let mut compressed = compress_call_wire(&[0x6a, 0]);
+        compressed.truncate(compressed.len() - 1);
+        assert!(process_history_sync(compressed, None, false).is_err());
+        let result = process_history_sync(compress_call_wire(&[]), None, false).unwrap();
+        assert!(result.call_log_records.is_empty());
     }
 
     /// `phoneNumberToLidMappings` (field 15) is the bulk PN-LID identity seed;
@@ -4214,6 +4306,7 @@ mod tests {
             own_pushname: None,
             nct_salt: None,
             conversations_processed: 0,
+            call_log_records: Vec::new(),
             tc_token_candidates: Vec::new(),
             msg_secret_records: Vec::new(),
             lid_mappings: Vec::new(),
