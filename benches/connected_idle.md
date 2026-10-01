@@ -64,7 +64,8 @@ Boolean arguments mean `false = InMemoryBackend`, `true = file-backed SQLite`.
 * `cache_maintenance_after_activity`: connection **and activity** are setup; only
   the explicit production cache sweep and settling are timed.
 * Both use fresh fixtures; graceful shutdown/database cleanup is outside timing.
-  `AllocProfiler` supplies native Divan allocation columns and CodSpeed uses its
+  Shutdown/database cleanup errors fail the fixture. `AllocProfiler` supplies
+  native Divan allocation columns and CodSpeed uses its
   supported simulation/memory instruments. These rows are CPU/allocation-peak
   measurements, **not retained heap, elapsed idle or RSS**. They never sleep for
   a minute or advance virtual time inside a simulated CPU region.
@@ -153,52 +154,16 @@ pages/arenas for reuse. A lower peak alone does not prove lower retention, and a
 flat RSS alone does not prove that Rust objects stayed live. Report all three
 readings and the control/noise range; never upload RssAnon as a CodSpeed metric.
 
-## Observed native baseline (2026-10-01)
+## Native baseline validation
 
-Library source: main `19eb64cac58bc2e36cc9e2bc3c92fe9af3a78729`; fixture code:
-`e92fb44f1bd08d7324688a7805bd1beb03e6b3a1`. Linux AArch64, glibc 2.39,
-Rust `1.98.0-nightly (01dfd7924 2026-06-15)`, **dev/unoptimized + debuginfo**,
-minimal features above, frozen malloc environment above. No compiler/build
-script was running during sampling. These are debug-profile baseline observations,
-**not** release performance, optimization gains, or CodSpeed readings.
+The first native batch's RSS table has been withdrawn: its counting allocator
+used the trait-default `alloc_zeroed` (eager memset), not System's calloc/lazy-page
+behavior. The corrected allocator forwards all four System allocation methods.
+A replacement baseline will use fresh activity/control children and the same
+feature/profile/malloc settings. No old RSS values are presented as production
+allocator evidence.
 
-Three fresh processes per backend/mode, all 12 successful. Each elapsed idle
-interval was 61,001–61,006 ms. Activity children delivered/committed all 256
-messages, dispatched history, remained connected with periodic pong(s), and
-went from 32 running workers to zero. All SQLite fixture files were removed.
-
-Median requested Rust bytes (live deltas are relative to `runtime_baseline`):
-
-| Backend / mode | Cumulative peak (absolute B) | After activity ΔB | After 61s ΔB | After sweep ΔB |
-| --- | ---: | ---: | ---: | ---: |
-| Memory / control | 1,197,133 | 201,265 | 168,809 | 170,482 |
-| Memory / activity | 4,790,526 | 1,954,893 | 1,580,591 | 1,582,120 |
-| SQLite / control | 1,082,647 | 97,568 | 69,427 | 71,100 |
-| SQLite / activity | 5,241,544 | 1,730,302 | 1,355,698 | 1,357,227 |
-
-RssAnon deltas from runtime baseline (min / median / max KiB):
-
-| Backend / mode | After activity | After 61s and sweep |
-| --- | ---: | ---: |
-| Memory / control | 232 / 232 / 232 | 1,136 / 1,136 / 1,136 |
-| Memory / activity | 4,852 / 4,856 / 4,864 | 4,852 / 4,856 / 4,864 |
-| SQLite / control | 968 / 972 / 1,008 | 1,820 / 1,844 / 1,912 |
-| SQLite / activity | 6,404 / 6,412 / 6,456 | 6,404 / 6,412 / 6,456 |
-
-Activity Rust live bytes fell 374,302 B (memory) and 374,604–374,755 B
-(SQLite) during idle, with **no RssAnon change in any activity child**.
-Fresh startup/periodic work also affects controls: SQLite's after-activity
-live delta ranged 95,545–205,419 B, narrowing to 68,179–70,259 B after idle.
-Do not attribute every change solely to workers or compare raw cohort peaks
-as a storage-backend optimization claim.
-
-After graceful shutdown, activity live deltas were 74,119 B (memory median)
-and 75,253 B (SQLite median); after runtime drop, 25,027 B and 26,161 B.
-RssAnon activity medians after teardown remained +2,824 / +5,384 KiB.
-This is end-of-life accounting, not an assertion that process-global buffers
-or allocator pages must disappear when one client is dropped.
-
-To reproduce this **dev** baseline, omit `--release` from the build command and
+To reproduce a **dev** baseline, omit `--release` from the build command and
 invoke `target/debug/examples/connected_idle --repeats 3` with the same malloc
 and `CARGO_TARGET_DIR` environment. Keep raw JSONL and min/median/max output;
-release builds should establish their own baseline rather than reuse this table.
+release builds should establish their own baseline rather than reuse a dev table.

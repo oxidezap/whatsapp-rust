@@ -1,12 +1,15 @@
 //! Lifecycle proof only: virtual Tokio time is not a native memory measurement.
 
+#[path = "../src/bench_support/connected_idle/util.rs"]
+mod fixture_util;
+
 use anyhow::{Result, ensure};
 use whatsapp_rust::bench_support::connected_idle::{BackendFixture, LANES, Session};
 
 #[tokio::test(start_paused = true)]
 async fn connected_activity_and_idle_lifecycle() -> Result<()> {
     let backend = BackendFixture::memory();
-    let session = Session::connect(backend.backend.clone()).await?;
+    let session = Session::connect(backend.backend()).await?;
     let activity = session.prepare_activity().await?;
     session.receive_activity(activity).await?;
     let busy = session.checkpoint().await;
@@ -25,14 +28,15 @@ async fn connected_activity_and_idle_lifecycle() -> Result<()> {
         session.checkpoint().await.connected,
         "maintenance disconnected client"
     );
-    session.shutdown().await
+    session.shutdown().await?;
+    backend.cleanup()
 }
 
 #[cfg(feature = "sqlite-storage")]
 #[tokio::test]
 async fn sqlite_connected_activity_and_virtual_idle() -> Result<()> {
     let backend = BackendFixture::sqlite().await?;
-    let session = Session::connect(backend.backend.clone()).await?;
+    let session = Session::connect(backend.backend()).await?;
     let activity = session.prepare_activity().await?;
     session.receive_activity(activity).await?;
     ensure!(
@@ -45,13 +49,14 @@ async fn sqlite_connected_activity_and_virtual_idle() -> Result<()> {
     let idle = session.checkpoint().await;
     ensure!(idle.connected && idle.running_workers == 0, "{idle:?}");
     session.maintenance().await?;
-    session.shutdown().await
+    session.shutdown().await?;
+    backend.cleanup()
 }
 
 #[tokio::test(start_paused = true)]
 async fn connected_control_stays_alive_without_activity() -> Result<()> {
     let backend = BackendFixture::memory();
-    let session = Session::connect(backend.backend.clone()).await?;
+    let session = Session::connect(backend.backend()).await?;
     session.finish_control().await?;
     session.idle().await?;
     // Recent-activity decisions use wacore's real monotonic clock, not Tokio
@@ -66,5 +71,6 @@ async fn connected_control_stays_alive_without_activity() -> Result<()> {
         session.pongs() > 0,
         "keepalive never reached the synthetic server"
     );
-    session.shutdown().await
+    session.shutdown().await?;
+    backend.cleanup()
 }

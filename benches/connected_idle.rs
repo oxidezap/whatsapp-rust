@@ -7,7 +7,7 @@ struct Fixture<'a> {
     rt: &'a tokio::runtime::Runtime,
     session: Option<Session>,
     activity: Option<Activity>,
-    _backend: BackendFixture,
+    backend: Option<BackendFixture>,
 }
 
 impl Drop for Fixture<'_> {
@@ -16,6 +16,9 @@ impl Drop for Fixture<'_> {
             self.rt
                 .block_on(session.shutdown())
                 .expect("fixture shutdown");
+        }
+        if let Some(backend) = self.backend.take() {
+            backend.cleanup().expect("fixture database cleanup");
         }
     }
 }
@@ -45,9 +48,7 @@ fn activity_peak(bencher: divan::Bencher, sqlite: bool) {
                 } else {
                     BackendFixture::memory()
                 };
-                let session = Session::connect(backend.backend.clone())
-                    .await
-                    .expect("connect");
+                let session = Session::connect(backend.backend()).await.expect("connect");
                 let activity = session
                     .prepare_activity()
                     .await
@@ -56,7 +57,7 @@ fn activity_peak(bencher: divan::Bencher, sqlite: bool) {
                     rt: &rt,
                     session: Some(session),
                     activity: Some(activity),
-                    _backend: backend,
+                    backend: Some(backend),
                 }
             })
         })
@@ -84,16 +85,14 @@ fn cache_maintenance_after_activity(bencher: divan::Bencher, sqlite: bool) {
                 } else {
                     BackendFixture::memory()
                 };
-                let session = Session::connect(backend.backend.clone())
-                    .await
-                    .expect("connect");
+                let session = Session::connect(backend.backend()).await.expect("connect");
                 let activity = session.prepare_activity().await.expect("prepare activity");
                 session.receive_activity(activity).await.expect("activity");
                 Fixture {
                     rt: &rt,
                     session: Some(session),
                     activity: None,
-                    _backend: backend,
+                    backend: Some(backend),
                 }
             })
         })

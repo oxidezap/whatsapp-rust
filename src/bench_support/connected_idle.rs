@@ -5,6 +5,8 @@
 //! No connection flags are set by this fixture. Unsupported initialization IQs get 503;
 //! active and keepalive IQs succeed. This is not full WhatsApp service emulation.
 
+mod util;
+
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,7 +37,7 @@ use crate::waproto::whatsapp as wa;
 /// A private real SQLite file per process/sample, never `:memory:`. Keeping this
 /// guard outside Session also keeps database-path allocations stable across checkpoints.
 pub struct BackendFixture {
-    pub backend: Arc<dyn Backend>,
+    backend: Option<Arc<dyn Backend>>,
     #[cfg(feature = "sqlite-storage")]
     path: Option<std::path::PathBuf>,
 }
@@ -43,7 +45,7 @@ pub struct BackendFixture {
 impl BackendFixture {
     pub fn memory() -> Self {
         Self {
-            backend: Arc::new(wacore::store::InMemoryBackend::new()),
+            backend: Some(Arc::new(wacore::store::InMemoryBackend::new())),
             #[cfg(feature = "sqlite-storage")]
             path: None,
         }
@@ -70,19 +72,40 @@ impl BackendFixture {
         let backend =
             crate::store::SqliteStore::new(path.to_str().context("SQLite path encoding")?).await?;
         Ok(Self {
-            backend: Arc::new(backend),
+            backend: Some(Arc::new(backend)),
             path: Some(path),
         })
+    }
+
+    pub fn backend(&self) -> Arc<dyn Backend> {
+        self.backend.as_ref().expect("live fixture backend").clone()
+    }
+
+    /// Release the backend before unlinking its owned files; failures invalidate
+    /// a measurement rather than being silently reported as successful cleanup.
+    pub fn cleanup(mut self) -> Result<()> {
+        drop(self.backend.take());
+        self.cleanup_files()
+    }
+
+    fn cleanup_files(&mut self) -> Result<()> {
+        #[cfg(feature = "sqlite-storage")]
+        if let Some(path) = &self.path {
+            util::cleanup_database(path)?;
+            self.path = None;
+        }
+        Ok(())
     }
 }
 
 impl Drop for BackendFixture {
+    // Even cancellation/unwinding must make fixture cleanup failures visible
+    // without relying on an application-installed logger.
+    #[allow(clippy::print_stderr)]
     fn drop(&mut self) {
-        #[cfg(feature = "sqlite-storage")]
-        if let Some(path) = &self.path {
-            for suffix in ["", "-wal", "-shm"] {
-                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-            }
+        drop(self.backend.take());
+        if let Err(error) = self.cleanup_files() {
+            eprintln!("connected idle fixture cleanup failed: {error:#}");
         }
     }
 }
@@ -399,13 +422,7 @@ impl Session {
     }
 
     async fn wait_until(&self, ready: impl Fn() -> bool) -> Result<()> {
-        tokio::time::timeout(DEADLINE, async {
-            while !ready() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .context("connected fixture condition timed out")
+        util::wait_until(DEADLINE, ready).await
     }
 
     pub async fn checkpoint(&self) -> Checkpoint {
@@ -442,7 +459,7 @@ impl Session {
                 if state.open_lanes == 0 && state.running_workers == 0 {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
             Ok::<_, anyhow::Error>(())
         })

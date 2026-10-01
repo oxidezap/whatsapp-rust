@@ -16,10 +16,19 @@ fn add(bytes: usize) {
 
 // SAFETY: every operation delegates to System with unchanged pointers/layouts;
 // only allocation-free atomic accounting is added, and failed allocations do
-// not alter the counters. Default alloc_zeroed delegates to our counted alloc.
+// not alter the counters. Zeroed requests retain System's calloc/lazy-page
+// behavior instead of the trait default's eager memset through alloc.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            add(layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc_zeroed(layout) };
         if !ptr.is_null() {
             add(layout.size());
         }

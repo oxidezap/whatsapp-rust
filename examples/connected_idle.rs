@@ -122,7 +122,7 @@ fn child(backend: &str, mode: &str) -> Result<Run> {
         } else {
             BackendFixture::memory()
         };
-        let session = Session::connect(store.backend.clone()).await?;
+        let session = Session::connect(store.backend()).await?;
         samples.push(sample("connected_before_activity", start, Some(&session)).await?);
         if mode == "activity" {
             let activity = session.prepare_activity().await?;
@@ -154,7 +154,7 @@ fn child(backend: &str, mode: &str) -> Result<Run> {
             "delivery mismatch"
         );
         session.shutdown().await?;
-        drop(store);
+        store.cleanup()?;
         samples.push(sample("after_shutdown", start, None).await?);
         Ok::<_, anyhow::Error>(Run {
             backend: backend.into(),
