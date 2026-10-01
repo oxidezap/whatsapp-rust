@@ -1,9 +1,8 @@
 //! Downstream use of both group projections through one lookup contract.
 
-use whatsapp_rust::types::jid::Jid;
 use whatsapp_rust::{
     Client, GroupError, GroupHierarchy, GroupLookupResult, GroupMetadata, GroupMetadataResult,
-    GroupOverview, GroupOverviewResult, GroupType, SubgroupKind, group_type,
+    GroupOverview, GroupOverviewResult, GroupType, Jid, SubgroupKind, group_type,
 };
 
 // A group-list UI can share its partial/refusal handling without knowing which
