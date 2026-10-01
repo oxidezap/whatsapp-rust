@@ -289,6 +289,28 @@ enum PeerBehavior {
     LogInAndAnswerRequests,
 }
 
+fn decode_peer_frame(
+    cipher: &wacore::handshake::NoiseCipher,
+    counter: &mut u32,
+    mut packed: Vec<u8>,
+) -> anyhow::Result<OwnedNodeRef> {
+    cipher.decrypt_in_place_with_counter(*counter, &mut packed)?;
+    *counter += 1;
+    let decoded = wacore_binary::util::unpack(&packed)?;
+    Ok(OwnedNodeRef::new(decoded.into_owned())?)
+}
+
+fn peer_observation(node: &OwnedNodeRef) -> (String, String) {
+    let mut attrs = node.get().attrs();
+    (
+        attrs.optional_string("id").unwrap_or_default().into_owned(),
+        attrs
+            .optional_string("xmlns")
+            .unwrap_or_default()
+            .into_owned(),
+    )
+}
+
 async fn run_peer(
     listener: TcpListener,
     behavior: PeerBehavior,
@@ -321,23 +343,8 @@ async fn run_peer(
                     return Ok(());
                 }
             };
-        let mut packed = ciphertext;
-        client_to_server.decrypt_in_place_with_counter(incoming_counter, &mut packed)?;
-        incoming_counter += 1;
-        let decoded = wacore_binary::util::unpack(&packed)?;
-        let node = OwnedNodeRef::new(decoded.into_owned())?;
-        let xmlns = node
-            .get()
-            .attrs()
-            .optional_string("xmlns")
-            .unwrap_or_default()
-            .into_owned();
-        let id = node
-            .get()
-            .attrs()
-            .optional_string("id")
-            .unwrap_or_default()
-            .into_owned();
+        let node = decode_peer_frame(&client_to_server, &mut incoming_counter, ciphertext)?;
+        let (id, xmlns) = peer_observation(&node);
         observed.send((id.clone(), xmlns.clone())).await?;
 
         let should_answer = match behavior {
@@ -408,6 +415,128 @@ async fn dial_and_read(client: Arc<Client>) -> Option<DisconnectReason> {
         .await
 }
 
+async fn wait_for_application_iqs(
+    rx: &async_channel::Receiver<(String, String)>,
+    seen: &mut Vec<(String, String)>,
+) -> anyhow::Result<()> {
+    // Transport.send can carry several Noise frames; only the peer's decoded
+    // application IDs prove progress. Keep every observation for the later
+    // real-ping assertion, including any ping arriving during this wait.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ![("ignored", "test:ignored"), ("other", "test:other")]
+            .iter()
+            .all(|(id, xmlns)| seen.iter().any(|event| event.0 == *id && event.1 == *xmlns))
+        {
+            seen.push(rx.recv().await?);
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("authenticated application IQ progress stalled; seen={seen:?}"))?
+}
+
+fn control_frame(counter: u32, id: &str, namespace: &str) -> Bytes {
+    let node = NodeBuilder::new("iq")
+        .attr("id", id)
+        .attr("type", "get")
+        .attr("xmlns", namespace)
+        .build();
+    let packed = wacore_binary::marshal::marshal(&node).unwrap();
+    let cipher = wacore::handshake::NoiseCipher::new(&[0; 32]).unwrap();
+    let ciphertext = cipher.encrypt_with_counter(counter, &packed).unwrap();
+    Bytes::from(wacore::framing::encode_frame(&ciphertext, None).unwrap())
+}
+
+/// The controls share the real peer's framing, authentication, nonce sequence
+/// and observation path. Fixed keys avoid repeating XX setup; the victim below
+/// still exercises the complete handshake and production IQ/keepalive loops.
+async fn control_progress(
+    outgoing: &[Bytes],
+) -> (
+    anyhow::Result<()>,
+    anyhow::Result<()>,
+    Vec<(String, String)>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let writes = Arc::new(AtomicUsize::new(0));
+    let factory = LoopbackTcpFactory {
+        address: listener.local_addr().unwrap(),
+        writes: writes.clone(),
+        write_notify: Arc::new(tokio::sync::Notify::new()),
+    };
+    let (tx, rx) = async_channel::unbounded();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let cipher = wacore::handshake::NoiseCipher::new(&[0; 32])?;
+        let mut counter = 0;
+        loop {
+            let frame = match read_frame(&mut stream, false).await {
+                Ok(frame) => frame,
+                Err(error) if error.downcast_ref::<std::io::Error>().is_some() => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            let node = decode_peer_frame(&cipher, &mut counter, frame)?;
+            tx.send(peer_observation(&node)).await?;
+        }
+    });
+    let (transport, _events) = factory.create_transport().await.unwrap();
+    for write in outgoing {
+        transport.send(write.clone()).await.unwrap();
+    }
+    assert_eq!(writes.load(Ordering::Relaxed), outgoing.len());
+    transport.disconnect().await;
+    let mut seen = Vec::new();
+    let progress = wait_for_application_iqs(&rx, &mut seen).await;
+    let peer_result = peer.await.unwrap();
+    (progress, peer_result, seen)
+}
+
+#[tokio::test]
+async fn application_progress_accepts_two_noise_frames_in_one_transport_send() {
+    let mut coalesced = control_frame(0, "ignored", "test:ignored").to_vec();
+    coalesced.extend_from_slice(&control_frame(1, "other", "test:other"));
+    let (progress, peer, seen) = control_progress(&[Bytes::from(coalesced)]).await;
+    progress.unwrap();
+    peer.unwrap();
+    assert_eq!(seen.len(), 2);
+}
+
+#[tokio::test]
+async fn application_progress_rejects_missing_second_frame() {
+    let (progress, peer, seen) =
+        control_progress(&[control_frame(0, "ignored", "test:ignored")]).await;
+    assert!(progress.is_err());
+    peer.unwrap();
+    assert_eq!(seen, [("ignored".into(), "test:ignored".into())]);
+}
+
+#[tokio::test]
+async fn application_progress_rejects_malformed_second_frame() {
+    let mut coalesced = control_frame(0, "ignored", "test:ignored").to_vec();
+    let mut malformed = control_frame(1, "other", "test:other").to_vec();
+    *malformed.last_mut().unwrap() ^= 1;
+    coalesced.extend_from_slice(&malformed);
+    let (progress, peer, seen) = control_progress(&[Bytes::from(coalesced)]).await;
+    assert!(progress.is_err());
+    assert!(peer.is_err(), "the second frame must fail authentication");
+    assert_eq!(seen, [("ignored".into(), "test:ignored".into())]);
+}
+
+#[tokio::test]
+async fn application_progress_does_not_credit_a_ping_as_the_other_iq() {
+    let (progress, peer, seen) = control_progress(&[
+        control_frame(0, "ignored", "test:ignored"),
+        control_frame(1, "other", "w:p"),
+    ])
+    .await;
+    assert!(
+        progress.is_err(),
+        "two transport sends are not two application IQs"
+    );
+    peer.unwrap();
+    assert_eq!(seen.len(), 2);
+}
+
 async fn wait_for_writes(writes: &AtomicUsize, write_notify: &tokio::sync::Notify, count: usize) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while writes.load(Ordering::Relaxed) < count {
@@ -455,14 +584,13 @@ async fn loopback_tcp_ignored_iq_survives_until_timeout_when_noise_ping_is_answe
         observed_tx,
         handshake_tx,
     ));
-    let (client, writes, write_notify) = connected_client(address).await;
+    let (client, writes, _write_notify) = connected_client(address).await;
     let reader = tokio::spawn(dial_and_read(client.clone()));
     await_connected(&client).await;
     tokio::time::timeout(Duration::from_secs(5), handshake_rx.recv())
         .await
         .expect("the TCP peer completes the real Noise handshake")
         .unwrap();
-    let handshake_writes = writes.load(Ordering::Relaxed);
 
     let ignored = send_request(&client, "ignored", "test:ignored", None).await;
     let unrelated = send_request(
@@ -472,7 +600,10 @@ async fn loopback_tcp_ignored_iq_survives_until_timeout_when_noise_ping_is_answe
         Some(Duration::from_secs(120)),
     )
     .await;
-    wait_for_writes(&writes, &write_notify, handshake_writes + 2).await;
+    let mut seen = Vec::new();
+    wait_for_application_iqs(&observed_rx, &mut seen)
+        .await
+        .expect("the peer authenticates both concurrent application IQs within 5s");
     let ignored_result = tokio::time::timeout(Duration::from_secs(15), ignored)
         .await
         .expect("the default IQ timeout should expire before any reconnect")
@@ -493,10 +624,9 @@ async fn loopback_tcp_ignored_iq_survives_until_timeout_when_noise_ping_is_answe
         client.is_connected(),
         "answered Noise probes keep the TCP connection alive"
     );
+    seen.extend(drain_observed(&observed_rx));
     assert!(
-        drain_observed(&observed_rx)
-            .iter()
-            .any(|(_, xmlns)| xmlns == "w:p"),
+        seen.iter().any(|(_, xmlns)| xmlns == "w:p"),
         "the peer must receive a real w:p over TCP"
     );
     assert!(
