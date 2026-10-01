@@ -3967,6 +3967,8 @@ pub(crate) fn dm_stanza_to(recipient_bare: &Jid, to: &Jid) -> Jid {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    mod privacy_tokens;
+
     use super::*;
     use crate::test_utils::wait_for_lock_waiter;
     use std::str::FromStr;

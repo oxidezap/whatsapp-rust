@@ -462,10 +462,21 @@ pub(crate) async fn create_iq_test_client() -> (
     Arc<Client>,
     Arc<crate::transport::mock::CapturingMockTransport>,
 ) {
+    create_iq_test_client_with_backend(create_test_backend().await).await
+}
+
+/// The same connected, Noise-framed fixture with a caller-owned backend for
+/// persistence/reload and fault-injection tests.
+#[cfg(test)]
+pub(crate) async fn create_iq_test_client_with_backend(
+    backend: Arc<dyn Backend>,
+) -> (
+    Arc<Client>,
+    Arc<crate::transport::mock::CapturingMockTransport>,
+) {
     use crate::transport::mock::CapturingMockTransportFactory;
     use wacore::handshake::NoiseCipher;
 
-    let backend = create_test_backend().await;
     let pm = Arc::new(
         PersistenceManager::new(backend)
             .await

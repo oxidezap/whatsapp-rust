@@ -26,13 +26,10 @@ impl Client {
 
     /// Look up and include a privacy token in outgoing 1:1 message stanza nodes.
     ///
-    /// Follows WA Web's fallback chain (MsgCreateFanoutStanza.js `Re = R(te) ?? D(te, s)`):
-    ///   1. tctoken — stored trusted contact token, gated on
-    ///      `privacy_token_sending_on_all_1_on_1_messages` (WA Web `R`).
+    /// Follows the fallback chain selected by [`wacore::iq::tctoken::choose_privacy_token`]:
+    ///   1. tctoken — stored, non-empty, unexpired received trusted-contact token.
     ///   2. cstoken — `HMAC-SHA256(nct_salt, recipient_lid)` fallback, gated
-    ///      independently on `wa_nct_token_send_enabled` (WA Web `D`). The cstoken
-    ///      is NOT nested behind the 1:1 prop — WA Web attaches it even when `R`
-    ///      returns null.
+    ///      independently on `wa_nct_token_send_enabled`.
     ///   3. No token — message sent without token (server may return 463).
     ///
     /// Returns whether a new tc token should be issued after send.
@@ -95,7 +92,7 @@ impl Client {
                 && !is_tc_token_expired_with_at(entry.token_timestamp, &tc_config, now))
             .then_some(entry.token.as_slice())
         });
-        // cstoken needs both the NCT salt and a resolved account LID (WA Web `D`).
+        // cstoken needs both the NCT salt and a resolved account LID.
         let snapshot = self.persistence_manager.get_device_snapshot();
         let cs_token_inputs: Option<(&[u8], &wacore_binary::CompactString)> =
             match (&snapshot.nct_salt, &resolved_lid) {
@@ -103,17 +100,13 @@ impl Client {
                 _ => None,
             };
 
-        let tc_send_enabled = self
-            .ab_props
-            .is_enabled(web::PRIVACY_TOKEN_SENDING_ON_ALL_1_ON_1_MESSAGES)
-            .await;
         let nct_send_enabled = self
             .ab_props
             .is_enabled(web::WA_NCT_TOKEN_SEND_ENABLED)
             .await;
 
         let choice = choose_privacy_token(
-            tc_send_enabled,
+            false,
             nct_send_enabled,
             valid_tc_token.is_some(),
             cs_token_inputs.is_some(),
