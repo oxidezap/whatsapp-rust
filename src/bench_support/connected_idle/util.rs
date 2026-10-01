@@ -49,9 +49,25 @@ mod tests {
     fn cleanup_reports_io_failures_and_accepts_missing_sidecars() -> Result<()> {
         let root = std::env::var_os("CARGO_TARGET_DIR")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("target"));
-        let path = root.join(format!("connected-idle-cleanup-{}.db", std::process::id()));
+            .unwrap_or_else(|| std::path::PathBuf::from("target"))
+            .join("connected-idle");
+        std::fs::create_dir_all(&root)?;
+        let path = root.join(format!(
+            "cleanup-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
         std::fs::create_dir(&path)?;
+        struct OwnedPath(std::path::PathBuf);
+        impl Drop for OwnedPath {
+            fn drop(&mut self) {
+                // Best effort on test failure only; the successful path below
+                // explicitly checks cleanup. Never remove someone else's path.
+                let _ = std::fs::remove_file(&self.0);
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let _owned = OwnedPath(path.clone());
         let failure = cleanup_database(&path);
         std::fs::remove_dir(&path)?;
         assert!(

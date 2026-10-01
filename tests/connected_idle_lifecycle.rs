@@ -53,6 +53,26 @@ async fn sqlite_connected_activity_and_virtual_idle() -> Result<()> {
     backend.cleanup()
 }
 
+#[tokio::test]
+async fn shutdown_releases_active_workers_before_backend_cleanup() -> Result<()> {
+    #[cfg(feature = "sqlite-storage")]
+    let backends = [BackendFixture::memory(), BackendFixture::sqlite().await?];
+    #[cfg(not(feature = "sqlite-storage"))]
+    let backends = [BackendFixture::memory()];
+    for backend in backends {
+        let session = Session::connect(backend.backend()).await?;
+        let activity = session.prepare_activity().await?;
+        session.receive_activity(activity).await?;
+        ensure!(
+            session.checkpoint().await.running_workers > 0,
+            "test must disconnect before idle retirement"
+        );
+        session.shutdown().await?;
+        backend.cleanup()?;
+    }
+    Ok(())
+}
+
 #[tokio::test(start_paused = true)]
 async fn connected_control_stays_alive_without_activity() -> Result<()> {
     let backend = BackendFixture::memory();
