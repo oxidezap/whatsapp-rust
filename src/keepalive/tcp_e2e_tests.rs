@@ -300,21 +300,30 @@ fn decode_peer_frame(
     Ok(OwnedNodeRef::new(decoded.into_owned())?)
 }
 
-fn peer_observation(node: &OwnedNodeRef) -> (String, String) {
+#[derive(Debug)]
+struct PeerObservation {
+    id: String,
+    xmlns: String,
+    is_iq_get: bool,
+}
+
+fn peer_observation(node: &OwnedNodeRef) -> PeerObservation {
     let mut attrs = node.get().attrs();
-    (
-        attrs.optional_string("id").unwrap_or_default().into_owned(),
-        attrs
+    PeerObservation {
+        id: attrs.optional_string("id").unwrap_or_default().into_owned(),
+        xmlns: attrs
             .optional_string("xmlns")
             .unwrap_or_default()
             .into_owned(),
-    )
+        is_iq_get: node.get().tag.as_ref() == "iq"
+            && attrs.optional_string("type").as_deref() == Some("get"),
+    }
 }
 
 async fn run_peer(
     listener: TcpListener,
     behavior: PeerBehavior,
-    observed: async_channel::Sender<(String, String)>,
+    observed: async_channel::Sender<PeerObservation>,
     handshake_complete: async_channel::Sender<()>,
 ) -> anyhow::Result<()> {
     let (mut stream, _) = listener.accept().await?;
@@ -338,14 +347,20 @@ async fn run_peer(
                 Ok(Err(error)) => return Err(error),
                 Err(_) => {
                     observed
-                        .send(("peer_timeout".into(), "no TCP frame after handshake".into()))
+                        .send(PeerObservation {
+                            id: "peer_timeout".into(),
+                            xmlns: "no TCP frame after handshake".into(),
+                            is_iq_get: false,
+                        })
                         .await?;
                     return Ok(());
                 }
             };
         let node = decode_peer_frame(&client_to_server, &mut incoming_counter, ciphertext)?;
-        let (id, xmlns) = peer_observation(&node);
-        observed.send((id.clone(), xmlns.clone())).await?;
+        let observation = peer_observation(&node);
+        let id = observation.id.clone();
+        let xmlns = observation.xmlns.clone();
+        observed.send(observation).await?;
 
         let should_answer = match behavior {
             PeerBehavior::AnswerProbes => xmlns == "w:p" || xmlns == "test:other",
@@ -376,7 +391,7 @@ async fn run_peer(
     }
 }
 
-fn drain_observed(rx: &async_channel::Receiver<(String, String)>) -> Vec<(String, String)> {
+fn drain_observed(rx: &async_channel::Receiver<PeerObservation>) -> Vec<PeerObservation> {
     let mut observed = Vec::new();
     while let Ok(event) = rx.try_recv() {
         observed.push(event);
@@ -416,16 +431,20 @@ async fn dial_and_read(client: Arc<Client>) -> Option<DisconnectReason> {
 }
 
 async fn wait_for_application_iqs(
-    rx: &async_channel::Receiver<(String, String)>,
-    seen: &mut Vec<(String, String)>,
+    rx: &async_channel::Receiver<PeerObservation>,
+    seen: &mut Vec<PeerObservation>,
 ) -> anyhow::Result<()> {
     // Transport.send can carry several Noise frames; only the peer's decoded
-    // application IDs prove progress. Keep every observation for the later
+    // application get-IQs prove progress: matching attributes on a different
+    // stanza are not the requests we sent. Keep every observation for the later
     // real-ping assertion, including any ping arriving during this wait.
     tokio::time::timeout(Duration::from_secs(5), async {
         while ![("ignored", "test:ignored"), ("other", "test:other")]
             .iter()
-            .all(|(id, xmlns)| seen.iter().any(|event| event.0 == *id && event.1 == *xmlns))
+            .all(|(id, xmlns)| {
+                seen.iter()
+                    .any(|event| event.is_iq_get && event.id == *id && event.xmlns == *xmlns)
+            })
         {
             seen.push(rx.recv().await?);
         }
@@ -436,12 +455,18 @@ async fn wait_for_application_iqs(
 }
 
 fn control_frame(counter: u32, id: &str, namespace: &str) -> Bytes {
-    let node = NodeBuilder::new("iq")
-        .attr("id", id)
-        .attr("type", "get")
-        .attr("xmlns", namespace)
-        .build();
-    let packed = wacore_binary::marshal::marshal(&node).unwrap();
+    control_node_frame(
+        counter,
+        &NodeBuilder::new("iq")
+            .attr("id", id)
+            .attr("type", "get")
+            .attr("xmlns", namespace)
+            .build(),
+    )
+}
+
+fn control_node_frame(counter: u32, node: &wacore_binary::Node) -> Bytes {
+    let packed = wacore_binary::marshal::marshal(node).unwrap();
     let cipher = wacore::handshake::NoiseCipher::new(&[0; 32]).unwrap();
     let ciphertext = cipher.encrypt_with_counter(counter, &packed).unwrap();
     Bytes::from(wacore::framing::encode_frame(&ciphertext, None).unwrap())
@@ -452,11 +477,7 @@ fn control_frame(counter: u32, id: &str, namespace: &str) -> Bytes {
 /// still exercises the complete handshake and production IQ/keepalive loops.
 async fn control_progress(
     outgoing: &[Bytes],
-) -> (
-    anyhow::Result<()>,
-    anyhow::Result<()>,
-    Vec<(String, String)>,
-) {
+) -> (anyhow::Result<()>, anyhow::Result<()>, Vec<PeerObservation>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let writes = Arc::new(AtomicUsize::new(0));
     let factory = LoopbackTcpFactory {
@@ -507,7 +528,9 @@ async fn application_progress_rejects_missing_second_frame() {
         control_progress(&[control_frame(0, "ignored", "test:ignored")]).await;
     assert!(progress.is_err());
     peer.unwrap();
-    assert_eq!(seen, [("ignored".into(), "test:ignored".into())]);
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].id, "ignored");
+    assert_eq!(seen[0].xmlns, "test:ignored");
 }
 
 #[tokio::test]
@@ -519,7 +542,9 @@ async fn application_progress_rejects_malformed_second_frame() {
     let (progress, peer, seen) = control_progress(&[Bytes::from(coalesced)]).await;
     assert!(progress.is_err());
     assert!(peer.is_err(), "the second frame must fail authentication");
-    assert_eq!(seen, [("ignored".into(), "test:ignored".into())]);
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].id, "ignored");
+    assert_eq!(seen[0].xmlns, "test:ignored");
 }
 
 #[tokio::test]
@@ -535,6 +560,42 @@ async fn application_progress_does_not_credit_a_ping_as_the_other_iq() {
     );
     peer.unwrap();
     assert_eq!(seen.len(), 2);
+}
+
+#[tokio::test]
+async fn application_progress_rejects_non_iq_with_matching_id_and_namespace() {
+    let wrong_tag = NodeBuilder::new("presence")
+        .attr("id", "other")
+        .attr("xmlns", "test:other")
+        .attr("type", "get")
+        .build();
+    let (progress, peer, seen) = control_progress(&[
+        control_frame(0, "ignored", "test:ignored"),
+        control_node_frame(1, &wrong_tag),
+    ])
+    .await;
+    assert!(progress.is_err());
+    peer.unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(!seen[1].is_iq_get);
+}
+
+#[tokio::test]
+async fn application_progress_rejects_wrong_iq_type_with_matching_id_and_namespace() {
+    let wrong_type = NodeBuilder::new("iq")
+        .attr("id", "other")
+        .attr("xmlns", "test:other")
+        .attr("type", "result")
+        .build();
+    let (progress, peer, seen) = control_progress(&[
+        control_frame(0, "ignored", "test:ignored"),
+        control_node_frame(1, &wrong_type),
+    ])
+    .await;
+    assert!(progress.is_err());
+    peer.unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(!seen[1].is_iq_get);
 }
 
 async fn wait_for_writes(writes: &AtomicUsize, write_notify: &tokio::sync::Notify, count: usize) {
@@ -626,7 +687,7 @@ async fn loopback_tcp_ignored_iq_survives_until_timeout_when_noise_ping_is_answe
     );
     seen.extend(drain_observed(&observed_rx));
     assert!(
-        seen.iter().any(|(_, xmlns)| xmlns == "w:p"),
+        seen.iter().any(|event| event.xmlns == "w:p"),
         "the peer must receive a real w:p over TCP"
     );
     assert!(
@@ -699,7 +760,7 @@ async fn loopback_tcp_silent_peer_reconnects_after_one_noise_ping() {
         2,
         "one ignored application IQ and one liveness probe"
     );
-    assert_eq!(seen[1].1, "w:p");
+    assert_eq!(seen[1].xmlns, "w:p");
     peer.await.unwrap().unwrap();
 }
 
@@ -744,8 +805,8 @@ async fn loopback_tcp_keepalive_pings_after_login() {
     // Ten real seconds are 100 on the client's clock: several keepalive ticks,
     // enough for the login's own requests to settle and the link to go idle.
     let pinged = tokio::time::timeout(Duration::from_secs(10), async {
-        while let Ok((_, xmlns)) = observed_rx.recv().await {
-            if xmlns == "w:p" {
+        while let Ok(event) = observed_rx.recv().await {
+            if event.xmlns == "w:p" {
                 return true;
             }
         }
