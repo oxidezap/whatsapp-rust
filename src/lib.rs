@@ -360,7 +360,9 @@ pub use features::{MexDoc, MexOperation};
 pub use features::{ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
 
 pub mod bot;
-pub use bot::{BotRunOutcome, BotShutdownReport};
+pub use bot::{
+    BotRunOutcome, BotShutdownReport, CallbackEventHandler, EventDelivery, EventDeliveryStats,
+};
 pub mod lid_pn_cache;
 #[cfg(feature = "signal")]
 pub mod shutdown;
@@ -374,7 +376,9 @@ pub mod version;
 /// `use whatsapp_rust::prelude::*;`.
 pub mod prelude {
     pub use crate::bot::{Bot, BotBuilder, BotHandle, EventDelivery, MessageContext};
-    pub use crate::bot::{BotRunOutcome, BotShutdownReport};
+    pub use crate::bot::{
+        BotRunOutcome, BotShutdownReport, CallbackEventHandler, EventDeliveryStats,
+    };
     pub use crate::client::{
         Client, ClientBuilder, ClientBuilderError, ClientError, ClientOptions, Connection,
         DecryptedPayloadLease, EncDecryptFailedLease, RawNodeLease, SentFrameLease,

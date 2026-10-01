@@ -10,16 +10,15 @@ use crate::store::persistence_manager::PersistenceManager;
 use crate::store::traits::Backend;
 use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
-use crate::types::events::{Event, EventHandler, EventInterest, EventKind};
+use crate::types::events::{Event, EventHandler, EventInterest, EventKind, Subscription};
 use crate::types::history_sync_admission::HistorySyncAdmission;
 use crate::types::message::MessageInfo;
-use futures::FutureExt;
 use log::{info, warn};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use wacore::handshake::NoiseCertPolicy;
 use wacore::proto_helpers::MessageBuilderExt;
@@ -252,170 +251,12 @@ impl MessageContext {
     }
 }
 
-type EventHandlerCallback =
-    Arc<dyn Fn(Arc<Event>, Arc<Client>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
-
-/// The user callback bundled with the set of event kinds it wants. Carrying the
-/// interest here lets the bus skip materializing (and boxing) events the
-/// callback ignores.
-struct RegisteredHandler {
-    callback: EventHandlerCallback,
-    interest: EventInterest,
-}
-
-/// Union of every registered callback's interest, so the bus only materializes
-/// events at least one callback wants.
-fn combined_interest(handlers: &[RegisteredHandler]) -> EventInterest {
-    handlers
-        .iter()
-        .fold(EventInterest::none(), |acc, h| acc.union(h.interest))
-}
-
-/// How a bot's registered callbacks receive events off the core event bus.
-#[derive(Clone, Copy, Debug, Default)]
-#[non_exhaustive]
-pub enum EventDelivery {
-    /// Each event is delivered to each interested callback on its own spawned
-    /// task (default). A slow callback stalls neither the bus nor its siblings,
-    /// but ordering across events is not guaranteed and a persistently slow
-    /// consumer can accumulate unbounded in-flight tasks.
-    #[default]
-    Concurrent,
-    /// Events are delivered to the callbacks strictly in arrival order through a
-    /// single bounded mailbox drained by one task — the ordered `messages.upsert`
-    /// contract used by interoperable clients. Bounds
-    /// memory: when the mailbox is full the event is dropped and counted in
-    /// [`StatsSnapshot::events_dropped`](wacore::stats::StatsSnapshot::events_dropped)
-    /// instead of blocking the receive pipeline or growing without limit.
-    /// Register an inbound durability hook when no drop is acceptable
-    /// (at-least-once via redelivery).
-    Ordered {
-        /// Mailbox capacity — events buffered before drops begin. Clamped to ≥1.
-        capacity: usize,
-    },
-}
-
-/// Bridges the registered closures onto the core event bus per the chosen
-/// [`EventDelivery`] strategy.
-enum Delivery {
-    /// Fan each event out to every interested callback on its own spawned task.
-    Concurrent { handlers: Arc<[RegisteredHandler]> },
-    /// Hand each event to a single ordered drainer via a bounded mailbox.
-    Ordered {
-        tx: async_channel::Sender<Arc<Event>>,
-    },
-}
-
-struct CallbackBusAdapter {
-    // Weak: the bus lives inside `client.core`, so a strong ref here would pin
-    // the client for its whole lifetime. Upgraded per dispatch.
-    client: Weak<Client>,
-    delivery: Delivery,
-    interest: EventInterest,
-}
-
-impl CallbackBusAdapter {
-    fn new(client: Arc<Client>, handlers: Vec<RegisteredHandler>, delivery: EventDelivery) -> Self {
-        let interest = combined_interest(&handlers);
-        let delivery = match delivery {
-            EventDelivery::Concurrent => Delivery::Concurrent {
-                handlers: handlers.into(),
-            },
-            EventDelivery::Ordered { capacity } => {
-                let (tx, rx) = async_channel::bounded::<Arc<Event>>(capacity.max(1));
-                let handlers: Arc<[RegisteredHandler]> = handlers.into();
-                // Single drainer preserves arrival order; within an event the
-                // callbacks run in registration order. Weak so a dropped client
-                // exits the loop.
-                let drain_client = Arc::downgrade(&client);
-                let drain_handlers = Arc::clone(&handlers);
-                client
-                    .runtime
-                    .spawn(Box::pin(async move {
-                        while let Ok(event) = rx.recv().await {
-                            let Some(client) = drain_client.upgrade() else {
-                                break;
-                            };
-                            let kind = event.kind();
-                            for handler in drain_handlers.iter() {
-                                if handler.interest.wants(kind) {
-                                    // Keep the lone drainer alive across a faulty
-                                    // callback. catch_unwind guards only poll, so
-                                    // build the future inside the awaited block
-                                    // too — a panic while creating it is caught as
-                                    // well, not just one while polling.
-                                    let cb = handler.callback.clone();
-                                    let ev = Arc::clone(&event);
-                                    let cl = client.clone();
-                                    let ran =
-                                        std::panic::AssertUnwindSafe(
-                                            async move { cb(ev, cl).await },
-                                        )
-                                        .catch_unwind()
-                                        .await;
-                                    if ran.is_err() {
-                                        warn!(
-                                            "ordered event delivery callback panicked; continuing"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }))
-                    .detach();
-                Delivery::Ordered { tx }
-            }
-        };
-        Self {
-            client: Arc::downgrade(&client),
-            delivery,
-            interest,
-        }
-    }
-}
-
-impl EventHandler for CallbackBusAdapter {
-    fn handle_event(&self, event: Arc<Event>) {
-        match &self.delivery {
-            Delivery::Concurrent { handlers } => {
-                let Some(client) = self.client.upgrade() else {
-                    return;
-                };
-                let kind = event.kind();
-                for handler in handlers.iter() {
-                    if !handler.interest.wants(kind) {
-                        continue;
-                    }
-                    let callback = handler.callback.clone();
-                    let cb_client = client.clone();
-                    let event = Arc::clone(&event);
-                    client.runtime.spawn_detached(Box::pin(async move {
-                        callback(event, cb_client).await;
-                    }));
-                }
-            }
-            // Non-blocking on purpose: dropping on a full mailbox keeps a slow
-            // consumer from ever backpressuring the receive pipeline. Only a
-            // full mailbox is a capacity drop; a closed channel means the drainer
-            // is gone (teardown/panic) and must not be masked as one.
-            Delivery::Ordered { tx } => match tx.try_send(event) {
-                Ok(()) => {}
-                Err(async_channel::TrySendError::Full(_)) => {
-                    if let Some(client) = self.client.upgrade() {
-                        client.stats.record_event_dropped();
-                    }
-                }
-                Err(async_channel::TrySendError::Closed(_)) => {
-                    log::debug!("ordered event delivery channel closed; dropping event");
-                }
-            },
-        }
-    }
-
-    fn interest(&self) -> EventInterest {
-        self.interest
-    }
-}
+mod event_delivery;
+use CallbackEventHandler as CallbackBusAdapter;
+use event_delivery::RegisteredHandler;
+pub use event_delivery::{CallbackEventHandler, EventDelivery, EventDeliveryStats};
+#[cfg(test)]
+use event_delivery::{EventHandlerCallback, combined_interest};
 
 /// Observed background supervision exit, or why no run result is available.
 #[derive(Debug)]
@@ -438,14 +279,63 @@ pub struct BotShutdownReport {
     pub run: BotRunOutcome,
 }
 
+// Builder callbacks belong to the driver, not the Client's event bus lifetime.
+// Either guard can close this shared registration, including an unpolled driver.
+// Take it out of the mutex before bus removal or worker aborts (both can reenter).
+struct CallbackRegistration {
+    subscription: Subscription,
+    handler: Arc<CallbackEventHandler>,
+}
+
+#[derive(Clone, Default)]
+struct BotCallbackGuard {
+    registration: Option<Arc<Mutex<Option<CallbackRegistration>>>>,
+}
+
+impl BotCallbackGuard {
+    fn new(subscription: Subscription, handler: Arc<CallbackEventHandler>) -> Self {
+        Self {
+            registration: Some(Arc::new(Mutex::new(Some(CallbackRegistration {
+                subscription,
+                handler,
+            })))),
+        }
+    }
+
+    fn cancel(&self) {
+        let registration = self.registration.as_ref().and_then(|registration| {
+            registration
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+        });
+        if let Some(CallbackRegistration {
+            subscription,
+            handler,
+        }) = registration
+        {
+            drop(subscription);
+            handler.cancel();
+        }
+    }
+}
+
+impl Drop for BotCallbackGuard {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 /// Handle to a bot started in the background via [`Bot::spawn`]. Awaiting it
 /// preserves the run outcome, or reports an abort request / unobserved exit.
 ///
-/// Dropping the handle aborts the bot task. Keep it alive for as long as the
+/// Dropping the handle aborts the bot task and its builder callback delivery,
+/// without joining or draining callbacks. Keep it alive for as long as the
 /// bot should run, and prefer [`BotHandle::shutdown`] to stop it.
 #[must_use = "dropping the handle aborts the bot; bind it and await it, or call .shutdown()"]
 pub struct BotHandle {
     client: Arc<Client>,
+    callbacks: BotCallbackGuard,
     done_rx: futures::channel::oneshot::Receiver<crate::RunCompletionReason>,
     abort_handle: wacore::runtime::AbortHandle,
     abort_requested: AtomicBool,
@@ -468,10 +358,12 @@ impl BotHandle {
 
     /// Abort the bot task immediately. Skips the flush work
     /// [`BotHandle::shutdown`] performs, so recently captured state may be
-    /// lost; escape hatch only.
+    /// lost; escape hatch only. Also cancels builder callbacks without draining
+    /// or waiting for the runtime to acknowledge driver cancellation.
     pub fn abort(&self) {
         self.abort_requested.store(true, Ordering::Release);
         self.abort_waker.wake();
+        self.callbacks.cancel();
         self.abort_handle.abort();
     }
 }
@@ -550,7 +442,10 @@ async fn run_metered<F: std::future::Future>(
 /// Handlers registered through the builder (`on_message`, `on_event`, …)
 /// receive typed [`Event`] payloads. Anything the
 /// builder does not expose is reachable on the underlying client via
-/// [`Bot::client`], which stays valid after the bot is started.
+/// [`Bot::client`], which stays valid after the bot is started. Builder callback
+/// delivery ends with the driver, including foreground future cancellation;
+/// accepted callbacks are aborted, not drained or joined. Independent Client
+/// subscriptions and raw handlers keep their existing ownership policies.
 pub struct Bot {
     client: Arc<Client>,
     sync_task_receiver: Option<async_channel::Receiver<crate::sync_task::MajorSyncTask>>,
@@ -619,24 +514,28 @@ impl Bot {
     )]
     async fn run_graph(self) -> crate::RunCompletionReason {
         let instrument = self.task_instrument.clone();
-        let client = self.start_background();
+        let (client, _callbacks) = self.start_background();
         run_metered(client.run(), instrument).await
     }
 
     /// Start the bot on its runtime and return a [`BotHandle`] to await,
     /// gracefully shut down, or abort it.
     pub fn spawn(self) -> BotHandle {
-        let client = self.start_background();
+        let (client, callbacks) = self.start_background();
 
         let run_client = client.clone();
+        let driver_callbacks = callbacks.clone();
         let (done_tx, done_rx) = futures::channel::oneshot::channel();
         let abort_handle = client.runtime.spawn(Box::pin(async move {
+            let callbacks = driver_callbacks;
             let reason = run_client.run().await;
+            drop(callbacks);
             let _ = done_tx.send(reason);
         }));
 
         BotHandle {
             client,
+            callbacks,
             done_rx,
             abort_handle,
             abort_requested: AtomicBool::new(false),
@@ -646,7 +545,7 @@ impl Bot {
 
     /// Wires the background workers and event handlers, returning the client
     /// that drives the connection. Shared by [`Bot::run`] and [`Bot::spawn`].
-    fn start_background(self) -> Arc<Client> {
+    fn start_background(self) -> (Arc<Client>, BotCallbackGuard) {
         let Bot {
             client,
             sync_task_receiver,
@@ -661,17 +560,17 @@ impl Bot {
             client.start_sync_task_worker(receiver);
         }
 
-        if !event_handlers.is_empty() {
-            client
-                .core
-                .event_bus
-                .subscribe_handler(Arc::new(CallbackBusAdapter::new(
-                    client.clone(),
-                    event_handlers,
-                    event_delivery,
-                )))
-                .detach();
-        }
+        let callbacks = if event_handlers.is_empty() {
+            BotCallbackGuard::default()
+        } else {
+            let handler = Arc::new(CallbackBusAdapter::new(
+                client.clone(),
+                event_handlers,
+                event_delivery,
+            ));
+            let subscription = client.subscribe_handler(handler.clone());
+            BotCallbackGuard::new(subscription, handler)
+        };
         for handler in raw_handlers {
             client.core.event_bus.subscribe_handler(handler).detach();
         }
@@ -721,7 +620,7 @@ impl Bot {
             })).detach();
         }
 
-        client
+        (client, callbacks)
     }
 }
 
@@ -1300,7 +1199,8 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     }
 
     /// Choose how registered callbacks receive events. Defaults to
-    /// [`EventDelivery::Concurrent`]; use [`EventDelivery::Ordered`] for
+    /// [`EventDelivery::BoundedConcurrent`] (256 queued events, 16 workers);
+    /// use [`EventDelivery::Ordered`] for
     /// in-arrival-order, bounded delivery. Only affects the closure-based
     /// callbacks, not raw
     /// [`with_event_handler`](Self::with_event_handler) handlers, which always
@@ -2682,6 +2582,7 @@ mod tests {
     ) -> BotHandle {
         BotHandle {
             client,
+            callbacks: BotCallbackGuard::default(),
             done_rx,
             abort_handle,
             abort_requested: AtomicBool::new(false),
@@ -2798,6 +2699,127 @@ mod tests {
         drop(handle);
         assert_eq!(aborted.load(Ordering::Relaxed), 1);
         client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bot_driver_guard_preserves_queue_and_active_cancellation_accounting() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let bot = Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .with_event_delivery(EventDelivery::Ordered { capacity: 2 })
+            .on_event_for(&[EventKind::Connected], move |_, client| {
+                let entered = entered_tx.clone();
+                async move {
+                    entered.try_send(()).unwrap();
+                    std::future::pending::<()>().await;
+                    drop(client);
+                }
+            })
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+        client.pause().await;
+        let handle = bot.spawn();
+        let adapter = handle
+            .callbacks
+            .registration
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .handler
+            .clone();
+        let connected = || Event::Connected(crate::types::events::Connected::builder().build());
+        client.core.event_bus.dispatch(connected());
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..3 {
+            client.core.event_bus.dispatch(connected());
+        }
+        assert_eq!(adapter.stats().accepted, 3);
+        assert_eq!(adapter.stats().dropped_full, 1);
+        assert_eq!(adapter.stats().callbacks_active, 1);
+        handle.abort();
+        assert!(!client.shutdown_signal().is_fired());
+        client
+            .core
+            .event_bus
+            .dispatch_with(EventKind::Connected, || {
+                panic!("closed builder registration still constructs payloads")
+            });
+        crate::test_utils::poll_until("scoped callback cancellation", || {
+            adapter.stats().callbacks_active == 0 && adapter.stats().discarded == 2
+        })
+        .await;
+        assert_eq!(adapter.stats().accepted, 3);
+        assert_eq!(adapter.stats().callbacks_started, 1);
+        assert_eq!(adapter.stats().callbacks_cancelled, 1);
+        assert_eq!(adapter.stats().callbacks_completed, 0);
+        assert_eq!(client.stats().events_dropped, 1);
+        drop(handle);
+        let weak = Arc::downgrade(&client);
+        drop(client);
+        crate::test_utils::poll_until("scoped Client released", || weak.upgrade().is_none()).await;
+    }
+
+    #[tokio::test]
+    async fn unpolled_bot_driver_guard_discards_queue_without_starting_callbacks() {
+        let bot = Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .with_event_delivery(EventDelivery::Ordered { capacity: 1 })
+            .on_event_for(&[EventKind::Connected], |_, _| async {
+                panic!("callback started after unpolled driver cancellation")
+            })
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+        let handle = bot.spawn();
+        let adapter = handle
+            .callbacks
+            .registration
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .handler
+            .clone();
+        let event = Arc::new(Event::Connected(
+            crate::types::events::Connected::builder().build(),
+        ));
+        let weak_event = Arc::downgrade(&event);
+        adapter.handle_event(event);
+        assert_eq!(adapter.stats().callbacks_started, 0);
+        drop(handle);
+        assert!(!client.core.event_bus.has_handler_for(EventKind::Connected));
+        assert!(!client.shutdown_signal().is_fired());
+        crate::test_utils::poll_until("unpolled driver queue released", || {
+            weak_event.upgrade().is_none() && adapter.stats().discarded == 1
+        })
+        .await;
+        assert_eq!(adapter.stats().accepted, 1);
+        assert_eq!(adapter.stats().callbacks_started, 0);
+        assert_eq!(adapter.stats().callbacks_active, 0);
+        assert_eq!(adapter.stats().callbacks_cancelled, 0);
+        let weak = Arc::downgrade(&client);
+        drop(client);
+        crate::test_utils::poll_until("unpolled driver Client released", || {
+            weak.upgrade().is_none()
+        })
+        .await;
     }
 
     #[tokio::test]

@@ -483,22 +483,50 @@ impl Client {
         }
     }
 
-    /// Register a chatstate handler which will be invoked when a `<chatstate>` stanza is received.
-    ///
-    /// The handler receives a `ChatStateEvent` with the parsed chat state information.
+    /// Subscribe to chatstate through the core event bus. The adapter preserves
+    /// chat, group participant and typing/audio/idle state. Retain the Subscription;
+    /// dropping it removes future deliveries (an old bus snapshot may still deliver).
+    /// Accepted work is cancelled when the adapter is dropped or Client shuts down.
+    /// Each registration uses an ordered, non-blocking 256-event mailbox; overflow
+    /// drops the newest event and increments Client::stats().events_dropped.
+    /// Synchronous user code runs on a worker, but cannot be preempted once entered.
+    pub fn subscribe_chatstate_handler(
+        self: &Arc<Self>,
+        handler: Arc<dyn Fn(ChatStateEvent) + Send + Sync>,
+    ) -> wacore::types::events::Subscription {
+        use crate::bot::{CallbackEventHandler, EventDelivery};
+        use crate::handlers::chatstate::ChatstateRegistration;
+        use wacore::types::events::{EventInterest, EventKind};
+
+        let callback = CallbackEventHandler::from_callback(
+            self,
+            EventInterest::of(&[EventKind::ChatPresence]),
+            EventDelivery::Ordered { capacity: 256 },
+            move |event, _client| {
+                let handler = handler.clone();
+                async move {
+                    if let Event::ChatPresence(presence) = &*event {
+                        handler(ChatStateEvent::from_presence(presence));
+                    }
+                }
+            },
+        );
+        self.chatstate_handler_count.fetch_add(1, Ordering::Relaxed);
+        self.subscribe_handler(Arc::new(ChatstateRegistration {
+            callback,
+            count: self.chatstate_handler_count.clone(),
+        }))
+    }
+
+    /// Compatibility registration, permanent for this Client's bus lifetime.
+    /// Prefer [`Self::subscribe_chatstate_handler`] for RAII unregistration.
+    /// This wrapper detaches that Subscription: the bus owns the adapter, not the
+    /// caller. It uses the same bounded/ordered policy and shutdown cancellation.
+    /// Do not register the same observer on both paths: each registration is independent.
     pub fn register_chatstate_handler(&self, handler: Arc<dyn Fn(ChatStateEvent) + Send + Sync>) {
-        let mut guard = self
-            .chatstate_handlers
-            .write()
-            .unwrap_or_else(|p| p.into_inner());
-        let mut handlers = Vec::with_capacity(guard.len() + 1);
-        handlers.extend(guard.iter().cloned());
-        handlers.push(handler);
-        *guard = Arc::from(handlers);
-        // Published after the snapshot is in place, so a reader that sees a
-        // non-zero count always finds the handler behind it.
-        self.chatstate_handler_count
-            .store(guard.len(), Ordering::Release);
+        if let Some(client) = self.self_weak.get().and_then(|weak| weak.upgrade()) {
+            client.subscribe_chatstate_handler(handler).detach();
+        }
     }
 
     /// Dispatch a parsed chatstate stanza to registered handlers.
@@ -517,7 +545,16 @@ impl Client {
         use wacore::types::message::MessageSource;
         use wacore::types::presence::{ChatPresence, ChatPresenceMedia};
 
-        // Dispatch via event bus
+        if !self
+            .core
+            .event_bus
+            .has_handler_for(wacore::types::events::EventKind::ChatPresence)
+        {
+            return;
+        }
+        #[cfg(test)]
+        self.chatstate_events_built.fetch_add(1, Ordering::Release);
+
         let (chat, sender, is_group) = match &stanza.source {
             ChatstateSource::User { from } => (from.clone(), from.clone(), false),
             ChatstateSource::Group { from, participant } => {
@@ -550,28 +587,6 @@ impl Client {
                 .media(media)
                 .build(),
         ));
-
-        // Invoke legacy callback handlers. Building the event is only worth it
-        // once something reads it, and the default registers nothing.
-        if self.chatstate_handler_count.load(Ordering::Acquire) == 0 {
-            return;
-        }
-        #[cfg(test)]
-        self.chatstate_events_built.fetch_add(1, Ordering::Release);
-        let event = ChatStateEvent::from_stanza(stanza);
-        let handlers = self
-            .chatstate_handlers
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        for handler in handlers.iter().cloned() {
-            let event_clone = event.clone();
-            self.runtime
-                .spawn(Box::pin(async move {
-                    (handler)(event_clone);
-                }))
-                .detach();
-        }
     }
 
     /// Whether delivery receipts should be sent active (rendered as ticks) vs

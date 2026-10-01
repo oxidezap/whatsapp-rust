@@ -195,11 +195,11 @@ metrics = ["wacore/metrics"]
 # Render raw phone numbers in tracing fields instead of the redacted `pn#<hash>`.
 # Local debugging only; never enable in production.
 tracing-pii = ["wacore/tracing-pii", "wacore-binary/tracing-pii"]
-# Offline fixture for the client-level benchmarks (`benches/`). Not a public
+# Native fixtures for the client-level benchmarks (`benches/`). Not a public
 # API: the module it enables is `#[doc(hidden)]` and exists only so a bench
 # target, which links the crate from outside, can reach the crate-private send
 # internals it measures. Never enable it in a shipping build.
-bench-harness = ["tokio-runtime", "tokio/rt-multi-thread"]
+bench-harness = ["tokio-runtime", "tokio/rt-multi-thread", "dep:wacore-noise", "wacore-noise/test-util"]
 # Native integration fixtures only. Never enable in a shipping dependency.
 test-support = ["voip-runtime", "tokio-runtime", "dep:wacore-noise", "wacore-noise/test-util"]
 danger-skip-tls-verify = ["whatsapp-rust-tokio-transport?/danger-skip-tls-verify"]
@@ -411,6 +411,20 @@ required-features = ["bench-harness"]
 name = "client_receive"
 harness = false
 required-features = ["bench-harness"]
+
+[[bench]]
+name = "connected_idle"
+harness = false
+required-features = ["bench-harness", "sqlite-storage"]
+
+[[test]]
+name = "connected_idle_lifecycle"
+required-features = ["bench-harness"]
+
+[[example]]
+name = "connected_idle"
+test = true
+required-features = ["bench-harness", "sqlite-storage"]
 
 [[bench]]
 name = "client_dm_send"
