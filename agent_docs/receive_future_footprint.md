@@ -6,6 +6,9 @@ was kept for the production baseline and candidate, built in-place. The selected
 candidate delays the outer message Arc until dispatch, shares probe-materialized
 plaintext, and boxes only the secret-envelope continuation. Processing stays
 inline; lane lifecycle, Signal locks and commit ordering are unchanged.
+The raw matched measurements use snapshot `6f10080`; a later benchmark-only
+single-poll enqueue guard prevents worker scheduling if enqueue yields. No
+historical enqueue timing is claimed to isolate creation with that newer guard.
 
 ## Future and requested-heap results
 
@@ -31,9 +34,10 @@ Five DHAT repetitions per lane count, fixture/encrypted inputs outside profiling
 
 These cold/drained values were exact over five repetitions. Optimized-profile
 requested heap falls 4768 B per lane (31.83% cold peak at 256 lanes). The 16 B
-per-lane difference from test-profile state is configuration-specific. Warm
-peaks fall similarly; post-close retained heap is unchanged within small
-variable-length receipt strings. This is **not allocator RSS or connected-idle
+per-lane difference from test-profile state is configuration-specific. Cumulative
+high water after the warm batch falls similarly; it is not an independent warm
+peak and may retain the cold maximum. Post-close retained heap is unchanged
+within small variable-length receipt strings. This is **not allocator RSS or connected-idle
 memory**. Lane allocation counts are unchanged.
 
 Fifty ordinary DMs retain the same 273151 total requested bytes / 1962 blocks.
@@ -43,9 +47,12 @@ last two paths. A concrete plaintext-batch entry future shrinks 9008 -> 4240 B;
 both are below Tokio 1.53.1's release `block_on` boxing threshold, 16384 B.
 Runtime-entry future moves remain a harness artifact, not per-message clones.
 
-An empty/malformed secret carrier costs an additional **1976 B / one boxed
-continuation per message**, with batch peak 2096 -> 3736 B. This control does not
-measure successful decryption or every resend shape: substituted envelopes can
+An empty/malformed secret carrier adds **1976 B of total requested allocation /
+one boxed continuation per message**: a 50-message batch totals 82924 -> 181724 B
+and 481 -> 531 blocks. Batch peak separately rises 2096 -> 3736 B (+1640 B);
+total allocation and peak live heap differ because allocation lifetimes overlap
+differently. This control does not measure successful decryption or every resend
+shape: substituted envelopes can
 create a different final inner Arc, and an unresolved duplicate probe can retry
 materialization during dispatch. These costs are not claimed absent.
 
@@ -92,5 +99,7 @@ Save the built executables for both revisions. Run the bench executable directly
 with `--bench --color never --timer os --sample-count 30`; the `--bench` flag is
 required by this Divan fork. Alternate versions across five paired rounds.
 Run `receive_footprint` separately; never interpret DHAT walltime as latency.
-The library suite passed 2258 tests, the ignored layout audit and touched-crate
-all-target clippy passed. Fixture inputs use fictitious identities.
+At the measurement snapshot, the library suite passed 2258 tests, the ignored
+layout audit and touched-crate all-target clippy passed. The newer enqueue guard
+has a separate 1/32/256-lane no-worker-poll regression test. Fixture inputs use
+fictitious identities.

@@ -5,7 +5,9 @@
 //! the profiler. A fresh profiler/harness per repetition counts only allocations
 //! made during receive, not the pre-existing Signal/session/input graphs.
 //! `drained` is retained requested heap with workers still alive; `closed` is
-//! after shutdown. These are not allocator RSS or connected-idle measurements.
+//! after shutdown. `peak_after_warm` is the cumulative high-water mark since cold
+//! enqueue, not an isolated warm-phase peak. These are not allocator RSS or
+//! connected-idle measurements.
 //!
 //! Plaintext controls isolate early-Arc/cold-future costs without Signal crypto.
 //! Empty SKDM/secret carriers exercise allocation branches, not key installation
@@ -46,7 +48,7 @@ fn main() {
             assert_eq!(harness.messages_delivered() - before, 512);
             assert_eq!(harness.active_lanes(), 0);
             println!(
-                "lanes={lanes} repetition={repetition} enqueued={} cold_peak={} drained={} warm_peak={} warmed={} closed={} total={} allocations={}",
+                "lanes={lanes} repetition={repetition} enqueued={} cold_peak={} drained={} peak_after_warm={} warmed={} closed={} total={} allocations={}",
                 enqueued.curr_bytes,
                 drained.max_bytes,
                 drained.curr_bytes,

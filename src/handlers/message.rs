@@ -402,6 +402,23 @@ mod tests {
         assert_eq!(size_of::<QueuedChatMessage>(), 2 * size_of::<usize>());
     }
 
+    #[cfg(feature = "bench-harness")]
+    #[test]
+    fn isolated_cold_lane_enqueue_does_not_poll_workers() {
+        let harness = crate::bench_support::MultiLaneReceiveHarness::new(256);
+        for lanes in [1, 32, 256] {
+            let batch = harness.generate_burst(lanes, lanes);
+            let before = harness.messages_delivered();
+            let target = harness.enqueue(&batch);
+            assert_eq!(harness.messages_delivered(), before);
+            assert_eq!(target, before + lanes as u64);
+            harness.drain(target);
+            assert_eq!(harness.messages_delivered(), target);
+            harness.close_lanes();
+            assert_eq!(harness.active_lanes(), 0);
+        }
+    }
+
     #[tokio::test]
     #[ignore = "layout diagnostic: run explicitly with --ignored --nocapture"]
     async fn audit_receive_future_and_struct_layouts() {

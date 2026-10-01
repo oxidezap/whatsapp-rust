@@ -1286,11 +1286,16 @@ impl MultiLaneReceiveHarness {
         });
     }
 
-    /// Enqueue without driving the workers to completion, returning the delivery
-    /// count to pass to [`Self::drain`]. Separates cold lane creation from decrypt
-    /// and shutdown in the manual measurements. The runtime is single-threaded.
+    /// Enqueue without polling spawned workers, returning the delivery count to
+    /// pass to [`Self::drain`]. An isolated measurement must fail if enqueue yields
+    /// rather than silently including decrypt work from the runtime scheduler.
     pub fn enqueue(&self, nodes: &[Arc<wacore_binary::OwnedNodeRef>]) -> u64 {
-        self.runtime.block_on(self.enqueue_batch(nodes))
+        use futures::FutureExt;
+
+        let _runtime = self.runtime.enter();
+        self.enqueue_batch(nodes)
+            .now_or_never()
+            .expect("isolated enqueue yielded: worker work would contaminate the measurement")
     }
 
     /// Complete a previous [`Self::enqueue`], including outbound receipts.
