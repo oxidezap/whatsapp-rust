@@ -1240,47 +1240,24 @@ struct FastRecord<'a> {
     is_bot_invocation: bool,
 }
 
-/// Carrier slots inspected by the forwarded check; mirrors the
-/// `is_forwarded` chain of `MessageInternalFields`.
-const N_CARRIERS: usize = 27;
-const _: () = assert!(N_CARRIERS <= u32::BITS as usize);
+/// Derive wire slots from the same schema carriers as the decoded helpers.
+/// Keep a match for tag dispatch and dense slots for the forwarded bitset.
+macro_rules! define_carrier_slots {
+    ($($field:ident => $tag:ident / $($module:ident)::+),+ $(,)?) => {
+        const N_CARRIERS: usize = [$(stringify!($field)),+].len();
+        const _: () = assert!(N_CARRIERS <= u64::BITS as usize);
 
-/// Map a `Message` field tag to its forwarded-carrier slot and the
-/// `contextInfo` tag inside that carrier. A `match` so the dispatch compiles
-/// to a jump table; schema-pinned through the tags consts in the patterns.
-#[rustfmt::skip]
-fn carrier_slot(field: u32) -> Option<(usize, u32)> {
-    Some(match field {
-        tags::message::EXTENDED_TEXT_MESSAGE => (0, tags::message::extended_text_message::CONTEXT_INFO),
-        tags::message::IMAGE_MESSAGE => (1, tags::message::image_message::CONTEXT_INFO),
-        tags::message::VIDEO_MESSAGE => (2, tags::message::video_message::CONTEXT_INFO),
-        tags::message::AUDIO_MESSAGE => (3, tags::message::audio_message::CONTEXT_INFO),
-        tags::message::DOCUMENT_MESSAGE => (4, tags::message::document_message::CONTEXT_INFO),
-        tags::message::STICKER_MESSAGE => (5, tags::message::sticker_message::CONTEXT_INFO),
-        tags::message::LOCATION_MESSAGE => (6, tags::message::location_message::CONTEXT_INFO),
-        tags::message::LIVE_LOCATION_MESSAGE => (7, tags::message::live_location_message::CONTEXT_INFO),
-        tags::message::CONTACT_MESSAGE => (8, tags::message::contact_message::CONTEXT_INFO),
-        tags::message::CONTACTS_ARRAY_MESSAGE => (9, tags::message::contacts_array_message::CONTEXT_INFO),
-        tags::message::BUTTONS_MESSAGE => (10, tags::message::buttons_message::CONTEXT_INFO),
-        tags::message::BUTTONS_RESPONSE_MESSAGE => (11, tags::message::buttons_response_message::CONTEXT_INFO),
-        tags::message::LIST_MESSAGE => (12, tags::message::list_message::CONTEXT_INFO),
-        tags::message::LIST_RESPONSE_MESSAGE => (13, tags::message::list_response_message::CONTEXT_INFO),
-        tags::message::TEMPLATE_MESSAGE => (14, tags::message::template_message::CONTEXT_INFO),
-        tags::message::TEMPLATE_BUTTON_REPLY_MESSAGE => (15, tags::message::template_button_reply_message::CONTEXT_INFO),
-        tags::message::INTERACTIVE_MESSAGE => (16, tags::message::interactive_message::CONTEXT_INFO),
-        tags::message::INTERACTIVE_RESPONSE_MESSAGE => (17, tags::message::interactive_response_message::CONTEXT_INFO),
-        tags::message::POLL_CREATION_MESSAGE => (18, tags::message::poll_creation_message::CONTEXT_INFO),
-        tags::message::POLL_CREATION_MESSAGE_V2 => (19, tags::message::poll_creation_message::CONTEXT_INFO),
-        tags::message::POLL_CREATION_MESSAGE_V3 => (20, tags::message::poll_creation_message::CONTEXT_INFO),
-        tags::message::PRODUCT_MESSAGE => (21, tags::message::product_message::CONTEXT_INFO),
-        tags::message::ORDER_MESSAGE => (22, tags::message::order_message::CONTEXT_INFO),
-        tags::message::GROUP_INVITE_MESSAGE => (23, tags::message::group_invite_message::CONTEXT_INFO),
-        tags::message::EVENT_MESSAGE => (24, tags::message::event_message::CONTEXT_INFO),
-        tags::message::STICKER_PACK_MESSAGE => (25, tags::message::sticker_pack_message::CONTEXT_INFO),
-        tags::message::NEWSLETTER_ADMIN_INVITE_MESSAGE => (26, tags::message::newsletter_admin_invite_message::CONTEXT_INFO),
-        _ => return None,
-    })
+        fn carrier_slot(field: u32) -> Option<(usize, u32)> {
+            #[allow(non_camel_case_types)]
+            enum Carrier { $($field),+ }
+            Some(match field {
+                $(tags::message::$tag => (Carrier::$field as usize, tags::$($module)::+::CONTEXT_INFO),)+
+                _ => return None,
+            })
+        }
+    };
 }
+crate::proto_helpers::with_context_info_fields!(define_carrier_slots!());
 
 /// Wrapper slots for `base_message`, in the same priority order as
 /// `MessageInternalFields::base_message`.
@@ -1664,7 +1641,7 @@ struct MsgLevel<'a> {
     has_bot_metadata: bool,
     is_poll_or_event: bool,
     /// Carrier slots whose final merged `context_info.is_forwarded` is true.
-    forwarded_carriers: u32,
+    forwarded_carriers: u64,
     /// Wrapper payloads found at this level, by priority slot.
     wrappers: [Option<&'a [u8]>; N_WRAPPERS],
 }
@@ -1722,7 +1699,7 @@ fn scan_message_level(msg: &[u8]) -> Result<MsgLevel<'_>, WalkStop> {
                             if f.wt != wire_type::VARINT {
                                 return Err(WalkStop::Malformed);
                             }
-                            let carrier_bit = 1_u32 << slot;
+                            let carrier_bit = 1_u64 << slot;
                             if f.varint != 0 {
                                 level.forwarded_carriers |= carrier_bit;
                             } else {
@@ -2289,7 +2266,7 @@ fn first_wrapped_message(message: &wa::Message) -> Option<&wa::Message> {
 
 fn message_context_is_forwarded(message: &wa::Message) -> bool {
     macro_rules! has_forwarded_context {
-        ($($field:ident),* $(,)?) => {
+        ($($field:ident => $tag:ident / $($module:ident)::+),+ $(,)?) => {
             $(
                 if message.$field.as_option()
                     .and_then(|m| m.context_info.as_option())
@@ -2301,35 +2278,10 @@ fn message_context_is_forwarded(message: &wa::Message) -> bool {
         };
     }
 
-    has_forwarded_context!(
-        event_message,
-        template_message,
-        template_button_reply_message,
-        buttons_response_message,
-        list_response_message,
-        poll_creation_message,
-        poll_creation_message_v2,
-        poll_creation_message_v3,
-        newsletter_admin_invite_message,
-        group_invite_message,
-        list_message,
-        buttons_message,
-        sticker_pack_message,
-        interactive_message,
-        interactive_response_message,
-        image_message,
-        contact_message,
-        location_message,
-        extended_text_message,
-        document_message,
-        audio_message,
-        video_message,
-        contacts_array_message,
-        live_location_message,
-        sticker_message,
-        product_message,
-        order_message,
-    );
+    // History rejects secrets if *any* carrier is forwarded. The public
+    // context getter chooses the first present context, so it cannot replace
+    // this predicate on messages containing multiple bodies.
+    crate::proto_helpers::with_context_info_fields!(has_forwarded_context!());
 
     false
 }
@@ -2756,6 +2708,128 @@ mod tests {
             message: message.map(buffa::MessageField::some).unwrap_or_default(),
             message_timestamp: Some(1_700_000_777),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn video_note_has_history_context_slot() {
+        assert!(carrier_slot(tags::message::PTV_MESSAGE).is_some());
+    }
+
+    #[test]
+    fn all_history_context_slots_match_decoded_carriers() {
+        let mut slots = std::collections::BTreeSet::new();
+        macro_rules! check {
+            ($($field:ident => $tag:ident / $($module:ident)::+),+ $(,)?) => {
+                $(
+                    let (slot, context_tag) = carrier_slot(tags::message::$tag).unwrap();
+                    assert!(slots.insert(slot), "duplicate slot: {}", stringify!($field));
+                    assert_eq!(context_tag, tags::$($module)::+::CONTEXT_INFO);
+                    for forwarded in [None, Some(false), Some(true)] {
+                        let mut message = wa::Message::default();
+                        message.$field.get_or_insert_default().context_info =
+                            buffa::MessageField::some(wa::ContextInfo {
+                                is_forwarded: forwarded,
+                                ..Default::default()
+                            });
+                        let encoded = message.encode_to_vec();
+                        let level = scan_message_level(&encoded).ok().unwrap();
+                        assert_eq!(level.forwarded_carriers,
+                            if forwarded == Some(true) { 1_u64 << slot } else { 0 },
+                            "{}: {forwarded:?}", stringify!($field));
+                        assert_eq!(message_context_is_forwarded(&message), forwarded == Some(true));
+
+                        // Exercise the actual secret extraction and full-decode fallback.
+                        let mut web = keyed("carrier-message", false, Some(message));
+                        web.message_secret = Some(vec![0x5A; 32]);
+                        let raw = wrap_in_history_msg(&web);
+                        let expected = usize::from(forwarded != Some(true));
+                        assert_eq!(run_with_raw_history_msg(&raw).len(), expected, "{}", stringify!($field));
+                        assert_eq!(run_with_raw_history_msg(&raw), oracle_records(&raw), "{}", stringify!($field));
+                    }
+
+                    // Merge presence/overwrite semantics within each carrier.
+                    let mut forwarded = wa::Message::default();
+                    forwarded.$field.get_or_insert_default().context_info =
+                        buffa::MessageField::some(wa::ContextInfo {
+                            is_forwarded: Some(true),
+                            ..Default::default()
+                        });
+                    let mut absent = wa::Message::default();
+                    absent.$field.get_or_insert_default();
+                    let mut raw = forwarded.encode_to_vec();
+                    raw.extend_from_slice(&absent.encode_to_vec());
+                    assert_eq!(scan_message_level(&raw).ok().unwrap().forwarded_carriers, 1_u64 << slot);
+                    absent.$field.get_or_insert_default().context_info =
+                        buffa::MessageField::some(wa::ContextInfo {
+                            is_forwarded: Some(false),
+                            ..Default::default()
+                        });
+                    raw.extend_from_slice(&absent.encode_to_vec());
+                    assert_eq!(scan_message_level(&raw).ok().unwrap().forwarded_carriers, 0);
+                    assert!(!message_context_is_forwarded(&wa::Message::decode_from_slice(&raw).unwrap()));
+                )+
+            };
+        }
+        crate::proto_helpers::with_context_info_fields!(check!());
+        assert_eq!(slots.len(), 42);
+        assert_eq!(slots.len(), N_CARRIERS);
+        assert_eq!(
+            slots.into_iter().collect::<Vec<_>>(),
+            (0..N_CARRIERS).collect::<Vec<_>>()
+        );
+        assert!(carrier_slot(tags::message::MESSAGE_CONTEXT_INFO).is_none());
+        assert!(carrier_slot(tags::message::EPHEMERAL_MESSAGE).is_none());
+        assert!(carrier_slot(tags::message::POLL_UPDATE_MESSAGE).is_none());
+    }
+
+    #[test]
+    fn history_checks_any_context_and_preserves_recursive_wrappers() {
+        use crate::proto_helpers::MessageExt;
+        let mut message = wa::Message::default();
+        message
+            .extended_text_message
+            .get_or_insert_default()
+            .context_info = buffa::MessageField::some(wa::ContextInfo::default());
+        message.music_message.get_or_insert_default().context_info =
+            buffa::MessageField::some(wa::ContextInfo {
+                is_forwarded: Some(true),
+                ..Default::default()
+            });
+        assert!(!message.is_forwarded()); // First context is not forwarded.
+        assert!(message_context_is_forwarded(&message)); // History inspects all.
+        assert_ne!(
+            scan_message_level(&message.encode_to_vec())
+                .ok()
+                .unwrap()
+                .forwarded_carriers,
+            0
+        );
+
+        // History already unwraps recursively, unlike the public ordered pass.
+        for device_first in [true, false] {
+            let device = |inner| wa::Message {
+                device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
+                    message: buffa::MessageField::some(inner),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let ephemeral = |inner| wa::Message {
+                ephemeral_message: buffa::MessageField::some(fp(inner)),
+                ..Default::default()
+            };
+            let wrapped = if device_first {
+                device(ephemeral(message.clone()))
+            } else {
+                ephemeral(device(message.clone()))
+            };
+            assert!(message_is_forwarded(&wrapped));
+            let mut web = keyed("wrapped-carrier", false, Some(wrapped));
+            web.message_secret = Some(vec![0x5A; 32]);
+            let raw = wrap_in_history_msg(&web);
+            assert!(run_with_raw_history_msg(&raw).is_empty());
+            assert_eq!(run_with_raw_history_msg(&raw), oracle_records(&raw));
         }
     }
 
