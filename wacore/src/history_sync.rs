@@ -1,4 +1,3 @@
-use buffa::Message as _;
 use bytes::Bytes;
 use compact_str::CompactString;
 use smallvec::SmallVec;
@@ -529,7 +528,7 @@ where
             tags::history_sync::CALL_LOG_RECORDS => {
                 // Like optional mappings, a corrupt record must not cost the
                 // other chunk harvest. Outer framing/zlib errors remain fatal.
-                match wa::CallLogRecord::decode_from_slice(value) {
+                match waproto::codec::call_log_record_decode(value) {
                     Ok(record) => result.call_log_records.push(record),
                     Err(_) => log::warn!("Skipping undecodable history-sync call record"),
                 }

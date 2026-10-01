@@ -957,6 +957,28 @@ mod tests {
         }
     }
 
+    struct HarvestBeforeCallRecorder {
+        client: std::sync::Weak<Client>,
+        recorder: Arc<CallHistoryRecorder>,
+    }
+
+    impl wacore::types::events::EventHandler for HarvestBeforeCallRecorder {
+        fn handle_event(&self, event: Arc<Event>) {
+            if matches!(&*event, Event::CallLogHistory(_)) {
+                // Assert at callback time, not merely after processing returns:
+                // moving call dispatch ahead of harvest must fail this fixture.
+                let client = self.client.upgrade().unwrap();
+                let snapshot = client.persistence_manager.get_device_snapshot();
+                assert_eq!(snapshot.nct_salt.as_deref(), Some(&[17; 32][..]));
+            }
+            wacore::types::events::EventHandler::handle_event(self.recorder.as_ref(), event);
+        }
+
+        fn interest(&self) -> wacore::types::events::EventInterest {
+            wacore::types::events::EventHandler::interest(self.recorder.as_ref())
+        }
+    }
+
     async fn process_call_history_chunk(
         client: &Arc<Client>,
         records: Vec<wa::CallLogRecord>,
@@ -1006,7 +1028,10 @@ mod tests {
         client
             .core
             .event_bus
-            .subscribe_handler(recorder.clone())
+            .subscribe_handler(Arc::new(HarvestBeforeCallRecorder {
+                client: Arc::downgrade(&client),
+                recorder: recorder.clone(),
+            }))
             .detach();
         let receipt = client.wait_for_sent_node(crate::client::NodeFilter::tag("receipt"));
         let records = vec![
