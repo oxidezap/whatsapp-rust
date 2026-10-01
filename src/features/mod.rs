@@ -83,13 +83,13 @@ pub use group_history::{GroupHistoryRetryToken, GroupHistoryShareOutcome, GroupH
 pub use groups::{
     CreateGroupResult, GroupAppealStatus, GroupCreateOptions, GroupDescription,
     GroupEphemeralSettings, GroupError, GroupHierarchy, GroupHistoryAddResult, GroupJoinError,
-    GroupMessageReporter, GroupMetadata, GroupMetadataResult, GroupOverview, GroupOverviewResult,
-    GroupParticipant, GroupParticipantDetails, GroupParticipantOptions, GroupPictureEntry,
-    GroupProfilePicture, GroupProfilePictureOutcome, GroupSubject, Groups, GrowthLockInfo,
-    HistorySharePreparation, InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode,
-    MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
-    ParticipantType, PictureType, PreparedGroupHistoryShare, PreviousDescription,
-    ReportedGroupMessage, ReportedGroupMessages, SubgroupKind,
+    GroupLookupResult, GroupMessageReporter, GroupMetadata, GroupMetadataResult, GroupOverview,
+    GroupOverviewResult, GroupParticipant, GroupParticipantDetails, GroupParticipantOptions,
+    GroupPictureEntry, GroupProfilePicture, GroupProfilePictureOutcome, GroupSubject, Groups,
+    GrowthLockInfo, HistorySharePreparation, InviteInfoError, JoinGroupResult, MemberAddMode,
+    MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest,
+    ParticipantChangeResponse, ParticipantType, PictureType, PreparedGroupHistoryShare,
+    PreviousDescription, ReportedGroupMessage, ReportedGroupMessages, SubgroupKind,
 };
 
 pub use labels::Labels;

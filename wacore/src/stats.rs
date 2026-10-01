@@ -128,8 +128,9 @@ pub struct SessionStats {
     messages_sent: AtomicU64,
     messages_received: AtomicU64,
     /// Inbound events dropped because a consumer's bounded delivery mailbox was
-    /// full (opt-in `EventDelivery::Ordered`). Non-zero means a slow consumer is
-    /// shedding events; the durability hook is the at-least-once escape hatch.
+    /// full (bounded callback adapters). Counts per adapter, not unique protocol
+    /// facts. ChannelEventHandler keeps its own counters. This is observer loss,
+    /// not a durability-hook failure and does not imply server redelivery.
     events_dropped: AtomicU64,
     /// Attempts to obtain key material for one device that failed, split by
     /// [`UnkeyableDevice`].
