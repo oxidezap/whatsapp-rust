@@ -1042,7 +1042,7 @@ mod tests {
                 duration: Some(91),
                 is_incoming: Some(true), // Deliberately contradictory: never read for direction.
                 is_video: Some(true),
-                call_result: Some(wa::call_log_record::CallResult::CONNECTED.into()),
+                call_result: Some(wa::call_log_record::CallResult::CONNECTED),
                 ..Default::default()
             },
             wa::CallLogRecord {
@@ -1105,7 +1105,7 @@ mod tests {
                 assert_eq!(call.record.is_video, Some(true));
                 assert_eq!(
                     call.record.call_result,
-                    Some(wa::call_log_record::CallResult::CONNECTED.into())
+                    Some(wa::call_log_record::CallResult::CONNECTED)
                 );
             } else {
                 assert_eq!(call.record.participants.len(), 1);
