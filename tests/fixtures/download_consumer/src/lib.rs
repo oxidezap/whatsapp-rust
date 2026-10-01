@@ -112,7 +112,7 @@ mod tests {
         assert!(matches!(independent_error, MediaDownloadError::NoHosts));
     }
 
-    struct AcceptedBody;
+    struct AcceptedBody(bool);
     #[async_trait]
     impl HttpClient for AcceptedBody {
         async fn execute(&self, _: HttpRequest) -> Result<HttpResponse> {
@@ -121,15 +121,28 @@ mod tests {
                 body: b"external destination".to_vec(),
             })
         }
+        fn supports_streaming(&self) -> bool {
+            self.0
+        }
+        fn execute_streaming(&self, _: HttpRequest) -> Result<wacore::net::StreamingHttpResponse> {
+            Ok(wacore::net::StreamingHttpResponse {
+                status_code: 200,
+                body: Box::new(Cursor::new(b"external destination".to_vec())),
+            })
+        }
     }
 
     #[derive(Debug)]
     struct DestinationFault {
         sink: HostWriter,
         failed: bool,
+        fail_write: bool,
     }
     impl std::io::Write for DestinationFault {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                return Err(std::io::Error::from_raw_os_error(28));
+            }
             self.sink.write(bytes)
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -143,7 +156,7 @@ mod tests {
     }
     impl DownloadWriter for DestinationFault {
         fn truncate(&mut self, len: u64) -> std::io::Result<()> {
-            if !self.failed {
+            if !self.fail_write && !self.failed {
                 self.failed = true;
                 return Err(std::io::Error::from_raw_os_error(28));
             }
@@ -160,44 +173,47 @@ mod tests {
             file_sha256: Some(encrypted.file_sha256.to_vec()),
             ..Default::default()
         };
-        let writer = || DestinationFault {
-            sink: HostWriter(Cursor::new(Vec::new())),
-            failed: false,
-        };
-        let client = client_with_http(AcceptedBody).await;
-        let error = client
-            .download_to_writer(&message, writer())
-            .await
-            .unwrap_err();
-        let ClientDownloadError::WriterIo(cause) = error else {
-            panic!("wrong destination classification: {error:?}");
-        };
-        assert_eq!(
-            cause
-                .downcast_ref::<std::io::Error>()
-                .unwrap()
-                .raw_os_error(),
-            Some(28)
-        );
-        let independent = MediaDownloader::new(
-            Arc::new(AcceptedBody),
-            Arc::new(TokioRuntime),
-            MediaRoute::unauthenticated(Vec::new()),
-        );
-        let error = independent
-            .download_to_writer(&message, writer())
-            .await
-            .unwrap_err();
-        let MediaDownloadError::WriterIo(cause) = error else {
-            panic!("wrong destination classification: {error:?}");
-        };
-        assert_eq!(
-            cause
-                .downcast_ref::<std::io::Error>()
-                .unwrap()
-                .raw_os_error(),
-            Some(28)
-        );
+        for streaming in [false, true] {
+            for fail_write in [false, true] {
+                let writer = || DestinationFault {
+                    sink: HostWriter(Cursor::new(Vec::new())),
+                    failed: false,
+                    fail_write,
+                };
+                let client = client_with_http(AcceptedBody(streaming)).await;
+                let error = client
+                    .download_to_writer(&message, writer())
+                    .await
+                    .unwrap_err();
+                let ClientDownloadError::WriterIo(cause) = error else {
+                    panic!("wrong destination classification: {error:?}");
+                };
+                let io = cause.downcast_ref::<std::io::Error>().unwrap();
+                assert_eq!(io.raw_os_error(), Some(28));
+                assert_eq!(
+                    io.to_string(),
+                    std::io::Error::from_raw_os_error(28).to_string()
+                );
+                let independent = MediaDownloader::new(
+                    Arc::new(AcceptedBody(streaming)),
+                    Arc::new(TokioRuntime),
+                    MediaRoute::unauthenticated(Vec::new()),
+                );
+                let error = independent
+                    .download_to_writer(&message, writer())
+                    .await
+                    .unwrap_err();
+                let MediaDownloadError::WriterIo(cause) = error else {
+                    panic!("wrong destination classification: {error:?}");
+                };
+                let io = cause.downcast_ref::<std::io::Error>().unwrap();
+                assert_eq!(io.raw_os_error(), Some(28));
+                assert_eq!(
+                    io.to_string(),
+                    std::io::Error::from_raw_os_error(28).to_string()
+                );
+            }
+        }
     }
 
     // Intentional compatibility fixture only; the library tree uses canonical APIs.

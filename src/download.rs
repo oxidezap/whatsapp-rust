@@ -308,14 +308,30 @@ impl DownloadRequestError {
     }
 
     fn streamed(error: anyhow::Error) -> Self {
-        if error
+        let tagged = error
             .downcast_ref::<std::io::Error>()
             .and_then(std::io::Error::get_ref)
-            .is_some_and(|cause| cause.is::<WriterIoCause>())
-        {
-            Self::WriterIo(error)
-        } else {
-            Self::Other(error)
+            .is_some_and(|cause| cause.is::<WriterIoCause>());
+        if !tagged {
+            return Self::Other(error);
+        }
+        // Strip the private origin tag: direct downcasts must expose the same
+        // original OS code and message as buffered writer failures.
+        match error.downcast::<std::io::Error>() {
+            Ok(error) => {
+                let kind = error.kind();
+                match error
+                    .into_inner()
+                    .map(|inner| inner.downcast::<WriterIoCause>())
+                {
+                    Some(Ok(cause)) => Self::writer_io(cause.0),
+                    // Defensive fallbacks retain available causes without a
+                    // panic; the immutable tag check above excludes them.
+                    Some(Err(cause)) => Self::writer_io(std::io::Error::new(kind, cause)),
+                    None => Self::writer_io(kind.into()),
+                }
+            }
+            Err(error) => Self::WriterIo(error),
         }
     }
 
@@ -3040,11 +3056,11 @@ mod tests {
                                     .is_some_and(|io| io.kind() == std::io::ErrorKind::WriteZero)
                             }));
                         } else {
-                            assert!(
-                                cause.chain().any(|source| source
-                                    .downcast_ref::<std::io::Error>()
-                                    .is_some_and(|io| io.raw_os_error() == Some(28))),
-                                "lost original I/O: {error:?}"
+                            let io = cause.downcast_ref::<std::io::Error>().unwrap();
+                            assert_eq!(io.raw_os_error(), Some(28), "lost original I/O: {error:?}");
+                            assert_eq!(
+                                io.to_string(),
+                                std::io::Error::from_raw_os_error(28).to_string()
                             );
                         }
                         assert_eq!(cleanup.is_some(), refuse_cleanup);
