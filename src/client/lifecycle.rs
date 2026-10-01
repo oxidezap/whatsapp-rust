@@ -1725,11 +1725,12 @@ impl Client {
         }
     }
 
-    /// Drop the current connection and reconnect immediately with no delay.
+    /// Drop the current connection and skip the reconnect backoff.
     ///
     /// Unlike [`reconnect`](Self::reconnect), which introduces a deliberate offline window,
     /// this method sets the `expected_disconnect` flag so the run loop
-    /// skips the backoff delay and reconnects as fast as possible.
+    /// skips the backoff delay and reconnects as fast as possible. An installed
+    /// [`crate::ConnectAdmission`] policy still reserves that run-loop attempt.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.conn.reconnect_immediately", level = "info", skip_all)
