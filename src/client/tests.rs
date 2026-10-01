@@ -3721,7 +3721,7 @@ async fn runtime_cache_config_honors_disabled_recent_cache() {
 /// the runtime-retained `RuntimeCacheConfig` (456 B down to 136 B on the
 /// structs). A struct-level delta alone does not prove the per-client saving,
 /// since neighbor-field padding could absorb part of it. The current fixed
-/// client layout is 4320 B before feature-sized fields and the 56 B pending
+/// client layout is 4288 B before feature-sized fields and the 56 B pending
 /// call-offer tracker. The tracker is needed even without the VoIP subsystem:
 /// a terminate must cancel an offer paused on identity learning. It retains
 /// only in-flight offers, and `memory_report()` exposes their count. The
@@ -3736,12 +3736,11 @@ async fn runtime_cache_config_honors_disabled_recent_cache() {
 fn client_size_pins_runtime_cache_config_saving() {
     use std::mem::size_of;
 
-    // Measured fixed part of `size_of::<Client>()` at the head of the #1482
-    // follow-ups, default features, no subsystem attached. Every
-    // size-varying attachment is measured in this same build and stacked on
-    // top, so no feature combination false-fails: only an unaccounted layout
-    // move trips the assert.
-    let mut expected = 4320
+    // Fixed part after removing the duplicate chatstate RwLock<Arc<[handler]>>
+    // table (32 inline bytes on this target); its count remains one pointer.
+    // Every size-varying attachment is measured in this same build and stacked
+    // on top, so only an unaccounted layout move trips the assert.
+    let mut expected = 4288
         + size_of::<subsystem::Subsystems>()
         + size_of::<crate::handlers::call::pending_offers::PendingOffers>()
         + size_of::<Arc<std::sync::Mutex<crate::retry::HistoryPayloadRegistry>>>();
@@ -6307,6 +6306,232 @@ async fn chatstate_dispatch_reaches_every_registered_handler() {
         1,
         "the event is built once and cloned per handler"
     );
+}
+
+#[tokio::test]
+async fn chatstate_bus_adapter_preserves_parsed_states_and_subscription_lifetime() {
+    use crate::handlers::chatstate::ChatstateHandler;
+    use crate::handlers::traits::StanzaHandler;
+    use wacore::iq::chatstate::ReceivedChatState;
+    use wacore::types::events::{ChannelEventHandler, EventInterest, EventKind};
+    let client = crate::test_utils::create_test_client().await;
+    let (tx, rx) = async_channel::unbounded();
+    let subscription = client.subscribe_chatstate_handler(Arc::new(move |event| {
+        tx.try_send(event).unwrap();
+    }));
+    let (bus, events) = ChannelEventHandler::with_capacity(8);
+    let _bus_subscription = client.subscribe(EventInterest::of(&[EventKind::ChatPresence]), bus);
+    for group in [false, true] {
+        for (tag, media, expected) in [
+            ("composing", None, ReceivedChatState::Typing),
+            (
+                "composing",
+                Some("audio"),
+                ReceivedChatState::RecordingAudio,
+            ),
+            ("paused", None, ReceivedChatState::Idle),
+        ] {
+            let chat = if group {
+                "120363000001@g.us"
+            } else {
+                "12025550102@s.whatsapp.net"
+            };
+            let mut state = NodeBuilder::new(tag);
+            if let Some(media) = media {
+                state = state.attr("media", media);
+            }
+            let mut stanza = NodeBuilder::new("chatstate")
+                .attr("from", chat)
+                .children([state.build()]);
+            if group {
+                stanza = stanza.attr("participant", "12025550103@s.whatsapp.net");
+            }
+            assert!(
+                ChatstateHandler
+                    .handle(
+                        client.clone(),
+                        crate::test_utils::node_to_owned_ref(&stanza.build()),
+                        &mut false
+                    )
+                    .await
+            );
+            let legacy_view = rx.recv().await.unwrap();
+            assert_eq!(legacy_view.chat.to_string(), chat);
+            assert_eq!(legacy_view.state, expected);
+            assert_eq!(
+                legacy_view.participant.as_ref().map(ToString::to_string),
+                group.then(|| "12025550103@s.whatsapp.net".to_string())
+            );
+            let Event::ChatPresence(update) = &*events.recv().await.unwrap() else {
+                panic!("chat presence")
+            };
+            let equivalent = ChatStateEvent::from_presence(update);
+            assert_eq!(equivalent.chat, legacy_view.chat);
+            assert_eq!(equivalent.participant, legacy_view.participant);
+            assert_eq!(equivalent.state, legacy_view.state);
+            assert!(
+                rx.try_recv().is_err(),
+                "one fact per registration, no second dispatcher"
+            );
+        }
+    }
+    drop(subscription);
+    client
+        .dispatch_chatstate_event(test_chatstate_stanza())
+        .await;
+    assert!(rx.try_recv().is_err());
+    assert_eq!(client.chatstate_handler_count.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn slow_callback_does_not_hold_chatstate_protocol_dispatch() {
+    use crate::bot::{CallbackEventHandler, EventDelivery};
+    use crate::handlers::{chatstate::ChatstateHandler, traits::StanzaHandler};
+    use wacore::types::events::{ChannelEventHandler, EventInterest, EventKind};
+    let client = crate::test_utils::create_test_client().await;
+    let (started_tx, started_rx) = async_channel::bounded(1);
+    let callback = CallbackEventHandler::from_callback(
+        &client,
+        EventInterest::of(&[EventKind::ChatPresence]),
+        EventDelivery::Ordered { capacity: 1 },
+        move |_, _| {
+            let tx = started_tx.clone();
+            async move {
+                tx.send(()).await.unwrap();
+                std::future::pending::<()>().await;
+            }
+        },
+    );
+    let _callback_subscription = client.subscribe_handler(callback.clone());
+    let (bus, events) = ChannelEventHandler::with_capacity(8);
+    let _bus_subscription = client.subscribe_handler(bus);
+    let node = crate::test_utils::node_to_owned_ref(
+        &NodeBuilder::new("chatstate")
+            .attr("from", "12025550102@s.whatsapp.net")
+            .children([NodeBuilder::new("composing").build()])
+            .build(),
+    );
+    ChatstateHandler
+        .handle(client.clone(), node.clone(), &mut false)
+        .await;
+    started_rx.recv().await.unwrap();
+    // The actual stanza handler keeps dispatching while the consumer is parked.
+    for _ in 0..3 {
+        ChatstateHandler
+            .handle(client.clone(), node.clone(), &mut false)
+            .await;
+    }
+    assert_eq!(events.len(), 4);
+    assert_eq!(callback.stats().dropped_full, 2);
+    assert_eq!(callback.stats().callbacks_active, 1);
+    client.shutdown().await;
+    crate::test_utils::poll_until("slow callback cancelled", || {
+        callback.stats().callbacks_active == 0
+    })
+    .await;
+}
+
+/// Exercise encrypted transport frames and the central reader, not just direct
+/// bus dispatch. A parked observer must not delay an unrelated IQ response.
+#[tokio::test]
+async fn central_reader_resolves_iq_while_event_callback_is_pending() {
+    use crate::bot::{CallbackEventHandler, EventDelivery};
+    use crate::transport::TransportEvent;
+    use wacore::handshake::NoiseCipher;
+    use wacore::net::DisconnectReason;
+    use wacore::types::events::{EventInterest, EventKind};
+
+    let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+    let (tx, receiver) = async_channel::bounded(8);
+    *client.transport_events.lock().await = Some(receiver);
+    let (entered_tx, entered_rx) = async_channel::bounded(1);
+    let callback = CallbackEventHandler::from_callback(
+        &client,
+        EventInterest::of(&[EventKind::ChatPresence]),
+        EventDelivery::Ordered { capacity: 1 },
+        move |_, _| {
+            let entered = entered_tx.clone();
+            async move {
+                entered.send(()).await.unwrap();
+                std::future::pending::<()>().await;
+            }
+        },
+    );
+    let _subscription = client.subscribe_handler(callback.clone());
+    let reader_client = client.clone();
+    let reader = tokio::spawn(async move {
+        reader_client
+            .connection_for_test()
+            .read_until_disconnected()
+            .await;
+    });
+    let cipher = NoiseCipher::new(&[0u8; 32]).unwrap();
+    let frame = |node: Node, counter| {
+        let mut packed = wacore_binary::marshal::marshal(&node).unwrap();
+        cipher
+            .encrypt_in_place_with_counter(counter, &mut packed)
+            .unwrap();
+        TransportEvent::DataReceived(wacore::framing::encode_frame(&packed, None).unwrap().into())
+    };
+    let chatstate = || {
+        NodeBuilder::new("chatstate")
+            .attr("from", "12025550102@s.whatsapp.net")
+            .children([NodeBuilder::new("composing").build()])
+            .build()
+    };
+    tx.send(frame(chatstate(), 0)).await.unwrap();
+    entered_rx.recv().await.unwrap(); // Trigger: callback has reached Pending.
+    // Saturate the observer mailbox. These frames still reach the reader/handler.
+    for counter in 1..4 {
+        tx.send(frame(chatstate(), counter)).await.unwrap();
+    }
+    let (response_tx, response_rx) = oneshot::channel();
+    assert!(
+        client
+            .response_waiters_guard()
+            .try_insert_guarded(
+                "observer-progress".to_string(),
+                ResponseWaiter::Iq(response_tx),
+            )
+            .is_some()
+    );
+    tx.send(frame(
+        NodeBuilder::new("iq")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "observer-progress")
+            .attr("type", "result")
+            .build(),
+        4,
+    ))
+    .await
+    .unwrap();
+    // Falsifier: this cannot complete if callback delivery blocks the reader.
+    let response = tokio::time::timeout(Duration::from_secs(5), response_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.tag(), "iq");
+    // IQ resolution is inline, but chatstate dispatch runs on independent tasks.
+    // Synchronize their counters only after reader progress has been proved.
+    crate::test_utils::poll_until("observer mailbox saturated", || {
+        callback.stats().dropped_full == 2
+    })
+    .await;
+    assert_eq!(callback.stats().callbacks_active, 1);
+    assert_eq!(callback.stats().dropped_full, 2);
+    assert_eq!(client.stats().events_dropped, 2);
+    tx.send(TransportEvent::Disconnected(DisconnectReason::StreamEnded))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), reader)
+        .await
+        .unwrap()
+        .unwrap();
+    client.shutdown().await;
+    crate::test_utils::poll_until("observer released after reader exit", || {
+        callback.stats().callbacks_active == 0
+    })
+    .await;
 }
 
 // --- stanza interceptors ---------------------------------------------------

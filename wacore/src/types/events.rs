@@ -407,7 +407,17 @@ pub struct ChannelEventStats {
 }
 
 impl ChannelEventHandler {
+    /// Bounded by default: 256 waiting events, dropping newest on overflow.
+    /// This replaces the historical unlimited default; use [`Self::unbounded`]
+    /// only when the host supplies its own memory/consumer lifetime bound.
+    /// See [`Self::stats`] for enqueue, full and closed outcomes.
     pub fn new() -> (Arc<Self>, async_channel::Receiver<Arc<Event>>) {
+        Self::with_capacity(256)
+    }
+
+    /// Explicitly unlimited mailbox. Slow or absent consumers can retain every
+    /// event indefinitely; dispatch still never waits for the receiver.
+    pub fn unbounded() -> (Arc<Self>, async_channel::Receiver<Arc<Event>>) {
         let (tx, rx) = async_channel::unbounded();
         (Arc::new(Self::from_sender(tx)), rx)
     }
@@ -580,6 +590,8 @@ impl CoreEventBusInner {
 ///
 /// Dropping it removes the handler. A dispatch that already cloned the old
 /// snapshot may still complete once, while later dispatches cannot see it.
+/// Removal does not retract channel-enqueued events or cancel work a handler
+/// already spawned. Adapter-specific cancellation/lifetime policies still apply.
 #[must_use = "dropping the subscription immediately unregisters the event handler"]
 pub struct Subscription {
     bus: std::sync::Weak<CoreEventBusInner>,
@@ -3713,5 +3725,36 @@ mod tests {
             1,
             "the removed subscription receives no future event"
         );
+    }
+
+    #[test]
+    fn channel_default_is_bounded_and_unlimited_is_explicit() {
+        let (handler, receiver) = ChannelEventHandler::new();
+        assert_eq!(receiver.capacity(), Some(256));
+        for _ in 0..300 {
+            handler.handle_event(Arc::new(Event::Connected(Connected::builder().build())));
+        }
+        assert_eq!(receiver.len(), 256);
+        assert_eq!(handler.stats().enqueued, 256);
+        assert_eq!(handler.stats().dropped_full, 44);
+        let (unlimited, receiver) = ChannelEventHandler::unbounded();
+        assert_eq!(receiver.capacity(), None);
+        for _ in 0..300 {
+            unlimited.handle_event(Arc::new(Event::Connected(Connected::builder().build())));
+        }
+        assert_eq!(receiver.len(), 300);
+        assert_eq!(unlimited.stats().dropped_full, 0);
+    }
+
+    #[test]
+    fn channel_zero_capacity_is_one_and_never_rendezvous() {
+        let (handler, receiver) = ChannelEventHandler::with_capacity(0);
+        assert_eq!(receiver.capacity(), Some(1));
+        for _ in 0..2 {
+            handler.handle_event(Arc::new(Event::Connected(Connected::builder().build())));
+        }
+        assert_eq!(receiver.len(), 1);
+        assert_eq!(handler.stats().enqueued, 1);
+        assert_eq!(handler.stats().dropped_full, 1);
     }
 }

@@ -1,7 +1,11 @@
 //! Tokio WebSocket transport for whatsapp-rust.
 //!
-//! For custom connections, use [`from_websocket`].
+//! For custom byte streams (including proxy tunnels), use
+//! [`TokioWebSocketTransportFactory::with_dialer`]. For already-upgraded sockets,
+//! use [`from_websocket`]. This transport requires a native Tokio runtime; it
+//! does not support browser WASM.
 
+use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
@@ -17,6 +21,29 @@ use wacore::net::{
 };
 
 pub use tokio_websockets::Connector;
+
+/// A connected byte stream on which the factory performs TLS and WebSocket upgrade.
+pub trait DialStream: AsyncRead + AsyncWrite + Send + Unpin {}
+
+impl<S: AsyncRead + AsyncWrite + Send + Unpin> DialStream for S {}
+
+/// Type-erased stream returned by a [`StreamDialer`].
+pub type BoxedStream = Box<dyn DialStream>;
+
+/// Supplies a connected, unencrypted byte stream, without a WebSocket upgrade.
+///
+/// `host` is the URL hostname (IPv6 without brackets), and `port` is its explicit
+/// port or 80/443 for ws/wss. A tunnel must target these, not replace the URL:
+/// the factory still uses the URL for TLS verification/SNI and HTTP Host/path.
+/// Implementations own DNS, proxy negotiation, authentication and socket options.
+///
+/// The future is awaited inline, inside the client's existing transport timeout.
+/// Cancellation drops it (and any stream it owns); implementations must not leave
+/// detached connection tasks running. Errors retain their source chain.
+#[async_trait]
+pub trait StreamDialer: Send + Sync {
+    async fn dial(&self, host: &str, port: u16) -> Result<BoxedStream, anyhow::Error>;
+}
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
@@ -308,7 +335,9 @@ async fn read_pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
 /// Wraps an already-upgraded [`WebSocketStream`] into a [`Transport`] + event channel.
 ///
-/// Useful for custom connection strategies (e.g. IPv4 preference, TCP keepalive).
+/// For custom dialing (e.g. proxy tunnels, IPv4 preference, TCP keepalive), prefer
+/// [`TokioWebSocketTransportFactory::with_dialer`] to retain the canonical upgrade.
+/// This function remains available when the caller intentionally owns the upgrade.
 pub fn from_websocket<S>(
     ws: WebSocketStream<S>,
 ) -> (Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)
@@ -331,7 +360,8 @@ where
 
 /// Default [`TransportFactory`] using system DNS, TCP, and TLS.
 ///
-/// For custom connection logic, use [`from_websocket`] directly.
+/// Use [`Self::with_dialer`] to replace only the connection step while retaining
+/// TLS configuration, resumption, and the canonical WebSocket upgrade.
 pub struct TokioWebSocketTransportFactory {
     url: String,
     connector: Option<Connector>,
@@ -340,6 +370,7 @@ pub struct TokioWebSocketTransportFactory {
     /// it permanently empty, so resumption could never fire.
     default_connector: std::sync::OnceLock<Connector>,
     origin: Option<String>,
+    dialer: Option<Arc<dyn StreamDialer>>,
 }
 
 impl TokioWebSocketTransportFactory {
@@ -349,11 +380,44 @@ impl TokioWebSocketTransportFactory {
             connector: None,
             default_connector: std::sync::OnceLock::new(),
             origin: Some(WHATSAPP_WEB_ORIGIN.to_string()),
+            dialer: None,
         }
     }
 
     pub fn with_url(mut self, url: impl Into<String>) -> Self {
         self.url = url.into();
+        self
+    }
+
+    /// Replace system DNS/TCP dialing with a caller-supplied connected byte stream.
+    ///
+    /// The factory still performs TLS for `wss` using its retained default or
+    /// [`Self::with_connector`] connector, then the same upgrade and Origin policy
+    /// as direct dialing. `ws` stays plaintext, even with a TLS connector selected.
+    /// The hook accepts `ws`/`wss` URLs with a hostname and a valid optional `u16`
+    /// port; malformed destinations are rejected before the dialer runs. The
+    /// no-hook path retains tokio-websockets' URL handling.
+    /// No proxy protocol is implemented here. Unlike [`from_websocket`], the caller
+    /// must supply a stream **before** TLS/HTTP upgrade. Existing factory callers
+    /// need no changes. This adds one stream allocation and dynamic I/O dispatch
+    /// only on the custom path; the direct path remains unboxed.
+    ///
+    /// ```
+    /// use async_trait::async_trait;
+    /// use whatsapp_rust_tokio_transport::{BoxedStream, StreamDialer, TokioWebSocketTransportFactory};
+    ///
+    /// struct Dialer;
+    /// #[async_trait]
+    /// impl StreamDialer for Dialer {
+    ///     async fn dial(&self, host: &str, port: u16) -> anyhow::Result<BoxedStream> {
+    ///         // A proxy implementation would establish its tunnel here instead.
+    ///         Ok(Box::new(tokio::net::TcpStream::connect((host, port)).await?))
+    ///     }
+    /// }
+    /// let factory = TokioWebSocketTransportFactory::new().with_dialer(Dialer);
+    /// ```
+    pub fn with_dialer(mut self, dialer: impl StreamDialer + 'static) -> Self {
+        self.dialer = Some(Arc::new(dialer));
         self
     }
 
@@ -379,8 +443,8 @@ impl TokioWebSocketTransportFactory {
     /// Use a custom TLS [`Connector`] instead of the built-in default.
     ///
     /// This is the primary extension point for custom TLS configuration
-    /// (e.g. custom CA certificates, client certs). For full proxy support,
-    /// implement [`TransportFactory`] directly and use [`from_websocket`].
+    /// (e.g. custom CA certificates, client certs). For proxy tunnels, use
+    /// [`Self::with_dialer`] so the factory retains ownership of TLS and upgrade.
     ///
     /// Repeated dials on one factory retain its default connector. Separate
     /// factories build separate defaults. To share TLS configuration and session
@@ -427,16 +491,20 @@ impl TransportFactory for TokioWebSocketTransportFactory {
     async fn create_transport(
         &self,
     ) -> Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>), anyhow::Error> {
-        let uri: http::Uri = self
-            .url
-            .parse()
-            .map_err(|e| anyhow::anyhow!("Failed to parse URL: {e}"))?;
+        let uri: http::Uri = self.url.parse().context("Failed to parse URL")?;
+        let custom_dial = if let Some(dialer) = &self.dialer {
+            let (host, port) = dial_destination(&uri)?;
+            Some((dialer, host, port))
+        } else {
+            None
+        };
 
         let connector = match &self.connector {
             Some(c) => c,
             None => self.default_connector.get_or_init(default_tls_connector),
         };
 
+        let use_tls = uri.scheme_str() == Some("wss");
         let mut builder = ClientBuilder::from_uri(uri).connector(connector);
         if let Some(origin) = &self.origin {
             let value = http::HeaderValue::from_str(origin)
@@ -447,13 +515,70 @@ impl TransportFactory for TokioWebSocketTransportFactory {
         }
 
         debug!("Dialing WebSocket");
-        let (ws, _) = builder
-            .connect()
-            .await
-            .map_err(|e| anyhow::anyhow!("WebSocket connect failed: {e}"))?;
-
-        Ok(from_websocket(ws))
+        if let Some((dialer, host, port)) = custom_dial {
+            let stream = dialer
+                .dial(&host, port)
+                .await
+                .context("Stream dial failed")?;
+            let connector = if use_tls {
+                connector
+            } else {
+                &Connector::Plain
+            };
+            let stream = connector.wrap(&host, stream).await.map_err(connect_error)?;
+            let (ws, _) = builder.connect_on(stream).await.map_err(connect_error)?;
+            Ok(from_websocket(ws))
+        } else {
+            let (ws, _) = builder.connect().await.map_err(connect_error)?;
+            Ok(from_websocket(ws))
+        }
     }
+}
+
+fn dial_destination(uri: &http::Uri) -> anyhow::Result<(String, u16)> {
+    let authority = uri
+        .authority()
+        .ok_or(tokio_websockets::Error::CannotResolveHost)?;
+    let host = authority.host();
+    if host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .is_empty()
+    {
+        return Err(tokio_websockets::Error::CannotResolveHost.into());
+    }
+    let default_port = match uri.scheme_str() {
+        Some("ws") => 80,
+        Some("wss") => 443,
+        _ => return Err(tokio_websockets::Error::UnsupportedScheme.into()),
+    };
+    // http::Uri accepts invalid explicit ports, then port_u16() returns None.
+    // Do not hand caller code a different target via a silent 80/443 fallback.
+    // The no-hook path deliberately retains upstream connect() behavior.
+    let host_port = authority.as_str().rsplit('@').next().unwrap_or_default();
+    let suffix = host_port.strip_prefix(host).unwrap_or_default();
+    let port = if let Some(port) = suffix.strip_prefix(':') {
+        // Integer parsing accepts a leading '+', but URL ports are digits only.
+        anyhow::ensure!(
+            port.bytes().all(|byte| byte.is_ascii_digit()),
+            "Invalid URL port"
+        );
+        port.parse::<u16>().context("Invalid URL port")?
+    } else {
+        default_port
+    };
+    // Match tokio-websockets: IPv6 brackets belong in HTTP Host, not TLS/DNS.
+    Ok((
+        host.trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_owned(),
+        port,
+    ))
+}
+
+fn connect_error(error: tokio_websockets::Error) -> anyhow::Error {
+    let message = format!("WebSocket connect failed: {error}");
+    anyhow::Error::new(error).context(message)
 }
 
 #[cfg(test)]
@@ -514,6 +639,28 @@ mod tests {
         );
     }
 
+    struct TcpDialer;
+
+    #[async_trait]
+    impl StreamDialer for TcpDialer {
+        async fn dial(&self, host: &str, port: u16) -> anyhow::Result<BoxedStream> {
+            Ok(Box::new(
+                tokio::net::TcpStream::connect((host, port)).await?,
+            ))
+        }
+    }
+
+    fn with_test_dialer(
+        factory: TokioWebSocketTransportFactory,
+        custom: bool,
+    ) -> TokioWebSocketTransportFactory {
+        if custom {
+            factory.with_dialer(TcpDialer)
+        } else {
+            factory
+        }
+    }
+
     async fn attempt_dial(factory: &mut TokioWebSocketTransportFactory) {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -528,7 +675,16 @@ mod tests {
 
     #[tokio::test]
     async fn the_default_connector_is_retained_across_dials() {
-        let mut factory = TokioWebSocketTransportFactory::new();
+        check_default_connector_retention(false).await;
+    }
+
+    #[tokio::test]
+    async fn custom_dials_retain_the_default_connector() {
+        check_default_connector_retention(true).await;
+    }
+
+    async fn check_default_connector_retention(custom: bool) {
+        let mut factory = with_test_dialer(TokioWebSocketTransportFactory::new(), custom);
         assert!(factory.default_connector.get().is_none());
 
         attempt_dial(&mut factory).await;
@@ -540,7 +696,7 @@ mod tests {
             rustls_config(factory.default_connector.get().unwrap()),
         ));
 
-        let mut other = TokioWebSocketTransportFactory::new();
+        let mut other = with_test_dialer(TokioWebSocketTransportFactory::new(), custom);
         attempt_dial(&mut other).await;
         assert!(!Arc::ptr_eq(
             &config,
@@ -719,6 +875,15 @@ mod tests {
 
     #[tokio::test]
     async fn shared_factories_retain_tls_sessions_across_ed_and_ports() {
+        check_shared_tls_sessions(false).await;
+    }
+
+    #[tokio::test]
+    async fn custom_dials_retain_selected_connector_and_tls_sessions() {
+        check_shared_tls_sessions(true).await;
+    }
+
+    async fn check_shared_tls_sessions(custom: bool) {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let (server_config, cert) = tls_server_config("127.0.0.1");
             let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -726,9 +891,12 @@ mod tests {
             let store = TicketStore::new();
             let tls = trusted_connector(cert.clone(), &store);
             let make_factory = |port, target: &str, tls: tokio_rustls::TlsConnector| {
-                TokioWebSocketTransportFactory::new()
-                    .with_url(format!("wss://127.0.0.1:{port}{target}"))
-                    .with_connector(Connector::Rustls(tls))
+                with_test_dialer(
+                    TokioWebSocketTransportFactory::new()
+                        .with_url(format!("wss://127.0.0.1:{port}{target}"))
+                        .with_connector(Connector::Rustls(tls)),
+                    custom,
+                )
             };
             let a = make_factory(
                 first.local_addr().unwrap().port(),
@@ -877,6 +1045,83 @@ mod tests {
         }
     }
 
+    struct RoutedDialer(std::net::SocketAddr);
+
+    #[async_trait]
+    impl StreamDialer for RoutedDialer {
+        async fn dial(&self, host: &str, port: u16) -> anyhow::Result<BoxedStream> {
+            assert!(matches!(host, "localhost" | "wrong.invalid"));
+            assert_eq!(port, self.0.port());
+            Ok(Box::new(tokio::net::TcpStream::connect(self.0).await?))
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_dials_use_the_url_hostname_for_sni_and_verification() {
+        let (server_config, cert) = tls_server_config("localhost");
+        let tls = trusted_connector(cert, &TicketStore::new());
+        for name in ["localhost", "wrong.invalid"] {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let factory = TokioWebSocketTransportFactory::new()
+                    .with_url(format!("wss://{name}:{}/ws/chat?ED=AQ==", addr.port()))
+                    .with_connector(Connector::Rustls(tls.clone()))
+                    .with_dialer(RoutedDialer(addr));
+                let server = async {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    let result = tokio_rustls::TlsAcceptor::from(server_config.clone())
+                        .accept(tcp)
+                        .await;
+                    if name == "localhost" {
+                        let stream = result.unwrap();
+                        assert_eq!(stream.get_ref().1.server_name(), Some(name));
+                        let (request, mut ws) = tokio_websockets::ServerBuilder::new()
+                            .accept(stream)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            request.headers()[http::header::HOST],
+                            format!("{name}:{}", addr.port())
+                        );
+                        assert_eq!(
+                            request.uri().path_and_query().unwrap().as_str(),
+                            "/ws/chat?ED=AQ=="
+                        );
+                        assert_eq!(request.headers()[http::header::ORIGIN], WHATSAPP_WEB_ORIGIN);
+                        assert!(ws.next().await.unwrap().unwrap().is_close());
+                    } else {
+                        assert!(result.is_err());
+                    }
+                };
+                let client = async {
+                    match factory.create_transport().await {
+                        Ok((transport, _events)) => {
+                            assert_eq!(name, "localhost");
+                            transport.disconnect().await;
+                        }
+                        Err(error) => {
+                            assert_eq!(name, "wrong.invalid");
+                            assert!(
+                                error.to_string().contains("certificate not valid for name"),
+                                "{error}"
+                            );
+                            assert!(error.downcast_ref::<tokio_websockets::Error>().is_some());
+                        }
+                    }
+                };
+                tokio::join!(server, client);
+                assert!(factory.default_connector.get().is_none());
+                assert!(Arc::ptr_eq(
+                    tls.config(),
+                    rustls_config(factory.connector.as_ref().unwrap())
+                ));
+            })
+            .await
+            .unwrap();
+        }
+    }
+
     /// The retained default must stay unbuilt when the caller supplied one:
     /// building it anyway would pay for a TLS config nothing ever dials with.
     #[tokio::test]
@@ -902,6 +1147,7 @@ mod tests {
     /// The connect itself always fails, because the listener answers nothing.
     async fn captured_upgrade_request(
         factory: TokioWebSocketTransportFactory,
+        custom: bool,
     ) -> Result<String, anyhow::Error> {
         use tokio::io::AsyncReadExt;
 
@@ -921,8 +1167,8 @@ mod tests {
             Ok::<_, std::io::Error>(String::from_utf8_lossy(&request).into_owned())
         });
 
-        let _ = factory
-            .with_url(format!("ws://{addr}/ws/chat"))
+        let _ = with_test_dialer(factory, custom)
+            .with_url(format!("ws://{addr}/ws/chat?ED=AQ=="))
             .create_transport()
             .await;
 
@@ -930,44 +1176,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upgrade_carries_the_web_origin_by_default() -> Result<(), anyhow::Error> {
-        let request = captured_upgrade_request(TokioWebSocketTransportFactory::new()).await?;
+    async fn direct_and_custom_upgrade_requests_are_equivalent() {
+        let direct = captured_upgrade_request(TokioWebSocketTransportFactory::new(), false)
+            .await
+            .unwrap();
+        let custom = captured_upgrade_request(TokioWebSocketTransportFactory::new(), true)
+            .await
+            .unwrap();
+        let stable_headers = |request: &str| {
+            request
+                .lines()
+                .filter(|line| {
+                    // Each fixture has its own ephemeral port and random nonce.
+                    !line.starts_with("Host:") && !line.starts_with("Sec-WebSocket-Key:")
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(stable_headers(&direct), stable_headers(&custom));
+    }
 
-        assert!(
-            request.contains(&format!("origin: {WHATSAPP_WEB_ORIGIN}\r\n")),
-            "upgrade must carry the WA Web origin, got:\n{request}"
-        );
+    #[tokio::test]
+    async fn upgrade_carries_the_web_origin_by_default() -> Result<(), anyhow::Error> {
+        for custom in [false, true] {
+            let request =
+                captured_upgrade_request(TokioWebSocketTransportFactory::new(), custom).await?;
+            assert!(request.starts_with("GET /ws/chat?ED=AQ== HTTP/1.1\r\n"));
+            assert!(
+                request.contains(&format!("origin: {WHATSAPP_WEB_ORIGIN}\r\n")),
+                "upgrade must carry the WA Web origin, got:\n{request}"
+            );
+        }
         Ok(())
     }
 
     #[tokio::test]
     async fn with_origin_replaces_the_default() -> Result<(), anyhow::Error> {
-        let request = captured_upgrade_request(
-            TokioWebSocketTransportFactory::new().with_origin("https://relay.example"),
-        )
-        .await?;
-
-        assert!(
-            request.contains("origin: https://relay.example\r\n"),
-            "the override must reach the wire, got:\n{request}"
-        );
-        assert!(
-            !request.contains(WHATSAPP_WEB_ORIGIN),
-            "the default must not be sent alongside it, got:\n{request}"
-        );
+        for custom in [false, true] {
+            let request = captured_upgrade_request(
+                TokioWebSocketTransportFactory::new().with_origin("https://relay.example"),
+                custom,
+            )
+            .await?;
+            assert!(
+                request.contains("origin: https://relay.example\r\n"),
+                "{request}"
+            );
+            assert!(!request.contains(WHATSAPP_WEB_ORIGIN), "{request}");
+        }
         Ok(())
     }
 
     #[tokio::test]
     async fn without_origin_omits_the_header() -> Result<(), anyhow::Error> {
-        let request =
-            captured_upgrade_request(TokioWebSocketTransportFactory::new().without_origin())
-                .await?;
-
-        assert!(
-            !request.to_ascii_lowercase().contains("origin:"),
-            "opting out must send no origin at all, got:\n{request}"
-        );
+        for custom in [false, true] {
+            let request = captured_upgrade_request(
+                TokioWebSocketTransportFactory::new().without_origin(),
+                custom,
+            )
+            .await?;
+            assert!(
+                !request.to_ascii_lowercase().contains("origin:"),
+                "{request}"
+            );
+        }
         Ok(())
     }
 }

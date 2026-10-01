@@ -25,6 +25,8 @@
 //!
 //! Only compiled under the non-default `bench-harness` feature.
 
+pub mod connected_idle;
+
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 

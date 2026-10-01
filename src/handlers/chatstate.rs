@@ -26,6 +26,26 @@ pub struct ChatStateEvent {
 }
 
 impl ChatStateEvent {
+    /// Convert the bus payload back to the compatibility chatstate view.
+    pub fn from_presence(presence: &wacore::types::events::ChatPresenceUpdate) -> Self {
+        use wacore::types::presence::{ChatPresence, ChatPresenceMedia};
+        let state = match (presence.state, presence.media) {
+            (ChatPresence::Composing, ChatPresenceMedia::Audio) => {
+                ReceivedChatState::RecordingAudio
+            }
+            (ChatPresence::Composing, _) => ReceivedChatState::Typing,
+            _ => ReceivedChatState::Idle,
+        };
+        Self {
+            chat: presence.source.chat.clone(),
+            participant: presence
+                .source
+                .is_group
+                .then(|| presence.source.sender.clone()),
+            state,
+        }
+    }
+
     /// Create a `ChatStateEvent` from a parsed `ChatstateStanza`.
     pub fn from_stanza(stanza: ChatstateStanza) -> Self {
         let (chat, participant) = match stanza.source {
@@ -37,6 +57,28 @@ impl ChatStateEvent {
             participant,
             state: stanza.state,
         }
+    }
+}
+
+pub(crate) struct ChatstateRegistration {
+    pub(crate) callback: Arc<crate::bot::CallbackEventHandler>,
+    pub(crate) count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl wacore::types::events::EventHandler for ChatstateRegistration {
+    fn handle_event(&self, event: Arc<wacore::types::events::Event>) {
+        self.callback.handle_event(event);
+    }
+
+    fn interest(&self) -> wacore::types::events::EventInterest {
+        self.callback.interest()
+    }
+}
+
+impl Drop for ChatstateRegistration {
+    fn drop(&mut self) {
+        self.count
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

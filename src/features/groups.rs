@@ -348,18 +348,58 @@ struct UpdateGroupPropertyVars {
     update: GroupPropertyUpdate,
 }
 
-/// Result for a single group in a batch metadata query.
-#[derive(Debug, Clone)]
-pub enum GroupMetadataResult {
-    Full(Box<GroupMetadata>),
-    /// Server returned truncated info (only id and size).
-    Truncated {
-        id: Jid,
-        size: u32,
-    },
+/// Per-group outcome of a batch lookup, independent of its projection.
+///
+/// [`Groups::fetch_metadata_batch`] and [`Groups::fetch_overviews`] share
+/// these states, but keep their complete and slim payloads respectively.
+/// Operational failures remain in the outer `Result<_, GroupError>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GroupLookupResult<T> {
+    /// The requested projection is available. An overview is not full metadata.
+    Found(T),
+    /// Only identity and the server-reported count are available, not a payload.
+    Truncated { id: Jid, participant_count: u32 },
+    /// The server refused access to this group.
     Forbidden(Jid),
+    /// The server reported this group as not found.
     NotFound(Jid),
 }
+
+impl<T> GroupLookupResult<T> {
+    /// Transform a found payload without changing partial or refusal outcomes.
+    ///
+    /// For example, reuse overview display logic for an already-fetched
+    /// metadata batch without another query:
+    ///
+    /// ```
+    /// use whatsapp_rust::{GroupMetadataResult, GroupOverview, GroupOverviewResult};
+    ///
+    /// fn overview(result: GroupMetadataResult) -> GroupOverviewResult {
+    ///     result.map(|metadata| GroupOverview::from(metadata.as_ref()))
+    /// }
+    /// ```
+    pub fn map<U>(self, found: impl FnOnce(T) -> U) -> GroupLookupResult<U> {
+        match self {
+            Self::Found(value) => GroupLookupResult::Found(found(value)),
+            Self::Truncated {
+                id,
+                participant_count,
+            } => GroupLookupResult::Truncated {
+                id,
+                participant_count,
+            },
+            Self::Forbidden(id) => GroupLookupResult::Forbidden(id),
+            Self::NotFound(id) => GroupLookupResult::NotFound(id),
+        }
+    }
+}
+
+/// Result for one group in a [`Groups::fetch_metadata_batch`] query.
+///
+/// The complete payload stays boxed; [`GroupLookupResult::Truncated`] never
+/// fabricates metadata or an empty participant list.
+pub type GroupMetadataResult = GroupLookupResult<Box<GroupMetadata>>;
 
 /// Where a group sits in the community hierarchy, derived from the
 /// community flags the wire already carries (`<parent>`, `<linked_parent>`,
@@ -394,9 +434,8 @@ pub enum SubgroupKind {
 /// Slim, display-oriented view of one group: identity, subject, hierarchy,
 /// and membership size — no participants, no settings.
 ///
-/// This is the canonical source of subject, community hierarchy, parent,
-/// subgroup kind, and participant count for high-level callers. Fetch it with
-/// [`Groups::list_participating`] (every group the account is in) or
+/// Use this projection when participants and settings are not needed. Fetch
+/// it with [`Groups::list_participating`] (every group the account is in) or
 /// [`Groups::fetch_overviews`] (a chosen subset); both always hit the
 /// network and never backfill LID/PN mappings.
 /// `subject` is optional because the protocol can explicitly omit it.
@@ -516,8 +555,20 @@ impl GroupOverview {
     }
 }
 
+impl From<&GroupMetadata> for GroupOverview {
+    /// Project already-fetched metadata without fetching or resolving anything.
+    fn from(metadata: &GroupMetadata) -> Self {
+        Self {
+            id: metadata.id.clone(),
+            subject: metadata.subject.clone(),
+            hierarchy: metadata.hierarchy(),
+            participant_count: metadata.participant_count,
+        }
+    }
+}
+
 impl GroupHierarchy {
-    /// Canonical hierarchy normalizer: every overview source funnels through
+    /// Canonical hierarchy normalizer: every group projection funnels through
     /// here, so there is exactly one place where flag combinations become a
     /// hierarchy value.
     fn from_flags(flags: &OverviewFlags) -> Self {
@@ -557,20 +608,12 @@ impl GroupHierarchy {
     }
 }
 
-/// Result for a single group in a [`Groups::fetch_overviews`] batch query.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum GroupOverviewResult {
-    Found(GroupOverview),
-    /// Server returned truncated info (only id and size).
-    Truncated {
-        id: Jid,
-        participant_count: u32,
-    },
-    Forbidden(Jid),
-    NotFound(Jid),
-}
+/// Result for one group in a [`Groups::fetch_overviews`] query.
+pub type GroupOverviewResult = GroupLookupResult<GroupOverview>;
 
+/// Full group projection, including the participants and settings returned by
+/// the server. Use [`Self::hierarchy`] for the normalized community role; raw
+/// wire flags remain available for advanced callers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GroupMetadata {
     pub id: Jid,
@@ -617,8 +660,9 @@ pub struct GroupMetadata {
     pub member_add_mode: Option<MemberAddMode>,
     /// Who can use invite links.
     pub member_link_mode: Option<MemberLinkMode>,
-    /// Total participant count.
-    pub size: Option<u32>,
+    /// Server-reported total participant count, when present. This need not
+    /// equal `participants.len()` and does not promise a complete member list.
+    pub participant_count: Option<u32>,
     /// Whether this group is a community parent group.
     pub is_parent_group: bool,
     pub parent_membership_approval_required: bool,
@@ -658,6 +702,16 @@ pub struct GroupMetadata {
     /// Whether limit sharing is enabled.
     pub is_limit_sharing_enabled: bool,
     pub limit_sharing_trigger: Option<u32>,
+}
+
+impl GroupMetadata {
+    /// Community hierarchy, using the same normalization as [`GroupOverview`].
+    ///
+    /// Computed from the retained wire flags rather than cached separately,
+    /// so it remains consistent if a caller edits those public fields.
+    pub fn hierarchy(&self) -> GroupHierarchy {
+        GroupHierarchy::from_metadata(self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -726,7 +780,7 @@ impl From<GroupMetadataResponse> for GroupMetadata {
             membership_approval: group.membership_approval,
             member_add_mode: group.member_add_mode,
             member_link_mode: group.member_link_mode,
-            size: group.size,
+            participant_count: group.size,
             is_parent_group: group.is_parent_group,
             parent_membership_approval_required: group.parent_membership_approval_required,
             parent_group_jid: group.parent_group_jid,
@@ -2776,7 +2830,7 @@ impl<'a> Groups<'a> {
         Ok(self.client.execute(AcknowledgeGroupIq::new(jid)).await?)
     }
 
-    /// Batch fetch complete, user-facing metadata for multiple groups at once
+    /// Batch fetch full, user-facing metadata for multiple groups at once
     /// (max 10,000). Always hits the network; no LID/PN backfill — call
     /// [`Groups::resolve_participant_addresses`] per result when PN-keyed
     /// display data is needed.
@@ -2803,11 +2857,12 @@ impl<'a> Groups<'a> {
             .into_iter()
             .map(|r| match r {
                 RawBatchResult::Full(info) => {
-                    GroupMetadataResult::Full(Box::new(GroupMetadata::from(*info)))
+                    GroupMetadataResult::Found(Box::new(GroupMetadata::from(*info)))
                 }
-                RawBatchResult::Truncated { id, size } => {
-                    GroupMetadataResult::Truncated { id, size }
-                }
+                RawBatchResult::Truncated { id, size } => GroupMetadataResult::Truncated {
+                    id,
+                    participant_count: size,
+                },
                 RawBatchResult::Forbidden(id) => GroupMetadataResult::Forbidden(id),
                 RawBatchResult::NotFound(id) => GroupMetadataResult::NotFound(id),
             })
@@ -4889,6 +4944,307 @@ mod tests {
     }
 
     #[test]
+    fn metadata_and_overview_share_hierarchy_and_optional_fields() {
+        use wacore::iq::groups::GroupOverviewData;
+        use wacore::protocol::ProtocolNode;
+        use wacore_binary::builder::NodeBuilder;
+
+        let parent: Jid = "120363000000000011@g.us".parse().unwrap();
+        for (linked, community, announcement, general, expected) in [
+            (false, false, false, false, GroupHierarchy::Standalone),
+            (false, true, false, false, GroupHierarchy::Community),
+            (
+                true,
+                false,
+                false,
+                false,
+                GroupHierarchy::Subgroup {
+                    parent: parent.clone(),
+                    kind: SubgroupKind::Regular,
+                },
+            ),
+            (
+                true,
+                false,
+                true,
+                false,
+                GroupHierarchy::Subgroup {
+                    parent: parent.clone(),
+                    kind: SubgroupKind::Announcement,
+                },
+            ),
+            (
+                true,
+                false,
+                false,
+                true,
+                GroupHierarchy::Subgroup {
+                    parent: parent.clone(),
+                    kind: SubgroupKind::General,
+                },
+            ),
+            // Preserve independent wire flags; normalization is an API policy.
+            (
+                true,
+                true,
+                true,
+                true,
+                GroupHierarchy::Subgroup {
+                    parent: parent.clone(),
+                    kind: SubgroupKind::Announcement,
+                },
+            ),
+        ] {
+            let mut children = Vec::new();
+            if linked {
+                children.push(
+                    NodeBuilder::new("linked_parent")
+                        .attr("jid", &parent)
+                        .build(),
+                );
+            }
+            if community {
+                children.push(NodeBuilder::new("parent").build());
+            }
+            if announcement {
+                children.push(NodeBuilder::new("default_sub_group").build());
+            }
+            if general {
+                children.push(NodeBuilder::new("general_chat").build());
+            }
+            let node = NodeBuilder::new("group")
+                .attr("id", "120363000000000012@g.us")
+                .children(children)
+                .build();
+            let mut metadata =
+                GroupMetadata::from(GroupMetadataResponse::try_from_node(&node).unwrap());
+            let overview = GroupOverview::from_overview_data(
+                &GroupOverviewData::try_from_node(&node).unwrap(),
+            );
+            assert_eq!(metadata.hierarchy(), expected);
+            assert_eq!(overview.hierarchy, expected);
+            assert_eq!(GroupOverview::from(&metadata), overview);
+            assert_eq!(metadata.subject, None);
+            assert_eq!(metadata.participant_count, None);
+            assert_eq!(metadata.is_parent_group, community);
+            assert_eq!(metadata.is_default_sub_group, announcement);
+            assert_eq!(metadata.is_general_chat, general);
+            assert_eq!(metadata.parent_group_jid.is_some(), linked);
+            metadata.parent_group_jid = None;
+            metadata.is_parent_group = false;
+            assert_eq!(metadata.hierarchy(), GroupHierarchy::Standalone);
+        }
+    }
+
+    #[tokio::test]
+    async fn group_batch_lookups_share_outcomes_and_request_shape() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let jids: Vec<Jid> = (21..=24)
+            .map(|id| format!("1203630000000000{id}@g.us").parse().unwrap())
+            .collect();
+        let mut previous = None;
+        for metadata in [true, false] {
+            let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            let query = {
+                let client = client.clone();
+                let jids = jids.clone();
+                tokio::spawn(async move {
+                    if metadata {
+                        client
+                            .groups()
+                            .fetch_metadata_batch(&jids)
+                            .await
+                            .map(|results| {
+                                results
+                                    .into_iter()
+                                    .map(|result| {
+                                        result.map(|metadata| {
+                                            assert_eq!(metadata.participants.len(), 1);
+                                            assert!(metadata.is_locked);
+                                            // Reported count is not inferred from the collected participants.
+                                            assert_eq!(metadata.participant_count, Some(42));
+                                            GroupOverview::from(metadata.as_ref())
+                                        })
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                    } else {
+                        client.groups().fetch_overviews(&jids).await
+                    }
+                })
+            };
+            let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+            let sent = sent.get();
+            assert_eq!(sent.attrs().optional_string("type").as_deref(), Some("get"));
+            assert_eq!(
+                sent.attrs().optional_string("xmlns").as_deref(),
+                Some("w:g2")
+            );
+            assert_eq!(sent.attrs().optional_string("to").as_deref(), Some("g.us"));
+            let request = sent.get_optional_child("query").unwrap();
+            let requested: Vec<_> = request
+                .get_children_by_tag("group")
+                .map(|group| {
+                    assert!(group.children().is_none_or(|children| children.is_empty()));
+                    group.attrs().optional_string("jid").unwrap().to_string()
+                })
+                .collect();
+            assert_eq!(
+                requested,
+                jids.iter().map(ToString::to_string).collect::<Vec<_>>()
+            );
+            let id = sent.attrs().optional_string("id").unwrap().to_string();
+            let response = NodeBuilder::new("iq")
+                .attr("type", "result")
+                .attr("id", &id)
+                .children([NodeBuilder::new("groups")
+                    .children([
+                        NodeBuilder::new("group")
+                            .attr("id", &jids[0])
+                            .attr("size", "42")
+                            .children([
+                                NodeBuilder::new("participant")
+                                    .attr("jid", "15555550101@s.whatsapp.net")
+                                    .build(),
+                                NodeBuilder::new("locked").build(),
+                            ])
+                            .build(),
+                        NodeBuilder::new("group")
+                            .attr("id", &jids[1])
+                            .attr("truncated", "true")
+                            .attr("size", "900")
+                            .build(),
+                        NodeBuilder::new("group")
+                            .attr("id", &jids[2])
+                            .attr("error", "403")
+                            .build(),
+                        NodeBuilder::new("group")
+                            .attr("id", &jids[3])
+                            .attr("error", "404")
+                            .build(),
+                    ])
+                    .build()])
+                .build();
+            crate::test_utils::answer_iq(&client, &id, &response).await;
+            let results = query.await.unwrap().unwrap();
+            assert_eq!(results.len(), 4);
+            assert!(matches!(&results[0], GroupLookupResult::Found(overview)
+                if overview.id == jids[0] && overview.subject.is_none() && overview.participant_count == Some(42)));
+            assert_eq!(
+                results[1],
+                GroupLookupResult::Truncated {
+                    id: jids[1].clone(),
+                    participant_count: 900
+                }
+            );
+            assert_eq!(results[2], GroupLookupResult::Forbidden(jids[2].clone()));
+            assert_eq!(results[3], GroupLookupResult::NotFound(jids[3].clone()));
+            if let Some(previous) = &previous {
+                assert_eq!(&results, previous);
+            }
+            previous = Some(results);
+            assert_eq!(
+                transport.sent_count(),
+                1,
+                "neither lookup may enrich or query again"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn group_batch_operational_errors_keep_sources_and_rejection_stanzas() {
+        use std::error::Error as _;
+        use wacore_binary::builder::NodeBuilder;
+
+        for metadata in [true, false] {
+            for server_error in [true, false] {
+                let (client, transport) = crate::test_utils::create_iq_test_client().await;
+                let group = description_test_group();
+                let query = {
+                    let client = client.clone();
+                    let group = group.clone();
+                    tokio::spawn(async move {
+                        if metadata {
+                            client
+                                .groups()
+                                .fetch_metadata_batch(&[group])
+                                .await
+                                .map(|_| ())
+                        } else {
+                            client.groups().fetch_overviews(&[group]).await.map(|_| ())
+                        }
+                    })
+                };
+                let id = pending_group_query(&transport, 0).await;
+                let payload = if server_error {
+                    NodeBuilder::new("error")
+                        .attr("code", "429")
+                        .attr("text", "rate-overlimit")
+                        .attr("type", "wait")
+                        .attr("backoff", "60")
+                        .build()
+                } else {
+                    // A partial count is required, not silently synthesized as zero.
+                    NodeBuilder::new("groups")
+                        .children([NodeBuilder::new("group")
+                            .attr("id", &group)
+                            .attr("truncated", "true")
+                            .build()])
+                        .build()
+                };
+                let response = NodeBuilder::new("iq")
+                    .attr("type", if server_error { "error" } else { "result" })
+                    .attr("id", &id)
+                    .children([payload])
+                    .build();
+                crate::test_utils::answer_iq(&client, &id, &response).await;
+                let error = query.await.unwrap().unwrap_err();
+                assert!(error.source().unwrap().downcast_ref::<IqError>().is_some());
+                if server_error {
+                    let GroupError::Iq(IqError::ServerError {
+                        code,
+                        error_type,
+                        backoff,
+                        response,
+                        ..
+                    }) = error
+                    else {
+                        panic!("expected preserved server error");
+                    };
+                    assert_eq!(code, 429);
+                    assert_eq!(error_type.as_deref(), Some("wait"));
+                    assert_eq!(backoff, Some(60));
+                    let rejection = response.get();
+                    assert_eq!(
+                        rejection.attrs().optional_string("id").as_deref(),
+                        Some(id.as_str())
+                    );
+                    assert_eq!(
+                        rejection.attrs().optional_string("type").as_deref(),
+                        Some("error")
+                    );
+                    let error_node = rejection.get_optional_child("error").unwrap();
+                    assert_eq!(
+                        error_node.attrs().optional_string("text").as_deref(),
+                        Some("rate-overlimit")
+                    );
+                } else {
+                    let GroupError::Iq(IqError::ParseError(source)) = error else {
+                        panic!("expected parse error, not a group lookup state");
+                    };
+                    assert!(
+                        source
+                            .to_string()
+                            .contains("missing required attribute size")
+                    );
+                }
+                assert_eq!(transport.sent_count(), 1);
+            }
+        }
+    }
+
+    #[test]
     fn group_overview_derives_hierarchy_from_community_flags() {
         use wacore::iq::groups::GroupMetadataResponse;
         use wacore::protocol::ProtocolNode;
@@ -5188,6 +5544,7 @@ mod tests {
         crate::test_utils::answer_iq(&client, &id, &response).await;
         let overviews = query.await.unwrap().unwrap();
         assert!(overviews.is_empty());
+        assert_eq!(transport.sent_count(), 1);
     }
 
     #[tokio::test]
@@ -5217,6 +5574,9 @@ mod tests {
                     .attr("size", "3")
                     .children([
                         NodeBuilder::new("participant").build(),
+                        NodeBuilder::new("ephemeral")
+                            .attr("expiration", "invalid")
+                            .build(),
                         NodeBuilder::new("parent").build(),
                     ])
                     .build()])
@@ -5229,6 +5589,7 @@ mod tests {
         assert_eq!(overviews[0].subject, Some("Participating".to_string()));
         assert_eq!(overviews[0].hierarchy, GroupHierarchy::Community);
         assert_eq!(overviews[0].participant_count, Some(3));
+        assert_eq!(transport.sent_count(), 1);
     }
 
     #[tokio::test]
@@ -5255,7 +5616,12 @@ mod tests {
                     .attr("id", found.to_string())
                     .attr("subject", "Found")
                     .attr("size", "5")
-                    .children([NodeBuilder::new("participant").build()])
+                    .children([
+                        NodeBuilder::new("participant").build(),
+                        NodeBuilder::new("ephemeral")
+                            .attr("expiration", "invalid")
+                            .build(),
+                    ])
                     .build()])
                 .build()])
             .build();

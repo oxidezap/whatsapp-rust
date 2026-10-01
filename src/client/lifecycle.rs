@@ -746,8 +746,7 @@ impl Client {
             inbound_durability_hook: std::sync::OnceLock::new(),
             retry_admission: std::sync::OnceLock::new(),
             history_sync_admission,
-            chatstate_handlers: std::sync::RwLock::new(Arc::from([])),
-            chatstate_handler_count: AtomicUsize::new(0),
+            chatstate_handler_count: Arc::new(AtomicUsize::new(0)),
             pdo_pending_requests: cache_config.pdo_pending_requests.build_with_ttl(),
             pdo_requested: cache_config.pdo_requested.build_with_ttl(),
             device_registry_cache: device_topology::DeviceRegistryCache::new(

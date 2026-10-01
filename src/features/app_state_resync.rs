@@ -63,8 +63,9 @@ pub enum AppStateResyncMode {
     /// bus's, and under
     /// [`EventDelivery::Concurrent`](crate::bot::EventDelivery::Concurrent) each
     /// callback runs in a task of its own, while
-    /// [`EventDelivery::Ordered`](crate::bot::EventDelivery::Ordered) queues and
-    /// drops on a full mailbox. A report is evidence about the sync, not about a
+    /// [`EventDelivery::Ordered`](crate::bot::EventDelivery::Ordered) and the
+    /// bounded concurrent default buffer events in a mailbox and drop the newest
+    /// event when it is full. A report is evidence about the sync, not about a
     /// consumer's mirror.
     ///
     /// A collection can also come back `synced` having replayed nothing, because

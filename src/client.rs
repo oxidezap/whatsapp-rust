@@ -385,9 +385,6 @@ use crate::socket::{NoiseSocket, SocketError, error::EncryptSendError};
 use crate::sync_task::MajorSyncTask;
 use wacore::runtime::Runtime;
 
-/// Type alias for chatstate event handler functions.
-type ChatStateHandler = Arc<dyn Fn(ChatStateEvent) + Send + Sync>;
-
 /// Per-chat lane for sequential message processing. Combines the enqueue lock
 /// and queue sender into a single cached entry (one lookup instead of two).
 /// Keyed by `Jid` to avoid per-message `to_string()` allocation.
@@ -1962,15 +1959,9 @@ pub struct Client {
     pub(crate) history_sync_admission:
         Option<Arc<dyn crate::types::history_sync_admission::HistorySyncAdmission>>,
 
-    /// Chat state (typing indicator) handlers registered by external consumers.
-    /// Each handler receives a `ChatStateEvent` describing the chat, optional participant and state.
-    ///
-    /// Copy-on-write behind a sync lock, guarded by `chatstate_handler_count` so
-    /// the default (no handler registered) never takes the lock nor builds the
-    /// event that only a handler would read. The outer lock is inline (`Client`
-    /// is always behind `Arc`); only the inner snapshot is `Arc`-shared.
-    pub(crate) chatstate_handlers: std::sync::RwLock<Arc<[ChatStateHandler]>>,
-    pub(crate) chatstate_handler_count: AtomicUsize,
+    /// Live chatstate adapters owned by the event bus (including retired snapshots).
+    /// Handler storage and filtering belong exclusively to the core event bus.
+    pub(crate) chatstate_handler_count: Arc<AtomicUsize>,
 
     pub(crate) pdo_pending_requests: Cache<ChatMessageId, crate::pdo::PendingPdoRequest>,
 
