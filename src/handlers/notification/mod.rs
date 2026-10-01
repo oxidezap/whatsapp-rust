@@ -138,6 +138,9 @@ use privacy_business::*;
 use profile::*;
 
 #[cfg(test)]
+mod reachout_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::lid_pn_cache::LearningSource;

@@ -703,8 +703,10 @@ pub trait VoipMediaSession: MaybeSendSync + 'static {
     /// Snapshot of the counters the control plane republishes for `CallHandle`.
     fn stats(&self) -> MediaStats;
 
-    /// One subscription per call. Event delivery competes with itself the same way
-    /// `CallHandle::events()` does today.
+    /// The call's public event receiver. The facade acquires it once and exposes it through
+    /// `CallHandle::take_events()`, whose acquisition slot is shared across handle clones.
+    /// Receiver clones compete for the same queue; this is not broadcast. This trait does not
+    /// enforce the facade's take-once policy on direct backend subscriptions.
     fn subscribe(&self) -> async_channel::Receiver<MediaEvent>;
 
     /// Idempotent close; releases the transport.

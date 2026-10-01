@@ -2463,14 +2463,15 @@ mod tests {
     }
 
     /// A history-sync seed reaches `put_msg_secrets` as one oversized batch.
-    /// Trimming only after the whole batch landed would bound the row count but
-    /// not the table, and on wasm32 that allocation is never returned -- so what
-    /// this asserts is the allocation, not the length: one big batch must cost
-    /// no more table than the same rows trickling in one at a time.
+    /// Both batch and single-row writes must bound retained rows and keep the
+    /// newest deadlines. HashMap capacity is not a retention invariant: growth
+    /// and headroom after removal can differ between the two insertion paths.
     #[tokio::test]
-    async fn one_oversized_msg_secret_batch_costs_no_more_table_than_trickling() {
+    async fn oversized_msg_secret_batch_and_trickling_retain_newest_rows() {
         let chat: wacore_binary::Jid = "1@s.whatsapp.net".parse().unwrap();
-        let now = crate::time::now_secs();
+        // Unique, nonzero deadlines increase with the padded message IDs, so
+        // batch sorting and eviction have the same unambiguous order.
+        let now = 1_700_000_000;
         let total = MAX_MSG_SECRETS * 4;
         let row = |i: usize| {
             MsgSecretEntry::new(
@@ -2492,16 +2493,37 @@ mod tests {
         let trickled = InMemoryBackend::new();
         for i in 0..total {
             trickled.put_msg_secrets(vec![row(i)]).await.unwrap();
+            let len = trickled.state.lock().await.msg_secrets.len();
+            assert!(
+                len <= MAX_MSG_SECRETS,
+                "trickled secrets exceeded the cap at insert {i}"
+            );
+            assert!(
+                len >= (i + 1).min(MAX_MSG_SECRETS * 3 / 4),
+                "trickled eviction overshot the low-water target at insert {i}"
+            );
         }
 
-        let batched_capacity = batched.state.lock().await.msg_secrets.capacity();
-        let trickled_capacity = trickled.state.lock().await.msg_secrets.capacity();
-        assert!(
-            batched_capacity <= trickled_capacity,
-            "an oversized batch grew the table past the bound: \
-             batched {batched_capacity} > trickled {trickled_capacity}"
-        );
-        assert!(batched.state.lock().await.msg_secrets.len() <= MAX_MSG_SECRETS);
+        for (strategy, backend) in [("batched", &batched), ("trickled", &trickled)] {
+            let state = backend.state.lock().await;
+            let len = state.msg_secrets.len();
+            assert!(
+                len <= MAX_MSG_SECRETS,
+                "{strategy} secrets exceeded the cap"
+            );
+            assert!(
+                len >= MAX_MSG_SECRETS * 3 / 4,
+                "{strategy} eviction removed more than its low-water target"
+            );
+            let mut retained: Vec<_> = state
+                .msg_secrets
+                .keys()
+                .map(|key| key.msg_id.as_ref())
+                .collect();
+            retained.sort_unstable();
+            let expected: Vec<_> = (total - len..total).map(|i| format!("m{i:07}")).collect();
+            assert_eq!(retained, expected, "{strategy} must retain the newest rows");
+        }
     }
 
     /// History seeding and inbound bot capture file one secret under two sender

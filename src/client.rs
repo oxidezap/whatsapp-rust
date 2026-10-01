@@ -28,7 +28,7 @@ mod sessions;
 pub(crate) mod subsystem;
 pub(crate) mod voip;
 use builder::{ClientAssembly, ClientExtensions};
-pub use builder::{ClientBuild, ClientBuilder, ClientBuilderError};
+pub use builder::{ClientBuild, ClientBuilder, ClientBuilderError, ClientOptions};
 pub(crate) use device_memo_stats::{
     DeviceMemoCounters, GroupDevicesMemoOutcome, SkdmTargetsMemoOutcome,
 };
@@ -38,7 +38,9 @@ use extension_lifecycle::LifecycleRegistration;
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use extension_lifecycle::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
-pub use lifecycle::{Connection, ProtocolTerminalReason, Reachability, RunCompletionReason};
+pub use lifecycle::{
+    ConflictKind, Connection, ProtocolTerminalReason, Reachability, RunCompletionReason,
+};
 pub use voip::{CallError, Voip};
 
 use crate::cache::Cache;

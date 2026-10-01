@@ -1,11 +1,14 @@
 use crate::client::Client;
 use crate::types::events::{Event, EventKind};
 use log::{debug, warn};
+use serde::Deserialize;
 use std::sync::Arc;
 use wacore::appstate::patch_decode::WAPatchName;
 use wacore::runtime::BoxFuture;
 use wacore::stanza::groups::{GroupNotification, GroupNotificationAction};
-use wacore::types::events::{GroupUpdate, MexNotification};
+use wacore::types::events::{
+    GroupUpdate, MexNotification, ReachoutTimelock, ReachoutTimelockUpdate,
+};
 use wacore_binary::NodeContentRef;
 use wacore_binary::{NodeRef, OwnedNodeRef};
 
@@ -520,6 +523,37 @@ pub(crate) fn handle_mex_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
         "mex notification received: op_name={op_name} offline={}",
         offline.is_some()
     );
+    // WAWebHandleMexNotification routes this exact op with mexResponse.data;
+    // WAWebMexReachoutTimelockNotificationHandler reads the notify field. Reuse
+    // the pull state's Deserialize impl on the borrowed subtree: the raw twin
+    // retains the entire original Value, including fields we do not model.
+    if op_name == "NotificationUserReachoutTimelockUpdate"
+        && client
+            .core
+            .event_bus
+            .has_handler_for(EventKind::ReachoutTimelockUpdate)
+        && let Some(state) = payload
+            .get("data")
+            .and_then(|data| data.get("xwa2_notify_account_reachout_timelock"))
+            .filter(|state| state.is_object())
+    {
+        match ReachoutTimelock::deserialize(state) {
+            Ok(state) => client
+                .core
+                .event_bus
+                .dispatch(Event::ReachoutTimelockUpdate(
+                    ReachoutTimelockUpdate::builder()
+                        .state(state)
+                        .maybe_from(from.clone())
+                        .maybe_stanza_id(stanza_id.clone())
+                        .maybe_offline(offline.clone())
+                        .build(),
+                )),
+            Err(e) => {
+                warn!(target: "Client/Mex", "mex notification op={op_name} invalid reachout state: {e}");
+            }
+        }
+    }
     client
         .core
         .event_bus

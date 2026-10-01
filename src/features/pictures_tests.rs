@@ -577,3 +577,7 @@ async fn picture_lookup_execute_leaves_ordinary_and_non_rejection_core_parse_err
         }
     }
 }
+
+#[cfg(feature = "metrics")]
+#[path = "pictures_metrics_tests.rs"]
+mod metrics;

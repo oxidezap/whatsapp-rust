@@ -105,6 +105,7 @@ pub use mex::{
     MexFatalError, MexGraphQLError, MexRequest, MexResponse, NewChatMessageCapping, OwnUsername,
     ReachoutTimelock,
 };
+pub use mex::{MexDoc, MexOperation};
 
 pub use newsletter::{
     Newsletter, NewsletterAdminInfo, NewsletterAdminProfile, NewsletterError, NewsletterFollower,

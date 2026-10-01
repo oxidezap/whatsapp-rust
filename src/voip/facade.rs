@@ -2053,7 +2053,7 @@ async fn place_call(
         client: client_weak(client),
         muted,
         video: video_shared,
-        events: ev_rx,
+        events: Arc::new(std::sync::Mutex::new(Some(ev_rx))),
         ended,
         media: Some(media),
     })
@@ -3050,7 +3050,7 @@ async fn open_registered_media(
         client: client_weak(client),
         muted,
         video: video_shared,
-        events: ev_rx,
+        events: Arc::new(std::sync::Mutex::new(Some(ev_rx))),
         ended: registration.ended.clone(),
         media: Some(session),
     })
@@ -3468,7 +3468,8 @@ pub struct CallHandle {
     client: std::sync::Weak<Client>,
     muted: Arc<AtomicBool>,
     video: Arc<VideoShared>,
-    events: async_channel::Receiver<CallEvent>,
+    // Acquisition belongs to the call, not to any one handle clone.
+    events: Arc<std::sync::Mutex<Option<async_channel::Receiver<CallEvent>>>>,
     ended: Arc<EndedFlag>,
     /// The media session this call reserved. Held so counters are read through the seam
     /// (`VoipMediaSession::stats`) rather than a parallel cell, and so the handle can steer video
@@ -4711,13 +4712,37 @@ impl CallHandle {
         }
     }
 
-    /// Subscribe to call lifecycle and media diagnostics.
+    /// Take ownership of the call's lifecycle and media diagnostic receiver.
     ///
-    /// All receivers returned here (and across cloned handles) share ONE queue: each event is
-    /// delivered to exactly one receiver, competitively. Drive a single consumer loop per call;
-    /// polling two receivers concurrently splits the events between them rather than broadcasting.
-    pub fn events(&self) -> async_channel::Receiver<CallEvent> {
-        self.events.clone()
+    /// Only the first acquisition returns `Some`, across **all** clones of this handle. Later
+    /// attempts return `None`, including after the acquired receiver is dropped or the call ends.
+    /// Dropping it does not end the call or restore acquisition; retain it for the consumer loop.
+    /// Acquisition is synchronous, so cancelling a subsequent `recv()` does not restore it either.
+    /// Queued events remain available if the receiver is first taken after the call ends.
+    ///
+    /// This is not broadcast or a durable subscription. The returned `async_channel::Receiver`
+    /// can itself be cloned by the host, but those clones compete for the **same** queue, rather
+    /// than observing independent event streams. Backend capacity and overflow policies are
+    /// unchanged; there is no exactly-once processing or redelivery guarantee. Use
+    /// [`wait_ended`](Self::wait_ended) for sticky completion independent of event consumption.
+    ///
+    /// ```no_run
+    /// # fn consume(call: &whatsapp_rust::voip::CallHandle) {
+    /// let Some(events) = call.take_events() else {
+    ///     return; // another owner already acquired this call's receiver
+    /// };
+    /// // Move `events` into one consumer task; keep `call` for control operations.
+    /// # }
+    /// ```
+    ///
+    /// The former cloning accessor is intentionally unavailable:
+    /// ```compile_fail
+    /// # fn legacy(call: &whatsapp_rust::voip::CallHandle) {
+    /// let independent_observer = call.events();
+    /// # }
+    /// ```
+    pub fn take_events(&self) -> Option<async_channel::Receiver<CallEvent>> {
+        self.events.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// Resolve once the call's media task has finished (relay disconnect, send failure, or hangup).
@@ -4726,6 +4751,147 @@ impl CallHandle {
         // same-call-id replacement, whose task already ended and set the flag) never parks on a
         // one-shot notification that already fired.
         self.ended.wait().await;
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod event_ownership_tests {
+    use super::*;
+
+    fn handle() -> (CallHandle, async_channel::Sender<CallEvent>) {
+        let (sender, receiver) = async_channel::bounded(8);
+        (
+            CallHandle {
+                call_id: "CALL-EVENT-OWNERSHIP".into(),
+                generation: 1,
+                peer_jid: Jid::lid("123456"),
+                call_creator: Jid::lid("654321"),
+                client_registry: Arc::new(wacore::voip_control::registry::CallRegistry::new()),
+                pending_outgoing_calls: Arc::new(std::sync::Mutex::new(Default::default())),
+                client: std::sync::Weak::new(),
+                muted: Arc::new(AtomicBool::new(false)),
+                video: Arc::new(VideoShared::new()),
+                events: Arc::new(std::sync::Mutex::new(Some(receiver))),
+                ended: Arc::new(EndedFlag::default()),
+                media: None,
+            },
+            sender,
+        )
+    }
+
+    #[test]
+    fn concurrent_handle_clones_acquire_only_one_receiver() {
+        let (handle, sender) = handle();
+        sender.try_send(CallEvent::RelayAllocated).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let clone = handle.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    clone.take_events()
+                })
+            })
+            .collect();
+        let receivers: Vec<_> = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(receivers.len(), 1);
+        assert_eq!(receivers[0].try_recv(), Ok(CallEvent::RelayAllocated));
+        assert!(handle.take_events().is_none());
+        assert!(handle.clone().take_events().is_none());
+    }
+
+    #[test]
+    fn drop_does_not_restore_acquisition_or_retain_hidden_receiver() {
+        let (handle, sender) = handle();
+        let clone = handle.clone();
+        let receiver = handle.take_events().unwrap();
+        drop(receiver);
+        assert!(handle.take_events().is_none());
+        assert!(clone.take_events().is_none());
+        assert!(
+            sender.is_closed(),
+            "handles retain no hidden receiver after take"
+        );
+        assert!(
+            !handle.ended.done.load(Ordering::SeqCst),
+            "receiver Drop is not hangup"
+        );
+    }
+
+    #[test]
+    fn host_receiver_clones_are_competitive_not_broadcast() {
+        let (handle, sender) = handle();
+        let receiver = handle.take_events().unwrap();
+        let competitor = receiver.clone();
+        sender.try_send(CallEvent::RelayAllocated).unwrap();
+        assert_eq!(receiver.try_recv(), Ok(CallEvent::RelayAllocated));
+        assert_eq!(
+            competitor.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        );
+        sender.try_send(CallEvent::RelayAllocated).unwrap();
+        assert_eq!(competitor.try_recv(), Ok(CallEvent::RelayAllocated));
+        assert_eq!(receiver.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn cancelled_recv_does_not_restore_acquisition() {
+        let (handle, sender) = handle();
+        let receiver = handle.take_events().unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), receiver.recv())
+                .await
+                .is_err()
+        );
+        assert!(handle.clone().take_events().is_none());
+        sender.try_send(CallEvent::RelayAllocated).unwrap();
+        assert_eq!(receiver.recv().await.unwrap(), CallEvent::RelayAllocated);
+    }
+
+    #[tokio::test]
+    async fn late_acquisition_and_wait_ended_are_independent_and_sticky() {
+        let (handle, sender) = handle();
+        sender.try_send(CallEvent::RelayAllocated).unwrap();
+        sender.close();
+        handle.ended.notify();
+        let clone = handle.clone();
+        let receiver = clone.take_events().unwrap();
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(1), handle.wait_ended())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), clone.wait_ended())
+                .await
+                .unwrap();
+        }
+        assert_eq!(receiver.try_recv(), Ok(CallEvent::RelayAllocated));
+        assert_eq!(
+            receiver.try_recv(),
+            Err(async_channel::TryRecvError::Closed)
+        );
+        assert!(handle.take_events().is_none());
+    }
+
+    #[test]
+    fn retained_receiver_does_not_retain_call_state() {
+        let (handle, _sender) = handle();
+        let slot = Arc::downgrade(&handle.events);
+        let ended = Arc::downgrade(&handle.ended);
+        let registry = Arc::downgrade(&handle.client_registry);
+        let video = Arc::downgrade(&handle.video);
+        let clone = handle.clone();
+        let receiver = handle.take_events().unwrap();
+        drop(handle);
+        drop(clone);
+        assert!(slot.upgrade().is_none());
+        assert!(ended.upgrade().is_none());
+        assert!(registry.upgrade().is_none());
+        assert!(video.upgrade().is_none());
+        drop(receiver);
     }
 }
 
@@ -6353,7 +6519,7 @@ mod tests {
             client: std::sync::Weak::new(),
             muted: Arc::new(AtomicBool::new(false)),
             video: Arc::new(VideoShared::new()),
-            events: ev_rx,
+            events: Arc::new(Mutex::new(Some(ev_rx))),
             ended: Arc::new(EndedFlag::default()),
             media: None,
         };
@@ -6858,7 +7024,8 @@ mod tests {
         );
 
         // Whatever the stream carries, none of it may claim the media setup failed.
-        while let Ok(event) = handle.events().try_recv() {
+        let events = handle.take_events().expect("first acquisition");
+        while let Ok(event) = events.try_recv() {
             assert!(
                 !matches!(event, CallEvent::MediaSetupFailed(_)),
                 "a hangup published a setup failure: {event:?}"
@@ -6916,7 +7083,8 @@ mod tests {
             "a dial that refuses must fail the attach, got {res:?}"
         );
 
-        let event = tokio::time::timeout(Duration::from_secs(2), handle.events().recv())
+        let events = handle.take_events().expect("first acquisition");
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
             .await
             .expect("the dial's reason must reach the handle, not only its caller")
             .expect("the event stream must carry it before it closes");
@@ -7248,7 +7416,7 @@ mod tests {
             client: Arc::downgrade(client),
             muted: Arc::new(AtomicBool::new(false)),
             video: Arc::new(VideoShared::new()),
-            events: ev_rx,
+            events: Arc::new(Mutex::new(Some(ev_rx))),
             ended: Arc::new(EndedFlag::default()),
             media: None,
         }
@@ -7275,7 +7443,7 @@ mod tests {
             client: std::sync::Weak::new(),
             muted: Arc::new(AtomicBool::new(false)),
             video: Arc::new(VideoShared::new()),
-            events: ev_rx,
+            events: Arc::new(Mutex::new(Some(ev_rx))),
             ended: Arc::new(EndedFlag::default()),
             media: client
                 .call_registry()
@@ -10577,7 +10745,8 @@ mod tests {
             "a refusing provider must surface as a Setup error, got {res:?}"
         );
 
-        let event = tokio::time::timeout(Duration::from_secs(2), handle.events().recv())
+        let events = handle.take_events().expect("first acquisition");
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
             .await
             .expect("the reason must reach the handle rather than only the log")
             .expect("the event stream must carry it before it closes");
@@ -11461,7 +11630,7 @@ mod tests {
             client: Arc::downgrade(&client),
             muted: Arc::new(AtomicBool::new(false)),
             video: video_shared.clone(),
-            events: ev_rx,
+            events: Arc::new(Mutex::new(Some(ev_rx))),
             ended: Arc::new(EndedFlag::default()),
             media: None,
         };
@@ -11542,7 +11711,7 @@ mod tests {
             client: Arc::downgrade(&client),
             muted: Arc::new(AtomicBool::new(false)),
             video: video.clone(),
-            events,
+            events: Arc::new(Mutex::new(Some(events))),
             ended: Arc::new(EndedFlag::default()),
             media: None,
         };
@@ -11633,7 +11802,7 @@ mod tests {
             client: Arc::downgrade(&client),
             muted: Arc::new(AtomicBool::new(false)),
             video: video.clone(),
-            events,
+            events: Arc::new(Mutex::new(Some(events))),
             ended: Arc::new(EndedFlag::default()),
             media: None,
         };
@@ -11767,7 +11936,7 @@ mod tests {
             client: Arc::downgrade(&client),
             muted: Arc::new(AtomicBool::new(false)),
             video: video.clone(),
-            events,
+            events: Arc::new(Mutex::new(Some(events))),
             ended: Arc::new(EndedFlag::default()),
             media: None,
         };
@@ -12005,7 +12174,7 @@ mod tests {
             client: Arc::downgrade(&client),
             muted: Arc::new(AtomicBool::new(false)),
             video: video.clone(),
-            events,
+            events: Arc::new(Mutex::new(Some(events))),
             ended: Arc::new(EndedFlag::default()),
             media: None,
         };
@@ -12797,7 +12966,8 @@ mod control_only_tests {
             generation,
             peer_video.clone()
         ));
-        assert_eq!(handle.events().try_recv(), Ok(peer_video));
+        let events = handle.take_events().expect("first acquisition");
+        assert_eq!(events.try_recv(), Ok(peer_video));
 
         // Counters the backend sets are what the handle reports.
         media.set_stats(
@@ -12818,10 +12988,7 @@ mod control_only_tests {
             Some(wacore::voip_control::MediaCloseReason::Local)
         );
         assert!(
-            matches!(
-                handle.events().try_recv(),
-                Err(async_channel::TryRecvError::Closed)
-            ),
+            matches!(events.try_recv(), Err(async_channel::TryRecvError::Closed)),
             "the closed stream ends the consumer instead of parking it"
         );
         assert!(

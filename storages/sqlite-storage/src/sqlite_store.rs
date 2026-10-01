@@ -469,6 +469,16 @@ pub(crate) struct ReadPool {
     pub(crate) semaphore: Arc<tokio::sync::Semaphore>,
 }
 
+/// Fixed-device storage handle implementing the open domain traits in `Backend`.
+/// Obtain siblings from [`crate::SqliteDatabase::store`] without opening new pools.
+/// Domain operations do not accept a second account id:
+///
+/// ```compile_fail
+/// use whatsapp_rust_sqlite_storage::SqliteStore;
+/// async fn cross_scope(store: &SqliteStore) {
+///     store.put_session_for_device("15550000001.1", b"state", 2).await.unwrap();
+/// }
+/// ```
 #[derive(Clone)]
 pub struct SqliteStore {
     pub(crate) pool: SqlitePool,
@@ -569,16 +579,16 @@ pub(crate) async fn await_barrier_hook(hook: &Option<CommitBarrierHook>) -> Resu
 #[cfg(not(target_family = "wasm"))]
 pub type CommitBarrierHook = Arc<dyn Fn() -> CommitBarrierFuture + Send + Sync + 'static>;
 
-/// Per-store connection tuning. [`Default`] is a low-memory profile sized for one
-/// `SqliteStore` per WhatsApp session on a single process: a single pooled connection
-/// (operations are serialized internally, so a second would only idle) sharing one
-/// process-wide r2d2 thread pool, with a 512 KiB page cache. Raise `pool_size` for real
-/// concurrent DB access — it drives both the pool and the internal serialization in
-/// lockstep — or `cache_size_kib` for a hotter/larger DB; pass a `thread_pool` to control
-/// r2d2's management threads (e.g. share your own across crates).
+/// Per-database connection tuning for [`crate::SqliteDatabase::open`].
+/// [`Default`] is a low-memory profile: one writer and, when native WAL/private
+/// cache permits it, one reader, sharing a process-wide r2d2 management thread
+/// pool, with a 512 KiB page-cache cap per connection. `pool_size` and the writer
+/// semaphore stay in lockstep; prefer `read_pool_size` for read concurrency.
+/// Set `cache_size_kib` for a hotter/larger DB, or `thread_pool` to control r2d2's
+/// management threads (e.g. share your own across crates).
 ///
-/// Sessions that share one database file can go further and share the connection
-/// itself: see [`SqliteStore::share_for_device`].
+/// Multiple sessions on one database share these resources via
+/// [`crate::SqliteDatabase::store`] or legacy [`SqliteStore::share_for_device`].
 ///
 /// **The other profile: one long-lived session, one large database.** A process
 /// that pairs once and stays connected for weeks — a bot — is the opposite
@@ -986,7 +996,7 @@ fn is_shared_cache(database_url: &str) -> bool {
 impl SqliteStore {
     /// Open a store with the default low-memory [`SqliteStoreConfig`].
     pub async fn new(database_url: &str) -> std::result::Result<Self, StoreError> {
-        Self::build(database_url, 1, SqliteStoreConfig::default()).await
+        Self::open(database_url, SqliteStoreConfig::default()).await
     }
 
     /// Open a store with a custom [`SqliteStoreConfig`] (the default favours low memory /
@@ -995,14 +1005,14 @@ impl SqliteStore {
         database_url: &str,
         config: SqliteStoreConfig,
     ) -> std::result::Result<Self, StoreError> {
-        Self::build(database_url, 1, config).await
+        Self::open(database_url, config).await
     }
 
     pub async fn new_for_device(
         database_url: &str,
         device_id: i32,
     ) -> std::result::Result<Self, StoreError> {
-        Self::build(database_url, device_id, SqliteStoreConfig::default()).await
+        Self::with_config_for_device(database_url, device_id, SqliteStoreConfig::default()).await
     }
 
     /// Open a store for a specific device with a custom [`SqliteStoreConfig`].
@@ -1011,10 +1021,39 @@ impl SqliteStore {
         device_id: i32,
         config: SqliteStoreConfig,
     ) -> std::result::Result<Self, StoreError> {
-        Self::build(database_url, device_id, config).await
+        Ok(crate::SqliteDatabase::open(database_url, config)
+            .await?
+            .store(device_id))
     }
 
-    async fn build(
+    /// Open one account (device id 1) without needing a database administration
+    /// handle. Like all opening paths, this does not create the device row;
+    /// the client's normal provisioning path calls `DeviceStore::create`.
+    pub async fn open(database_url: &str, config: SqliteStoreConfig) -> Result<Self> {
+        Self::with_config_for_device(database_url, 1, config).await
+    }
+
+    /// Administration and whole-pool reporting for this store's database.
+    /// No connections are opened; dropping either handle leaves the other usable.
+    pub fn database(&self) -> crate::SqliteDatabase {
+        crate::SqliteDatabase {
+            template: self.clone(),
+        }
+    }
+
+    /// Resources owned by the device scope, excluding shared pool resources.
+    /// There are no per-device caches in this adapter. This reports zero payload
+    /// memory, not the size of this small Rust handle or SQLite's shared cache.
+    /// Compose with `database().resource_report()` **once per database**.
+    /// The legacy `DeviceStore::resource_report` remains a whole-pool report.
+    pub fn scoped_resource_report(&self) -> wacore::stats::StorageResourceReport {
+        wacore::stats::StorageResourceReport {
+            memory_bytes: Some(0),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) async fn build(
         database_url: &str,
         device_id: i32,
         config: SqliteStoreConfig,
@@ -1192,6 +1231,7 @@ impl SqliteStore {
         })
     }
 
+    /// Fixed account scope used by all domain trait operations on this handle.
     pub fn device_id(&self) -> i32 {
         self.device_id
     }
@@ -1517,7 +1557,7 @@ impl SqliteStore {
         Ok(KeyPair::new(public_key, private_key))
     }
 
-    pub async fn save_device_data_for_device(
+    async fn save_device_data_for_device(
         &self,
         device_id: i32,
         device_data: &CoreDevice,
@@ -1752,6 +1792,7 @@ impl SqliteStore {
         .await
     }
 
+    /// Compatibility wrapper for [`crate::SqliteDatabase::list_devices`].
     /// Every account in this database file, newest allocation last.
     ///
     /// This is the read side of the multi-account shape: `device` is a table of
@@ -1774,6 +1815,10 @@ impl SqliteStore {
     /// # Ok(()) }
     /// ```
     pub async fn list_devices(&self) -> Result<Vec<StoredDeviceSummary>> {
+        self.database().list_devices().await
+    }
+
+    pub(crate) async fn list_devices_impl(&self) -> Result<Vec<StoredDeviceSummary>> {
         self.read_query(|conn| {
             #[derive(QueryableByName)]
             struct Row {
@@ -1813,6 +1858,8 @@ impl SqliteStore {
         .await
     }
 
+    /// Compatibility wrapper for [`crate::SqliteDatabase::create_device`],
+    /// retaining the historical `(id, store)` return shape.
     /// Create another account in this database and return a handle bound to it.
     ///
     /// The id is allocated by SQLite's `AUTOINCREMENT` inside the same
@@ -1835,6 +1882,11 @@ impl SqliteStore {
     /// # Ok(()) }
     /// ```
     pub async fn create_sibling_device(&self) -> Result<(i32, SqliteStore)> {
+        let store = self.database().create_device().await?;
+        Ok((store.device_id(), store))
+    }
+
+    pub(crate) async fn create_sibling_device_impl(&self) -> Result<(i32, SqliteStore)> {
         let row = Arc::new(FreshDeviceRow::new(None)?);
         let device_id = self
             .with_retry("create_sibling_device", move || {
@@ -1852,6 +1904,7 @@ impl SqliteStore {
         Ok((device_id, self.share_for_device(device_id)))
     }
 
+    /// Compatibility wrapper for [`crate::SqliteDatabase::reset_device`].
     /// Wipe an account's state and start it over under the same id.
     ///
     /// Everything account-scoped goes, and the `device` row is recreated with
@@ -1873,6 +1926,10 @@ impl SqliteStore {
     /// resetting. Enforcing it here would need a per-write liveness check on
     /// every Signal and device write, which this storage boundary does not own.
     pub async fn reset_device(&self, device_id: i32) -> Result<SqliteStore> {
+        self.database().reset_device(device_id).await
+    }
+
+    pub(crate) async fn reset_device_impl(&self, device_id: i32) -> Result<SqliteStore> {
         let row = Arc::new(FreshDeviceRow::new(Some(device_id))?);
         self.with_retry("reset_device", move || {
             let row = Arc::clone(&row);
@@ -1898,6 +1955,7 @@ impl SqliteStore {
         Ok(self.share_for_device(device_id))
     }
 
+    /// Compatibility wrapper for [`crate::SqliteDatabase::remove_device`].
     /// Delete an account's state and its `device` row, atomically.
     ///
     /// Like [`SqliteStore::reset_device`], but the row does not come back, so
@@ -1911,6 +1969,10 @@ impl SqliteStore {
     /// the purged tables, so the caller must stop that account's background work
     /// before removing it, the same way [`SqliteStore::reset_device`] requires.
     pub async fn remove_device(&self, device_id: i32) -> Result<()> {
+        self.database().remove_device(device_id).await
+    }
+
+    pub(crate) async fn remove_device_impl(&self, device_id: i32) -> Result<()> {
         self.with_retry("remove_device", move || {
             Box::new(move |conn: &mut SqliteConnection| {
                 conn.immediate_transaction(|conn| {
@@ -1929,7 +1991,12 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Compatibility accessor; prefer database administration or `DeviceStore::exists`.
     pub async fn device_exists(&self, device_id: i32) -> Result<bool> {
+        self.database().device_exists(device_id).await
+    }
+
+    pub(crate) async fn device_exists_impl(&self, device_id: i32) -> Result<bool> {
         use crate::schema::device;
 
         self.read_query(move |conn| {
@@ -1944,7 +2011,7 @@ impl SqliteStore {
         .await
     }
 
-    pub async fn load_device_data_for_device(&self, device_id: i32) -> Result<Option<CoreDevice>> {
+    async fn load_device_data_for_device(&self, device_id: i32) -> Result<Option<CoreDevice>> {
         use crate::schema::device;
 
         let row = self
@@ -2072,7 +2139,7 @@ impl SqliteStore {
         }
     }
 
-    pub async fn put_identity_for_device(
+    async fn put_identity_for_device(
         &self,
         address: &str,
         key: [u8; 32],
@@ -2096,7 +2163,7 @@ impl SqliteStore {
         .map(|_| ())
     }
 
-    pub async fn delete_identity_for_device(&self, address: &str, device_id: i32) -> Result<()> {
+    async fn delete_identity_for_device(&self, address: &str, device_id: i32) -> Result<()> {
         let address_owned = address.to_string();
         self.write_blocking(move |conn| {
             diesel::delete(
@@ -2111,7 +2178,7 @@ impl SqliteStore {
         .await
     }
 
-    pub async fn load_identity_for_device(
+    async fn load_identity_for_device(
         &self,
         address: &str,
         device_id: i32,
@@ -2130,7 +2197,7 @@ impl SqliteStore {
         .await
     }
 
-    pub async fn get_session_for_device(
+    async fn get_session_for_device(
         &self,
         address: &str,
         device_id: i32,
@@ -2150,7 +2217,7 @@ impl SqliteStore {
         .await
     }
 
-    pub async fn put_session_for_device(
+    async fn put_session_for_device(
         &self,
         address: &str,
         session: &[u8],
@@ -2177,7 +2244,7 @@ impl SqliteStore {
         .map(|_| ())
     }
 
-    pub async fn delete_session_for_device(&self, address: &str, device_id: i32) -> Result<()> {
+    async fn delete_session_for_device(&self, address: &str, device_id: i32) -> Result<()> {
         let address_owned = address.to_string();
         self.write_blocking(move |conn| {
             diesel::delete(
@@ -2192,7 +2259,7 @@ impl SqliteStore {
         .await
     }
 
-    pub async fn put_sender_key_for_device(
+    async fn put_sender_key_for_device(
         &self,
         address: &str,
         record: &[u8],
@@ -2213,7 +2280,7 @@ impl SqliteStore {
         .await
     }
 
-    pub async fn get_sender_key_for_device(
+    async fn get_sender_key_for_device(
         &self,
         address: &str,
         device_id: i32,
@@ -2232,7 +2299,7 @@ impl SqliteStore {
         .await
     }
 
-    pub async fn delete_sender_key_for_device(&self, address: &str, device_id: i32) -> Result<()> {
+    async fn delete_sender_key_for_device(&self, address: &str, device_id: i32) -> Result<()> {
         let address = address.to_string();
         self.write_blocking(move |conn| {
             diesel::delete(
@@ -2247,7 +2314,7 @@ impl SqliteStore {
         .await
     }
 
-    pub async fn get_app_state_sync_key_for_device(
+    async fn get_app_state_sync_key_for_device(
         &self,
         key_id: &[u8],
         device_id: i32,
@@ -2293,7 +2360,7 @@ impl SqliteStore {
         }
     }
 
-    pub async fn set_app_state_sync_key_for_device(
+    async fn set_app_state_sync_key_for_device(
         &self,
         key_id: &[u8],
         key: AppStateSyncKey,
@@ -2318,7 +2385,7 @@ impl SqliteStore {
         .await
     }
 
-    pub async fn get_latest_app_state_sync_key_id_for_device(
+    async fn get_latest_app_state_sync_key_id_for_device(
         &self,
         device_id: i32,
     ) -> Result<Option<Vec<u8>>> {
@@ -2352,7 +2419,7 @@ impl SqliteStore {
         Ok(res)
     }
 
-    pub async fn get_app_state_version_for_device(
+    async fn get_app_state_version_for_device(
         &self,
         name: &str,
         device_id: i32,
@@ -2392,11 +2459,7 @@ impl SqliteStore {
         }
     }
 
-    pub async fn delete_app_state_version_for_device(
-        &self,
-        name: &str,
-        device_id: i32,
-    ) -> Result<()> {
+    async fn delete_app_state_version_for_device(&self, name: &str, device_id: i32) -> Result<()> {
         let name = name.to_string();
         self.with_retry("delete_app_state_version", || {
             let name = name.clone();
@@ -2413,7 +2476,7 @@ impl SqliteStore {
         .await
     }
 
-    pub async fn set_app_state_version_for_device(
+    async fn set_app_state_version_for_device(
         &self,
         name: &str,
         state: HashState,
@@ -2433,7 +2496,7 @@ impl SqliteStore {
         .await
     }
 
-    pub async fn put_app_state_mutation_macs_for_device(
+    async fn put_app_state_mutation_macs_for_device(
         &self,
         name: &str,
         version: u64,
@@ -2462,7 +2525,7 @@ impl SqliteStore {
         .await
     }
 
-    pub async fn delete_app_state_mutation_macs_for_device(
+    async fn delete_app_state_mutation_macs_for_device(
         &self,
         name: &str,
         index_macs: &[Vec<u8>],
@@ -2493,7 +2556,7 @@ impl SqliteStore {
     /// the 270 us a patch took to persist. Committing them together is also
     /// strictly stronger than either order the sync loop used: the version
     /// can no longer land without the MACs it pairs with.
-    pub async fn commit_app_state_patch_for_device(
+    async fn commit_app_state_patch_for_device(
         &self,
         name: &str,
         state: &HashState,
@@ -2522,7 +2585,7 @@ impl SqliteStore {
         .await
     }
 
-    pub async fn get_app_state_mutation_mac_for_device(
+    async fn get_app_state_mutation_mac_for_device(
         &self,
         name: &str,
         index_mac: &[u8],
@@ -2547,7 +2610,7 @@ impl SqliteStore {
     /// Batched read of previous-MAC values for many index_macs in one query
     /// (single spawn_blocking + `index_mac IN (...)`), replacing the per-mutation
     /// N+1 in appstate sync.
-    pub async fn get_app_state_mutation_macs_batch_for_device(
+    async fn get_app_state_mutation_macs_batch_for_device(
         &self,
         name: &str,
         index_macs: &[[u8; 32]],
@@ -4728,8 +4791,9 @@ impl DeviceStore for SqliteStore {
         .await
     }
 
-    /// Per-session storage memory, the largest per-session chunk in the
-    /// profiling that motivated this (the default 512 KiB page cache).
+    /// Compatibility whole-pool report, **not** additive per-device memory.
+    /// For multi-account accounting use `SqliteDatabase::resource_report` once
+    /// plus `SqliteStore::scoped_resource_report` for each device scope.
     ///
     /// SQLite's exact cache-in-use (`sqlite3_db_status(SQLITE_DBSTATUS_CACHE_USED)`)
     /// needs the raw `sqlite3*` handle, which Diesel does not expose through a

@@ -1,0 +1,16 @@
+# Standalone host fixture: deliberately outside the workspace and its dependency aliases.
+[package]
+name = "client-options-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+rust-version = "1.94"
+
+[workspace]
+
+[dependencies]
+whatsapp-rust = { path = "../..", default-features = false, features = ["tokio-runtime"] }
+anyhow = "1.0"
+async-channel = "2.5.0"
+async-trait = "0.1.91"
+tokio = { version = "1.53.1", features = ["macros", "rt"] }
