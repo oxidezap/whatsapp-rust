@@ -2,44 +2,63 @@ use std::str::FromStr;
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
-/// Single source of truth for the message types that carry a `context_info`
-/// field. Consumed by `for_each_context_info_message!`, `set_context_info`
-/// (via an inlined `try_attach!`), `get_ephemeral_expiration`, and
-/// `set_ephemeral_expiration`. Add new WA message types with context_info here.
+/// Direct `Message` fields whose payload declares `ContextInfo` in the schema.
+/// The order preserves the helpers' first-carrier precedence; new carriers are
+/// appended. All 42 direct carriers are included, even non-renderable bodies:
+/// these helpers expose schema fields, not a promise that a body can be sent.
+/// `MessageContextInfo`, wrapper contents, and contexts nested inside payloads
+/// are distinct and are not direct carriers. Wire metadata lets history sync
+/// share this list without changing its any-forwarded-carrier policy.
 macro_rules! with_context_info_fields {
     ($callback:ident!($($prefix:tt)*)) => {
-        $callback!($($prefix)*
-            extended_text_message,
-            image_message,
-            video_message,
-            ptv_message,
-            audio_message,
-            document_message,
-            sticker_message,
-            location_message,
-            live_location_message,
-            contact_message,
-            contacts_array_message,
-            buttons_message,
-            buttons_response_message,
-            list_message,
-            list_response_message,
-            template_message,
-            template_button_reply_message,
-            interactive_message,
-            interactive_response_message,
-            poll_creation_message,
-            poll_creation_message_v2,
-            poll_creation_message_v3,
-            product_message,
-            order_message,
-            group_invite_message,
-            event_message,
-            sticker_pack_message,
-            newsletter_admin_invite_message,
-        )
+        $callback! { $($prefix)*
+            extended_text_message => EXTENDED_TEXT_MESSAGE / message::extended_text_message,
+            image_message => IMAGE_MESSAGE / message::image_message,
+            video_message => VIDEO_MESSAGE / message::video_message,
+            ptv_message => PTV_MESSAGE / message::video_message,
+            audio_message => AUDIO_MESSAGE / message::audio_message,
+            document_message => DOCUMENT_MESSAGE / message::document_message,
+            sticker_message => STICKER_MESSAGE / message::sticker_message,
+            location_message => LOCATION_MESSAGE / message::location_message,
+            live_location_message => LIVE_LOCATION_MESSAGE / message::live_location_message,
+            contact_message => CONTACT_MESSAGE / message::contact_message,
+            contacts_array_message => CONTACTS_ARRAY_MESSAGE / message::contacts_array_message,
+            buttons_message => BUTTONS_MESSAGE / message::buttons_message,
+            buttons_response_message => BUTTONS_RESPONSE_MESSAGE / message::buttons_response_message,
+            list_message => LIST_MESSAGE / message::list_message,
+            list_response_message => LIST_RESPONSE_MESSAGE / message::list_response_message,
+            template_message => TEMPLATE_MESSAGE / message::template_message,
+            template_button_reply_message => TEMPLATE_BUTTON_REPLY_MESSAGE / message::template_button_reply_message,
+            interactive_message => INTERACTIVE_MESSAGE / message::interactive_message,
+            interactive_response_message => INTERACTIVE_RESPONSE_MESSAGE / message::interactive_response_message,
+            poll_creation_message => POLL_CREATION_MESSAGE / message::poll_creation_message,
+            poll_creation_message_v2 => POLL_CREATION_MESSAGE_V2 / message::poll_creation_message,
+            poll_creation_message_v3 => POLL_CREATION_MESSAGE_V3 / message::poll_creation_message,
+            product_message => PRODUCT_MESSAGE / message::product_message,
+            order_message => ORDER_MESSAGE / message::order_message,
+            group_invite_message => GROUP_INVITE_MESSAGE / message::group_invite_message,
+            event_message => EVENT_MESSAGE / message::event_message,
+            sticker_pack_message => STICKER_PACK_MESSAGE / message::sticker_pack_message,
+            newsletter_admin_invite_message => NEWSLETTER_ADMIN_INVITE_MESSAGE / message::newsletter_admin_invite_message,
+            poll_creation_message_v5 => POLL_CREATION_MESSAGE_V5 / message::poll_creation_message,
+            poll_creation_message_v6 => POLL_CREATION_MESSAGE_V6 / message::poll_creation_message,
+            call => CALL / message::call,
+            request_phone_number_message => REQUEST_PHONE_NUMBER_MESSAGE / message::request_phone_number_message,
+            message_history_bundle => MESSAGE_HISTORY_BUNDLE / message::message_history_bundle,
+            album_message => ALBUM_MESSAGE / message::album_message,
+            poll_result_snapshot_message => POLL_RESULT_SNAPSHOT_MESSAGE / message::poll_result_snapshot_message,
+            rich_response_message => RICH_RESPONSE_MESSAGE / ai_rich_response_message,
+            message_history_notice => MESSAGE_HISTORY_NOTICE / message::message_history_notice,
+            newsletter_follower_invite_message_v2 => NEWSLETTER_FOLLOWER_INVITE_MESSAGE_V2 / message::newsletter_follower_invite_message,
+            poll_result_snapshot_message_v3 => POLL_RESULT_SNAPSHOT_MESSAGE_V3 / message::poll_result_snapshot_message,
+            event_invite_message => EVENT_INVITE_MESSAGE / message::event_invite_message,
+            split_payment_message => SPLIT_PAYMENT_MESSAGE / message::split_payment_message,
+            music_message => MUSIC_MESSAGE / message::music_message,
+        }
     };
 }
+
+pub(crate) use with_context_info_fields;
 
 /// Applies an operation to all message types that have a `context_info` field.
 ///
@@ -56,7 +75,7 @@ macro_rules! for_each_context_info_message {
 }
 
 macro_rules! for_each_context_info_impl {
-    ($msg:expr, $ctx:ident, $body:block, $($field:ident),+ $(,)?) => {
+    ($msg:expr, $ctx:ident, $body:block, $($field:ident => $tag:ident / $($module:ident)::+),+ $(,)?) => {
         $(
             if let Some(m) = $msg.$field.as_option_mut()
                 && let Some($ctx) = m.context_info.as_option_mut()
@@ -67,15 +86,15 @@ macro_rules! for_each_context_info_impl {
     };
 }
 
-/// Returns `Some(ctx)` for the first message variant carrying a `ContextInfo`,
-/// short-circuiting on match (`break 'find`). Read-only variant of
+/// Returns `Some(ctx)` for the first message variant with a present `ContextInfo`.
+/// Read-only variant of
 /// [`for_each_context_info_message!`].
 macro_rules! find_context_info_ref {
     ($msg:expr) => {{ with_context_info_fields!(find_context_info_impl!($msg,)) }};
 }
 
 macro_rules! find_context_info_impl {
-    ($msg:expr, $($field:ident),+ $(,)?) => {{
+    ($msg:expr, $($field:ident => $tag:ident / $($module:ident)::+),+ $(,)?) => {{
         let mut found: Option<&wa::ContextInfo> = None;
         $(
             if found.is_none()
@@ -201,7 +220,34 @@ pub trait MessageExt {
     /// ```
     fn set_context_info(&mut self, context: wa::ContextInfo) -> bool;
 
-    /// Reads `context_info.expiration` from the first message type that has it.
+    /// Borrows the first present [`wa::ContextInfo`] on
+    /// [`get_base_message`](Self::get_base_message), without cloning or allocating.
+    ///
+    /// Uses the same wrapper order and carrier precedence as
+    /// [`is_forwarded`](Self::is_forwarded). A carrier without context is skipped;
+    /// an empty but present context is returned. `MessageContextInfo` is a
+    /// separate top-level metadata type and is not returned by this accessor.
+    ///
+    /// Provided by default so existing implementations need no new method.
+    ///
+    /// ```
+    /// use wacore::proto_helpers::{MessageBuilderExt, MessageExt};
+    /// use waproto::whatsapp as wa;
+    ///
+    /// let message = wa::Message::text_with_context("reply", wa::ContextInfo {
+    ///     stanza_id: Some("original-message".into()),
+    ///     ..Default::default()
+    /// });
+    /// assert_eq!(message.context_info().unwrap().stanza_id.as_deref(), Some("original-message"));
+    /// ```
+    fn context_info(&self) -> Option<&wa::ContextInfo> {
+        let base = self.get_base_message();
+        find_context_info_ref!(base)
+    }
+
+    /// Reads the first positive `context_info.expiration` on this message.
+    /// Unlike [`context_info`](Self::context_info), does not unwrap the message
+    /// and skips contexts whose expiration is missing or zero.
     fn get_ephemeral_expiration(&self) -> Option<u32>;
 
     /// Sets `context_info.expiration` on the first message type found, creating
@@ -217,7 +263,7 @@ pub trait MessageExt {
     /// `messageSecret` for forwarded payloads).
     fn is_forwarded(&self) -> bool;
 
-    /// `true` if `context_info.mentioned_jid` on any base message contains
+    /// `true` if the first present base-message context's `mentioned_jid` contains
     /// a JID whose user-form ends with `@bot`. Mirrors WA Web's
     /// `mentionedJidList.find(jid.isBot())` lookup used to derive
     /// `invokedBotWid` when `messageSecret` is present.
@@ -386,7 +432,7 @@ impl MessageExt for wa::Message {
         msg.message_context_info = buffa::MessageField::none();
 
         macro_rules! set_forward {
-            ($($field:ident),+ $(,)?) => {
+            ($($field:ident => $tag:ident / $($module:ident)::+),+ $(,)?) => {
                 $(
                     if let Some(m) = msg.$field.as_option_mut() {
                         let ctx = m.context_info.get_or_insert_default();
@@ -426,7 +472,7 @@ impl MessageExt for wa::Message {
 
     fn set_context_info(&mut self, context: wa::ContextInfo) -> bool {
         macro_rules! try_attach {
-            ($($field:ident),+ $(,)?) => {
+            ($($field:ident => $tag:ident / $($module:ident)::+),+ $(,)?) => {
                 $(
                     if let Some(m) = self.$field.as_option_mut() {
                         m.context_info = buffa::MessageField::some(context);
@@ -453,7 +499,7 @@ impl MessageExt for wa::Message {
 
     fn get_ephemeral_expiration(&self) -> Option<u32> {
         macro_rules! check {
-            ($($field:ident),+ $(,)?) => {
+            ($($field:ident => $tag:ident / $($module:ident)::+),+ $(,)?) => {
                 $(
                     if let Some(m) = self.$field.as_option()
                         && let Some(ctx) = m.context_info.as_option()
@@ -474,7 +520,7 @@ impl MessageExt for wa::Message {
             return false;
         }
         macro_rules! try_set {
-            ($($field:ident),+ $(,)?) => {
+            ($($field:ident => $tag:ident / $($module:ident)::+),+ $(,)?) => {
                 $(
                     if let Some(m) = self.$field.as_option_mut() {
                         let ctx = m.context_info.get_or_insert_default();
@@ -505,15 +551,13 @@ impl MessageExt for wa::Message {
     }
 
     fn is_forwarded(&self) -> bool {
-        let base = self.get_base_message();
-        find_context_info_ref!(base)
+        self.context_info()
             .and_then(|ctx| ctx.is_forwarded)
             .unwrap_or(false)
     }
 
     fn mentions_any_bot(&self) -> bool {
-        let base = self.get_base_message();
-        let Some(ctx) = find_context_info_ref!(base) else {
+        let Some(ctx) = self.context_info() else {
             return false;
         };
         // Use the canonical `Jid::is_bot()` contract — it covers both the

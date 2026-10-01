@@ -135,12 +135,11 @@ impl From<GroupError> for SendError {
             GroupError::Iq(iq) => SendError::Iq(iq),
             GroupError::InvalidRequest(msg) => SendError::InvalidRequest(msg),
             GroupError::Internal(e) => SendError::from_anyhow(e),
-            // No dedicated variant for MEX mutations or description conflicts;
-            // preserve the full typed error as the `Internal` source so its
-            // Display/source chain survives.
-            group @ (GroupError::Mex(_) | GroupError::DescriptionConflict) => {
-                SendError::Internal(group.into())
-            }
+            // Preserve domain errors without a dedicated send variant as typed
+            // sources rather than flattening their Display text.
+            group @ (GroupError::Mex(_)
+            | GroupError::DescriptionConflict
+            | GroupError::EmptyPicture) => SendError::Internal(group.into()),
         }
     }
 }
