@@ -211,6 +211,13 @@ pub(crate) struct PlaintextHandleOutcome {
     skdm_only: bool,
 }
 
+#[cfg(feature = "bench-harness")]
+impl PlaintextHandleOutcome {
+    pub(crate) fn flags(self) -> (bool, bool) {
+        (self.dispatched, self.skdm_only)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MessageDispatch {
     Decrypted,
@@ -299,11 +306,12 @@ pub(crate) struct PublicationGuard {
 }
 
 /// Duplicate-probe answer with the plaintext already resolved: dispatch must
-/// reuse it instead of resolving the parent secret a second time. Boxed: the
-/// mismatch path is rare and `wa::Message` is close to a kilobyte.
+/// reuse it instead of resolving the parent secret a second time. Carry the
+/// final event handle so the near-kilobyte message never moves through the
+/// receive/dispatch futures again.
 pub(crate) enum ProbeOutcome {
     Suppress,
-    Proceed { decrypted: Option<Box<wa::Message>> },
+    Proceed { decrypted: Option<Arc<wa::Message>> },
 }
 
 impl PublicationGuard {

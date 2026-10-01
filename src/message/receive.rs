@@ -1832,6 +1832,7 @@ impl Client {
         // is nested inside device_sent_message.message and must be
         // extracted before protocol checks or dispatch.
         let mut msg = wacore::messages::unwrap_device_sent(original_msg);
+        let skdm_only = wacore::messages::is_sender_key_distribution_only(&mut msg);
 
         if info.source.chat.is_group()
             && let Some(protocol) = msg.protocol_message.as_option()
@@ -1961,7 +1962,7 @@ impl Client {
         // (protocol-level key exchange) with no user-visible content.
         // These arrive as a separate pkmsg enc node alongside the actual
         // group message (skmsg) and would otherwise surface as "unknown".
-        if wacore::messages::is_sender_key_distribution_only(&mut msg) {
+        if skdm_only {
             log::debug!(
                 "[msg:{}] Skipping event dispatch for sender key distribution message",
                 info.id
@@ -2015,11 +2016,14 @@ impl Client {
                         ..Default::default()
                     });
                 }
-                ProbeOutcome::Proceed { decrypted } => decrypted.map(|boxed| *boxed),
+                ProbeOutcome::Proceed { decrypted } => decrypted,
             };
+            // Only messages entering dispatch need an outer message Arc. Avoid
+            // that allocation for SKDM carriers and suppressed resends; dispatch
+            // still carries the event's final handle rather than a Message.
             let commit_state = self
-                .dispatch_parsed_message_with_decrypted(
-                    msg,
+                .dispatch_shared_message_with_decrypted(
+                    Arc::new(msg),
                     info,
                     app_state_key_share_job.is_some(),
                     pre_decrypted,

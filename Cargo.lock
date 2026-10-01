@@ -5671,6 +5671,7 @@ dependencies = [
  "cbc",
  "chrono",
  "codspeed-divan-compat",
+ "dhat",
  "diesel",
  "env_logger",
  "event-listener",

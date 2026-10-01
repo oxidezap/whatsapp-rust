@@ -512,6 +512,14 @@ mod tests {
         );
         let dispatch_size = size_of_val(&dispatch_fut);
         drop(dispatch_fut);
+        let shared_dispatch_fut = client.dispatch_shared_message_with_decrypted(
+            Arc::new(waproto::whatsapp::Message::default()),
+            &dummy_info,
+            false,
+            None,
+        );
+        let shared_dispatch_size = size_of_val(&shared_dispatch_fut);
+        drop(shared_dispatch_fut);
 
         // 10. harness receive async block future
         let harness_fut = async {
@@ -537,6 +545,7 @@ mod tests {
         println!("process_session_enc_batch future: {session_batch_size} bytes");
         println!("handle_decrypted_plaintext future: {handle_plaintext_size} bytes");
         println!("dispatch_parsed_message future: {dispatch_size} bytes");
+        println!("dispatch_shared_message_with_decrypted future: {shared_dispatch_size} bytes");
 
         println!(
             "waproto::whatsapp::Message: {} bytes",
@@ -570,6 +579,18 @@ mod tests {
         println!(
             "InboundCommitState: {} bytes",
             size_of::<crate::message::InboundCommitState>()
+        );
+        let pdo = waproto::whatsapp::message::PeerDataOperationRequestResponseMessage::default();
+        println!(
+            "handle_pdo_response future: {} bytes",
+            size_of_val(&client.handle_pdo_response(&pdo, &dummy_info))
+        );
+        println!(
+            "probe_message_dispatch future: {} bytes",
+            size_of_val(
+                &client
+                    .probe_message_dispatch(&dummy_info, &waproto::whatsapp::Message::default(),)
+            )
         );
         println!("=== END SIZEOF REPORT ===");
     }

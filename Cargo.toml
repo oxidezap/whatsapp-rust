@@ -341,6 +341,7 @@ cbc = { workspace = true, features = ["block-padding"] }
 # through `whatsapp-rust-sqlite-storage` in production.
 diesel = { workspace = true }
 divan = { workspace = true }
+dhat = "0.3"
 env_logger = { workspace = true }
 # URL parser for the benchmark example's mock admin endpoint derivation.
 # Dev-only so production builds carry no new dependency; already in the tree
@@ -390,6 +391,13 @@ required-features = ["tracing"]
 [[example]]
 name = "metrics"
 required-features = ["metrics"]
+
+# Manual retained-heap diagnostic, kept out of CodSpeed's benchmark discovery.
+# Build with --profile bench to match the client_receive compiler settings.
+[[example]]
+name = "receive_footprint"
+test = false
+required-features = ["bench-harness"]
 
 # Client-level group-send sweep. `required-features` keeps the fixture out of
 # an ordinary `cargo bench`/`cargo build --all-targets`, which would otherwise
