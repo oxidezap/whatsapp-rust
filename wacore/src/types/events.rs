@@ -204,6 +204,28 @@ impl Serialize for LazyHistorySync {
     }
 }
 
+// One declaration owns the enum and its authoritative public enumeration.
+macro_rules! event_kinds {
+    ($(#[$enum_attr:meta])* pub enum $name:ident {
+        $($(#[$variant_attr:meta])* $variant:ident,)*
+    }) => {
+        $(#[$enum_attr])*
+        pub enum $name {
+            $($(#[$variant_attr])* $variant,)*
+        }
+
+        impl $name {
+            /// All declared kinds in discriminant order, including retired slots.
+            ///
+            /// Hosts can walk this list to test their handling or registration
+            /// coverage when upgrading. New kinds are appended; matches still
+            /// require a wildcard because this enum is non-exhaustive.
+            pub const ALL: &'static [Self] = &[$(Self::$variant,)*];
+        }
+    };
+}
+
+event_kinds! {
 /// Discriminant for each [`Event`] variant, used to express handler interest
 /// without materializing the event. One per `Event` variant; the value doubles
 /// as a bit index in [`EventInterest`], so there can be at most 128 kinds.
@@ -297,9 +319,8 @@ pub enum EventKind {
     FavoritesUpdate,
     StatusPrivacyUpdate,
     ReachoutTimelockUpdate,
-    // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
-    // each discriminant as a bit in a u128) and keep the guard pointing at the
-    // last variant.
+    // Append new kinds here. The list and capacity guard are generated/derived.
+}
 }
 
 impl EventKind {
@@ -310,7 +331,19 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::ReachoutTimelockUpdate as u8) < EventKind::CAPACITY);
+const _: () = {
+    let kinds = EventKind::ALL;
+    assert!(!kinds.is_empty());
+    assert!(kinds.len() <= EventKind::CAPACITY as usize);
+    let last = kinds[kinds.len() - 1] as usize;
+    assert!(last < EventKind::CAPACITY as usize);
+    assert!(last == kinds.len() - 1);
+    let mut i = 0;
+    while i < kinds.len() {
+        assert!(kinds[i] as usize == i);
+        i += 1;
+    }
+};
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -2957,6 +2990,20 @@ mod tests {
         assert_eq!(EventKind::FavoritesUpdate as u8, 74);
         assert_eq!(EventKind::StatusPrivacyUpdate as u8, 75);
         assert_eq!(EventKind::ReachoutTimelockUpdate as u8, 76);
+    }
+
+    #[test]
+    fn event_kind_list_is_discriminant_ordered() {
+        assert_eq!(EventKind::ALL.len(), 77);
+        assert!(EventKind::ALL.len() <= EventKind::CAPACITY as usize);
+        for (i, &kind) in EventKind::ALL.iter().enumerate() {
+            assert_eq!(kind as u8 as usize, i);
+            assert!(EventInterest::ALL.wants(kind));
+            assert!(EventInterest::of(&[kind]).wants(kind));
+        }
+        // ALL deliberately includes unknown/future bits, not just known kinds.
+        assert_eq!(EventInterest::ALL.0, u128::MAX);
+        assert_ne!(EventInterest::of(EventKind::ALL), EventInterest::ALL);
     }
 
     /// Every rejection a consumer can be handed must survive being persisted
