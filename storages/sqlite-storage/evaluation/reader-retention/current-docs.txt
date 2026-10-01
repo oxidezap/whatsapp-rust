@@ -1,0 +1,20 @@
+    Finished `release` profile [optimized] target(s) in 0.33s
+   Doc-tests whatsapp_rust_sqlite_storage
+
+running 6 tests
+test storages/sqlite-storage/src/database.rs - database::SqliteDatabase (line 22) - compile ... ok
+test storages/sqlite-storage/src/sqlite_store.rs - sqlite_store::SqliteStore::create_sibling_device (line 1903) - compile ... ok
+test storages/sqlite-storage/src/sqlite_store.rs - sqlite_store::SqliteStore::list_devices (line 1835) - compile ... ok
+test storages/sqlite-storage/src/sqlite_store.rs - sqlite_store::SqliteStore::share_for_device (line 1317) - compile ... ok
+test storages/sqlite-storage/src/sqlite_store.rs - sqlite_store::SqliteStoreConfig (line 604) ... ok
+test storages/sqlite-storage/src/sqlite_store.rs - sqlite_store::SqliteStoreConfig::with_connection_init (line 754) - compile ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test storages/sqlite-storage/src/sqlite_store.rs - sqlite_store::SqliteStore (line 476) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+all doctests ran in 1.25s; merged doctests compilation took 1.14s

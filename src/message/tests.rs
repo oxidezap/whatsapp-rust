@@ -10015,6 +10015,124 @@ where
     None
 }
 
+#[tokio::test]
+async fn plaintext_ownership_boundary_preserves_carrier_and_resend_dispatch() {
+    use wacore::messages::MessageUtils;
+
+    let client = crate::test_utils::create_test_client().await;
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    let _subscription = client.subscribe_handler(collector.clone());
+    let info = Arc::new(MessageInfo {
+        id: "DELAYED_PLAINTEXT".into(),
+        source: wacore::types::message::MessageSource {
+            chat: "15550000101@s.whatsapp.net".parse().unwrap(),
+            sender: "15550000101@s.whatsapp.net".parse().unwrap(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let mut message = wa::Message::default();
+    message
+        .sender_key_distribution_message
+        .get_or_insert_default();
+    let carrier = client
+        .handle_decrypted_plaintext(
+            "msg",
+            MessageUtils::encode_and_pad(&message),
+            2,
+            0,
+            Default::default(),
+            &info,
+        )
+        .await
+        .unwrap();
+    assert!(carrier.skdm_only);
+    assert!(!carrier.dispatched);
+    assert!(
+        collector
+            .events()
+            .iter()
+            .all(|event| !matches!(event.as_ref(), Event::Messages(_)))
+    );
+    assert!(!client.message_already_dispatched(&info).await);
+
+    // The same carrier with visible content must publish once, and its resend
+    // must still take the duplicate path rather than the SKDM-only exit.
+    message.conversation = Some("visible carrier".into());
+    for _ in 0..2 {
+        let outcome = client
+            .handle_decrypted_plaintext(
+                "msg",
+                MessageUtils::encode_and_pad(&message),
+                2,
+                0,
+                Default::default(),
+                &info,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.dispatched);
+        assert!(!outcome.skdm_only);
+    }
+    let events = collector.events();
+    let messages: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event.as_ref() {
+            Event::Messages(batch) => Some(batch.messages.iter()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].message.conversation.as_deref(),
+        Some("visible carrier")
+    );
+    assert!(messages[0].message.sender_key_distribution_message.is_set());
+    assert!(Arc::ptr_eq(&info, &messages[0].info));
+    assert_eq!(client.stats().messages_suppressed_duplicate, 1);
+}
+
+#[tokio::test]
+async fn shared_plaintext_dispatch_keeps_the_event_message_allocation() {
+    let client = crate::test_utils::create_test_client().await;
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    let _subscription = client.subscribe_handler(collector.clone());
+    let info = Arc::new(MessageInfo {
+        id: "SHARED_PLAINTEXT".into(),
+        source: wacore::types::message::MessageSource {
+            chat: "15550000101@s.whatsapp.net".parse().unwrap(),
+            sender: "15550000101@s.whatsapp.net".parse().unwrap(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let message = Arc::new(wa::Message {
+        conversation: Some("shared plaintext".into()),
+        ..Default::default()
+    });
+    assert!(matches!(
+        client
+            .dispatch_shared_message_with_decrypted(Arc::clone(&message), &info, false, None)
+            .await,
+        InboundCommitState::Durable
+    ));
+    let event = collect_event(
+        &client,
+        collector,
+        |event| matches!(event, Event::Messages(_)),
+        1000,
+    )
+    .await
+    .expect("plaintext event");
+    let Event::Messages(batch) = event.as_ref() else {
+        panic!("expected Messages");
+    };
+    assert_eq!(batch.messages.len(), 1);
+    assert!(Arc::ptr_eq(&message, &batch.messages[0].message));
+    assert!(Arc::ptr_eq(&info, &batch.messages[0].info));
+}
+
 fn legacy_edit_text(msg: &wa::Message) -> Option<&str> {
     msg.protocol_message
         .as_option()

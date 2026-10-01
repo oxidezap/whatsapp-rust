@@ -19,7 +19,9 @@
 //!   and framed; the transport drops the frame.
 
 use divan::black_box;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+use wacore::types::message::{MessageInfo, MessageSource};
+use waproto::whatsapp as wa;
 use whatsapp_rust::bench_support::ReceiveHarness;
 
 fn main() {
@@ -120,6 +122,93 @@ fn group_receive_burst(bencher: divan::Bencher) {
     assert!(round_delivered > 0);
 }
 
+const PLAINTEXT_CASES: &[&str] = &["text", "skdm_only", "suppressed", "malformed_secret"];
+
+/// Isolate decode/dispatch ownership costs from Signal. No DHAT allocator is
+/// installed here. Empty secret/SKDM carriers exercise allocation branches, not
+/// successful secret decryption or sender-key installation.
+#[divan::bench(args = PLAINTEXT_CASES, sample_count = SAMPLE_COUNT, sample_size = 1)]
+fn plaintext_ownership_controls(bencher: divan::Bencher, case: &str) {
+    let harness = ReceiveHarness::new();
+    let make_info = |id: String| {
+        Arc::new(MessageInfo {
+            id: id.into(),
+            source: MessageSource {
+                chat: "15550000101@s.whatsapp.net"
+                    .parse()
+                    .expect("synthetic chat"),
+                sender: "15550000101@s.whatsapp.net"
+                    .parse()
+                    .expect("synthetic sender"),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    };
+    let seed = make_info("PLAINTEXT_SEED".into());
+    let mut message = wa::Message {
+        conversation: Some("control".into()),
+        ..Default::default()
+    };
+    harness.plaintext_burst(vec![(
+        wacore::messages::MessageUtils::encode_and_pad(&message),
+        Arc::clone(&seed),
+    )]);
+    match case {
+        "text" | "suppressed" => {}
+        "skdm_only" => {
+            message.conversation = None;
+            message
+                .sender_key_distribution_message
+                .get_or_insert_default();
+        }
+        "malformed_secret" => {
+            message.conversation = None;
+            message.secret_encrypted_message.get_or_insert_default();
+        }
+        _ => unreachable!("fixed benchmark cases"),
+    }
+    let before = harness.messages_delivered();
+    let mut next_id = 0u64;
+    let mut received = 0u64;
+    bencher
+        .counter(divan::counter::ItemsCount::new(BURST_SIZE as u64))
+        .with_inputs(|| {
+            (0..BURST_SIZE)
+                .map(|_| {
+                    next_id += 1;
+                    let info = if case == "suppressed" {
+                        Arc::clone(&seed)
+                    } else {
+                        make_info(format!("PLAINTEXT-{next_id}"))
+                    };
+                    (
+                        wacore::messages::MessageUtils::encode_and_pad(&message),
+                        info,
+                    )
+                })
+                .collect()
+        })
+        .bench_local_values(|payloads| {
+            let outcomes = harness.plaintext_burst(black_box(payloads));
+            assert_eq!(
+                outcomes,
+                if case == "skdm_only" {
+                    (0, BURST_SIZE)
+                } else {
+                    (BURST_SIZE, 0)
+                }
+            );
+            received += BURST_SIZE as u64;
+        });
+    let expected = if case == "skdm_only" || case == "suppressed" {
+        0
+    } else {
+        received
+    };
+    assert_eq!(harness.messages_delivered() - before, expected);
+}
+
 /// Multi-lane harness initialized with 256 distinct groups and installed sender keys.
 fn multilane_harness() -> &'static whatsapp_rust::bench_support::MultiLaneReceiveHarness {
     static HARNESS: OnceLock<whatsapp_rust::bench_support::MultiLaneReceiveHarness> =
@@ -129,6 +218,52 @@ fn multilane_harness() -> &'static whatsapp_rust::bench_support::MultiLaneReceiv
 
 const LANE_COUNTS: &[usize] = &[1, 32, 256];
 const WORKER_BURST_SIZE: usize = 256;
+
+/// Lane creation and enqueue only. Drain/decrypt/shutdown happen between timed
+/// samples, so future-state movement is not hidden behind group signature cost.
+#[divan::bench(args = LANE_COUNTS, sample_count = WORKER_SAMPLE_COUNT, sample_size = 1)]
+fn worker_lane_creation(bencher: divan::Bencher, lanes: usize) {
+    let harness = multilane_harness();
+    let pending = std::cell::Cell::new(None);
+    let before = harness.messages_delivered();
+    let mut enqueued = 0;
+    bencher
+        .with_inputs(|| {
+            if let Some(target) = pending.take() {
+                harness.drain(target);
+            }
+            harness.close_lanes();
+            harness.generate_burst(lanes, lanes)
+        })
+        .bench_local_values(|batch| {
+            enqueued += batch.len() as u64;
+            pending.set(Some(harness.enqueue(black_box(&batch))));
+        });
+    if let Some(target) = pending.take() {
+        harness.drain(target);
+    }
+    harness.close_lanes();
+    assert_eq!(harness.messages_delivered() - before, enqueued);
+}
+
+/// Steady receive with every lane already alive; excludes initial creation and
+/// final shutdown, with the same fixed 256-message burst as `worker_lanes`.
+#[divan::bench(args = LANE_COUNTS, sample_count = WORKER_SAMPLE_COUNT, sample_size = 1)]
+fn worker_lanes_warm(bencher: divan::Bencher, lanes: usize) {
+    let harness = multilane_harness();
+    harness.enqueue_and_drain(&harness.generate_burst(lanes, lanes));
+    let before = harness.messages_delivered();
+    let mut received = 0;
+    bencher
+        .counter(divan::counter::ItemsCount::new(WORKER_BURST_SIZE as u64))
+        .with_inputs(|| harness.generate_burst(lanes, WORKER_BURST_SIZE))
+        .bench_local_values(|batch| {
+            received += batch.len() as u64;
+            harness.enqueue_and_drain(black_box(&batch));
+        });
+    assert_eq!(harness.messages_delivered() - before, received);
+    harness.close_lanes();
+}
 #[allow(dead_code)]
 const WORKER_SAMPLE_COUNT: u32 = 10;
 

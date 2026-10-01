@@ -13,7 +13,10 @@
 /// # async fn f(mut handle: whatsapp_rust::bot::BotHandle) {
 /// tokio::select! {
 ///     _ = &mut handle => {}
-///     _ = whatsapp_rust::shutdown_signal() => handle.shutdown().await,
+///     _ = whatsapp_rust::shutdown_signal() => {
+///         let report = handle.shutdown().await;
+///         eprintln!("{report:?}");
+///     },
 /// }
 /// # }
 /// ```

@@ -18,6 +18,7 @@ use log::{info, warn};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use thiserror::Error;
 use wacore::handshake::NoiseCertPolicy;
@@ -416,16 +417,39 @@ impl EventHandler for CallbackBusAdapter {
     }
 }
 
+/// Observed background supervision exit, or why no run result is available.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum BotRunOutcome {
+    Completed(crate::RunCompletionReason),
+    /// This handle requested abort. Not an executor acknowledgement that the
+    /// task has stopped: custom runtimes may defer or ignore cancellation.
+    AbortRequested,
+    /// The result sender disappeared without an observed run exit or abort
+    /// request. Runtime cancellation, panic and executor loss are not inferred.
+    Unobserved,
+}
+
+/// Graceful client cleanup and the separately observed background run outcome.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct BotShutdownReport {
+    pub shutdown: crate::ShutdownReport,
+    pub run: BotRunOutcome,
+}
+
 /// Handle to a bot started in the background via [`Bot::spawn`]. Awaiting it
-/// resolves once the run loop exits (logout, [`BotHandle::shutdown`], or abort).
+/// preserves the run outcome, or reports an abort request / unobserved exit.
 ///
 /// Dropping the handle aborts the bot task. Keep it alive for as long as the
 /// bot should run, and prefer [`BotHandle::shutdown`] to stop it.
 #[must_use = "dropping the handle aborts the bot; bind it and await it, or call .shutdown()"]
 pub struct BotHandle {
     client: Arc<Client>,
-    done_rx: futures::channel::oneshot::Receiver<()>,
+    done_rx: futures::channel::oneshot::Receiver<crate::RunCompletionReason>,
     abort_handle: wacore::runtime::AbortHandle,
+    abort_requested: AtomicBool,
+    abort_waker: futures::task::AtomicWaker,
 }
 
 impl BotHandle {
@@ -436,30 +460,42 @@ impl BotHandle {
     /// Gracefully stop the bot: disconnects (flushing the device snapshot,
     /// buffered receipts and message secrets) and waits for the run loop to
     /// exit.
-    pub async fn shutdown(self) {
-        self.client.disconnect().await;
-        let mut done_rx = self.done_rx;
-        let _ = (&mut done_rx).await;
+    pub async fn shutdown(self) -> BotShutdownReport {
+        let shutdown = self.client.shutdown().await;
+        let run = self.await;
+        BotShutdownReport { shutdown, run }
     }
 
     /// Abort the bot task immediately. Skips the flush work
     /// [`BotHandle::shutdown`] performs, so recently captured state may be
     /// lost; escape hatch only.
     pub fn abort(&self) {
+        self.abort_requested.store(true, Ordering::Release);
+        self.abort_waker.wake();
         self.abort_handle.abort();
     }
 }
 
 impl std::future::Future for BotHandle {
-    type Output = ();
+    type Output = BotRunOutcome;
 
     fn poll(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        // Canceled only happens when the run task was aborted; both outcomes
-        // mean "the bot is no longer running", which is all awaiters care about.
-        Pin::new(&mut self.done_rx).poll(cx).map(|_| ())
+        use std::task::Poll;
+        self.abort_waker.register(cx.waker());
+        // An already-sent run verdict wins over a later abort request. A
+        // request with no verdict must not wait for an executor to drop its
+        // sender (custom runtimes are allowed to delay that indefinitely).
+        match Pin::new(&mut self.done_rx).poll(cx) {
+            Poll::Ready(Ok(reason)) => Poll::Ready(BotRunOutcome::Completed(reason)),
+            _ if self.abort_requested.load(Ordering::Acquire) => {
+                Poll::Ready(BotRunOutcome::AbortRequested)
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(BotRunOutcome::Unobserved),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -563,14 +599,13 @@ impl Bot {
     /// own binary. The boxed barrier below type-erases the graph in a plain
     /// (linker-shared) function, so callers poll through a vtable and the
     /// graph is compiled once, here. One allocation per process.
-    pub async fn run(self) {
-        let _ = self.run_with_reason().await;
+    pub async fn run(self) -> crate::RunCompletionReason {
+        self.run_boxed().await
     }
 
-    /// Run the bot and report why its client supervision ended. Existing
-    /// callers can continue using [`Self::run`], which returns `()`.
+    /// Compatibility alias for [`Self::run`], with the same full outcome.
     pub async fn run_with_reason(self) -> crate::RunCompletionReason {
-        self.run_boxed().await
+        self.run().await
     }
 
     #[inline(never)]
@@ -585,7 +620,7 @@ impl Bot {
     async fn run_graph(self) -> crate::RunCompletionReason {
         let instrument = self.task_instrument.clone();
         let client = self.start_background();
-        run_metered(client.run_with_reason(), instrument).await
+        run_metered(client.run(), instrument).await
     }
 
     /// Start the bot on its runtime and return a [`BotHandle`] to await,
@@ -594,16 +629,18 @@ impl Bot {
         let client = self.start_background();
 
         let run_client = client.clone();
-        let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();
+        let (done_tx, done_rx) = futures::channel::oneshot::channel();
         let abort_handle = client.runtime.spawn(Box::pin(async move {
-            run_client.run_with_reason().await;
-            let _ = done_tx.send(());
+            let reason = run_client.run().await;
+            let _ = done_tx.send(reason);
         }));
 
         BotHandle {
             client,
             done_rx,
             abort_handle,
+            abort_requested: AtomicBool::new(false),
+            abort_waker: futures::task::AtomicWaker::new(),
         }
     }
 
@@ -645,7 +682,7 @@ impl Bot {
             client.runtime.spawn(Box::pin(async move {
                 // Wait for socket to be ready (before login) with 30 second timeout
                 if let Err(e) = client_for_pair
-                    .wait_for_socket(std::time::Duration::from_secs(30))
+                    .wait_for_socket_ready(std::time::Duration::from_secs(30))
                     .await
                 {
                     warn!(target: "Bot/PairCode", "Timeout waiting for socket: {}", e);
@@ -2326,8 +2363,7 @@ mod tests {
                 &self,
                 _metadata: &crate::HistorySyncMetadata<'_>,
             ) -> crate::HistorySyncDecision {
-                self.decisions
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.decisions.fetch_add(1, Ordering::SeqCst);
                 crate::HistorySyncDecision::Accept
             }
         }
@@ -2358,7 +2394,7 @@ mod tests {
             }),
             crate::HistorySyncDecision::Accept
         );
-        assert_eq!(decisions.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(decisions.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2637,6 +2673,131 @@ mod tests {
             key.participant.as_deref(),
             Some("15551112222@s.whatsapp.net")
         );
+    }
+
+    fn background_handle_for_test(
+        client: Arc<Client>,
+        done_rx: futures::channel::oneshot::Receiver<crate::RunCompletionReason>,
+        abort_handle: wacore::runtime::AbortHandle,
+    ) -> BotHandle {
+        BotHandle {
+            client,
+            done_rx,
+            abort_handle,
+            abort_requested: AtomicBool::new(false),
+            abort_waker: futures::task::AtomicWaker::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn background_driver_preserves_actual_stopped_reason() {
+        let bot = Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+        client.pause().await;
+        let handle = bot.spawn();
+        crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+        client.stop_supervision_loop();
+        assert!(matches!(
+            handle.await,
+            BotRunOutcome::Completed(crate::RunCompletionReason::Stopped)
+        ));
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn background_outcome_preserves_typed_protocol_conflict() {
+        let client = crate::test_utils::create_test_client().await;
+        for kind in [
+            crate::ConflictKind::Replaced,
+            crate::ConflictKind::DeviceRemoved,
+            crate::ConflictKind::Unknown,
+        ] {
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            sender
+                .send(crate::RunCompletionReason::AutoReconnectDisabled {
+                    connection: None,
+                    connect_error: None,
+                    protocol_error: Some(crate::ProtocolTerminalReason::Conflict(kind)),
+                })
+                .unwrap();
+            let handle = background_handle_for_test(
+                client.clone(),
+                receiver,
+                wacore::runtime::AbortHandle::noop(),
+            );
+            match handle.await {
+                BotRunOutcome::Completed(crate::RunCompletionReason::AutoReconnectDisabled {
+                    protocol_error: Some(crate::ProtocolTerminalReason::Conflict(observed)),
+                    ..
+                }) => assert_eq!(observed, kind),
+                other => panic!("lost typed protocol cause: {other:?}"),
+            }
+        }
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn explicit_abort_does_not_wait_for_a_retained_sender() {
+        let client = crate::test_utils::create_test_client().await;
+        let (_retained_sender, receiver) = futures::channel::oneshot::channel();
+        let handle =
+            background_handle_for_test(client, receiver, wacore::runtime::AbortHandle::noop());
+        handle.abort();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+                .await
+                .unwrap(),
+            BotRunOutcome::AbortRequested
+        ));
+    }
+
+    #[tokio::test]
+    async fn lost_sender_is_unobserved_not_abort_or_panic() {
+        let client = crate::test_utils::create_test_client().await;
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        drop(sender);
+        let handle =
+            background_handle_for_test(client, receiver, wacore::runtime::AbortHandle::noop());
+        assert!(matches!(handle.await, BotRunOutcome::Unobserved));
+    }
+
+    #[tokio::test]
+    async fn observed_run_exit_wins_over_late_abort() {
+        let client = crate::test_utils::create_test_client().await;
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        sender.send(crate::RunCompletionReason::Stopped).unwrap();
+        let handle =
+            background_handle_for_test(client, receiver, wacore::runtime::AbortHandle::noop());
+        handle.abort();
+        assert!(matches!(
+            handle.await,
+            BotRunOutcome::Completed(crate::RunCompletionReason::Stopped)
+        ));
+    }
+
+    #[tokio::test]
+    async fn drop_still_aborts_even_when_client_arc_is_retained() {
+        let client = crate::test_utils::create_test_client().await;
+        let (_sender, receiver) = futures::channel::oneshot::channel();
+        let aborted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = aborted.clone();
+        let handle = background_handle_for_test(
+            client.clone(),
+            receiver,
+            wacore::runtime::AbortHandle::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+        drop(handle);
+        assert_eq!(aborted.load(Ordering::Relaxed), 1);
+        client.shutdown().await;
     }
 
     #[tokio::test]

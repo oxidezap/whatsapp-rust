@@ -1,0 +1,16 @@
+
+running 1 test
+test sqlite_store::reader_lifecycle_tests::measure_reader_retention ... mode=baseline stores=50 idle_timeout_secs=1
+warm_scan=false
+baseline: sqlite_heap=0 rss_anon=5742592 rss_total=10297344 writers=0 readers=0
+point_reads: sqlite_heap=11370848 rss_anon=17571840 rss_total=22159360 writers=50 readers=50
+idle: sqlite_heap=10181248 rss_anon=19353600 rss_total=24006656 writers=50 readers=50
+cold_resume_ns_p50_p99=(103200, 2395086)
+resumed: sqlite_heap=11370848 rss_anon=20115456 rss_total=24768512 writers=50 readers=50
+warm_read_ns_p50_p99=(41440, 2259287)
+active: reads=2000 writes=200 elapsed_ns=320230534 read_ns_p50_p99=(35920, 1974006)
+shutdown: sqlite_heap=0 rss_anon=20787200 rss_total=25407488 writers=0 readers=0
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 130 filtered out; finished in 33.45s
+

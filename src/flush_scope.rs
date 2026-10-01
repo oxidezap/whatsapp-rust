@@ -11,6 +11,20 @@ use std::time::Duration;
 
 use wacore::runtime::{Runtime, Spawnable};
 
+/// What a bounded drain observed at its decision point.
+/// Completion of tracked work includes cancellation, not successful delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DrainOutcome {
+    Completed,
+    /// The producer reported non-durable state; work may remain for redelivery.
+    Failed,
+    /// The deadline won, even if work finished just after that decision.
+    TimedOut,
+    /// No result was received from the worker performing the drain.
+    Unobserved,
+}
+
 /// Bit 0 of [`FlushScope::state`]: the scope is closed to new work.
 const CLOSED: usize = 1;
 /// One tracked unit of work, i.e. one live [`FlushGuard`]; the count lives in
@@ -112,14 +126,14 @@ impl FlushScope {
 
     /// Wait until every tracked task has finished or the timeout elapses.
     /// Emits a warn log on timeout with the number of leaked tasks.
-    pub async fn flush(&self, rt: &dyn Runtime, timeout: Duration) {
+    pub async fn flush(&self, rt: &dyn Runtime, timeout: Duration) -> DrainOutcome {
         use wacore::time::Instant;
 
         let deadline = Instant::now() + timeout;
         loop {
             let listener = self.idle.listen();
             if self.tracked() == 0 {
-                return;
+                return DrainOutcome::Completed;
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -132,7 +146,7 @@ impl FlushScope {
                     "FlushScope timed out with {} pending task(s)",
                     self.tracked()
                 );
-                return;
+                return DrainOutcome::TimedOut;
             }
         }
     }
@@ -202,7 +216,10 @@ mod tests {
         assert_eq!(scope.pending(), 5);
 
         let start = Instant::now();
-        scope.flush(&*runtime, Duration::from_secs(1)).await;
+        assert_eq!(
+            scope.flush(&*runtime, Duration::from_secs(1)).await,
+            DrainOutcome::Completed
+        );
         assert!(start.elapsed() < Duration::from_millis(500));
         assert_eq!(scope.pending(), 0);
     }
@@ -250,7 +267,10 @@ mod tests {
         });
 
         let start = Instant::now();
-        scope.flush(&*runtime, Duration::from_millis(50)).await;
+        assert_eq!(
+            scope.flush(&*runtime, Duration::from_millis(50)).await,
+            DrainOutcome::TimedOut
+        );
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_millis(50));
         assert!(elapsed < Duration::from_millis(500));
@@ -319,6 +339,51 @@ mod tests {
             0,
             "guard must drop with the never-polled future"
         );
+    }
+
+    struct DropBeforePollRuntime;
+
+    impl Runtime for DropBeforePollRuntime {
+        fn spawn(
+            &self,
+            future: wacore::runtime::BoxFuture<'static, ()>,
+        ) -> wacore::runtime::AbortHandle {
+            drop(future);
+            wacore::runtime::AbortHandle::noop()
+        }
+        fn sleep(&self, duration: Duration) -> wacore::runtime::BoxFuture<'static, ()> {
+            Box::pin(tokio::time::sleep(duration))
+        }
+        fn spawn_blocking(
+            &self,
+            f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> wacore::runtime::BoxFuture<'static, ()> {
+            Box::pin(async move { f() })
+        }
+        fn yield_now(&self) -> Option<wacore::runtime::BoxFuture<'static, ()>> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_drop_before_first_poll_releases_real_spawn_guard() {
+        let scope = Arc::new(FlushScope::new());
+        scope.spawn(&DropBeforePollRuntime, futures::future::pending());
+        assert_eq!(scope.pending(), 0);
+        assert_eq!(
+            scope.flush(&DropBeforePollRuntime, Duration::ZERO).await,
+            DrainOutcome::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_verdict_survives_later_completion() {
+        let scope = Arc::new(FlushScope::new());
+        let guard = scope.try_track().unwrap();
+        let verdict = scope.flush(&*rt(), Duration::ZERO).await;
+        drop(guard);
+        assert_eq!(scope.pending(), 0);
+        assert_eq!(verdict, DrainOutcome::TimedOut);
     }
 
     #[tokio::test]

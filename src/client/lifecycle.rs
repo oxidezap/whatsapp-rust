@@ -2,13 +2,34 @@
 
 use super::*;
 use crate::cache_config::CacheConfig;
+pub use crate::flush_scope::DrainOutcome;
+pub use crate::msg_secret_buffer::SecretFlushReport;
 use wacore::net::DisconnectReason;
+
+/// Observations made by this invocation of terminal shutdown.
+/// This is not a global durability fence: concurrent producers, callbacks,
+/// detached work and other teardown invocations are not joined by this report.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ShutdownReport {
+    /// Pre-close inbound rows/Signal durability decision. Hook failure can
+    /// still mean Completed: durable replay rows remain, not successful callbacks.
+    pub inbound: DrainOutcome,
+    /// Tracked outbound guards drained (including cancellation), not delivery.
+    pub outbound: DrainOutcome,
+    /// This call's device snapshot flush, with the original storage error.
+    pub device: Result<(), crate::store::error::StoreError>,
+    /// Post-close permit-held inbound/Signal cache settle in this cleanup.
+    pub signal_settle: DrainOutcome,
+    /// Cumulative secret write failures, including earlier detached writes.
+    pub message_secrets: SecretFlushReport,
+}
 
 /// Why [`Client::run`] stopped supervising the session.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RunCompletionReason {
-    /// A terminal shutdown was requested through `disconnect`, `logout`, or drop.
+    /// A terminal shutdown was requested through `shutdown`, `logout`, or drop.
     ShutdownRequested,
     /// The current connection ended while automatic reconnection was disabled.
     /// Logout may publish this observation while its best-effort deregistration
@@ -157,10 +178,10 @@ impl Client {
         self.shutdown_notifier.subscribe()
     }
 
-    /// Synchronous flag-only equivalent of the first lines of `disconnect()`.
+    /// Synchronous flag-only equivalent of the first lines of `shutdown()`.
     /// Spawned tasks watching `is_shutting_down()` / `shutdown_notifier` exit
     /// on their next poll. Does NOT flush, close the transport, or touch
-    /// persistence — prefer `disconnect()` whenever you can `await`. Exists
+    /// persistence — prefer `shutdown()` whenever you can `await`. Exists
     /// for `Drop` impls on FFI wrappers (e.g. `WasmWhatsAppClient`) that
     /// can't run async cleanup synchronously.
     pub fn signal_shutdown_sync(&self) {
@@ -813,7 +834,8 @@ impl Client {
     /// driven, by this loop or by [`Connection::read_until_disconnected`], no
     /// frame is decoded and no event is emitted.
     ///
-    /// Returns when the session is over for good: [`disconnect`](Self::disconnect),
+    /// Compatibility spelling of [`Self::run`], preserving the same reason.
+    /// Returns when the session is over for good: [`shutdown`](Self::shutdown),
     /// [`logout`](Self::logout), or a connection ending with auto-reconnect off.
     /// [`pause`](Self::pause) does not end it — the loop parks and this call
     /// keeps running until [`resume`](Self::resume) or one of the above.
@@ -821,17 +843,15 @@ impl Client {
     // lifetime, distorting duration/throughput metrics just like the removed
     // keepalive-loop span. Identity (lid/pn) attribution comes from the
     // per-operation spans (send/request), which record it themselves.
-    pub async fn run(self: &Arc<Self>) {
-        let _ = self.run_with_reason().await;
+    pub async fn run_with_reason(self: &Arc<Self>) -> RunCompletionReason {
+        self.run().await
     }
 
-    /// Drive the session until supervision ends and report the observed
-    /// completion reason. A policy stop can race another teardown operation,
-    /// so this value describes the branch that ended this run, not a durable
-    /// account of every operation still in flight.
-    /// This additive companion preserves the unit-returning [`Self::run`]
-    /// contract for existing callers.
-    pub async fn run_with_reason(self: &Arc<Self>) -> RunCompletionReason {
+    /// Drive the connection/read/reconnect loop and preserve its observed outcome.
+    /// Pause parks this loop; only resume or a terminal stop releases it.
+    /// A policy stop can race another teardown: this is the branch that ended
+    /// this run, not a durability report or a join of every worker.
+    pub async fn run(self: &Arc<Self>) -> RunCompletionReason {
         #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle
             && !lifecycle.wait_until_active().await
@@ -1489,7 +1509,14 @@ impl Client {
                 .build(),
         )));
 
-        self.disconnect().await;
+        self.shutdown().await;
+    }
+
+    /// Compatibility alias for terminal [`Self::shutdown`].
+    /// Retains the historical unit return, discarding the shutdown report.
+    /// Soft-deprecated in documentation; no compiler warning during migration.
+    pub async fn disconnect(self: &Arc<Self>) {
+        let _ = self.shutdown().await;
     }
 
     /// End this client's session for good: close the socket, stop the run
@@ -1510,9 +1537,9 @@ impl Client {
     /// run loop in place, which is what makes them reversible.
     #[cfg_attr(
         feature = "tracing",
-        tracing::instrument(name = "wa.conn.disconnect", level = "info", skip_all)
+        tracing::instrument(name = "wa.conn.shutdown", level = "info", skip_all)
     )]
-    pub async fn disconnect(self: &Arc<Self>) {
+    pub async fn shutdown(self: &Arc<Self>) -> ShutdownReport {
         info!("Disconnecting client intentionally.");
         wacore::telemetry::set_connected(false);
         self.publish_terminal_verdict();
@@ -1536,18 +1563,21 @@ impl Client {
         // buffered receipts stay unsent too, because their SKDM/session state
         // may not be durable yet (receipting an SKDM whose sender key only
         // lives in the cache would lose it to a crash with no redelivery).
-        self.flush_inbound_commits_bounded(Duration::from_secs(5))
+        let inbound = self
+            .flush_inbound_commits_bounded(Duration::from_secs(5))
             .await;
         // Prevent late receipt producers from escaping the drain window.
         self.outbound_flush.close();
-        self.outbound_flush
+        let outbound = self
+            .outbound_flush
             .flush(&*self.runtime, Duration::from_secs(5))
             .await;
         self.notify_connection_shutdown();
         self.pending_group_device_resync.clear();
 
-        if let Err(e) = self.persistence_manager.flush().await {
-            log::error!("Failed to flush device state during disconnect: {e}");
+        let device = self.persistence_manager.flush().await;
+        if let Err(e) = &device {
+            log::error!("Failed to flush device state during shutdown: {e}");
         }
 
         // Close after flush; cleanup may also win this race on the run loop.
@@ -1558,7 +1588,7 @@ impl Client {
         if let Some(transport) = transport {
             self.close_transport_bounded(&transport).await;
         }
-        self.cleanup_connection_state().await;
+        let signal_settle = self.cleanup_connection_state().await;
 
         // The write-behind secret drain is detached; a clean exit right after
         // a capture must not lose the only copy. Sealing first degrades any
@@ -1566,9 +1596,16 @@ impl Client {
         // inline write, so nothing can land on the detached drain after the
         // final flush below and then be acked.
         self.msg_secret_buffer.seal();
-        self.msg_secret_buffer.flush().await;
+        let message_secrets = self.msg_secret_buffer.flush().await;
         #[cfg(feature = "client-lifecycle")]
         self.shutdown_lifecycle().await;
+        ShutdownReport {
+            inbound,
+            outbound,
+            device,
+            signal_settle,
+            message_secrets,
+        }
     }
 
     /// Backoff step used by [`reconnect()`](Self::reconnect) to create an offline window.
@@ -1895,9 +1932,10 @@ impl Client {
         tracing::instrument(name = "wa.conn.cleanup", level = "debug", skip_all)
     )]
     #[cfg(not(feature = "client-lifecycle"))]
-    pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) {
-        self.cleanup_connection_state_inner().await;
+    pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) -> DrainOutcome {
+        let outcome = self.cleanup_connection_state_inner().await;
         self.clear_connection_scoped_pair_code().await;
+        outcome
     }
 
     /// A pair-code flow belongs to the connection that carried it: the pairing
@@ -1918,11 +1956,11 @@ impl Client {
         tracing::instrument(name = "wa.conn.cleanup", level = "debug", skip_all)
     )]
     #[cfg(feature = "client-lifecycle")]
-    pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) {
+    pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) -> DrainOutcome {
         if self.lifecycle.is_none() {
-            self.cleanup_connection_state_inner().await;
+            let outcome = self.cleanup_connection_state_inner().await;
             self.clear_connection_scoped_pair_code().await;
-            return;
+            return outcome;
         }
 
         // Scope closure must survive a caller dropping its cleanup waiter.
@@ -1936,15 +1974,19 @@ impl Client {
                 let _ = completed.send(result);
             }))
             .detach();
-        match completion.await {
-            Ok(Ok(())) => {}
+        let outcome = match completion.await {
+            Ok(Ok(outcome)) => outcome,
             Ok(Err(panic)) => std::panic::resume_unwind(panic),
-            Err(_) => error!("Detached connection cleanup stopped before completion"),
-        }
+            Err(_) => {
+                error!("Detached connection cleanup stopped before completion");
+                DrainOutcome::Unobserved
+            }
+        };
         self.clear_connection_scoped_pair_code().await;
+        outcome
     }
 
-    async fn cleanup_connection_state_inner(&self) {
+    async fn cleanup_connection_state_inner(&self) -> DrainOutcome {
         #[cfg(feature = "client-lifecycle")]
         let login_transition = self
             .login_transition
@@ -2070,10 +2112,11 @@ impl Client {
         // could persist that drain's rowless advances. The worker re-checks the
         // generation (bumped above) once it gets the gate, so it stands down.
         let flush_gate = self.signal_flush_lifecycle.lock().await;
-        if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
+        let mut signal_settle = if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade())
+        {
             client
                 .teardown_inbound_commits_bounded(Duration::from_secs(5))
-                .await;
+                .await
         } else {
             // Same class of bug as the complete_offline_sync twin: a silent
             // skip here is the acked-before-committed loss — make it loud,
@@ -2082,7 +2125,8 @@ impl Client {
                 "cleanup_connection_state: self_weak upgrade failed; dropping uncommitted drain entries and their unflushed Signal state"
             );
             self.signal_cache.clear().await;
-        }
+            DrainOutcome::Unobserved
+        };
         // Everything the drain-to-live transition also writes goes under the
         // lock the finisher publishes beneath, starting with the permit count:
         // whichever of the two wins the stamp, its writes land wholly before
@@ -2115,6 +2159,9 @@ impl Client {
                 "cleanup_connection_state: dropping unflushed Signal state along with late uncommitted drain entries"
             );
             self.signal_cache.clear().await;
+            if signal_settle == DrainOutcome::Completed {
+                signal_settle = DrainOutcome::Failed;
+            }
         }
         // Cache is settled and any dropped entries cleared; a worker may run again.
         drop(flush_gate);
@@ -2164,6 +2211,7 @@ impl Client {
 
         #[cfg(feature = "client-lifecycle")]
         drop(scope_close);
+        signal_settle
     }
 
     /// Waits for the noise socket to be established.
@@ -2174,26 +2222,33 @@ impl Client {
     ///
     /// If the socket is already connected, returns immediately.
     pub async fn wait_for_socket(&self, timeout: Duration) -> Result<(), ConnectError> {
-        // Fast path: already connected. Not while paused, though — the flag is
-        // published before the teardown clears `is_connected`, and the socket
-        // this would report is the one being closed.
-        if self.is_connected() && !self.is_paused() {
+        self.wait_for_socket_ready(timeout).await
+    }
+
+    /// Wait only for the Noise socket, including pre-login pairing.
+    pub async fn wait_for_socket_ready(&self, timeout: Duration) -> Result<(), ConnectError> {
+        if self.is_socket_ready() {
             return Ok(());
         }
+        rt_timeout(&*self.runtime, timeout, async {
+            loop {
+                let changed = self.socket_ready_notifier.listen();
+                if self.is_socket_ready() {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .map_err(|_| ConnectError::Timeout {
+            stage: ConnectStage::Socket,
+            timeout,
+        })
+    }
 
-        // Register waiter and re-check to avoid race condition:
-        // If socket becomes ready between checks, the notified future captures it.
-        let notified = self.socket_ready_notifier.listen();
-        if self.is_connected() && !self.is_paused() {
-            return Ok(());
-        }
-
-        rt_timeout(&*self.runtime, timeout, notified)
-            .await
-            .map_err(|_| ConnectError::Timeout {
-                stage: ConnectStage::Socket,
-                timeout,
-            })
+    /// A usable socket, not proof of authentication or critical sync readiness.
+    pub fn is_socket_ready(&self) -> bool {
+        self.is_connected() && !self.is_paused()
     }
 
     /// Waits for the client to establish a connection and complete login.
@@ -2204,24 +2259,33 @@ impl Client {
     ///
     /// If the client is already connected and logged in, returns immediately.
     pub async fn wait_for_connected(&self, timeout: Duration) -> Result<(), ConnectError> {
-        // Fast path: fully ready (connected + logged in + critical sync done).
-        if self.is_fully_ready() {
+        self.wait_for_session_ready(timeout).await
+    }
+
+    /// Wait for authentication and critical app-state sync to settle (including
+    /// its existing failure policy), not just the pre-login socket.
+    pub async fn wait_for_session_ready(&self, timeout: Duration) -> Result<(), ConnectError> {
+        if self.is_session_ready() {
             return Ok(());
         }
+        rt_timeout(&*self.runtime, timeout, async {
+            loop {
+                let changed = self.connected_notifier.listen();
+                if self.is_session_ready() {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .map_err(|_| ConnectError::Timeout {
+            stage: ConnectStage::Ready,
+            timeout,
+        })
+    }
 
-        // Register waiter and re-check to avoid TOCTOU race:
-        // dispatch_connected() could fire between the check above and notified() registration.
-        let notified = self.connected_notifier.listen();
-        if self.is_fully_ready() {
-            return Ok(());
-        }
-
-        rt_timeout(&*self.runtime, timeout, notified)
-            .await
-            .map_err(|_| ConnectError::Timeout {
-                stage: ConnectStage::Ready,
-                timeout,
-            })
+    pub fn is_session_ready(&self) -> bool {
+        self.is_fully_ready()
     }
 
     pub fn is_connected(&self) -> bool {
@@ -3192,6 +3256,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_report_preserves_device_and_signal_failure() {
+        use crate::store::commands::DeviceCommand;
+        use crate::store::error::StoreError;
+        use whatsapp_rust_sqlite_storage::{SqliteDatabase, SqliteDatabaseConfig};
+        let fail = Arc::new(AtomicBool::new(false));
+        let barrier_fail = fail.clone();
+        // Same named shared-memory URI supported by create_test_backend.
+        let database_url = format!(
+            "file:lifecycle-flush-{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let database = SqliteDatabase::open(
+            &database_url,
+            SqliteDatabaseConfig::default().with_commit_barrier(Arc::new(move || {
+                let fail = barrier_fail.clone();
+                Box::pin(async move {
+                    if fail.load(Ordering::Acquire) {
+                        Err(StoreError::Io(std::io::Error::other(
+                            "synthetic persistence failure",
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                })
+            })),
+        )
+        .await
+        .unwrap();
+        let client =
+            crate::test_utils::create_test_client_with_backend(Arc::new(database.store(1))).await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetPushName("fictional".into()))
+            .await;
+        let address = wacore::libsignal::protocol::ProtocolAddress::new("15550000001", 1.into());
+        assert!(
+            client
+                .signal_cache
+                .try_put_session(
+                    &address,
+                    wacore::libsignal::protocol::SessionRecord::new_fresh(),
+                )
+                .is_ok()
+        );
+        fail.store(true, Ordering::Release);
+        let report = client.shutdown().await;
+        assert!(
+            report.device.is_err(),
+            "logged storage failure must remain observable"
+        );
+        assert_eq!(report.inbound, DrainOutcome::Failed);
+        assert_eq!(report.signal_settle, DrainOutcome::Failed);
+        assert_eq!(report.outbound, DrainOutcome::Completed);
+        assert!(matches!(
+            client.run().await,
+            RunCompletionReason::ShutdownRequested
+        ));
+        assert!(matches!(
+            client.connect().await,
+            Err(ConnectError::Shutdown)
+        ));
+        client.resume();
+        assert!(matches!(
+            client.connect().await,
+            Err(ConnectError::Shutdown)
+        ));
+        fail.store(false, Ordering::Release);
+        let fresh =
+            crate::test_utils::create_test_client_with_backend(Arc::new(database.store(1))).await;
+        assert!(!fresh.shutdown_signal().is_fired());
+        fresh.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn inbound_deadline_is_observed_in_shutdown_report() {
+        let client = crate::test_utils::create_test_client().await;
+        client.swap_message_semaphore(1);
+        let permit = client.acquire_message_processing_permit().await;
+        let outbound_guard = client.outbound_flush.try_track().unwrap();
+        let report = client.shutdown().await;
+        assert_eq!(report.inbound, DrainOutcome::TimedOut);
+        assert_eq!(report.outbound, DrainOutcome::TimedOut);
+        assert_eq!(report.signal_settle, DrainOutcome::TimedOut);
+        drop(permit);
+        drop(outbound_guard);
+        assert_eq!(report.inbound, DrainOutcome::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn socket_pairing_and_session_ready_are_distinct() {
+        let client = crate::test_utils::create_test_client().await;
+        client.set_connected_for_test(true);
+        client.is_logged_in.store(false, Ordering::Relaxed);
+        client.is_ready.store(false, Ordering::Relaxed);
+        client
+            .wait_for_socket_ready(Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(client.is_socket_ready());
+        assert!(!client.is_session_ready());
+        let waiter = tokio::spawn({
+            let client = client.clone();
+            async move { client.wait_for_session_ready(Duration::from_secs(5)).await }
+        });
+        crate::test_utils::wait_for_notifier_listeners(&client.connected_notifier, 1).await;
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        // Authentication and even a spurious notification are not critical-sync completion.
+        client.connected_notifier.notify(usize::MAX);
+        tokio::task::yield_now().await;
+        crate::test_utils::wait_for_notifier_listeners(&client.connected_notifier, 1).await;
+        assert!(!waiter.is_finished());
+        client.publish_connected();
+        waiter.await.unwrap().unwrap();
+        assert!(client.is_session_ready());
+        client.wait_for_socket_ready(Duration::ZERO).await.unwrap();
+        client.wait_for_session_ready(Duration::ZERO).await.unwrap();
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn canonical_run_preserves_stopped_and_pause_remains_reversible() {
+        let client = crate::test_utils::create_test_client().await;
+        client.pause().await;
+        assert!(client.is_paused());
+        assert!(!client.shutdown_signal().is_fired());
+        let runner = tokio::spawn({
+            let client = client.clone();
+            async move { client.run().await }
+        });
+        crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+        client.stop_supervision_loop();
+        assert!(matches!(
+            runner.await.unwrap(),
+            RunCompletionReason::Stopped
+        ));
+        client.resume();
+        assert!(!client.is_paused());
+        assert!(!client.shutdown_signal().is_fired());
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn a_second_run_reports_already_running_without_stopping_the_first() {
         let (client, entered, release) = client_parked_in_connect().await;
         let first_client = Arc::clone(&client);
@@ -3199,7 +3405,7 @@ mod tests {
         next_connect_attempt(&entered).await;
 
         assert!(matches!(
-            client.run_with_reason().await,
+            client.run().await,
             RunCompletionReason::AlreadyRunning
         ));
         assert!(!first.is_finished());
@@ -4000,7 +4206,9 @@ mod tests {
     /// reconnect backoff. The attempt counter is bumped immediately before the
     /// wait, so observing the bump is proof the loop is parked there — no
     /// timed guess involved.
-    async fn run_until_parked_in_backoff(client: &Arc<Client>) -> tokio::task::JoinHandle<()> {
+    async fn run_until_parked_in_backoff(
+        client: &Arc<Client>,
+    ) -> tokio::task::JoinHandle<RunCompletionReason> {
         client
             .auto_reconnect_errors
             .store(CAPPED_BACKOFF_ATTEMPTS, Ordering::Relaxed);

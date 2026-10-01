@@ -39,7 +39,8 @@ use extension_lifecycle::LifecycleRegistration;
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use extension_lifecycle::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
 pub use lifecycle::{
-    ConflictKind, Connection, ProtocolTerminalReason, Reachability, RunCompletionReason,
+    ConflictKind, Connection, DrainOutcome, ProtocolTerminalReason, Reachability,
+    RunCompletionReason, SecretFlushReport, ShutdownReport,
 };
 pub use voip::{CallError, Voip};
 

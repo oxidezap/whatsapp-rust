@@ -9,6 +9,7 @@
 //! also WA Web behavior (the same pipeline with an immediate flush).
 
 use super::*;
+use crate::flush_scope::DrainOutcome;
 use portable_atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use wacore::store::traits::{PendingInboundKey, PendingInboundRow};
@@ -563,7 +564,7 @@ impl Client {
     pub(crate) async fn teardown_inbound_commits_bounded(
         self: &Arc<Self>,
         limit: std::time::Duration,
-    ) {
+    ) -> DrainOutcome {
         let settle = async {
             let _permit = self.acquire_message_processing_permit().await;
             let batch = self.inbound_commit_batch.take();
@@ -587,46 +588,52 @@ impl Client {
                     Ok(()) => {
                         self.flush_offline_receipts();
                         self.signal_cache.clear_after_flush().await;
+                        DrainOutcome::Completed
                     }
                     // Committed/acked state the server never redelivers: keep
                     // it resident so the next successful flush persists it.
                     // Safe to carry across the reconnect — the teardown
                     // generation bump plus the post-permit re-check mean no
                     // late decrypt can mix rowless advances into it.
-                    Err(e) => log::error!(
-                        "cleanup_connection_state: signal cache flush failed, keeping cache to avoid dropping Signal state: {e:?}"
-                    ),
+                    Err(e) => {
+                        log::error!(
+                            "cleanup_connection_state: signal cache flush failed, keeping cache to avoid dropping Signal state: {e:?}"
+                        );
+                        DrainOutcome::Failed
+                    }
                 }
             } else {
                 log::warn!(
                     "cleanup_connection_state: dropping unflushed Signal state for uncommitted drain entries; the server redelivers them"
                 );
                 self.signal_cache.clear().await;
+                DrainOutcome::Failed
             }
         };
-        if wacore::runtime::timeout(&*self.runtime, limit, settle)
-            .await
-            .is_err()
-        {
-            // Drop the whole dirty cache — do NOT sample has_entries() (it
-            // races the permit holder we timed out on, per the earlier
-            // review). A hook-timeout is the common case: the settle held
-            // the permit and its ReinsertGuard has restored the entries by
-            // now, and clearing drops their rowless advances safely (rows
-            // never persisted → server redelivers). The rare case is a
-            // worker hung mid-decrypt holding the permit; it may have
-            // advanced a ratchet WITHOUT enqueueing an entry (SKDM-only),
-            // which the reset-coupled clear cannot see — so the only
-            // rowless-safe action is to clear unconditionally here. The one
-            // thing this can drop is committed state a PRIOR connection's
-            // failed flush retained AND no flush since re-persisted: a
-            // total-storage-outage corner where the system is already
-            // degraded, and losing redeliverable-on-reauth state beats
-            // silently acking a rowless duplicate.
-            log::warn!(
-                "Timed out settling the inbound drain during teardown; dropping the dirty Signal cache so no rowless ratchet advance can persist"
-            );
-            self.signal_cache.clear().await;
+        match wacore::runtime::timeout(&*self.runtime, limit, settle).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                // Drop the whole dirty cache — do NOT sample has_entries() (it
+                // races the permit holder we timed out on, per the earlier
+                // review). A hook-timeout is the common case: the settle held
+                // the permit and its ReinsertGuard has restored the entries by
+                // now, and clearing drops their rowless advances safely (rows
+                // never persisted → server redelivers). The rare case is a
+                // worker hung mid-decrypt holding the permit; it may have
+                // advanced a ratchet WITHOUT enqueueing an entry (SKDM-only),
+                // which the reset-coupled clear cannot see — so the only
+                // rowless-safe action is to clear unconditionally here. The one
+                // thing this can drop is committed state a PRIOR connection's
+                // failed flush retained AND no flush since re-persisted: a
+                // total-storage-outage corner where the system is already
+                // degraded, and losing redeliverable-on-reauth state beats
+                // silently acking a rowless duplicate.
+                log::warn!(
+                    "Timed out settling the inbound drain during teardown; dropping the dirty Signal cache so no rowless ratchet advance can persist"
+                );
+                self.signal_cache.clear().await;
+                DrainOutcome::TimedOut
+            }
         }
     }
 
@@ -639,7 +646,7 @@ impl Client {
     pub(crate) async fn flush_inbound_commits_bounded(
         self: &Arc<Self>,
         limit: std::time::Duration,
-    ) -> bool {
+    ) -> DrainOutcome {
         match wacore::runtime::timeout(
             &*self.runtime,
             limit,
@@ -647,12 +654,13 @@ impl Client {
         )
         .await
         {
-            Ok(durable) => durable,
+            Ok(true) => DrainOutcome::Completed,
+            Ok(false) => DrainOutcome::Failed,
             Err(_) => {
                 log::warn!(
                     "Timed out committing the inbound drain batch during teardown; leaving entries for redelivery"
                 );
-                false
+                DrainOutcome::TimedOut
             }
         }
     }

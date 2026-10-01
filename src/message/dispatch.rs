@@ -106,7 +106,7 @@ impl Client {
         // not suppress.
         let decrypted = if crate::features::message_edit::carries_secret_encrypted(message) {
             match self
-                .maybe_decrypt_secret_encrypted_message(message, info)
+                .materialize_secret_encrypted_message(message, info)
                 .await
             {
                 Some(inner) => Some(inner),
@@ -124,9 +124,7 @@ impl Client {
         }) {
             ProbeOutcome::Suppress
         } else {
-            ProbeOutcome::Proceed {
-                decrypted: decrypted.map(Box::new),
-            }
+            ProbeOutcome::Proceed { decrypted }
         }
     }
 
@@ -230,19 +228,38 @@ impl Client {
         info: &Arc<MessageInfo>,
         track_commit: bool,
     ) -> InboundCommitState {
-        self.dispatch_parsed_message_with_decrypted(msg, info, track_commit, None)
+        self.dispatch_shared_message_with_decrypted(Arc::new(msg), info, track_commit, None)
             .await
     }
 
-    /// Same as [`Self::dispatch_parsed_message`], but reuses a plaintext the
-    /// duplicate probe already materialized instead of resolving the parent
-    /// secret a second time.
-    pub(crate) async fn dispatch_parsed_message_with_decrypted(
+    /// Ordinary messages do not need this state machine: resolving a secret
+    /// envelope holds a decoded Message across storage/resolver awaits. Keep
+    /// that state off the inline receive future, allocating only for envelopes
+    /// and returning the final event handle rather than a large value.
+    async fn materialize_secret_encrypted_message(
         self: &Arc<Self>,
-        msg: wa::Message,
+        message: &wa::Message,
+        info: &Arc<MessageInfo>,
+    ) -> Option<Arc<wa::Message>> {
+        if !crate::features::message_edit::carries_secret_encrypted(message) {
+            return None;
+        }
+        Box::pin(async {
+            self.maybe_decrypt_secret_encrypted_message(message, info)
+                .await
+                .map(Arc::new)
+        })
+        .await
+    }
+
+    /// Dispatch an already-shared plaintext, reusing any envelope the duplicate
+    /// probe materialized instead of resolving the parent secret a second time.
+    pub(crate) async fn dispatch_shared_message_with_decrypted(
+        self: &Arc<Self>,
+        msg: Arc<wa::Message>,
         info: &Arc<MessageInfo>,
         track_commit: bool,
-        pre_decrypted: Option<wa::Message>,
+        pre_decrypted: Option<Arc<wa::Message>>,
     ) -> InboundCommitState {
         use wacore::proto_helpers::MessageExt;
         wacore::telemetry::recv("decrypted");
@@ -258,10 +275,7 @@ impl Client {
         self.maybe_capture_inbound_msg_secret(&msg, info).await;
         let decrypted = match pre_decrypted {
             Some(inner) => Some(inner),
-            None => {
-                self.maybe_decrypt_secret_encrypted_message(&msg, info)
-                    .await
-            }
+            None => self.materialize_secret_encrypted_message(&msg, info).await,
         };
         // A decrypted comment surfaces as its inner body Message, which has no
         // slot for the parent post key; carry the threading link beside it.
@@ -273,7 +287,7 @@ impl Client {
         } else {
             None
         };
-        let dispatch_msg = Arc::new(decrypted.unwrap_or(msg));
+        let dispatch_msg = decrypted.unwrap_or(msg);
 
         // Newsletters never enter the commit pipeline: the plaintext stanza
         // was already transport-acked at enqueue and the server never

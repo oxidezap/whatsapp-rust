@@ -233,10 +233,10 @@ async fn test_upload_then_download_image() -> anyhow::Result<()> {
 
     info!("Uploaded: direct_path={}", upload.direct_path);
 
-    // Download using download_from_params
+    // DownloadParams uses the same canonical entry as message types.
     let downloaded = client
         .client
-        .download_from_params(&DownloadParams::encrypted(
+        .download(&DownloadParams::encrypted(
             &upload.direct_path,
             &upload.media_key,
             &upload.file_sha256,
@@ -269,7 +269,7 @@ async fn test_upload_then_download_video() -> anyhow::Result<()> {
 
     let downloaded = client
         .client
-        .download_from_params(&DownloadParams::encrypted(
+        .download(&DownloadParams::encrypted(
             &upload.direct_path,
             &upload.media_key,
             &upload.file_sha256,
@@ -299,7 +299,7 @@ async fn test_upload_then_download_document() -> anyhow::Result<()> {
 
     let downloaded = client
         .client
-        .download_from_params(&DownloadParams::encrypted(
+        .download(&DownloadParams::encrypted(
             &upload.direct_path,
             &upload.media_key,
             &upload.file_sha256,
@@ -364,7 +364,7 @@ async fn test_upload_then_download_to_writer() -> anyhow::Result<()> {
     let cursor = std::io::Cursor::new(Vec::<u8>::new());
     let result_cursor = client
         .client
-        .download_from_params_to_writer(
+        .download_to_writer(
             &DownloadParams::encrypted(
                 &upload.direct_path,
                 &upload.media_key,
@@ -846,7 +846,7 @@ async fn test_upload_download_large_file() -> anyhow::Result<()> {
 
     let downloaded = client
         .client
-        .download_from_params(&DownloadParams::encrypted(
+        .download(&DownloadParams::encrypted(
             &upload.direct_path,
             &upload.media_key,
             &upload.file_sha256,
@@ -884,7 +884,7 @@ async fn test_multiple_uploads_reuse_media_conn() -> anyhow::Result<()> {
         // Verify round-trip
         let downloaded = client
             .client
-            .download_from_params(&DownloadParams::encrypted(
+            .download(&DownloadParams::encrypted(
                 &resp.direct_path,
                 &resp.media_key,
                 &resp.file_sha256,

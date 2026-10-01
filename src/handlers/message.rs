@@ -402,6 +402,23 @@ mod tests {
         assert_eq!(size_of::<QueuedChatMessage>(), 2 * size_of::<usize>());
     }
 
+    #[cfg(feature = "bench-harness")]
+    #[test]
+    fn isolated_cold_lane_enqueue_does_not_poll_workers() {
+        let harness = crate::bench_support::MultiLaneReceiveHarness::new(256);
+        for lanes in [1, 32, 256] {
+            let batch = harness.generate_burst(lanes, lanes);
+            let before = harness.messages_delivered();
+            let target = harness.enqueue(&batch);
+            assert_eq!(harness.messages_delivered(), before);
+            assert_eq!(target, before + lanes as u64);
+            harness.drain(target);
+            assert_eq!(harness.messages_delivered(), target);
+            harness.close_lanes();
+            assert_eq!(harness.active_lanes(), 0);
+        }
+    }
+
     #[tokio::test]
     #[ignore = "layout diagnostic: run explicitly with --ignored --nocapture"]
     async fn audit_receive_future_and_struct_layouts() {
@@ -512,6 +529,14 @@ mod tests {
         );
         let dispatch_size = size_of_val(&dispatch_fut);
         drop(dispatch_fut);
+        let shared_dispatch_fut = client.dispatch_shared_message_with_decrypted(
+            Arc::new(waproto::whatsapp::Message::default()),
+            &dummy_info,
+            false,
+            None,
+        );
+        let shared_dispatch_size = size_of_val(&shared_dispatch_fut);
+        drop(shared_dispatch_fut);
 
         // 10. harness receive async block future
         let harness_fut = async {
@@ -537,6 +562,7 @@ mod tests {
         println!("process_session_enc_batch future: {session_batch_size} bytes");
         println!("handle_decrypted_plaintext future: {handle_plaintext_size} bytes");
         println!("dispatch_parsed_message future: {dispatch_size} bytes");
+        println!("dispatch_shared_message_with_decrypted future: {shared_dispatch_size} bytes");
 
         println!(
             "waproto::whatsapp::Message: {} bytes",
@@ -570,6 +596,18 @@ mod tests {
         println!(
             "InboundCommitState: {} bytes",
             size_of::<crate::message::InboundCommitState>()
+        );
+        let pdo = waproto::whatsapp::message::PeerDataOperationRequestResponseMessage::default();
+        println!(
+            "handle_pdo_response future: {} bytes",
+            size_of_val(&client.handle_pdo_response(&pdo, &dummy_info))
+        );
+        println!(
+            "probe_message_dispatch future: {} bytes",
+            size_of_val(
+                &client
+                    .probe_message_dispatch(&dummy_info, &waproto::whatsapp::Message::default(),)
+            )
         );
         println!("=== END SIZEOF REPORT ===");
     }
