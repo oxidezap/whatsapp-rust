@@ -62,7 +62,7 @@ async fn dispatch(client: &Arc<Client>, state: &'static str, media: Option<&str>
     }
     let node = NodeBuilder::new("chatstate")
         .attr("from", "120363000001@g.us")
-        .attr("participant", "15550001111@s.whatsapp.net")
+        .attr("participant", "12025550111@s.whatsapp.net")
         .children([child.build()])
         .build();
     let packed = wacore_binary::marshal::marshal(&node).unwrap();
@@ -110,7 +110,7 @@ async fn async_observer_is_filtered_and_subscription_is_raii() {
     dispatch(&client, "composing", Some("audio")).await;
     let observed = receive(&rx).await;
     assert!(
-        matches!(&*observed, Event::ChatPresence(update) if update.source.chat.to_string() == "120363000001@g.us" && update.source.sender.to_string() == "15550001111@s.whatsapp.net")
+        matches!(&*observed, Event::ChatPresence(update) if update.source.chat.to_string() == "120363000001@g.us" && update.source.sender.to_string() == "12025550111@s.whatsapp.net")
     );
     drop(subscription);
     dispatch(&client, "paused", None).await;
@@ -141,7 +141,7 @@ async fn chatstate_compatibility_view_uses_the_same_bus_fact() {
         assert_eq!(observed.chat.to_string(), "120363000001@g.us");
         assert_eq!(
             observed.participant.unwrap().to_string(),
-            "15550001111@s.whatsapp.net"
+            "12025550111@s.whatsapp.net"
         );
         assert_eq!(observed.state, expected);
         assert!(rx.try_recv().is_err());
@@ -550,7 +550,7 @@ async fn builder_callbacks_deliver_normally_until_driver_scope_ends() {
             let observed = receive(&rx).await;
             assert!(matches!(&*observed, Event::ChatPresence(update)
                 if update.source.chat.to_string() == "120363000001@g.us"
-                    && update.source.sender.to_string() == "15550001111@s.whatsapp.net"));
+                    && update.source.sender.to_string() == "12025550111@s.whatsapp.net"));
         }
         assert_eq!(client.stats().events_dropped, 0);
         handle.abort();
