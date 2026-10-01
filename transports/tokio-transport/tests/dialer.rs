@@ -50,6 +50,8 @@ async fn invalid_urls_and_origin_never_invoke_the_dialer() {
         "ws://[]/",
         "ws://host:65536/",
         "ws://host:bad/",
+        "ws://host:+443/",
+        "ws://host:-1/",
         "ftp://host/",
         "not a uri",
     ] {

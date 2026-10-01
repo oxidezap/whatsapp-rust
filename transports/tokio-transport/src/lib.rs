@@ -558,6 +558,11 @@ fn dial_destination(uri: &http::Uri) -> anyhow::Result<(String, u16)> {
     let host_port = authority.as_str().rsplit('@').next().unwrap_or_default();
     let suffix = host_port.strip_prefix(host).unwrap_or_default();
     let port = if let Some(port) = suffix.strip_prefix(':') {
+        // Integer parsing accepts a leading '+', but URL ports are digits only.
+        anyhow::ensure!(
+            port.bytes().all(|byte| byte.is_ascii_digit()),
+            "Invalid URL port"
+        );
         port.parse::<u16>().context("Invalid URL port")?
     } else {
         default_port
