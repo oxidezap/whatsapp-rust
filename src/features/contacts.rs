@@ -3,19 +3,20 @@
 //! Profile picture types are defined in `wacore::iq::contacts`.
 //! Usync types are defined in `wacore::iq::usync`.
 
+use super::pictures;
 use crate::client::Client;
 use crate::request::IqError;
 use log::debug;
 use std::collections::HashMap;
 use std::time::Duration;
 use thiserror::Error;
-use wacore::iq::contacts::ProfilePictureSpec;
 use wacore::iq::usync::{
     IsOnWhatsAppQueryType, IsOnWhatsAppSpec, IsOnWhatsAppUser, UserInfoSpec, UsernameLookupSpec,
 };
 use wacore_binary::{Jid, JidExt};
 
 // Re-export types from wacore
+pub use super::pictures::{ProfilePictureRequest, ProfilePictureTarget};
 pub use wacore::iq::contacts::{ProfilePicture, ProfilePictureLookup, ProfilePictureType};
 pub use wacore::iq::usync::{
     IsOnWhatsAppResult, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UserInfo, UsernameLookup,
@@ -46,6 +47,15 @@ impl<'a> ProfilePictureLookupOptions<'a> {
             persona_id: None,
             timeout: None,
         }
+    }
+
+    fn into_request(self) -> ProfilePictureRequest<'a> {
+        ProfilePictureRequest::new(ProfilePictureTarget::Contact(self.jid), self.picture_type)
+            .existing_id(self.existing_id)
+            .common_gid(self.common_gid)
+            .invite(self.invite)
+            .persona_id(self.persona_id)
+            .timeout(self.timeout)
     }
 
     pub fn preview(mut self, preview: bool) -> Self {
@@ -273,8 +283,21 @@ impl<'a> Contacts<'a> {
         Ok(results)
     }
 
-    /// Lookup a profile picture preserving detailed protocol outcomes:
-    /// `Found`, `Unchanged`, `NotFound`, `NotAuthorized`.
+    /// Canonical lookup with explicit size/route and preserved rejection metadata.
+    ///
+    /// Found/Unchanged/NotFound/NotAuthorized remain distinct. A 429 is an
+    /// `IqError::ServerError` with its original stanza and backoff, never an empty
+    /// `RateOverlimit`. There is no automatic community fallback. `into_found()`
+    /// discards all non-found states; Unchanged says nothing about cached bytes.
+    pub async fn lookup_picture(
+        &self,
+        request: ProfilePictureRequest<'_>,
+    ) -> Result<ProfilePictureLookup, ContactError> {
+        Ok(pictures::lookup(self.client, request, false).await?)
+    }
+
+    /// Compatibility lookup with boolean size and lossy 429 `RateOverlimit`.
+    /// Prefer [`Self::lookup_picture`] to preserve rejection metadata.
     pub async fn lookup_profile_picture(
         &self,
         jid: &Jid,
@@ -289,85 +312,15 @@ impl<'a> Contacts<'a> {
         .await
     }
 
-    /// Lookup a profile picture with configurable picture, cache, group, invite, persona, and timeout options.
+    /// Compatibility lookup with advanced options. A 429 becomes an empty
+    /// `RateOverlimit`; prefer [`Self::lookup_picture`] to preserve its metadata.
     ///
     /// A valid privacy token is loaded automatically from the client store when applicable.
     pub async fn lookup_profile_picture_with_options(
         &self,
         options: ProfilePictureLookupOptions<'_>,
     ) -> Result<ProfilePictureLookup, ContactError> {
-        let jid = options.jid;
-        // The system JID never answers this IQ; skip it.
-        if jid.is_psa() {
-            return Ok(ProfilePictureLookup::NotFound);
-        }
-
-        debug!(
-            "lookup_profile_picture: fetching {:?} picture for {} (existing_id={:?})",
-            options.picture_type, jid, options.existing_id
-        );
-
-        let spec = self.profile_picture_spec(&options).await;
-        match self.client.execute(spec).await {
-            Ok(lookup) => Ok(lookup),
-            // Server-level IQ error mappings (WA Web parseIqResponse / whatspec GetResponseError):
-            Err(IqError::ServerError { code: 404, .. }) => Ok(ProfilePictureLookup::NotFound),
-            Err(IqError::ServerError {
-                code: 401 | 403, ..
-            }) => Ok(ProfilePictureLookup::NotAuthorized),
-            Err(IqError::ServerError { code: 429, .. }) => Ok(ProfilePictureLookup::RateOverlimit),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Builds the `<picture>` request for `options`, including the privacy-token
-    /// versus `common_gid` fallback. Shared by the typed lookup and the legacy
-    /// getter so the two agree on the wire.
-    async fn profile_picture_spec(
-        &self,
-        options: &ProfilePictureLookupOptions<'_>,
-    ) -> ProfilePictureSpec {
-        let jid = options.jid;
-        let mut spec = ProfilePictureSpec::new(jid, options.picture_type);
-        if let Some(id) = options.existing_id {
-            spec = spec.with_existing_id(id);
-        }
-        if let Some(invite) = options.invite {
-            spec = spec.with_invite(invite);
-        }
-        if let Some(persona_id) = options.persona_id {
-            spec = spec.with_persona_id(persona_id);
-        }
-        if let Some(timeout) = options.timeout {
-            spec = spec.with_timeout(timeout);
-        }
-
-        // Skip own JID: server never responds when tctoken is sent for self
-        let is_own_jid = self.client.is_own_jid(jid);
-        let tc_token = if !jid.is_group()
-            && !jid.is_newsletter()
-            && !jid.is_bot()
-            && !jid.is_broadcast_list()
-            && !jid.is_status_broadcast()
-            && !is_own_jid
-            && self
-                .client
-                .ab_props
-                .is_enabled(wacore::iq::props::stale::PROFILE_PIC_PRIVACY_TOKEN)
-                .await
-        {
-            self.client.lookup_tc_token_for_jid(jid).await
-        } else {
-            None
-        };
-
-        // WhatsApp Web uses common_gid as a fallback only when no tctoken is present.
-        if let Some(token) = tc_token {
-            spec = spec.with_tc_token(token);
-        } else if let Some(common_gid) = options.common_gid {
-            spec = spec.with_common_gid(common_gid.clone());
-        }
-        spec
+        Ok(pictures::lookup(self.client, options.into_request(), true).await?)
     }
 
     /// Fetch a profile picture URL for a given JID.
@@ -375,8 +328,8 @@ impl<'a> Contacts<'a> {
     /// Returns `Ok(Some(ProfilePicture))` if found, or `Ok(None)` if no picture is set,
     /// unchanged, or unauthorized.
     ///
-    /// For detailed outcome states (`Found`, `Unchanged`, `NotFound`, `NotAuthorized`),
-    /// prefer [`Self::lookup_profile_picture`].
+    /// IQ-level 429 remains an error carrying rejection/backoff metadata.
+    /// Prefer [`Self::lookup_picture`] for detailed outcomes and explicit size.
     pub async fn get_profile_picture(
         &self,
         jid: &Jid,
@@ -391,8 +344,8 @@ impl<'a> Contacts<'a> {
     /// Returns `Ok(Some(ProfilePicture))` if found, or `Ok(None)` if no picture is set,
     /// unchanged, or unauthorized.
     ///
-    /// For detailed outcome states (`Found`, `Unchanged`, `NotFound`, `NotAuthorized`),
-    /// prefer [`Self::lookup_profile_picture`].
+    /// IQ-level 429 remains an error carrying rejection/backoff metadata.
+    /// Prefer [`Self::lookup_picture`] for detailed outcomes and explicit size.
     pub async fn get_profile_picture_with_timeout(
         &self,
         jid: &Jid,
@@ -403,22 +356,13 @@ impl<'a> Contacts<'a> {
         if jid.is_psa() {
             return Ok(None);
         }
-        // Executed directly rather than through `lookup_profile_picture_with_options`
-        // so a 429 keeps its server `<iq type="error">` (the `backoff` a caller must
-        // honour), which the typed outcome does not carry.
+        // Retain the legacy parser: top-level 429 stays an error, while a
+        // nested legacy RateOverlimit is still collapsed to None.
         let options = ProfilePictureLookupOptions::new(jid)
             .preview(preview)
             .timeout(timeout);
-        let spec = self.profile_picture_spec(&options).await;
-        match self.client.execute(spec).await {
-            Ok(lookup) => Ok(lookup.into_found()),
-            // 404/401/403 = no profile picture (or not authorized to see it).
-            Err(IqError::ServerError {
-                code: 404 | 401 | 403,
-                ..
-            }) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        let spec = pictures::build_spec(self.client, &options.into_request()).await;
+        Ok(pictures::legacy_found(self.client.execute(spec).await)?)
     }
 
     pub async fn get_user_info(

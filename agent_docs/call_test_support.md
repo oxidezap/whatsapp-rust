@@ -143,8 +143,9 @@ orientation: Option<u8>
 upgrade_token: Option<VideoUpgradeToken>
 ```
 
-Consume this variant from one `CallHandle::events()` receiver for all peer
-video states, including upgrade requests, accepts and stops. Pass its token to
+Acquire the receiver once with `CallHandle::take_events()` and retain it for all peer
+video states, including upgrade requests, accepts and stops. Acquisition is shared
+across handle clones; later attempts return `None`, even after receiver Drop. Pass its token to
 `accept_video` when accepting a request. Do not join a separate global
 `IncomingCall` stream to recover identity or update the same state from that
 stream; the two consumers can run in a different order.

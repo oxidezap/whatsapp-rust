@@ -19,6 +19,7 @@ mod media_reupload;
 pub mod message_edit;
 mod mex;
 pub(crate) mod newsletter;
+mod pictures;
 mod polls;
 mod presence;
 mod profile;
@@ -67,8 +68,9 @@ pub use comments::Comments;
 
 pub use contacts::{
     ContactError, Contacts, IsOnWhatsAppResult, ProfilePicture, ProfilePictureLookup,
-    ProfilePictureLookupOptions, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UserInfo,
-    UsernameLookup, UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError, VerifiedName,
+    ProfilePictureLookupOptions, ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType,
+    USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UserInfo, UsernameLookup, UsernameLookupError,
+    UsernameLookupUser, UsyncSubprotocolError, VerifiedName,
 };
 
 pub use events::{EventCreationParams, EventResponseType, Events};
@@ -101,6 +103,7 @@ pub use mex::{
     MexFatalError, MexGraphQLError, MexRequest, MexResponse, NewChatMessageCapping, OwnUsername,
     ReachoutTimelock,
 };
+pub use mex::{MexDoc, MexOperation};
 
 pub use newsletter::{
     Newsletter, NewsletterAdminInfo, NewsletterAdminProfile, NewsletterError, NewsletterFollower,

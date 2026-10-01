@@ -216,21 +216,28 @@ struct Fixture {
     own_sending_jid: Jid,
 }
 
-async fn build_fixture(group_size: usize) -> Fixture {
-    let backend = Arc::new(InMemoryBackend::new());
+async fn build_offline_client() -> Arc<Client> {
     let pm = Arc::new(
-        PersistenceManager::new(backend)
+        PersistenceManager::new(Arc::new(InMemoryBackend::new()))
             .await
             .expect("persistence manager"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(TokioRuntime),
-        pm,
-        Arc::new(SinkTransportFactory),
-        Arc::new(NoopHttpClient),
-        None,
-    )
-    .await;
+    // Offline fixtures intentionally drop the manual receiver rather than starting
+    // a major-sync consumer they do not exercise.
+    Client::builder()
+        .with_runtime(TokioRuntime)
+        .with_persistence_manager(pm)
+        .with_transport_factory(SinkTransportFactory)
+        .with_http_client(NoopHttpClient)
+        .build()
+        .await
+        .expect("offline client")
+        .into_parts()
+        .0
+}
+
+async fn build_fixture(group_size: usize) -> Fixture {
+    let client = build_offline_client().await;
 
     let own_pn = Jid::new(OWN_USER, Server::Pn);
     let own_lid = Jid::new("100000000000001", Server::Lid);
@@ -433,14 +440,15 @@ async fn establish_acknowledged_session(client: &Arc<Client>, peer: &Jid) -> Arc
             .await
             .expect("companion persistence manager"),
     );
-    let (peer_client, _sync_rx) = Client::new(
-        Arc::new(TokioRuntime),
-        peer_pm,
-        Arc::new(SinkTransportFactory),
-        Arc::new(NoopHttpClient),
-        None,
-    )
-    .await;
+    let (peer_client, _sync_rx) = Client::builder()
+        .with_runtime(TokioRuntime)
+        .with_persistence_manager(peer_pm)
+        .with_transport_factory(SinkTransportFactory)
+        .with_http_client(NoopHttpClient)
+        .build()
+        .await
+        .expect("offline client")
+        .into_parts();
 
     let own_snapshot = client.persistence_manager.get_device_snapshot();
     let own_address = own_snapshot
@@ -637,20 +645,7 @@ async fn build_dm_fixture(peer_devices: usize, addressing: DmAddressing) -> (Arc
 
     assert!(peer_devices >= 1, "a recipient has at least its primary");
 
-    let backend = Arc::new(InMemoryBackend::new());
-    let pm = Arc::new(
-        PersistenceManager::new(backend)
-            .await
-            .expect("persistence manager"),
-    );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(TokioRuntime),
-        pm,
-        Arc::new(SinkTransportFactory),
-        Arc::new(NoopHttpClient),
-        None,
-    )
-    .await;
+    let client = build_offline_client().await;
 
     let own_pn = Jid::new(OWN_USER, Server::Pn);
     let own_lid = Jid::new("100000000000001", Server::Lid);
@@ -1353,20 +1348,7 @@ async fn build_multilane_receive_fixture(
     use wacore::libsignal::protocol::create_sender_key_distribution_message;
     use wacore::types::jid::{JidExt, make_sender_key_name};
 
-    let backend = Arc::new(InMemoryBackend::new());
-    let pm = Arc::new(
-        PersistenceManager::new(backend)
-            .await
-            .expect("persistence manager"),
-    );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(TokioRuntime),
-        pm,
-        Arc::new(SinkTransportFactory),
-        Arc::new(NoopHttpClient),
-        None,
-    )
-    .await;
+    let client = build_offline_client().await;
 
     let own_pn = Jid::new(OWN_USER, Server::Pn);
     let own_lid = Jid::new("100000000000001", Server::Lid);
@@ -1469,20 +1451,7 @@ async fn build_receive_fixture() -> ReceiveFixture {
     use wacore::libsignal::protocol::create_sender_key_distribution_message;
     use wacore::types::jid::{JidExt, make_sender_key_name};
 
-    let backend = Arc::new(InMemoryBackend::new());
-    let pm = Arc::new(
-        PersistenceManager::new(backend)
-            .await
-            .expect("persistence manager"),
-    );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(TokioRuntime),
-        pm,
-        Arc::new(SinkTransportFactory),
-        Arc::new(NoopHttpClient),
-        None,
-    )
-    .await;
+    let client = build_offline_client().await;
 
     let own_pn = Jid::new(OWN_USER, Server::Pn);
     let own_lid = Jid::new("100000000000001", Server::Lid);
@@ -1686,20 +1655,7 @@ async fn build_scale_fixture(
     groups: usize,
     members: usize,
 ) -> (Arc<Client>, Vec<(Jid, Arc<GroupRoutingInfo>)>, Jid) {
-    let backend = Arc::new(InMemoryBackend::new());
-    let pm = Arc::new(
-        PersistenceManager::new(backend)
-            .await
-            .expect("persistence manager"),
-    );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(TokioRuntime),
-        pm,
-        Arc::new(SinkTransportFactory),
-        Arc::new(NoopHttpClient),
-        None,
-    )
-    .await;
+    let client = build_offline_client().await;
 
     let own_pn = Jid::new(OWN_USER, Server::Pn);
     let own_lid = Jid::new("100000000000001", Server::Lid);

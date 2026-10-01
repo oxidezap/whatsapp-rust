@@ -1,9 +1,9 @@
 use crate::cache_config::CacheConfig;
-use crate::client::{Client, ClientBuilderError};
+use crate::client::{Client, ClientBuilder, ClientBuilderError, ClientOptions};
 use crate::features::PresencePolicy;
 use crate::pair_code::PairCodeOptions;
 #[cfg(feature = "plugins")]
-use crate::plugins::{ClientPlugin, PluginHostConfig, PluginRegistration, UntypedClientPlugin};
+use crate::plugins::{ClientPlugin, PluginHostConfig, UntypedClientPlugin};
 use crate::store::commands::DeviceCommand;
 use crate::store::error::StoreError;
 use crate::store::persistence_manager::PersistenceManager;
@@ -15,7 +15,6 @@ use crate::types::history_sync_admission::HistorySyncAdmission;
 use crate::types::message::MessageInfo;
 use futures::FutureExt;
 use log::{info, warn};
-use std::collections::HashMap;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -696,7 +695,13 @@ impl Bot {
 /// only available once all four are [`Provided`], turning missing-field errors
 /// into compile-time errors. With the default cargo features, transport, HTTP
 /// client and runtime start [`Provided`] (Tokio WebSocket, ureq, Tokio), so
-/// only the backend is required.
+/// only the backend is required. Shared options never satisfy required dependencies:
+///
+/// ```compile_fail
+/// use whatsapp_rust::bot::Bot;
+/// use whatsapp_rust::ClientOptions;
+/// let _ = Bot::builder().with_client_options(ClientOptions::default()).build();
+/// ```
 #[must_use = "call .build() to produce the Bot; the builder does nothing on its own"]
 pub struct BotBuilder<
     B = MissingBackend,
@@ -706,68 +711,39 @@ pub struct BotBuilder<
 > {
     // Required fields (guaranteed present when B/T/H/R = Provided)
     backend: Option<Arc<dyn Backend>>,
-    transport_factory: Option<Arc<dyn crate::transport::TransportFactory>>,
-    http_client: Option<Arc<dyn crate::http::HttpClient>>,
-    runtime: Option<Arc<dyn Runtime>>,
+    client_builder: ClientBuilder,
     // Optional fields
     event_handlers: Vec<RegisteredHandler>,
     event_delivery: EventDelivery,
     raw_handlers: Vec<Arc<dyn EventHandler>>,
-    custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
-    inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
-    history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
-    override_version: Option<(u32, u32, u32)>,
     device_props_override: Option<DevicePropsOverride>,
     pair_code_options: Option<PairCodeOptions>,
-    skip_history_sync: bool,
-    ab_props_fetch: bool,
-    watched_ab_props: Vec<wacore::iq::abprops::AbProp>,
-    presence_policy: PresencePolicy,
-    noise_cert_policy: NoiseCertPolicy,
     initial_push_name: Option<String>,
-    cache_config: CacheConfig,
-    wanted_pre_key_count: Option<usize>,
-    resend_rate_limit: Option<(u32, u32)>,
-    task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
-    alloc_meter: Option<Arc<wacore::stats::AllocMeter>>,
-    #[cfg(feature = "plugins")]
-    plugins: Vec<PluginRegistration>,
-    #[cfg(feature = "plugins")]
-    plugin_host_config: PluginHostConfig,
     _marker: PhantomData<(B, T, H, R)>,
 }
 
 impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, DefaultRuntimeState> {
     fn new() -> Self {
+        let mut client_builder =
+            ClientBuilder::new().with_background_saver_interval(std::time::Duration::from_secs(30));
+        if let Some(factory) = default_transport_factory() {
+            client_builder = client_builder.with_transport_factory_arc(factory);
+        }
+        if let Some(http) = default_http_client() {
+            client_builder = client_builder.with_http_client_arc(http);
+        }
+        if let Some(runtime) = default_runtime() {
+            client_builder = client_builder.with_runtime_arc(runtime);
+        }
         Self {
             backend: None,
-            transport_factory: default_transport_factory(),
-            http_client: default_http_client(),
-            runtime: default_runtime(),
+            client_builder,
             event_handlers: Vec::new(),
             event_delivery: EventDelivery::default(),
             raw_handlers: Vec::new(),
-            custom_enc_handlers: HashMap::new(),
-            inbound_durability_hook: None,
-            history_sync_admission: None,
-            override_version: None,
             device_props_override: None,
             pair_code_options: None,
-            skip_history_sync: false,
-            ab_props_fetch: true,
-            watched_ab_props: Vec::new(),
-            presence_policy: PresencePolicy::default(),
-            noise_cert_policy: NoiseCertPolicy::default(),
             initial_push_name: None,
-            cache_config: CacheConfig::default(),
-            wanted_pre_key_count: None,
-            resend_rate_limit: None,
-            task_instrument: None,
-            alloc_meter: None,
-            #[cfg(feature = "plugins")]
-            plugins: Vec::new(),
-            #[cfg(feature = "plugins")]
-            plugin_host_config: PluginHostConfig::default(),
             _marker: PhantomData,
         }
     }
@@ -779,35 +755,62 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     fn cast<B2, T2, H2, R2>(self) -> BotBuilder<B2, T2, H2, R2> {
         BotBuilder {
             backend: self.backend,
-            transport_factory: self.transport_factory,
-            http_client: self.http_client,
-            runtime: self.runtime,
+            client_builder: self.client_builder,
             event_handlers: self.event_handlers,
             event_delivery: self.event_delivery,
             raw_handlers: self.raw_handlers,
-            custom_enc_handlers: self.custom_enc_handlers,
-            inbound_durability_hook: self.inbound_durability_hook,
-            history_sync_admission: self.history_sync_admission,
-            override_version: self.override_version,
             device_props_override: self.device_props_override,
             pair_code_options: self.pair_code_options,
-            skip_history_sync: self.skip_history_sync,
-            ab_props_fetch: self.ab_props_fetch,
-            watched_ab_props: self.watched_ab_props,
-            presence_policy: self.presence_policy,
-            noise_cert_policy: self.noise_cert_policy,
             initial_push_name: self.initial_push_name,
-            cache_config: self.cache_config,
-            wanted_pre_key_count: self.wanted_pre_key_count,
-            resend_rate_limit: self.resend_rate_limit,
-            task_instrument: self.task_instrument,
-            alloc_meter: self.alloc_meter,
-            #[cfg(feature = "plugins")]
-            plugins: self.plugins,
-            #[cfg(feature = "plugins")]
-            plugin_host_config: self.plugin_host_config,
             _marker: PhantomData,
         }
+    }
+
+    /// Replace the shared configuration, including the background saver policy.
+    /// Passing [`ClientOptions::default()`] disables Bot's default 30-second saver.
+    /// Injected dependencies and callbacks are unchanged.
+    pub fn with_client_options(mut self, options: ClientOptions) -> Self {
+        self.client_builder = self.client_builder.with_options(options);
+        self
+    }
+
+    /// Borrow the effective shared construction options.
+    pub fn client_options(&self) -> &ClientOptions {
+        self.client_builder.options()
+    }
+
+    /// Share an already-erased transport without wrapping it in another Arc.
+    pub fn with_transport_factory_arc(
+        mut self,
+        factory: Arc<dyn crate::transport::TransportFactory>,
+    ) -> BotBuilder<B, Provided, H, R> {
+        self.client_builder = self.client_builder.with_transport_factory_arc(factory);
+        self.cast()
+    }
+
+    /// Share an already-erased runtime across sessions.
+    pub fn with_runtime_arc(mut self, runtime: Arc<dyn Runtime>) -> BotBuilder<B, T, H, Provided> {
+        self.client_builder = self.client_builder.with_runtime_arc(runtime);
+        self.cast()
+    }
+
+    /// Register an already-shared encrypted-payload handler.
+    pub fn with_enc_handler_arc(
+        mut self,
+        enc_type: impl Into<String>,
+        handler: Arc<dyn EncHandler>,
+    ) -> Self {
+        self.client_builder = self.client_builder.with_enc_handler_arc(enc_type, handler);
+        self
+    }
+
+    /// Register an already-shared durability hook.
+    pub fn with_inbound_durability_hook_arc(
+        mut self,
+        hook: Arc<dyn InboundDurabilityHook>,
+    ) -> Self {
+        self.client_builder = self.client_builder.with_inbound_durability_hook_arc(hook);
+        self
     }
 
     // ── Required-field setters (each transitions one type parameter) ──────
@@ -848,7 +851,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     where
         F: crate::transport::TransportFactory + 'static,
     {
-        self.transport_factory = Some(Arc::new(factory));
+        self.client_builder = self.client_builder.with_transport_factory(factory);
         self.cast()
     }
 
@@ -939,14 +942,14 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         mut self,
         client: Arc<dyn crate::http::HttpClient>,
     ) -> BotBuilder<B, T, Provided, R> {
-        self.http_client = Some(client);
+        self.client_builder = self.client_builder.with_http_client_arc(client);
         self.cast()
     }
 
     /// Set the async runtime implementation, replacing the `tokio-runtime`
     /// default when that feature is enabled.
     pub fn with_runtime<Rt: Runtime>(mut self, runtime: Rt) -> BotBuilder<B, T, H, Provided> {
-        self.runtime = Some(Arc::new(runtime));
+        self.client_builder = self.client_builder.with_runtime(runtime);
         self.cast()
     }
 
@@ -992,11 +995,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         mut self,
         instrument: Arc<dyn wacore::stats::TaskInstrument>,
     ) -> Self {
-        self.task_instrument = Some(instrument);
-        // Clear any alloc-meter handle: only the last instrument set is driven by
-        // the poll hooks, so a stale handle would make resource_report() report a
-        // never-updated all-zero snapshot instead of `None`.
-        self.alloc_meter = None;
+        self.client_builder = self.client_builder.with_task_instrument(instrument);
         self
     }
 
@@ -1013,8 +1012,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// [`AllocMeter::on_alloc`]: wacore::stats::AllocMeter::on_alloc
     /// [`AllocMeter::on_dealloc`]: wacore::stats::AllocMeter::on_dealloc
     pub fn with_alloc_meter(mut self, meter: Arc<wacore::stats::AllocMeter>) -> Self {
-        self.task_instrument = Some(meter.clone());
-        self.alloc_meter = Some(meter);
+        self.client_builder = self.client_builder.with_alloc_meter(meter);
         self
     }
 
@@ -1022,7 +1020,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     #[cfg(feature = "plugins")]
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     pub fn with_plugin<P: ClientPlugin>(mut self, plugin: P) -> Self {
-        self.plugins.push(PluginRegistration::new(plugin));
+        self.client_builder = self.client_builder.with_plugin(plugin);
         self
     }
 
@@ -1030,7 +1028,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     #[cfg(feature = "plugins")]
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     pub fn with_plugin_arc<P: ClientPlugin>(mut self, plugin: Arc<P>) -> Self {
-        self.plugins.push(PluginRegistration::new_arc(plugin));
+        self.client_builder = self.client_builder.with_plugin_arc(plugin);
         self
     }
 
@@ -1038,7 +1036,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     #[cfg(feature = "plugins")]
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     pub fn with_untyped_plugin<P: UntypedClientPlugin>(mut self, plugin: P) -> Self {
-        self.plugins.push(PluginRegistration::new_untyped(plugin));
+        self.client_builder = self.client_builder.with_untyped_plugin(plugin);
         self
     }
 
@@ -1049,8 +1047,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         mut self,
         plugin: Arc<P>,
     ) -> Self {
-        self.plugins
-            .push(PluginRegistration::new_untyped_arc(plugin));
+        self.client_builder = self.client_builder.with_untyped_plugin_arc(plugin);
         self
     }
 
@@ -1058,7 +1055,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     #[cfg(feature = "plugins")]
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     pub fn with_plugin_host_config(mut self, config: PluginHostConfig) -> Self {
-        self.plugin_host_config = config;
+        self.client_builder = self.client_builder.with_plugin_host_config(config);
         self
     }
 
@@ -1287,8 +1284,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     where
         Eh: EncHandler + 'static,
     {
-        self.custom_enc_handlers
-            .insert(enc_type.into(), Arc::new(handler));
+        self.client_builder = self.client_builder.with_enc_handler(enc_type, handler);
         self
     }
 
@@ -1305,7 +1301,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     where
         Dh: InboundDurabilityHook + 'static,
     {
-        self.inbound_durability_hook = Some(Arc::new(hook));
+        self.client_builder = self.client_builder.with_inbound_durability_hook(hook);
         self
     }
 
@@ -1315,7 +1311,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     where
         A: HistorySyncAdmission + 'static,
     {
-        self.history_sync_admission = Some(Arc::new(admission));
+        self.client_builder = self.client_builder.with_history_sync_admission(admission);
         self
     }
 
@@ -1324,7 +1320,9 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         mut self,
         admission: Arc<dyn HistorySyncAdmission>,
     ) -> Self {
-        self.history_sync_admission = Some(admission);
+        self.client_builder = self
+            .client_builder
+            .with_history_sync_admission_arc(admission);
         self
     }
 
@@ -1336,7 +1334,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// # Arguments
     /// * `version` - A tuple of (primary, secondary, tertiary) version numbers
     pub fn with_version(mut self, version: (u32, u32, u32)) -> Self {
-        self.override_version = Some(version);
+        self.client_builder = self.client_builder.with_version_override(version);
         self
     }
 
@@ -1413,7 +1411,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     ///
     /// Default: `false` (history sync is processed normally).
     pub fn skip_history_sync(mut self) -> Self {
-        self.skip_history_sync = true;
+        self.client_builder = self.client_builder.with_skip_history_sync(true);
         self
     }
 
@@ -1421,7 +1419,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// default; see [`ClientBuilder::with_ab_props_fetch`](crate::client::ClientBuilder::with_ab_props_fetch) for what turning
     /// it off costs and which targets would want to.
     pub fn with_ab_props_fetch(mut self, enabled: bool) -> Self {
-        self.ab_props_fetch = enabled;
+        self.client_builder = self.client_builder.with_ab_props_fetch(enabled);
         self
     }
 
@@ -1432,7 +1430,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         mut self,
         props: impl IntoIterator<Item = wacore::iq::abprops::AbProp>,
     ) -> Self {
-        self.watched_ab_props.extend(props);
+        self.client_builder = self.client_builder.with_watched_ab_props(props);
         self
     }
 
@@ -1441,7 +1439,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// Default: [`PresencePolicy::Automatic`], which matches WhatsApp Web. See
     /// [`PresencePolicy::Manual`] for the host that has to own it.
     pub fn with_presence_policy(mut self, policy: PresencePolicy) -> Self {
-        self.presence_policy = policy;
+        self.client_builder = self.client_builder.with_presence_policy(policy);
         self
     }
 
@@ -1452,7 +1450,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// against a mock server that cannot produce a WhatsApp-rooted chain.
     /// Fixed at build time and applied to every connect, including reconnects.
     pub fn with_noise_cert_policy(mut self, policy: NoiseCertPolicy) -> Self {
-        self.noise_cert_policy = policy;
+        self.client_builder = self.client_builder.with_noise_cert_policy(policy);
         self
     }
 
@@ -1462,7 +1460,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// protocol-safe range at upload time. Useful for memory-constrained or
     /// embedded consumers that want a smaller batch.
     pub fn with_wanted_pre_key_count(mut self, count: usize) -> Self {
-        self.wanted_pre_key_count = Some(count);
+        self.client_builder = self.client_builder.with_wanted_pre_key_count(count);
         self
     }
 
@@ -1478,7 +1476,9 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// calling this. Can also be retuned live via
     /// [`Client::set_resend_rate_limit`](crate::Client::set_resend_rate_limit).
     pub fn with_resend_rate_limit(mut self, burst: u32, refill_per_min: u32) -> Self {
-        self.resend_rate_limit = Some((burst, refill_per_min));
+        self.client_builder = self
+            .client_builder
+            .with_resend_rate_limit(burst, refill_per_min);
         self
     }
 
@@ -1513,7 +1513,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     ///     .await?;
     /// ```
     pub fn with_cache_config(mut self, config: CacheConfig) -> Self {
-        self.cache_config = config;
+        self.client_builder = self.client_builder.with_cache_config(config);
         self
     }
 }
@@ -1538,18 +1538,12 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         tracing::instrument(name = "wa.bot.build", level = "debug", skip_all, err(Debug))
     )]
     async fn build_graph(self) -> Result<Bot, BotBuilderError> {
-        // Destructure to extract required fields — typestate guarantees all are Some.
-        let (Some(runtime), Some(backend), Some(transport_factory), Some(http_client)) = (
-            self.runtime,
-            self.backend,
-            self.transport_factory,
-            self.http_client,
-        ) else {
+        // Typestate guarantees the backend and embedded platform dependencies are present.
+        let Some(backend) = self.backend else {
             unreachable!("typestate guarantees all required fields are Provided")
         };
 
-        let task_instrument = self.task_instrument;
-        let alloc_meter = self.alloc_meter;
+        let task_instrument = self.client_builder.task_instrument();
 
         // Note: For multi-account mode, create the backend with SqliteStore::new_for_device()
         // before passing it to with_backend_arc()
@@ -1592,47 +1586,9 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         }
 
         info!("Creating client...");
-        let client_builder = Client::builder()
-            .with_runtime_arc(runtime)
-            .with_persistence_manager(persistence_manager)
-            .with_transport_factory_arc(transport_factory)
-            .with_http_client_arc(http_client)
-            .with_cache_config(self.cache_config)
-            .with_noise_cert_policy(self.noise_cert_policy)
-            .with_custom_enc_handlers(self.custom_enc_handlers)
-            .with_skip_history_sync(self.skip_history_sync)
-            .with_ab_props_fetch(self.ab_props_fetch)
-            .with_watched_ab_props(self.watched_ab_props)
-            .with_presence_policy(self.presence_policy)
-            .with_background_saver_interval(std::time::Duration::from_secs(30));
-        #[cfg(feature = "plugins")]
-        let client_builder = client_builder
-            .with_plugin_registrations(self.plugins)
-            .with_plugin_host_config(self.plugin_host_config);
-        let mut client_builder = client_builder;
-
-        if let Some(version) = self.override_version {
-            client_builder = client_builder.with_version_override(version);
-        }
-        if let Some(hook) = self.inbound_durability_hook {
-            client_builder = client_builder.with_inbound_durability_hook_arc(hook);
-        }
-        if let Some(admission) = self.history_sync_admission {
-            client_builder = client_builder.with_history_sync_admission_arc(admission);
-        }
-        if let Some(count) = self.wanted_pre_key_count {
-            client_builder = client_builder.with_wanted_pre_key_count(count);
-        }
-        if let Some((burst, refill_per_min)) = self.resend_rate_limit {
-            client_builder = client_builder.with_resend_rate_limit(burst, refill_per_min);
-        }
-        client_builder = match alloc_meter {
-            Some(meter) => client_builder.with_alloc_meter(meter),
-            None => match task_instrument.clone() {
-                Some(instrument) => client_builder.with_task_instrument(instrument),
-                None => client_builder,
-            },
-        };
+        let client_builder = self
+            .client_builder
+            .with_persistence_manager(persistence_manager);
 
         let (client, sync_task_receiver) = client_builder.build().await?.into_parts();
 

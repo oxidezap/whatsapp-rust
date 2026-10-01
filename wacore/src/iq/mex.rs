@@ -16,12 +16,12 @@
 //! </iq>
 //! ```
 //!
-//! # Variables are all-or-nothing
+//! # Declared variables are not necessarily required
 //!
-//! The server binds a persisted query's variables by name and answers a bare
-//! `400 Bad Request` when it cannot bind one, so a call site has to decide every
-//! variable the document declares. That is why a generated `Variables` is not
-//! `Default`, and it is the compiler that enforces it:
+//! Generated `Variables` have no `Default`, so callers deliberately choose each
+//! field. `None` fields can be omitted from serialization, including optional
+//! variables omitted by WhatsApp Web. `VARIABLE_KEYS` lists declarations, not
+//! requiredness; neither construction nor execution validates key presence:
 //!
 //! ```compile_fail
 //! use wacore::iq::mex_operations::fetch_newsletter;

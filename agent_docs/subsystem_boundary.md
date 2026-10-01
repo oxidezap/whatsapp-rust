@@ -195,7 +195,7 @@ alone, with the resident engine off. The signaling types that used to live in
 format types, the group control vocabulary -- were moved into
 `wacore::voip_control`, and `wacore::voip` re-exports them, so the historical
 paths keep resolving. The public event and command surface
-(`CallHandle::events()`, `CallHandle::media_stats()`) reads the session through
+(`CallHandle::take_events()`, `CallHandle::media_stats()`) reads the session through
 `subscribe()`/`stats()`, not an engine-owned enum or cell.
 
 `voip-control` carries the contract **and** the call flow: `src/voip` is gated on

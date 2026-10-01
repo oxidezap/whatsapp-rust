@@ -56,13 +56,15 @@ pub enum ProfilePictureType {
 pub enum ProfilePictureLookup {
     /// A profile picture was found.
     Found(ProfilePicture),
-    /// The profile picture has not changed since the provided `existing_id`.
+    /// No new URL was returned on a conditional lookup (or explicit status 304).
+    /// This does not establish that the caller has image bytes in its cache.
     Unchanged,
     /// The entity has no profile picture set (e.g. 404 item-not-found, 204 no-content, or empty).
     NotFound,
     /// Not authorized to view the profile picture (e.g. 401 not-authorized, 403 forbidden, privacy settings).
     NotAuthorized,
-    /// Rate limit reached for profile picture queries (429 rate-overlimit).
+    /// Lossy legacy parser state for 429 rate-overlimit. High-level canonical
+    /// lookup preserves the rejection as an error instead; this carries no backoff.
     RateOverlimit,
 }
 
@@ -75,7 +77,8 @@ impl ProfilePictureLookup {
         }
     }
 
-    /// Converts into `Option<ProfilePicture>`, dropping non-found states.
+    /// Deliberately discards Unchanged, NotFound, NotAuthorized and the legacy
+    /// RateOverlimit state, returning only a newly found picture.
     pub fn into_found(self) -> Option<ProfilePicture> {
         match self {
             Self::Found(pic) => Some(pic),
@@ -230,6 +233,37 @@ impl ProfilePictureSpec {
         self.timeout = Some(timeout);
         self
     }
+
+    /// Parse without losing an embedded 429 rejection. The error is a
+    /// `crate::request::IqError`, so the runtime can attach the original stanza.
+    /// The legacy `IqSpec` parser retains its unit RateOverlimit for compatibility.
+    pub fn parse_response_preserving_rate_limit(
+        &self,
+        response: &NodeRef<'_>,
+    ) -> Result<ProfilePictureLookup, anyhow::Error> {
+        let picture = if let Some(pictures) = response.get_optional_child("pictures") {
+            pictures.get_optional_child("picture")
+        } else {
+            response.get_optional_child("picture")
+        };
+        if let Some(error) = picture.and_then(|picture| picture.get_optional_child("error"))
+            && error.get_attr("code").is_some_and(|code| code == "429")
+        {
+            return Err(crate::request::IqError::ServerError {
+                code: 429,
+                text: error
+                    .get_attr("text")
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+                error_type: error.get_attr("type").map(|s| s.to_string()),
+                backoff: error
+                    .get_attr("backoff")
+                    .and_then(|s| s.as_str().parse().ok()),
+            }
+            .into());
+        }
+        self.parse_response(response)
+    }
 }
 
 impl IqSpec for ProfilePictureSpec {
@@ -308,8 +342,8 @@ impl IqSpec for ProfilePictureSpec {
 
         let picture_node = match picture_node {
             Some(p) => p,
-            // Empty <iq type="result"/> (no <picture> node = GetResponseSuccessNoData):
-            // On conditional lookup with existing_id, WhatsApp Web server sends no data on unchanged.
+            // No new picture data: preserve the existing conditional-lookup
+            // interpretation, without implying the consumer has cached bytes.
             None => {
                 return if self.existing_id.is_some() {
                     Ok(ProfilePictureLookup::Unchanged)
@@ -350,7 +384,7 @@ impl IqSpec for ProfilePictureSpec {
 
         let id = match picture_node.attrs().optional_string("id") {
             Some(s) => s.to_string(),
-            // Empty <picture/> with no attributes = cache hit (picture unchanged)
+            // No new picture data; only a conditional lookup can be Unchanged.
             None => {
                 return if self.existing_id.is_some() {
                     Ok(ProfilePictureLookup::Unchanged)
@@ -362,7 +396,7 @@ impl IqSpec for ProfilePictureSpec {
 
         let url = match picture_node.attrs().optional_string("url") {
             Some(s) => s.to_string(),
-            // <picture id="..."/> with no url = cache hit variant (picture unchanged)
+            // An ID without a URL supplies no newly found picture.
             None => {
                 return if self.existing_id.is_some() {
                     Ok(ProfilePictureLookup::Unchanged)

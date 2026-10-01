@@ -1,0 +1,13 @@
+[package]
+name = "voip-control-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+runtime = ["whatsapp-rust/voip-mlow"]
+
+[dependencies]
+whatsapp-rust = { path = "../../..", default-features = false, features = ["voip-control"] }

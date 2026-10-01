@@ -35,7 +35,39 @@ pub enum RunCompletionReason {
 pub enum ProtocolTerminalReason {
     StreamErrorCode(u16),
     ConnectFailure(ConnectFailureReason),
-    Conflict,
+    /// A nonempty stream-conflict type, classified without retaining its text.
+    Conflict(ConflictKind),
+}
+
+/// The cause carried by a terminal stream conflict.
+///
+/// This classification does not prescribe credential deletion or reconnection.
+/// Unknown types remain distinct from a confirmed device removal.
+///
+/// ```
+/// use whatsapp_rust::{ConflictKind, ProtocolTerminalReason};
+///
+/// fn conflict_cause(reason: ProtocolTerminalReason) -> &'static str {
+///     match reason {
+///         ProtocolTerminalReason::Conflict(ConflictKind::Replaced) => "replaced",
+///         ProtocolTerminalReason::Conflict(ConflictKind::DeviceRemoved) => "device removed",
+///         ProtocolTerminalReason::Conflict(_) => "unrecognized conflict",
+///         _ => "not a conflict",
+///     }
+/// }
+/// assert_eq!(conflict_cause(ProtocolTerminalReason::Conflict(ConflictKind::Replaced)), "replaced");
+/// let _: whatsapp_rust::prelude::ConflictKind = ConflictKind::Unknown;
+/// let _: whatsapp_rust::client::ConflictKind = ConflictKind::Unknown;
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConflictKind {
+    /// Another session replaced this stream (`replaced`).
+    Replaced,
+    /// This companion device was removed (`device_removed`).
+    DeviceRemoved,
+    /// A nonempty conflict type this client does not recognize.
+    Unknown,
 }
 
 struct ConnectionEnd {
@@ -407,8 +439,15 @@ impl Client {
 
     /// Create a new `Client` with default cache configuration.
     ///
-    /// This is the standard constructor. Use [`Client::new_with_cache_config`]
-    /// if you need to customise cache TTL / capacity.
+    /// Prefer [`Client::builder`] and [`ClientBuild::into_parts`](super::ClientBuild::into_parts)
+    /// for manual sync ownership, or `into_client()` for the default sync worker.
+    #[cfg_attr(
+        not(test),
+        deprecated(
+            since = "0.7.0",
+            note = "use Client::builder().build().await?.into_parts() or into_client()"
+        )
+    )]
     pub async fn new(
         runtime: Arc<dyn Runtime>,
         persistence_manager: Arc<PersistenceManager>,
@@ -429,6 +468,14 @@ impl Client {
     }
 
     /// Create a new `Client` with a custom [`CacheConfig`].
+    /// Prefer [`Client::builder`] with `with_cache_config`, then `into_parts()`.
+    #[cfg_attr(
+        not(test),
+        deprecated(
+            since = "0.7.0",
+            note = "use Client::builder().with_cache_config(...).build().await?.into_parts()"
+        )
+    )]
     pub async fn new_with_cache_config(
         runtime: Arc<dyn Runtime>,
         persistence_manager: Arc<PersistenceManager>,
@@ -2810,6 +2857,79 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stream_conflicts_survive_reader_cleanup_and_keep_their_events() {
+        for (conflict_type, kind) in [
+            ("replaced", ConflictKind::Replaced),
+            ("device_removed", ConflictKind::DeviceRemoved),
+            ("future_conflict", ConflictKind::Unknown),
+        ] {
+            let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+            client
+                .core
+                .event_bus
+                .subscribe_handler(collector.clone())
+                .detach();
+            client.is_logged_in.store(true, Ordering::Relaxed);
+            client
+                .send_node(
+                    NodeBuilder::new("stream:error")
+                        .children([NodeBuilder::new("conflict")
+                            .attr("type", conflict_type)
+                            .build()])
+                        .build(),
+                )
+                .await
+                .unwrap();
+            crate::test_utils::poll_until("the conflict frame to be written", || {
+                transport.sent_count() >= 1
+            })
+            .await;
+            let frame = transport.sent().remove(0);
+            let (events, receiver) = async_channel::bounded(2);
+            *client.transport_events.lock().await = Some(receiver);
+            events
+                .send(crate::transport::TransportEvent::DataReceived(frame))
+                .await
+                .unwrap();
+
+            let end = tokio::time::timeout(
+                Duration::from_secs(5),
+                client
+                    .connection_for_test()
+                    .read_until_disconnected_with_outcome(),
+            )
+            .await
+            .expect("a conflict must end the reader");
+            assert_eq!(
+                end.terminal_reason,
+                Some(ProtocolTerminalReason::Conflict(kind))
+            );
+            assert!(end.unexpected.is_none());
+            assert!(!client.is_connected());
+            assert!(!client.is_logged_in.load(Ordering::Relaxed));
+            assert!(!client.enable_auto_reconnect.load(Ordering::Relaxed));
+            assert!(client.expected_disconnect.load(Ordering::Relaxed));
+            let events = collector.events();
+            let terminal_events: Vec<_> = events
+                .iter()
+                .filter(|event| matches!(***event, Event::StreamReplaced(_) | Event::LoggedOut(_)))
+                .collect();
+            assert_eq!(terminal_events.len(), 1);
+            match &**terminal_events[0] {
+                Event::StreamReplaced(_) => assert_eq!(kind, ConflictKind::Replaced),
+                Event::LoggedOut(logged_out) => {
+                    assert_ne!(kind, ConflictKind::Replaced);
+                    assert!(!logged_out.on_connect);
+                    assert_eq!(logged_out.reason, ConnectFailureReason::LoggedOut);
+                    assert_eq!(logged_out.raw.as_ref().unwrap().tag, "stream:error");
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+    }
+
     /// The other half of the contract: connecting alone still guarantees a live
     /// socket, and guarantees nothing about reading it. The frame stays queued,
     /// no node is decoded, and no error says so, which is why the connection
@@ -3116,19 +3236,95 @@ mod tests {
 
     #[tokio::test]
     async fn expected_stream_flag_during_failed_connect_preserves_no_transport_cause() {
-        let (client, entered, release) = client_parked_in_connect().await;
-        let node = NodeBuilder::new("stream:error").attr("code", "401").build();
-        let runner = Arc::clone(&client);
-        let run = tokio::spawn(async move { runner.run_with_reason().await });
-        next_connect_attempt(&entered).await;
-        client.handle_stream_error(&node.as_node_ref()).await;
-        release.send(()).await.unwrap();
-        match run.await.unwrap() {
-            RunCompletionReason::AutoReconnectDisabled {
-                protocol_error: Some(ProtocolTerminalReason::StreamErrorCode(401)),
-                ..
-            } => {}
-            other => panic!("unexpected completion: {other:?}"),
+        for code in [401, 409, 516] {
+            for conflict in [
+                None,
+                Some(NodeBuilder::new("conflict").build()),
+                Some(NodeBuilder::new("conflict").attr("type", "").build()),
+            ] {
+                let (client, entered, release) = client_parked_in_connect().await;
+                let node = NodeBuilder::new("stream:error")
+                    .attr("code", code.to_string())
+                    .children(conflict)
+                    .build();
+                let runner = Arc::clone(&client);
+                let run = tokio::spawn(async move { runner.run_with_reason().await });
+                next_connect_attempt(&entered).await;
+                client.handle_stream_error(&node.as_node_ref()).await;
+                release.send(()).await.unwrap();
+                match run.await.unwrap() {
+                    RunCompletionReason::AutoReconnectDisabled {
+                        connection: None,
+                        connect_error: Some(ConnectError::Version(_)),
+                        protocol_error,
+                    } => assert_eq!(
+                        protocol_error,
+                        Some(ProtocolTerminalReason::StreamErrorCode(code))
+                    ),
+                    other => panic!("unexpected completion: {other:?}"),
+                }
+            }
+        }
+    }
+
+    // Drive the real handler while a synthetic connect is parked, then consume
+    // the run's return directly: no event subscription or cached reason is needed.
+    #[tokio::test]
+    async fn stream_conflicts_reach_run_completion() {
+        for (conflict_type, kind) in [
+            ("replaced", ConflictKind::Replaced),
+            ("device_removed", ConflictKind::DeviceRemoved),
+            ("future_conflict", ConflictKind::Unknown),
+        ] {
+            let (client, entered, release) = client_parked_in_connect().await;
+            let node = NodeBuilder::new("stream:error")
+                .children([NodeBuilder::new("conflict")
+                    .attr("type", conflict_type)
+                    .build()])
+                .build();
+            let runner = Arc::clone(&client);
+            let run = tokio::spawn(async move { runner.run_with_reason().await });
+            next_connect_attempt(&entered).await;
+            client.handle_stream_error(&node.as_node_ref()).await;
+            release.send(()).await.unwrap();
+            match run.await.unwrap() {
+                RunCompletionReason::AutoReconnectDisabled {
+                    connection: None,
+                    connect_error: Some(ConnectError::Version(_)),
+                    protocol_error,
+                } => assert_eq!(protocol_error, Some(ProtocolTerminalReason::Conflict(kind))),
+                other => panic!("unexpected completion for {conflict_type}: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_or_absent_conflict_types_do_not_create_a_terminal_reason() {
+        for conflict in [
+            None,
+            Some(NodeBuilder::new("conflict").build()),
+            Some(NodeBuilder::new("conflict").attr("type", "").build()),
+        ] {
+            let client = crate::test_utils::create_test_client().await;
+            client.is_logged_in.store(true, Ordering::Relaxed);
+            let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+            client
+                .core
+                .event_bus
+                .subscribe_handler(collector.clone())
+                .detach();
+            let node = NodeBuilder::new("stream:error").children(conflict).build();
+            client.handle_stream_error(&node.as_node_ref()).await;
+            assert_eq!(client.take_protocol_terminal_reason(), None);
+            assert!(client.enable_auto_reconnect.load(Ordering::Relaxed));
+            assert!(client.is_logged_in.load(Ordering::Relaxed));
+            assert!(!client.expected_disconnect.load(Ordering::Relaxed));
+            assert!(
+                !collector
+                    .events()
+                    .iter()
+                    .any(|event| matches!(**event, Event::StreamReplaced(_) | Event::LoggedOut(_)))
+            );
         }
     }
 

@@ -54,7 +54,19 @@ impl ClientBuild {
     }
 
     /// Transfer ownership of the client and its sole sync-task receiver.
-    /// The caller must drain the receiver for history sync to keep working.
+    /// No major-sync worker is started on this path. The caller must drain the
+    /// receiver and call [`Client::process_sync_task`] for history sync to keep
+    /// working. Ordinary services already started by `build()` are unaffected;
+    /// this is not an inert-client constructor.
+    ///
+    /// ```no_run
+    /// # async fn example(build: whatsapp_rust::ClientBuild) {
+    /// let (client, receiver) = build.into_parts();
+    /// while let Ok(task) = receiver.recv().await {
+    ///     client.process_sync_task(task).await;
+    /// }
+    /// # }
+    /// ```
     pub fn into_parts(self) -> (Arc<Client>, async_channel::Receiver<MajorSyncTask>) {
         (self.client, self.sync_task_receiver)
     }
@@ -109,6 +121,54 @@ pub enum ClientBuilderError {
     PluginPlan(#[from] PluginPlanError),
 }
 
+/// Shared runtime, cache and sync configuration for both construction facades.
+///
+/// Start with [`Default`] and change the fields you need. Applying options replaces
+/// the entire configuration, including the saver policy: the low-level default is
+/// no saver, whereas [`crate::bot::BotBuilder`] starts with a 30-second saver.
+/// Host dependencies and Bot callbacks are deliberately not part of this value.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ClientOptions {
+    /// `None` keeps the client's automatic version selection.
+    pub override_version: Option<(u32, u32, u32)>,
+    /// Cache TTLs, capacities, resource pools and optional shared cache stores.
+    pub cache_config: CacheConfig,
+    /// Acknowledge history-sync notifications without processing their payloads.
+    pub skip_history_sync: bool,
+    /// Fetch server A/B props on connect; see [`ClientBuilder::with_ab_props_fetch`].
+    pub ab_props_fetch: bool,
+    /// Additional props to retain; see [`ClientBuilder::with_watched_ab_props`].
+    pub watched_ab_props: Vec<AbProp>,
+    /// Ownership of the account's own available-presence announcement.
+    pub presence_policy: PresencePolicy,
+    /// Server certificate verification for every Noise handshake.
+    pub noise_cert_policy: NoiseCertPolicy,
+    /// `None` keeps the client's default prekey batch size.
+    pub wanted_pre_key_count: Option<usize>,
+    /// Optional `(burst, refill_per_minute)` override for outbound retry resends.
+    pub resend_rate_limit: Option<(u32, u32)>,
+    /// `None` disables periodic persistence; zero is rejected during build.
+    pub background_saver_interval: Option<Duration>,
+}
+
+impl Default for ClientOptions {
+    fn default() -> Self {
+        Self {
+            override_version: None,
+            cache_config: CacheConfig::default(),
+            skip_history_sync: false,
+            ab_props_fetch: true,
+            watched_ab_props: Vec::new(),
+            presence_policy: PresencePolicy::default(),
+            noise_cert_policy: NoiseCertPolicy::default(),
+            wanted_pre_key_count: None,
+            resend_rate_limit: None,
+            background_saver_interval: None,
+        }
+    }
+}
+
 /// Runtime-validated, low-level builder for [`Client`].
 ///
 /// Unlike [`crate::bot::BotBuilder`], this builder deliberately does not use
@@ -120,21 +180,12 @@ pub struct ClientBuilder {
     persistence_manager: Option<Arc<PersistenceManager>>,
     transport_factory: Option<Arc<dyn TransportFactory>>,
     http_client: Option<Arc<dyn HttpClient>>,
-    override_version: Option<(u32, u32, u32)>,
-    cache_config: CacheConfig,
+    options: ClientOptions,
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
     history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
-    skip_history_sync: bool,
-    ab_props_fetch: bool,
-    watched_ab_props: Vec<AbProp>,
-    presence_policy: PresencePolicy,
-    noise_cert_policy: NoiseCertPolicy,
-    wanted_pre_key_count: Option<usize>,
-    resend_rate_limit: Option<(u32, u32)>,
     task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
     alloc_meter: Option<Arc<wacore::stats::AllocMeter>>,
-    background_saver_interval: Option<Duration>,
     #[cfg(feature = "client-lifecycle")]
     lifecycle: Option<Arc<dyn ClientLifecycle>>,
     #[cfg(feature = "plugins")]
@@ -162,21 +213,12 @@ impl ClientBuilder {
             persistence_manager: None,
             transport_factory: None,
             http_client: None,
-            override_version: None,
-            cache_config: CacheConfig::default(),
+            options: ClientOptions::default(),
             custom_enc_handlers: HashMap::new(),
             inbound_durability_hook: None,
             history_sync_admission: None,
-            skip_history_sync: false,
-            ab_props_fetch: true,
-            watched_ab_props: Vec::new(),
-            presence_policy: PresencePolicy::default(),
-            noise_cert_policy: NoiseCertPolicy::default(),
-            wanted_pre_key_count: None,
-            resend_rate_limit: None,
             task_instrument: None,
             alloc_meter: None,
-            background_saver_interval: None,
             #[cfg(feature = "client-lifecycle")]
             lifecycle: None,
             #[cfg(feature = "plugins")]
@@ -188,6 +230,22 @@ impl ClientBuilder {
         }
     }
 
+    pub(crate) fn task_instrument(&self) -> Option<Arc<dyn wacore::stats::TaskInstrument>> {
+        self.task_instrument.clone()
+    }
+
+    /// Replace all shared options without changing injected dependencies.
+    pub fn with_options(mut self, options: ClientOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Borrow the effective shared construction options.
+    pub fn options(&self) -> &ClientOptions {
+        &self.options
+    }
+
+    /// Move a concrete runtime into this builder; use the Arc variant to share it.
     pub fn with_runtime<R>(mut self, runtime: R) -> Self
     where
         R: Runtime,
@@ -196,11 +254,13 @@ impl ClientBuilder {
         self
     }
 
+    /// Reuse an already-shared runtime without another Arc allocation.
     pub fn with_runtime_arc(mut self, runtime: Arc<dyn Runtime>) -> Self {
         self.runtime = Some(runtime);
         self
     }
 
+    /// Set the persistence manager for this session.
     pub fn with_persistence_manager(
         mut self,
         persistence_manager: Arc<PersistenceManager>,
@@ -209,6 +269,7 @@ impl ClientBuilder {
         self
     }
 
+    /// Move a concrete connection factory into this builder.
     pub fn with_transport_factory<T>(mut self, transport_factory: T) -> Self
     where
         T: TransportFactory + 'static,
@@ -217,6 +278,7 @@ impl ClientBuilder {
         self
     }
 
+    /// Reuse an already-shared connection factory.
     pub fn with_transport_factory_arc(
         mut self,
         transport_factory: Arc<dyn TransportFactory>,
@@ -225,6 +287,7 @@ impl ClientBuilder {
         self
     }
 
+    /// Move a concrete HTTP client into this builder, without requiring Clone.
     pub fn with_http_client<H>(mut self, http_client: H) -> Self
     where
         H: HttpClient + 'static,
@@ -233,6 +296,7 @@ impl ClientBuilder {
         self
     }
 
+    /// Reuse an already-shared HTTP client and its pool across sessions.
     pub fn with_http_client_arc(mut self, http_client: Arc<dyn HttpClient>) -> Self {
         self.http_client = Some(http_client);
         self
@@ -263,13 +327,15 @@ impl ClientBuilder {
         self
     }
 
+    /// Override automatic WhatsApp version selection.
     pub fn with_version_override(mut self, version: (u32, u32, u32)) -> Self {
-        self.override_version = Some(version);
+        self.options.override_version = Some(version);
         self
     }
 
+    /// Replace cache/resource settings, preserving other shared options.
     pub fn with_cache_config(mut self, cache_config: CacheConfig) -> Self {
-        self.cache_config = cache_config;
+        self.options.cache_config = cache_config;
         self
     }
 
@@ -291,14 +357,6 @@ impl ClientBuilder {
     ) -> Self {
         self.custom_enc_handlers
             .insert(payload_type.into(), handler);
-        self
-    }
-
-    pub(crate) fn with_custom_enc_handlers(
-        mut self,
-        handlers: HashMap<String, Arc<dyn EncHandler>>,
-    ) -> Self {
-        self.custom_enc_handlers = handlers;
         self
     }
 
@@ -339,8 +397,9 @@ impl ClientBuilder {
         self
     }
 
+    /// Acknowledge history-sync notifications without processing them when true.
     pub fn with_skip_history_sync(mut self, skip: bool) -> Self {
-        self.skip_history_sync = skip;
+        self.options.skip_history_sync = skip;
         self
     }
 
@@ -361,7 +420,7 @@ impl ClientBuilder {
     /// the props (`lid_one_on_one_migration_enabled` defaults to off), and
     /// privacy-token and trusted-contact-token gates run on their defaults.
     pub fn with_ab_props_fetch(mut self, enabled: bool) -> Self {
-        self.ab_props_fetch = enabled;
+        self.options.ab_props_fetch = enabled;
         self
     }
 
@@ -371,14 +430,14 @@ impl ClientBuilder {
     /// watch while the catalog streams in, so the set is fixed here, before
     /// the first fetch. Accumulates across calls.
     pub fn with_watched_ab_props(mut self, props: impl IntoIterator<Item = AbProp>) -> Self {
-        self.watched_ab_props.extend(props);
+        self.options.watched_ab_props.extend(props);
         self
     }
 
     /// Choose who announces the account's own `available` presence; see
     /// [`PresencePolicy`].
     pub fn with_presence_policy(mut self, policy: PresencePolicy) -> Self {
-        self.presence_policy = policy;
+        self.options.presence_policy = policy;
         self
     }
 
@@ -389,17 +448,19 @@ impl ClientBuilder {
     /// against a mock server that cannot produce a WhatsApp-rooted chain.
     /// Fixed at build time and applied to every connect, including reconnects.
     pub fn with_noise_cert_policy(mut self, policy: NoiseCertPolicy) -> Self {
-        self.noise_cert_policy = policy;
+        self.options.noise_cert_policy = policy;
         self
     }
 
+    /// Override the prekey batch size (clamped to protocol limits at upload).
     pub fn with_wanted_pre_key_count(mut self, count: usize) -> Self {
-        self.wanted_pre_key_count = Some(count);
+        self.options.wanted_pre_key_count = Some(count);
         self
     }
 
+    /// Override the outbound retry token bucket's burst and per-minute refill.
     pub fn with_resend_rate_limit(mut self, burst: u32, refill_per_min: u32) -> Self {
-        self.resend_rate_limit = Some((burst, refill_per_min));
+        self.options.resend_rate_limit = Some((burst, refill_per_min));
         self
     }
 
@@ -422,7 +483,7 @@ impl ClientBuilder {
 
     /// Run periodic device persistence for the lifetime of the client.
     pub fn with_background_saver_interval(mut self, interval: Duration) -> Self {
-        self.background_saver_interval = Some(interval);
+        self.options.background_saver_interval = Some(interval);
         self
     }
 
@@ -489,15 +550,6 @@ impl ClientBuilder {
         self
     }
 
-    #[cfg(feature = "plugins")]
-    pub(crate) fn with_plugin_registrations(
-        mut self,
-        registrations: Vec<PluginRegistration>,
-    ) -> Self {
-        self.plugins = registrations;
-        self
-    }
-
     /// Validate dependencies, assemble an inert client, then start its services.
     pub async fn build(self) -> Result<ClientBuild, ClientBuilderError> {
         self.build_boxed().await
@@ -529,7 +581,7 @@ impl ClientBuilder {
                 .cloned()
                 .ok_or(ClientBuilderError::MissingHttpClient)?;
 
-            if self.background_saver_interval == Some(Duration::ZERO) {
+            if self.options.background_saver_interval == Some(Duration::ZERO) {
                 return Err(ClientBuilderError::InvalidBackgroundSaverInterval);
             }
 
@@ -563,13 +615,14 @@ impl ClientBuilder {
         override_version: Option<(u32, u32, u32)>,
         cache_config: CacheConfig,
     ) -> ClientBuild {
-        let result = Self {
-            override_version,
-            cache_config,
-            ..Self::new()
-        }
-        .finish(runtime, persistence_manager, transport_factory, http_client)
-        .await;
+        let result = Self::new()
+            .with_options(ClientOptions {
+                override_version,
+                cache_config,
+                ..ClientOptions::default()
+            })
+            .finish(runtime, persistence_manager, transport_factory, http_client)
+            .await;
         match result {
             Ok(build) => build,
             Err(error) => unreachable!("default lifecycle-free build failed: {error}"),
@@ -583,6 +636,7 @@ impl ClientBuilder {
         transport_factory: Arc<dyn TransportFactory>,
         http_client: Arc<dyn HttpClient>,
     ) -> Result<ClientBuild, ClientBuilderError> {
+        let options = self.options;
         #[cfg(feature = "plugins")]
         let plugin_plan = PluginPlan::prepare(self.plugins)?;
         let runtime: Arc<dyn Runtime> = match self.task_instrument {
@@ -621,14 +675,14 @@ impl ClientBuilder {
             Arc::clone(&persistence_manager),
             transport_factory,
             http_client,
-            self.override_version,
-            self.cache_config,
+            options.override_version,
+            options.cache_config,
             ClientExtensions {
                 #[cfg(feature = "client-lifecycle")]
                 lifecycle,
                 #[cfg(feature = "plugins")]
                 plugin_host,
-                noise_cert_policy: self.noise_cert_policy,
+                noise_cert_policy: options.noise_cert_policy,
                 history_sync_admission: self.history_sync_admission,
             },
         );
@@ -670,20 +724,20 @@ impl ClientBuilder {
         if let Some(hook) = self.inbound_durability_hook {
             let _ = client.inbound_durability_hook.set(hook);
         }
-        if self.skip_history_sync {
+        if options.skip_history_sync {
             client.set_skip_history_sync(true);
         }
-        if !self.ab_props_fetch {
+        if !options.ab_props_fetch {
             client.set_ab_props_fetch(false);
         }
-        if !self.watched_ab_props.is_empty() {
-            client.ab_props.watch_many(&self.watched_ab_props).await;
+        if !options.watched_ab_props.is_empty() {
+            client.ab_props.watch_many(&options.watched_ab_props).await;
         }
-        client.set_presence_policy(self.presence_policy);
-        if let Some(count) = self.wanted_pre_key_count {
+        client.set_presence_policy(options.presence_policy);
+        if let Some(count) = options.wanted_pre_key_count {
             client.set_wanted_pre_key_count(count);
         }
-        if let Some((burst, refill_per_min)) = self.resend_rate_limit {
+        if let Some((burst, refill_per_min)) = options.resend_rate_limit {
             client.set_resend_rate_limit(burst, refill_per_min);
         }
         if let Some(meter) = self.alloc_meter {
@@ -701,7 +755,7 @@ impl ClientBuilder {
         }
 
         let build = assembly.start();
-        if let Some(interval) = self.background_saver_interval {
+        if let Some(interval) = options.background_saver_interval {
             let saver_handle = persistence_manager.run_background_saver(
                 runtime,
                 interval,
@@ -1111,18 +1165,18 @@ mod tests {
     fn noise_cert_policy_setter_stores_per_builder_value() {
         let strict = ClientBuilder::new();
         assert_eq!(
-            strict.noise_cert_policy,
+            strict.options.noise_cert_policy,
             NoiseCertPolicy::default(),
             "fresh builder carries the default policy"
         );
         let bypass =
             ClientBuilder::new().with_noise_cert_policy(NoiseCertPolicy::DangerSkipCertChainVerify);
         assert_eq!(
-            bypass.noise_cert_policy,
+            bypass.options.noise_cert_policy,
             NoiseCertPolicy::DangerSkipCertChainVerify
         );
         // No shared state: opting one builder in leaves the other alone.
-        assert_eq!(strict.noise_cert_policy, NoiseCertPolicy::default());
+        assert_eq!(strict.options.noise_cert_policy, NoiseCertPolicy::default());
     }
 
     #[test]
@@ -1504,6 +1558,43 @@ mod tests {
             .expect("complete builder")
             .into_client();
 
+        assert!(!client.major_sync_task_sender.is_closed());
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn sync_receiver_has_one_owner_and_into_client_starts_one_worker() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let build = complete_builder()
+            .await
+            .with_runtime(CountingRuntime {
+                spawns: spawns.clone(),
+            })
+            .build()
+            .await
+            .expect("manual build");
+        let before = spawns.load(Ordering::SeqCst);
+        let (client, receiver) = build.into_parts();
+        assert_eq!(spawns.load(Ordering::SeqCst), before);
+        assert_eq!(receiver.receiver_count(), 1);
+        drop(receiver);
+        assert!(
+            client.major_sync_task_sender.is_closed(),
+            "no hidden receiver clone or consumer"
+        );
+        client.signal_shutdown_sync();
+
+        let build = complete_builder()
+            .await
+            .with_runtime(CountingRuntime {
+                spawns: spawns.clone(),
+            })
+            .build()
+            .await
+            .expect("automatic build");
+        let before = spawns.load(Ordering::SeqCst);
+        let client = build.into_client();
+        assert_eq!(spawns.load(Ordering::SeqCst), before + 1);
         assert!(!client.major_sync_task_sender.is_closed());
         client.signal_shutdown_sync();
     }
