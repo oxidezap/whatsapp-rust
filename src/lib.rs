@@ -234,6 +234,7 @@ pub use client::{
     ConflictKind, ConnectError, ConnectStage, DrainOutcome, ProtocolTerminalReason, Reachability,
     RunCompletionReason, SecretFlushReport, ShutdownReport, SignalMaintenanceError,
 };
+pub use types::connect_admission::ConnectAdmission;
 pub use types::durability_hook::InboundDurabilityHook;
 pub use types::history_sync_admission::{
     HistorySyncAdmission, HistorySyncDecision, HistorySyncMetadata,

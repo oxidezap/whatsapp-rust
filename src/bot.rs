@@ -8,6 +8,7 @@ use crate::store::commands::DeviceCommand;
 use crate::store::error::StoreError;
 use crate::store::persistence_manager::PersistenceManager;
 use crate::store::traits::Backend;
+use crate::types::connect_admission::ConnectAdmission;
 use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
 use crate::types::events::{Event, EventHandler, EventInterest, EventKind, Subscription};
@@ -1262,6 +1263,22 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self.client_builder = self
             .client_builder
             .with_history_sync_admission_arc(admission);
+        self
+    }
+
+    /// Pace first and reconnect run-loop dials with a synchronous host policy.
+    /// See [`ConnectAdmission`] for cancellation and reservation limits.
+    pub fn with_connect_admission<A>(mut self, admission: A) -> Self
+    where
+        A: ConnectAdmission + 'static,
+    {
+        self.client_builder = self.client_builder.with_connect_admission(admission);
+        self
+    }
+
+    /// Share a host's dial budget across bots. Manual `connect()` is unaffected.
+    pub fn with_connect_admission_arc(mut self, admission: Arc<dyn ConnectAdmission>) -> Self {
+        self.client_builder = self.client_builder.with_connect_admission_arc(admission);
         self
     }
 
