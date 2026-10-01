@@ -699,8 +699,8 @@ where
 
     /// Release the slot table's buckets once it holds nothing.
     ///
-    /// Used by synchronous TTL removal and async expiry maintenance:
-    /// hashbrown never shrinks on remove, so a burst that grew the
+    /// Called only from the synchronous TTL cache (the dispatch-once dedup
+    /// table): hashbrown never shrinks on remove, so a burst that grew the
     /// table to thousands of buckets kept them with zero entries until the
     /// next burst. The threshold is empty, not a low-water mark: any
     /// non-empty table may regrow on the very next insert, paying a realloc
@@ -1749,8 +1749,7 @@ where
         }
     }
 
-    /// Evict expired entries, release empty expiring tables' buckets, and
-    /// clean up unused init locks. Nonempty tables keep their allocation.
+    /// Evict expired entries and clean up unused init locks.
     pub async fn run_pending_tasks(&self) {
         // Nothing can be expired without a TTL or TTI, so a cache configured
         // with neither (the coordination caches, the default LID/PN maps)
@@ -1763,7 +1762,6 @@ where
                 return;
             };
             managed.retain_unexpired(|entry| self.is_expired(entry, now));
-            managed.shrink_if_empty();
         }
 
         // Clean up init locks not actively held. `get()`, not `init_locks()`: a
@@ -3128,7 +3126,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn async_maintenance_releases_empty_buckets_and_refills() {
+    async fn async_maintenance_retains_empty_buckets_and_refills() {
         const BURST: u32 = 4_000;
         let cache = PortableCache::builder()
             .time_to_live(Duration::ZERO)
@@ -3137,13 +3135,19 @@ mod tests {
             for key in 0..BURST {
                 cache.insert(key, key).await;
             }
-            assert!(managed_footprint(&cache).await.0 >= BURST as usize);
+            let grown = managed_footprint(&cache).await;
+            assert!(grown.0 >= BURST as usize);
+            let table_bytes =
+                |capacity| wacore::stats::hash_table_bytes(capacity, size_of::<Slot<u32, u32>>());
             cache.run_pending_tasks().await;
             assert_eq!(cache.entry_count(), 0);
-            assert_eq!(managed_footprint(&cache).await, (0, 0));
+            let retained = managed_footprint(&cache).await;
+            // Tombstones can change usable capacity, but not allocated buckets.
+            assert_eq!(table_bytes(retained.0), table_bytes(grown.0));
+            assert!(retained.1 > 0);
             for _ in 0..10 {
                 cache.run_pending_tasks().await;
-                assert_eq!(managed_footprint(&cache).await, (0, 0));
+                assert_eq!(managed_footprint(&cache).await, retained);
             }
         }
     }
@@ -3193,7 +3197,8 @@ mod tests {
             }
             cache.invalidate(&0).await;
             cache.run_pending_tasks().await;
-            assert_eq!(managed_footprint(&cache).await, (0, 0));
+            assert_eq!(cache.entry_count(), 0);
+            assert_eq!(table_bytes(managed_footprint(&cache).await.0), before);
         }
     }
 
