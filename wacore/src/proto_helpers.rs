@@ -241,7 +241,8 @@ pub trait MessageExt {
     /// assert_eq!(message.context_info().unwrap().stanza_id.as_deref(), Some("original-message"));
     /// ```
     fn context_info(&self) -> Option<&wa::ContextInfo> {
-        find_context_info_ref!(self.get_base_message())
+        let base = self.get_base_message();
+        find_context_info_ref!(base)
     }
 
     /// Reads the first positive `context_info.expiration` on this message.

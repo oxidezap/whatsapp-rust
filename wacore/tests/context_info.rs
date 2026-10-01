@@ -1,3 +1,5 @@
+use std::cell::Cell;
+use std::collections::BTreeSet;
 use wacore::proto_helpers::MessageExt;
 use waproto::whatsapp as wa;
 
@@ -75,6 +77,61 @@ fn carriers() -> Vec<(&'static str, wa::Message)> {
         music_message,
     );
     messages
+}
+
+// A narrow check of the vendored proto's formatting, not runtime reflection.
+// Only optional fields directly inside a named message are relevant here.
+fn proto_direct_optional_fields<'a>(source: &'a str, name: &str) -> Vec<(&'a str, &'a str)> {
+    let marker = format!("message {name} {{");
+    let body = source.split_once(&marker).unwrap().1;
+    let mut depth = 1;
+    let mut fields = Vec::new();
+    for line in body.lines() {
+        if depth == 1
+            && let Some(field) = line.trim().strip_prefix("optional ")
+        {
+            let mut tokens = field.split_whitespace();
+            fields.push((tokens.next().unwrap(), tokens.next().unwrap()));
+        }
+        depth += line.matches('{').count();
+        depth -= line.matches('}').count();
+        if depth == 0 {
+            return fields;
+        }
+    }
+    panic!("unterminated proto message: {name}");
+}
+
+#[test]
+fn independent_carrier_fixtures_match_the_schema() {
+    let source = include_str!("../../waproto/src/whatsapp.proto");
+    let message_scope = source.split_once("message Message {").unwrap().1;
+    let schema: BTreeSet<_> = proto_direct_optional_fields(source, "Message")
+        .into_iter()
+        .filter(|(payload, _)| {
+            let marker = format!("message {payload} {{");
+            // Several ContextInfo subtypes reuse Message's payload names.
+            // Resolve Message-local declarations before top-level ones.
+            let scope = if message_scope.contains(&marker) {
+                message_scope
+            } else {
+                source
+            };
+            scope.contains(&marker)
+                && proto_direct_optional_fields(scope, payload)
+                    .contains(&("ContextInfo", "contextInfo"))
+        })
+        .map(|(_, name)| name.to_ascii_lowercase())
+        .collect();
+    let fixtures: BTreeSet<_> = carriers()
+        .into_iter()
+        .map(|(name, _)| name.replace('_', "").to_ascii_lowercase())
+        .collect();
+    assert!(!schema.is_empty());
+    assert_eq!(
+        fixtures, schema,
+        "update independent fixtures when schema carriers change"
+    );
 }
 
 #[test]
@@ -223,10 +280,11 @@ fn context_absence_and_precedence_are_preserved() {
 
 // An existing downstream implementation supplies only the pre-existing methods.
 // The new accessor must be provided by the trait, not a required host method.
-struct MessageView(wa::Message);
+struct MessageView(wa::Message, Cell<usize>);
 
 impl MessageExt for MessageView {
     fn get_base_message(&self) -> &wa::Message {
+        self.1.set(self.1.get() + 1);
         self.0.get_base_message()
     }
     fn into_base_message(self) -> wa::Message {
@@ -270,11 +328,24 @@ impl MessageExt for MessageView {
 #[test]
 fn downstream_trait_implementation_inherits_borrowed_accessor() {
     let (_, message) = carriers().pop().unwrap();
-    let view = MessageView(message);
+    let view = MessageView(message, Cell::new(0));
     assert!(std::ptr::eq(
         view.context_info().unwrap(),
         view.0.context_info().unwrap()
     ));
+}
+
+#[test]
+fn context_unwraps_only_once_for_late_or_absent_carriers() {
+    let (_, late) = carriers().pop().unwrap();
+    for message in [late, wa::Message::default()] {
+        let view = MessageView(message, Cell::new(0));
+        assert_eq!(
+            view.context_info().is_some(),
+            view.0.context_info().is_some()
+        );
+        assert_eq!(view.1.get(), 1);
+    }
 }
 
 #[test]
