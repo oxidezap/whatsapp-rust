@@ -192,6 +192,7 @@ async fn retirement_protects_leases_and_reopens_beside_a_writer() {
         .unwrap();
     drop(write_conn);
     drop(writer);
+    drop(pool);
     drop(store);
     drop(sibling);
     // The SharedSqlite lease is sufficient to keep the pool usable after store drop.
@@ -204,7 +205,6 @@ async fn retirement_protects_leases_and_reopens_beside_a_writer() {
         .await
         .unwrap();
     drop(shared);
-    drop(pool);
 }
 
 #[tokio::test]
@@ -339,7 +339,8 @@ async fn measure_reader_retention() {
         if adaptive { "adaptive" } else { "baseline" }
     );
     let warm = std::env::var("SQLITE_READER_WARM").as_deref() == Ok("scan");
-    println!("warm_scan={warm}");
+    let production = idle_secs == 600;
+    println!("warm_scan={warm} production_builder={production}");
     let db = TempDb::new("retention_measurement");
     let seed = SqliteStore::with_config(
         &db.url(),
@@ -361,8 +362,25 @@ async fn measure_reader_retention() {
     checkpoint("baseline", &[]);
     let mut stores = Vec::new();
     for _ in 0..count {
-        let store =
-            store_with_readers(&db.url(), adaptive, Duration::from_secs(idle_secs), 1, None).await;
+        let store = if production {
+            // Both real-interval arms use the actual constructor. The baseline
+            // binary is built with the pre-change reader-builder body restored;
+            // these assertions catch accidentally measuring the wrong policy.
+            SqliteStore::with_config(&db.url(), SqliteStoreConfig::default())
+                .await
+                .unwrap()
+        } else {
+            store_with_readers(&db.url(), adaptive, Duration::from_secs(idle_secs), 1, None).await
+        };
+        let reads = store.reads.as_ref().unwrap();
+        assert_eq!(reads.pool.min_idle(), if adaptive { Some(0) } else { None });
+        assert_eq!(
+            reads.pool.idle_timeout(),
+            Some(Duration::from_secs(idle_secs))
+        );
+        assert_eq!(reads.pool.max_size(), 1);
+        assert_eq!(reads.pool.state().connections, 1, "eager validation");
+        assert_eq!(reads.semaphore.available_permits(), 1);
         store.get_session("fictitious.0:0").await.unwrap();
         stores.push(store);
     }
@@ -390,6 +408,14 @@ async fn measure_reader_retention() {
     }
     tokio::time::sleep(Duration::from_secs(idle_secs + 31)).await;
     checkpoint("idle", &stores);
+    for store in &stores {
+        assert_eq!(store.pool.state().connections, 1, "writer retained");
+        assert_eq!(
+            store.reads.as_ref().unwrap().pool.state().connections,
+            if adaptive { 0 } else { 1 },
+            "observed retirement, not inferred heap"
+        );
+    }
 
     let mut resume = Vec::new();
     for store in &stores {
@@ -399,6 +425,11 @@ async fn measure_reader_retention() {
     }
     println!("cold_resume_ns_p50_p99={:?}", percentiles(resume));
     checkpoint("resumed", &stores);
+    assert!(
+        stores
+            .iter()
+            .all(|store| store.reads.as_ref().unwrap().pool.state().connections == 1)
+    );
     let mut warm_latency = Vec::new();
     for store in &stores {
         for _ in 0..100 {

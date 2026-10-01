@@ -1,0 +1,196 @@
+command: CARGO_BUILD_JOBS=1 CARGO_PROFILE_RELEASE_LTO=off cargo clippy --locked --release -p whatsapp-rust-sqlite-storage --all-targets --verbose -- -D warnings
+       Fresh unicode-ident v1.0.24
+       Fresh proc-macro2 v1.0.107
+       Fresh quote v1.0.47
+       Fresh syn v3.0.6
+       Fresh serde_derive v1.0.229
+       Fresh syn v2.0.119
+       Fresh rustversion v1.0.23
+       Fresh thiserror-impl v2.0.21
+       Fresh autocfg v1.5.1
+       Fresh simdutf8 v0.1.5
+       Fresh serde_core v1.0.229
+       Fresh prettyplease v0.2.37
+       Fresh buffa-descriptor v0.9.2
+       Fresh fastrand v2.5.0
+       Fresh find-msvc-tools v0.1.12
+       Fresh heck v0.5.0
+       Fresh shlex v2.0.1
+       Fresh cc v1.4.5
+       Fresh tempfile v3.27.0
+       Fresh buffa-codegen v0.9.2
+       Fresh ident_case v1.0.1
+       Fresh strsim v0.11.1
+       Fresh buffa-build v0.9.2
+       Fresh cfg-if v1.0.4
+       Fresh serde v1.0.229
+       Fresh libc v0.2.189
+       Fresh semver v1.0.28
+       Fresh rustc_version v0.4.1
+       Fresh synstructure v0.13.2
+       Fresh typenum v1.20.1
+       Fresh hybrid-array v0.4.14
+       Fresh zerofrom-derive v0.1.7
+       Fresh yoke-derive v0.8.2
+       Fresh either v1.18.0
+       Fresh crypto-common v0.2.2
+       Fresh fnv v1.0.7
+       Fresh vcpkg v0.2.15
+       Fresh pkg-config v0.3.34
+       Fresh darling_core v0.21.3
+       Fresh async-trait v0.1.92
+       Fresh wacore-derive v0.7.0 (<repo>/wacore/derive)
+       Fresh memchr v2.8.3
+       Fresh cfg_aliases v0.2.2
+       Fresh darling_macro v0.21.3
+       Fresh darling_core v0.24.1
+       Fresh darling_macro v0.24.1
+       Fresh darling v0.21.3
+       Fresh block-buffer v0.12.1
+       Fresh futures-macro v0.3.34
+       Fresh cmov v0.5.4
+       Fresh ctutils v0.4.2
+       Fresh dsl_auto_type v0.2.0
+       Fresh darling v0.24.1
+       Fresh prettyplease v0.3.0
+       Fresh zmij v1.0.23
+       Fresh diesel_table_macro_syntax v0.3.0
+       Fresh itoa v1.0.18
+       Fresh diesel_derives v2.3.10
+       Fresh bon-macros v3.10.1
+       Fresh rand_core v0.10.1
+       Fresh pin-project-lite v0.2.17
+       Fresh equivalent v1.0.2
+       Fresh indexmap v2.14.2
+       Fresh smallvec v1.16.2
+       Fresh num-traits v0.2.19
+       Fresh divan-macros v0.1.17
+       Fresh toml_datetime v1.1.1+spec-1.1.0
+       Fresh toml_edit v0.25.13+spec-1.1.0
+       Fresh migrations_macros v2.3.0
+       Fresh serde_json v1.0.151
+       Fresh block-padding v0.4.2
+       Fresh cpufeatures v0.3.1
+       Fresh tokio-macros v2.7.2
+       Fresh inout v0.2.2
+       Fresh proc-macro-crate v3.5.0
+       Fresh getrandom v0.4.3
+       Fresh digest v0.11.3
+       Fresh itertools v0.14.0
+       Fresh parking v2.2.1
+       Fresh event-listener v5.4.2
+       Fresh codspeed-divan-compat-macros v5.0.1
+       Fresh cipher v0.5.2
+       Fresh cpubits v0.1.1
+       Fresh bitflags v2.13.1
+       Fresh foldhash v0.1.5
+       Fresh bytes v1.12.1
+       Fresh log v0.4.34
+       Fresh hashbrown v0.15.5
+       Fresh event-listener-strategy v0.5.4
+       Fresh universal-hash v0.6.1
+       Fresh anyhow v1.0.104
+       Fresh thiserror v2.0.21
+       Fresh base64 v0.22.1
+       Fresh zeroize v1.9.0
+       Fresh scopeguard v1.2.0
+       Fresh once_cell v1.21.4
+       Fresh subtle v2.6.1
+       Fresh curve25519-dalek v5.0.0
+       Fresh buffa v0.9.2
+       Fresh lock_api v0.4.14
+       Fresh polyval v0.7.3
+       Fresh hmac v0.13.0
+       Fresh parking_lot_core v0.9.12
+       Fresh chacha20 v0.10.2
+       Fresh zerofrom v0.1.8
+       Fresh castaway v0.2.4
+       Fresh futures-core v0.3.34
+       Fresh stable_deref_trait v1.2.1
+       Fresh static_assertions v1.1.0
+       Fresh linux-raw-sys v0.12.1
+       Fresh rustix v1.1.4
+       Fresh compact_str v0.10.0
+       Fresh yoke v0.8.3
+       Fresh rand v0.10.3
+       Fresh parking_lot v0.12.5
+       Fresh hkdf v0.13.0
+       Fresh ghash v0.6.0
+       Fresh waproto v0.7.0 (<repo>/waproto)
+       Fresh x25519-dalek v3.0.0
+       Fresh async-lock v3.4.2
+       Fresh aes v0.9.3
+       Fresh ctr v0.10.1
+       Fresh cbc v0.2.1
+       Fresh sha2 v0.11.0
+       Fresh sha1 v0.11.0
+       Fresh chrono v0.4.45
+       Fresh portable-atomic v1.15.0
+       Fresh winnow v1.0.4
+       Fresh hex v0.4.3
+       Fresh zlib-rs v0.6.8
+       Fresh futures-sink v0.3.34
+       Fresh smoothutf8 v0.2.3
+       Fresh wacore-binary v0.7.0 (<repo>/wacore/binary)
+       Fresh futures-channel v0.3.34
+       Fresh wacore-libsignal v0.7.0 (<repo>/wacore/libsignal)
+       Fresh toml_parser v1.1.3+spec-1.1.0
+       Fresh scheduled-thread-pool v0.2.7
+       Fresh terminal_size v0.4.4
+       Fresh approx v0.5.1
+       Fresh crossbeam-utils v0.8.23
+       Fresh serde_spanned v1.1.1
+       Fresh toml_datetime v0.7.5+spec-1.1.0
+       Fresh winnow v0.7.15
+       Fresh futures-io v0.3.34
+       Fresh futures-task v0.3.34
+       Fresh slab v0.4.12
+       Fresh anstyle v1.0.14
+       Fresh clap_lex v1.1.0
+       Fresh clap_builder v4.6.7
+       Fresh futures-util v0.3.34
+       Fresh toml v0.9.12+spec-1.1.0
+       Fresh concurrent-queue v2.5.0
+       Fresh statrs v0.18.0
+       Fresh r2d2 v0.8.10
+       Dirty whatsapp-rust-sqlite-storage v0.7.0 (<repo>/storages/sqlite-storage): the file `storages/sqlite-storage/src/sqlite_store.rs` has changed (1790848213.118797638s, 44m 42s after last build at 1790845531.047493673s)
+    Checking whatsapp-rust-sqlite-storage v0.7.0 (<repo>/storages/sqlite-storage)
+     Running `/home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/clippy-driver /home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/rustc --crate-name whatsapp_rust_sqlite_storage --edition=2024 storages/sqlite-storage/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata -C opt-level=z -C lto=off -C embed-bitcode=no -C codegen-units=1 --warn=unused_qualifications --warn=unexpected_cfgs '--deny=clippy::todo' '--warn=clippy::print_stdout' '--warn=clippy::print_stderr' '--deny=clippy::disallowed_types' '--deny=clippy::disallowed_methods' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs)' --cfg 'feature="bundled-sqlite"' --cfg 'feature="default"' --cfg 'feature="libsqlite3-sys"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("bundled-sqlite", "default", "libsqlite3-sys", "test-util", "wasm-test"))' -C metadata=b1e8aa9b07d750e8 -C extra-filename=-4ad6b21bd0908074 --out-dir <repo>/target/release/deps -C strip=debuginfo -L dependency=<repo>/target/release/deps --extern async_trait=<repo>/target/release/deps/libasync_trait-5f22670ab661c8ac.so --extern buffa=<repo>/target/release/deps/libbuffa-76c60bc47ee14f54.rmeta --extern bytes=<repo>/target/release/deps/libbytes-dc91705e20e11642.rmeta --extern diesel=<repo>/target/release/deps/libdiesel-8ef2cde408751db5.rmeta --extern diesel_migrations=<repo>/target/release/deps/libdiesel_migrations-371a100663b28b9b.rmeta --extern libsqlite3_sys=<repo>/target/release/deps/liblibsqlite3_sys-3db5bb40b1395af8.rmeta --extern log=<repo>/target/release/deps/liblog-79a6845eb1332a2c.rmeta --extern scheduled_thread_pool=<repo>/target/release/deps/libscheduled_thread_pool-617dfa0015f16755.rmeta --extern serde_json=<repo>/target/release/deps/libserde_json-ecffdb00a7446f9d.rmeta --extern thiserror=<repo>/target/release/deps/libthiserror-5f3b94c769716b50.rmeta --extern tokio=<repo>/target/release/deps/libtokio-d0a5284654e292f7.rmeta --extern wacore=<repo>/target/release/deps/libwacore-3fbce22c5c0a376e.rmeta --extern wacore_binary=<repo>/target/release/deps/libwacore_binary-f3e0dfdbf74debe1.rmeta --verbose -L native=<repo>/target/release/build/libsqlite3-sys-9cd1990fa493881b/out`
+       Fresh nix v0.31.3
+       Fresh libsqlite3-sys v0.38.2
+       Fresh aho-corasick v1.1.5
+       Fresh serde-big-array v0.5.1
+       Fresh glob v0.3.4
+       Fresh colored v3.1.1
+       Fresh regex-syntax v0.8.11
+       Fresh downcast-rs v2.0.2
+       Fresh diesel v2.3.13
+       Fresh regex-automata v0.4.18
+       Fresh codspeed v5.0.1
+       Fresh wacore-appstate v0.7.0 (<repo>/wacore/appstate)
+       Fresh async-channel v2.5.0
+       Fresh migrations_internals v2.3.0
+       Fresh futures v0.3.34
+       Fresh clap v4.6.7
+       Fresh wacore-noise v0.7.0 (<repo>/wacore/noise)
+       Fresh bon v3.10.1
+       Fresh hashbrown v0.17.1
+       Fresh base64 v0.23.1
+       Fresh regex-lite v0.1.9
+       Fresh condtype v1.3.0
+       Fresh codspeed-divan-compat-walltime v5.0.1
+       Fresh wacore v0.7.0 (<repo>/wacore)
+       Fresh diesel_migrations v2.3.2
+       Fresh regex v1.13.1
+       Fresh tokio v1.53.1
+     Running `/home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/clippy-driver /home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/rustc --crate-name whatsapp_rust_sqlite_storage --edition=2024 storages/sqlite-storage/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata -C opt-level=z -C panic=abort -C lto=off -C embed-bitcode=no -C codegen-units=1 --warn=unused_qualifications --warn=unexpected_cfgs '--deny=clippy::todo' '--warn=clippy::print_stdout' '--warn=clippy::print_stderr' '--deny=clippy::disallowed_types' '--deny=clippy::disallowed_methods' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs)' --cfg 'feature="bundled-sqlite"' --cfg 'feature="default"' --cfg 'feature="libsqlite3-sys"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("bundled-sqlite", "default", "libsqlite3-sys", "test-util", "wasm-test"))' -C metadata=f7b2d957433e539e -C extra-filename=-3cfbc293d8ad2d09 --out-dir <repo>/target/release/deps -C strip=debuginfo -L dependency=<repo>/target/release/deps --extern async_trait=<repo>/target/release/deps/libasync_trait-5f22670ab661c8ac.so --extern buffa=<repo>/target/release/deps/libbuffa-d8050af86bf40065.rmeta --extern bytes=<repo>/target/release/deps/libbytes-bbe99efb47122d3d.rmeta --extern diesel=<repo>/target/release/deps/libdiesel-6538f80da2c5ea3d.rmeta --extern diesel_migrations=<repo>/target/release/deps/libdiesel_migrations-be39d0ab20715fec.rmeta --extern libsqlite3_sys=<repo>/target/release/deps/liblibsqlite3_sys-c463cc6356162001.rmeta --extern log=<repo>/target/release/deps/liblog-70ea8447ef9cae86.rmeta --extern scheduled_thread_pool=<repo>/target/release/deps/libscheduled_thread_pool-8f4e3180db6533d1.rmeta --extern serde_json=<repo>/target/release/deps/libserde_json-8244fd1ac1703839.rmeta --extern thiserror=<repo>/target/release/deps/libthiserror-7b989f9f338d40e5.rmeta --extern tokio=<repo>/target/release/deps/libtokio-f3f8c772e1f2c568.rmeta --extern wacore=<repo>/target/release/deps/libwacore-e05269eaffa4bf46.rmeta --extern wacore_binary=<repo>/target/release/deps/libwacore_binary-e717be689c6b6938.rmeta --verbose -L native=<repo>/target/release/build/libsqlite3-sys-9cd1990fa493881b/out`
+       Fresh codspeed-divan-compat v5.0.1
+     Running `/home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/clippy-driver /home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/rustc --crate-name msg_secret_storage --edition=2024 storages/sqlite-storage/examples/msg_secret_storage.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,metadata -C opt-level=z -C panic=abort -C lto=off -C embed-bitcode=no -C codegen-units=1 --warn=unused_qualifications --warn=unexpected_cfgs '--deny=clippy::todo' '--warn=clippy::print_stdout' '--warn=clippy::print_stderr' '--deny=clippy::disallowed_types' '--deny=clippy::disallowed_methods' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs)' --cfg 'feature="bundled-sqlite"' --cfg 'feature="default"' --cfg 'feature="libsqlite3-sys"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("bundled-sqlite", "default", "libsqlite3-sys", "test-util", "wasm-test"))' -C metadata=089afeedfb023094 -C extra-filename=-09c28498d11dc29f --out-dir <repo>/target/release/examples -C strip=debuginfo -L dependency=<repo>/target/release/deps --extern async_trait=<repo>/target/release/deps/libasync_trait-5f22670ab661c8ac.so --extern buffa=<repo>/target/release/deps/libbuffa-d8050af86bf40065.rmeta --extern bytes=<repo>/target/release/deps/libbytes-bbe99efb47122d3d.rmeta --extern divan=<repo>/target/release/deps/libcodspeed_divan_compat-06e1bdd73fe4b55a.rmeta --extern diesel=<repo>/target/release/deps/libdiesel-6538f80da2c5ea3d.rmeta --extern diesel_migrations=<repo>/target/release/deps/libdiesel_migrations-be39d0ab20715fec.rmeta --extern libsqlite3_sys=<repo>/target/release/deps/liblibsqlite3_sys-c463cc6356162001.rmeta --extern log=<repo>/target/release/deps/liblog-70ea8447ef9cae86.rmeta --extern portable_atomic=<repo>/target/release/deps/libportable_atomic-f3bd70ddac13f412.rmeta --extern rand=<repo>/target/release/deps/librand-79603a57466902c7.rmeta --extern scheduled_thread_pool=<repo>/target/release/deps/libscheduled_thread_pool-8f4e3180db6533d1.rmeta --extern serde_json=<repo>/target/release/deps/libserde_json-8244fd1ac1703839.rmeta --extern thiserror=<repo>/target/release/deps/libthiserror-7b989f9f338d40e5.rmeta --extern tokio=<repo>/target/release/deps/libtokio-f3f8c772e1f2c568.rmeta --extern wacore=<repo>/target/release/deps/libwacore-e05269eaffa4bf46.rmeta --extern wacore_binary=<repo>/target/release/deps/libwacore_binary-e717be689c6b6938.rmeta --extern waproto=<repo>/target/release/deps/libwaproto-022d0550bf7f1b7c.rmeta --extern whatsapp_rust_sqlite_storage=<repo>/target/release/deps/libwhatsapp_rust_sqlite_storage-3cfbc293d8ad2d09.rmeta --verbose -L native=<repo>/target/release/build/codspeed-c9c5062da7a46957/out -L native=<repo>/target/release/build/libsqlite3-sys-9cd1990fa493881b/out`
+     Running `/home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/clippy-driver /home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/rustc --crate-name per_connection_memory --edition=2024 storages/sqlite-storage/examples/per_connection_memory.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,metadata -C opt-level=z -C panic=abort -C lto=off -C embed-bitcode=no -C codegen-units=1 --warn=unused_qualifications --warn=unexpected_cfgs '--deny=clippy::todo' '--warn=clippy::print_stdout' '--warn=clippy::print_stderr' '--deny=clippy::disallowed_types' '--deny=clippy::disallowed_methods' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs)' --cfg 'feature="bundled-sqlite"' --cfg 'feature="default"' --cfg 'feature="libsqlite3-sys"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("bundled-sqlite", "default", "libsqlite3-sys", "test-util", "wasm-test"))' -C metadata=395d942aa0ed6cba -C extra-filename=-c0fb83decc96f610 --out-dir <repo>/target/release/examples -C strip=debuginfo -L dependency=<repo>/target/release/deps --extern async_trait=<repo>/target/release/deps/libasync_trait-5f22670ab661c8ac.so --extern buffa=<repo>/target/release/deps/libbuffa-d8050af86bf40065.rmeta --extern bytes=<repo>/target/release/deps/libbytes-bbe99efb47122d3d.rmeta --extern divan=<repo>/target/release/deps/libcodspeed_divan_compat-06e1bdd73fe4b55a.rmeta --extern diesel=<repo>/target/release/deps/libdiesel-6538f80da2c5ea3d.rmeta --extern diesel_migrations=<repo>/target/release/deps/libdiesel_migrations-be39d0ab20715fec.rmeta --extern libsqlite3_sys=<repo>/target/release/deps/liblibsqlite3_sys-c463cc6356162001.rmeta --extern log=<repo>/target/release/deps/liblog-70ea8447ef9cae86.rmeta --extern portable_atomic=<repo>/target/release/deps/libportable_atomic-f3bd70ddac13f412.rmeta --extern rand=<repo>/target/release/deps/librand-79603a57466902c7.rmeta --extern scheduled_thread_pool=<repo>/target/release/deps/libscheduled_thread_pool-8f4e3180db6533d1.rmeta --extern serde_json=<repo>/target/release/deps/libserde_json-8244fd1ac1703839.rmeta --extern thiserror=<repo>/target/release/deps/libthiserror-7b989f9f338d40e5.rmeta --extern tokio=<repo>/target/release/deps/libtokio-f3f8c772e1f2c568.rmeta --extern wacore=<repo>/target/release/deps/libwacore-e05269eaffa4bf46.rmeta --extern wacore_binary=<repo>/target/release/deps/libwacore_binary-e717be689c6b6938.rmeta --extern waproto=<repo>/target/release/deps/libwaproto-022d0550bf7f1b7c.rmeta --extern whatsapp_rust_sqlite_storage=<repo>/target/release/deps/libwhatsapp_rust_sqlite_storage-3cfbc293d8ad2d09.rmeta --verbose -L native=<repo>/target/release/build/codspeed-c9c5062da7a46957/out -L native=<repo>/target/release/build/libsqlite3-sys-9cd1990fa493881b/out`
+     Running `/home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/clippy-driver /home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/rustc --crate-name database_api --edition=2024 storages/sqlite-storage/tests/database_api.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,metadata -C opt-level=z -C lto=off -C embed-bitcode=no -C codegen-units=1 --warn=unused_qualifications --warn=unexpected_cfgs '--deny=clippy::todo' '--warn=clippy::print_stdout' '--warn=clippy::print_stderr' '--deny=clippy::disallowed_types' '--deny=clippy::disallowed_methods' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs)' --test --cfg 'feature="bundled-sqlite"' --cfg 'feature="default"' --cfg 'feature="libsqlite3-sys"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("bundled-sqlite", "default", "libsqlite3-sys", "test-util", "wasm-test"))' -C metadata=48e065ebb6f98bee -C extra-filename=-9c53335c840aebd6 --out-dir <repo>/target/release/deps -C strip=debuginfo -L dependency=<repo>/target/release/deps --extern async_trait=<repo>/target/release/deps/libasync_trait-5f22670ab661c8ac.so --extern buffa=<repo>/target/release/deps/libbuffa-76c60bc47ee14f54.rmeta --extern bytes=<repo>/target/release/deps/libbytes-dc91705e20e11642.rmeta --extern divan=<repo>/target/release/deps/libcodspeed_divan_compat-2e0222ae7d186676.rmeta --extern diesel=<repo>/target/release/deps/libdiesel-8ef2cde408751db5.rmeta --extern diesel_migrations=<repo>/target/release/deps/libdiesel_migrations-371a100663b28b9b.rmeta --extern libsqlite3_sys=<repo>/target/release/deps/liblibsqlite3_sys-3db5bb40b1395af8.rmeta --extern log=<repo>/target/release/deps/liblog-79a6845eb1332a2c.rmeta --extern portable_atomic=<repo>/target/release/deps/libportable_atomic-84c1f18f3d2deeb0.rmeta --extern rand=<repo>/target/release/deps/librand-2733e600854a64f8.rmeta --extern scheduled_thread_pool=<repo>/target/release/deps/libscheduled_thread_pool-617dfa0015f16755.rmeta --extern serde_json=<repo>/target/release/deps/libserde_json-ecffdb00a7446f9d.rmeta --extern thiserror=<repo>/target/release/deps/libthiserror-5f3b94c769716b50.rmeta --extern tokio=<repo>/target/release/deps/libtokio-d0a5284654e292f7.rmeta --extern wacore=<repo>/target/release/deps/libwacore-3fbce22c5c0a376e.rmeta --extern wacore_binary=<repo>/target/release/deps/libwacore_binary-f3e0dfdbf74debe1.rmeta --extern waproto=<repo>/target/release/deps/libwaproto-785f588ea5fe8af6.rmeta --extern whatsapp_rust_sqlite_storage=<repo>/target/release/deps/libwhatsapp_rust_sqlite_storage-4ad6b21bd0908074.rmeta --verbose -L native=<repo>/target/release/build/codspeed-c9c5062da7a46957/out -L native=<repo>/target/release/build/libsqlite3-sys-9cd1990fa493881b/out`
+     Running `/home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/clippy-driver /home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/rustc --crate-name store_contention --edition=2024 storages/sqlite-storage/benches/store_contention.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,metadata -C opt-level=z -C lto=off -C embed-bitcode=no -C codegen-units=1 --warn=unused_qualifications --warn=unexpected_cfgs '--deny=clippy::todo' '--warn=clippy::print_stdout' '--warn=clippy::print_stderr' '--deny=clippy::disallowed_types' '--deny=clippy::disallowed_methods' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs)' --cfg test --cfg 'feature="bundled-sqlite"' --cfg 'feature="default"' --cfg 'feature="libsqlite3-sys"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("bundled-sqlite", "default", "libsqlite3-sys", "test-util", "wasm-test"))' -C metadata=b810a265e507e361 -C extra-filename=-c51124d04dfac7c8 --out-dir <repo>/target/release/deps -C strip=debuginfo -L dependency=<repo>/target/release/deps --extern async_trait=<repo>/target/release/deps/libasync_trait-5f22670ab661c8ac.so --extern buffa=<repo>/target/release/deps/libbuffa-76c60bc47ee14f54.rmeta --extern bytes=<repo>/target/release/deps/libbytes-dc91705e20e11642.rmeta --extern divan=<repo>/target/release/deps/libcodspeed_divan_compat-2e0222ae7d186676.rmeta --extern diesel=<repo>/target/release/deps/libdiesel-8ef2cde408751db5.rmeta --extern diesel_migrations=<repo>/target/release/deps/libdiesel_migrations-371a100663b28b9b.rmeta --extern libsqlite3_sys=<repo>/target/release/deps/liblibsqlite3_sys-3db5bb40b1395af8.rmeta --extern log=<repo>/target/release/deps/liblog-79a6845eb1332a2c.rmeta --extern portable_atomic=<repo>/target/release/deps/libportable_atomic-84c1f18f3d2deeb0.rmeta --extern rand=<repo>/target/release/deps/librand-2733e600854a64f8.rmeta --extern scheduled_thread_pool=<repo>/target/release/deps/libscheduled_thread_pool-617dfa0015f16755.rmeta --extern serde_json=<repo>/target/release/deps/libserde_json-ecffdb00a7446f9d.rmeta --extern thiserror=<repo>/target/release/deps/libthiserror-5f3b94c769716b50.rmeta --extern tokio=<repo>/target/release/deps/libtokio-d0a5284654e292f7.rmeta --extern wacore=<repo>/target/release/deps/libwacore-3fbce22c5c0a376e.rmeta --extern wacore_binary=<repo>/target/release/deps/libwacore_binary-f3e0dfdbf74debe1.rmeta --extern waproto=<repo>/target/release/deps/libwaproto-785f588ea5fe8af6.rmeta --extern whatsapp_rust_sqlite_storage=<repo>/target/release/deps/libwhatsapp_rust_sqlite_storage-4ad6b21bd0908074.rmeta --verbose -L native=<repo>/target/release/build/codspeed-c9c5062da7a46957/out -L native=<repo>/target/release/build/libsqlite3-sys-9cd1990fa493881b/out`
+     Running `/home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/clippy-driver /home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/rustc --crate-name signal_cache_contention --edition=2024 storages/sqlite-storage/benches/signal_cache_contention.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,metadata -C opt-level=z -C lto=off -C embed-bitcode=no -C codegen-units=1 --warn=unused_qualifications --warn=unexpected_cfgs '--deny=clippy::todo' '--warn=clippy::print_stdout' '--warn=clippy::print_stderr' '--deny=clippy::disallowed_types' '--deny=clippy::disallowed_methods' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs)' --cfg test --cfg 'feature="bundled-sqlite"' --cfg 'feature="default"' --cfg 'feature="libsqlite3-sys"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("bundled-sqlite", "default", "libsqlite3-sys", "test-util", "wasm-test"))' -C metadata=cbcc49247b8632d0 -C extra-filename=-7cd210599d2b467a --out-dir <repo>/target/release/deps -C strip=debuginfo -L dependency=<repo>/target/release/deps --extern async_trait=<repo>/target/release/deps/libasync_trait-5f22670ab661c8ac.so --extern buffa=<repo>/target/release/deps/libbuffa-76c60bc47ee14f54.rmeta --extern bytes=<repo>/target/release/deps/libbytes-dc91705e20e11642.rmeta --extern divan=<repo>/target/release/deps/libcodspeed_divan_compat-2e0222ae7d186676.rmeta --extern diesel=<repo>/target/release/deps/libdiesel-8ef2cde408751db5.rmeta --extern diesel_migrations=<repo>/target/release/deps/libdiesel_migrations-371a100663b28b9b.rmeta --extern libsqlite3_sys=<repo>/target/release/deps/liblibsqlite3_sys-3db5bb40b1395af8.rmeta --extern log=<repo>/target/release/deps/liblog-79a6845eb1332a2c.rmeta --extern portable_atomic=<repo>/target/release/deps/libportable_atomic-84c1f18f3d2deeb0.rmeta --extern rand=<repo>/target/release/deps/librand-2733e600854a64f8.rmeta --extern scheduled_thread_pool=<repo>/target/release/deps/libscheduled_thread_pool-617dfa0015f16755.rmeta --extern serde_json=<repo>/target/release/deps/libserde_json-ecffdb00a7446f9d.rmeta --extern thiserror=<repo>/target/release/deps/libthiserror-5f3b94c769716b50.rmeta --extern tokio=<repo>/target/release/deps/libtokio-d0a5284654e292f7.rmeta --extern wacore=<repo>/target/release/deps/libwacore-3fbce22c5c0a376e.rmeta --extern wacore_binary=<repo>/target/release/deps/libwacore_binary-f3e0dfdbf74debe1.rmeta --extern waproto=<repo>/target/release/deps/libwaproto-785f588ea5fe8af6.rmeta --extern whatsapp_rust_sqlite_storage=<repo>/target/release/deps/libwhatsapp_rust_sqlite_storage-4ad6b21bd0908074.rmeta --verbose -L native=<repo>/target/release/build/codspeed-c9c5062da7a46957/out -L native=<repo>/target/release/build/libsqlite3-sys-9cd1990fa493881b/out`
+     Running `/home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/clippy-driver /home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/rustc --crate-name signal_flush --edition=2024 storages/sqlite-storage/benches/signal_flush.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,metadata -C opt-level=z -C lto=off -C embed-bitcode=no -C codegen-units=1 --warn=unused_qualifications --warn=unexpected_cfgs '--deny=clippy::todo' '--warn=clippy::print_stdout' '--warn=clippy::print_stderr' '--deny=clippy::disallowed_types' '--deny=clippy::disallowed_methods' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs)' --cfg test --cfg 'feature="bundled-sqlite"' --cfg 'feature="default"' --cfg 'feature="libsqlite3-sys"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("bundled-sqlite", "default", "libsqlite3-sys", "test-util", "wasm-test"))' -C metadata=0a5f572afa4c42f7 -C extra-filename=-c2c99197b59d222e --out-dir <repo>/target/release/deps -C strip=debuginfo -L dependency=<repo>/target/release/deps --extern async_trait=<repo>/target/release/deps/libasync_trait-5f22670ab661c8ac.so --extern buffa=<repo>/target/release/deps/libbuffa-76c60bc47ee14f54.rmeta --extern bytes=<repo>/target/release/deps/libbytes-dc91705e20e11642.rmeta --extern divan=<repo>/target/release/deps/libcodspeed_divan_compat-2e0222ae7d186676.rmeta --extern diesel=<repo>/target/release/deps/libdiesel-8ef2cde408751db5.rmeta --extern diesel_migrations=<repo>/target/release/deps/libdiesel_migrations-371a100663b28b9b.rmeta --extern libsqlite3_sys=<repo>/target/release/deps/liblibsqlite3_sys-3db5bb40b1395af8.rmeta --extern log=<repo>/target/release/deps/liblog-79a6845eb1332a2c.rmeta --extern portable_atomic=<repo>/target/release/deps/libportable_atomic-84c1f18f3d2deeb0.rmeta --extern rand=<repo>/target/release/deps/librand-2733e600854a64f8.rmeta --extern scheduled_thread_pool=<repo>/target/release/deps/libscheduled_thread_pool-617dfa0015f16755.rmeta --extern serde_json=<repo>/target/release/deps/libserde_json-ecffdb00a7446f9d.rmeta --extern thiserror=<repo>/target/release/deps/libthiserror-5f3b94c769716b50.rmeta --extern tokio=<repo>/target/release/deps/libtokio-d0a5284654e292f7.rmeta --extern wacore=<repo>/target/release/deps/libwacore-3fbce22c5c0a376e.rmeta --extern wacore_binary=<repo>/target/release/deps/libwacore_binary-f3e0dfdbf74debe1.rmeta --extern waproto=<repo>/target/release/deps/libwaproto-785f588ea5fe8af6.rmeta --extern whatsapp_rust_sqlite_storage=<repo>/target/release/deps/libwhatsapp_rust_sqlite_storage-4ad6b21bd0908074.rmeta --verbose -L native=<repo>/target/release/build/codspeed-c9c5062da7a46957/out -L native=<repo>/target/release/build/libsqlite3-sys-9cd1990fa493881b/out`
+     Running `/home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/clippy-driver /home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/rustc --crate-name store_shapes --edition=2024 storages/sqlite-storage/benches/store_shapes.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,metadata -C opt-level=z -C lto=off -C embed-bitcode=no -C codegen-units=1 --warn=unused_qualifications --warn=unexpected_cfgs '--deny=clippy::todo' '--warn=clippy::print_stdout' '--warn=clippy::print_stderr' '--deny=clippy::disallowed_types' '--deny=clippy::disallowed_methods' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs)' --cfg test --cfg 'feature="bundled-sqlite"' --cfg 'feature="default"' --cfg 'feature="libsqlite3-sys"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("bundled-sqlite", "default", "libsqlite3-sys", "test-util", "wasm-test"))' -C metadata=866f3cd45070dac2 -C extra-filename=-e032fde429899d95 --out-dir <repo>/target/release/deps -C strip=debuginfo -L dependency=<repo>/target/release/deps --extern async_trait=<repo>/target/release/deps/libasync_trait-5f22670ab661c8ac.so --extern buffa=<repo>/target/release/deps/libbuffa-76c60bc47ee14f54.rmeta --extern bytes=<repo>/target/release/deps/libbytes-dc91705e20e11642.rmeta --extern divan=<repo>/target/release/deps/libcodspeed_divan_compat-2e0222ae7d186676.rmeta --extern diesel=<repo>/target/release/deps/libdiesel-8ef2cde408751db5.rmeta --extern diesel_migrations=<repo>/target/release/deps/libdiesel_migrations-371a100663b28b9b.rmeta --extern libsqlite3_sys=<repo>/target/release/deps/liblibsqlite3_sys-3db5bb40b1395af8.rmeta --extern log=<repo>/target/release/deps/liblog-79a6845eb1332a2c.rmeta --extern portable_atomic=<repo>/target/release/deps/libportable_atomic-84c1f18f3d2deeb0.rmeta --extern rand=<repo>/target/release/deps/librand-2733e600854a64f8.rmeta --extern scheduled_thread_pool=<repo>/target/release/deps/libscheduled_thread_pool-617dfa0015f16755.rmeta --extern serde_json=<repo>/target/release/deps/libserde_json-ecffdb00a7446f9d.rmeta --extern thiserror=<repo>/target/release/deps/libthiserror-5f3b94c769716b50.rmeta --extern tokio=<repo>/target/release/deps/libtokio-d0a5284654e292f7.rmeta --extern wacore=<repo>/target/release/deps/libwacore-3fbce22c5c0a376e.rmeta --extern wacore_binary=<repo>/target/release/deps/libwacore_binary-f3e0dfdbf74debe1.rmeta --extern waproto=<repo>/target/release/deps/libwaproto-785f588ea5fe8af6.rmeta --extern whatsapp_rust_sqlite_storage=<repo>/target/release/deps/libwhatsapp_rust_sqlite_storage-4ad6b21bd0908074.rmeta --verbose -L native=<repo>/target/release/build/codspeed-c9c5062da7a46957/out -L native=<repo>/target/release/build/libsqlite3-sys-9cd1990fa493881b/out`
+     Running `/home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/clippy-driver /home/agent/.rustup/toolchains/nightly-2026-06-16-aarch64-unknown-linux-gnu/bin/rustc --crate-name whatsapp_rust_sqlite_storage --edition=2024 storages/sqlite-storage/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,metadata -C opt-level=z -C lto=off -C embed-bitcode=no -C codegen-units=1 --warn=unused_qualifications --warn=unexpected_cfgs '--deny=clippy::todo' '--warn=clippy::print_stdout' '--warn=clippy::print_stderr' '--deny=clippy::disallowed_types' '--deny=clippy::disallowed_methods' '--deny=clippy::dbg_macro' --check-cfg 'cfg(docsrs)' --test --cfg 'feature="bundled-sqlite"' --cfg 'feature="default"' --cfg 'feature="libsqlite3-sys"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("bundled-sqlite", "default", "libsqlite3-sys", "test-util", "wasm-test"))' -C metadata=9affb1782b573421 -C extra-filename=-ccf5e3922427004e --out-dir <repo>/target/release/deps -C strip=debuginfo -L dependency=<repo>/target/release/deps --extern async_trait=<repo>/target/release/deps/libasync_trait-5f22670ab661c8ac.so --extern buffa=<repo>/target/release/deps/libbuffa-76c60bc47ee14f54.rmeta --extern bytes=<repo>/target/release/deps/libbytes-dc91705e20e11642.rmeta --extern divan=<repo>/target/release/deps/libcodspeed_divan_compat-2e0222ae7d186676.rmeta --extern diesel=<repo>/target/release/deps/libdiesel-8ef2cde408751db5.rmeta --extern diesel_migrations=<repo>/target/release/deps/libdiesel_migrations-371a100663b28b9b.rmeta --extern libsqlite3_sys=<repo>/target/release/deps/liblibsqlite3_sys-3db5bb40b1395af8.rmeta --extern log=<repo>/target/release/deps/liblog-79a6845eb1332a2c.rmeta --extern portable_atomic=<repo>/target/release/deps/libportable_atomic-84c1f18f3d2deeb0.rmeta --extern rand=<repo>/target/release/deps/librand-2733e600854a64f8.rmeta --extern scheduled_thread_pool=<repo>/target/release/deps/libscheduled_thread_pool-617dfa0015f16755.rmeta --extern serde_json=<repo>/target/release/deps/libserde_json-ecffdb00a7446f9d.rmeta --extern thiserror=<repo>/target/release/deps/libthiserror-5f3b94c769716b50.rmeta --extern tokio=<repo>/target/release/deps/libtokio-d0a5284654e292f7.rmeta --extern wacore=<repo>/target/release/deps/libwacore-3fbce22c5c0a376e.rmeta --extern wacore_binary=<repo>/target/release/deps/libwacore_binary-f3e0dfdbf74debe1.rmeta --extern waproto=<repo>/target/release/deps/libwaproto-785f588ea5fe8af6.rmeta --verbose -L native=<repo>/target/release/build/codspeed-c9c5062da7a46957/out -L native=<repo>/target/release/build/libsqlite3-sys-9cd1990fa493881b/out`
+    Finished `release` profile [optimized] target(s) in 24.60s

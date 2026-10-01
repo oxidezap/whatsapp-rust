@@ -51,9 +51,22 @@ open. The point-read profile prices the ordinary small reader cache; setting
 `SQLITE_READER_WARM=scan` first scans the records to fill reader page caches.
 `SQLITE_READER_COUNT=1` covers the single-store shape. Both arms shorten only
 the reader idle timeout to one second, retaining r2d2's actual thirty-second
-reaper. The baseline also reaps/replaces readers, avoiding an unfair comparison
-against a permanently warm baseline. Set `SQLITE_READER_IDLE_SECS=600` to
-verify the real ten-minute interval.
+reaper. These accelerated runs attach an explicit reader-pool replica; they
+are not production-constructor measurements. The baseline also reaps/replaces
+readers, avoiding an unfair comparison against a permanently warm baseline.
+
+`SQLITE_READER_IDLE_SECS=600` instead uses the actual
+`SqliteStore::with_config(default)` constructor, with no timeout override.
+Build separate baseline and candidate binaries for that comparison: apply
+`evaluation/reader-retention/production-baseline.patch` to restore only the
+pre-change reader-builder body, build and preserve the baseline executable,
+reverse the patch, then build the candidate executable with identical flags.
+Run each executable separately with `SQLITE_READER_COUNT=50`, the matching
+`SQLITE_READER_MODE`, and `SQLITE_READER_IDLE_SECS=600`; never compile during
+a measurement. The evaluator asserts the effective minimum-idle policy,
+600-second timeout, eager reader count, retained writer count, observed idle
+reader count and reacquisition count. A mismatched binary/mode fails rather
+than silently measuring a different policy.
 
 Checkpoints report SQLite's process-global `sqlite3_memory_used()` (live native
 SQLite allocations, not total process heap), procfs `RssAnon` and total RSS
@@ -68,7 +81,12 @@ reads with 200 upserts of 256 existing 1 KiB session records, reporting total
 wall time and point-read p50/p99. The timing includes real SQLite and the normal
 store API dispatch, not mocks or simulated instruction counts.
 
-## Results
+## Original replica results
+
+The original measurements below used the explicit reader-pool replica, including
+the real elapsed 600-second run. They remain archived under their original
+`6f07e3ab` prototype identity. The production-builder follow-up is separate;
+see the artifact manifest for revision and factory provenance.
 
 Measured on the primary Linux aarch64 VPS, `nightly-2026-06-16`, optimized
 release with LTO disabled for this bounded storage evaluator. No compiler or
@@ -84,7 +102,7 @@ Post-idle checkpoints (bytes; writer count is unchanged):
 | 50 stores, point reads, accelerated ABBA | 10,181,248 | 5,249,648 | 18,382,848–19,353,600 | 17,571,840–17,575,936 | 50 → 0 |
 | 50 stores, full scans, accelerated | 9,089,264 | 4,157,648 | 19,869,696 | 17,829,888 | 50 → 0 |
 | 1 store, point read, accelerated | 204,064 | 105,432 | 6,029,312 | 5,902,336 | 1 → 0 |
-| **50 stores, real 600-second timeout** | **9,865,264** | **4,933,648** | **19,173,376** | **17,645,568** | **50 → 0** |
+| **50 stores, replica with real 600-second timeout** | **9,865,264** | **4,933,648** | **19,173,376** | **17,645,568** | **50 → 0** |
 
 The incremental native SQLite heap saving is approximately **98,632 bytes
 (96.3 KiB) per reader**. The actual-interval run saves 4,931,616 bytes of live
@@ -118,10 +136,48 @@ speedup**, nor a precision claim that excludes a small regression. The visible
 tradeoff is paying connection initialization on the first read after prolonged
 idle; warm operations retain their separate WAL reader queue.
 
-### Correctness and scope
+## Production-builder follow-up
 
-Native tests cover eager initialization of every configured reader, an in-use
-WAL snapshot surviving retirement of another reader, committed-state visibility,
+A separate review-correction pair on `19eb64ca` + the candidate uses
+`SqliteStore::with_config(default)` for **both** arms. The baseline executable
+restores only the original reader-builder body; the candidate uses the shipped
+builder unchanged. Same optimized profile, bundled SQLite, seeded file, 50
+stores, point warmup and fixed active workload. No compiler ran during either
+measurement. Pool-policy and observed-count assertions pass in both arms.
+
+| Post-idle metric | Production baseline | Production candidate |
+| --- | ---: | ---: |
+| Live SQLite heap, bytes | 9,865,264 | 4,933,664 |
+| RssAnon, bytes | 18,563,072 | 17,879,040 |
+| Total RSS, bytes | 23,285,760 | 22,589,440 |
+| Readers / writers | 50 / 50 | 0 / 50 |
+| First-read p50 / p99, ms | 0.074 / 0.364 | 0.509 / 1.050 |
+| Warm-read p50 / p99, ms | 0.037 / 0.433 | 0.043 / 0.297 |
+| Active workload wall time, ms | 427.1 | 256.9 |
+
+The production path confirms **4,931,600 bytes (96.3 KiB per retired reader)**
+of live SQLite savings. It does **not** confirm an equivalent RSS drop:
+post-idle RssAnon differs by 684,032 bytes; the arms start the idle phase with
+a 225,280-byte difference in the opposite direction, giving a 909,312-byte
+difference in phase growth. Candidate RssAnon itself increases by 106,496
+bytes during idle despite SQLite freeing allocations. All 50 readers reopen
+successfully; dropping the stores returns live SQLite heap to zero.
+
+Cold initialization again costs roughly 0.44 ms at the sampled median. Active
+wall times now span 216–427 ms across archived comparisons. The apparently
+faster candidate in this pair is **not claimed as an active speedup**; warm
+medians and tails vary, and these runs cannot exclude a small active regression.
+The practical tradeoff remains lower idle connection cost versus a first-read
+reopen after ten minutes. The pair takes 632.07 + 631.90 seconds (21.1 minutes)
+of measurement time; the separate serial rebuilds take 74 + 70 seconds.
+Inflight lease/snapshot, cancellation and failure cases remain separately
+identified accelerated real-SQLite tests, not a claimed ten-minute lease test.
+
+## Correctness and scope
+
+Native tests cover eager initialization of every configured production reader.
+Accelerated replica tests cover an in-use WAL snapshot surviving retirement of
+another reader, committed-state visibility,
 concurrent cold reacquisition, `query_only`, busy timeout and foreign keys,
 reader-init failure/recovery, cancellation retaining a blocking job's lease,
 shared/sibling handle lifetime, and shutdown. Existing storage tests cover
@@ -141,6 +197,11 @@ repository's 64 KiB binary-growth envelope. Its `.text` grows 4,464 bytes and
 allocated sections grow 4,528 bytes. The larger file delta is layout/padding,
 not 64 KiB of extra instructions. It is recorded rather than waived; this is
 not the default-fat-LTO `demo` CI gate, and does not replace that check.
+The separate default-feature demo CI comparison subsequently passes: +704
+bytes stripped, +640 bytes `.text`, -16 bytes allocated sections, no dependency
+increase (baseline `19eb64cac`, tested PR merge head `0c4a0321a`). The WASM
+release build and feature-matrix checks also pass; no ESP runtime result is
+inferred.
 
 Upstream's subsequent SQLite database/device administration API refactor
 retains the same reader builder, pragmas, pools, semaphores and migrations.

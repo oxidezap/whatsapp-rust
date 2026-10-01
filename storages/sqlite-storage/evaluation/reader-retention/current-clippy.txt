@@ -1,12 +1,16 @@
-   Compiling waproto v0.7.0 (/home/agent/.treehouse/whatsapp-rust-cc1b74/6/whatsapp-rust/waproto)
-   Compiling wacore-binary v0.7.0 (/home/agent/.treehouse/whatsapp-rust-cc1b74/6/whatsapp-rust/wacore/binary)
-   Compiling wacore-derive v0.7.0 (/home/agent/.treehouse/whatsapp-rust-cc1b74/6/whatsapp-rust/wacore/derive)
-   Compiling wacore v0.7.0 (/home/agent/.treehouse/whatsapp-rust-cc1b74/6/whatsapp-rust/wacore)
-   Compiling whatsapp-rust-sqlite-storage v0.7.0 (/home/agent/.treehouse/whatsapp-rust-cc1b74/6/whatsapp-rust/storages/sqlite-storage)
-    Checking wacore-libsignal v0.7.0 (/home/agent/.treehouse/whatsapp-rust-cc1b74/6/whatsapp-rust/wacore/libsignal)
+Original post-rebase lint output; argv was not captured in this archive.
+See review-clippy.txt for the command-recorded verbose follow-up and driver proof.
+Only the machine-specific checkout prefix is redacted; the raw local log is retained.
+
+   Compiling waproto v0.7.0 (<repo>/waproto)
+   Compiling wacore-binary v0.7.0 (<repo>/wacore/binary)
+   Compiling wacore-derive v0.7.0 (<repo>/wacore/derive)
+   Compiling wacore v0.7.0 (<repo>/wacore)
+   Compiling whatsapp-rust-sqlite-storage v0.7.0 (<repo>/storages/sqlite-storage)
+    Checking wacore-libsignal v0.7.0 (<repo>/wacore/libsignal)
     Checking bitflags v2.13.1
-    Checking wacore-appstate v0.7.0 (/home/agent/.treehouse/whatsapp-rust-cc1b74/6/whatsapp-rust/wacore/appstate)
-    Checking wacore-noise v0.7.0 (/home/agent/.treehouse/whatsapp-rust-cc1b74/6/whatsapp-rust/wacore/noise)
+    Checking wacore-appstate v0.7.0 (<repo>/wacore/appstate)
+    Checking wacore-noise v0.7.0 (<repo>/wacore/noise)
     Checking linux-raw-sys v0.12.1
     Checking rustix v1.1.4
     Checking terminal_size v0.4.4
