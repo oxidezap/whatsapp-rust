@@ -1,0 +1,70 @@
+//! Lifecycle proof only: virtual Tokio time is not a native memory measurement.
+
+use anyhow::{Result, ensure};
+use whatsapp_rust::bench_support::connected_idle::{BackendFixture, LANES, Session};
+
+#[tokio::test(start_paused = true)]
+async fn connected_activity_and_idle_lifecycle() -> Result<()> {
+    let backend = BackendFixture::memory();
+    let session = Session::connect(backend.backend.clone()).await?;
+    let activity = session.prepare_activity().await?;
+    session.receive_activity(activity).await?;
+    let busy = session.checkpoint().await;
+    ensure!(
+        busy.connected && busy.open_lanes == LANES,
+        "activity did not create live workers: {busy:?}"
+    );
+    session.idle().await?;
+    let idle = session.checkpoint().await;
+    ensure!(
+        idle.connected && idle.open_lanes == 0 && idle.running_workers == 0,
+        "{idle:?}"
+    );
+    session.maintenance().await?;
+    ensure!(
+        session.checkpoint().await.connected,
+        "maintenance disconnected client"
+    );
+    session.shutdown().await
+}
+
+#[cfg(feature = "sqlite-storage")]
+#[tokio::test]
+async fn sqlite_connected_activity_and_virtual_idle() -> Result<()> {
+    let backend = BackendFixture::sqlite().await?;
+    let session = Session::connect(backend.backend.clone()).await?;
+    let activity = session.prepare_activity().await?;
+    session.receive_activity(activity).await?;
+    ensure!(
+        session.checkpoint().await.open_lanes == LANES,
+        "SQLite activity missed workers"
+    );
+    tokio::time::pause();
+    session.idle().await?;
+    tokio::time::resume();
+    let idle = session.checkpoint().await;
+    ensure!(idle.connected && idle.running_workers == 0, "{idle:?}");
+    session.maintenance().await?;
+    session.shutdown().await
+}
+
+#[tokio::test(start_paused = true)]
+async fn connected_control_stays_alive_without_activity() -> Result<()> {
+    let backend = BackendFixture::memory();
+    let session = Session::connect(backend.backend.clone()).await?;
+    session.finish_control().await?;
+    session.idle().await?;
+    // Recent-activity decisions use wacore's real monotonic clock, not Tokio
+    // time. The native measurement verifies periodic keepalive instead.
+    session.probe().await?;
+    let control = session.checkpoint().await;
+    ensure!(
+        control.connected && control.lanes == 0 && control.messages == 0,
+        "{control:?}"
+    );
+    ensure!(
+        session.pongs() > 0,
+        "keepalive never reached the synthetic server"
+    );
+    session.shutdown().await
+}
