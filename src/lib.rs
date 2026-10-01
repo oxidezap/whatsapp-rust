@@ -234,6 +234,7 @@ pub use client::{
     ConflictKind, ConnectError, ConnectStage, DrainOutcome, ProtocolTerminalReason, Reachability,
     RunCompletionReason, SecretFlushReport, ShutdownReport, SignalMaintenanceError,
 };
+pub use types::connect_admission::ConnectAdmission;
 pub use types::durability_hook::InboundDurabilityHook;
 pub use types::history_sync_admission::{
     HistorySyncAdmission, HistorySyncDecision, HistorySyncMetadata,
@@ -327,33 +328,33 @@ pub use features::{
     EventCreationParams, EventResponseType, Events, GroupAppealStatus, GroupCreateOptions,
     GroupDescription, GroupEphemeralSettings, GroupError, GroupHierarchy, GroupHistoryAddResult,
     GroupHistoryRetryToken, GroupHistoryShareOutcome, GroupHistorySkipReason, GroupJoinError,
-    GroupMessageReporter, GroupMetadata, GroupMetadataResult, GroupOverview, GroupOverviewResult,
-    GroupParticipant, GroupParticipantDetails, GroupParticipantOptions, GroupPictureEntry,
-    GroupProfilePicture, GroupProfilePictureOutcome, GroupSubject, GroupType, Groups,
-    GrowthLockInfo, HistorySharePreparation, ImporterAddress, InviteInfoError, IsOnWhatsAppResult,
-    JoinGroupResult, Labels, LinkSubgroupOptions, LinkSubgroupsResult, MediaRetryResult,
-    MediaReupload, MediaReuploadError, MediaReuploadRequest, MemberAddMode, MemberLinkMode,
-    MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, MessageEditError,
-    MessageRetransmission, Mex, MexError, MexErrorExtensions, MexFatalError, MexGraphQLError,
-    MexRequest, MexResponse, NackReason, NewChatMessageCapping, Newsletter, NewsletterAdminInfo,
-    NewsletterAdminProfile, NewsletterError, NewsletterFollower, NewsletterMediaType,
-    NewsletterMessage, NewsletterMessageAssociationType, NewsletterMessageType, NewsletterMetadata,
-    NewsletterMyAddOns, NewsletterMyPollVote, NewsletterMyReaction, NewsletterPollVote,
-    NewsletterQuestionType, NewsletterReactionCount, NewsletterRole, NewsletterState,
-    NewsletterVerification, Order, OrderPriceDetails, OrderProduct, OwnUsername,
-    ParticipantChangeResponse, ParticipantType, PictureType, PollError, PollOptionResult,
-    PollVoteCiphertext, Polls, PreparedGroupHistoryShare, Presence, PresenceError, PresencePolicy,
-    PresenceStatus, PreviousDescription, Price, Product, ProductAvailability, ProductImage,
-    ProductVideo, Profile, ProfileError, ProfilePicture, ProfilePictureLookup,
-    ProfilePictureLookupOptions, QuickReplies, ReachoutTimelock, ReportedGroupMessage,
-    ReportedGroupMessages, RetryReason, RetryRequestError, RetryRequestOptions,
-    RetryRequestOutcome, SalePrice, SecretEncKind, SecretEncrypted, SetProfilePictureResponse,
-    Signal, SignalError, SignalSessionInfo, SignalSessionMigration, StanzaRejection,
-    StanzaResponseError, Status, StatusPrivacySetting, StatusSendOptions, SubgroupKind,
-    SubgroupVisibility, SyncActionMessageRange, TcToken, TcTokenError, USERNAME_MAX_LENGTH,
-    USERNAME_MIN_LENGTH, UnlinkSubgroupsResult, UserInfo, UsernameLookup, UsernameLookupError,
-    UsernameLookupUser, UsyncSubprotocolError, VariantProperty, VerifiedName, group_type,
-    message_key, message_range,
+    GroupLookupResult, GroupMessageReporter, GroupMetadata, GroupMetadataResult, GroupOverview,
+    GroupOverviewResult, GroupParticipant, GroupParticipantDetails, GroupParticipantOptions,
+    GroupPictureEntry, GroupProfilePicture, GroupProfilePictureOutcome, GroupSubject, GroupType,
+    Groups, GrowthLockInfo, HistorySharePreparation, ImporterAddress, InviteInfoError,
+    IsOnWhatsAppResult, JoinGroupResult, Labels, LinkSubgroupOptions, LinkSubgroupsResult,
+    MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest, MemberAddMode,
+    MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest,
+    MessageEditError, MessageRetransmission, Mex, MexError, MexErrorExtensions, MexFatalError,
+    MexGraphQLError, MexRequest, MexResponse, NackReason, NewChatMessageCapping, Newsletter,
+    NewsletterAdminInfo, NewsletterAdminProfile, NewsletterError, NewsletterFollower,
+    NewsletterMediaType, NewsletterMessage, NewsletterMessageAssociationType,
+    NewsletterMessageType, NewsletterMetadata, NewsletterMyAddOns, NewsletterMyPollVote,
+    NewsletterMyReaction, NewsletterPollVote, NewsletterQuestionType, NewsletterReactionCount,
+    NewsletterRole, NewsletterState, NewsletterVerification, Order, OrderPriceDetails,
+    OrderProduct, OwnUsername, ParticipantChangeResponse, ParticipantType, PictureType, PollError,
+    PollOptionResult, PollVoteCiphertext, Polls, PreparedGroupHistoryShare, Presence,
+    PresenceError, PresencePolicy, PresenceStatus, PreviousDescription, Price, Product,
+    ProductAvailability, ProductImage, ProductVideo, Profile, ProfileError, ProfilePicture,
+    ProfilePictureLookup, ProfilePictureLookupOptions, QuickReplies, ReachoutTimelock,
+    ReportedGroupMessage, ReportedGroupMessages, RetryReason, RetryRequestError,
+    RetryRequestOptions, RetryRequestOutcome, SalePrice, SecretEncKind, SecretEncrypted,
+    SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo, SignalSessionMigration,
+    StanzaRejection, StanzaResponseError, Status, StatusPrivacySetting, StatusSendOptions,
+    SubgroupKind, SubgroupVisibility, SyncActionMessageRange, TcToken, TcTokenError,
+    USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UnlinkSubgroupsResult, UserInfo, UsernameLookup,
+    UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError, VariantProperty, VerifiedName,
+    group_type, message_key, message_range,
 };
 pub use features::{MexDoc, MexOperation};
 
@@ -363,6 +364,7 @@ pub mod bot;
 pub use bot::{
     BotRunOutcome, BotShutdownReport, CallbackEventHandler, EventDelivery, EventDeliveryStats,
 };
+pub use store::StoreRelease;
 pub mod lid_pn_cache;
 #[cfg(feature = "signal")]
 pub mod shutdown;
@@ -406,6 +408,7 @@ pub mod prelude {
     pub use crate::send::{EditOptions, SendError, SendOptions, SendResult};
     #[cfg(feature = "signal")]
     pub use crate::shutdown::shutdown_signal;
+    pub use crate::store::StoreRelease;
     #[cfg(feature = "sqlite-storage")]
     pub use crate::store::{SqliteStore, StoredDeviceSummary};
     pub use crate::types::events::{

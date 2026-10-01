@@ -280,7 +280,7 @@ impl Client {
         if has_l1_cache && let Some(bytes) = self.recent_messages.remove(key).await {
             if let Ok(msg) = waproto::codec::message_decode(bytes.as_slice()) {
                 // Cache hit — consume the DB row in the background to avoid orphans.
-                let backend = self.persistence_manager.backend();
+                let backend = self.persistence_manager.backend_lease();
                 let mid = key.id.clone();
                 self.runtime
                     .spawn(Box::pin(async move {
@@ -465,7 +465,7 @@ impl Client {
             self.recent_messages
                 .insert(key, std::sync::Arc::clone(&shared))
                 .await;
-            let backend = self.persistence_manager.backend();
+            let backend = self.persistence_manager.backend_lease();
             self.runtime
                 .spawn(Box::pin(async move {
                     if let Err(e) = backend

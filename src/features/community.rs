@@ -189,16 +189,16 @@ pub struct UnlinkSubgroupsResult {
     pub failed_groups: Vec<(Jid, u32)>,
 }
 
-/// Determine the group type from metadata fields.
+/// Compatibility classification of a group's community role.
 ///
-/// A pure projection of [`GroupHierarchy`](crate::GroupHierarchy):
+/// Prefer [`GroupMetadata::hierarchy`] for new code: unlike this classifier,
+/// [`GroupHierarchy`](crate::GroupHierarchy) also retains the parent JID.
+/// This helper remains a pure projection of that hierarchy:
 /// the classification runs through the single canonical normalizer, so this
 /// and overview hierarchies agree by construction instead of reimplementing
 /// flag precedence.
 pub fn group_type(metadata: &GroupMetadata) -> GroupType {
-    // from_metadata is the canonical normalizer; match on its output rather
-    // than re-reading the flags so precedence lives in exactly one place.
-    let hierarchy = crate::features::groups::GroupHierarchy::from_metadata(metadata);
+    let hierarchy = metadata.hierarchy();
     // Exhaustive on purpose: this match lives in the crate that defines the
     // enums, so `#[non_exhaustive]` does not require a wildcard here. Leaving
     // one out means a future `GroupHierarchy`/`SubgroupKind` variant forces a

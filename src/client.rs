@@ -1955,6 +1955,9 @@ pub struct Client {
     pub(crate) retry_admission:
         std::sync::OnceLock<Arc<dyn crate::types::retry_admission::RetryAdmission>>,
 
+    /// Optional run-loop dial admission policy, fixed during assembly.
+    pub(crate) connect_admission:
+        Option<Arc<dyn crate::types::connect_admission::ConnectAdmission>>,
     /// Optional inbound history-sync admission policy, fixed during assembly.
     pub(crate) history_sync_admission:
         Option<Arc<dyn crate::types::history_sync_admission::HistorySyncAdmission>>,

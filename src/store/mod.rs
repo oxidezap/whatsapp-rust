@@ -1,6 +1,10 @@
 pub mod commands;
 pub mod error;
 pub mod persistence_manager;
+pub(crate) mod release;
+pub use release::StoreRelease;
+#[cfg(test)]
+mod backend_probe;
 pub mod signal;
 pub mod signal_adapter;
 pub mod signal_cache;

@@ -632,6 +632,31 @@ impl Client {
         }
     }
 
+    /// Observe when the crate releases this session's storage ownership.
+    ///
+    /// Shutdown/run completion is not this boundary: detached owners and the
+    /// saver's final flush may still hold the backend. The returned handle owns
+    /// neither this client nor its store. Drop all client/manager handles before
+    /// awaiting it; shutdown itself deliberately does not wait for host owners.
+    /// See [`crate::StoreRelease`] for external-handle and runtime limitations.
+    ///
+    /// ```no_run
+    /// use whatsapp_rust::bot::BotHandle;
+    ///
+    /// async fn stop(handle: BotHandle) {
+    ///     // The temporary client Arc is not retained by the observer.
+    ///     let released = handle.client().store_release();
+    ///     let report = handle.shutdown().await;
+    ///     released.wait().await;
+    ///     // Inspect report for durability; release alone does not imply success
+    ///     // or that independently held database handles have closed.
+    ///     let _ = report;
+    /// }
+    /// ```
+    pub fn store_release(&self) -> crate::StoreRelease {
+        self.persistence_manager.store_release()
+    }
+
     /// Get access to the PersistenceManager for this client.
     /// This is useful for multi-account scenarios to get the device ID.
     pub fn persistence_manager(&self) -> Arc<PersistenceManager> {

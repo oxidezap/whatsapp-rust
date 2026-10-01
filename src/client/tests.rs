@@ -3726,7 +3726,10 @@ async fn runtime_cache_config_honors_disabled_recent_cache() {
 /// a terminate must cancel an offer paused on identity learning. It retains
 /// only in-flight offers, and `memory_report()` exposes their count. The
 /// history-sync admission policy is an immutable optional `Arc`, so it avoids
-/// the synchronization-cell cost of the former `OnceLock` field.
+/// the synchronization-cell cost of the former `OnceLock` field. Dial admission
+/// adds a two-word optional trait-object Arc: measured 4384 -> 4400 B under
+/// default features at admission's intake, accounted separately without raising
+/// the fixed base.
 ///
 /// Rebaseline: the failure message prints the current size; set the base just
 /// above it. Test cfg only: `#[cfg(test)]` fields shift the number versus a
@@ -3743,7 +3746,12 @@ fn client_size_pins_runtime_cache_config_saving() {
     let mut expected = 4288
         + size_of::<subsystem::Subsystems>()
         + size_of::<crate::handlers::call::pending_offers::PendingOffers>()
-        + size_of::<Arc<std::sync::Mutex<crate::retry::HistoryPayloadRegistry>>>();
+        + size_of::<Arc<std::sync::Mutex<crate::retry::HistoryPayloadRegistry>>>()
+        + size_of::<Option<Arc<dyn crate::ConnectAdmission>>>();
+    assert_eq!(
+        size_of::<Option<Arc<dyn crate::ConnectAdmission>>>(),
+        2 * size_of::<usize>(),
+    );
     if cfg!(feature = "client-lifecycle") {
         expected += size_of::<std::sync::Mutex<()>>() + size_of::<Option<Arc<()>>>();
     }
