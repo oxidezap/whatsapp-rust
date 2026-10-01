@@ -326,27 +326,6 @@ impl Drop for BotCallbackGuard {
     }
 }
 
-/// Observed background supervision exit, or why no run result is available.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum BotRunOutcome {
-    Completed(crate::RunCompletionReason),
-    /// This handle requested abort. Not an executor acknowledgement that the
-    /// task has stopped: custom runtimes may defer or ignore cancellation.
-    AbortRequested,
-    /// The result sender disappeared without an observed run exit or abort
-    /// request. Runtime cancellation, panic and executor loss are not inferred.
-    Unobserved,
-}
-
-/// Graceful client cleanup and the separately observed background run outcome.
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct BotShutdownReport {
-    pub shutdown: crate::ShutdownReport,
-    pub run: BotRunOutcome,
-}
-
 /// Handle to a bot started in the background via [`Bot::spawn`]. Awaiting it
 /// preserves the run outcome, or reports an abort request / unobserved exit.
 ///
