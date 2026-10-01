@@ -93,6 +93,6 @@ fn main() {
         assert_eq!(interest.wants(kind), wanted, "{kind:?}");
         assert!(EventInterest::ALL.wants(kind));
     }
-    assert_eq!(std::mem::size_of::<EventKind>(), 1);
-    assert_eq!(std::mem::size_of::<EventInterest>(), 16);
+    assert_eq!(size_of::<EventKind>(), 1);
+    assert_eq!(size_of::<EventInterest>(), 16);
 }
