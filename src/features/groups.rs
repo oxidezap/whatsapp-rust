@@ -5215,9 +5215,20 @@ mod tests {
                     assert_eq!(code, 429);
                     assert_eq!(error_type.as_deref(), Some("wait"));
                     assert_eq!(backoff, Some(60));
-                    let shared = response.as_arc().clone();
-                    assert!(Arc::ptr_eq(&shared, response.as_arc()));
-                    assert!(response.get().get_optional_child("error").is_some());
+                    let rejection = response.get();
+                    assert_eq!(
+                        rejection.attrs().optional_string("id").as_deref(),
+                        Some(id.as_str())
+                    );
+                    assert_eq!(
+                        rejection.attrs().optional_string("type").as_deref(),
+                        Some("error")
+                    );
+                    let error_node = rejection.get_optional_child("error").unwrap();
+                    assert_eq!(
+                        error_node.attrs().optional_string("text").as_deref(),
+                        Some("rate-overlimit")
+                    );
                 } else {
                     let GroupError::Iq(IqError::ParseError(source)) = error else {
                         panic!("expected parse error, not a group lookup state");
