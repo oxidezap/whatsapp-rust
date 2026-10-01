@@ -40,10 +40,21 @@ async fn boxed_static_send_and_async_trait_consumers() {
     assert!(Arc::ptr_eq(&backend, &device.backend));
     use whatsapp_rust::prelude::StoreRelease as PreludeStoreRelease;
     let release: PreludeStoreRelease = manager.store_release();
-    let boxed: BoxFuture<'static, ()> = Box::pin(release.wait());
+    let mut boxed: BoxFuture<'static, ()> = Box::pin(release.wait());
+    assert!(
+        futures::poll!(boxed.as_mut()).is_pending(),
+        "release fence fired while the manager still owns its backend lease"
+    );
     drop(manager);
-    boxed.await;
-    Released::released(&release).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), boxed)
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        Released::released(&release),
+    )
+    .await
+    .unwrap();
     // Raw host-owned Device/snapshot/backend handles are deliberately outside
     // the crate's release fence, not transformed or silently closed.
     drop((device, snapshot, backend));
