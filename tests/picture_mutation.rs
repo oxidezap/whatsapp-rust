@@ -1,5 +1,9 @@
 //! Public imports and boxed futures for explicit set/remove operations.
 use std::{future::Future, pin::Pin};
+use whatsapp_rust::features::{
+    GroupError as FeatureGroupError, NewsletterError as FeatureNewsletterError,
+    ProfileError as FeatureProfileError,
+};
 use whatsapp_rust::wacore_binary::Jid;
 use whatsapp_rust::{Client, GroupError, NewsletterError, ProfileError};
 
@@ -25,7 +29,7 @@ fn mutation_calls<'a>(
 #[test]
 fn public_picture_mutations_and_typed_empty_errors_compile() {
     let _ = mutation_calls;
-    let _: whatsapp_rust::features::ProfileError = ProfileError::EmptyPicture;
-    let _: whatsapp_rust::features::GroupError = GroupError::EmptyPicture;
-    let _: whatsapp_rust::features::NewsletterError = NewsletterError::EmptyPicture;
+    let _: FeatureProfileError = ProfileError::EmptyPicture;
+    let _: FeatureGroupError = GroupError::EmptyPicture;
+    let _: FeatureNewsletterError = NewsletterError::EmptyPicture;
 }
