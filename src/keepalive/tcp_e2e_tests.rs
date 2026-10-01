@@ -5,6 +5,7 @@ use crate::store::persistence_manager::PersistenceManager;
 use crate::test_utils::{MockHttpClient, create_test_backend, log_capture};
 use crate::transport::{DisconnectReason, Transport, TransportEvent, TransportFactory};
 use crate::waproto::whatsapp as wa;
+use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::future::Future;
@@ -446,7 +447,10 @@ async fn wait_for_application_iqs(
                     .any(|event| event.is_iq_get && event.id == *id && event.xmlns == *xmlns)
             })
         {
-            seen.push(rx.recv().await?);
+            let event = rx.recv().await.with_context(|| {
+                format!("peer observations closed before both application IQs; seen={seen:?}")
+            })?;
+            seen.push(event);
         }
         Ok::<_, anyhow::Error>(())
     })
@@ -526,7 +530,13 @@ async fn application_progress_accepts_two_noise_frames_in_one_transport_send() {
 async fn application_progress_rejects_missing_second_frame() {
     let (progress, peer, seen) =
         control_progress(&[control_frame(0, "ignored", "test:ignored")]).await;
-    assert!(progress.is_err());
+    let failure = progress.unwrap_err();
+    assert!(failure.downcast_ref::<async_channel::RecvError>().is_some());
+    let message = failure.to_string();
+    assert!(
+        message.contains("seen=") && message.contains("ignored"),
+        "{message}"
+    );
     peer.unwrap();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].id, "ignored");
