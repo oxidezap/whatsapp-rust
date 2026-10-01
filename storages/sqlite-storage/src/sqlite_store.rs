@@ -638,7 +638,12 @@ pub struct SqliteStoreConfig {
     /// path keeps its own, so a burst of readers can never starve the writer.
     ///
     /// Costs one connection's page cache ([`cache_size_kib`](Self::cache_size_kib))
-    /// each, which is the reason to set it to `0` in a process holding many
+    /// each while active. Native WAL readers are reclaimed after r2d2's existing
+    /// ten-minute idle timeout (plus up to thirty seconds of reaper lag). Only
+    /// unleased connections are closed; the next read reopens one with the same
+    /// initialization hook and pragmas, without queueing behind the writer.
+    /// All requested readers are still validated eagerly at startup. Set this
+    /// to `0` to avoid their startup cost as well in a process holding many
     /// per-session stores that read rarely.
     pub read_pool_size: u32,
     /// `PRAGMA cache_size`, in KiB per connection.
@@ -1198,12 +1203,34 @@ impl SqliteStore {
             let manager = ConnectionManager::<SqliteConnection>::new(&db_url);
             let pool = crate::pool::spawn_blocking(
                 move || -> std::result::Result<SqlitePool, StoreError> {
-                    crate::pool::builder(read_thread_pool)
+                    let builder = crate::pool::builder(read_thread_pool);
+                    // Keep r2d2's ten-minute idle timeout, but do not immediately
+                    // replace retired readers. The existing semaphore and pooled
+                    // checkout lease still bound concurrency and protect in-use
+                    // connections; the next read recreates one on demand.
+                    #[cfg(not(target_family = "wasm"))]
+                    let builder = builder.min_idle(Some(0));
+                    let pool = builder
                         .max_size(read_pool_size)
                         .test_on_check_out(false)
                         .connection_customizer(Box::new(read_options))
                         .build(manager)
-                        .map_err(|e| StoreError::Connection(Box::new(e)))
+                        .map_err(|e| StoreError::Connection(Box::new(e)))?;
+                    // Validate every requested native reader at open, as before:
+                    // hook or pragma failures must reject the constructor, not
+                    // be deferred until the first message after pairing.
+                    #[cfg(not(target_family = "wasm"))]
+                    {
+                        let mut initial = Vec::with_capacity(read_pool_size as usize);
+                        for _ in 0..read_pool_size {
+                            initial.push(
+                                pool.get()
+                                    .map_err(|e| StoreError::Connection(Box::new(e)))?,
+                            );
+                        }
+                        drop(initial);
+                    }
+                    Ok(pool)
                 },
             )
             .await
@@ -7624,6 +7651,10 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "sqlite_store/reader_lifecycle_tests.rs"]
+mod reader_lifecycle_tests;
 
 /// Routing of read-only work onto the reader connections.
 #[cfg(test)]

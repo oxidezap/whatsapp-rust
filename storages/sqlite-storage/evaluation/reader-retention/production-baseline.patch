@@ -1,0 +1,41 @@
+diff --git a/storages/sqlite-storage/src/sqlite_store.rs b/storages/sqlite-storage/src/sqlite_store.rs
+index 04e97aa6..79483037 100644
+--- a/storages/sqlite-storage/src/sqlite_store.rs
++++ b/storages/sqlite-storage/src/sqlite_store.rs
+@@ -1203,34 +1203,12 @@ impl SqliteStore {
+             let manager = ConnectionManager::<SqliteConnection>::new(&db_url);
+             let pool = crate::pool::spawn_blocking(
+                 move || -> std::result::Result<SqlitePool, StoreError> {
+-                    let builder = crate::pool::builder(read_thread_pool);
+-                    // Keep r2d2's ten-minute idle timeout, but do not immediately
+-                    // replace retired readers. The existing semaphore and pooled
+-                    // checkout lease still bound concurrency and protect in-use
+-                    // connections; the next read recreates one on demand.
+-                    #[cfg(not(target_family = "wasm"))]
+-                    let builder = builder.min_idle(Some(0));
+-                    let pool = builder
++                    crate::pool::builder(read_thread_pool)
+                         .max_size(read_pool_size)
+                         .test_on_check_out(false)
+                         .connection_customizer(Box::new(read_options))
+                         .build(manager)
+-                        .map_err(|e| StoreError::Connection(Box::new(e)))?;
+-                    // Validate every requested native reader at open, as before:
+-                    // hook or pragma failures must reject the constructor, not
+-                    // be deferred until the first message after pairing.
+-                    #[cfg(not(target_family = "wasm"))]
+-                    {
+-                        let mut initial = Vec::with_capacity(read_pool_size as usize);
+-                        for _ in 0..read_pool_size {
+-                            initial.push(
+-                                pool.get()
+-                                    .map_err(|e| StoreError::Connection(Box::new(e)))?,
+-                            );
+-                        }
+-                        drop(initial);
+-                    }
+-                    Ok(pool)
++                        .map_err(|e| StoreError::Connection(Box::new(e)))
+                 },
+             )
+             .await

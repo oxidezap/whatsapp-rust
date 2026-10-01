@@ -945,6 +945,45 @@ impl ReceiveHarness {
         });
     }
 
+    /// Plaintext-only allocation control: bypass classification and Signal crypto,
+    /// but keep decode, special handling, dispatch and receipt flush unchanged.
+    /// Inputs are moved, never cloned. The counts are `(dispatched, skdm_only)`;
+    /// suppressed resends count as dispatched, so also check `messages_delivered`.
+    pub fn plaintext_burst(
+        &self,
+        payloads: Vec<(Vec<u8>, Arc<wacore::types::message::MessageInfo>)>,
+    ) -> (usize, usize) {
+        self.runtime.block_on(self.handle_plaintext_batch(payloads))
+    }
+
+    /// The harness entry's state size, separating runtime-entry future moves
+    /// (and any size-triggered Tokio box) from per-message application costs.
+    pub fn plaintext_burst_future_bytes(&self) -> usize {
+        size_of_val(&self.handle_plaintext_batch(Vec::new()))
+    }
+
+    async fn handle_plaintext_batch(
+        &self,
+        payloads: Vec<(Vec<u8>, Arc<wacore::types::message::MessageInfo>)>,
+    ) -> (usize, usize) {
+        let mut counts = (0, 0);
+        for (payload, info) in payloads {
+            let outcome = self
+                .client
+                .handle_decrypted_plaintext("msg", payload, 2, 0, Default::default(), &info)
+                .await
+                .expect("plaintext handling failed");
+            let (dispatched, skdm_only) = outcome.flags();
+            counts.0 += usize::from(dispatched);
+            counts.1 += usize::from(skdm_only);
+        }
+        self.client
+            .outbound_flush
+            .flush(&*self.client.runtime, std::time::Duration::from_secs(5))
+            .await;
+        counts
+    }
+
     /// Enqueue stanzas through the real production `MessageHandler::handle_inline` into
     /// chat lanes, driving the lane workers to process them, and flush outbound receipts.
     pub fn enqueue_and_drain(&self, nodes: &[Arc<wacore_binary::OwnedNodeRef>]) {
@@ -1237,29 +1276,55 @@ impl MultiLaneReceiveHarness {
     /// their respective chat lanes, await their processing, and flush outbound receipts.
     pub fn enqueue_and_drain(&self, nodes: &[Arc<wacore_binary::OwnedNodeRef>]) {
         self.runtime.block_on(async {
-            let target = self.messages_delivered() + nodes.len() as u64;
-            for node in nodes {
-                let mut cancelled = false;
-                let accepted = crate::handlers::message::MessageHandler::handle_inline(
-                    Arc::clone(&self.client),
-                    Arc::clone(node),
-                    &mut cancelled,
-                )
-                .await;
-                assert!(accepted && !cancelled, "message enqueue failed");
-            }
-            tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                while self.messages_delivered() < target {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("lane delivery timed out: a decrypt, commit, or worker failed");
-            self.client
-                .outbound_flush
-                .flush(&*self.client.runtime, std::time::Duration::from_secs(5))
-                .await;
+            let target = self.enqueue_batch(nodes).await;
+            self.drain_until(target).await;
         });
+    }
+
+    /// Enqueue without polling spawned workers, returning the delivery count to
+    /// pass to [`Self::drain`]. An isolated measurement must fail if enqueue yields
+    /// rather than silently including decrypt work from the runtime scheduler.
+    pub fn enqueue(&self, nodes: &[Arc<wacore_binary::OwnedNodeRef>]) -> u64 {
+        use futures::FutureExt;
+
+        let _runtime = self.runtime.enter();
+        self.enqueue_batch(nodes)
+            .now_or_never()
+            .expect("isolated enqueue yielded: worker work would contaminate the measurement")
+    }
+
+    /// Complete a previous [`Self::enqueue`], including outbound receipts.
+    pub fn drain(&self, target: u64) {
+        self.runtime.block_on(self.drain_until(target));
+    }
+
+    async fn enqueue_batch(&self, nodes: &[Arc<wacore_binary::OwnedNodeRef>]) -> u64 {
+        let target = self.messages_delivered() + nodes.len() as u64;
+        for node in nodes {
+            let mut cancelled = false;
+            let accepted = crate::handlers::message::MessageHandler::handle_inline(
+                Arc::clone(&self.client),
+                Arc::clone(node),
+                &mut cancelled,
+            )
+            .await;
+            assert!(accepted && !cancelled, "message enqueue failed");
+        }
+        target
+    }
+
+    async fn drain_until(&self, target: u64) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while self.messages_delivered() < target {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lane delivery timed out: a decrypt, commit, or worker failed");
+        self.client
+            .outbound_flush
+            .flush(&*self.client.runtime, std::time::Duration::from_secs(5))
+            .await;
     }
 
     /// Receive a burst of stanzas within a single runtime entry (`block_on`),
