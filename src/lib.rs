@@ -224,15 +224,15 @@ pub use client::{
 };
 pub use client::{CallError, Voip};
 pub use client::{
-    Client, ClientBuild, ClientBuilder, ClientBuilderError, Connection, DecryptedPayloadLease,
-    EncDecryptFailedLease, RawNodeLease, SentFrameLease,
+    Client, ClientBuild, ClientBuilder, ClientBuilderError, ClientOptions, Connection,
+    DecryptedPayloadLease, EncDecryptFailedLease, RawNodeLease, SentFrameLease,
 };
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
 pub use client::{
-    ConnectError, ConnectStage, ProtocolTerminalReason, Reachability, RunCompletionReason,
-    SignalMaintenanceError,
+    ConflictKind, ConnectError, ConnectStage, ProtocolTerminalReason, Reachability,
+    RunCompletionReason, SignalMaintenanceError,
 };
 pub use types::durability_hook::InboundDurabilityHook;
 pub use types::history_sync_admission::{
@@ -355,6 +355,9 @@ pub use features::{
     UsernameLookupUser, UsyncSubprotocolError, VariantProperty, VerifiedName, group_type,
     message_key, message_range,
 };
+pub use features::{MexDoc, MexOperation};
+
+pub use features::{ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
 
 pub mod bot;
 pub mod lid_pn_cache;
@@ -371,14 +374,14 @@ pub mod version;
 pub mod prelude {
     pub use crate::bot::{Bot, BotBuilder, BotHandle, EventDelivery, MessageContext};
     pub use crate::client::{
-        Client, ClientBuilder, ClientBuilderError, ClientError, Connection, DecryptedPayloadLease,
-        EncDecryptFailedLease, RawNodeLease, SentFrameLease,
+        Client, ClientBuilder, ClientBuilderError, ClientError, ClientOptions, Connection,
+        DecryptedPayloadLease, EncDecryptFailedLease, RawNodeLease, SentFrameLease,
     };
     #[cfg(feature = "client-lifecycle")]
     #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
     pub use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
     pub use crate::client::{
-        ConnectError, ConnectStage, ProtocolTerminalReason, RunCompletionReason,
+        ConflictKind, ConnectError, ConnectStage, ProtocolTerminalReason, RunCompletionReason,
     };
     #[cfg(feature = "plugins")]
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]

@@ -344,6 +344,15 @@ impl Client {
     /// # Ok(())
     /// # }
     /// ```
+    pub async fn send_iq(
+        &self,
+        query: InfoQuery<'_>,
+    ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
+        self.send_iq_inner(query, true).await
+    }
+
+    // Typed execution defers only the outcome counter until its parser finishes;
+    // tracing, wire observers and the measured exchange remain shared with raw IQs.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -359,9 +368,10 @@ impl Client {
             err(Debug)
         )
     )]
-    pub async fn send_iq(
+    async fn send_iq_inner(
         &self,
         query: InfoQuery<'_>,
+        record_outcome: bool,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
         #[cfg(feature = "tracing")]
         self.record_identity_on_span(&tracing::Span::current());
@@ -380,6 +390,7 @@ impl Client {
             iq_timeout,
             Box::pin(async { self.send_node(node).await }),
             None,
+            record_outcome,
         )
         .await
     }
@@ -432,6 +443,7 @@ impl Client {
             timeout.unwrap_or(DEFAULT_IQ_TIMEOUT),
             Box::pin(async { self.send_node(node).await }),
             on_sent,
+            true,
         )
         .await
     }
@@ -471,9 +483,32 @@ impl Client {
             Err(e) => return Err(IqError::EncodeError(e)),
         };
 
-        let response = self.execute_prepared(req_id, prepared).await?;
-        spec.parse_response(response.get())
-            .map_err(IqError::ParseError)
+        let result = self
+            .execute_prepared(req_id, prepared)
+            .await
+            .and_then(|response| {
+                spec.parse_response(response.get()).map_err(|error| {
+                    // A spec can report a typed rejection embedded in a result IQ.
+                    // Attach its original response without changing ordinary parse errors.
+                    match error.downcast_ref::<wacore::request::IqError>() {
+                        Some(wacore::request::IqError::ServerError {
+                            code,
+                            text,
+                            error_type,
+                            backoff,
+                        }) => IqError::ServerError {
+                            code: *code,
+                            text: text.clone(),
+                            error_type: error_type.clone(),
+                            backoff: *backoff,
+                            response: response.clone().into(),
+                        },
+                        _ => IqError::ParseError(error),
+                    }
+                })
+            });
+        record_iq_outcome(&result);
+        result
     }
 
     /// [`Client::execute`] for a spec whose response is consumed as it is
@@ -575,17 +610,18 @@ impl Client {
                     DEFAULT_IQ_TIMEOUT,
                     Box::pin(async { self.send_raw_bytes(buf).await }),
                     None,
+                    false,
                 )
                 .await
             }
             PreparedIq::Query(iq) => {
                 let mut iq = *iq;
                 // Reuse the id already generated for the fast-path attempt so
-                // send_iq doesn't mint a second one.
+                // the shared send path doesn't mint a second one.
                 if iq.id.is_none() {
                     iq.id = Some(req_id);
                 }
-                self.send_iq(iq).await
+                self.send_iq_inner(iq, false).await
             }
         }
     }
@@ -604,6 +640,7 @@ impl Client {
         timeout: Duration,
         send_fn: IqSendFuture<'_>,
         on_sent: Option<IqOnSent<'_>>,
+        record_outcome: bool,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
         let (tx, rx) = futures::channel::oneshot::channel();
         let result = self
@@ -625,7 +662,9 @@ impl Client {
                     Err(e) => Err(IqError::from_response(e, &response_node)),
                 }
             });
-        record_iq_outcome(&result);
+        if record_outcome {
+            record_iq_outcome(&result);
+        }
         result
     }
 
