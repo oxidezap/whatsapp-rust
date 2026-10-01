@@ -533,6 +533,7 @@ impl Client {
             plugin_host,
             noise_cert_policy,
             history_sync_admission,
+            connect_admission,
         } = extensions;
         let mut unique_id_bytes = [0u8; 2];
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut unique_id_bytes);
@@ -746,6 +747,7 @@ impl Client {
             inbound_durability_hook: std::sync::OnceLock::new(),
             retry_admission: std::sync::OnceLock::new(),
             history_sync_admission,
+            connect_admission,
             chatstate_handlers: std::sync::RwLock::new(Arc::from([])),
             chatstate_handler_count: AtomicUsize::new(0),
             pdo_pending_requests: cache_config.pdo_pending_requests.build_with_ttl(),
@@ -849,6 +851,8 @@ impl Client {
 
     /// Drive the connection/read/reconnect loop and preserve its observed outcome.
     /// Pause parks this loop; only resume or a terminal stop releases it.
+    /// An optional [`crate::ConnectAdmission`] policy paces each attempt before
+    /// `connect()`, including the first, without using the transport timeout.
     /// A policy stop can race another teardown: this is the branch that ended
     /// this run, not a durability report or a join of every worker.
     pub async fn run(self: &Arc<Self>) -> RunCompletionReason {
@@ -872,10 +876,8 @@ impl Client {
             self.is_running.store(false, Ordering::SeqCst);
             return RunCompletionReason::ShutdownRequested;
         }
-        // Reconnects are counted at iteration start: every pass after the
-        // first is an attempt actually being made. Counting at the branches
-        // below would also count a final pass that never reconnects (a user
-        // disconnect() flips is_running while the branch runs).
+        // Count only at the attempt boundary, after admission: abandoned host
+        // reservations are not reconnect attempts.
         let mut first_connect = true;
         let mut last_connect_error: Option<ConnectError>;
         let mut last_disconnect_reason: Option<DisconnectReason>;
@@ -893,6 +895,26 @@ impl Client {
                 info!("Session paused; not connecting until resumed.");
                 self.wait_while_paused().await;
                 continue;
+            }
+            if let Some(admission) = &self.connect_admission {
+                // Snapshot before the inline callback: even a pause/resume
+                // entirely inside it invalidates this reservation.
+                let pause_generation = self.pause_generation.load(Ordering::SeqCst);
+                let delay = admission.delay();
+                if !self
+                    .wait_for_connect_admission(delay, pause_generation, &shutdown)
+                    .await
+                {
+                    if self.is_paused()
+                        || self.pause_generation.load(Ordering::SeqCst) != pause_generation
+                    {
+                        // No attempt consumed this pause's teardown fact. Do
+                        // not let it waive backoff for a later real failure.
+                        self.pause_teardown_pending.store(false, Ordering::Relaxed);
+                        self.clear_connection_backoff_state();
+                    }
+                    continue;
+                }
             }
             if !first_connect {
                 self.stats.record_reconnect();
@@ -1089,6 +1111,43 @@ impl Client {
             RunCompletionReason::ShutdownRequested
         } else {
             completion
+        }
+    }
+
+    /// Serve a host reservation without starting a connect attempt. Unrelated
+    /// session notifications merely re-check state; unlike the backoff, this
+    /// wait may watch the session notifier because it never collapses on an
+    /// ordinary teardown wake. The generation catches a rapid pause/resume.
+    async fn wait_for_connect_admission(
+        &self,
+        delay: Duration,
+        pause_generation: u64,
+        shutdown: &wacore::runtime::ShutdownSignal,
+    ) -> bool {
+        let can_dial = || {
+            !shutdown.is_fired()
+                && self.is_running.load(Ordering::Relaxed)
+                && !self.is_paused()
+                && self.pause_generation.load(Ordering::SeqCst) == pause_generation
+        };
+        if delay.is_zero() {
+            return can_dial();
+        }
+        let sleep = self.runtime.sleep(delay).fuse();
+        let stopped = wacore::runtime::wait_for_shutdown(shutdown).fuse();
+        futures::pin_mut!(sleep, stopped);
+        loop {
+            // Register before checking: pause/resume and supervision-stop
+            // notifications must not be lost between the check and select.
+            let changed = self.session_state_notifier.listen();
+            if !can_dial() {
+                return false;
+            }
+            futures::select! {
+                _ = sleep => return can_dial(),
+                _ = stopped => return false,
+                _ = changed.fuse() => {}
+            }
         }
     }
 
@@ -1877,7 +1936,8 @@ impl Client {
     }
 
     /// Release a [`pause`](Self::pause): the run loop reconnects at once, with
-    /// no backoff owed for an offline window the application chose.
+    /// no backoff owed for an offline window the application chose. An installed
+    /// [`crate::ConnectAdmission`] policy still reserves the next attempt anew.
     ///
     /// Returns once the loop has been told, not once it is connected — wait for
     /// that with [`wait_for_connected`](Self::wait_for_connected). A no-op on a
@@ -2624,6 +2684,9 @@ impl Drop for Connection<'_> {
 }
 
 #[cfg(test)]
+mod admission_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -2757,6 +2820,7 @@ mod tests {
                     plugin_host: None,
                     noise_cert_policy: wacore::handshake::NoiseCertPolicy::default(),
                     history_sync_admission: None,
+                    connect_admission: None,
                 },
             )
         };

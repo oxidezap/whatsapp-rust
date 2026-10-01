@@ -19,6 +19,7 @@ use crate::store::error::StoreError;
 use crate::store::persistence_manager::PersistenceManager;
 use crate::sync_task::MajorSyncTask;
 use crate::transport::TransportFactory;
+use crate::types::connect_admission::ConnectAdmission;
 use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
 use crate::types::history_sync_admission::HistorySyncAdmission;
@@ -184,6 +185,7 @@ pub struct ClientBuilder {
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
     history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
+    connect_admission: Option<Arc<dyn ConnectAdmission>>,
     task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
     alloc_meter: Option<Arc<wacore::stats::AllocMeter>>,
     #[cfg(feature = "client-lifecycle")]
@@ -217,6 +219,7 @@ impl ClientBuilder {
             custom_enc_handlers: HashMap::new(),
             inbound_durability_hook: None,
             history_sync_admission: None,
+            connect_admission: None,
             task_instrument: None,
             alloc_meter: None,
             #[cfg(feature = "client-lifecycle")]
@@ -394,6 +397,22 @@ impl ClientBuilder {
         admission: Arc<dyn HistorySyncAdmission>,
     ) -> Self {
         self.history_sync_admission = Some(admission);
+        self
+    }
+
+    /// Pace first and reconnect run-loop dials with a synchronous host policy.
+    /// See [`ConnectAdmission`] for cancellation and reservation limits.
+    pub fn with_connect_admission<A>(mut self, admission: A) -> Self
+    where
+        A: ConnectAdmission + 'static,
+    {
+        self.connect_admission = Some(Arc::new(admission));
+        self
+    }
+
+    /// Share a host's dial budget across clients. Manual `connect()` is unaffected.
+    pub fn with_connect_admission_arc(mut self, admission: Arc<dyn ConnectAdmission>) -> Self {
+        self.connect_admission = Some(admission);
         self
     }
 
@@ -684,6 +703,7 @@ impl ClientBuilder {
                 plugin_host,
                 noise_cert_policy: options.noise_cert_policy,
                 history_sync_admission: self.history_sync_admission,
+                connect_admission: self.connect_admission,
             },
         );
         let client = assembly.client();
@@ -867,6 +887,7 @@ pub(super) struct ClientExtensions {
     pub(super) plugin_host: Option<Arc<PluginHost>>,
     pub(super) noise_cert_policy: NoiseCertPolicy,
     pub(super) history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
+    pub(super) connect_admission: Option<Arc<dyn ConnectAdmission>>,
 }
 
 impl ClientAssembly {
