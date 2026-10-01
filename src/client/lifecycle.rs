@@ -560,7 +560,7 @@ impl Client {
             runtime: runtime.clone(),
             core,
             msg_secret_buffer: crate::msg_secret_buffer::MsgSecretWriteBuffer::new(
-                persistence_manager.backend(),
+                persistence_manager.backend_lease(),
                 runtime.clone(),
             ),
             persistence_manager: persistence_manager.clone(),
