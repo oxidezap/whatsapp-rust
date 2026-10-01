@@ -349,7 +349,9 @@ impl BotHandle {
 
     /// Gracefully stop the bot: disconnects (flushing the device snapshot,
     /// buffered receipts and message secrets) and waits for the run loop to
-    /// exit.
+    /// exit. This does not join detached owners or imply storage release; obtain
+    /// [`Client::store_release`] before consuming this handle to observe that
+    /// separate ownership boundary.
     pub async fn shutdown(self) -> BotShutdownReport {
         let shutdown = self.client.shutdown().await;
         let run = self.await;

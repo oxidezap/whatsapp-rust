@@ -1,4 +1,5 @@
 use super::error::StoreError;
+use super::release::{BackendLease, StoreRelease};
 use crate::store::Device;
 use crate::store::traits::Backend;
 use async_lock::{Mutex, RwLock};
@@ -39,7 +40,6 @@ pub struct PersistenceManager {
     /// `get_device_snapshot` into an Arc refcount bump instead of a full
     /// Device clone (the snapshot is read on every inbound message).
     device_snapshot: std::sync::RwLock<Arc<Device>>,
-    backend: Arc<dyn Backend>,
     dirty: Arc<AtomicBool>,
     /// The manager, not a flush caller, owns an initiated save. Cancellation
     /// releases the driver lock but retains the future, including a backend's
@@ -52,6 +52,22 @@ pub struct PersistenceManager {
     fail_sender_key_device_clears: AtomicBool,
     #[cfg(test)]
     fail_sender_key_device_status_writes: AtomicBool,
+    // Last: mutable/cached Devices and cancellation-retained saves must release
+    // their raw backend references before the manager releases its lease.
+    backend: BackendLease,
+}
+
+struct DeviceSave {
+    // Fields drop in order, even if its driving future was never polled or is
+    // cancelled: the raw backend in the snapshot goes before the ownership lease.
+    snapshot: Arc<Device>,
+    backend: BackendLease,
+}
+
+impl DeviceSave {
+    async fn run(&self) -> Result<(), StoreError> {
+        self.backend.save(&self.snapshot.core).await
+    }
 }
 
 impl PersistenceManager {
@@ -86,7 +102,7 @@ impl PersistenceManager {
         Ok(Self {
             device: Arc::new(RwLock::new(device)),
             device_snapshot: std::sync::RwLock::new(snapshot),
-            backend,
+            backend: BackendLease::new(backend),
             dirty: Arc::new(AtomicBool::new(false)),
             pending_save: Mutex::new(None),
             save_notify: Arc::new(Event::new()),
@@ -114,7 +130,20 @@ impl PersistenceManager {
             .clone()
     }
 
+    /// A host-owned handle to the original backend allocation. Such raw handles
+    /// are outside [`StoreRelease`]'s crate-ownership boundary.
     pub fn backend(&self) -> Arc<dyn Backend> {
+        self.backend.raw()
+    }
+
+    /// Observe release without owning this manager or its backend. Sharing this
+    /// manager between clients shares the release boundary; drop all manager and
+    /// client handles before waiting. Raw backend/Device handles may outlive it.
+    pub fn store_release(&self) -> StoreRelease {
+        self.backend.observer()
+    }
+
+    pub(crate) fn backend_lease(&self) -> BackendLease {
         self.backend.clone()
     }
 
@@ -171,10 +200,13 @@ impl PersistenceManager {
         }
         let snapshot = self.get_device_snapshot();
         drop(device_guard);
-        let backend = self.backend.clone();
-        *pending = Some(pending_device_save(Box::pin(async move {
-            backend.save(&snapshot.core).await
-        })));
+        let save = DeviceSave {
+            snapshot,
+            backend: self.backend_lease(),
+        };
+        *pending = Some(pending_device_save(Box::pin(
+            async move { save.run().await },
+        )));
         self.finish_device_save(&mut pending).await
     }
 
@@ -518,6 +550,75 @@ mod tests {
             restarted.get_device_snapshot().status_privacy.as_deref(),
             Some(&action)
         );
+    }
+
+    #[tokio::test]
+    async fn last_client_drop_does_not_release_a_parked_saver_flush() {
+        assert_saver_retains_backend(true).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_saver_releases_only_when_its_future_is_destroyed() {
+        assert_saver_retains_backend(false).await;
+    }
+
+    async fn assert_saver_retains_backend(complete: bool) {
+        use crate::store::release::tests::{ProbeBackend, SaverRuntime};
+        let (mut backend, dropped) = ProbeBackend::new();
+        let (unpark, parked) = async_channel::bounded(1);
+        let (entered, entry) = async_channel::bounded(1);
+        backend.gate = Some(parked);
+        backend.entered = Some(entered);
+        let client = crate::test_utils::create_test_client_with_backend(Arc::new(backend)).await;
+        let weak = Arc::downgrade(&client);
+        let pm = client.persistence_manager();
+        let release = client.store_release();
+        let mut waiter = Box::pin(release.wait());
+        let runtime = Arc::new(SaverRuntime::new());
+        let notifier = wacore::runtime::ShutdownNotifier::new();
+        let handle = pm.clone().run_background_saver(
+            runtime.clone(),
+            Duration::from_secs(3600),
+            notifier.subscribe(),
+        );
+        assert!(client.saver_handle.set(handle).is_ok());
+        let mut saver = runtime.future.lock().unwrap().take().unwrap();
+        assert!(futures::poll!(saver.as_mut()).is_pending());
+
+        // A save retained after driver cancellation is real manager state.
+        // The clean saver is parked in select; only shutdown wakes it, so this
+        // resumes inside the final flush (not the initial or periodic flush).
+        let save = DeviceSave {
+            snapshot: pm.get_device_snapshot(),
+            backend: pm.backend_lease(),
+        };
+        *pm.pending_save.lock().await =
+            Some(pending_device_save(Box::pin(
+                async move { save.run().await },
+            )));
+        notifier.notify();
+        assert!(futures::poll!(saver.as_mut()).is_pending());
+        entry.try_recv().unwrap();
+        drop(pm);
+        drop(client);
+        crate::test_utils::poll_until("last client reference", || weak.upgrade().is_none()).await;
+        assert!(runtime.aborted.load(Ordering::SeqCst));
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "saver retains backend after Client Drop"
+        );
+        assert!(futures::poll!(waiter.as_mut()).is_pending());
+        if complete {
+            unpark.send(()).await.unwrap();
+            saver.await;
+        } else {
+            drop(saver); // executor acknowledgement, not merely the abort request
+        }
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        release.wait().await;
     }
 
     // Saver must observe shutdown.notify, run a final flush, and exit so the

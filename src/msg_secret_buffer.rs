@@ -173,7 +173,7 @@ pub(crate) struct MsgSecretWriteBuffer {
     /// ownership: it holds a Weak, and the Sender above lives here, so dropping
     /// the buffer closes the channel and ends the worker.
     worker_started: AtomicBool,
-    backend: Arc<dyn crate::store::traits::Backend>,
+    backend: crate::store::release::BackendLease,
     runtime: Arc<dyn wacore::runtime::Runtime>,
     /// Batches written so far; test observability for the coalescing claim.
     #[cfg(test)]
@@ -184,14 +184,14 @@ pub(crate) struct MsgSecretWriteBuffer {
 
 impl MsgSecretWriteBuffer {
     pub(crate) fn new(
-        backend: Arc<dyn crate::store::traits::Backend>,
+        backend: crate::store::release::BackendLease,
         runtime: Arc<dyn wacore::runtime::Runtime>,
     ) -> Arc<Self> {
         Self::with_pending_limit(backend, runtime, MAX_PENDING_MSG_SECRETS)
     }
 
     fn with_pending_limit(
-        backend: Arc<dyn crate::store::traits::Backend>,
+        backend: crate::store::release::BackendLease,
         runtime: Arc<dyn wacore::runtime::Runtime>,
         pending_limit: usize,
     ) -> Arc<Self> {
@@ -496,13 +496,16 @@ mod tests {
 
     async fn buffer() -> Arc<MsgSecretWriteBuffer> {
         let backend = crate::test_utils::create_test_backend().await;
-        MsgSecretWriteBuffer::new(backend, Arc::new(crate::runtime_impl::TokioRuntime))
+        MsgSecretWriteBuffer::new(
+            crate::store::release::BackendLease::new(backend),
+            Arc::new(crate::runtime_impl::TokioRuntime),
+        )
     }
 
     async fn buffer_with_pending_limit(pending_limit: usize) -> Arc<MsgSecretWriteBuffer> {
         let backend = crate::test_utils::create_test_backend().await;
         MsgSecretWriteBuffer::with_pending_limit(
-            backend,
+            crate::store::release::BackendLease::new(backend),
             Arc::new(crate::runtime_impl::TokioRuntime),
             pending_limit,
         )
@@ -1040,7 +1043,7 @@ mod tests {
         .await
         .unwrap();
         let buffer = MsgSecretWriteBuffer::new(
-            Arc::new(database.store(1)),
+            crate::store::release::BackendLease::new(Arc::new(database.store(1))),
             Arc::new(crate::runtime_impl::TokioRuntime),
         );
         buffer

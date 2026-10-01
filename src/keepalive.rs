@@ -588,7 +588,7 @@ impl Client {
     /// it, and cheap enough for a live connection by contract
     /// (`DeviceStore::maintenance`).
     fn spawn_engine_maintenance(&self) {
-        let backend = self.persistence_manager.backend();
+        let backend = self.persistence_manager.backend_lease();
         self.runtime
             .spawn(Box::pin(async move {
                 if let Err(e) = backend.maintenance().await {
@@ -629,6 +629,35 @@ mod tests {
     use super::*;
     use crate::socket::error::{EncryptSendError, SocketError};
     use wacore_binary::builder::NodeBuilder;
+
+    #[tokio::test]
+    async fn storage_maintenance_keeps_its_lease_after_client_drop() {
+        use crate::store::release::tests::ProbeBackend;
+        let (mut backend, dropped) = ProbeBackend::new();
+        let (unpark, parked) = async_channel::bounded(1);
+        let (entered, entry) = async_channel::bounded(1);
+        backend.gate_method = "maintenance";
+        backend.gate = Some(parked);
+        backend.entered = Some(entered);
+        let client = crate::test_utils::create_test_client_with_backend(Arc::new(backend)).await;
+        let release = client.store_release();
+        let weak = Arc::downgrade(&client);
+        client.spawn_engine_maintenance();
+        tokio::time::timeout(Duration::from_secs(5), entry.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(client);
+        crate::test_utils::poll_until("last client reference", || weak.upgrade().is_none()).await;
+        let mut waiter = Box::pin(release.wait());
+        assert!(futures::poll!(waiter.as_mut()).is_pending());
+        assert!(!dropped.load(Ordering::SeqCst));
+        unpark.send(()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+    }
 
     // The maintenance cadence is a tick count, so the interval it really lands
     // on depends on where each randomized tick falls. Both ends must stay in

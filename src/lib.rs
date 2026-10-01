@@ -363,6 +363,7 @@ pub mod bot;
 pub use bot::{
     BotRunOutcome, BotShutdownReport, CallbackEventHandler, EventDelivery, EventDeliveryStats,
 };
+pub use store::StoreRelease;
 pub mod lid_pn_cache;
 #[cfg(feature = "signal")]
 pub mod shutdown;
@@ -406,6 +407,7 @@ pub mod prelude {
     pub use crate::send::{EditOptions, SendError, SendOptions, SendResult};
     #[cfg(feature = "signal")]
     pub use crate::shutdown::shutdown_signal;
+    pub use crate::store::StoreRelease;
     #[cfg(feature = "sqlite-storage")]
     pub use crate::store::{SqliteStore, StoredDeviceSummary};
     pub use crate::types::events::{
