@@ -458,7 +458,8 @@ jobs:
           CARGO_BUILD_JOBS: "1"
           RUSTFLAGS: ""
           CARGO_ENCODED_RUSTFLAGS: ""
-        run: cargo run --manifest-path tests/event-kind-consumer/Cargo.toml
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: cargo run --locked --manifest-path tests/event-kind-consumer/Cargo.toml
       - name: Publish test timings
         if: always()
         uses: actions/upload-artifact@v7
