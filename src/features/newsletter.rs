@@ -39,6 +39,9 @@ pub enum NewsletterError {
     /// Connection/transport failure sending a plaintext stanza (edit/revoke).
     #[error("{0}")]
     Client(#[from] ClientError),
+    /// Picture data was empty; use the dedicated removal operation instead.
+    #[error("picture data cannot be empty; use remove_picture instead")]
+    EmptyPicture,
     /// The request was malformed (e.g. a non-newsletter JID, an empty target
     /// message id, or a missing element in the server response).
     #[error("invalid newsletter request: {0}")]
@@ -584,11 +587,18 @@ impl<'a> Newsletter<'a> {
     /// Carried by the same mutation as [`Newsletter::update`] — WA Web edits the
     /// picture through `updates.picture`, base64-encoded — so the response is the
     /// newsletter's refreshed metadata.
+    ///
+    /// Empty data returns [`NewsletterError::EmptyPicture`] before sending anything.
+    /// Use [`Newsletter::remove_picture`] to remove the picture explicitly.
+    /// Only non-emptiness is checked; JPEG contents are not validated or transformed.
     pub async fn set_picture(
         &self,
         jid: &Jid,
         jpeg: &[u8],
     ) -> Result<NewsletterMetadata, NewsletterError> {
+        if jpeg.is_empty() {
+            return Err(NewsletterError::EmptyPicture);
+        }
         self.update_picture(jid, Some(jpeg)).await
     }
 

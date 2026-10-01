@@ -19,6 +19,8 @@ mod media_reupload;
 pub mod message_edit;
 mod mex;
 pub(crate) mod newsletter;
+#[cfg(test)]
+mod picture_mutation_tests;
 mod pictures;
 mod polls;
 mod presence;

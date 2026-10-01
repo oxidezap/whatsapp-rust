@@ -24,6 +24,9 @@ pub enum ProfileError {
     /// Connection/transport failure sending a stanza (push-name presence).
     #[error("{0}")]
     Client(#[from] ClientError),
+    /// Picture data was empty; use the dedicated removal operation instead.
+    #[error("picture data cannot be empty; use remove_profile_picture instead")]
+    EmptyPicture,
     /// A provided argument is invalid (e.g. an empty push name).
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
@@ -112,8 +115,9 @@ impl<'a> Profile<'a> {
     /// Sends a JPEG image as the new profile picture. The image should already
     /// be properly sized/cropped by the caller (WhatsApp typically uses 640x640).
     ///
-    /// Passing empty `image_data` **removes** the picture (matching WhatsApp Web);
-    /// call [`Profile::remove_profile_picture`] when removal is the intent.
+    /// Empty data returns [`ProfileError::EmptyPicture`] before sending anything.
+    /// Use [`Profile::remove_profile_picture`] to remove the picture explicitly.
+    /// Only non-emptiness is checked; JPEG contents are not validated or transformed.
     ///
     /// ## Wire Format
     /// ```xml
@@ -125,11 +129,13 @@ impl<'a> Profile<'a> {
         &self,
         image_data: Vec<u8>,
     ) -> Result<SetProfilePictureResponse, ProfileError> {
-        // for_own routes empty bytes to the remove path, matching WA Web; no panic.
+        if image_data.is_empty() {
+            return Err(ProfileError::EmptyPicture);
+        }
         debug!("Setting profile picture (size={} bytes)", image_data.len());
         Ok(self
             .client
-            .execute(SetProfilePictureSpec::for_own(image_data))
+            .execute(SetProfilePictureSpec::set_own(image_data))
             .await?)
     }
 

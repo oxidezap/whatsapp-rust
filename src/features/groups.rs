@@ -61,6 +61,9 @@ pub enum GroupError {
     /// A MEX (GraphQL) group-property mutation failed.
     #[error("{0}")]
     Mex(#[from] MexError),
+    /// Picture data was empty; use the dedicated removal operation instead.
+    #[error("picture data cannot be empty; use remove_profile_picture instead")]
+    EmptyPicture,
     /// The request was malformed (e.g. empty invite code, batch over the limit,
     /// expired V4 invite, non-group JID where one is required).
     #[error("invalid group request: {0}")]
@@ -2930,8 +2933,9 @@ impl<'a> Groups<'a> {
     /// Set a group's profile picture (admin operation).
     ///
     /// Sends a JPEG; the caller should size/crop it (WhatsApp uses 640x640).
-    /// Passing empty `image_data` removes the picture, mirroring the own-picture
-    /// API; prefer [`Groups::remove_profile_picture`] when removal is the intent.
+    /// Empty data returns [`GroupError::EmptyPicture`] before sending anything.
+    /// Use [`Groups::remove_profile_picture`] to remove the picture explicitly.
+    /// Only non-emptiness is checked; JPEG contents are not validated or transformed.
     ///
     /// ## Wire Format
     /// ```xml
@@ -2944,10 +2948,13 @@ impl<'a> Groups<'a> {
         group_jid: impl Into<Jid>,
         image_data: Vec<u8>,
     ) -> Result<SetProfilePictureResponse, GroupError> {
+        if image_data.is_empty() {
+            return Err(GroupError::EmptyPicture);
+        }
         let group_jid = &group_jid.into();
         Ok(self
             .client
-            .execute(SetProfilePictureSpec::for_group(group_jid, image_data))
+            .execute(SetProfilePictureSpec::set_group(group_jid, image_data))
             .await?)
     }
 
