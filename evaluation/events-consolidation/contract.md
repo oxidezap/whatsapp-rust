@@ -38,7 +38,9 @@ controls for both removed names.
   explicit detach. Removal stops future dispatch snapshots; an old snapshot may
   still deliver. It cannot retract events already accepted by a channel or a
   separately retained callback adapter. `CallbackEventHandler::cancel()` aborts
-  accepted work explicitly; dropping its last owner also cancels it.
+  accepted work explicitly; dropping its last owner also cancels it. Cancellation
+  is cooperative at future poll boundaries, not preemption of blocking synchronous
+  callback code, and does not stop tasks a callback spawned elsewhere.
 - `ChannelEventHandler::new()` stays bounded at 256, `with_capacity(0)` clamps to
   one, and `unbounded()` remains an explicitly unlimited host capability.
 - Terminal and driver-scope cancellation, weak Client ownership, Runtime,
