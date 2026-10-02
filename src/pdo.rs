@@ -360,12 +360,16 @@ impl Client {
                             })
                         })
                         .cloned();
-                    if !explicit_retry
+                    // Explicit retries bypass a spent gate, not an unsent reservation:
+                    // its pending slot can disappear while the session wait is still live.
+                    if current.is_some_and(|memo| {
+                        memo.outcome.load(std::sync::atomic::Ordering::Acquire) == PDO_IN_FLIGHT
+                    }) || (!explicit_retry
                         && (previous.is_some()
                             || current.is_some_and(|memo| {
                                 memo.outcome.load(std::sync::atomic::Ordering::Acquire)
                                     != PDO_FAILED
-                            }))
+                            })))
                     {
                         return (normalized, ());
                     }
