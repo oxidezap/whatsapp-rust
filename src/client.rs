@@ -80,7 +80,7 @@ use wacore_binary::Jid;
 
 use portable_atomic::AtomicU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use wacore::stanza::wire_tags::{NotificationType, StanzaTag};
 
 /// Lease that keeps decrypted-payload events enabled for one consumer.
@@ -1123,7 +1123,8 @@ pub enum ConnectError {
     /// Construction never completed, so the attempt was rejected before any I/O.
     #[error("client construction did not activate")]
     NotActivated,
-    /// The client was shut down. Shutdown is final, so build a new client
+    /// The client was shut down or ended by a terminal protocol verdict.
+    /// This is final, so build a new client
     /// rather than reconnecting this one.
     #[error("client has been shut down")]
     Shutdown,
@@ -1484,6 +1485,54 @@ impl ResponseWaiterMap {
 /// for message-id pinning, ephemeral expiration, and cache freshness. Domain
 /// operations hang off accessors such as [`Client::groups`], [`Client::contacts`],
 /// and [`Client::presence`].
+/// Preference and irreversible protocol verdict share one atomic word so a
+/// concurrent host re-enable cannot erase the verdict. The Arc stays the same
+/// size as the former raw atomic handle; no extra Client attachment is needed.
+struct AutoReconnect(AtomicU8);
+
+impl AutoReconnect {
+    const ENABLED: u8 = 1;
+    const TERMINAL: u8 = 2;
+
+    fn new(enabled: bool) -> Self {
+        Self(AtomicU8::new(u8::from(enabled)))
+    }
+
+    fn load(&self, ordering: Ordering) -> bool {
+        self.0.load(ordering) & Self::ENABLED != 0
+    }
+
+    fn swap(&self, enabled: bool, ordering: Ordering) -> bool {
+        let previous = self
+            .0
+            .fetch_update(ordering, Ordering::Relaxed, |state| {
+                Some(if enabled && state & Self::TERMINAL == 0 {
+                    state | Self::ENABLED
+                } else {
+                    state & !Self::ENABLED
+                })
+            })
+            .unwrap_or_else(|state| state);
+        previous & Self::ENABLED != 0
+    }
+
+    fn store(&self, enabled: bool, ordering: Ordering) {
+        self.swap(enabled, ordering);
+    }
+
+    fn stop_permanently(&self) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                Some((state | Self::TERMINAL) & !Self::ENABLED)
+            });
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.0.load(Ordering::Acquire) & Self::TERMINAL != 0
+    }
+}
+
 /// Session client with encapsulated implementation state.
 ///
 /// Use [`Self::set_auto_reconnect`], [`Self::http_client`], builder-installed
@@ -1768,8 +1817,7 @@ pub struct Client {
     /// window does not end because our socket did.
     pub(crate) duplicate_dispatch_suppressed: AtomicU64,
 
-    enable_auto_reconnect: Arc<AtomicBool>,
-    auto_reconnect_changed: event_listener::Event,
+    enable_auto_reconnect: Arc<AutoReconnect>,
     /// Set by [`Client::pause`] and cleared by [`Client::resume`]: the run loop
     /// parks instead of connecting for as long as it holds.
     ///

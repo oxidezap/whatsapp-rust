@@ -223,13 +223,15 @@ impl PersistenceManager {
     async fn save_to_disk(&self) -> Result<(), StoreError> {
         let mut pending = self.pending_save.lock().await;
         self.finish_device_save(&mut pending).await?;
+        // An async modifier may still hold the write guard with dirty=false.
+        // Even a clean/final flush must wait for its publication before deciding
+        // there is nothing to save. Shutdown keeps its existing bounded wait.
+        let device_guard = self.device.read().await;
         if !self.dirty.load(Ordering::Acquire) {
             return Ok(());
         }
 
-        // Synchronize with publication before consuming dirty: a modifier sets
-        // it while still rebuilding the snapshot under the device write guard.
-        let device_guard = self.device.read().await;
+        // Consume dirty only after publication under the device write guard.
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return Ok(());
         }

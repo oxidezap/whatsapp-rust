@@ -118,10 +118,12 @@ impl Client {
     }
 
     pub(crate) fn record_protocol_terminal_reason(&self, reason: ProtocolTerminalReason) {
+        self.enable_auto_reconnect.stop_permanently();
         *self
             .protocol_terminal_reason
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason);
+        self.notify_session_state();
     }
 
     fn take_protocol_terminal_reason(&self) -> Option<ProtocolTerminalReason> {
@@ -280,10 +282,9 @@ impl Client {
     ///
     /// Built from the signals that actually mean *terminal*. The shutdown
     /// notifier is deliberately left untouched by reconnects, and it is fired by
-    /// `disconnect`, `logout` and `signal_shutdown_sync`. The stream errors that
-    /// end a session without going through those clear `enable_auto_reconnect`
-    /// and set `expected_disconnect` together, which is what tells them apart
-    /// from an application merely turning auto-reconnect off.
+    /// `disconnect`, `logout` and `signal_shutdown_sync`. A protocol-terminal
+    /// verdict is sticky in the reconnect state even after its diagnostic reason
+    /// is consumed, and cannot be undone by changing the host preference.
     ///
     /// Not `is_running` on its own: that tracks whether anything is driving the
     /// client, which a client that only connected never has, so a healthy one
@@ -295,7 +296,7 @@ impl Client {
     /// waiter parked on a connection that is never coming has no other way to
     /// learn that it should stop.
     pub(crate) fn is_terminal(&self) -> bool {
-        if self.shutdown_signal().is_fired() {
+        if self.shutdown_signal().is_fired() || self.enable_auto_reconnect.is_terminal() {
             return true;
         }
         // The reconnect preference alone is not proof: an application may
@@ -689,8 +690,7 @@ impl Client {
             }),
             offline_batch: Arc::new(offline_resume::OfflineBatchCoordinator::new()),
 
-            enable_auto_reconnect: Arc::new(AtomicBool::new(true)),
-            auto_reconnect_changed: event_listener::Event::new(),
+            enable_auto_reconnect: Arc::new(AutoReconnect::new(true)),
             paused: AtomicBool::new(false),
             pause_state_notifier: event_listener::Event::new(),
             pause_teardown_pending: AtomicBool::new(false),
@@ -874,6 +874,13 @@ impl Client {
         if shutdown.is_fired() {
             warn!("Client `run` called after shutdown.");
             return RunCompletionReason::ShutdownRequested;
+        }
+        if self.enable_auto_reconnect.is_terminal() {
+            return RunCompletionReason::AutoReconnectDisabled {
+                connection: None,
+                connect_error: None,
+                protocol_error: self.take_protocol_terminal_reason(),
+            };
         }
         if self.is_running.swap(true, Ordering::SeqCst) {
             warn!("Client `run` method called while already running.");
@@ -1106,11 +1113,10 @@ impl Client {
             // above. `pause()` landing here must not wait out a delay before
             // parking, and `resume()` must not wait one out at all — the
             // contract is that a pause owes no backoff, and the cap is 900s.
-            // Deliberately NOT `session_state_notifier`, which every teardown
-            // fires: watching that would collapse the backoff this loop exists
-            // to serve and hammer the server. Only the two transitions that
-            // have to be seen promptly fire this one, and the loop re-reads the
-            // state either way.
+            // A bare session-state notification must not complete this arm:
+            // every teardown fires it and would collapse the backoff. The
+            // separate policy future filters those hints, completing only when
+            // reconnect is disabled. This arm still shortens delay only on pause.
             futures::select! {
                 _ = self.runtime.sleep(delay).fuse() => {}
                 _ = shutdown_fired.fuse() => {
@@ -1145,7 +1151,7 @@ impl Client {
             // Register before reading: a disable between the read and park must
             // not leave the run loop asleep for the whole backoff. Re-enabling
             // alone never cancels or shortens that backoff.
-            let changed = self.auto_reconnect_changed.listen();
+            let changed = self.session_state_notifier.listen();
             if !self.auto_reconnect_enabled() {
                 return;
             }
@@ -1233,7 +1239,7 @@ impl Client {
         // Same refusal `run` makes: a shutdown is published once and for good,
         // and a connection established after it would be one the application
         // has already been told does not exist. A new client is the way back.
-        if self.shutdown_signal().is_fired() {
+        if self.shutdown_signal().is_fired() || self.enable_auto_reconnect.is_terminal() {
             return Err(ConnectError::Shutdown);
         }
         // A pause is a standing instruction that no connection exists, and it
@@ -1255,7 +1261,7 @@ impl Client {
     /// awaited — a window as wide as the 20s connect timeout. Checked once at
     /// the start, either one would be published straight over.
     fn connect_refusal(&self, attempt_pause_generation: u64) -> Option<ConnectError> {
-        if self.shutdown_signal().is_fired() {
+        if self.shutdown_signal().is_fired() || self.enable_auto_reconnect.is_terminal() {
             return Some(ConnectError::Shutdown);
         }
         // The generation, not just the flag: a `pause()` and `resume()` that
@@ -3526,7 +3532,10 @@ mod tests {
     async fn disabling_reconnect_after_a_connect_failure_preserves_the_error() {
         let (client, entered, release) = client_parked_in_connect().await;
         client.enable_auto_reconnect.store(false, Ordering::Relaxed);
-        client.record_protocol_terminal_reason(ProtocolTerminalReason::StreamErrorCode(401));
+        // A stale diagnostic, not a real terminal verdict: run must discard it
+        // before this fresh attempt while still preserving the actual failure.
+        *client.protocol_terminal_reason.lock().unwrap() =
+            Some(ProtocolTerminalReason::StreamErrorCode(401));
         let runner = Arc::clone(&client);
         let run = tokio::spawn(async move { runner.run_with_reason().await });
         next_connect_attempt(&entered).await;
@@ -4345,6 +4354,73 @@ mod tests {
             .await
             .expect("run() must return when disconnect() fires, not after the 900s backoff")
             .expect("the run task must not panic");
+    }
+
+    #[tokio::test]
+    async fn reenable_cannot_erase_a_consumed_protocol_terminal_verdict() {
+        let client = crate::test_utils::create_test_client().await;
+        let error = NodeBuilder::new("stream:error")
+            .children([NodeBuilder::new("conflict")
+                .attr("type", "replaced")
+                .build()])
+            .build();
+        client.handle_stream_error(&error.as_node_ref()).await;
+        assert!(client.is_terminal());
+        client.set_auto_reconnect(true);
+        assert!(!client.auto_reconnect_enabled());
+        assert!(matches!(
+            client.connect().await,
+            Err(ConnectError::Shutdown)
+        ));
+        assert!(matches!(
+            client.run().await,
+            RunCompletionReason::AutoReconnectDisabled {
+                protocol_error: Some(ProtocolTerminalReason::Conflict(ConflictKind::Replaced)),
+                ..
+            }
+        ));
+        // run consumed the diagnostic reason, not the irreversible state.
+        client.set_auto_reconnect(true);
+        assert!(client.is_terminal());
+        assert!(!client.auto_reconnect_enabled());
+        assert!(matches!(
+            client.run().await,
+            RunCompletionReason::AutoReconnectDisabled {
+                connect_error: None,
+                protocol_error: None,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn terminal_verdict_wins_concurrent_host_reenable() {
+        for _ in 0..32 {
+            let policy = Arc::new(AutoReconnect::new(true));
+            let host = Arc::clone(&policy);
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    for _ in 0..1000 {
+                        host.swap(true, Ordering::AcqRel);
+                    }
+                });
+                policy.stop_permanently();
+            });
+            assert!(policy.is_terminal());
+            assert!(!policy.load(Ordering::Acquire));
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_policy_wait_ignores_unrelated_session_notifications() {
+        let client = crate::test_utils::create_test_client().await;
+        let mut disabled = Box::pin(client.wait_for_auto_reconnect_disabled());
+        assert!(futures::poll!(disabled.as_mut()).is_pending());
+        client.notify_session_state();
+        assert!(futures::poll!(disabled.as_mut()).is_pending());
+        client.set_auto_reconnect(false);
+        assert!(futures::poll!(disabled.as_mut()).is_ready());
     }
 
     /// `signal_shutdown_sync()` is the flag-only path taken by `Drop` impls on

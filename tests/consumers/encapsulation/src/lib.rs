@@ -57,7 +57,9 @@ pub fn inspect(client: &Client) -> BoxFuture<'_, ()> {
     })
 }
 
-pub fn mutate_adapter(pm: &PersistenceManager) -> BoxFuture<'_, u32> {
+pub fn mutate_adapter(
+    pm: &PersistenceManager,
+) -> BoxFuture<'_, Result<u32, whatsapp_rust::wacore::libsignal::protocol::SignalProtocolError>> {
     Box::pin(async move {
         pm.modify_device_async(|device| {
             Box::pin(async move {
@@ -66,7 +68,6 @@ pub fn mutate_adapter(pm: &PersistenceManager) -> BoxFuture<'_, u32> {
             })
         })
         .await
-        .expect("in-memory identity read")
     })
 }
 
@@ -129,7 +130,7 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let pm = ready(PersistenceManager::new(backend.clone())).unwrap();
         let before = pm.get_device_snapshot();
-        assert_eq!(ready(mutate_adapter(&pm)), before.registration_id);
+        assert_eq!(ready(mutate_adapter(&pm)).unwrap(), before.registration_id);
         ready(pm.modify_device(|device| device.push_name = "host".into()));
         let after = pm.get_device_snapshot();
         assert_eq!(after.push_name, "host");

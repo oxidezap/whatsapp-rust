@@ -182,6 +182,30 @@ async fn scoped_device_mutation_publishes_success_error_and_cancellation() {
 }
 
 #[tokio::test]
+async fn clean_flush_waits_for_an_active_modifier_before_reporting_success() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let pm = PersistenceManager::new(backend.clone()).await.unwrap();
+    let mut mutation = Box::pin(pm.modify_device_async(|device| {
+        Box::pin(async move {
+            device.push_name = "during-flush".into();
+            std::future::pending::<()>().await;
+        })
+    }));
+    assert!(whatsapp_rust::futures::poll!(mutation.as_mut()).is_pending());
+    let mut flush = Box::pin(pm.flush());
+    assert!(
+        whatsapp_rust::futures::poll!(flush.as_mut()).is_pending(),
+        "clean/final flush must wait for the active modifier's publication"
+    );
+    drop(mutation);
+    flush.await.unwrap();
+    assert_eq!(
+        backend.load().await.unwrap().unwrap().push_name,
+        "during-flush"
+    );
+}
+
+#[tokio::test]
 async fn panicking_modifier_publishes_partial_state_and_releases_lock() {
     use whatsapp_rust::futures::FutureExt;
     let backend = Arc::new(InMemoryBackend::new());

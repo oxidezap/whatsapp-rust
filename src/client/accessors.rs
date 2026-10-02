@@ -23,10 +23,10 @@ impl Client {
     ///
     /// Disabling wakes an outstanding reconnect backoff promptly. The first
     /// attempt is still allowed, even when disabled before `run`. This does not
-    /// shut down, resume a paused session, or clear the terminal shutdown signal.
+    /// shut down or resume a paused session. Re-enabling cannot clear a terminal
+    /// shutdown or protocol verdict; construct a new Client for a new session.
     pub fn set_auto_reconnect(&self, enabled: bool) {
         if self.enable_auto_reconnect.swap(enabled, Ordering::AcqRel) != enabled {
-            self.auto_reconnect_changed.notify(usize::MAX);
             self.notify_session_state();
         }
     }
