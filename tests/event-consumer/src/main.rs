@@ -16,6 +16,9 @@ impl EventHandler for HostHandler {
 }
 
 // Export keeps the host capability exercised in the linked WASM artifact too.
+// SAFETY: This standalone executable owns `event_host_probe`; it is defined once
+// and no linked dependency declares that symbol. This fixture is not a library
+// exposing the symbol for linkage into another host's namespace.
 #[unsafe(no_mangle)]
 pub extern "C" fn event_host_probe() -> usize {
     let bus = CoreEventBus::new();

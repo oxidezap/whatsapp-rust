@@ -4,7 +4,8 @@ PR: https://github.com/oxidezap/whatsapp-rust/pull/1607
 Base: `d9f78b806f1f4ca80c8008caa5846e5d542c2c55`.
 Implementation checkpoint: `fb2d6e20f2c69764b12f1faa666f6162a66f9179`.
 Final tested code/CI source: `a5b7c4e502d4cc34d62ff05dd7577b00f0cb1938`.
-The subsequent change is documentation-only (this receipt and cancellation limits).
+Subsequent changes are documentation-only (this receipt, cancellation limits and
+an exported-symbol SAFETY comment in the standalone executable).
 The forge's current PR head and the final operational receipt identify the latest
 published source; results below are explicitly checkpoint-scoped, not blanket CI
 approval. Full local command output, exit files, timings, input hashes and CI/review
@@ -44,7 +45,9 @@ public 13, lib 4,153 (4 existing skipped), doctests 37 (27 existing ignored), ro
 and standalone formatting checks, matched native/WASM builds, and the standalone
 host tests at **Rust 1.94.1 MSRV** (13 public + 1 synchronous host + 2 negative
 old-name doctests). No children remained live when documentation was corrected.
-The runtime/fixture/CI inputs are unchanged by that documentation-only correction.
+Runtime/CI code and executable fixture behavior are unchanged by the subsequent
+documentation-only corrections; the export's single definition was checked with
+repository search and `nm` on the linked native executable.
 
 Default touched Clippy passed at the implementation checkpoint; final-head CI
 still owns all-feature build/lint/test, feature-matrix, rustdoc and full demo-size
@@ -82,7 +85,11 @@ Initial source checkpoint reviews: Greptile substantive review (5/5, no findings
 Cubic substantive review (2 findings: CI artifact reuse and deliberate source
 breaks), Codex configured code/security reviews completed. CodeRabbit's initial
 passing check was **rate-limited, not a substantive review**; its stated reset was
-33 minutes. Latest-head reviews and required CI are still being monitored.
+33 minutes. Its eventual substantive full review at `fe8fafba` posted one finding:
+add a SAFETY note to the fixture's retained WASM export. That note is now present,
+with single-symbol ownership verified; the export remains necessary to retain the
+host probe in the linked WASM artifact. Latest-head reviews and required CI are
+still being monitored.
 
 Cubic's subsequent contract wording finding is addressed by explicitly stating
 cooperative future-poll-boundary cancellation: no preemption of blocking code or
