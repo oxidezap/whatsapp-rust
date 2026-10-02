@@ -158,7 +158,7 @@ impl Client {
         tracing::instrument(name = "wa.send.unified_session", level = "debug", skip_all)
     )]
     pub(crate) async fn send_unified_session(&self) {
-        if !self.is_connected() {
+        if !self.is_socket_connected() {
             debug!(target: "Client/UnifiedSession", "Skipping: not connected");
             return;
         }

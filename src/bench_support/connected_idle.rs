@@ -240,7 +240,10 @@ impl Session {
         session
             .wait_until(|| session.wire.active.load(Ordering::Relaxed) > 0)
             .await?;
-        ensure!(session.client.is_connected(), "login lost its connection");
+        ensure!(
+            session.client.is_socket_connected(),
+            "login lost its connection"
+        );
         Ok(session)
     }
 
@@ -405,7 +408,7 @@ impl Session {
             )
             .await?;
         self.client.wait_for_startup_sync(DEADLINE).await?;
-        self.client.wait_for_connected(DEADLINE).await?;
+        self.client.wait_for_session_ready(DEADLINE).await?;
         // Connected/empty IQ waiters do not fence startup tasks awaiting storage
         // or not yet polled. Join their finite descendants before measurement.
         tokio::time::timeout(DEADLINE, self.client.bench_startup.wait())
@@ -444,7 +447,7 @@ impl Session {
             })
             .await;
         Checkpoint {
-            connected: self.client.is_connected(),
+            connected: self.client.is_socket_connected(),
             lanes,
             open_lanes,
             running_workers,
@@ -515,7 +518,7 @@ impl Session {
 
     pub async fn shutdown(mut self) -> Result<()> {
         let client = Arc::downgrade(&self.client);
-        self.client.disconnect().await;
+        self.client.shutdown().await;
         let reader_result: Result<()> = match self.reader.take() {
             Some(mut reader) => match tokio::time::timeout(DEADLINE, &mut reader).await {
                 Ok(joined) => joined

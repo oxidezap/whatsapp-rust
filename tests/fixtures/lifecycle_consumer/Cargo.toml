@@ -1,0 +1,16 @@
+[package]
+name = "lifecycle-api-consumer"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[workspace]
+
+[dependencies]
+whatsapp-rust = { path = "../../..", default-features = false }
+async-trait = "0.1.91"
+
+[[bin]]
+name = "size_probe"
+path = "src/main.rs"

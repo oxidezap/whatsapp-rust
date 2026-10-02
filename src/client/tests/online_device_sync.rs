@@ -100,7 +100,7 @@ pub(super) async fn fixture(name: &str) -> (Arc<Client>, Arc<RefreshRuntime>) {
     let runtime = Arc::new(RefreshRuntime::default());
     let client = crate::test_utils::create_test_client_with_runtime(name, runtime.clone()).await;
     assert!(
-        !client.is_connected(),
+        !client.is_socket_connected(),
         "this fixture must exercise refresh failure"
     );
     (client, runtime)

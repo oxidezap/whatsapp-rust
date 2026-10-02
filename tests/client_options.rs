@@ -97,7 +97,7 @@ async fn options_and_shared_dependencies_reach_both_facades() {
         assert!(!built.ab_props_fetch_enabled());
         assert_eq!(built.presence_policy(), PresencePolicy::Manual);
         assert_eq!(built.wanted_pre_key_count(), 123);
-        built.disconnect().await;
+        built.shutdown().await;
     }
     assert_eq!(receiver.receiver_count(), 1);
 }
@@ -118,7 +118,7 @@ async fn concrete_implementations_and_dynamic_errors() {
         .await
         .unwrap()
         .into_client();
-    client.disconnect().await;
+    client.shutdown().await;
     let bot = Bot::builder()
         .with_backend(InMemoryBackend::new())
         .with_runtime(TokioRuntime)
@@ -127,7 +127,7 @@ async fn concrete_implementations_and_dynamic_errors() {
         .build()
         .await
         .unwrap();
-    bot.client().disconnect().await;
+    bot.client().shutdown().await;
 }
 
 #[test]

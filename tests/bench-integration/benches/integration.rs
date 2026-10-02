@@ -183,7 +183,7 @@ fn connect_to_ready(bencher: divan::Bencher) {
             let c = TestClient::connect("bench_connect")
                 .await
                 .expect("connect client");
-            c.disconnect().await;
+            c.shutdown().await;
         });
     });
 }

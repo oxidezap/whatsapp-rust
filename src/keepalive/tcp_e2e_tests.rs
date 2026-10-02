@@ -628,7 +628,7 @@ async fn wait_for_writes(writes: &AtomicUsize, write_notify: &tokio::sync::Notif
 
 async fn await_connected(client: &Client) {
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !client.is_connected() || !client.is_running.load(Ordering::Acquire) {
+        while !client.is_socket_connected() || !client.is_running.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
     })
@@ -682,7 +682,7 @@ async fn loopback_tcp_ignored_iq_survives_until_timeout_when_noise_ping_is_answe
     assert!(
         matches!(ignored_result, Err(IqError::Timeout)),
         "answered-probe connection should remain through IQ timeout, got {ignored_result:?}; connected={}, peer_finished={}, writes={}, lifecycle_logs={:?}",
-        client.is_connected(),
+        client.is_socket_connected(),
         peer.is_finished(),
         writes.load(Ordering::Relaxed),
         (
@@ -692,7 +692,7 @@ async fn loopback_tcp_ignored_iq_survives_until_timeout_when_noise_ping_is_answe
         )
     );
     assert!(
-        client.is_connected(),
+        client.is_socket_connected(),
         "answered Noise probes keep the TCP connection alive"
     );
     seen.extend(drain_observed(&observed_rx));
@@ -704,7 +704,7 @@ async fn loopback_tcp_ignored_iq_survives_until_timeout_when_noise_ping_is_answe
         unrelated.await.unwrap().is_ok(),
         "the controlled peer answers the unrelated IQ"
     );
-    client.disconnect().await;
+    client.shutdown().await;
     assert!(reader.await.unwrap().is_none());
     peer.await.unwrap().unwrap();
 }
@@ -748,7 +748,7 @@ async fn loopback_tcp_silent_peer_reconnects_after_one_noise_ping() {
         disconnected.is_none(),
         "watchdog reconnect is an expected teardown"
     );
-    assert!(!client.is_connected());
+    assert!(!client.is_socket_connected());
     assert!(
         started.elapsed() >= DEAD_SOCKET_TIME,
         "disconnected after {:?}; keepalive logs: {:?}",
@@ -828,7 +828,7 @@ async fn loopback_tcp_keepalive_pings_after_login() {
         "a logged-in idle connection must be pinged; keepalive logs: {:?}",
         logs.records_for("Client/Keepalive")
     );
-    client.disconnect().await;
+    client.shutdown().await;
     assert!(reader.await.unwrap().is_none());
     peer.await.unwrap().unwrap();
 }

@@ -1696,7 +1696,7 @@ async fn run_bot(mode: Mode) -> Result<()> {
         tokio::spawn(async move {
             // Wait until the socket is up before placing the call; if it never connects, don't dial.
             if let Err(e) = client2
-                .wait_for_connected(std::time::Duration::from_secs(60))
+                .wait_for_session_ready(std::time::Duration::from_secs(60))
                 .await
             {
                 warn!("not connected within 60s, skipping outgoing call: {e}");

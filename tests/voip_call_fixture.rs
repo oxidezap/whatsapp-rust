@@ -78,11 +78,11 @@ async fn dormant(fixture: &CallFixture) -> Result<CallHandle> {
 #[tokio::test]
 async fn builder_returns_real_dormant_handle_only_after_offer_completion() -> Result<()> {
     let fixture = CallFixture::new().await?;
-    assert!(fixture.client().is_connected());
+    assert!(fixture.client().is_socket_connected());
     assert!(fixture.client().is_logged_in());
     fixture
         .client()
-        .wait_for_connected(Duration::from_secs(1))
+        .wait_for_session_ready(Duration::from_secs(1))
         .await?;
     let start = start(&fixture);
     let offer = fixture.next_offer().await?;
@@ -339,7 +339,7 @@ async fn dropped_offer_refuses_send_and_dropped_fixture_reaps_a_real_handle() ->
     let client = fixture.client().clone();
     drop(fixture);
     tokio::time::timeout(Duration::from_secs(5), handle.wait_ended()).await?;
-    assert!(!client.is_connected());
+    assert!(!client.is_socket_connected());
     Ok(())
 }
 
