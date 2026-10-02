@@ -2,6 +2,33 @@
 //!
 //! This crate provides a SQLite-based storage implementation for the whatsapp-rust library.
 //! It implements all the required storage traits from wacore::store::traits.
+//!
+//! Open a single account with [`SqliteStore::open`], or tune/share a database
+//! with [`SqliteDatabase::open`] and select scopes with [`SqliteDatabase::store`].
+//! Administration belongs to the database; [`SharedSqlite`] remains available
+//! for advanced adapters with their own tables and account predicates.
+//!
+//! The pre-1.0 constructor/configuration aliases are deliberately removed:
+//! ```compile_fail
+//! use whatsapp_rust_sqlite_storage::SqliteStore;
+//! let _ = SqliteStore::new("whatsapp.db");
+//! ```
+//! ```compile_fail
+//! use whatsapp_rust_sqlite_storage::SqliteStoreConfig;
+//! ```
+//! Scope changes and administration are not operations on a backend handle:
+//! ```compile_fail
+//! use whatsapp_rust_sqlite_storage::SqliteStore;
+//! fn old_scope(store: &SqliteStore) {
+//!     let _ = store.share_for_device(2);
+//! }
+//! ```
+//! ```compile_fail
+//! use whatsapp_rust_sqlite_storage::SqliteStore;
+//! fn old_admin(store: &SqliteStore) {
+//!     let _ = store.list_devices();
+//! }
+//! ```
 
 mod database;
 mod pool;

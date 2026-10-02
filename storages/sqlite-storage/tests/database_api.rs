@@ -86,7 +86,7 @@ async fn single_account_defaults_and_custom_configuration() {
         busy_timeout: std::time::Duration::from_millis(75),
         ..Default::default()
     };
-    let store = whatsapp_rust_sqlite_storage::SqliteDatabase::open(&fixture.url(), custom)
+    let store = SqliteDatabase::open(&fixture.url(), custom)
         .await
         .unwrap()
         .store(1);
