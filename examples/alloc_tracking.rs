@@ -113,7 +113,7 @@ fn main() {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Shutting down...");
-                    client.disconnect().await;
+                    client.shutdown().await;
                     break;
                 }
             }

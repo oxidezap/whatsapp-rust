@@ -235,7 +235,7 @@ impl TestClient {
 
         let run_handle = bot.spawn();
 
-        // Readiness gate: `wait_for_connected` resolves on the canonical
+        // Readiness gate: `wait_for_session_ready` resolves on the canonical
         // `is_ready` signal (`dispatch_connected`, after the critical sync) via
         // a notifier, so it does not race event arrival order or fall back to an
         // orthogonal signal — the earlier flake, where a fixed 30s wait for
