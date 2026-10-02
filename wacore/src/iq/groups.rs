@@ -1925,7 +1925,7 @@ impl IqSpec for GroupCreateIq {
         let mut info = GroupMetadataResponse::try_from_node_ref(group_node)?;
 
         // Server may omit `<parent>` from a community-create reply; overlay
-        // request flags so `group_type()` classifies without a follow-up query.
+        // request flags so metadata hierarchy classifies without a follow-up query.
         // A `linked_parent` (in request or response) means this is a subgroup,
         // so don't promote it to parent even if `is_parent` was requested.
         let is_linked_subgroup =

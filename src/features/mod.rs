@@ -60,8 +60,8 @@ pub use chat_actions::{
 
 pub use community::{
     Community, CommunityError, CommunitySubgroup, CreateCommunityOptions, CreateCommunityResult,
-    CreateSubgroupOptions, GroupType, LinkSubgroupOptions, LinkSubgroupsResult, SubgroupVisibility,
-    UnlinkSubgroupsResult, group_type,
+    CreateSubgroupOptions, LinkSubgroupOptions, LinkSubgroupsResult, SubgroupVisibility,
+    UnlinkSubgroupsResult,
 };
 
 pub use chatstate::{ChatStateError, ChatStateType, Chatstate};
