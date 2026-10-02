@@ -57,7 +57,7 @@ impl CallEvents {
     /// Receive the next event, waiting if the queue is empty.
     ///
     /// Returns an error only when the producer has closed and all queued events were consumed.
-    /// Cancelling a pending call leaves the queue available to the next receive.
+    /// Cancelling a pending receive leaves the queue available to the next receive.
     pub async fn recv(&mut self) -> Result<CallEvent, async_channel::RecvError> {
         self.receiver.as_ref().get_ref().recv().await
     }
