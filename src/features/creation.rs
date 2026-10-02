@@ -69,6 +69,10 @@ macro_rules! creation_types {
         }
 
         impl<'a> $reference<'a> {
+            /// The creator is the original crypto identity; it may be a PN/LID
+            /// alias of `message.sender()`. This constructor validates shape,
+            /// not identity equivalence or the secret's association with a
+            /// creation. External hosts must supply the matching metadata.
             pub fn new(
                 message: crate::MessageRef<'a>,
                 creator: &'a Jid,

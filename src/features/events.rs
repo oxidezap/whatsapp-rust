@@ -150,14 +150,17 @@ impl<'a> Events<'a> {
         extra_guest_count: Option<i32>,
     ) -> Result<SendResult, SendError> {
         let chat = chat_jid.into();
-        let secret = crate::MessageSecret::try_from(message_secret)
-            .map_err(|error| SendError::InvalidRequest(error.to_string()))?;
+        let secret = crate::MessageSecret::try_from(message_secret)?;
         let own = self.client.pn().ok_or(SendError::NotLoggedIn)?.to_non_ad();
         let message = crate::MessageRef::new(
             &chat,
             crate::MessageId::new(event_msg_id)?,
             Some(event_creator_jid),
-            own.is_same_user_as(event_creator_jid),
+            own.is_same_user_as(event_creator_jid)
+                || self
+                    .client
+                    .lid()
+                    .is_some_and(|lid| lid.is_same_user_as(event_creator_jid)),
         )?;
         self.respond(
             &EventRef::new(message, event_creator_jid, &secret)?,

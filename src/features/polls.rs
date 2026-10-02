@@ -81,7 +81,8 @@ impl<'a> Polls<'a> {
     ///
     /// `correct_index` is the 0-based index into `options` of the right answer.
     /// Quizzes are inherently single-select (WA Web forces `selectableOptionsCount=1`),
-    /// so the count is fixed at 1. Returns the `message_secret` needed to decrypt votes.
+    /// so the count is fixed at 1. Returns [`CreatedPoll`]; use its `poll_ref()`
+    /// for voting or [`CreatedPoll::secret`] for explicit decryption interop.
     pub async fn create_quiz(
         &self,
         to: impl Into<Jid>,
@@ -216,7 +217,11 @@ impl<'a> Polls<'a> {
             &chat,
             crate::MessageId::new(poll_msg_id)?,
             Some(poll_creator_jid),
-            own.is_same_user_as(poll_creator_jid),
+            own.is_same_user_as(poll_creator_jid)
+                || self
+                    .client
+                    .lid()
+                    .is_some_and(|lid| lid.is_same_user_as(poll_creator_jid)),
         )?;
         self.vote(
             &PollRef::new(message, poll_creator_jid, &secret)?,

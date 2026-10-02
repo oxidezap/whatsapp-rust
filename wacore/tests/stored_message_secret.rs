@@ -17,7 +17,7 @@ async fn named_read_unknown_known_merge_and_retention() {
     assert_eq!(unknown.message_ts, None);
     assert_eq!(unknown.secret.as_bytes(), &[177; 32]);
     assert!(!format!("{unknown:#?}").contains("177"));
-    for (message_ts, expires_at) in [(100, 200), (0, 150), (90, 190), (120, 250)] {
+    for (message_ts, expires_at) in [(120, 250), (0, 150), (90, 190), (100, 200)] {
         backend
             .put_msg_secrets(vec![MsgSecretEntry {
                 chat: "c".into(),

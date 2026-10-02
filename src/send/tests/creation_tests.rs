@@ -289,9 +289,68 @@ async fn group_created_references_preserve_pn_lid_and_decrypt_real_wire() {
             .unwrap();
         assert_eq!(event.creator(), &fixture.own_sending.to_non_ad());
         let response = check_event(&fixture.client, &event, true).await;
-        for (i, result) in [poll.send_result(), &vote, event.send_result(), &response]
-            .iter()
-            .enumerate()
+        let raw_vote = fixture
+            .client
+            .polls()
+            .vote_raw(
+                &fixture.group,
+                &poll.send_result().message_id,
+                poll.creator(),
+                poll.secret().as_bytes(),
+                &["Yes".to_owned()],
+            )
+            .await
+            .unwrap();
+        let raw_response = fixture
+            .client
+            .events()
+            .respond_raw(
+                &fixture.group,
+                &event.send_result().message_id,
+                event.creator(),
+                event.secret().as_bytes(),
+                EventResponseType::Going,
+                None,
+            )
+            .await
+            .unwrap();
+        for (key, parent) in [
+            (
+                raw_vote
+                    .message
+                    .poll_update_message
+                    .poll_creation_message_key
+                    .as_option()
+                    .unwrap(),
+                poll.send_result(),
+            ),
+            (
+                raw_response
+                    .message
+                    .enc_event_response_message
+                    .event_creation_message_key
+                    .as_option()
+                    .unwrap(),
+                event.send_result(),
+            ),
+        ] {
+            assert_eq!(key.from_me, Some(true));
+            assert_eq!(key.id.as_deref(), Some(parent.message_id.as_str()));
+            assert_eq!(
+                key.participant,
+                Some(fixture.own_sending.to_non_ad_string())
+            );
+        }
+        for (i, result) in [
+            poll.send_result(),
+            &vote,
+            event.send_result(),
+            &response,
+            &raw_vote,
+            &raw_response,
+        ]
+        .iter()
+        .enumerate()
         {
             let stanza = fixture.stanza(i + 1).await;
             assert_eq!(
@@ -323,7 +382,7 @@ async fn group_created_references_preserve_pn_lid_and_decrypt_real_wire() {
                         .as_deref(),
                     Some(expected.as_bytes().as_slice())
                 );
-            } else if i == 1 {
+            } else if i == 1 || i == 4 {
                 assert_eq!(
                     decoded.poll_update_message,
                     result.message.poll_update_message
@@ -350,20 +409,23 @@ async fn malformed_raw_inputs_fail_before_wire_and_debug_has_negative_controls()
                 .await,
             Err(crate::PollError::InvalidSecret(_))
         ));
-        assert!(matches!(
-            client
-                .events()
-                .respond_raw(
-                    &peer,
-                    "E",
-                    &peer,
-                    &vec![177; length],
-                    EventResponseType::Going,
-                    None
-                )
-                .await,
-            Err(SendError::InvalidRequest(_))
-        ));
+        let error = client
+            .events()
+            .respond_raw(
+                &peer,
+                "E",
+                &peer,
+                &vec![177; length],
+                EventResponseType::Going,
+                None,
+            )
+            .await
+            .unwrap_err();
+        let SendError::InvalidSecret(length_error) = &error else {
+            panic!("expected typed length error, got {error:?}");
+        };
+        assert_eq!(length_error.actual, length);
+        assert!(!format!("{error:#?}").contains("177"));
     }
     assert!(
         client

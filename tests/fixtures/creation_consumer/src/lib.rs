@@ -73,7 +73,7 @@ mod tests {
         let message = MessageRef::new(
             &chat,
             MessageId::new("CREATION").unwrap(),
-            Some(&creator),
+            Some(&chat), // PN sender and its externally known LID crypto alias
             false,
         )
         .unwrap();

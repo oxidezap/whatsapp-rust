@@ -18,18 +18,25 @@ borrow addressing and secret material, returning `Result<_, MessageRefError>`
 like A06's `SendResult::message_ref`. Cloning a result shares the original
 protobuf `Arc`; referencing it neither clones nor retains that protobuf.
 The stored creator is the send branch's selected identity, not a post-send
-routing lookup. Ordinary DM creation secrets use our PN, bot DMs our LID;
-groups use the actual PN/LID sender identity selected for encryption.
+routing lookup. The captured creator identity is our PN for ordinary DMs,
+our LID for bot DMs, and the actual PN/LID sender selected for groups. The
+secret itself is random protocol-sized bytes regardless of chat namespace.
 
 For received or manually persisted creations, construct `PollRef::new` or
 `EventRef::new` from a `MessageRef`, the original creator JID, and a borrowed
-`MessageSecret`. Canonical `Polls::vote(&PollRef, options)` and
+`MessageSecret`. The creator may be a PN/LID alias of the reference sender;
+construction checks shape, not identity equivalence or secret association.
+External hosts must supply metadata for the same original creation.
+Canonical `Polls::vote(&PollRef, options)` and
 `Events::respond(&EventRef, response, extra_guests)` use that metadata together.
 Their parent key's `from_me` comes from the reference, including our own LID
 creations. Crypto namespace selection and alias decryption remain unchanged.
 `Polls::decrypt_vote_ref(ciphertext, &PollRef, voter)` is available alongside
 explicit byte-based decryption/aggregation interop. Advanced positional sends
-are named `vote_raw` / `respond_raw`; they validate secret length and ID first.
+are named `vote_raw` / `respond_raw`; they validate secret length and ID first
+and recognize our own PN or LID when deriving the parent key's `from_me`.
+Invalid raw secrets retain the typed length error in `PollError::InvalidSecret`
+or `SendError::InvalidSecret`, respectively.
 
 Creation references address E2E chats, not newsletters/status/broadcast lists.
 Those origins are rejected by these creation helpers before network work;
