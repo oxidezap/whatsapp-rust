@@ -43,42 +43,19 @@ fn participant_targets(node: &wacore_binary::OwnedNodeRef) -> Vec<Jid> {
         .collect()
 }
 
-fn operation_key(result: &SendResult, index: usize) -> &wa::MessageKey {
-    match index {
-        0 | 1 => result
-            .message
-            .protocol_message
-            .as_option()
-            .unwrap()
-            .key
-            .as_option()
-            .unwrap(),
-        2 => result
-            .message
-            .reaction_message
-            .as_option()
-            .unwrap()
-            .key
-            .as_option()
-            .unwrap(),
-        3 => result
-            .message
-            .pin_in_chat_message
-            .as_option()
-            .unwrap()
-            .key
-            .as_option()
-            .unwrap(),
-        4 => result
-            .message
-            .keep_in_chat_message
-            .as_option()
-            .unwrap()
-            .key
-            .as_option()
-            .unwrap(),
+fn message_operation_key(message: &wa::Message, index: usize) -> &wa::MessageKey {
+    let key = match index {
+        0 | 1 => &message.protocol_message.as_option().unwrap().key,
+        2 => &message.reaction_message.as_option().unwrap().key,
+        3 => &message.pin_in_chat_message.as_option().unwrap().key,
+        4 => &message.keep_in_chat_message.as_option().unwrap().key,
         _ => unreachable!(),
-    }
+    };
+    key.as_option().unwrap()
+}
+
+fn operation_key(result: &SendResult, index: usize) -> &wa::MessageKey {
+    message_operation_key(&result.message, index)
 }
 
 #[tokio::test]
@@ -983,37 +960,7 @@ async fn review_own_group_send_reference_keys_encrypt_original_author() {
                 5 | 6 => 4,
                 _ => unreachable!(),
             };
-            let decoded_key = match kind {
-                0 | 1 => decoded
-                    .protocol_message
-                    .as_option()
-                    .unwrap()
-                    .key
-                    .as_option()
-                    .unwrap(),
-                2 => decoded
-                    .reaction_message
-                    .as_option()
-                    .unwrap()
-                    .key
-                    .as_option()
-                    .unwrap(),
-                3 => decoded
-                    .pin_in_chat_message
-                    .as_option()
-                    .unwrap()
-                    .key
-                    .as_option()
-                    .unwrap(),
-                4 => decoded
-                    .keep_in_chat_message
-                    .as_option()
-                    .unwrap()
-                    .key
-                    .as_option()
-                    .unwrap(),
-                _ => unreachable!(),
-            };
+            let decoded_key = message_operation_key(&decoded, kind);
             assert_eq!(decoded_key, operation_key(result, kind));
             assert_eq!(decoded_key.id.as_deref(), Some(content.message_id.as_str()));
             assert_ne!(decoded_key.id.as_deref(), Some(result.message_id.as_str()));

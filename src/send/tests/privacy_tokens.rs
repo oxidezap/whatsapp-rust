@@ -353,36 +353,70 @@ async fn self_pn_and_lid_sends_never_attach_tokens() {
 }
 
 #[tokio::test]
+async fn namespace_fixture_same_second_seed_replay_counterfactual() {
+    use crate::lid_pn_cache::{LearningSource, LidPnCache, LidPnEntry};
+
+    let pn = "100000000000777";
+    let original_lid = "555000000000777";
+    let replacement_lid = "111111111111";
+    let seed_second = 1_700_000_000;
+    for (offset, expected_after_replay) in [(0, original_lid), (1, replacement_lid)] {
+        let cache = LidPnCache::new();
+        let original =
+            LidPnEntry::with_timestamp(original_lid, pn, seed_second, LearningSource::Usync);
+        cache.add(&original).await;
+        // Model a startup read that finishes applying after the live remap.
+        // The strict-newer twin distinguishes timestamp ordering from tokens.
+        let startup_snapshot = [original];
+        let replacement = LidPnEntry::with_timestamp(
+            replacement_lid,
+            pn,
+            seed_second + offset,
+            LearningSource::Usync,
+        );
+        cache.add(&replacement).await;
+        assert_eq!(
+            cache.get_current_lid(pn).await.as_deref(),
+            Some(replacement_lid)
+        );
+        cache.warm_up(startup_snapshot).await;
+        assert_eq!(
+            cache.get_current_lid(pn).await.as_deref(),
+            Some(expected_after_replay)
+        );
+    }
+}
+
+#[tokio::test]
 async fn other_namespace_peer_still_gets_received_token() {
     let (client, transport) = crate::test_utils::create_iq_test_client().await;
-    let (pn, _) = seed_dm_wire_namespace_state(&client).await;
+    // This tests full JID domains, not remapping: seed the intended alias once
+    // so a delayed same-second startup snapshot cannot replay another alias.
+    let (pn, lid) =
+        seed_dm_wire_namespace_state_for_peer_lid(&client, Jid::lid("111111111111")).await;
     let own_pn = client.pn().unwrap();
+    assert_eq!(lid.user, own_pn.user);
+    assert_ne!(lid.server, own_pn.server);
     // A companion, not device 0: the existing fanout filter must not mistake
     // the synthetic peer's primary device for our exact sending-device tuple.
     client
         .persistence_manager
         .process_command(DeviceCommand::SetId(Some(own_pn.with_device(1))))
         .await;
-    let lid = Jid::lid(own_pn.user);
-    client
-        .add_lid_pn_mapping(
-            &lid.user,
-            &pn.user,
-            crate::lid_pn_cache::LearningSource::Usync,
-        )
-        .await
-        .unwrap();
-    crate::test_utils::seed_peer_session(&client, &lid).await;
     configure_tokens(&client, &lid, Some(false), true).await;
     client
         .persistence_manager
         .process_command(DeviceCommand::SetLidMigrated(true))
         .await;
-    client
+    let result = client
         .send_message(pn.clone(), wa::Message::text("namespace control"))
         .await
         .unwrap();
     let owned = crate::test_utils::decode_sent_iq(&transport, 0).await;
+    assert_eq!(
+        owned.get().attrs().optional_string("id").as_deref(),
+        Some(result.message_id.as_str())
+    );
     assert_encrypted_dm(owned.get(), &lid);
     assert_tokens(owned.get(), Some(RECEIVED_TOKEN), None);
 }

@@ -8495,6 +8495,14 @@ mod tests {
     /// session for the peer's LID device so the offline fanout can encrypt
     /// without a socket. Returns `(peer_pn, peer_lid)`.
     async fn seed_dm_wire_namespace_state(client: &Arc<Client>) -> (Jid, Jid) {
+        let peer_lid: Jid = "555000000000777@lid".parse().unwrap();
+        seed_dm_wire_namespace_state_for_peer_lid(client, peer_lid).await
+    }
+
+    async fn seed_dm_wire_namespace_state_for_peer_lid(
+        client: &Arc<Client>,
+        peer_lid: Jid,
+    ) -> (Jid, Jid) {
         use wacore::libsignal::protocol::{
             IdentityKeyPair, KeyPair, PreKeyBundle, SignalProtocolError, UsePQRatchet,
             process_prekey_bundle,
@@ -8519,7 +8527,6 @@ mod tests {
         // The peer is LID-mapped: the wire namespace is then decided solely by
         // the account's migration state.
         let peer_pn: Jid = "100000000000777@s.whatsapp.net".parse().unwrap();
-        let peer_lid: Jid = "555000000000777@lid".parse().unwrap();
         client
             .add_lid_pn_mapping(
                 peer_lid.user.as_str(),
