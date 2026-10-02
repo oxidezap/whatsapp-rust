@@ -2511,7 +2511,25 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "subprocess isolation is unsupported under Miri")]
     fn call_harvest_diagnostic_is_single_and_redacted() {
+        // log::set_logger is irreversible. Run the capture in a fresh process
+        // with exactly this test, leaving the parent's logger/level untouched.
+        if std::env::var_os("WACORE_DIAGNOSTIC_TEST_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "history_sync::tests::call_harvest_diagnostic_is_single_and_redacted",
+                ])
+                .env("WACORE_DIAGNOSTIC_TEST_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child diagnostic test failed: {output:?}"
+            );
+            return;
+        }
         struct Capture(std::sync::Mutex<Vec<String>>);
         impl log::Log for Capture {
             fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
