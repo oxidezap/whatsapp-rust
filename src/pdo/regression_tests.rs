@@ -149,6 +149,94 @@ async fn top_level_participant_does_not_bypass_stale_owner() {
 }
 
 #[tokio::test]
+async fn short_circuited_retry_preserves_inflight_automatic_gate() {
+    let (client, info) = client_with_session().await;
+    let peer: Jid = "12025550100@s.whatsapp.net".parse().unwrap();
+    let session = client
+        .session_lock_for(peer.to_protocol_address().as_str())
+        .await;
+    let lock = session.lock().await;
+    let automatic = tokio::spawn({
+        let client = client.clone();
+        let info = info.clone();
+        async move { client.send_pdo_placeholder_resend_request(&info).await }
+    });
+    let owner = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some((_, owner)) = client.pdo_pending_requests.get(&pending_key(&info)).await {
+                break owner;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("automatic request must reserve pending before waiting for its session");
+    assert_eq!(
+        owner.outcome.load(std::sync::atomic::Ordering::Acquire),
+        super::super::PDO_IN_FLIGHT
+    );
+    assert_eq!(
+        client
+            .retry_pdo_placeholder_resend_request(&info)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        client
+            .pdo_requested
+            .get(&gate_key(&info))
+            .await
+            .as_ref()
+            .map(|memo| memo.request_id.as_str()),
+        Some(owner.request_id.as_str()),
+        "a short-circuited retry must retain the automatic reservation"
+    );
+    drop(lock);
+    automatic.await.unwrap().unwrap();
+    assert_eq!(
+        client
+            .pdo_requested
+            .get(&gate_key(&info))
+            .await
+            .unwrap()
+            .request_id,
+        owner.request_id
+    );
+    client
+        .handle_placeholder_resend_response(&top_level_response(&info), &owner.request_id)
+        .await;
+    assert!(
+        client
+            .pdo_pending_requests
+            .get(&pending_key(&info))
+            .await
+            .is_none()
+    );
+    client
+        .send_pdo_placeholder_resend_request(&info)
+        .await
+        .unwrap();
+    assert!(
+        client
+            .pdo_pending_requests
+            .get(&pending_key(&info))
+            .await
+            .is_none(),
+        "redelivery must not send a second automatic request"
+    );
+    assert_eq!(
+        client
+            .pdo_requested
+            .get(&gate_key(&info))
+            .await
+            .unwrap()
+            .request_id,
+        owner.request_id
+    );
+}
+
+#[tokio::test]
 async fn previous_response_while_retry_waits_for_session_is_delivered() {
     let (client, info) = client_with_session().await;
     let old = send_automatic(&client, &info).await;
