@@ -2626,7 +2626,7 @@ mod tests {
                 .pdo_requested
                 .insert(
                     gate.clone(),
-                    PdoRequestMemo::new(&info, "AUTOMATIC_REQUEST".into(), false, None),
+                    PdoRequestMemo::sent_for_test(&info, "AUTOMATIC_REQUEST".into(), false),
                 )
                 .await;
             let id = client
@@ -3060,7 +3060,7 @@ mod tests {
                 .pdo_requested
                 .insert(
                     gate.clone(),
-                    PdoRequestMemo::new(&info, "VALID_PRIOR".into(), false, None),
+                    PdoRequestMemo::sent_for_test(&info, "VALID_PRIOR".into(), false),
                 )
                 .await;
             let peer: Jid = "12025550100@s.whatsapp.net".parse().unwrap();
