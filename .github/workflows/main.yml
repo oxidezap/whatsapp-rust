@@ -465,6 +465,7 @@ jobs:
           CARGO_BUILD_JOBS: "1"
           RUSTFLAGS: ""
           CARGO_ENCODED_RUSTFLAGS: ""
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           cargo test --locked --manifest-path tests/group-call-aliases-consumer/Cargo.toml
           cargo test --locked --manifest-path tests/group-call-aliases-consumer/Cargo.toml --features voip-control
