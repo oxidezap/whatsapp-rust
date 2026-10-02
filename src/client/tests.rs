@@ -1709,11 +1709,10 @@ async fn cleanup_connection_state_flushes_dirty_signal_state() {
 
     // cleanup cleared the cache, so a hit now can only come from the DB,
     // proving the flush ran before the clear.
-    let device = client.persistence_manager.get_device_arc().await;
-    let guard = device.read().await;
+    let backend = client.persistence_manager.backend();
     let persisted = client
         .signal_cache
-        .get_identity(&addr, &*guard.backend)
+        .get_identity(&addr, &*backend)
         .await
         .expect("get_identity must not error");
     assert!(
@@ -1737,11 +1736,10 @@ async fn cleanup_connection_state_flushes_dirty_sender_key() {
 
     client.cleanup_connection_state().await;
 
-    let device = client.persistence_manager.get_device_arc().await;
-    let guard = device.read().await;
+    let backend = client.persistence_manager.backend();
     let persisted = client
         .signal_cache
-        .get_sender_key(&name, &*guard.backend)
+        .get_sender_key(&name, &*backend)
         .await
         .expect("get_sender_key must not error");
     assert!(
@@ -1774,11 +1772,10 @@ async fn cleanup_connection_state_does_not_burn_a_clean_sender_key_lease() {
 
     client.cleanup_connection_state().await;
 
-    let device = client.persistence_manager.get_device_arc().await;
-    let guard = device.read().await;
+    let backend = client.persistence_manager.backend();
     let reloaded = client
         .signal_cache
-        .get_sender_key(&name, &*guard.backend)
+        .get_sender_key(&name, &*backend)
         .await
         .expect("sender key load")
         .expect("sender key");
@@ -1817,11 +1814,10 @@ async fn cleanup_connection_state_keeps_state_when_flush_fails() {
 
     // flush() failed, so clear() was skipped; the unpersisted sender key
     // survives in the write-back cache instead of being dropped.
-    let device = client.persistence_manager.get_device_arc().await;
-    let guard = device.read().await;
+    let backend = client.persistence_manager.backend();
     let persisted = client
         .signal_cache
-        .get_sender_key(&name, &*guard.backend)
+        .get_sender_key(&name, &*backend)
         .await
         .expect("get_sender_key must not error");
     assert!(

@@ -298,8 +298,8 @@ impl Client {
         if self.shutdown_signal().is_fired() {
             return true;
         }
-        // `enable_auto_reconnect` alone is a preference, not proof: it is public,
-        // and an application may clear it on a healthy connection to mean "do
+        // The reconnect preference alone is not proof: an application may
+        // disable it on a healthy connection to mean "do
         // not come back after this one ends". The internal paths that really do
         // end the session — conflict, 516, an unrecoverable connect failure —
         // always set `expected_disconnect` alongside it, so the pair is what
@@ -690,6 +690,7 @@ impl Client {
             offline_batch: Arc::new(offline_resume::OfflineBatchCoordinator::new()),
 
             enable_auto_reconnect: Arc::new(AtomicBool::new(true)),
+            auto_reconnect_changed: event_listener::Event::new(),
             paused: AtomicBool::new(false),
             pause_state_notifier: event_listener::Event::new(),
             pause_teardown_pending: AtomicBool::new(false),
@@ -885,9 +886,9 @@ impl Client {
         // Count only at the attempt boundary, after admission: abandoned host
         // reservations are not reconnect attempts.
         let mut first_connect = true;
-        let mut last_connect_error: Option<ConnectError>;
-        let mut last_disconnect_reason: Option<DisconnectReason>;
-        let mut last_protocol_reason: Option<ProtocolTerminalReason>;
+        let mut last_connect_error: Option<ConnectError> = None;
+        let mut last_disconnect_reason: Option<DisconnectReason> = None;
+        let mut last_protocol_reason: Option<ProtocolTerminalReason> = None;
         let mut completion = RunCompletionReason::Stopped;
         while self.is_running.load(Ordering::Relaxed) {
             // The one place a pause is honoured, and it is before the attempt
@@ -923,6 +924,15 @@ impl Client {
                 }
             }
             if !first_connect {
+                if !self.auto_reconnect_enabled() {
+                    self.stop_supervision_loop();
+                    completion = RunCompletionReason::AutoReconnectDisabled {
+                        connection: last_disconnect_reason,
+                        connect_error: last_connect_error,
+                        protocol_error: last_protocol_reason,
+                    };
+                    break;
+                }
                 self.stats.record_reconnect();
             }
             first_connect = false;
@@ -1091,6 +1101,7 @@ impl Client {
             // fires on every disconnect the loop is here to reconnect from, so
             // watching it would collapse the backoff instead of interrupting it.
             let shutdown_fired = wacore::runtime::wait_for_shutdown(&shutdown);
+            let reconnect_disabled = self.wait_for_auto_reconnect_disabled();
             // Third arm for the pause state, on the listener registered
             // above. `pause()` landing here must not wait out a delay before
             // parking, and `resume()` must not wait one out at all — the
@@ -1105,6 +1116,15 @@ impl Client {
                 _ = shutdown_fired.fuse() => {
                     debug!("Shutdown signalled during reconnect backoff, exiting run loop.");
                 }
+                _ = reconnect_disabled.fuse() => {
+                    self.stop_supervision_loop();
+                    completion = RunCompletionReason::AutoReconnectDisabled {
+                        connection: last_disconnect_reason,
+                        connect_error: last_connect_error,
+                        protocol_error: last_protocol_reason,
+                    };
+                    break;
+                }
                 _ = pause_changed.fuse() => {
                     debug!("Pause state changed during reconnect backoff, re-reading it.");
                 }
@@ -1117,6 +1137,19 @@ impl Client {
             RunCompletionReason::ShutdownRequested
         } else {
             completion
+        }
+    }
+
+    async fn wait_for_auto_reconnect_disabled(&self) {
+        loop {
+            // Register before reading: a disable between the read and park must
+            // not leave the run loop asleep for the whole backoff. Re-enabling
+            // alone never cancels or shortens that backoff.
+            let changed = self.auto_reconnect_changed.listen();
+            if !self.auto_reconnect_enabled() {
+                return;
+            }
+            changed.await;
         }
     }
 

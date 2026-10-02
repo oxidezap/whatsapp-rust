@@ -1,7 +1,6 @@
 //! Offline sends use real Signal sessions and Noise-framed transport output;
 //! they do not authenticate to WhatsApp or establish server acceptance.
 use super::*;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use wacore::iq::{abprops::web, tctoken::compute_cs_token};
 use wacore::store::traits::TcTokenEntry;
@@ -620,7 +619,7 @@ async fn nack_reachout_and_device_removal_remain_distinct() {
     client
         .process_node(crate::test_utils::node_to_owned_ref(&ack))
         .await;
-    assert!(client.enable_auto_reconnect.load(Ordering::Relaxed));
+    assert!(client.auto_reconnect_enabled());
     assert!(
         collector
             .events()
@@ -650,14 +649,14 @@ async fn nack_reachout_and_device_removal_remain_distinct() {
     client
         .process_node(crate::test_utils::node_to_owned_ref(&notify))
         .await;
-    assert!(client.enable_auto_reconnect.load(Ordering::Relaxed));
+    assert!(client.auto_reconnect_enabled());
     let conflict = NodeBuilder::new("stream:error")
         .children([NodeBuilder::new("conflict")
             .attr("type", "device_removed")
             .build()])
         .build();
     client.handle_stream_error(&conflict.as_node_ref()).await;
-    assert!(!client.enable_auto_reconnect.load(Ordering::Relaxed));
+    assert!(!client.auto_reconnect_enabled());
     let events = collector.events();
     let typed = events
         .iter()

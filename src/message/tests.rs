@@ -1464,33 +1464,31 @@ async fn test_self_sent_lid_group_message_sender_key_mismatch() {
         lid_protocol_address.to_string()
     );
 
-    let device_arc = pm.get_device_arc().await;
-    let skdm = {
-        let mut device_guard = device_arc.write().await;
-        create_sender_key_distribution_message(
-            &lid_sender_key_name,
-            &mut *device_guard,
-            &mut rand::make_rng::<rand::rngs::StdRng>(),
-        )
-        .await
-        .expect("Failed to create SKDM")
-    };
-
-    {
-        let mut device_guard = device_arc.write().await;
-        process_sender_key_distribution_message(&lid_sender_key_name, &skdm, &mut *device_guard)
+    let name = lid_sender_key_name.clone();
+    pm.modify_device_async(move |device| {
+        Box::pin(async move {
+            let skdm = create_sender_key_distribution_message(
+                &name,
+                device,
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )
             .await
-            .expect("Failed to process SKDM with LID address");
-    }
+            .expect("Failed to create SKDM");
+            process_sender_key_distribution_message(&name, &skdm, device)
+                .await
+                .expect("Failed to process SKDM with LID address");
+        })
+    })
+    .await;
 
     // Try to retrieve using PHONE NUMBER address (THE BUG)
     let phone_protocol_address = own_phone.to_protocol_address();
     let phone_sender_key_name = make_sender_key_name(&group_jid, &phone_protocol_address);
 
-    let phone_lookup_result = {
-        let device_guard = device_arc.read().await;
-        device_guard.load_sender_key(&phone_sender_key_name).await
-    };
+    let phone_lookup_result = pm
+        .get_device_snapshot()
+        .load_sender_key(&phone_sender_key_name)
+        .await;
 
     assert!(
         phone_lookup_result
@@ -1500,10 +1498,10 @@ async fn test_self_sent_lid_group_message_sender_key_mismatch() {
     );
 
     // Try to retrieve using LID address (THE FIX)
-    let lid_lookup_result = {
-        let device_guard = device_arc.read().await;
-        device_guard.load_sender_key(&lid_sender_key_name).await
-    };
+    let lid_lookup_result = pm
+        .get_device_snapshot()
+        .load_sender_key(&lid_sender_key_name)
+        .await;
 
     assert!(
         lid_lookup_result
@@ -1557,29 +1555,27 @@ async fn test_multiple_lid_participants_sender_key_isolation() {
         ("111222333444555.3:10@lid", "559876543210:10@s.whatsapp.net"),
     ];
 
-    let device_arc = pm.get_device_arc().await;
-
     // Create and store sender keys for each participant under their LID address
     for (lid_str, _phone_str) in &participants {
         let lid_jid: Jid = lid_str.parse().expect("test JID should be valid");
         let lid_protocol_address = lid_jid.to_protocol_address();
         let lid_sender_key_name = make_sender_key_name(&group_jid, &lid_protocol_address);
 
-        let skdm = {
-            let mut device_guard = device_arc.write().await;
-            create_sender_key_distribution_message(
-                &lid_sender_key_name,
-                &mut *device_guard,
-                &mut rand::make_rng::<rand::rngs::StdRng>(),
-            )
-            .await
-            .expect("Failed to create SKDM")
-        };
-
-        let mut device_guard = device_arc.write().await;
-        process_sender_key_distribution_message(&lid_sender_key_name, &skdm, &mut *device_guard)
-            .await
-            .expect("Failed to process SKDM");
+        pm.modify_device_async(move |device| {
+            Box::pin(async move {
+                let skdm = create_sender_key_distribution_message(
+                    &lid_sender_key_name,
+                    device,
+                    &mut rand::make_rng::<rand::rngs::StdRng>(),
+                )
+                .await
+                .expect("Failed to create SKDM");
+                process_sender_key_distribution_message(&lid_sender_key_name, &skdm, device)
+                    .await
+                    .expect("Failed to process SKDM");
+            })
+        })
+        .await;
     }
 
     // Verify each participant's sender key can be retrieved using their LID address
@@ -1594,10 +1590,10 @@ async fn test_multiple_lid_participants_sender_key_isolation() {
         let phone_sender_key_name = make_sender_key_name(&group_jid, &phone_protocol_address);
 
         // Should find with LID address
-        let lid_lookup = {
-            let device_guard = device_arc.read().await;
-            device_guard.load_sender_key(&lid_sender_key_name).await
-        };
+        let lid_lookup = pm
+            .get_device_snapshot()
+            .load_sender_key(&lid_sender_key_name)
+            .await;
         assert!(
             lid_lookup.expect("lookup should not error").is_some(),
             "Sender key for {} should be found with LID address",
@@ -1605,10 +1601,10 @@ async fn test_multiple_lid_participants_sender_key_isolation() {
         );
 
         // Should NOT find with phone number address (the bug)
-        let phone_lookup = {
-            let device_guard = device_arc.read().await;
-            device_guard.load_sender_key(&phone_sender_key_name).await
-        };
+        let phone_lookup = pm
+            .get_device_snapshot()
+            .load_sender_key(&phone_sender_key_name)
+            .await;
         assert!(
             phone_lookup.expect("lookup should not error").is_none(),
             "Sender key for {} should NOT be found with phone number address",
@@ -2021,23 +2017,25 @@ async fn test_sender_key_always_uses_display_jid() {
     let display_protocol_address = display_jid.to_protocol_address();
     let display_sender_key_name = make_sender_key_name(&group_jid, &display_protocol_address);
 
-    let device_arc = pm.get_device_arc().await;
-    {
-        let mut device_guard = device_arc.write().await;
-        create_sender_key_distribution_message(
-            &display_sender_key_name,
-            &mut *device_guard,
-            &mut rand::make_rng::<rand::rngs::StdRng>(),
-        )
-        .await
-        .expect("Failed to create SKDM");
-    }
+    let name = display_sender_key_name.clone();
+    pm.modify_device_async(move |device| {
+        Box::pin(async move {
+            create_sender_key_distribution_message(
+                &name,
+                device,
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )
+            .await
+            .expect("Failed to create SKDM");
+        })
+    })
+    .await;
 
     // Verify it's stored under display JID
-    let lookup_with_display = {
-        let device_guard = device_arc.read().await;
-        device_guard.load_sender_key(&display_sender_key_name).await
-    };
+    let lookup_with_display = pm
+        .get_device_snapshot()
+        .load_sender_key(&display_sender_key_name)
+        .await;
     assert!(
         lookup_with_display
             .expect("lookup should not error")
@@ -2049,12 +2047,10 @@ async fn test_sender_key_always_uses_display_jid() {
     let encryption_protocol_address = encryption_jid.to_protocol_address();
     let encryption_sender_key_name = make_sender_key_name(&group_jid, &encryption_protocol_address);
 
-    let lookup_with_encryption = {
-        let device_guard = device_arc.read().await;
-        device_guard
-            .load_sender_key(&encryption_sender_key_name)
-            .await
-    };
+    let lookup_with_encryption = pm
+        .get_device_snapshot()
+        .load_sender_key(&encryption_sender_key_name)
+        .await;
     assert!(
         lookup_with_encryption
             .expect("lookup should not error")
@@ -2112,35 +2108,39 @@ async fn test_second_message_with_only_skmsg_decrypts() {
     let sender_protocol_address = sender_jid.to_protocol_address();
     let sender_key_name = make_sender_key_name(&group_jid, &sender_protocol_address);
 
-    let device_arc = pm.get_device_arc().await;
-    {
-        let mut device_guard = device_arc.write().await;
-        let skdm = create_sender_key_distribution_message(
-            &sender_key_name,
-            &mut *device_guard,
-            &mut rand::make_rng::<rand::rngs::StdRng>(),
-        )
-        .await
-        .expect("Failed to create SKDM");
-
-        process_sender_key_distribution_message(&sender_key_name, &skdm, &mut *device_guard)
+    let name = sender_key_name.clone();
+    pm.modify_device_async(move |device| {
+        Box::pin(async move {
+            let skdm = create_sender_key_distribution_message(
+                &name,
+                device,
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )
             .await
-            .expect("Failed to process SKDM");
-    }
+            .expect("Failed to create SKDM");
+            process_sender_key_distribution_message(&name, &skdm, device)
+                .await
+                .expect("Failed to process SKDM");
+        })
+    })
+    .await;
 
     // Create message with ONLY skmsg (simulating second message after session established)
-    let skmsg_ciphertext = {
-        let mut device_guard = device_arc.write().await;
-        let sender_key_msg = group_encrypt(
-            &mut *device_guard,
-            &sender_key_name,
-            b"ping",
-            &mut rand::make_rng::<rand::rngs::StdRng>(),
-        )
-        .await
-        .expect("Failed to encrypt with sender key");
-        sender_key_msg.serialized().to_vec()
-    };
+    let skmsg_ciphertext = pm
+        .modify_device_async(move |device| {
+            Box::pin(async move {
+                let sender_key_msg = group_encrypt(
+                    device,
+                    &sender_key_name,
+                    b"ping",
+                    &mut rand::make_rng::<rand::rngs::StdRng>(),
+                )
+                .await
+                .expect("Failed to encrypt with sender key");
+                sender_key_msg.serialized().to_vec()
+            })
+        })
+        .await;
 
     let skmsg_node = NodeBuilder::new("enc")
         .attr("type", "skmsg")
@@ -15171,7 +15171,7 @@ async fn a_corrupt_stored_prekey_is_not_blamed_on_the_peer() {
     use wacore::libsignal::store::PreKeyStore as WacorePreKeyStore;
 
     let client = crate::test_utils::create_test_client_with_name("enc_fail_corrupt_row").await;
-    let device = client.persistence_manager.get_device_arc().await;
+    let device = client.persistence_manager.get_device_snapshot();
 
     // A stored structure with no key material: what a truncated or partially
     // written row deserializes into.
@@ -15181,8 +15181,7 @@ async fn a_corrupt_stored_prekey_is_not_blamed_on_the_peer() {
         private_key: None,
     };
     {
-        let guard = device.read().await;
-        WacorePreKeyStore::store_prekey(&*guard, 7, corrupt, false)
+        WacorePreKeyStore::store_prekey(&*device, 7, corrupt, false)
             .await
             .expect("stored");
     }

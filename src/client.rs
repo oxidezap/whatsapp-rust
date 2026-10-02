@@ -1484,6 +1484,24 @@ impl ResponseWaiterMap {
 /// for message-id pinning, ephemeral expiration, and cache freshness. Domain
 /// operations hang off accessors such as [`Client::groups`], [`Client::contacts`],
 /// and [`Client::presence`].
+/// Session client with encapsulated implementation state.
+///
+/// Use [`Self::set_auto_reconnect`], [`Self::http_client`], builder-installed
+/// encrypted handlers, and [`Self::memory_report`] instead of implementation
+/// containers. These fields are deliberately unavailable to consumers:
+///
+/// ```compile_fail,E0616
+/// fn raw_cache(client: &whatsapp_rust::Client) { let _ = &client.group_cache; }
+/// ```
+/// ```compile_fail,E0616
+/// fn raw_policy(client: &whatsapp_rust::Client) { let _ = &client.enable_auto_reconnect; }
+/// ```
+/// ```compile_fail,E0616
+/// fn raw_handlers(client: &whatsapp_rust::Client) { let _ = &client.custom_enc_handlers; }
+/// ```
+/// ```compile_fail,E0616
+/// fn raw_http(client: &whatsapp_rust::Client) { let _ = &client.http_client; }
+/// ```
 pub struct Client {
     pub(crate) runtime: Arc<dyn Runtime>,
     pub(crate) core: wacore::client::CoreClient,
@@ -1656,7 +1674,7 @@ pub struct Client {
 
     /// Lazily built on the first group send and never replaced afterwards, so a
     /// `OnceLock` keeps the read on that path down to an atomic load.
-    pub group_cache: std::sync::OnceLock<Arc<GroupCache>>,
+    pub(crate) group_cache: std::sync::OnceLock<Arc<GroupCache>>,
 
     pub(crate) expected_disconnect: AtomicBool,
     /// Set by `reconnect()` to suppress the "Message loop exited with an error" warning.
@@ -1750,7 +1768,8 @@ pub struct Client {
     /// window does not end because our socket did.
     pub(crate) duplicate_dispatch_suppressed: AtomicU64,
 
-    pub enable_auto_reconnect: Arc<AtomicBool>,
+    enable_auto_reconnect: Arc<AtomicBool>,
+    auto_reconnect_changed: event_listener::Event,
     /// Set by [`Client::pause`] and cleared by [`Client::resume`]: the run loop
     /// parks instead of connecting for as long as it holds.
     ///
@@ -1942,7 +1961,7 @@ pub struct Client {
     /// Custom handlers for encrypted message types. Set once at `Bot::build` and
     /// immutable afterward, so the receive hot path reads it with a plain
     /// `OnceLock::get` (no lock) and no per-node guard acquisition.
-    pub custom_enc_handlers: std::sync::OnceLock<HashMap<String, Arc<dyn EncHandler>>>,
+    pub(crate) custom_enc_handlers: std::sync::OnceLock<HashMap<String, Arc<dyn EncHandler>>>,
 
     /// Optional inbound durability hook. When set, the transport ack for a
     /// decrypted user message is deferred until the hook commits it, converting
@@ -2054,7 +2073,7 @@ pub struct Client {
     pub(crate) synchronous_ack: bool,
 
     /// HTTP client for making HTTP requests (media upload/download, version fetching)
-    pub http_client: Arc<dyn crate::http::HttpClient>,
+    pub(crate) http_client: Arc<dyn crate::http::HttpClient>,
 
     /// Version override for testing or manual specification
     pub(crate) override_version: Option<(u32, u32, u32)>,
