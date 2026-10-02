@@ -1281,7 +1281,7 @@ fn spawn_call_event_listener(
     auto_video: bool,
     state: Arc<Mutex<CallState>>,
 ) {
-    let Some(events) = handle.take_events() else {
+    let Some(mut events) = handle.take_events() else {
         warn!("call event receiver already owned by another consumer");
         return;
     };

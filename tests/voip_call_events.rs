@@ -1,6 +1,7 @@
 //! Ownership checks against a real facade handle, outside the library package boundary.
 #![cfg(all(feature = "test-support", not(target_arch = "wasm32")))]
 
+use futures::StreamExt;
 use std::{sync::Arc, time::Duration};
 use whatsapp_rust::{test_support::CallFixture, voip::CallHandle};
 
@@ -62,13 +63,18 @@ async fn shutdown_before_first_acquisition_preserves_sticky_completion() -> anyh
     let fixture = CallFixture::new().await?;
     let call = dormant(&fixture).await?;
     fixture.shutdown().await?;
-    let events = call
+    let mut events = call
         .take_events()
         .expect("ending does not consume acquisition");
     for _ in 0..2 {
         tokio::time::timeout(Duration::from_secs(1), call.wait_ended()).await?;
     }
     assert!(call.clone().take_events().is_none());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while events.next().await.is_some() {}
+    })
+    .await?;
+    assert!(events.recv().await.is_err());
     drop(events);
     assert!(call.take_events().is_none());
     Ok(())
