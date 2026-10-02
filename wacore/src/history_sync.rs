@@ -29,6 +29,12 @@ pub enum HistorySyncError {
 /// instead (a strictly tighter bound).
 pub const MAX_DECOMPRESSED: u64 = 64 * 1024 * 1024;
 
+/// Local typed-call retention limits, not WhatsApp protocol limits or heap/RSS
+/// measurements. Check count and cumulative encoded payload bytes before decode:
+/// dense empty records otherwise amplify a bounded inflate into huge allocations.
+const MAX_CALL_RECORDS: usize = 1024;
+const MAX_CALL_RECORD_BYTES: usize = 128 * 1024;
+
 #[derive(Debug)]
 pub struct HistorySyncResult {
     pub own_pushname: Option<String>,
@@ -39,7 +45,9 @@ pub struct HistorySyncResult {
     pub conversations_processed: usize,
     /// Pairing-history call records (field 13), in wire order. Records are
     /// decoded individually during the same inflate walk, never by reparsing
-    /// the whole chunk. Malformed framed entries are skipped.
+    /// the whole chunk. Malformed framed entries are skipped. If the local
+    /// count/encoded-byte budget is exceeded, the entire typed-call harvest is
+    /// suppressed (not a prefix); other harvest and retained raw bytes survive.
     pub call_log_records: Vec<wa::CallLogRecord>,
     /// Tctoken candidates extracted from 1:1 conversations during streaming.
     pub tc_token_candidates: Vec<TcTokenCandidate>,
@@ -475,6 +483,10 @@ where
     const RECORD_RESERVE_BYTE_CAP: usize = 2 * 1024 * 1024;
     const RESERVE_HEADROOM_DIVISOR: usize = 8;
     let mut density_reserved = false;
+    let mut call_record_count = 0usize;
+    let mut call_record_bytes = 0usize;
+    let mut malformed_call_records = 0usize;
+    let mut call_budget_exceeded = false;
 
     while let Some(field) = walker.next_field()? {
         if field.wire_type != wire_type::LENGTH_DELIMITED {
@@ -526,11 +538,25 @@ where
                 }
             }
             tags::history_sync::CALL_LOG_RECORDS => {
-                // Like optional mappings, a corrupt record must not cost the
-                // other chunk harvest. Outer framing/zlib errors remain fatal.
+                if call_budget_exceeded {
+                    continue;
+                }
+                let count = call_record_count.checked_add(1);
+                let bytes = call_record_bytes.checked_add(value.len());
+                if count.is_none_or(|n| n > MAX_CALL_RECORDS)
+                    || bytes.is_none_or(|n| n > MAX_CALL_RECORD_BYTES)
+                {
+                    call_budget_exceeded = true;
+                    // Suppress the whole typed-call harvest, not a misleading
+                    // prefix. Keep walking other fields and retain the raw chunk.
+                    result.call_log_records = Vec::new();
+                    continue;
+                }
+                call_record_count = count.unwrap_or(MAX_CALL_RECORDS);
+                call_record_bytes = bytes.unwrap_or(MAX_CALL_RECORD_BYTES);
                 match waproto::codec::call_log_record_decode(value) {
                     Ok(record) => result.call_log_records.push(record),
-                    Err(_) => log::warn!("Skipping undecodable history-sync call record"),
+                    Err(_) => malformed_call_records += 1,
                 }
             }
             // pushnames (repeated) — only our own is needed
@@ -554,6 +580,13 @@ where
         }
     }
 
+    if malformed_call_records != 0 || call_budget_exceeded {
+        // One redacted diagnostic per chunk, never a log write for each bad
+        // entry. Budget exhaustion is observable even when every entry is valid.
+        log::warn!(
+            "History-sync call harvest: malformed={malformed_call_records}, typed_calls_suppressed={call_budget_exceeded}"
+        );
+    }
     result.decompressed_size = walker.total_out() as usize;
     // Both sources have been walked by now, so this is the first point where a
     // LID's competing pairs can be compared against each other.
@@ -2390,6 +2423,124 @@ mod tests {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(raw).unwrap();
         encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn call_record_count_budget_preserves_raw_and_other_harvest() {
+        for count in [MAX_CALL_RECORDS, MAX_CALL_RECORDS + 1] {
+            let hs = wa::HistorySync {
+                call_log_records: vec![wa::CallLogRecord::default(); count],
+                nct_salt: Some(vec![42; 32]),
+                conversations: vec![wa::Conversation {
+                    id: "15550000002@s.whatsapp.net".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let result = process_history_sync(encode_and_compress(&hs), None, true).unwrap();
+            assert_eq!(
+                result.call_log_records.len(),
+                if count == MAX_CALL_RECORDS { count } else { 0 }
+            );
+            assert_eq!(result.nct_salt, hs.nct_salt);
+            assert_eq!(result.conversations_processed, 1);
+            let blob = result.compressed_bytes.unwrap();
+            let mut stream = HistorySyncStream::new(&blob, MAX_DECOMPRESSED);
+            assert!(stream.next_conversation().unwrap().is_some());
+            assert!(stream.next_conversation().unwrap().is_none());
+            assert_eq!(stream.remainder().unwrap().call_log_records.len(), count);
+        }
+    }
+
+    #[test]
+    fn call_record_wire_byte_budget_is_cumulative_and_checked_before_decode() {
+        let sized_record = |bytes: usize| {
+            // field11 tag + three-byte string length; no production payload.
+            let record = wa::CallLogRecord {
+                call_id: Some("x".repeat(bytes - 4)),
+                ..Default::default()
+            };
+            assert_eq!(record.encode_to_vec().len(), bytes);
+            record
+        };
+        for (records, expected) in [
+            (vec![sized_record(MAX_CALL_RECORD_BYTES)], 1),
+            (vec![sized_record(MAX_CALL_RECORD_BYTES + 1)], 0),
+            (vec![sized_record(MAX_CALL_RECORD_BYTES / 2); 2], 2),
+            (
+                vec![
+                    sized_record(MAX_CALL_RECORD_BYTES / 2),
+                    sized_record(MAX_CALL_RECORD_BYTES / 2 + 1),
+                ],
+                0,
+            ),
+        ] {
+            let hs = wa::HistorySync {
+                call_log_records: records,
+                nct_salt: Some(vec![42]),
+                ..Default::default()
+            };
+            let result = process_history_sync(encode_and_compress(&hs), None, true).unwrap();
+            assert_eq!(result.call_log_records.len(), expected);
+            assert_eq!(result.nct_salt, Some(vec![42]));
+            let blob = result.compressed_bytes.unwrap();
+            let mut stream = HistorySyncStream::new(&blob, MAX_DECOMPRESSED);
+            assert!(stream.next_conversation().unwrap().is_none());
+            assert_eq!(
+                stream.remainder().unwrap().call_log_records,
+                hs.call_log_records
+            );
+        }
+        // The over-budget entry is deliberately malformed: checking AFTER
+        // decode would skip it but incorrectly retain the earlier typed prefix.
+        let mut raw = vec![0x6a, 0];
+        raw.push(0x6a);
+        let size = MAX_CALL_RECORD_BYTES + 1;
+        let mut n = size;
+        while n >= 128 {
+            raw.push((n as u8 & 0x7f) | 0x80);
+            n >>= 7;
+        }
+        raw.push(n as u8);
+        raw.resize(raw.len() + size, 0xff);
+        raw.extend_from_slice(&[0x9a, 1, 1, 42]);
+        let result = process_history_sync(compress_call_wire(&raw), None, true).unwrap();
+        assert!(result.call_log_records.is_empty());
+        assert_eq!(result.nct_salt, Some(vec![42]));
+        assert!(result.compressed_bytes.is_some());
+    }
+
+    #[test]
+    fn call_harvest_diagnostic_is_single_and_redacted() {
+        struct Capture(std::sync::Mutex<Vec<String>>);
+        impl log::Log for Capture {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.level() == log::Level::Warn
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                if std::thread::current().name()
+                    == Some("history_sync::tests::call_harvest_diagnostic_is_single_and_redacted")
+                    && self.enabled(record.metadata())
+                {
+                    self.0.lock().unwrap().push(record.args().to_string());
+                }
+            }
+            fn flush(&self) {}
+        }
+        static CAPTURE: Capture = Capture(std::sync::Mutex::new(Vec::new()));
+        log::set_logger(&CAPTURE).unwrap();
+        log::set_max_level(log::LevelFilter::Warn);
+        let mut raw = [0x6a, 3, 0x62, 2, b'x'].repeat(MAX_CALL_RECORDS + 1);
+        raw.extend_from_slice(&[0x9a, 1, 1, 42]);
+        let result = process_history_sync(compress_call_wire(&raw), None, true).unwrap();
+        assert!(result.call_log_records.is_empty());
+        assert_eq!(result.nct_salt, Some(vec![42]));
+        let messages = CAPTURE.0.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0],
+            "History-sync call harvest: malformed=1024, typed_calls_suppressed=true"
+        );
     }
 
     #[test]

@@ -2958,13 +2958,16 @@ pub struct CallLogSync {
 ///
 /// The record is shared with [`CallLogSync`], but history has no mutation index,
 /// mutation write time or app-state full-sync flag. This event is delivered in
-/// record wire order after the chunk's internal harvest, before its
-/// [`Event::HistorySync`]. It promises neither cross-chunk ordering nor dedup:
+/// record wire order after the chunk's internal harvest and legacy
+/// [`Event::HistorySync`], so the new burst cannot displace that chunk in a
+/// bounded mailbox. Local retention limits may suppress all typed calls for an
+/// over-budget chunk; the raw lazy history remains available for recovery.
+/// It promises neither cross-chunk ordering nor dedup:
 /// replayed chunks can emit the same calls again. Consumers may upsert using
 /// the record's optional call identifier and creator.
 ///
 /// ```
-/// use wacore::types::events::{Event, EventInterest, EventKind};
+/// use wacore::types::events::{CallLogHistory, Event, EventInterest, EventKind};
 /// let interest = EventInterest::of(&[EventKind::CallLogHistory]);
 /// assert!(interest.wants(EventKind::CallLogHistory));
 /// fn placed(event: &Event) -> Option<bool> {
@@ -2973,6 +2976,8 @@ pub struct CallLogSync {
 ///         _ => None,
 ///     }
 /// }
+/// let event = Event::CallLogHistory(CallLogHistory::builder().record(Box::default()).build());
+/// assert_eq!(placed(&event), None);
 /// ```
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
@@ -2981,7 +2986,8 @@ pub struct CallLogHistory {
     /// Absent or unparseable creators stay unknown; raw text stays in `record`.
     pub call_creator_jid: Option<Jid>,
     /// Whether this account placed the call, comparing the creator against
-    /// the account's canonical PN and LID. `None` for an unknown creator.
+    /// the chunk's fixed canonical PN/LID snapshot. `None` for an unknown
+    /// creator or when neither account identity is available.
     /// `record.is_incoming` is never used to invent a direction.
     pub from_me: Option<bool>,
     /// The call's own `record.start_time` (Unix seconds), not a mutation's

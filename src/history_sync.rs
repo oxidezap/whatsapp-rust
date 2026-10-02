@@ -541,26 +541,11 @@ impl Client {
                 self.store_history_sync_msg_secret_entries(secret_entries, secret_seed_config)
                     .await;
 
-                // Same creator-based direction as app-state, but never invent
-                // its required index creator or write-time envelope for history.
-                for record in sync_result.call_log_records {
-                    let call_creator_jid = record
-                        .call_creator_jid
-                        .as_deref()
-                        .and_then(|raw| raw.parse::<Jid>().ok());
-                    let from_me = call_creator_jid.as_ref().map(|jid| self.is_own_jid(jid));
-                    let timestamp = record.start_time.and_then(wacore::time::from_secs);
-                    self.core.event_bus.dispatch(Event::CallLogHistory(
-                        CallLogHistory::builder()
-                            .maybe_call_creator_jid(call_creator_jid)
-                            .maybe_from_me(from_me)
-                            .maybe_timestamp(timestamp)
-                            .record(Box::new(record))
-                            .maybe_sync_type(notification.sync_type.map(|t| t as i32))
-                            .maybe_chunk_order(notification.chunk_order)
-                            .build(),
-                    ));
-                }
+                // One canonical identity snapshot for the entire chunk, before
+                // any host callback can change it. This is the same predicate
+                // underlying is_own_jid, without reloading per record.
+                let identity = self.persistence_manager.get_device_snapshot();
+                let identity_known = identity.pn.is_some() || identity.lid.is_some();
 
                 // No interest pre-check: dispatch() evaluates handler interest
                 // against a single bus snapshot (and skips materializing the
@@ -581,6 +566,37 @@ impl Client {
                     self.core
                         .event_bus
                         .dispatch(Event::HistorySync(Box::new(lazy_hs)));
+                }
+
+                // Preserve the legacy chunk's place in bounded/drop-newest
+                // mailboxes before the new burst consumes their capacity. This
+                // adds no reliability guarantee for an already-full mailbox.
+                for record in sync_result.call_log_records {
+                    let call_creator_jid = record
+                        .call_creator_jid
+                        .as_deref()
+                        .and_then(|raw| raw.parse::<Jid>().ok());
+                    let from_me = call_creator_jid
+                        .as_ref()
+                        .filter(|_| identity_known)
+                        .map(|jid| {
+                            crate::send::is_own_identity(
+                                identity.pn.as_ref(),
+                                identity.lid.as_ref(),
+                                jid,
+                            )
+                        });
+                    let timestamp = record.start_time.and_then(wacore::time::from_secs);
+                    self.core.event_bus.dispatch(Event::CallLogHistory(
+                        CallLogHistory::builder()
+                            .maybe_call_creator_jid(call_creator_jid)
+                            .maybe_from_me(from_me)
+                            .maybe_timestamp(timestamp)
+                            .record(Box::new(record))
+                            .maybe_sync_type(notification.sync_type.map(|t| t as i32))
+                            .maybe_chunk_order(notification.chunk_order)
+                            .build(),
+                    ));
                 }
             }
             Some((Err(e), _)) => {
@@ -1085,7 +1101,7 @@ mod tests {
         );
         let events = recorder.0.lock().unwrap();
         assert_eq!(events.len(), 3);
-        for (index, direction, seconds) in [(0, true, 1_700_000_000), (1, false, 1_700_000_100)] {
+        for (index, direction, seconds) in [(1, true, 1_700_000_000), (2, false, 1_700_000_100)] {
             let Event::CallLogHistory(call) = &*events[index] else {
                 panic!("expected call record");
             };
@@ -1100,7 +1116,7 @@ mod tests {
                 call.call_creator_jid.as_ref().unwrap().to_string(),
                 call.record.call_creator_jid.as_deref().unwrap()
             );
-            if index == 0 {
+            if index == 1 {
                 assert_eq!(call.record.duration, Some(91));
                 assert_eq!(call.record.is_video, Some(true));
                 assert_eq!(
@@ -1111,8 +1127,8 @@ mod tests {
                 assert_eq!(call.record.participants.len(), 1);
             }
         }
-        let Event::HistorySync(lazy) = &*events[2] else {
-            panic!("expected chunk event last");
+        let Event::HistorySync(lazy) = &*events[0] else {
+            panic!("expected legacy chunk event first");
         };
         assert_eq!(lazy.chunk_order(), Some(7));
         assert_eq!(lazy.get().unwrap().call_log_records.len(), 2);
@@ -1172,7 +1188,7 @@ mod tests {
                 .into_iter()
                 .enumerate()
             {
-                let Event::CallLogHistory(call) = &*events[offset + index] else {
+                let Event::CallLogHistory(call) = &*events[offset + index + 1] else {
                     panic!("expected call");
                 };
                 assert_eq!(call.from_me, direction);
@@ -1184,7 +1200,7 @@ mod tests {
                 assert_eq!(call.call_creator_jid.is_some(), direction.is_some());
                 assert_eq!(call.record.call_id, None);
             }
-            assert!(matches!(&*events[offset + 5], Event::HistorySync(_)));
+            assert!(matches!(&*events[offset], Event::HistorySync(_)));
         }
         let Event::HistorySync(last) = &*events[12] else {
             panic!("empty chunk event");
@@ -1239,7 +1255,7 @@ mod tests {
             .await;
         let events = recorder.0.lock().unwrap();
         assert_eq!(events.len(), 2);
-        let Event::CallLogHistory(call) = &*events[0] else {
+        let Event::CallLogHistory(call) = &*events[1] else {
             panic!("valid record");
         };
         assert_eq!(call.timestamp, None);
@@ -1247,7 +1263,196 @@ mod tests {
         assert_eq!(call.call_creator_jid, None);
         assert_eq!(call.chunk_order, None);
         assert_eq!(call.sync_type, None);
-        assert!(matches!(&*events[1], Event::HistorySync(_)));
+        assert!(matches!(&*events[0], Event::HistorySync(_)));
+    }
+
+    #[tokio::test]
+    async fn call_history_keeps_legacy_chunk_in_default_bounded_mailbox() {
+        use wacore::types::events::ChannelEventHandler;
+        let client =
+            crate::test_utils::create_test_client_with_name("call_history_backpressure").await;
+        client.is_running.store(true, Ordering::Relaxed);
+        let (handler, receiver) = ChannelEventHandler::new();
+        client
+            .core
+            .event_bus
+            .subscribe_handler(handler.clone())
+            .detach();
+        process_call_history_chunk(
+            &client,
+            (0..300)
+                .map(|n| wa::CallLogRecord {
+                    call_id: Some(format!("call-{n}")),
+                    ..Default::default()
+                })
+                .collect(),
+            4,
+        )
+        .await;
+        let mut calls = Vec::new();
+        let mut saw_history = false;
+        while let Ok(event) = receiver.try_recv() {
+            match &*event {
+                Event::HistorySync(lazy) => {
+                    assert!(calls.is_empty());
+                    assert_eq!(lazy.get().unwrap().call_log_records.len(), 300);
+                    saw_history = true;
+                }
+                Event::CallLogHistory(call) => {
+                    assert!(saw_history);
+                    calls.push(call.record.call_id.clone().unwrap());
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_history);
+        assert!(!calls.is_empty());
+        for (n, id) in calls.iter().enumerate() {
+            assert_eq!(id, &format!("call-{n}"));
+        }
+        assert!(handler.stats().dropped_full > 0);
+    }
+
+    #[tokio::test]
+    async fn call_history_budget_emits_only_raw_chunk_and_preserves_harvest() {
+        let client = crate::test_utils::create_test_client_with_name("call_history_budget").await;
+        client.is_running.store(true, Ordering::Relaxed);
+        let recorder = Arc::new(CallHistoryRecorder(std::sync::Mutex::new(Vec::new())));
+        client
+            .core
+            .event_bus
+            .subscribe_handler(recorder.clone())
+            .detach();
+        process_call_history_chunk(&client, vec![wa::CallLogRecord::default(); 1025], 5).await;
+        let events = recorder.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let Event::HistorySync(lazy) = &*events[0] else {
+            panic!("raw chunk must survive");
+        };
+        assert_eq!(lazy.get().unwrap().call_log_records.len(), 1025);
+        assert_eq!(lazy.get().unwrap().conversations.len(), 1);
+        assert_eq!(
+            client
+                .persistence_manager
+                .get_device_snapshot()
+                .nct_salt
+                .as_deref(),
+            Some(&[17; 32][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn call_history_direction_is_unknown_without_account_identities() {
+        let client =
+            crate::test_utils::create_test_client_with_name("call_history_no_identity").await;
+        client.is_running.store(true, Ordering::Relaxed);
+        for command in [
+            wacore::store::commands::DeviceCommand::SetId(None),
+            wacore::store::commands::DeviceCommand::SetLid(None),
+        ] {
+            client.persistence_manager.process_command(command).await;
+        }
+        let recorder = Arc::new(CallHistoryRecorder(std::sync::Mutex::new(Vec::new())));
+        client
+            .core
+            .event_bus
+            .subscribe_handler(recorder.clone())
+            .detach();
+        process_call_history_chunk(
+            &client,
+            vec![wa::CallLogRecord {
+                call_creator_jid: Some("15550000001@s.whatsapp.net".into()),
+                ..Default::default()
+            }],
+            6,
+        )
+        .await;
+        let events = recorder.0.lock().unwrap();
+        let Event::CallLogHistory(call) = &*events[1] else {
+            panic!("expected call");
+        };
+        assert!(call.call_creator_jid.is_some());
+        assert_eq!(call.from_me, None);
+    }
+
+    #[tokio::test]
+    async fn call_history_uses_one_identity_snapshot_despite_host_updates() {
+        struct ChangeIdentity {
+            client: std::sync::Weak<Client>,
+            changed: std::sync::atomic::AtomicBool,
+            recorder: Arc<CallHistoryRecorder>,
+        }
+        impl wacore::types::events::EventHandler for ChangeIdentity {
+            fn handle_event(&self, event: Arc<Event>) {
+                use futures::FutureExt;
+                if !self.changed.swap(true, Ordering::Relaxed) {
+                    let client = self.client.upgrade().unwrap();
+                    // No lock is held by dispatch: deterministically apply the
+                    // command in its first poll, never mutate Device directly.
+                    client
+                        .persistence_manager
+                        .process_command(wacore::store::commands::DeviceCommand::SetId(Some(
+                            "15550000002@s.whatsapp.net".parse().unwrap(),
+                        )))
+                        .now_or_never()
+                        .expect("uncontended command must be ready");
+                }
+                wacore::types::events::EventHandler::handle_event(self.recorder.as_ref(), event);
+            }
+            fn interest(&self) -> wacore::types::events::EventInterest {
+                wacore::types::events::EventHandler::interest(self.recorder.as_ref())
+            }
+        }
+        let client =
+            crate::test_utils::create_test_client_with_name("call_history_identity_update").await;
+        client.is_running.store(true, Ordering::Relaxed);
+        client
+            .persistence_manager
+            .process_command(wacore::store::commands::DeviceCommand::SetId(Some(
+                "15550000001@s.whatsapp.net".parse().unwrap(),
+            )))
+            .await;
+        let recorder = Arc::new(CallHistoryRecorder(std::sync::Mutex::new(Vec::new())));
+        client
+            .core
+            .event_bus
+            .subscribe_handler(Arc::new(ChangeIdentity {
+                client: Arc::downgrade(&client),
+                changed: std::sync::atomic::AtomicBool::new(false),
+                recorder: recorder.clone(),
+            }))
+            .detach();
+        process_call_history_chunk(
+            &client,
+            vec![
+                wa::CallLogRecord {
+                    call_creator_jid: Some("15550000001:8@c.us".into()),
+                    ..Default::default()
+                };
+                2
+            ],
+            7,
+        )
+        .await;
+        let events = recorder.0.lock().unwrap();
+        assert!(matches!(&*events[0], Event::HistorySync(_)));
+        for event in &events[1..] {
+            let Event::CallLogHistory(call) = &**event else {
+                panic!("expected call");
+            };
+            assert_eq!(call.from_me, Some(true));
+        }
+        assert_eq!(
+            client
+                .persistence_manager
+                .get_device_snapshot()
+                .pn
+                .as_ref()
+                .unwrap()
+                .user
+                .as_str(),
+            "15550000002"
+        );
     }
 
     fn sender_record(from_me: bool) -> HistoryMsgSecretRecordRef<'static> {
