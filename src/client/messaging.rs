@@ -112,10 +112,8 @@ impl Client {
         Ok(())
     }
 
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.node", level = "debug", skip_all, fields(tag = %node.tag), err(Debug)))]
     pub async fn send_node(&self, node: Node) -> Result<(), ClientError> {
-        let plaintext_buf = self.marshal_node_for_send(node)?;
-        self.send_raw_bytes(plaintext_buf).await
+        self.send_node_observed(node, None).await
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.node", level = "debug", skip_all, fields(tag = %node.tag), err(Debug)))]
