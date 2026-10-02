@@ -1221,6 +1221,7 @@ version = "0.0.0"
 dependencies = [
  "tokio",
  "whatsapp-rust",
+ "whatsapp-rust-sqlite-storage",
 ]
 
 [[package]]
@@ -1455,6 +1456,7 @@ dependencies = [
  "ctr",
  "event-listener",
  "futures",
+ "getrandom",
  "hashbrown 0.17.1",
  "hex",
  "hkdf",
