@@ -369,7 +369,12 @@ impl Client {
                     {
                         return (normalized, ());
                     }
-                    let claimed = previous.is_none();
+                    // An unsent gate is still a reservation, even though
+                    // live_owner must ignore it as a response owner.
+                    let claimed = previous.is_none()
+                        && current.is_none_or(|memo| {
+                            memo.outcome.load(std::sync::atomic::Ordering::Acquire) == PDO_FAILED
+                        });
                     let memo =
                         PdoRequestMemo::new(info, request_id.clone(), explicit_retry, previous);
                     let next = if claimed {
@@ -466,8 +471,20 @@ impl Client {
                                 .store(PDO_FAILED, std::sync::atomic::Ordering::Release);
                             (
                                 current
-                                    .filter(|current| current.request_id == request_id)
-                                    .and_then(|_| same_owner.then(|| owner.live_owner()).flatten()),
+                                    .filter(|current| {
+                                        same_owner && current.request_id == request_id
+                                    })
+                                    .and_then(|_| {
+                                        // Restore an evicted reservation from the pending slot,
+                                        // not only an owner that has already reached the writer.
+                                        if owner.outcome.load(std::sync::atomic::Ordering::Acquire)
+                                            == PDO_IN_FLIGHT
+                                        {
+                                            Some(owner.clone())
+                                        } else {
+                                            owner.live_owner()
+                                        }
+                                    }),
                                 (),
                             )
                         }) as PdoGateUpdate<'_>,

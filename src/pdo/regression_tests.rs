@@ -148,8 +148,7 @@ async fn top_level_participant_does_not_bypass_stale_owner() {
     assert_eq!(delivered[0].info.source.sender, info.source.sender);
 }
 
-#[tokio::test]
-async fn short_circuited_retry_preserves_inflight_automatic_gate() {
+async fn check_short_circuited_retry(evict_gate: bool) {
     let (client, info) = client_with_session().await;
     let peer: Jid = "12025550100@s.whatsapp.net".parse().unwrap();
     let session = client
@@ -175,6 +174,9 @@ async fn short_circuited_retry_preserves_inflight_automatic_gate() {
         owner.outcome.load(std::sync::atomic::Ordering::Acquire),
         super::super::PDO_IN_FLIGHT
     );
+    if evict_gate {
+        client.pdo_requested.remove(&gate_key(&info)).await;
+    }
     assert_eq!(
         client
             .retry_pdo_placeholder_resend_request(&info)
@@ -234,6 +236,16 @@ async fn short_circuited_retry_preserves_inflight_automatic_gate() {
             .request_id,
         owner.request_id
     );
+}
+
+#[tokio::test]
+async fn short_circuited_retry_preserves_inflight_automatic_gate() {
+    check_short_circuited_retry(false).await;
+}
+
+#[tokio::test]
+async fn short_circuited_retry_restores_evicted_inflight_automatic_gate() {
+    check_short_circuited_retry(true).await;
 }
 
 #[tokio::test]
