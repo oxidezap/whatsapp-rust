@@ -357,7 +357,7 @@ async fn create_test_client_with_config_and_runtime(
     );
 
     let backend = Arc::new(
-        SqliteStore::new(&db_name)
+        SqliteStore::open(&db_name)
             .await
             .expect("test backend should initialize"),
     ) as Arc<dyn Backend>;
@@ -479,7 +479,7 @@ pub async fn create_test_backend() -> Arc<dyn Backend> {
     );
 
     Arc::new(
-        SqliteStore::new(&db_name)
+        SqliteStore::open(&db_name)
             .await
             .expect("test backend should initialize"),
     ) as Arc<dyn Backend>

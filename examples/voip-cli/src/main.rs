@@ -1661,7 +1661,7 @@ async fn run_bot(mode: Mode) -> Result<()> {
         audio.name(),
         audio.signaling_rate()
     );
-    let store = SqliteStore::new("whatsapp.db")
+    let store = SqliteStore::open("whatsapp.db")
         .await
         .map_err(|e| anyhow!("sqlite: {e}"))?;
     let (accept, target, video) = match mode {

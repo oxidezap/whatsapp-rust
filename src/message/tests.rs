@@ -27,7 +27,7 @@ fn mock_http_client() -> Arc<dyn crate::http::HttpClient> {
 #[tokio::test]
 async fn test_parse_message_info_for_status_broadcast() {
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_status_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_status_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -88,7 +88,7 @@ async fn test_status_broadcast_cold_cache_resolves_to_lid() {
     use wacore_binary::Server;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_status_cold_cache?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_status_cold_cache?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -185,7 +185,7 @@ async fn test_status_broadcast_hosted_family_with_device_id_resolves_to_hosted_l
     use wacore_binary::Server;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_status_hosted_device?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_status_hosted_device?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -281,7 +281,7 @@ async fn test_process_session_enc_batch_handles_session_not_found_gracefully() {
     use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair, SignalMessage};
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_graceful_fail?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_graceful_fail?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -354,7 +354,7 @@ async fn test_process_session_enc_batch_handles_session_not_found_gracefully() {
 #[tokio::test]
 async fn batch_accumulates_undecryptable_and_dispatches_once() {
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_batch_undec_once?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_batch_undec_once?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -429,7 +429,7 @@ async fn test_empty_session_record_treated_as_session_not_found() {
     use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair, SessionRecord, SignalMessage};
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_empty_session?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_empty_session?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -1336,7 +1336,7 @@ async fn test_handle_incoming_message_skips_skmsg_after_msg_failure() {
     use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair, SignalMessage};
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_skip_skmsg_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_skip_skmsg_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -1425,7 +1425,7 @@ async fn test_self_sent_lid_group_message_sender_key_mismatch() {
     };
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_sender_key_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_sender_key_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -1527,7 +1527,7 @@ async fn test_multiple_lid_participants_sender_key_isolation() {
     };
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_multi_lid_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_multi_lid_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -1733,7 +1733,7 @@ async fn test_parse_message_info_sender_alt_extraction() {
     use wacore_binary::builder::NodeBuilder;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_sender_alt_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_sender_alt_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -1989,7 +1989,7 @@ async fn test_sender_key_always_uses_display_jid() {
     use wacore::libsignal::protocol::{SenderKeyStore, create_sender_key_distribution_message};
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_display_jid_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_display_jid_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2083,7 +2083,7 @@ async fn test_second_message_with_only_skmsg_decrypts() {
     use wacore_binary::builder::NodeBuilder;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_second_msg_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_second_msg_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2186,7 +2186,7 @@ async fn test_untrusted_identity_error_is_caught_and_handled() {
 
     // Setup
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_untrusted_identity_caught?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_untrusted_identity_caught?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2258,7 +2258,7 @@ async fn test_untrusted_identity_does_not_break_batch_processing() {
     use std::sync::Arc;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_untrusted_batch?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_untrusted_batch?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2340,7 +2340,7 @@ async fn test_untrusted_identity_in_group_context() {
     use std::sync::Arc;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_untrusted_group?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_untrusted_group?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2418,7 +2418,7 @@ async fn test_parse_message_info_self_sent_dm_via_lid() {
     use wacore_binary::builder::NodeBuilder;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_self_dm_lid_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_self_dm_lid_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2516,7 +2516,7 @@ async fn test_parse_message_info_dm_from_other_via_lid() {
     use wacore_binary::builder::NodeBuilder;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_other_dm_lid_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_other_dm_lid_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2610,7 +2610,7 @@ async fn test_parse_message_info_dm_to_self() {
     use wacore_binary::builder::NodeBuilder;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_dm_to_self_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_dm_to_self_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2702,7 +2702,7 @@ async fn test_parse_message_info_dm_to_self() {
 async fn test_lid_pn_cache_populated_on_message_with_sender_lid() {
     // Setup client
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_lid_cache_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_lid_cache_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2771,7 +2771,7 @@ async fn test_lid_pn_cache_populated_on_message_with_sender_lid() {
 async fn test_lid_pn_cache_not_populated_without_sender_lid() {
     // Setup client
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_no_lid_cache_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_no_lid_cache_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2829,7 +2829,7 @@ async fn test_lid_pn_cache_populated_for_lid_sender_with_participant_pn() {
 
     // Setup client
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_lid_sender_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_lid_sender_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2902,7 +2902,7 @@ async fn test_lid_pn_cache_populated_for_lid_sender_with_participant_pn() {
 async fn test_lid_pn_cache_handles_repeated_messages() {
     // Setup client
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_repeated_msg_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_repeated_msg_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2979,7 +2979,7 @@ async fn test_pn_message_uses_lid_for_session_lookup_when_mapping_known() {
     use wacore::types::jid::JidExt;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_pn_to_lid_session_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_pn_to_lid_session_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -3118,7 +3118,7 @@ async fn test_pn_message_uses_cached_lid_without_sender_lid_attribute() {
     use wacore::types::jid::JidExt;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_cached_lid_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_cached_lid_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -3231,7 +3231,7 @@ async fn test_pn_message_uses_pn_when_no_lid_mapping() {
     use wacore::types::jid::JidExt;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_no_lid_mapping_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_no_lid_mapping_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -3382,7 +3382,7 @@ async fn create_test_client_for_retry_with_id(test_id: &str) -> Arc<Client> {
     );
 
     let backend = Arc::new(
-        SqliteStore::new(&db_name)
+        SqliteStore::open(&db_name)
             .await
             .expect("Failed to create test backend"),
     );
@@ -4025,7 +4025,7 @@ fn skdm_only_fallback_ack_decision_requires_clean_session_batch() {
 #[tokio::test]
 async fn test_parse_message_info_missing_id_returns_error() {
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_missing_id_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_missing_id_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -4075,7 +4075,7 @@ async fn test_no_sender_key_sends_immediate_retry() {
     use wacore_binary::builder::NodeBuilder;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_retry_immediate?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_retry_immediate?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -5708,7 +5708,7 @@ async fn capturing_client_with_cache_config(
     );
 
     let backend = Arc::new(
-        SqliteStore::new(&db_name)
+        SqliteStore::open(&db_name)
             .await
             .expect("test backend should initialize"),
     );

@@ -74,7 +74,7 @@ impl PersistenceManager {
     /// Create a PersistenceManager with a backend implementation.
     ///
     /// Note: The backend should already be configured with the correct device_id
-    /// (via SqliteStore::new_for_device for multi-account scenarios).
+    /// (via SqliteDatabase::store for multi-account scenarios).
     pub async fn new(backend: Arc<dyn Backend>) -> Result<Self, StoreError> {
         debug!("PersistenceManager: Ensuring device row exists.");
         // Ensure a device row exists for this backend's device_id; create it if not.

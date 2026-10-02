@@ -490,7 +490,7 @@ async fn sqlite_fixture(
     Arc<Client>,
     Arc<crate::transport::mock::CapturingMockTransport>,
 ) {
-    let backend = Arc::new(crate::store::SqliteStore::new(uri).await.unwrap());
+    let backend = Arc::new(crate::store::SqliteStore::open(uri).await.unwrap());
     crate::test_utils::create_iq_test_client_with_backend(backend).await
 }
 
