@@ -1,4 +1,19 @@
 //! External compilation of hierarchy, lookup envelopes, and call-action wire tags.
+//!
+//! Deliberate alias removals (the positive tests below cover the replacements):
+//!
+//! ```compile_fail
+//! use whatsapp_rust::{GroupType, group_type};
+//! ```
+//!
+//! ```compile_fail
+//! use whatsapp_rust::features::community::{GroupType, group_type};
+//! ```
+//!
+//! ```compile_fail
+//! use whatsapp_rust::wacore::types::call::CallAction;
+//! fn legacy(action: &CallAction) { let _ = action.action_kind(); }
+//! ```
 
 #[cfg(test)]
 #[path = "../../group_lookup_contract.rs"]
@@ -60,9 +75,18 @@ mod call_action {
             .children([NodeBuilder::new("future_call_action").build()])
             .build();
         assert!(parse_call_stanza(&unknown.as_node_ref()).unwrap().is_none());
-        let malformed = NodeBuilder::new("call")
-            .children([NodeBuilder::new("offer_notice").build()])
-            .build();
-        assert!(parse_call_stanza(&malformed.as_node_ref()).is_err());
+        for missing in ["call-id", "call-creator"] {
+            let mut action = NodeBuilder::new("offer_notice");
+            if missing != "call-id" {
+                action = action.attr("call-id", "CALL-ID");
+            }
+            let malformed = NodeBuilder::new("call")
+                .attr("from", "111111111111111@lid")
+                .attr("t", "1704067200")
+                .children([action.build()])
+                .build();
+            let error = parse_call_stanza(&malformed.as_node_ref()).unwrap_err();
+            assert!(error.to_string().contains(&format!("missing '{missing}'")));
+        }
     }
 }
