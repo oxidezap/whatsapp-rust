@@ -4027,7 +4027,7 @@ async fn active_chat_lane_survives_capacity_pressure() {
 /// accurately models the pre-fix scenario: socket is Some + mutex is held
 /// by another task = old is_socket_connected() returned false.
 #[tokio::test]
-async fn test_is_connected_not_affected_by_mutex_contention() {
+async fn test_is_socket_connected_not_affected_by_mutex_contention() {
     use crate::socket::NoiseSocket;
     use wacore::handshake::NoiseCipher;
 
