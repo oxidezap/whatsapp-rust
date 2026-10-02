@@ -1448,43 +1448,6 @@ impl ResponseWaiterMap {
     }
 }
 
-/// A single WhatsApp session: the connection, the Signal state, and every
-/// protocol operation built on top of them.
-///
-/// This is the low-level entry point. Build one with
-/// [`ClientBuilder`], which
-/// takes the four platform dependencies (storage backend, transport factory,
-/// HTTP client, async runtime) and validates them at runtime. Most applications
-/// should use [`Bot`](crate::bot::Bot) instead and reach the client through
-/// [`Bot::client`](crate::bot::Bot::client); `Client` is what remains when you
-/// need to drive the lifecycle yourself, from an FFI host, or from a wrapper
-/// that cannot express typestate generics.
-///
-/// The client is always used behind an `Arc` (most methods take `self: &Arc<Self>`)
-/// and is cheap to clone and share across tasks.
-///
-/// # Lifecycle
-///
-/// [`Client::run`] owns the session: it connects, keeps the socket alive, and
-/// reconnects with backoff until [`Client::disconnect`] is called or the device
-/// is logged out. [`Client::connect`] performs a single connection attempt
-/// without the supervision loop, for hosts that manage retries themselves.
-///
-/// # Events
-///
-/// Everything the server reports (messages, receipts, pairing progress,
-/// connection state) is delivered as an [`Event`]
-/// on the event bus. Register a handler with [`Client::subscribe`] (explicit
-/// [`EventInterest`](wacore::types::events::EventInterest) filter) or
-/// [`Client::subscribe_handler`].
-///
-/// # Sending
-///
-/// [`Client::send_message`] covers the common path;
-/// [`Client::send_message_with_options`] takes a [`SendOptions`](crate::send::SendOptions)
-/// for message-id pinning, ephemeral expiration, and cache freshness. Domain
-/// operations hang off accessors such as [`Client::groups`], [`Client::contacts`],
-/// and [`Client::presence`].
 /// Preference and irreversible protocol verdict share one atomic word so a
 /// concurrent host re-enable cannot erase the verdict. The Arc stays the same
 /// size as the former raw atomic handle; no extra Client attachment is needed.
@@ -1533,7 +1496,45 @@ impl AutoReconnect {
     }
 }
 
-/// Session client with encapsulated implementation state.
+/// A single WhatsApp session: the connection, the Signal state, and every
+/// protocol operation built on top of them.
+///
+/// This is the low-level entry point. Build one with
+/// [`ClientBuilder`], which
+/// takes the four platform dependencies (storage backend, transport factory,
+/// HTTP client, async runtime) and validates them at runtime. Most applications
+/// should use [`Bot`](crate::bot::Bot) instead and reach the client through
+/// [`Bot::client`](crate::bot::Bot::client); `Client` is what remains when you
+/// need to drive the lifecycle yourself, from an FFI host, or from a wrapper
+/// that cannot express typestate generics.
+///
+/// The client is always used behind an `Arc` (most methods take `self: &Arc<Self>`)
+/// and is cheap to clone and share across tasks.
+///
+/// # Lifecycle
+///
+/// [`Client::run`] owns the session: it connects, keeps the socket alive, and
+/// reconnects with backoff until [`Client::disconnect`] is called or the device
+/// is logged out. [`Client::connect`] performs a single connection attempt
+/// without the supervision loop, for hosts that manage retries themselves.
+///
+/// # Events
+///
+/// Everything the server reports (messages, receipts, pairing progress,
+/// connection state) is delivered as an [`Event`]
+/// on the event bus. Register a handler with [`Client::subscribe`] (explicit
+/// [`EventInterest`](wacore::types::events::EventInterest) filter) or
+/// [`Client::subscribe_handler`].
+///
+/// # Sending
+///
+/// [`Client::send_message`] covers the common path;
+/// [`Client::send_message_with_options`] takes a [`SendOptions`](crate::send::SendOptions)
+/// for message-id pinning, ephemeral expiration, and cache freshness. Domain
+/// operations hang off accessors such as [`Client::groups`], [`Client::contacts`],
+/// and [`Client::presence`].
+///
+/// # Encapsulated implementation state
 ///
 /// Use [`Self::set_auto_reconnect`], [`Self::http_client`], builder-installed
 /// encrypted handlers, and [`Self::memory_report`] instead of implementation

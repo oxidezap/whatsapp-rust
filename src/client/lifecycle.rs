@@ -118,12 +118,10 @@ impl Client {
     }
 
     pub(crate) fn record_protocol_terminal_reason(&self, reason: ProtocolTerminalReason) {
-        self.enable_auto_reconnect.stop_permanently();
         *self
             .protocol_terminal_reason
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason);
-        self.notify_session_state();
     }
 
     fn take_protocol_terminal_reason(&self) -> Option<ProtocolTerminalReason> {
@@ -875,16 +873,17 @@ impl Client {
             warn!("Client `run` called after shutdown.");
             return RunCompletionReason::ShutdownRequested;
         }
+        if self.is_running.swap(true, Ordering::SeqCst) {
+            warn!("Client `run` method called while already running.");
+            return RunCompletionReason::AlreadyRunning;
+        }
         if self.enable_auto_reconnect.is_terminal() {
+            self.stop_supervision_loop();
             return RunCompletionReason::AutoReconnectDisabled {
                 connection: None,
                 connect_error: None,
                 protocol_error: self.take_protocol_terminal_reason(),
             };
-        }
-        if self.is_running.swap(true, Ordering::SeqCst) {
-            warn!("Client `run` method called while already running.");
-            return RunCompletionReason::AlreadyRunning;
         }
         if shutdown.is_fired() {
             self.is_running.store(false, Ordering::SeqCst);
@@ -3532,10 +3531,7 @@ mod tests {
     async fn disabling_reconnect_after_a_connect_failure_preserves_the_error() {
         let (client, entered, release) = client_parked_in_connect().await;
         client.enable_auto_reconnect.store(false, Ordering::Relaxed);
-        // A stale diagnostic, not a real terminal verdict: run must discard it
-        // before this fresh attempt while still preserving the actual failure.
-        *client.protocol_terminal_reason.lock().unwrap() =
-            Some(ProtocolTerminalReason::StreamErrorCode(401));
+        client.record_protocol_terminal_reason(ProtocolTerminalReason::StreamErrorCode(401));
         let runner = Arc::clone(&client);
         let run = tokio::spawn(async move { runner.run_with_reason().await });
         next_connect_attempt(&entered).await;
@@ -4354,6 +4350,50 @@ mod tests {
             .await
             .expect("run() must return when disconnect() fires, not after the 900s backoff")
             .expect("the run task must not panic");
+    }
+
+    #[tokio::test]
+    async fn transient_connect_failures_do_not_latch_a_terminal_reconnect_state() {
+        for code in [500, 503] {
+            let client = crate::test_utils::create_test_client().await;
+            let failure = NodeBuilder::new("failure")
+                .attr("reason", code.to_string())
+                .build();
+            client.handle_connect_failure(&failure.as_node_ref()).await;
+            assert!(client.auto_reconnect_enabled());
+            assert!(!client.enable_auto_reconnect.is_terminal());
+            client.set_auto_reconnect(false);
+            client.set_auto_reconnect(true);
+            assert!(client.auto_reconnect_enabled());
+            assert!(!client.is_terminal());
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_run_cannot_consume_the_active_runs_terminal_reason() {
+        let (client, entered, release) = client_parked_in_connect().await;
+        let runner = Arc::clone(&client);
+        let active = tokio::spawn(async move { runner.run().await });
+        next_connect_attempt(&entered).await;
+        let error = NodeBuilder::new("stream:error")
+            .children([NodeBuilder::new("conflict")
+                .attr("type", "replaced")
+                .build()])
+            .build();
+        client.handle_stream_error(&error.as_node_ref()).await;
+        assert!(matches!(
+            client.run().await,
+            RunCompletionReason::AlreadyRunning
+        ));
+        release.send(()).await.unwrap();
+        assert!(matches!(
+            active.await.unwrap(),
+            RunCompletionReason::AutoReconnectDisabled {
+                connect_error: Some(ConnectError::Version(_)),
+                protocol_error: Some(ProtocolTerminalReason::Conflict(ConflictKind::Replaced)),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

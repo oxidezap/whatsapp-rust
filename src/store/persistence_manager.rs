@@ -225,7 +225,8 @@ impl PersistenceManager {
         self.finish_device_save(&mut pending).await?;
         // An async modifier may still hold the write guard with dirty=false.
         // Even a clean/final flush must wait for its publication before deciding
-        // there is nothing to save. Shutdown keeps its existing bounded wait.
+        // there is nothing to save. The host must finish/cancel the modifier:
+        // device persistence, unlike the client's task drains, is not timed out.
         let device_guard = self.device.read().await;
         if !self.dirty.load(Ordering::Acquire) {
             return Ok(());

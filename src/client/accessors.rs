@@ -31,6 +31,11 @@ impl Client {
         }
     }
 
+    pub(crate) fn stop_auto_reconnect_permanently(&self) {
+        self.enable_auto_reconnect.stop_permanently();
+        self.notify_session_state();
+    }
+
     /// Reuse the injected HTTP service, for example with an independent
     /// [`crate::download::MediaDownloader`]. Cloning this Arc retains the original
     /// host allocation, not the Client; it cannot replace the client's service.
