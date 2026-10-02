@@ -3033,7 +3033,7 @@ impl<'a> Groups<'a> {
         let resp = self
             .client
             .mex()
-            .mutate(mex_request!(
+            .execute(mex_request!(
                 update_group_property,
                 UpdateGroupPropertyVars {
                     group_id: jid.to_string(),

@@ -397,7 +397,7 @@ impl<'a> Business<'a> {
         let response = self
             .client
             .mex()
-            .query(mex_request!(query_catalog, catalog_variables(jid, options)))
+            .execute(mex_request!(query_catalog, catalog_variables(jid, options)))
             .await?;
 
         parse_catalog(&response_data(response.data, "catalog")?)
@@ -416,7 +416,7 @@ impl<'a> Business<'a> {
         let response = self
             .client
             .mex()
-            .query(mex_request!(
+            .execute(mex_request!(
                 query_product_collections,
                 collection_variables(jid, options)
             ))
@@ -440,7 +440,7 @@ impl<'a> Business<'a> {
         let response = self
             .client
             .mex()
-            .query(mex_request!(
+            .execute(mex_request!(
                 biz_query_order,
                 order_variables(jid, order_id, token)
             ))

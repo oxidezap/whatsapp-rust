@@ -89,27 +89,27 @@ fn explicit_raw_path_preserves_direct_wire_serialization() {
     assert_eq!(wire(&custom), wire(&request));
 }
 
-// Also check execution paths/futures are available from a downstream package.
+#[test]
+fn custom_descriptor_and_raw_constructor_remain_available() {
+    let doc = whatsapp_rust::MexDoc {
+        name: "ConsumerCustomQuery",
+        id: "123456789",
+    };
+    let operation = MexOperation::<serde_json::Value>::from_raw_parts(doc, &["optional"]);
+    let request = operation.request(serde_json::json!({}));
+    assert_eq!(request.missing_variables().unwrap(), ["optional"]);
+    assert_eq!(wire(&request), br#"{"variables":{}}"#);
+    let raw = MexRequest::new_raw(doc, &["optional"], &request.variables);
+    assert_eq!(wire(&raw), wire(&request));
+}
+
+// Also check the canonical executor's future from a downstream package.
 #[allow(dead_code)]
-async fn public_execution_aliases(
-    client: &whatsapp_rust::Client,
-) -> Result<(), whatsapp_rust::MexError> {
+async fn public_execution(client: &whatsapp_rust::Client) -> Result<(), whatsapp_rust::MexError> {
     let op = mex_operation!(join_newsletter);
     client
         .mex()
         .execute(op.request(join_newsletter::Variables {
-            newsletter_id: None,
-        }))
-        .await?;
-    client
-        .mex()
-        .query(op.request(join_newsletter::Variables {
-            newsletter_id: None,
-        }))
-        .await?;
-    client
-        .mex()
-        .mutate(op.request(join_newsletter::Variables {
             newsletter_id: None,
         }))
         .await?;

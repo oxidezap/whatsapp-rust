@@ -470,7 +470,7 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .query(mex_request!(fetch_all_newsletters_metadata {
+            .execute(mex_request!(fetch_all_newsletters_metadata {
                 // Both gate response blocks this client does not parse. WA Web
                 // reads the same two feature flags and sends whatever they say,
                 // so `false` is a value the server sees from it every day.
@@ -490,7 +490,7 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .query(mex_request!(
+            .execute(mex_request!(
                 fetch_newsletter,
                 newsletter_variables(&jid.to_string(), "JID")
             ))
@@ -510,7 +510,7 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .mutate(mex_request!(create_newsletter {
+            .execute(mex_request!(create_newsletter {
                 input: Some(create_newsletter::Input {
                     name: Some(name.to_string()),
                     description: description.map(str::to_string),
@@ -538,7 +538,7 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .mutate(mex_request!(join_newsletter {
+            .execute(mex_request!(join_newsletter {
                 newsletter_id: Some(jid.to_string()),
             }))
             .await?;
@@ -561,7 +561,7 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .mutate(mex_request!(leave_newsletter {
+            .execute(mex_request!(leave_newsletter {
                 newsletter_id: Some(jid.to_string()),
             }))
             .await?;
@@ -588,7 +588,7 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .mutate(mex_request!(update_newsletter {
+            .execute(mex_request!(update_newsletter {
                 newsletter_id: Some(jid.to_string()),
                 updates: Some(update_newsletter::Updates {
                     name: name.map(str::to_string),
@@ -636,7 +636,7 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .mutate(mex_request!(
+            .execute(mex_request!(
                 update_newsletter,
                 picture_update_variables(jid, jpeg)
             ))
@@ -651,7 +651,7 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .mutate(mex_request!(delete_newsletter, delete_variables(jid)))
+            .execute(mex_request!(delete_newsletter, delete_variables(jid)))
             .await?;
 
         take_data_field(response.data, "xwa2_newsletter_delete_v2")?;
@@ -667,7 +667,7 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .mutate(mex_request!(
+            .execute(mex_request!(
                 change_newsletter_owner,
                 change_owner_variables(jid, &user)
             ))
@@ -685,7 +685,7 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .mutate(mex_request!(
+            .execute(mex_request!(
                 demote_newsletter_admin,
                 demote_admin_variables(jid, &user)
             ))
@@ -714,7 +714,7 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .query(mex_request!(
+            .execute(mex_request!(
                 fetch_newsletter_admin_info,
                 admin_info_variables(jid)
             ))
@@ -736,7 +736,7 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .query(mex_request!(
+            .execute(mex_request!(
                 fetch_newsletter_followers,
                 followers_variables(jid, count)
             ))
@@ -772,7 +772,7 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .mutate(mex_request!(
+            .execute(mex_request!(
                 update_newsletter_user_setting,
                 mute_user_setting_variables(jid, mute_type, muted)
             ))
@@ -797,7 +797,7 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .query(mex_request!(
+            .execute(mex_request!(
                 fetch_newsletter,
                 newsletter_variables(invite_code, "INVITE")
             ))
