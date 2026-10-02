@@ -148,7 +148,7 @@ async fn top_level_participant_does_not_bypass_stale_owner() {
     assert_eq!(delivered[0].info.source.sender, info.source.sender);
 }
 
-async fn check_short_circuited_retry(evict_gate: bool) {
+async fn check_short_circuited_retry(evict_gate: bool, evict_pending: bool) {
     let (client, info) = client_with_session().await;
     let peer: Jid = "12025550100@s.whatsapp.net".parse().unwrap();
     let session = client
@@ -177,13 +177,27 @@ async fn check_short_circuited_retry(evict_gate: bool) {
     if evict_gate {
         client.pdo_requested.remove(&gate_key(&info)).await;
     }
-    assert_eq!(
-        client
-            .retry_pdo_placeholder_resend_request(&info)
-            .await
-            .unwrap(),
-        None
-    );
+    if evict_pending {
+        client.pdo_pending_requests.remove(&pending_key(&info)).await;
+    }
+    let retry = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::select! {
+            result = client.retry_pdo_placeholder_resend_request(&info) => result.unwrap(),
+            replacement = async {
+                loop {
+                    if let Some((_, memo)) = client.pdo_pending_requests.get(&pending_key(&info)).await {
+                        break memo.request_id.clone();
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }, if evict_pending => panic!(
+                "retry replaced the retained unsent reservation with {replacement}"
+            ),
+        }
+    })
+    .await
+    .expect("retained unsent reservation must short-circuit before the held session lock");
+    assert_eq!(retry, None);
     assert_eq!(
         client
             .pdo_requested
@@ -240,12 +254,17 @@ async fn check_short_circuited_retry(evict_gate: bool) {
 
 #[tokio::test]
 async fn short_circuited_retry_preserves_inflight_automatic_gate() {
-    check_short_circuited_retry(false).await;
+    check_short_circuited_retry(false, false).await;
 }
 
 #[tokio::test]
 async fn short_circuited_retry_restores_evicted_inflight_automatic_gate() {
-    check_short_circuited_retry(true).await;
+    check_short_circuited_retry(true, false).await;
+}
+
+#[tokio::test]
+async fn retained_inflight_gate_short_circuits_retry_after_pending_eviction() {
+    check_short_circuited_retry(false, true).await;
 }
 
 #[tokio::test]
