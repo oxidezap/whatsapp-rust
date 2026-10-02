@@ -2,6 +2,7 @@
 //! they do not authenticate to WhatsApp or establish server acceptance.
 use super::*;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use wacore::iq::{abprops::web, tctoken::compute_cs_token};
 use wacore::store::traits::TcTokenEntry;
 
@@ -479,8 +480,15 @@ async fn drop_fixture_table(uri: String, table: &'static str) {
 
 #[tokio::test]
 async fn received_token_survives_backend_reopen_and_dm_send() {
-    let uri = memory_uri();
-    let (original, _) = sqlite_fixture(&uri).await;
+    let directory = std::env::temp_dir().join(format!("privacy-token-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let cleanup = scopeguard::guard(directory, |directory| {
+        // Best effort on assertion failure; successful cleanup is checked below.
+        let _ = std::fs::remove_dir_all(directory);
+    });
+    let path = cleanup.join("tokens.db");
+    let uri = path.to_str().unwrap();
+    let (original, _) = sqlite_fixture(uri).await;
     let (_, lid) = seed_dm_wire_namespace_state(&original).await;
     configure_tokens(&original, &lid, Some(false), true).await;
     let stored = original
@@ -490,7 +498,23 @@ async fn received_token_survives_backend_reopen_and_dm_send() {
         .await
         .unwrap()
         .unwrap();
-    let (reloaded, transport) = sqlite_fixture(&uri).await;
+    let backend = original.persistence_manager.backend();
+    let weak_backend = Arc::downgrade(&backend);
+    drop(backend);
+    let released = original.store_release();
+    original.shutdown().await.device.unwrap();
+    drop(original);
+    // No host-owned backend/Device handles or unawaited backend I/O exist in
+    // this fixture. Join crate ownership, then prove its original store died
+    // before opening a new pool; this is a clean reopen, not a power-loss test.
+    tokio::time::timeout(Duration::from_secs(5), released.wait())
+        .await
+        .unwrap();
+    assert!(
+        weak_backend.upgrade().is_none(),
+        "original store is still alive"
+    );
+    let (reloaded, transport) = sqlite_fixture(uri).await;
     let (pn, _) = seed_dm_wire_namespace_state(&reloaded).await;
     configure_props(&reloaded, None, true).await;
     reloaded
@@ -510,6 +534,13 @@ async fn received_token_survives_backend_reopen_and_dm_send() {
     assert_eq!(after.token, stored.token);
     assert_eq!(after.token_timestamp, stored.token_timestamp);
     assert_eq!(after.sender_timestamp, stored.sender_timestamp);
+    let released = reloaded.store_release();
+    reloaded.shutdown().await.device.unwrap();
+    drop(reloaded);
+    tokio::time::timeout(Duration::from_secs(5), released.wait())
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(scopeguard::ScopeGuard::into_inner(cleanup)).unwrap();
 }
 
 #[tokio::test]

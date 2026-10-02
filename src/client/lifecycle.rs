@@ -639,6 +639,8 @@ impl Client {
             expected_disconnect: AtomicBool::new(false),
             intentional_reconnect: AtomicBool::new(false),
             connection_generation: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "bench-harness")]
+            bench_startup: Arc::default(),
 
             recent_messages: cache_config.recent_messages.build_with_ttl(),
 
@@ -812,8 +814,12 @@ impl Client {
 
     pub(super) fn start_services(self: &Arc<Self>) {
         let warm_up_arc = self.clone();
+        #[cfg(feature = "bench-harness")]
+        let startup_task = self.bench_startup.begin();
         self.runtime
             .spawn(Box::pin(async move {
+                #[cfg(feature = "bench-harness")]
+                let _startup_task = startup_task;
                 if let Err(e) = warm_up_arc.warm_up_lid_pn_cache().await {
                     warn!("Failed to warm up LID-PN cache: {e}");
                 }

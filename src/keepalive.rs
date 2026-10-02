@@ -558,8 +558,12 @@ impl Client {
     /// re-commit it instead of the redelivery being acked as a duplicate.
     pub(crate) fn run_startup_maintenance(self: &Arc<Self>) {
         let client = Arc::clone(self);
+        #[cfg(feature = "bench-harness")]
+        let startup_task = self.bench_startup.begin();
         self.runtime
             .spawn(Box::pin(async move {
+                #[cfg(feature = "bench-harness")]
+                let _startup_task = startup_task;
                 client.run_startup_retention_cleanup().await;
             }))
             .detach();

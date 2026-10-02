@@ -7,6 +7,8 @@ pub(crate) use app_state::{
 };
 #[cfg(test)]
 pub(crate) use app_state::{SyncHolder, batched_sync_outcome_tests::batch_result};
+#[cfg(any(feature = "bench-harness", test))]
+mod bench_startup;
 mod builder;
 mod context_impl;
 mod device_memo_stats;
@@ -1664,6 +1666,8 @@ pub struct Client {
     /// Connection generation counter - incremented on each new connection.
     /// Used to detect stale post-login tasks from previous connections.
     pub(crate) connection_generation: Arc<AtomicU64>,
+    #[cfg(feature = "bench-harness")]
+    pub(crate) bench_startup: Arc<bench_startup::StartupTasks>,
 
     /// Cache for recent messages (serialized bytes) for retry functionality.
     /// Uses an in-process cache with TTL and max capacity for automatic eviction.

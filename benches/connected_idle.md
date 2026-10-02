@@ -61,8 +61,15 @@ Boolean arguments mean `false = InMemoryBackend`, `true = file-backed SQLite`.
 * `activity_peak`: setup builds/connects the client, establishes keys and prepares
   ciphertext/history **outside** the measured region. The timed region receives
   the prepared workload, finishes offline drain and flushes library work.
-* `cache_maintenance_after_activity`: connection **and activity** are setup; only
-  the explicit production cache sweep and settling are timed.
+* `cache_maintenance_after_activity`: connection **and activity** are setup;
+  setup also joins finite construction/post-login tasks and their finite children.
+  Registration happens before spawn under `bench-harness`, with RAII completion
+  on return or cancellation. Empty IQ waiters alone cannot establish this barrier:
+  initialization may be unpolled or awaiting SQLite before its next query.
+  Only the explicit production cache sweep and settling are timed. Maintenance
+  rejects pending/new initialization and checks the synthetic wire's initialization
+  IQ count; it never waits for startup inside this timed region. Periodic keepalive
+  and other session-long workers are deliberately not part of the startup barrier.
 * Both use fresh fixtures; graceful shutdown/database cleanup is outside timing.
   Shutdown/database cleanup errors fail the fixture. `AllocProfiler` supplies
   native Divan allocation columns and CodSpeed uses its
@@ -155,6 +162,11 @@ flat RSS alone does not prove that Rust objects stayed live. Report all three
 readings and the control/noise range; never upload RssAnon as a CodSpeed metric.
 
 ## Corrected native baseline (2026-10-01)
+
+These are historical measurements of the fixture revision pinned below, before
+its finite-startup barrier. Do not relabel them as measurements of the current
+fixture or compare maintenance costs across the changed setup boundary without
+fresh matched runs.
 
 The first batch's RSS evidence is **invalid/superseded**: its counting allocator
 used trait-default `alloc_zeroed` (eager memset), not System's calloc/lazy-page

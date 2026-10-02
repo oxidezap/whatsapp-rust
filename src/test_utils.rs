@@ -315,6 +315,35 @@ pub async fn create_test_client_with_config(
     http_client: Arc<dyn HttpClient>,
     cache_config: crate::cache_config::CacheConfig,
 ) -> Arc<Client> {
+    create_test_client_with_config_and_runtime(
+        name,
+        http_client,
+        cache_config,
+        Arc::new(TokioRuntime),
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn create_test_client_with_runtime(
+    name: &str,
+    runtime: Arc<dyn wacore::runtime::Runtime>,
+) -> Arc<Client> {
+    create_test_client_with_config_and_runtime(
+        name,
+        Arc::new(MockHttpClient),
+        crate::cache_config::CacheConfig::default(),
+        runtime,
+    )
+    .await
+}
+
+async fn create_test_client_with_config_and_runtime(
+    name: &str,
+    http_client: Arc<dyn HttpClient>,
+    cache_config: crate::cache_config::CacheConfig,
+    runtime: Arc<dyn wacore::runtime::Runtime>,
+) -> Arc<Client> {
     use portable_atomic::AtomicU64;
     use std::sync::atomic::Ordering;
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -333,7 +362,7 @@ pub async fn create_test_client_with_config(
             .expect("test backend should initialize"),
     ) as Arc<dyn Backend>;
 
-    create_test_client_from_backend(backend, http_client, cache_config).await
+    create_test_client_from_backend(backend, http_client, cache_config, runtime).await
 }
 
 pub async fn create_test_client_with_backend(backend: Arc<dyn Backend>) -> Arc<Client> {
@@ -341,6 +370,7 @@ pub async fn create_test_client_with_backend(backend: Arc<dyn Backend>) -> Arc<C
         backend,
         Arc::new(MockHttpClient),
         crate::cache_config::CacheConfig::default(),
+        Arc::new(TokioRuntime),
     )
     .await
 }
@@ -349,6 +379,7 @@ async fn create_test_client_from_backend(
     backend: Arc<dyn Backend>,
     http_client: Arc<dyn HttpClient>,
     cache_config: crate::cache_config::CacheConfig,
+    runtime: Arc<dyn wacore::runtime::Runtime>,
 ) -> Arc<Client> {
     let pm = Arc::new(
         PersistenceManager::new(backend)
@@ -357,7 +388,7 @@ async fn create_test_client_from_backend(
     );
 
     let (client, _rx) = Client::new_with_cache_config(
-        Arc::new(TokioRuntime),
+        runtime,
         pm,
         Arc::new(MockTransportFactory::new()),
         http_client,

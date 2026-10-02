@@ -6,6 +6,8 @@ use crate::test_utils::MockHttpClient;
 use futures::channel::oneshot;
 use wacore_binary::SERVER_JID;
 
+mod online_device_sync;
+
 #[tokio::test]
 async fn replacing_status_privacy_releases_the_assembled_copy() {
     let backend = crate::test_utils::create_test_backend().await;
@@ -3758,6 +3760,13 @@ fn client_size_pins_runtime_cache_config_saving() {
     if cfg!(feature = "plugins") {
         expected += size_of::<Option<Arc<()>>>();
     }
+    #[cfg(feature = "bench-harness")]
+    {
+        // Only the benchmark carries this one-pointer attachment (4368 ->
+        // 4376 B on x86_64 defaults). The fixed base and production budgets
+        // stay unchanged, just as for the other feature-sized attachments.
+        expected += size_of::<Arc<bench_startup::StartupTasks>>();
+    }
     assert_eq!(
         size_of::<Client>(),
         expected,
@@ -5477,20 +5486,17 @@ async fn memory_report_sums_chat_lane_backlog() {
 /// triggered another refresh.
 #[tokio::test]
 async fn online_device_sync_releases_its_dedup_entry() {
-    let client = crate::test_utils::create_test_client_with_name("online_device_sync").await;
+    let (client, runtime) = online_device_sync::fixture("online_device_sync").await;
     let jid: Jid = "19045550180@s.whatsapp.net".parse().unwrap();
 
     // Not connected, so the refresh fails; the release must not depend on it
-    // succeeding.
+    // succeeding. Observe before scheduling, then join the actual future/guard
+    // drop instead of assuming 1000 scheduler yields completed SQLite work.
+    let completion = runtime.observe_next(None);
     client
         .schedule_unknown_device_sync(jid.clone(), false)
         .await;
-    for _ in 0..1_000 {
-        if client.pending_device_sync.len() == 0 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    online_device_sync::wait(completion).await;
     assert_eq!(
         client.pending_device_sync.len(),
         0,

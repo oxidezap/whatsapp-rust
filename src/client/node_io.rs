@@ -1201,7 +1201,11 @@ impl Client {
 
         let client_clone = self.clone();
         let task_generation = current_generation;
+        #[cfg(feature = "bench-harness")]
+        let startup_task = self.bench_startup.begin();
         self.runtime.spawn_detached(Box::pin(async move {
+            #[cfg(feature = "bench-harness")]
+            let _startup_task = startup_task;
             // Update LID if changed (moved here to avoid blocking the read loop
             // on Device snapshot + write lock).
             if let Some(lid) = lid_from_server {
@@ -1292,9 +1296,13 @@ impl Client {
             check_generation!();
             let key_client = client_clone.clone();
             let key_generation = task_generation;
+            #[cfg(feature = "bench-harness")]
+            let key_startup = _startup_task.child();
             client_clone
                 .runtime
                 .spawn_detached(Box::pin(async move {
+                    #[cfg(feature = "bench-harness")]
+                    let _startup_task = key_startup;
                     // A newer connection may have taken over between spawn and now.
                     if key_client.connection_generation.load(Ordering::SeqCst) != key_generation {
                         return;
@@ -1362,7 +1370,11 @@ impl Client {
             // Background initialization queries (can run in parallel, non-blocking)
             let bg_client = client_clone.clone();
             let bg_generation = task_generation;
+            #[cfg(feature = "bench-harness")]
+            let bg_startup = _startup_task.child();
             client_clone.runtime.spawn_detached(Box::pin(async move {
+                #[cfg(feature = "bench-harness")]
+                let _startup_task = bg_startup;
                 // Check connection and generation before starting background queries
                 if bg_client.connection_generation.load(Ordering::SeqCst) != bg_generation {
                     debug!("Skipping background init queries: connection generation changed");
@@ -1482,6 +1494,8 @@ impl Client {
                     task_generation,
                     flag_set,
                     needs_pushname_from_sync,
+                    #[cfg(feature = "bench-harness")]
+                    &_startup_task,
                 ))
                 .await;
             } else {
@@ -1521,6 +1535,7 @@ impl Client {
         task_generation: u64,
         flag_set: bool,
         needs_pushname_from_sync: bool,
+        #[cfg(feature = "bench-harness")] startup_task: &bench_startup::StartupTask,
     ) {
         macro_rules! check_generation {
             () => {
@@ -1564,7 +1579,11 @@ impl Client {
         let timeout_generation = task_generation;
         let timeout_rt = self.runtime.clone();
         let timeout_settled = critical_sync_settled.clone();
+        #[cfg(feature = "bench-harness")]
+        let timeout_startup = startup_task.child();
         let critical_sync_timeout_handle = timeout_rt.spawn(Box::pin(async move {
+            #[cfg(feature = "bench-harness")]
+            let _startup_task = timeout_startup;
             timeout_client.runtime.sleep(Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS)).await;
             // Check generation — if connection was replaced, this timeout is stale
             if timeout_client.connection_generation.load(Ordering::SeqCst)
@@ -1689,7 +1708,11 @@ impl Client {
         // Spawn remaining non-critical collections in background
         let sync_client = self.clone();
         let sync_generation = task_generation;
+        #[cfg(feature = "bench-harness")]
+        let sync_startup = startup_task.child();
         self.runtime.spawn_detached(Box::pin(async move {
+            #[cfg(feature = "bench-harness")]
+            let _startup_task = sync_startup;
             if sync_client.connection_generation.load(Ordering::SeqCst) != sync_generation {
                 debug!("App state sync cancelled: connection generation changed");
                 return;

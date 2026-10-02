@@ -205,6 +205,7 @@ impl Session {
             server_rx,
             active: AtomicUsize::new(0),
             pongs: AtomicUsize::new(0),
+            initialization_iqs: AtomicUsize::new(0),
         });
         let counts = Arc::new(Counts::default());
         let client = ClientBuilder::new()
@@ -405,6 +406,11 @@ impl Session {
             .await?;
         self.client.wait_for_startup_sync(DEADLINE).await?;
         self.client.wait_for_connected(DEADLINE).await?;
+        // Connected/empty IQ waiters do not fence startup tasks awaiting storage
+        // or not yet polled. Join their finite descendants before measurement.
+        tokio::time::timeout(DEADLINE, self.client.bench_startup.wait())
+            .await
+            .context("finite startup tasks did not finish")?;
         Ok(())
     }
 
@@ -467,9 +473,31 @@ impl Session {
         self.settle().await
     }
 
+    /// Measure only after `receive_activity` or `finish_control` has joined
+    /// startup. A new initialization invalidates the sample instead of becoming
+    /// hidden scheduler work in the maintenance cost.
     pub async fn maintenance(&self) -> Result<()> {
+        let started = self.client.bench_startup.started();
+        let initialization_iqs = self.initialization_iqs();
+        ensure!(
+            self.client.bench_startup.pending() == 0,
+            "startup is still in flight before maintenance"
+        );
         self.client.run_cache_maintenance().await;
-        self.settle().await
+        self.settle().await?;
+        ensure!(
+            self.client.bench_startup.pending() == 0
+                && self.client.bench_startup.started() == started
+                && self.initialization_iqs() == initialization_iqs,
+            "initialization entered measured maintenance"
+        );
+        Ok(())
+    }
+
+    /// Unsupported, non-active/non-keepalive IQs observed by the synthetic wire.
+    /// Lifecycle tests use this to reject initialization leaking into maintenance.
+    pub fn initialization_iqs(&self) -> usize {
+        self.wire.initialization_iqs.load(Ordering::Relaxed)
     }
 
     pub fn pongs(&self) -> usize {
@@ -560,6 +588,7 @@ struct Wire {
     server_rx: async_channel::Receiver<TransportEvent>,
     active: AtomicUsize,
     pongs: AtomicUsize,
+    initialization_iqs: AtomicUsize,
 }
 
 impl Wire {
@@ -723,6 +752,7 @@ impl Transport for Wire {
                     .attr("from", Jid::new("", Server::Pn))
                     .attr("type", if active || ping { "result" } else { "error" });
                 if !active && !ping {
+                    self.initialization_iqs.fetch_add(1, Ordering::Relaxed);
                     reply = reply.children([NodeBuilder::new("error")
                         .attr("code", "503")
                         .attr("text", "unsupported fixture IQ")

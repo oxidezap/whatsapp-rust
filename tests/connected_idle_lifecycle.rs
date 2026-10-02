@@ -84,6 +84,57 @@ async fn shutdown_releases_active_workers_before_backend_cleanup() -> Result<()>
     Ok(())
 }
 
+#[tokio::test]
+async fn startup_is_joined_before_maintenance_for_both_backends() -> Result<()> {
+    #[cfg(feature = "sqlite-storage")]
+    let backends = [BackendFixture::memory(), BackendFixture::sqlite().await?];
+    #[cfg(not(feature = "sqlite-storage"))]
+    let backends = [BackendFixture::memory()];
+    for backend in backends {
+        let session = Session::connect(backend.backend()).await?;
+        let error = session
+            .maintenance()
+            .await
+            .expect_err("offline startup is pending");
+        ensure!(error.to_string().contains("startup is still in flight"));
+        session.finish_control().await?;
+        let initialization_iqs = session.initialization_iqs();
+        ensure!(
+            initialization_iqs > 0,
+            "control did not exercise initialization"
+        );
+        session.maintenance().await?;
+        session.maintenance().await?;
+        ensure!(session.initialization_iqs() == initialization_iqs);
+        session.shutdown().await?;
+        backend.cleanup()?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn activity_setup_excludes_initialization_from_maintenance() -> Result<()> {
+    #[cfg(feature = "sqlite-storage")]
+    let backends = [BackendFixture::memory(), BackendFixture::sqlite().await?];
+    #[cfg(not(feature = "sqlite-storage"))]
+    let backends = [BackendFixture::memory()];
+    for backend in backends {
+        let session = Session::connect(backend.backend()).await?;
+        let activity = session.prepare_activity().await?;
+        session.receive_activity(activity).await?;
+        let initialization_iqs = session.initialization_iqs();
+        ensure!(
+            initialization_iqs > 0,
+            "activity did not exercise initialization"
+        );
+        session.maintenance().await?;
+        ensure!(session.initialization_iqs() == initialization_iqs);
+        session.shutdown().await?;
+        backend.cleanup()?;
+    }
+    Ok(())
+}
+
 #[tokio::test(start_paused = true)]
 async fn connected_control_stays_alive_without_activity() -> Result<()> {
     let backend = BackendFixture::memory();
