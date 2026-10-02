@@ -809,6 +809,7 @@ version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]
@@ -1678,6 +1679,7 @@ dependencies = [
  "diesel",
  "diesel_migrations",
  "gloo-timers",
+ "libsqlite3-sys",
  "log",
  "scheduled-thread-pool",
  "serde_json",
