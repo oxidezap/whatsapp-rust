@@ -557,15 +557,10 @@ fn mex_graphql_error_is_not_reported_as_a_server_rejection() {
         &(),
     )
     .unwrap();
-    let node = whatsapp_rust::wacore_binary::builder::NodeBuilder::new("iq")
-        .children([
-            whatsapp_rust::wacore_binary::builder::NodeBuilder::new("result")
-                .bytes(
-                    br#"{"errors":[{"message":"denied","extensions":{"error_code":403}}]}"#
-                        .to_vec(),
-                )
-                .build(),
-        ])
+    let node = NodeBuilder::new("iq")
+        .children([NodeBuilder::new("result")
+            .bytes(br#"{"errors":[{"message":"denied","extensions":{"error_code":403}}]}"#.to_vec())
+            .build()])
         .build();
     let parse = spec.parse_response(&node.as_node_ref()).unwrap_err();
     assert_eq!(parse.downcast_ref::<MexFatalError>().unwrap().code, 403);
