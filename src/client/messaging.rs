@@ -520,12 +520,30 @@ impl Client {
     }
 
     /// Subscribe to chatstate through the core event bus. The adapter preserves
-    /// chat, group participant and typing/audio/idle state. Retain the Subscription;
-    /// dropping it removes future deliveries (an old bus snapshot may still deliver).
+    /// chat, group participant and typing/audio/idle state, so a synchronous
+    /// observer need not translate presence/media pairs or recover the optional
+    /// group participant. For async callbacks or configurable delivery, use
+    /// [`crate::CallbackEventHandler`] with [`Self::subscribe_handler`] instead.
+    ///
+    /// Migration from permanent registration: retain the returned Subscription
+    /// in the owner's scope rather than discarding it. Dropping it removes future
+    /// deliveries (an old bus snapshot may still deliver).
     /// Accepted work is cancelled when the adapter is dropped or Client shuts down.
     /// Each registration uses an ordered, non-blocking 256-event mailbox; overflow
     /// drops the newest event and increments Client::stats().events_dropped.
     /// Synchronous user code runs on a worker, but cannot be preempted once entered.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use whatsapp_rust::Client;
+    /// # fn observe(client: &Arc<Client>) {
+    /// let subscription = client.subscribe_chatstate_handler(Arc::new(|event| {
+    ///     println!("{:?}: {:?}", event.chat, event.state);
+    /// }));
+    /// // Keep subscription in the observer owner's state until it should stop.
+    /// drop(subscription);
+    /// # }
+    /// ```
     pub fn subscribe_chatstate_handler(
         self: &Arc<Self>,
         handler: Arc<dyn Fn(ChatStateEvent) + Send + Sync>,
@@ -552,17 +570,6 @@ impl Client {
             callback,
             count: self.chatstate_handler_count.clone(),
         }))
-    }
-
-    /// Compatibility registration, permanent for this Client's bus lifetime.
-    /// Prefer [`Self::subscribe_chatstate_handler`] for RAII unregistration.
-    /// This wrapper detaches that Subscription: the bus owns the adapter, not the
-    /// caller. It uses the same bounded/ordered policy and shutdown cancellation.
-    /// Do not register the same observer on both paths: each registration is independent.
-    pub fn register_chatstate_handler(&self, handler: Arc<dyn Fn(ChatStateEvent) + Send + Sync>) {
-        if let Some(client) = self.self_weak.get().and_then(|weak| weak.upgrade()) {
-            client.subscribe_chatstate_handler(handler).detach();
-        }
     }
 
     /// Dispatch a parsed chatstate stanza to registered handlers.

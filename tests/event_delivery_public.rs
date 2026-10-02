@@ -127,6 +127,9 @@ async fn chatstate_compatibility_view_uses_the_same_bus_fact() {
     let subscription = client.subscribe_chatstate_handler(Arc::new(move |event| {
         tx.try_send(event).unwrap();
     }));
+    let (bus, events) = ChannelEventHandler::with_capacity(8);
+    let bus_subscription =
+        client.subscribe(EventInterest::of(&[EventKind::ChatPresence]), bus.clone());
     for (state, media, expected) in [
         ("composing", None, ReceivedChatState::Typing),
         (
@@ -140,15 +143,29 @@ async fn chatstate_compatibility_view_uses_the_same_bus_fact() {
         let observed = receive(&rx).await;
         assert_eq!(observed.chat.to_string(), "120363000001@g.us");
         assert_eq!(
-            observed.participant.unwrap().to_string(),
+            observed.participant.as_ref().unwrap().to_string(),
             "12025550111@s.whatsapp.net"
         );
         assert_eq!(observed.state, expected);
-        assert!(rx.try_recv().is_err());
+        let fact = receive(&events).await;
+        let Event::ChatPresence(presence) = &*fact else {
+            panic!("shared chat presence fact")
+        };
+        let projected = whatsapp_rust::ChatStateEvent::from_presence(presence);
+        assert_eq!(observed.chat, projected.chat);
+        assert_eq!(observed.participant, projected.participant);
+        assert_eq!(observed.state, projected.state);
+        assert!(rx.try_recv().is_err(), "one typed view per registration");
+        assert!(events.try_recv().is_err(), "one bus fact per registration");
     }
+    assert_eq!(bus.stats().enqueued, 3);
     drop(subscription);
     dispatch(&client, "composing", None).await;
     assert!(rx.try_recv().is_err());
+    assert_eq!(bus.stats().enqueued, 4, "independent bus observer remains");
+    drop(bus_subscription);
+    dispatch(&client, "paused", None).await;
+    assert_eq!(bus.stats().enqueued, 4);
     client.shutdown().await;
 }
 
@@ -186,6 +203,56 @@ async fn bounded_pool_drops_newest_without_stalling_protocol_handler() {
     client.shutdown().await;
     eventually(|| handler.stats().callbacks_active == 0 && handler.stats().discarded == 2).await;
     assert_eq!(handler.stats().callbacks_cancelled, 2);
+}
+
+#[tokio::test]
+async fn ordered_delivery_preserves_accepted_order_and_drops_newest() {
+    let client = client().await;
+    let (started_tx, started) = async_channel::unbounded();
+    let (release, permits) = async_channel::bounded::<()>(1);
+    let handler = CallbackEventHandler::from_callback(
+        &client,
+        EventInterest::of(&[EventKind::ChatPresence]),
+        EventDelivery::Ordered { capacity: 2 },
+        move |event, _| {
+            let started = started_tx.clone();
+            let permits = permits.clone();
+            async move {
+                let Event::ChatPresence(presence) = &*event else {
+                    panic!("chat presence")
+                };
+                started
+                    .send(whatsapp_rust::ChatStateEvent::from_presence(presence).state)
+                    .await
+                    .unwrap();
+                permits.recv().await.unwrap();
+            }
+        },
+    );
+    let subscription = client.subscribe_handler(handler.clone());
+    dispatch(&client, "composing", None).await;
+    assert_eq!(receive(&started).await, ReceivedChatState::Typing);
+    dispatch(&client, "composing", Some("audio")).await;
+    dispatch(&client, "paused", None).await;
+    dispatch(&client, "composing", None).await; // newest is rejected
+    assert_eq!(handler.stats().accepted, 3);
+    assert_eq!(handler.stats().dropped_full, 1);
+    assert_eq!(handler.stats().callbacks_active, 1);
+    assert!(started.try_recv().is_err());
+    for state in [ReceivedChatState::RecordingAudio, ReceivedChatState::Idle] {
+        release.send(()).await.unwrap();
+        assert_eq!(receive(&started).await, state);
+        assert_eq!(handler.stats().callbacks_active, 1);
+    }
+    release.send(()).await.unwrap();
+    eventually(|| handler.stats().callbacks_completed == 3).await;
+    assert!(started.try_recv().is_err());
+    assert_eq!(client.stats().events_dropped, 1);
+    drop(subscription);
+    dispatch(&client, "paused", None).await;
+    assert_eq!(handler.stats().accepted, 3);
+    handler.cancel();
+    client.shutdown().await;
 }
 
 #[tokio::test]
@@ -375,7 +442,7 @@ fn callback_policies() -> [EventDelivery; 4] {
             max_concurrency: 2,
         },
         EventDelivery::default(),
-        EventDelivery::Concurrent,
+        EventDelivery::ConcurrentUnbounded,
     ]
 }
 

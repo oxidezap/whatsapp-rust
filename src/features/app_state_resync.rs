@@ -61,7 +61,7 @@ pub enum AppStateResyncMode {
     /// *dispatched to the event bus* by then, and the collection's own state is
     /// persisted. It does not mean handlers have run. Delivery from there is the
     /// bus's, and under
-    /// [`EventDelivery::Concurrent`](crate::bot::EventDelivery::Concurrent) each
+    /// [`EventDelivery::ConcurrentUnbounded`](crate::bot::EventDelivery::ConcurrentUnbounded) each
     /// callback runs in a task of its own, while
     /// [`EventDelivery::Ordered`](crate::bot::EventDelivery::Ordered) and the
     /// bounded concurrent default buffer events in a mailbox and drop the newest
