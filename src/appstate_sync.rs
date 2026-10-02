@@ -292,12 +292,12 @@ mod tests {
             Ok(entries.len())
         }
 
-        async fn get_msg_secret(
+        async fn get_stored_msg_secret(
             &self,
             _chat: &str,
             _sender: &str,
             _msg_id: &str,
-        ) -> StoreResult<Option<Vec<u8>>> {
+        ) -> StoreResult<Option<wacore::store::traits::StoredMessageSecret>> {
             Ok(None)
         }
 

@@ -163,11 +163,13 @@ pub(crate) mod test_alloc {
 pub use wacore::appstate::patch_decode::WAPatchName;
 pub use wacore::appstate::schemas;
 pub use wacore::client_profile::ClientProfile;
+pub use wacore::store::traits::StoredMessageSecret;
 /// Optional metrics emission (the `metrics` feature). No-op when the feature is off.
 pub use wacore::telemetry;
 pub use wacore::types::message_ref::{
     MessageId, MessageRef, MessageRefError, NewsletterMessageRef, ServerMessageId, StanzaId,
 };
+pub use wacore::types::message_secret::{InvalidMessageSecret, MessageSecret};
 pub use wacore::{
     iq::privacy as privacy_settings, proto_helpers, sticker_pack, store::traits, webp,
 };
@@ -359,7 +361,7 @@ pub use features::{
     UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError, VariantProperty, VerifiedName,
     group_type, message_key, message_range,
 };
-pub use features::{MexDoc, MexOperation};
+pub use features::{CreatedEvent, CreatedPoll, EventRef, MexDoc, MexOperation, PollRef};
 
 pub use features::{ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
 
@@ -419,7 +421,10 @@ pub mod prelude {
         EventKind, InboundMessage, MessageBatch, Subscription,
     };
     pub use crate::types::message::MessageInfo;
-    pub use crate::{Jid, Server};
+    pub use crate::{
+        CreatedEvent, CreatedPoll, EventRef, InvalidMessageSecret, Jid, MessageSecret, PollRef,
+        Server, StoredMessageSecret,
+    };
     pub use crate::{
         MessageId, MessageRef, MessageRefError, NewsletterMessageRef, ServerMessageId, StanzaId,
     };

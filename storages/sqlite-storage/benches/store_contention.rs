@@ -1,6 +1,6 @@
 //! Reads alongside a write burst, with a reader pool configured.
 //! `get_group_metadata` routes through `read_query` (reader connection);
-//! `get_devices` and `get_msg_secret_with_ts` are on the `ON_THE_WRITE_QUEUE`
+//! `get_devices` and `get_stored_msg_secret` are on the `ON_THE_WRITE_QUEUE`
 //! allowlist and take the write permit instead. Each contended sample is one
 //! burst, holding the permit before the read is issued, and one read, both
 //! awaited, so the work per sample is fixed; see `read_under_write` for why a
