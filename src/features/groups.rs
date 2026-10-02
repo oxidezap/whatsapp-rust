@@ -1,4 +1,3 @@
-use super::pictures::{self, ProfilePictureRequest, ProfilePictureTarget};
 use crate::client::Client;
 use crate::features::group_history::{
     GroupHistoryLimits, GroupHistoryPolicyError, GroupHistoryRetryToken, GroupHistoryShareOutcome,
@@ -14,8 +13,6 @@ use std::sync::Arc;
 use thiserror::Error;
 use wacore::client::context::GroupRoutingInfo;
 use wacore::download::MediaType;
-pub use wacore::iq::contacts::ProfilePictureLookup;
-use wacore::iq::contacts::ProfilePictureType as ContactPictureType;
 pub use wacore::iq::contacts::SetProfilePictureResponse;
 use wacore::iq::contacts::SetProfilePictureSpec;
 use wacore::iq::groups::{
@@ -2913,7 +2910,10 @@ impl<'a> Groups<'a> {
             .collect())
     }
 
-    /// Batch fetch group profile pictures (max 1,000).
+    /// Batch fetch group profile pictures (max 1,000) in one `w:g2` IQ.
+    ///
+    /// This has per-entry batch outcomes and a distinct cost from individual
+    /// `contacts().lookup_picture()` requests with Group or Community targets.
     pub async fn get_profile_pictures(
         &self,
         group_jids: Vec<Jid>,
@@ -2934,55 +2934,6 @@ impl<'a> Groups<'a> {
             .client
             .execute(GetGroupProfilePicturesIq::with_type(&groups))
             .await?)
-    }
-
-    /// Compatibility lookup; 429 becomes a lossy `RateOverlimit`. For preserved
-    /// errors and explicit size, use `contacts().lookup_picture()` with a Group target.
-    /// Lookup an individual group's profile picture preserving detailed protocol outcomes:
-    /// `Found`, `Unchanged`, `NotFound`, `NotAuthorized`.
-    pub async fn lookup_profile_picture(
-        &self,
-        group_jid: &Jid,
-        preview: bool,
-        existing_id: Option<&str>,
-    ) -> Result<ProfilePictureLookup, GroupError> {
-        let picture_type = if preview {
-            ContactPictureType::Preview
-        } else {
-            ContactPictureType::Full
-        };
-        Ok(pictures::lookup(
-            self.client,
-            ProfilePictureRequest::new(ProfilePictureTarget::Group(group_jid), picture_type)
-                .existing_id(existing_id),
-            true,
-        )
-        .await?)
-    }
-
-    /// Compatibility lookup via `w:g2`; 429 becomes a lossy `RateOverlimit`.
-    /// Prefer `contacts().lookup_picture()` with an explicit Community target.
-    pub async fn lookup_community_profile_picture(
-        &self,
-        community_jid: &Jid,
-        preview: bool,
-        existing_id: Option<&str>,
-    ) -> Result<ProfilePictureLookup, GroupError> {
-        let picture_type = if preview {
-            ContactPictureType::Preview
-        } else {
-            ContactPictureType::Full
-        };
-        Ok(pictures::lookup(
-            self.client,
-            ProfilePictureRequest::new(
-                ProfilePictureTarget::Community(community_jid),
-                picture_type,
-            )
-            .existing_id(existing_id),
-            true,
-        )
-        .await?)
     }
 
     /// Set a group's profile picture (admin operation).

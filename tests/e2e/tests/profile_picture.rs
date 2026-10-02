@@ -1,6 +1,9 @@
 use e2e_tests::TestClient;
 use log::info;
 use wacore::types::events::Event;
+use whatsapp_rust::{
+    ProfilePictureLookup, ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType,
+};
 
 #[tokio::test]
 async fn test_set_profile_picture() -> anyhow::Result<()> {
@@ -25,8 +28,12 @@ async fn test_set_profile_picture() -> anyhow::Result<()> {
     let pic = client
         .client
         .contacts()
-        .get_profile_picture(&own_jid, false)
-        .await?;
+        .lookup_picture(ProfilePictureRequest::new(
+            ProfilePictureTarget::Contact(&own_jid),
+            ProfilePictureType::Full,
+        ))
+        .await?
+        .into_found();
     assert!(
         pic.is_some(),
         "Profile picture should be retrievable after setting"
@@ -93,8 +100,12 @@ async fn test_set_profile_picture_then_update() -> anyhow::Result<()> {
     let pic = client
         .client
         .contacts()
-        .get_profile_picture(&own_jid, false)
-        .await?;
+        .lookup_picture(ProfilePictureRequest::new(
+            ProfilePictureTarget::Contact(&own_jid),
+            ProfilePictureType::Full,
+        ))
+        .await?
+        .into_found();
     assert!(pic.is_some());
     assert_eq!(
         pic.unwrap().id,
@@ -148,10 +159,13 @@ async fn test_remove_profile_picture() -> anyhow::Result<()> {
     let pic = client
         .client
         .contacts()
-        .get_profile_picture(&own_jid, false)
+        .lookup_picture(ProfilePictureRequest::new(
+            ProfilePictureTarget::Contact(&own_jid),
+            ProfilePictureType::Full,
+        ))
         .await?;
     assert!(
-        pic.is_none(),
+        matches!(pic, ProfilePictureLookup::NotFound),
         "Profile picture should be gone after removal"
     );
     info!("Confirmed: no profile picture after removal");
@@ -166,14 +180,20 @@ async fn test_get_nonexistent_profile_picture() -> anyhow::Result<()> {
 
     let client = TestClient::connect("e2e_get_no_ppic").await?;
 
-    // Query own picture without ever setting one — should return None
+    // Query own picture without ever setting one — should return NotFound
     let own_jid = client.client.pn().expect("should have PN after pairing");
     let pic = client
         .client
         .contacts()
-        .get_profile_picture(&own_jid, true)
+        .lookup_picture(ProfilePictureRequest::new(
+            ProfilePictureTarget::Contact(&own_jid),
+            ProfilePictureType::Preview,
+        ))
         .await?;
-    assert!(pic.is_none(), "Should return None for user with no picture");
+    assert!(
+        matches!(pic, ProfilePictureLookup::NotFound),
+        "Should return NotFound for user with no picture"
+    );
     info!("Confirmed: no picture for fresh user");
 
     client.disconnect().await;
@@ -202,8 +222,12 @@ async fn test_get_contact_profile_picture() -> anyhow::Result<()> {
     let pic = client_a
         .client
         .contacts()
-        .get_profile_picture(&jid_b, false)
-        .await?;
+        .lookup_picture(ProfilePictureRequest::new(
+            ProfilePictureTarget::Contact(&jid_b),
+            ProfilePictureType::Full,
+        ))
+        .await?
+        .into_found();
     assert!(pic.is_some(), "A should see B's profile picture");
     let pic = pic.unwrap();
     assert_eq!(pic.id, set_resp.id, "Picture ID should match what B set");
@@ -219,7 +243,7 @@ async fn test_get_contact_profile_picture() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_get_profile_picture_preview_and_full() -> anyhow::Result<()> {
+async fn test_lookup_picture_preview_and_full() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let mut client = TestClient::connect("e2e_ppic_types").await?;
@@ -239,8 +263,12 @@ async fn test_get_profile_picture_preview_and_full() -> anyhow::Result<()> {
     let preview = client
         .client
         .contacts()
-        .get_profile_picture(&own_jid, true)
-        .await?;
+        .lookup_picture(ProfilePictureRequest::new(
+            ProfilePictureTarget::Contact(&own_jid),
+            ProfilePictureType::Preview,
+        ))
+        .await?
+        .into_found();
     assert!(preview.is_some(), "Preview should be available");
     let preview = preview.unwrap();
     assert_eq!(preview.id, set_resp.id);
@@ -250,8 +278,12 @@ async fn test_get_profile_picture_preview_and_full() -> anyhow::Result<()> {
     let full = client
         .client
         .contacts()
-        .get_profile_picture(&own_jid, false)
-        .await?;
+        .lookup_picture(ProfilePictureRequest::new(
+            ProfilePictureTarget::Contact(&own_jid),
+            ProfilePictureType::Full,
+        ))
+        .await?
+        .into_found();
     assert!(full.is_some(), "Full picture should be available");
     let full = full.unwrap();
     assert_eq!(full.id, set_resp.id);

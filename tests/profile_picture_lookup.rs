@@ -43,7 +43,6 @@ fn picture_lookup_into_found_explicitly_discards_non_found_states() {
         ProfilePictureLookup::Unchanged,
         ProfilePictureLookup::NotFound,
         ProfilePictureLookup::NotAuthorized,
-        ProfilePictureLookup::RateOverlimit,
     ] {
         assert!(outcome.into_found().is_none());
     }

@@ -2,10 +2,7 @@
 
 use crate::{client::Client, request::IqError};
 use std::time::Duration;
-use wacore::iq::{
-    contacts::{ProfilePictureLookup, ProfilePictureSpec, ProfilePictureType},
-    spec::IqSpec,
-};
+use wacore::iq::contacts::{ProfilePictureLookup, ProfilePictureSpec, ProfilePictureType};
 use wacore_binary::{Jid, JidExt};
 
 /// Explicit picture route. No route triggers a fallback or metadata query.
@@ -154,64 +151,26 @@ pub(crate) async fn build_spec(
 
 pub(crate) fn classify(
     result: Result<ProfilePictureLookup, IqError>,
-    legacy_rate_limit: bool,
 ) -> Result<ProfilePictureLookup, IqError> {
     match result {
         Err(IqError::ServerError { code: 404, .. }) => Ok(ProfilePictureLookup::NotFound),
         Err(IqError::ServerError {
             code: 401 | 403, ..
         }) => Ok(ProfilePictureLookup::NotAuthorized),
-        Err(IqError::ServerError { code: 429, .. }) if legacy_rate_limit => {
-            Ok(ProfilePictureLookup::RateOverlimit)
-        }
         other => other,
-    }
-}
-
-// Getter compatibility: use the legacy parser, but never collapse an IQ-level 429.
-pub(crate) fn legacy_found(
-    result: Result<ProfilePictureLookup, IqError>,
-) -> Result<Option<wacore::iq::contacts::ProfilePicture>, IqError> {
-    classify(result, false).map(ProfilePictureLookup::into_found)
-}
-
-struct PreservingPictureSpec(ProfilePictureSpec);
-
-impl IqSpec for PreservingPictureSpec {
-    type Response = ProfilePictureLookup;
-
-    fn build_iq(&self) -> wacore::request::InfoQuery<'static> {
-        self.0.build_iq()
-    }
-
-    fn encode_iq_direct(&self, request_id: &str, out: &mut Vec<u8>) -> Result<bool, anyhow::Error> {
-        self.0.encode_iq_direct(request_id, out)
-    }
-
-    fn parse_response(
-        &self,
-        response: &wacore_binary::NodeRef<'_>,
-    ) -> Result<Self::Response, anyhow::Error> {
-        self.0.parse_response_preserving_rate_limit(response)
     }
 }
 
 pub(crate) async fn lookup(
     client: &Client,
     request: ProfilePictureRequest<'_>,
-    legacy_rate_limit: bool,
 ) -> Result<ProfilePictureLookup, IqError> {
     // The system JID never answers this IQ, even with a timeout override.
     if request.target.jid().is_psa() {
         return Ok(ProfilePictureLookup::NotFound);
     }
     let spec = build_spec(client, &request).await;
-    let result = if legacy_rate_limit {
-        client.execute(spec).await
-    } else {
-        client.execute(PreservingPictureSpec(spec)).await
-    };
-    classify(result, legacy_rate_limit)
+    classify(client.execute(spec).await)
 }
 
 #[cfg(test)]
