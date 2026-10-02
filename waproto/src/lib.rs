@@ -248,6 +248,14 @@ pub mod codec {
         whatsapp::HistorySync::decode_from_slice(bytes)
     }
 
+    /// History field 13 is decoded one record at a time during streaming.
+    #[inline(never)]
+    pub fn call_log_record_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::CallLogRecord, buffa::DecodeError> {
+        whatsapp::CallLogRecord::decode_from_slice(bytes)
+    }
+
     /// Append the encoded `HistorySync` to `out`. Infallible into a `Vec`.
     #[inline(never)]
     pub fn history_sync_encode_into(msg: &whatsapp::HistorySync, out: &mut Vec<u8>) {
@@ -740,6 +748,25 @@ mod tests {
     use super::whatsapp as wa;
     use buffa::Message;
     use buffa::view::MessageView;
+
+    #[test]
+    fn call_log_record_codec_preserves_optional_fields_and_rejects_truncation() {
+        let record = wa::CallLogRecord {
+            call_id: Some("synthetic-call".into()),
+            start_time: Some(-1),
+            is_incoming: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::codec::call_log_record_decode(&record.encode_to_vec()).unwrap(),
+            record
+        );
+        assert_eq!(
+            super::codec::call_log_record_decode(&[]).unwrap(),
+            wa::CallLogRecord::default()
+        );
+        assert!(super::codec::call_log_record_decode(&[0x62, 2, b'x']).is_err());
+    }
 
     #[test]
     fn generated_views_and_oneofs_round_trip() {

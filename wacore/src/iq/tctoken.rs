@@ -395,21 +395,31 @@ pub enum PrivacyTokenChoice {
     None,
 }
 
-/// Decide which privacy token to attach, mirroring WA Web's
-/// `Re = R(te) ?? D(te, s)` in `MsgCreateFanoutStanza.js`.
+/// Decide which privacy token to attach to an outgoing 1:1 message.
 ///
-/// `tc_send_enabled` (`privacy_token_sending_on_all_1_on_1_messages`) gates the
-/// tctoken only — WA Web's `R`. The cstoken is gated independently on
-/// `nct_send_enabled` (`wa_nct_token_send_enabled`) — WA Web's `D` — and is NOT
-/// nested behind the 1:1 prop: when `R` yields nothing (prop off, or token
-/// missing/expired), `D` still runs.
+/// A valid received tctoken takes precedence. Only when it is missing or expired
+/// may an NCT cstoken be used, requiring `nct_send_enabled`
+/// (`wa_nct_token_send_enabled`) and available salt/recipient account LID inputs.
+/// This mirrors `WAWebSendMsgCreateFanoutStanza` in the observed WA Web
+/// 2.3000.1045368834 and 2.3000.1047483476 snapshots.
+///
+/// The first argument, formerly `tc_send_enabled`
+/// (`privacy_token_sending_on_all_1_on_1_messages`), is retained for source
+/// compatibility but is ignored: it no longer controls attachment in this path.
+/// Token validity and recipient eligibility remain the caller's responsibility.
+///
+/// ```
+/// use wacore::iq::tctoken::{choose_privacy_token, PrivacyTokenChoice};
+/// assert_eq!(choose_privacy_token(false, false, true, false), PrivacyTokenChoice::TcToken);
+/// assert_eq!(choose_privacy_token(false, true, true, true), PrivacyTokenChoice::TcToken);
+/// ```
 pub fn choose_privacy_token(
-    tc_send_enabled: bool,
+    _tc_send_enabled: bool,
     nct_send_enabled: bool,
     has_valid_tc_token: bool,
     can_build_cs_token: bool,
 ) -> PrivacyTokenChoice {
-    if tc_send_enabled && has_valid_tc_token {
+    if has_valid_tc_token {
         PrivacyTokenChoice::TcToken
     } else if nct_send_enabled && can_build_cs_token {
         PrivacyTokenChoice::CsToken
@@ -763,6 +773,22 @@ mod tests {
     }
 
     #[test]
+    fn valid_tc_token_with_legacy_flag_false_and_nct_off() {
+        assert_eq!(
+            choose_privacy_token(false, false, true, false),
+            PrivacyTokenChoice::TcToken
+        );
+    }
+
+    #[test]
+    fn valid_tc_token_with_legacy_flag_false_and_nct_available() {
+        assert_eq!(
+            choose_privacy_token(false, true, true, true),
+            PrivacyTokenChoice::TcToken
+        );
+    }
+
+    #[test]
     fn choose_prefers_valid_tc_token() {
         assert_eq!(
             choose_privacy_token(true, true, true, true),
@@ -780,17 +806,15 @@ mod tests {
     }
 
     #[test]
-    fn choose_cs_token_when_tc_send_disabled() {
-        // Regression: the cstoken is gated only on nct_send_enabled and must be
-        // attached even when privacy_token_sending_on_all_1_on_1_messages is off.
+    fn choose_fallback_independent_of_legacy_flag() {
+        // NCT remains independently gated when no valid received token exists.
         assert_eq!(
             choose_privacy_token(false, true, false, true),
             PrivacyTokenChoice::CsToken
         );
-        // A valid tc token is ignored while its own prop is off; cstoken still wins.
         assert_eq!(
             choose_privacy_token(false, true, true, true),
-            PrivacyTokenChoice::CsToken
+            PrivacyTokenChoice::TcToken
         );
     }
 
@@ -807,10 +831,34 @@ mod tests {
     }
 
     #[test]
-    fn choose_none_when_all_disabled() {
+    fn choose_none_without_valid_tc_token_or_nct() {
         assert_eq!(
-            choose_privacy_token(false, false, true, true),
+            choose_privacy_token(false, false, false, true),
             PrivacyTokenChoice::None
         );
+    }
+
+    #[test]
+    fn privacy_token_selection_matrix() {
+        for legacy in [false, true] {
+            for nct in [false, true] {
+                for valid_tc in [false, true] {
+                    for cs_inputs in [false, true] {
+                        let expected = if valid_tc {
+                            PrivacyTokenChoice::TcToken
+                        } else if nct && cs_inputs {
+                            PrivacyTokenChoice::CsToken
+                        } else {
+                            PrivacyTokenChoice::None
+                        };
+                        assert_eq!(
+                            choose_privacy_token(legacy, nct, valid_tc, cs_inputs),
+                            expected,
+                            "legacy={legacy}, nct={nct}, valid_tc={valid_tc}, cs_inputs={cs_inputs}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

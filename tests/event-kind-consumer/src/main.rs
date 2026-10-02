@@ -73,6 +73,7 @@ fn disposition(kind: EventKind) -> Option<bool> {
         | ContactRemoved
         | EncDecryptFailed
         | CallLogSync
+        | CallLogHistory
         | ClientExpirationChanged
         | OfflineSyncInterrupted
         | LockChatUpdate

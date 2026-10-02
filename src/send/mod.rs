@@ -28,6 +28,7 @@ use thiserror::Error;
 mod actions;
 pub(crate) mod group_repair;
 mod tctoken_lifecycle;
+pub(crate) use tctoken_lifecycle::is_own_identity;
 
 /// Error returned by the message send path ([`Client::send_message`],
 /// [`Client::send_text`], [`Client::forward_message`], reactions, edits,
@@ -3970,6 +3971,8 @@ pub(crate) fn dm_stanza_to(recipient_bare: &Jid, to: &Jid) -> Jid {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    mod privacy_tokens;
+
     use super::*;
     use crate::test_utils::wait_for_lock_waiter;
     use std::str::FromStr;
