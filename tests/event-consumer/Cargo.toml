@@ -7,6 +7,10 @@ rust-version = "1.94"
 
 [workspace]
 
+[features]
+default = ["native-tests"]
+native-tests = ["whatsapp-rust/tokio-runtime", "dep:tokio"]
+
 [dependencies]
-whatsapp-rust = { path = "../..", default-features = false, features = ["tokio-runtime"] }
-tokio = { version = "1.53.1", features = ["macros", "rt", "time"] }
+whatsapp-rust = { path = "../..", default-features = false }
+tokio = { version = "1.53.1", features = ["macros", "rt", "time"], optional = true }
