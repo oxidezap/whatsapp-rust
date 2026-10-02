@@ -56,7 +56,7 @@ async fn canonical_roundtrip(
     .await
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum Route {
     Contact,
     Group,
@@ -97,14 +97,19 @@ async fn canonical_roundtrip_route(
             "w:g2"
         } else {
             "w:profile:picture"
-        }
+        },
+        "route={route:?}, size={size:?}, existing_id={existing_id:?}",
     );
     let picture = if community {
         assert_eq!(
             sent.get().get_attr("to").unwrap().as_str(),
-            "15550000001-7@g.us"
+            "15550000001-7@g.us",
+            "route={route:?}, size={size:?}, existing_id={existing_id:?}",
         );
-        assert!(sent.get().get_attr("target").is_none());
+        assert!(
+            sent.get().get_attr("target").is_none(),
+            "route={route:?}, size={size:?}, existing_id={existing_id:?}"
+        );
         sent.get()
             .get_optional_child("pictures")
             .unwrap()
@@ -113,7 +118,8 @@ async fn canonical_roundtrip_route(
     } else {
         assert_eq!(
             sent.get().get_attr("to").unwrap().as_str(),
-            "s.whatsapp.net"
+            "s.whatsapp.net",
+            "route={route:?}, size={size:?}, existing_id={existing_id:?}",
         );
         assert_eq!(
             sent.get().get_attr("target").unwrap().as_str(),
@@ -121,15 +127,25 @@ async fn canonical_roundtrip_route(
                 "15550000001@s.whatsapp.net"
             } else {
                 "15550000001-7@g.us"
-            }
+            },
+            "route={route:?}, size={size:?}, existing_id={existing_id:?}",
         );
         sent.get().get_optional_child("picture").unwrap()
     };
-    assert_eq!(picture.get_attr("type").unwrap().as_str(), size.as_str());
-    assert_eq!(picture.get_attr("query").unwrap().as_str(), "url");
+    assert_eq!(
+        picture.get_attr("type").unwrap().as_str(),
+        size.as_str(),
+        "route={route:?}, size={size:?}, existing_id={existing_id:?}"
+    );
+    assert_eq!(
+        picture.get_attr("query").unwrap().as_str(),
+        "url",
+        "route={route:?}, size={size:?}, existing_id={existing_id:?}"
+    );
     assert_eq!(
         picture.get_attr("id").map(|s| s.as_str().into_owned()),
         existing_id.map(str::to_owned),
+        "route={route:?}, size={size:?}, existing_id={existing_id:?}",
     );
     let id = sent.get().get_attr("id").unwrap().to_string();
     let response = if community && let Some(picture) = response.get_optional_child("picture") {
@@ -147,7 +163,7 @@ async fn canonical_roundtrip_route(
     assert_eq!(
         transport.sent().len(),
         1,
-        "lookup must not make a hidden fallback IQ"
+        "lookup must not make a hidden fallback IQ: route={route:?}, size={size:?}, existing_id={existing_id:?}"
     );
     (result, original)
 }
@@ -250,7 +266,11 @@ async fn picture_lookup_all_routes_and_sizes_preserve_outcomes_and_rejections() 
     for route in [Route::Contact, Route::Group, Route::Community] {
         for size in [ProfilePictureType::Preview, ProfilePictureType::Full] {
             let (found, _) = canonical_roundtrip_route(found_response(), None, route, size).await;
-            assert_eq!(found.unwrap().found().unwrap().id, "photo-7");
+            assert_eq!(
+                found.unwrap().found().unwrap().id,
+                "photo-7",
+                "route={route:?}, size={size:?}"
+            );
             for existing_id in [None, Some("photo-7")] {
                 for picture in [
                     None,
@@ -263,18 +283,21 @@ async fn picture_lookup_all_routes_and_sizes_preserve_outcomes_and_rejections() 
                         .build();
                     let (outcome, _) =
                         canonical_roundtrip_route(response, existing_id, route, size).await;
-                    let outcome = outcome.unwrap();
+                    let outcome = outcome.unwrap_or_else(|e| {
+                        panic!("route={route:?}, size={size:?}, existing_id={existing_id:?}: {e:?}")
+                    });
                     assert_eq!(
                         outcome,
                         if existing_id.is_some() {
                             ProfilePictureLookup::Unchanged
                         } else {
                             ProfilePictureLookup::NotFound
-                        }
+                        },
+                        "route={route:?}, size={size:?}, existing_id={existing_id:?}",
                     );
                     assert!(
                         outcome.into_found().is_none(),
-                        "no invented URL or local bytes"
+                        "no invented URL or local bytes: route={route:?}, size={size:?}, existing_id={existing_id:?}"
                     );
                 }
             }
@@ -291,7 +314,8 @@ async fn picture_lookup_all_routes_and_sizes_preserve_outcomes_and_rejections() 
                         .await
                         .0
                         .unwrap(),
-                    expected
+                    expected,
+                    "route={route:?}, size={size:?}, status={status}",
                 );
             }
             for nested in [false, true] {
@@ -305,23 +329,27 @@ async fn picture_lookup_all_routes_and_sizes_preserve_outcomes_and_rejections() 
                             ProfilePictureLookup::NotFound
                         } else {
                             ProfilePictureLookup::NotAuthorized
-                        }
+                        },
+                        "route={route:?}, size={size:?}, nested={nested}, code={code}",
                     );
                 }
                 for backoff in [None, Some(73)] {
                     let (result, original) =
                         canonical_roundtrip_route(refusal(429, nested, backoff), None, route, size)
                             .await;
-                    let error = result.unwrap_err();
-                    let rejection = error.server_rejection().unwrap();
-                    assert_eq!(rejection.code, 429);
-                    assert_eq!(rejection.text, "synthetic-refusal");
-                    assert_eq!(rejection.error_type, Some("wait"));
-                    assert_eq!(rejection.backoff, backoff);
+                    let context = format!(
+                        "route={route:?}, size={size:?}, nested={nested}, code=429, backoff={backoff:?}"
+                    );
+                    let error = result.expect_err(&context);
+                    let rejection = error.server_rejection().expect(&context);
+                    assert_eq!(rejection.code, 429, "{context}");
+                    assert_eq!(rejection.text, "synthetic-refusal", "{context}");
+                    assert_eq!(rejection.error_type, Some("wait"), "{context}");
+                    assert_eq!(rejection.backoff, backoff, "{context}");
                     let ContactError::Iq(IqError::ServerError { response, .. }) = error else {
-                        panic!("typed rejection lost")
+                        panic!("typed rejection lost: {context}")
                     };
-                    assert!(Arc::ptr_eq(response.as_arc(), &original));
+                    assert!(Arc::ptr_eq(response.as_arc(), &original), "{context}");
                 }
             }
         }

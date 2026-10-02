@@ -460,6 +460,10 @@ jobs:
           CARGO_ENCODED_RUSTFLAGS: ""
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: cargo run --locked --manifest-path tests/event-kind-consumer/Cargo.toml
+      - name: Build the standalone picture consumer at MSRV
+        env:
+          CARGO_BUILD_JOBS: "1"
+        run: cargo build --locked --release --manifest-path tests/fixtures/pictures_consumer/Cargo.toml
       - name: Publish test timings
         if: always()
         uses: actions/upload-artifact@v7

@@ -3,8 +3,8 @@ use std::{future::Future, pin::Pin, time::Duration};
 use whatsapp_rust::features::ProfilePictureRequest as FeatureRequest;
 use whatsapp_rust::wacore_binary::Jid;
 use whatsapp_rust::{
-    Client, ContactError, ProfilePictureLookup, ProfilePictureRequest, ProfilePictureTarget,
-    ProfilePictureType,
+    Client, ContactError, ErrorChainExt, ProfilePictureLookup, ProfilePictureRequest,
+    ProfilePictureTarget, ProfilePictureType,
 };
 
 fn boxed_lookup<'a>(
@@ -29,6 +29,9 @@ fn boxed_lookup<'a>(
 #[test]
 fn picture_lookup_public_imports_and_boxed_future_compile() {
     let _ = boxed_lookup;
+    // `server_rejection` is a trait method, including for downstream callers.
+    let rejection_code = |error: &ContactError| error.server_rejection().map(|r| r.code);
+    let _ = rejection_code;
     let jid = Jid::pn("15550000001");
     let request: FeatureRequest<'_> = ProfilePictureRequest::new(
         ProfilePictureTarget::Contact(&jid),

@@ -14,6 +14,11 @@
 //!   <picture id="123456789" url="https://..." direct_path="/v/..."/>
 //! </iq>
 //!
+//! <!-- Response (rate limited: typed rejection, not a lookup state) -->
+//! <iq from="s.whatsapp.net" id="..." type="result">
+//!   <picture><error code="429" text="rate-overlimit" type="wait" backoff="73"/></picture>
+//! </iq>
+//!
 //! <!-- Response (not found) -->
 //! <iq from="s.whatsapp.net" id="..." type="result">
 //!   <picture>
@@ -21,6 +26,11 @@
 //!   </picture>
 //! </iq>
 //! ```
+//!
+//! The embedded 429 produces a [`crate::request::IqError::ServerError`] source
+//! retaining text, type and optional backoff. Runtime `Client::execute` attaches
+//! the original stanza, as it does for an IQ-envelope rejection. Core parsing
+//! alone does not own or attach a runtime response stanza.
 
 use crate::iq::spec::IqSpec;
 use crate::iq::tctoken::build_tc_token_node;

@@ -22,6 +22,8 @@ All types remain exported through `whatsapp_rust` and `whatsapp_rust::features`.
 
 `preview=true` maps to `ProfilePictureType::Preview`; `false` maps to `Full`.
 Group wrapper errors now come from `ContactError`, not `GroupError`.
+Import `whatsapp_rust::ErrorChainExt` to call `server_rejection()` on the error;
+it is a trait method, not an inherent method.
 
 ```rust,ignore
 let outcome = client.contacts().lookup_picture(
@@ -107,7 +109,15 @@ under `.task/pictures/` in the task worktree (not bundled into source).
   wacore 1,733 passed / 1 ignored, both exit 0. Routed regressions and unchanged
   setter/removal controls passed without assertion or timeout weakening.
 
-Final metrics negatives, doctests, external consumer comparisons, Clippy,
-E2E compilation and current-head CI are reported in the PR.
+- Initial head metrics picture suite: 12 passed, including real raw/ordinary
+  parser/domain-error/streaming/cancel controls and the changed direct-spec
+  nested-429 failure counter. Public external-crate test: 2 passed.
+  Doctests: wacore 7 passed / 11 ignored; whatsapp-rust 30 passed / 16 ignored.
+- Configured Cubic/Greptile reviews were read. Added the required external
+  ErrorChainExt import, a precise core/runtime 429 wire doc, matrix diagnostics,
+  and fixture builds in the existing MSRV/WASM CI jobs (no new pipeline/job).
+
+Final external consumer comparisons, Clippy, E2E compilation and current-head
+CI are reported in the PR.
 The repository's native Binary Size hard gate remains authoritative for the
 full default-feature demo. No RAM/binary savings are inferred from API names.
