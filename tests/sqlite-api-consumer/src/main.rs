@@ -28,12 +28,18 @@ async fn capabilities(url: &str) -> Result<Arc<dyn Backend>> {
     Ok(Arc::new(account))
 }
 
+// DeviceStore exposes local futures on wasm32; retain the Send proof on native.
+#[cfg(not(target_arch = "wasm32"))]
+type OpeningFuture = Pin<Box<dyn Future<Output = Result<Arc<dyn Backend>>> + Send>>;
+#[cfg(target_arch = "wasm32")]
+type OpeningFuture = Pin<Box<dyn Future<Output = Result<Arc<dyn Backend>>>>>;
+
 fn main() {
     // Type erasure also proves downstream boxed-future/trait-object compatibility.
     // A vtable retains poll code for both native and WASM release measurements.
-    let future: Pin<Box<dyn Future<Output = Result<Arc<dyn Backend>>> + Send>> = Box::pin(
-        capabilities("file:sqlite_external_probe?mode=memory&cache=shared"),
-    );
+    let future: OpeningFuture = Box::pin(capabilities(
+        "file:sqlite_external_probe?mode=memory&cache=shared",
+    ));
     drop(std::hint::black_box(future));
     let config = SqliteDatabaseConfig::default().with_read_pool_size(0);
     drop(std::hint::black_box(SqliteDatabase::open(
