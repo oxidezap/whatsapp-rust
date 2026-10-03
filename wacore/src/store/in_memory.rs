@@ -85,7 +85,7 @@ impl Equivalent<BaseKeyKey> for BaseKeyKeyRef<'_> {
 }
 
 /// Stored msg-secret value: `(secret_bytes, expires_at_secs, message_ts_secs)`.
-type MsgSecretRow = (MessageSecret, i64, i64);
+type MsgSecretRow = (MessageSecretBytes, i64, i64);
 
 #[derive(Eq, Hash, PartialEq)]
 struct MsgSecretKey {
@@ -1254,24 +1254,12 @@ impl MsgSecretStore for InMemoryBackend {
         Ok(stored)
     }
 
-    async fn get_msg_secret(
+    async fn get_stored_msg_secret(
         &self,
         chat: &str,
         sender: &str,
         msg_id: &str,
-    ) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .get_msg_secret_with_ts(chat, sender, msg_id)
-            .await?
-            .map(|(secret, _)| secret))
-    }
-
-    async fn get_msg_secret_with_ts(
-        &self,
-        chat: &str,
-        sender: &str,
-        msg_id: &str,
-    ) -> Result<Option<(Vec<u8>, i64)>> {
+    ) -> Result<Option<StoredMessageSecret>> {
         Ok(self
             .state
             .lock()
@@ -1282,7 +1270,9 @@ impl MsgSecretStore for InMemoryBackend {
                 sender,
                 msg_id,
             })
-            .map(|(secret, _, message_ts)| (secret.to_vec(), *message_ts)))
+            .map(|(secret, _, message_ts)| {
+                StoredMessageSecret::new(MessageSecret::from_bytes(*secret), Some(*message_ts))
+            }))
     }
 
     async fn delete_expired_msg_secrets(&self, cutoff_timestamp: i64) -> Result<u32> {

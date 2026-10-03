@@ -206,10 +206,10 @@ impl Client {
         // LID/PN alternate.
         let buffered = self
             .msg_secret_buffer
-            .lookup(&chat_for_lookup, &original_sender_str, target_id)
+            .lookup_stored(&chat_for_lookup, &original_sender_str, target_id)
             .or_else(|| {
                 fallback_original_sender.as_ref().and_then(|alt| {
-                    self.msg_secret_buffer.lookup(
+                    self.msg_secret_buffer.lookup_stored(
                         &chat_for_lookup,
                         &alt.to_non_ad_string(),
                         target_id,
@@ -219,7 +219,7 @@ impl Client {
         let store_secret = match buffered {
             Some(found) => Some(found),
             None => match backend
-                .get_msg_secret_with_ts(&chat_for_lookup, &original_sender_str, target_id)
+                .get_stored_msg_secret(&chat_for_lookup, &original_sender_str, target_id)
                 .await
             {
                 Ok(Some(found)) => Some(found),
@@ -227,7 +227,7 @@ impl Client {
                     Some(alt) => {
                         let alt_str = alt.to_non_ad_string();
                         match backend
-                            .get_msg_secret_with_ts(&chat_for_lookup, &alt_str, target_id)
+                            .get_stored_msg_secret(&chat_for_lookup, &alt_str, target_id)
                             .await
                         {
                             Ok(found) => found,
@@ -258,7 +258,10 @@ impl Client {
         // timestamp yields `0` here, which the check reads as unknown and
         // leaves permissive.
         let (secret, parent_ts) = match store_secret {
-            Some((secret, ts)) => (secret, ts),
+            Some(stored) => (
+                stored.secret.into_bytes().to_vec(),
+                stored.message_ts.unwrap_or(0),
+            ),
             None => {
                 let alternate = fallback_original_sender
                     .as_ref()

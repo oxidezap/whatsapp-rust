@@ -15,6 +15,11 @@ pub enum StoreError {
     #[error("data validation failed: {0}")]
     Validation(String),
 
+    /// Invalid persisted message-secret data. The source contains only the
+    /// observed length, never the key material.
+    #[error("invalid stored message secret: {0}")]
+    InvalidMessageSecret(#[source] crate::types::message_secret::InvalidMessageSecret),
+
     #[error("database connection error")]
     Connection(#[source] Box<dyn std::error::Error + Send + Sync>),
 

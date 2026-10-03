@@ -9,6 +9,8 @@ pub use waproto::whatsapp::message::event_response_message::EventResponseType;
 use crate::client::Client;
 use crate::send::{SendError, SendResult};
 
+super::creation::creation_types!(CreatedEvent, EventRef, event_ref);
+
 /// Parameters for creating an event message. Only `name` is required.
 #[derive(Debug, Clone, Default)]
 pub struct EventCreationParams {
@@ -31,13 +33,23 @@ impl<'a> Events<'a> {
         Self { client }
     }
 
-    /// Create an event. Returns the `message_secret` the creator needs to decrypt
-    /// later responses (RSVPs) via [`wacore::event::decrypt_event_response_with_secret`].
+    /// Create an E2E event. Its named result carries the secret needed to decrypt
+    /// RSVPs via [`wacore::event::decrypt_event_response_with_secret`].
+    ///
+    /// ```no_run
+    /// # use whatsapp_rust::{Client, Jid, EventCreationParams, EventResponseType};
+    /// # async fn example(client: &Client, chat: &Jid) -> whatsapp_rust::anyhow::Result<()> {
+    /// let created = client.events().create(chat, EventCreationParams {
+    ///     name: "Launch".into(), ..Default::default()
+    /// }).await?;
+    /// client.events().respond(&created.event_ref()?, EventResponseType::Going, None).await?;
+    /// # Ok(()) }
+    /// ```
     pub async fn create(
         &self,
         to: impl Into<Jid>,
         params: EventCreationParams,
-    ) -> Result<(SendResult, Vec<u8>), SendError> {
+    ) -> Result<CreatedEvent, SendError> {
         let to = &to.into();
         if params.name.trim().is_empty() {
             return Err(SendError::InvalidRequest(
@@ -53,41 +65,32 @@ impl<'a> Events<'a> {
         // Events carry a per-message secret (like polls); responders derive their
         // RSVP encryption key from it. WA Web rejects an event without one
         // (Events/ValidationError MISSING_MESSAGE_SECRET).
-        let message_secret: Vec<u8> = {
+        let message_secret = {
             use rand::Rng;
-            let mut secret = vec![0u8; 32];
+            let mut secret = [0u8; wacore::reporting_token::MESSAGE_SECRET_SIZE];
             rand::rng().fill_bytes(&mut secret);
-            secret
+            crate::MessageSecret::from_bytes(secret)
         };
         message.message_context_info = buffa::MessageField::some(wa::MessageContextInfo {
-            message_secret: Some(message_secret.clone()),
+            message_secret: Some(message_secret.as_bytes().to_vec()),
             ..Default::default()
         });
 
-        let result = self.client.send_message(to, message).await?;
-        Ok((result, message_secret))
+        let (result, creator) = self.client.send_creation_message(to, message).await?;
+        Ok(CreatedEvent::new(result, creator, message_secret))
     }
 
-    /// RSVP to an event. `message_secret` is the event's secret (from its creation
-    /// message); `event_creator_jid` is who created the event.
+    /// RSVP using the creation's addressing, creator and validated secret.
     pub async fn respond(
         &self,
-        chat_jid: impl Into<Jid>,
-        event_msg_id: &str,
-        event_creator_jid: &Jid,
-        message_secret: &[u8],
+        target: &EventRef<'_>,
         response: EventResponseType,
         extra_guest_count: Option<i32>,
     ) -> Result<SendResult, SendError> {
-        let chat_jid = &chat_jid.into();
-        // The event secret keys the RSVP's HKDF; a wrong length is caller error,
-        // not an internal failure, so reject it before the encrypt call.
-        if message_secret.len() != 32 {
-            return Err(SendError::InvalidRequest(format!(
-                "event message_secret must be 32 bytes, got {}",
-                message_secret.len()
-            )));
-        }
+        let chat_jid = target.message().chat();
+        let event_msg_id = target.message().id().as_str();
+        let event_creator_jid = target.creator();
+        let message_secret = target.secret().as_bytes();
         let my_jid = self.client.pn().ok_or(SendError::NotLoggedIn)?;
         let my_base = my_jid.to_non_ad();
 
@@ -111,7 +114,7 @@ impl<'a> Events<'a> {
             &responder_str,
         )?;
 
-        let from_me = my_base.is_same_user_as(event_creator_jid);
+        let from_me = target.message().from_me();
         let enc = wa::message::EncEventResponseMessage {
             event_creation_message_key: buffa::MessageField::some(wa::MessageKey {
                 remote_jid: Some(chat_jid.to_string()),
@@ -133,6 +136,38 @@ impl<'a> Events<'a> {
         };
 
         self.client.send_message(chat_jid, message).await
+    }
+
+    /// Explicit raw addressing interop. Rejects malformed secret lengths before
+    /// encryption; prefer `respond` with received or created event metadata.
+    pub async fn respond_raw(
+        &self,
+        chat_jid: impl Into<Jid>,
+        event_msg_id: &str,
+        event_creator_jid: &Jid,
+        message_secret: &[u8],
+        response: EventResponseType,
+        extra_guest_count: Option<i32>,
+    ) -> Result<SendResult, SendError> {
+        let chat = chat_jid.into();
+        let secret = crate::MessageSecret::try_from(message_secret)?;
+        let own = self.client.pn().ok_or(SendError::NotLoggedIn)?.to_non_ad();
+        let message = crate::MessageRef::new(
+            &chat,
+            crate::MessageId::new(event_msg_id)?,
+            Some(event_creator_jid),
+            own.is_same_user_as(event_creator_jid)
+                || self
+                    .client
+                    .lid()
+                    .is_some_and(|lid| lid.is_same_user_as(event_creator_jid)),
+        )?;
+        self.respond(
+            &EventRef::new(message, event_creator_jid, &secret)?,
+            response,
+            extra_guest_count,
+        )
+        .await
     }
 
     /// The responder (self) JID keys the RSVP's HKDF/AAD, so it must use the event
