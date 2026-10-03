@@ -44,6 +44,9 @@ pub enum SendError {
     /// Invalid or incomplete target addressing, rejected before sending.
     #[error("{0}")]
     MessageRef(#[from] crate::MessageRefError),
+    /// Malformed raw message-secret material, rejected before encryption.
+    #[error("{0}")]
+    InvalidSecret(#[from] crate::InvalidMessageSecret),
     /// Connection/transport/IQ failure (embeds the shared base error).
     // No `#[from]`: the manual `From<ClientError>` impl flattens a bare `?` so
     // `NotLoggedIn`/`Iq` stay matchable instead of nesting under `Client(..)`.
@@ -309,6 +312,7 @@ struct DmBranchRequest<'a> {
     is_status_addon: bool,
     device_freshness: crate::cache::Freshness,
     borrowed_message_id: bool,
+    creation_sender: Option<&'a mut Option<Jid>>,
 }
 
 struct GroupDirectBranchRequest<'a> {
@@ -909,6 +913,9 @@ pub(crate) struct SendPipelineOptions<'a> {
     pub(crate) group_history_notice: bool,
     /// Capture the exact fanout phash before registering an ACK waiter.
     pub(crate) history_expected_phash: Option<&'a mut Option<wacore_binary::CompactString>>,
+    /// Capture the identity actually selected by the encryption branch, not a
+    /// later metadata lookup that can change namespaces after the send.
+    pub(crate) creation_sender: Option<&'a mut Option<Jid>>,
 }
 
 /// The devices a freshly resolved fan-out holds that the sent stanza did not.
@@ -1407,8 +1414,13 @@ impl Client {
         let message = std::sync::Arc::new(message);
         async move {
             // Box::pin: the inner future carries ~1 KB of pre-encrypt locals.
-            Box::pin(self.send_message_with_options_inner(to, message, SendOptions::default()))
-                .await
+            Box::pin(self.send_message_with_options_inner(
+                to,
+                message,
+                SendOptions::default(),
+                None,
+            ))
+            .await
         }
     }
 
@@ -1422,8 +1434,13 @@ impl Client {
         let to = to.into();
         let message = std::sync::Arc::new(wa::Message::text(text));
         async move {
-            Box::pin(self.send_message_with_options_inner(to, message, SendOptions::default()))
-                .await
+            Box::pin(self.send_message_with_options_inner(
+                to,
+                message,
+                SendOptions::default(),
+                None,
+            ))
+            .await
         }
     }
 
@@ -1448,7 +1465,8 @@ impl Client {
         // built straight into the allocation the result hands back.
         let body = std::sync::Arc::new(message.get_base_message().prepare_for_forward());
         async move {
-            Box::pin(self.send_message_with_options_inner(to, body, SendOptions::default())).await
+            Box::pin(self.send_message_with_options_inner(to, body, SendOptions::default(), None))
+                .await
         }
     }
 
@@ -1464,7 +1482,33 @@ impl Client {
         // Sync-prologue `Arc` + Box::pin as in send_message.
         let to = to.into();
         let message = std::sync::Arc::new(message);
-        async move { Box::pin(self.send_message_with_options_inner(to, message, options)).await }
+        async move { Box::pin(self.send_message_with_options_inner(to, message, options, None)).await }
+    }
+
+    pub(crate) async fn send_creation_message(
+        &self,
+        to: &Jid,
+        message: wa::Message,
+    ) -> Result<(SendResult, Jid), SendError> {
+        // These references address E2E creations. Raw newsletter publication
+        // remains available through send_message and the newsletter facade.
+        if to.is_newsletter() || to.is_broadcast_list() || to.is_status_broadcast() {
+            return Err(SendError::InvalidRequest(
+                "creation requires an E2E chat".into(),
+            ));
+        }
+        let mut creator = None;
+        let result = Box::pin(self.send_message_with_options_inner(
+            to.clone(),
+            std::sync::Arc::new(message),
+            SendOptions::default(),
+            Some(&mut creator),
+        ))
+        .await?;
+        let creator = creator.ok_or_else(|| {
+            SendError::InvalidRequest("creation send did not report a sender identity".into())
+        })?;
+        Ok((result, creator.to_non_ad()))
     }
 
     #[cfg_attr(
@@ -1486,6 +1530,7 @@ impl Client {
         to: Jid,
         mut message: std::sync::Arc<wa::Message>,
         options: SendOptions,
+        creation_sender: Option<&mut Option<Jid>>,
     ) -> Result<SendResult, SendError> {
         #[cfg(feature = "tracing")]
         self.record_identity_on_span(&tracing::Span::current());
@@ -1584,6 +1629,7 @@ impl Client {
                     stanza_type: stanza_type_override,
                     group_metadata_freshness,
                     device_freshness,
+                    creation_sender,
                     ..Default::default()
                 },
             )
@@ -2686,6 +2732,7 @@ impl Client {
             group_direct_recipients,
             group_history_notice,
             history_expected_phash,
+            mut creation_sender,
         } = options;
         // Callers that already stamped their message hand the instant down; the
         // rest sample here so the pipeline below still has exactly one.
@@ -2830,9 +2877,16 @@ impl Client {
                 is_status_addon,
                 device_freshness,
                 borrowed_message_id,
+                creation_sender: creation_sender.as_deref_mut(),
             }))
             .await?
         };
+
+        if let Some(capture) = creation_sender
+            && let Some(sender) = outbound_group_sender_identity.as_ref()
+        {
+            *capture = Some(sender.clone());
+        }
 
         // The outbound advance must be durable BEFORE the stanza hits the wire:
         // reusing an outbound counter reuses its message key + IV. Counters are
@@ -3485,6 +3539,7 @@ impl Client {
             is_status_addon,
             device_freshness,
             borrowed_message_id,
+            creation_sender,
         } = request;
         let mut should_issue_tc_token_after_send = false;
         let (prepared, dm_devices) = {
@@ -3520,6 +3575,18 @@ impl Client {
                 .pn
                 .as_ref()
                 .ok_or(ClientError::NotLoggedIn)?;
+
+            if let Some(capture) = creation_sender {
+                *capture = Some(if to.is_bot() {
+                    device_snapshot
+                        .lid
+                        .as_ref()
+                        .ok_or(ClientError::NotLoggedIn)?
+                        .clone()
+                } else {
+                    own_jid.clone()
+                });
+            }
 
             // PN→LID mapping (WA Web: ManagePhoneNumberMappingJob)
             if to.is_pn() && self.lid_pn_cache.get_current_lid(&to.user).await.is_none() {
@@ -4005,6 +4072,7 @@ pub(crate) fn dm_stanza_to(recipient_bare: &Jid, to: &Jid) -> Jid {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    mod creation_tests;
     mod message_reference_tests;
     mod privacy_tokens;
 
@@ -9478,11 +9546,13 @@ mod tests {
         );
 
         let options = ["yes".to_string(), "no".to_string()];
-        let (poll, secret) = client
+        let created = client
             .polls()
             .create(peer_pn.clone(), "lunch?", &options, 1)
             .await
             .expect("connected test client should complete the poll");
+        let poll = created.send_result();
+        let secret = created.secret();
         let creation = poll
             .message
             .poll_creation_message_v3
@@ -9495,7 +9565,7 @@ mod tests {
                 .message_context_info
                 .as_option()
                 .and_then(|c| c.message_secret.as_deref()),
-            Some(secret.as_slice()),
+            Some(secret.as_bytes().as_slice()),
             "a poll's own secret is part of the message it built, so the wire \
              copy and the reported one agree on it"
         );

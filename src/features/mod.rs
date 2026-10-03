@@ -9,6 +9,7 @@ mod chatstate;
 mod comments;
 mod community;
 mod contacts;
+mod creation;
 mod events;
 pub(crate) mod favorites;
 mod group_history;
@@ -75,7 +76,7 @@ pub use contacts::{
     UsyncSubprotocolError, VerifiedName,
 };
 
-pub use events::{EventCreationParams, EventResponseType, Events};
+pub use events::{CreatedEvent, EventCreationParams, EventRef, EventResponseType, Events};
 
 pub(crate) use group_history::group_history_bundle_fits_current_limits;
 pub use group_history::{GroupHistoryRetryToken, GroupHistoryShareOutcome, GroupHistorySkipReason};
@@ -115,7 +116,7 @@ pub use newsletter::{
     NewsletterRole, NewsletterState, NewsletterVerification,
 };
 
-pub use polls::{PollError, PollOptionResult, PollVoteCiphertext, Polls};
+pub use polls::{CreatedPoll, PollError, PollOptionResult, PollRef, PollVoteCiphertext, Polls};
 
 pub use presence::{Presence, PresenceError, PresencePolicy, PresenceStatus};
 
