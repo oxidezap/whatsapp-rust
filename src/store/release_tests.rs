@@ -174,7 +174,8 @@ async fn host_raw_handles_keep_their_identity_without_pinning_observation() {
     let original: Arc<dyn Backend> = Arc::new(backend);
     let pm = PersistenceManager::new(original.clone()).await.unwrap();
     let snapshot = pm.get_device_snapshot();
-    let device_arc = pm.get_device_arc().await;
+    let second_snapshot = pm.get_device_snapshot();
+    assert!(Arc::ptr_eq(&snapshot, &second_snapshot));
     let literal = Device {
         core: snapshot.core.clone(),
         backend: original.clone(),
@@ -196,7 +197,7 @@ async fn host_raw_handles_keep_their_identity_without_pinning_observation() {
         !dropped.load(Ordering::SeqCst),
         "host-owned handles remain outside the boundary"
     );
-    drop((snapshot, device_arc, literal, original));
+    drop((snapshot, second_snapshot, literal, original));
     assert!(dropped.load(Ordering::SeqCst));
 }
 

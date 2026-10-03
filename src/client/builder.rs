@@ -346,6 +346,8 @@ impl ClientBuilder {
     }
 
     /// Register a handler for one encrypted payload type before the client starts.
+    /// The last registration for the same type wins. Custom handlers take
+    /// precedence over built-in handlers; the registry is frozen at build time.
     pub fn with_enc_handler<H>(mut self, payload_type: impl Into<String>, handler: H) -> Self
     where
         H: EncHandler + 'static,
@@ -355,7 +357,9 @@ impl ClientBuilder {
         self
     }
 
-    /// Register an already-shared encrypted payload handler.
+    /// Register an already-shared encrypted payload handler, preserving its Arc
+    /// identity. Uses the same last-registration-wins rule as
+    /// [`Self::with_enc_handler`].
     pub fn with_enc_handler_arc(
         mut self,
         payload_type: impl Into<String>,
@@ -742,7 +746,7 @@ impl ClientBuilder {
         let mut construction = ClientConstructionGuard::new(Arc::clone(&client));
 
         if !self.custom_enc_handlers.is_empty() {
-            let _ = client.custom_enc_handlers.set(self.custom_enc_handlers);
+            let _ = client.install_enc_handlers(self.custom_enc_handlers);
         }
         if let Some(hook) = self.inbound_durability_hook {
             let _ = client.inbound_durability_hook.set(hook);

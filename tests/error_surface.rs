@@ -268,10 +268,7 @@ fn wrapping_variants_preserve_their_typed_source() {
     assert_source_is::<IqError>(&CommunityError::Iq(rejected(403)), "CommunityError::Iq");
     assert_source_is::<IqError>(&TcTokenError::Iq(rejected(403)), "TcTokenError::Iq");
 
-    let mex = || MexError::ExtensionError {
-        code: 1,
-        message: "denied".to_string(),
-    };
+    let mex = || MexError::Request(rejected(403));
     assert_source_is::<MexError>(&GroupError::Mex(mex()), "GroupError::Mex");
     assert_source_is::<MexError>(&CommunityError::Mex(mex()), "CommunityError::Mex");
     assert_source_is::<MexError>(&NewsletterError::Mex(mex()), "NewsletterError::Mex");
@@ -547,10 +544,30 @@ fn internal_anyhow_still_exposes_its_head() {
 /// the IQ `code` attribute. Reporting it as a server rejection would make the
 /// number mean two things.
 #[test]
-fn mex_extension_error_is_not_reported_as_a_server_rejection() {
-    let err = GroupError::Mex(MexError::ExtensionError {
+fn mex_graphql_error_is_not_reported_as_a_server_rejection() {
+    use whatsapp_rust::wacore::iq::{
+        mex::{MexDoc, MexFatalError, MexQuerySpec},
+        spec::IqSpec,
+    };
+    let spec = MexQuerySpec::new(
+        MexDoc {
+            name: "ConsumerQuery",
+            id: "123456789",
+        },
+        &(),
+    )
+    .unwrap();
+    let node = NodeBuilder::new("iq")
+        .children([NodeBuilder::new("result")
+            .bytes(br#"{"errors":[{"message":"denied","extensions":{"error_code":403}}]}"#.to_vec())
+            .build()])
+        .build();
+    let parse = spec.parse_response(&node.as_node_ref()).unwrap_err();
+    assert_eq!(parse.downcast_ref::<MexFatalError>().unwrap().code, 403);
+    let err = GroupError::Mex(MexError::GraphQl {
         code: 403,
         message: "denied".to_string(),
+        source: Box::new(IqError::ParseError(parse)),
     });
     assert_eq!(err.server_rejection(), None);
     // It is still recoverable by type, just not under a category it does not
@@ -558,8 +575,21 @@ fn mex_extension_error_is_not_reported_as_a_server_rejection() {
     let source = StdError::source(&err).expect("source preserved");
     assert!(matches!(
         source.downcast_ref::<MexError>(),
-        Some(MexError::ExtensionError { code: 403, .. })
+        Some(MexError::GraphQl { code: 403, .. })
     ));
+    let iq = source.source().unwrap().downcast_ref::<IqError>().unwrap();
+    let fatal = iq
+        .source()
+        .unwrap()
+        .downcast_ref::<MexFatalError>()
+        .unwrap();
+    assert_eq!(fatal.query, "ConsumerQuery");
+    assert_eq!(fatal.message, "denied");
+    // A real IQ refusal inside MEX remains a server rejection.
+    assert_eq!(
+        code_of(&GroupError::Mex(MexError::Request(rejected(403)))),
+        Some(403)
+    );
 }
 
 /// An IQ `code` and an HTTP status are different layers. A stanza the chat

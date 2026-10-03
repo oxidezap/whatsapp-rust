@@ -10,6 +10,9 @@ use whatsapp_rust::voip_control::{CallDirection, MediaEvent, MediaSessionKey, Vo
 #[test]
 fn external_backend_and_receiver_imports_remain_public() {
     let _acquire = consumer::acquire;
+    let _receive = consumer::receive;
+    let _stream = consumer::stream;
+    let _task = consumer::consumer_task;
     let _transport = consumer::install_transport;
     let key = MediaSessionKey::builder()
         .call_id("CALL-EVENT-CONSUMER".into())

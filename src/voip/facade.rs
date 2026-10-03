@@ -4720,10 +4720,9 @@ impl CallHandle {
     /// Acquisition is synchronous, so cancelling a subsequent `recv()` does not restore it either.
     /// Queued events remain available if the receiver is first taken after the call ends.
     ///
-    /// This is not broadcast or a durable subscription. The returned `async_channel::Receiver`
-    /// can itself be cloned by the host, but those clones compete for the **same** queue, rather
-    /// than observing independent event streams. Backend capacity and overflow policies are
-    /// unchanged; there is no exactly-once processing or redelivery guarantee. Use
+    /// The owned [`super::CallEvents`] cannot be cloned and receives with exclusive access.
+    /// This is not broadcast or a durable subscription. Backend capacity and overflow policies
+    /// are unchanged; there is no exactly-once processing or redelivery guarantee. Use
     /// [`wait_ended`](Self::wait_ended) for sticky completion independent of event consumption.
     ///
     /// ```no_run
@@ -4741,8 +4740,12 @@ impl CallHandle {
     /// let independent_observer = call.events();
     /// # }
     /// ```
-    pub fn take_events(&self) -> Option<async_channel::Receiver<CallEvent>> {
-        self.events.lock().unwrap_or_else(|e| e.into_inner()).take()
+    pub fn take_events(&self) -> Option<super::CallEvents> {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map(super::CallEvents::new)
     }
 
     /// Resolve once the call's media task has finished (relay disconnect, send failure, or hangup).
@@ -4794,7 +4797,7 @@ mod event_ownership_tests {
                 })
             })
             .collect();
-        let receivers: Vec<_> = workers
+        let mut receivers: Vec<_> = workers
             .into_iter()
             .filter_map(|worker| worker.join().unwrap())
             .collect();
@@ -4822,26 +4825,33 @@ mod event_ownership_tests {
         );
     }
 
-    #[test]
-    fn host_receiver_clones_are_competitive_not_broadcast() {
+    #[tokio::test]
+    async fn stream_and_recv_share_order_and_drain_before_closed() {
+        use futures::StreamExt;
+
         let (handle, sender) = handle();
-        let receiver = handle.take_events().unwrap();
-        let competitor = receiver.clone();
+        let mut events = handle.take_events().unwrap();
+        assert!(futures::poll!(std::pin::pin!(events.next())).is_pending());
         sender.try_send(CallEvent::RelayAllocated).unwrap();
-        assert_eq!(receiver.try_recv(), Ok(CallEvent::RelayAllocated));
+        sender
+            .try_send(CallEvent::MediaSetupFailed("synthetic".into()))
+            .unwrap();
+        sender.close();
+        assert_eq!(events.next().await, Some(CallEvent::RelayAllocated));
         assert_eq!(
-            competitor.try_recv(),
-            Err(async_channel::TryRecvError::Empty)
+            events.recv().await,
+            Ok(CallEvent::MediaSetupFailed("synthetic".into()))
         );
-        sender.try_send(CallEvent::RelayAllocated).unwrap();
-        assert_eq!(competitor.try_recv(), Ok(CallEvent::RelayAllocated));
-        assert_eq!(receiver.try_recv(), Err(async_channel::TryRecvError::Empty));
+        assert_eq!(events.next().await, None);
+        assert_eq!(events.recv().await, Err(async_channel::RecvError));
+        assert_eq!(events.next().await, None);
+        assert!(handle.take_events().is_none());
     }
 
     #[tokio::test]
     async fn cancelled_recv_does_not_restore_acquisition() {
         let (handle, sender) = handle();
-        let receiver = handle.take_events().unwrap();
+        let mut receiver = handle.take_events().unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(1), receiver.recv())
                 .await
@@ -4859,7 +4869,7 @@ mod event_ownership_tests {
         sender.close();
         handle.ended.notify();
         let clone = handle.clone();
-        let receiver = clone.take_events().unwrap();
+        let mut receiver = clone.take_events().unwrap();
         for _ in 0..2 {
             tokio::time::timeout(Duration::from_secs(1), handle.wait_ended())
                 .await
@@ -4874,6 +4884,35 @@ mod event_ownership_tests {
             Err(async_channel::TryRecvError::Closed)
         );
         assert!(handle.take_events().is_none());
+    }
+
+    #[test]
+    fn bounded_queue_overflow_policy_is_unchanged() {
+        let (handle, sender) = handle();
+        let mut events = handle.take_events().unwrap();
+        for _ in 0..8 {
+            sender.try_send(CallEvent::RelayAllocated).unwrap();
+        }
+        assert!(matches!(
+            sender.try_send(CallEvent::RelayAllocated),
+            Err(async_channel::TrySendError::Full(_))
+        ));
+        for _ in 0..8 {
+            assert_eq!(events.try_recv(), Ok(CallEvent::RelayAllocated));
+        }
+        assert_eq!(events.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn producer_close_wakes_pending_stream() {
+        use futures::StreamExt;
+
+        let (handle, sender) = handle();
+        let mut events = handle.take_events().unwrap();
+        let mut pending = std::pin::pin!(events.next());
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        sender.close();
+        assert_eq!(pending.await, None);
     }
 
     #[test]
@@ -7024,7 +7063,7 @@ mod tests {
         );
 
         // Whatever the stream carries, none of it may claim the media setup failed.
-        let events = handle.take_events().expect("first acquisition");
+        let mut events = handle.take_events().expect("first acquisition");
         while let Ok(event) = events.try_recv() {
             assert!(
                 !matches!(event, CallEvent::MediaSetupFailed(_)),
@@ -7083,7 +7122,7 @@ mod tests {
             "a dial that refuses must fail the attach, got {res:?}"
         );
 
-        let events = handle.take_events().expect("first acquisition");
+        let mut events = handle.take_events().expect("first acquisition");
         let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
             .await
             .expect("the dial's reason must reach the handle, not only its caller")
@@ -10745,7 +10784,7 @@ mod tests {
             "a refusing provider must surface as a Setup error, got {res:?}"
         );
 
-        let events = handle.take_events().expect("first acquisition");
+        let mut events = handle.take_events().expect("first acquisition");
         let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
             .await
             .expect("the reason must reach the handle rather than only the log")
@@ -12966,7 +13005,7 @@ mod control_only_tests {
             generation,
             peer_video.clone()
         ));
-        let events = handle.take_events().expect("first acquisition");
+        let mut events = handle.take_events().expect("first acquisition");
         assert_eq!(events.try_recv(), Ok(peer_video));
 
         // Counters the backend sets are what the handle reports.

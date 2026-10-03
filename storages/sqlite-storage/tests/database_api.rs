@@ -65,7 +65,7 @@ async fn settings(db: &SqliteDatabase) -> Settings {
 #[tokio::test]
 async fn single_account_defaults_and_custom_configuration() {
     let fixture = Fixture::new();
-    let store = SqliteStore::new(&fixture.url()).await.unwrap();
+    let store = SqliteStore::open(&fixture.url()).await.unwrap();
     assert_eq!(store.device_id(), 1);
     assert!(!store.exists().await.unwrap());
     assert_eq!(store.create().await.unwrap(), 1);
@@ -86,7 +86,10 @@ async fn single_account_defaults_and_custom_configuration() {
         busy_timeout: std::time::Duration::from_millis(75),
         ..Default::default()
     };
-    let store = SqliteStore::open(&fixture.url(), custom).await.unwrap();
+    let store = SqliteDatabase::open(&fixture.url(), custom)
+        .await
+        .unwrap()
+        .store(1);
     let actual = settings(&store.database()).await;
     assert_eq!(actual.cache_size, -128);
     assert_eq!(actual.synchronous, 2);
@@ -254,6 +257,124 @@ async fn pool_reporting_and_barrier_are_not_per_account() {
         Arc::new(store)
     }
     assert!(backend(b).exists().await.unwrap());
+}
+
+#[tokio::test]
+async fn file_close_reopen_preserves_accounts_and_adapter_rows() {
+    let fixture = Fixture::new();
+    let db = SqliteDatabase::open(&fixture.url(), Default::default())
+        .await
+        .unwrap();
+    let a = db.provision_device(1).await.unwrap();
+    let b = db.create_device().await.unwrap();
+    let b_id = b.device_id();
+    a.put_session("15550000001.1", b"first").await.unwrap();
+    b.put_session("15550000001.1", b"second").await.unwrap();
+    let a_identity = a.load().await.unwrap().unwrap().identity_key.public_key;
+    let b_identity = b.load().await.unwrap().unwrap().identity_key.public_key;
+    let shared = db.shared();
+    shared.run(|conn| {
+        diesel::sql_query("CREATE TABLE external_adapter (device_id INTEGER PRIMARY KEY REFERENCES device(id) ON DELETE CASCADE, value TEXT NOT NULL)")
+            .execute(conn).map_err(db_err)?;
+        diesel::sql_query("INSERT INTO external_adapter VALUES (1, 'adapter')")
+            .execute(conn).map_err(db_err)?;
+        diesel::sql_query("UPDATE device SET pn = '15550000001@s.whatsapp.net', lid = '10000000001@lid', push_name = 'Fixture' WHERE id = 1")
+            .execute(conn).map_err(db_err)?;
+        Ok(())
+    }).await.unwrap();
+    drop(shared);
+    drop(a);
+    drop(b);
+    drop(db);
+
+    // A fresh open, not merely another scoped handle on the original pools.
+    let db = SqliteDatabase::open(&fixture.url(), Default::default())
+        .await
+        .unwrap();
+    let a = db.store(1);
+    let b = db.store(b_id);
+    assert_eq!(
+        a.get_session("15550000001.1").await.unwrap().unwrap(),
+        b"first".as_slice()
+    );
+    assert_eq!(
+        b.get_session("15550000001.1").await.unwrap().unwrap(),
+        b"second".as_slice()
+    );
+    assert_eq!(
+        a.load().await.unwrap().unwrap().identity_key.public_key,
+        a_identity
+    );
+    assert_eq!(
+        b.load().await.unwrap().unwrap().identity_key.public_key,
+        b_identity
+    );
+    let listed = db.list_devices().await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(
+        listed[0].pn.as_ref().unwrap().to_string(),
+        "15550000001@s.whatsapp.net"
+    );
+    assert_eq!(
+        listed[0].lid.as_ref().unwrap().to_string(),
+        "10000000001@lid"
+    );
+    assert_eq!(listed[0].push_name, "Fixture");
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        value: String,
+    }
+    let row: Row = db
+        .shared()
+        .read(|conn| {
+            diesel::sql_query("SELECT value FROM external_adapter WHERE device_id = 1")
+                .get_result(conn)
+                .map_err(db_err)
+        })
+        .await
+        .unwrap();
+    assert_eq!(row.value, "adapter");
+}
+
+#[tokio::test]
+async fn external_adapter_keeps_resources_alive_until_its_last_reference() {
+    let fixture = Fixture::new();
+    let witness = Arc::new(());
+    let weak = Arc::downgrade(&witness);
+    let barrier: CommitBarrierHook = Arc::new(move || {
+        let _keep_alive = &witness;
+        Box::pin(async { Ok(()) })
+    });
+    let db = SqliteDatabase::open(
+        &fixture.url(),
+        SqliteDatabaseConfig::default().with_commit_barrier(barrier),
+    )
+    .await
+    .unwrap();
+    let store = db.provision_device(1).await.unwrap();
+    let adapter = db.shared();
+    drop(db);
+    assert!(store.exists().await.unwrap());
+    drop(store);
+    assert!(weak.upgrade().is_some(), "adapter retains the same barrier");
+    adapter
+        .run(|conn| {
+            diesel::sql_query("CREATE TABLE external_adapter (value INTEGER)")
+                .execute(conn)
+                .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let clone = adapter.clone();
+    drop(adapter);
+    assert!(weak.upgrade().is_some());
+    drop(clone);
+    assert!(
+        weak.upgrade().is_none(),
+        "last adapter releases the barrier"
+    );
 }
 
 #[tokio::test]

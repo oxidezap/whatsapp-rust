@@ -20,7 +20,7 @@ use std::task::Poll;
 use std::time::Duration;
 use wacore::appstate::processor::AppStateMutationMAC;
 use wacore::store::traits::{AppSyncStore, DeviceInfo, DeviceListRecord, ProtocolStore};
-use whatsapp_rust_sqlite_storage::{SqliteStore, SqliteStoreConfig};
+use whatsapp_rust_sqlite_storage::{SqliteDatabaseConfig, SqliteStore};
 
 fn main() {
     divan::main();
@@ -121,11 +121,12 @@ fn harness() -> &'static Harness {
         remove_db_files(&path);
         let url = path.to_str().expect("utf-8").to_owned();
         let store = runtime
-            .block_on(SqliteStore::with_config(
+            .block_on(whatsapp_rust_sqlite_storage::SqliteDatabase::open(
                 &url,
-                SqliteStoreConfig::default().with_read_pool_size(4),
+                SqliteDatabaseConfig::default().with_read_pool_size(4),
             ))
-            .expect("open store");
+            .expect("open store")
+            .store(1);
         runtime.block_on(async {
             wacore::store::traits::DeviceStore::create(&store)
                 .await

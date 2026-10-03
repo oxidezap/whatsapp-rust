@@ -1,6 +1,5 @@
 //! Public lifecycle contracts; no network, private state, or SQLite required.
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use whatsapp_rust::bot::{Bot, BotRunOutcome};
@@ -92,15 +91,9 @@ async fn foreground_and_background_preserve_shutdown_reason() {
 #[tokio::test]
 async fn background_preserves_auto_reconnect_failure() {
     let foreground = bot().await;
-    foreground
-        .client()
-        .enable_auto_reconnect
-        .store(false, Ordering::Relaxed);
+    foreground.client().set_auto_reconnect(false);
     let background = bot().await;
-    background
-        .client()
-        .enable_auto_reconnect
-        .store(false, Ordering::Relaxed);
+    background.client().set_auto_reconnect(false);
     let fore = foreground.run().await;
     let back = match background.spawn().await {
         BotRunOutcome::Completed(reason) => reason,

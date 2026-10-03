@@ -16,6 +16,29 @@ mod contracts;
 /// let mut request = mex_operation!(join_newsletter).request(join_newsletter::Variables { newsletter_id: None });
 /// request.doc.id = "another operation";
 /// ```
+/// The positional constructor is removed; explicit raw construction remains.
+/// ```compile_fail
+/// use wa::MexRequest;
+/// let request = MexRequest::new("CustomQuery", "123456789", &[], ());
+/// ```
+/// Only the canonical executor is public.
+/// ```compile_fail
+/// # async fn removed(client: &wa::Client) {
+/// use wa::{mex_operation, wacore::iq::mex_operations::get_username};
+/// client.mex().query(mex_operation!(get_username).request(get_username::Variables {})).await;
+/// # }
+/// ```
+/// ```compile_fail
+/// # async fn removed(client: &wa::Client) {
+/// use wa::{mex_operation, wacore::iq::mex_operations::get_username};
+/// client.mex().mutate(mex_operation!(get_username).request(get_username::Variables {})).await;
+/// # }
+/// ```
+/// Fatal extension failures retain their source in GraphQl, not ExtensionError.
+/// ```compile_fail
+/// use wa::MexError;
+/// let error = MexError::ExtensionError { code: 404, message: "absent".into() };
+/// ```
 pub fn generated_descriptor() -> whatsapp_rust::MexOperation<
     whatsapp_rust::wacore::iq::mex_operations::join_newsletter::Variables,
 > {

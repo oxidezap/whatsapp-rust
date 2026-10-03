@@ -280,10 +280,9 @@ impl Client {
     ///
     /// Built from the signals that actually mean *terminal*. The shutdown
     /// notifier is deliberately left untouched by reconnects, and it is fired by
-    /// `disconnect`, `logout` and `signal_shutdown_sync`. The stream errors that
-    /// end a session without going through those clear `enable_auto_reconnect`
-    /// and set `expected_disconnect` together, which is what tells them apart
-    /// from an application merely turning auto-reconnect off.
+    /// `disconnect`, `logout` and `signal_shutdown_sync`. A protocol-terminal
+    /// verdict is sticky in the reconnect state even after its diagnostic reason
+    /// is consumed, and cannot be undone by changing the host preference.
     ///
     /// Not `is_running` on its own: that tracks whether anything is driving the
     /// client, which a client that only connected never has, so a healthy one
@@ -295,11 +294,11 @@ impl Client {
     /// waiter parked on a connection that is never coming has no other way to
     /// learn that it should stop.
     pub(crate) fn is_terminal(&self) -> bool {
-        if self.shutdown_signal().is_fired() {
+        if self.shutdown_signal().is_fired() || self.enable_auto_reconnect.is_terminal() {
             return true;
         }
-        // `enable_auto_reconnect` alone is a preference, not proof: it is public,
-        // and an application may clear it on a healthy connection to mean "do
+        // The reconnect preference alone is not proof: an application may
+        // disable it on a healthy connection to mean "do
         // not come back after this one ends". The internal paths that really do
         // end the session — conflict, 516, an unrecoverable connect failure —
         // always set `expected_disconnect` alongside it, so the pair is what
@@ -689,7 +688,7 @@ impl Client {
             }),
             offline_batch: Arc::new(offline_resume::OfflineBatchCoordinator::new()),
 
-            enable_auto_reconnect: Arc::new(AtomicBool::new(true)),
+            enable_auto_reconnect: Arc::new(AutoReconnect::new(true)),
             paused: AtomicBool::new(false),
             pause_state_notifier: event_listener::Event::new(),
             pause_teardown_pending: AtomicBool::new(false),
@@ -878,6 +877,14 @@ impl Client {
             warn!("Client `run` method called while already running.");
             return RunCompletionReason::AlreadyRunning;
         }
+        if self.enable_auto_reconnect.is_terminal() {
+            self.stop_supervision_loop();
+            return RunCompletionReason::AutoReconnectDisabled {
+                connection: None,
+                connect_error: None,
+                protocol_error: self.take_protocol_terminal_reason(),
+            };
+        }
         if shutdown.is_fired() {
             self.is_running.store(false, Ordering::SeqCst);
             return RunCompletionReason::ShutdownRequested;
@@ -885,9 +892,9 @@ impl Client {
         // Count only at the attempt boundary, after admission: abandoned host
         // reservations are not reconnect attempts.
         let mut first_connect = true;
-        let mut last_connect_error: Option<ConnectError>;
-        let mut last_disconnect_reason: Option<DisconnectReason>;
-        let mut last_protocol_reason: Option<ProtocolTerminalReason>;
+        let mut last_connect_error: Option<ConnectError> = None;
+        let mut last_disconnect_reason: Option<DisconnectReason> = None;
+        let mut last_protocol_reason: Option<ProtocolTerminalReason> = None;
         let mut completion = RunCompletionReason::Stopped;
         while self.is_running.load(Ordering::Relaxed) {
             // The one place a pause is honoured, and it is before the attempt
@@ -923,6 +930,15 @@ impl Client {
                 }
             }
             if !first_connect {
+                if !self.auto_reconnect_enabled() {
+                    self.stop_supervision_loop();
+                    completion = RunCompletionReason::AutoReconnectDisabled {
+                        connection: last_disconnect_reason,
+                        connect_error: last_connect_error,
+                        protocol_error: last_protocol_reason,
+                    };
+                    break;
+                }
                 self.stats.record_reconnect();
             }
             first_connect = false;
@@ -1091,19 +1107,28 @@ impl Client {
             // fires on every disconnect the loop is here to reconnect from, so
             // watching it would collapse the backoff instead of interrupting it.
             let shutdown_fired = wacore::runtime::wait_for_shutdown(&shutdown);
+            let reconnect_disabled = self.wait_for_auto_reconnect_disabled();
             // Third arm for the pause state, on the listener registered
             // above. `pause()` landing here must not wait out a delay before
             // parking, and `resume()` must not wait one out at all — the
             // contract is that a pause owes no backoff, and the cap is 900s.
-            // Deliberately NOT `session_state_notifier`, which every teardown
-            // fires: watching that would collapse the backoff this loop exists
-            // to serve and hammer the server. Only the two transitions that
-            // have to be seen promptly fire this one, and the loop re-reads the
-            // state either way.
+            // A bare session-state notification must not complete this arm:
+            // every teardown fires it and would collapse the backoff. The
+            // separate policy future filters those hints, completing only when
+            // reconnect is disabled. This arm still shortens delay only on pause.
             futures::select! {
                 _ = self.runtime.sleep(delay).fuse() => {}
                 _ = shutdown_fired.fuse() => {
                     debug!("Shutdown signalled during reconnect backoff, exiting run loop.");
+                }
+                _ = reconnect_disabled.fuse() => {
+                    self.stop_supervision_loop();
+                    completion = RunCompletionReason::AutoReconnectDisabled {
+                        connection: last_disconnect_reason,
+                        connect_error: last_connect_error,
+                        protocol_error: last_protocol_reason,
+                    };
+                    break;
                 }
                 _ = pause_changed.fuse() => {
                     debug!("Pause state changed during reconnect backoff, re-reading it.");
@@ -1117,6 +1142,19 @@ impl Client {
             RunCompletionReason::ShutdownRequested
         } else {
             completion
+        }
+    }
+
+    async fn wait_for_auto_reconnect_disabled(&self) {
+        loop {
+            // Register before reading: a disable between the read and park must
+            // not leave the run loop asleep for the whole backoff. Re-enabling
+            // alone never cancels or shortens that backoff.
+            let changed = self.session_state_notifier.listen();
+            if !self.auto_reconnect_enabled() {
+                return;
+            }
+            changed.await;
         }
     }
 
@@ -1200,7 +1238,7 @@ impl Client {
         // Same refusal `run` makes: a shutdown is published once and for good,
         // and a connection established after it would be one the application
         // has already been told does not exist. A new client is the way back.
-        if self.shutdown_signal().is_fired() {
+        if self.shutdown_signal().is_fired() || self.enable_auto_reconnect.is_terminal() {
             return Err(ConnectError::Shutdown);
         }
         // A pause is a standing instruction that no connection exists, and it
@@ -1222,7 +1260,7 @@ impl Client {
     /// awaited — a window as wide as the 20s connect timeout. Checked once at
     /// the start, either one would be published straight over.
     fn connect_refusal(&self, attempt_pause_generation: u64) -> Option<ConnectError> {
-        if self.shutdown_signal().is_fired() {
+        if self.shutdown_signal().is_fired() || self.enable_auto_reconnect.is_terminal() {
             return Some(ConnectError::Shutdown);
         }
         // The generation, not just the flag: a `pause()` and `resume()` that
@@ -4312,6 +4350,117 @@ mod tests {
             .await
             .expect("run() must return when disconnect() fires, not after the 900s backoff")
             .expect("the run task must not panic");
+    }
+
+    #[tokio::test]
+    async fn transient_connect_failures_do_not_latch_a_terminal_reconnect_state() {
+        for code in [500, 503] {
+            let client = crate::test_utils::create_test_client().await;
+            let failure = NodeBuilder::new("failure")
+                .attr("reason", code.to_string())
+                .build();
+            client.handle_connect_failure(&failure.as_node_ref()).await;
+            assert!(client.auto_reconnect_enabled());
+            assert!(!client.enable_auto_reconnect.is_terminal());
+            client.set_auto_reconnect(false);
+            client.set_auto_reconnect(true);
+            assert!(client.auto_reconnect_enabled());
+            assert!(!client.is_terminal());
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_run_cannot_consume_the_active_runs_terminal_reason() {
+        let (client, entered, release) = client_parked_in_connect().await;
+        let runner = Arc::clone(&client);
+        let active = tokio::spawn(async move { runner.run().await });
+        next_connect_attempt(&entered).await;
+        let error = NodeBuilder::new("stream:error")
+            .children([NodeBuilder::new("conflict")
+                .attr("type", "replaced")
+                .build()])
+            .build();
+        client.handle_stream_error(&error.as_node_ref()).await;
+        assert!(matches!(
+            client.run().await,
+            RunCompletionReason::AlreadyRunning
+        ));
+        release.send(()).await.unwrap();
+        assert!(matches!(
+            active.await.unwrap(),
+            RunCompletionReason::AutoReconnectDisabled {
+                connect_error: Some(ConnectError::Version(_)),
+                protocol_error: Some(ProtocolTerminalReason::Conflict(ConflictKind::Replaced)),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reenable_cannot_erase_a_consumed_protocol_terminal_verdict() {
+        let client = crate::test_utils::create_test_client().await;
+        let error = NodeBuilder::new("stream:error")
+            .children([NodeBuilder::new("conflict")
+                .attr("type", "replaced")
+                .build()])
+            .build();
+        client.handle_stream_error(&error.as_node_ref()).await;
+        assert!(client.is_terminal());
+        client.set_auto_reconnect(true);
+        assert!(!client.auto_reconnect_enabled());
+        assert!(matches!(
+            client.connect().await,
+            Err(ConnectError::Shutdown)
+        ));
+        assert!(matches!(
+            client.run().await,
+            RunCompletionReason::AutoReconnectDisabled {
+                protocol_error: Some(ProtocolTerminalReason::Conflict(ConflictKind::Replaced)),
+                ..
+            }
+        ));
+        // run consumed the diagnostic reason, not the irreversible state.
+        client.set_auto_reconnect(true);
+        assert!(client.is_terminal());
+        assert!(!client.auto_reconnect_enabled());
+        assert!(matches!(
+            client.run().await,
+            RunCompletionReason::AutoReconnectDisabled {
+                connect_error: None,
+                protocol_error: None,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn terminal_verdict_wins_concurrent_host_reenable() {
+        for _ in 0..32 {
+            let policy = Arc::new(AutoReconnect::new(true));
+            let host = Arc::clone(&policy);
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    for _ in 0..1000 {
+                        host.swap(true, Ordering::AcqRel);
+                    }
+                });
+                policy.stop_permanently();
+            });
+            assert!(policy.is_terminal());
+            assert!(!policy.load(Ordering::Acquire));
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_policy_wait_ignores_unrelated_session_notifications() {
+        let client = crate::test_utils::create_test_client().await;
+        let mut disabled = Box::pin(client.wait_for_auto_reconnect_disabled());
+        assert!(futures::poll!(disabled.as_mut()).is_pending());
+        client.notify_session_state();
+        assert!(futures::poll!(disabled.as_mut()).is_pending());
+        client.set_auto_reconnect(false);
+        assert!(futures::poll!(disabled.as_mut()).is_ready());
     }
 
     /// `signal_shutdown_sync()` is the flag-only path taken by `Drop` impls on

@@ -970,7 +970,10 @@ async fn test_restricted_profile_picture_requires_tctoken() -> anyhow::Result<()
     let denied = client_b
         .client
         .contacts()
-        .get_profile_picture(&jid_a, false)
+        .lookup_picture(whatsapp_rust::ProfilePictureRequest::new(
+            whatsapp_rust::ProfilePictureTarget::Contact(&jid_a),
+            whatsapp_rust::ProfilePictureType::Full,
+        ))
         .await?;
     let denied_node = tokio::time::timeout(tokio::time::Duration::from_secs(10), denied_waiter)
         .await
@@ -979,7 +982,7 @@ async fn test_restricted_profile_picture_requires_tctoken() -> anyhow::Result<()
     assert!(!has_descendant(&denied_node, "tctoken"));
     assert!(!has_descendant(&denied_node, "cstoken"));
     assert!(
-        denied.is_none(),
+        matches!(denied, whatsapp_rust::ProfilePictureLookup::NotAuthorized),
         "restricted profile picture should be hidden without a tc token"
     );
 
@@ -1003,7 +1006,10 @@ async fn test_restricted_profile_picture_requires_tctoken() -> anyhow::Result<()
     let allowed = client_b
         .client
         .contacts()
-        .get_profile_picture(&jid_a, false)
+        .lookup_picture(whatsapp_rust::ProfilePictureRequest::new(
+            whatsapp_rust::ProfilePictureTarget::Contact(&jid_a),
+            whatsapp_rust::ProfilePictureType::Full,
+        ))
         .await?;
     let allowed_node = tokio::time::timeout(tokio::time::Duration::from_secs(10), allowed_waiter)
         .await
@@ -1012,7 +1018,7 @@ async fn test_restricted_profile_picture_requires_tctoken() -> anyhow::Result<()
     assert!(has_descendant(&allowed_node, "tctoken"));
     assert!(!has_descendant(&allowed_node, "cstoken"));
     assert!(
-        allowed.is_some(),
+        allowed.is_found(),
         "restricted profile picture should be visible once tc token exists"
     );
 
