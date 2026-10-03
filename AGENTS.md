@@ -73,6 +73,7 @@ Read the one that covers what you are touching:
 | `agent_docs/observability.md` | Adding a cache, counter, or anything reported by `memory_report()` / `stats()` |
 | `agent_docs/plugin_architecture.md` | Touching the `plugins` / `client-lifecycle` feature surface |
 | `agent_docs/voip_audio_codecs.md` | VoIP media: codec profiles, negotiation, encoded audio API |
+| `agent_docs/voip_group_calls.md` | Group calls: how an invited device joins, live wire facts, receiver subscription, an end-to-end bot example |
 | `agent_docs/voip_media_oracle.md` | Building differential audio/video traces against captured WhatsApp wasm |
 | `agent_docs/voip_conformance.md` | Running or extending the full JS/wasm/Rust VoIP conformance gate |
 | `agent_docs/mlow_derivation.md` | Re-deriving MLOW fixtures from pinned J/S wasm captures |
