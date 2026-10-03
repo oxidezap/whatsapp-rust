@@ -1538,8 +1538,12 @@ fn parse_newsletter_messages_response(
 
         // The wire `id` (string) is what edit/revoke key on; keep it alongside
         // server_id (which is used for pagination/reactions).
+        // History can still be addressed by server_id without a usable client
+        // id. Project the legacy empty sentinel to absence rather than losing
+        // the entire page; explicit IDs supplied to operations still validate.
         let message_id = msg_node
             .get_attr("id")
+            .filter(|v| !v.as_str().is_empty())
             .map(|v| crate::MessageId::new(v.as_str()))
             .transpose()?;
 
@@ -2763,18 +2767,25 @@ mod tests {
             reference.require_message_id(),
             Err(crate::MessageRefError::MissingMessageId)
         );
-        let invalid = history_response(vec![
+        let empty = history_response(vec![
             NodeBuilder::new("message")
                 .attr("server_id", 1u64)
                 .attr("id", "")
                 .build(),
         ]);
-        assert!(matches!(
-            parse_newsletter_messages_response(&invalid.as_node_ref()),
-            Err(NewsletterError::MessageRef(
-                crate::MessageRefError::EmptyMessageId
-            ))
-        ));
+        let messages = parse_newsletter_messages_response(&empty.as_node_ref()).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, None);
+        let reference = messages[0].message_ref(&chat).unwrap();
+        assert_eq!(reference.server_id().unwrap().get(), 1);
+        assert_eq!(
+            reference.require_message_id(),
+            Err(crate::MessageRefError::MissingMessageId)
+        );
+        assert_eq!(
+            crate::MessageId::new(""),
+            Err(crate::MessageRefError::EmptyMessageId)
+        );
     }
 
     /// Wrap message nodes in the `<iq><messages>` envelope the server answers
