@@ -121,10 +121,10 @@ macro_rules! forward_domains {
         }
         impl MsgSecretStore for $owner {
             forward_methods! {
-                fn put_msg_secret<'s, 'a, 'b, 'c, 'd>(this: &'s Self, chat: &'a str, sender: &'b str, msg_id: &'c str, secret: &'d MessageSecret) -> Result<()>;
+                fn put_msg_secret<'s, 'a, 'b, 'c, 'd>(this: &'s Self, chat: &'a str, sender: &'b str, msg_id: &'c str, secret: &'d MessageSecretBytes) -> Result<()>;
                 fn put_msg_secrets<'s>(this: &'s Self, entries: Vec<MsgSecretEntry>) -> Result<usize>;
                 fn get_msg_secret<'s, 'a, 'b, 'c>(this: &'s Self, chat: &'a str, sender: &'b str, msg_id: &'c str) -> Result<Option<Vec<u8>>>;
-                fn get_msg_secret_with_ts<'s, 'a, 'b, 'c>(this: &'s Self, chat: &'a str, sender: &'b str, msg_id: &'c str) -> Result<Option<(Vec<u8>, i64)>>;
+                fn get_stored_msg_secret<'s, 'a, 'b, 'c>(this: &'s Self, chat: &'a str, sender: &'b str, msg_id: &'c str) -> Result<Option<StoredMessageSecret>>;
                 fn delete_expired_msg_secrets<'s>(this: &'s Self, cutoff_timestamp: i64) -> Result<u32>;
             }
         }

@@ -329,9 +329,23 @@ impl MsgSecretWriteBuffer {
         self.wake_tx.close();
     }
 
-    /// Buffered-first read. Returns `(secret, message_ts)` like
-    /// `get_msg_secret_with_ts`.
+    /// Byte-only projection for the crypto paths that do not use parent time.
     pub(crate) fn lookup(&self, chat: &str, sender: &str, msg_id: &str) -> Option<(Vec<u8>, i64)> {
+        self.lookup_stored(chat, sender, msg_id).map(|stored| {
+            (
+                stored.secret.into_bytes().to_vec(),
+                stored.message_ts.unwrap_or(0),
+            )
+        })
+    }
+
+    /// Buffered-first read with the same validated shape as the backend.
+    pub(crate) fn lookup_stored(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> Option<wacore::store::traits::StoredMessageSecret> {
         let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         pending
             .get(&KeyRef {
@@ -339,7 +353,12 @@ impl MsgSecretWriteBuffer {
                 sender,
                 msg_id,
             })
-            .map(|e| (e.secret.to_vec(), e.message_ts))
+            .map(|e| {
+                wacore::store::traits::StoredMessageSecret::new(
+                    wacore::store::traits::MessageSecret::from_bytes(e.secret),
+                    Some(e.message_ts),
+                )
+            })
     }
 
     /// Signal the drain worker, starting it on first use.

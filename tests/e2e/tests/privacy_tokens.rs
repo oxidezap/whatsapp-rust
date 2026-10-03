@@ -7,7 +7,7 @@ use wacore::store::traits::TcTokenEntry;
 use wacore::types::events::Event;
 use wacore_binary::OwnedNodeRef;
 use wacore_binary::node::Node;
-use whatsapp_rust::{NodeFilter, SendOptions};
+use whatsapp_rust::{MessageId, NodeFilter, SendOptions, SendRequest};
 
 fn has_descendant(node: &Node, tag: &str) -> bool {
     node.children().is_some_and(|children| {
@@ -46,10 +46,9 @@ async fn send_message_and_expect_463_with_id(
 
     let returned_id = sender
         .client
-        .send_message_with_options(
-            recipient_jid.clone(),
-            text_msg(text),
-            SendOptions::default().with_message_id(msg_id.clone()),
+        .send(
+            SendRequest::new(recipient_jid, text_msg(text))
+                .with_options(SendOptions::default().with_message_id(MessageId::new(&msg_id)?)),
         )
         .await?
         .message_id;
@@ -521,11 +520,14 @@ async fn test_history_sync_nct_salt_enables_cstoken_first_contact() -> anyhow::R
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b
         .client
-        .send_message_with_options(
-            jid_a_lid,
-            text_msg("history-sync cstoken first contact"),
-            SendOptions::default()
-                .with_message_id(format!("E2ECSHIST{}", uuid::Uuid::new_v4().simple())),
+        .send(
+            SendRequest::new(&jid_a_lid, text_msg("history-sync cstoken first contact"))
+                .with_options(
+                    SendOptions::default().with_message_id(MessageId::new(format!(
+                        "E2ECSHIST{}",
+                        uuid::Uuid::new_v4().simple()
+                    ))?),
+                ),
         )
         .await?;
     let sent = tokio::time::timeout(tokio::time::Duration::from_secs(10), sent_waiter)
@@ -585,11 +587,13 @@ async fn test_cstoken_only_first_contact_succeeds_when_tctoken_disabled() -> any
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b
         .client
-        .send_message_with_options(
-            jid_a_lid,
-            text_msg("cstoken-only first contact"),
-            SendOptions::default()
-                .with_message_id(format!("E2ECSONLY{}", uuid::Uuid::new_v4().simple())),
+        .send(
+            SendRequest::new(&jid_a_lid, text_msg("cstoken-only first contact")).with_options(
+                SendOptions::default().with_message_id(MessageId::new(format!(
+                    "E2ECSONLY{}",
+                    uuid::Uuid::new_v4().simple()
+                ))?),
+            ),
         )
         .await?;
     let sent = tokio::time::timeout(tokio::time::Duration::from_secs(10), sent_waiter)
@@ -643,11 +647,13 @@ async fn test_syncd_nct_salt_enables_cstoken_first_contact() -> anyhow::Result<(
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b
         .client
-        .send_message_with_options(
-            jid_a_lid,
-            text_msg("syncd cstoken first contact"),
-            SendOptions::default()
-                .with_message_id(format!("E2ECSSYN{}", uuid::Uuid::new_v4().simple())),
+        .send(
+            SendRequest::new(&jid_a_lid, text_msg("syncd cstoken first contact")).with_options(
+                SendOptions::default().with_message_id(MessageId::new(format!(
+                    "E2ECSSYN{}",
+                    uuid::Uuid::new_v4().simple()
+                ))?),
+            ),
         )
         .await?;
     let sent = tokio::time::timeout(tokio::time::Duration::from_secs(10), sent_waiter)
@@ -771,11 +777,13 @@ async fn test_tctoken_only_reply_succeeds_when_cstoken_disabled() -> anyhow::Res
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b
         .client
-        .send_message_with_options(
-            jid_a.clone(),
-            text_msg("tctoken-only reply"),
-            SendOptions::default()
-                .with_message_id(format!("E2ETCONLY{}", uuid::Uuid::new_v4().simple())),
+        .send(
+            SendRequest::new(&jid_a, text_msg("tctoken-only reply")).with_options(
+                SendOptions::default().with_message_id(MessageId::new(format!(
+                    "E2ETCONLY{}",
+                    uuid::Uuid::new_v4().simple()
+                ))?),
+            ),
         )
         .await?;
     let sent = tokio::time::timeout(tokio::time::Duration::from_secs(10), sent_waiter)
@@ -834,11 +842,13 @@ async fn test_nct_salt_survives_reconnect_and_still_allows_first_contact() -> an
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b
         .client
-        .send_message_with_options(
-            jid_a_lid,
-            text_msg("reconnect cstoken first contact"),
-            SendOptions::default()
-                .with_message_id(format!("E2ECSRECON{}", uuid::Uuid::new_v4().simple())),
+        .send(
+            SendRequest::new(&jid_a_lid, text_msg("reconnect cstoken first contact")).with_options(
+                SendOptions::default().with_message_id(MessageId::new(format!(
+                    "E2ECSRECON{}",
+                    uuid::Uuid::new_v4().simple()
+                ))?),
+            ),
         )
         .await?;
     let sent = tokio::time::timeout(tokio::time::Duration::from_secs(10), sent_waiter)
@@ -906,10 +916,9 @@ async fn test_pn_target_first_contact_uses_cstoken_after_lid_resolution() -> any
     let sent_waiter = client_b.sent_message_waiter(&msg_id);
     client_b
         .client
-        .send_message_with_options(
-            jid_a_pn.clone(),
-            text_msg("pn-target cstoken first contact"),
-            SendOptions::default().with_message_id(msg_id),
+        .send(
+            SendRequest::new(&jid_a_pn, text_msg("pn-target cstoken first contact"))
+                .with_options(SendOptions::default().with_message_id(MessageId::new(msg_id)?)),
         )
         .await?;
     let sent = tokio::time::timeout(tokio::time::Duration::from_secs(10), sent_waiter)

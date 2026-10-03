@@ -26,6 +26,8 @@ use crate::request::IqError;
 use thiserror::Error;
 
 mod actions;
+mod requests;
+pub use requests::{EditRequest, SendRequest};
 pub(crate) mod group_repair;
 mod tctoken_lifecycle;
 pub(crate) use tctoken_lifecycle::is_own_identity;
@@ -44,6 +46,9 @@ pub enum SendError {
     /// Invalid or incomplete target addressing, rejected before sending.
     #[error("{0}")]
     MessageRef(#[from] crate::MessageRefError),
+    /// Malformed raw message-secret material, rejected before encryption.
+    #[error("{0}")]
+    InvalidSecret(#[from] crate::InvalidMessageSecret),
     /// Connection/transport/IQ failure (embeds the shared base error).
     // No `#[from]`: the manual `From<ClientError>` impl flattens a bare `?` so
     // `NotLoggedIn`/`Iq` stay matchable instead of nesting under `Client(..)`.
@@ -309,6 +314,7 @@ struct DmBranchRequest<'a> {
     is_status_addon: bool,
     device_freshness: crate::cache::Freshness,
     borrowed_message_id: bool,
+    creation_sender: Option<&'a mut Option<Jid>>,
 }
 
 struct GroupDirectBranchRequest<'a> {
@@ -422,7 +428,7 @@ impl SendBranchOutput {
     }
 }
 
-/// Options for [`Client::send_message_with_options`].
+/// Options for [`SendRequest`] passed to [`Client::send`].
 ///
 /// Start from [`SendOptions::default`] and chain the `with_*` setters; the
 /// struct is `#[non_exhaustive]` so new knobs can be added without breaking
@@ -430,14 +436,16 @@ impl SendBranchOutput {
 ///
 /// ```
 /// # use whatsapp_rust::send::SendOptions;
-/// let options = SendOptions::default().with_message_id("3EB0ABCDEF");
+/// # use whatsapp_rust::MessageId;
+/// let options = SendOptions::default().with_message_id(MessageId::new("3EB0ABCDEF")?);
+/// # Ok::<(), whatsapp_rust::MessageRefError>(())
 /// ```
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct SendOptions {
     /// Override the auto-generated message ID.
     /// Useful for resending a failed message with the same ID or idempotency.
-    pub message_id: Option<String>,
+    pub message_id: Option<crate::MessageId>,
     /// Extra XML child nodes on the message stanza. A node the send already
     /// derives from the message content — `<biz>`, and `<bot>` on a DM — is
     /// refused with [`SendError::InvalidRequest`] rather than stacked next to
@@ -459,8 +467,8 @@ pub struct SendOptions {
 impl SendOptions {
     /// See [`SendOptions::message_id`].
     #[must_use]
-    pub fn with_message_id(mut self, message_id: impl Into<String>) -> Self {
-        self.message_id = Some(message_id.into());
+    pub fn with_message_id(mut self, message_id: crate::MessageId) -> Self {
+        self.message_id = Some(message_id);
         self
     }
 
@@ -500,7 +508,7 @@ impl SendOptions {
     }
 }
 
-/// Options for [`Client::edit_message_with_options`].
+/// Options for [`EditRequest`] passed to [`Client::edit_message`].
 ///
 /// Start from [`EditOptions::default`] and chain the `with_*` setters; the
 /// struct is `#[non_exhaustive]` so new knobs can be added without breaking
@@ -517,14 +525,14 @@ pub struct EditOptions {
     /// - Whether the wire-level collision is honored is server- and
     ///   client-dependent (the server may dedupe against the outer id), so treat
     ///   the visible outcome as non-guaranteed.
-    pub stanza_id: Option<String>,
+    pub stanza_id: Option<crate::StanzaId>,
 }
 
 impl EditOptions {
     /// See [`EditOptions::stanza_id`].
     #[must_use]
-    pub fn with_stanza_id(mut self, stanza_id: impl Into<String>) -> Self {
-        self.stanza_id = Some(stanza_id.into());
+    pub fn with_stanza_id(mut self, stanza_id: crate::StanzaId) -> Self {
+        self.stanza_id = Some(stanza_id);
         self
     }
 }
@@ -909,6 +917,9 @@ pub(crate) struct SendPipelineOptions<'a> {
     pub(crate) group_history_notice: bool,
     /// Capture the exact fanout phash before registering an ACK waiter.
     pub(crate) history_expected_phash: Option<&'a mut Option<wacore_binary::CompactString>>,
+    /// Capture the identity actually selected by the encryption branch, not a
+    /// later metadata lookup that can change namespaces after the send.
+    pub(crate) creation_sender: Option<&'a mut Option<Jid>>,
 }
 
 /// The devices a freshly resolved fan-out holds that the sent stanza did not.
@@ -939,7 +950,7 @@ pub(crate) struct DmDeltaResend<'a> {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct SendResult {
-    pub message_id: String,
+    pub message_id: crate::MessageId,
     pub to: Jid,
     /// The message this send encoded, exactly as the pipeline handed it to
     /// the encoder: after every change the send applied on the caller's
@@ -979,12 +990,7 @@ impl SendResult {
     /// revoke or add-on. Its body stays in the existing Arc, untouched. For
     /// newsletter plaintext sends use `newsletter_ref` instead.
     pub fn message_ref(&self) -> Result<crate::MessageRef<'_>, crate::MessageRefError> {
-        crate::MessageRef::new(
-            &self.to,
-            crate::MessageId::new(&self.message_id)?,
-            None,
-            true,
-        )
+        crate::MessageRef::new(&self.to, self.message_id.clone(), None, true)
     }
 
     /// A freshly sent newsletter post has a client id but no server id until
@@ -992,18 +998,14 @@ impl SendResult {
     pub fn newsletter_ref(
         &self,
     ) -> Result<crate::NewsletterMessageRef<'_>, crate::MessageRefError> {
-        crate::NewsletterMessageRef::new(
-            &self.to,
-            Some(crate::MessageId::new(&self.message_id)?),
-            None,
-        )
-        .map(|r| r.with_from_me(true))
+        crate::NewsletterMessageRef::new(&self.to, Some(self.message_id.clone()), None)
+            .map(|r| r.with_from_me(true))
     }
 
     /// Outer operation id for ACK correlation. For edits/revokes this is NOT
     /// the original target id; an ACK match does not prove recipient delivery.
-    pub fn stanza_id(&self) -> Result<crate::StanzaId, crate::MessageRefError> {
-        crate::StanzaId::new(&self.message_id)
+    pub fn stanza_id(&self) -> crate::StanzaId {
+        crate::StanzaId::from_message_id(&self.message_id)
     }
 
     /// `participant` is `None` -- only valid for the sender's own messages.
@@ -1011,7 +1013,7 @@ impl SendResult {
         wa::MessageKey {
             remote_jid: Some(self.to.to_string()),
             from_me: Some(true),
-            id: Some(self.message_id.clone()),
+            id: Some(self.message_id.to_string()),
             participant: None,
         }
     }
@@ -1390,7 +1392,21 @@ pub(crate) fn build_edit_message(
 }
 
 impl Client {
-    /// Send a message to a user, group, or newsletter.
+    /// Canonical send entry point. All content shortcuts use this implementation.
+    ///
+    /// Newsletter content remains plaintext; status uses the dedicated facade.
+    pub async fn send(&self, request: SendRequest) -> Result<SendResult, SendError> {
+        Box::pin(self.send_message_with_options_inner(
+            request.to,
+            request.message,
+            request.options,
+            None,
+        ))
+        .await
+    }
+
+    /// Send a message to a user, group, or newsletter with default options.
+    /// For configurable sends use [`Self::send`] with [`SendRequest`].
     ///
     /// Newsletter messages are sent as plaintext (no E2E encryption).
     /// For status/story updates use [`Client::status()`] instead.
@@ -1399,17 +1415,7 @@ impl Client {
         to: impl Into<Jid>,
         message: wa::Message,
     ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
-        // Sync-prologue allocation: a plain async fn would hold the ~1 KB
-        // message by value in every embedder's frame. An `Arc` rather than a
-        // `Box` because the same allocation is what `SendResult::message`
-        // hands back, so the send never copies the message again.
-        let to = to.into();
-        let message = std::sync::Arc::new(message);
-        async move {
-            // Box::pin: the inner future carries ~1 KB of pre-encrypt locals.
-            Box::pin(self.send_message_with_options_inner(to, message, SendOptions::default()))
-                .await
-        }
+        self.send(SendRequest::from_owned(to.into(), message))
     }
 
     /// Plain-text convenience over [`Client::send_message`].
@@ -1419,12 +1425,7 @@ impl Client {
         text: impl Into<String>,
     ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
         use wacore::proto_helpers::MessageBuilderExt;
-        let to = to.into();
-        let message = std::sync::Arc::new(wa::Message::text(text));
-        async move {
-            Box::pin(self.send_message_with_options_inner(to, message, SendOptions::default()))
-                .await
-        }
+        self.send(SendRequest::from_owned(to.into(), wa::Message::text(text)))
     }
 
     /// Forward an existing message to a chat.
@@ -1443,28 +1444,48 @@ impl Client {
         message: &wa::Message,
     ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
         use wacore::proto_helpers::MessageExt;
-        let to = to.into();
-        // Same sync-prologue `Arc` as `send_message`: the prepared copy is
-        // built straight into the allocation the result hands back.
-        let body = std::sync::Arc::new(message.get_base_message().prepare_for_forward());
-        async move {
-            Box::pin(self.send_message_with_options_inner(to, body, SendOptions::default())).await
-        }
+        self.send(SendRequest::from_owned(
+            to.into(),
+            message.get_base_message().prepare_for_forward(),
+        ))
     }
 
-    /// Send a message with additional options.
-    pub fn send_message_with_options(
+    // Fixture adapter for pre-existing directed send controls. Production and
+    // external hosts use only the canonical request or the default shortcuts.
+    #[cfg(test)]
+    fn send_message_with_options(
         &self,
         to: impl Into<Jid>,
         message: wa::Message,
         options: SendOptions,
     ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
-        // Thin generic shim: the large async body below stays monomorphic so
-        // each `Into<Jid>` instantiation does not duplicate the state machine.
-        // Sync-prologue `Arc` + Box::pin as in send_message.
-        let to = to.into();
-        let message = std::sync::Arc::new(message);
-        async move { Box::pin(self.send_message_with_options_inner(to, message, options)).await }
+        self.send(SendRequest::from_owned(to.into(), message).with_options(options))
+    }
+
+    pub(crate) async fn send_creation_message(
+        &self,
+        to: &Jid,
+        message: wa::Message,
+    ) -> Result<(SendResult, Jid), SendError> {
+        // These references address E2E creations. Raw newsletter publication
+        // remains available through send_message and the newsletter facade.
+        if to.is_newsletter() || to.is_broadcast_list() || to.is_status_broadcast() {
+            return Err(SendError::InvalidRequest(
+                "creation requires an E2E chat".into(),
+            ));
+        }
+        let mut creator = None;
+        let result = Box::pin(self.send_message_with_options_inner(
+            to.clone(),
+            std::sync::Arc::new(message),
+            SendOptions::default(),
+            Some(&mut creator),
+        ))
+        .await?;
+        let creator = creator.ok_or_else(|| {
+            SendError::InvalidRequest("creation send did not report a sender identity".into())
+        })?;
+        Ok((result, creator.to_non_ad()))
     }
 
     #[cfg_attr(
@@ -1486,17 +1507,12 @@ impl Client {
         to: Jid,
         mut message: std::sync::Arc<wa::Message>,
         options: SendOptions,
+        creation_sender: Option<&mut Option<Jid>>,
     ) -> Result<SendResult, SendError> {
         #[cfg(feature = "tracing")]
         self.record_identity_on_span(&tracing::Span::current());
 
         validate_extra_stanza_nodes(&options.extra_stanza_nodes)?;
-        if options.message_id.as_ref().is_some_and(String::is_empty) {
-            return Err(SendError::InvalidRequest(
-                "message ID must not be empty".into(),
-            ));
-        }
-
         let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
         self.stats.record_message_sent();
         wacore::telemetry::send(match to.server {
@@ -1522,7 +1538,7 @@ impl Client {
         let device_freshness = options.device_freshness;
         let sent_at = SendInstant::now();
         let request_id = match options.message_id {
-            Some(id) => id,
+            Some(id) => id.into_string(),
             None => self.generate_message_id_at(sent_at.unix_secs_u64()),
         };
         // Both paths below consume `to`, so save a copy for the result. The id
@@ -1556,7 +1572,7 @@ impl Client {
                 .build();
             self.send_node(stanza).await?;
             return Ok(SendResult {
-                message_id: request_id,
+                message_id: crate::MessageId::try_from(request_id)?,
                 to: result_to,
                 recipient_fanout: None,
                 message,
@@ -1584,13 +1600,14 @@ impl Client {
                     stanza_type: stanza_type_override,
                     group_metadata_freshness,
                     device_freshness,
+                    creation_sender,
                     ..Default::default()
                 },
             )
             .await
             .map_err(SendError::from_anyhow)?;
         Ok(SendResult {
-            message_id: request_id,
+            message_id: crate::MessageId::try_from(request_id)?,
             to: result_to,
             recipient_fanout,
             message,
@@ -1873,7 +1890,7 @@ impl Client {
         }
 
         Ok(SendResult {
-            message_id: request_id,
+            message_id: crate::MessageId::try_from(request_id)?,
             to,
             recipient_fanout: None,
             message: std::sync::Arc::new(message),
@@ -2618,7 +2635,7 @@ impl Client {
             .await
             .map_err(SendError::from_anyhow)?;
         Ok(SendResult {
-            message_id: request_id,
+            message_id: crate::MessageId::try_from(request_id)?,
             to: result_to,
             recipient_fanout,
             message,
@@ -2686,6 +2703,7 @@ impl Client {
             group_direct_recipients,
             group_history_notice,
             history_expected_phash,
+            mut creation_sender,
         } = options;
         // Callers that already stamped their message hand the instant down; the
         // rest sample here so the pipeline below still has exactly one.
@@ -2830,9 +2848,16 @@ impl Client {
                 is_status_addon,
                 device_freshness,
                 borrowed_message_id,
+                creation_sender: creation_sender.as_deref_mut(),
             }))
             .await?
         };
+
+        if let Some(capture) = creation_sender
+            && let Some(sender) = outbound_group_sender_identity.as_ref()
+        {
+            *capture = Some(sender.clone());
+        }
 
         // The outbound advance must be durable BEFORE the stanza hits the wire:
         // reusing an outbound counter reuses its message key + IV. Counters are
@@ -3485,6 +3510,7 @@ impl Client {
             is_status_addon,
             device_freshness,
             borrowed_message_id,
+            creation_sender,
         } = request;
         let mut should_issue_tc_token_after_send = false;
         let (prepared, dm_devices) = {
@@ -3520,6 +3546,18 @@ impl Client {
                 .pn
                 .as_ref()
                 .ok_or(ClientError::NotLoggedIn)?;
+
+            if let Some(capture) = creation_sender {
+                *capture = Some(if to.is_bot() {
+                    device_snapshot
+                        .lid
+                        .as_ref()
+                        .ok_or(ClientError::NotLoggedIn)?
+                        .clone()
+                } else {
+                    own_jid.clone()
+                });
+            }
 
             // PN→LID mapping (WA Web: ManagePhoneNumberMappingJob)
             if to.is_pn() && self.lid_pn_cache.get_current_lid(&to.user).await.is_none() {
@@ -4005,8 +4043,10 @@ pub(crate) fn dm_stanza_to(recipient_bare: &Jid, to: &Jid) -> Jid {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    mod creation_tests;
     mod message_reference_tests;
     mod privacy_tokens;
+    mod request_tests;
 
     use super::*;
     use crate::test_utils::wait_for_lock_waiter;
@@ -4333,13 +4373,14 @@ mod tests {
         let client = crate::test_utils::create_test_client().await;
         let to: Jid = "111111111111@s.whatsapp.net".parse().unwrap();
         let err = client
-            .edit_message(
+            .edit_message_raw(
                 to,
                 "ORIG_ID",
                 wa::Message {
                     conversation: Some("x".into()),
                     ..Default::default()
                 },
+                EditOptions::default(),
             )
             .await
             .expect_err("logged-out DM edit must error");
@@ -4349,30 +4390,12 @@ mod tests {
         );
     }
 
-    // An empty EditOptions::stanza_id must land in request_id and be rejected as
-    // InvalidRequest — doubles as a guard that stanza_id actually reaches the id.
-    #[tokio::test]
-    async fn edit_message_with_empty_stanza_id_returns_invalid_request() {
-        let client = crate::test_utils::create_test_client().await;
-        seed_pn(&client, "222222222222@s.whatsapp.net").await;
-        let to: Jid = "111111111111@s.whatsapp.net".parse().unwrap();
-        let err = client
-            .edit_message_with_options(
-                to,
-                "ORIG_ID",
-                wa::Message {
-                    conversation: Some("x".into()),
-                    ..Default::default()
-                },
-                EditOptions {
-                    stanza_id: Some(String::new()),
-                },
-            )
-            .await
-            .expect_err("empty stanza_id must error");
-        assert!(
-            matches!(err, SendError::InvalidRequest(_)),
-            "expected SendError::InvalidRequest, got: {err:?}"
+    // Invalid operation IDs now fail before an EditOptions can carry them.
+    #[test]
+    fn edit_options_cannot_carry_an_empty_stanza_id() {
+        assert_eq!(
+            crate::StanzaId::new(""),
+            Err(crate::MessageRefError::EmptyStanzaId)
         );
     }
 
@@ -4649,7 +4672,8 @@ mod tests {
                 .send_message_with_options(
                     self.group.clone(),
                     wa::Message::text("hi"),
-                    SendOptions::default().with_message_id(message_id),
+                    SendOptions::default()
+                        .with_message_id(crate::MessageId::new(message_id).unwrap()),
                 )
                 .await
                 .expect("group text send should reach the wire");
@@ -4777,7 +4801,7 @@ mod tests {
                     fixture.group.clone(),
                     message.clone(),
                     SendOptions::default()
-                        .with_message_id(id)
+                        .with_message_id(crate::MessageId::new(id).unwrap())
                         .with_extra_stanza_nodes(vec![
                             NodeBuilder::new("meta").attr("origin", "synthetic").build(),
                         ]),
@@ -5906,7 +5930,8 @@ mod tests {
             .send_message_with_options(
                 group.clone(),
                 wa::Message::text("hi"),
-                SendOptions::default().with_message_id("LIDREPAIR1"),
+                SendOptions::default()
+                    .with_message_id(crate::MessageId::new("LIDREPAIR1").unwrap()),
             )
             .await
             .expect("group text send should reach the wire");
@@ -8912,7 +8937,7 @@ mod tests {
         // No socket on the test client: send_node captures the node, then errors.
         let _ = client
             .newsletter()
-            .edit_message(&channel, "TARGETMID", content)
+            .edit_message_raw(&channel, "TARGETMID", content)
             .await;
 
         let node = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
@@ -8934,7 +8959,7 @@ mod tests {
 
         let e1 = client
             .newsletter()
-            .edit_message(
+            .edit_message_raw(
                 &dm,
                 "MID",
                 wa::Message {
@@ -8948,7 +8973,7 @@ mod tests {
 
         let e2 = client
             .newsletter()
-            .revoke_message(&group, "MID")
+            .revoke_message_raw(&group, "MID")
             .await
             .expect_err("revoke_message must reject a group JID");
         assert!(e2.to_string().to_lowercase().contains("newsletter"));
@@ -8963,7 +8988,7 @@ mod tests {
 
         let e1 = client
             .newsletter()
-            .edit_message(
+            .edit_message_raw(
                 &channel,
                 "",
                 wa::Message {
@@ -8977,7 +9002,7 @@ mod tests {
 
         let e2 = client
             .newsletter()
-            .revoke_message(&channel, "")
+            .revoke_message_raw(&channel, "")
             .await
             .expect_err("revoke_message must reject an empty message_id");
         assert!(e2.to_string().to_lowercase().contains("message_id"));
@@ -9187,7 +9212,7 @@ mod tests {
                     conversation: Some("hi".into()),
                     ..Default::default()
                 },
-                SendOptions::default().with_message_id(message_id),
+                SendOptions::default().with_message_id(crate::MessageId::new(message_id).unwrap()),
             )
             .await
             .expect("connected test client should complete the send");
@@ -9335,7 +9360,7 @@ mod tests {
                 .lookup(
                     &peer_pn.to_non_ad_string(),
                     &client.pn().expect("own pn").to_non_ad_string(),
-                    &result.message_id,
+                    result.message_id.as_str(),
                 )
                 .is_some(),
             "the secret the wire copy carries is still held for the message's add-ons"
@@ -9356,7 +9381,12 @@ mod tests {
         );
 
         let result = client
-            .edit_message(peer_pn.clone(), "ORIGINAL", wa::Message::text("new"))
+            .edit_message_raw(
+                peer_pn.clone(),
+                "ORIGINAL",
+                wa::Message::text("new"),
+                EditOptions::default(),
+            )
             .await
             .expect("connected test client should complete the edit");
 
@@ -9398,12 +9428,12 @@ mod tests {
         );
 
         let borrowed = client
-            .edit_message_with_options(
+            .edit_message_raw(
                 peer_pn.clone(),
                 "ORIGINAL",
                 wa::Message::text("newer"),
                 EditOptions {
-                    stanza_id: Some("BORROWED".into()),
+                    stanza_id: Some(crate::StanzaId::new("BORROWED").unwrap()),
                 },
             )
             .await
@@ -9478,11 +9508,13 @@ mod tests {
         );
 
         let options = ["yes".to_string(), "no".to_string()];
-        let (poll, secret) = client
+        let created = client
             .polls()
             .create(peer_pn.clone(), "lunch?", &options, 1)
             .await
             .expect("connected test client should complete the poll");
+        let poll = created.send_result();
+        let secret = created.secret();
         let creation = poll
             .message
             .poll_creation_message_v3
@@ -9495,7 +9527,7 @@ mod tests {
                 .message_context_info
                 .as_option()
                 .and_then(|c| c.message_secret.as_deref()),
-            Some(secret.as_slice()),
+            Some(secret.as_bytes().as_slice()),
             "a poll's own secret is part of the message it built, so the wire \
              copy and the reported one agree on it"
         );
@@ -9520,7 +9552,7 @@ mod tests {
                     conversation: Some("hi".into()),
                     ..Default::default()
                 },
-                SendOptions::default().with_message_id(message_id),
+                SendOptions::default().with_message_id(crate::MessageId::new(message_id).unwrap()),
             )
             .await
             .expect("a legacy-spelled recipient is a recipient");
@@ -9617,7 +9649,7 @@ mod tests {
                     conversation: Some("hi".into()),
                     ..Default::default()
                 },
-                SendOptions::default().with_message_id(message_id),
+                SendOptions::default().with_message_id(crate::MessageId::new(message_id).unwrap()),
             )
             .await
             .expect("the send itself succeeds");
@@ -9672,7 +9704,7 @@ mod tests {
                 .send_message_with_options(
                     fixture.group.clone(),
                     wa::Message::text(id),
-                    SendOptions::default().with_message_id(id),
+                    SendOptions::default().with_message_id(crate::MessageId::new(id).unwrap()),
                 )
                 .await
                 .unwrap();
@@ -9887,7 +9919,7 @@ mod tests {
                     group,
                     wa::Message::text("snapshot"),
                     SendOptions::default()
-                        .with_message_id("FROZENGROUPDEVICES")
+                        .with_message_id(crate::MessageId::new("FROZENGROUPDEVICES").unwrap())
                         .with_device_freshness(crate::cache::Freshness::Refresh),
                 )
                 .await
@@ -10496,16 +10528,9 @@ mod tests {
             ..Default::default()
         };
 
-        let public = client
-            .send_message_with_options(
-                peer.clone(),
-                msg.clone(),
-                SendOptions::default().with_message_id(""),
-            )
-            .await;
-        assert!(
-            matches!(public, Err(SendError::InvalidRequest(_))),
-            "public send must reject an empty id, got {public:?}"
+        assert_eq!(
+            crate::MessageId::new(""),
+            Err(crate::MessageRefError::EmptyMessageId)
         );
 
         let internal = client
@@ -10545,7 +10570,7 @@ mod tests {
                     conversation: Some("hi".into()),
                     ..Default::default()
                 },
-                SendOptions::default().with_message_id(message_id),
+                SendOptions::default().with_message_id(crate::MessageId::new(message_id).unwrap()),
             )
             .await
             .expect("newsletter send is plaintext and needs no session");
@@ -10578,7 +10603,7 @@ mod jid_into_convention {
             .await;
         let _ = client.forward_message(&jid, &msg).await;
         let _ = client
-            .edit_message(&jid, "ID", wa::Message::default())
+            .edit_message_raw(&jid, "ID", wa::Message::default(), EditOptions::default())
             .await;
         let _ = client.revoke_message(&jid, "ID", RevokeType::Sender).await;
         let _ = client
@@ -10599,7 +10624,12 @@ mod jid_into_convention {
             .await;
         let _ = client.forward_message(jid.clone(), &msg).await;
         let _ = client
-            .edit_message(jid.clone(), "ID", wa::Message::default())
+            .edit_message_raw(
+                jid.clone(),
+                "ID",
+                wa::Message::default(),
+                EditOptions::default(),
+            )
             .await;
         let _ = client
             .revoke_message(jid.clone(), "ID", RevokeType::Sender)
@@ -10656,10 +10686,10 @@ mod future_size_tests {
             size_of_val(&f)
         );
         drop(f);
-        let f = client.send_message_with_options(jid, msg, Default::default());
+        let f = client.send(super::SendRequest::new(&jid, msg));
         assert!(
             size_of_val(&f) <= 192,
-            "send_message_with_options future grew to {} B (budget 192)",
+            "canonical send future grew to {} B (budget 192)",
             size_of_val(&f)
         );
         drop(f);
@@ -10816,7 +10846,7 @@ mod clock_budget_tests {
             .get_msg_secret(
                 &peer.to_non_ad_string(),
                 &format!("{OWN_PN}@s.whatsapp.net"),
-                &sent.message_id,
+                sent.message_id.as_str(),
             )
             .await
             .expect("msg secret lookup");

@@ -18,7 +18,38 @@ use wacore_binary::Jid;
 
 /// Inline protocol-sized message secret. The array makes invalid lengths
 /// unrepresentable without a heap allocation or pointer indirection per row.
-pub type MessageSecret = [u8; crate::reporting_token::MESSAGE_SECRET_SIZE];
+pub type MessageSecretBytes = [u8; crate::reporting_token::MESSAGE_SECRET_SIZE];
+
+pub use crate::types::message_secret::{InvalidMessageSecret, MessageSecret};
+
+/// A validated stored secret and the parent's event time in Unix seconds.
+/// `None` means unknown, not the Unix epoch. Retention deadlines remain a
+/// separate persisted property and are not changed by this read projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StoredMessageSecret {
+    pub secret: MessageSecret,
+    pub message_ts: Option<i64>,
+}
+
+impl StoredMessageSecret {
+    pub fn new(secret: MessageSecret, message_ts: Option<i64>) -> Self {
+        Self {
+            secret,
+            message_ts: message_ts.filter(|ts| *ts != 0),
+        }
+    }
+
+    /// Validate bytes read from storage, mapping malformed rows to a typed
+    /// invalid-data error without truncating, padding or logging their contents.
+    pub fn from_stored_bytes(secret: &[u8], message_ts: i64) -> Result<Self> {
+        Ok(Self::new(
+            MessageSecret::try_from(secret)
+                .map_err(crate::store::error::StoreError::InvalidMessageSecret)?,
+            Some(message_ts),
+        ))
+    }
+}
 
 /// App state synchronization key for WhatsApp's app state protocol.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -67,7 +98,7 @@ pub struct MsgSecretEntry {
     /// Message identifier. `Arc<str>` keeps entry clones used by buffered
     /// persistence cheap without changing the serialized representation.
     pub msg_id: Arc<str>,
-    pub secret: MessageSecret,
+    pub secret: MessageSecretBytes,
     /// Absolute unix-seconds retention deadline. `0` means never expire.
     /// Computed by the caller from the parent message's event time plus a
     /// per-add-on-kind horizon (see `MsgSecretRetention`). The store prunes
@@ -104,7 +135,7 @@ impl MsgSecretEntry {
         chat: &Jid,
         sender: &Jid,
         msg_id: &str,
-        secret: MessageSecret,
+        secret: MessageSecretBytes,
         expires_at: i64,
         message_ts: i64,
     ) -> Self {
@@ -1320,28 +1351,32 @@ pub trait MsgSecretStore: Send + Sync {
     /// (the later non-zero parent time wins; a `0` never clobbers a known one).
     async fn put_msg_secrets(&self, entries: Vec<MsgSecretEntry>) -> Result<usize>;
 
-    /// Fetch the persisted secret; returns `None` if absent.
+    /// Read a validated secret and all available parent timestamp metadata.
+    ///
+    /// Required deliberately: an adapter migration must choose whether its
+    /// timestamp is known, rather than inheriting a default that silently loses
+    /// it. Backends without timestamps explicitly return `message_ts: None`.
+    /// Malformed persisted bytes must return `StoreError::InvalidMessageSecret`.
+    async fn get_stored_msg_secret(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> Result<Option<StoredMessageSecret>>;
+
+    /// Explicit byte-only interoperability projection. Prefer
+    /// [`Self::get_stored_msg_secret`] when the parent time matters. Even this
+    /// projection validates the persisted bytes through the named read.
     async fn get_msg_secret(
         &self,
         chat: &str,
         sender: &str,
         msg_id: &str,
-    ) -> Result<Option<Vec<u8>>>;
-
-    /// Fetch the secret together with the parent message's event time
-    /// (`message_ts`, `0` when unknown), so the receive path can enforce the
-    /// edit-processing window. Default pairs `get_msg_secret` with `0`;
-    /// backends that store `message_ts` override this.
-    async fn get_msg_secret_with_ts(
-        &self,
-        chat: &str,
-        sender: &str,
-        msg_id: &str,
-    ) -> Result<Option<(Vec<u8>, i64)>> {
+    ) -> Result<Option<Vec<u8>>> {
         Ok(self
-            .get_msg_secret(chat, sender, msg_id)
+            .get_stored_msg_secret(chat, sender, msg_id)
             .await?
-            .map(|secret| (secret, 0)))
+            .map(|stored| stored.secret.into_bytes().to_vec()))
     }
 
     /// Delete rows whose non-zero `expires_at` is at or before

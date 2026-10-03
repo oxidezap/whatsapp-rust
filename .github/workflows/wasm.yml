@@ -71,6 +71,14 @@ jobs:
           cargo build --locked --release
           --manifest-path tests/fixtures/pictures_consumer/Cargo.toml
           --target wasm32-unknown-unknown
+      - name: Build the standalone send/edit request host for wasm32
+        env:
+          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+          CARGO_BUILD_JOBS: "1"
+        run: >
+          cargo build --locked --release
+          --manifest-path tests/fixtures/requests_consumer/Cargo.toml
+          --target wasm32-unknown-unknown --features requests
       # The SQLite store reaches wasm through `storages/sqlite-storage/src/pool.rs`,
       # which swaps r2d2 and tokio's blocking pool for a single connection behind a
       # lock. Both of those type-check on wasm and only fail when a thread is actually

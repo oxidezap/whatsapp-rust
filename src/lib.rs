@@ -163,11 +163,13 @@ pub(crate) mod test_alloc {
 pub use wacore::appstate::patch_decode::WAPatchName;
 pub use wacore::appstate::schemas;
 pub use wacore::client_profile::ClientProfile;
+pub use wacore::store::traits::StoredMessageSecret;
 /// Optional metrics emission (the `metrics` feature). No-op when the feature is off.
 pub use wacore::telemetry;
 pub use wacore::types::message_ref::{
     MessageId, MessageRef, MessageRefError, NewsletterMessageRef, ServerMessageId, StanzaId,
 };
+pub use wacore::types::message_secret::{InvalidMessageSecret, MessageSecret};
 pub use wacore::{
     iq::privacy as privacy_settings, proto_helpers, sticker_pack, store::traits, webp,
 };
@@ -291,7 +293,10 @@ pub mod runtime_impl;
 pub use runtime_impl::TokioRuntime;
 pub use wacore::runtime::Runtime;
 pub mod send;
-pub use send::{EditOptions, PinDuration, RevokeType, SendError, SendOptions, SendResult};
+pub use send::{
+    EditOptions, EditRequest, PinDuration, RevokeType, SendError, SendOptions, SendRequest,
+    SendResult,
+};
 pub use wacore::send::StanzaType;
 pub mod media;
 pub mod session;
@@ -360,7 +365,7 @@ pub use features::{
     UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError, VariantProperty, VerifiedName,
     message_key, message_range,
 };
-pub use features::{MexDoc, MexOperation};
+pub use features::{CreatedEvent, CreatedPoll, EventRef, MexDoc, MexOperation, PollRef};
 
 pub use features::{ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
 
@@ -409,7 +414,9 @@ pub mod prelude {
     pub use crate::request::{IqError, RejectionStanza};
     #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
     pub use crate::runtime_impl::TokioRuntime;
-    pub use crate::send::{EditOptions, SendError, SendOptions, SendResult};
+    pub use crate::send::{
+        EditOptions, EditRequest, SendError, SendOptions, SendRequest, SendResult,
+    };
     #[cfg(feature = "signal")]
     pub use crate::shutdown::shutdown_signal;
     pub use crate::store::StoreRelease;
@@ -420,7 +427,10 @@ pub mod prelude {
         EventKind, InboundMessage, MessageBatch, Subscription,
     };
     pub use crate::types::message::MessageInfo;
-    pub use crate::{Jid, Server};
+    pub use crate::{
+        CreatedEvent, CreatedPoll, EventRef, InvalidMessageSecret, Jid, MessageSecret, PollRef,
+        Server, StoredMessageSecret,
+    };
     pub use crate::{
         MessageId, MessageRef, MessageRefError, NewsletterMessageRef, ServerMessageId, StanzaId,
     };

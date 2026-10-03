@@ -4461,26 +4461,12 @@ impl MsgSecretStore for SqliteStore {
         .await
     }
 
-    async fn get_msg_secret(
+    async fn get_stored_msg_secret(
         &self,
         chat: &str,
         sender: &str,
         msg_id: &str,
-    ) -> Result<Option<Vec<u8>>> {
-        // Same row, one column narrower: delegating keeps the query and the
-        // routing decision in one place rather than two that can drift.
-        Ok(self
-            .get_msg_secret_with_ts(chat, sender, msg_id)
-            .await?
-            .map(|(secret, _)| secret))
-    }
-
-    async fn get_msg_secret_with_ts(
-        &self,
-        chat: &str,
-        sender: &str,
-        msg_id: &str,
-    ) -> Result<Option<(Vec<u8>, i64)>> {
+    ) -> Result<Option<StoredMessageSecret>> {
         // Stays on the write queue, so a lookup racing a secret write waits for
         // it instead of reading the snapshot before it. A miss here is terminal
         // -- the reaction, vote or edit is dropped with no retry -- and history
@@ -4490,7 +4476,7 @@ impl MsgSecretStore for SqliteStore {
         let chat = chat.to_string();
         let sender = sender.to_string();
         let msg_id = msg_id.to_string();
-        self.with_semaphore(move || -> Result<Option<(Vec<u8>, i64)>> {
+        self.with_semaphore(move || -> Result<Option<StoredMessageSecret>> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -4503,7 +4489,10 @@ impl MsgSecretStore for SqliteStore {
                 .first(&mut *conn)
                 .optional()
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
-            Ok(row)
+            row.map(|(secret, message_ts)| {
+                StoredMessageSecret::from_stored_bytes(&secret, message_ts)
+            })
+            .transpose()
         })
         .await
     }
@@ -7325,7 +7314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_msg_secret_with_ts_round_trips_and_keeps_parent_ts() {
+    async fn named_secret_read_round_trips_and_keeps_parent_ts() {
         let store = create_test_store().await;
         let parent_ts = 1_700_000_000i64;
         store
@@ -7340,8 +7329,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.get_msg_secret_with_ts("c", "s", "M").await.unwrap(),
-            Some((vec![5u8; 32], parent_ts))
+            store.get_stored_msg_secret("c", "s", "M").await.unwrap(),
+            Some(StoredMessageSecret::new(
+                MessageSecret::from_bytes([5; 32]),
+                Some(parent_ts)
+            ))
         );
 
         // A later write with an unknown ts (0) must not clobber the known one.
@@ -7350,19 +7342,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.get_msg_secret_with_ts("c", "s", "M").await.unwrap(),
-            Some((vec![5u8; 32], parent_ts)),
+            store.get_stored_msg_secret("c", "s", "M").await.unwrap(),
+            Some(StoredMessageSecret::new(
+                MessageSecret::from_bytes([5; 32]),
+                Some(parent_ts)
+            )),
             "message_ts (immutable parent time) must survive a 0-ts redelivery"
         );
 
         // Absent row → None.
         assert_eq!(
             store
-                .get_msg_secret_with_ts("c", "s", "MISSING")
+                .get_stored_msg_secret("c", "s", "MISSING")
                 .await
                 .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn named_secret_read_reports_unknown_and_invalid_persisted_data() {
+        let store = create_test_store().await;
+        store
+            .put_msg_secret("c", "s", "M", &[177; 32])
+            .await
+            .unwrap();
+        let stored = store
+            .get_stored_msg_secret("c", "s", "M")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.message_ts, None);
+        assert_eq!(stored.secret.as_bytes(), &[177; 32]);
+        assert!(!format!("{stored:#?}").contains("177"));
+        for length in [0, 31, 33] {
+            let pool = store.pool.clone();
+            let device_id = store.device_id;
+            store
+                .with_semaphore(move || {
+                    let mut conn = pool
+                        .get()
+                        .map_err(|e| StoreError::Connection(Box::new(e)))?;
+                    diesel::update(
+                        msg_secrets::table
+                            .filter(msg_secrets::chat.eq("c"))
+                            .filter(msg_secrets::sender.eq("s"))
+                            .filter(msg_secrets::msg_id.eq("M"))
+                            .filter(msg_secrets::device_id.eq(device_id)),
+                    )
+                    .set(msg_secrets::secret.eq(vec![177u8; length]))
+                    .execute(&mut *conn)
+                    .map_err(|e| StoreError::Database(Box::new(e)))?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let error = store
+                .get_stored_msg_secret("c", "s", "M")
+                .await
+                .unwrap_err();
+            assert!(matches!(error, StoreError::InvalidMessageSecret(_)));
+            let source = std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<InvalidMessageSecret>()
+                .unwrap();
+            assert_eq!(source.actual, length);
+            assert!(!format!("{error:#?}").contains("177"));
+            assert!(matches!(
+                store.get_msg_secret("c", "s", "M").await,
+                Err(StoreError::InvalidMessageSecret(_))
+            ));
+        }
     }
 
     /// Multi-account isolation: same DB, different device_id rows must not
@@ -7676,7 +7726,7 @@ mod read_routing_tests {
         assert_eq!(store.get_msg_secret(GROUP, ADDR, "m1").await.unwrap(), None);
         assert_eq!(
             store
-                .get_msg_secret_with_ts(GROUP, ADDR, "m1")
+                .get_stored_msg_secret(GROUP, ADDR, "m1")
                 .await
                 .unwrap(),
             None
@@ -7871,10 +7921,13 @@ mod read_routing_tests {
         );
         assert_eq!(
             store
-                .get_msg_secret_with_ts(GROUP, ADDR, "m1")
+                .get_stored_msg_secret(GROUP, ADDR, "m1")
                 .await
                 .unwrap(),
-            Some((vec![5u8; 32], 11))
+            Some(StoredMessageSecret::new(
+                MessageSecret::from_bytes([5; 32]),
+                Some(11)
+            ))
         );
     }
 
@@ -8312,7 +8365,7 @@ mod read_routing_tests {
              and forces an unnecessary redelivery",
         ),
         (
-            "get_msg_secret_with_ts",
+            "get_stored_msg_secret",
             "a miss is terminal for the reaction/vote/edit, so the lookup must wait \
              out a concurrent secret write rather than read the snapshot before it",
         ),

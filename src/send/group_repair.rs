@@ -785,7 +785,8 @@ mod tests {
                 .send_message_with_options(
                     group.clone(),
                     waproto::whatsapp::Message::text("original message"),
-                    super::super::SendOptions::default().with_message_id("CONTINUITY"),
+                    super::super::SendOptions::default()
+                        .with_message_id(crate::MessageId::new("CONTINUITY").unwrap()),
                 )
                 .await
                 .unwrap();
