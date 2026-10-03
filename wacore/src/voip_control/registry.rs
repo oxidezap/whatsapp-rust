@@ -988,12 +988,6 @@ impl CallRegistry {
                     .as_ref()
                     .and_then(GroupCallState::snapshot)
                     .is_some_and(|snapshot| snapshot.media == "video");
-            let local_member = entry
-                .group_invite_self_device
-                .as_ref()
-                .is_some_and(|device| {
-                    Self::group_update_contains_connected_device(&update, &device.jid)
-                });
             // One preview both decides admission and becomes the committed state. `apply_update`
             // mutates nothing on a rejected transaction, so a preview that did not apply is still
             // byte-identical to the entry's own state and can be stored back unconditionally.
@@ -1005,6 +999,15 @@ impl CallRegistry {
             });
             let previous_transaction = preview.snapshot().map(|snapshot| snapshot.transaction_id);
             let applied = preview.apply_update(update);
+            // Relay-only adoption cannot authorize membership from its obsolete carrying roster.
+            let local_member = preview.snapshot().is_some_and(|committed| {
+                entry
+                    .group_invite_self_device
+                    .as_ref()
+                    .is_some_and(|device| {
+                        Self::group_update_contains_connected_device(committed, &device.jid)
+                    })
+            });
             let downgrades_video = had_video
                 && preview
                     .snapshot()
@@ -4443,6 +4446,55 @@ mod tests {
             listener.now_or_never().is_some(),
             "admission wakes the media attachment waiter"
         );
+    }
+
+    #[test]
+    fn relay_only_old_roster_cannot_admit_a_waiting_room_device() {
+        let reg = CallRegistry::new();
+        let mut waiting = session("GROUP-CALL");
+        assert!(waiting.transition_to(CallPhase::Calling));
+        assert!(waiting.transition_to(CallPhase::WaitingRoom));
+        let generation = reg.insert_call_link_checked(waiting).expect("call-link");
+        let heartbeat_aborted = Arc::new(AtomicBool::new(false));
+        reg.set_waiting_room_task("GROUP-CALL", generation, flag_handle(&heartbeat_aborted));
+        assert_eq!(
+            reg.apply_group_update_if_current(group_update(15), generation),
+            GroupStateApply::Applied
+        );
+        let local_device = Jid::new("222222222222222", Server::Lid).with_device(1);
+        assert!(reg.set_group_invite_self_device(
+            "GROUP-CALL",
+            generation,
+            GroupCallDevice::new(local_device.clone()).with_capability(1, [1])
+        ));
+        let mut older = group_update(13);
+        older.relay = Some(group_relay(1));
+        let mut local_participant = GroupCallParticipant::new(
+            local_device.to_non_ad(),
+            vec![GroupCallDevice::new(local_device)],
+        );
+        local_participant.state = Some("connected".to_string());
+        older.participants = vec![local_participant];
+        assert_eq!(
+            reg.apply_group_update_if_current(older, generation),
+            GroupStateApply::Applied
+        );
+        assert_eq!(
+            reg.phase("GROUP-CALL"),
+            Some(CallPhase::WaitingRoom),
+            "only the committed roster can authorize local admission"
+        );
+        assert!(
+            !heartbeat_aborted.load(Ordering::SeqCst),
+            "stale roster cannot cancel heartbeat"
+        );
+        let group = reg
+            .group_state_if_current("GROUP-CALL", generation)
+            .unwrap();
+        let committed = group.snapshot().unwrap();
+        assert_eq!(committed.transaction_id, 15);
+        assert!(committed.participants.is_empty());
+        assert!(committed.relay.is_some());
     }
 
     #[test]
