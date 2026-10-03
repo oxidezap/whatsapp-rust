@@ -481,7 +481,7 @@ mod tests {
         assert_eq!(metrics.health, PluginHealth::Degraded);
         assert!(metrics.events.expect("metrics event stats").dropped > 0);
 
-        client.disconnect().await;
+        client.shutdown().await;
         assert!(api.snapshot().shutdown);
         assert!(matches!(
             router.subscribe(

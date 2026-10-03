@@ -387,15 +387,16 @@ async fn create_test_client_from_backend(
             .expect("persistence manager should initialize"),
     );
 
-    let (client, _rx) = Client::new_with_cache_config(
-        runtime,
-        pm,
-        Arc::new(MockTransportFactory::new()),
-        http_client,
-        None,
-        cache_config,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(runtime)
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(MockTransportFactory::new()))
+        .with_http_client_arc(http_client)
+        .with_cache_config(cache_config)
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Tests exercise live-path semantics by default (a fresh client starts in
     // drain mode: 1-permit semaphore, inbound commits batch instead of
@@ -419,14 +420,15 @@ pub(crate) async fn create_test_client_with_transport_factory(
             .expect("persistence manager should initialize"),
     );
 
-    let (client, _rx) = Client::new(
-        Arc::new(TokioRuntime),
-        pm,
-        transport_factory,
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(transport_factory)
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     client.enter_live_mode_for_tests();
 
@@ -515,14 +517,15 @@ pub(crate) async fn create_iq_test_client_with_backend(
     );
     let factory = CapturingMockTransportFactory::new();
     let transport = factory.transport();
-    let (client, _sync_rx) = Client::new(
-        Arc::new(TokioRuntime),
-        pm,
-        Arc::new(factory),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(factory))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Wired to the client's own observers like the real socket is, so per-frame
     // bookkeeping and sent-frame forwarding are part of what tests observe.

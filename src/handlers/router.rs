@@ -165,14 +165,15 @@ mod tests {
             .expect("persistence manager should initialize");
         let transport = Arc::new(crate::transport::mock::MockTransportFactory::new());
         let http_client = Arc::new(MockHttpClient);
-        let (client, _rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            Arc::new(pm),
-            transport,
-            http_client,
-            None,
-        )
-        .await;
+        let (client, _rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(Arc::new(pm))
+            .with_transport_factory_arc(transport)
+            .with_http_client_arc(http_client)
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let mut cancelled = false;
         let result = router.dispatch(client, node, &mut cancelled).await;
@@ -198,14 +199,15 @@ mod tests {
             .expect("persistence manager should initialize");
         let transport = Arc::new(crate::transport::mock::MockTransportFactory::new());
         let http_client = Arc::new(MockHttpClient);
-        let (client, _rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            Arc::new(pm),
-            transport,
-            http_client,
-            None,
-        )
-        .await;
+        let (client, _rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(Arc::new(pm))
+            .with_transport_factory_arc(transport)
+            .with_http_client_arc(http_client)
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let mut cancelled = false;
         let result = router.dispatch(client, node, &mut cancelled).await;

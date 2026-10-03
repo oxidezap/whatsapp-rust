@@ -433,7 +433,7 @@ impl<'a> AcceptCall<'a> {
         // The decrypt above may await on the network (prekey fetch). If the connection dropped
         // meanwhile, cleanup_connection_state reaped the pending registration. Preserve the
         // connection-specific error before checking the generation.
-        if !self.client.is_connected() {
+        if !self.client.is_socket_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
         registration.ensure_current()?;
@@ -1031,7 +1031,7 @@ impl<'a> OutgoingGroupCall<'a> {
         };
         drop(transition_guard);
 
-        if !self.client.is_connected() {
+        if !self.client.is_socket_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
         let handle = open_registered_media(
@@ -1229,7 +1229,7 @@ impl<'a> CallLinkCall<'a> {
                 .build(),
         );
 
-        if !self.client.is_connected() {
+        if !self.client.is_socket_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
         let handle =
@@ -8655,14 +8655,15 @@ mod tests {
         )))
         .await;
         let transport = Arc::new(crate::transport::mock::MockTransportFactory::new());
-        let (client, _rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            Arc::new(pm),
-            transport,
-            Arc::new(MockHttpClient),
-            None,
-        )
-        .await;
+        let (client, _rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(Arc::new(pm))
+            .with_transport_factory_arc(transport)
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let count = Arc::new(AtomicUsize::new(0));
         struct CountingTransport {
@@ -10778,14 +10779,15 @@ mod tests {
         )))
         .await;
         let transport = Arc::new(crate::transport::mock::MockTransportFactory::new());
-        let (client, _rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            Arc::new(pm),
-            transport,
-            Arc::new(MockHttpClient),
-            None,
-        )
-        .await;
+        let (client, _rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(Arc::new(pm))
+            .with_transport_factory_arc(transport)
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
         // Intentionally leave noise_socket unset so send_node errors.
         client.set_connected_for_test(true);
         client
@@ -10956,7 +10958,7 @@ mod tests {
     // stanza-id waiter is gone.
     #[tokio::test]
     async fn relay_waiter_no_ack_removes_response_waiter() {
-        // make_client's Client::new already sets self_weak, so spawn_outgoing_relay_waiter can upgrade
+        // make_client's builder already sets self_weak, so spawn_outgoing_relay_waiter can upgrade
         // an owned Arc<Client>.
         let client = make_client().await;
 
@@ -11011,14 +11013,15 @@ mod tests {
         )))
         .await;
         let transport = Arc::new(crate::transport::mock::MockTransportFactory::new());
-        let (client, _rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            Arc::new(pm),
-            transport,
-            Arc::new(MockHttpClient),
-            None,
-        )
-        .await;
+        let (client, _rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(Arc::new(pm))
+            .with_transport_factory_arc(transport)
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
         client.set_connected_for_test(true);
         client
     }

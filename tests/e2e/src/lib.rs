@@ -116,7 +116,7 @@ async fn connect_diagnostics(
         Err(_) => format!(
             "diagnostics_timed_out_after={}s, socket_connected={}, logged_in={}",
             TIMEOUT.as_secs(),
-            client.is_connected(),
+            client.is_socket_connected(),
             client.is_logged_in(),
         ),
     }
@@ -157,7 +157,7 @@ async fn collect_connect_diagnostics(
     format!(
         "socket_connected={}, logged_in={}, has_pn={}, has_lid={}, sync_keys={}, \
          primary_pn_session={}, primary_lid_session={}, app_state_requests={}, app_state_syncs={}",
-        client.is_connected(),
+        client.is_socket_connected(),
         client.is_logged_in(),
         has_pn,
         has_lid,
@@ -235,7 +235,7 @@ impl TestClient {
 
         let run_handle = bot.spawn();
 
-        // Readiness gate: `wait_for_connected` resolves on the canonical
+        // Readiness gate: `wait_for_session_ready` resolves on the canonical
         // `is_ready` signal (`dispatch_connected`, after the critical sync) via
         // a notifier, so it does not race event arrival order or fall back to an
         // orthogonal signal — the earlier flake, where a fixed 30s wait for
@@ -243,11 +243,11 @@ impl TestClient {
         // in the unbounded `event_rx`; the predicate-filtered `wait_for_event`
         // discards them.
         if let Err(e) = client
-            .wait_for_connected(tokio::time::Duration::from_secs(60))
+            .wait_for_session_ready(tokio::time::Duration::from_secs(60))
             .await
         {
             let diagnostics = connect_diagnostics(&client, &backend).await;
-            client.disconnect().await;
+            client.shutdown().await;
             drop(run_handle);
             return Err(anyhow::anyhow!(
                 "{prefix}: client never became ready after pairing ({diagnostics}): {e}"
@@ -264,7 +264,7 @@ impl TestClient {
             .await
         {
             let diagnostics = connect_diagnostics(&client, &backend).await;
-            client.disconnect().await;
+            client.shutdown().await;
             drop(run_handle);
             return Err(anyhow::anyhow!(
                 "{prefix}: startup sync did not settle ({diagnostics}): {e}"
@@ -546,14 +546,14 @@ impl TestClient {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
 
         loop {
-            if !self.client.is_connected() {
+            if !self.client.is_socket_connected() {
                 return Ok(());
             }
 
             // Re-sample the flag: the teardown runs on another task and can flip it
             // between the check above and the deadline expiring, and a disconnect
             // that lands in that window is a success, not a timeout.
-            if tokio::time::Instant::now() >= deadline && self.client.is_connected() {
+            if tokio::time::Instant::now() >= deadline && self.client.is_socket_connected() {
                 return Err(anyhow::anyhow!(
                     "Timed out after {timeout_secs}s waiting for the client to go offline"
                 ));
@@ -599,7 +599,7 @@ impl TestClient {
 
     /// Disconnect and wait for the run task to complete cleanly.
     pub async fn disconnect(self) {
-        self.client.disconnect().await;
+        self.client.shutdown().await;
         let run_handle = self.run_handle;
 
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), run_handle).await {

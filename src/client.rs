@@ -41,8 +41,9 @@ use extension_lifecycle::LifecycleRegistration;
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use extension_lifecycle::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
 pub use lifecycle::{
-    ConflictKind, Connection, DrainOutcome, ProtocolTerminalReason, Reachability,
-    RunCompletionReason, SecretFlushReport, ShutdownReport,
+    ConflictKind, Connection, DeregistrationOutcome, DeregistrationSkipReason, DrainOutcome,
+    LogoutReport, ProtocolTerminalReason, Reachability, RunCompletionReason, SecretFlushReport,
+    ShutdownReport,
 };
 pub use voip::{CallError, Voip};
 
@@ -1113,7 +1114,7 @@ impl std::fmt::Display for ConnectStage {
 }
 
 /// Failure modes of [`Client::connect`] and of the readiness waiters
-/// ([`Client::wait_for_socket`], [`Client::wait_for_connected`]).
+/// ([`Client::wait_for_socket_ready`], [`Client::wait_for_session_ready`]).
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ConnectError {
@@ -1514,7 +1515,7 @@ impl AutoReconnect {
 /// # Lifecycle
 ///
 /// [`Client::run`] owns the session: it connects, keeps the socket alive, and
-/// reconnects with backoff until [`Client::disconnect`] is called or the device
+/// reconnects with backoff until [`Client::shutdown`] is called or the device
 /// is logged out. [`Client::connect`] performs a single connection attempt
 /// without the supervision loop, for hosts that manage retries themselves.
 ///
@@ -1606,7 +1607,7 @@ pub struct Client {
     /// including reconnects, reads this same value, so the policy cannot
     /// change under an in-flight handshake.
     pub(crate) noise_cert_policy: wacore::handshake::NoiseCertPolicy,
-    /// Terminal shutdown (process-wide). Fired ONLY by `disconnect()`.
+    /// Terminal shutdown (process-wide). Fired by shutdown, logout or synchronous drop cleanup.
     /// Long-lived subscribers that must outlive reconnect cycles (saver,
     /// device registry cleanup) subscribe here.
     pub(crate) shutdown_notifier: wacore::runtime::ShutdownNotifier,
@@ -1926,7 +1927,7 @@ pub struct Client {
     /// Task count, retained payload storage, peaks, and idle notification for
     /// history sync work.
     pub(crate) history_sync_activity: Arc<crate::sync_task::HistorySyncActivity>,
-    /// Flushed by `disconnect()`/`reconnect()` before tearing down the transport
+    /// Flushed by `shutdown()`/`reconnect()` before tearing down the transport
     /// so in-flight delivery receipts aren't dropped with `NotConnected`
     /// (issue #571).
     pub(crate) outbound_flush: Arc<crate::flush_scope::FlushScope>,
@@ -1960,7 +1961,7 @@ pub struct Client {
     pub(crate) socket_ready_notifier: event_listener::Event,
     /// Set to `true` only when `dispatch_connected()` fires (once the critical
     /// sync has an answer, clean or not). Reset on each new connection attempt.
-    /// Used by `wait_for_connected()` to avoid a false-positive fast path when
+    /// Used by `wait_for_session_ready()` to avoid a false-positive fast path when
     /// the client is logged in but critical app state hasn't been asked for yet.
     pub(crate) is_ready: AtomicBool,
     /// Notifier for when the client is fully connected and logged in.

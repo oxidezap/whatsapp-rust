@@ -3474,7 +3474,7 @@ mod tests {
             vec!["install:runtime-foundation", "install:runtime-dependent"]
         );
 
-        client.disconnect().await;
+        client.shutdown().await;
         assert_eq!(
             *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
             vec![
@@ -3570,7 +3570,7 @@ mod tests {
         assert_eq!(client.plugin_manifests().len(), 1);
         assert!(client.plugin_stats().is_some());
         assert!(client.plugin_event_router().is_some());
-        client.disconnect().await;
+        client.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3747,7 +3747,7 @@ mod tests {
             vec!["install:foundation", "install:dependent"]
         );
 
-        client.disconnect().await;
+        client.shutdown().await;
         assert_eq!(
             *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
             vec![
@@ -3794,7 +3794,7 @@ mod tests {
             .expect("declared dependency plan");
         let client = build.into_client();
         assert_eq!(client.plugin::<TransitiveProbe>().as_deref(), Some(&true));
-        client.disconnect().await;
+        client.shutdown().await;
     }
 
     impl<const MARKER: u8> ClientPlugin for DeclarativePlugin<MARKER> {
@@ -4084,7 +4084,7 @@ mod tests {
         let weak_api = Arc::downgrade(&api);
         drop(api);
 
-        client.disconnect().await;
+        client.shutdown().await;
         drop(client);
         wait_for_flag(&api_dropped).await;
         assert!(weak_api.upgrade().is_none());
@@ -4771,7 +4771,7 @@ mod tests {
         assert_eq!(stats.plugins[0].connection_generations, 0);
         assert_eq!(stats.plugins[0].callbacks_completed, 2);
 
-        client.disconnect().await;
+        client.shutdown().await;
         assert!(install_dropped.load(Ordering::Acquire));
         assert!(shutdown_after_task.load(Ordering::Acquire));
         let stats = client.plugin_stats().expect("stopped plugin stats");
@@ -4822,7 +4822,7 @@ mod tests {
         assert!(connection_finished.load(Ordering::Acquire));
         assert!(closed_after_task.load(Ordering::Acquire));
 
-        client.disconnect().await;
+        client.shutdown().await;
         assert!(install_finished.load(Ordering::Acquire));
         assert!(shutdown_after_task.load(Ordering::Acquire));
         let stats = client.plugin_stats().expect("cooperative plugin stats");
@@ -4854,7 +4854,7 @@ mod tests {
             .into_client();
         wait_for_flag(&started).await;
 
-        client.disconnect().await;
+        client.shutdown().await;
         wait_for_flag(&finished).await;
         let stats = client.plugin_stats().expect("timed drain stats");
         assert_eq!(stats.plugins[0].task_drain_timeouts, 1);
@@ -5328,7 +5328,7 @@ mod tests {
         assert_eq!(stats.upstream_callback_failures, 1);
         assert_eq!(stats.upstream_callback_timeouts, 0);
         assert_eq!(stats.plugins[0].health, PluginHealth::Healthy);
-        client.disconnect().await;
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -5382,7 +5382,7 @@ mod tests {
             .expect("following plugin stats");
         assert_eq!(following.health, PluginHealth::Healthy);
         assert_eq!(following.callbacks_completed, 1);
-        client.disconnect().await;
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -5430,7 +5430,7 @@ mod tests {
             .expect("following plugin stats");
         assert_eq!(following.health, PluginHealth::Healthy);
         assert_eq!(following.callbacks_completed, 1);
-        client.disconnect().await;
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -5449,7 +5449,7 @@ mod tests {
             vec!["install:upstream", "install:foundation"]
         );
 
-        client.disconnect().await;
+        client.shutdown().await;
         assert_eq!(
             *log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
             vec![
@@ -5651,7 +5651,7 @@ mod tests {
         assert!(client.core.event_bus.has_handler_for(EventKind::Connected));
         assert!(client.raw_node_forwarding_enabled());
 
-        client.disconnect().await;
+        client.shutdown().await;
         assert!(!client.core.event_bus.has_handler_for(EventKind::Connected));
         assert!(!client.raw_node_forwarding_enabled());
     }
@@ -5964,7 +5964,7 @@ mod tests {
             .plugin::<InterceptingPlugin>()
             .expect("interception API");
 
-        client.disconnect().await;
+        client.shutdown().await;
         assert!(!api.registration.is_active());
         assert!(!client.has_stanza_interceptors());
     }
@@ -5982,7 +5982,7 @@ mod tests {
             .plugin::<InterceptingPlugin>()
             .expect("interception API");
 
-        client.disconnect().await;
+        client.shutdown().await;
         assert!(matches!(
             api.interception.register(Arc::new(PanickingInterceptor)),
             Err(PluginResourceError::ShuttingDown)
@@ -6121,7 +6121,7 @@ mod tests {
                 .core_event_subscriptions,
             0
         );
-        client.disconnect().await;
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -6181,7 +6181,7 @@ mod tests {
                 .all(|registration| registration.upgrade().is_none())
         );
         assert_eq!(resources.stats().core_event_subscriptions, 0);
-        client.disconnect().await;
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -6221,7 +6221,7 @@ mod tests {
             .find(|plugin| plugin.plugin_id == "shutdown-signal")
             .expect("unaffected plugin stats");
         assert_eq!(unaffected.health, PluginHealth::Healthy);
-        client.disconnect().await;
+        client.shutdown().await;
     }
 
     #[test]
@@ -6273,7 +6273,7 @@ mod tests {
             .expect("panicking plugin stats");
         assert_eq!(panicking.health, PluginHealth::Degraded);
         assert_eq!(panicking.resource_teardown_panics, 1);
-        client.disconnect().await;
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -6296,7 +6296,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("reentrant handler teardown must not deadlock");
         shutdown.join().expect("shutdown thread");
-        client.disconnect().await;
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -6330,7 +6330,7 @@ mod tests {
             .expect("rejected reentrant subscription must not deadlock");
         assert!(matches!(result, Err(PluginResourceError::ShuttingDown)));
         subscribe.join().expect("subscription thread");
-        client.disconnect().await;
+        client.shutdown().await;
     }
 
     #[tokio::test]
@@ -6360,7 +6360,7 @@ mod tests {
                 .event_bus
                 .has_handler_for(EventKind::Connected)
         );
-        retained_client.disconnect().await;
+        retained_client.shutdown().await;
     }
 
     struct CapabilityProbe;
@@ -6400,7 +6400,7 @@ mod tests {
             Some(&[false, false, true, false, false])
         );
         assert!(client.plugin_event_router().is_none());
-        client.disconnect().await;
+        client.shutdown().await;
     }
 
     struct PluginEventPublisher;
@@ -6511,7 +6511,7 @@ mod tests {
         assert_eq!(event.connection_generation, next_generation);
         assert_eq!(event.sequence, 2);
 
-        client.disconnect().await;
+        client.shutdown().await;
         assert!(matches!(
             publisher.publish(&tick, 2, PluginEventPayloadEncoding::Json, Bytes::new(),),
             Err(PluginEventPublishError::Resource(

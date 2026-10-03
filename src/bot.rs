@@ -511,7 +511,7 @@ impl Bot {
     }
 
     /// Run the bot on the current task until it shuts down (logout, or
-    /// [`Client::disconnect`] called on [`Bot::client`] from another task).
+    /// [`Client::shutdown`] called on [`Bot::client`] from another task).
     ///
     /// To run in the background instead, use [`Bot::spawn`].
     ///
@@ -522,11 +522,6 @@ impl Bot {
     /// graph is compiled once, here. One allocation per process.
     pub async fn run(self) -> crate::RunCompletionReason {
         self.run_boxed().await
-    }
-
-    /// Compatibility alias for [`Self::run`], with the same full outcome.
-    pub async fn run_with_reason(self) -> crate::RunCompletionReason {
-        self.run().await
     }
 
     #[inline(never)]
@@ -1679,7 +1674,7 @@ mod tests {
             bot.client().plugin::<BotBuilderPlugin>().as_deref(),
             Some(&"installed")
         );
-        bot.client().disconnect().await;
+        bot.client().shutdown().await;
     }
 
     #[tokio::test]
@@ -1698,7 +1693,7 @@ mod tests {
             default_bot.client().noise_cert_policy,
             NoiseCertPolicy::default()
         );
-        default_bot.client().disconnect().await;
+        default_bot.client().shutdown().await;
 
         let bypass_bot = Bot::builder()
             .with_backend_arc(create_test_sqlite_backend().await)
@@ -1713,7 +1708,7 @@ mod tests {
             bypass_bot.client().noise_cert_policy,
             NoiseCertPolicy::DangerSkipCertChainVerify
         );
-        bypass_bot.client().disconnect().await;
+        bypass_bot.client().shutdown().await;
 
         // Explicit Strict is distinct from the default only when the
         // default changes: the setter, not a build flag, decides.
@@ -1730,7 +1725,7 @@ mod tests {
             strict_bot.client().noise_cert_policy,
             NoiseCertPolicy::Strict
         );
-        strict_bot.client().disconnect().await;
+        strict_bot.client().shutdown().await;
     }
 
     fn pairing_code_event(code: &str) -> Arc<Event> {

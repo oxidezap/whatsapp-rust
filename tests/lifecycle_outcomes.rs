@@ -4,11 +4,14 @@ use std::time::Duration;
 
 use whatsapp_rust::bot::{Bot, BotRunOutcome};
 use whatsapp_rust::http::{HttpClient, HttpRequest, HttpResponse};
+use whatsapp_rust::prelude::LogoutReport as PreludeLogoutReport;
 use whatsapp_rust::store::persistence_manager::PersistenceManager;
 use whatsapp_rust::transport::{Transport, TransportEvent, TransportFactory};
+use whatsapp_rust::wacore::runtime::BoxFuture;
 use whatsapp_rust::wacore::store::in_memory::InMemoryBackend;
 use whatsapp_rust::{
-    Client, ConnectError, DrainOutcome, Reachability, RunCompletionReason, TokioRuntime,
+    Client, ConnectError, DeregistrationOutcome, DeregistrationSkipReason, DrainOutcome,
+    LogoutReport, Reachability, RunCompletionReason, TokioRuntime,
 };
 
 struct OfflineHttp;
@@ -195,6 +198,45 @@ async fn aborted_handle_returns_without_waiting_for_run_sender() {
             .await
             .unwrap(),
         BotRunOutcome::AbortRequested
+    ));
+}
+
+#[async_trait::async_trait]
+trait HostLogout {
+    async fn logout_report(&self) -> LogoutReport;
+}
+
+#[async_trait::async_trait]
+impl HostLogout for Arc<Client> {
+    async fn logout_report(&self) -> LogoutReport {
+        // Both async_trait and host boxing must keep the future Send on native.
+        let future: BoxFuture<'_, LogoutReport> = Box::pin(self.logout());
+        future.await
+    }
+}
+
+#[tokio::test]
+async fn offline_logout_reports_local_shutdown_without_claiming_deregistration() {
+    let client = client().await;
+    assert!(!client.is_socket_connected());
+    assert!(!client.is_session_ready());
+    let report: PreludeLogoutReport = client.logout_report().await;
+    assert!(matches!(
+        report.deregistration,
+        DeregistrationOutcome::NotAttempted(DeregistrationSkipReason::Offline)
+    ));
+    assert_eq!(report.shutdown.inbound, DrainOutcome::Completed);
+    assert_eq!(report.shutdown.outbound, DrainOutcome::Completed);
+    assert_eq!(report.shutdown.signal_settle, DrainOutcome::Completed);
+    assert!(report.shutdown.device.is_ok());
+    assert!(client.shutdown_signal().is_fired());
+    assert!(matches!(
+        client.run().await,
+        RunCompletionReason::ShutdownRequested
+    ));
+    assert!(matches!(
+        client.connect().await,
+        Err(ConnectError::Shutdown)
     ));
 }
 

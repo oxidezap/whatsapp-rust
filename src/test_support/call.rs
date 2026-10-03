@@ -182,7 +182,7 @@ impl CallFixture {
             fixture
                 .inject(NodeBuilder::new("success").attr("lid", own).build())
                 .await?;
-            fixture.client.wait_for_connected(DEADLINE).await?;
+            fixture.client.wait_for_session_ready(DEADLINE).await?;
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -277,7 +277,7 @@ impl CallFixture {
 
     /// End the actual client connection and all registered calls.
     pub async fn shutdown(&self) -> Result<()> {
-        self.client.disconnect().await;
+        self.client.shutdown().await;
         let reader = self.reader.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(reader) = reader {
             let mut reader = scopeguard::guard(reader, |reader| reader.abort());

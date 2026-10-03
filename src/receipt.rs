@@ -2000,14 +2000,17 @@ mod tests {
                 .await
                 .expect("persistence manager should initialize"),
         );
-        let (client, _rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm,
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-        )
-        .await;
+        let (client, _rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm)
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let info = MessageInfo {
             id: "TEST-ID-123".into(),
@@ -2044,14 +2047,17 @@ mod tests {
                 .await
                 .expect("persistence manager should initialize"),
         );
-        let (client, _rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm,
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-        )
-        .await;
+        let (client, _rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm)
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let info = MessageInfo {
             id: "GROUP-MSG-ID".into(),
@@ -2081,14 +2087,17 @@ mod tests {
                 .await
                 .expect("persistence manager should initialize"),
         );
-        let (client, _rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm,
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-        )
-        .await;
+        let (client, _rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm)
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let info = MessageInfo {
             id: "OWN-MSG-ID".into(),
@@ -2120,14 +2129,17 @@ mod tests {
                 .await
                 .expect("persistence manager should initialize"),
         );
-        let (client, _rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm,
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-        )
-        .await;
+        let (client, _rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm)
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let info = MessageInfo {
             id: "".into(), // Empty ID
@@ -2157,14 +2169,17 @@ mod tests {
                 .await
                 .expect("persistence manager should initialize"),
         );
-        let (client, _rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm,
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-        )
-        .await;
+        let (client, _rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm)
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let info = MessageInfo {
             id: "STATUS-MSG-ID".into(),
@@ -2245,14 +2260,17 @@ mod tests {
                 .await
                 .expect("persistence manager should initialize"),
         );
-        let (client, _rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm,
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-        )
-        .await;
+        let (client, _rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm)
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let collector = Arc::new(TestEventCollector::default());
         client.subscribe_handler(collector.clone()).detach();
@@ -3564,14 +3582,17 @@ mod tests {
                 .await
                 .expect("persistence manager should initialize"),
         );
-        let (client, _rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm,
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-        )
-        .await;
+        let (client, _rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm)
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         assert_eq!(
             client.memory_report().await.offline_receipt_buffer.entries,
@@ -3606,14 +3627,17 @@ mod tests {
                 .await
                 .expect("persistence manager should initialize"),
         );
-        let (client, _rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm,
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-        )
-        .await;
+        let (client, _rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm)
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         // Offline messages buffer instead of sending 1:1.
         let info = offline_info(

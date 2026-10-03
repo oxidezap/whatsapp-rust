@@ -270,7 +270,7 @@ impl Client {
                 return;
             }
 
-            if !self.is_connected() {
+            if !self.is_socket_connected() {
                 debug!("Stopping presence re-subscribe: connection closed");
                 return;
             }

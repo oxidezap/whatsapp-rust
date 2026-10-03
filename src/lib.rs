@@ -163,11 +163,13 @@ pub(crate) mod test_alloc {
 pub use wacore::appstate::patch_decode::WAPatchName;
 pub use wacore::appstate::schemas;
 pub use wacore::client_profile::ClientProfile;
+pub use wacore::store::traits::StoredMessageSecret;
 /// Optional metrics emission (the `metrics` feature). No-op when the feature is off.
 pub use wacore::telemetry;
 pub use wacore::types::message_ref::{
     MessageId, MessageRef, MessageRefError, NewsletterMessageRef, ServerMessageId, StanzaId,
 };
+pub use wacore::types::message_secret::{InvalidMessageSecret, MessageSecret};
 pub use wacore::{
     iq::privacy as privacy_settings, proto_helpers, sticker_pack, store::traits, webp,
 };
@@ -234,8 +236,9 @@ pub use client::{
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
 pub use client::{
-    ConflictKind, ConnectError, ConnectStage, DrainOutcome, ProtocolTerminalReason, Reachability,
-    RunCompletionReason, SecretFlushReport, ShutdownReport, SignalMaintenanceError,
+    ConflictKind, ConnectError, ConnectStage, DeregistrationOutcome, DeregistrationSkipReason,
+    DrainOutcome, LogoutReport, ProtocolTerminalReason, Reachability, RunCompletionReason,
+    SecretFlushReport, ShutdownReport, SignalMaintenanceError,
 };
 pub use types::connect_admission::ConnectAdmission;
 pub use types::durability_hook::InboundDurabilityHook;
@@ -360,7 +363,7 @@ pub use features::{
     UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError, VariantProperty, VerifiedName,
     message_key, message_range,
 };
-pub use features::{MexDoc, MexOperation};
+pub use features::{CreatedEvent, CreatedPoll, EventRef, MexDoc, MexOperation, PollRef};
 
 pub use features::{ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
 
@@ -393,8 +396,9 @@ pub mod prelude {
     #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
     pub use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
     pub use crate::client::{
-        ConflictKind, ConnectError, ConnectStage, DrainOutcome, ProtocolTerminalReason,
-        RunCompletionReason, SecretFlushReport, ShutdownReport,
+        ConflictKind, ConnectError, ConnectStage, DeregistrationOutcome, DeregistrationSkipReason,
+        DrainOutcome, LogoutReport, ProtocolTerminalReason, RunCompletionReason, SecretFlushReport,
+        ShutdownReport,
     };
     #[cfg(feature = "plugins")]
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
@@ -420,7 +424,10 @@ pub mod prelude {
         EventKind, InboundMessage, MessageBatch, Subscription,
     };
     pub use crate::types::message::MessageInfo;
-    pub use crate::{Jid, Server};
+    pub use crate::{
+        CreatedEvent, CreatedPoll, EventRef, InvalidMessageSecret, Jid, MessageSecret, PollRef,
+        Server, StoredMessageSecret,
+    };
     pub use crate::{
         MessageId, MessageRef, MessageRefError, NewsletterMessageRef, ServerMessageId, StanzaId,
     };

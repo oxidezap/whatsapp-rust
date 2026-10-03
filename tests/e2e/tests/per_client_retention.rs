@@ -131,7 +131,7 @@ fn the_allocator_counts_what_it_hands_out() {
 /// that is.
 ///
 /// The capacities are the constants the client and the Tokio transport build
-/// with (`Client::new` and `EVENT_CHANNEL_CAPACITY`); they are restated here
+/// with (`Client::builder().build()` and `EVENT_CHANNEL_CAPACITY`); they are restated here
 /// because a channel's preallocation is not reachable from outside it, so the
 /// only way to price one is to build an identical channel.
 #[test]

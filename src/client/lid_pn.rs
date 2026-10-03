@@ -3180,7 +3180,7 @@ mod tests {
             .unwrap()
             .insert(key.clone());
 
-        client.disconnect().await;
+        client.shutdown().await;
 
         assert!(
             client.pending_lid_refreshes.lock().unwrap().contains(&key),

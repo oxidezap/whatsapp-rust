@@ -225,7 +225,7 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
                                         .build(),
                                 ));
                             if !pair_code_outstanding {
-                                client_clone.disconnect().await;
+                                client_clone.shutdown().await;
                             }
                         }))
                         .detach();

@@ -110,8 +110,8 @@ fn main() {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Shutting down both sessions...");
-                    client_a.disconnect().await;
-                    client_b.disconnect().await;
+                    client_a.shutdown().await;
+                    client_b.shutdown().await;
                     break;
                 }
             }
