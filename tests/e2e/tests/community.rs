@@ -1,9 +1,9 @@
 use e2e_tests::TestClient;
 use log::info;
-use whatsapp_rust::GroupType;
+use whatsapp_rust::GroupHierarchy;
 use whatsapp_rust::features::{
     CreateCommunityOptions, CreateSubgroupOptions, GroupCreateOptions, LinkSubgroupOptions,
-    SubgroupVisibility, group_type,
+    SubgroupVisibility,
 };
 
 #[tokio::test]
@@ -33,7 +33,7 @@ async fn test_community_create() -> anyhow::Result<()> {
         result.metadata.is_parent_group,
         "create result should classify as a parent group"
     );
-    assert_eq!(group_type(&result.metadata), GroupType::Community);
+    assert_eq!(result.metadata.hierarchy(), GroupHierarchy::Community);
 
     // Cross-check against a fresh `fetch_metadata` query.
     let metadata = client
@@ -42,7 +42,7 @@ async fn test_community_create() -> anyhow::Result<()> {
         .fetch_metadata(&result.metadata.id)
         .await?;
     assert!(metadata.is_parent_group, "should be a parent group");
-    assert_eq!(group_type(&metadata), GroupType::Community);
+    assert_eq!(metadata.hierarchy(), GroupHierarchy::Community);
 
     client.disconnect().await;
     Ok(())

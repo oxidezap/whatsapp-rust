@@ -19,10 +19,13 @@ use wacore::iq::usync::{
 use wacore::stanza::business::BusinessNotificationType;
 use wacore::stanza::devices::DeviceNotificationType;
 use wacore::stanza::groups::{GroupNotificationAction, MembershipRequestMethod};
-use wacore::types::call::CallAction;
+use wacore::types::call::{CallAction, CallActionTag, VideoState};
 use wacore::types::events::{
     BusinessUpdateType, ConnectFailureReason, DecryptFailMode, DeviceListUpdateType, TempBanReason,
     UnavailableType,
+};
+use wacore::types::group_call::{
+    CallLinkMedia, GroupCallEncRekey, GroupCallUpdate, ScreenShare, ScreenShareState, WaitingRoom,
 };
 use wacore::types::lid_pn::LearningSource;
 use wacore::types::message::{AddressingMode, EditAttribute, MessageCategory};
@@ -40,16 +43,183 @@ where
     }
 }
 
-#[allow(deprecated)]
 #[test]
-fn call_action_kind_remains_a_source_compatible_wire_tag_alias() {
-    let action = CallAction::OfferNotice {
-        call_id: "TEST-CALL-ID".to_string(),
-        call_creator: Jid::new("111111111111111", wacore_binary::jid::Server::Lid),
-        is_video: false,
-        is_group: true,
-    };
-    assert_eq!(action.action_kind(), action.wire_tag());
+fn call_actions_keep_exact_wire_tags_and_string_discriminators() {
+    let creator = Jid::new("111111111111111", wacore_binary::jid::Server::Lid);
+    let id = "TEST-CALL-ID".to_owned();
+    let actions = [
+        (
+            CallAction::Offer {
+                call_id: id.clone(),
+                call_creator: creator.clone(),
+                caller_pn: None,
+                caller_country_code: None,
+                device_class: None,
+                joinable: false,
+                is_video: false,
+                audio: vec![],
+                group_jid: None,
+            },
+            "offer",
+            CallActionTag::Offer,
+        ),
+        (
+            CallAction::OfferNotice {
+                call_id: id.clone(),
+                call_creator: creator.clone(),
+                is_video: false,
+                is_group: true,
+            },
+            "offer_notice",
+            CallActionTag::OfferNotice,
+        ),
+        (
+            CallAction::PreAccept {
+                call_id: id.clone(),
+                call_creator: creator.clone(),
+                audio: vec![],
+            },
+            "preaccept",
+            CallActionTag::PreAccept,
+        ),
+        (
+            CallAction::Accept {
+                call_id: id.clone(),
+                call_creator: creator.clone(),
+                audio: vec![],
+            },
+            "accept",
+            CallActionTag::Accept,
+        ),
+        (
+            CallAction::Reject {
+                call_id: id.clone(),
+                call_creator: creator.clone(),
+                reason: None,
+            },
+            "reject",
+            CallActionTag::Reject,
+        ),
+        (
+            CallAction::Terminate {
+                call_id: id.clone(),
+                call_creator: creator.clone(),
+                reason: None,
+                duration: None,
+                audio_duration: None,
+            },
+            "terminate",
+            CallActionTag::Terminate,
+        ),
+        (
+            CallAction::Transport {
+                call_id: id.clone(),
+                call_creator: creator.clone(),
+                p2p_cand_round: None,
+                transport_message_type: None,
+            },
+            "transport",
+            CallActionTag::Transport,
+        ),
+        (
+            CallAction::RelayLatency {
+                call_id: id.clone(),
+                call_creator: creator.clone(),
+            },
+            "relaylatency",
+            CallActionTag::RelayLatency,
+        ),
+        (
+            CallAction::VideoState {
+                call_id: id.clone(),
+                call_creator: creator.clone(),
+                state: VideoState::Stopped,
+                orientation: None,
+                dec: None,
+            },
+            "video",
+            CallActionTag::VideoState,
+        ),
+        (
+            CallAction::GroupUpdate {
+                update: Box::new(
+                    GroupCallUpdate::builder()
+                        .call_id(id.clone())
+                        .call_creator(creator.clone())
+                        .transaction_id(1)
+                        .media("audio".to_owned())
+                        .connected_limit(8)
+                        .joinable(true)
+                        .av_upgradable(false)
+                        .rekey_requested(false)
+                        .participants(vec![])
+                        .build(),
+                ),
+            },
+            "group_update",
+            CallActionTag::GroupUpdate,
+        ),
+        (
+            CallAction::EncRekey {
+                rekey: Box::new(
+                    GroupCallEncRekey::builder()
+                        .call_id(id.clone())
+                        .call_creator(creator.clone())
+                        .transaction_id(1)
+                        .key_generation(2)
+                        .encryption_type("pkmsg".to_owned())
+                        .encryption_version(2)
+                        .ciphertext(vec![1, 2])
+                        .build(),
+                ),
+            },
+            "enc_rekey",
+            CallActionTag::EncRekey,
+        ),
+        (
+            CallAction::WaitingRoomUpdate {
+                room: Box::new(
+                    WaitingRoom::builder()
+                        .call_id(id.clone())
+                        .call_creator(creator.clone())
+                        .link_token("TEST-TOKEN".to_owned())
+                        .media(CallLinkMedia::Audio)
+                        .enabled(true)
+                        .is_admin(false)
+                        .users(vec![])
+                        .build(),
+                ),
+            },
+            "waiting_room_update",
+            CallActionTag::WaitingRoomUpdate,
+        ),
+        (
+            CallAction::RaiseHand {
+                call_id: id.clone(),
+                call_creator: creator.clone(),
+                raised: true,
+            },
+            "user_action",
+            CallActionTag::RaiseHand,
+        ),
+        (
+            CallAction::ScreenShare {
+                call_id: id,
+                call_creator: creator,
+                screen_share: ScreenShare::new(ScreenShareState::Started, Some(7)),
+            },
+            "screen_share",
+            CallActionTag::ScreenShare,
+        ),
+    ];
+    for (action, wire, tag) in actions {
+        assert_eq!(action.wire_tag(), wire);
+        assert_eq!(tag.as_str(), wire);
+        assert_eq!(CallActionTag::try_from(wire).unwrap(), tag);
+        assert_eq!(serde_json::to_value(&action).unwrap()["type"], wire);
+    }
+    assert!(CallActionTag::try_from("PreAccept").is_err());
+    assert!(CallActionTag::try_from("future_call_action").is_err());
 }
 
 /// `serde_json` discards the field count handed to `serialize_struct`, so a

@@ -447,8 +447,8 @@ pub struct GroupOverview {
 }
 
 /// Wire-level overview flags shared by every overview source (`participating`
-/// and batch responses). One normalizer so [`GroupHierarchy`] and the
-/// community classifier cannot drift: precedence is an API decision (an
+/// and batch responses). One normalizer so full metadata and overview
+/// hierarchies cannot drift: precedence is an API decision (an
 /// explicit `<linked_parent>` names a subgroup, so it wins over a bare
 /// `<parent>` marker), not a protocol rule — the server sends the flags
 /// independently with no XOR between them.
@@ -592,9 +592,8 @@ impl GroupHierarchy {
         }
     }
 
-    /// Canonical hierarchy of a full metadata object: the same normalizer
-    /// every overview source uses, so `group_type` in the community feature
-    /// is a pure projection of this value and the two can never disagree.
+    /// Canonical hierarchy of a full metadata object, using the same
+    /// normalizer as every overview source.
     pub fn from_metadata(meta: &GroupMetadata) -> Self {
         Self::from_flags(&OverviewFlags {
             is_parent_group: meta.is_parent_group,
@@ -706,6 +705,29 @@ impl GroupMetadata {
     ///
     /// Computed from the retained wire flags rather than cached separately,
     /// so it remains consistent if a caller edits those public fields.
+    /// Only the parent JID is cloned; participants and settings are not copied.
+    ///
+    /// Replaces `group_type` / `GroupType`: `Default` maps to
+    /// [`GroupHierarchy::Standalone`], `Community` to [`GroupHierarchy::Community`],
+    /// and the linked roles to [`GroupHierarchy::Subgroup`] with
+    /// [`SubgroupKind::Regular`], [`SubgroupKind::Announcement`], or
+    /// [`SubgroupKind::General`], retaining the parent JID.
+    ///
+    /// ```
+    /// use whatsapp_rust::{GroupHierarchy, GroupMetadata, SubgroupKind};
+    /// let metadata = GroupMetadata::default();
+    /// match metadata.hierarchy() {
+    ///     GroupHierarchy::Standalone => {},
+    ///     GroupHierarchy::Community => {},
+    ///     GroupHierarchy::Subgroup { parent, kind: SubgroupKind::General } => {
+    ///         println!("General chat in {parent}");
+    ///     },
+    ///     GroupHierarchy::Subgroup { parent, kind } => {
+    ///         println!("Other subgroup in {parent}: {kind:?}");
+    ///     },
+    ///     _ => {}, // The hierarchy is extensible.
+    /// }
+    /// ```
     pub fn hierarchy(&self) -> GroupHierarchy {
         GroupHierarchy::from_metadata(self)
     }
