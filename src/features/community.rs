@@ -50,22 +50,6 @@ pub enum CommunityError {
 
 // Types
 
-/// Classification of a group within the community hierarchy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum GroupType {
-    /// Regular standalone group (not part of a community).
-    Default,
-    /// Community parent group.
-    Community,
-    /// A subgroup linked to a community.
-    LinkedSubgroup,
-    /// The default announcement subgroup of a community.
-    LinkedAnnouncementGroup,
-    /// The general chat subgroup of a community.
-    LinkedGeneralGroup,
-}
-
 /// Options for creating a new community.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateCommunityOptions {
@@ -187,33 +171,6 @@ pub struct LinkSubgroupsResult {
 pub struct UnlinkSubgroupsResult {
     pub unlinked_jids: Vec<Jid>,
     pub failed_groups: Vec<(Jid, u32)>,
-}
-
-/// Compatibility classification of a group's community role.
-///
-/// Prefer [`GroupMetadata::hierarchy`] for new code: unlike this classifier,
-/// [`GroupHierarchy`](crate::GroupHierarchy) also retains the parent JID.
-/// This helper remains a pure projection of that hierarchy:
-/// the classification runs through the single canonical normalizer, so this
-/// and overview hierarchies agree by construction instead of reimplementing
-/// flag precedence.
-pub fn group_type(metadata: &GroupMetadata) -> GroupType {
-    let hierarchy = metadata.hierarchy();
-    // Exhaustive on purpose: this match lives in the crate that defines the
-    // enums, so `#[non_exhaustive]` does not require a wildcard here. Leaving
-    // one out means a future `GroupHierarchy`/`SubgroupKind` variant forces a
-    // classification decision instead of silently defaulting.
-    match hierarchy {
-        crate::features::groups::GroupHierarchy::Standalone => GroupType::Default,
-        crate::features::groups::GroupHierarchy::Community => GroupType::Community,
-        crate::features::groups::GroupHierarchy::Subgroup { kind, .. } => match kind {
-            crate::features::groups::SubgroupKind::Announcement => {
-                GroupType::LinkedAnnouncementGroup
-            }
-            crate::features::groups::SubgroupKind::General => GroupType::LinkedGeneralGroup,
-            crate::features::groups::SubgroupKind::Regular => GroupType::LinkedSubgroup,
-        },
-    }
 }
 
 // Feature handle
