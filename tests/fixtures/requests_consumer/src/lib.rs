@@ -6,9 +6,21 @@ use wa::{
     SendOptions, SendRequest, SendResult, StanzaId, async_trait, waproto::whatsapp::Message,
 };
 
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg(not(target_arch = "wasm32"))]
+#[async_trait]
 pub trait Host: Send + Sync {
+    async fn send_and_edit(
+        &self,
+        chat: &Jid,
+        target: MessageRef<'_>,
+        creator: &Jid,
+        secret: &MessageSecret,
+    ) -> Result<SendResult, SendError>;
+}
+
+#[cfg(target_arch = "wasm32")]
+#[async_trait(?Send)]
+pub trait Host {
     async fn send_and_edit(
         &self,
         chat: &Jid,
@@ -55,7 +67,22 @@ pub fn boxed<'a>(client: &'a Client, chat: &'a Jid) -> BoxedSend<'a> {
     let send = client.send(SendRequest::new(chat, Message::text("hello")));
     #[cfg(not(feature = "requests"))]
     let send = client.send_message(chat, Message::text("hello"));
-    Box::pin(send)
+    Box::pin(async move {
+        let sent = send.await?;
+        #[cfg(feature = "requests")]
+        let edit = client.edit_message(EditRequest::new(
+            sent.message_ref()?,
+            Message::text("edited"),
+        ));
+        #[cfg(not(feature = "requests"))]
+        let edit = client.edit_message_raw(
+            chat,
+            sent.message_id.as_str(),
+            Message::text("edited"),
+            EditOptions::default(),
+        );
+        edit.await
+    })
 }
 
 /// Compilation checks the result contracts without manufacturing a sealed result.
