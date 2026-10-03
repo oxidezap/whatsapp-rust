@@ -14,6 +14,55 @@ pub struct IdentityTags {
 }
 
 impl Client {
+    /// Whether a finished connection will be retried by [`Self::run`].
+    pub fn auto_reconnect_enabled(&self) -> bool {
+        self.enable_auto_reconnect.load(Ordering::Acquire)
+    }
+
+    /// Change the reconnect preference without closing the current connection.
+    ///
+    /// Disabling wakes an outstanding reconnect backoff promptly. The first
+    /// attempt is still allowed, even when disabled before `run`. This does not
+    /// shut down or resume a paused session. Re-enabling cannot clear a terminal
+    /// shutdown or protocol verdict; construct a new Client for a new session.
+    pub fn set_auto_reconnect(&self, enabled: bool) {
+        if self.enable_auto_reconnect.swap(enabled, Ordering::AcqRel) != enabled {
+            self.notify_session_state();
+        }
+    }
+
+    pub(crate) fn stop_auto_reconnect_permanently(&self) {
+        self.enable_auto_reconnect.stop_permanently();
+        self.notify_session_state();
+    }
+
+    /// Reuse the injected HTTP service, for example with an independent
+    /// [`crate::download::MediaDownloader`]. Cloning this Arc retains the original
+    /// host allocation, not the Client; it cannot replace the client's service.
+    pub fn http_client(&self) -> &Arc<dyn crate::http::HttpClient> {
+        &self.http_client
+    }
+
+    /// Whether a custom handler was installed for this payload type at build time.
+    /// Handlers are immutable after construction; configure them through
+    /// [`ClientBuilder::with_enc_handler`] or [`ClientBuilder::with_enc_handler_arc`].
+    pub fn has_enc_handler(&self, payload_type: &str) -> bool {
+        self.custom_enc_handlers
+            .get()
+            .is_some_and(|handlers| handlers.contains_key(payload_type))
+    }
+
+    pub(crate) fn install_enc_handlers(
+        &self,
+        handlers: HashMap<String, Arc<dyn EncHandler>>,
+    ) -> bool {
+        self.custom_enc_handlers.set(handlers).is_ok()
+    }
+
+    pub(crate) fn initialized_group_cache(&self) -> Option<&Arc<GroupCache>> {
+        self.group_cache.get()
+    }
+
     pub(crate) fn get_group_cache(&self) -> &Arc<GroupCache> {
         self.group_cache.get_or_init(|| {
             debug!("Initializing Group Cache for the first time.");

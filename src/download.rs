@@ -748,6 +748,7 @@ impl Client {
     /// Downloads and decrypts media from WhatsApp's CDN into memory.
     ///
     /// The canonical buffered entry for both message types and [`DownloadParams`].
+    /// Pass parameters directly as `client.download(&params).await`.
     /// Returns a [`ClientDownloadError`] only after applicable refresh/failover;
     /// static URLs need no session and cannot benefit from refreshing one.
     ///
@@ -820,20 +821,6 @@ impl Client {
         wacore::sticker_pack::parse_sticker_pack_response(&response.body)
     }
 
-    /// Compatibility alias for [`Self::download`]; `DownloadParams` implements
-    /// [`Downloadable`] just like the message types.
-    #[deprecated(
-        since = "0.7.0",
-        note = "use download(params); DownloadParams implements Downloadable"
-    )]
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.download_from_params", level = "debug", skip_all, fields(kind = ?params.media_type), err(Debug)))]
-    pub async fn download_from_params(
-        &self,
-        params: &DownloadParams,
-    ) -> std::result::Result<Vec<u8>, ClientDownloadError> {
-        self.download(params).await
-    }
-
     async fn prepare_requests(
         &self,
         downloadable: &dyn Downloadable,
@@ -857,7 +844,8 @@ impl Client {
     }
 
     /// Downloads authenticated media into a truncatable writer. The canonical
-    /// writer entry for both message types and [`DownloadParams`].
+    /// writer entry for both message types and [`DownloadParams`]. Pass parameters
+    /// directly as `client.download_to_writer(&params, writer).await`.
     ///
     /// With a streaming HTTP adapter, download, decryption and writes happen in
     /// a single blocking task. Without streaming, the HTTP response is buffered
@@ -910,17 +898,6 @@ impl Client {
         )
         .await
         .map_err(ClientDownloadError::from)
-    }
-
-    /// Compatibility alias for [`Self::download_to_writer`].
-    #[deprecated(since = "0.7.0", note = "use download_to_writer(params, writer)")]
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.download_from_params_to_writer", level = "debug", skip_all, fields(kind = ?params.media_type), err(Debug)))]
-    pub async fn download_from_params_to_writer<W: DownloadWriter + Send + 'static>(
-        &self,
-        params: &DownloadParams,
-        writer: W,
-    ) -> std::result::Result<W, ClientDownloadError> {
-        self.download_to_writer(params, writer).await
     }
 }
 

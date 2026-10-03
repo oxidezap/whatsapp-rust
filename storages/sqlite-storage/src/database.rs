@@ -4,13 +4,7 @@ use wacore::stats::StorageResourceReport;
 use wacore::store::error::Result;
 use wacore::store::traits::DeviceStore;
 
-use crate::{SharedSqlite, SqliteStore, SqliteStoreConfig, StoredDeviceSummary};
-
-/// Connection tuning for [`SqliteDatabase::open`].
-///
-/// This is the existing configuration type, not a second set of defaults.
-/// Its historical name remains supported for source compatibility.
-pub type SqliteDatabaseConfig = SqliteStoreConfig;
+use crate::{SharedSqlite, SqliteDatabaseConfig, SqliteStore, StoredDeviceSummary};
 
 /// A shared SQLite database, independent of the account selected by a store.
 ///
@@ -46,6 +40,9 @@ impl SqliteDatabase {
 
     /// Select a fixed device id without checking existence or provisioning it.
     /// All stores obtained here share the writer/read pools, permits and barrier.
+    /// Selection opens no connections. Writer concurrency follows `pool_size`;
+    /// `read_pool_size` widens only the read side. Count resource reports once
+    /// per database, not once per selected account.
     pub fn store(&self, device_id: i32) -> SqliteStore {
         self.template.share_for_device(device_id)
     }
@@ -57,6 +54,8 @@ impl SqliteDatabase {
 
     /// Allocate and provision a fresh account atomically. Its id is available via
     /// [`SqliteStore::device_id`]; the returned store shares this database's pools.
+    /// SQLite allocates the id with `AUTOINCREMENT` in the insert transaction,
+    /// so concurrent creates cannot collide and removed ids are not reissued.
     pub async fn create_device(&self) -> Result<SqliteStore> {
         self.template
             .create_sibling_device_impl()

@@ -80,7 +80,7 @@ use wacore_binary::Jid;
 
 use portable_atomic::AtomicU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use wacore::stanza::wire_tags::{NotificationType, StanzaTag};
 
 /// Lease that keeps decrypted-payload events enabled for one consumer.
@@ -1123,7 +1123,8 @@ pub enum ConnectError {
     /// Construction never completed, so the attempt was rejected before any I/O.
     #[error("client construction did not activate")]
     NotActivated,
-    /// The client was shut down. Shutdown is final, so build a new client
+    /// The client was shut down or ended by a terminal protocol verdict.
+    /// This is final, so build a new client
     /// rather than reconnecting this one.
     #[error("client has been shut down")]
     Shutdown,
@@ -1447,6 +1448,54 @@ impl ResponseWaiterMap {
     }
 }
 
+/// Preference and irreversible protocol verdict share one atomic word so a
+/// concurrent host re-enable cannot erase the verdict. The Arc stays the same
+/// size as the former raw atomic handle; no extra Client attachment is needed.
+struct AutoReconnect(AtomicU8);
+
+impl AutoReconnect {
+    const ENABLED: u8 = 1;
+    const TERMINAL: u8 = 2;
+
+    fn new(enabled: bool) -> Self {
+        Self(AtomicU8::new(u8::from(enabled)))
+    }
+
+    fn load(&self, ordering: Ordering) -> bool {
+        self.0.load(ordering) & Self::ENABLED != 0
+    }
+
+    fn swap(&self, enabled: bool, ordering: Ordering) -> bool {
+        let previous = self
+            .0
+            .fetch_update(ordering, Ordering::Relaxed, |state| {
+                Some(if enabled && state & Self::TERMINAL == 0 {
+                    state | Self::ENABLED
+                } else {
+                    state & !Self::ENABLED
+                })
+            })
+            .unwrap_or_else(|state| state);
+        previous & Self::ENABLED != 0
+    }
+
+    fn store(&self, enabled: bool, ordering: Ordering) {
+        self.swap(enabled, ordering);
+    }
+
+    fn stop_permanently(&self) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                Some((state | Self::TERMINAL) & !Self::ENABLED)
+            });
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.0.load(Ordering::Acquire) & Self::TERMINAL != 0
+    }
+}
+
 /// A single WhatsApp session: the connection, the Signal state, and every
 /// protocol operation built on top of them.
 ///
@@ -1484,6 +1533,25 @@ impl ResponseWaiterMap {
 /// for message-id pinning, ephemeral expiration, and cache freshness. Domain
 /// operations hang off accessors such as [`Client::groups`], [`Client::contacts`],
 /// and [`Client::presence`].
+///
+/// # Encapsulated implementation state
+///
+/// Use [`Self::set_auto_reconnect`], [`Self::http_client`], builder-installed
+/// encrypted handlers, and [`Self::memory_report`] instead of implementation
+/// containers. These fields are deliberately unavailable to consumers:
+///
+/// ```compile_fail,E0616
+/// fn raw_cache(client: &whatsapp_rust::Client) { let _ = &client.group_cache; }
+/// ```
+/// ```compile_fail,E0616
+/// fn raw_policy(client: &whatsapp_rust::Client) { let _ = &client.enable_auto_reconnect; }
+/// ```
+/// ```compile_fail,E0616
+/// fn raw_handlers(client: &whatsapp_rust::Client) { let _ = &client.custom_enc_handlers; }
+/// ```
+/// ```compile_fail,E0616
+/// fn raw_http(client: &whatsapp_rust::Client) { let _ = &client.http_client; }
+/// ```
 pub struct Client {
     pub(crate) runtime: Arc<dyn Runtime>,
     pub(crate) core: wacore::client::CoreClient,
@@ -1656,7 +1724,7 @@ pub struct Client {
 
     /// Lazily built on the first group send and never replaced afterwards, so a
     /// `OnceLock` keeps the read on that path down to an atomic load.
-    pub group_cache: std::sync::OnceLock<Arc<GroupCache>>,
+    pub(crate) group_cache: std::sync::OnceLock<Arc<GroupCache>>,
 
     pub(crate) expected_disconnect: AtomicBool,
     /// Set by `reconnect()` to suppress the "Message loop exited with an error" warning.
@@ -1750,7 +1818,7 @@ pub struct Client {
     /// window does not end because our socket did.
     pub(crate) duplicate_dispatch_suppressed: AtomicU64,
 
-    pub enable_auto_reconnect: Arc<AtomicBool>,
+    enable_auto_reconnect: Arc<AutoReconnect>,
     /// Set by [`Client::pause`] and cleared by [`Client::resume`]: the run loop
     /// parks instead of connecting for as long as it holds.
     ///
@@ -1942,7 +2010,7 @@ pub struct Client {
     /// Custom handlers for encrypted message types. Set once at `Bot::build` and
     /// immutable afterward, so the receive hot path reads it with a plain
     /// `OnceLock::get` (no lock) and no per-node guard acquisition.
-    pub custom_enc_handlers: std::sync::OnceLock<HashMap<String, Arc<dyn EncHandler>>>,
+    pub(crate) custom_enc_handlers: std::sync::OnceLock<HashMap<String, Arc<dyn EncHandler>>>,
 
     /// Optional inbound durability hook. When set, the transport ack for a
     /// decrypted user message is deferred until the hook commits it, converting
@@ -2054,7 +2122,7 @@ pub struct Client {
     pub(crate) synchronous_ack: bool,
 
     /// HTTP client for making HTTP requests (media upload/download, version fetching)
-    pub http_client: Arc<dyn crate::http::HttpClient>,
+    pub(crate) http_client: Arc<dyn crate::http::HttpClient>,
 
     /// Version override for testing or manual specification
     pub(crate) override_version: Option<(u32, u32, u32)>,

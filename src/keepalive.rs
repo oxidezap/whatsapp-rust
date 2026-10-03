@@ -416,7 +416,7 @@ impl Client {
         self.lid_pn_cache.run_pending_tasks().await;
         // `get()`, not `get_group_cache()`: maintenance must not be what
         // builds a cache the client never used.
-        if let Some(group_cache) = self.group_cache.get() {
+        if let Some(group_cache) = self.initialized_group_cache() {
             group_cache.run_pending_tasks().await;
         }
     }

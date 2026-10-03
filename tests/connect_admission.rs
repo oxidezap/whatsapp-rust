@@ -177,9 +177,7 @@ async fn connect_admission_first_and_forced_reconnect_order() {
 #[tokio::test(start_paused = true)]
 async fn connect_admission_wait_is_outside_transport_timeout() {
     let f = Fixture::new(Some(vec![Duration::from_secs(60)]), Duration::ZERO).await;
-    f.client
-        .enable_auto_reconnect
-        .store(false, Ordering::Relaxed);
+    f.client.set_auto_reconnect(false);
     let run = f.run();
     f.admitted.recv().await.unwrap();
     tokio::time::advance(Duration::from_secs(59)).await;
@@ -209,9 +207,7 @@ async fn connect_admission_wait_is_outside_transport_timeout() {
 #[tokio::test(start_paused = true)]
 async fn connect_admission_does_not_extend_the_factory_timeout() {
     let f = Fixture::new(Some(vec![Duration::from_secs(60)]), Duration::ZERO).await;
-    f.client
-        .enable_auto_reconnect
-        .store(false, Ordering::Relaxed);
+    f.client.set_auto_reconnect(false);
     let run = f.run();
     f.admitted.recv().await.unwrap();
     tokio::time::advance(Duration::from_secs(60)).await;

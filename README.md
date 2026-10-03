@@ -30,7 +30,7 @@ use whatsapp_rust::prelude::*;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bot = Bot::builder()
-        .with_backend(SqliteStore::new("whatsapp.db").await?)
+        .with_backend(SqliteStore::open("whatsapp.db").await?)
         .on_qr_code(|code, _timeout| async move {
             println!("Scan to pair:\n{code}");
         })

@@ -93,7 +93,7 @@ fn spend_dm(record: &mut SessionRecord) -> (u32, DmFingerprint) {
 }
 
 async fn crash_child(database: &str) -> ! {
-    let store = SqliteStore::new(database).await.expect("SQLite store");
+    let store = SqliteStore::open(database).await.expect("SQLite store");
     let cache = SignalStoreCache::new();
     let address = dm_address();
     let name = group_name();
@@ -150,7 +150,7 @@ fn crash_now() -> ! {
 }
 
 async fn verify_recovery(database: &str) {
-    let store = SqliteStore::new(database)
+    let store = SqliteStore::open(database)
         .await
         .expect("reopen SQLite store");
     let cache = SignalStoreCache::new();
