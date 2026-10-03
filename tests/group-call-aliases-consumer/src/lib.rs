@@ -2,7 +2,9 @@
 //!
 //! Deliberate alias removals through the formerly public reexports. Check each
 //! alias separately so restoring just one cannot hide behind the other's error.
-//! The positive counterparts use the same accessible paths and setup.
+//! The positive counterparts use the same accessible paths and setup. Nightly
+//! also checks the error-code annotations; stable accepts any compilation error,
+//! so its results still need the positive controls and diagnostic inspection.
 //!
 //! ```
 //! use whatsapp_rust::{GroupHierarchy, GroupMetadata};
@@ -10,11 +12,11 @@
 //! assert_eq!(metadata.hierarchy(), GroupHierarchy::Standalone);
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0432
 //! use whatsapp_rust::GroupType;
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0432
 //! use whatsapp_rust::group_type;
 //! ```
 //!
@@ -25,11 +27,11 @@
 //! assert_eq!(metadata.hierarchy(), GroupHierarchy::Standalone);
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0432
 //! use whatsapp_rust::features::GroupType;
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0432
 //! use whatsapp_rust::features::group_type;
 //! ```
 //!
