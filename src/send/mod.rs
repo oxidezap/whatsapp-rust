@@ -45,7 +45,7 @@ pub enum SendError {
     #[error("{0}")]
     MessageRef(#[from] crate::MessageRefError),
     /// Malformed raw message-secret material, rejected before encryption.
-    #[error(transparent)]
+    #[error("{0}")]
     InvalidSecret(#[from] crate::InvalidMessageSecret),
     /// Connection/transport/IQ failure (embeds the shared base error).
     // No `#[from]`: the manual `From<ClientError>` impl flattens a bare `?` so

@@ -25,9 +25,9 @@ pub enum PollError {
     /// quiz index, selectable count out of range).
     #[error("invalid poll: {0}")]
     InvalidPoll(String),
-    #[error(transparent)]
+    #[error("{0}")]
     InvalidSecret(#[from] crate::InvalidMessageSecret),
-    #[error(transparent)]
+    #[error("{0}")]
     Reference(#[from] crate::MessageRefError),
     /// The client is not logged in, so the voter identity can't be resolved.
     #[error("client is not logged in")]
