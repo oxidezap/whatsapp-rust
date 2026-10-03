@@ -81,7 +81,36 @@ pub fn boxed<'a>(client: &'a Client, chat: &'a Jid) -> BoxedSend<'a> {
             Message::text("edited"),
             EditOptions::default(),
         );
-        edit.await
+        edit.await?;
+
+        // Retain secret-edit capability in BOTH measured roots via a real named
+        // creation. Canonical edits use its captured creator; raw edits keep
+        // their documented current-identity assumption.
+        let created = client
+            .events()
+            .create(
+                chat,
+                wa::EventCreationParams {
+                    name: "Launch".into(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let mut update = Message::default();
+        update.event_message.get_or_insert_default().name = Some("Updated launch".into());
+        #[cfg(feature = "requests")]
+        let encrypted = client.edit_message(
+            EditRequest::new(created.send_result().message_ref()?, update)
+                .with_secret(created.creator(), created.secret()),
+        );
+        #[cfg(not(feature = "requests"))]
+        let encrypted = client.edit_message_encrypted_raw(
+            &created.send_result().to,
+            created.send_result().message_id.as_str(),
+            created.secret().as_bytes(),
+            update,
+        );
+        encrypted.await
     })
 }
 
