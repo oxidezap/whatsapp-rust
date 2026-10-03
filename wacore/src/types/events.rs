@@ -320,6 +320,7 @@ pub enum EventKind {
     StatusPrivacyUpdate,
     ReachoutTimelockUpdate,
     CallLogHistory,
+    UnarchiveChatsSettingUpdate,
     // Append new kinds here. The list and capacity guard are generated/derived.
 }
 }
@@ -1280,6 +1281,11 @@ pub enum Event {
     /// One call record from a successfully processed pairing-history chunk.
     /// Distinct from the app-state mutation envelope in [`Event::CallLogSync`].
     CallLogHistory(CallLogHistory),
+
+    /// The account's "Keep chats archived" setting changed on a linked device
+    /// (`setting_unarchiveChats` syncd mutation,
+    /// `UnarchiveChatsSetting.unarchiveChats`).
+    UnarchiveChatsSettingUpdate(UnarchiveChatsSettingUpdate),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1399,6 +1405,7 @@ impl Event {
             Event::EncDecryptFailed(_) => EventKind::EncDecryptFailed,
             Event::CallLogSync(_) => EventKind::CallLogSync,
             Event::CallLogHistory(_) => EventKind::CallLogHistory,
+            Event::UnarchiveChatsSettingUpdate(_) => EventKind::UnarchiveChatsSettingUpdate,
             Event::ClientExpirationChanged(_) => EventKind::ClientExpirationChanged,
             Event::OfflineSyncInterrupted(_) => EventKind::OfflineSyncInterrupted,
             Event::LockChatUpdate(_) => EventKind::LockChatUpdate,
@@ -2944,6 +2951,23 @@ pub struct DisableLinkPreviewsUpdate {
     pub from_full_sync: bool,
 }
 
+/// The account-wide "Keep chats archived" setting changed on a linked device
+/// (`setting_unarchiveChats`).
+///
+/// The wire flag is the inverse of the phone's switch: `unarchive_chats` is
+/// `true` when "Keep chats archived" is off, so a new message moves its chat
+/// out of the archive.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct UnarchiveChatsSettingUpdate {
+    /// `true` when a new message should unarchive its chat. Only emitted when
+    /// the wire carried the flag.
+    pub unarchive_chats: bool,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::UnarchiveChatsSetting>,
+    pub from_full_sync: bool,
+}
+
 /// A saved contact was deleted on a linked device.
 ///
 /// Carries no action payload: the mutation is a syncd `Remove`, and WA Web's
@@ -3091,12 +3115,16 @@ mod tests {
         assert_eq!(EventKind::StatusPrivacyUpdate as u8, 75);
         assert_eq!(EventKind::ReachoutTimelockUpdate as u8, 76);
         assert_eq!(EventKind::CallLogHistory as u8, 77);
+        assert_eq!(EventKind::UnarchiveChatsSettingUpdate as u8, 78);
     }
 
     #[test]
     fn event_kind_list_is_discriminant_ordered() {
-        assert_eq!(EventKind::ALL.len(), 78);
-        assert_eq!(EventKind::ALL.last(), Some(&EventKind::CallLogHistory));
+        assert_eq!(EventKind::ALL.len(), 79);
+        assert_eq!(
+            EventKind::ALL.last(),
+            Some(&EventKind::UnarchiveChatsSettingUpdate)
+        );
         assert!(EventKind::ALL.len() <= EventKind::CAPACITY as usize);
         for (i, &kind) in EventKind::ALL.iter().enumerate() {
             assert_eq!(kind as u8 as usize, i);

@@ -3946,6 +3946,7 @@ fn redacted_index(
         | "nct_salt_sync"
         | "setting_pushName"
         | "setting_disableLinkPreviews"
+        | "setting_unarchiveChats"
         | "favoriteSticker"
         | "removeRecentSticker" => &[Opaque],
         _ => &[],
@@ -3967,7 +3968,7 @@ fn redacted_index(
         "label_edit" => &["label"],
         "nct_salt_sync" => &["salt"],
         "setting_pushName" => &["push_name"],
-        "setting_disableLinkPreviews" => &["setting"],
+        "setting_disableLinkPreviews" | "setting_unarchiveChats" => &["setting"],
         _ => &[],
     };
     fn render(kind: IndexLogKind, label: &str, arg: &str) -> String {
@@ -4202,6 +4203,11 @@ fn mutation_effect_detail(m: &crate::appstate_sync::Mutation) -> Option<Mutation
             .as_option()
             .and_then(|a| a.is_previews_disabled)
             .map(|b| MutationEffectDetail::Bool("disabled", b)),
+        "setting_unarchiveChats" => v
+            .unarchive_chats_setting
+            .as_option()
+            .and_then(|a| a.unarchive_chats)
+            .map(|b| MutationEffectDetail::Bool("unarchive", b)),
         "label_edit" => v
             .label_edit_action
             .as_option()
