@@ -1,0 +1,16 @@
+# Standalone consumer: only the public root crate and its coherent reexports.
+[package]
+name = "group-call-aliases-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+rust-version = "1.94"
+
+[workspace]
+
+[dependencies]
+whatsapp-rust = { path = "../..", default-features = false }
+
+[features]
+voip-control = ["whatsapp-rust/voip-control"]
+voip-runtime = ["whatsapp-rust/voip-runtime"]
