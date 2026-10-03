@@ -398,6 +398,123 @@ async fn group_created_references_preserve_pn_lid_and_decrypt_real_wire() {
 }
 
 #[tokio::test]
+async fn poll_vote_reference_sender_is_not_the_crypto_creator() {
+    let fixture = GroupSendFixture::new_lid(2).await;
+    let created = fixture
+        .client
+        .polls()
+        .create(&fixture.group, "Question", &["Yes".into(), "No".into()], 1)
+        .await
+        .unwrap();
+    let sender = fixture.client.pn().unwrap().to_non_ad();
+    assert_ne!(&sender, created.creator());
+    let message = crate::MessageRef::new(
+        &fixture.group,
+        created.send_result().message_id.clone(),
+        Some(&sender),
+        true,
+    )
+    .unwrap();
+    let expected_key = message.to_raw_key();
+    let target = crate::PollRef::new(message, created.creator(), created.secret()).unwrap();
+    let result = fixture
+        .client
+        .polls()
+        .vote(&target, &["Yes".into()])
+        .await
+        .unwrap();
+    let update = result.message.poll_update_message.as_option().unwrap();
+    let enc = update.vote.as_option().unwrap();
+    let ciphertext = PollVoteCiphertext {
+        enc_payload: enc.enc_payload.as_deref().unwrap(),
+        enc_iv: enc.enc_iv.as_deref().unwrap(),
+    };
+    let hashes = fixture
+        .client
+        .polls()
+        .decrypt_vote_ref(ciphertext, &target, created.creator())
+        .await
+        .unwrap();
+    assert_eq!(hashes, vec![compute_option_hash("Yes").to_vec()]);
+    assert!(
+        wacore::poll::decrypt_poll_vote_with_secret(
+            ciphertext,
+            created.secret().as_bytes(),
+            created.send_result().message_id.as_str(),
+            &sender.to_non_ad_string(),
+            &created.creator().to_non_ad_string(),
+        )
+        .is_err(),
+        "stanza sender must not replace captured creator in crypto"
+    );
+    assert_eq!(
+        update.poll_creation_message_key.participant, expected_key.participant,
+        "the A06 addressing reference supplies the group participant"
+    );
+}
+
+#[tokio::test]
+async fn bot_creation_requires_known_crypto_namespace_not_a_pn_fallback() {
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+    let bot: Jid = "770000099@bot".parse().unwrap();
+    seed_dm_wire_namespace_state_for_peer_lid(&client, bot.clone()).await;
+    let own_lid = client.lid().unwrap().to_non_ad();
+    let options = ["Yes".into(), "No".into()];
+    let created = client
+        .polls()
+        .create(&bot, "Question", &options, 1)
+        .await
+        .unwrap();
+    assert_eq!(created.creator(), &own_lid);
+    assert!(
+        transport.sent_count() > 0,
+        "known-namespace creation reaches wire"
+    );
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLid(None))
+        .await;
+    let before = transport.sent_count();
+    assert!(matches!(
+        client.polls().create(&bot, "Question", &options, 1).await,
+        Err(crate::PollError::Send(SendError::NotLoggedIn))
+    ));
+    assert_eq!(transport.sent_count(), before);
+    client
+        .send_message(&bot, wa::Message::text("ordinary"))
+        .await
+        .unwrap();
+    assert!(
+        transport.sent_count() > before,
+        "ordinary send does not claim creation metadata"
+    );
+    let pn = client.pn().unwrap().to_non_ad_string();
+    let hashes = [compute_option_hash("Yes").to_vec()];
+    let (payload, iv) = wacore::poll::encrypt_poll_vote_with_secret(
+        &hashes,
+        created.secret().as_bytes(),
+        created.send_result().message_id.as_str(),
+        &pn,
+        &pn,
+    )
+    .unwrap();
+    assert!(
+        wacore::poll::decrypt_poll_vote_with_secret(
+            PollVoteCiphertext {
+                enc_payload: &payload,
+                enc_iv: &iv
+            },
+            created.secret().as_bytes(),
+            created.send_result().message_id.as_str(),
+            &own_lid.to_non_ad_string(),
+            &pn,
+        )
+        .is_err(),
+        "blind PN fallback changes the captured original crypto namespace"
+    );
+}
+
+#[tokio::test]
 async fn malformed_raw_inputs_fail_before_wire_and_debug_has_negative_controls() {
     let (client, transport) = crate::test_utils::create_iq_test_client().await;
     let peer = Jid::pn("15550000001");

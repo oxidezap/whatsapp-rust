@@ -177,7 +177,15 @@ impl<'a> Polls<'a> {
                 from_me: Some(from_me),
                 id: Some(poll_msg_id.to_string()),
                 participant: if chat_jid.is_group() {
-                    Some(poll_creator_jid.to_string())
+                    // Addressing belongs to the message reference; the exact
+                    // captured creator above remains the crypto namespace.
+                    Some(
+                        target
+                            .message()
+                            .sender()
+                            .unwrap_or(poll_creator_jid)
+                            .to_string(),
+                    )
                 } else {
                     None
                 },

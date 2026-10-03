@@ -476,6 +476,7 @@ jobs:
           CARGO_BUILD_JOBS: "1"
           RUSTFLAGS: ""
           CARGO_ENCODED_RUSTFLAGS: ""
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: cargo test --locked --manifest-path tests/fixtures/requests_consumer/Cargo.toml
       - name: Publish test timings
         if: always()
