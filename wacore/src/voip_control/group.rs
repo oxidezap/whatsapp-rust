@@ -73,11 +73,16 @@ impl GroupCallState {
         if !valid_group_snapshot(&update) {
             return GroupStateApply::InvalidSnapshot;
         }
-        if self
-            .snapshot
-            .as_ref()
-            .is_some_and(|current| update.transaction_id <= current.transaction_id)
+        if let Some(current) = self.snapshot.as_mut()
+            && update.transaction_id <= current.transaction_id
         {
+            // The call service can deliver the relay allocation on an older roster transaction
+            // after a newer roster-only one (live: tx=13 with relay after tx=15 without). Keep the
+            // newer roster and adopt the relay; dropping it leaves an invitee unable to join.
+            if current.relay.is_none() && update.relay.is_some() {
+                current.relay = update.relay;
+                return GroupStateApply::Applied;
+            }
             return GroupStateApply::Stale;
         }
         if let Some(current_group_jid) = self
@@ -122,6 +127,25 @@ impl GroupCallState {
                         .map(|canonical| (canonical, screen_share))
                 })
                 .collect();
+        }
+        // Roster updates omit the pid of devices whose pid did not change (live: every device
+        // is pid-less in the update right after the one that assigned pids). Absent means
+        // unchanged; treating it as removed re-subscribes media with an empty receiver list and
+        // the relay stops forwarding audio.
+        if let Some(previous) = self.snapshot.as_ref() {
+            let known: HashMap<Jid, u32> = previous
+                .participants
+                .iter()
+                .flat_map(|participant| participant.devices.iter())
+                .filter_map(|device| device.pid.map(|pid| (device.jid.clone(), pid)))
+                .collect();
+            for participant in update.participants.iter_mut().filter(|p| p.is_connected()) {
+                for device in &mut participant.devices {
+                    if device.pid.is_none() {
+                        device.pid = known.get(&device.jid).copied();
+                    }
+                }
+            }
         }
         if update.relay.is_none() {
             // Roster-only updates do not revoke the relay allocation. The media engine follows the
@@ -239,14 +263,8 @@ fn valid_group_snapshot(update: &GroupCallUpdate) -> bool {
     {
         return false;
     }
-    if update
-        .relay
-        .as_ref()
-        .and_then(|relay| relay.transaction_id)
-        .is_some_and(|transaction_id| transaction_id != update.transaction_id)
-    {
-        return false;
-    }
+    // The relay's transaction_id numbers relay allocations, not roster transactions (live: relay
+    // transaction-id 1 inside group_update transaction-id 13), so the two are not compared.
 
     let mut users = HashSet::with_capacity(update.participants.len());
     let mut pids = HashSet::new();
@@ -265,7 +283,8 @@ fn valid_group_snapshot(update: &GroupCallUpdate) -> bool {
                         .as_ref()
                         .is_some_and(|pn| device_user == pn.to_non_ad()))
                     && devices.insert(device.jid.clone())
-                    && device.pid.is_none_or(|pid| pid != 0 && pids.insert(pid))
+                    // pid 0 is a real participant id: the call creator gets it.
+                    && device.pid.is_none_or(|pid| pids.insert(pid))
             })
     }) && validate_group_snapshot_for_media(update).is_ok()
 }
@@ -299,7 +318,7 @@ pub(crate) fn validate_group_snapshot_for_media(update: &GroupCallUpdate) -> Res
             continue;
         };
         let participant_id = format_e2e_srtp_participant_id(&device.jid.to_string());
-        if pid == 0 || !pids.insert(pid) || !devices.insert(participant_id.clone()) {
+        if !pids.insert(pid) || !devices.insert(participant_id.clone()) {
             return Err(());
         }
         let audio_ssrc = derive_wasm_participant_ssrc(&update.call_id, &participant_id, 0);
@@ -540,6 +559,134 @@ mod tests {
                 .and_then(|snapshot| snapshot.relay.as_ref()),
             Some(&relay),
             "an omitted relay is a roster-only update, not allocation revocation"
+        );
+    }
+
+    fn relay_tx(transaction_id: u32) -> GroupCallRelay {
+        GroupCallRelay::builder()
+            .transaction_id(transaction_id)
+            .self_pid(1)
+            .uuid("RELAY-UUID".to_string())
+            .participant_uuid("PARTICIPANT-UUID".to_string())
+            .attribute_padding(false)
+            .warp_mi_tag_len(16)
+            .endpoints(Vec::new())
+            .build()
+    }
+
+    fn without_pid(mut participant: GroupCallParticipant) -> GroupCallParticipant {
+        for device in &mut participant.devices {
+            device.pid = None;
+        }
+        participant
+    }
+
+    #[test]
+    fn relay_transaction_is_independent_of_the_roster_transaction() {
+        let mut state = GroupCallState::new("CALL", creator());
+        let mut snapshot = update(13, vec![participant("100001", "connected", 1)]);
+        snapshot.relay = Some(relay_tx(1));
+        assert_eq!(state.apply_update(snapshot), GroupStateApply::Applied);
+        assert_eq!(
+            state
+                .snapshot()
+                .and_then(|snapshot| snapshot.relay.as_ref())
+                .and_then(|relay| relay.transaction_id),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_late_relay_on_an_older_transaction_is_adopted_without_regressing_the_roster() {
+        let mut state = GroupCallState::new("CALL", creator());
+        let newer = update(
+            15,
+            vec![
+                participant("100001", "connected", 1),
+                participant("200002", "connected", 2),
+            ],
+        );
+        assert_eq!(state.apply_update(newer), GroupStateApply::Applied);
+
+        let mut older = update(13, vec![participant("100001", "connected", 1)]);
+        older.relay = Some(relay_tx(1));
+        assert_eq!(state.apply_update(older), GroupStateApply::Applied);
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.transaction_id, 15, "the newer roster stays");
+        assert_eq!(snapshot.participants.len(), 2);
+        assert!(snapshot.relay.is_some(), "the late relay is adopted");
+
+        let mut stale = update(14, vec![participant("100001", "connected", 1)]);
+        stale.relay = Some(relay_tx(2));
+        assert_eq!(
+            state.apply_update(stale),
+            GroupStateApply::Stale,
+            "an older relay never replaces one already held"
+        );
+    }
+
+    #[test]
+    fn pid_zero_is_a_valid_participant_id() {
+        let mut state = GroupCallState::new("CALL", creator());
+        assert_eq!(
+            state.apply_update(update(
+                1,
+                vec![
+                    participant("100001", "connected", 0),
+                    participant("200002", "connected", 1),
+                ],
+            )),
+            GroupStateApply::Applied,
+            "the call creator is pid 0 on live calls"
+        );
+        assert_eq!(
+            state.apply_update(update(
+                2,
+                vec![
+                    participant("100001", "connected", 0),
+                    participant("200002", "connected", 0),
+                ],
+            )),
+            GroupStateApply::InvalidSnapshot,
+            "pids stay unique"
+        );
+    }
+
+    #[test]
+    fn roster_updates_without_pids_keep_the_known_pids() {
+        let mut state = GroupCallState::new("CALL", creator());
+        assert_eq!(
+            state.apply_update(update(
+                1,
+                vec![
+                    participant("100001", "connected", 0),
+                    participant("200002", "connected", 1),
+                ],
+            )),
+            GroupStateApply::Applied
+        );
+        assert_eq!(
+            state.apply_update(update(
+                2,
+                vec![
+                    without_pid(participant("100001", "connected", 0)),
+                    without_pid(participant("200002", "connected", 1)),
+                    without_pid(participant("300003", "invited", 9)),
+                ],
+            )),
+            GroupStateApply::Applied
+        );
+        let pids: Vec<_> = state
+            .snapshot()
+            .expect("snapshot")
+            .participants
+            .iter()
+            .map(|participant| participant.devices[0].pid)
+            .collect();
+        assert_eq!(
+            pids,
+            vec![Some(0), Some(1), None],
+            "absent pids mean unchanged; a device never seen with a pid stays pid-less"
         );
     }
 

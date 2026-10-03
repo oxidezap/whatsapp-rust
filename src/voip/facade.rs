@@ -307,6 +307,12 @@ impl<'a> AcceptCall<'a> {
                 .is_none()
             && let Some(generation) = group_generation
         {
+            // The call service sends an invited device the group relay only after that device has
+            // pre-accepted and accepted the invitation (live: without them no group_update arrives
+            // and this wait always times out), so answer the invitation before waiting for it.
+            let voip = self.client.voip();
+            voip.preaccept_group_invite(self.incoming).await?;
+            voip.accept_group_invite(self.incoming).await?;
             group = Some(
                 match wacore::runtime::timeout(
                     &*self.client.runtime,
@@ -5960,6 +5966,74 @@ mod tests {
             client.call_registry().active_count(),
             0,
             "invalid video configuration must fail before registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn relayless_group_invite_is_answered_before_waiting_for_the_relay() {
+        let (client, _sent) = make_sending_client().await;
+        let mut incoming = incoming_offer(false);
+        let call_id = incoming.action.call_id().to_string();
+        incoming.group = Some(Box::new(
+            GroupCallUpdate::builder()
+                .call_id(call_id.clone())
+                .call_creator(caller())
+                .transaction_id(1)
+                .media("audio".to_string())
+                .connected_limit(32)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(false)
+                .participants(Vec::new())
+                .build(),
+        ));
+        let mut session = wacore::voip_control::CallSession::new_incoming(
+            incoming.action.call_id(),
+            incoming.from.clone(),
+            incoming.action.call_creator().clone(),
+        );
+        session.group = incoming.group.as_deref().cloned();
+        let generation = client
+            .call_registry()
+            .insert_ringing_group_if_inactive(session)
+            .expect("valid group snapshot")
+            .expect("ringing group generation");
+        incoming.set_ringing_generation(generation);
+        let call_service = Jid::new(&call_id, Server::Call).to_string();
+        let first = client.wait_for_sent_node(
+            crate::client::NodeFilter::tag("call").attr("to", call_service.as_str()),
+        );
+        let (_source_tx, source_rx) = async_channel::unbounded::<Bytes>();
+        let (sink_tx, _sink_rx) = async_channel::unbounded::<EncodedAudioFrame>();
+        let voip = client.voip();
+        let start = voip
+            .accept(&incoming)
+            .encoded_audio(AudioFormat::MLOW_16KHZ_60MS, source_rx, sink_tx)
+            .start();
+        tokio::pin!(start);
+
+        let action = |node: &wacore_binary::Node| {
+            node.as_node_ref().children().expect("call action")[0]
+                .tag
+                .as_ref()
+                .to_string()
+        };
+        let preaccept = tokio::select! {
+            node = first => node.expect("first call-service stanza"),
+            _ = &mut start => panic!("start must not finish before the invitation is answered"),
+        };
+        assert_eq!(action(&preaccept), "preaccept");
+        let second = client.wait_for_sent_node(
+            crate::client::NodeFilter::tag("call").attr("to", call_service.as_str()),
+        );
+        let accept = tokio::select! {
+            node = second => node.expect("second call-service stanza"),
+            _ = &mut start => panic!("start must not finish before the invitation is answered"),
+        };
+        assert_eq!(
+            action(&accept),
+            "accept",
+            "the invitation is accepted while start() still waits for the group relay"
         );
     }
 
