@@ -121,14 +121,38 @@ fn start(
     })
 }
 
+fn start_observing_cleanup(
+    client: Arc<Client>,
+    incoming: IncomingCall,
+) -> (
+    tokio::task::JoinHandle<Result<CallHandle, CallError>>,
+    async_channel::Receiver<()>,
+) {
+    let (completed, completion) = async_channel::bounded(1);
+    let setup = tokio::spawn(async move {
+        let (_source_tx, source_rx) = async_channel::unbounded::<Bytes>();
+        let (sink_tx, _sink_rx) = async_channel::unbounded::<EncodedAudioFrame>();
+        client
+            .voip()
+            .accept(&incoming)
+            .observe_cleanup(completed)
+            .encoded_audio(AudioFormat::MLOW_16KHZ_60MS, source_rx, sink_tx)
+            .start()
+            .await
+    });
+    (setup, completion)
+}
+
 async fn wait_frames(transport: &CapturingMockTransport, count: usize) {
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while transport.sent_count() < count {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("expected complete wire frames");
+    // Keep the same one-second bound even when the protocol timer is intentionally paused.
+    let deadline = wacore::time::Instant::now() + Duration::from_secs(1);
+    while transport.sent_count() < count {
+        assert!(
+            wacore::time::Instant::now() < deadline,
+            "expected complete wire frames"
+        );
+        tokio::task::yield_now().await;
+    }
 }
 
 fn actions(transport: &CapturingMockTransport) -> Vec<String> {
@@ -159,6 +183,19 @@ fn supply_relay(client: &Client, incoming: &IncomingCall, generation: u64, media
             .apply_group_update_if_current(update, generation),
         GroupStateApply::Applied
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_frames_fail_without_advancing_paused_protocol_time() {
+    let protocol_start = tokio::time::Instant::now();
+    let capture = Arc::new(CapturingMockTransport::new());
+    let wait = tokio::spawn(async move { wait_frames(&capture, 1).await });
+    assert!(
+        wait.await
+            .expect_err("missing frames must fail their fixed deadline")
+            .is_panic()
+    );
+    assert_eq!(tokio::time::Instant::now(), protocol_start);
 }
 
 #[tokio::test]
@@ -270,7 +307,7 @@ async fn invitation_concurrent_starts_claim_the_ringing_generation_once() {
 #[tokio::test]
 async fn invitation_cleanup_cannot_terminate_a_same_id_replacement() {
     let (client, transport, incoming, generation) = fixture(false, "audio").await;
-    let setup = start(client.clone(), incoming.clone());
+    let (setup, completion) = start_observing_cleanup(client.clone(), incoming.clone());
     wait_frames(&transport, 2).await;
     let replacement = {
         let _transition = client
@@ -298,11 +335,10 @@ async fn invitation_cleanup_cannot_terminate_a_same_id_replacement() {
         setup.await.expect("task"),
         Err(CallError::CallEndedDuringSetup)
     ));
-    // Let detached generation-aware teardown finish claiming (and rejecting) the old generation.
-    tokio::task::yield_now().await;
-    let _transition = client
-        .lock_answer_transition(incoming.action.call_id())
-        .await;
+    tokio::time::timeout(Duration::from_secs(1), completion.recv())
+        .await
+        .expect("owned cleanup completed before deadline")
+        .expect("cleanup completion");
     assert_eq!(
         client
             .call_registry()
@@ -376,7 +412,10 @@ async fn invitation_cancellation_during_each_early_write_keeps_cleanup_ownership
             }),
         );
         let setup = start(client.clone(), incoming.clone());
-        entered_rx.recv().await.expect("early write entered");
+        tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("early write entered before deadline")
+            .expect("early write entered");
         setup.abort();
         assert!(matches!(setup.await, Err(error) if error.is_cancelled()));
         // The Noise sender owns its queued write even when its caller is cancelled. Allow it to
@@ -396,6 +435,43 @@ async fn invitation_cancellation_during_each_early_write_keeps_cleanup_ownership
                 .is_none()
         );
     }
+}
+
+#[tokio::test]
+async fn invitation_relay_arriving_before_claim_does_not_accept_before_validation() {
+    let (client, transport, incoming, generation) = fixture(false, "audio").await;
+    let lane = client
+        .lock_answer_transition(incoming.action.call_id())
+        .await;
+    let (_source_tx, source_rx) = async_channel::unbounded::<Bytes>();
+    let (sink_tx, _sink_rx) = async_channel::unbounded::<EncodedAudioFrame>();
+    let voip = client.voip();
+    let setup = voip
+        .accept(&incoming)
+        .encoded_audio(AudioFormat::MLOW_16KHZ_60MS, source_rx, sink_tx)
+        .start();
+    tokio::pin!(setup);
+    assert!(
+        futures::poll!(&mut setup).is_pending(),
+        "setup blocked on held claim lane"
+    );
+    supply_relay(&client, &incoming, generation, "audio");
+    client
+        .persistence_manager()
+        .process_command(crate::store::commands::DeviceCommand::SetLid(None))
+        .await;
+    drop(lane);
+    assert!(
+        matches!(setup.await, Err(CallError::Media("no own LID"))),
+        "known context failure must be validated before acceptance"
+    );
+    assert_eq!(actions(&transport), ["preaccept", "terminate"]);
+    assert!(
+        client
+            .call_registry()
+            .generation_of(incoming.action.call_id())
+            .is_none()
+    );
 }
 
 #[tokio::test]

@@ -39,11 +39,14 @@ phone (creator)            call service (<call_id>@call)            this device
    `apply_group_control` accepts that address (`is_call_service_sender`) in addition to the
    creator. The snapshot that carries the relay can arrive *after* a newer roster-only one (live:
    `tx=13` with relay after `tx=15` without). `GroupCallState::apply_update` keeps the newer
-   roster and adopts the late relay. A relay already held is never replaced by an older one.
+   roster and advances only the relay allocation when it is first supplied or explicitly newer.
+   Roster progress likewise cannot roll a held relay allocation back.
 4. **Media.** `start()` builds a group engine from the snapshot and connects the relay, without
    repeating the invitation responses. The receiver subscription in the STUN
    Allocate lists the pids of the connected remote devices.
-5. **Epoch.** If the snapshot has `rekey="1"`, this device generates the group epoch and sends it
+5. **Epoch.** A fresh committed roster with `rekey="1"` requests a group epoch; a relay-only
+   adoption must not replay an older roster's rekey request. Fan-out uses the committed, PID-stabilized
+   participants without changing the requesting transaction. This device sends the group epoch
    to every connected remote device as `<enc_rekey>`. Inbound RTP stays gated until an epoch is
    installed.
 6. **Roster updates.** Later `group_update`s omit the pid of devices whose pid did not change. An

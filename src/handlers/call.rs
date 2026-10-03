@@ -1286,7 +1286,9 @@ async fn apply_group_control(client: &Client, call: &IncomingCall, generation: u
                 );
                 return false;
             }
-            match registry.apply_group_update_if_current(update.as_ref().clone(), generation) {
+            let (applied, roster) = registry
+                .apply_group_update_if_current_with_roster(update.as_ref().clone(), generation);
+            match applied {
                 GroupStateApply::Applied => {
                     // Media follows the committed snapshot, not the raw update: the committed one
                     // keeps the relay and the pids a roster-only update leaves out.
@@ -1313,8 +1315,12 @@ async fn apply_group_control(client: &Client, call: &IncomingCall, generation: u
                         registry.remove_if_current(&update.call_id, generation);
                         return false;
                     }
-                    if update.rekey_requested {
-                        match crate::voip::facade::fanout_group_epoch(client, update).await {
+                    // A late relay is not a new roster epoch. Only a fresh committed roster may
+                    // fan out a key, with inherited PIDs included and its original transaction.
+                    if update.rekey_requested
+                        && let Some(roster) = roster
+                    {
+                        match crate::voip::facade::fanout_group_epoch(client, &roster).await {
                             Ok(fanout) => {
                                 let fanout_generation = fanout.generation();
                                 if let Err(error) = fanout.commit(|epoch| {
@@ -2656,6 +2662,87 @@ mod tests {
                     .build()])
                 .build()])
             .build()
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn relay_only_update_does_not_replay_an_old_rekey_request() {
+        let client = make_sending_client().await;
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetLid(None))
+            .await;
+        let registry = client.call_registry();
+        let creator = fake_caller_lid();
+        let call_id = "RELAY-ONLY-EPOCH";
+        let initial = GroupCallUpdate::builder()
+            .call_id(call_id.to_string())
+            .call_creator(creator.clone())
+            .transaction_id(15)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
+            call_id,
+            Jid::new(call_id, Server::Call),
+            creator.clone(),
+        );
+        session.group = Some(initial.clone());
+        let generation = registry.insert_group_checked(session).expect("group");
+        let mut older = initial;
+        older.transaction_id = 13;
+        older.rekey_requested = true;
+        older.relay = Some(
+            wacore::types::group_call::GroupCallRelay::builder()
+                .transaction_id(1)
+                .self_pid(0)
+                .uuid("TEST-RELAY".to_string())
+                .participant_uuid("TEST-PARTICIPANT".to_string())
+                .attribute_padding(false)
+                .warp_mi_tag_len(4)
+                .key(vec![7; 32])
+                .tokens(vec![vec![9; 16]])
+                .endpoints(vec![
+                    wacore::types::group_call::GroupCallRelayEndpoint::builder()
+                        .relay_id(1)
+                        .token_id(0)
+                        .auth_token_id(0)
+                        .relay_name("test-relay".to_string())
+                        .is_fna(false)
+                        .ipv4("203.0.113.7".to_string())
+                        .port(3478)
+                        .build(),
+                ])
+                .build(),
+        );
+        let call = IncomingCall::new_for_test(
+            creator,
+            "RELAY-ONLY-STANZA".into(),
+            wacore::time::from_secs(1_700_000_000).expect("time"),
+            CallAction::GroupUpdate {
+                update: Box::new(older),
+            },
+        );
+        assert!(apply_group_control(&client, &call, generation).await);
+        assert_eq!(
+            registry.generation_of(call_id),
+            Some(generation),
+            "relay adoption is not a new epoch request; missing own LID must never enter fanout teardown"
+        );
+        let committed = registry
+            .group_state_if_current(call_id, generation)
+            .expect("state");
+        assert_eq!(committed.snapshot().expect("snapshot").transaction_id, 15);
+        assert!(committed.snapshot().expect("snapshot").relay.is_some());
+        assert_eq!(
+            registry.pending_group_epoch_transaction_if_current(call_id, generation),
+            None
+        );
+        registry.remove_if_current(call_id, generation);
     }
 
     #[cfg(feature = "voip-control")]

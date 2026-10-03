@@ -169,6 +169,8 @@ pub struct AcceptCall<'a> {
     pub(crate) incoming: &'a IncomingCall,
     audio: Option<AudioEndpoints>,
     video: Option<VideoEndpoints>,
+    #[cfg(test)]
+    cleanup_completed: Option<async_channel::Sender<()>>,
 }
 
 async fn wait_for_group_relay(
@@ -198,7 +200,15 @@ impl<'a> AcceptCall<'a> {
             incoming,
             audio: None,
             video: None,
+            #[cfg(test)]
+            cleanup_completed: None,
         }
+    }
+
+    #[cfg(test)]
+    fn observe_cleanup(mut self, completed: async_channel::Sender<()>) -> Self {
+        self.cleanup_completed = Some(completed);
+        self
     }
 
     impl_media_builder_methods!();
@@ -308,7 +318,7 @@ impl<'a> AcceptCall<'a> {
             ));
         }
         let is_group = group.is_some();
-        let needs_group_relay = is_group
+        let mut needs_group_relay = is_group
             && self.incoming.media().is_none()
             && group
                 .as_ref()
@@ -370,6 +380,13 @@ impl<'a> AcceptCall<'a> {
                     "group offer signaling and roster media modes differ".to_string(),
                 ));
             }
+            // The transition lane may have waited while a relay arrived. A now-known context
+            // follows normal prepare-before-accept ordering instead of the relay-trigger path.
+            needs_group_relay = self.incoming.media().is_none()
+                && group
+                    .as_ref()
+                    .and_then(|group| group.relay.as_ref())
+                    .is_none();
             if !registry.promote_ringing_group_if_current(session, generation) {
                 return Err(CallError::CallEndedDuringSetup);
             }
@@ -378,6 +395,10 @@ impl<'a> AcceptCall<'a> {
             RegisteredCall::new(self.client, session).await
         };
         let mut teardown = AnswerTeardown::new(self.client, &registration);
+        #[cfg(test)]
+        {
+            teardown.cleanup_completed = self.cleanup_completed.take();
+        }
         let preaccept_id = self.client.generate_request_id();
         let accept_id = self.client.generate_request_id();
         let (preaccept, accept) = build_answer_signaling(
@@ -2696,6 +2717,8 @@ struct AnswerTeardown {
     armed: bool,
     claimed: bool,
     transition: Option<async_lock::MutexGuardArc<()>>,
+    #[cfg(test)]
+    cleanup_completed: Option<async_channel::Sender<()>>,
 }
 
 struct GroupOfferTeardown {
@@ -2867,6 +2890,8 @@ impl AnswerTeardown {
             armed: false,
             claimed: false,
             transition: None,
+            #[cfg(test)]
+            cleanup_completed: None,
         }
     }
 
@@ -2878,6 +2903,10 @@ impl AnswerTeardown {
         self.armed = false;
         self.claimed = false;
         self.transition = None;
+        #[cfg(test)]
+        if let Some(completed) = self.cleanup_completed.take() {
+            let _ = completed.try_send(());
+        }
     }
 
     async fn terminate(&mut self, client: &Client) {
@@ -2913,6 +2942,8 @@ impl Drop for AnswerTeardown {
         let generation = self.generation;
         let claimed = self.claimed;
         let transition = self.transition.take();
+        #[cfg(test)]
+        let completed = self.cleanup_completed.take();
         let runtime = client.runtime.clone();
         runtime
             .spawn(Box::pin(async move {
@@ -2922,6 +2953,10 @@ impl Drop for AnswerTeardown {
                 };
                 if claimed || registry.remove_if_current(&call_id, generation) {
                     send_answer_terminate(&client, &call_id, &peer_jid, &call_creator).await;
+                }
+                #[cfg(test)]
+                if let Some(completed) = completed {
+                    let _ = completed.try_send(());
                 }
             }))
             .detach();

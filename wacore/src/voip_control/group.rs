@@ -65,7 +65,7 @@ impl GroupCallState {
         &self.screen_shares
     }
 
-    /// Replace the current authoritative snapshot when its transaction is newer.
+    /// Advance the authoritative roster and relay allocation on their independent transactions.
     pub fn apply_update(&mut self, mut update: GroupCallUpdate) -> GroupStateApply {
         if !self.matches_identity(&update.call_id, &update.call_creator) {
             return GroupStateApply::IdentityMismatch;
@@ -87,12 +87,22 @@ impl GroupCallState {
             }
         }
 
+        let advances_relay = update.relay.as_ref().is_some_and(|incoming| {
+            self.snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.relay.as_ref())
+                .is_none_or(|held| {
+                    incoming.transaction_id.is_some_and(|next| {
+                        held.transaction_id.is_none_or(|previous| next > previous)
+                    })
+                })
+        });
         if let Some(current) = self.snapshot.as_mut()
             && update.transaction_id <= current.transaction_id
         {
-            // Relay allocations and rosters have independent epochs. An older roster may supply
-            // the first relay, but only after the established group identity has been checked.
-            if current.relay.is_none() && update.relay.is_some() {
+            // An older roster may supply the first or a newer allocation, after identity
+            // validation, but cannot replace the roster or mutate participant controls.
+            if advances_relay {
                 current.relay = update.relay;
                 return GroupStateApply::Applied;
             }
@@ -136,10 +146,9 @@ impl GroupCallState {
                 }
             }
         }
-        if update.relay.is_none() {
-            // Roster-only updates do not revoke the relay allocation. The media engine follows the
-            // same absent-means-no-refresh rule, so the durable snapshot must retain the last usable
-            // relay for builders that attach after this transaction commits.
+        if !advances_relay {
+            // Roster progress cannot revoke or roll back a held allocation. An absent/unknown
+            // relay transaction provides no evidence to replace an explicitly known epoch.
             update.relay = self
                 .snapshot
                 .as_ref()
@@ -663,11 +672,39 @@ mod tests {
         assert!(snapshot.relay.is_some(), "the late relay is adopted");
 
         let mut stale = update(14, vec![participant("100001", "connected", 1)]);
-        stale.relay = Some(relay_tx(2));
+        stale.relay = Some(relay_tx(0));
         assert_eq!(
             state.apply_update(stale),
             GroupStateApply::Stale,
             "an older relay never replaces one already held"
+        );
+    }
+
+    #[test]
+    fn newer_relay_allocation_does_not_depend_on_roster_freshness() {
+        let mut state = GroupCallState::new("CALL", creator());
+        let mut initial = update(15, vec![participant("100001", "connected", 0)]);
+        initial.relay = Some(relay_tx(1));
+        assert_eq!(
+            state.apply_update(initial.clone()),
+            GroupStateApply::Applied
+        );
+        let mut older_roster = update(13, vec![participant("100001", "invited", 0)]);
+        older_roster.relay = Some(relay_tx(2));
+        assert_eq!(state.apply_update(older_roster), GroupStateApply::Applied);
+        let current = state.snapshot().unwrap();
+        assert_eq!(current.transaction_id, 15);
+        assert_eq!(current.participants, initial.participants);
+        assert_eq!(current.relay, Some(relay_tx(2)));
+        let mut newer_roster = update(16, initial.participants.clone());
+        newer_roster.relay = Some(relay_tx(1));
+        assert_eq!(state.apply_update(newer_roster), GroupStateApply::Applied);
+        let current = state.snapshot().unwrap();
+        assert_eq!(current.transaction_id, 16);
+        assert_eq!(
+            current.relay,
+            Some(relay_tx(2)),
+            "roster progress cannot roll relay allocation backwards"
         );
     }
 

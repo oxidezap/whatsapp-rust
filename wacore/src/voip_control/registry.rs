@@ -929,7 +929,7 @@ impl CallRegistry {
 
     /// Atomically apply a newer authoritative group snapshot to an active call.
     pub fn apply_group_update(&self, update: GroupCallUpdate) -> GroupStateApply {
-        self.apply_group_update_inner(update, None)
+        self.apply_group_update_inner(update, None).0
     }
 
     /// Apply a group snapshot only while `generation` still owns this call-id.
@@ -938,6 +938,19 @@ impl CallRegistry {
         update: GroupCallUpdate,
         generation: u64,
     ) -> GroupStateApply {
+        self.apply_group_update_inner(update, Some(generation)).0
+    }
+
+    /// Apply an update and return its exact committed roster only when the roster advances.
+    ///
+    /// Relay-only adoption still returns `Applied`, but is not a new roster/rekey transaction.
+    /// The distinction and PID-stabilized snapshot are captured under the registry lock, so
+    /// callers need not infer freshness from a separate, racy snapshot lookup.
+    pub fn apply_group_update_if_current_with_roster(
+        &self,
+        update: GroupCallUpdate,
+        generation: u64,
+    ) -> (GroupStateApply, Option<GroupCallUpdate>) {
         self.apply_group_update_inner(update, Some(generation))
     }
 
@@ -945,20 +958,20 @@ impl CallRegistry {
         &self,
         update: GroupCallUpdate,
         generation: Option<u64>,
-    ) -> GroupStateApply {
+    ) -> (GroupStateApply, Option<GroupCallUpdate>) {
         if crate::voip_control::group::validate_group_relay_update(&update).is_err() {
-            return GroupStateApply::InvalidSnapshot;
+            return (GroupStateApply::InvalidSnapshot, None);
         }
         // Held so the commit lookup survives `update` being moved into the preview.
         let call_id = update.call_id.clone();
-        let (applied, waiting_room_task, video_teardown, event) = {
+        let (applied, roster, waiting_room_task, video_teardown, event) = {
             let ringing = self.ringing_calls();
             let mut map = self.active_calls();
             let Some(entry) = map
                 .get(&call_id)
                 .filter(|entry| generation.is_none_or(|current| entry.generation == current))
             else {
-                return GroupStateApply::UnknownCall;
+                return (GroupStateApply::UnknownCall, None);
             };
             if let (Some(established), Some(relay)) =
                 (entry.group_warp_mi_tag_len, update.relay.as_ref())
@@ -967,15 +980,14 @@ impl CallRegistry {
                 // Reject before GroupCallState consumes the transaction. The media pipelines retain
                 // their original packet boundary, so a corrected same-transaction refresh must
                 // remain admissible instead of splitting registry and driver state.
-                return GroupStateApply::InvalidSnapshot;
+                return (GroupStateApply::InvalidSnapshot, None);
             }
-            let downgrades_video = update.media == "audio"
-                && (entry.session.is_video
-                    || entry
-                        .group
-                        .as_ref()
-                        .and_then(GroupCallState::snapshot)
-                        .is_some_and(|snapshot| snapshot.media == "video"));
+            let had_video = entry.session.is_video
+                || entry
+                    .group
+                    .as_ref()
+                    .and_then(GroupCallState::snapshot)
+                    .is_some_and(|snapshot| snapshot.media == "video");
             let local_member = entry
                 .group_invite_self_device
                 .as_ref()
@@ -991,7 +1003,20 @@ impl CallRegistry {
                     entry.session.call_creator.clone(),
                 )
             });
+            let previous_transaction = preview.snapshot().map(|snapshot| snapshot.transaction_id);
             let applied = preview.apply_update(update);
+            let downgrades_video = had_video
+                && preview
+                    .snapshot()
+                    .is_some_and(|snapshot| snapshot.media == "audio");
+            let roster = preview
+                .snapshot()
+                .filter(|snapshot| {
+                    applied == GroupStateApply::Applied
+                        && previous_transaction
+                            .is_none_or(|previous| snapshot.transaction_id > previous)
+                })
+                .cloned();
             if applied == GroupStateApply::Applied {
                 if entry.is_group_call && entry.session.phase() == CallPhase::Ringing {
                     let mut preview_session = entry.session.clone();
@@ -1006,7 +1031,7 @@ impl CallRegistry {
                     ) {
                         // Preserve the transaction watermark so a corrected same-transaction
                         // snapshot can still be accepted.
-                        return GroupStateApply::InvalidSnapshot;
+                        return (GroupStateApply::InvalidSnapshot, None);
                     }
                 }
                 let committed = preview
@@ -1021,7 +1046,7 @@ impl CallRegistry {
                     // Do not consume the authoritative transaction when its committed form cannot
                     // fit one production media-driver slot, including before the sender attaches.
                     // A corrected same-transaction redelivery must remain admissible.
-                    return GroupStateApply::InvalidSnapshot;
+                    return (GroupStateApply::InvalidSnapshot, None);
                 }
             }
             let entry = map.get_mut(&call_id).expect("entry presence checked");
@@ -1101,6 +1126,7 @@ impl CallRegistry {
             };
             (
                 applied,
+                roster,
                 waiting_room_task,
                 video_teardown,
                 (applied == GroupStateApply::Applied).then(|| entry.group_update_event.clone()),
@@ -1115,7 +1141,7 @@ impl CallRegistry {
         if let Some(event) = event {
             event.notify(usize::MAX);
         }
-        applied
+        (applied, roster)
     }
 
     fn group_update_contains_connected_device(update: &GroupCallUpdate, device: &Jid) -> bool {
@@ -3781,6 +3807,67 @@ mod tests {
                 port: Some(3478),
             }])
             .build()
+    }
+
+    #[test]
+    fn fresh_group_commit_exposes_only_pid_stabilized_rekey_rosters() {
+        let reg = CallRegistry::new();
+        let mut initial = group_update(15);
+        initial.media = "video".to_string();
+        initial.participants = vec![crate::types::group_call::GroupCallParticipant {
+            jid: Jid::new("100001", Server::Lid),
+            pn: None,
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![crate::types::group_call::GroupCallDevice {
+                jid: Jid::new("100001", Server::Lid).with_device(1),
+                platform: None,
+                pid: Some(0),
+                capability_version: None,
+                capability: Vec::new(),
+            }],
+        }];
+        let mut session = CallSession::new_outgoing(
+            &initial.call_id,
+            Jid::new(&initial.call_id, Server::Call),
+            initial.call_creator.clone(),
+        );
+        session.is_video = true;
+        session.group = Some(initial.clone());
+        let generation = reg.insert_group_checked(session).expect("group");
+        let mut older = group_update(13);
+        older.rekey_requested = true;
+        older.relay = Some(group_relay(1));
+        let (applied, roster) = reg.apply_group_update_if_current_with_roster(older, generation);
+        assert_eq!(applied, GroupStateApply::Applied);
+        assert!(
+            roster.is_none(),
+            "relay-only adoption cannot request a new key epoch"
+        );
+        assert!(
+            reg.snapshot_if_current(&initial.call_id, generation)
+                .unwrap()
+                .is_video,
+            "an old relay-carrying audio roster cannot downgrade committed video"
+        );
+        let mut next = initial;
+        next.transaction_id = 16;
+        next.rekey_requested = true;
+        next.participants[0].devices[0].pid = None;
+        let (applied, roster) = reg.apply_group_update_if_current_with_roster(next, generation);
+        assert_eq!(applied, GroupStateApply::Applied);
+        let committed = roster.expect("fresh committed roster");
+        assert_eq!(
+            committed.transaction_id, 16,
+            "never substitute a key transaction"
+        );
+        assert!(committed.rekey_requested);
+        assert_eq!(committed.participants[0].devices[0].pid, Some(0));
+        assert_eq!(
+            committed.participants[0].devices[0].jid,
+            Jid::new("100001", Server::Lid).with_device(1),
+            "crypto namespace stays authoritative"
+        );
     }
 
     #[test]
