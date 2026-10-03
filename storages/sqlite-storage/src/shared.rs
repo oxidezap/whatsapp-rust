@@ -65,7 +65,7 @@ impl SharedSqlite {
     /// escapes the serialization the store relies on and can deadlock against
     /// the real writer on the transaction upgrade, which `busy_timeout` cannot
     /// resolve. When a store has no reader connections configured
-    /// ([`SqliteStoreConfig::read_pool_size`](crate::SqliteStoreConfig::read_pool_size)
+    /// ([`SqliteDatabaseConfig::read_pool_size`](crate::SqliteDatabaseConfig::read_pool_size)
     /// left at 0) this queues on the write permit exactly like
     /// [`run`](Self::run), so it is always safe to call — it simply buys no
     /// concurrency until the embedder opts in.
@@ -173,7 +173,7 @@ mod tests {
     }
 
     async fn create_test_store(tag: &str) -> SqliteStore {
-        SqliteStore::new(&unique_db_name(tag))
+        SqliteStore::open(&unique_db_name(tag))
             .await
             .expect("Failed to create test store")
     }
@@ -221,7 +221,7 @@ mod tests {
 
     #[tokio::test]
     async fn shared_write_awaits_barrier_but_read_does_not() {
-        use crate::sqlite_store::{CommitBarrierHook, SqliteStoreConfig};
+        use crate::sqlite_store::{CommitBarrierHook, SqliteDatabaseConfig};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -230,12 +230,13 @@ mod tests {
             calls_for_hook.fetch_add(1, Ordering::Relaxed);
             Box::pin(async { Ok::<(), StoreError>(()) })
         });
-        let store = SqliteStore::with_config(
+        let store = crate::SqliteDatabase::open(
             &unique_db_name("barrier"),
-            SqliteStoreConfig::default().with_commit_barrier(barrier),
+            SqliteDatabaseConfig::default().with_commit_barrier(barrier),
         )
         .await
-        .expect("barrier store");
+        .expect("barrier store")
+        .store(1);
         let shared = store.shared();
         shared
             .run(|conn| {
@@ -261,14 +262,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_constructor_barrier_failure_rejects_the_store() {
-        use crate::sqlite_store::{CommitBarrierHook, SqliteStoreConfig};
+        use crate::sqlite_store::{CommitBarrierHook, SqliteDatabaseConfig};
 
         let barrier: CommitBarrierHook = Arc::new(|| {
             Box::pin(async { Err(StoreError::Validation("commit barrier failed".into())) })
         });
-        let result = SqliteStore::with_config(
+        let result = crate::SqliteDatabase::open(
             &unique_db_name("barrier_error"),
-            SqliteStoreConfig::default().with_commit_barrier(barrier),
+            SqliteDatabaseConfig::default().with_commit_barrier(barrier),
         )
         .await;
         assert!(
@@ -279,7 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_pending_barrier_holds_the_write_permit() {
-        use crate::sqlite_store::{CommitBarrierHook, SqliteStoreConfig};
+        use crate::sqlite_store::{CommitBarrierHook, SqliteDatabaseConfig};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::sync::{Notify, Semaphore};
 
@@ -303,12 +304,13 @@ mod tests {
                 })
             })
         };
-        let mut store = SqliteStore::with_config(
+        let mut store = crate::SqliteDatabase::open(
             &unique_db_name("barrier_pending"),
-            SqliteStoreConfig::default(),
+            SqliteDatabaseConfig::default(),
         )
         .await
-        .expect("store");
+        .expect("store")
+        .store(1);
         store.commit_barrier = Some(hook);
         let shared = store.shared();
         let first = tokio::spawn({
@@ -407,16 +409,17 @@ mod tests {
 
     #[tokio::test]
     async fn signal_batch_surfaces_barrier_error() {
-        use crate::sqlite_store::{CommitBarrierHook, SqliteStoreConfig};
+        use crate::sqlite_store::{CommitBarrierHook, SqliteDatabaseConfig};
         use bytes::Bytes;
         use wacore::store::traits::SignalStore;
 
-        let mut store = SqliteStore::with_config(
+        let mut store = crate::SqliteDatabase::open(
             &unique_db_name("signal_barrier_error"),
-            SqliteStoreConfig::default(),
+            SqliteDatabaseConfig::default(),
         )
         .await
-        .expect("store");
+        .expect("store")
+        .store(1);
         let barrier: CommitBarrierHook =
             Arc::new(|| Box::pin(async { Err(StoreError::Validation("IDB quota".into())) }));
         store.commit_barrier = Some(barrier);
@@ -434,14 +437,15 @@ mod tests {
 
     #[tokio::test]
     async fn shared_write_surfaces_typed_barrier_error() {
-        use crate::sqlite_store::{CommitBarrierHook, SqliteStoreConfig};
+        use crate::sqlite_store::{CommitBarrierHook, SqliteDatabaseConfig};
 
-        let mut store = SqliteStore::with_config(
+        let mut store = crate::SqliteDatabase::open(
             &unique_db_name("shared_barrier_error"),
-            SqliteStoreConfig::default(),
+            SqliteDatabaseConfig::default(),
         )
         .await
-        .expect("store");
+        .expect("store")
+        .store(1);
         let barrier: CommitBarrierHook =
             Arc::new(|| Box::pin(async { Err(StoreError::Validation("IDB quota".into())) }));
         store.commit_barrier = Some(barrier);
@@ -506,19 +510,20 @@ mod tests {
     /// query stalled every other read on the session for its whole duration.
     #[tokio::test]
     async fn reads_run_concurrently_when_reader_connections_are_configured() {
-        use crate::sqlite_store::SqliteStoreConfig;
+        use crate::sqlite_store::SqliteDatabaseConfig;
         use std::sync::Arc;
 
         let db = TempDb::new("read_concurrency");
-        let store = SqliteStore::with_config(
+        let store = crate::SqliteDatabase::open(
             &db.url(),
-            SqliteStoreConfig {
+            SqliteDatabaseConfig {
                 read_pool_size: 4,
                 ..Default::default()
             },
         )
         .await
-        .expect("store with reader connections");
+        .expect("store with reader connections")
+        .store(1);
         assert!(store.reads.is_some(), "a file-backed store reaches WAL");
         let shared = store.shared();
 
@@ -569,19 +574,20 @@ mod tests {
     /// the writer waiting for a connection.
     #[tokio::test]
     async fn a_write_proceeds_while_every_reader_permit_is_held() {
-        use crate::sqlite_store::SqliteStoreConfig;
+        use crate::sqlite_store::SqliteDatabaseConfig;
         use std::sync::Arc;
 
         let db = TempDb::new("write_not_starved");
-        let store = SqliteStore::with_config(
+        let store = crate::SqliteDatabase::open(
             &db.url(),
-            SqliteStoreConfig {
+            SqliteDatabaseConfig {
                 read_pool_size: 2,
                 ..Default::default()
             },
         )
         .await
-        .expect("store with reader connections");
+        .expect("store with reader connections")
+        .store(1);
         let shared = store.shared();
         shared
             .run(|conn| {
@@ -652,18 +658,19 @@ mod tests {
     /// fails loudly instead of silently escaping the write serialization.
     #[tokio::test]
     async fn a_write_through_the_read_path_is_refused() {
-        use crate::sqlite_store::SqliteStoreConfig;
+        use crate::sqlite_store::SqliteDatabaseConfig;
 
         let db = TempDb::new("read_only");
-        let store = SqliteStore::with_config(
+        let store = crate::SqliteDatabase::open(
             &db.url(),
-            SqliteStoreConfig {
+            SqliteDatabaseConfig {
                 read_pool_size: 1,
                 ..Default::default()
             },
         )
         .await
-        .expect("store with reader connections");
+        .expect("store with reader connections")
+        .store(1);
         let shared = store.shared();
 
         let result = shared
@@ -682,17 +689,18 @@ mod tests {
     /// single queue rather than pretending.
     #[tokio::test]
     async fn reader_connections_are_declined_without_wal() {
-        use crate::sqlite_store::SqliteStoreConfig;
+        use crate::sqlite_store::SqliteDatabaseConfig;
 
-        let store = SqliteStore::with_config(
+        let store = crate::SqliteDatabase::open(
             &unique_db_name("no_wal"),
-            SqliteStoreConfig {
+            SqliteDatabaseConfig {
                 read_pool_size: 4,
                 ..Default::default()
             },
         )
         .await
-        .expect("in-memory store still opens");
+        .expect("in-memory store still opens")
+        .store(1);
         assert!(store.reads.is_none(), "no WAL, no reader pool");
 
         // And reads still work, on the write queue.
@@ -712,18 +720,19 @@ mod tests {
     /// connections through — into table locks that block the writer outright.
     #[tokio::test]
     async fn reader_connections_are_declined_for_shared_cache() {
-        use crate::sqlite_store::SqliteStoreConfig;
+        use crate::sqlite_store::SqliteDatabaseConfig;
 
         let db = TempDb::new("shared_cache");
-        let store = SqliteStore::with_config(
+        let store = crate::SqliteDatabase::open(
             &format!("file:{}?cache=shared", db.url()),
-            SqliteStoreConfig {
+            SqliteDatabaseConfig {
                 read_pool_size: 4,
                 ..Default::default()
             },
         )
         .await
-        .expect("shared-cache store still opens");
+        .expect("shared-cache store still opens")
+        .store(1);
         assert!(
             store.reads.is_none(),
             "shared cache serializes readers against the writer anyway"
@@ -731,15 +740,16 @@ mod tests {
 
         // The same file without the parameter does get reader connections, so
         // the decline is about the cache mode and not about the path.
-        let store = SqliteStore::with_config(
+        let store = crate::SqliteDatabase::open(
             &db.url(),
-            SqliteStoreConfig {
+            SqliteDatabaseConfig {
                 read_pool_size: 4,
                 ..Default::default()
             },
         )
         .await
-        .expect("private-cache store opens");
+        .expect("private-cache store opens")
+        .store(1);
         assert!(
             store.reads.is_some(),
             "private cache under WAL gets readers"
@@ -751,18 +761,19 @@ mod tests {
     /// as if it were the whole store's.
     #[tokio::test]
     async fn resource_report_counts_reader_connections() {
-        use crate::sqlite_store::SqliteStoreConfig;
+        use crate::sqlite_store::SqliteDatabaseConfig;
         use wacore::store::traits::DeviceStore;
 
         let db = TempDb::new("report_readers");
-        let config = || SqliteStoreConfig {
+        let config = || SqliteDatabaseConfig {
             read_pool_size: 3,
             ..Default::default()
         };
 
-        let with_readers = SqliteStore::with_config(&db.url(), config())
+        let with_readers = crate::SqliteDatabase::open(&db.url(), config())
             .await
-            .expect("store opens");
+            .expect("store opens")
+            .store(1);
         assert!(with_readers.reads.is_some(), "readers are configured");
         // r2d2 opens min_idle connections eagerly; touch the read path so the
         // reader pool has definitely opened one to account for.
@@ -778,7 +789,7 @@ mod tests {
             .expect("read succeeds");
 
         let baseline = TempDb::new("report_no_readers");
-        let without = SqliteStore::new(&baseline.url())
+        let without = SqliteStore::open(&baseline.url())
             .await
             .expect("store opens");
 

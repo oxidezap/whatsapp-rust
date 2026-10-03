@@ -36,7 +36,7 @@
 //! deliberately no "invalid input", "protocol violation" or "internal" query:
 //! each domain spells those as its own `InvalidRequest(String)`-style variant
 //! with no shared representation, so any such split would be invented here
-//! rather than recovered. [`crate::features::MexError::ExtensionError`] is
+//! rather than recovered. [`crate::features::MexError::GraphQl`] is
 //! likewise not reported as a server rejection: its `code` is a GraphQL
 //! extension code, a different space from the IQ `code` attribute, and merging
 //! the two would make the number meaningless.

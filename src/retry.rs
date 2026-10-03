@@ -6,7 +6,6 @@ use crate::types::events::Receipt;
 use log::{debug, info, warn};
 use wacore::types::message::MessageCategory;
 
-use scopeguard;
 use std::sync::Arc;
 use wacore::iq::prekeys::{OneTimePreKeyNode, SignedPreKeyNode};
 use wacore::libsignal::protocol::{PreKeyBundle, PublicKey};

@@ -262,7 +262,7 @@ async fn check_outcomes(handle: PrometheusHandle) {
             }
         }
     }
-    // The deliberate legacy embedded-error tolerance is not reclassified.
+    // The direct spec now has the same typed embedded rejection policy as the facade.
     let (client, transport) = create_iq_test_client().await;
     let before = counts(&handle);
     let c = client.clone();
@@ -278,10 +278,10 @@ async fn check_outcomes(handle: PrometheusHandle) {
     )
     .await;
     assert!(matches!(
-        task.await.unwrap().unwrap(),
-        ProfilePictureLookup::RateOverlimit
+        task.await.unwrap(),
+        Err(IqError::ServerError { code: 429, .. })
     ));
-    assert_delta(&handle, before, [1, 0, 0]);
+    assert_delta(&handle, before, [0, 1, 0]);
 
     // Streaming remains independently counted once after its own consumption.
     for error in [false, true] {

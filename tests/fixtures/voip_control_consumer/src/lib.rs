@@ -1,6 +1,7 @@
 //! Standalone consumer: no workspace Cargo configuration or direct engine dependency.
 use std::sync::Arc;
-use whatsapp_rust::voip::{CallEvent, CallHandle};
+use whatsapp_rust::futures::future::BoxFuture;
+use whatsapp_rust::voip::{CallEvent, CallEvents, CallHandle};
 use whatsapp_rust::voip_control::{
     CallDirection, GroupCallUpdate, MediaCloseReason, MediaCommand, MediaEvent, MediaOpenContext,
     MediaSessionKey, MediaSessionSpec, MediaSetupError, MediaStats, VoipMediaBackend,
@@ -8,8 +9,26 @@ use whatsapp_rust::voip_control::{
 };
 use whatsapp_rust::{async_channel, async_trait};
 
-pub fn acquire(call: &CallHandle) -> Option<async_channel::Receiver<CallEvent>> {
+pub fn acquire(call: &CallHandle) -> Option<CallEvents> {
     call.take_events()
+}
+
+pub async fn receive(events: &mut CallEvents) -> Result<CallEvent, async_channel::RecvError> {
+    events.recv().await
+}
+
+pub async fn stream(events: &mut CallEvents) -> Option<CallEvent> {
+    use whatsapp_rust::futures::StreamExt;
+    events.next().await
+}
+
+pub fn consumer_task(events: CallEvents) -> BoxFuture<'static, ()> {
+    use whatsapp_rust::futures::FutureExt;
+    async move {
+        let mut events = events;
+        while let Ok(_event) = events.recv().await {}
+    }
+    .boxed()
 }
 
 pub struct ExternalBackend;

@@ -2075,7 +2075,7 @@ impl Client {
                 conflict_type
             );
             self.expected_disconnect.store(true, Ordering::Relaxed);
-            self.enable_auto_reconnect.store(false, Ordering::Relaxed);
+            self.stop_auto_reconnect_permanently();
 
             let event = if conflict_type == "replaced" {
                 Event::StreamReplaced(crate::types::events::StreamReplaced::builder().build())
@@ -2107,7 +2107,7 @@ impl Client {
                         );
                     }
                     self.expected_disconnect.store(true, Ordering::Relaxed);
-                    self.enable_auto_reconnect.store(false, Ordering::Relaxed);
+                    self.stop_auto_reconnect_permanently();
                     self.core.event_bus.dispatch(Event::LoggedOut(Box::new(
                         crate::types::events::LoggedOut::builder()
                             .on_connect(false)
@@ -2125,7 +2125,7 @@ impl Client {
                         );
                     }
                     self.expected_disconnect.store(true, Ordering::Relaxed);
-                    self.enable_auto_reconnect.store(false, Ordering::Relaxed);
+                    self.stop_auto_reconnect_permanently();
                     self.core.event_bus.dispatch(Event::LoggedOut(Box::new(
                         crate::types::events::LoggedOut::builder()
                             .on_connect(false)
@@ -2143,7 +2143,7 @@ impl Client {
                         );
                     }
                     self.expected_disconnect.store(true, Ordering::Relaxed);
-                    self.enable_auto_reconnect.store(false, Ordering::Relaxed);
+                    self.stop_auto_reconnect_permanently();
                     self.core.event_bus.dispatch(Event::StreamReplaced(
                         crate::types::events::StreamReplaced::builder().build(),
                     ));
@@ -2263,7 +2263,7 @@ impl Client {
         if reason.should_reconnect() {
             self.expected_disconnect.store(false, Ordering::Relaxed);
         } else {
-            self.enable_auto_reconnect.store(false, Ordering::Relaxed);
+            self.stop_auto_reconnect_permanently();
         }
         // Announced after the classification, not before it. This notify is what
         // wakes work parked in `await_connection`, and that work answers by

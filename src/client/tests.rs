@@ -626,7 +626,7 @@ async fn server_ack_from_stays_none_for_a_malformed_jid() {
 #[tokio::test]
 async fn test_lid_pn_cache_basic_operations() {
     let backend = Arc::new(
-        crate::store::SqliteStore::new("file:memdb_lid_cache_basic?mode=memory&cache=shared")
+        crate::store::SqliteStore::open("file:memdb_lid_cache_basic?mode=memory&cache=shared")
             .await
             .expect("Failed to create in-memory backend for test"),
     );
@@ -697,7 +697,7 @@ async fn test_lid_pn_cache_basic_operations() {
 #[tokio::test]
 async fn test_lid_pn_cache_timestamp_resolution() {
     let backend = Arc::new(
-        crate::store::SqliteStore::new("file:memdb_lid_cache_timestamp?mode=memory&cache=shared")
+        crate::store::SqliteStore::open("file:memdb_lid_cache_timestamp?mode=memory&cache=shared")
             .await
             .expect("Failed to create in-memory backend for test"),
     );
@@ -788,7 +788,7 @@ async fn test_get_lid_for_phone_via_send_context_resolver() {
     use wacore::client::context::SendContextResolver;
 
     let backend = Arc::new(
-        crate::store::SqliteStore::new("file:memdb_get_lid_for_phone?mode=memory&cache=shared")
+        crate::store::SqliteStore::open("file:memdb_get_lid_for_phone?mode=memory&cache=shared")
             .await
             .expect("Failed to create in-memory backend for test"),
     );
@@ -843,9 +843,11 @@ async fn test_get_lid_for_phone_via_send_context_resolver() {
 #[tokio::test]
 async fn test_wait_for_offline_delivery_end_returns_immediately_when_flag_set() {
     let backend = Arc::new(
-        crate::store::SqliteStore::new("file:memdb_offline_sync_flag_set?mode=memory&cache=shared")
-            .await
-            .expect("Failed to create in-memory backend for test"),
+        crate::store::SqliteStore::open(
+            "file:memdb_offline_sync_flag_set?mode=memory&cache=shared",
+        )
+        .await
+        .expect("Failed to create in-memory backend for test"),
     );
     let pm = Arc::new(
         PersistenceManager::new(backend)
@@ -885,7 +887,7 @@ async fn test_wait_for_offline_delivery_end_returns_immediately_when_flag_set() 
 #[tokio::test]
 async fn test_wait_for_offline_delivery_end_times_out_when_flag_not_set() {
     let backend = Arc::new(
-        crate::store::SqliteStore::new("file:memdb_offline_sync_timeout?mode=memory&cache=shared")
+        crate::store::SqliteStore::open("file:memdb_offline_sync_timeout?mode=memory&cache=shared")
             .await
             .expect("Failed to create in-memory backend for test"),
     );
@@ -955,7 +957,7 @@ async fn test_wait_for_offline_delivery_end_times_out_when_flag_not_set() {
 #[tokio::test]
 async fn test_wait_for_offline_delivery_end_returns_on_notify() {
     let backend = Arc::new(
-        crate::store::SqliteStore::new("file:memdb_offline_notify?mode=memory&cache=shared")
+        crate::store::SqliteStore::open("file:memdb_offline_notify?mode=memory&cache=shared")
             .await
             .expect("Failed to create in-memory backend for test"),
     );
@@ -1005,7 +1007,7 @@ async fn test_wait_for_offline_delivery_end_returns_on_notify() {
 #[tokio::test]
 async fn test_offline_sync_flag_initially_false() {
     let backend = Arc::new(
-        crate::store::SqliteStore::new("file:memdb_offline_flag_initial?mode=memory&cache=shared")
+        crate::store::SqliteStore::open("file:memdb_offline_flag_initial?mode=memory&cache=shared")
             .await
             .expect("Failed to create in-memory backend for test"),
     );
@@ -1042,7 +1044,7 @@ async fn test_offline_sync_lifecycle() {
     use std::sync::atomic::Ordering;
 
     let backend = Arc::new(
-        crate::store::SqliteStore::new("file:memdb_offline_lifecycle?mode=memory&cache=shared")
+        crate::store::SqliteStore::open("file:memdb_offline_lifecycle?mode=memory&cache=shared")
             .await
             .expect("Failed to create in-memory backend for test"),
     );
@@ -1103,7 +1105,7 @@ async fn test_offline_sync_lifecycle() {
 #[tokio::test]
 async fn test_primary_phone_session_probe_fails_without_pn() {
     let backend = Arc::new(
-        crate::store::SqliteStore::new("file:memdb_no_pn?mode=memory&cache=shared")
+        crate::store::SqliteStore::open("file:memdb_no_pn?mode=memory&cache=shared")
             .await
             .expect("Failed to create in-memory backend for test"),
     );
@@ -1150,7 +1152,7 @@ async fn test_ensure_e2e_sessions_waits_for_offline_sync() {
     use wacore_binary::Jid;
 
     let backend = Arc::new(
-        crate::store::SqliteStore::new("file:memdb_ensure_e2e_waits?mode=memory&cache=shared")
+        crate::store::SqliteStore::open("file:memdb_ensure_e2e_waits?mode=memory&cache=shared")
             .await
             .expect("Failed to create in-memory backend for test"),
     );
@@ -1267,7 +1269,7 @@ async fn test_primary_phone_session_probe_does_not_wait_for_offline_sync() {
     use wacore_binary::Jid;
 
     let backend = Arc::new(
-        crate::store::SqliteStore::new("file:memdb_immediate_no_wait?mode=memory&cache=shared")
+        crate::store::SqliteStore::open("file:memdb_immediate_no_wait?mode=memory&cache=shared")
             .await
             .expect("Failed to create in-memory backend for test"),
     );
@@ -1347,7 +1349,7 @@ async fn test_primary_phone_session_probe_leaves_an_existing_session_alone() {
     use wacore_binary::Jid;
 
     let backend = Arc::new(
-        crate::store::SqliteStore::new("file:memdb_skip_existing?mode=memory&cache=shared")
+        crate::store::SqliteStore::open("file:memdb_skip_existing?mode=memory&cache=shared")
             .await
             .expect("Failed to create in-memory backend for test"),
     );
@@ -1728,11 +1730,10 @@ async fn cleanup_connection_state_flushes_dirty_signal_state() {
 
     // cleanup cleared the cache, so a hit now can only come from the DB,
     // proving the flush ran before the clear.
-    let device = client.persistence_manager.get_device_arc().await;
-    let guard = device.read().await;
+    let backend = client.persistence_manager.backend();
     let persisted = client
         .signal_cache
-        .get_identity(&addr, &*guard.backend)
+        .get_identity(&addr, &*backend)
         .await
         .expect("get_identity must not error");
     assert!(
@@ -1756,11 +1757,10 @@ async fn cleanup_connection_state_flushes_dirty_sender_key() {
 
     client.cleanup_connection_state().await;
 
-    let device = client.persistence_manager.get_device_arc().await;
-    let guard = device.read().await;
+    let backend = client.persistence_manager.backend();
     let persisted = client
         .signal_cache
-        .get_sender_key(&name, &*guard.backend)
+        .get_sender_key(&name, &*backend)
         .await
         .expect("get_sender_key must not error");
     assert!(
@@ -1793,11 +1793,10 @@ async fn cleanup_connection_state_does_not_burn_a_clean_sender_key_lease() {
 
     client.cleanup_connection_state().await;
 
-    let device = client.persistence_manager.get_device_arc().await;
-    let guard = device.read().await;
+    let backend = client.persistence_manager.backend();
     let reloaded = client
         .signal_cache
-        .get_sender_key(&name, &*guard.backend)
+        .get_sender_key(&name, &*backend)
         .await
         .expect("sender key load")
         .expect("sender key");
@@ -1836,11 +1835,10 @@ async fn cleanup_connection_state_keeps_state_when_flush_fails() {
 
     // flush() failed, so clear() was skipped; the unpersisted sender key
     // survives in the write-back cache instead of being dropped.
-    let device = client.persistence_manager.get_device_arc().await;
-    let guard = device.read().await;
+    let backend = client.persistence_manager.backend();
     let persisted = client
         .signal_cache
-        .get_sender_key(&name, &*guard.backend)
+        .get_sender_key(&name, &*backend)
         .await
         .expect("get_sender_key must not error");
     assert!(
@@ -5700,7 +5698,7 @@ async fn startup_maintenance_leaves_the_pending_inbound_buffer_alone() {
         std::process::id(),
         unique_id
     );
-    let sqlite = SqliteStore::new(&db_name)
+    let sqlite = SqliteStore::open(&db_name)
         .await
         .expect("backend initializes");
     let shared = sqlite.shared();

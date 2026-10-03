@@ -468,7 +468,7 @@ async fn peer_video_queue_keeps_sender_state_and_upgrade_token_in_order() -> Res
         .inject(video_stanza(&sibling, VideoState::Stopped, 0))
         .await?;
 
-    let events = handle.take_events().expect("first acquisition");
+    let mut events = handle.take_events().expect("first acquisition");
     let queued: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
     assert_eq!(
         queued.len(),
@@ -584,7 +584,7 @@ async fn peer_video_metadata_reports_routed_sender_and_supplied_creator_without_
             .build()
     };
     fixture.inject(video(VideoState::Stopped)).await?;
-    let events = handle.take_events().expect("first acquisition");
+    let mut events = handle.take_events().expect("first acquisition");
     assert_eq!(
         events.try_recv()?,
         CallEvent::PeerVideoStateChanged {
@@ -605,7 +605,7 @@ async fn peer_video_metadata_reports_routed_sender_and_supplied_creator_without_
     );
     fixture.inject(video(VideoState::Unknown(99))).await?;
     assert!(
-        events.is_empty(),
+        matches!(events.try_recv(), Err(async_channel::TryRecvError::Empty)),
         "an ignored transition must publish neither variant"
     );
     assert_eq!(handle.peer_jid(), winner);

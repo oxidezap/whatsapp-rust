@@ -27,7 +27,7 @@ fn mock_http_client() -> Arc<dyn crate::http::HttpClient> {
 #[tokio::test]
 async fn test_parse_message_info_for_status_broadcast() {
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_status_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_status_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -89,7 +89,7 @@ async fn test_status_broadcast_cold_cache_resolves_to_lid() {
     use wacore_binary::Server;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_status_cold_cache?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_status_cold_cache?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -187,7 +187,7 @@ async fn test_status_broadcast_hosted_family_with_device_id_resolves_to_hosted_l
     use wacore_binary::Server;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_status_hosted_device?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_status_hosted_device?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -284,7 +284,7 @@ async fn test_process_session_enc_batch_handles_session_not_found_gracefully() {
     use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair, SignalMessage};
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_graceful_fail?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_graceful_fail?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -358,7 +358,7 @@ async fn test_process_session_enc_batch_handles_session_not_found_gracefully() {
 #[tokio::test]
 async fn batch_accumulates_undecryptable_and_dispatches_once() {
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_batch_undec_once?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_batch_undec_once?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -434,7 +434,7 @@ async fn test_empty_session_record_treated_as_session_not_found() {
     use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair, SessionRecord, SignalMessage};
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_empty_session?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_empty_session?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -1342,7 +1342,7 @@ async fn test_handle_incoming_message_skips_skmsg_after_msg_failure() {
     use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair, SignalMessage};
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_skip_skmsg_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_skip_skmsg_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -1432,7 +1432,7 @@ async fn test_self_sent_lid_group_message_sender_key_mismatch() {
     };
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_sender_key_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_sender_key_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -1472,33 +1472,31 @@ async fn test_self_sent_lid_group_message_sender_key_mismatch() {
         lid_protocol_address.to_string()
     );
 
-    let device_arc = pm.get_device_arc().await;
-    let skdm = {
-        let mut device_guard = device_arc.write().await;
-        create_sender_key_distribution_message(
-            &lid_sender_key_name,
-            &mut *device_guard,
-            &mut rand::make_rng::<rand::rngs::StdRng>(),
-        )
-        .await
-        .expect("Failed to create SKDM")
-    };
-
-    {
-        let mut device_guard = device_arc.write().await;
-        process_sender_key_distribution_message(&lid_sender_key_name, &skdm, &mut *device_guard)
+    let name = lid_sender_key_name.clone();
+    pm.modify_device_async(move |device| {
+        Box::pin(async move {
+            let skdm = create_sender_key_distribution_message(
+                &name,
+                device,
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )
             .await
-            .expect("Failed to process SKDM with LID address");
-    }
+            .expect("Failed to create SKDM");
+            process_sender_key_distribution_message(&name, &skdm, device)
+                .await
+                .expect("Failed to process SKDM with LID address");
+        })
+    })
+    .await;
 
     // Try to retrieve using PHONE NUMBER address (THE BUG)
     let phone_protocol_address = own_phone.to_protocol_address();
     let phone_sender_key_name = make_sender_key_name(&group_jid, &phone_protocol_address);
 
-    let phone_lookup_result = {
-        let device_guard = device_arc.read().await;
-        device_guard.load_sender_key(&phone_sender_key_name).await
-    };
+    let phone_lookup_result = pm
+        .get_device_snapshot()
+        .load_sender_key(&phone_sender_key_name)
+        .await;
 
     assert!(
         phone_lookup_result
@@ -1508,10 +1506,10 @@ async fn test_self_sent_lid_group_message_sender_key_mismatch() {
     );
 
     // Try to retrieve using LID address (THE FIX)
-    let lid_lookup_result = {
-        let device_guard = device_arc.read().await;
-        device_guard.load_sender_key(&lid_sender_key_name).await
-    };
+    let lid_lookup_result = pm
+        .get_device_snapshot()
+        .load_sender_key(&lid_sender_key_name)
+        .await;
 
     assert!(
         lid_lookup_result
@@ -1535,7 +1533,7 @@ async fn test_multiple_lid_participants_sender_key_isolation() {
     };
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_multi_lid_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_multi_lid_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -1566,29 +1564,27 @@ async fn test_multiple_lid_participants_sender_key_isolation() {
         ("111222333444555.3:10@lid", "559876543210:10@s.whatsapp.net"),
     ];
 
-    let device_arc = pm.get_device_arc().await;
-
     // Create and store sender keys for each participant under their LID address
     for (lid_str, _phone_str) in &participants {
         let lid_jid: Jid = lid_str.parse().expect("test JID should be valid");
         let lid_protocol_address = lid_jid.to_protocol_address();
         let lid_sender_key_name = make_sender_key_name(&group_jid, &lid_protocol_address);
 
-        let skdm = {
-            let mut device_guard = device_arc.write().await;
-            create_sender_key_distribution_message(
-                &lid_sender_key_name,
-                &mut *device_guard,
-                &mut rand::make_rng::<rand::rngs::StdRng>(),
-            )
-            .await
-            .expect("Failed to create SKDM")
-        };
-
-        let mut device_guard = device_arc.write().await;
-        process_sender_key_distribution_message(&lid_sender_key_name, &skdm, &mut *device_guard)
-            .await
-            .expect("Failed to process SKDM");
+        pm.modify_device_async(move |device| {
+            Box::pin(async move {
+                let skdm = create_sender_key_distribution_message(
+                    &lid_sender_key_name,
+                    device,
+                    &mut rand::make_rng::<rand::rngs::StdRng>(),
+                )
+                .await
+                .expect("Failed to create SKDM");
+                process_sender_key_distribution_message(&lid_sender_key_name, &skdm, device)
+                    .await
+                    .expect("Failed to process SKDM");
+            })
+        })
+        .await;
     }
 
     // Verify each participant's sender key can be retrieved using their LID address
@@ -1603,10 +1599,10 @@ async fn test_multiple_lid_participants_sender_key_isolation() {
         let phone_sender_key_name = make_sender_key_name(&group_jid, &phone_protocol_address);
 
         // Should find with LID address
-        let lid_lookup = {
-            let device_guard = device_arc.read().await;
-            device_guard.load_sender_key(&lid_sender_key_name).await
-        };
+        let lid_lookup = pm
+            .get_device_snapshot()
+            .load_sender_key(&lid_sender_key_name)
+            .await;
         assert!(
             lid_lookup.expect("lookup should not error").is_some(),
             "Sender key for {} should be found with LID address",
@@ -1614,10 +1610,10 @@ async fn test_multiple_lid_participants_sender_key_isolation() {
         );
 
         // Should NOT find with phone number address (the bug)
-        let phone_lookup = {
-            let device_guard = device_arc.read().await;
-            device_guard.load_sender_key(&phone_sender_key_name).await
-        };
+        let phone_lookup = pm
+            .get_device_snapshot()
+            .load_sender_key(&phone_sender_key_name)
+            .await;
         assert!(
             phone_lookup.expect("lookup should not error").is_none(),
             "Sender key for {} should NOT be found with phone number address",
@@ -1742,7 +1738,7 @@ async fn test_parse_message_info_sender_alt_extraction() {
     use wacore_binary::builder::NodeBuilder;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_sender_alt_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_sender_alt_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -1999,7 +1995,7 @@ async fn test_sender_key_always_uses_display_jid() {
     use wacore::libsignal::protocol::{SenderKeyStore, create_sender_key_distribution_message};
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_display_jid_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_display_jid_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2032,23 +2028,25 @@ async fn test_sender_key_always_uses_display_jid() {
     let display_protocol_address = display_jid.to_protocol_address();
     let display_sender_key_name = make_sender_key_name(&group_jid, &display_protocol_address);
 
-    let device_arc = pm.get_device_arc().await;
-    {
-        let mut device_guard = device_arc.write().await;
-        create_sender_key_distribution_message(
-            &display_sender_key_name,
-            &mut *device_guard,
-            &mut rand::make_rng::<rand::rngs::StdRng>(),
-        )
-        .await
-        .expect("Failed to create SKDM");
-    }
+    let name = display_sender_key_name.clone();
+    pm.modify_device_async(move |device| {
+        Box::pin(async move {
+            create_sender_key_distribution_message(
+                &name,
+                device,
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )
+            .await
+            .expect("Failed to create SKDM");
+        })
+    })
+    .await;
 
     // Verify it's stored under display JID
-    let lookup_with_display = {
-        let device_guard = device_arc.read().await;
-        device_guard.load_sender_key(&display_sender_key_name).await
-    };
+    let lookup_with_display = pm
+        .get_device_snapshot()
+        .load_sender_key(&display_sender_key_name)
+        .await;
     assert!(
         lookup_with_display
             .expect("lookup should not error")
@@ -2060,12 +2058,10 @@ async fn test_sender_key_always_uses_display_jid() {
     let encryption_protocol_address = encryption_jid.to_protocol_address();
     let encryption_sender_key_name = make_sender_key_name(&group_jid, &encryption_protocol_address);
 
-    let lookup_with_encryption = {
-        let device_guard = device_arc.read().await;
-        device_guard
-            .load_sender_key(&encryption_sender_key_name)
-            .await
-    };
+    let lookup_with_encryption = pm
+        .get_device_snapshot()
+        .load_sender_key(&encryption_sender_key_name)
+        .await;
     assert!(
         lookup_with_encryption
             .expect("lookup should not error")
@@ -2094,7 +2090,7 @@ async fn test_second_message_with_only_skmsg_decrypts() {
     use wacore_binary::builder::NodeBuilder;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_second_msg_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_second_msg_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2124,35 +2120,39 @@ async fn test_second_message_with_only_skmsg_decrypts() {
     let sender_protocol_address = sender_jid.to_protocol_address();
     let sender_key_name = make_sender_key_name(&group_jid, &sender_protocol_address);
 
-    let device_arc = pm.get_device_arc().await;
-    {
-        let mut device_guard = device_arc.write().await;
-        let skdm = create_sender_key_distribution_message(
-            &sender_key_name,
-            &mut *device_guard,
-            &mut rand::make_rng::<rand::rngs::StdRng>(),
-        )
-        .await
-        .expect("Failed to create SKDM");
-
-        process_sender_key_distribution_message(&sender_key_name, &skdm, &mut *device_guard)
+    let name = sender_key_name.clone();
+    pm.modify_device_async(move |device| {
+        Box::pin(async move {
+            let skdm = create_sender_key_distribution_message(
+                &name,
+                device,
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )
             .await
-            .expect("Failed to process SKDM");
-    }
+            .expect("Failed to create SKDM");
+            process_sender_key_distribution_message(&name, &skdm, device)
+                .await
+                .expect("Failed to process SKDM");
+        })
+    })
+    .await;
 
     // Create message with ONLY skmsg (simulating second message after session established)
-    let skmsg_ciphertext = {
-        let mut device_guard = device_arc.write().await;
-        let sender_key_msg = group_encrypt(
-            &mut *device_guard,
-            &sender_key_name,
-            b"ping",
-            &mut rand::make_rng::<rand::rngs::StdRng>(),
-        )
-        .await
-        .expect("Failed to encrypt with sender key");
-        sender_key_msg.serialized().to_vec()
-    };
+    let skmsg_ciphertext = pm
+        .modify_device_async(move |device| {
+            Box::pin(async move {
+                let sender_key_msg = group_encrypt(
+                    device,
+                    &sender_key_name,
+                    b"ping",
+                    &mut rand::make_rng::<rand::rngs::StdRng>(),
+                )
+                .await
+                .expect("Failed to encrypt with sender key");
+                sender_key_msg.serialized().to_vec()
+            })
+        })
+        .await;
 
     let skmsg_node = NodeBuilder::new("enc")
         .attr("type", "skmsg")
@@ -2198,7 +2198,7 @@ async fn test_untrusted_identity_error_is_caught_and_handled() {
 
     // Setup
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_untrusted_identity_caught?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_untrusted_identity_caught?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2271,7 +2271,7 @@ async fn test_untrusted_identity_does_not_break_batch_processing() {
     use std::sync::Arc;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_untrusted_batch?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_untrusted_batch?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2354,7 +2354,7 @@ async fn test_untrusted_identity_in_group_context() {
     use std::sync::Arc;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_untrusted_group?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_untrusted_group?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2433,7 +2433,7 @@ async fn test_parse_message_info_self_sent_dm_via_lid() {
     use wacore_binary::builder::NodeBuilder;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_self_dm_lid_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_self_dm_lid_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2532,7 +2532,7 @@ async fn test_parse_message_info_dm_from_other_via_lid() {
     use wacore_binary::builder::NodeBuilder;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_other_dm_lid_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_other_dm_lid_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2627,7 +2627,7 @@ async fn test_parse_message_info_dm_to_self() {
     use wacore_binary::builder::NodeBuilder;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_dm_to_self_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_dm_to_self_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2720,7 +2720,7 @@ async fn test_parse_message_info_dm_to_self() {
 async fn test_lid_pn_cache_populated_on_message_with_sender_lid() {
     // Setup client
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_lid_cache_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_lid_cache_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2790,7 +2790,7 @@ async fn test_lid_pn_cache_populated_on_message_with_sender_lid() {
 async fn test_lid_pn_cache_not_populated_without_sender_lid() {
     // Setup client
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_no_lid_cache_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_no_lid_cache_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2849,7 +2849,7 @@ async fn test_lid_pn_cache_populated_for_lid_sender_with_participant_pn() {
 
     // Setup client
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_lid_sender_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_lid_sender_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -2923,7 +2923,7 @@ async fn test_lid_pn_cache_populated_for_lid_sender_with_participant_pn() {
 async fn test_lid_pn_cache_handles_repeated_messages() {
     // Setup client
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_repeated_msg_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_repeated_msg_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -3001,7 +3001,7 @@ async fn test_pn_message_uses_lid_for_session_lookup_when_mapping_known() {
     use wacore::types::jid::JidExt;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_pn_to_lid_session_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_pn_to_lid_session_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -3141,7 +3141,7 @@ async fn test_pn_message_uses_cached_lid_without_sender_lid_attribute() {
     use wacore::types::jid::JidExt;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_cached_lid_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_cached_lid_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -3255,7 +3255,7 @@ async fn test_pn_message_uses_pn_when_no_lid_mapping() {
     use wacore::types::jid::JidExt;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_no_lid_mapping_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_no_lid_mapping_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -3407,7 +3407,7 @@ async fn create_test_client_for_retry_with_id(test_id: &str) -> Arc<Client> {
     );
 
     let backend = Arc::new(
-        SqliteStore::new(&db_name)
+        SqliteStore::open(&db_name)
             .await
             .expect("Failed to create test backend"),
     );
@@ -4051,7 +4051,7 @@ fn skdm_only_fallback_ack_decision_requires_clean_session_batch() {
 #[tokio::test]
 async fn test_parse_message_info_missing_id_returns_error() {
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_missing_id_test?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_missing_id_test?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -4102,7 +4102,7 @@ async fn test_no_sender_key_sends_immediate_retry() {
     use wacore_binary::builder::NodeBuilder;
 
     let backend = Arc::new(
-        SqliteStore::new("file:memdb_retry_immediate?mode=memory&cache=shared")
+        SqliteStore::open("file:memdb_retry_immediate?mode=memory&cache=shared")
             .await
             .expect("Failed to create test backend"),
     );
@@ -5736,7 +5736,7 @@ async fn capturing_client_with_cache_config(
     );
 
     let backend = Arc::new(
-        SqliteStore::new(&db_name)
+        SqliteStore::open(&db_name)
             .await
             .expect("test backend should initialize"),
     );
@@ -15200,7 +15200,7 @@ async fn a_corrupt_stored_prekey_is_not_blamed_on_the_peer() {
     use wacore::libsignal::store::PreKeyStore as WacorePreKeyStore;
 
     let client = crate::test_utils::create_test_client_with_name("enc_fail_corrupt_row").await;
-    let device = client.persistence_manager.get_device_arc().await;
+    let device = client.persistence_manager.get_device_snapshot();
 
     // A stored structure with no key material: what a truncated or partially
     // written row deserializes into.
@@ -15210,8 +15210,7 @@ async fn a_corrupt_stored_prekey_is_not_blamed_on_the_peer() {
         private_key: None,
     };
     {
-        let guard = device.read().await;
-        WacorePreKeyStore::store_prekey(&*guard, 7, corrupt, false)
+        WacorePreKeyStore::store_prekey(&*device, 7, corrupt, false)
             .await
             .expect("stored");
     }

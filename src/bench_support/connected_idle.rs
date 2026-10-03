@@ -70,7 +70,7 @@ impl BackendFixture {
             path.display()
         );
         let backend =
-            crate::store::SqliteStore::new(path.to_str().context("SQLite path encoding")?).await?;
+            crate::store::SqliteStore::open(path.to_str().context("SQLite path encoding")?).await?;
         Ok(Self {
             backend: Some(Arc::new(backend)),
             path: Some(path),

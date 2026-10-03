@@ -1,0 +1,13 @@
+[package]
+name = "encapsulation-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+whatsapp-rust = { path = "../../..", default-features = false }
+
+[features]
+plugins = ["whatsapp-rust/plugins"]

@@ -114,7 +114,7 @@ impl Harness {
             std::env::temp_dir().join(format!("wa-signal-cache-{}-{chats}.db", std::process::id()));
         remove_db_files(&path);
         let store = runtime
-            .block_on(SqliteStore::new(path.to_str().expect("path")))
+            .block_on(SqliteStore::open(path.to_str().expect("path")))
             .expect("store");
         let cache = Arc::new(SignalStoreCache::new());
         let mut rng = rand::rngs::StdRng::seed_from_u64(FIXTURE_SEED);

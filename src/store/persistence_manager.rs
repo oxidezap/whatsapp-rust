@@ -2,7 +2,7 @@ use super::error::StoreError;
 use super::release::{BackendLease, StoreRelease};
 use crate::store::Device;
 use crate::store::traits::Backend;
-use async_lock::{Mutex, RwLock};
+use async_lock::{Mutex, RwLock, RwLockWriteGuard};
 use event_listener::Event;
 use futures::FutureExt;
 use log::{debug, error};
@@ -33,6 +33,14 @@ fn pending_device_save(
     }
 }
 
+/// Managed device mutations publish a cached snapshot and schedule persistence.
+/// Reading a snapshot does not give access to the manager's writable lock:
+///
+/// ```compile_fail,E0599
+/// async fn raw_device(pm: &whatsapp_rust::store::persistence_manager::PersistenceManager) {
+///     let _ = pm.get_device_arc().await;
+/// }
+/// ```
 pub struct PersistenceManager {
     device: Arc<RwLock<Device>>,
     /// Read-mostly snapshot, rebuilt under the device write guard in
@@ -57,6 +65,27 @@ pub struct PersistenceManager {
     backend: BackendLease,
 }
 
+/// Publish even when an advanced modifier unwinds or its future is cancelled.
+/// The guard never escapes the manager, so no live mutation can bypass this path.
+struct DeviceMutation<'a> {
+    manager: &'a PersistenceManager,
+    device: RwLockWriteGuard<'a, Device>,
+}
+
+impl Drop for DeviceMutation<'_> {
+    fn drop(&mut self) {
+        // Dirty before rebuilding, under the device write guard: a racing flush
+        // waits for publication before consuming the dirty flag.
+        self.manager.dirty.store(true, Ordering::Relaxed);
+        *self
+            .manager
+            .device_snapshot
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = Arc::new(self.device.clone());
+        self.manager.save_notify.notify(1);
+    }
+}
+
 struct DeviceSave {
     // Fields drop in order, even if its driving future was never polled or is
     // cancelled: the raw backend in the snapshot goes before the ownership lease.
@@ -74,7 +103,7 @@ impl PersistenceManager {
     /// Create a PersistenceManager with a backend implementation.
     ///
     /// Note: The backend should already be configured with the correct device_id
-    /// (via SqliteStore::new_for_device for multi-account scenarios).
+    /// (via SqliteDatabase::store for multi-account scenarios).
     pub async fn new(backend: Arc<dyn Backend>) -> Result<Self, StoreError> {
         debug!("PersistenceManager: Ensuring device row exists.");
         // Ensure a device row exists for this backend's device_id; create it if not.
@@ -114,12 +143,6 @@ impl PersistenceManager {
         })
     }
 
-    /// Handle for callers that need `&mut Device` trait access directly.
-    /// For plain reads, prefer [`get_device_snapshot`](Self::get_device_snapshot).
-    pub async fn get_device_arc(&self) -> Arc<RwLock<Device>> {
-        self.device.clone()
-    }
-
     /// Cheap point-in-time view of the device state: an Arc refcount bump,
     /// no locking against writers and no Device clone. Always reflects the
     /// last committed `modify_device`/`process_command` mutation.
@@ -152,29 +175,41 @@ impl PersistenceManager {
         self.saver_halted.load(Ordering::Acquire)
     }
 
+    /// Mutate managed device state and publish its snapshot, dirty flag and save
+    /// notification before returning. Prefer [`Self::process_command`] for named
+    /// operations. Unwinding publishes any partial mutation; this is not rollback.
     pub async fn modify_device<F, R>(&self, modifier: F) -> R
     where
         F: FnOnce(&mut Device) -> R,
     {
-        let mut device_guard = self.device.write().await;
-        let result = modifier(&mut device_guard);
+        let mut mutation = DeviceMutation {
+            manager: self,
+            device: self.device.write().await,
+        };
+        modifier(&mut mutation.device)
+    }
 
-        // Dirty BEFORE the snapshot rebuild: a shutdown flush racing this
-        // window must see the store dirty, or it would exit clean and drop
-        // the committed mutation (the clone below is not free).
-        self.dirty.store(true, Ordering::Relaxed);
-
-        // Rebuild while still holding the write guard so no reader can
-        // observe post-mutation effects with a pre-mutation snapshot.
-        *self
-            .device_snapshot
-            .write()
-            .unwrap_or_else(|p| p.into_inner()) = Arc::new(device_guard.clone());
-        drop(device_guard);
-
-        self.save_notify.notify(1);
-
-        result
+    /// Advanced adapter access to `&mut Device` across an async trait call,
+    /// without exposing the writable lock. The boxed callback keeps the device
+    /// borrow inside this operation and preserves native/wasm future conventions.
+    ///
+    /// On completion, error, panic or cancellation after lock acquisition, any
+    /// partial mutation is published and scheduled for saving, not rolled back.
+    /// This does not make detached backend I/O transactional or flush it.
+    ///
+    /// The device write lock is held during the callback. Do not re-enter this
+    /// manager (including `flush`) from it. Ordinary Signal operations should use
+    /// [`super::signal_adapter::SignalProtocolStoreAdapter`] instead, which reads
+    /// snapshots per call without holding the device lock over backend I/O.
+    pub async fn modify_device_async<F, R>(&self, modifier: F) -> R
+    where
+        F: for<'a> FnOnce(&'a mut Device) -> wacore::runtime::BoxFuture<'a, R>,
+    {
+        let mut mutation = DeviceMutation {
+            manager: self,
+            device: self.device.write().await,
+        };
+        modifier(&mut mutation.device).await
     }
 
     /// Flush any dirty device state to the backend immediately.
@@ -188,13 +223,16 @@ impl PersistenceManager {
     async fn save_to_disk(&self) -> Result<(), StoreError> {
         let mut pending = self.pending_save.lock().await;
         self.finish_device_save(&mut pending).await?;
+        // An async modifier may still hold the write guard with dirty=false.
+        // Even a clean/final flush must wait for its publication before deciding
+        // there is nothing to save. The host must finish/cancel the modifier:
+        // device persistence, unlike the client's task drains, is not timed out.
+        let device_guard = self.device.read().await;
         if !self.dirty.load(Ordering::Acquire) {
             return Ok(());
         }
 
-        // Synchronize with publication before consuming dirty: a modifier sets
-        // it while still rebuilding the snapshot under the device write guard.
-        let device_guard = self.device.read().await;
+        // Consume dirty only after publication under the device write guard.
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
@@ -431,6 +469,37 @@ mod tests {
     use crate::runtime_impl::TokioRuntime;
     use wacore::store::traits::DeviceStore;
     use wacore::time::Instant;
+
+    #[tokio::test]
+    async fn scoped_mutations_notify_saving_even_when_cancelled() {
+        let backend = Arc::new(wacore::store::in_memory::InMemoryBackend::new());
+        let pm = PersistenceManager::new(backend.clone()).await.unwrap();
+        let mut notified = Box::pin(pm.save_notify.listen());
+        assert!(futures::poll!(notified.as_mut()).is_pending());
+        pm.modify_device(|device| device.push_name = "sync".into())
+            .await;
+        assert!(futures::poll!(notified.as_mut()).is_ready());
+        assert!(pm.dirty.load(Ordering::Acquire));
+        pm.flush().await.unwrap();
+
+        let mut notified = Box::pin(pm.save_notify.listen());
+        let mut mutation = Box::pin(pm.modify_device_async(|device| {
+            Box::pin(async move {
+                device.push_name = "cancelled".into();
+                std::future::pending::<()>().await;
+            })
+        }));
+        assert!(futures::poll!(mutation.as_mut()).is_pending());
+        assert!(futures::poll!(notified.as_mut()).is_pending());
+        drop(mutation);
+        assert!(futures::poll!(notified.as_mut()).is_ready());
+        assert!(pm.dirty.load(Ordering::Acquire));
+        pm.flush().await.unwrap();
+        assert_eq!(
+            backend.load().await.unwrap().unwrap().push_name,
+            "cancelled"
+        );
+    }
 
     #[tokio::test]
     async fn audit_cancelled_flush_must_preserve_dirty_device() {

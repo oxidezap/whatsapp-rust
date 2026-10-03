@@ -425,7 +425,7 @@ impl<'a> Community<'a> {
         let response = self
             .client
             .mex()
-            .query(mex_request!(fetch_all_subgroups {
+            .execute(mex_request!(fetch_all_subgroups {
                 group_id: Some(community_jid.to_string()),
                 query_context: Some(SUBGROUP_QUERY_CONTEXT.to_string()),
                 // WA Web names a subgroup the user has already joined here, to
@@ -515,7 +515,7 @@ impl<'a> Community<'a> {
         let response = self
             .client
             .mex()
-            .query(mex_request!(query_subgroup_participant_count {
+            .execute(mex_request!(query_subgroup_participant_count {
                 input: Some(query_subgroup_participant_count::Input {
                     group_jid: Some(community_jid.to_string()),
                     query_context: Some(SUBGROUP_QUERY_CONTEXT.to_string()),

@@ -605,11 +605,11 @@ being bounded.
 `resource_report` is. What it must never do is take an exclusive lock on the
 whole database: `VACUUM` (the only thing that returns free-list pages to the
 filesystem) stays an explicit embedder call. The SQLite incremental-vacuum
-support (`SqliteStoreConfig::incremental_vacuum`) is the safe subset: it is
+support (`SqliteDatabaseConfig::incremental_vacuum`) is the safe subset: it is
 opt-in, it never switches an existing database out of its mode, and it reclaims
 at most a bounded page count per pass.
 
-### `SqliteStoreConfig::mmap_size` — page-cache tuning knob
+### `SqliteDatabaseConfig::mmap_size` — page-cache tuning knob
 
 `mmap_size` (new optional field, default `None` = current behavior; builder
 `with_mmap_size`) emits `PRAGMA mmap_size`, moving reads to reclaimable,

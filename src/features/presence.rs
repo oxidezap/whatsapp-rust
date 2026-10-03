@@ -361,7 +361,7 @@ mod tests {
             uuid::Uuid::new_v4()
         );
         Arc::new(
-            SqliteStore::new(&temp_db)
+            SqliteStore::open(&temp_db)
                 .await
                 .expect("Failed to create test SqliteStore"),
         ) as Arc<dyn Backend>

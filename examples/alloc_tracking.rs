@@ -65,7 +65,7 @@ fn main() {
         .expect("Failed to build tokio runtime");
 
     rt.block_on(async {
-        let store = match SqliteStore::new("session_a.db").await {
+        let store = match SqliteStore::open("session_a.db").await {
             Ok(store) => store,
             Err(e) => {
                 error!("failed to create SQLite backend: {e}");

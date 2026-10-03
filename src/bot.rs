@@ -453,7 +453,7 @@ async fn run_metered<F: std::future::Future>(
 /// # use whatsapp_rust::prelude::*;
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let bot = Bot::builder()
-///     .with_backend(SqliteStore::new("whatsapp.db").await?)
+///     .with_backend(SqliteStore::open("whatsapp.db").await?)
 ///     .on_message(|ctx| async move {
 ///         let _ = ctx.reply("pong").await;
 ///     })
@@ -781,14 +781,14 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// A bot that pairs once and stays connected for weeks is the
     /// single-long-lived-session profile, and `SqliteStore`'s defaults are tuned
     /// for the opposite one (many small per-session stores in a process). See
-    /// the `SqliteStoreConfig` docs for the cache size, reader count and mmap
+    /// the `SqliteDatabaseConfig` docs for the cache size, reader count and mmap
     /// setting that profile wants, and pass them with
-    /// `SqliteStore::with_config`.
+    /// `SqliteDatabase::open(..., config).await?.store(1)`.
     ///
     /// # Example
     /// ```rust,ignore
     /// let bot = Bot::builder()
-    ///     .with_backend(SqliteStore::new("whatsapp.db").await?)
+    ///     .with_backend(SqliteStore::open("whatsapp.db").await?)
     ///     .build()
     ///     .await?;
     /// ```
@@ -888,7 +888,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// for db in session_databases {
     ///     bots.push(
     ///         Bot::builder()
-    ///             .with_backend(SqliteStore::new(db).await?)
+    ///             .with_backend(SqliteStore::open(db).await?)
     ///             .with_http_client_arc(http.clone())
     ///             .build()
     ///             .await?,
@@ -1519,7 +1519,7 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
 
         let task_instrument = self.client_builder.task_instrument();
 
-        // Note: For multi-account mode, create the backend with SqliteStore::new_for_device()
+        // Note: For multi-account mode, select the backend with SqliteDatabase::store()
         // before passing it to with_backend_arc()
         let persistence_manager = Arc::new(PersistenceManager::new(backend).await?);
 
@@ -1608,7 +1608,7 @@ mod tests {
             uuid::Uuid::new_v4()
         );
         Arc::new(
-            SqliteStore::new(&temp_db)
+            SqliteStore::open(&temp_db)
                 .await
                 .expect("Failed to create test SqliteStore"),
         ) as Arc<dyn Backend>
@@ -1620,9 +1620,10 @@ mod tests {
             uuid::Uuid::new_v4()
         );
         Arc::new(
-            SqliteStore::new_for_device(&temp_db, device_id)
+            whatsapp_rust_sqlite_storage::SqliteDatabase::open(&temp_db, Default::default())
                 .await
-                .expect("Failed to create test SqliteStore"),
+                .expect("Failed to create test SqliteStore")
+                .store(device_id),
         ) as Arc<dyn Backend>
     }
 
@@ -2020,7 +2021,7 @@ mod tests {
             "file:memdb_bot_{}?mode=memory&cache=shared",
             uuid::Uuid::new_v4()
         );
-        let store = SqliteStore::new(&temp_db)
+        let store = SqliteStore::open(&temp_db)
             .await
             .expect("Failed to create test SqliteStore");
 
