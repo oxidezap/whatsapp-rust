@@ -1,13 +1,56 @@
 //! External compilation of hierarchy, lookup envelopes, and call-action wire tags.
 //!
-//! Deliberate alias removals (the positive tests below cover the replacements):
+//! Deliberate alias removals through the formerly public reexports. Check each
+//! alias separately so restoring just one cannot hide behind the other's error.
+//! The positive counterparts use the same accessible paths and setup. Nightly
+//! also checks the error-code annotations; stable accepts any compilation error,
+//! so its results still need the positive controls and diagnostic inspection.
 //!
-//! ```compile_fail
-//! use whatsapp_rust::{GroupType, group_type};
 //! ```
+//! use whatsapp_rust::{GroupHierarchy, GroupMetadata};
+//! let metadata = GroupMetadata::default();
+//! assert_eq!(metadata.hierarchy(), GroupHierarchy::Standalone);
+//! ```
+//!
+//! ```compile_fail,E0432
+//! use whatsapp_rust::GroupType;
+//! ```
+//!
+//! ```compile_fail,E0432
+//! use whatsapp_rust::group_type;
+//! ```
+//!
+//! ```
+//! use whatsapp_rust::features::{Community, GroupHierarchy, GroupMetadata};
+//! let _: Option<Community<'_>> = None;
+//! let metadata = GroupMetadata::default();
+//! assert_eq!(metadata.hierarchy(), GroupHierarchy::Standalone);
+//! ```
+//!
+//! ```compile_fail,E0432
+//! use whatsapp_rust::features::GroupType;
+//! ```
+//!
+//! ```compile_fail,E0432
+//! use whatsapp_rust::features::group_type;
+//! ```
+//!
+//! Module privacy is a separate contract, not evidence of alias removal: the
+//! original legacy-path check would fail even if both aliases were restored.
 //!
 //! ```compile_fail
 //! use whatsapp_rust::features::community::{GroupType, group_type};
+//! ```
+//!
+//! Even a retained public type cannot be imported through that private module:
+//!
+//! ```compile_fail
+//! use whatsapp_rust::features::community::Community;
+//! ```
+//!
+//! ```
+//! use whatsapp_rust::wacore::types::call::CallAction;
+//! fn current(action: &CallAction) { let _: &str = action.wire_tag(); }
 //! ```
 //!
 //! ```compile_fail

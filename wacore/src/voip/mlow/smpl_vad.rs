@@ -166,11 +166,17 @@ enum VadType {
     Hangover,
 }
 
-/// VAD output for one 60 ms packet: per-internal-frame speech-activity probability and the
-/// packet-level `coded_as_active_voice` flag.
+/// VAD output for one 60 ms packet: per-internal-frame speech-activity probability, the
+/// packet-level `coded_as_active_voice` flag, and the raw decision behind it.
 pub(crate) struct VadPacketResult {
     pub vad_results: [f32; 3],
+    /// Any internal frame active OR within the DTX hangover: the frame is CODED as active voice,
+    /// which is what gates the two LSF symbols. Equals `MlowToc::active` (`vad || bit1`).
     pub coded_as_active_voice: bool,
+    /// Any internal frame active before the hangover promotion: the TOC's VAD bit itself. A packet
+    /// that is only active through the hangover sets bit 1 instead, which is the reference's
+    /// `0x12`.
+    pub speech_detected: bool,
 }
 
 impl SmplVadState {
@@ -407,6 +413,7 @@ impl SmplVadState {
             return VadPacketResult {
                 vad_results,
                 coded_as_active_voice: false,
+                speech_detected: false,
             };
         }
         let mut vad_type = [VadType::Inactive; 3];
@@ -424,9 +431,11 @@ impl SmplVadState {
         }
 
         let mut coded_as_active_voice = false;
+        let mut speech_detected = false;
         for ty in vad_type.iter_mut() {
             if *ty == VadType::Active {
                 self.remaining_dtx_hangover = self.hangover_ms;
+                speech_detected = true;
             } else if self.remaining_dtx_hangover > 0 {
                 *ty = VadType::Hangover;
                 self.remaining_dtx_hangover -= PACKET_MS / FRAMES_PER_PACKET as i32;
@@ -439,6 +448,7 @@ impl SmplVadState {
         VadPacketResult {
             vad_results,
             coded_as_active_voice,
+            speech_detected,
         }
     }
 }
