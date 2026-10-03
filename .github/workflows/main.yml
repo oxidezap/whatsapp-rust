@@ -460,6 +460,16 @@ jobs:
           CARGO_ENCODED_RUSTFLAGS: ""
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: cargo run --locked --manifest-path tests/event-kind-consumer/Cargo.toml
+      - name: Test the standalone group and call-action host at MSRV
+        env:
+          CARGO_BUILD_JOBS: "1"
+          RUSTFLAGS: ""
+          CARGO_ENCODED_RUSTFLAGS: ""
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo test --locked --manifest-path tests/group-call-aliases-consumer/Cargo.toml
+          cargo test --locked --manifest-path tests/group-call-aliases-consumer/Cargo.toml --features voip-control
+          cargo test --locked --manifest-path tests/group-call-aliases-consumer/Cargo.toml --features voip-runtime
       - name: Build the standalone picture consumer at MSRV
         env:
           CARGO_BUILD_JOBS: "1"

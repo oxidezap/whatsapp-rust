@@ -135,6 +135,10 @@ impl VideoState {
 
 /// Fields kept per-variant (not a shared `BasicCallMeta`) so the `serde` shape
 /// mirrors the stanza 1:1 for downstream JS consumers.
+///
+/// Use [`Self::wire_tag`] for the action's exact wire string (for example,
+/// `"offer_notice"` or `"relaylatency"`), replacing the removed `action_kind`
+/// alias. The serialized `type` discriminator uses that same string.
 #[derive(Debug, Clone, crate::WireEnum)]
 #[wire(tag = "type")]
 // Forward-compat: WA can add call sub-types, so an external exhaustive match must keep a wildcard.
@@ -284,13 +288,6 @@ impl CallAction {
             Self::EncRekey { rekey } => &rekey.call_creator,
             Self::WaitingRoomUpdate { room } => &room.call_creator,
         }
-    }
-
-    /// Backwards-compatible name for the action's wire tag.
-    #[deprecated(since = "0.6.0", note = "use CallAction::wire_tag")]
-    #[inline]
-    pub fn action_kind(&self) -> &'static str {
-        self.wire_tag()
     }
 }
 
