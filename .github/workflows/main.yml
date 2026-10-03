@@ -460,6 +460,13 @@ jobs:
           CARGO_ENCODED_RUSTFLAGS: ""
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: cargo run --locked --manifest-path tests/event-kind-consumer/Cargo.toml
+      - name: Test the standalone event-delivery host and removed API controls at MSRV
+        env:
+          CARGO_BUILD_JOBS: "1"
+          RUSTFLAGS: ""
+          CARGO_ENCODED_RUSTFLAGS: ""
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: cargo test --locked --manifest-path tests/event-consumer/Cargo.toml
       - name: Test the standalone creation/secret host at MSRV
         env:
           CARGO_BUILD_JOBS: "1"

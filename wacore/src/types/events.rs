@@ -395,7 +395,15 @@ impl EventInterest {
     }
 }
 
+/// Host-implementable synchronous delivery on the core bus dispatch path.
+///
+/// The bus calls each interested registration inline, outside its table lock.
+/// Implementations must return promptly: enqueue with a non-blocking operation
+/// or schedule host-owned work rather than waiting for space, I/O or user code.
+/// Async callback adapters are separate; this trait does not spawn or await work.
 pub trait EventHandler: crate::sync_marker::MaybeSendSync {
+    /// Observe one bus fact. Any queued/spawned work and its cancellation policy
+    /// belong to the implementation, not to the bus or Subscription.
     fn handle_event(&self, event: Arc<Event>);
 
     /// Registration-time interest hint used by

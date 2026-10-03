@@ -38,7 +38,7 @@ pub enum EventDelivery {
     /// Explicit opt-in to the historical unbounded spawn-per-callback policy.
     /// No ordering or memory/task bound. Tasks still observe terminal shutdown
     /// and adapter cancellation; synchronous blocking user code is not preemptible.
-    Concurrent,
+    ConcurrentUnbounded,
     /// A fixed worker pool; each worker handles one event's interested callbacks
     /// in registration order. Different events may overlap and finish out of order.
     BoundedConcurrent {
@@ -72,7 +72,7 @@ impl Default for EventDelivery {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct EventDeliveryStats {
-    /// Events accepted (for Concurrent, accepted for fanout).
+    /// Events accepted (for ConcurrentUnbounded, accepted for fanout).
     pub accepted: u64,
     /// Events rejected by a full mailbox; also included in Client::stats().events_dropped.
     pub dropped_full: u64,
@@ -151,7 +151,7 @@ impl Drop for CallbackGuard {
 }
 
 enum Delivery {
-    Concurrent(Arc<[RegisteredHandler]>),
+    ConcurrentUnbounded(Arc<[RegisteredHandler]>),
     Queued(async_channel::Sender<QueuedEvent>),
 }
 
@@ -227,7 +227,7 @@ impl CallbackEventHandler {
         let counters = Arc::new(Counters::default());
         let mut workers = Vec::new();
         let delivery = match policy {
-            EventDelivery::Concurrent => Delivery::Concurrent(handlers),
+            EventDelivery::ConcurrentUnbounded => Delivery::ConcurrentUnbounded(handlers),
             EventDelivery::Ordered { capacity }
             | EventDelivery::BoundedConcurrent { capacity, .. } => {
                 let concurrency = match policy {
@@ -326,7 +326,7 @@ impl EventHandler for CallbackEventHandler {
             return;
         }
         match &self.delivery {
-            Delivery::Concurrent(handlers) => {
+            Delivery::ConcurrentUnbounded(handlers) => {
                 let Some(client) = self.client.upgrade() else {
                     return;
                 };

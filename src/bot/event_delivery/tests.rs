@@ -98,7 +98,7 @@ async fn zero_capacity_and_concurrency_are_clamped_not_unbounded() {
 #[tokio::test]
 async fn shutdown_cancels_running_and_pending_without_retaining_client() {
     for policy in [
-        EventDelivery::Concurrent,
+        EventDelivery::ConcurrentUnbounded,
         EventDelivery::Ordered { capacity: 2 },
         EventDelivery::default(),
     ] {
@@ -358,7 +358,7 @@ async fn concurrent_panics_are_isolated_and_counted() {
     let adapter = CallbackEventHandler::from_callback(
         &client,
         EventInterest::ALL,
-        EventDelivery::Concurrent,
+        EventDelivery::ConcurrentUnbounded,
         |event, _| {
             if matches!(&*event, Event::PairingCode(code) if code.code == "creation") {
                 panic!("creation panic");

@@ -6317,14 +6317,17 @@ async fn chatstate_dispatch_reaches_every_registered_handler() {
     let client = crate::test_utils::create_test_client().await;
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-    for tag in ["first", "second"] {
-        let seen = seen.clone();
-        client.register_chatstate_handler(Arc::new(move |event| {
-            seen.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push((tag, event.chat.to_string()));
-        }));
-    }
+    let subscriptions: Vec<_> = ["first", "second"]
+        .into_iter()
+        .map(|tag| {
+            let seen = seen.clone();
+            client.subscribe_chatstate_handler(Arc::new(move |event| {
+                seen.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((tag, event.chat.to_string()));
+            }))
+        })
+        .collect();
 
     client
         .dispatch_chatstate_event(test_chatstate_stanza())
@@ -6349,6 +6352,12 @@ async fn chatstate_dispatch_reaches_every_registered_handler() {
         1,
         "the event is built once and cloned per handler"
     );
+    drop(subscriptions);
+    assert_eq!(client.chatstate_handler_count.load(Ordering::Relaxed), 0);
+    client
+        .dispatch_chatstate_event(test_chatstate_stanza())
+        .await;
+    assert_eq!(client.chatstate_events_built.load(Ordering::Acquire), 1);
 }
 
 #[tokio::test]
@@ -6416,6 +6425,7 @@ async fn chatstate_bus_adapter_preserves_parsed_states_and_subscription_lifetime
                 rx.try_recv().is_err(),
                 "one fact per registration, no second dispatcher"
             );
+            assert!(events.try_recv().is_err(), "one shared bus fact");
         }
     }
     drop(subscription);

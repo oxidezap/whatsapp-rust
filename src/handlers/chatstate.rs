@@ -26,7 +26,7 @@ pub struct ChatStateEvent {
 }
 
 impl ChatStateEvent {
-    /// Convert the bus payload back to the compatibility chatstate view.
+    /// Project the shared bus payload into the typed chatstate view.
     pub fn from_presence(presence: &wacore::types::events::ChatPresenceUpdate) -> Self {
         use wacore::types::presence::{ChatPresence, ChatPresenceMedia};
         let state = match (presence.state, presence.media) {
