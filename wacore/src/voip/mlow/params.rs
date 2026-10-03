@@ -59,5 +59,8 @@ pub(crate) struct SmplInternalParams {
 pub(crate) struct SmplFrameParams {
     pub toc: u8,
     pub config: usize,
+    /// Whether the packet is coded as active voice (`MlowToc::active`). Two LSF symbols are on the
+    /// wire only then, so the writer has to agree with the reader about it.
+    pub coded_as_active_voice: bool,
     pub internal: [SmplInternalParams; 3],
 }

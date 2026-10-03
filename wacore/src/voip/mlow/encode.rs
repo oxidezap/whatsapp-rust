@@ -126,7 +126,14 @@ pub(crate) fn encode_smpl_frame_into(
     enc: &mut RangeEncoder,
     output: &mut Vec<u8>,
 ) -> Result<(), MlowError> {
-    let (p2, p3, p4) = (320i32, 4i32, 1i32);
+    // `p4 + s1` is the frame type the pulse geometry is indexed by: 0 BACKGROUND_NOISE,
+    // 1 UNVOICED, 2 VOICED, the same row `smpl_perc` caps the pulse budget with
+    // (`SMPL_MAX_PULSES_PER_FRAME`). So it is the packet's activity flag, not a constant: a frame
+    // coded inactive has half the pulse capacity (80 against 160), and `decode_smpl_pulses` reads
+    // it as `i32::from(coded_as_active_voice)`. Writing 1 here for an inactive frame encodes the
+    // splits under a geometry the reader does not use, and the body ends in the wrong place.
+    let (p2, p3) = (320i32, 4i32);
+    let p4 = i32::from(fp.coded_as_active_voice);
     let p6 = fp.config as i32;
     let tbl = load_smpl_tables();
     let mem = load_smpl_mem();
@@ -135,7 +142,15 @@ pub(crate) fn encode_smpl_frame_into(
     let mut st = SmplLsfState::default();
     for f in 0..3 {
         let ip = &fp.internal[f];
-        encode_smpl_lsf(enc, tbl, &mut st, fp.config, f, &ip.lsf);
+        encode_smpl_lsf(
+            enc,
+            tbl,
+            &mut st,
+            fp.config,
+            f,
+            &ip.lsf,
+            fp.coded_as_active_voice,
+        );
         encode_smpl_pulses(enc, cc, p2, p3, p4, p6, ip.lsf.stage1, &ip.pulses);
         // Voiced internal frames emit a pitch block; unvoiced emit a gains block (never both).
         if ip.lsf.stage1 == 1 {
@@ -168,6 +183,10 @@ pub(crate) fn encode_smpl_frame_into(
 }
 
 /// Inverse of `decode_smpl_lsf`: mirror the selector/grid/16-residual/extra reads, mutating `st`.
+///
+/// The voicing selector and the interpolation index are on the wire only for a frame coded as
+/// active voice, exactly as `decode_smpl_lsf` gates its reads: writing them for an inactive frame
+/// would leave two symbols the reader never consumes and desync everything after.
 fn encode_smpl_lsf(
     enc: &mut RangeEncoder,
     t: &SmplTables,
@@ -175,7 +194,12 @@ fn encode_smpl_lsf(
     config: usize,
     intf: usize,
     lsf: &SmplLsfParams,
+    coded_as_active_voice: bool,
 ) {
+    debug_assert!(
+        coded_as_active_voice || (lsf.stage1 == 0 && lsf.extra == 0),
+        "an inactive frame is unvoiced with interpolation index 0 by definition"
+    );
     let sel = if intf == 0 {
         0
     } else if st.prev_stage1 != 0 {
@@ -184,7 +208,9 @@ fn encode_smpl_lsf(
         1
     };
     let stage1 = lsf.stage1;
-    enc.encode_cdf(stage1, &t.lsf_sel[sel]);
+    if coded_as_active_voice {
+        enc.encode_cdf(stage1, &t.lsf_sel[sel]);
+    }
 
     let enter_match = intf != 0;
     let m = enter_match && (stage1 == st.prev_stage1);
@@ -217,7 +243,9 @@ fn encode_smpl_lsf(
     for (k, c) in st2.iter().enumerate().take(16) {
         enc.encode_cdf(lsf.stage2[k], c);
     }
-    enc.encode_cdf(lsf.extra, &t.lsf_extra);
+    if coded_as_active_voice {
+        enc.encode_cdf(lsf.extra, &t.lsf_extra);
+    }
 }
 
 /// Inverse of `decode_smpl_pulses` (config=0 NB count, p3=4): re-derive the count interval and the
@@ -733,15 +761,137 @@ mod tests {
         );
     }
 
-    // R9: the encoder is config-0 / no-DTX, so every emitted frame has the active MLOW TOC. Codec
-    // routing comes from negotiation, not from interpreting this byte.
+    // R9: the encoder is config-0 / no-DTX / 16 kHz / 60 ms / mono, so the only bits that vary are
+    // the two activity bits. Codec routing comes from negotiation, not from interpreting this byte.
     #[test]
-    fn encoder_emits_only_active_mlow_toc() {
+    fn encoder_emits_only_config_0_60ms_tocs() {
         let input = synth_input();
         for frame in encode_all(&mut MlowEncoder::new(), &input) {
             let toc = frame[0];
-            assert_eq!(toc, 0x50, "encoder emitted non-config-0 TOC 0x{toc:02x}");
+            assert!(
+                matches!(toc, 0x50 | 0x12 | 0x10),
+                "encoder emitted non-config-0 TOC 0x{toc:02x}"
+            );
+            let parsed = crate::voip::mlow::toc::parse_mlow_toc(toc);
+            assert!(!parsed.sid && !parsed.low_rate && !parsed.stereo && !parsed.std_opus);
+            assert_eq!((parsed.sample_rate, parsed.frame_ms), (16000, 60));
         }
+    }
+
+    /// 1 s of a speech-like tone, 3 s of a -60 dBFS comfort-noise floor, 1 s of tone again.
+    fn speech_silence_speech() -> Vec<f32> {
+        use std::f32::consts::PI;
+        let mut seed: u32 = 0x1234_5678;
+        let mut noise = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / 8_388_608.0 - 1.0
+        };
+        let tone = |i: usize| {
+            let t = i as f32 / 16000.0;
+            0.25 * (2.0 * PI * 150.0 * t).sin() + 0.05 * (2.0 * PI * 1700.0 * t).sin()
+        };
+        let mut sig: Vec<f32> = (0..16_000).map(tone).collect();
+        sig.extend((0..48_000).map(|_| 0.001 * noise()));
+        sig.extend((0..16_000).map(tone));
+        sig
+    }
+
+    /// The whole point of coding a frame inactive: a receiver can tell the sender's background noise
+    /// apart from its speech. The reference emits `0x10` over silence with DTX off, promoting to
+    /// `0x12` for the hangover packet after a talkspurt, and this encoder has to agree, because a
+    /// stream that claims active voice at a comfort-noise level for seconds on end is a shape no
+    /// real client produces.
+    #[test]
+    fn silence_is_coded_inactive_and_speech_is_not() {
+        let tocs: Vec<u8> = encode_all(&mut MlowEncoder::new(), &speech_silence_speech())
+            .iter()
+            .map(|f| f[0])
+            .collect();
+        let run = |from: usize, want: u8| tocs[from..].iter().take_while(|&&t| t == want).count();
+        assert!(
+            run(0, 0x50) >= 14,
+            "the whole first talkspurt is active voice: {tocs:02x?}"
+        );
+        let silence_at = 36;
+        assert!(
+            run(silence_at, 0x10) >= 25,
+            "a settled comfort-noise floor stays coded inactive: {tocs:02x?}"
+        );
+        let speech_again = tocs
+            .iter()
+            .rposition(|&t| t == 0x10)
+            .expect("the silence is coded inactive")
+            + 1;
+        assert!(
+            run(speech_again, 0x50) >= 14,
+            "speech after the silence is active voice again: {tocs:02x?}"
+        );
+        assert!(
+            tocs.contains(&0x12),
+            "the DTX hangover packet after a talkspurt keeps the frame coded active with the VAD bit \
+             clear: {tocs:02x?}"
+        );
+        // Pure digital silence from the first frame: no talkspurt to hang over from, so inactive
+        // almost immediately.
+        let zeros = vec![0.0f32; 960 * 20];
+        let z: Vec<u8> = encode_all(&mut MlowEncoder::new(), &zeros)
+            .iter()
+            .map(|f| f[0])
+            .collect();
+        assert!(
+            z[1..].iter().all(|&t| t == 0x10),
+            "digital silence is coded inactive: {z:02x?}"
+        );
+    }
+
+    /// An inactive frame leaves two LSF symbols off the wire, so a writer that still emits them (or
+    /// a reader that still consumes them) desyncs the range coder and poisons the cross-frame
+    /// predictor for every packet after it. The canary is the talkspurt AFTER the silence: it only
+    /// decodes at full level if nothing drifted through 44 inactive frames.
+    #[test]
+    fn inactive_frames_decode_without_desync() {
+        let frames = encode_all(&mut MlowEncoder::new(), &speech_silence_speech());
+        let mut dec = MlowDecoder::new();
+        let mut levels = Vec::with_capacity(frames.len());
+        let (mut decoded, mut concealed, mut off_point) = (0u32, 0u32, 0u32);
+        for f in &frames {
+            let pcm = dec.decode(f);
+            let r = dec.take_frame_report();
+            decoded += u32::from(r.decoded);
+            concealed += u32::from(r.concealed);
+            off_point += u32::from(r.off_point);
+            assert_eq!(pcm.len(), 960, "every frame fills its 60 ms slot");
+            assert!(pcm.iter().all(|s| s.is_finite()), "finite output");
+            let rms = (pcm.iter().map(|s| s * s).sum::<f32>() / pcm.len() as f32).sqrt();
+            levels.push(20.0 * (rms + 1e-12).log10());
+        }
+        assert_eq!(
+            (concealed, off_point),
+            (0, 0),
+            "our own bitstream must never be concealed or refused"
+        );
+        // `decoded` counts internal frames, three to a 60 ms packet.
+        assert_eq!(
+            decoded as usize,
+            frames.len() * 3,
+            "every internal frame carried coded audio"
+        );
+        let speech_before = levels[8];
+        let silence = levels[40];
+        let speech_after = levels[75];
+        assert!(
+            speech_before > -25.0 && speech_after > -25.0,
+            "both talkspurts decode at speech level: {speech_before:.1} then {speech_after:.1} dBFS"
+        );
+        assert!(
+            (speech_after - speech_before).abs() < 6.0,
+            "the talkspurt after 44 inactive frames must decode like the one before it \
+             ({speech_before:.1} vs {speech_after:.1} dBFS): a range-coder desync shows up here"
+        );
+        assert!(
+            silence < speech_before - 20.0,
+            "the inactive stretch stays a floor, not noise blown up by a desync ({silence:.1} dBFS)"
+        );
     }
 
     // Dev oracle: decode hex frames (MLOW_HEX) through `decode_smpl_pitch`, dumping each voiced

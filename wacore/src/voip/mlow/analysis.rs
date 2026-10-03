@@ -216,6 +216,7 @@ pub(crate) fn smpl_analyze_frame_st(
         .process_packet(vad_pcm, SMPL_INTF_LEN);
     let sp_act_prob = vad.vad_results;
     let coded_as_active_voice = vad.coded_as_active_voice;
+    let speech_detected = vad.speech_detected;
 
     // Encoder input high-pass (ARMA2, fcorner 35 Hz), matching the real encoder. Removes the
     // low-frequency content the decoder's de-emphasis would otherwise over-amplify; the residual the
@@ -397,9 +398,22 @@ pub(crate) fn smpl_analyze_frame_st(
     es.hp_pitch_hist = hp_pitch_hist;
     es.prev_lsfq = prev_lsfq;
     es.prev_voiced = prev_voiced;
+    // 16 kHz, 60 ms, config 0, no SID: bit 4 of the frame-size index, plus the activity bits.
+    // Speech detected -> VAD bit (0x50). Only the DTX hangover keeps it coded active -> bit 1
+    // instead (0x12). Neither -> coded inactive (0x10), the shape the reference emits over silence
+    // with DTX off, and the one a receiver can tell apart from speech.
+    const TOC_60MS_16K: u8 = 0x10;
+    let toc = if speech_detected {
+        TOC_60MS_16K | 0x40
+    } else if coded_as_active_voice {
+        TOC_60MS_16K | 0x02
+    } else {
+        TOC_60MS_16K
+    };
     super::params::SmplFrameParams {
-        toc: 0x50,
+        toc,
         config: 0,
+        coded_as_active_voice,
         internal,
     }
 }
@@ -549,7 +563,8 @@ fn smpl_unvoiced_candidate(
     // Per-subframe interpolated LPC (smpl_lpc_interpol): early subframes blend the previous frame's
     // committed NLSF with this frame's, smoothing the spectral transition the residual is whitened by.
     // The interpolation search tries idx 1 too and keeps it when it lowers the residual energy.
-    let (predcoefs, res_lpc, interpol_idx) = smpl_lsf_interpol_search(&brec, fe.prev_lsfq, win_n);
+    let (predcoefs, res_lpc, interpol_idx) =
+        smpl_lsf_interpol_search(&brec, fe.prev_lsfq, win_n, cs.coded_as_active_voice);
 
     // Run the CELP excitation encoder per subframe (each with its interpolated predcoef). Lend
     // `perc_corrs` via mem::take (it is not reached through `cs`) instead of a deep clone.
@@ -790,10 +805,15 @@ fn perc_corrs_to_wght(
 /// The per-subframe residual + interpolated predcoef for `lsf_interpol_idx` 0, and the alternative
 /// idx 1 when it lowers the summed per-subframe residual RMS by the 0.998 margin. Returns (predcoefs,
 /// residual, chosen idx). At complexity 5-8 this search runs for every active frame.
+///
+/// `coded_as_active_voice` false pins the index to 0 without searching, because the index is not on
+/// the wire for such a frame (`decode_smpl_lsf` reads 0 for it): choosing 1 would whiten the
+/// residual under an interpolation the decoder will not reproduce.
 fn smpl_lsf_interpol_search(
     brec: &[f32],
     prev_lsfq: &[f32],
     win_n: &[f32],
+    coded_as_active_voice: bool,
 ) -> ([[f32; 17]; SMPL_SUBFR_COUNT], Vec<f32>, i32) {
     let residual_for = |idx: usize| -> ([[f32; 17]; SMPL_SUBFR_COUNT], Vec<f32>, f32) {
         let (predcoefs, _ilsf) =
@@ -811,6 +831,9 @@ fn smpl_lsf_interpol_search(
 
     let (pc0, res0, rms0) = residual_for(0);
     // The alt interpolation runs whenever lsf_interpol_search && active && numsubfrs>1.
+    if !coded_as_active_voice {
+        return (pc0, res0, 0);
+    }
     let (pc1, res1, rms1) = residual_for(1);
     if rms1 < rms0 * 0.998 {
         (pc1, res1, 1)
