@@ -262,7 +262,7 @@ impl Client {
                 ),
             "invalid placeholder sender"
         );
-        if !self.is_connected() {
+        if !self.is_socket_connected() {
             return Err(crate::client::ClientError::NotConnected.into());
         }
         self.send_pdo_placeholder_resend_request_impl(info, true)
@@ -1660,14 +1660,15 @@ mod tests {
 
         let backend = create_test_backend().await;
         let pm = Arc::new(PersistenceManager::new(backend).await.unwrap());
-        let (client, _rx) = Client::new(
-            Arc::new(TokioRuntime),
-            pm,
-            Arc::new(MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-        )
-        .await;
+        let (client, _rx) = Client::builder()
+            .with_runtime_arc(Arc::new(TokioRuntime))
+            .with_persistence_manager(pm)
+            .with_transport_factory_arc(Arc::new(MockTransportFactory::new()))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
         client
     }
 

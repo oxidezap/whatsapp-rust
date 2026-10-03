@@ -32,14 +32,15 @@ async fn replacing_status_privacy_releases_the_assembled_copy() {
         .expect("seeded audience");
     let old_allocation = Arc::downgrade(&held);
 
-    let (_client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        persistence_manager.clone(),
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (_client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(persistence_manager.clone())
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let second = wa::sync_action_value::StatusPrivacyAction {
         mode: Some(buffa::EnumValue::Unknown(100)),
@@ -61,14 +62,15 @@ async fn test_ack_behavior_for_incoming_stanzas() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // --- Assertions ---
 
@@ -178,14 +180,15 @@ async fn test_ack_waiter_resolves() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // 1. Insert a waiter for a specific ID
     let test_id = "ack-test-123".to_string();
@@ -243,14 +246,15 @@ async fn test_ack_without_matching_waiter() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Create an ack without any matching waiter
     let ack_node = NodeBuilder::new("ack")
@@ -631,14 +635,15 @@ async fn test_lid_pn_cache_basic_operations() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Initially, the cache should be empty for a phone number
     let phone = "559980000001";
@@ -701,14 +706,15 @@ async fn test_lid_pn_cache_timestamp_resolution() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let phone = "559980000001";
     let lid_old = "100000012345678";
@@ -791,14 +797,15 @@ async fn test_get_lid_for_phone_via_send_context_resolver() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let phone = "559980000001";
     let lid = "100000012345678";
@@ -847,14 +854,15 @@ async fn test_wait_for_offline_delivery_end_returns_immediately_when_flag_set() 
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Set the flag to true (simulating offline sync completed)
     client.offline_sync_completed.store(true, Ordering::Relaxed);
@@ -888,14 +896,15 @@ async fn test_wait_for_offline_delivery_end_times_out_when_flag_not_set() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Flag is false by default, so use a short timeout and verify the helper
     // marks the sync complete on timeout.
@@ -957,14 +966,15 @@ async fn test_wait_for_offline_delivery_end_returns_on_notify() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let client_clone = client.clone();
 
@@ -1006,14 +1016,15 @@ async fn test_offline_sync_flag_initially_false() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // The flag should be false initially
     assert!(
@@ -1042,14 +1053,15 @@ async fn test_offline_sync_lifecycle() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // 1. Initially false
     assert!(!client.offline_sync_completed.load(Ordering::Relaxed));
@@ -1102,14 +1114,15 @@ async fn test_primary_phone_session_probe_fails_without_pn() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // No PN set, so this should fail
     let result = client.log_primary_phone_session_state().await;
@@ -1148,14 +1161,15 @@ async fn test_ensure_e2e_sessions_waits_for_offline_sync() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Flag is false (offline sync not complete)
     assert!(!client.offline_sync_completed.load(Ordering::Relaxed));
@@ -1271,14 +1285,15 @@ async fn test_primary_phone_session_probe_does_not_wait_for_offline_sync() {
     })
     .await;
 
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Flag is false (offline sync not complete - simulating login state)
     assert!(!client.offline_sync_completed.load(Ordering::Relaxed));
@@ -1379,14 +1394,15 @@ async fn test_primary_phone_session_probe_leaves_an_existing_session_alone() {
             .expect("a stored session serializes")
     };
 
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm.clone(),
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm.clone())
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Call log_primary_phone_session_state
     // It should return Ok(()) immediately without fetching prekeys
@@ -1512,14 +1528,15 @@ async fn test_server_time_offset_extraction() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Initially, offset should be 0
     assert_eq!(
@@ -1586,14 +1603,15 @@ async fn test_unified_session_manager_integration() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Initially, sequence should be 0
     assert_eq!(
@@ -1684,14 +1702,15 @@ async fn create_offline_sync_test_client() -> Arc<Client> {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
     client
 }
 
@@ -2243,14 +2262,15 @@ async fn test_handle_iq_ping_with_child_element() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let ping_node = NodeBuilder::new("iq")
         .attr("type", "get")
@@ -2277,14 +2297,15 @@ async fn test_handle_iq_ping_with_xmlns_attribute() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let ping_node = NodeBuilder::new("iq")
         .attr("type", "get")
@@ -2310,14 +2331,15 @@ async fn test_handle_iq_ping_with_both_child_and_xmlns() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let ping_node = NodeBuilder::new("iq")
         .attr("type", "get")
@@ -2344,14 +2366,15 @@ async fn test_handle_iq_ping_without_type_attr() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let ping_node = NodeBuilder::new("iq")
         .attr("from", SERVER_JID)
@@ -2375,14 +2398,15 @@ async fn test_handle_iq_non_ping_returns_false() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let non_ping_node = NodeBuilder::new("iq")
         .attr("type", "get")
@@ -2407,14 +2431,15 @@ async fn test_handle_iq_ping_wrong_type_returns_false() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let result_node = NodeBuilder::new("iq")
         .attr("type", "result")
@@ -3193,14 +3218,15 @@ async fn test_handle_iq_ping_without_id() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Server ping without id — real format observed in production logs
     let ping_node = NodeBuilder::new("iq")
@@ -3600,15 +3626,16 @@ async fn test_custom_cache_config_is_respected() {
 
     // Verify that constructing a client with a custom config does not panic
     // and the client is usable.
-    let (client, _rx) = Client::new_with_cache_config(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-        custom_config,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .with_cache_config(custom_config)
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     assert!(!client.is_logged_in());
 }
@@ -3989,16 +4016,16 @@ async fn active_chat_lane_survives_capacity_pressure() {
     );
 }
 
-/// Proves that `is_connected()` no longer gives false negatives under mutex
+/// Proves that `is_socket_connected()` no longer gives false negatives under mutex
 /// contention. Before the fix, `try_lock()` would fail when another task held
-/// the noise_socket mutex, causing `is_connected()` to return `false` even
+/// the noise_socket mutex, causing `is_socket_connected()` to return `false` even
 /// though the connection was alive — silently dropping receipt acks.
 ///
 /// This test sets up a real NoiseSocket (same as socket unit tests) so it
 /// accurately models the pre-fix scenario: socket is Some + mutex is held
-/// by another task = old is_connected() returned false.
+/// by another task = old is_socket_connected() returned false.
 #[tokio::test]
-async fn test_is_connected_not_affected_by_mutex_contention() {
+async fn test_is_socket_connected_not_affected_by_mutex_contention() {
     use crate::socket::NoiseSocket;
     use wacore::handshake::NoiseCipher;
 
@@ -4008,17 +4035,18 @@ async fn test_is_connected_not_affected_by_mutex_contention() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Initially not connected
-    assert!(!client.is_connected(), "should start disconnected");
+    assert!(!client.is_socket_connected(), "should start disconnected");
 
     // Simulate a real connection: create a NoiseSocket and store it
     let transport: Arc<dyn crate::transport::Transport> =
@@ -4035,14 +4063,14 @@ async fn test_is_connected_not_affected_by_mutex_contention() {
     *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.is_connected.store(true, Ordering::Release);
 
-    assert!(client.is_connected(), "should report connected");
+    assert!(client.is_socket_connected(), "should report connected");
 
-    // Hold the noise_socket mutex — this used to make is_connected() return
+    // Hold the noise_socket mutex — this used to make is_socket_connected() return
     // false via try_lock() even though the socket was Some(...)
     let _guard = client.noise_socket.lock().unwrap();
     assert!(
-        client.is_connected(),
-        "is_connected() must return true even while noise_socket mutex is held"
+        client.is_socket_connected(),
+        "is_socket_connected() must return true even while noise_socket mutex is held"
     );
 }
 
@@ -4132,7 +4160,7 @@ async fn disconnect_does_not_signal_connection_cleanup_before_outbound_flush() {
 
     let disconnect_client = Arc::clone(&client);
     let disconnect_task = tokio::spawn(async move {
-        disconnect_client.disconnect().await;
+        disconnect_client.shutdown().await;
     });
 
     // disconnect() closes the scope and then parks in `outbound_flush.flush`; the
@@ -4870,14 +4898,15 @@ async fn test_send_ack_for_returns_error_when_disconnected() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Not connected — send_ack_for should return Err, not Ok
     let receipt = NodeBuilder::new("receipt")
@@ -4979,14 +5008,15 @@ async fn test_send_ack_for_returns_ok_on_expected_disconnect() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Set expected disconnect — send_ack_for should gracefully return Ok
     client.expected_disconnect.store(true, Ordering::Relaxed);
@@ -5067,7 +5097,7 @@ async fn terminal_disconnect_propagates_to_per_connection_signal() {
     let client = crate::test_utils::create_test_client().await;
     let conn_signal = client.connection_shutdown_signal();
 
-    client.disconnect().await;
+    client.shutdown().await;
 
     assert!(
         conn_signal.is_fired(),
@@ -5516,15 +5546,16 @@ async fn online_device_sync_releases_its_dedup_entry_when_never_polled() {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new_with_cache_config(
-        Arc::new(DropSpawnRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-        CacheConfig::default(),
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(DropSpawnRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .with_cache_config(CacheConfig::default())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
     let jid: Jid = "19045550180@s.whatsapp.net".parse().unwrap();
 
     client
@@ -7949,7 +7980,7 @@ async fn a_rate_limited_session_is_not_a_reachable_one() {
     client.handle_stream_error(&error.as_node_ref()).await;
 
     assert!(
-        client.is_connected(),
+        client.is_socket_connected(),
         "the socket the rate limit arrived on is still open"
     );
     assert!(!client.is_terminal(), "and the session is not over");
@@ -8227,14 +8258,15 @@ async fn offline_resume_test_client() -> Arc<Client> {
             .await
             .expect("persistence manager should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(crate::transport::mock::MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(crate::transport::mock::MockTransportFactory::new()))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
     client
 }
 

@@ -1021,7 +1021,7 @@ mod tests {
                     .as_ref()
                     .and_then(Weak::upgrade)
                     .expect("installed client");
-                client.disconnect().await;
+                client.shutdown().await;
                 self.events
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1517,7 +1517,7 @@ mod tests {
 
         let disconnect_client = Arc::clone(&client);
         let disconnect = tokio::spawn(async move {
-            disconnect_client.disconnect().await;
+            disconnect_client.shutdown().await;
         });
         tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
             .await

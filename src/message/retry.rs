@@ -27,7 +27,7 @@ impl Client {
         if stanza.get_attr("from").is_none() {
             return Err(crate::features::RetryRequestError::MissingAttribute("from"));
         }
-        if !self.is_connected() {
+        if !self.is_socket_connected() {
             return Err(crate::client::ClientError::NotConnected.into());
         }
 

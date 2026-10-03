@@ -2454,15 +2454,18 @@ mod tests {
         // Enable L1 cache so MockBackend (which doesn't persist) works for this test
         let mut config = crate::cache_config::CacheConfig::default();
         config.recent_messages.capacity = 1_000;
-        let (client, _sync_rx) = Client::new_with_cache_config(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm.clone(),
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-            config,
-        )
-        .await;
+        let (client, _sync_rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm.clone())
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .with_cache_config(config)
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let chat: Jid = "120363021033254949@g.us"
             .parse()
@@ -2508,15 +2511,18 @@ mod tests {
             config.recent_messages.capacity, 0,
             "this test asserts the DB-only (capacity 0) path"
         );
-        let (client, _sync_rx) = Client::new_with_cache_config(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm.clone(),
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-            config,
-        )
-        .await;
+        let (client, _sync_rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm.clone())
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .with_cache_config(config)
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let chat: Jid = "120363021033254949@g.us"
             .parse()
@@ -2553,15 +2559,18 @@ mod tests {
         );
         let mut config = crate::cache_config::CacheConfig::default();
         config.recent_messages.capacity = 1_000;
-        let (client, _sync_rx) = Client::new_with_cache_config(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm.clone(),
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-            config,
-        )
-        .await;
+        let (client, _sync_rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm.clone())
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .with_cache_config(config)
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let chat: Jid = "120363021033254949@g.us".parse().unwrap();
         let msg_id = "PEEK1".to_string();
@@ -3512,15 +3521,18 @@ mod tests {
         let pm = Arc::new(PersistenceManager::new(backend).await.unwrap());
         let mut config = crate::cache_config::CacheConfig::default();
         config.recent_messages.capacity = 1_000;
-        let (client, _rx) = Client::new_with_cache_config(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm,
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-            config,
-        )
-        .await;
+        let (client, _rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm)
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .with_cache_config(config)
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let group: Jid = "120363021033254949@g.us".parse().unwrap();
         let msg_id = "RLMSG001";
@@ -4601,15 +4613,18 @@ mod tests {
         let pm = Arc::new(PersistenceManager::new(backend.clone()).await.unwrap());
         let mut config = crate::cache_config::CacheConfig::default();
         config.recent_messages.capacity = 1_000;
-        let (client, _rx) = Client::new_with_cache_config(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm,
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-            config,
-        )
-        .await;
+        let (client, _rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm)
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .with_cache_config(config)
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let own_lid: Jid = "100000000001040:13@lid".parse().unwrap();
         client
@@ -4912,14 +4927,17 @@ mod tests {
                 .await
                 .expect("persistence manager should initialize"),
         );
-        let (client, _sync_rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm,
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-        )
-        .await;
+        let (client, _sync_rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm)
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let remote_identity = IdentityKeyPair::generate(&mut rng);
@@ -5590,15 +5608,18 @@ mod tests {
         // Enable L1 cache so MockBackend (which doesn't persist) works for this test
         let mut config = crate::cache_config::CacheConfig::default();
         config.recent_messages.capacity = 1_000;
-        let (client, _sync_rx) = Client::new_with_cache_config(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm.clone(),
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-            config,
-        )
-        .await;
+        let (client, _sync_rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm.clone())
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .with_cache_config(config)
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let msg = wa::Message {
             extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
@@ -5655,15 +5676,18 @@ mod tests {
         );
         let mut config = crate::cache_config::CacheConfig::default();
         config.recent_messages.capacity = 1_000;
-        let (client, _sync_rx) = Client::new_with_cache_config(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm.clone(),
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-            config,
-        )
-        .await;
+        let (client, _sync_rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm.clone())
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .with_cache_config(config)
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let bare_jid: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
         let msg_id = "RETRY_MSG_001";
@@ -5711,15 +5735,18 @@ mod tests {
         );
         let mut config = crate::cache_config::CacheConfig::default();
         config.recent_messages.capacity = 1_000;
-        let (client, _sync_rx) = Client::new_with_cache_config(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm.clone(),
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-            config,
-        )
-        .await;
+        let (client, _sync_rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm.clone())
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .with_cache_config(config)
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let pn_jid: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
         let lid_jid: Jid = "236395184570386@lid".parse().unwrap();
@@ -5770,14 +5797,17 @@ mod tests {
                 .await
                 .expect("persistence manager should initialize"),
         );
-        let (client, _sync_rx) = Client::new(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm.clone(),
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-        )
-        .await;
+        let (client, _sync_rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm.clone())
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let pn_jid: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
         let lid_jid: Jid = "236395184570386@lid".parse().unwrap();
@@ -5828,15 +5858,18 @@ mod tests {
         );
         let mut config = crate::cache_config::CacheConfig::default();
         config.recent_messages.capacity = 1_000;
-        let (client, _sync_rx) = Client::new_with_cache_config(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm.clone(),
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-            config,
-        )
-        .await;
+        let (client, _sync_rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm.clone())
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .with_cache_config(config)
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let pn_jid: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
         let lid_jid: Jid = "236395184570386@lid".parse().unwrap();
@@ -5890,15 +5923,18 @@ mod tests {
         );
         let mut config = crate::cache_config::CacheConfig::default();
         config.recent_messages.capacity = 1_000;
-        let (client, _sync_rx) = Client::new_with_cache_config(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm.clone(),
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-            config,
-        )
-        .await;
+        let (client, _sync_rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm.clone())
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .with_cache_config(config)
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let lid_jid: Jid = "236395184570386@lid".parse().unwrap();
         let msg_id = "RETRY_NO_ALT";
@@ -5936,15 +5972,18 @@ mod tests {
         );
         let mut config = crate::cache_config::CacheConfig::default();
         config.recent_messages.capacity = 1_000;
-        let (client, _sync_rx) = Client::new_with_cache_config(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm.clone(),
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-            config,
-        )
-        .await;
+        let (client, _sync_rx) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm.clone())
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(MockHttpClient))
+            .with_cache_config(config)
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
 
         let pn_jid: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
         let lid_jid: Jid = "236395184570386@lid".parse().unwrap();

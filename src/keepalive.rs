@@ -139,7 +139,7 @@ impl Client {
         tracing::instrument(name = "wa.conn.keepalive.ping", level = "debug", skip_all)
     )]
     async fn send_keepalive(&self) -> KeepaliveResult {
-        if !self.is_connected() {
+        if !self.is_socket_connected() {
             return KeepaliveResult::FatalFailure;
         }
 
@@ -255,7 +255,7 @@ impl Client {
 
             futures::select! {
                 _ = self.runtime.sleep(interval).fuse() => {
-                    if !self.is_connected() {
+                    if !self.is_socket_connected() {
                         debug!(target: "Client/Keepalive", "Not connected, exiting keepalive loop.");
                         return;
                     }
@@ -716,7 +716,7 @@ mod tests {
 
     /// A keepalive belongs to the connection it was started for. Its first poll
     /// can land after that connection is gone — the spawn only promises the
-    /// task will run — and `is_connected()` is true again by then if a
+    /// task will run — and `is_socket_connected()` is true again by then if a
     /// reconnect has completed, so without the generation check the old loop
     /// would go on pinging the new connection's socket alongside its own
     /// keepalive: two pingers on one socket, and one more with every reconnect.

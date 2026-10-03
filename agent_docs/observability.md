@@ -812,7 +812,7 @@ Against that, the two preallocated bounded queues a session owns:
 
 | queue | capacity | payload | retained |
 | --- | ---: | ---: | ---: |
-| `major_sync_task_sender` (`Client::new`) | 8 | 56 B | ~0.5 KiB |
+| `major_sync_task_sender` (`Client::builder().build()`) | 8 | 56 B | ~0.5 KiB |
 | transport events (`EVENT_CHANNEL_CAPACITY`, per connection) | 64 | 40 B | 3 840 B |
 
 (The sync queue was measured at 2 816 B when its capacity was 32; the 8-slot

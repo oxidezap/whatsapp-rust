@@ -168,6 +168,51 @@ async fn shutdown_does_not_release_a_detached_client_owner() {
 }
 
 #[tokio::test]
+async fn logout_retains_local_flush_failure_and_does_not_claim_backend_release() {
+    use crate::store::commands::DeviceCommand;
+    let (mut backend, dropped) = ProbeBackend::new();
+    backend.fail_save = true;
+    let client = crate::test_utils::create_test_client_with_backend(Arc::new(backend)).await;
+    let weak = Arc::downgrade(&client);
+    let release = client.store_release();
+    let mut waiter = Box::pin(release.wait());
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetPushName("synthetic logout".into()))
+        .await;
+    let report = tokio::time::timeout(std::time::Duration::from_secs(5), client.logout())
+        .await
+        .expect("offline logout should finish despite failed persistence");
+    assert!(matches!(
+        report.deregistration,
+        crate::DeregistrationOutcome::NotAttempted(crate::DeregistrationSkipReason::Offline)
+    ));
+    let Err(wacore::store::error::StoreError::Io(source)) = &report.shutdown.device else {
+        panic!("local save failure must retain its original type and source");
+    };
+    assert_eq!(source.to_string(), "synthetic save failure");
+    assert_eq!(report.shutdown.outbound, crate::DrainOutcome::Completed);
+    assert!(matches!(
+        client.run().await,
+        crate::RunCompletionReason::ShutdownRequested
+    ));
+    assert!(futures::poll!(waiter.as_mut()).is_pending());
+    assert!(
+        !dropped.load(Ordering::SeqCst),
+        "caller Arc still owns the backend"
+    );
+    drop(client);
+    tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+        .await
+        .expect("backend lease should end after its owners drop");
+    assert!(weak.upgrade().is_none());
+    assert!(dropped.load(Ordering::SeqCst));
+    // A held report/observer carries observations, not ownership of the store.
+    assert!(report.shutdown.device.is_err());
+    release.wait().await;
+}
+
+#[tokio::test]
 async fn host_raw_handles_keep_their_identity_without_pinning_observation() {
     use crate::store::{Device, persistence_manager::PersistenceManager};
     let (backend, dropped) = ProbeBackend::new();
@@ -375,15 +420,18 @@ async fn sent_message_backend_workers_keep_their_lease_after_client_drop() {
         );
         let mut config = crate::cache_config::CacheConfig::default();
         config.recent_messages.capacity = 16;
-        let (client, _rx) = crate::Client::new_with_cache_config(
-            Arc::new(crate::runtime_impl::TokioRuntime),
-            pm,
-            Arc::new(crate::transport::mock::MockTransportFactory::new()),
-            Arc::new(crate::test_utils::MockHttpClient),
-            None,
-            config,
-        )
-        .await;
+        let (client, _rx) = crate::Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm)
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(crate::test_utils::MockHttpClient))
+            .with_cache_config(config)
+            .build()
+            .await
+            .expect("test client should build")
+            .into_parts();
         client.enter_live_mode_for_tests();
         assert!(client.cache_config.recent_messages_enabled);
         let weak = Arc::downgrade(&client);

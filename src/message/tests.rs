@@ -36,14 +36,15 @@ async fn test_parse_message_info_for_status_broadcast() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let participant_jid_str = "556899336555:42@s.whatsapp.net";
     let status_broadcast_jid_str = "status@broadcast";
@@ -97,14 +98,15 @@ async fn test_status_broadcast_cold_cache_resolves_to_lid() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let pn_user = "559980000001";
     let lid_user = "100000012345678";
@@ -194,14 +196,15 @@ async fn test_status_broadcast_hosted_family_with_device_id_resolves_to_hosted_l
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let pn_user = "559980000001";
     let lid_user = "100000012345678";
@@ -290,14 +293,15 @@ async fn test_process_session_enc_batch_handles_session_not_found_gracefully() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let sender_jid: Jid = "1234567890@s.whatsapp.net"
         .parse()
@@ -363,14 +367,15 @@ async fn batch_accumulates_undecryptable_and_dispatches_once() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let recorder = Arc::new(EventRecorder::default());
     client.subscribe_handler(recorder.clone()).detach();
@@ -438,14 +443,15 @@ async fn test_empty_session_record_treated_as_session_not_found() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let sender_jid: Jid = "0000000000000@s.whatsapp.net"
         .parse()
@@ -1345,14 +1351,15 @@ async fn test_handle_incoming_message_skips_skmsg_after_msg_failure() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let sender_jid: Jid = "1234567890@s.whatsapp.net"
         .parse()
@@ -1434,14 +1441,15 @@ async fn test_self_sent_lid_group_message_sender_key_mismatch() {
             .await
             .expect("test backend should initialize"),
     );
-    let (_client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm.clone(),
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (_client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm.clone())
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let own_lid: Jid = "100000000000001.1:75@lid"
         .parse()
@@ -1535,14 +1543,15 @@ async fn test_multiple_lid_participants_sender_key_isolation() {
             .expect("test backend should initialize"),
     );
     let transport_factory = Arc::new(crate::transport::mock::MockTransportFactory::new());
-    let (_client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm.clone(),
-        transport_factory,
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (_client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm.clone())
+        .with_transport_factory_arc(transport_factory)
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let group_jid: Jid = "120363021033254949@g.us"
         .parse()
@@ -1754,14 +1763,15 @@ async fn test_parse_message_info_sender_alt_extraction() {
     })
     .await;
 
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Test case 1: LID group message with participant_pn
     let lid_group_node = NodeBuilder::new("message")
@@ -1994,14 +2004,15 @@ async fn test_sender_key_always_uses_display_jid() {
             .await
             .expect("test backend should initialize"),
     );
-    let (_client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm.clone(),
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (_client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm.clone())
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let group_jid: Jid = "120363021033254949@g.us"
         .parse()
@@ -2088,14 +2099,15 @@ async fn test_second_message_with_only_skmsg_decrypts() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm.clone(),
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm.clone())
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let sender_jid: Jid = "100000000000001.1:75@lid"
         .parse()
@@ -2195,14 +2207,15 @@ async fn test_untrusted_identity_error_is_caught_and_handled() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm.clone(),
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm.clone())
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let sender_jid: Jid = "559981212574@s.whatsapp.net"
         .parse()
@@ -2267,14 +2280,15 @@ async fn test_untrusted_identity_does_not_break_batch_processing() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm.clone(),
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm.clone())
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let sender_jid: Jid = "559981212574@s.whatsapp.net"
         .parse()
@@ -2349,14 +2363,15 @@ async fn test_untrusted_identity_in_group_context() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm.clone(),
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm.clone())
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Simulate a group chat scenario
     let group_jid: Jid = "120363021033254949@g.us"
@@ -2443,14 +2458,15 @@ async fn test_parse_message_info_self_sent_dm_via_lid() {
     })
     .await;
 
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Simulate self-sent DM to another user (from your phone to your bot echo)
     // Real log example:
@@ -2541,14 +2557,15 @@ async fn test_parse_message_info_dm_from_other_via_lid() {
     })
     .await;
 
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Simulate DM from another user via their LID
     // The sender_pn attribute should contain their phone number for session lookup
@@ -2635,14 +2652,15 @@ async fn test_parse_message_info_dm_to_self() {
     })
     .await;
 
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     // Simulate DM to self (like "Notes to Myself" or pinging yourself)
     // from=your_LID, recipient=your_LID, peer_recipient_pn=your_PN
@@ -2711,14 +2729,15 @@ async fn test_lid_pn_cache_populated_on_message_with_sender_lid() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let phone = "559980000001";
     let lid = "100000012345678";
@@ -2780,14 +2799,15 @@ async fn test_lid_pn_cache_not_populated_without_sender_lid() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let phone = "559980000001";
 
@@ -2838,14 +2858,15 @@ async fn test_lid_pn_cache_populated_for_lid_sender_with_participant_pn() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let lid = "100000012345678";
     let phone = "559980000001";
@@ -2911,14 +2932,15 @@ async fn test_lid_pn_cache_handles_repeated_messages() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let phone = "559980000001";
     let lid = "100000012345678";
@@ -2988,14 +3010,15 @@ async fn test_pn_message_uses_lid_for_session_lookup_when_mapping_known() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let lid = "100000012345678";
     let phone = "559980000001";
@@ -3127,14 +3150,15 @@ async fn test_pn_message_uses_cached_lid_without_sender_lid_attribute() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let lid = "100000012345678";
     let phone = "559980000001";
@@ -3240,14 +3264,15 @@ async fn test_pn_message_uses_pn_when_no_lid_mapping() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let phone = "559980000001";
 
@@ -3391,14 +3416,15 @@ async fn create_test_client_for_retry_with_id(test_id: &str) -> Arc<Client> {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
     client
 }
 
@@ -4034,14 +4060,15 @@ async fn test_parse_message_info_missing_id_returns_error() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _sync_rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let node = NodeBuilder::new("message")
         .attr("from", "15551234567@s.whatsapp.net")
@@ -4084,14 +4111,15 @@ async fn test_no_sender_key_sends_immediate_retry() {
             .await
             .expect("test backend should initialize"),
     );
-    let (client, _rx) = Client::new(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm.clone(),
-        mock_transport(),
-        mock_http_client(),
-        None,
-    )
-    .await;
+    let (client, _rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm.clone())
+        .with_transport_factory_arc(mock_transport())
+        .with_http_client_arc(mock_http_client())
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let group_jid: Jid = "120363021033254949@g.us".parse().unwrap();
     let sender_jid: Jid = "1234567890:1@s.whatsapp.net".parse().unwrap();
@@ -5719,15 +5747,16 @@ async fn capturing_client_with_cache_config(
     );
     let factory = CapturingMockTransportFactory::new();
     let transport = factory.transport();
-    let (client, _sync_rx) = Client::new_with_cache_config(
-        Arc::new(crate::runtime_impl::TokioRuntime),
-        pm,
-        Arc::new(factory),
-        Arc::new(MockHttpClient),
-        None,
-        cache_config,
-    )
-    .await;
+    let (client, _sync_rx) = Client::builder()
+        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+        .with_persistence_manager(pm)
+        .with_transport_factory_arc(Arc::new(factory))
+        .with_http_client_arc(Arc::new(MockHttpClient))
+        .with_cache_config(cache_config)
+        .build()
+        .await
+        .expect("test client should build")
+        .into_parts();
 
     let key = [0u8; 32];
     let write_key = NoiseCipher::new(&key).expect("32-byte key");
@@ -9311,7 +9340,7 @@ async fn custom_handler_only_skips_fallback_ack() {
         calls: Arc::clone(&calls),
     });
     // custom_enc_handlers is set-once (immutable after build); capturing_client
-    // builds via Client::new and leaves it unset, so set it here.
+    // builds via Client::builder and leaves it unset, so set it here.
     let mut handlers = HashMap::new();
     handlers.insert("frskmsg".to_string(), handler as Arc<dyn EncHandler>);
     // set() returns Err(map) on the already-set path; the map isn't Debug, so

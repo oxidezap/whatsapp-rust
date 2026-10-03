@@ -857,7 +857,7 @@ impl Client {
     /// rather than raced against the disconnect, and sending them anyway would
     /// also hold the outbound flush open until its timeout.
     pub(crate) fn outbound_teardown_in_progress(&self) -> bool {
-        self.expected_disconnect.load(Ordering::Relaxed) || !self.is_connected()
+        self.expected_disconnect.load(Ordering::Relaxed) || !self.is_socket_connected()
     }
 
     /// How many queued acks one burst may take.
@@ -1014,7 +1014,7 @@ impl Client {
         if self.expected_disconnect.load(Ordering::Relaxed) {
             return Ok(());
         }
-        if !self.is_connected() {
+        if !self.is_socket_connected() {
             return Err(ClientError::NotConnected);
         }
         let buf = match self
@@ -1264,7 +1264,7 @@ impl Client {
             // Check connection before network operations.
             // During pairing, a 515 disconnect happens quickly after success,
             // so the socket may already be gone.
-            if !client_clone.is_connected() {
+            if !client_clone.is_socket_connected() {
                 debug!(
                     "Skipping post-login init: connection closed (likely pairing phase reconnect)"
                 );
@@ -1275,7 +1275,7 @@ impl Client {
             client_clone.send_unified_session().await;
 
             check_generation!();
-            if !client_clone.is_connected() {
+            if !client_clone.is_socket_connected() {
                 debug!("Skipping passive tasks: connection closed");
                 return;
             }
@@ -1341,7 +1341,7 @@ impl Client {
             // The server sends <ib><offline count="X"/></ib> AFTER we exit passive mode.
             // This matches WhatsApp Web's behavior: executePassiveTasks() -> sendPassiveModeProtocol("active")
             check_generation!();
-            if !client_clone.is_connected() {
+            if !client_clone.is_socket_connected() {
                 debug!("Skipping active IQ: connection closed");
                 return;
             }
@@ -1362,7 +1362,7 @@ impl Client {
 
             // Re-check connection and generation before sending presence
             check_generation!();
-            if !client_clone.is_connected() {
+            if !client_clone.is_socket_connected() {
                 debug!("Skipping presence: connection closed");
                 return;
             }
@@ -1380,7 +1380,7 @@ impl Client {
                     debug!("Skipping background init queries: connection generation changed");
                     return;
                 }
-                if !bg_client.is_connected() {
+                if !bg_client.is_socket_connected() {
                     debug!("Skipping background init queries: connection closed");
                     return;
                 }

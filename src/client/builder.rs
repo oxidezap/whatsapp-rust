@@ -633,28 +633,6 @@ impl ClientBuilder {
         })
     }
 
-    pub(crate) async fn build_required(
-        runtime: Arc<dyn Runtime>,
-        persistence_manager: Arc<PersistenceManager>,
-        transport_factory: Arc<dyn TransportFactory>,
-        http_client: Arc<dyn HttpClient>,
-        override_version: Option<(u32, u32, u32)>,
-        cache_config: CacheConfig,
-    ) -> ClientBuild {
-        let result = Self::new()
-            .with_options(ClientOptions {
-                override_version,
-                cache_config,
-                ..ClientOptions::default()
-            })
-            .finish(runtime, persistence_manager, transport_factory, http_client)
-            .await;
-        match result {
-            Ok(build) => build,
-            Err(error) => unreachable!("default lifecycle-free build failed: {error}"),
-        }
-    }
-
     async fn finish(
         self,
         runtime: Arc<dyn Runtime>,

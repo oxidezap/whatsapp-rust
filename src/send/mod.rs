@@ -4215,7 +4215,7 @@ mod tests {
         // the cooldown, not a query still running.
         tokio::task::yield_now().await;
         assert_eq!(client.pending_group_device_resync.len(), 1);
-        client.disconnect().await;
+        client.shutdown().await;
         assert_eq!(client.pending_group_device_resync.len(), 0);
     }
 
@@ -10819,7 +10819,7 @@ mod clock_budget_tests {
             reads.monotonic
         );
 
-        client.disconnect().await;
+        client.shutdown().await;
     }
 
     /// One send, one instant: the message id, the biz node, the privacy-token
@@ -10855,7 +10855,7 @@ mod clock_budget_tests {
             "the send persisted an outbound secret under the measured instant"
         );
 
-        client.disconnect().await;
+        client.shutdown().await;
     }
 
     /// The wire timestamp is the one thing the budget must never buy: the
@@ -10896,6 +10896,6 @@ mod clock_budget_tests {
             "wire timestamp {stamped} outside [{before}, {after}]"
         );
 
-        client.disconnect().await;
+        client.shutdown().await;
     }
 }

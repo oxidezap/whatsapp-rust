@@ -25,7 +25,7 @@ async fn test_disconnect_cleans_session() -> anyhow::Result<()> {
     assert!(tc.client.is_logged_in());
 
     let client = tc.client.clone();
-    client.disconnect().await;
+    client.shutdown().await;
     tc.run_handle.abort();
 
     // Verify the disconnect was clean.

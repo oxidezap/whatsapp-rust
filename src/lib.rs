@@ -236,8 +236,9 @@ pub use client::{
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
 pub use client::{
-    ConflictKind, ConnectError, ConnectStage, DrainOutcome, ProtocolTerminalReason, Reachability,
-    RunCompletionReason, SecretFlushReport, ShutdownReport, SignalMaintenanceError,
+    ConflictKind, ConnectError, ConnectStage, DeregistrationOutcome, DeregistrationSkipReason,
+    DrainOutcome, LogoutReport, ProtocolTerminalReason, Reachability, RunCompletionReason,
+    SecretFlushReport, ShutdownReport, SignalMaintenanceError,
 };
 pub use types::connect_admission::ConnectAdmission;
 pub use types::durability_hook::InboundDurabilityHook;
@@ -398,8 +399,9 @@ pub mod prelude {
     #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
     pub use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
     pub use crate::client::{
-        ConflictKind, ConnectError, ConnectStage, DrainOutcome, ProtocolTerminalReason,
-        RunCompletionReason, SecretFlushReport, ShutdownReport,
+        ConflictKind, ConnectError, ConnectStage, DeregistrationOutcome, DeregistrationSkipReason,
+        DrainOutcome, LogoutReport, ProtocolTerminalReason, RunCompletionReason, SecretFlushReport,
+        ShutdownReport,
     };
     #[cfg(feature = "plugins")]
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]

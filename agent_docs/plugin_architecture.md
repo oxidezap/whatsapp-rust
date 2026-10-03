@@ -267,7 +267,7 @@ callback is lossless and precedes terminal `Shutdown`, so the queue may
 temporarily exceed its target to preserve cleanup.
 
 `signal_shutdown_sync()` closes tasks, subscriptions, event routes, and
-capability handles promptly. `disconnect().await` remains required for async
+capability handles promptly. `shutdown().await` remains required for async
 task barriers, hooks, durability flushing, and transport teardown. `Drop` can
 only provide the synchronous signal.
 

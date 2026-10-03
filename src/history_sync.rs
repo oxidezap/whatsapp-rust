@@ -387,7 +387,7 @@ impl Client {
             (inline_payload, payload_bytes)
         } else {
             log::info!("Downloading external history sync blob...");
-            if self.is_shutting_down() || !self.is_connected() {
+            if self.is_shutting_down() || !self.is_socket_connected() {
                 log::debug!(
                     "Aborting history sync {} before blob download: client disconnected",
                     message_id

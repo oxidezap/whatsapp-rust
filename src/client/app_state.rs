@@ -7643,7 +7643,7 @@ mod connection_guard_tests {
         client.is_running.store(true, Ordering::Relaxed);
         client.set_connected_for_test(true);
 
-        assert!(!client.is_terminal() && client.is_connected());
+        assert!(!client.is_terminal() && client.is_socket_connected());
 
         // The state `reconnect_immediately()` leaves behind.
         client.expected_disconnect.store(true, Ordering::Relaxed);
@@ -7973,7 +7973,7 @@ mod sync_outcome_tests {
         // admits the window on the very first connection.
         client.is_logged_in.store(true, Ordering::Relaxed);
         assert!(
-            client.is_logged_in() && client.is_connected(),
+            client.is_logged_in() && client.is_socket_connected(),
             "which is why the flags alone said yes"
         );
         assert!(
@@ -8151,7 +8151,7 @@ mod retiring_socket_tests {
         client.expected_disconnect.store(true, Ordering::Relaxed);
 
         assert!(
-            client.is_connected() && client.is_logged_in(),
+            client.is_socket_connected() && client.is_logged_in(),
             "and every other signal still says the socket is fine"
         );
         assert!(
