@@ -84,7 +84,7 @@ async fn test_message_revoke() -> anyhow::Result<()> {
         .client
         .revoke_message(
             jid_b,
-            msg_id.clone(),
+            msg_id.as_str(),
             whatsapp_rust::send::RevokeType::Sender,
         )
         .await?;

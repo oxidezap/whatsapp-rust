@@ -117,7 +117,12 @@ async fn assert_dm_operations(legacy: Option<bool>, nct: bool, migrated: bool) {
                 .await
                 .unwrap(),
             2 => client
-                .edit_message(pn.clone(), "ORIGINAL", wa::Message::text("offline edit"))
+                .edit_message_raw(
+                    pn.clone(),
+                    "ORIGINAL",
+                    wa::Message::text("offline edit"),
+                    EditOptions::default(),
+                )
                 .await
                 .unwrap(),
             _ => unreachable!(),
@@ -440,7 +445,7 @@ async fn group_newsletter_and_status_addon_keep_token_exclusions() {
     configure_tokens(&client, &channel, Some(true), true).await;
     client
         .newsletter()
-        .edit_message(&channel, "ORIGINAL", wa::Message::text("channel control"))
+        .edit_message_raw(&channel, "ORIGINAL", wa::Message::text("channel control"))
         .await
         .unwrap();
     let owned = crate::test_utils::decode_sent_iq(&transport, 0).await;

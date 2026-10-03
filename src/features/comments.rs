@@ -118,7 +118,7 @@ impl<'a> Comments<'a> {
             .persist_outbound_msg_secret(
                 chat,
                 &commenter,
-                &result.message_id,
+                result.message_id.as_str(),
                 &comment_secret,
                 wacore::msg_secret::RetentionClass::Text,
                 crate::send::SendInstant::now(),

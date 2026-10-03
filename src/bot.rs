@@ -241,11 +241,13 @@ impl MessageContext {
     /// what the returned result describes.
     pub async fn edit_message(
         &self,
-        original_message_id: impl Into<String>,
+        original_message_id: crate::MessageId,
         new_message: wa::Message,
     ) -> Result<crate::send::SendResult, crate::send::SendError> {
+        let target =
+            crate::MessageRef::new(&self.info.source.chat, original_message_id, None, true)?;
         self.client
-            .edit_message(&self.info.source.chat, original_message_id, new_message)
+            .edit_message(crate::EditRequest::new(target, new_message))
             .await
     }
 

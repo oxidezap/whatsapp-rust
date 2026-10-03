@@ -157,7 +157,7 @@ async fn test_cross_collection_mutations() -> anyhow::Result<()> {
     client_a
         .client
         .chat_actions()
-        .star_message(&jid_b, None, &msg_id, true)
+        .star_message(&jid_b, None, msg_id.as_str(), true)
         .await?;
     info!("Star (regular_high) succeeded");
 

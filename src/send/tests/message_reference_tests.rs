@@ -72,7 +72,12 @@ async fn legacy_and_reference_message_transport_match() {
     };
     let raw = [
         client
-            .edit_message(&peer, "OWN_ORIGINAL", wa::Message::text("changed"))
+            .edit_message_raw(
+                &peer,
+                "OWN_ORIGINAL",
+                wa::Message::text("changed"),
+                EditOptions::default(),
+            )
             .await
             .unwrap(),
         client
@@ -91,7 +96,10 @@ async fn legacy_and_reference_message_transport_match() {
     ];
     let typed = vec![
         client
-            .edit_message_ref(&target, wa::Message::text("changed"))
+            .edit_message(EditRequest::new(
+                target.clone(),
+                wa::Message::text("changed"),
+            ))
             .await
             .unwrap(),
         client.revoke_message_ref(&target).await.unwrap(),
@@ -245,7 +253,7 @@ async fn received_context_and_own_result_references_borrow_metadata() {
     assert_eq!(dm_ref.to_raw_key().participant, None);
     assert_eq!(dm_ref.to_raw_key().from_me, Some(false));
     let own = SendResult {
-        message_id: "OWN_CONTENT".into(),
+        message_id: MessageId::new("OWN_CONTENT").unwrap(),
         to: dm,
         message: Arc::new(wa::Message::text("own")),
         recipient_fanout: None,
@@ -276,15 +284,15 @@ async fn own_send_reference_and_channel_reference_are_distinct() {
             .send_message_with_options(
                 chat,
                 wa::Message::text("post"),
-                SendOptions::default().with_message_id("OWN_CONTENT"),
+                SendOptions::default().with_message_id(MessageId::new("OWN_CONTENT").unwrap()),
             )
             .await
             .unwrap();
         let body = result.message.clone();
-        assert_eq!(result.message_id, "OWN_CONTENT");
+        assert_eq!(result.message_id.as_str(), "OWN_CONTENT");
         assert_eq!(&result.to, chat);
         assert_eq!(result.message.conversation.as_deref(), Some("post"));
-        assert_eq!(result.stanza_id().unwrap().as_str(), "OWN_CONTENT");
+        assert_eq!(result.stanza_id().as_str(), "OWN_CONTENT");
         if chat.is_newsletter() {
             assert_eq!(
                 result.message_ref().unwrap_err(),
@@ -368,7 +376,7 @@ async fn own_dm_reference_operations_keep_content_and_operation_ids_separate() {
     let own = MessageRef::new(&peer, MessageId::new("OWN_ORIGINAL").unwrap(), None, true).unwrap();
     let results = [
         client
-            .edit_message_ref(&own, wa::Message::text("changed"))
+            .edit_message(EditRequest::new(own.clone(), wa::Message::text("changed")))
             .await
             .unwrap(),
         client.revoke_message_ref(&own).await.unwrap(),
@@ -386,7 +394,7 @@ async fn own_dm_reference_operations_keep_content_and_operation_ids_separate() {
         let node = sent_message(&nodes, result);
         assert_eq!(
             node.get().attrs().optional_string("id").as_deref(),
-            Some(result.stanza_id().unwrap().as_str())
+            Some(result.stanza_id().as_str())
         );
         assert_eq!(node.get().attrs().optional_jid("to"), Some(peer.clone()));
         let key = match i {
@@ -453,14 +461,10 @@ async fn newsletter_reference_operations_reach_transport_with_distinct_ids() {
         .unwrap();
     client
         .newsletter()
-        .edit_message_ref(&target, wa::Message::text("edited"))
+        .edit_message(&target, wa::Message::text("edited"))
         .await
         .unwrap();
-    client
-        .newsletter()
-        .revoke_message_ref(&target)
-        .await
-        .unwrap();
+    client.newsletter().revoke_message(&target).await.unwrap();
     for (index, id) in [&ack_id, &vote_id].iter().enumerate() {
         let node = crate::test_utils::decode_sent_iq(&transport, index).await;
         let node = node.get();
@@ -543,14 +547,14 @@ async fn missing_newsletter_ids_and_invalid_chat_operations_send_nothing() {
     assert!(matches!(
         client
             .newsletter()
-            .edit_message_ref(&server_only, wa::Message::text("bad"))
+            .edit_message(&server_only, wa::Message::text("bad"))
             .await,
         Err(crate::NewsletterError::MessageRef(
             MessageRefError::MissingMessageId
         ))
     ));
     assert!(matches!(
-        client.newsletter().revoke_message_ref(&server_only).await,
+        client.newsletter().revoke_message(&server_only).await,
         Err(crate::NewsletterError::MessageRef(
             MessageRefError::MissingMessageId
         ))
@@ -559,7 +563,7 @@ async fn missing_newsletter_ids_and_invalid_chat_operations_send_nothing() {
     let received = MessageRef::new(&dm, MessageId::new("DM").unwrap(), Some(&dm), false).unwrap();
     assert!(matches!(
         client
-            .edit_message_ref(&received, wa::Message::default())
+            .edit_message(EditRequest::new(received.clone(), wa::Message::default()))
             .await,
         Err(SendError::MessageRef(MessageRefError::NotFromMe))
     ));
@@ -647,7 +651,7 @@ async fn group_reference_operations_encrypt_operation_specific_keys() {
         let calls = [
             fixture
                 .client
-                .edit_message_ref(&own, wa::Message::text("changed"))
+                .edit_message(EditRequest::new(own.clone(), wa::Message::text("changed")))
                 .await
                 .unwrap(),
             fixture.client.revoke_message_ref(&own).await.unwrap(),
@@ -674,7 +678,7 @@ async fn group_reference_operations_encrypt_operation_specific_keys() {
             let stanza = stanza.get();
             assert_eq!(
                 stanza.attrs().optional_string("id").as_deref(),
-                Some(result.stanza_id().unwrap().as_str())
+                Some(result.stanza_id().as_str())
             );
             let enc = stanza.get_optional_child("enc").unwrap();
             assert_eq!(
@@ -791,7 +795,10 @@ async fn review_cached_cag_typed_edit_rejects_without_message_send() {
     assert!(matches!(
         fixture
             .client
-            .edit_message_ref(&target, wa::Message::text("changed"))
+            .edit_message(EditRequest::new(
+                target.clone(),
+                wa::Message::text("changed")
+            ))
             .await,
         Err(SendError::InvalidRequest(_))
     ));
@@ -908,7 +915,10 @@ async fn review_own_group_send_reference_keys_encrypt_original_author() {
         let results = [
             fixture
                 .client
-                .edit_message_ref(&target, wa::Message::text("edited"))
+                .edit_message(EditRequest::new(
+                    target.clone(),
+                    wa::Message::text("edited"),
+                ))
                 .await
                 .unwrap(),
             fixture.client.revoke_message_ref(&target).await.unwrap(),
@@ -1023,7 +1033,7 @@ async fn review_typed_edit_validates_origin_before_group_lookup() {
     assert!(matches!(
         fixture
             .client
-            .edit_message_ref(&target, wa::Message::text("bad"))
+            .edit_message(EditRequest::new(target.clone(), wa::Message::text("bad")))
             .await,
         Err(SendError::MessageRef(MessageRefError::NotFromMe))
     ));
@@ -1038,7 +1048,7 @@ async fn review_typed_edit_validates_origin_before_group_lookup() {
     assert!(matches!(
         fixture
             .client
-            .edit_message_ref(&target, wa::Message::text("bad"))
+            .edit_message(EditRequest::new(target.clone(), wa::Message::text("bad")))
             .await,
         Err(SendError::MessageRef(MessageRefError::UnsupportedOrigin))
     ));
@@ -1055,7 +1065,7 @@ async fn review_unknown_group_subtype_queries_and_rejects_confirmed_cag() {
         let target =
             MessageRef::new(&chat, MessageId::new("CAG_TARGET").unwrap(), None, true).unwrap();
         client
-            .edit_message_ref(&target, wa::Message::text("bad"))
+            .edit_message(EditRequest::new(target, wa::Message::text("bad")))
             .await
     });
     let sent = crate::test_utils::decode_sent_iq(&fixture.transport, 0).await;
@@ -1109,7 +1119,7 @@ async fn review_metadata_errors_preserve_source_and_rejection_allocation() {
             let target = content.message_ref().unwrap();
             if edit {
                 client
-                    .edit_message_ref(&target, wa::Message::text("bad"))
+                    .edit_message(EditRequest::new(target.clone(), wa::Message::text("bad")))
                     .await
             } else {
                 client.pin_message_ref(&target, PinDuration::Days7).await

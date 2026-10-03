@@ -6,8 +6,8 @@ use whatsapp_rust::prelude::MessageBuilderExt;
 use whatsapp_rust::wacore::types::events::InboundMessage;
 use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
 use whatsapp_rust::{
-    Client, MessageId, MessageRef, MessageRefError, NewsletterMessageRef, PinDuration, SendResult,
-    ServerMessageId, StanzaId, anyhow, async_trait, waproto::whatsapp as wa,
+    Client, EditRequest, MessageId, MessageRef, MessageRefError, NewsletterMessageRef, PinDuration,
+    SendResult, ServerMessageId, StanzaId, anyhow, async_trait, waproto::whatsapp as wa,
 };
 
 #[async_trait]
@@ -26,8 +26,11 @@ impl MessageOperations for Client {
         target: &MessageRef<'_>,
         post: &NewsletterMessageRef<'_>,
     ) -> anyhow::Result<()> {
-        self.edit_message_ref(target, wa::Message::text("replacement"))
-            .await?;
+        self.edit_message(EditRequest::new(
+            target.clone(),
+            wa::Message::text("replacement"),
+        ))
+        .await?;
         self.revoke_message_ref(target).await?;
         self.send_reaction_ref(target, "👍").await?;
         self.pin_message_ref(target, PinDuration::Days7).await?;
@@ -41,9 +44,9 @@ impl MessageOperations for Client {
             .send_poll_vote_ref(post, &[[7; 32]])
             .await?;
         self.newsletter()
-            .edit_message_ref(post, wa::Message::text("replacement"))
+            .edit_message(post, wa::Message::text("replacement"))
             .await?;
-        self.newsletter().revoke_message_ref(post).await?;
+        self.newsletter().revoke_message(post).await?;
         Ok(())
     }
 }
@@ -72,11 +75,7 @@ fn returned_result_references<'a>(
     dm: &'a SendResult,
     channel: &'a SendResult,
 ) -> Result<(MessageRef<'a>, NewsletterMessageRef<'a>, StanzaId), MessageRefError> {
-    Ok((
-        dm.message_ref()?,
-        channel.newsletter_ref()?,
-        dm.stanza_id()?,
-    ))
+    Ok((dm.message_ref()?, channel.newsletter_ref()?, dm.stanza_id()))
 }
 
 #[test]

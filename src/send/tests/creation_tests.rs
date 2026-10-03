@@ -11,7 +11,7 @@ fn assert_poll_debug_and_borrowing(created: &CreatedPoll) {
     let result = created.send_result();
     let count = Arc::strong_count(&result.message);
     let reference = created.poll_ref().unwrap();
-    assert_eq!(reference.message().id().as_str(), result.message_id);
+    assert_eq!(reference.message().id(), &result.message_id);
     assert!(reference.message().from_me());
     assert!(std::ptr::eq(reference.message().chat(), &result.to));
     assert!(std::ptr::eq(reference.creator(), created.creator()));
@@ -85,7 +85,7 @@ async fn check_poll(client: &Arc<Client>, created: &CreatedPoll, group: bool) ->
             .decrypt_vote(
                 cipher,
                 reference.secret().as_bytes(),
-                &vote.message_id,
+                vote.message_id.as_str(),
                 reference.creator(),
                 reference.creator()
             )
@@ -100,7 +100,7 @@ async fn check_event(client: &Arc<Client>, created: &CreatedEvent, group: bool) 
     let result = created.send_result();
     let count = Arc::strong_count(&result.message);
     let reference = created.event_ref().unwrap();
-    assert_eq!(reference.message().id().as_str(), result.message_id);
+    assert_eq!(reference.message().id(), &result.message_id);
     assert!(std::ptr::eq(reference.secret(), created.secret()));
     assert_eq!(Arc::strong_count(&result.message), count);
     assert_redacted(created, "CreatedEvent");
@@ -128,7 +128,7 @@ async fn check_event(client: &Arc<Client>, created: &CreatedEvent, group: bool) 
         enc.enc_payload.as_deref().unwrap(),
         enc.enc_iv.as_deref().unwrap(),
         created.secret().as_bytes(),
-        &result.message_id,
+        result.message_id.as_str(),
         &created.creator().to_string(),
         &created.creator().to_string(),
     )
@@ -140,7 +140,7 @@ async fn check_event(client: &Arc<Client>, created: &CreatedEvent, group: bool) 
             enc.enc_payload.as_deref().unwrap(),
             enc.enc_iv.as_deref().unwrap(),
             &[0; 32],
-            &result.message_id,
+            result.message_id.as_str(),
             &created.creator().to_string(),
             &created.creator().to_string(),
         )
@@ -294,7 +294,7 @@ async fn group_created_references_preserve_pn_lid_and_decrypt_real_wire() {
             .polls()
             .vote_raw(
                 &fixture.group,
-                &poll.send_result().message_id,
+                poll.send_result().message_id.as_str(),
                 poll.creator(),
                 poll.secret().as_bytes(),
                 &["Yes".to_owned()],
@@ -306,7 +306,7 @@ async fn group_created_references_preserve_pn_lid_and_decrypt_real_wire() {
             .events()
             .respond_raw(
                 &fixture.group,
-                &event.send_result().message_id,
+                event.send_result().message_id.as_str(),
                 event.creator(),
                 event.secret().as_bytes(),
                 EventResponseType::Going,
@@ -444,7 +444,7 @@ async fn malformed_raw_inputs_fail_before_wire_and_debug_has_negative_controls()
     assert_eq!(transport.sent_count(), 0);
     let secret = MessageSecret::from_bytes([177; 32]);
     let raw = SendResult {
-        message_id: "SECRET-CONTROL".into(),
+        message_id: crate::MessageId::new("SECRET-CONTROL").unwrap(),
         to: peer.clone(),
         recipient_fanout: None,
         message: Arc::new(wa::Message {

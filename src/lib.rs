@@ -293,7 +293,10 @@ pub mod runtime_impl;
 pub use runtime_impl::TokioRuntime;
 pub use wacore::runtime::Runtime;
 pub mod send;
-pub use send::{EditOptions, PinDuration, RevokeType, SendError, SendOptions, SendResult};
+pub use send::{
+    EditOptions, EditRequest, PinDuration, RevokeType, SendError, SendOptions, SendRequest,
+    SendResult,
+};
 pub use wacore::send::StanzaType;
 pub mod media;
 pub mod session;
@@ -412,7 +415,9 @@ pub mod prelude {
     pub use crate::request::{IqError, RejectionStanza};
     #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
     pub use crate::runtime_impl::TokioRuntime;
-    pub use crate::send::{EditOptions, SendError, SendOptions, SendResult};
+    pub use crate::send::{
+        EditOptions, EditRequest, SendError, SendOptions, SendRequest, SendResult,
+    };
     #[cfg(feature = "signal")]
     pub use crate::shutdown::shutdown_signal;
     pub use crate::store::StoreRelease;
