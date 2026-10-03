@@ -1290,10 +1290,17 @@ async fn apply_group_control(client: &Client, call: &IncomingCall, generation: u
                 GroupStateApply::Applied => {
                     // Media follows the committed snapshot, not the raw update: the committed one
                     // keeps the relay and the pids a roster-only update leaves out.
-                    let committed = registry
+                    let Some(committed) = registry
                         .group_state_if_current(&update.call_id, generation)
                         .and_then(|group| group.snapshot().cloned())
-                        .unwrap_or_else(|| update.as_ref().clone());
+                    else {
+                        // A concurrently ended/replaced generation has no snapshot to publish.
+                        // Never substitute the raw roster that omits inherited relay/PID state.
+                        debug!(
+                            "committed group snapshot no longer available for call generation {generation}"
+                        );
+                        return false;
+                    };
                     if !registry.send_group_update_if_current(
                         &update.call_id,
                         generation,

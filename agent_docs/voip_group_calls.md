@@ -19,7 +19,7 @@ phone (creator)            call service (<call_id>@call)            this device
       │                       ◀── <accept>     (accept_group_invite)  ────│
       │                       ── <group_update tx=N rekey=1><relay …/> ─▶ │  relay + roster
       │                       ── <group_update tx=N+2> (roster only) ───▶ │
-      │                       ◀── <preaccept>/<accept> with media ────────│  start() completes
+      │                                                                 │  start() attaches media
       │ ◀─────────── <enc_rekey> (our epoch, Signal-encrypted) ──────────│  rekey=1 → we fan out
       │ ◀════════════ RTP/RTCP through the relay (WARP/E2E-SRTP) ════════▶│
       │                       ── <terminate reason=group_call_ended> ───▶ │  call ends
@@ -30,16 +30,18 @@ phone (creator)            call service (<call_id>@call)            this device
    (`insert_ringing_group_if_inactive`) and the `IncomingCall` carries that ringing generation.
 2. **Answering the invitation.** The call service sends the relay-bearing `group_update` only
    after this device has pre-accepted and accepted the invitation. `AcceptCall::start()` therefore
-   calls `Voip::preaccept_group_invite` and `Voip::accept_group_invite` before it waits for the
-   relay (`OFFER_ACK_RELAY_TIMEOUT`). Both stay public for applications that answer early, while
-   the invitation still rings.
+   claims the ringing generation and sends one `<preaccept>` and one `<accept>` with the selected
+   media parameters before waiting for the relay (`OFFER_ACK_RELAY_TIMEOUT`). Timeout, cancellation
+   or setup failure owns generation-aware termination. The separate `Voip::preaccept_group_invite`
+   and `Voip::accept_group_invite` methods remain public low-level responses; this example does not
+   call them before `start()`.
 3. **Relay snapshot.** `group_update` arrives from `<call_id>@call`, not from the creator's device.
    `apply_group_control` accepts that address (`is_call_service_sender`) in addition to the
    creator. The snapshot that carries the relay can arrive *after* a newer roster-only one (live:
    `tx=13` with relay after `tx=15` without). `GroupCallState::apply_update` keeps the newer
    roster and adopts the late relay. A relay already held is never replaced by an older one.
-4. **Media.** `start()` builds a group engine from the snapshot, connects the relay, and sends
-   its own `<preaccept>`/`<accept>` with audio parameters. The receiver subscription in the STUN
+4. **Media.** `start()` builds a group engine from the snapshot and connects the relay, without
+   repeating the invitation responses. The receiver subscription in the STUN
    Allocate lists the pids of the connected remote devices.
 5. **Epoch.** If the snapshot has `rekey="1"`, this device generates the group epoch and sends it
    to every connected remote device as `<enc_rekey>`. Inbound RTP stays gated until an epoch is
@@ -68,7 +70,13 @@ phone (creator)            call service (<call_id>@call)            this device
 
 An application that answers allowed group calls and exchanges audio with another system, such as
 a speech model. Audio is 16 kHz mono `i16`, exactly 960 samples (60 ms) per frame, in both
-directions (see `voip_audio_codecs.md`).
+directions (see `voip_audio_codecs.md`). The application must declare both dependencies:
+
+```toml
+[dependencies]
+whatsapp-rust = { version = "0.7", features = ["voip"] }
+tokio = { version = "1", features = ["rt", "time"] }
+```
 
 ```rust
 use std::sync::Arc;
@@ -159,6 +167,6 @@ Notes for applications:
 | --- | --- |
 | `start()` fails with `call service request timed out` | The invitation was not answered before the relay wait (step 2), or the relay snapshot was rejected (steps 3 and 6) |
 | `rejected group snapshot from non-creator sender` | A `group_update` from `<call_id>@call` reached a build without `is_call_service_sender` |
-| `rejected invalid group snapshot` | A snapshot rule rejected it. Typical cases: a relay `transaction-id` compared with the roster's, or a pid of 0 |
+| `rejected invalid group snapshot` | A snapshot rule rejected it, such as duplicate PIDs or an invalid participant/device roster. Only older builds rejected independent relay/roster `transaction-id`s or PID 0; both are supported here. |
 | The roster lists the device as connected, but `rtp_received` stops after a few packets | The receiver subscription was re-sent without the remote pids (step 6) |
 | Every frame is silent and `rtp_received` grows | The epoch is not installed, or the codec does not match the stream (`voip_audio_codecs.md`) |
