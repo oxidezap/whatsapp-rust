@@ -73,13 +73,6 @@ impl GroupCallState {
         if !valid_group_snapshot(&update) {
             return GroupStateApply::InvalidSnapshot;
         }
-        if self
-            .snapshot
-            .as_ref()
-            .is_some_and(|current| update.transaction_id <= current.transaction_id)
-        {
-            return GroupStateApply::Stale;
-        }
         if let Some(current_group_jid) = self
             .snapshot
             .as_ref()
@@ -94,6 +87,68 @@ impl GroupCallState {
             }
         }
 
+        if let Some(current) = self.snapshot.as_mut()
+            && update.transaction_id <= current.transaction_id
+        {
+            // Relay allocations and rosters have independent epochs. An older roster may supply
+            // the first relay, but only after the established group identity has been checked.
+            if current.relay.is_none() && update.relay.is_some() {
+                current.relay = update.relay;
+                return GroupStateApply::Applied;
+            }
+            return GroupStateApply::Stale;
+        }
+        // Roster-only updates omit unchanged PIDs. Stabilize the candidate before validation:
+        // an explicit reassignment can collide with an inherited PID (including PID zero).
+        if let Some(previous) = self.snapshot.as_ref() {
+            let mut known: HashMap<_, _> = previous
+                .participants
+                .iter()
+                .flat_map(|participant| &participant.devices)
+                .filter_map(|device| device.pid.map(|pid| (device.jid.clone(), pid)))
+                .collect();
+            // Exact namespace advertisements take precedence; mapped aliases are fallback only.
+            for participant in &previous.participants {
+                for device in &participant.devices {
+                    if let Some(pid) = device.pid
+                        && let Some(alias) = mapped_group_device(
+                            &participant.jid,
+                            participant.pn.as_ref(),
+                            &device.jid,
+                        )
+                    {
+                        known.entry(alias).or_insert(pid);
+                    }
+                }
+            }
+            for participant in update.participants.iter_mut().filter(|p| p.is_connected()) {
+                for device in &mut participant.devices {
+                    if device.pid.is_none() {
+                        device.pid = known.get(&device.jid).copied().or_else(|| {
+                            mapped_group_device(
+                                &participant.jid,
+                                participant.pn.as_ref(),
+                                &device.jid,
+                            )
+                            .and_then(|alias| known.get(&alias).copied())
+                        });
+                    }
+                }
+            }
+        }
+        if update.relay.is_none() {
+            // Roster-only updates do not revoke the relay allocation. The media engine follows the
+            // same absent-means-no-refresh rule, so the durable snapshot must retain the last usable
+            // relay for builders that attach after this transaction commits.
+            update.relay = self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.relay.clone());
+        }
+        if !valid_group_snapshot(&update) {
+            return GroupStateApply::InvalidSnapshot;
+        }
+        // Only the fully validated candidate may consume a transaction or alter participant controls.
         let canonical = update
             .participants
             .iter()
@@ -122,15 +177,6 @@ impl GroupCallState {
                         .map(|canonical| (canonical, screen_share))
                 })
                 .collect();
-        }
-        if update.relay.is_none() {
-            // Roster-only updates do not revoke the relay allocation. The media engine follows the
-            // same absent-means-no-refresh rule, so the durable snapshot must retain the last usable
-            // relay for builders that attach after this transaction commits.
-            update.relay = self
-                .snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.relay.clone());
         }
         self.snapshot = Some(update);
         GroupStateApply::Applied
@@ -191,6 +237,30 @@ impl GroupCallState {
     }
 }
 
+// PID continuity alone may use the roster's explicit PN/LID mapping. Preserve the full device
+// suffix and never rewrite the stored JID: media/Signal namespaces and their key derivations differ.
+fn mapped_group_device(owner: &Jid, pn: Option<&Jid>, device: &Jid) -> Option<Jid> {
+    let pn = pn?;
+    if owner.server != wacore_binary::Server::Lid
+        || pn.server != wacore_binary::Server::Pn
+        || owner.integrator != pn.integrator
+    {
+        return None;
+    }
+    let user = device.to_non_ad();
+    let alternate = if user == owner.to_non_ad() {
+        pn
+    } else if user == pn.to_non_ad() {
+        owner
+    } else {
+        return None;
+    };
+    let mut alias = device.clone();
+    alias.user = alternate.user.clone();
+    alias.server = alternate.server;
+    Some(alias)
+}
+
 impl crate::stats::HeapSize for GroupCallState {
     fn heap_bytes(&self) -> usize {
         use core::mem::size_of;
@@ -239,14 +309,8 @@ fn valid_group_snapshot(update: &GroupCallUpdate) -> bool {
     {
         return false;
     }
-    if update
-        .relay
-        .as_ref()
-        .and_then(|relay| relay.transaction_id)
-        .is_some_and(|transaction_id| transaction_id != update.transaction_id)
-    {
-        return false;
-    }
+    // The relay's transaction_id numbers relay allocations, not roster transactions (live: relay
+    // transaction-id 1 inside group_update transaction-id 13), so the two are not compared.
 
     let mut users = HashSet::with_capacity(update.participants.len());
     let mut pids = HashSet::new();
@@ -265,7 +329,8 @@ fn valid_group_snapshot(update: &GroupCallUpdate) -> bool {
                         .as_ref()
                         .is_some_and(|pn| device_user == pn.to_non_ad()))
                     && devices.insert(device.jid.clone())
-                    && device.pid.is_none_or(|pid| pid != 0 && pids.insert(pid))
+                    // pid 0 is a real participant id: the call creator gets it.
+                    && device.pid.is_none_or(|pid| pids.insert(pid))
             })
     }) && validate_group_snapshot_for_media(update).is_ok()
 }
@@ -299,7 +364,7 @@ pub(crate) fn validate_group_snapshot_for_media(update: &GroupCallUpdate) -> Res
             continue;
         };
         let participant_id = format_e2e_srtp_participant_id(&device.jid.to_string());
-        if pid == 0 || !pids.insert(pid) || !devices.insert(participant_id.clone()) {
+        if !pids.insert(pid) || !devices.insert(participant_id.clone()) {
             return Err(());
         }
         let audio_ssrc = derive_wasm_participant_ssrc(&update.call_id, &participant_id, 0);
@@ -540,6 +605,324 @@ mod tests {
                 .and_then(|snapshot| snapshot.relay.as_ref()),
             Some(&relay),
             "an omitted relay is a roster-only update, not allocation revocation"
+        );
+    }
+
+    fn relay_tx(transaction_id: u32) -> GroupCallRelay {
+        GroupCallRelay::builder()
+            .transaction_id(transaction_id)
+            .self_pid(1)
+            .uuid("RELAY-UUID".to_string())
+            .participant_uuid("PARTICIPANT-UUID".to_string())
+            .attribute_padding(false)
+            .warp_mi_tag_len(16)
+            .endpoints(Vec::new())
+            .build()
+    }
+
+    fn without_pid(mut participant: GroupCallParticipant) -> GroupCallParticipant {
+        for device in &mut participant.devices {
+            device.pid = None;
+        }
+        participant
+    }
+
+    #[test]
+    fn relay_transaction_is_independent_of_the_roster_transaction() {
+        let mut state = GroupCallState::new("CALL", creator());
+        let mut snapshot = update(13, vec![participant("100001", "connected", 1)]);
+        snapshot.relay = Some(relay_tx(1));
+        assert_eq!(state.apply_update(snapshot), GroupStateApply::Applied);
+        assert_eq!(
+            state
+                .snapshot()
+                .and_then(|snapshot| snapshot.relay.as_ref())
+                .and_then(|relay| relay.transaction_id),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_late_relay_on_an_older_transaction_is_adopted_without_regressing_the_roster() {
+        let mut state = GroupCallState::new("CALL", creator());
+        let newer = update(
+            15,
+            vec![
+                participant("100001", "connected", 1),
+                participant("200002", "connected", 2),
+            ],
+        );
+        assert_eq!(state.apply_update(newer), GroupStateApply::Applied);
+
+        let mut older = update(13, vec![participant("100001", "connected", 1)]);
+        older.relay = Some(relay_tx(1));
+        assert_eq!(state.apply_update(older), GroupStateApply::Applied);
+        let snapshot = state.snapshot().expect("snapshot");
+        assert_eq!(snapshot.transaction_id, 15, "the newer roster stays");
+        assert_eq!(snapshot.participants.len(), 2);
+        assert!(snapshot.relay.is_some(), "the late relay is adopted");
+
+        let mut stale = update(14, vec![participant("100001", "connected", 1)]);
+        stale.relay = Some(relay_tx(2));
+        assert_eq!(
+            state.apply_update(stale),
+            GroupStateApply::Stale,
+            "an older relay never replaces one already held"
+        );
+    }
+
+    #[test]
+    fn late_relay_cannot_bypass_an_established_group_identity() {
+        for transaction_id in [13, 15, 16] {
+            let mut state = GroupCallState::new("CALL", creator());
+            let mut current = update(15, vec![participant("100001", "connected", 0)]);
+            current.group_jid = Some(Jid::new("100001-200002", Server::Group));
+            assert_eq!(
+                state.apply_update(current.clone()),
+                GroupStateApply::Applied
+            );
+            let mut conflicting = update(transaction_id, current.participants.clone());
+            conflicting.group_jid = Some(Jid::new("300003-400004", Server::Group));
+            conflicting.relay = Some(relay_tx(1));
+            assert_eq!(
+                state.apply_update(conflicting),
+                GroupStateApply::IdentityMismatch
+            );
+            assert_eq!(
+                state.snapshot(),
+                Some(&current),
+                "rejection is mutation-free"
+            );
+
+            let mut matching = update(transaction_id, current.participants.clone());
+            matching.relay = Some(relay_tx(1));
+            assert_eq!(state.apply_update(matching), GroupStateApply::Applied);
+            let committed = state.snapshot().expect("snapshot");
+            assert_eq!(committed.transaction_id, transaction_id.max(15));
+            assert_eq!(committed.group_jid, current.group_jid);
+            assert_eq!(committed.participants, current.participants);
+            assert_eq!(committed.relay, Some(relay_tx(1)));
+        }
+    }
+
+    #[test]
+    fn restored_pid_collisions_do_not_consume_transactions_or_controls() {
+        for pid in [0, 1] {
+            let mut state = GroupCallState::new("CALL", creator());
+            let current = update(1, vec![participant("100001", "connected", pid)]);
+            assert_eq!(
+                state.apply_update(current.clone()),
+                GroupStateApply::Applied
+            );
+            let hand = current.participants[0].jid.clone();
+            state.set_raised_hand(&hand, true);
+            let share = ScreenShare {
+                state: ScreenShareState::Started,
+                version: 2,
+                screen_share_id: Some(7),
+            };
+            state.set_screen_share(&hand, share.clone());
+            let mut collision = update(
+                2,
+                vec![
+                    without_pid(participant("100001", "connected", pid)),
+                    participant("200002", "connected", pid),
+                ],
+            );
+            collision.media = "audio".to_string();
+            collision.relay = Some(relay_tx(9));
+            assert_eq!(
+                state.apply_update(collision),
+                GroupStateApply::InvalidSnapshot
+            );
+            assert_eq!(state.snapshot(), Some(&current));
+            assert!(state.raised_hands().contains(&hand));
+            assert_eq!(state.screen_shares().get(&hand), Some(&share));
+
+            let corrected = update(
+                2,
+                vec![
+                    without_pid(participant("100001", "connected", pid)),
+                    participant("200002", "connected", pid + 2),
+                ],
+            );
+            assert_eq!(state.apply_update(corrected), GroupStateApply::Applied);
+            assert_eq!(
+                state.snapshot().expect("snapshot").participants[0].devices[0].pid,
+                Some(pid)
+            );
+            assert!(validate_group_snapshot_for_media(state.snapshot().expect("snapshot")).is_ok());
+        }
+    }
+
+    #[test]
+    fn pid_restoration_uses_only_explicit_pn_lid_device_mapping() {
+        let lid = Jid::new("200002", Server::Lid);
+        let pn = Jid::new("15550002002", Server::Pn);
+        for (old_identity, new_identity) in [(&lid, &pn), (&pn, &lid)] {
+            let mut state = GroupCallState::new("CALL", creator());
+            let mut old = participant("200002", "connected", 0);
+            old.pn = Some(pn.clone());
+            old.devices[0].jid = old_identity.with_device(1);
+            assert_eq!(
+                state.apply_update(update(1, vec![old])),
+                GroupStateApply::Applied
+            );
+            let mut new = without_pid(participant("200002", "connected", 0));
+            new.pn = Some(pn.clone());
+            new.devices[0].jid = new_identity.with_device(1);
+            assert_eq!(
+                state.apply_update(update(2, vec![new.clone()])),
+                GroupStateApply::Applied
+            );
+            assert_eq!(
+                state.snapshot().expect("snapshot").participants[0].devices[0].pid,
+                Some(0)
+            );
+            assert_eq!(
+                state.snapshot().expect("snapshot").participants[0].devices[0].jid,
+                new.devices[0].jid,
+                "PID continuity must not rewrite the media crypto namespace"
+            );
+
+            new.devices[0].jid = new_identity.with_device(2);
+            assert_eq!(
+                state.apply_update(update(3, vec![new])),
+                GroupStateApply::Applied
+            );
+            assert_eq!(
+                state.snapshot().expect("snapshot").participants[0].devices[0].pid,
+                None,
+                "a sibling device cannot inherit the other device's PID"
+            );
+        }
+        let mut state = GroupCallState::new("CALL", creator());
+        assert_eq!(
+            state.apply_update(update(1, vec![participant("200002", "connected", 0)])),
+            GroupStateApply::Applied
+        );
+        let mut unrelated = without_pid(participant("200002", "connected", 0));
+        unrelated.jid = Jid::new("200002", Server::Pn);
+        unrelated.devices[0].jid = unrelated.jid.with_device(1);
+        assert_eq!(
+            state.apply_update(update(2, vec![unrelated])),
+            GroupStateApply::Applied
+        );
+        assert_eq!(
+            state.snapshot().expect("snapshot").participants[0].devices[0].pid,
+            None,
+            "equal user text in different namespaces is not an identity mapping"
+        );
+    }
+
+    #[test]
+    fn pid_restoration_prefers_explicit_namespace_pids_over_aliases() {
+        for reverse in [false, true] {
+            let mut owner = participant("100001", "connected", 0);
+            owner.pn = Some(Jid::new("200002", Server::Pn));
+            let lid_device = owner.devices[0].jid.clone();
+            let mut pn_device = owner.devices[0].clone();
+            pn_device.jid = Jid::new("200002", Server::Pn).with_device(lid_device.device);
+            pn_device.pid = Some(1);
+            let pn_jid = pn_device.jid.clone();
+            owner.devices.push(pn_device);
+            if reverse {
+                owner.devices.reverse();
+            }
+            let mut state = GroupCallState::new("CALL", creator());
+            assert_eq!(
+                state.apply_update(update(1, vec![owner.clone()])),
+                GroupStateApply::Applied
+            );
+            for device in &mut owner.devices {
+                device.pid = None;
+            }
+            assert_eq!(
+                state.apply_update(update(2, vec![owner])),
+                GroupStateApply::Applied
+            );
+            let devices = &state.snapshot().unwrap().participants[0].devices;
+            assert_eq!(
+                devices
+                    .iter()
+                    .find(|device| device.jid == lid_device)
+                    .unwrap()
+                    .pid,
+                Some(0)
+            );
+            assert_eq!(
+                devices
+                    .iter()
+                    .find(|device| device.jid == pn_jid)
+                    .unwrap()
+                    .pid,
+                Some(1)
+            );
+        }
+    }
+
+    #[test]
+    fn pid_zero_is_a_valid_participant_id() {
+        let mut state = GroupCallState::new("CALL", creator());
+        assert_eq!(
+            state.apply_update(update(
+                1,
+                vec![
+                    participant("100001", "connected", 0),
+                    participant("200002", "connected", 1),
+                ],
+            )),
+            GroupStateApply::Applied,
+            "the call creator is pid 0 on live calls"
+        );
+        assert_eq!(
+            state.apply_update(update(
+                2,
+                vec![
+                    participant("100001", "connected", 0),
+                    participant("200002", "connected", 0),
+                ],
+            )),
+            GroupStateApply::InvalidSnapshot,
+            "pids stay unique"
+        );
+    }
+
+    #[test]
+    fn roster_updates_without_pids_keep_the_known_pids() {
+        let mut state = GroupCallState::new("CALL", creator());
+        assert_eq!(
+            state.apply_update(update(
+                1,
+                vec![
+                    participant("100001", "connected", 0),
+                    participant("200002", "connected", 1),
+                ],
+            )),
+            GroupStateApply::Applied
+        );
+        assert_eq!(
+            state.apply_update(update(
+                2,
+                vec![
+                    without_pid(participant("100001", "connected", 0)),
+                    without_pid(participant("200002", "connected", 1)),
+                    without_pid(participant("300003", "invited", 9)),
+                ],
+            )),
+            GroupStateApply::Applied
+        );
+        let pids: Vec<_> = state
+            .snapshot()
+            .expect("snapshot")
+            .participants
+            .iter()
+            .map(|participant| participant.devices[0].pid)
+            .collect();
+        assert_eq!(
+            pids,
+            vec![Some(0), Some(1), None],
+            "absent pids mean unchanged; a device never seen with a pid stays pid-less"
         );
     }
 

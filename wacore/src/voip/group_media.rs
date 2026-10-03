@@ -870,6 +870,73 @@ mod tests {
     }
 
     #[test]
+    fn creator_receiver_pid_zero_survives_a_pidless_roster_and_decrypts_media() {
+        use crate::voip_control::group::{GroupCallState, GroupStateApply};
+
+        let epoch = [0x42; 32];
+        let local = Jid::new("100001", Server::Lid).with_device(1);
+        let creator = Jid::new("200002", Server::Lid).with_device(2);
+        let mut first = update(7, vec![device("100001", 1, 1), device("200002", 2, 0)]);
+        first.call_creator = creator.clone();
+        let mut state = GroupCallState::new("CALL", creator.clone());
+        assert_eq!(state.apply_update(first.clone()), GroupStateApply::Applied);
+        let mut media = GroupMediaRegistry::new(
+            "CALL",
+            creator.clone(),
+            &local,
+            960,
+            WARP_MI_TAG_LEN,
+            VIDEO_TS_STRIDE_15FPS,
+        )
+        .unwrap();
+        assert_eq!(
+            media.apply_raw_epoch(7, &epoch).unwrap(),
+            GroupEpochApply::Buffered
+        );
+        assert_eq!(
+            media.apply_group_update(state.snapshot().unwrap()).unwrap(),
+            GroupRosterApply::Applied
+        );
+        assert_eq!(
+            media.active_pids(),
+            [0],
+            "the creator is a genuine remote receiver"
+        );
+        let payload = [0x50, 1, 2, 3, 4, 5, 6, 7];
+        let mut sender = peer_sender(&epoch, &creator);
+        assert_eq!(
+            media
+                .unprotect_audio(&sender.protect_audio(&payload))
+                .unwrap()
+                .payload,
+            payload
+        );
+
+        let mut next = first;
+        next.transaction_id = 8;
+        for participant in &mut next.participants {
+            for device in &mut participant.devices {
+                device.pid = None;
+            }
+        }
+        assert_eq!(state.apply_update(next), GroupStateApply::Applied);
+        assert_eq!(
+            media.apply_group_update(state.snapshot().unwrap()).unwrap(),
+            GroupRosterApply::Applied
+        );
+        assert_eq!(media.active_pids(), [0]);
+        assert_eq!(media.installed_epoch_transaction(), Some(7));
+        let received = media
+            .unprotect_audio(&sender.protect_audio(&payload))
+            .unwrap();
+        assert_eq!(
+            received.device_jid, creator,
+            "crypto keeps the authoritative LID device namespace"
+        );
+        assert_eq!(received.payload, payload);
+    }
+
+    #[test]
     fn future_epoch_activates_when_roster_arrives_and_routes_by_ssrc() {
         let epoch = [0x42; 32];
         let alice = Jid::new("200002", Server::Lid).with_device(2);

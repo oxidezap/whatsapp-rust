@@ -299,27 +299,6 @@ impl<'a> AcceptCall<'a> {
             ),
             None => None,
         };
-        if self.incoming.group.is_some()
-            && self.incoming.media().is_none()
-            && group
-                .as_ref()
-                .and_then(|update| update.relay.as_ref())
-                .is_none()
-            && let Some(generation) = group_generation
-        {
-            group = Some(
-                match wacore::runtime::timeout(
-                    &*self.client.runtime,
-                    OFFER_ACK_RELAY_TIMEOUT,
-                    wait_for_group_relay(&registry, call_id, generation),
-                )
-                .await
-                {
-                    Ok(result) => result?,
-                    Err(_) => return Err(CallError::ResponseTimeout),
-                },
-            );
-        }
         if group
             .as_ref()
             .is_some_and(|group| (group.media == "video") != *offered_video)
@@ -329,7 +308,14 @@ impl<'a> AcceptCall<'a> {
             ));
         }
         let is_group = group.is_some();
-        if self.incoming.media().is_none()
+        let needs_group_relay = is_group
+            && self.incoming.media().is_none()
+            && group
+                .as_ref()
+                .and_then(|group| group.relay.as_ref())
+                .is_none();
+        if !needs_group_relay
+            && self.incoming.media().is_none()
             && group
                 .as_ref()
                 .and_then(|group| group.relay.as_ref())
@@ -361,11 +347,29 @@ impl<'a> AcceptCall<'a> {
             (announcer, orientation)
         });
         session.group = group.clone();
-        // Register BEFORE the decrypt await. A peer <terminate> can now reap this generation during
+        if is_group {
+            session.transition_to(CallPhase::Connecting);
+        }
+        // Register BEFORE any invitation response or the decrypt await. A peer <terminate> can now reap this generation during
         // setup, instead of falling through terminate_call as an unknown call and letting us accept
         // a call that has already ended.
         let mut registration = if let Some(generation) = group_generation {
             let _answer_transition = self.client.lock_answer_transition(call_id).await;
+            // Claim once under the same lane as teardown/replacement, before any response is sent.
+            if registry.ringing_group_generation(call_id, call_creator) != Some(generation) {
+                return Err(CallError::CallEndedDuringSetup);
+            }
+            group = registry
+                .group_state_if_current(call_id, generation)
+                .and_then(|state| state.snapshot().cloned());
+            if group
+                .as_ref()
+                .is_some_and(|group| (group.media == "video") != *offered_video)
+            {
+                return Err(CallError::Response(
+                    "group offer signaling and roster media modes differ".to_string(),
+                ));
+            }
             if !registry.promote_ringing_group_if_current(session, generation) {
                 return Err(CallError::CallEndedDuringSetup);
             }
@@ -384,6 +388,39 @@ impl<'a> AcceptCall<'a> {
             &preaccept_id,
             &accept_id,
         )?;
+        // Transfer removal ownership to the generation-aware teardown before the first ambiguous
+        // write. RegisteredCall::drop must not reap the generation before teardown can claim it.
+        teardown.arm();
+        registration.disarm();
+        let (preaccept, accept) = if needs_group_relay {
+            // An invitation with no relay must answer first to trigger the relay allocation. Use
+            // the selected media answer once, rather than sending a second pair after the wait.
+            send_answer_node(self.client, &registration, &mut teardown, preaccept).await?;
+            send_answer_node(self.client, &registration, &mut teardown, accept).await?;
+            group = Some(
+                match wacore::runtime::timeout(
+                    &*self.client.runtime,
+                    OFFER_ACK_RELAY_TIMEOUT,
+                    wait_for_group_relay(&registry, call_id, registration.generation),
+                )
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => return Err(CallError::ResponseTimeout),
+                },
+            );
+            if group
+                .as_ref()
+                .is_some_and(|group| (group.media == "video") != *offered_video)
+            {
+                return Err(CallError::Response(
+                    "group offer signaling and roster media modes differ".to_string(),
+                ));
+            }
+            (None, None)
+        } else {
+            (Some(preaccept), Some(accept))
+        };
         let (spec, built_call_id) = send_preaccept_then_prepare(
             self.client,
             &registration,
@@ -402,7 +439,9 @@ impl<'a> AcceptCall<'a> {
         registration.ensure_current()?;
         // Final acceptance waits until media setup succeeded and the registered generation is still
         // current; only then may the caller apply the participant keys and enter the call.
-        send_answer_node(self.client, &registration, &mut teardown, accept).await?;
+        if let Some(accept) = accept {
+            send_answer_node(self.client, &registration, &mut teardown, accept).await?;
+        }
         let result = open_registered_media(
             self.client,
             &registration,
@@ -1527,12 +1566,13 @@ async fn send_preaccept_then_prepare<T>(
     client: &Client,
     registration: &RegisteredCall,
     teardown: &mut AnswerTeardown,
-    preaccept: wacore_binary::Node,
+    preaccept: Option<wacore_binary::Node>,
     prepare: impl Future<Output = Result<T, CallError>>,
 ) -> Result<T, CallError> {
-    // Preaccept is the early device-selection response: send it before Signal decrypt/prekey I/O
-    // so the caller stops ringing sibling devices while this answer prepares its media.
-    send_answer_node(client, registration, teardown, preaccept).await?;
+    // Preaccept precedes Signal decrypt/prekey I/O unless the relay-less group path sent it already.
+    if let Some(preaccept) = preaccept {
+        send_answer_node(client, registration, teardown, preaccept).await?;
+    }
     match prepare.await {
         Ok(prepared) => Ok(prepared),
         Err(error) => {
@@ -5964,6 +6004,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relayless_group_invite_is_answered_before_waiting_for_the_relay() {
+        let (client, _sent) = make_sending_client().await;
+        let transport = Arc::new(crate::transport::mock::CapturingMockTransport::new());
+        install_noise_transport(&client, transport.clone()).await;
+        let mut incoming = incoming_offer(false);
+        let call_id = incoming.action.call_id().to_string();
+        incoming.group = Some(Box::new(
+            GroupCallUpdate::builder()
+                .call_id(call_id.clone())
+                .call_creator(caller())
+                .transaction_id(1)
+                .media("audio".to_string())
+                .connected_limit(32)
+                .joinable(true)
+                .av_upgradable(true)
+                .rekey_requested(false)
+                .participants(Vec::new())
+                .build(),
+        ));
+        let mut session = wacore::voip_control::CallSession::new_incoming(
+            incoming.action.call_id(),
+            incoming.from.clone(),
+            incoming.action.call_creator().clone(),
+        );
+        session.group = incoming.group.as_deref().cloned();
+        let generation = client
+            .call_registry()
+            .insert_ringing_group_if_inactive(session)
+            .expect("valid group snapshot")
+            .expect("ringing group generation");
+        incoming.set_ringing_generation(generation);
+        let call_service = Jid::new(&call_id, Server::Call).to_string();
+        let (_source_tx, source_rx) = async_channel::unbounded::<Bytes>();
+        let (sink_tx, _sink_rx) = async_channel::unbounded::<EncodedAudioFrame>();
+        let voip = client.voip();
+        let start = voip
+            .accept(&incoming)
+            .encoded_audio(AudioFormat::MLOW_16KHZ_60MS, source_rx, sink_tx)
+            .start();
+        tokio::pin!(start);
+
+        // Both responses can be sent in one polling burst. A second one-shot observer installed
+        // after the first response loses that accept; the transport retains the entire wire stream.
+        tokio::select! {
+            _ = async {
+                while transport.sent_count() < 2 {
+                    tokio::task::yield_now().await;
+                }
+            } => {},
+            _ = &mut start => panic!("start must not finish before the invitation is answered"),
+        }
+        let frames = crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0; 32]);
+        assert_eq!(frames.len(), 2);
+        for (frame, expected) in frames.iter().zip(["preaccept", "accept"]) {
+            let bytes = wacore_binary::util::unpack(frame).expect("frame");
+            let node = wacore_binary::OwnedNodeRef::new(bytes.into_owned()).expect("node");
+            assert_eq!(
+                node.get().get_attr("to").map(ToString::to_string),
+                Some(call_service.clone())
+            );
+            assert_eq!(
+                node.get().children().expect("action")[0].tag.as_ref(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn incoming_group_offer_rejects_conflicting_roster_media() {
         let client = make_client().await;
         let mut incoming = incoming_offer(true);
@@ -6394,8 +6502,13 @@ mod tests {
             }
         };
 
-        let answer =
-            send_preaccept_then_prepare(&client, &registration, &mut teardown, preaccept, prepare);
+        let answer = send_preaccept_then_prepare(
+            &client,
+            &registration,
+            &mut teardown,
+            Some(preaccept),
+            prepare,
+        );
         let observe = async {
             preaccept_waiter.await.expect("preaccept waiter");
             assert!(
@@ -6431,10 +6544,16 @@ mod tests {
         let (prepare_tx, prepare_rx) = async_channel::bounded(1);
 
         let answer = async {
-            send_preaccept_then_prepare(&client, &registration, &mut teardown, preaccept, async {
-                prepare_rx.recv().await.expect("release preparation");
-                Ok::<_, CallError>(())
-            })
+            send_preaccept_then_prepare(
+                &client,
+                &registration,
+                &mut teardown,
+                Some(preaccept),
+                async {
+                    prepare_rx.recv().await.expect("release preparation");
+                    Ok::<_, CallError>(())
+                },
+            )
             .await?;
             registration.ensure_current()?;
             send_answer_node(&client, &registration, &mut teardown, accept).await
@@ -12626,6 +12745,9 @@ mod tests {
         assert_eq!(ctl_rx.try_recv(), Err(async_channel::TryRecvError::Empty));
     }
 }
+
+#[cfg(test)]
+mod invited_group_tests;
 
 /// The control-plane vertical slice: a real `Client` with an injected `FakeMediaBackend`, compiled
 /// **without** the resident engine. This is the architectural gate for the seam — if any production

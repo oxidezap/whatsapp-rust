@@ -179,6 +179,7 @@ impl StanzaHandler for CallHandler {
                             &routed_call_sender(&call),
                         )
                     })
+                    && !is_call_service_sender(&routed_call_sender(&call), call.action.call_id())
                 {
                     warn!(
                         "call: rejected group terminate from non-creator sender for {}",
@@ -1277,7 +1278,8 @@ async fn apply_group_control(client: &Client, call: &IncomingCall, generation: u
                 generation,
                 &update.call_creator,
                 &sender,
-            ) {
+            ) && !is_call_service_sender(&sender, &update.call_id)
+            {
                 warn!(
                     "call: rejected group snapshot from non-creator sender for {}",
                     update.call_id
@@ -1286,10 +1288,23 @@ async fn apply_group_control(client: &Client, call: &IncomingCall, generation: u
             }
             match registry.apply_group_update_if_current(update.as_ref().clone(), generation) {
                 GroupStateApply::Applied => {
+                    // Media follows the committed snapshot, not the raw update: the committed one
+                    // keeps the relay and the pids a roster-only update leaves out.
+                    let Some(committed) = registry
+                        .group_state_if_current(&update.call_id, generation)
+                        .and_then(|group| group.snapshot().cloned())
+                    else {
+                        // A concurrently ended/replaced generation has no snapshot to publish.
+                        // Never substitute the raw roster that omits inherited relay/PID state.
+                        debug!(
+                            "committed group snapshot no longer available for call generation {generation}"
+                        );
+                        return false;
+                    };
                     if !registry.send_group_update_if_current(
                         &update.call_id,
                         generation,
-                        update.as_ref().clone(),
+                        committed,
                     ) {
                         warn!(
                             "call: terminating {} after its committed group snapshot could not reach media",
@@ -1458,6 +1473,14 @@ fn validate_group_epoch_key(raw_epoch: &[u8]) -> anyhow::Result<()> {
         anyhow::bail!("call key must contain exactly 32 bytes");
     }
     Ok(())
+}
+
+/// The call service's own address for this call, `<call_id>@call`. Live group calls deliver the
+/// authoritative `group_update` snapshots (including the relay an invited device needs to join)
+/// and the final `terminate` from it rather than from the creator's device.
+#[cfg(feature = "voip-control")]
+fn is_call_service_sender(sender: &Jid, call_id: &str) -> bool {
+    sender.server == Server::Call && sender.device == 0 && sender.user.as_str() == call_id
 }
 
 #[cfg(feature = "voip-control")]
@@ -1702,6 +1725,28 @@ mod tests {
                     .build()])
                 .build()])
             .build()
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[test]
+    fn call_service_sender_is_the_exact_call_address() {
+        let call_id = "GROUP-CALL";
+        assert!(is_call_service_sender(
+            &Jid::new(call_id, Server::Call),
+            call_id
+        ));
+        assert!(!is_call_service_sender(
+            &Jid::new("OTHER-CALL", Server::Call),
+            call_id
+        ));
+        assert!(!is_call_service_sender(
+            &Jid::new(call_id, Server::Lid),
+            call_id
+        ));
+        assert!(!is_call_service_sender(
+            &Jid::new(call_id, Server::Call).with_device(2),
+            call_id
+        ));
     }
 
     #[cfg(feature = "voip-control")]
