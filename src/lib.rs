@@ -250,9 +250,11 @@ pub mod handlers;
 pub use handlers::chatstate::ChatStateEvent;
 pub mod handshake;
 pub mod jid_utils;
-pub mod keepalive;
+// Worker modules contain only inherent Client operations, not host types.
+// Those operations remain public through Client rather than an empty module.
+mod keepalive;
 pub mod mediaconn;
-pub mod message;
+mod message;
 pub(crate) mod msg_secret_buffer;
 pub mod pair;
 pub mod pair_code;
@@ -305,12 +307,12 @@ pub use upload::UploadOptions;
 
 pub mod pdo;
 pub mod prekeys;
-pub mod receipt;
-pub mod retry;
+mod receipt;
+mod retry;
 pub mod unified_session;
 
 pub mod appstate_sync;
-pub mod history_sync;
+mod history_sync;
 pub mod usync;
 
 /// Declared syncd action names for log gating (generated, no `Schema` records).
@@ -348,16 +350,15 @@ pub use features::{
     ParticipantChangeResponse, ParticipantType, PictureType, PollError, PollOptionResult,
     PollVoteCiphertext, Polls, PreparedGroupHistoryShare, Presence, PresenceError, PresencePolicy,
     PresenceStatus, PreviousDescription, Price, Product, ProductAvailability, ProductImage,
-    ProductVideo, Profile, ProfileError, ProfilePicture, ProfilePictureLookup,
-    ProfilePictureLookupOptions, QuickReplies, ReachoutTimelock, ReportedGroupMessage,
-    ReportedGroupMessages, RetryReason, RetryRequestError, RetryRequestOptions,
-    RetryRequestOutcome, SalePrice, SecretEncKind, SecretEncrypted, SetProfilePictureResponse,
-    Signal, SignalError, SignalSessionInfo, SignalSessionMigration, StanzaRejection,
-    StanzaResponseError, Status, StatusPrivacySetting, StatusSendOptions, SubgroupKind,
-    SubgroupVisibility, SyncActionMessageRange, TcToken, TcTokenError, USERNAME_MAX_LENGTH,
-    USERNAME_MIN_LENGTH, UnlinkSubgroupsResult, UserInfo, UsernameLookup, UsernameLookupError,
-    UsernameLookupUser, UsyncSubprotocolError, VariantProperty, VerifiedName, message_key,
-    message_range,
+    ProductVideo, Profile, ProfileError, ProfilePicture, ProfilePictureLookup, QuickReplies,
+    ReachoutTimelock, ReportedGroupMessage, ReportedGroupMessages, RetryReason, RetryRequestError,
+    RetryRequestOptions, RetryRequestOutcome, SalePrice, SecretEncKind, SecretEncrypted,
+    SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo, SignalSessionMigration,
+    StanzaRejection, StanzaResponseError, Status, StatusPrivacySetting, StatusSendOptions,
+    SubgroupKind, SubgroupVisibility, SyncActionMessageRange, TcToken, TcTokenError,
+    USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UnlinkSubgroupsResult, UserInfo, UsernameLookup,
+    UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError, VariantProperty, VerifiedName,
+    message_key, message_range,
 };
 pub use features::{MexDoc, MexOperation};
 

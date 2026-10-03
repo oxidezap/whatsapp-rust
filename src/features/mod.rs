@@ -70,9 +70,9 @@ pub use comments::Comments;
 
 pub use contacts::{
     ContactError, Contacts, IsOnWhatsAppResult, ProfilePicture, ProfilePictureLookup,
-    ProfilePictureLookupOptions, ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType,
-    USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UserInfo, UsernameLookup, UsernameLookupError,
-    UsernameLookupUser, UsyncSubprotocolError, VerifiedName,
+    ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType, USERNAME_MAX_LENGTH,
+    USERNAME_MIN_LENGTH, UserInfo, UsernameLookup, UsernameLookupError, UsernameLookupUser,
+    UsyncSubprotocolError, VerifiedName,
 };
 
 pub use events::{EventCreationParams, EventResponseType, Events};

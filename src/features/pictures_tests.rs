@@ -1,8 +1,9 @@
 use super::*;
 use crate::ErrorChainExt;
 use crate::features::ContactError;
-use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq, server_error_iq};
+use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
 use std::sync::Arc;
+use wacore::iq::spec::IqSpec;
 use wacore_binary::{Node, NodeContent, OwnedNodeRef, builder::NodeBuilder};
 
 fn found_response() -> Node {
@@ -46,13 +47,27 @@ async fn canonical_roundtrip(
     Result<ProfilePictureLookup, ContactError>,
     Arc<OwnedNodeRef>,
 ) {
-    canonical_roundtrip_route(response, existing_id, false).await
+    canonical_roundtrip_route(
+        response,
+        existing_id,
+        Route::Contact,
+        ProfilePictureType::Preview,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Route {
+    Contact,
+    Group,
+    Community,
 }
 
 async fn canonical_roundtrip_route(
     response: Node,
     existing_id: Option<&'static str>,
-    community: bool,
+    route: Route,
+    size: ProfilePictureType,
 ) -> (
     Result<ProfilePictureLookup, ContactError>,
     Arc<OwnedNodeRef>,
@@ -60,32 +75,95 @@ async fn canonical_roundtrip_route(
     let (client, transport) = create_iq_test_client().await;
     let task_client = client.clone();
     let task = tokio::spawn(async move {
-        let jid = if community {
-            Jid::group("15550000001-7")
-        } else {
-            Jid::pn("15550000001")
+        let jid = match route {
+            Route::Contact => Jid::pn("15550000001"),
+            Route::Group | Route::Community => Jid::group("15550000001-7"),
         };
-        let target = if community {
-            ProfilePictureTarget::Community(&jid)
-        } else {
-            ProfilePictureTarget::Contact(&jid)
+        let target = match route {
+            Route::Contact => ProfilePictureTarget::Contact(&jid),
+            Route::Group => ProfilePictureTarget::Group(&jid),
+            Route::Community => ProfilePictureTarget::Community(&jid),
         };
         task_client
             .contacts()
-            .lookup_picture(
-                ProfilePictureRequest::new(target, ProfilePictureType::Preview)
-                    .existing_id(existing_id),
-            )
+            .lookup_picture(ProfilePictureRequest::new(target, size).existing_id(existing_id))
             .await
     });
     let sent = decode_sent_iq(&transport, 0).await;
+    let community = matches!(route, Route::Community);
+    assert_eq!(
+        sent.get().get_attr("xmlns").unwrap().as_str(),
+        if community {
+            "w:g2"
+        } else {
+            "w:profile:picture"
+        },
+        "route={route:?}, size={size:?}, existing_id={existing_id:?}",
+    );
+    let picture = if community {
+        assert_eq!(
+            sent.get().get_attr("to").unwrap().as_str(),
+            "15550000001-7@g.us",
+            "route={route:?}, size={size:?}, existing_id={existing_id:?}",
+        );
+        assert!(
+            sent.get().get_attr("target").is_none(),
+            "route={route:?}, size={size:?}, existing_id={existing_id:?}"
+        );
+        sent.get()
+            .get_optional_child("pictures")
+            .unwrap()
+            .get_optional_child("picture")
+            .unwrap()
+    } else {
+        assert_eq!(
+            sent.get().get_attr("to").unwrap().as_str(),
+            "s.whatsapp.net",
+            "route={route:?}, size={size:?}, existing_id={existing_id:?}",
+        );
+        assert_eq!(
+            sent.get().get_attr("target").unwrap().as_str(),
+            if matches!(route, Route::Contact) {
+                "15550000001@s.whatsapp.net"
+            } else {
+                "15550000001-7@g.us"
+            },
+            "route={route:?}, size={size:?}, existing_id={existing_id:?}",
+        );
+        sent.get().get_optional_child("picture").unwrap()
+    };
+    assert_eq!(
+        picture.get_attr("type").unwrap().as_str(),
+        size.as_str(),
+        "route={route:?}, size={size:?}, existing_id={existing_id:?}"
+    );
+    assert_eq!(
+        picture.get_attr("query").unwrap().as_str(),
+        "url",
+        "route={route:?}, size={size:?}, existing_id={existing_id:?}"
+    );
+    assert_eq!(
+        picture.get_attr("id").map(|s| s.as_str().into_owned()),
+        existing_id.map(str::to_owned),
+        "route={route:?}, size={size:?}, existing_id={existing_id:?}",
+    );
     let id = sent.get().get_attr("id").unwrap().to_string();
+    let response = if community && let Some(picture) = response.get_optional_child("picture") {
+        NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("pictures")
+                .children([picture.clone()])
+                .build()])
+            .build()
+    } else {
+        response
+    };
     let original = answer_iq(&client, &id, &response).await;
     let result = task.await.unwrap();
     assert_eq!(
         transport.sent().len(),
         1,
-        "lookup must not make a hidden fallback IQ"
+        "lookup must not make a hidden fallback IQ: route={route:?}, size={size:?}, existing_id={existing_id:?}"
     );
     (result, original)
 }
@@ -161,82 +239,209 @@ async fn picture_lookup_rate_limit_keeps_source_original_stanza_and_optional_bac
 }
 
 #[tokio::test]
-async fn picture_lookup_legacy_getter_and_lookups_keep_their_distinct_429_behavior() {
-    // Exercise the actual facade wrappers, not just their result mapper.
-    for wrapper in 0..5 {
-        for nested in [false, true] {
-            let (client, transport) = create_iq_test_client().await;
-            let c = client.clone();
-            let task = tokio::spawn(async move {
-                let jid = Jid::group("15550000001-7");
-                match wrapper {
-                    0 => c
-                        .contacts()
-                        .get_profile_picture(&jid, true)
-                        .await
-                        .map(|p| p.is_some()),
-                    1 => c
-                        .contacts()
-                        .get_profile_picture_with_timeout(&jid, true, Some(Duration::from_secs(1)))
-                        .await
-                        .map(|p| p.is_some()),
-                    2 => c
-                        .contacts()
-                        .lookup_profile_picture(&jid, true, None)
-                        .await
-                        .map(|p| p.is_rate_overlimit()),
-                    3 => c
-                        .groups()
-                        .lookup_profile_picture(&jid, true, None)
-                        .await
-                        .map(|p| p.is_rate_overlimit())
-                        .map_err(|e| {
-                            ContactError::Iq(match e {
-                                crate::features::GroupError::Iq(iq) => iq,
-                                _ => panic!("unexpected group error"),
-                            })
-                        }),
-                    _ => c
-                        .groups()
-                        .lookup_community_profile_picture(&jid, true, None)
-                        .await
-                        .map(|p| p.is_rate_overlimit())
-                        .map_err(|e| {
-                            ContactError::Iq(match e {
-                                crate::features::GroupError::Iq(iq) => iq,
-                                _ => panic!("unexpected group error"),
-                            })
-                        }),
+async fn picture_lookup_direct_spec_preserves_nested_rejection() {
+    let (client, transport) = create_iq_test_client().await;
+    let c = client.clone();
+    let task = tokio::spawn(async move {
+        c.execute(ProfilePictureSpec::preview(&Jid::pn("15550000001")))
+            .await
+    });
+    let sent = decode_sent_iq(&transport, 0).await;
+    let original = answer_iq(
+        &client,
+        &sent.get().get_attr("id").unwrap().to_string(),
+        &refusal(429, true, Some(12)),
+    )
+    .await;
+    let error = task.await.unwrap().unwrap_err();
+    assert_eq!(error.server_rejection().unwrap().backoff, Some(12));
+    let IqError::ServerError { response, .. } = error else {
+        panic!("typed rejection lost")
+    };
+    assert!(Arc::ptr_eq(response.as_arc(), &original));
+}
+
+#[tokio::test]
+async fn picture_lookup_all_routes_and_sizes_preserve_outcomes_and_rejections() {
+    for route in [Route::Contact, Route::Group, Route::Community] {
+        for size in [ProfilePictureType::Preview, ProfilePictureType::Full] {
+            let (found, _) = canonical_roundtrip_route(found_response(), None, route, size).await;
+            assert_eq!(
+                found.unwrap().found().unwrap().id,
+                "photo-7",
+                "route={route:?}, size={size:?}"
+            );
+            for existing_id in [None, Some("photo-7")] {
+                for picture in [
+                    None,
+                    Some(NodeBuilder::new("picture").build()),
+                    Some(NodeBuilder::new("picture").attr("id", "photo-7").build()),
+                ] {
+                    let response = NodeBuilder::new("iq")
+                        .attr("type", "result")
+                        .children(picture)
+                        .build();
+                    let (outcome, _) =
+                        canonical_roundtrip_route(response, existing_id, route, size).await;
+                    let outcome = outcome.unwrap_or_else(|e| {
+                        panic!("route={route:?}, size={size:?}, existing_id={existing_id:?}: {e:?}")
+                    });
+                    assert_eq!(
+                        outcome,
+                        if existing_id.is_some() {
+                            ProfilePictureLookup::Unchanged
+                        } else {
+                            ProfilePictureLookup::NotFound
+                        },
+                        "route={route:?}, size={size:?}, existing_id={existing_id:?}",
+                    );
+                    assert!(
+                        outcome.into_found().is_none(),
+                        "no invented URL or local bytes: route={route:?}, size={size:?}, existing_id={existing_id:?}"
+                    );
                 }
-            });
-            let sent = decode_sent_iq(&transport, 0).await;
-            let id = sent.get().get_attr("id").unwrap().to_string();
-            answer_iq(&client, &id, &refusal(429, nested, Some(12))).await;
-            let result = task.await.unwrap();
-            if wrapper < 2 && !nested {
-                let rejection = result.unwrap_err();
-                assert_eq!(rejection.server_rejection().unwrap().backoff, Some(12));
-            } else {
-                assert_eq!(result.unwrap(), wrapper >= 2);
             }
-            assert_eq!(transport.sent().len(), 1);
+            for (status, expected) in [
+                ("304", ProfilePictureLookup::Unchanged),
+                ("204", ProfilePictureLookup::NotFound),
+            ] {
+                let response = NodeBuilder::new("iq")
+                    .attr("type", "result")
+                    .children([NodeBuilder::new("picture").attr("status", status).build()])
+                    .build();
+                assert_eq!(
+                    canonical_roundtrip_route(response, None, route, size)
+                        .await
+                        .0
+                        .unwrap(),
+                    expected,
+                    "route={route:?}, size={size:?}, status={status}",
+                );
+            }
+            for nested in [false, true] {
+                for code in [401, 403, 404] {
+                    assert_eq!(
+                        canonical_roundtrip_route(refusal(code, nested, None), None, route, size)
+                            .await
+                            .0
+                            .unwrap(),
+                        if code == 404 {
+                            ProfilePictureLookup::NotFound
+                        } else {
+                            ProfilePictureLookup::NotAuthorized
+                        },
+                        "route={route:?}, size={size:?}, nested={nested}, code={code}",
+                    );
+                }
+                for backoff in [None, Some(73)] {
+                    let (result, original) =
+                        canonical_roundtrip_route(refusal(429, nested, backoff), None, route, size)
+                            .await;
+                    let context = format!(
+                        "route={route:?}, size={size:?}, nested={nested}, code=429, backoff={backoff:?}"
+                    );
+                    let error = result.expect_err(&context);
+                    let rejection = error.server_rejection().expect(&context);
+                    assert_eq!(rejection.code, 429, "{context}");
+                    assert_eq!(rejection.text, "synthetic-refusal", "{context}");
+                    assert_eq!(rejection.error_type, Some("wait"), "{context}");
+                    assert_eq!(rejection.backoff, backoff, "{context}");
+                    let ContactError::Iq(IqError::ServerError { response, .. }) = error else {
+                        panic!("typed rejection lost: {context}")
+                    };
+                    assert!(Arc::ptr_eq(response.as_arc(), &original), "{context}");
+                }
+            }
         }
     }
-    for code in [401, 403, 404] {
-        assert!(
-            legacy_found(Err(server_error_iq(code, "refusal", None, None)))
-                .unwrap()
-                .is_none()
+}
+
+#[tokio::test]
+async fn picture_group_batch_keeps_one_iq_per_entry_outcomes_and_limit() {
+    use crate::features::{GroupError, GroupProfilePictureOutcome, PictureType};
+    let (client, transport) = create_iq_test_client().await;
+    let c = client.clone();
+    let task = tokio::spawn(async move {
+        c.groups()
+            .get_profile_pictures(
+                (1..=4)
+                    .map(|n| Jid::group(format!("15550000001-{n}")))
+                    .collect(),
+                PictureType::Image,
+            )
+            .await
+    });
+    let sent = decode_sent_iq(&transport, 0).await;
+    assert_eq!(sent.get().get_attr("xmlns").unwrap().as_str(), "w:g2");
+    assert_eq!(sent.get().get_attr("to").unwrap().as_str(), "g.us");
+    let pictures = sent.get().get_optional_child("pictures").unwrap();
+    let entries: Vec<_> = pictures.get_children_by_tag("picture").collect();
+    assert_eq!(entries.len(), 4);
+    for (n, entry) in entries.iter().enumerate() {
+        assert_eq!(entry.get_attr("type").unwrap().as_str(), "image");
+        assert_eq!(
+            entry.get_attr("sub_group_jid").unwrap().as_str(),
+            format!("15550000001-{}@g.us", n + 1)
         );
+        assert!(entry.get_attr("parent_group_jid").is_none());
     }
-    for outcome in [
-        ProfilePictureLookup::Unchanged,
-        ProfilePictureLookup::NotFound,
-        ProfilePictureLookup::NotAuthorized,
-        ProfilePictureLookup::RateOverlimit,
-    ] {
-        assert!(legacy_found(Ok(outcome)).unwrap().is_none());
-    }
+    let response = NodeBuilder::new("iq")
+        .attr("type", "result")
+        .children([NodeBuilder::new("pictures")
+            .children([
+                NodeBuilder::new("picture")
+                    .attr("sub_group_jid", "15550000001-1@g.us")
+                    .attr("id", "photo-1")
+                    .attr("url", "https://example.test/batch.jpg")
+                    .build(),
+                NodeBuilder::new("picture")
+                    .attr("sub_group_jid", "15550000001-2@g.us")
+                    .attr("status", "304")
+                    .build(),
+                NodeBuilder::new("picture")
+                    .attr("sub_group_jid", "15550000001-3@g.us")
+                    .attr("status", "204")
+                    .build(),
+                NodeBuilder::new("picture")
+                    .attr("sub_group_jid", "15550000001-4@g.us")
+                    .attr("status", "500")
+                    .build(),
+            ])
+            .build()])
+        .build();
+    answer_iq(
+        &client,
+        &sent.get().get_attr("id").unwrap().to_string(),
+        &response,
+    )
+    .await;
+    let results = task.await.unwrap().unwrap();
+    assert_eq!(results.len(), 4);
+    assert!(matches!(
+        results[0].outcome(),
+        GroupProfilePictureOutcome::Found { .. }
+    ));
+    assert_eq!(results[1].outcome(), GroupProfilePictureOutcome::Unchanged);
+    assert_eq!(results[2].outcome(), GroupProfilePictureOutcome::NotFound);
+    assert_eq!(
+        results[3].outcome(),
+        GroupProfilePictureOutcome::Error { code: 500 }
+    );
+    assert_eq!(transport.sent().len(), 1);
+    let oversized =
+        vec![Jid::group("15550000001-7"); wacore::iq::groups::BATCH_PROFILE_PICTURES_LIMIT + 1];
+    assert!(matches!(
+        client
+            .groups()
+            .get_profile_pictures(oversized, PictureType::Preview)
+            .await,
+        Err(GroupError::InvalidRequest(_))
+    ));
+    assert_eq!(
+        transport.sent().len(),
+        1,
+        "limit must reject before sending"
+    );
 }
 
 #[test]
@@ -347,15 +552,6 @@ async fn picture_lookup_psa_is_short_circuited_and_timeout_remains_an_error() {
     assert_eq!(
         client.contacts().lookup_picture(request).await.unwrap(),
         ProfilePictureLookup::NotFound
-    );
-    assert!(transport.sent().is_empty());
-    assert!(
-        client
-            .contacts()
-            .get_profile_picture_with_timeout(&psa, false, Some(Duration::from_millis(1)))
-            .await
-            .unwrap()
-            .is_none()
     );
     assert!(transport.sent().is_empty());
     let jid = Jid::pn("15550000001");
@@ -508,7 +704,13 @@ async fn picture_lookup_community_nested_rate_limit_retains_original_response() 
                 .clone()])
             .build()])
         .build();
-    let (result, original) = canonical_roundtrip_route(response, None, true).await;
+    let (result, original) = canonical_roundtrip_route(
+        response,
+        None,
+        Route::Community,
+        ProfilePictureType::Preview,
+    )
+    .await;
     let error = result.unwrap_err();
     assert_eq!(error.server_rejection().unwrap().backoff, Some(33));
     let ContactError::Iq(IqError::ServerError { response: kept, .. }) = error else {

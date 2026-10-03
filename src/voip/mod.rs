@@ -33,6 +33,7 @@ compile_error!(
 
 pub mod audio;
 pub mod driver;
+mod events;
 pub mod facade;
 pub mod registry;
 pub mod session;
@@ -46,6 +47,7 @@ pub use state::collections;
 pub(crate) use state::Voip;
 
 pub use audio::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
+pub use events::CallEvents;
 pub use facade::{
     AcceptCall, CallHandle, CallLinkCall, CallTermination, GroupBoundCall, OutgoingCall,
     OutgoingGroupCall, VIDEO_UPGRADE_TIMEOUT,

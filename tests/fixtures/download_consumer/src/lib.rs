@@ -216,20 +216,18 @@ mod tests {
         }
     }
 
-    // Intentional compatibility fixture only; the library tree uses canonical APIs.
-    #[allow(deprecated)]
     #[tokio::test]
-    async fn legacy_aliases_delegate_to_the_same_final_session_error() {
+    async fn download_params_use_canonical_entries_with_final_session_errors() {
         let client = client().await;
         let params =
             DownloadParams::encrypted("/d", &[1; 32], &[2; 32], &[3; 32], 16, MediaType::Image);
         assert!(matches!(
-            client.download_from_params(&params).await.unwrap_err(),
+            client.download(&params).await.unwrap_err(),
             ClientDownloadError::MediaSession { .. }
         ));
         assert!(matches!(
             client
-                .download_from_params_to_writer(&params, Cursor::new(Vec::new()))
+                .download_to_writer(&params, Cursor::new(Vec::new()))
                 .await
                 .unwrap_err(),
             ClientDownloadError::MediaSession { .. }

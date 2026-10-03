@@ -14,8 +14,8 @@
 //!     --example per_connection_memory -- compile-options
 //! ```
 //!
-//! * `pools` — one `SqliteStore::new_for_device` per session (today's shape).
-//! * `handles` — one store, then `share_for_device` per session (one pool).
+//! * `pools` — one `SqliteDatabase::open` per session (independent pools).
+//! * `handles` — one database, then `SqliteDatabase::store` per session.
 //! * `warm` — every session scans the seeded table first, filling its page
 //!   cache to the `cache_kib` cap. Without it each session only does the small
 //!   reads an idle session does, which is the realistic steady state.
@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use diesel::prelude::*;
 use wacore::store::traits::SignalStore as _;
-use whatsapp_rust_sqlite_storage::{SqliteStore, SqliteStoreConfig};
+use whatsapp_rust_sqlite_storage::{SqliteDatabaseConfig, SqliteStore};
 
 /// Rows of ~1 KiB each: enough database that a full scan can fill a 512 KiB
 /// page cache several times over, so the cap is what bounds a warm connection.
@@ -67,7 +67,10 @@ fn db_err(e: diesel::result::Error) -> wacore::store::error::StoreError {
 
 /// Seed a database large enough that page caches have something to hold.
 async fn seed(url: &str) {
-    let store = SqliteStore::new_for_device(url, 1).await.expect("open");
+    let store = whatsapp_rust_sqlite_storage::SqliteDatabase::open(url, Default::default())
+        .await
+        .expect("open")
+        .store(1);
     let record = vec![0x5au8; ROW_BYTES];
     for chunk in (0..SEED_ROWS).collect::<Vec<_>>().chunks(200) {
         let batch: Vec<_> = chunk
@@ -144,19 +147,20 @@ async fn write_burst(stores: Vec<SqliteStore>) -> (Duration, Duration, Duration)
 /// the second is not measured against the pages, WAL and rows the first left
 /// behind — which would confound the comparison with run order.
 async fn writes(dir: &std::path::Path, sessions: usize, read_pool_size: u32) {
-    let config = || SqliteStoreConfig {
+    let config = || SqliteDatabaseConfig {
         read_pool_size,
         ..Default::default()
     };
     let url = |name: &str| dir.join(name).to_string_lossy().into_owned();
 
     let shared_url = url("writes_handles.db");
-    let base = SqliteStore::with_config_for_device(&shared_url, 1, config())
+    let base = whatsapp_rust_sqlite_storage::SqliteDatabase::open(&shared_url, config())
         .await
-        .expect("open");
+        .expect("open")
+        .store(1);
     let mut fleet = vec![base.clone()];
     for device_id in 2..=sessions {
-        fleet.push(base.share_for_device(device_id as i32));
+        fleet.push(base.database().store(device_id as i32));
     }
     let (total, fastest, slowest) = write_burst(fleet).await;
     println!(
@@ -168,9 +172,10 @@ async fn writes(dir: &std::path::Path, sessions: usize, read_pool_size: u32) {
     let mut separate = Vec::new();
     for device_id in 1..=sessions {
         separate.push(
-            SqliteStore::with_config_for_device(&separate_url, device_id as i32, config())
+            whatsapp_rust_sqlite_storage::SqliteDatabase::open(&separate_url, config())
                 .await
-                .expect("open"),
+                .expect("open")
+                .store(device_id as i32),
         );
     }
     let (total, fastest, slowest) = write_burst(separate).await;
@@ -181,7 +186,7 @@ async fn writes(dir: &std::path::Path, sessions: usize, read_pool_size: u32) {
 }
 
 async fn compile_options(url: &str) {
-    let store = SqliteStore::new(url).await.expect("open");
+    let store = SqliteStore::open(url).await.expect("open");
     #[derive(QueryableByName)]
     struct Opt {
         #[diesel(sql_type = diesel::sql_types::Text)]
@@ -244,7 +249,7 @@ async fn main() {
     }
 
     seed(&url).await;
-    let config = || SqliteStoreConfig {
+    let config = || SqliteDatabaseConfig {
         cache_size_kib: cache_kib,
         ..Default::default()
     };
@@ -259,14 +264,16 @@ async fn main() {
     for n in 0..sessions {
         let device_id = n as i32 + 1;
         let store = match (mode, stores.first()) {
-            ("pools", _) => SqliteStore::with_config_for_device(&url, device_id, config())
+            ("pools", _) => whatsapp_rust_sqlite_storage::SqliteDatabase::open(&url, config())
                 .await
-                .expect("open"),
+                .expect("open")
+                .store(device_id),
             // The first handle is a real store; the rest hang off it.
-            ("handles", None) => SqliteStore::with_config_for_device(&url, device_id, config())
+            ("handles", None) => whatsapp_rust_sqlite_storage::SqliteDatabase::open(&url, config())
                 .await
-                .expect("open"),
-            ("handles", Some(base)) => base.share_for_device(device_id),
+                .expect("open")
+                .store(device_id),
+            ("handles", Some(base)) => base.database().store(device_id),
             (other, _) => panic!("unknown mode {other}"),
         };
         touch(&store).await;

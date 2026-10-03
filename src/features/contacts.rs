@@ -8,7 +8,6 @@ use crate::client::Client;
 use crate::request::IqError;
 use log::debug;
 use std::collections::HashMap;
-use std::time::Duration;
 use thiserror::Error;
 use wacore::iq::usync::{
     IsOnWhatsAppQueryType, IsOnWhatsAppSpec, IsOnWhatsAppUser, UserInfoSpec, UsernameLookupSpec,
@@ -23,80 +22,6 @@ pub use wacore::iq::usync::{
     UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError,
 };
 pub use wacore::stanza::business::VerifiedName;
-
-/// Options for querying a profile picture with full protocol control.
-#[derive(Debug, Clone)]
-pub struct ProfilePictureLookupOptions<'a> {
-    pub jid: &'a Jid,
-    pub picture_type: ProfilePictureType,
-    pub existing_id: Option<&'a str>,
-    pub common_gid: Option<&'a Jid>,
-    pub invite: Option<&'a str>,
-    pub persona_id: Option<&'a str>,
-    pub timeout: Option<Duration>,
-}
-
-impl<'a> ProfilePictureLookupOptions<'a> {
-    pub fn new(jid: &'a Jid) -> Self {
-        Self {
-            jid,
-            picture_type: ProfilePictureType::Preview,
-            existing_id: None,
-            common_gid: None,
-            invite: None,
-            persona_id: None,
-            timeout: None,
-        }
-    }
-
-    fn into_request(self) -> ProfilePictureRequest<'a> {
-        ProfilePictureRequest::new(ProfilePictureTarget::Contact(self.jid), self.picture_type)
-            .existing_id(self.existing_id)
-            .common_gid(self.common_gid)
-            .invite(self.invite)
-            .persona_id(self.persona_id)
-            .timeout(self.timeout)
-    }
-
-    pub fn preview(mut self, preview: bool) -> Self {
-        self.picture_type = if preview {
-            ProfilePictureType::Preview
-        } else {
-            ProfilePictureType::Full
-        };
-        self
-    }
-
-    pub fn picture_type(mut self, picture_type: ProfilePictureType) -> Self {
-        self.picture_type = picture_type;
-        self
-    }
-
-    pub fn existing_id(mut self, existing_id: Option<&'a str>) -> Self {
-        self.existing_id = existing_id;
-        self
-    }
-
-    pub fn common_gid(mut self, common_gid: Option<&'a Jid>) -> Self {
-        self.common_gid = common_gid;
-        self
-    }
-
-    pub fn invite(mut self, invite: Option<&'a str>) -> Self {
-        self.invite = invite;
-        self
-    }
-
-    pub fn persona_id(mut self, persona_id: Option<&'a str>) -> Self {
-        self.persona_id = persona_id;
-        self
-    }
-
-    pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
-        self.timeout = timeout;
-        self
-    }
-}
 
 /// Error returned by contact-information operations (existence checks,
 /// profile pictures, user info).
@@ -286,83 +211,28 @@ impl<'a> Contacts<'a> {
     /// Canonical lookup with explicit size/route and preserved rejection metadata.
     ///
     /// Found/Unchanged/NotFound/NotAuthorized remain distinct. A 429 is an
-    /// `IqError::ServerError` with its original stanza and backoff, never an empty
-    /// `RateOverlimit`. There is no automatic community fallback. `into_found()`
+    /// `IqError::ServerError` with its original stanza and optional backoff.
+    /// There is no automatic community fallback. `into_found()` explicitly
     /// discards all non-found states; Unchanged says nothing about cached bytes.
+    ///
+    /// ```no_run
+    /// # use whatsapp_rust::{Client, ContactError, ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
+    /// # use whatsapp_rust::wacore_binary::Jid;
+    /// # async fn example(client: &Client, jid: &Jid) -> Result<(), ContactError> {
+    /// let outcome = client.contacts().lookup_picture(ProfilePictureRequest::new(
+    ///     ProfilePictureTarget::Group(jid), ProfilePictureType::Full,
+    /// )).await?;
+    /// // Only when the consumer intentionally needs newly found URLs alone:
+    /// let picture = outcome.into_found();
+    /// # let _ = picture;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn lookup_picture(
         &self,
         request: ProfilePictureRequest<'_>,
     ) -> Result<ProfilePictureLookup, ContactError> {
-        Ok(pictures::lookup(self.client, request, false).await?)
-    }
-
-    /// Compatibility lookup with boolean size and lossy 429 `RateOverlimit`.
-    /// Prefer [`Self::lookup_picture`] to preserve rejection metadata.
-    pub async fn lookup_profile_picture(
-        &self,
-        jid: &Jid,
-        preview: bool,
-        existing_id: Option<&str>,
-    ) -> Result<ProfilePictureLookup, ContactError> {
-        self.lookup_profile_picture_with_options(
-            ProfilePictureLookupOptions::new(jid)
-                .preview(preview)
-                .existing_id(existing_id),
-        )
-        .await
-    }
-
-    /// Compatibility lookup with advanced options. A 429 becomes an empty
-    /// `RateOverlimit`; prefer [`Self::lookup_picture`] to preserve its metadata.
-    ///
-    /// A valid privacy token is loaded automatically from the client store when applicable.
-    pub async fn lookup_profile_picture_with_options(
-        &self,
-        options: ProfilePictureLookupOptions<'_>,
-    ) -> Result<ProfilePictureLookup, ContactError> {
-        Ok(pictures::lookup(self.client, options.into_request(), true).await?)
-    }
-
-    /// Fetch a profile picture URL for a given JID.
-    ///
-    /// Returns `Ok(Some(ProfilePicture))` if found, or `Ok(None)` if no picture is set,
-    /// unchanged, or unauthorized.
-    ///
-    /// IQ-level 429 remains an error carrying rejection/backoff metadata.
-    /// Prefer [`Self::lookup_picture`] for detailed outcomes and explicit size.
-    pub async fn get_profile_picture(
-        &self,
-        jid: &Jid,
-        preview: bool,
-    ) -> Result<Option<ProfilePicture>, ContactError> {
-        self.get_profile_picture_with_timeout(jid, preview, None)
-            .await
-    }
-
-    /// Fetch a profile picture with an optional request timeout override.
-    ///
-    /// Returns `Ok(Some(ProfilePicture))` if found, or `Ok(None)` if no picture is set,
-    /// unchanged, or unauthorized.
-    ///
-    /// IQ-level 429 remains an error carrying rejection/backoff metadata.
-    /// Prefer [`Self::lookup_picture`] for detailed outcomes and explicit size.
-    pub async fn get_profile_picture_with_timeout(
-        &self,
-        jid: &Jid,
-        preview: bool,
-        timeout: Option<Duration>,
-    ) -> Result<Option<ProfilePicture>, ContactError> {
-        // The system JID never answers this IQ; skip it to save the full timeout.
-        if jid.is_psa() {
-            return Ok(None);
-        }
-        // Retain the legacy parser: top-level 429 stays an error, while a
-        // nested legacy RateOverlimit is still collapsed to None.
-        let options = ProfilePictureLookupOptions::new(jid)
-            .preview(preview)
-            .timeout(timeout);
-        let spec = pictures::build_spec(self.client, &options.into_request()).await;
-        Ok(pictures::legacy_found(self.client.execute(spec).await)?)
+        Ok(pictures::lookup(self.client, request).await?)
     }
 
     pub async fn get_user_info(
@@ -489,10 +359,13 @@ mod tests {
 
         let result = client
             .contacts()
-            .get_profile_picture(&psa_jid(), false)
+            .lookup_picture(ProfilePictureRequest::new(
+                ProfilePictureTarget::Contact(&psa_jid()),
+                ProfilePictureType::Full,
+            ))
             .await;
 
-        assert!(matches!(result, Ok(None)));
+        assert!(matches!(result, Ok(ProfilePictureLookup::NotFound)));
     }
 
     #[tokio::test]
@@ -503,7 +376,10 @@ mod tests {
         // proving the short-circuit is scoped to the system JID.
         let err = client
             .contacts()
-            .get_profile_picture(&Jid::pn("12025550111"), false)
+            .lookup_picture(ProfilePictureRequest::new(
+                ProfilePictureTarget::Contact(&Jid::pn("12025550111")),
+                ProfilePictureType::Full,
+            ))
             .await
             .unwrap_err();
 

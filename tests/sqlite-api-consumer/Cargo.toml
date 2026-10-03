@@ -1,0 +1,21 @@
+# Standalone host fixture: no workspace dependency aliases.
+[package]
+name = "sqlite-api-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+rust-version = "1.94"
+
+[workspace]
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+whatsapp-rust = { path = "../..", default-features = false, features = ["sqlite-storage-bundled"] }
+
+# Match the established browser harness: Diesel selects sqlite-wasm-rs here,
+# not native bundled SQLite. wasm-test forwards only the supported wacore/js.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+whatsapp-rust = { path = "../..", default-features = false, features = ["sqlite-storage"] }
+whatsapp-rust-sqlite-storage = { path = "../../storages/sqlite-storage", default-features = false, features = ["wasm-test"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt"] }

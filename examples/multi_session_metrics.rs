@@ -23,7 +23,7 @@ use wacore::stats::CpuMeter;
 use whatsapp_rust::prelude::*;
 
 async fn build_session(db_path: &str, label: &'static str) -> Option<(Bot, Arc<CpuMeter>)> {
-    let store = match SqliteStore::new(db_path).await {
+    let store = match SqliteStore::open(db_path).await {
         Ok(store) => store,
         Err(e) => {
             error!("[{label}] failed to create SQLite backend: {e}");

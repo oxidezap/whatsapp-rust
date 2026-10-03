@@ -110,7 +110,7 @@ struct DeviceRow {
     status_privacy: Option<Vec<u8>>,
 }
 
-/// One account in a database that holds several, as [`SqliteStore::list_devices`]
+/// One account in a database that holds several, as [`crate::SqliteDatabase::list_devices`]
 /// reports it.
 ///
 /// `linked` mirrors [`wacore::store::Device::is_registered`]: the row exists from
@@ -128,8 +128,8 @@ pub struct StoredDeviceSummary {
 /// A freshly generated [`CoreDevice`] laid out as one row of `device`.
 ///
 /// The point of the type is the two callers that must produce identical fresh
-/// accounts: [`SqliteStore::create_sibling_device`] and
-/// [`SqliteStore::reset_device`]. Building the column list twice is how the two
+/// accounts: [`crate::SqliteDatabase::create_device`] and
+/// [`crate::SqliteDatabase::reset_device`]. Building the column list twice is how the two
 /// drift as fields are added.
 ///
 /// `id` uses `treat_none_as_default_value`, so `None` drops the column from the
@@ -221,8 +221,8 @@ impl FreshDeviceRow {
 /// Every table that carries a per-account `device_id`, and therefore everything
 /// that has to go when an account is reset or removed.
 ///
-/// Deliberately one list read by both [`SqliteStore::reset_device`] and
-/// [`SqliteStore::remove_device`], so the two cannot drift. A test
+/// Deliberately one list read by both [`crate::SqliteDatabase::reset_device`] and
+/// [`crate::SqliteDatabase::remove_device`], so the two cannot drift. A test
 /// (`account_scoped_table_list_covers_the_schema`) compares it against
 /// `pragma_table_info` and fails on any `device_id` column the list is missing,
 /// which is the only way a newly added table cannot silently leak account state.
@@ -484,7 +484,7 @@ pub struct SqliteStore {
     pub(crate) pool: SqlitePool,
     pub(crate) db_semaphore: Arc<tokio::sync::Semaphore>,
     /// A separate, `query_only` pool and its permits, when
-    /// [`SqliteStoreConfig::read_pool_size`] asked for reader connections and
+    /// [`SqliteDatabaseConfig::read_pool_size`] asked for reader connections and
     /// the database is actually in WAL. `None` keeps reads on `pool` behind
     /// `db_semaphore` — the original behaviour, where one queue covers
     /// everything.
@@ -506,7 +506,7 @@ pub struct SqliteStore {
     pub(crate) commit_barrier: Option<CommitBarrierHook>,
     /// Opt-in reclaim of free pages during maintenance. Only acts when the
     /// database is already in `auto_vacuum = INCREMENTAL`; see
-    /// [`SqliteStoreConfig::incremental_vacuum`].
+    /// [`SqliteDatabaseConfig::incremental_vacuum`].
     incremental_vacuum: bool,
     incremental_vacuum_pages: u32,
     device_id: i32,
@@ -588,7 +588,7 @@ pub type CommitBarrierHook = Arc<dyn Fn() -> CommitBarrierFuture + Send + Sync +
 /// management threads (e.g. share your own across crates).
 ///
 /// Multiple sessions on one database share these resources via
-/// [`crate::SqliteDatabase::store`] or legacy [`SqliteStore::share_for_device`].
+/// [`crate::SqliteDatabase::store`].
 ///
 /// **The other profile: one long-lived session, one large database.** A process
 /// that pairs once and stays connected for weeks — a bot — is the opposite
@@ -602,8 +602,8 @@ pub type CommitBarrierHook = Arc<dyn Fn() -> CommitBarrierFuture + Send + Sync +
 /// name the profile instead:
 ///
 /// ```
-/// # use whatsapp_rust_sqlite_storage::SqliteStoreConfig;
-/// let config = SqliteStoreConfig {
+/// # use whatsapp_rust_sqlite_storage::SqliteDatabaseConfig;
+/// let config = SqliteDatabaseConfig {
 ///     // A warm cache for a database far larger than the default assumes.
 ///     cache_size_kib: 16 * 1024,
 ///     // Two readers, so a session lookup never waits out a write-behind flush.
@@ -614,7 +614,7 @@ pub type CommitBarrierHook = Arc<dyn Fn() -> CommitBarrierFuture + Send + Sync +
 /// .with_mmap_size(256 * 1024 * 1024);
 /// ```
 #[derive(Clone)]
-pub struct SqliteStoreConfig {
+pub struct SqliteDatabaseConfig {
     /// Max concurrent operations: r2d2 `max_size` AND the internal semaphore permits,
     /// kept in lockstep. Clamped to at least 1.
     ///
@@ -654,7 +654,7 @@ pub struct SqliteStoreConfig {
     /// not expose the `sqlite3*`). Measured on an idle session, dropping this
     /// from 512 to 1 moved resident memory from ~123 to ~92 KiB per connection
     /// — so tuning it down does not substitute for holding fewer connections;
-    /// see [`SqliteStore::share_for_device`].
+    /// use [`crate::SqliteDatabase::store`] to share connections.
     pub cache_size_kib: u32,
     /// `PRAGMA mmap_size`, in bytes. `None` (default) leaves mmap off — the
     /// current behavior. When set, pages are read through a reclaimable,
@@ -675,7 +675,7 @@ pub struct SqliteStoreConfig {
     pub thread_pool: Option<Arc<scheduled_thread_pool::ScheduledThreadPool>>,
     /// Optional hook run first on every new pooled connection, before the store's own
     /// pragmas, WAL setup, and migrations. See [`ConnectionInitHook`] for the contract;
-    /// set via [`SqliteStoreConfig::with_connection_init`].
+    /// set via [`SqliteDatabaseConfig::with_connection_init`].
     pub connection_init: Option<ConnectionInitHook>,
     /// Optional awaitable called after each successful SQLite write commit.
     /// Readers never call it. The callback runs while the write permit is held
@@ -705,7 +705,7 @@ pub struct SqliteStoreConfig {
     pub incremental_vacuum_pages: u32,
 }
 
-impl Default for SqliteStoreConfig {
+impl Default for SqliteDatabaseConfig {
     fn default() -> Self {
         Self {
             pool_size: 1,
@@ -728,7 +728,7 @@ impl Default for SqliteStoreConfig {
     }
 }
 
-impl SqliteStoreConfig {
+impl SqliteDatabaseConfig {
     /// Reserve `n` connections for read-only work, so reads stop queueing
     /// behind the write permit. See [`read_pool_size`](Self::read_pool_size)
     /// for what it costs and why raising `pool_size` is not the same thing.
@@ -739,7 +739,7 @@ impl SqliteStoreConfig {
 
     /// Set `PRAGMA mmap_size` (bytes), enabling file-backed memory-mapped reads.
     /// Builder-style so new optional knobs don't force struct-literal churn;
-    /// pass `0` to keep mmap off. See the [`SqliteStoreConfig::mmap_size`] caveat.
+    /// pass `0` to keep mmap off. See the [`SqliteDatabaseConfig::mmap_size`] caveat.
     pub fn with_mmap_size(mut self, bytes: u64) -> Self {
         self.mmap_size = Some(bytes);
         self
@@ -752,10 +752,10 @@ impl SqliteStoreConfig {
     /// ideally verified — before anything else touches the database:
     ///
     /// ```no_run
-    /// # use whatsapp_rust_sqlite_storage::SqliteStoreConfig;
+    /// # use whatsapp_rust_sqlite_storage::SqliteDatabaseConfig;
     /// use diesel::prelude::*;
     ///
-    /// let config = SqliteStoreConfig::default().with_connection_init(move |conn| {
+    /// let config = SqliteDatabaseConfig::default().with_connection_init(move |conn| {
     ///     diesel::sql_query("PRAGMA key = 'my-passphrase';").execute(conn)?;
     ///     // Verify the key: this fails on a wrongly-keyed database.
     ///     diesel::sql_query("SELECT count(*) FROM sqlite_master;").execute(conn)?;
@@ -795,7 +795,7 @@ impl SqliteStoreConfig {
     /// add pointer-map overhead. Enabling this never forces a reorganization:
     /// `auto_vacuum` is set only when the store opens a brand-new empty file,
     /// and the maintenance pass reclaims only when the database is already in
-    /// that mode. See [`SqliteStoreConfig::incremental_vacuum`] for why a full
+    /// that mode. See [`SqliteDatabaseConfig::incremental_vacuum`] for why a full
     /// `VACUUM` is not run.
     pub fn with_incremental_vacuum(mut self, pages: u32) -> Self {
         self.incremental_vacuum = pages > 0;
@@ -999,43 +999,18 @@ fn is_shared_cache(database_url: &str) -> bool {
 }
 
 impl SqliteStore {
-    /// Open a store with the default low-memory [`SqliteStoreConfig`].
-    pub async fn new(database_url: &str) -> std::result::Result<Self, StoreError> {
-        Self::open(database_url, SqliteStoreConfig::default()).await
-    }
-
-    /// Open a store with a custom [`SqliteStoreConfig`] (the default favours low memory /
-    /// high session density; override to trade memory for concurrency or cache).
-    pub async fn with_config(
-        database_url: &str,
-        config: SqliteStoreConfig,
-    ) -> std::result::Result<Self, StoreError> {
-        Self::open(database_url, config).await
-    }
-
-    pub async fn new_for_device(
-        database_url: &str,
-        device_id: i32,
-    ) -> std::result::Result<Self, StoreError> {
-        Self::with_config_for_device(database_url, device_id, SqliteStoreConfig::default()).await
-    }
-
-    /// Open a store for a specific device with a custom [`SqliteStoreConfig`].
-    pub async fn with_config_for_device(
-        database_url: &str,
-        device_id: i32,
-        config: SqliteStoreConfig,
-    ) -> std::result::Result<Self, StoreError> {
-        Ok(crate::SqliteDatabase::open(database_url, config)
-            .await?
-            .store(device_id))
-    }
-
-    /// Open one account (device id 1) without needing a database administration
-    /// handle. Like all opening paths, this does not create the device row;
-    /// the client's normal provisioning path calls `DeviceStore::create`.
-    pub async fn open(database_url: &str, config: SqliteStoreConfig) -> Result<Self> {
-        Self::with_config_for_device(database_url, 1, config).await
+    /// Open one account (device id 1) with the default low-memory configuration.
+    /// This does not create the device row; the client's normal provisioning
+    /// path calls `DeviceStore::create`.
+    ///
+    /// For custom connection tuning or multiple accounts, use
+    /// [`crate::SqliteDatabase::open`] and [`crate::SqliteDatabase::store`].
+    pub async fn open(database_url: &str) -> Result<Self> {
+        Ok(
+            crate::SqliteDatabase::open(database_url, SqliteDatabaseConfig::default())
+                .await?
+                .store(1),
+        )
     }
 
     /// Administration and whole-pool reporting for this store's database.
@@ -1061,7 +1036,7 @@ impl SqliteStore {
     pub(crate) async fn build(
         database_url: &str,
         device_id: i32,
-        config: SqliteStoreConfig,
+        config: SqliteDatabaseConfig,
     ) -> std::result::Result<Self, StoreError> {
         let manager = ConnectionManager::<SqliteConnection>::new(database_url);
         // pool_size drives both r2d2's max_size and the semaphore permits, so a serialized
@@ -1271,7 +1246,7 @@ impl SqliteStore {
     /// and a connection costs memory before it reads a single row: a 48,000 B
     /// lookaside slab (`SQLITE_DEFAULT_LOOKASIDE` 1200,40, which this build
     /// does not override), plus a page cache that grows to
-    /// [`SqliteStoreConfig::cache_size_kib`]. Measured on an idle session that
+    /// [`SqliteDatabaseConfig::cache_size_kib`]. Measured on an idle session that
     /// has only done a couple of point reads, that is ~123 KiB of resident
     /// memory per session, and it does not shrink meaningfully with a smaller
     /// cache cap: ~92 KiB of it survives `cache_size_kib = 1`. Nothing else
@@ -1287,11 +1262,10 @@ impl SqliteStore {
     /// What it does **not** do:
     ///
     /// - **Create the device row.** It only stamps queries with `device_id`.
-    ///   The row still comes from the usual provisioning path — the same
-    ///   [`create_new_device`](Self::create_new_device) or restore that a store
-    ///   from [`new_for_device`](Self::new_for_device) would need.
+    ///   The row still comes from `DeviceStore::create`, database provisioning
+    ///   or restore; selecting a scope does not write.
     /// - **Isolate writes.** Siblings share the write permits, of which
-    ///   [`SqliteStoreConfig::pool_size`] decides the number — so at its
+    ///   [`SqliteDatabaseConfig::pool_size`] decides the number — so at its
     ///   default of 1 their writes serialize against each other, and a base
     ///   store built with a wider pool passes that width on instead. That is
     ///   the trade, and at the default it is not free: on a burst where every
@@ -1303,7 +1277,7 @@ impl SqliteStore {
     ///   backoff (measured: ~2x spread between the fastest and slowest
     ///   session). So this is for fleets that are mostly idle — the shape
     ///   sessions actually have — and not for continuously writing ones.
-    ///   [`SqliteStoreConfig::read_pool_size`] widens the *read* side only,
+    ///   [`SqliteDatabaseConfig::read_pool_size`] widens the *read* side only,
     ///   and its connections are shared here too.
     /// - **Split the resource report.** `resource_report()` describes the
     ///   *pool*, and siblings share one, so every handle reports the same
@@ -1314,15 +1288,8 @@ impl SqliteStore {
     ///   saving this method exists for is exactly why there is only one pool
     ///   left to count.
     ///
-    /// ```no_run
-    /// # use whatsapp_rust_sqlite_storage::SqliteStore;
-    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    /// let device_1 = SqliteStore::new_for_device("whatsapp.db", 1).await?;
-    /// // One pool, one connection, two sessions.
-    /// let device_2 = device_1.share_for_device(2);
-    /// # Ok(()) }
-    /// ```
-    pub fn share_for_device(&self, device_id: i32) -> Self {
+    /// The public account-selection entry point is `SqliteDatabase::store`.
+    pub(crate) fn share_for_device(&self, device_id: i32) -> Self {
         Self {
             pool: self.pool.clone(),
             db_semaphore: Arc::clone(&self.db_semaphore),
@@ -1748,7 +1715,7 @@ impl SqliteStore {
         .await
     }
 
-    pub async fn create_new_device(&self) -> Result<i32> {
+    pub(crate) async fn create_new_device(&self) -> Result<i32> {
         let device_id = self.device_id;
         let new_device = wacore::store::Device::new();
 
@@ -1819,32 +1786,6 @@ impl SqliteStore {
         .await
     }
 
-    /// Compatibility wrapper for [`crate::SqliteDatabase::list_devices`].
-    /// Every account in this database file, newest allocation last.
-    ///
-    /// This is the read side of the multi-account shape: `device` is a table of
-    /// accounts, and the only way to learn which `AccountId`s exist without
-    /// reaching into a private schema. Ordered by `id` so callers that treat the
-    /// first row as "the primary account" get a stable answer.
-    ///
-    /// The startup pattern for a fleet of mostly idle accounts: enumerate here
-    /// once, then hand each id to [`SqliteStore::share_for_device`] rather than
-    /// opening a store per account, since each store would carry its own pool
-    /// and connection.
-    ///
-    /// ```no_run
-    /// # use whatsapp_rust_sqlite_storage::SqliteStore;
-    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    /// let store = SqliteStore::new("whatsapp.db").await?;
-    /// for account in store.list_devices().await? {
-    ///     let session = store.share_for_device(account.id);
-    /// }
-    /// # Ok(()) }
-    /// ```
-    pub async fn list_devices(&self) -> Result<Vec<StoredDeviceSummary>> {
-        self.database().list_devices().await
-    }
-
     pub(crate) async fn list_devices_impl(&self) -> Result<Vec<StoredDeviceSummary>> {
         self.read_query(|conn| {
             #[derive(QueryableByName)]
@@ -1885,34 +1826,6 @@ impl SqliteStore {
         .await
     }
 
-    /// Compatibility wrapper for [`crate::SqliteDatabase::create_device`],
-    /// retaining the historical `(id, store)` return shape.
-    /// Create another account in this database and return a handle bound to it.
-    ///
-    /// The id is allocated by SQLite's `AUTOINCREMENT` inside the same
-    /// transaction as the insert, via `last_insert_rowid()` on the connection
-    /// that wrote the row. Choosing it in Rust (`MAX(id) + 1`) races between
-    /// concurrent creates and, worse, can reuse an id a `remove_device` deleted,
-    /// which would make an `AccountId` resolve to a different person.
-    ///
-    /// The returned handle reuses this store's pool and write permit via
-    /// [`SqliteStore::share_for_device`], which is the shape a fleet of mostly
-    /// idle accounts wants: see that method for what is shared and what it
-    /// costs.
-    ///
-    /// ```no_run
-    /// # use whatsapp_rust_sqlite_storage::SqliteStore;
-    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    /// let store = SqliteStore::new("whatsapp.db").await?;
-    /// let (id, account) = store.create_sibling_device().await?;
-    /// assert_eq!(account.device_id(), id);
-    /// # Ok(()) }
-    /// ```
-    pub async fn create_sibling_device(&self) -> Result<(i32, SqliteStore)> {
-        let store = self.database().create_device().await?;
-        Ok((store.device_id(), store))
-    }
-
     pub(crate) async fn create_sibling_device_impl(&self) -> Result<(i32, SqliteStore)> {
         let row = Arc::new(FreshDeviceRow::new(None)?);
         let device_id = self
@@ -1929,31 +1842,6 @@ impl SqliteStore {
             })
             .await?;
         Ok((device_id, self.share_for_device(device_id)))
-    }
-
-    /// Compatibility wrapper for [`crate::SqliteDatabase::reset_device`].
-    /// Wipe an account's state and start it over under the same id.
-    ///
-    /// Everything account-scoped goes, and the `device` row is recreated with
-    /// the same id and freshly generated keys, in one `BEGIN IMMEDIATE`
-    /// transaction: `AccountId(2)` stays `AccountId(2)`, but its identity,
-    /// prekeys, sessions and app-state are gone and pairing starts from zero.
-    /// The id is preserved precisely so the caller's references stay valid;
-    /// state is what is disposable.
-    ///
-    /// Missing account is [`StoreError::DeviceNotFound`].
-    ///
-    /// **Other handles are not invalidated.** A store sharing this device_id,
-    /// whether a sibling from [`SqliteStore::share_for_device`] or a second
-    /// [`SqliteStore::new_for_device`] on the same file, keeps working, and its
-    /// next write lands on the recreated account. Calling this while another
-    /// handle still holds live in-memory state for the account is therefore a
-    /// caller error: the caller owns the client lifecycle, and must stop that
-    /// account's background work (device background saver, Signal flush) before
-    /// resetting. Enforcing it here would need a per-write liveness check on
-    /// every Signal and device write, which this storage boundary does not own.
-    pub async fn reset_device(&self, device_id: i32) -> Result<SqliteStore> {
-        self.database().reset_device(device_id).await
     }
 
     pub(crate) async fn reset_device_impl(&self, device_id: i32) -> Result<SqliteStore> {
@@ -1982,23 +1870,6 @@ impl SqliteStore {
         Ok(self.share_for_device(device_id))
     }
 
-    /// Compatibility wrapper for [`crate::SqliteDatabase::remove_device`].
-    /// Delete an account's state and its `device` row, atomically.
-    ///
-    /// Like [`SqliteStore::reset_device`], but the row does not come back, so
-    /// the id is retired for good: `AUTOINCREMENT` will not reissue it, and the
-    /// purge leaves no account-scoped row behind for a future id to inherit.
-    ///
-    /// Missing account is [`StoreError::DeviceNotFound`].
-    ///
-    /// **Other handles are not invalidated.** A live handle for this device can
-    /// recreate the row with its next `save`, and a Signal write can repopulate
-    /// the purged tables, so the caller must stop that account's background work
-    /// before removing it, the same way [`SqliteStore::reset_device`] requires.
-    pub async fn remove_device(&self, device_id: i32) -> Result<()> {
-        self.database().remove_device(device_id).await
-    }
-
     pub(crate) async fn remove_device_impl(&self, device_id: i32) -> Result<()> {
         self.with_retry("remove_device", move || {
             Box::new(move |conn: &mut SqliteConnection| {
@@ -2016,11 +1887,6 @@ impl SqliteStore {
         .await
         .map_err(|e| missing_device(e, device_id))?;
         Ok(())
-    }
-
-    /// Compatibility accessor; prefer database administration or `DeviceStore::exists`.
-    pub async fn device_exists(&self, device_id: i32) -> Result<bool> {
-        self.database().device_exists(device_id).await
     }
 
     pub(crate) async fn device_exists_impl(&self, device_id: i32) -> Result<bool> {
@@ -4673,7 +4539,7 @@ impl DeviceStore for SqliteStore {
     }
 
     async fn exists(&self) -> Result<bool> {
-        SqliteStore::device_exists(self, self.device_id).await
+        self.device_exists_impl(self.device_id).await
     }
 
     async fn create(&self) -> Result<i32> {
@@ -4833,7 +4699,7 @@ impl DeviceStore for SqliteStore {
     /// — a no-op for the default single-connection store. `pages` is the
     /// database page count (a size indicator, shared across connections).
     ///
-    /// Caveat: this does not account for [`SqliteStoreConfig::mmap_size`]. With
+    /// Caveat: this does not account for [`SqliteDatabaseConfig::mmap_size`]. With
     /// mmap enabled, some reads bypass the heap page cache via an OS-reclaimable
     /// file mapping, so the estimate can overstate actual process-heap residency
     /// for that session.
@@ -4972,7 +4838,7 @@ mod tests {
             std::process::id(),
             id
         );
-        SqliteStore::new(&db_name)
+        SqliteStore::open(&db_name)
             .await
             .expect("Failed to create test store")
     }
@@ -5399,14 +5265,14 @@ mod tests {
     ///
     /// The old shape is reconstructed on a freshly migrated file by adding the
     /// column back and rebuilding the old index, then deleting this migration's
-    /// row from the ledger. `SqliteStore::new` then runs it for real.
+    /// row from the ledger. `SqliteStore::open` then runs it for real.
     #[tokio::test]
     async fn reopening_an_old_database_runs_the_migration_and_upgrades_it() {
         use diesel::connection::SimpleConnection;
 
         let db = read_routing_tests::TempDb::new("upgrade_old_db");
         let url = db.url();
-        let store = SqliteStore::new(&url).await.expect("fresh store");
+        let store = SqliteStore::open(&url).await.expect("fresh store");
         store
             .put_msg_secrets(vec![MsgSecretEntry {
                 chat: Arc::from("19045550180@s.whatsapp.net"),
@@ -5433,7 +5299,7 @@ mod tests {
         }
 
         // Reopening runs the pending migration for real.
-        let upgraded = SqliteStore::new(&url)
+        let upgraded = SqliteStore::open(&url)
             .await
             .expect("the store must migrate an old database");
 
@@ -5540,13 +5406,13 @@ mod tests {
         );
 
         // Default profile is the opinionated low-memory one (additive API: new() is unchanged).
-        let def = SqliteStoreConfig::default();
+        let def = SqliteDatabaseConfig::default();
         assert_eq!(def.pool_size, 1);
         assert_eq!(def.cache_size_kib, 512);
 
         // A non-default config (more concurrency, bigger cache, full durability, injected
         // thread pool) must build and operate identically — only the resource profile differs.
-        let config = SqliteStoreConfig {
+        let config = SqliteDatabaseConfig {
             pool_size: 2,
             read_pool_size: 0,
             cache_size_kib: 4096,
@@ -5563,9 +5429,10 @@ mod tests {
             incremental_vacuum: false,
             incremental_vacuum_pages: 400,
         };
-        let store = SqliteStore::with_config(&db_name, config)
+        let store = crate::SqliteDatabase::open(&db_name, config)
             .await
-            .expect("custom-config store");
+            .expect("custom-config store")
+            .store(1);
 
         let mac = AppStateMutationMAC {
             index_mac: vec![1u8; 32],
@@ -5612,7 +5479,7 @@ mod tests {
 
     /// The performance-relevant pragmas a default store runs on. The custom-config
     /// test above pins the tunables when they are overridden; these are the values
-    /// every consumer that never touches `SqliteStoreConfig` actually gets, and
+    /// every consumer that never touches `SqliteDatabaseConfig` actually gets, and
     /// they are the ones a "why is this slow" investigation starts from.
     #[tokio::test]
     async fn default_pragmas_are_normal_sync_and_memory_temp_store() {
@@ -5620,7 +5487,7 @@ mod tests {
             "file:memdb_default_pragmas_{}?mode=memory&cache=shared",
             std::process::id()
         );
-        let store = SqliteStore::new(&db_name).await.expect("default store");
+        let store = SqliteStore::open(&db_name).await.expect("default store");
 
         #[derive(diesel::QueryableByName)]
         struct Pragmas {
@@ -5674,7 +5541,7 @@ mod tests {
             let calls = calls.clone();
             let saw_migrations_table = saw_migrations_table.clone();
             let saw_store_pragmas = saw_store_pragmas.clone();
-            SqliteStoreConfig::default().with_connection_init(move |conn| {
+            SqliteDatabaseConfig::default().with_connection_init(move |conn| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 let migrated: Count = diesel::sql_query(
                     "SELECT count(*) AS n FROM sqlite_master \
@@ -5695,9 +5562,10 @@ mod tests {
             })
         };
 
-        let store = SqliteStore::with_config(&db_name, config)
+        let store = crate::SqliteDatabase::open(&db_name, config)
             .await
-            .expect("store with connection_init");
+            .expect("store with connection_init")
+            .store(1);
 
         assert!(calls.load(Ordering::Relaxed) >= 1, "hook ran");
         assert!(
@@ -6562,18 +6430,19 @@ mod tests {
         );
 
         let device_id = 42;
-        let store = SqliteStore::new_for_device(&db_name, device_id)
+        let store = crate::SqliteDatabase::open(&db_name, Default::default())
             .await
-            .expect("Failed to create test store");
+            .expect("Failed to create test store")
+            .store(device_id);
 
-        assert!(!store.device_exists(device_id).await.unwrap());
+        assert!(!store.database().device_exists(device_id).await.unwrap());
         let returned_id = store.create_new_device().await.unwrap();
         assert_eq!(returned_id, device_id);
-        assert!(store.device_exists(device_id).await.unwrap());
+        assert!(store.database().device_exists(device_id).await.unwrap());
 
         // Row 1 should NOT exist (would if auto-increment was used)
         if device_id != 1 {
-            assert!(!store.device_exists(1).await.unwrap());
+            assert!(!store.database().device_exists(1).await.unwrap());
         }
 
         let loaded = store.load_device_data_for_device(device_id).await.unwrap();
@@ -6721,9 +6590,10 @@ mod tests {
         );
 
         let device_id = 9;
-        let _writer = SqliteStore::new_for_device(&db_name, device_id)
+        let _writer = crate::SqliteDatabase::open(&db_name, Default::default())
             .await
-            .expect("create store");
+            .expect("create store")
+            .store(device_id);
         _writer.create_new_device().await.expect("create device");
 
         let mut device = _writer
@@ -6742,9 +6612,10 @@ mod tests {
             .await
             .expect("save with watermarks");
 
-        let store = SqliteStore::new_for_device(&db_name, device_id)
+        let store = crate::SqliteDatabase::open(&db_name, Default::default())
             .await
-            .expect("reopen store");
+            .expect("reopen store")
+            .store(device_id);
         let loaded = store
             .load_device_data_for_device(device_id)
             .await
@@ -6767,7 +6638,10 @@ mod tests {
             std::process::id(),
             NEXT_DB.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        let store = SqliteStore::new_for_device(&db, 91).await.unwrap();
+        let store = crate::SqliteDatabase::open(&db, Default::default())
+            .await
+            .unwrap()
+            .store(91);
         store.create_new_device().await.unwrap();
         let mut device = store
             .load_device_data_for_device(91)
@@ -6785,7 +6659,10 @@ mod tests {
             .save_device_data_for_device(91, &device)
             .await
             .unwrap();
-        let reopened = SqliteStore::new_for_device(&db, 91).await.unwrap();
+        let reopened = crate::SqliteDatabase::open(&db, Default::default())
+            .await
+            .unwrap()
+            .store(91);
         let loaded = reopened
             .load_device_data_for_device(91)
             .await
@@ -6873,9 +6750,10 @@ mod tests {
         // database while at least one connection is open. Dropping the
         // first store would also drop the schema before the second can
         // see it.
-        let _writer = SqliteStore::new_for_device(&db_name, device_id)
+        let _writer = crate::SqliteDatabase::open(&db_name, Default::default())
             .await
-            .expect("create store");
+            .expect("create store")
+            .store(device_id);
         _writer.create_new_device().await.expect("create device");
 
         let mut device = _writer
@@ -6893,9 +6771,10 @@ mod tests {
         // exact path a fresh-process load would take — schema migration
         // already applied, BLOB column present, and the protobuf-encoded
         // chain decoded by the load path.
-        let store = SqliteStore::new_for_device(&db_name, device_id)
+        let store = crate::SqliteDatabase::open(&db_name, Default::default())
             .await
-            .expect("reopen store");
+            .expect("reopen store")
+            .store(device_id);
         let loaded = store
             .load_device_data_for_device(device_id)
             .await
@@ -7499,12 +7378,14 @@ mod tests {
             std::process::id(),
             id
         );
-        let store_a = SqliteStore::new_for_device(&shared_url, 1)
+        let store_a = crate::SqliteDatabase::open(&shared_url, Default::default())
             .await
-            .expect("store_a");
-        let store_b = SqliteStore::new_for_device(&shared_url, 2)
+            .expect("store_a")
+            .store(1);
+        let store_b = crate::SqliteDatabase::open(&shared_url, Default::default())
             .await
-            .expect("store_b");
+            .expect("store_b")
+            .store(2);
 
         store_a
             .put_msg_secret("c", "s", "M", &[7u8; 32])
@@ -7579,12 +7460,12 @@ mod tests {
     #[test]
     fn mmap_size_config_is_opt_in() {
         assert_eq!(
-            SqliteStoreConfig::default().mmap_size,
+            SqliteDatabaseConfig::default().mmap_size,
             None,
             "default leaves mmap off (current behavior)"
         );
         assert_eq!(
-            SqliteStoreConfig::default()
+            SqliteDatabaseConfig::default()
                 .with_mmap_size(64 * 1024 * 1024)
                 .mmap_size,
             Some(64 * 1024 * 1024),
@@ -7621,17 +7502,18 @@ mod tests {
 
         // Default config emits no mmap pragma, and SQLITE_DEFAULT_MMAP_SIZE is 0,
         // so mmap reads back off. Deterministic across environments.
-        let def_store = SqliteStore::new(&url).await.expect("default store");
+        let def_store = SqliteStore::open(&url).await.expect("default store");
         assert_eq!(read_mmap(&def_store), 0, "default keeps mmap off");
         drop(def_store);
 
         // Opt-in: the store builds with the pragma applied (on_acquire didn't
         // error) and stays fully operational.
         const MMAP: u64 = 64 * 1024 * 1024;
-        let cfg = SqliteStoreConfig::default().with_mmap_size(MMAP);
-        let store = SqliteStore::with_config(&url, cfg)
+        let cfg = SqliteDatabaseConfig::default().with_mmap_size(MMAP);
+        let store = crate::SqliteDatabase::open(&url, cfg)
             .await
-            .expect("mmap store builds");
+            .expect("mmap store builds")
+            .store(1);
         store
             .put_identity("559980000001@s.whatsapp.net", [9u8; 32])
             .await
@@ -7695,15 +7577,16 @@ mod read_routing_tests {
     }
 
     async fn store_with(read_pool_size: u32, db: &TempDb) -> SqliteStore {
-        let store = SqliteStore::with_config(
+        let store = crate::SqliteDatabase::open(
             &db.url(),
-            SqliteStoreConfig {
+            SqliteDatabaseConfig {
                 read_pool_size,
                 ..Default::default()
             },
         )
         .await
-        .expect("store opens");
+        .expect("store opens")
+        .store(1);
         assert_eq!(
             store.reads.is_some(),
             read_pool_size > 0,
@@ -7798,7 +7681,7 @@ mod read_routing_tests {
                 .unwrap(),
             None
         );
-        assert!(store.device_exists(1).await.unwrap());
+        assert!(store.database().device_exists(1).await.unwrap());
         assert!(
             store
                 .load_device_data_for_device(1)
@@ -8125,16 +8008,17 @@ mod read_routing_tests {
     #[tokio::test]
     async fn a_multi_statement_read_is_snapshot_isolated_with_a_wider_write_pool() {
         let db = TempDb::new("wide_pool");
-        let store = SqliteStore::with_config(
+        let store = crate::SqliteDatabase::open(
             &db.url(),
-            SqliteStoreConfig {
+            SqliteDatabaseConfig {
                 pool_size: 2,
                 read_pool_size: 0,
                 ..Default::default()
             },
         )
         .await
-        .expect("store opens");
+        .expect("store opens")
+        .store(1);
         assert!(store.reads.is_none(), "no reader connections requested");
         store.create_new_device().await.expect("device row");
         store.put_session(ADDR, b"blob").await.unwrap();
@@ -8210,16 +8094,17 @@ mod read_routing_tests {
             "file:memdb_snapshot_gate_{}_{id}?mode=memory&cache=shared",
             std::process::id()
         );
-        let store = SqliteStore::with_config(
+        let store = crate::SqliteDatabase::open(
             &url,
-            SqliteStoreConfig {
+            SqliteDatabaseConfig {
                 pool_size: 2,
                 read_pool_size: 4,
                 ..Default::default()
             },
         )
         .await
-        .expect("store opens");
+        .expect("store opens")
+        .store(1);
 
         assert!(store.reads.is_none(), "shared cache declines reader pool");
         assert!(
@@ -8633,9 +8518,10 @@ mod share_for_device_tests {
     const WRITES_PER_SESSION: usize = 25;
 
     async fn base_store(db: &TempDb) -> SqliteStore {
-        SqliteStore::new_for_device(&db.url(), 1)
+        crate::SqliteDatabase::open(&db.url(), Default::default())
             .await
             .expect("store opens")
+            .store(1)
     }
 
     /// Sibling handles are only plumbing: the `device_id` is what separates
@@ -8773,9 +8659,10 @@ mod share_for_device_tests {
         let db = TempDb::new("share_conn_count_baseline");
         let mut separate = Vec::new();
         for device_id in 1..=SESSIONS as i32 {
-            let store = SqliteStore::new_for_device(&db.url(), device_id)
+            let store = crate::SqliteDatabase::open(&db.url(), Default::default())
                 .await
-                .expect("store opens");
+                .expect("store opens")
+                .store(device_id);
             store.get_session("probe").await.expect("read");
             separate.push(store);
         }
@@ -8826,16 +8713,16 @@ mod share_for_device_tests {
     #[tokio::test]
     async fn concurrent_writes_serialize_across_siblings_at_the_default_pool_size() {
         let db = TempDb::new("share_write_contention");
-        let base = SqliteStore::with_config_for_device(
+        let base = crate::SqliteDatabase::open(
             &db.url(),
-            1,
-            SqliteStoreConfig {
+            SqliteDatabaseConfig {
                 pool_size: 1,
                 ..Default::default()
             },
         )
         .await
-        .expect("store opens");
+        .expect("store opens")
+        .store(1);
         let mut fleet = vec![base.clone()];
         for device_id in 2..=SESSIONS as i32 {
             fleet.push(base.share_for_device(device_id));
@@ -8846,9 +8733,10 @@ mod share_for_device_tests {
         let mut separate = Vec::new();
         for device_id in 1..=SESSIONS as i32 {
             separate.push(
-                SqliteStore::new_for_device(&db.url(), device_id)
+                crate::SqliteDatabase::open(&db.url(), Default::default())
                     .await
-                    .expect("store opens"),
+                    .expect("store opens")
+                    .store(device_id),
             );
         }
         let (separate_total, separate_sessions) = write_burst(separate).await;
@@ -8888,7 +8776,7 @@ mod lifecycle_tests {
     use std::collections::HashSet;
 
     async fn store(db: &TempDb) -> SqliteStore {
-        SqliteStore::new(&db.url()).await.expect("store opens")
+        SqliteStore::open(&db.url()).await.expect("store opens")
     }
 
     /// Seat one row in every account-scoped table for `device_id`, using each
@@ -9023,13 +8911,15 @@ mod lifecycle_tests {
         let db = TempDb::new("lifecycle_create");
         let base = store(&db).await;
 
-        let (first_id, first) = base.create_sibling_device().await.expect("create");
-        let (second_id, second) = base.create_sibling_device().await.expect("create");
+        let first = base.database().create_device().await.expect("create");
+        let first_id = first.device_id();
+        let second = base.database().create_device().await.expect("create");
+        let second_id = second.device_id();
         assert_eq!(first.device_id(), first_id);
         assert_eq!(second.device_id(), second_id);
         assert_ne!(first_id, second_id, "allocated ids must be distinct");
 
-        let listed = base.list_devices().await.expect("list");
+        let listed = base.database().list_devices().await.expect("list");
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, first_id);
         assert!(listed.iter().all(|d| !d.linked));
@@ -9057,8 +8947,13 @@ mod lifecycle_tests {
         .await
         .expect("pair device 1");
 
-        let (id, _) = base.create_sibling_device().await.expect("create");
-        let listed = base.list_devices().await.expect("list");
+        let id = base
+            .database()
+            .create_device()
+            .await
+            .expect("create")
+            .device_id();
+        let listed = base.database().list_devices().await.expect("list");
         assert_eq!(listed.len(), 2);
 
         let paired = listed.iter().find(|d| d.id == 1).expect("device 1");
@@ -9082,7 +8977,8 @@ mod lifecycle_tests {
     async fn reset_device_clears_state_and_keeps_the_id() {
         let db = TempDb::new("lifecycle_reset");
         let base = store(&db).await;
-        let (id, account) = base.create_sibling_device().await.expect("create");
+        let account = base.database().create_device().await.expect("create");
+        let id = account.device_id();
         {
             let pool = account.pool.clone();
             let mut conn = pool.get().expect("a connection");
@@ -9098,7 +8994,7 @@ mod lifecycle_tests {
             "seed must write a row in every account-scoped table, missing: {unseeded:?}"
         );
 
-        let reset = base.reset_device(id).await.expect("reset");
+        let reset = base.database().reset_device(id).await.expect("reset");
         assert_eq!(reset.device_id(), id, "reset keeps the account id");
 
         let after = scoped_row_counts(&base, id);
@@ -9115,7 +9011,7 @@ mod lifecycle_tests {
             .expect("load after reset")
             .expect("device row recreated");
         assert!(reloaded.pn.is_none(), "reset leaves the account unpaired");
-        let listed = base.list_devices().await.expect("list");
+        let listed = base.database().list_devices().await.expect("list");
         assert!(listed.iter().any(|d| d.id == id));
     }
 
@@ -9123,7 +9019,8 @@ mod lifecycle_tests {
     async fn remove_device_purges_and_retires_the_id() {
         let db = TempDb::new("lifecycle_remove");
         let base = store(&db).await;
-        let (id, account) = base.create_sibling_device().await.expect("create");
+        let account = base.database().create_device().await.expect("create");
+        let id = account.device_id();
         {
             let pool = account.pool.clone();
             let mut conn = pool.get().expect("a connection");
@@ -9137,9 +9034,9 @@ mod lifecycle_tests {
             seeded.iter().filter(|(_, n)| *n == 0).collect::<Vec<_>>()
         );
 
-        base.remove_device(id).await.expect("remove");
+        base.database().remove_device(id).await.expect("remove");
 
-        assert!(!base.device_exists(id).await.expect("exists"));
+        assert!(!base.database().device_exists(id).await.expect("exists"));
         let after = scoped_row_counts(&base, id);
         assert!(
             after.iter().all(|(_, n)| *n == 0),
@@ -9148,7 +9045,12 @@ mod lifecycle_tests {
         );
 
         // AUTOINCREMENT retires the id: no later allocation may reuse it.
-        let (next_id, _) = base.create_sibling_device().await.expect("create");
+        let next_id = base
+            .database()
+            .create_device()
+            .await
+            .expect("create")
+            .device_id();
         assert_ne!(next_id, id, "a removed id must never be reissued");
     }
 
@@ -9158,12 +9060,12 @@ mod lifecycle_tests {
         let base = store(&db).await;
         base.create_new_device().await.expect("device 1");
 
-        let reset = base.reset_device(9_999).await.err();
+        let reset = base.database().reset_device(9_999).await.err();
         assert!(
             matches!(reset, Some(StoreError::DeviceNotFound(9_999))),
             "reset of an unknown device names it, got {reset:?}"
         );
-        let remove = base.remove_device(9_999).await.err();
+        let remove = base.database().remove_device(9_999).await.err();
         assert!(
             matches!(remove, Some(StoreError::DeviceNotFound(9_999))),
             "remove of an unknown device names it, got {remove:?}"
@@ -9179,21 +9081,26 @@ mod lifecycle_tests {
         // serialize them and the test would pass without exercising SQLite's
         // allocation at all. Each create is a single INSERT, so the
         // read-then-write deadlock the config warns about does not arise.
-        let base = SqliteStore::with_config(
+        let base = crate::SqliteDatabase::open(
             &db.url(),
-            SqliteStoreConfig {
+            SqliteDatabaseConfig {
                 pool_size: CREATES as u32,
                 ..Default::default()
             },
         )
         .await
-        .expect("store opens");
+        .expect("store opens")
+        .store(1);
 
         let mut tasks = Vec::new();
         for _ in 0..CREATES {
             let base = base.clone();
             tasks.push(tokio::spawn(async move {
-                base.create_sibling_device().await.expect("create").0
+                base.database()
+                    .create_device()
+                    .await
+                    .expect("create")
+                    .device_id()
             }));
         }
         let mut ids = Vec::new();
@@ -9208,6 +9115,7 @@ mod lifecycle_tests {
             "concurrent creates returned a duplicate id: {ids:?}"
         );
         let listed: HashSet<i32> = base
+            .database()
             .list_devices()
             .await
             .expect("list")
@@ -9227,7 +9135,8 @@ mod lifecycle_tests {
     async fn a_sibling_table_cascades_away_with_its_account() {
         let db = TempDb::new("lifecycle_cascade");
         let base = store(&db).await;
-        let (id, account) = base.create_sibling_device().await.expect("create");
+        let account = base.database().create_device().await.expect("create");
+        let id = account.device_id();
 
         // Stand in for a sibling store's table: keyed by device_id, owned by
         // someone else, declared the way the contract requires.
@@ -9270,7 +9179,7 @@ mod lifecycle_tests {
 
         // reset_device recreates the device row, so the cascade has to run on
         // the delete in the middle, not on the reinsert.
-        base.reset_device(id).await.expect("reset");
+        base.database().reset_device(id).await.expect("reset");
         assert_eq!(
             sibling_rows(&base),
             0,
@@ -9288,7 +9197,7 @@ mod lifecycle_tests {
             .execute(&mut *conn)
             .expect("sibling row again");
         }
-        base.remove_device(id).await.expect("remove");
+        base.database().remove_device(id).await.expect("remove");
         assert_eq!(
             sibling_rows(&base),
             0,
@@ -9312,7 +9221,7 @@ mod maintenance_tests {
     #[tokio::test]
     async fn a_fresh_store_runs_maintenance_and_caps_its_wal() {
         let db = TempDb::new("maintenance_fresh");
-        let store = SqliteStore::new(&db.url()).await.expect("store opens");
+        let store = SqliteStore::open(&db.url()).await.expect("store opens");
 
         #[derive(diesel::QueryableByName)]
         struct Limit {
@@ -9358,7 +9267,7 @@ mod maintenance_tests {
     async fn incremental_vacuum_is_opt_in_and_never_reorganizes_an_existing_db() {
         // Default: off.
         let db = TempDb::new("maintenance_av_default");
-        let store = SqliteStore::new(&db.url()).await.expect("store opens");
+        let store = SqliteStore::open(&db.url()).await.expect("store opens");
         assert_eq!(
             auto_vacuum_mode(&store),
             0,
@@ -9370,10 +9279,11 @@ mod maintenance_tests {
         // Fresh file + opt-in: the mode is set, and the pass reclaims pages
         // without error.
         let db = TempDb::new("maintenance_av_fresh");
-        let cfg = SqliteStoreConfig::default().with_incremental_vacuum(100);
-        let store = SqliteStore::with_config(&db.url(), cfg)
+        let cfg = SqliteDatabaseConfig::default().with_incremental_vacuum(100);
+        let store = crate::SqliteDatabase::open(&db.url(), cfg)
             .await
-            .expect("store opens");
+            .expect("store opens")
+            .store(1);
         assert_eq!(
             auto_vacuum_mode(&store),
             2,
@@ -9405,17 +9315,18 @@ mod maintenance_tests {
         // Populated database + opt-in: SQLite ignores the mode change, so the
         // store must leave it at NONE and simply not reclaim. No VACUUM.
         let db = TempDb::new("maintenance_av_populated");
-        let plain = SqliteStore::new(&db.url()).await.expect("store opens");
+        let plain = SqliteStore::open(&db.url()).await.expect("store opens");
         plain
             .put_msg_secret("c", "s", "M", &[1u8; 32])
             .await
             .expect("populate");
         drop(plain);
 
-        let cfg = SqliteStoreConfig::default().with_incremental_vacuum(100);
-        let reopened = SqliteStore::with_config(&db.url(), cfg)
+        let cfg = SqliteDatabaseConfig::default().with_incremental_vacuum(100);
+        let reopened = crate::SqliteDatabase::open(&db.url(), cfg)
             .await
-            .expect("reopen");
+            .expect("reopen")
+            .store(1);
         assert_eq!(
             auto_vacuum_mode(&reopened),
             0,
@@ -9430,15 +9341,16 @@ mod maintenance_tests {
         // a pass that reclaims nothing: switching a fresh file into INCREMENTAL
         // is one-way outside a VACUUM, so it must not happen with no reclaim to
         // justify the pointer-map overhead.
-        let cfg = SqliteStoreConfig::default().with_incremental_vacuum(0);
+        let cfg = SqliteDatabaseConfig::default().with_incremental_vacuum(0);
         assert!(
             !cfg.incremental_vacuum,
             "a zero batch leaves the option off"
         );
         let db = TempDb::new("maintenance_av_zero");
-        let zero = SqliteStore::with_config(&db.url(), cfg)
+        let zero = crate::SqliteDatabase::open(&db.url(), cfg)
             .await
-            .expect("store opens");
+            .expect("store opens")
+            .store(1);
         assert_eq!(
             auto_vacuum_mode(&zero),
             0,
@@ -9493,7 +9405,7 @@ mod maintenance_tests {
         let db = TempDb::new("maintenance uri wal");
         let url = format!("file:{}?mode=rwc", db.url().replace(' ', "%20"));
         assert!(url.contains("%20"), "the fixture path must carry an escape");
-        let store = SqliteStore::new(&url)
+        let store = SqliteStore::open(&url)
             .await
             .expect("store opens by an escaped URI");
         store
@@ -9524,7 +9436,7 @@ mod maintenance_tests {
     async fn a_uri_opened_store_reports_its_wal() {
         let db = TempDb::new("maintenance_uri_wal");
         let url = format!("file:{}?mode=rwc", db.url());
-        let store = SqliteStore::new(&url).await.expect("store opens by URI");
+        let store = SqliteStore::open(&url).await.expect("store opens by URI");
         // One write so the WAL exists on disk.
         store
             .put_msg_secrets(vec![MsgSecretEntry {
@@ -9555,7 +9467,7 @@ mod maintenance_tests {
         const LIMIT: u64 = 33_554_432;
 
         let db = TempDb::new("maintenance_wal");
-        let store = SqliteStore::new(&db.url()).await.expect("store opens");
+        let store = SqliteStore::open(&db.url()).await.expect("store opens");
         let entries: Vec<MsgSecretEntry> = (0..ROWS)
             .map(|i| MsgSecretEntry {
                 chat: Arc::from(format!("1904555{:04}@s.whatsapp.net", i % 10_000).as_str()),
@@ -9615,7 +9527,7 @@ mod retention_sweep_tests {
     #[tokio::test]
     async fn each_sweep_deletes_only_its_expired_rows() {
         let db = TempDb::new("retention_sweeps");
-        let store = SqliteStore::new(&db.url()).await.expect("store opens");
+        let store = SqliteStore::open(&db.url()).await.expect("store opens");
         let now = wacore::time::now_secs();
 
         store
@@ -9733,7 +9645,7 @@ mod retention_sweep_tests {
     #[tokio::test]
     async fn the_base_key_sweep_deletes_only_backdated_rows() {
         let db = TempDb::new("base_key_sweep");
-        let store = SqliteStore::new(&db.url()).await.expect("store opens");
+        let store = SqliteStore::open(&db.url()).await.expect("store opens");
         let now = wacore::time::now_secs();
 
         store
@@ -9784,7 +9696,7 @@ mod retention_sweep_tests {
         use wacore::appstate::processor::AppStateMutationMAC;
 
         let db = TempDb::new("retention_under_write");
-        let store = Arc::new(SqliteStore::new(&db.url()).await.expect("store opens"));
+        let store = Arc::new(SqliteStore::open(&db.url()).await.expect("store opens"));
         store
             .store_sent_message("1@s.whatsapp.net", "OLD", b"payload")
             .await

@@ -66,7 +66,7 @@ impl Db {
         remove_db_files(&path);
         let url = path.to_str().expect("utf-8 temp path").to_owned();
         let store = runtime
-            .block_on(SqliteStore::new(&url))
+            .block_on(SqliteStore::open(&url))
             .expect("open file-backed store");
         // `lid_pn_mapping` references the device row the store stamps.
         runtime

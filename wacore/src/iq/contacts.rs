@@ -14,6 +14,11 @@
 //!   <picture id="123456789" url="https://..." direct_path="/v/..."/>
 //! </iq>
 //!
+//! <!-- Response (rate limited: typed rejection, not a lookup state) -->
+//! <iq from="s.whatsapp.net" id="..." type="result">
+//!   <picture><error code="429" text="rate-overlimit" type="wait" backoff="73"/></picture>
+//! </iq>
+//!
 //! <!-- Response (not found) -->
 //! <iq from="s.whatsapp.net" id="..." type="result">
 //!   <picture>
@@ -21,6 +26,11 @@
 //!   </picture>
 //! </iq>
 //! ```
+//!
+//! The embedded 429 produces a [`crate::request::IqError::ServerError`] source
+//! retaining text, type and optional backoff. Runtime `Client::execute` attaches
+//! the original stanza, as it does for an IQ-envelope rejection. Core parsing
+//! alone does not own or attach a runtime response stanza.
 
 use crate::iq::spec::IqSpec;
 use crate::iq::tctoken::build_tc_token_node;
@@ -50,7 +60,9 @@ pub enum ProfilePictureType {
     Full,
 }
 
-/// The outcome of a profile picture query.
+/// The successful outcome of a profile picture query.
+///
+/// Rejections such as 429 are errors, not empty states in this enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProfilePictureLookup {
@@ -63,9 +75,6 @@ pub enum ProfilePictureLookup {
     NotFound,
     /// Not authorized to view the profile picture (e.g. 401 not-authorized, 403 forbidden, privacy settings).
     NotAuthorized,
-    /// Lossy legacy parser state for 429 rate-overlimit. High-level canonical
-    /// lookup preserves the rejection as an error instead; this carries no backoff.
-    RateOverlimit,
 }
 
 impl ProfilePictureLookup {
@@ -77,8 +86,8 @@ impl ProfilePictureLookup {
         }
     }
 
-    /// Deliberately discards Unchanged, NotFound, NotAuthorized and the legacy
-    /// RateOverlimit state, returning only a newly found picture.
+    /// Deliberately discards Unchanged, NotFound and NotAuthorized,
+    /// returning only a newly found picture.
     pub fn into_found(self) -> Option<ProfilePicture> {
         match self {
             Self::Found(pic) => Some(pic),
@@ -104,11 +113,6 @@ impl ProfilePictureLookup {
     /// Returns `true` if unauthorized to view the profile picture.
     pub fn is_not_authorized(&self) -> bool {
         matches!(self, Self::NotAuthorized)
-    }
-
-    /// Returns `true` if rate limited (429 rate-overlimit).
-    pub fn is_rate_overlimit(&self) -> bool {
-        matches!(self, Self::RateOverlimit)
     }
 }
 
@@ -233,37 +237,6 @@ impl ProfilePictureSpec {
         self.timeout = Some(timeout);
         self
     }
-
-    /// Parse without losing an embedded 429 rejection. The error is a
-    /// `crate::request::IqError`, so the runtime can attach the original stanza.
-    /// The legacy `IqSpec` parser retains its unit RateOverlimit for compatibility.
-    pub fn parse_response_preserving_rate_limit(
-        &self,
-        response: &NodeRef<'_>,
-    ) -> Result<ProfilePictureLookup, anyhow::Error> {
-        let picture = if let Some(pictures) = response.get_optional_child("pictures") {
-            pictures.get_optional_child("picture")
-        } else {
-            response.get_optional_child("picture")
-        };
-        if let Some(error) = picture.and_then(|picture| picture.get_optional_child("error"))
-            && error.get_attr("code").is_some_and(|code| code == "429")
-        {
-            return Err(crate::request::IqError::ServerError {
-                code: 429,
-                text: error
-                    .get_attr("text")
-                    .map(|s| s.to_string())
-                    .unwrap_or_default(),
-                error_type: error.get_attr("type").map(|s| s.to_string()),
-                backoff: error
-                    .get_attr("backoff")
-                    .and_then(|s| s.as_str().parse().ok()),
-            }
-            .into());
-        }
-        self.parse_response(response)
-    }
 }
 
 impl IqSpec for ProfilePictureSpec {
@@ -364,7 +337,20 @@ impl IqSpec for ProfilePictureSpec {
                 return Ok(ProfilePictureLookup::NotAuthorized);
             }
             if code_str == "429" {
-                return Ok(ProfilePictureLookup::RateOverlimit);
+                // Keep the typed rejection so the runtime can attach the original
+                // stanza, just as it does for an IQ-envelope rejection.
+                return Err(crate::request::IqError::ServerError {
+                    code: 429,
+                    text: error_node
+                        .get_attr("text")
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                    error_type: error_node.get_attr("type").map(|s| s.to_string()),
+                    backoff: error_node
+                        .get_attr("backoff")
+                        .and_then(|s| s.as_str().parse().ok()),
+                }
+                .into());
             }
             let text = error_node.attrs().optional_string("text");
             let text_str = text.as_deref().unwrap_or("unknown error");
@@ -786,10 +772,12 @@ mod tests {
                     .build()])
                 .build()])
             .build();
-        assert_eq!(
-            spec.parse_response(&resp_429.as_node_ref()).unwrap(),
-            ProfilePictureLookup::RateOverlimit
-        );
+        let error = spec.parse_response(&resp_429.as_node_ref()).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<crate::request::IqError>(),
+            Some(crate::request::IqError::ServerError { code: 429, text, .. })
+                if text == "rate-overlimit"
+        ));
     }
 
     #[test]

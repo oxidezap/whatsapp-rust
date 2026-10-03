@@ -468,7 +468,7 @@ async fn completed_background_driver_cancels_callbacks_while_handle_is_retained(
         let mut handle = bot.spawn();
         dispatch(&client, "composing", None).await;
         assert_eq!(receive(&probe.started).await, EventKind::ChatPresence);
-        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        client.set_auto_reconnect(false);
         client.resume();
         let verdict = tokio::time::timeout(Duration::from_secs(5), &mut handle)
             .await
@@ -500,7 +500,7 @@ async fn completed_foreground_driver_cancels_callbacks_while_future_is_retained(
         poll_paused_driver(driver.as_mut()).await;
         dispatch(&client, "composing", None).await;
         assert_eq!(receive(&probe.started).await, EventKind::ChatPresence);
-        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        client.set_auto_reconnect(false);
         client.resume();
         let verdict = tokio::time::timeout(Duration::from_secs(5), driver.as_mut())
             .await

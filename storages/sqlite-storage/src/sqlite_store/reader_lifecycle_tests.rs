@@ -17,16 +17,17 @@ async fn store_with_readers(
     readers: u32,
     hook: Option<ConnectionInitHook>,
 ) -> SqliteStore {
-    let config = SqliteStoreConfig::default();
-    let mut store = SqliteStore::with_config(
+    let config = SqliteDatabaseConfig::default();
+    let mut store = crate::SqliteDatabase::open(
         url,
-        SqliteStoreConfig {
+        SqliteDatabaseConfig {
             read_pool_size: 0,
             ..config.clone()
         },
     )
     .await
-    .expect("writer and migrations");
+    .expect("writer and migrations")
+    .store(1);
     let options = ConnectionOptions {
         cache_size_kib: config.cache_size_kib,
         mmap_size: config.mmap_size,
@@ -77,9 +78,9 @@ async fn production_readers_are_eagerly_validated_before_becoming_reclaimable() 
     let db = TempDb::new("reader_defaults");
     let initialized = Arc::new(AtomicUsize::new(0));
     let hook = initialized.clone();
-    let store = SqliteStore::with_config(
+    let store = crate::SqliteDatabase::open(
         &db.url(),
-        SqliteStoreConfig::default()
+        SqliteDatabaseConfig::default()
             .with_read_pool_size(3)
             .with_connection_init(move |_| {
                 hook.fetch_add(1, Ordering::SeqCst);
@@ -87,7 +88,8 @@ async fn production_readers_are_eagerly_validated_before_becoming_reclaimable() 
             }),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .store(1);
     let reads = store.reads.as_ref().unwrap();
     assert_eq!(reads.pool.min_idle(), Some(0));
     assert_eq!(reads.pool.idle_timeout(), Some(Duration::from_secs(600)));
@@ -342,12 +344,13 @@ async fn measure_reader_retention() {
     let production = idle_secs == 600;
     println!("warm_scan={warm} production_builder={production}");
     let db = TempDb::new("retention_measurement");
-    let seed = SqliteStore::with_config(
+    let seed = crate::SqliteDatabase::open(
         &db.url(),
-        SqliteStoreConfig::default().with_read_pool_size(0),
+        SqliteDatabaseConfig::default().with_read_pool_size(0),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .store(1);
     let rows: Vec<_> = (0..4000)
         .map(|i| {
             (
@@ -366,9 +369,10 @@ async fn measure_reader_retention() {
             // Both real-interval arms use the actual constructor. The baseline
             // binary is built with the pre-change reader-builder body restored;
             // these assertions catch accidentally measuring the wrong policy.
-            SqliteStore::with_config(&db.url(), SqliteStoreConfig::default())
+            crate::SqliteDatabase::open(&db.url(), SqliteDatabaseConfig::default())
                 .await
                 .unwrap()
+                .store(1)
         } else {
             store_with_readers(&db.url(), adaptive, Duration::from_secs(idle_secs), 1, None).await
         };
