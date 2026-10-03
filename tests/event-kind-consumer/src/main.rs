@@ -81,7 +81,8 @@ fn disposition(kind: EventKind) -> Option<bool> {
         | RemoveRecentStickerUpdate
         | FavoritesUpdate
         | StatusPrivacyUpdate
-        | ReachoutTimelockUpdate => Some(false),
+        | ReachoutTimelockUpdate
+        | UnarchiveChatsSettingUpdate => Some(false),
         _ => None,
     }
 }
