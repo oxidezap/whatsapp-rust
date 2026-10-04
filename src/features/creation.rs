@@ -1,5 +1,14 @@
 //! Shared implementation of the poll/event creation contracts, not a send pipeline.
 
+/// A fresh secret for one message. Callers retain their own validation,
+/// identity selection and context construction before publishing it.
+pub(super) fn generate_message_secret() -> crate::MessageSecret {
+    use rand::Rng;
+    let mut bytes = [0u8; wacore::reporting_token::MESSAGE_SECRET_SIZE];
+    rand::rng().fill_bytes(&mut bytes);
+    crate::MessageSecret::from_bytes(bytes)
+}
+
 macro_rules! creation_types {
     ($created:ident, $reference:ident, $accessor:ident) => {
         /// Successfully sent creation, its actual creator identity and its secret.

@@ -121,12 +121,7 @@ impl<'a> Comments<'a> {
         }
 
         // Fresh secret so the comment can itself receive encrypted add-ons.
-        let comment_secret: [u8; 32] = {
-            use rand::Rng;
-            let mut secret = [0u8; 32];
-            rand::rng().fill_bytes(&mut secret);
-            secret
-        };
+        let comment_secret = super::creation::generate_message_secret().into_bytes();
 
         let message = wa::Message {
             enc_comment_message: buffa::MessageField::some(wa::message::EncCommentMessage {

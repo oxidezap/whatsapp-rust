@@ -61,14 +61,14 @@ async fn check_poll(client: &Arc<Client>, created: &CreatedPoll, group: bool) ->
     };
     let hashes = client
         .polls()
-        .decrypt_vote_ref(cipher, &reference, created.creator())
+        .decrypt_vote(cipher, &reference, created.creator())
         .await
         .unwrap();
     assert_eq!(hashes, vec![compute_option_hash("Yes").to_vec()]);
     assert!(
         client
             .polls()
-            .decrypt_vote(
+            .decrypt_vote_raw(
                 cipher,
                 &[0; 32],
                 reference.message().id().as_str(),
@@ -82,7 +82,7 @@ async fn check_poll(client: &Arc<Client>, created: &CreatedPoll, group: bool) ->
     assert!(
         client
             .polls()
-            .decrypt_vote(
+            .decrypt_vote_raw(
                 cipher,
                 reference.secret().as_bytes(),
                 vote.message_id.as_str(),
@@ -426,7 +426,7 @@ async fn poll_vote_reference_sender_is_not_the_crypto_creator() {
     let hashes = fixture
         .client
         .polls()
-        .decrypt_vote_ref(ciphertext, &target, created.creator())
+        .decrypt_vote(ciphertext, &target, created.creator())
         .await
         .unwrap();
     assert_eq!(hashes, vec![compute_option_hash("Yes").to_vec()]);

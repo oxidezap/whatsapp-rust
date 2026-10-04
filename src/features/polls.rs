@@ -120,12 +120,7 @@ impl<'a> Polls<'a> {
 
         // WA Web generates a 32-byte random secret at poll creation time
         // (SendPollCreationMsgAction.js:158). Voters need this to derive their encryption key.
-        let message_secret = {
-            use rand::Rng;
-            let mut secret = [0u8; wacore::reporting_token::MESSAGE_SECRET_SIZE];
-            rand::rng().fill_bytes(&mut secret);
-            crate::MessageSecret::from_bytes(secret)
-        };
+        let message_secret = super::creation::generate_message_secret();
 
         message.message_context_info = buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(message_secret.as_bytes().to_vec()),
@@ -238,14 +233,23 @@ impl<'a> Polls<'a> {
         .await
     }
 
-    /// Decrypt with the same creation reference used by `vote`.
-    pub async fn decrypt_vote_ref(
+    /// Decrypt with the same creation reference used by [`Self::vote`].
+    /// Creator/voter PN/LID aliases use the same resolution as [`Self::decrypt_vote_raw`].
+    ///
+    /// ```no_run
+    /// # use whatsapp_rust::{Client, Jid, PollRef, PollVoteCiphertext, PollError};
+    /// # async fn decrypt(client: &Client, target: &PollRef<'_>, voter: &Jid,
+    /// #     ciphertext: PollVoteCiphertext<'_>) -> Result<(), PollError> {
+    /// let option_hashes = client.polls().decrypt_vote(ciphertext, target, voter).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn decrypt_vote(
         &self,
         ciphertext: PollVoteCiphertext<'_>,
         target: &PollRef<'_>,
         voter_jid: &Jid,
     ) -> Result<Vec<Vec<u8>>, PollError> {
-        self.decrypt_vote(
+        self.decrypt_vote_raw(
             ciphertext,
             target.secret().as_bytes(),
             target.message().id().as_str(),
@@ -280,10 +284,12 @@ impl<'a> Polls<'a> {
         }
     }
 
-    /// Selected option hashes (32 bytes each). Tries known creator and voter
+    /// Explicit byte/ID interoperability for selected option hashes (32 bytes each).
+    /// Prefer [`Self::decrypt_vote`] when a [`PollRef`] is available.
+    /// Tries known creator and voter
     /// aliases independently, so votes authored across the LID migration open
     /// even when the two supplied identities use different namespaces.
-    pub async fn decrypt_vote(
+    pub async fn decrypt_vote_raw(
         &self,
         ciphertext: PollVoteCiphertext<'_>,
         message_secret: &[u8],
@@ -682,7 +688,7 @@ mod tests {
         // Consumer feeds LID JIDs; primary (LID) fails, fallback swaps to PN.
         let out = client
             .polls()
-            .decrypt_vote(
+            .decrypt_vote_raw(
                 PollVoteCiphertext {
                     enc_payload: &enc,
                     enc_iv: &iv,
@@ -716,7 +722,7 @@ mod tests {
 
         let res = client
             .polls()
-            .decrypt_vote(
+            .decrypt_vote_raw(
                 PollVoteCiphertext {
                     enc_payload: &enc,
                     enc_iv: &iv,
@@ -767,7 +773,7 @@ mod tests {
                     for supplied_voter in &voters {
                         let actual = client
                             .polls()
-                            .decrypt_vote(
+                            .decrypt_vote_raw(
                                 ciphertext,
                                 &secret,
                                 "P1-MATRIX",
@@ -840,14 +846,14 @@ mod tests {
             };
             let actual = client
                 .polls()
-                .decrypt_vote(ciphertext, &secret, "P1-ONE-MAPPING", &creator, &voter)
+                .decrypt_vote_raw(ciphertext, &secret, "P1-ONE-MAPPING", &creator, &voter)
                 .await
                 .expect("only the identity that needs converting must be mapped");
             assert_eq!(actual, hashes);
             assert!(
                 client
                     .polls()
-                    .decrypt_vote(ciphertext, &[0xFF; 32], "P1-ONE-MAPPING", &creator, &voter,)
+                    .decrypt_vote_raw(ciphertext, &[0xFF; 32], "P1-ONE-MAPPING", &creator, &voter,)
                     .await
                     .is_err(),
                 "known aliases must not bypass authentication"

@@ -66,12 +66,7 @@ impl<'a> Events<'a> {
         // Events carry a per-message secret (like polls); responders derive their
         // RSVP encryption key from it. WA Web rejects an event without one
         // (Events/ValidationError MISSING_MESSAGE_SECRET).
-        let message_secret = {
-            use rand::Rng;
-            let mut secret = [0u8; wacore::reporting_token::MESSAGE_SECRET_SIZE];
-            rand::rng().fill_bytes(&mut secret);
-            crate::MessageSecret::from_bytes(secret)
-        };
+        let message_secret = super::creation::generate_message_secret();
         message.message_context_info = buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(message_secret.as_bytes().to_vec()),
             ..Default::default()
