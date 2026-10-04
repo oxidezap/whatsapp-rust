@@ -108,6 +108,7 @@ fn nullable_lsf_observation_preserves_all_packets_pcm_and_present_centroids() ->
     let nullable = run_spec(&path, &module, &nullable_dir)?;
     assert_eq!(raw.outputs.len(), nullable.outputs.len());
     let mut absent = 0;
+    let mut present = 0;
     for (before, after) in raw.outputs.iter().zip(&nullable.outputs) {
         assert_eq!(before.file, after.file);
         if let Some(suffix) = before.file.strip_prefix("lsf_cond_")
@@ -119,11 +120,15 @@ fn nullable_lsf_observation_preserves_all_packets_pcm_and_present_centroids() ->
             assert_eq!(after.bytes, 0);
             assert!(std::fs::read(nullable_dir.join(&after.file))?.is_empty());
         } else {
+            if before.file.starts_with("lsf_cond_") && !before.file.starts_with("lsf_cond_ptr_") {
+                present += 1;
+            }
             assert_eq!(before.bytes, after.bytes, "{}", before.file);
             assert_eq!(before.sha256, after.sha256, "{}", before.file);
         }
     }
     assert_eq!(absent, 111);
+    assert_eq!(present, 219);
     eprintln!(
         "pinned J LSF: 111 absent + 219 present centroids; all 220 packet/PCM hashes preserved"
     );
