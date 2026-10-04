@@ -120,9 +120,9 @@ fn nullable_lsf_observation_preserves_all_packets_pcm_and_present_centroids() ->
             assert_eq!(after.bytes, 0);
             assert!(std::fs::read(nullable_dir.join(&after.file))?.is_empty());
         } else {
-            present += usize::from(
-                before.file.starts_with("lsf_cond_") && !before.file.starts_with("lsf_cond_ptr_"),
-            );
+            if before.file.starts_with("lsf_cond_") && !before.file.starts_with("lsf_cond_ptr_") {
+                present += 1;
+            }
             assert_eq!(before.bytes, after.bytes, "{}", before.file);
             assert_eq!(before.sha256, after.sha256, "{}", before.file);
         }
