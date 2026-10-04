@@ -837,7 +837,7 @@ impl Client {
 
     /// Register a waiter for an incoming node matching the given filter.
     ///
-    /// Returns a receiver that resolves when a matching node arrives.
+    /// Returns an owned future that resolves when a matching node arrives.
     /// The waiter starts buffering immediately, so register it **before**
     /// performing the action that triggers the expected node.
     ///
@@ -852,18 +852,8 @@ impl Client {
     /// client.groups().add_participants(&group_jid, &[jid_c]).await?;
     /// let node = waiter.await.expect("notification arrived");
     /// ```
-    pub fn wait_for_node(
-        &self,
-        filter: NodeFilter,
-    ) -> futures::channel::oneshot::Receiver<Arc<wacore_binary::OwnedNodeRef>> {
-        let (tx, rx) = futures::channel::oneshot::channel();
-        self.node_waiter_count.fetch_add(1, Ordering::Release);
-        let mut waiters = self
-            .node_waiters
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        waiters.push(NodeWaiter { filter, tx });
-        rx
+    pub fn wait_for_node(&self, filter: NodeFilter) -> NodeWaiter<wacore_binary::OwnedNodeRef> {
+        register_node_waiter(&self.node_waiters, &self.node_waiter_count, filter)
     }
 
     /// Register a waiter for an outgoing node before it is encrypted and sent.
@@ -871,18 +861,12 @@ impl Client {
     /// This is intended for tests and diagnostics that need to inspect the raw
     /// stanza built by the client, such as asserting whether `<tctoken>` or
     /// `<cstoken>` was attached.
-    pub fn wait_for_sent_node(
-        &self,
-        filter: NodeFilter,
-    ) -> futures::channel::oneshot::Receiver<Arc<Node>> {
-        let (tx, rx) = futures::channel::oneshot::channel();
-        self.sent_node_waiter_count.fetch_add(1, Ordering::Release);
-        let mut waiters = self
-            .sent_node_waiters
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        waiters.push(SentNodeWaiter { filter, tx });
-        rx
+    pub fn wait_for_sent_node(&self, filter: NodeFilter) -> NodeWaiter<Node> {
+        register_node_waiter(
+            &self.sent_node_waiters,
+            &self.sent_node_waiter_count,
+            filter,
+        )
     }
 
     /// Poison-recovering lock of the `response_waiters` map. Centralizes the
@@ -899,28 +883,21 @@ impl Client {
     /// Check pending node waiters against an incoming node.
     /// Only called when `node_waiter_count > 0`.
     pub(crate) fn resolve_node_waiters(&self, node: &Arc<wacore_binary::OwnedNodeRef>) {
-        resolve_waiters(&self.node_waiters, &self.node_waiter_count, node);
+        resolve_waiters(
+            &self.node_waiters,
+            &self.node_waiter_count,
+            node,
+            node.get(),
+        );
     }
 
     pub(crate) fn resolve_sent_node_waiters(&self, node: &Arc<Node>) {
-        let nr = node.as_node_ref();
-        let mut waiters = self
-            .sent_node_waiters
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut i = 0;
-        while i < waiters.len() {
-            if waiters[i].tx.is_canceled() {
-                waiters.swap_remove(i);
-                self.sent_node_waiter_count.fetch_sub(1, Ordering::Release);
-            } else if waiters[i].filter.matches(&nr) {
-                let w = waiters.swap_remove(i);
-                self.sent_node_waiter_count.fetch_sub(1, Ordering::Release);
-                let _ = w.tx.send(Arc::clone(node));
-            } else {
-                i += 1;
-            }
-        }
+        resolve_waiters(
+            &self.sent_node_waiters,
+            &self.sent_node_waiter_count,
+            node,
+            &node.as_node_ref(),
+        );
     }
 
     pub(crate) fn clear_sent_node_waiters(&self) {
@@ -928,12 +905,11 @@ impl Client {
             .sent_node_waiters
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let count = waiters.len();
-        if count > 0 {
-            waiters.clear();
-            self.sent_node_waiter_count
-                .fetch_sub(count, Ordering::Release);
-        }
+        let removed = std::mem::take(&mut *waiters);
+        self.sent_node_waiter_count
+            .fetch_sub(removed.len(), Ordering::Release);
+        drop(waiters);
+        drop(removed);
     }
 
     fn should_downgrade_sync_error(&self, err: &anyhow::Error) -> bool {

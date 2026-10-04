@@ -93,6 +93,7 @@ pub use groups::{
 
 pub use labels::Labels;
 
+pub(crate) use media_reupload::MediaReuploadInFlight;
 pub use media_reupload::{
     MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest,
 };

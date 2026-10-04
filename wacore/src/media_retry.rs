@@ -228,10 +228,12 @@ pub fn parse_media_retry_notification(
     let notification = wa::MediaRetryNotificationView::decode_view(&plaintext)
         .map_err(|e| anyhow!("protobuf decode failed: {e}"))?;
 
-    // Validate stanza ID matches
-    if let Some(returned_id) = notification.stanza_id
-        && returned_id != msg_id.as_str()
-    {
+    // The encrypted payload must bind to the outer correlation ID, including
+    // on error results. Plaintext <error> notifications take the branch above.
+    let returned_id = notification
+        .stanza_id
+        .ok_or_else(|| anyhow!("encrypted media retry notification missing stanza ID"))?;
+    if returned_id != msg_id.as_str() {
         return Err(anyhow!(
             "stanza ID mismatch: expected {msg_id}, got {returned_id}"
         ));
@@ -260,6 +262,70 @@ pub fn parse_media_retry_notification(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // WAWebHandleMediaRetryNotification, WA 2.3000.1045368834:
+    // bundle 034314e49fa571a8e2e8491843a15536326b4a47d1f66ac7704d2332ee1b391e,
+    // bytes 1049768..1052840, compares decrypted stanzaId strictly.
+    #[test]
+    fn encrypted_response_requires_matching_stanza_id() {
+        use buffa::Message;
+        let key = [42; 32];
+        for id in [Some("MSG"), None, Some("OTHER")] {
+            let plaintext = wa::MediaRetryNotification {
+                stanza_id: id.map(str::to_owned),
+                direct_path: Some("/media/test.enc".into()),
+                result: Some(wa::media_retry_notification::ResultType::SUCCESS.into()),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            let iv = [1; 12];
+            let mut encrypted = Vec::new();
+            aes_256_gcm_encrypt(
+                &derive_media_retry_key(&key).unwrap(),
+                &iv,
+                b"MSG",
+                &plaintext,
+                &mut encrypted,
+            )
+            .unwrap();
+            let node = NodeBuilder::new("notification")
+                .attr("id", "MSG")
+                .children([NodeBuilder::new("encrypt")
+                    .children([
+                        NodeBuilder::new("enc_p").bytes(encrypted).build(),
+                        NodeBuilder::new("enc_iv").bytes(iv.to_vec()).build(),
+                    ])
+                    .build()])
+                .build();
+            let result = parse_media_retry_notification(&node.as_node_ref(), &key);
+            if id == Some("MSG") {
+                assert!(
+                    matches!(result.unwrap(), MediaRetryResult::Success { direct_path } if direct_path == "/media/test.enc")
+                );
+            } else {
+                assert!(result.unwrap_err().to_string().contains("stanza ID"));
+            }
+        }
+    }
+
+    #[test]
+    fn plaintext_errors_do_not_require_encrypted_stanza_id() {
+        for code in [2, 3, 99] {
+            let node = NodeBuilder::new("notification")
+                .attr("id", "MSG")
+                .children([NodeBuilder::new("error")
+                    .attr("code", code.to_string())
+                    .build()])
+                .build();
+            let result = parse_media_retry_notification(&node.as_node_ref(), &[1; 32]).unwrap();
+            assert!(matches!(
+                (code, result),
+                (2, MediaRetryResult::NotFound)
+                    | (3, MediaRetryResult::DecryptionError)
+                    | (99, MediaRetryResult::GeneralError)
+            ));
+        }
+    }
 
     #[test]
     fn round_trip_encrypt_decrypt() {

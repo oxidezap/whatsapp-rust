@@ -585,10 +585,11 @@ impl Client {
                 ResponseWaiterMap::with_stream_counter(Arc::clone(&stream_waiter_count)),
             )),
             stream_waiter_count,
-            node_waiters: std::sync::Mutex::new(Vec::new()),
-            node_waiter_count: AtomicUsize::new(0),
-            sent_node_waiters: std::sync::Mutex::new(Vec::new()),
-            sent_node_waiter_count: AtomicUsize::new(0),
+            media_reuploads: std::sync::Mutex::new(HashMap::new()),
+            node_waiters: Arc::new(std::sync::Mutex::new(Vec::new())),
+            node_waiter_count: Arc::new(AtomicUsize::new(0)),
+            sent_node_waiters: Arc::new(std::sync::Mutex::new(Vec::new())),
+            sent_node_waiter_count: Arc::new(AtomicUsize::new(0)),
             unique_id: format!("{}.{}", unique_id_bytes[0], unique_id_bytes[1]),
             id_counter: Arc::new(AtomicU64::new(0)),
             unified_session: crate::unified_session::UnifiedSessionManager::new(),
@@ -1719,21 +1720,9 @@ impl Client {
         }
     }
 
-    /// Backoff step used by [`reconnect()`](Self::reconnect) to create an offline window.
-    ///
-    /// `fibonacci_backoff(RECONNECT_BACKOFF_STEP)` determines the delay before
-    /// the run loop re-connects.  This must be longer than the mock server's
-    /// chatstate TTL (`CHATSTATE_TTL_SECS=3`) so the TTL-expiry test passes.
-    ///
-    /// Only that one test needs a *timed* window. Everything else that wants the
-    /// client offline while it does something uses [`pause`](Self::pause) and
-    /// [`resume`](Self::resume), which make the window a fact the caller closes
-    /// rather than a delay it hopes is long enough. That is also the answer for
-    /// an embedder that wants a different offline window: this constant is not
-    /// it, and nothing here takes one per call.
-    ///
-    /// Sequence: fib(0)=1s, fib(1)=1s, fib(2)=2s, fib(3)=3s, **fib(4)=5s**.
-    pub const RECONNECT_BACKOFF_STEP: u32 = 4;
+    // A deliberate reconnect starts at five seconds to avoid a rapid reconnect
+    // loop on an unchanged network. Immediate reconnect explicitly skips it.
+    const RECONNECT_BACKOFF_STEP: u32 = 4;
 
     /// Drop the current connection and trigger the auto-reconnect loop.
     ///
@@ -1763,19 +1752,7 @@ impl Client {
         // Deliberate step: the stability reset must not erase it.
         self.backoff_reset_suppressed.store(true, Ordering::Relaxed);
 
-        // Same durable-before-receipts gate as disconnect().
-        self.flush_inbound_commits_bounded(Duration::from_secs(2))
-            .await;
-        self.outbound_flush.close();
-        self.outbound_flush
-            .flush(&*self.runtime, Duration::from_secs(2))
-            .await;
-        self.notify_connection_shutdown();
-
-        let transport = self.transport.lock().await.clone();
-        if let Some(transport) = transport {
-            self.close_transport_bounded(&transport).await;
-        }
+        self.teardown_for_reconnect().await;
     }
 
     /// Drop the current connection and skip the reconnect backoff.
@@ -1796,7 +1773,12 @@ impl Client {
         }
         self.expected_disconnect.store(true, Ordering::Relaxed);
 
-        // Same durable-before-receipts gate as disconnect().
+        self.teardown_for_reconnect().await;
+    }
+
+    async fn teardown_for_reconnect(self: &Arc<Self>) {
+        // Preserve durable commits before receipts and bound every flush before
+        // closing the transport, even when storage or the socket stalls.
         self.flush_inbound_commits_bounded(Duration::from_secs(2))
             .await;
         self.outbound_flush.close();
@@ -1804,7 +1786,6 @@ impl Client {
             .flush(&*self.runtime, Duration::from_secs(2))
             .await;
         self.notify_connection_shutdown();
-
         let transport = self.transport.lock().await.clone();
         if let Some(transport) = transport {
             self.close_transport_bounded(&transport).await;

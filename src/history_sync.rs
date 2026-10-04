@@ -850,10 +850,7 @@ mod tests {
     async fn client_with_receipt_waiter(
         _name: &str,
         admission: Arc<dyn crate::HistorySyncAdmission>,
-    ) -> (
-        Arc<Client>,
-        futures::channel::oneshot::Receiver<Arc<wacore_binary::Node>>,
-    ) {
+    ) -> (Arc<Client>, crate::NodeWaiter<wacore_binary::Node>) {
         let (client, _receiver) =
             crate::test_utils::create_test_client_with_sync_receiver_and_admission(admission).await;
         client.is_running.store(true, Ordering::Relaxed);

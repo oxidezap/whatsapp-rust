@@ -2,7 +2,7 @@ use e2e_tests::{TestClient, text_msg};
 use log::info;
 use wacore::types::events::Event;
 
-/// Requires mock server with CHATSTATE_TTL_SECS=3 (so TTL expires before the ~5s reconnect).
+/// Requires mock server with CHATSTATE_TTL_SECS=3.
 #[tokio::test]
 async fn test_expired_chatstate_not_delivered() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -14,15 +14,14 @@ async fn test_expired_chatstate_not_delivered() -> anyhow::Result<()> {
 
     info!("B={jid_b}");
 
-    // reconnect() uses RECONNECT_BACKOFF_STEP to create a ~5s offline window.
-    // With CHATSTATE_TTL_SECS=3, the chatstate expires at 3s and B reconnects
-    // at ~5s, so the drain filters it out.
-    client_b.client.reconnect().await;
-    info!("B disconnected (will auto-reconnect after backoff)");
-    client_b.wait_for_disconnected(5).await?;
+    client_b.go_offline().await?;
 
     client_a.client.chatstate().send_composing(&jid_b).await?;
     info!("A sent typing indicator to offline B");
+
+    // Expiry is the behavior under test. Hold the pause past the mock's TTL;
+    // production reconnect backoff must not determine this offline window.
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
 
     // Queued behind the chatstate, and the barrier for the assertion below: the
     // server drains B's queue in order, so an unexpired chatstate would come out
@@ -33,6 +32,8 @@ async fn test_expired_chatstate_not_delivered() -> anyhow::Result<()> {
         .client
         .send_message(jid_b.clone(), text_msg(after_ttl))
         .await?;
+
+    client_b.come_back_online();
 
     client_b
         .assert_no_event_before(

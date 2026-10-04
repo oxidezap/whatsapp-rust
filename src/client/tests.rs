@@ -7,6 +7,7 @@ use futures::channel::oneshot;
 use wacore_binary::SERVER_JID;
 
 mod online_device_sync;
+mod owned_waiters;
 
 #[tokio::test]
 async fn replacing_status_privacy_releases_the_assembled_copy() {
@@ -3775,6 +3776,13 @@ fn client_size_pins_runtime_cache_config_saving() {
         + size_of::<crate::handlers::call::pending_offers::PendingOffers>()
         + size_of::<Arc<std::sync::Mutex<crate::retry::HistoryPayloadRegistry>>>()
         + size_of::<Option<Arc<dyn crate::ConnectAdmission>>>();
+    // Coalesced reuploads add a 56 B map on x86_64. Moving the two waiter
+    // mutex/Vec registries behind Arcs removes 48 inline bytes; their counters
+    // stay one word each. Account for the net +8 B without changing the base.
+    expected +=
+        size_of::<std::sync::Mutex<HashMap<String, crate::features::MediaReuploadInFlight>>>()
+            - 2 * (size_of::<NodeWaiterEntries<Node>>()
+                - size_of::<Arc<NodeWaiterEntries<Node>>>());
     assert_eq!(
         size_of::<Option<Arc<dyn crate::ConnectAdmission>>>(),
         2 * size_of::<usize>(),
@@ -4076,6 +4084,16 @@ async fn test_is_socket_connected_not_affected_by_mutex_contention() {
 
 #[tokio::test]
 async fn disconnect_does_not_signal_connection_cleanup_before_outbound_flush() {
+    assert_teardown_flush_order(None).await;
+}
+
+#[tokio::test]
+async fn reconnect_modes_flush_before_signalling_cleanup() {
+    assert_teardown_flush_order(Some(false)).await;
+    assert_teardown_flush_order(Some(true)).await;
+}
+
+async fn assert_teardown_flush_order(reconnect_immediately: Option<bool>) {
     use crate::socket::NoiseSocket;
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -4160,7 +4178,13 @@ async fn disconnect_does_not_signal_connection_cleanup_before_outbound_flush() {
 
     let disconnect_client = Arc::clone(&client);
     let disconnect_task = tokio::spawn(async move {
-        disconnect_client.shutdown().await;
+        match reconnect_immediately {
+            None => {
+                disconnect_client.shutdown().await;
+            }
+            Some(false) => disconnect_client.reconnect().await,
+            Some(true) => disconnect_client.reconnect_immediately().await,
+        }
     });
 
     // disconnect() closes the scope and then parks in `outbound_flush.flush`; the

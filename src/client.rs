@@ -284,7 +284,7 @@ impl wacore::socket::FrameTap for SentFrameTap {
 #[derive(Debug, Clone)]
 pub struct NodeFilter {
     tag: String,
-    attrs: Vec<(String, String)>,
+    attrs: Vec<(String, Option<String>)>,
 }
 
 impl NodeFilter {
@@ -298,7 +298,12 @@ impl NodeFilter {
 
     /// Add an attribute constraint. All attributes must match.
     pub fn attr(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.attrs.push((key.into(), value.into()));
+        self.attrs.push((key.into(), Some(value.into())));
+        self
+    }
+
+    pub(crate) fn without_attr(mut self, key: impl Into<String>) -> Self {
+        self.attrs.push((key.into(), None));
         self
     }
 
@@ -309,44 +314,116 @@ impl NodeFilter {
 
     fn matches(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         node.tag == self.tag.as_str()
-            && self.attrs.iter().all(|(k, v)| {
-                node.get_attr(k.as_str())
-                    .is_some_and(|attr| attr == v.as_str())
+            && self.attrs.iter().all(|(k, v)| match v {
+                Some(value) => node
+                    .get_attr(k.as_str())
+                    .is_some_and(|attr| attr == value.as_str()),
+                None => node.get_attr(k.as_str()).is_none(),
             })
     }
 }
 
-struct NodeWaiter {
+struct NodeWaiterEntry<T> {
+    id: u64,
     filter: NodeFilter,
-    tx: futures::channel::oneshot::Sender<Arc<wacore_binary::OwnedNodeRef>>,
+    tx: futures::channel::oneshot::Sender<Arc<T>>,
 }
 
-struct SentNodeWaiter {
-    filter: NodeFilter,
-    tx: futures::channel::oneshot::Sender<Arc<Node>>,
+type NodeWaiterEntries<T> = std::sync::Mutex<Vec<NodeWaiterEntry<T>>>;
+
+/// An immediately registered, owned node subscription.
+///
+/// Dropping this future removes its filter without waiting for traffic. It does
+/// not keep the client alive. Incoming subscriptions survive reconnect; outgoing
+/// diagnostic subscriptions are cancelled when the connection is cleaned up.
+#[must_use = "dropping the waiter cancels its subscription"]
+pub struct NodeWaiter<T> {
+    rx: futures::channel::oneshot::Receiver<Arc<T>>,
+    entries: std::sync::Weak<NodeWaiterEntries<T>>,
+    count: Arc<AtomicUsize>,
+    id: u64,
 }
 
-fn resolve_waiters(
-    waiters_mutex: &std::sync::Mutex<Vec<NodeWaiter>>,
+impl<T> NodeWaiter<T> {
+    /// Inspect a buffered match without waiting. A pending subscription remains
+    /// registered until it resolves or this handle is dropped.
+    pub fn try_recv(&mut self) -> Result<Option<Arc<T>>, futures::channel::oneshot::Canceled> {
+        self.rx.try_recv()
+    }
+}
+
+impl<T> Future for NodeWaiter<T> {
+    type Output = Result<Arc<T>, futures::channel::oneshot::Canceled>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.rx).poll(cx)
+    }
+}
+
+impl<T> Drop for NodeWaiter<T> {
+    fn drop(&mut self) {
+        if let Some(entries) = self.entries.upgrade() {
+            let mut entries = entries.lock().unwrap_or_else(|p| p.into_inner());
+            let removed = entries
+                .iter()
+                .position(|entry| entry.id == self.id)
+                .map(|index| {
+                    let entry = entries.swap_remove(index);
+                    self.count.fetch_sub(1, Ordering::Release);
+                    entry
+                });
+            drop(entries);
+            drop(removed);
+        }
+    }
+}
+
+fn register_node_waiter<T>(
+    entries: &Arc<NodeWaiterEntries<T>>,
+    count: &Arc<AtomicUsize>,
+    filter: NodeFilter,
+) -> NodeWaiter<T> {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let mut locked = entries.lock().unwrap_or_else(|p| p.into_inner());
+    locked.push(NodeWaiterEntry { id, filter, tx });
+    count.fetch_add(1, Ordering::Release);
+    NodeWaiter {
+        rx,
+        entries: Arc::downgrade(entries),
+        count: count.clone(),
+        id,
+    }
+}
+
+fn resolve_waiters<T>(
+    waiters_mutex: &NodeWaiterEntries<T>,
     counter: &AtomicUsize,
-    node: &Arc<wacore_binary::OwnedNodeRef>,
+    node: &Arc<T>,
+    nr: &wacore_binary::NodeRef<'_>,
 ) {
-    let nr = node.get();
     let mut waiters = waiters_mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut ready = Vec::new();
     let mut i = 0;
     while i < waiters.len() {
-        if waiters[i].tx.is_canceled() {
-            waiters.swap_remove(i);
-            counter.fetch_sub(1, Ordering::Release);
-        } else if waiters[i].filter.matches(nr) {
+        if waiters[i].filter.matches(nr) {
             let w = waiters.swap_remove(i);
             counter.fetch_sub(1, Ordering::Release);
-            let _ = w.tx.send(Arc::clone(node));
+            ready.push(w.tx);
         } else {
             i += 1;
         }
+    }
+    // A custom waker may synchronously drop a handle and re-enter the registry.
+    drop(waiters);
+    for tx in ready {
+        let _ = tx.send(Arc::clone(node));
     }
 }
 
@@ -1659,11 +1736,14 @@ pub struct Client {
     /// Generic node waiters for waiting on specific stanzas by tag/attributes.
     /// Uses std::sync::Mutex (not tokio) since the critical section is trivial.
     /// Guarded by `node_waiter_count` for zero-cost when no waiters are active.
-    node_waiters: std::sync::Mutex<Vec<NodeWaiter>>,
-    node_waiter_count: AtomicUsize,
+    node_waiters: Arc<NodeWaiterEntries<wacore_binary::OwnedNodeRef>>,
+    node_waiter_count: Arc<AtomicUsize>,
     /// Waiters for raw outgoing nodes before encryption.
-    sent_node_waiters: std::sync::Mutex<Vec<SentNodeWaiter>>,
-    sent_node_waiter_count: AtomicUsize,
+    sent_node_waiters: Arc<NodeWaiterEntries<Node>>,
+    sent_node_waiter_count: Arc<AtomicUsize>,
+
+    pub(crate) media_reuploads:
+        std::sync::Mutex<HashMap<String, crate::features::MediaReuploadInFlight>>,
 
     pub(crate) unique_id: String,
     pub(crate) id_counter: Arc<AtomicU64>,
