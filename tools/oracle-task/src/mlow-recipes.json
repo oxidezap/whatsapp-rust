@@ -185,7 +185,7 @@
   },
   "kernel": {
     "comment": [
-      "Read-only traces of pitch search and LSF quantization in the live encoder.\n\nPitch is inlined in J#10736. Entry at op1691 has the filtered 659-float LTP\nbuffer at local47 and PitchEstimator at local22; op4266 is after selection.\nLSF core J#10804 has the original 13-argument ABI. Params8..12 retain output\npointers until its implicit return. Conditional centroid state is p7 (nullable).\n"
+      "Read-only traces of pitch search and LSF quantization in the live encoder.\n\nPitch is inlined in J#10736. Entry at op1691 has the filtered 659-float LTP\nbuffer at local47 and PitchEstimator at local22; op4266 is after selection.\nLSF core J#10804 has the original 13-argument ABI. Params8..12 retain output\npointers until its implicit return. Conditional centroid state is p7 (nullable).\nA null p7 has no conditional-centroid buffer: record an empty snapshot, not the unrelated low-memory page.\n"
     ],
     "functions": {
       "core_encode": {
@@ -293,6 +293,7 @@
         "instruction": 0,
         "local": 7,
         "len": 2176,
+        "nullable": true,
         "count": 330,
         "out": "lsf_cond"
       },
