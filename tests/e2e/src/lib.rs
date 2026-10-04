@@ -328,15 +328,12 @@ impl TestClient {
         }
     }
 
-    pub fn sent_message_waiter(
-        &self,
-        msg_id: &str,
-    ) -> futures::channel::oneshot::Receiver<Arc<Node>> {
+    pub fn sent_message_waiter(&self, msg_id: &str) -> whatsapp_rust::NodeWaiter<Node> {
         self.client
             .wait_for_sent_node(whatsapp_rust::NodeFilter::tag("message").attr("id", msg_id))
     }
 
-    pub fn next_sent_message_waiter(&self) -> futures::channel::oneshot::Receiver<Arc<Node>> {
+    pub fn next_sent_message_waiter(&self) -> whatsapp_rust::NodeWaiter<Node> {
         self.client
             .wait_for_sent_node(whatsapp_rust::NodeFilter::tag("message"))
     }
