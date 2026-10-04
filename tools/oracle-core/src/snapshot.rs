@@ -165,6 +165,7 @@ mod tests {
 
     #[test]
     fn nullable_capture_preserves_present_memory_and_raw_zero_address_reads() {
+        let (_local, _cross_process) = crate::test_common::threaded_guard();
         let engine = wasmtime::Engine::default();
         let memory =
             wasmtime::SharedMemory::new(&engine, wasmtime::MemoryType::shared(1, 1)).unwrap();

@@ -79,7 +79,7 @@ fn nullable_lsf_observation_preserves_all_packets_pcm_and_present_centroids() ->
         eprintln!("skipping: JgwtTQVeWPm unavailable (set WA_WASM_DIR)");
         return Ok(());
     };
-    let _guard = common::threaded_guard();
+    let (_local, _cross_process) = common::threaded_guard();
     let work = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
     let module = work.path().join("JgwtTQVeWPm.wasm");
     std::fs::write(&module, bytes)?;
