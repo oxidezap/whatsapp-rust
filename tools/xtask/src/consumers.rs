@@ -346,6 +346,8 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
                     },
                 );
             let code = if let Some(expected) = &invocation.expect_failure {
+                // ANSI styling can split `error[E####]` under Actions' always-color env.
+                command.env("CARGO_TERM_COLOR", "never");
                 let output = command
                     .output()
                     .with_context(|| format!("execute {}", consumer.manifest))?;
