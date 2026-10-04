@@ -190,6 +190,15 @@ pub fn construct_inputs_and_mock() -> CacheConfig {
     config
 }
 
+/// Compile the supported cache argument from the bot's otherwise ignored example.
+pub fn configure_bot_cache_example() {
+    let _ = whatsapp_rust::bot::Bot::builder().with_cache_config(
+        CacheConfig::default()
+            .with_group_cache(CacheEntryConfig::new(None, 1_000))
+            .with_device_registry_cache(CacheEntryConfig::new(None, 5_000)),
+    );
+}
+
 /// Extensible enum matching preserves unknown wire values and future variants.
 pub fn availability_label(value: &ProductAvailability) -> &str {
     match value {
@@ -214,6 +223,7 @@ mod tests {
 
     #[test]
     fn construction_reading_and_host_mock_work() {
+        configure_bot_cache_example();
         let config = construct_inputs_and_mock();
         let store = config.cache_stores.group_cache.unwrap();
         whatsapp_rust::futures::executor::block_on(async {

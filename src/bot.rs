@@ -1480,11 +1480,11 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// // Disable TTL for group and device caches (good for bots with few groups)
     /// let bot = Bot::builder()
     ///     .with_backend(backend)
-    ///     .with_cache_config(CacheConfig {
-    ///         group_cache: CacheEntryConfig::new(None, 1_000),
-    ///         device_registry_cache: CacheEntryConfig::new(None, 5_000),
-    ///         ..Default::default()
-    ///     })
+    ///     .with_cache_config(
+    ///         CacheConfig::default()
+    ///             .with_group_cache(CacheEntryConfig::new(None, 1_000))
+    ///             .with_device_registry_cache(CacheEntryConfig::new(None, 5_000)),
+    ///     )
     ///     .build()
     ///     .await?;
     /// ```
