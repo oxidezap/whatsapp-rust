@@ -12,6 +12,10 @@ async fn connected_activity_and_idle_lifecycle() -> Result<()> {
     let session = Session::connect(backend.backend()).await?;
     let activity = session.prepare_activity().await?;
     session.receive_activity(activity).await?;
+    ensure!(
+        session.drain_encode_capacity() == Some(0),
+        "completed drain retained its encode buffer"
+    );
     let busy = session.checkpoint().await;
     ensure!(
         busy.connected && busy.open_lanes == LANES,
@@ -39,6 +43,10 @@ async fn sqlite_connected_activity_and_virtual_idle() -> Result<()> {
     let session = Session::connect(backend.backend()).await?;
     let activity = session.prepare_activity().await?;
     session.receive_activity(activity).await?;
+    ensure!(
+        session.drain_encode_capacity() == Some(0),
+        "completed SQLite drain retained its encode buffer"
+    );
     ensure!(
         session.checkpoint().await.open_lanes == LANES,
         "SQLite activity missed workers"

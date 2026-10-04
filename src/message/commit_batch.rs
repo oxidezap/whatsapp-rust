@@ -88,7 +88,8 @@ pub(crate) struct InboundCommitBatcher {
     /// Reusable encode arena for drain commits, which the processing permit
     /// already serializes — so this lock is never contended there. Live
     /// commits use a local buffer instead: sharing it would serialize
-    /// concurrent live-path hook calls that could previously overlap.
+    /// concurrent live-path hook calls that could previously overlap. Release
+    /// this buffer when the drain finishes; live traffic cannot reuse it.
     arena: async_lock::Mutex<Vec<u8>>,
 }
 
@@ -163,9 +164,8 @@ impl InboundCommitBatcher {
     ///   same line, for the same reason.
     /// - **The reusable encode arena**, whose lock a drain commit holds across
     ///   its backend write; a report must not queue behind one. Worth knowing
-    ///   that this hides real memory rather than a transient: the arena is
-    ///   cleared but not shrunk, so one oversized message leaves its capacity
-    ///   resident for the session.
+    ///   that this hides real memory during the drain: the arena retains its
+    ///   capacity between batches, then releases it on the live transition.
     pub(crate) fn pending_stats(&self) -> (usize, usize) {
         let state = self.lock();
         (state.entries.len(), state.bytes)
@@ -177,6 +177,17 @@ impl InboundCommitBatcher {
     fn deactivate(&self) {
         self.pending_live.store(false, Ordering::Release);
         self.active.store(false, Ordering::Release);
+        // Normal transitions hold the processing permit after the final
+        // commit, so no encoder owns this lock. A forced exit may race a
+        // stalled backend write: never block it or invalidate borrowed rows.
+        if let Some(mut arena) = self.arena.try_lock() {
+            *arena = Vec::new();
+        }
+    }
+
+    #[cfg(feature = "bench-harness")]
+    pub(crate) fn encode_arena_capacity(&self) -> Option<usize> {
+        self.arena.try_lock().map(|arena| arena.capacity())
     }
 
     /// Record that the end-of-drain flush failed before its durable point;
@@ -1160,6 +1171,57 @@ mod tests {
                 ..Default::default()
             }))
             .build()
+    }
+
+    #[tokio::test]
+    async fn drain_encode_arena_is_reused_then_released_in_live_mode() {
+        let client = create_test_client_with_failing_http("drain_arena_lifetime").await;
+        let hook = Arc::new(RecordingHook {
+            batches: Mutex::new(Vec::new()),
+        });
+        let _ = client.inbound_durability_hook.set(hook.clone());
+        client.inbound_commit_batch.reset();
+
+        let mut capacity = None;
+        for id in ["ARENA_1", "ARENA_2"] {
+            let mut incoming = item(id);
+            incoming.message = Arc::new(wa::Message {
+                conversation: Some("x".repeat(16 * 1024)),
+                ..Default::default()
+            });
+            client.commit_or_batch_inbound(incoming, false).await;
+            assert!(
+                client
+                    .flush_inbound_commits_under_permit(false, None, None)
+                    .await
+            );
+            let arena = client.inbound_commit_batch.arena.lock().await;
+            assert!(arena.capacity() >= 16 * 1024);
+            if let Some(previous) = capacity {
+                assert_eq!(arena.capacity(), previous, "reuse between drain batches");
+            }
+            capacity = Some(arena.capacity());
+        }
+
+        assert_eq!(hook.batches.lock().unwrap().len(), 2);
+        assert!(
+            client
+                .flush_inbound_commits_under_permit(true, None, None)
+                .await
+        );
+        assert!(!client.inbound_commit_batch.is_active());
+        assert_eq!(client.inbound_commit_batch.arena.lock().await.capacity(), 0);
+    }
+
+    #[tokio::test]
+    async fn forced_live_transition_leaves_an_inflight_encoder_untouched() {
+        let batcher = InboundCommitBatcher::default();
+        batcher.reset();
+        let mut arena = batcher.arena.lock().await;
+        arena.extend_from_slice(b"pending durable row");
+        batcher.force_live_dropping_entries();
+        assert!(!batcher.is_active());
+        assert_eq!(&*arena, b"pending durable row");
     }
 
     // During the drain, messages accumulate and one flush commits them all in

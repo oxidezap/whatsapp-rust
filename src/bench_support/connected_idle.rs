@@ -503,6 +503,12 @@ impl Session {
         self.wire.initialization_iqs.load(Ordering::Relaxed)
     }
 
+    /// Requested capacity of the drain-only encoding buffer; not total heap or RSS.
+    /// `None` means a commit still owns the buffer.
+    pub fn drain_encode_capacity(&self) -> Option<usize> {
+        self.client.inbound_commit_batch.encode_arena_capacity()
+    }
+
     pub fn pongs(&self) -> usize {
         self.wire.pongs.load(Ordering::Relaxed)
     }
