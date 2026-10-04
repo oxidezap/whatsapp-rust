@@ -1,8 +1,12 @@
 //! MLow ENTROPY ENCODER: the exact inverse of the byte-exact decoder. Given the analyzed
 //! `SmplFrameParams`, it reproduces the same range-coder symbol stream the decoder consumes, against
-//! the same config=0 runtime tables in the same field order. Targets the active config=0 path
-//! (0x50 frames), p3=4, p4=1. Internal frames are voiced (LTP pitch block) or unvoiced (gains
-//! block) per the analysis.
+//! the same config=0 runtime tables in the same field order. Targets config=0, 16 kHz, 60 ms, mono,
+//! no DTX, p3=4. The TOC's activity bits follow the SILK VAD, as the reference encoder's do: speech
+//! is `0x50`, a packet kept active only by the DTX hangover is `0x12`, and a settled noise floor is
+//! coded inactive as `0x10`. An inactive frame omits the LSF voicing selector and interpolation
+//! index and uses the BACKGROUND_NOISE pulse geometry (`p4 = 0`, half the pulse capacity); an
+//! active one carries both symbols with `p4 = 1`. Internal frames are voiced (LTP pitch block) or
+//! unvoiced (gains block) per the analysis, and an inactive frame is always unvoiced.
 
 use super::analysis::{SmplEncoderState, smpl_analyze_frame_st};
 use super::params::{
@@ -33,8 +37,9 @@ pub enum MlowError {
 
 /// Stateful pure-Rust MLow encoder for 60 ms mono PCM frames at 16 kHz.
 /// Accepts normalized `f32` samples through [`Self::encode`] or [`Self::encode_into`],
-/// and signed 16-bit samples through [`Self::encode_i16_into`]. Emits active config=0
-/// (`0x50`) wire frames, choosing voiced or unvoiced per internal frame via analysis-by-synthesis.
+/// and signed 16-bit samples through [`Self::encode_i16_into`]. Emits config=0 wire frames whose
+/// TOC is `0x50` for speech, `0x12` through the DTX hangover and `0x10` for background noise coded
+/// inactive, choosing voiced or unvoiced per internal frame via analysis-by-synthesis.
 pub struct MlowEncoder {
     state: SmplEncoderState,
     clean: Vec<f32>,
