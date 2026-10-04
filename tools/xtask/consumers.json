@@ -139,7 +139,7 @@
   },
   {
     "manifest": "tests/fixtures/community_consumer/Cargo.toml",
-    "locked": false,
+    "locked": true,
     "integration_pr": "https://github.com/oxidezap/whatsapp-rust/pull/1631",
     "commands": [
       { "lanes": ["native", "msrv"], "mode": "test" },
