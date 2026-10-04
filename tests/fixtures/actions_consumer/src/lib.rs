@@ -10,9 +10,21 @@ use wa::{
     async_trait, waproto::whatsapp as proto,
 };
 
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg(not(target_arch = "wasm32"))]
+#[async_trait]
 pub trait Host: Send + Sync {
+    async fn actions(
+        &self,
+        target: &MessageRef<'_>,
+        post: &NewsletterMessageRef<'_>,
+    ) -> anyhow::Result<()>;
+}
+
+// Browser clients and their futures are local: ?Send alone does not relax
+// the trait's supertraits, so retain Send + Sync only for the native host.
+#[cfg(target_arch = "wasm32")]
+#[async_trait(?Send)]
+pub trait Host {
     async fn actions(
         &self,
         target: &MessageRef<'_>,
