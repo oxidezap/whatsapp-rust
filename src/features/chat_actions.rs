@@ -448,6 +448,8 @@ fn parse_message_key_fields(kind: &str, index: &[String]) -> Option<(String, boo
 fn message_key_owned(target: &MessageRef<'_>) -> (String, Option<String>) {
     // WAWebSyncdActionUtils.buildMessageKey omits our own participant. A DM's
     // sender is addressing metadata, not a participant in its syncd index.
+    // Group authors use account identities, as in WAWebWidFactory.asUserWidOrThrow:
+    // strip the transport device without converting between PN and LID.
     let participant = if target.from_me() {
         None
     } else {
@@ -455,7 +457,7 @@ fn message_key_owned(target: &MessageRef<'_>) -> (String, Option<String>) {
     };
     (
         target.chat().to_string(),
-        participant.map(ToString::to_string),
+        participant.map(Jid::to_non_ad_string),
     )
 }
 
@@ -1278,6 +1280,19 @@ mod registry_tests {
                 "100000000001@lid",
             ),
             ("120000000001@g.us", "100000000001@lid", true, "0"),
+            (
+                "120000000001@g.us",
+                "12025550111:7@s.whatsapp.net",
+                false,
+                "12025550111@s.whatsapp.net",
+            ),
+            (
+                "120000000001@g.us",
+                "100000000001:9@lid",
+                false,
+                "100000000001@lid",
+            ),
+            ("120000000001@g.us", "100000000001:9@lid", true, "0"),
         ] {
             for operation in 0..3 {
                 let mutation =
