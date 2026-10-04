@@ -1,7 +1,7 @@
 //! Independent consumer: no transport, session, or runtime is constructed.
 use std::{future::Future, pin::Pin, sync::Arc};
 use wa::prelude::MessageBuilderExt;
-use wa::wacore::types::message::MessageInfo;
+use wa::wacore::types::message::{MessageInfo, MessageSource};
 use wa::{
     Client, EventCreationParams, MessageContext, MessageRef, NewsletterAdminInfo,
     NewsletterAdminProfile, NewsletterFollower, NewsletterMessage, NewsletterMessageRef,
@@ -71,7 +71,7 @@ pub async fn raw(
         .send_reaction_raw(target.chat(), target.to_raw_key(), "👍")
         .await?;
     client
-        .keep_message_raw(target.chat(), target.to_raw_key(), false)
+        .keep_message_raw(target.chat(), target.to_raw_key(), true)
         .await?;
     client
         .pin_message_raw(target.chat(), target.to_raw_key(), PinDuration::Days7)
@@ -100,16 +100,31 @@ pub async fn raw(
         .await?;
     let _: StanzaId = client
         .newsletter()
-        .send_poll_vote_raw(post.chat(), post.require_server_id()?.get(), &[])
+        .send_poll_vote_raw(post.chat(), post.require_server_id()?.get(), &[[7; 32]])
         .await?;
+    client.newsletter().edit_message_raw(post.chat(), post.require_message_id()?.as_str(), proto::Message::text("edit")).await?;
+    client.newsletter().revoke_message_raw(post.chat(), post.require_message_id()?.as_str()).await?;
     Ok(())
+}
+
+pub fn mock_info() -> MessageInfo {
+    MessageInfo {
+        id: "COMMENT".into(),
+        source: MessageSource {
+            chat: "120363000000000001@g.us".parse().expect("fixture group"),
+            sender: wa::Jid::lid("100000000000001"),
+            is_group: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 pub fn mock_context(client: Arc<Client>) -> MessageContext {
     MessageContext::builder()
         .client(client)
         .message(Arc::new(proto::Message::text("comment")))
-        .info(MessageInfo::default())
+        .info(mock_info())
         .ephemeral_expiration(86400)
         .comment_target(Box::new(proto::MessageKey {
             id: Some("PARENT".into()),
@@ -197,6 +212,10 @@ mod tests {
         fn assert_host<T: Host>() {}
         assert_host::<Client>();
         let _ = (boxed, raw, mock_context, context_actions);
+        let info = mock_info();
+        let reference = MessageRef::from_info(&info).expect("mock is actionable");
+        assert_eq!(reference.id().as_str(), "COMMENT");
+        assert_eq!(reference.sender(), Some(&info.source.sender));
         let EventCreationParams {
             name, start_time, ..
         } = event_params();

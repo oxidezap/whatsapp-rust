@@ -28,19 +28,15 @@ impl<'a> Comments<'a> {
     }
 
     /// Comment on a Community Announcement Group post with a text body.
-    /// Requires the parent's captured `messageSecret`.
+    /// Requires the parent's captured `messageSecret`. The caller must supply
+    /// a CAG post; a generic message reference does not attest group subtype.
     pub async fn send_text(
         &self,
         parent: &crate::MessageRef<'_>,
         text: &str,
     ) -> Result<SendResult, SendError> {
-        parent.require_chat_operation()?;
-        self.send_text_raw(
-            parent.chat(),
-            self.client.message_ref_addon_key(parent).await?,
-            text,
-        )
-        .await
+        self.send_text_raw(parent.chat(), self.parent_key(parent).await?, text)
+            .await
     }
 
     /// Comment with an arbitrary body, preserving the parent's author scope.
@@ -49,13 +45,21 @@ impl<'a> Comments<'a> {
         parent: &crate::MessageRef<'_>,
         body: wa::Message,
     ) -> Result<SendResult, SendError> {
+        self.send_message_raw(parent.chat(), self.parent_key(parent).await?, body)
+            .await
+    }
+
+    async fn parent_key(
+        &self,
+        parent: &crate::MessageRef<'_>,
+    ) -> Result<wa::MessageKey, SendError> {
         parent.require_chat_operation()?;
-        self.send_message_raw(
-            parent.chat(),
-            self.client.message_ref_addon_key(parent).await?,
-            body,
-        )
-        .await
+        if !parent.chat().is_group() {
+            return Err(crate::MessageRefError::UnsupportedOrigin.into());
+        }
+        // MessageRef carries no CAG subtype proof. Do not introduce metadata
+        // queries/fallbacks into the captured-secret comment path to obtain one.
+        self.client.message_ref_addon_key(parent).await
     }
 
     /// Explicit raw chat/key interop. `parent_key.participant` is the post

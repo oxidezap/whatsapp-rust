@@ -541,7 +541,10 @@ async fn malformed_raw_inputs_fail_before_wire_and_debug_has_negative_controls()
     assert!(
         client
             .events()
-            .create(&peer, EventCreationParams::default())
+            .create(
+                &peer,
+                EventCreationParams::builder().name(String::new()).build()
+            )
             .await
             .is_err()
     );

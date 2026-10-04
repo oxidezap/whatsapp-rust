@@ -38,7 +38,9 @@ envelope, not the parent content.
 Status reactions preserve author-device fanout. CAG reactions remain encrypted
 with the captured parent secret, and comments retain their encrypted body, parent
 author derivation, and fresh persisted comment secret. Typed comments reject
-status/broadcast-list origins before routing or secret lookup. Explicit raw paths
+non-group origins before routing or secret lookup. Generic references do not
+attest CAG subtype: callers supply CAG posts, rather than triggering new metadata
+queries/fallbacks just to classify the group. Explicit raw paths
 keep their pre-existing interop behavior, including raw server-reaction status
 delegation; they do not make a newsletter reference into a status reference.
 

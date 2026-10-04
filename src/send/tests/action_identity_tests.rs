@@ -151,6 +151,20 @@ async fn typed_cag_reactions_and_comments_keep_parent_author_and_comment_secret(
                     )
                     .unwrap();
                 assert_eq!(stored.secret.as_bytes().as_slice(), minted);
+                fixture.client.msg_secret_buffer.wait_flushed().await;
+                let persisted = fixture
+                    .client
+                    .persistence_manager
+                    .backend()
+                    .get_stored_msg_secret(
+                        &fixture.group.to_non_ad_string(),
+                        &modifier,
+                        result.message_id.as_str(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(persisted.secret.as_bytes().as_slice(), minted);
             }
         }
     }
@@ -180,6 +194,7 @@ async fn typed_comment_invalid_origin_and_missing_secret_send_nothing() {
         Err(SendError::InvalidRequest(_))
     ));
     for chat in [
+        Jid::pn("15550000001"),
         Jid::status_broadcast(),
         "123456789@broadcast".parse().unwrap(),
     ] {

@@ -1252,6 +1252,7 @@ dependencies = [
  "async-lock",
  "async-trait",
  "base64 0.23.1",
+ "bon",
  "buffa",
  "bytes",
  "chrono",
