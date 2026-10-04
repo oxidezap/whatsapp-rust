@@ -1,0 +1,18 @@
+[package]
+name = "groups-consumer"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[workspace]
+
+[features]
+default = ["runtime"]
+runtime = ["dep:wa"]
+js = ["wacore/js"]
+
+[dependencies]
+wacore = { path = "../../../wacore", default-features = false }
+wacore-binary = { path = "../../../wacore/binary" }
+wa = { package = "whatsapp-rust", path = "../../..", default-features = false, optional = true }

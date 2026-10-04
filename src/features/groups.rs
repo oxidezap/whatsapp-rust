@@ -610,7 +610,8 @@ pub type GroupOverviewResult = GroupLookupResult<GroupOverview>;
 /// Full group projection, including the participants and settings returned by
 /// the server. Use [`Self::hierarchy`] for the normalized community role; raw
 /// wire flags remain available for advanced callers.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GroupMetadata {
     pub id: Jid,
     pub subject: Option<String>,
@@ -701,6 +702,72 @@ pub struct GroupMetadata {
 }
 
 impl GroupMetadata {
+    /// Construct a minimal projection for a known group, useful for mocks.
+    ///
+    /// Optional server observations start absent; participants start empty and
+    /// wire flags start false. This does not fetch metadata or assert that the
+    /// participant list is complete. Populate the public fields as needed.
+    pub fn new(id: Jid) -> Self {
+        Self {
+            id,
+            subject: None,
+            notify: None,
+            participants: Vec::new(),
+            addressing_mode: AddressingMode::default(),
+            creator: None,
+            creator_pn: None,
+            creator_username: None,
+            creator_country_code: None,
+            creation_time: None,
+            participant_version_id: None,
+            admin_version_id: None,
+            open_thread_id: None,
+            has_missing_participant_identification: false,
+            subject_time: None,
+            subject_owner: None,
+            subject_owner_pn: None,
+            subject_owner_username: None,
+            description: None,
+            description_id: None,
+            description_owner: None,
+            description_owner_pn: None,
+            description_owner_username: None,
+            description_time: None,
+            is_locked: false,
+            is_announcement: false,
+            ephemeral: None,
+            membership_approval: false,
+            member_add_mode: None,
+            member_link_mode: None,
+            participant_count: None,
+            is_parent_group: false,
+            parent_membership_approval_required: false,
+            parent_group_jid: None,
+            is_default_sub_group: false,
+            is_general_chat: false,
+            allow_non_admin_sub_group_creation: false,
+            no_frequently_forwarded: false,
+            member_share_history_mode: None,
+            growth_locked: None,
+            is_suspended: false,
+            suspension_can_auto_file: false,
+            appeal_status: None,
+            appeal_update_time: None,
+            is_support_group: false,
+            allow_admin_reports: false,
+            is_hidden_group: false,
+            is_incognito: false,
+            has_group_history: false,
+            is_auto_add_disabled: false,
+            has_capi: false,
+            evolution_version: None,
+            has_group_safety_check: false,
+            participant_label_enabled: false,
+            is_limit_sharing_enabled: false,
+            limit_sharing_trigger: None,
+        }
+    }
+
     /// Community hierarchy, using the same normalization as [`GroupOverview`].
     ///
     /// Computed from the retained wire flags rather than cached separately,
@@ -715,7 +782,7 @@ impl GroupMetadata {
     ///
     /// ```
     /// use whatsapp_rust::{GroupHierarchy, GroupMetadata, SubgroupKind};
-    /// let metadata = GroupMetadata::default();
+    /// let metadata = GroupMetadata::new("120363000000000001@g.us".parse()?);
     /// match metadata.hierarchy() {
     ///     GroupHierarchy::Standalone => {},
     ///     GroupHierarchy::Community => {},
@@ -727,13 +794,16 @@ impl GroupMetadata {
     ///     },
     ///     _ => {}, // The hierarchy is extensible.
     /// }
+    /// # Ok::<(), whatsapp_rust::anyhow::Error>(())
     /// ```
     pub fn hierarchy(&self) -> GroupHierarchy {
         GroupHierarchy::from_metadata(self)
     }
 }
 
+/// Participant projection with public fields for reading and mock customization.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GroupParticipant {
     pub jid: Jid,
     pub phone_number: Option<Jid>,
@@ -744,6 +814,19 @@ pub struct GroupParticipant {
 }
 
 impl GroupParticipant {
+    /// Construct a member projection for a known JID, without auxiliary identity
+    /// or server details. This does not add the participant to a group.
+    pub fn new(jid: Jid) -> Self {
+        Self {
+            jid,
+            phone_number: None,
+            lid: None,
+            username: None,
+            participant_type: ParticipantType::Member,
+            details: None,
+        }
+    }
+
     pub fn is_admin(&self) -> bool {
         self.participant_type.is_admin()
     }
@@ -3488,7 +3571,7 @@ mod tests {
                 participant_type: ParticipantType::Admin,
                 details: None,
             }],
-            ..Default::default()
+            ..GroupMetadata::new(jid)
         };
 
         assert_eq!(metadata.subject.as_deref(), Some("Test Group"));
@@ -3523,7 +3606,7 @@ mod tests {
                 details: None,
             }],
             addressing_mode: AddressingMode::Lid,
-            ..Default::default()
+            ..GroupMetadata::new("120399@g.us".parse().unwrap())
         };
         client.groups().fill_participant_pns(&mut meta).await;
         assert_eq!(
@@ -3550,7 +3633,7 @@ mod tests {
                 details: None,
             }],
             addressing_mode: AddressingMode::Pn,
-            ..Default::default()
+            ..GroupMetadata::new("120398@g.us".parse().unwrap())
         };
         client.groups().fill_participant_pns(&mut meta).await;
         assert_eq!(meta.participants[0].phone_number, None);

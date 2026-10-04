@@ -210,6 +210,7 @@ crate::define_validated_string! {
 /// Options for a participant when creating a group.
 #[derive(Debug, Clone, bon::Builder)]
 #[builder(finish_fn = finish)]
+#[non_exhaustive]
 pub struct GroupParticipantOptions {
     pub jid: Jid,
     pub phone_number: Option<Jid>,
@@ -256,6 +257,7 @@ impl GroupParticipantOptions {
 // bare-value setter that shorthand would otherwise have provided.
 #[derive(Debug, Clone, bon::Builder)]
 #[builder(finish_fn = finish)]
+#[non_exhaustive]
 pub struct GroupCreateOptions {
     #[builder(into)]
     pub subject: String,
@@ -308,11 +310,25 @@ impl<S: group_create_options_builder::IsComplete> GroupCreateOptionsBuilder<S> {
 }
 
 impl GroupCreateOptions {
-    /// Create new options with just a subject (for backwards compatibility).
+    /// Create options with an explicit subject and the standard group settings.
+    ///
+    /// Participants are initially empty. Public fields can be customized after
+    /// construction; [`Self::builder`] provides the same defaults.
     pub fn new(subject: impl Into<String>) -> Self {
         Self {
             subject: subject.into(),
-            ..Default::default()
+            participants: Vec::new(),
+            member_link_mode: Some(MemberLinkMode::AdminLink),
+            member_add_mode: Some(MemberAddMode::AllMemberAdd),
+            membership_approval_mode: Some(MembershipApprovalMode::Off),
+            ephemeral_expiration: Some(0),
+            is_parent: false,
+            closed: false,
+            allow_non_admin_sub_group_creation: false,
+            create_general_chat: false,
+            linked_parent: None,
+            hidden_group: false,
+            description: None,
         }
     }
 
@@ -339,26 +355,6 @@ impl GroupCreateOptions {
     pub fn with_ephemeral_expiration(mut self, expiration: u32) -> Self {
         self.ephemeral_expiration = Some(expiration);
         self
-    }
-}
-
-impl Default for GroupCreateOptions {
-    fn default() -> Self {
-        Self {
-            subject: String::new(),
-            participants: Vec::new(),
-            member_link_mode: Some(MemberLinkMode::AdminLink),
-            member_add_mode: Some(MemberAddMode::AllMemberAdd),
-            membership_approval_mode: Some(MembershipApprovalMode::Off),
-            ephemeral_expiration: Some(0),
-            is_parent: false,
-            closed: false,
-            allow_non_admin_sub_group_creation: false,
-            create_general_chat: false,
-            linked_parent: None,
-            hidden_group: false,
-            description: None,
-        }
     }
 }
 
@@ -5670,7 +5666,7 @@ mod tests {
             closed: true,
             allow_non_admin_sub_group_creation: true,
             create_general_chat: true,
-            ..Default::default()
+            ..GroupCreateOptions::new("My Community")
         };
 
         let node = build_create_group_node(&options);
@@ -5703,7 +5699,7 @@ mod tests {
         let options = GroupCreateOptions {
             subject: "Regular Group".to_string(),
             is_parent: false,
-            ..Default::default()
+            ..GroupCreateOptions::new("Regular Group")
         };
 
         let node = build_create_group_node(&options);
@@ -6349,7 +6345,7 @@ mod tests {
             is_parent: true,
             closed: true,
             allow_non_admin_sub_group_creation: true,
-            ..Default::default()
+            ..GroupCreateOptions::new("My Community")
         };
         let spec = GroupCreateIq::new(options);
 
@@ -6377,7 +6373,7 @@ mod tests {
             subject: "Closed Community".into(),
             is_parent: true,
             allow_non_admin_sub_group_creation: false,
-            ..Default::default()
+            ..GroupCreateOptions::new("Closed Community")
         };
         let spec = GroupCreateIq::new(options);
 
@@ -6402,7 +6398,7 @@ mod tests {
             subject: "Community".into(),
             is_parent: true,
             allow_non_admin_sub_group_creation: false,
-            ..Default::default()
+            ..GroupCreateOptions::new("Community")
         };
         let spec = GroupCreateIq::new(options);
 
@@ -6425,7 +6421,7 @@ mod tests {
         let options = GroupCreateOptions {
             subject: "Subgroup".into(),
             linked_parent: Some(parent.clone()),
-            ..Default::default()
+            ..GroupCreateOptions::new("Subgroup")
         };
         let iq = GroupCreateIq::new(options).build_iq();
         let Some(NodeContent::Nodes(nodes)) = &iq.content else {
@@ -6454,7 +6450,7 @@ mod tests {
             allow_non_admin_sub_group_creation: true,
             create_general_chat: true,
             linked_parent: Some(parent.clone()),
-            ..Default::default()
+            ..GroupCreateOptions::new("Conflicting")
         };
         let iq = GroupCreateIq::new(options).build_iq();
         let Some(NodeContent::Nodes(nodes)) = &iq.content else {
@@ -6478,7 +6474,7 @@ mod tests {
             is_parent: true,
             allow_non_admin_sub_group_creation: true,
             linked_parent: Some(parent.clone()),
-            ..Default::default()
+            ..GroupCreateOptions::new("Subgroup")
         };
         let spec = GroupCreateIq::new(options);
 
@@ -6503,7 +6499,7 @@ mod tests {
         let options = GroupCreateOptions {
             subject: "Group with desc".into(),
             description: Some(GroupDescription::new("Hello, group").unwrap()),
-            ..Default::default()
+            ..GroupCreateOptions::new("Group with desc")
         };
         let iq = GroupCreateIq::new(options).build_iq();
         let Some(NodeContent::Nodes(nodes)) = &iq.content else {
@@ -6553,7 +6549,7 @@ mod tests {
             subject: "Plain Group".into(),
             is_parent: false,
             allow_non_admin_sub_group_creation: false,
-            ..Default::default()
+            ..GroupCreateOptions::new("Plain Group")
         };
         let spec = GroupCreateIq::new(options);
 

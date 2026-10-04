@@ -21,11 +21,10 @@ async fn test_group_send_uses_registry_cache_after_reconnect() -> anyhow::Result
     let group = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "Device Cache Test".into(),
-            participants: vec![GroupParticipantOptions::new(jid_b.clone())],
-            ..Default::default()
-        })
+        .create_group(
+            GroupCreateOptions::new("Device Cache Test")
+                .with_participant(GroupParticipantOptions::new(jid_b.clone())),
+        )
         .await?;
     let group_jid = group.metadata.id;
 

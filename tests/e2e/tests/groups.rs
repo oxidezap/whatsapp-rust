@@ -25,11 +25,10 @@ async fn test_group_create_send_message_and_add_member() -> anyhow::Result<()> {
     let create_result = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "E2E Test Group".to_string(),
-            participants: vec![GroupParticipantOptions::new(jid_b.clone())],
-            ..Default::default()
-        })
+        .create_group(
+            GroupCreateOptions::new("E2E Test Group")
+                .with_participant(GroupParticipantOptions::new(jid_b.clone())),
+        )
         .await?;
 
     let group_jid = create_result.metadata.id;
@@ -112,14 +111,12 @@ async fn test_group_remove_member() -> anyhow::Result<()> {
     let group_jid = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "Remove Test Group".to_string(),
-            participants: vec![
+        .create_group(
+            GroupCreateOptions::new("Remove Test Group").with_participants(vec![
                 GroupParticipantOptions::new(jid_b.clone()),
                 GroupParticipantOptions::new(jid_c.clone()),
-            ],
-            ..Default::default()
-        })
+            ]),
+        )
         .await?
         .metadata
         .id;
@@ -233,11 +230,10 @@ async fn test_group_promote_and_demote_admin() -> anyhow::Result<()> {
     let create_result = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "Promote Test Group".to_string(),
-            participants: vec![GroupParticipantOptions::new(jid_b.clone())],
-            ..Default::default()
-        })
+        .create_group(
+            GroupCreateOptions::new("Promote Test Group")
+                .with_participant(GroupParticipantOptions::new(jid_b.clone())),
+        )
         .await?;
 
     let group_jid = create_result.metadata.id;
@@ -324,11 +320,10 @@ async fn test_group_cache_invalidation_on_add() -> anyhow::Result<()> {
     let group_jid = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "Cache Invalidation Test".to_string(),
-            participants: vec![GroupParticipantOptions::new(jid_b.clone())],
-            ..Default::default()
-        })
+        .create_group(
+            GroupCreateOptions::new("Cache Invalidation Test")
+                .with_participant(GroupParticipantOptions::new(jid_b.clone())),
+        )
         .await?
         .metadata
         .id;
@@ -396,11 +391,10 @@ async fn test_group_settings() -> anyhow::Result<()> {
     let group_jid = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "Settings Test Group".to_string(),
-            participants: vec![GroupParticipantOptions::new(jid_b.clone())],
-            ..Default::default()
-        })
+        .create_group(
+            GroupCreateOptions::new("Settings Test Group")
+                .with_participant(GroupParticipantOptions::new(jid_b.clone())),
+        )
         .await?
         .metadata
         .id;
@@ -567,14 +561,12 @@ async fn test_group_leave() -> anyhow::Result<()> {
     let group_jid = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "Leave Test Group".to_string(),
-            participants: vec![
+        .create_group(
+            GroupCreateOptions::new("Leave Test Group").with_participants(vec![
                 GroupParticipantOptions::new(jid_b.clone()),
                 GroupParticipantOptions::new(jid_c.clone()),
-            ],
-            ..Default::default()
-        })
+            ]),
+        )
         .await?
         .metadata
         .id;
@@ -664,11 +656,10 @@ async fn test_per_device_sender_key_tracking() -> anyhow::Result<()> {
     let group_jid = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "SK Device Track Test".to_string(),
-            participants: vec![GroupParticipantOptions::new(jid_b.clone())],
-            ..Default::default()
-        })
+        .create_group(
+            GroupCreateOptions::new("SK Device Track Test")
+                .with_participant(GroupParticipantOptions::new(jid_b.clone())),
+        )
         .await?
         .metadata
         .id;
@@ -773,11 +764,10 @@ async fn test_routing_info_populates_lid_pn_cache_for_participants() -> anyhow::
     let group_jid = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "LID-PN mapping test".to_string(),
-            participants: vec![GroupParticipantOptions::new(jid_b_pn.clone())],
-            ..Default::default()
-        })
+        .create_group(
+            GroupCreateOptions::new("LID-PN mapping test")
+                .with_participant(GroupParticipantOptions::new(jid_b_pn.clone())),
+        )
         .await?
         .metadata
         .id;

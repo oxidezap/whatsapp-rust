@@ -43,11 +43,8 @@ fn both_endpoints_accept_the_same_status_renderer() {
     // Type-check real endpoints without a connection or hidden test features.
     let _ = fetch_rows;
     let id: Jid = "120363000000000021@g.us".parse().unwrap();
-    let metadata = GroupMetadata {
-        id,
-        participant_count: Some(42),
-        ..Default::default()
-    };
+    let mut metadata = GroupMetadata::new(id);
+    metadata.participant_count = Some(42);
     let full: GroupMetadataResult = GroupLookupResult::Found(Box::new(metadata));
     let GroupLookupResult::Found(metadata) = &full else {
         panic!("expected found metadata")
@@ -84,7 +81,7 @@ fn projection_mapping_never_invents_a_found_payload() {
 
 #[test]
 fn missing_count_does_not_become_zero_or_participant_length() {
-    let metadata = GroupMetadata::default();
+    let metadata = GroupMetadata::new("120363000000000021@g.us".parse().unwrap());
     assert_eq!(metadata.participant_count, None);
     assert_eq!(GroupOverview::from(&metadata).participant_count, None);
 }
@@ -96,13 +93,12 @@ fn hierarchy_preserves_all_roles_and_independent_flag_precedence() {
         for community in [false, true] {
             for announcement in [false, true] {
                 for general in [false, true] {
-                    let metadata = GroupMetadata {
-                        parent_group_jid: linked.then(|| parent.clone()),
-                        is_parent_group: community,
-                        is_default_sub_group: announcement,
-                        is_general_chat: general,
-                        ..Default::default()
-                    };
+                    let mut metadata =
+                        GroupMetadata::new("120363000000000021@g.us".parse().unwrap());
+                    metadata.parent_group_jid = linked.then(|| parent.clone());
+                    metadata.is_parent_group = community;
+                    metadata.is_default_sub_group = announcement;
+                    metadata.is_general_chat = general;
                     let expected = if linked {
                         GroupHierarchy::Subgroup {
                             parent: parent.clone(),
@@ -138,11 +134,9 @@ fn hierarchy_preserves_all_roles_and_independent_flag_precedence() {
 #[test]
 fn hierarchy_retains_the_parent_for_a_general_chat() {
     let parent: Jid = "120363000000000011@g.us".parse().unwrap();
-    let metadata = GroupMetadata {
-        parent_group_jid: Some(parent.clone()),
-        is_general_chat: true,
-        ..Default::default()
-    };
+    let mut metadata = GroupMetadata::new("120363000000000021@g.us".parse().unwrap());
+    metadata.parent_group_jid = Some(parent.clone());
+    metadata.is_general_chat = true;
     assert!(
         matches!(metadata.hierarchy(), GroupHierarchy::Subgroup { parent: actual, kind: SubgroupKind::General } if actual == parent)
     );

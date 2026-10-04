@@ -194,14 +194,12 @@ impl<'a> Community<'a> {
     ) -> Result<CreateCommunityResult, CommunityError> {
         let description = options.description.clone();
 
-        let create_options = GroupCreateOptions {
-            subject: options.name,
-            is_parent: true,
-            closed: options.closed,
-            allow_non_admin_sub_group_creation: options.allow_non_admin_sub_group_creation,
-            create_general_chat: options.create_general_chat,
-            ..Default::default()
-        };
+        let mut create_options = GroupCreateOptions::new(options.name);
+        create_options.is_parent = true;
+        create_options.closed = options.closed;
+        create_options.allow_non_admin_sub_group_creation =
+            options.allow_non_admin_sub_group_creation;
+        create_options.create_general_chat = options.create_general_chat;
 
         let mut metadata = self
             .client
@@ -245,18 +243,16 @@ impl<'a> Community<'a> {
         &self,
         options: CreateSubgroupOptions,
     ) -> Result<CreateCommunityResult, CommunityError> {
-        let create_options = GroupCreateOptions {
-            subject: options.name,
-            participants: options
+        let mut create_options = GroupCreateOptions::new(options.name).with_participants(
+            options
                 .participants
                 .iter()
                 .cloned()
                 .map(GroupParticipantOptions::new)
                 .collect(),
-            linked_parent: Some(options.parent_jid),
-            hidden_group: options.visibility == SubgroupVisibility::Hidden,
-            ..Default::default()
-        };
+        );
+        create_options.linked_parent = Some(options.parent_jid);
+        create_options.hidden_group = options.visibility == SubgroupVisibility::Hidden;
         let metadata = self
             .client
             .groups()
