@@ -282,7 +282,7 @@ fn wrapping_variants_preserve_their_typed_source() {
         "NewsletterError::Client",
     );
     assert_source_is::<ClientError>(
-        &MediaReuploadError::Client(client()),
+        &MediaReuploadError::Client(client().into()),
         "MediaReuploadError::Client",
     );
     assert_source_is::<ClientError>(

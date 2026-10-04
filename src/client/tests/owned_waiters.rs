@@ -135,19 +135,17 @@ async fn reupload_fixture() -> (Arc<Client>, Arc<CapturingMockTransport>) {
     (client, transport)
 }
 
-fn request(
+async fn request(
     client: Arc<Client>,
     chat: Jid,
     id: &'static str,
     key: [u8; 32],
-) -> impl Future<Output = Result<MediaRetryResult, MediaReuploadError>> {
-    async move {
-        let req = MediaReuploadRequest {
-            target: MessageRef::new(&chat, MessageId::new(id).unwrap(), None, false).unwrap(),
-            media_key: &key,
-        };
-        client.media_reupload().request(&req).await
-    }
+) -> Result<MediaRetryResult, MediaReuploadError> {
+    let req = MediaReuploadRequest {
+        target: MessageRef::new(&chat, MessageId::new(id).unwrap(), None, false).unwrap(),
+        media_key: &key,
+    };
+    client.media_reupload().request(&req).await
 }
 
 fn ack(id: &str) -> Node {
@@ -453,4 +451,74 @@ async fn node_waiter_wakes_happen_after_registry_unlock() {
     client.clear_sent_node_waiters();
     assert!(probe.woke.load(Ordering::Relaxed));
     assert!(!probe.locked.load(Ordering::Relaxed));
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconnect_timeouts_still_close_transport_in_both_modes() {
+    struct StalledClose(Arc<AtomicBool>);
+    #[async_trait::async_trait]
+    impl crate::transport::Transport for StalledClose {
+        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn disconnect(&self) {
+            self.0.store(true, Ordering::Relaxed);
+            std::future::pending::<()>().await;
+        }
+    }
+    for immediate in [false, true] {
+        let client = create_test_client().await;
+        client.swap_message_semaphore(1);
+        let inbound = client.acquire_message_processing_permit().await;
+        let outbound = client.outbound_flush.try_track().unwrap();
+        let close_called = Arc::new(AtomicBool::new(false));
+        *client.transport.lock().await = Some(Arc::new(StalledClose(close_called.clone())));
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(7), async {
+            if immediate {
+                client.reconnect_immediately().await;
+            } else {
+                client.reconnect().await;
+            }
+        })
+        .await
+        .expect("each teardown stage must remain bounded");
+        assert!(close_called.load(Ordering::Relaxed));
+        assert!(client.connection_shutdown_signal().is_fired());
+        assert_eq!(started.elapsed(), Duration::from_secs(6));
+        assert!(client.outbound_flush.try_track().is_none());
+        drop((inbound, outbound));
+        assert_eq!(client.outbound_flush.pending(), 0);
+    }
+}
+
+#[tokio::test]
+async fn dropping_all_reupload_subscribers_does_not_cycle_the_client() {
+    let (client, _) = reupload_fixture().await;
+    let weak = Arc::downgrade(&client);
+    let mut first = Box::pin(request(
+        client.clone(),
+        Jid::pn("15550000002"),
+        "DROP",
+        [1; 32],
+    ));
+    let mut second = Box::pin(request(
+        client.clone(),
+        Jid::pn("15550000002"),
+        "DROP",
+        [1; 32],
+    ));
+    assert!(futures::poll!(&mut first).is_pending());
+    assert!(futures::poll!(&mut second).is_pending());
+    drop(client);
+    drop(first);
+    assert!(
+        weak.upgrade().is_some(),
+        "remaining subscriber owns the operation"
+    );
+    drop(second);
+    crate::test_utils::poll_until("all coalesced client references released", || {
+        weak.upgrade().is_none()
+    })
+    .await;
 }
