@@ -1,14 +1,14 @@
 //! Independent consumer: no transport, session, or runtime is constructed.
 use std::{future::Future, pin::Pin, sync::Arc};
+use wa::bot::MessageContext;
 use wa::prelude::MessageBuilderExt;
 use wa::wacore::types::message::{MessageInfo, MessageSource};
 use wa::{
-    Client, EventCreationParams, MessageContext, MessageRef, NewsletterAdminInfo,
-    NewsletterAdminProfile, NewsletterFollower, NewsletterMessage, NewsletterMessageRef,
-    NewsletterMessageType, NewsletterMetadata, NewsletterMyAddOns, NewsletterMyPollVote,
-    NewsletterMyReaction, NewsletterPollVote, NewsletterReactionCount, NewsletterState,
-    NewsletterVerification, PinDuration, RevokeType, StanzaId, anyhow, async_trait,
-    waproto::whatsapp as proto,
+    Client, EventCreationParams, MessageRef, NewsletterAdminInfo, NewsletterAdminProfile,
+    NewsletterFollower, NewsletterMessage, NewsletterMessageRef, NewsletterMessageType,
+    NewsletterMetadata, NewsletterMyAddOns, NewsletterMyPollVote, NewsletterMyReaction,
+    NewsletterPollVote, NewsletterReactionCount, NewsletterState, NewsletterVerification,
+    PinDuration, RevokeType, StanzaId, anyhow, async_trait, waproto::whatsapp as proto,
 };
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -102,8 +102,18 @@ pub async fn raw(
         .newsletter()
         .send_poll_vote_raw(post.chat(), post.require_server_id()?.get(), &[[7; 32]])
         .await?;
-    client.newsletter().edit_message_raw(post.chat(), post.require_message_id()?.as_str(), proto::Message::text("edit")).await?;
-    client.newsletter().revoke_message_raw(post.chat(), post.require_message_id()?.as_str()).await?;
+    client
+        .newsletter()
+        .edit_message_raw(
+            post.chat(),
+            post.require_message_id()?.as_str(),
+            proto::Message::text("edit"),
+        )
+        .await?;
+    client
+        .newsletter()
+        .revoke_message_raw(post.chat(), post.require_message_id()?.as_str())
+        .await?;
     Ok(())
 }
 

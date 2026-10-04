@@ -66,7 +66,8 @@ async fn old(c: &Client, chat: &Jid) { let _ = c.revoke_message(chat, "CONTENT",
 ```
 
 ```compile_fail,E0061
-use wa::{MessageContext, RevokeType};
+use wa::bot::MessageContext;
+use wa::RevokeType;
 async fn old(c: &MessageContext) { let _ = c.revoke_message("CONTENT", RevokeType::Sender).await; }
 ```
 

@@ -4,7 +4,7 @@ Every newly protected DTO is checked independently, so restoring one literal
 cannot hide behind another's failure. Nightly verifies error codes as well.
 
 ```compile_fail,E0639
-use wa::MessageContext;
+use wa::bot::MessageContext;
 fn literal(value: MessageContext) { let _ = MessageContext { ..value }; }
 ```
 
@@ -53,7 +53,7 @@ fn literal(value: NewsletterMessage) { let _ = NewsletterMessage { ..value }; }
 Exhaustive external patterns must add `..`, rather than list today's fields.
 
 ```compile_fail,E0638
-use wa::MessageContext;
+use wa::bot::MessageContext;
 fn pattern(value: MessageContext) {
     let MessageContext { message, info, client, ephemeral_expiration, comment_target } = value;
 }
