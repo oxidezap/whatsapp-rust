@@ -8,21 +8,20 @@ Owned paths: `src/features/status.rs`, status-only parts of `src/send/mod.rs`, a
 `StatusSendOptions` is now `#[non_exhaustive]`. Construct with neutral `Default` and fluent `with_*` setters, following the existing `SendOptions` / `EditOptions` conventions. Default remains valid **configuration**: recipients are a separate required argument, not an empty required field hidden inside the options. Public fields stay readable/mutable; patterns need `..`.
 
 ```rust,no_run
-# async fn example(client: &whatsapp_rust::Client) -> anyhow::Result<()> {
-use whatsapp_rust::{Jid, MessageId, StanzaId, StatusPrivacySetting, StatusSendOptions};
+# async fn example(client: &whatsapp_rust::Client, validated_recipients: &[whatsapp_rust::Jid]) -> anyhow::Result<()> {
+use whatsapp_rust::{MessageId, StanzaId, StatusPrivacySetting, StatusSendOptions};
 use whatsapp_rust::waproto::whatsapp::message::extended_text_message::FontType;
-let recipients = [Jid::pn("15550000001")];
-// Use a compatible explicit list. A missing observed audience is not permission
-// to send to all contacts; privacy never automatically filters this array.
-let observed = client.status().audience();
+// Precondition: the host already checked that validated_recipients is compatible
+// with its synced AllowList audience. A missing observed audience is not permission
+// to send to all contacts; privacy never automatically filters this list.
 let post = client.status().send_text(
-    "Hello", 0xFF000000, FontType::SYSTEM, &recipients,
+    "Hello", 0xFF000000, FontType::SYSTEM, validated_recipients,
     StatusSendOptions::default()
         .with_privacy(StatusPrivacySetting::AllowList)
         .with_message_id(MessageId::new("STATUS-CONTENT")?),
 ).await?;
 let revoke = client.status().revoke(
-    post.message_id, &recipients,
+    post.message_id, validated_recipients,
     StatusSendOptions::default().with_stanza_id(StanzaId::new("REVOKE-OPERATION")?),
 ).await?;
 let operation = revoke.stanza_id(); // NOT the target content ID

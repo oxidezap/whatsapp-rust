@@ -1075,7 +1075,7 @@ fn status_id_override<'a>(
     if (is_content && options.stanza_id.is_some()) || (!is_content && options.message_id.is_some())
     {
         return Err(SendError::InvalidRequest(
-            "status posts require a content message_id override; revokes/reactions require a stanza_id override".into(),
+            "status posts do not accept a stanza_id override; revokes/reactions do not accept a message_id override".into(),
         ));
     }
     let outer_id = if is_content {
