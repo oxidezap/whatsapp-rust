@@ -135,9 +135,19 @@ mutation change.
 - The formerly singleton grouping test now uses **two** same-key peers.
   `peer_self_fanout_is_peer_msg_without_recipient`, chunking, large-backlog
   ordering/allocation controls and existing commit/teardown regressions remain.
+- Review follow-up removes both unused per-peer vectors: singleton peers keep
+  their original ID only in the representative, and flush sends the individual
+  node directly through the same `send_node` path. Peer failure warnings include
+  the original ID; ordinary warnings are unchanged. The new
+  `grouping_peers_does_not_allocate_per_message_id_vectors` control measured
+  **71 allocations for 64 peers** before production follow-up (exit 101), with
+  a limit of 12. A separate fixture-type compilation typo was corrected first,
+  not counted as that allocation reproduction. The ordinary backlog's existing
+  16-allocation budget is unchanged; the corrected peer allocation guard passes.
 
-Focused nextest validation ran 11 tests successfully (exit 0). The full local
-and current-source forge gate outcomes belong in the PR's validation record;
+After review follow-up, focused nextest validation ran 13 tests successfully
+(exit 0); the initial run passed 11. The full local and current-source forge gate
+outcomes belong in the PR's validation record;
 this focused result alone is not merge readiness. Existing native/wasm feature,
 MSRV, consumer, allocation/future/size and security checks are not waived. Any
 separate unresolved host/dependency security audit remains a blocker, not proof

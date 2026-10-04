@@ -325,7 +325,7 @@ fn build_delivery_receipt_node(info: &MessageInfo, active: bool) -> wacore_binar
 
 /// One buffered-offline delivery group: every entry shares identical
 /// receipt-level attrs, derived from the representative `rep`. Peer groups
-/// always contain a single message.
+/// always contain a single message in `rep`, so their `ids` stays empty.
 struct DeliveryReceiptGroup<'a> {
     rep: &'a MessageInfo,
     ids: Vec<&'a str>,
@@ -339,7 +339,7 @@ struct DeliveryReceiptGroup<'a> {
 /// the type attr, and the self-fanout recipient. Splitting more finely than
 /// WA Web (e.g. on recipient device) is always wire-safe; merging across any
 /// of these would corrupt the receipt. Keys are borrowed, no per-entry
-/// allocation beyond the ids vec.
+/// allocation beyond the non-peer ids vec.
 fn group_delivery_receipts<'a>(
     infos: &'a [Arc<MessageInfo>],
     active: bool,
@@ -365,7 +365,7 @@ fn group_delivery_receipts<'a>(
         // original id at the receipt root, as on the live peer path.
         if info.category == MessageCategory::Peer {
             slots.push(heads.len());
-            heads.push((info, 1));
+            heads.push((info, 0));
             continue;
         }
         let is_status = info.source.chat.is_status_broadcast();
@@ -406,7 +406,9 @@ fn group_delivery_receipts<'a>(
         })
         .collect();
     for (info, &slot) in infos.iter().zip(&slots) {
-        groups[slot].ids.push(&info.id);
+        if info.category != MessageCategory::Peer {
+            groups[slot].ids.push(&info.id);
+        }
     }
     groups
 }
@@ -904,14 +906,25 @@ impl Client {
                 groups.len()
             );
             for group in &groups {
-                let nodes = if group.rep.category == MessageCategory::Peer {
-                    vec![build_delivery_receipt_node(group.rep, active)]
-                } else {
-                    build_aggregate_delivery_receipt_nodes(
-                        group.rep, &group.ids, active, &timestamp,
-                    )
-                };
-                for node in nodes {
+                if group.rep.category == MessageCategory::Peer {
+                    if let Err(e) = client
+                        .send_node(build_delivery_receipt_node(group.rep, active))
+                        .await
+                        && !matches!(e, crate::client::ClientError::NotConnected)
+                    {
+                        log::warn!(
+                            target: "Client/Receipt",
+                            "Failed to send offline peer delivery receipt for message {} in chat {}: {:?}",
+                            group.rep.id,
+                            group.rep.source.chat.observe(),
+                            e
+                        );
+                    }
+                    continue;
+                }
+                for node in build_aggregate_delivery_receipt_nodes(
+                    group.rep, &group.ids, active, &timestamp,
+                ) {
                     if let Err(e) = client.send_node(node).await
                         && !matches!(e, crate::client::ClientError::NotConnected)
                     {
@@ -3655,8 +3668,10 @@ mod tests {
         assert_eq!(groups[0].ids, vec!["M1", "M2"]);
         assert_eq!(groups[1].ids, vec!["M3", "M4"]);
         assert_eq!(groups[2].ids, vec!["M5"]);
-        assert_eq!(groups[3].ids, vec!["M6"]);
-        assert_eq!(groups[4].ids, vec!["M7"]);
+        assert_eq!(groups[3].rep.id, "M6");
+        assert_eq!(groups[4].rep.id, "M7");
+        assert!(groups[3].ids.is_empty());
+        assert!(groups[4].ids.is_empty());
         assert_eq!(
             delivery_receipt_type(groups[3].rep, true),
             Some("peer_msg"),
@@ -3815,6 +3830,29 @@ mod tests {
             allocs <= 16,
             "grouping 1024 messages over 8 chats took {allocs} allocations"
         );
+    }
+
+    #[test]
+    fn grouping_peers_does_not_allocate_per_message_id_vectors() {
+        let infos: Vec<Arc<MessageInfo>> = (0..64)
+            .map(|i| {
+                let mut info = info_with("99000000000001@lid", "99000000000001:7@lid", false);
+                info.id = format!("PEER_{i:03}").into();
+                info.is_offline = true;
+                info.category = MessageCategory::Peer;
+                Arc::new(info)
+            })
+            .collect();
+        // Slots, growing heads and final groups, not an id allocation per
+        // peer: the original id already lives in each representative.
+        let allocs = crate::test_alloc::min_allocs(16, || group_delivery_receipts(&infos, true));
+        assert!(allocs <= 12, "grouping 64 peers took {allocs} allocations");
+        let groups = group_delivery_receipts(&infos, true);
+        assert_eq!(groups.len(), infos.len());
+        for (group, info) in groups.iter().zip(&infos) {
+            assert_eq!(group.rep.id, info.id);
+            assert!(group.ids.is_empty());
+        }
     }
 
     /// The opposite shape: every message lands in its own group, so no id
