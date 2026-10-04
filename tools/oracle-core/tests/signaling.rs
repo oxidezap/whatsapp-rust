@@ -1323,14 +1323,11 @@ fn the_engine_starts_an_outgoing_call() {
         // And then it stops. This pins the blocker rather than endorsing it:
         // `make_and_cache_offer` (offer.cc) returns 70008.
         //
-        // *Which* of its nine `70008` sites fires is not known. It is not
-        // `offer.cc:463`, the missing-self-participant one, though that was
-        // written here as established: with the engine's workers alive,
-        // `getCallInfo` answers, and it reports `participant_count: 2` with
-        // `11223344556677@lid` as `is_self: false` and `99887766554433@lid` as
-        // `is_self: true`. The self participant exists. Neither of the two
-        // functions that build it logs its "self participant not created"
-        // failure, either. See tools/oracle-core/tests/signaling.rs for the remaining candidates.
+        // 70008 is shared by several guards. This test observes the failure
+        // and lack of a send, but does not locate the guard in the pinned capture.
+        // Read `make_and_cache_offer` in that capture and mark its call sites
+        // with `oracle instrument --calls-in FUNC`; a body marker cannot tell
+        // which caller ran. Do not carry old-capture indices into this module.
         //
         // When this assertion starts failing, the blocker is gone: replace it
         // with one that expects an offer on the wire.

@@ -2,9 +2,9 @@
 //!
 //! This one builds a client with the plugin host on and no plugin installed;
 //! `size_probe_with_wam.rs` is the same program with one line added. Building
-//! both under the release profile and subtracting is what
-//! `agent_docs/architecture.md` asks for, and a pair is the only way to
-//! get it: the `demo` example cannot depend on a plugin crate that depends on
+//! both under the same release profile and comparing stripped bytes and text
+//! measures the plugin cost. Use the paired procedure in
+//! `agent_docs/testing.md`: the `demo` example cannot depend on a plugin crate that depends on
 //! it, so the comparison has to happen on this side of the edge.
 //!
 //! Neither is a working client, nothing here connects, and neither is built
