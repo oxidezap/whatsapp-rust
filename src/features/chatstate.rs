@@ -92,7 +92,10 @@ mod tests {
             let children = node.children().unwrap();
             assert_eq!(children.len(), 1);
             assert_eq!(children[0].tag, tag);
-            assert_eq!(children[0].get_attr("media").map(|v| v.as_str()), media);
+            assert_eq!(
+                children[0].get_attr("media").map(|v| v.as_str()).as_deref(),
+                media
+            );
         }
     }
 }
