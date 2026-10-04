@@ -408,7 +408,7 @@ impl Client {
         server_id: u64,
         reaction: &str,
     ) -> Result<String, anyhow::Error> {
-        let request_id = self.generate_message_id().into_string();
+        let request_id = self.generate_message_id_at(wacore::time::now_secs_u64());
 
         let stanza = NodeBuilder::new("message")
             .attr("to", to)
