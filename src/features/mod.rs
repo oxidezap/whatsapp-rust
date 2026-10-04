@@ -70,10 +70,8 @@ pub use chatstate::{ChatStateError, ChatStateType, Chatstate};
 pub use comments::Comments;
 
 pub use contacts::{
-    ContactError, Contacts, IsOnWhatsAppResult, ProfilePicture, ProfilePictureLookup,
-    ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType, USERNAME_MAX_LENGTH,
-    USERNAME_MIN_LENGTH, UserInfo, UsernameLookup, UsernameLookupError, UsernameLookupUser,
-    UsyncSubprotocolError, VerifiedName,
+    ContactError, Contacts, IsOnWhatsAppResult, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UserInfo,
+    UsernameLookup, UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError, VerifiedName,
 };
 
 pub use events::{CreatedEvent, EventCreationParams, EventRef, EventResponseType, Events};
@@ -114,6 +112,11 @@ pub use newsletter::{
     NewsletterMessageType, NewsletterMetadata, NewsletterMyAddOns, NewsletterMyPollVote,
     NewsletterMyReaction, NewsletterPollVote, NewsletterQuestionType, NewsletterReactionCount,
     NewsletterRole, NewsletterState, NewsletterVerification,
+};
+
+pub use pictures::{
+    Pictures, ProfilePicture, ProfilePictureLookup, ProfilePictureRequest, ProfilePictureTarget,
+    ProfilePictureType,
 };
 
 pub use polls::{CreatedPoll, PollError, PollOptionResult, PollRef, PollVoteCiphertext, Polls};

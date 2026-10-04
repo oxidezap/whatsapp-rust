@@ -353,7 +353,7 @@ pub use features::{
     NewsletterMyAddOns, NewsletterMyPollVote, NewsletterMyReaction, NewsletterPollVote,
     NewsletterQuestionType, NewsletterReactionCount, NewsletterRole, NewsletterState,
     NewsletterVerification, Order, OrderPriceDetails, OrderProduct, OwnUsername,
-    ParticipantChangeResponse, ParticipantType, PictureType, PollError, PollOptionResult,
+    ParticipantChangeResponse, ParticipantType, PictureType, Pictures, PollError, PollOptionResult,
     PollVoteCiphertext, Polls, PreparedGroupHistoryShare, Presence, PresenceError, PresencePolicy,
     PresenceStatus, PreviousDescription, Price, Product, ProductAvailability, ProductImage,
     ProductVideo, Profile, ProfileError, ProfilePicture, ProfilePictureLookup, QuickReplies,

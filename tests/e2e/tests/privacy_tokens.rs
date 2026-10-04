@@ -978,8 +978,8 @@ async fn test_restricted_profile_picture_requires_tctoken() -> anyhow::Result<()
     );
     let denied = client_b
         .client
-        .contacts()
-        .lookup_picture(whatsapp_rust::ProfilePictureRequest::new(
+        .pictures()
+        .lookup(whatsapp_rust::ProfilePictureRequest::new(
             whatsapp_rust::ProfilePictureTarget::Contact(&jid_a),
             whatsapp_rust::ProfilePictureType::Full,
         ))
@@ -1014,8 +1014,8 @@ async fn test_restricted_profile_picture_requires_tctoken() -> anyhow::Result<()
     );
     let allowed = client_b
         .client
-        .contacts()
-        .lookup_picture(whatsapp_rust::ProfilePictureRequest::new(
+        .pictures()
+        .lookup(whatsapp_rust::ProfilePictureRequest::new(
             whatsapp_rust::ProfilePictureTarget::Contact(&jid_a),
             whatsapp_rust::ProfilePictureType::Full,
         ))

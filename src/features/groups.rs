@@ -2935,7 +2935,7 @@ impl<'a> Groups<'a> {
     /// Batch fetch group profile pictures (max 1,000) in one `w:g2` IQ.
     ///
     /// This has per-entry batch outcomes and a distinct cost from individual
-    /// `contacts().lookup_picture()` requests with Group or Community targets.
+    /// `pictures().lookup()` requests with Group or Community targets.
     pub async fn get_profile_pictures(
         &self,
         group_jids: Vec<Jid>,

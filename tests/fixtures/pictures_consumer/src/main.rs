@@ -2,8 +2,8 @@
 use std::{future::Future, pin::Pin, time::Duration};
 use whatsapp_rust::features::{GroupError, GroupProfilePicture, PictureType};
 use whatsapp_rust::{
-    Client, ContactError, ProfilePictureLookup, ProfilePictureRequest, ProfilePictureTarget,
-    ProfilePictureType, async_trait, wacore_binary::Jid,
+    Client, ContactError, Pictures, ProfilePictureLookup, ProfilePictureRequest,
+    ProfilePictureTarget, ProfilePictureType, async_trait, wacore_binary::Jid,
 };
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -16,8 +16,8 @@ trait PictureHost {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl PictureHost for Client {
     async fn picture(&self, jid: &Jid) -> Result<ProfilePictureLookup, ContactError> {
-        self.contacts()
-            .lookup_picture(ProfilePictureRequest::new(
+        self.pictures()
+            .lookup(ProfilePictureRequest::new(
                 ProfilePictureTarget::Contact(jid),
                 ProfilePictureType::Full,
             ))
@@ -32,8 +32,12 @@ type LookupFuture<'a> =
 type LookupFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ProfilePictureLookup, ContactError>> + 'a>>;
 
+fn facade(client: &Client) -> Pictures<'_> {
+    client.pictures()
+}
+
 fn lookup<'a>(client: &'a Client, request: ProfilePictureRequest<'a>) -> LookupFuture<'a> {
-    Box::pin(async move { client.contacts().lookup_picture(request).await })
+    Box::pin(async move { client.pictures().lookup(request).await })
 }
 
 async fn batch(client: &Client, jid: &Jid) -> Result<Vec<GroupProfilePicture>, GroupError> {
@@ -60,6 +64,7 @@ fn main() {
             std::hint::black_box(request);
         }
     }
+    std::hint::black_box(facade);
     std::hint::black_box(lookup);
     std::hint::black_box(batch);
     std::hint::black_box(<Client as PictureHost>::picture);

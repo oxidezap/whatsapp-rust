@@ -313,8 +313,8 @@ async fn check_outcomes(handle: PrometheusHandle) {
         let before = counts(&handle);
         let c = client.clone();
         let task = tokio::spawn(async move {
-            c.contacts()
-                .lookup_picture(
+            c.pictures()
+                .lookup(
                     ProfilePictureRequest::new(
                         ProfilePictureTarget::Group(&Jid::group("15550000001-7")),
                         ProfilePictureType::Full,
