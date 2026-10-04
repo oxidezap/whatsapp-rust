@@ -136,5 +136,48 @@
       { "lanes": ["native", "msrv"], "mode": "test" },
       { "lanes": ["wasm"], "mode": "check" }
     ]
+  },
+  {
+    "manifest": "tests/fixtures/community_consumer/Cargo.toml",
+    "locked": false,
+    "integration_pr": "https://github.com/oxidezap/whatsapp-rust/pull/1631",
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["wasm"], "mode": "check" }
+    ]
+  },
+  {
+    "manifest": "tests/fixtures/status_consumer/Cargo.toml",
+    "locked": true,
+    "integration_pr": "https://github.com/oxidezap/whatsapp-rust/pull/1632",
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["wasm"], "mode": "check" },
+      {
+        "lanes": ["native", "msrv"], "mode": "check", "lib": true,
+        "features": ["old-message-id-string"],
+        "expect_failure": { "error_code": "E0308", "contains": ["expected `MessageId`", "found `String`"] }
+      },
+      {
+        "lanes": ["native", "msrv"], "mode": "check", "lib": true,
+        "features": ["old-revoke-string"],
+        "expect_failure": { "error_code": "E0308", "contains": ["expected `MessageId`", "found `&str`"] }
+      },
+      {
+        "lanes": ["native", "msrv"], "mode": "check", "lib": true,
+        "features": ["wrong-message-id-domain"],
+        "expect_failure": { "error_code": "E0308", "contains": ["expected `MessageId`", "found `StanzaId`"] }
+      },
+      {
+        "lanes": ["native", "msrv"], "mode": "check", "lib": true,
+        "features": ["wrong-stanza-id-domain"],
+        "expect_failure": { "error_code": "E0308", "contains": ["expected `StanzaId`", "found `MessageId`"] }
+      },
+      {
+        "lanes": ["native", "msrv"], "mode": "check", "lib": true,
+        "features": ["old-options-literal"],
+        "expect_failure": { "error_code": "E0639", "contains": ["non-exhaustive", "StatusSendOptions"] }
+      }
+    ]
   }
 ]

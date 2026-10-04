@@ -113,8 +113,11 @@ impl ExpectedFailure {
             "negative control did not report {}",
             self.error_code
         );
-        let text = diagnostic["message"]
+        // The rendered diagnostic also carries expected/found type labels and
+        // source spans, needed for directed E0308/E0639 library controls.
+        let text = diagnostic["rendered"]
             .as_str()
+            .or_else(|| diagnostic["message"].as_str())
             .context("compiler diagnostic text")?;
         for needle in &self.contains {
             ensure!(
@@ -254,8 +257,8 @@ fn validate(root: &Path, consumers: &[Consumer]) -> Result<()> {
             );
             if let Some(expected) = &invocation.expect_failure {
                 ensure!(
-                    invocation.mode == Mode::Check && invocation.bin.is_some(),
-                    "{}: directed negatives must check a named binary",
+                    invocation.mode == Mode::Check && (invocation.bin.is_some() || invocation.lib),
+                    "{}: directed negatives must check an explicit lib or named bin target",
                     consumer.manifest
                 );
                 ensure!(
@@ -570,6 +573,12 @@ mod tests {
             diagnostic("E0432", "VideoStateChanged CallEvent")
         );
         assert!(expected.verify(false, &split).is_err());
+        let typed = ExpectedFailure {
+            error_code: "E0308".into(),
+            contains: vec!["expected `MessageId`".into(), "found `String`".into()],
+        };
+        let typed_output = serde_json::json!({"reason":"compiler-message","message":{"level":"error","code":{"code":"E0308"},"message":"mismatched types","rendered":"error[E0308]: mismatched types\nexpected `MessageId`, found `String`"}}).to_string();
+        assert!(typed.verify(false, &typed_output).is_ok());
         assert!(
             expected
                 .verify(

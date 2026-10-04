@@ -79,7 +79,8 @@ entry to `true` without touching the shared root lock.
 ## Directed removal controls
 
 Keep the fixture's positive control and existing precise negative harness. For
-an intentionally failing optional binary, use an explicit diagnostic expectation:
+an intentionally failing optional binary or feature-gated library (`lib: true`),
+use an explicit diagnostic expectation:
 
 ```json
 {
@@ -95,7 +96,8 @@ an intentionally failing optional binary, use an explicit diagnostic expectation
 ```
 
 This succeeds only when Cargo's JSON messages contain exactly one compiler error
-with code `E0599` and every listed API fragment in that same diagnostic's message.
+with code `E0599` and every listed API fragment in that same rendered diagnostic.
+Rendered type labels also support precise `E0308` expected/found domain checks.
 An unexpectedly successful compile, missing dependency, unrelated/additional
 error, or absent fragment fails the gate. Stable rustdoc
 alone does not enforce an error-code annotation. Deliberately failing optional
