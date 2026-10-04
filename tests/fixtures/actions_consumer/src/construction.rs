@@ -109,7 +109,7 @@
 //! let _ = EventCreationParams::default();
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0277
 //! use wa::EventCreationParams;
 //! let _ = EventCreationParams::builder().build();
 //! ```
