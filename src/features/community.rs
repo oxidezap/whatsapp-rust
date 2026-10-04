@@ -797,7 +797,7 @@ mod tests {
     }
 
     async fn complete_creation(
-        client: &Client,
+        client: &std::sync::Arc<Client>,
         transport: &std::sync::Arc<crate::transport::mock::CapturingMockTransport>,
     ) {
         use wacore_binary::builder::NodeBuilder;
