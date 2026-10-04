@@ -12,6 +12,18 @@ use wacore_binary::{Jid, JidExt};
 ///
 /// Setters and removals remain on [`crate::Profile`], [`crate::Groups`], and
 /// [`crate::Community`]. Group batch lookup remains on [`crate::Groups`].
+///
+/// This replaces `Contacts::lookup_picture`; the old entry point is removed:
+/// ```compile_fail,E0599
+/// use whatsapp_rust::{Client, ContactError, ProfilePictureLookup,
+///     ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
+/// use whatsapp_rust::wacore_binary::Jid;
+/// async fn old_lookup(client: &Client, jid: &Jid) -> Result<ProfilePictureLookup, ContactError> {
+///     client.contacts().lookup_picture(ProfilePictureRequest::new(
+///         ProfilePictureTarget::Contact(jid), ProfilePictureType::Full,
+///     )).await
+/// }
+/// ```
 pub struct Pictures<'a> {
     client: &'a Client,
 }

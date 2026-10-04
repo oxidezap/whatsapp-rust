@@ -51,7 +51,10 @@ existing committed lockfile, dependency default-features=false).
   WASM boxing and async_trait deliberately use non-Send futures as before.
 - Root directed tests: `cargo test --locked -p whatsapp-rust --lib features::pictures`;
   metrics version adds `--features metrics`. `cargo test --locked -p whatsapp-rust --test profile_picture_lookup` covers downstream imports/boxing.
-- Rustdoc: `cargo test --locked -p whatsapp-rust --doc` covers the moved lookup example.
+- Rustdoc: `cargo test --locked -p whatsapp-rust --doc` covers the moved lookup example
+  and a second removal control on the public `Pictures` documentation. This runs
+  in the existing root Rustdoc job immediately, independently of R05 wiring the
+  standalone fixture's doctests into the central registry.
 
 ## Validation
 
