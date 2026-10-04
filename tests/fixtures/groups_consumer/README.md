@@ -9,7 +9,7 @@ mockable full metadata/participant outputs, not authenticated server behavior.
 ```console
 cargo test --locked --manifest-path tests/fixtures/groups_consumer/Cargo.toml
 cargo test --locked --manifest-path tests/fixtures/groups_consumer/Cargo.toml --no-default-features
-cargo +1.94.0 test --locked --manifest-path tests/fixtures/groups_consumer/Cargo.toml
+RUSTFLAGS='' CARGO_ENCODED_RUSTFLAGS='' cargo +1.94.0 test --locked --manifest-path tests/fixtures/groups_consumer/Cargo.toml
 RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo check --locked --manifest-path tests/fixtures/groups_consumer/Cargo.toml --no-default-features --features js --target wasm32-unknown-unknown
 ```
 
@@ -27,6 +27,10 @@ checks the annotated E0639/E0638/E0599 diagnostics; stable rustdoc accepts any
 compilation failure, so use nightly to verify causes as well as MSRV to verify
 consumer support. Missing builder identities use compile-fail controls without
 an error-code annotation because bon's typestate diagnostic can vary.
+
+The empty MSRV `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` opt out of this
+repository's nightly-only x86_64 link/codegen flags; they do not disable any
+fixture assertions.
 
 Do not use `--all-features` as a WASM substitute: it enables the runtime output
 mode intentionally excluded by the core-only WASM fixture check.

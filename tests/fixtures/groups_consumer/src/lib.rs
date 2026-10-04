@@ -26,6 +26,16 @@
 //!     GroupParticipantOptions::new(Jid::pn("15550000001"));
 //! ```
 //!
+//! ```compile_fail,E0638
+//! use wacore::iq::groups::GroupCreateOptions;
+//! let GroupCreateOptions {
+//!     subject, participants, member_link_mode, member_add_mode,
+//!     membership_approval_mode, ephemeral_expiration, is_parent, closed,
+//!     allow_non_admin_sub_group_creation, create_general_chat,
+//!     linked_parent, hidden_group, description,
+//! } = GroupCreateOptions::new("Fixture group");
+//! ```
+//!
 //! ```compile_fail,E0599
 //! use wacore::iq::groups::GroupCreateOptions;
 //! let options = GroupCreateOptions::default();
