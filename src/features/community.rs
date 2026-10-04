@@ -54,7 +54,7 @@ pub enum CommunityError {
         created_jid: Jid,
         step: CommunityConfigurationStep,
         #[source]
-        source: GroupError,
+        source: Box<GroupError>,
     },
 }
 
@@ -283,7 +283,7 @@ impl<'a> Community<'a> {
                 .map_err(|source| CommunityError::ConfigurationFailed {
                     created_jid: metadata.id.clone(),
                     step: CommunityConfigurationStep::SetDescription,
-                    source,
+                    source: Box::new(source),
                 })?;
             metadata.description = Some(desc_text);
         }
@@ -892,7 +892,7 @@ mod tests {
         assert_eq!(created_jid, community_jid());
         assert_eq!(step, CommunityConfigurationStep::SetDescription);
         assert!(
-            matches!(source, GroupError::Iq(IqError::ServerError { code: 403, ref text, .. }) if text == "denied")
+            matches!(*source, GroupError::Iq(IqError::ServerError { code: 403, ref text, .. }) if text == "denied")
         );
 
         let resume = {

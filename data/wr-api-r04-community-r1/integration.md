@@ -10,7 +10,7 @@ Community group inputs use `GroupCreateOptions::new(subject)` followed by public
 
 ## Partial creation: one error contract
 
-`CommunityError::ConfigurationFailed { created_jid: Jid, step: CommunityConfigurationStep, source: GroupError }`. `CommunityConfigurationStep::SetDescription` is non_exhaustive. Failure before creation retains existing errors. No parallel partial-success result family. The source stays typed and participates in std::error::Error chaining.
+`CommunityError::ConfigurationFailed { created_jid: Jid, step: CommunityConfigurationStep, source: Box<GroupError> }`. `CommunityConfigurationStep::SetDescription` is non_exhaustive. Failure before creation retains existing errors. No parallel partial-success result family. The source stays typed and participates in std::error::Error chaining.
 
 Creation validates even public unchecked newtypes before any remote effect. If description configuration fails, resume on `created_jid` using `Groups::set_description(..., PreviousDescription::Resolve)`; re-querying the current description token avoids assuming a failed/ambiguous IQ never committed. No rollback, atomicity, automatic retry or creation-retry guarantees. Cancellation after creation can still lose its result; this is not a durable workflow.
 
@@ -41,7 +41,7 @@ if let Err(CommunityError::ConfigurationFailed { created_jid, step, source }) = 
 
 ## Fixtures and modes
 
-Planned standalone manifest: `tests/fixtures/community_consumer/Cargo.toml`, native minimal runtime dependencies (root default-features=false), native test and doctest, compile-fail literal/exhaustive pattern controls, MSRV 1.94 check. Core-only WASM construction check where the root runtime feature surface permits; no new feature gates. In-process IQ fault injection tests in `features::community::tests` verify zero IQ on invalid 2049-character ASCII description, complete creation, preserved JID/step/source on second-IQ failure, and configuration resumption without a second create.
+Standalone manifest: `tests/fixtures/community_consumer/Cargo.toml`, native minimal runtime dependencies (root default-features=false), native test and doctest, compile-fail literal/exhaustive pattern controls, MSRV 1.94 check. Core-only WASM construction check where the root runtime feature surface permits; no new feature gates. In-process IQ fault injection tests in `features::community::tests` verify zero IQ on invalid 2049-character ASCII description, complete creation, preserved JID/step/source on second-IQ failure, and configuration resumption without a second create.
 
 ## Evidence
 

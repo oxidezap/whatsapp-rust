@@ -111,7 +111,7 @@ mod tests {
         let error = CommunityError::ConfigurationFailed {
             created_jid: jid.clone(),
             step: CommunityConfigurationStep::SetDescription,
-            source: GroupError::Iq(IqError::Timeout),
+            source: Box::new(GroupError::Iq(IqError::Timeout)),
         };
         assert!(std::error::Error::source(&error).is_some());
         match error {
@@ -122,7 +122,7 @@ mod tests {
             } => {
                 assert_eq!(created_jid, jid);
                 assert_eq!(step, CommunityConfigurationStep::SetDescription);
-                assert!(matches!(source, GroupError::Iq(IqError::Timeout)));
+                assert!(matches!(*source, GroupError::Iq(IqError::Timeout)));
             }
             _ => panic!("expected configuration failure"),
         }
