@@ -150,12 +150,12 @@ across handle clones; later attempts return `None`, even after receiver Drop. Pa
 `IncomingCall` stream to recover identity or update the same state from that
 stream; the two consumers can run in a different order.
 
-The source-bearing event is published after the existing typed-ACK and state
-commit checks, while holding the existing video-transition lock. Direct calls
-then publish the unchanged legacy `VideoStateChanged` on that same queue with
-identical state, orientation and token. New consumers must ignore the legacy
-companion; existing consumers can keep matching the legacy variant and ignore
-unknown variants. The old variant's fields and token type are unchanged.
+The source-bearing event is published once after the existing typed-ACK and state
+commit checks, while holding the existing video-transition lock. The legacy
+`CallEvent::VideoStateChanged` variant and its compatibility emission have been
+removed. Migrate matches to `CallEvent::PeerVideoStateChanged { state,
+orientation, upgrade_token, .. }`, or bind `source` and `call_creator` when needed.
+The state, orientation and upgrade token retain their meanings.
 
 `source` is the parsed `participant` when present, otherwise `from`. It is not
 replaced with the stored winning device. `call_creator` is the incoming value,
@@ -163,23 +163,27 @@ not an inference from the matched call ID. Group PN aliases remain PN aliases
 in the event, while the existing orientation path still canonicalizes them for
 the media registry. Groups publish only the new participant-scoped variant,
 with no upgrade token, after the existing post-ACK roster reauthorization.
-They still do not emit call-wide legacy video state or enter direct negotiation.
+They still do not enter direct negotiation.
 
 Neither identity field certifies authorization. The current direct handler can
 apply a sibling's state or a state carrying a different creator, and the event
 reports those inputs faithfully so a consumer can apply its own policy.
 
-The queue keeps its bounded eviction behavior. It is not a lossless history or
-an atomic pair mailbox. Normal handles have room for both variants; a custom
-single-slot core queue retains the legacy event, preserving its old behavior.
-Both JID allocations are included in the existing queue byte accounting.
+The queue keeps its bounded eviction behavior; it is not a lossless history.
+A custom single-slot core queue now retains the canonical identity-bearing event.
+Both JID allocations are included in the existing queue byte accounting. A
+closed receiver does not roll back an otherwise committed transition, its plane
+controls or the separate `IncomingCall` dispatch, even if it closes before the
+ACK starts. Publication fails and is logged. A missing media session/publication
+permit still prevents the direct typed ACK, as before.
 
 The fixture regression first failed on the original implementation with four
 states in order but four absent sources. It now checks source B's upgrade
 accept followed by source A's stop, then a request/token from B followed by a
-stop from A. Every direct pair agrees exactly, and the stopped request's token
-is expired. Separate tests cover routed identity, supplied creator, ignored
-states, group aliases, ACK ordering and legacy single-slot behavior.
+stop from A. Each committed notification produces exactly one event, and the
+stopped request's token is expired. Separate tests cover routed identity,
+supplied creator, ignored states, group aliases, ACK ordering, generation
+replacement, single-slot backpressure and receiver closure.
 
 This changes the in-process event API, not wire signaling, codecs, sender
 matching or authorization. It is not evidence of WhatsApp protocol parity.
