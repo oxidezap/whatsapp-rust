@@ -1399,6 +1399,9 @@ fn spawn_call_event_listener(
                         "🎥 relay-send backpressure: dropped {video_access_units} complete video AUs / {packets} packets"
                     );
                 }
+                CallEvent::PeerVideoStateChanged { .. } if handle.video_states().is_none() => {
+                    debug!("ignoring queued video state for an ended or replaced call");
+                }
                 CallEvent::PeerVideoStateChanged { source, state, .. }
                     if handle.group_state().is_some() =>
                 {
