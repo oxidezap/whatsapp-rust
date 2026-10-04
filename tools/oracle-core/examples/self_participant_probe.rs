@@ -27,7 +27,7 @@ const SELF_LID: &str = "99887766554433@lid";
 const PEER_LID: &str = "11223344556677@lid";
 const PEER_LID_DEVICE: &str = "11223344556677:0@lid";
 
-/// Offsets established from the disassembly; see `tools/oracle-core/tests/signaling.rs`.
+/// Capture-specific offsets derived from disassembly. Re-derive when the lock changes.
 const GROUP_IN_CALL: u32 = 659_164;
 const SELF_IN_GROUP: u32 = 592;
 

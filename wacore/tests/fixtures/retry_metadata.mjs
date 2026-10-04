@@ -1,6 +1,10 @@
 // Regenerate the golden file using the actual archived modules, not a JS port.
 // Usage: node retry_metadata.mjs /path/to/verified/restored/bundles > retry_metadata.json
-// See agent_docs/wa_web_reference.md for archive verification and stub scope.
+// See agent_docs/wa_web_reference.md for exact archive verification.
+// Runs real genMetaNode and protobuf unwrapping/key validation. Stubs disable
+// bot/origin metadata, the poll-result snapshot experiment and the diagnostic
+// three-level nesting gate. Media records are synthetic; this does not execute
+// media upload, retry eligibility, or a complete authenticated client.
 import fs from 'node:fs';
 import vm from 'node:vm';
 import crypto from 'node:crypto';

@@ -57,7 +57,7 @@ for verification and coverage boundaries.
   emscripten thread must use `can_block = 0` so waiting can yield to host code.
 - Main-runtime registration is currently disabled by default because synchronous
   proxy draining can deadlock startup. This remains a full-call coverage gap;
-  see `RuntimeOptions::register_main_runtime_thread` and `tests/signaling.rs`.
+  see `RuntimeOptions::set_main_thread_registration` and `tests/signaling.rs`.
   Do not turn a failed drain into evidence of no send.
 - Tests starting an engine acquire `common::threaded_guard()` (local and
   cross-process locks). Wait for observable progress/quiescence, not arbitrary

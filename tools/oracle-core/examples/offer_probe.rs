@@ -111,9 +111,8 @@ fn main() -> anyhow::Result<()> {
     let started = runtime.call_embind(
         "initVoipStack",
         &[
-            // The self JID. `tools/oracle-core/tests/signaling.rs` records this build wanting a bare
-            // LID here where the previous one took a phone number, and the
-            // creator check may well be relative to it.
+            // Self JID for this capture-specific probe. Verify initVoipStack's
+            // glue and identity spelling before using another capture.
             Value::Str(std::env::var("PROBE_SELF").unwrap_or_else(|_| jid(CALLEE))),
             Value::Str("0".into()),
             Value::Str("{}".into()),

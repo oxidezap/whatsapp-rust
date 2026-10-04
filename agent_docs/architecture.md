@@ -44,7 +44,7 @@ A clean reload in the same cache incarnation is exact; a new incarnation burns
 the persisted lease. An old database restore is not detectable from its bytes.
 Consumed prekeys are deleted only after their promoted session is durable.
 See `wacore/src/store/signal_cache.rs`, `wacore/libsignal/src/protocol/state/session.rs`
-and `sender_keys.rs` for lock order, cancellation guards and recovery tests.
+and `wacore/libsignal/src/protocol/sender_keys.rs` for lock order, cancellation guards and recovery tests.
 SQLite's default NORMAL mode establishes transaction/process-crash ordering;
 FULL is configurable for stronger storage durability. Do not promise power-loss
 survival under NORMAL.

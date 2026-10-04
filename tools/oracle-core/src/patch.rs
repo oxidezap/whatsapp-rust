@@ -8,7 +8,7 @@
 //!
 //! ## Why a body patch is not enough, and this is
 //!
-//! A body patch reports every caller of the function. Mark the specific call
+//! A body marker fires regardless of which caller invoked the function. Mark the specific call
 //! site when the question concerns one path; body markers cannot distinguish
 //! which caller reached it.
 //!
