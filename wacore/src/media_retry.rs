@@ -267,6 +267,7 @@ mod tests {
     // bundle 034314e49fa571a8e2e8491843a15536326b4a47d1f66ac7704d2332ee1b391e,
     // bytes 1049768..1052840, compares decrypted stanzaId strictly.
     #[test]
+    #[allow(clippy::disallowed_methods)] // Test-only protobuf fixture; no production encode tree.
     fn encrypted_response_requires_matching_stanza_id() {
         use buffa::Message;
         let key = [42; 32];
@@ -274,7 +275,7 @@ mod tests {
             let plaintext = wa::MediaRetryNotification {
                 stanza_id: id.map(str::to_owned),
                 direct_path: Some("/media/test.enc".into()),
-                result: Some(wa::media_retry_notification::ResultType::SUCCESS.into()),
+                result: Some(wa::media_retry_notification::ResultType::SUCCESS),
                 ..Default::default()
             }
             .encode_to_vec();
