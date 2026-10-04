@@ -3692,7 +3692,10 @@ mod tests {
                 release_send.send(()).await.expect("release Enabled send");
                 assert!(handling.await);
             }
-            assert!(cancelled, "closed receiver does not restore the generic ack");
+            assert!(
+                cancelled,
+                "closed receiver does not restore the generic ack"
+            );
             assert!(matches!(
                 event_rx.try_recv(),
                 Err(async_channel::TryRecvError::Closed)
@@ -3822,7 +3825,10 @@ mod tests {
                 registry.reserve_call_event("CALL-ID-0001").is_none(),
                 "the next transition must not overtake committed effects"
             );
-            assert!(event_rx.is_empty(), "publication must wait for Enabled send");
+            assert!(
+                event_rx.is_empty(),
+                "publication must wait for Enabled send"
+            );
             release_send.send(()).await.expect("release Enabled send");
             handling.await
         };
@@ -4232,7 +4238,10 @@ mod tests {
                 upgrade_token: None,
             }) if source == fake_caller_lid() && call_creator == fake_caller_lid()
         ));
-        assert!(ev_rx.is_empty(), "one-slot queue retains the canonical event");
+        assert!(
+            ev_rx.is_empty(),
+            "one-slot queue retains the canonical event"
+        );
         assert!(
             std::iter::from_fn(|| ctl_rx.try_recv().ok())
                 .any(|ctl| matches!(ctl, VideoControl::Enable)),
