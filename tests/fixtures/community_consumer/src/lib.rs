@@ -41,24 +41,23 @@ pub fn options() -> Result<CreateCommunityOptions, Box<dyn std::error::Error>> {
 
 /// Resume a configuration error on its created JID without issuing create again.
 /// Reading the current token matters when a failed IQ may have committed remotely.
-pub async fn resume_description(
+pub async fn resume_description<'a>(
     client: &Client,
-    error: CommunityError,
+    error: &'a CommunityError,
     requested: GroupDescription,
-) -> Result<Jid, Box<dyn std::error::Error>> {
+) -> Result<Jid, Box<dyn std::error::Error + 'a>> {
     match error {
         CommunityError::ConfigurationFailed {
             created_jid,
             step: CommunityConfigurationStep::SetDescription,
-            source,
+            ..
         } => {
-            // The caller can retain or report the original cause separately.
-            let _original_cause = source;
+            // Borrowing leaves the initial typed cause with the caller.
             client
                 .groups()
-                .set_description(&created_jid, Some(requested), PreviousDescription::Resolve)
+                .set_description(created_jid, Some(requested), PreviousDescription::Resolve)
                 .await?;
-            Ok(created_jid)
+            Ok(created_jid.clone())
         }
         other => Err(Box::new(other)),
     }

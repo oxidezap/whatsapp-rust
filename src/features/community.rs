@@ -258,6 +258,9 @@ impl<'a> Community<'a> {
         options.validate()?;
         let description = options.description;
 
+        // Preserve the existing two-stage community wire flow. Generic group
+        // creation also has an inline description option; adopting it here is
+        // a protocol-sequencing change, not part of this input/error fix.
         let mut create_options = GroupCreateOptions::new(options.name.into_string());
         create_options.is_parent = true;
         create_options.closed = options.closed;
@@ -311,7 +314,9 @@ impl<'a> Community<'a> {
         &self,
         options: CreateSubgroupOptions,
     ) -> Result<CreateCommunityResult, CommunityError> {
-        let mut create_options = GroupCreateOptions::new(options.name);
+        let name = GroupSubject::new(options.name)
+            .map_err(|error| CommunityError::InvalidRequest(error.to_string()))?;
+        let mut create_options = GroupCreateOptions::new(name.into_string());
         create_options.participants = options
             .participants
             .into_iter()
@@ -731,13 +736,13 @@ mod tests {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         let mut options = CreateCommunityOptions::new("Fictitious community").unwrap();
         options.description = Some(GroupDescription::new_unchecked("a".repeat(2049)));
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            client.community().create(options),
-        )
-        .await;
+        use futures::FutureExt;
+        let result = client.community().create(options).now_or_never();
         assert_eq!(transport.sent_count(), 0, "invalid input must send no IQ");
-        assert!(result.expect("validation must finish locally").is_err());
+        assert!(matches!(
+            result.expect("preflight must finish on first poll"),
+            Err(CommunityError::InvalidRequest(_))
+        ));
     }
 
     #[test]
@@ -757,10 +762,28 @@ mod tests {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         let mut options = CreateCommunityOptions::new("Fictitious community").unwrap();
         options.name = GroupSubject::new_unchecked("a".repeat(101));
+        use futures::FutureExt;
         assert!(matches!(
-            client.community().create(options).await,
+            client
+                .community()
+                .create(options)
+                .now_or_never()
+                .expect("preflight must finish on first poll"),
             Err(CommunityError::InvalidRequest(_))
         ));
+        assert_eq!(transport.sent_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_subgroup_name_sends_no_create_iq() {
+        use futures::FutureExt;
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let result = client
+            .community()
+            .create_subgroup("a".repeat(101), &[], community_jid())
+            .now_or_never()
+            .expect("preflight must finish on first poll");
+        assert!(matches!(result, Err(CommunityError::InvalidRequest(_))));
         assert_eq!(transport.sent_count(), 0);
     }
 

@@ -22,27 +22,50 @@ Serialization decision: existing facade results and tuples do not derive Seriali
 
 ## Migration
 
+Explicit, caller-selected resumption (not automatic library retry):
+
 ```rust,ignore
-let mut options = CreateCommunityOptions::new("Fictitious community")?
-    .with_description(GroupDescription::new("Description")?);
-options.closed = true;
-let result = client.community().create(options).await;
-if let Err(CommunityError::ConfigurationFailed { created_jid, step, source }) = result {
-    // Log source and match step with a wildcard for future steps.
-    client.groups().set_description(
-        created_jid,
-        Some(GroupDescription::new("Description")?),
-        PreviousDescription::Resolve,
-    ).await?;
+use whatsapp_rust::{Client, CommunityConfigurationStep, CommunityError,
+    CreateCommunityOptions, GroupDescription, Jid, PreviousDescription};
+
+async fn create_or_resume(client: &Client) -> Result<Jid, Box<dyn std::error::Error>> {
+    let mut options = CreateCommunityOptions::new("Fictitious community")?
+        .with_description(GroupDescription::new("Description")?);
+    options.closed = true;
+    match client.community().create(options).await {
+        Ok(created) => Ok(created.metadata.id),
+        Err(CommunityError::ConfigurationFailed {
+            created_jid, step: CommunityConfigurationStep::SetDescription, source,
+        }) => {
+            eprintln!("Initial description configuration failed: {source}");
+            client.groups().set_description(
+                &created_jid,
+                Some(GroupDescription::new("Description")?),
+                PreviousDescription::Resolve,
+            ).await?;
+            Ok(created_jid)
+        }
+        // Includes other creation errors and future configuration steps.
+        Err(error) => Err(error.into()),
+    }
 }
-// Before: for (jid, code) in result.failed_groups
-// After: for failure in result.failed_groups { use failure.jid and failure.code }
+```
+
+In the separate link/unlink batch flow:
+
+```rust,ignore
+// Before: for (jid, code) in batch_result.failed_groups
+for failure in batch_result.failed_groups {
+    eprintln!("{} failed with code {}", failure.jid, failure.code);
+}
 ```
 
 ## Fixtures and modes
 
-Standalone manifest: `tests/fixtures/community_consumer/Cargo.toml`, native minimal runtime dependencies (root default-features=false), native test and doctest, compile-fail literal/exhaustive pattern controls, MSRV 1.94 check. Core-only WASM construction check where the root runtime feature surface permits; no new feature gates. In-process IQ fault injection tests in `features::community::tests` verify zero IQ on invalid 2049-character ASCII description, complete creation, preserved JID/step/source on second-IQ failure, and configuration resumption without a second create.
+Standalone manifest: `tests/fixtures/community_consumer/Cargo.toml`, native minimal runtime dependencies (root default-features=false), native test and doctest, compile-fail literal/exhaustive pattern controls, MSRV 1.94 check. WASM construction check with `RUSTFLAGS='--cfg getrandom_backend="wasm_js"'`; no new feature gates. CI/registry ownership belongs to the R05 consumer-gate lane, which should register native test (including doctests), MSRV check and WASM check for this manifest. In-process IQ fault injection tests in `features::community::tests` verify zero IQ on invalid 2049-character ASCII description, complete creation, preserved JID/step/source on second-IQ failure, and configuration resumption without a second create.
 
 ## Evidence
 
 Current default verified via fetch: `e32ec562a207c95188693ec1a2738ea69c08fa48`. Description suppression exists both there and in historical `d9f78b806f1f4ca80c8008caa5846e5d542c2c55`; not a regression attributed to the API merges. Initial red-test build exceeded the foreground harness timeout before execution; no claim of baseline runtime reproduction yet. Final validation results will be appended here.
+
+Pinned whatspec IQ IR queried: `WASmaxOutGroupsCreateRequest` includes both optional `descriptionArgs` and `parentArgs`. Shape alone does not establish community creation sequencing. Local raw captures are not available in this worktree, so we do not assert that inline descriptions are server-forbidden for communities. We deliberately preserve the existing two-IQ behavior, as this task prohibits changing the wire, and document that decision where the group input is built.
