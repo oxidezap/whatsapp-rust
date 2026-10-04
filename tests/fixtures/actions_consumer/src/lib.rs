@@ -208,10 +208,8 @@ pub fn mock_history() -> NewsletterMessage {
         .build()
 }
 
-#[doc = include_str!("removed.md")]
-pub struct RemovedNames;
-#[doc = include_str!("construction.md")]
-pub struct ConstructionContract;
+pub mod construction;
+pub mod removed;
 
 #[cfg(test)]
 mod tests {
