@@ -77,6 +77,11 @@ jobs:
           - name: wacore-libsignal (address)
             cache-key: libsignal-address
             args: -p wacore-libsignal --lib address
+          # Scoped allocation ownership must survive cross-thread frees, TLS
+          # teardown and unwinding without recursing through the allocator.
+          - name: whatsapp-rust (test_alloc)
+            cache-key: sdk-test-alloc
+            args: -p whatsapp-rust --lib test_alloc::
     steps:
       - uses: actions/checkout@v7
         with:

@@ -216,37 +216,54 @@ pub(crate) mod test_alloc {
 
     #[test]
     fn unrelated_frees_cannot_hide_retained_bytes() {
-        use std::sync::mpsc::sync_channel;
-        let (ready_tx, ready_rx) = sync_channel(0);
-        let (free_tx, free_rx) = sync_channel(0);
-        let (freed_tx, freed_rx) = sync_channel(0);
-        let worker = std::thread::spawn(move || {
-            let mut preexisting = Some(std::hint::black_box(vec![0u8; 4096]));
-            ready_tx.send(()).unwrap();
-            for free_buffer in [false, true] {
-                free_rx.recv().unwrap();
-                if free_buffer {
-                    drop(preexisting.take());
+        let phase = AtomicUsize::new(0);
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                let preexisting = std::hint::black_box(vec![0u8; 4096]);
+                phase.store(1, Ordering::Release);
+                while phase.load(Ordering::Acquire) != 2 {
+                    std::thread::yield_now();
                 }
-                freed_tx.send(()).unwrap();
+                drop(preexisting);
+                phase.store(3, Ordering::Release);
+            });
+            while phase.load(Ordering::Acquire) != 1 {
+                std::thread::yield_now();
+            }
+            // The handshake itself must not allocate: channel parking can
+            // initialize thread-local state inside the measurement window.
+            let (sample, retained) = live_sample(|| {
+                let retained = std::hint::black_box(vec![0u8; 2048]);
+                phase.store(2, Ordering::Release);
+                while phase.load(Ordering::Acquire) != 3 {
+                    std::thread::yield_now();
+                }
+                retained
+            });
+            drop(retained);
+            assert_eq!(sample, (2048, 1));
+            assert!(sample.0 > 1024);
+        });
+    }
+
+    #[test]
+    fn min_live_retries_until_both_limits_hold_in_one_sample() {
+        let mut attempts = 0;
+        let sample = min_live((1024, 1), || {
+            attempts += 1;
+            match attempts {
+                1 => Some(vec![0u8; 2048]), // Only the allocation count fits.
+                2 => {
+                    let transient = std::hint::black_box((vec![0u8; 32], vec![0u8; 32]));
+                    drop(transient); // Only the retained-byte count fits.
+                    None
+                }
+                3 => Some(vec![0u8; 1024]),
+                _ => panic!("the third sample meets both limits"),
             }
         });
-        ready_rx.recv().unwrap();
-        // Warm the channels' thread-local parking state outside the sample.
-        free_tx.send(()).unwrap();
-        freed_rx.recv().unwrap();
-        // Exercise the same sample primitive as min_live. This deterministic
-        // negative control needs no warm-up retries or bulk preallocation.
-        let (sample, retained) = live_sample(|| {
-            let retained = std::hint::black_box(vec![0u8; 2048]);
-            free_tx.send(()).unwrap();
-            freed_rx.recv().unwrap();
-            retained
-        });
-        drop(retained);
-        worker.join().unwrap();
-        assert_eq!(sample, (2048, 1));
-        assert!(sample.0 > 1024);
+        assert_eq!(attempts, 3);
+        assert_eq!(sample, (1024, 1));
     }
 
     #[test]
