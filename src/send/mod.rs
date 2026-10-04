@@ -1065,6 +1065,28 @@ pub(crate) fn infer_stanza_metadata(msg: &wa::Message) -> (Option<EditAttribute>
     )
 }
 
+// Status posts use the outer wire ID as their content ID. Revokes/reactions
+// instead carry their target in an embedded key and need an operation ID.
+fn status_id_override<'a>(
+    message: &wa::Message,
+    options: &'a crate::features::status::StatusSendOptions,
+) -> Result<Option<&'a str>, SendError> {
+    let is_content = wacore::send::status_carries_privacy_meta(message);
+    if (is_content && options.stanza_id.is_some()) || (!is_content && options.message_id.is_some())
+    {
+        return Err(SendError::InvalidRequest(
+            "status posts require a content message_id override; revokes/reactions require a stanza_id override".into(),
+        ));
+    }
+    let outer_id = if is_content {
+        options.message_id.as_ref().map(crate::MessageId::as_str)
+    } else {
+        options.stanza_id.as_ref().map(crate::StanzaId::as_str)
+    };
+    validate_status_message_id(message, outer_id)?;
+    Ok(outer_id)
+}
+
 fn validate_status_message_id(
     message: &wa::Message,
     outer_id: Option<&str>,
@@ -1628,7 +1650,7 @@ impl Client {
         &self,
         message: wa::Message,
         recipients: &[Jid],
-        mut options: crate::features::status::StatusSendOptions,
+        options: crate::features::status::StatusSendOptions,
     ) -> Result<SendResult, SendError> {
         use wacore::client::context::GroupRoutingInfo;
         use wacore_binary::builder::NodeBuilder;
@@ -1640,7 +1662,7 @@ impl Client {
             ));
         }
         validate_extra_stanza_nodes(&options.extra_stanza_nodes)?;
-        validate_status_message_id(&message, options.message_id.as_deref())?;
+        let id_override = status_id_override(&message, &options)?.map(str::to_owned);
 
         // Status posts don't go through send_message_with_options, so count them here.
         let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
@@ -1648,10 +1670,7 @@ impl Client {
         wacore::telemetry::send("status");
 
         let to = Jid::status_broadcast();
-        let request_id = options
-            .message_id
-            .take()
-            .unwrap_or_else(|| self.generate_message_id());
+        let request_id = id_override.unwrap_or_else(|| self.generate_message_id());
 
         // Borrow from the held snapshot: no field clones, the Arc keeps it alive.
         let device_snapshot = self.persistence_manager.get_device_snapshot();
@@ -4112,6 +4131,78 @@ mod tests {
         ));
         assert!(validate_status_message_id(&revoke, Some("3EB0NEWSTANZAID")).is_ok());
         assert!(validate_status_message_id(&revoke, None).is_ok());
+        assert!(matches!(
+            validate_status_message_id(&revoke, Some("")),
+            Err(SendError::InvalidRequest(_))
+        ));
+
+        let collision = crate::StatusSendOptions::default()
+            .with_stanza_id(crate::StanzaId::new(target_id).unwrap());
+        assert!(matches!(
+            status_id_override(&revoke, &collision),
+            Err(SendError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn status_overrides_keep_content_and_operation_domains_distinct() {
+        use crate::{MessageId, StanzaId, StatusSendOptions};
+        let post = wa::Message::default();
+        let revoke = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::Revoke),
+                key: buffa::MessageField::some(wa::MessageKey {
+                    id: Some("TARGET".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let reaction = wa::Message {
+            reaction_message: buffa::MessageField::some(wa::message::ReactionMessage::default()),
+            ..Default::default()
+        };
+        let content =
+            StatusSendOptions::default().with_message_id(MessageId::new("CONTENT").unwrap());
+        let operation =
+            StatusSendOptions::default().with_stanza_id(StanzaId::new("OPERATION").unwrap());
+        assert_eq!(
+            status_id_override(&post, &content).unwrap(),
+            Some("CONTENT")
+        );
+        for message in [&revoke, &reaction] {
+            assert_eq!(
+                status_id_override(message, &operation).unwrap(),
+                Some("OPERATION")
+            );
+            assert!(matches!(
+                status_id_override(message, &content),
+                Err(SendError::InvalidRequest(_))
+            ));
+        }
+        assert!(matches!(
+            status_id_override(&post, &operation),
+            Err(SendError::InvalidRequest(_))
+        ));
+        let both = content.with_stanza_id(StanzaId::new("OPERATION").unwrap());
+        for message in [&post, &revoke, &reaction] {
+            assert!(
+                status_id_override(message, &StatusSendOptions::default())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(
+                status_id_override(message, &both),
+                Err(SendError::InvalidRequest(_))
+            ));
+            assert!(matches!(
+                validate_status_message_id(message, Some("")),
+                Err(SendError::InvalidRequest(_))
+            ));
+        }
+        assert!(MessageId::new("").is_err());
+        assert!(StanzaId::new("").is_err());
     }
 
     /// A DM that reached none of the recipient's devices must arrive at the
