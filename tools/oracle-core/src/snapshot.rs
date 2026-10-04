@@ -168,7 +168,8 @@ mod tests {
         let engine = wasmtime::Engine::default();
         let memory =
             wasmtime::SharedMemory::new(&engine, wasmtime::MemoryType::shared(1, 1)).unwrap();
-        let mut state = crate::state::HostState::default();
+        let mut state =
+            crate::state::HostState::for_thread(Default::default(), 0, Default::default());
         state.memory = Some(memory);
         state.write(0, b"NULL").unwrap();
         state.write(20, b"data").unwrap();
