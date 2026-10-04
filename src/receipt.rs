@@ -3845,7 +3845,7 @@ mod tests {
             .collect();
         // Slots, growing heads and final groups, not an id allocation per
         // peer: the original id already lives in each representative.
-        let allocs = crate::test_alloc::min_allocs(16, || group_delivery_receipts(&infos, true));
+        let allocs = crate::test_alloc::min_allocs(12, || group_delivery_receipts(&infos, true));
         assert!(allocs <= 12, "grouping 64 peers took {allocs} allocations");
         let groups = group_delivery_receipts(&infos, true);
         assert_eq!(groups.len(), infos.len());
