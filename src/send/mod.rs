@@ -2628,6 +2628,9 @@ impl Client {
                     sent_at: Some(sent_at),
                     request_id: Some(&request_id),
                     edit: Some(edit),
+                    extra_stanza_nodes: wacore::send::message_meta_from_message(&message)
+                        .into_iter()
+                        .collect(),
                     borrowed_message_id,
                     ..Default::default()
                 },

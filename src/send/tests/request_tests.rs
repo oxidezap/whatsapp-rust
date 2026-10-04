@@ -3,6 +3,384 @@ use crate::{EditRequest, MessageId, MessageRef, SendRequest, StanzaId};
 use wacore::proto_helpers::{MessageBuilderExt, MessageExt};
 
 #[tokio::test]
+async fn secret_event_edit_selects_event_crypto_and_wire_kind() {
+    assert_secret_creation_edit_wire(true).await;
+}
+
+#[tokio::test]
+async fn secret_poll_edit_selects_poll_crypto_and_wire_kind() {
+    assert_secret_creation_edit_wire(false).await;
+}
+
+async fn assert_secret_creation_edit_wire(is_event: bool) {
+    use wa::message::secret_encrypted_message::SecretEncType;
+    use wacore::libsignal::protocol::{
+        SenderKeyName, create_sender_key_distribution_message, group_decrypt,
+        process_sender_key_distribution_message,
+    };
+    use wacore::secret_enc_addon::ModificationType;
+
+    for fixture in [
+        GroupSendFixture::new().await,
+        GroupSendFixture::new_lid(2).await,
+    ] {
+        let (original, creator, secret) = if is_event {
+            let created = fixture
+                .client
+                .events()
+                .create(
+                    &fixture.group,
+                    crate::EventCreationParams {
+                        name: "Launch".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            (
+                created.send_result().clone(),
+                created.creator().clone(),
+                created.secret().clone(),
+            )
+        } else {
+            let created = fixture
+                .client
+                .polls()
+                .create_quiz(&fixture.group, "Question", &["Yes".into(), "No".into()], 0)
+                .await
+                .unwrap();
+            (
+                created.send_result().clone(),
+                created.creator().clone(),
+                created.secret().clone(),
+            )
+        };
+        let mut update = (*original.message).clone();
+        update.message_context_info = buffa::MessageField::none();
+        if is_event {
+            update.event_message.get_or_insert_default().name = Some("Updated launch".into());
+        } else {
+            update.poll_creation_message_v3.get_or_insert_default().name =
+                Some("Updated question".into());
+        }
+        let (kind, modification, stanza_type) = if is_event {
+            (
+                SecretEncType::EventEdit,
+                ModificationType::EventEdit,
+                "event",
+            )
+        } else {
+            (SecretEncType::PollEdit, ModificationType::PollEdit, "poll")
+        };
+        let name = SenderKeyName::from_parts(
+            &fixture.group.to_string(),
+            fixture.own_sending.to_protocol_address().as_str(),
+        );
+        let receiver = crate::test_utils::create_test_client().await;
+        let mut sender = fixture.client.signal_adapter();
+        let mut receiver = receiver.signal_adapter();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let distribution =
+            create_sender_key_distribution_message(&name, &mut sender.sender_key_store, &mut rng)
+                .await
+                .unwrap();
+        process_sender_key_distribution_message(
+            &name,
+            &distribution,
+            &mut receiver.sender_key_store,
+        )
+        .await
+        .unwrap();
+        let creator = creator.to_non_ad_string();
+        let editor = fixture.own_sending.to_non_ad_string();
+        let creator_jid: Jid = creator.parse().unwrap();
+        let context = wacore::message_edit::MessageEditContext {
+            original_msg_id: original.message_id.as_str(),
+            original_sender_jid: &creator,
+            editor_jid: &editor,
+        };
+        for raw in [false, true] {
+            let index = fixture.transport.sent_count();
+            let result = if raw {
+                fixture
+                    .client
+                    .edit_message_encrypted_raw(
+                        &fixture.group,
+                        original.message_id.as_str(),
+                        secret.as_bytes(),
+                        update.clone(),
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                fixture
+                    .client
+                    .edit_message(
+                        EditRequest::new(original.message_ref().unwrap(), update.clone())
+                            .with_secret(&creator_jid, &secret),
+                    )
+                    .await
+                    .unwrap()
+            };
+            let node = fixture.stanza(index).await;
+            let enc = node.get().get_optional_child("enc").unwrap();
+            let padded = group_decrypt(
+                enc.content_bytes().unwrap(),
+                &mut receiver.sender_key_store,
+                &name,
+            )
+            .await
+            .unwrap();
+            let plaintext = wacore::messages::unpad_plaintext(padded, 2).unwrap();
+            let wire = waproto::codec::message_decode(&plaintext).unwrap();
+            assert_eq!(
+                wire.secret_encrypted_message,
+                result.message.secret_encrypted_message
+            );
+            let envelope = wire.secret_encrypted_message.as_option().unwrap();
+            let inner = wacore::message_edit::decrypt_secret_encrypted(
+                envelope.enc_payload.as_deref().unwrap(),
+                envelope.enc_iv.as_deref().unwrap(),
+                secret.as_bytes(),
+                modification,
+                &context,
+            );
+            assert!(
+                inner.is_ok(),
+                "{kind:?} must authenticate under its own use case, not {:?}: {inner:?}",
+                envelope.secret_enc_type
+            );
+            assert_eq!(envelope.secret_enc_type, Some(kind));
+            let inner = inner.unwrap();
+            assert_eq!(
+                inner.protocol_message.edited_message.as_option(),
+                Some(&update)
+            );
+            assert_eq!(
+                inner.protocol_message.key.id.as_deref(),
+                Some(original.message_id.as_str())
+            );
+            assert_eq!(
+                envelope.target_message_key.participant.as_deref(),
+                Some(creator.as_str())
+            );
+            assert!(
+                wacore::message_edit::decrypt_message_edit(
+                    envelope.enc_payload.as_deref().unwrap(),
+                    envelope.enc_iv.as_deref().unwrap(),
+                    secret.as_bytes(),
+                    &context,
+                )
+                .is_err(),
+                "ordinary Message Edit is not an event/poll crypto namespace"
+            );
+            assert_eq!(
+                node.get().attrs().optional_string("type").as_deref(),
+                Some(stanza_type)
+            );
+            assert_eq!(
+                node.get().attrs().optional_string("edit").as_deref(),
+                Some("1")
+            );
+            assert_eq!(
+                node.get().attrs().optional_string("id").as_deref(),
+                Some(result.stanza_id().as_str())
+            );
+            if is_event {
+                assert_eq!(
+                    node.get()
+                        .get_optional_child("meta")
+                        .unwrap()
+                        .attrs()
+                        .optional_string("event_type")
+                        .as_deref(),
+                    Some("edit")
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn bot_secret_edit_uses_lid_editor_and_requires_known_namespace() {
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+    let bot: Jid = "770000099@bot".parse().unwrap();
+    seed_dm_wire_namespace_state_for_peer_lid(&client, bot.clone()).await;
+    let created = client
+        .polls()
+        .create(&bot, "Question", &["Yes".into(), "No".into()], 1)
+        .await
+        .unwrap();
+    let creator = created.creator().to_non_ad_string();
+    assert_eq!(created.creator(), &client.lid().unwrap().to_non_ad());
+    let pn = client.pn().unwrap().to_non_ad_string();
+    for raw in [false, true] {
+        let index = transport.sent_count();
+        let result = if raw {
+            client
+                .edit_message_encrypted_raw(
+                    &bot,
+                    created.send_result().message_id.as_str(),
+                    created.secret().as_bytes(),
+                    wa::Message::text("updated"),
+                )
+                .await
+                .unwrap()
+        } else {
+            client
+                .edit_message(
+                    EditRequest::new(
+                        created.send_result().message_ref().unwrap(),
+                        wa::Message::text("updated"),
+                    )
+                    .with_secret(created.creator(), created.secret()),
+                )
+                .await
+                .unwrap()
+        };
+        let node = crate::test_utils::decode_sent_iq(&transport, index).await;
+        assert_eq!(node.get().attrs().optional_jid("to"), Some(bot.clone()));
+        assert_eq!(
+            node.get().attrs().optional_string("edit").as_deref(),
+            Some("1")
+        );
+        let recipient = node
+            .get()
+            .get_optional_child("participants")
+            .unwrap()
+            .get_optional_child("to")
+            .unwrap();
+        assert_eq!(recipient.attrs().optional_jid("jid"), Some(bot.clone()));
+        assert!(
+            recipient
+                .get_optional_child("enc")
+                .unwrap()
+                .content_bytes()
+                .is_some()
+        );
+        let envelope = result.message.secret_encrypted_message.as_option().unwrap();
+        let context = wacore::message_edit::MessageEditContext {
+            original_msg_id: created.send_result().message_id.as_str(),
+            original_sender_jid: &creator,
+            editor_jid: &creator,
+        };
+        let inner = wacore::message_edit::decrypt_message_edit(
+            envelope.enc_payload.as_deref().unwrap(),
+            envelope.enc_iv.as_deref().unwrap(),
+            created.secret().as_bytes(),
+            &context,
+        )
+        .expect("the bot-observed LID editor must authenticate");
+        assert_eq!(
+            inner
+                .protocol_message
+                .edited_message
+                .conversation
+                .as_deref(),
+            Some("updated")
+        );
+        let wrong_editor = wacore::message_edit::MessageEditContext {
+            editor_jid: &pn,
+            ..context
+        };
+        assert!(
+            wacore::message_edit::decrypt_message_edit(
+                envelope.enc_payload.as_deref().unwrap(),
+                envelope.enc_iv.as_deref().unwrap(),
+                created.secret().as_bytes(),
+                &wrong_editor,
+            )
+            .is_err(),
+            "PN is not a bot editor namespace alias"
+        );
+    }
+    let later_editor = Jid::lid("100000000000999");
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLid(Some(later_editor.clone())))
+        .await;
+    let result = client
+        .edit_message(
+            EditRequest::new(
+                created.send_result().message_ref().unwrap(),
+                wa::Message::text("later edit"),
+            )
+            .with_secret(created.creator(), created.secret()),
+        )
+        .await
+        .unwrap();
+    let envelope = result.message.secret_encrypted_message.as_option().unwrap();
+    let editor = later_editor.to_non_ad_string();
+    let context = wacore::message_edit::MessageEditContext {
+        original_msg_id: created.send_result().message_id.as_str(),
+        original_sender_jid: &creator,
+        editor_jid: &editor,
+    };
+    let inner = wacore::message_edit::decrypt_message_edit(
+        envelope.enc_payload.as_deref().unwrap(),
+        envelope.enc_iv.as_deref().unwrap(),
+        created.secret().as_bytes(),
+        &context,
+    )
+    .unwrap();
+    assert_eq!(
+        inner
+            .protocol_message
+            .edited_message
+            .conversation
+            .as_deref(),
+        Some("later edit")
+    );
+    let substituted_creator = wacore::message_edit::MessageEditContext {
+        original_sender_jid: &editor,
+        ..context
+    };
+    assert!(
+        wacore::message_edit::decrypt_message_edit(
+            envelope.enc_payload.as_deref().unwrap(),
+            envelope.enc_iv.as_deref().unwrap(),
+            created.secret().as_bytes(),
+            &substituted_creator,
+        )
+        .is_err()
+    );
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLid(None))
+        .await;
+    let before = transport.sent_count();
+    assert!(matches!(
+        client
+            .edit_message(
+                EditRequest::new(
+                    created.send_result().message_ref().unwrap(),
+                    wa::Message::text("unroutable")
+                )
+                .with_secret(created.creator(), created.secret()),
+            )
+            .await,
+        Err(SendError::NotLoggedIn)
+    ));
+    assert!(matches!(
+        client
+            .edit_message_encrypted_raw(
+                &bot,
+                created.send_result().message_id.as_str(),
+                created.secret().as_bytes(),
+                wa::Message::text("unroutable"),
+            )
+            .await,
+        Err(SendError::NotLoggedIn)
+    ));
+    assert_eq!(transport.sent_count(), before);
+    client
+        .send_message(&bot, wa::Message::text("ordinary"))
+        .await
+        .unwrap();
+    assert!(transport.sent_count() > before);
+}
+
+#[tokio::test]
 async fn canonical_send_moves_body_and_options_to_real_newsletter_wire() {
     let (client, transport) = crate::test_utils::create_iq_test_client().await;
     let chat: Jid = "120363000000000001@newsletter".parse().unwrap();

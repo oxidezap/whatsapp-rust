@@ -368,7 +368,12 @@ impl Client {
                 .map_err(SendError::from_anyhow)?
                 .to_non_ad()
         } else {
-            self.pn().ok_or(SendError::NotLoggedIn)?.to_non_ad()
+            // The current DM editor uses the sending namespace (LID for bots),
+            // independently of the original creation's captured creator.
+            self.dm_sender_identity_for(&to)
+                .await
+                .ok_or(SendError::NotLoggedIn)?
+                .to_non_ad()
         };
         let participant = if to.is_group() {
             Some(original_creator.unwrap_or(&self_jid).to_non_ad_string())
@@ -673,9 +678,9 @@ impl Client {
     }
 }
 
-/// Build the outgoing `secret_encrypted_message` (MESSAGE_EDIT) envelope: encrypt the
-/// protocolMessage(MESSAGE_EDIT) under the original message's secret and wrap it with
-/// `messageContextInfo.messageSecret`, matching WAWebGenerateSecretMessageEditProto.
+/// Encrypt the edit protocol message under the original creation's secret.
+/// The replacement content selects both the envelope kind and HKDF use case;
+/// the addressing reference alone does not describe the original body kind.
 fn build_secret_message_edit(
     to: &Jid,
     original_id: &str,
@@ -685,6 +690,22 @@ fn build_secret_message_edit(
     message_secret: &[u8],
     new_content: wa::Message,
 ) -> Result<wa::Message, anyhow::Error> {
+    use wa::message::secret_encrypted_message::SecretEncType;
+    use wacore::secret_enc_addon::{AddonContext, ModificationType, encrypt_addon};
+
+    let (secret_enc_type, modification_type) = if new_content.event_message.is_set() {
+        (SecretEncType::EventEdit, ModificationType::EventEdit)
+    } else if new_content.poll_creation_message.is_set()
+        || new_content.poll_creation_message_v2.is_set()
+        || new_content.poll_creation_message_v3.is_set()
+        || new_content.poll_creation_message_v4.is_set()
+        || new_content.poll_creation_message_v5.is_set()
+        || new_content.poll_creation_message_v6.is_set()
+    {
+        (SecretEncType::PollEdit, ModificationType::PollEdit)
+    } else {
+        (SecretEncType::MessageEdit, ModificationType::MessageEdit)
+    };
     let inner = crate::send::build_edit_message(
         to,
         original_id.to_string(),
@@ -694,13 +715,17 @@ fn build_secret_message_edit(
     );
 
     // The creator is the original cryptographic namespace, not a routing alias.
-    let ctx = wacore::message_edit::MessageEditContext {
-        original_msg_id: original_id,
-        original_sender_jid: creator_jid_str,
-        editor_jid: self_jid_str,
+    let ctx = AddonContext {
+        stanza_id: original_id,
+        parent_msg_original_sender: creator_jid_str,
+        modification_sender: self_jid_str,
+        modification_type,
     };
-    let (enc_payload, iv) =
-        wacore::message_edit::encrypt_message_edit(&inner, message_secret, &ctx)?;
+    let (enc_payload, iv) = encrypt_addon(
+        &waproto::codec::message_to_vec(&inner),
+        message_secret,
+        &ctx,
+    )?;
 
     Ok(wa::Message {
         secret_encrypted_message: buffa::MessageField::some(wa::message::SecretEncryptedMessage {
@@ -712,9 +737,7 @@ fn build_secret_message_edit(
             }),
             enc_payload: Some(enc_payload),
             enc_iv: Some(iv.to_vec()),
-            secret_enc_type: Some(
-                wa::message::secret_encrypted_message::SecretEncType::MessageEdit,
-            ),
+            secret_enc_type: Some(secret_enc_type),
             remote_key_id: None,
         }),
         message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
@@ -728,6 +751,114 @@ fn build_secret_message_edit(
 #[cfg(test)]
 mod secret_message_edit_tests {
     use super::*;
+
+    #[test]
+    fn secret_edit_content_kind_and_hkdf_stay_paired() {
+        use wa::message::secret_encrypted_message::SecretEncType;
+        use wacore::secret_enc_addon::ModificationType;
+
+        let to = Jid::pn("15550000001");
+        let creator = "100000000000001@lid";
+        let editor = "15550000002@s.whatsapp.net";
+        let secret = [0x33; 32];
+        for variant in 0..8 {
+            let mut content = wa::Message::default();
+            match variant {
+                0 => {
+                    content.event_message.get_or_insert_default().name =
+                        Some("Updated event".into())
+                }
+                1 => {
+                    content.poll_creation_message.get_or_insert_default().name =
+                        Some("Updated poll".into())
+                }
+                2 => {
+                    content
+                        .poll_creation_message_v2
+                        .get_or_insert_default()
+                        .name = Some("Updated poll".into())
+                }
+                3 => {
+                    content
+                        .poll_creation_message_v3
+                        .get_or_insert_default()
+                        .name = Some("Updated poll".into())
+                }
+                4 => {
+                    content
+                        .poll_creation_message_v4
+                        .get_or_insert_default()
+                        .message
+                        .get_or_insert_default()
+                        .poll_creation_message_v3
+                        .get_or_insert_default()
+                        .name = Some("Updated poll".into())
+                }
+                5 => {
+                    content
+                        .poll_creation_message_v5
+                        .get_or_insert_default()
+                        .name = Some("Updated poll".into())
+                }
+                6 => {
+                    content
+                        .poll_creation_message_v6
+                        .get_or_insert_default()
+                        .name = Some("Updated poll".into())
+                }
+                _ => content.conversation = Some("Updated text".into()),
+            }
+            let (kind, modification) = match variant {
+                0 => (SecretEncType::EventEdit, ModificationType::EventEdit),
+                1..=6 => (SecretEncType::PollEdit, ModificationType::PollEdit),
+                _ => (SecretEncType::MessageEdit, ModificationType::MessageEdit),
+            };
+            let envelope = build_secret_message_edit(
+                &to,
+                "ORIGINAL",
+                None,
+                creator,
+                editor,
+                &secret,
+                content.clone(),
+            )
+            .unwrap();
+            let envelope = envelope.secret_encrypted_message.as_option().unwrap();
+            assert_eq!(envelope.secret_enc_type, Some(kind));
+            let context = wacore::message_edit::MessageEditContext {
+                original_msg_id: "ORIGINAL",
+                original_sender_jid: creator,
+                editor_jid: editor,
+            };
+            let inner = wacore::message_edit::decrypt_secret_encrypted(
+                envelope.enc_payload.as_deref().unwrap(),
+                envelope.enc_iv.as_deref().unwrap(),
+                &secret,
+                modification,
+                &context,
+            )
+            .unwrap();
+            assert_eq!(
+                inner.protocol_message.edited_message.as_option(),
+                Some(&content)
+            );
+            let wrong_modification = if variant == 7 {
+                ModificationType::EventEdit
+            } else {
+                ModificationType::MessageEdit
+            };
+            assert!(
+                wacore::message_edit::decrypt_secret_encrypted(
+                    envelope.enc_payload.as_deref().unwrap(),
+                    envelope.enc_iv.as_deref().unwrap(),
+                    &secret,
+                    wrong_modification,
+                    &context,
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn secret_message_edit_roundtrip() {

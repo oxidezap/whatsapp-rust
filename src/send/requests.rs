@@ -88,6 +88,8 @@ impl<'a> EditRequest<'a> {
     /// This is an explicit association supplied by the host, e.g. from a
     /// `CreatedEvent`. Address aliases are not cryptographically equivalent.
     /// No secret-store read or identity substitution is performed for it.
+    /// Event/poll replacement content selects its corresponding encrypted edit
+    /// kind; other replacement content uses the ordinary message-edit kind.
     pub fn with_secret(mut self, creator: &'a Jid, secret: &'a MessageSecret) -> Self {
         self.encryption = Some((creator, secret));
         self
