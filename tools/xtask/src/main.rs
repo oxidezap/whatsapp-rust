@@ -1,6 +1,7 @@
 //! Rust repository automation: `cargo xt`.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 mod ci;
+mod consumers;
 mod size;
 mod size_baseline;
 mod workflow;

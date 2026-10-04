@@ -1,0 +1,97 @@
+[
+  {
+    "manifest": "tests/client-options-consumer/Cargo.toml",
+    "locked": false,
+    "commands": [{ "lanes": ["native", "msrv"], "mode": "test" }]
+  },
+  {
+    "manifest": "tests/consumers/encapsulation/Cargo.toml",
+    "locked": true,
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["native", "msrv"], "mode": "test", "features": ["plugins"] },
+      { "lanes": ["wasm"], "mode": "check" },
+      { "lanes": ["wasm"], "mode": "check", "features": ["plugins"] }
+    ]
+  },
+  {
+    "manifest": "tests/event-consumer/Cargo.toml",
+    "locked": true,
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["wasm"], "mode": "check", "no_default_features": true }
+    ]
+  },
+  {
+    "manifest": "tests/event-kind-consumer/Cargo.toml",
+    "locked": true,
+    "commands": [{ "lanes": ["native", "msrv"], "mode": "run" }]
+  },
+  {
+    "manifest": "tests/fixtures/creation_consumer/Cargo.toml",
+    "locked": true,
+    "commands": [{ "lanes": ["native", "msrv"], "mode": "test" }]
+  },
+  {
+    "manifest": "tests/fixtures/download_consumer/Cargo.toml",
+    "locked": false,
+    "commands": [{ "lanes": ["native", "msrv"], "mode": "test" }]
+  },
+  {
+    "manifest": "tests/fixtures/lifecycle_consumer/Cargo.toml",
+    "locked": false,
+    "commands": [{ "lanes": ["native", "msrv", "wasm"], "mode": "build", "release": true }]
+  },
+  {
+    "manifest": "tests/fixtures/mex_consumer/Cargo.toml",
+    "locked": false,
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["wasm"], "mode": "build", "release": true, "bin": "size_probe" }
+    ]
+  },
+  {
+    "manifest": "tests/fixtures/pictures_consumer/Cargo.toml",
+    "locked": true,
+    "commands": [{ "lanes": ["native", "msrv", "wasm"], "mode": "build", "release": true }]
+  },
+  {
+    "manifest": "tests/fixtures/requests_consumer/Cargo.toml",
+    "locked": true,
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["native", "msrv"], "mode": "test", "features": ["requests"] },
+      { "lanes": ["wasm"], "mode": "build", "release": true, "features": ["requests"] }
+    ]
+  },
+  {
+    "manifest": "tests/fixtures/voip_control_consumer/Cargo.toml",
+    "locked": false,
+    "commands": [
+      { "lanes": ["native", "msrv", "wasm"], "mode": "build", "release": true },
+      { "lanes": ["native", "msrv", "wasm"], "mode": "build", "release": true, "features": ["runtime"] }
+    ]
+  },
+  {
+    "manifest": "tests/group-call-aliases-consumer/Cargo.toml",
+    "locked": true,
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["native", "msrv"], "mode": "test", "features": ["voip-control"] },
+      { "lanes": ["native", "msrv"], "mode": "test", "features": ["voip-runtime"] }
+    ]
+  },
+  {
+    "manifest": "tests/lifecycle-consumer/Cargo.toml",
+    "locked": false,
+    "commands": [{ "lanes": ["native", "msrv"], "mode": "test" }]
+  },
+  {
+    "manifest": "tests/sqlite-api-consumer/Cargo.toml",
+    "locked": true,
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["wasm"], "mode": "build", "release": true }
+    ]
+  }
+]
