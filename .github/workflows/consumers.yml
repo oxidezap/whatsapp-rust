@@ -38,19 +38,21 @@ jobs:
           toolchain: nightly-2026-06-16
       - uses: dtolnay/rust-toolchain@1.94.1
         if: matrix.lane == 'msrv'
-      - name: Install protoc
+      - name: Install protoc and cargo-nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: protoc@3.25.3
+          tool: protoc@3.25.3,cargo-nextest
       - uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "true"
           key: api-consumers-${{ matrix.lane }}
-      - name: Build driver, test registry and detect unregistered hosts
-        run: |
-          cargo +nightly-2026-06-16 test --locked -p whatsapp-xtask consumers::tests
-          cargo +nightly-2026-06-16 build --locked -p whatsapp-xtask
-          target/debug/whatsapp-xtask ci consumers check
+      - name: Test registry with the CI profile
+        if: matrix.lane == 'native'
+        run: cargo +nightly-2026-06-16 nextest run --profile ci --locked -p whatsapp-xtask consumers::tests
+      # Both independent runners need their own executable. run also validates
+      # the registry, so no additional lane-independent check step is necessary.
+      - name: Build driver
+        run: cargo +nightly-2026-06-16 build --locked -p whatsapp-xtask
       - name: Run native hosts and rustdoc negative controls
         if: matrix.lane == 'native'
         run: target/debug/whatsapp-xtask ci consumers run --lane native --toolchain nightly-2026-06-16

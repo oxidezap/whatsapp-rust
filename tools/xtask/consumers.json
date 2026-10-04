@@ -93,5 +93,48 @@
       { "lanes": ["native", "msrv"], "mode": "test" },
       { "lanes": ["wasm"], "mode": "build", "release": true }
     ]
+  },
+  {
+    "manifest": "tests/fixtures/groups_consumer/Cargo.toml",
+    "locked": true,
+    "integration_pr": "https://github.com/oxidezap/whatsapp-rust/pull/1627",
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["native", "msrv"], "mode": "test", "no_default_features": true },
+      { "lanes": ["wasm"], "mode": "check", "no_default_features": true, "features": ["js"] }
+    ]
+  },
+  {
+    "manifest": "tests/fixtures/peer_video_consumer/Cargo.toml",
+    "locked": false,
+    "integration_pr": "https://github.com/oxidezap/whatsapp-rust/pull/1624",
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["native", "msrv"], "mode": "check", "lib": true, "features": ["runtime"] },
+      { "lanes": ["wasm"], "mode": "check", "lib": true },
+      {
+        "lanes": ["native", "msrv"], "mode": "check",
+        "features": ["removed-video-state"], "bin": "removed-video-state",
+        "expect_failure": { "error_code": "E0599", "contains": ["VideoStateChanged", "CallEvent"] }
+      }
+    ]
+  },
+  {
+    "manifest": "tests/fixtures/media_cache_consumer/Cargo.toml",
+    "locked": true,
+    "integration_pr": "https://github.com/oxidezap/whatsapp-rust/pull/1628",
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["wasm"], "mode": "check", "lib": true }
+    ]
+  },
+  {
+    "manifest": "tests/fixtures/actions_consumer/Cargo.toml",
+    "locked": false,
+    "integration_pr": "https://github.com/oxidezap/whatsapp-rust/pull/1630",
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["wasm"], "mode": "check" }
+    ]
   }
 ]

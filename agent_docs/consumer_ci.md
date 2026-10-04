@@ -3,7 +3,7 @@
 `tools/xtask/consumers.json` is the execution registry for every standalone
 `Cargo.toml` below `tests/`. The only exclusions are the two root workspace test
 members (`tests/e2e` and `tests/bench-integration`). Discovery recursively scans
-source directories, ignoring hidden directories and `target`; it does not depend
+source directories (including hidden hosts), ignoring only `target` and `.git`; it does not depend
 on a directory being named `consumer`. Unregistered, missing, duplicate and
 non-standalone registrations fail the gate with their paths. Symlinks in the
 source tree are rejected rather than silently bypassing discovery.
@@ -21,8 +21,25 @@ CI runs native and MSRV hosts in `.github/workflows/consumers.yml` and WASM
 check/build modes in `.github/workflows/wasm.yml`. The xtask driver requires the
 **tooling** toolchain; the published crates' MSRV is lower. Build the driver with
 nightly and use `--toolchain 1.94.1` for the hosts, not `cargo +1.94.1 xt`.
-Registry unit tests also run in the consumer workflow. Matrix lanes do not imply
+Registry unit tests run once with nextest's `ci` profile in the native lane.
+Release publishing also depends on the consumer workflow. Matrix lanes do not imply
 a feature cross-product: only each entry's explicitly chosen features run.
+
+## Coordinated domain integration
+
+The registry also forward-registers the fixtures supplied by separately owned,
+unmerged domain PRs. Only those entries carry a temporary `integration_pr` URL.
+While a source manifest is absent, the gate prints `NOT YET INTEGRATED` with its
+PR URL and makes **no execution or coverage claim**. Once the domain fixture is
+present, all registered modes activate and its standalone/lock requirements are
+validated normally. Unknown new manifests still fail; existing required
+registrations never gain a missing-file exemption.
+
+After integrating a domain PR, remove its `integration_pr` marker in the same
+integration commit. This promotes its manifest to required coverage and makes
+future deletion fail the stale-registration check. These are campaign staging
+markers, not permanent fixture opt-outs. No API or fixture source is copied into
+the CI-owner branch to fake an integrated validation result.
 
 ## Registering a host
 
@@ -78,8 +95,9 @@ an intentionally failing optional binary, use an explicit diagnostic expectation
 }
 ```
 
-This succeeds only when compilation fails with `error[E0599]` and every listed
-API-specific diagnostic fragment. An unexpectedly successful compile, missing
-dependency, unrelated failure, or absent fragment fails the gate. Stable rustdoc
+This succeeds only when Cargo's JSON messages contain exactly one compiler error
+with code `E0599` and every listed API fragment in that same diagnostic's message.
+An unexpectedly successful compile, missing dependency, unrelated/additional
+error, or absent fragment fails the gate. Stable rustdoc
 alone does not enforce an error-code annotation. Deliberately failing optional
 features are never enabled by a general all-features walk.

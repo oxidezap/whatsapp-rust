@@ -42,6 +42,10 @@ jobs:
     name: Validate
     uses: ./.github/workflows/main.yml
 
+  validate-consumers:
+    name: Validate independent API consumers
+    uses: ./.github/workflows/consumers.yml
+
   validate-e2e:
     name: Validate E2E
     uses: ./.github/workflows/e2e.yml
@@ -49,7 +53,7 @@ jobs:
 
   publish:
     name: Publish to crates.io
-    needs: [preflight, validate, validate-e2e]
+    needs: [preflight, validate, validate-consumers, validate-e2e]
     runs-on: ubuntu-latest
     environment: release
     steps:

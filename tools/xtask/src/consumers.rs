@@ -61,6 +61,10 @@ struct Consumer {
     // Legacy fixtures without a committed lock resolve independently; never use
     // the root lock or add them to its workspace to make --locked work.
     locked: bool,
+    /// Temporary forward registration for a separately owned, unmerged domain PR.
+    /// Missing fixtures are reported, never executed or claimed covered.
+    #[serde(default)]
+    integration_pr: Option<String>,
     commands: Vec<Invocation>,
 }
 #[derive(Debug, Deserialize)]
@@ -89,30 +93,55 @@ struct ExpectedFailure {
     contains: Vec<String>,
 }
 impl ExpectedFailure {
-    fn verify(&self, success: bool, stderr: &str) -> Result<()> {
+    fn verify(&self, success: bool, stdout: &str) -> Result<()> {
         ensure!(!success, "removed API unexpectedly compiled");
+        let errors = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|message| {
+                message["reason"] == "compiler-message" && message["message"]["level"] == "error"
+            })
+            .collect::<Vec<_>>();
         ensure!(
-            stderr.contains(&format!("error[{}]", self.error_code)),
+            errors.len() == 1,
+            "negative control needs exactly one compiler error, got {}",
+            errors.len()
+        );
+        let diagnostic = &errors[0]["message"];
+        ensure!(
+            diagnostic["code"]["code"] == self.error_code,
             "negative control did not report {}",
             self.error_code
         );
+        let text = diagnostic["message"]
+            .as_str()
+            .context("compiler diagnostic text")?;
         for needle in &self.contains {
             ensure!(
-                stderr.contains(needle),
-                "negative control did not report {needle:?}"
+                text.contains(needle),
+                "negative control's {} diagnostic did not report {needle:?}",
+                self.error_code
             );
         }
         Ok(())
     }
 }
 
+fn manifest_key(path: &Path) -> Result<String> {
+    Ok(path
+        .components()
+        .map(|part| part.as_os_str().to_str().context("non-UTF8 manifest path"))
+        .collect::<Result<Vec<_>>>()?
+        .join("/"))
+}
+
 fn discover(dir: &Path, root: &Path, manifests: &mut BTreeSet<String>) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
-        // Build outputs and tool state are not source manifests. Recurse through
-        // every other tests/ directory, not just today's *consumer naming scheme.
-        if name == "target" || name.to_string_lossy().starts_with('.') {
+        // Only build output and VCS metadata are excluded; hidden host source
+        // directories must not bypass registration.
+        if name == "target" || name == ".git" {
             continue;
         }
         let kind = entry.file_type()?;
@@ -124,13 +153,7 @@ fn discover(dir: &Path, root: &Path, manifests: &mut BTreeSet<String>) -> Result
         if kind.is_dir() {
             discover(&entry.path(), root, manifests)?;
         } else if name == "Cargo.toml" {
-            manifests.insert(
-                entry
-                    .path()
-                    .strip_prefix(root)?
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+            manifests.insert(manifest_key(entry.path().strip_prefix(root)?)?);
         }
     }
     Ok(())
@@ -141,7 +164,8 @@ fn validate(root: &Path, consumers: &[Consumer]) -> Result<()> {
     for consumer in consumers {
         let path = Path::new(&consumer.manifest);
         ensure!(
-            path.components().all(|c| matches!(c, Component::Normal(_)))
+            !consumer.manifest.contains('\\')
+                && path.components().all(|c| matches!(c, Component::Normal(_)))
                 && path.starts_with("tests")
                 && path.file_name().is_some_and(|n| n == "Cargo.toml"),
             "invalid consumer manifest path: {}",
@@ -152,18 +176,34 @@ fn validate(root: &Path, consumers: &[Consumer]) -> Result<()> {
             "duplicate consumer: {}",
             consumer.manifest
         );
-        let text = std::fs::read_to_string(root.join(path))
-            .with_context(|| format!("registered consumer missing: {}", consumer.manifest))?;
-        ensure!(
-            text.lines().any(|line| line.trim() == "[workspace]"),
-            "{} must remain a standalone workspace",
-            consumer.manifest
-        );
-        ensure!(
-            !consumer.locked || root.join(path).with_file_name("Cargo.lock").is_file(),
-            "{} requires a committed Cargo.lock",
-            consumer.manifest
-        );
+        if let Some(pr) = &consumer.integration_pr {
+            let number = pr
+                .strip_prefix("https://github.com/oxidezap/whatsapp-rust/pull/")
+                .context("integration_pr must name this repository's PR")?;
+            ensure!(
+                !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()),
+                "invalid integration_pr: {pr}"
+            );
+        }
+        if root.join(path).is_file() {
+            let text = std::fs::read_to_string(root.join(path))?;
+            ensure!(
+                text.lines().any(|line| line.trim() == "[workspace]"),
+                "{} must remain a standalone workspace",
+                consumer.manifest
+            );
+            ensure!(
+                !consumer.locked || root.join(path).with_file_name("Cargo.lock").is_file(),
+                "{} requires a committed Cargo.lock",
+                consumer.manifest
+            );
+        } else {
+            ensure!(
+                consumer.integration_pr.is_some(),
+                "registered consumer missing: {}",
+                consumer.manifest
+            );
+        }
         ensure!(
             !consumer.commands.is_empty(),
             "{} has no commands",
@@ -171,6 +211,7 @@ fn validate(root: &Path, consumers: &[Consumer]) -> Result<()> {
         );
         let mut modes = BTreeSet::new();
         let mut has_native = false;
+        let mut has_msrv = false;
         for invocation in &consumer.commands {
             ensure!(
                 !invocation.lanes.is_empty(),
@@ -186,8 +227,10 @@ fn validate(root: &Path, consumers: &[Consumer]) -> Result<()> {
                 "{} has duplicate lanes",
                 consumer.manifest
             );
-            has_native |=
-                invocation.lanes.contains(&Lane::Native) || invocation.lanes.contains(&Lane::Msrv);
+            if invocation.expect_failure.is_none() {
+                has_native |= invocation.lanes.contains(&Lane::Native);
+                has_msrv |= invocation.lanes.contains(&Lane::Msrv);
+            }
             ensure!(
                 !invocation.lanes.contains(&Lane::Wasm)
                     || matches!(invocation.mode, Mode::Check | Mode::Build),
@@ -229,8 +272,8 @@ fn validate(root: &Path, consumers: &[Consumer]) -> Result<()> {
             }
         }
         ensure!(
-            has_native,
-            "{} has no native/MSRV execution",
+            has_native && has_msrv,
+            "{} needs positive execution in both native and MSRV lanes",
             consumer.manifest
         );
     }
@@ -243,7 +286,16 @@ fn validate(root: &Path, consumers: &[Consumer]) -> Result<()> {
         );
     }
     let unregistered = found.difference(&registered).cloned().collect::<Vec<_>>();
-    let stale = registered.difference(&found).cloned().collect::<Vec<_>>();
+    let staged = consumers
+        .iter()
+        .filter(|c| c.integration_pr.is_some())
+        .map(|c| c.manifest.clone())
+        .collect::<BTreeSet<_>>();
+    let stale = registered
+        .difference(&found)
+        .filter(|path| !staged.contains(*path))
+        .cloned()
+        .collect::<Vec<_>>();
     ensure!(
         unregistered.is_empty() && stale.is_empty(),
         "consumer registry drift; unregistered: {unregistered:?}; stale: {stale:?}. Register each tests/ Cargo.toml and meaningful modes in {REGISTRY}"
@@ -286,6 +338,25 @@ impl Invocation {
 pub fn run(root: &Path, task: Task) -> Result<u8> {
     let consumers: Vec<Consumer> = serde_json::from_slice(&std::fs::read(root.join(REGISTRY))?)?;
     validate(root, &consumers)?;
+    let present = consumers
+        .iter()
+        .filter(|c| root.join(&c.manifest).is_file())
+        .count();
+    for consumer in &consumers {
+        if let Some(pr) = &consumer.integration_pr {
+            if root.join(&consumer.manifest).is_file() {
+                println!(
+                    "Integrated forward registration: {} ({pr}); promote by removing integration_pr",
+                    consumer.manifest
+                );
+            } else {
+                println!(
+                    "NOT YET INTEGRATED: {} ({pr}); no commands executed or coverage claimed",
+                    consumer.manifest
+                );
+            }
+        }
+    }
     let Task::Run {
         lane,
         toolchain,
@@ -295,7 +366,7 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
     else {
         println!(
             "Consumer registry covers all {} standalone tests/ manifests.",
-            consumers.len()
+            present
         );
         return Ok(0);
     };
@@ -312,6 +383,9 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
     let mut count = 0;
     let mut first_failure = 0;
     for consumer in &consumers {
+        if !root.join(&consumer.manifest).is_file() {
+            continue;
+        }
         if manifest.as_ref().is_some_and(|m| m != &consumer.manifest) {
             continue;
         }
@@ -346,14 +420,20 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
                     },
                 );
             let code = if let Some(expected) = &invocation.expect_failure {
-                // ANSI styling can split `error[E####]` under Actions' always-color env.
-                command.env("CARGO_TERM_COLOR", "never");
+                // Structured diagnostics tie the code and API fragments to one
+                // primary error, independent of ANSI or unrelated stderr text.
+                command
+                    .args(["--message-format", "json"])
+                    .env("CARGO_TERM_COLOR", "never");
                 let output = command
                     .output()
                     .with_context(|| format!("execute {}", consumer.manifest))?;
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 eprint!("{stderr}");
-                match expected.verify(output.status.success(), &stderr) {
+                match expected.verify(
+                    output.status.success(),
+                    &String::from_utf8_lossy(&output.stdout),
+                ) {
                     Ok(()) => 0,
                     Err(error) => {
                         eprintln!("{error:#}");
@@ -407,12 +487,16 @@ mod tests {
     fn detects_new_manifests_even_without_consumer_in_their_name() {
         let (root, consumers) = fixture();
         validate(root.path(), &consumers).unwrap();
-        let added = root.path().join("tests/new-domain/deep");
+        assert_eq!(
+            manifest_key(Path::new("tests/fixtures/host/Cargo.toml")).unwrap(),
+            "tests/fixtures/host/Cargo.toml"
+        );
+        let added = root.path().join("tests/.new-domain/deep");
         std::fs::create_dir_all(&added).unwrap();
         std::fs::write(added.join("Cargo.toml"), "[workspace]").unwrap();
         let error = validate(root.path(), &consumers).unwrap_err().to_string();
         assert!(
-            error.contains("unregistered") && error.contains("tests/new-domain/deep/Cargo.toml")
+            error.contains("unregistered") && error.contains("tests/.new-domain/deep/Cargo.toml")
         );
     }
     #[test]
@@ -463,29 +547,63 @@ mod tests {
             error_code: "E0599".into(),
             contains: vec!["VideoStateChanged".into(), "CallEvent".into()],
         };
+        let diagnostic = |code: &str, message: &str| {
+            serde_json::json!({"reason":"compiler-message","message":{"level":"error","code":{"code":code},"message":message}}).to_string()
+        };
+        let correct = diagnostic(
+            "E0599",
+            "no variant named `VideoStateChanged` found for enum `CallEvent`",
+        );
+        assert!(expected.verify(false, &correct).is_ok());
+        assert!(expected.verify(true, &correct).is_err());
+        assert!(
+            expected
+                .verify(false, &diagnostic("E0432", "unresolved import"))
+                .is_err()
+        );
+        assert!(
+            expected
+                .verify(false, &diagnostic("E0599", "unrelated method absent"))
+                .is_err()
+        );
+        let split = format!(
+            "{}\n{}",
+            diagnostic("E0599", "unrelated method absent"),
+            diagnostic("E0432", "VideoStateChanged CallEvent")
+        );
+        assert!(expected.verify(false, &split).is_err());
         assert!(
             expected
                 .verify(
                     false,
-                    "error[E0599]: no variant named `VideoStateChanged` found for enum `CallEvent`"
+                    &format!("{correct}\n{}", diagnostic("E0432", "another error"))
                 )
-                .is_ok()
-        );
-        assert!(
-            expected
-                .verify(true, "error[E0599]: VideoStateChanged CallEvent")
                 .is_err()
         );
-        assert!(
-            expected
-                .verify(false, "error[E0432]: unresolved import")
-                .is_err()
-        );
-        assert!(
-            expected
-                .verify(false, "error[E0599]: unrelated method absent")
-                .is_err()
-        );
+    }
+    #[test]
+    fn forward_registration_is_explicit_and_checks_every_mode_when_fixture_arrives() {
+        let (root, mut consumers) = fixture();
+        let incoming: Consumer = serde_json::from_str(r#"{"manifest":"tests/fixtures/incoming/Cargo.toml","locked":true,"integration_pr":"https://github.com/oxidezap/whatsapp-rust/pull/1624","commands":[{"lanes":["native","msrv"],"mode":"test"},{"lanes":["wasm"],"mode":"check"}]}"#).unwrap();
+        consumers.push(incoming);
+        validate(root.path(), &consumers).unwrap();
+        let path = root.path().join(&consumers[1].manifest);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[workspace]").unwrap();
+        assert!(validate(root.path(), &consumers).is_err()); // Its lock is now mandatory.
+        std::fs::write(path.with_file_name("Cargo.lock"), "").unwrap();
+        validate(root.path(), &consumers).unwrap();
+        consumers[1].integration_pr = None; // Promote after domain integration.
+        std::fs::remove_file(path).unwrap();
+        assert!(validate(root.path(), &consumers).is_err());
+    }
+    #[test]
+    fn refuses_silent_native_or_msrv_coverage_gaps() {
+        let (root, mut consumers) = fixture();
+        consumers[0].commands[0].lanes = vec![Lane::Native];
+        assert!(validate(root.path(), &consumers).is_err());
+        consumers[0].commands[0].lanes = vec![Lane::Msrv];
+        assert!(validate(root.path(), &consumers).is_err());
     }
     #[test]
     fn refuses_wasm_test_run_and_missing_locks() {
