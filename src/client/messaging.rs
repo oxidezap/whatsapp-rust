@@ -602,10 +602,9 @@ impl Client {
         &self,
         stanza: wacore::iq::chatstate::ChatstateStanza,
     ) {
-        use wacore::iq::chatstate::{ChatstateSource, ReceivedChatState};
+        use wacore::iq::chatstate::ChatstateSource;
         use wacore::types::events::ChatPresenceUpdate;
         use wacore::types::message::MessageSource;
-        use wacore::types::presence::{ChatPresence, ChatPresenceMedia};
 
         if !self
             .core
@@ -624,14 +623,6 @@ impl Client {
             }
         };
 
-        let (state, media) = match stanza.state {
-            ReceivedChatState::Typing => (ChatPresence::Composing, ChatPresenceMedia::Text),
-            ReceivedChatState::RecordingAudio => {
-                (ChatPresence::Composing, ChatPresenceMedia::Audio)
-            }
-            ReceivedChatState::Idle => (ChatPresence::Paused, ChatPresenceMedia::Text),
-        };
-
         self.core.event_bus.dispatch(Event::ChatPresence(
             ChatPresenceUpdate::builder()
                 .source(MessageSource {
@@ -645,8 +636,7 @@ impl Client {
                     broadcast_list_owner: None,
                     recipient: None,
                 })
-                .state(state)
-                .media(media)
+                .state(stanza.state)
                 .build(),
         ));
     }

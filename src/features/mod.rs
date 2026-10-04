@@ -65,7 +65,7 @@ pub use community::{
     LinkSubgroupsResult, SubgroupFailure, SubgroupVisibility, UnlinkSubgroupsResult,
 };
 
-pub use chatstate::{ChatStateError, ChatStateType, Chatstate};
+pub use chatstate::{ChatActivity, ChatStateError, Chatstate};
 
 pub use comments::Comments;
 

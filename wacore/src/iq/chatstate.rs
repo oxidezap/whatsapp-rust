@@ -19,8 +19,8 @@
 //! </chatstate>
 //! ```
 
-use crate::WireEnum;
 use crate::protocol::ProtocolNode;
+use crate::types::presence::ChatActivity;
 use anyhow::Result;
 use thiserror::Error;
 use wacore_binary::Jid;
@@ -49,33 +49,27 @@ pub enum ChatstateParseError {
     InvalidJid(#[from] anyhow::Error),
 }
 
-/// Chat state type as received from incoming stanzas.
-///
-/// Aligned with WhatsApp Web's `WAChatState` constants:
-/// - `typing` = ACTIVE_CHAT_STATE_TYPE.TYPING
-/// - `recording_audio` = ACTIVE_CHAT_STATE_TYPE.RECORDING_AUDIO
-/// - `idle` = IDLE_CHAT_STATE_TYPE.IDLE
-#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
-pub enum ReceivedChatState {
-    /// User is typing text
-    #[wire = "typing"]
-    Typing,
-    /// User is recording a voice message
-    #[wire = "recording_audio"]
-    RecordingAudio,
-    /// User stopped typing/recording
-    #[wire = "idle"]
-    #[wire_default]
-    Idle,
-}
+impl ChatActivity {
+    /// Project semantic activity into the chatstate child sent on the wire.
+    pub fn into_child_node(self) -> Node {
+        use wacore_binary::builder::NodeBuilder;
+        match self {
+            Self::Typing => NodeBuilder::new("composing").build(),
+            Self::RecordingAudio => NodeBuilder::new("composing").attr("media", "audio").build(),
+            Self::Idle => NodeBuilder::new("paused").build(),
+        }
+    }
 
-impl ReceivedChatState {
     /// Parse chat state from a chatstate stanza's child node.
     ///
     /// Wire format (from WhatsApp Web's `WAHandleChatStateProtocol.parseChatStatus`):
     /// - `<composing/>` → Typing
     /// - `<composing media="audio"/>` → RecordingAudio
     /// - `<paused/>` → Idle
+    ///
+    /// Retains the parser's permissive fallback: unknown media on composing is
+    /// typing, and unknown child tags are idle. This is a semantic projection,
+    /// not a lossless raw-node parser.
     pub fn from_child_node(child: &NodeRef<'_>) -> Self {
         match child.tag.as_ref() {
             "composing" => {
@@ -125,7 +119,7 @@ pub enum ChatstateSource {
 #[derive(Debug, Clone)]
 pub struct ChatstateStanza {
     pub source: ChatstateSource,
-    pub state: ReceivedChatState,
+    pub state: ChatActivity,
 }
 
 impl ChatstateStanza {
@@ -159,8 +153,8 @@ impl ChatstateStanza {
         let state = node
             .children()
             .and_then(|children| children.first())
-            .map(ReceivedChatState::from_child_node)
-            .unwrap_or(ReceivedChatState::Idle);
+            .map(ChatActivity::from_child_node)
+            .unwrap_or(ChatActivity::Idle);
 
         Ok(Self { source, state })
     }
@@ -186,15 +180,56 @@ mod tests {
     use super::*;
     use wacore_binary::builder::NodeBuilder;
 
+    // WA Web 2.3000.1045368834: WASendChatStateProtocol and
+    // WASmaxOutChatstate{Composing,Paused}Mixin. Semantic names are not wire tags.
     #[test]
-    fn test_received_chat_state_string_enum() {
-        assert_eq!(ReceivedChatState::Typing.as_str(), "typing");
-        assert_eq!(
-            ReceivedChatState::RecordingAudio.as_str(),
-            "recording_audio"
-        );
-        assert_eq!(ReceivedChatState::Idle.as_str(), "idle");
-        assert_eq!(ReceivedChatState::default(), ReceivedChatState::Idle);
+    fn semantic_projection_retains_existing_unknown_payload_fallbacks() {
+        for (tag, media, expected) in [
+            ("composing", "video", ChatActivity::Typing),
+            ("paused", "audio", ChatActivity::Idle),
+            ("unknown", "audio", ChatActivity::Idle),
+        ] {
+            let child = NodeBuilder::new(tag)
+                .attr("media", media)
+                .attr("extra", "value")
+                .build();
+            assert_eq!(
+                ChatActivity::from_child_node(&child.as_node_ref()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn activity_projects_to_exact_wire_children() {
+        for (activity, tag, media, json) in [
+            (ChatActivity::Typing, "composing", None, "typing"),
+            (
+                ChatActivity::RecordingAudio,
+                "composing",
+                Some("audio"),
+                "recording_audio",
+            ),
+            (ChatActivity::Idle, "paused", None, "idle"),
+        ] {
+            let child = activity.into_child_node();
+            assert_eq!(child.tag, tag);
+            assert_eq!(
+                child.attrs.get("media").map(|v| v.as_str()).as_deref(),
+                media
+            );
+            assert_eq!(child.attrs.len(), usize::from(media.is_some()));
+            assert!(child.content.is_none());
+            assert_eq!(
+                ChatActivity::from_child_node(&child.as_node_ref()),
+                activity
+            );
+            assert_eq!(serde_json::to_value(activity).unwrap(), json);
+            assert_eq!(
+                serde_json::from_value::<ChatActivity>(serde_json::json!(json)).unwrap(),
+                activity
+            );
+        }
     }
 
     #[test]
@@ -206,7 +241,7 @@ mod tests {
 
         let stanza = ChatstateStanza::try_from_node(&node).unwrap();
         assert!(matches!(stanza.source, ChatstateSource::User { .. }));
-        assert_eq!(stanza.state, ReceivedChatState::Typing);
+        assert_eq!(stanza.state, ChatActivity::Typing);
 
         if let ChatstateSource::User { from } = stanza.source {
             assert_eq!(from.user, "1234567890");
@@ -221,7 +256,7 @@ mod tests {
             .build();
 
         let stanza = ChatstateStanza::try_from_node(&node).unwrap();
-        assert_eq!(stanza.state, ReceivedChatState::RecordingAudio);
+        assert_eq!(stanza.state, ChatActivity::RecordingAudio);
     }
 
     #[test]
@@ -232,7 +267,7 @@ mod tests {
             .build();
 
         let stanza = ChatstateStanza::try_from_node(&node).unwrap();
-        assert_eq!(stanza.state, ReceivedChatState::Idle);
+        assert_eq!(stanza.state, ChatActivity::Idle);
     }
 
     #[test]
@@ -245,7 +280,7 @@ mod tests {
 
         let stanza = ChatstateStanza::try_from_node(&node).unwrap();
         assert!(matches!(stanza.source, ChatstateSource::Group { .. }));
-        assert_eq!(stanza.state, ReceivedChatState::Typing);
+        assert_eq!(stanza.state, ChatActivity::Typing);
 
         if let ChatstateSource::Group { from, participant } = stanza.source {
             assert_eq!(from.user, "123456789-1234567890");
@@ -263,7 +298,7 @@ mod tests {
 
         let stanza = ChatstateStanza::try_from_node(&node).unwrap();
         assert!(matches!(stanza.source, ChatstateSource::Group { .. }));
-        assert_eq!(stanza.state, ReceivedChatState::RecordingAudio);
+        assert_eq!(stanza.state, ChatActivity::RecordingAudio);
     }
 
     #[test]
@@ -306,7 +341,7 @@ mod tests {
             .build();
 
         let stanza = ChatstateStanza::try_from_node(&node).unwrap();
-        assert_eq!(stanza.state, ReceivedChatState::Idle);
+        assert_eq!(stanza.state, ChatActivity::Idle);
     }
 
     #[test]
@@ -317,7 +352,7 @@ mod tests {
             .build();
 
         let stanza = ChatstateStanza::try_from_node(&node).unwrap();
-        assert_eq!(stanza.state, ReceivedChatState::Idle);
+        assert_eq!(stanza.state, ChatActivity::Idle);
     }
 
     #[test]
@@ -330,7 +365,7 @@ mod tests {
 
         let stanza = ChatstateStanza::parse(&node.as_node_ref()).unwrap();
         assert!(matches!(stanza.source, ChatstateSource::User { .. }));
-        assert_eq!(stanza.state, ReceivedChatState::Typing);
+        assert_eq!(stanza.state, ChatActivity::Typing);
 
         if let ChatstateSource::User { from } = stanza.source {
             assert_eq!(from.user, "236395184570386");
@@ -352,7 +387,7 @@ mod tests {
 
         let stanza = ChatstateStanza::parse(&node.as_node_ref()).unwrap();
         assert!(matches!(stanza.source, ChatstateSource::User { .. }));
-        assert_eq!(stanza.state, ReceivedChatState::Typing);
+        assert_eq!(stanza.state, ChatActivity::Typing);
 
         if let ChatstateSource::User { from } = stanza.source {
             assert_eq!(from.user, "236395184570386");
@@ -376,7 +411,7 @@ mod tests {
 
         let stanza = ChatstateStanza::parse(&node.as_node_ref()).unwrap();
         assert!(matches!(stanza.source, ChatstateSource::Group { .. }));
-        assert_eq!(stanza.state, ReceivedChatState::Typing);
+        assert_eq!(stanza.state, ChatActivity::Typing);
 
         if let ChatstateSource::Group { from, participant } = stanza.source {
             assert_eq!(from.server, "g.us");

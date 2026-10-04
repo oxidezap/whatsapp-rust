@@ -1072,7 +1072,7 @@ async fn test_restricted_presence_subscribe_requires_tctoken() -> anyhow::Result
     client_b
         .assert_no_event_before(
             30,
-            |e| matches!(e, Event::Presence(update) if update.from == jid_a && update.unavailable),
+            |e| matches!(e, Event::Presence(update) if update.from == jid_a && update.status == whatsapp_rust::PresenceStatus::Unavailable),
             |e| {
                 e.messages()
                     .any(|m| m.message.conversation.as_deref() == Some("seed presence tc token"))
@@ -1099,7 +1099,7 @@ async fn test_restricted_presence_subscribe_requires_tctoken() -> anyhow::Result
     let _ = client_b
         .wait_for_event(
             5,
-            |e| matches!(e, Event::Presence(update) if update.from == jid_a && update.unavailable),
+            |e| matches!(e, Event::Presence(update) if update.from == jid_a && update.status == whatsapp_rust::PresenceStatus::Unavailable),
         )
         .await?;
 
@@ -1107,7 +1107,7 @@ async fn test_restricted_presence_subscribe_requires_tctoken() -> anyhow::Result
     let _ = client_b
         .wait_for_event(
             10,
-            |e| matches!(e, Event::Presence(update) if update.from == jid_a && !update.unavailable),
+            |e| matches!(e, Event::Presence(update) if update.from == jid_a && update.status == whatsapp_rust::PresenceStatus::Available),
         )
         .await?;
 

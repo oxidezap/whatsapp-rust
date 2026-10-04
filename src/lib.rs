@@ -332,7 +332,7 @@ pub use features::{
     BotThemeMode, Bots, Business, BusinessCategory, BusinessError, BusinessHourMode, BusinessHours,
     BusinessHoursConfig, BusinessHoursUpdate, BusinessProfile, BusinessProfileUpdate,
     BusinessProfileUpdateError, CappingMvStatus, CappingOteStatus, CappingStatus, Catalog,
-    CatalogOptions, ChatActions, ChatStateError, ChatStateType, Chatstate, Collection,
+    CatalogOptions, ChatActions, ChatActivity, ChatStateError, Chatstate, Collection,
     CollectionOptions, Collections, Comments, Community, CommunityConfigurationStep,
     CommunityError, CommunitySubgroup, ContactError, Contacts, CoverPhotoUpload,
     CreateCommunityOptions, CreateCommunityResult, CreateGroupResult, CreateSubgroupOptions,

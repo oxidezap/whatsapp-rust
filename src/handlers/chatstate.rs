@@ -5,10 +5,9 @@ use crate::client::Client;
 use async_trait::async_trait;
 use log::debug;
 use std::sync::Arc;
-use wacore::iq::chatstate::{
-    ChatstateParseError, ChatstateSource, ChatstateStanza, ReceivedChatState,
-};
+use wacore::iq::chatstate::{ChatstateParseError, ChatstateSource, ChatstateStanza};
 use wacore::stanza::wire_tags::StanzaTag;
+use wacore::types::presence::ChatActivity;
 use wacore_binary::Jid;
 
 /// Event for incoming chatstate (`<chatstate/>`) stanzas.
@@ -22,27 +21,19 @@ pub struct ChatStateEvent {
     /// For group chats, the participant who triggered the event
     pub participant: Option<Jid>,
     /// The chat state (typing, recording_audio, or idle)
-    pub state: ReceivedChatState,
+    pub state: ChatActivity,
 }
 
 impl ChatStateEvent {
     /// Project the shared bus payload into the typed chatstate view.
     pub fn from_presence(presence: &wacore::types::events::ChatPresenceUpdate) -> Self {
-        use wacore::types::presence::{ChatPresence, ChatPresenceMedia};
-        let state = match (presence.state, presence.media) {
-            (ChatPresence::Composing, ChatPresenceMedia::Audio) => {
-                ReceivedChatState::RecordingAudio
-            }
-            (ChatPresence::Composing, _) => ReceivedChatState::Typing,
-            _ => ReceivedChatState::Idle,
-        };
         Self {
             chat: presence.source.chat.clone(),
             participant: presence
                 .source
                 .is_group
                 .then(|| presence.source.sender.clone()),
-            state,
+            state: presence.state,
         }
     }
 
