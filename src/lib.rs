@@ -13,10 +13,10 @@
 #[allow(clippy::disallowed_types)]
 pub(crate) mod test_alloc {
     use std::alloc::{GlobalAlloc, Layout, System};
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::ptr;
-    use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     pub(crate) static ALLOCS: AtomicU64 = AtomicU64::new(0);
@@ -32,27 +32,27 @@ pub(crate) mod test_alloc {
     }
 
     thread_local! {
-        // No destructor or allocation: allocator entry and thread teardown must
-        // not recursively initialize heap-backed TLS.
-        static ACTIVE: Cell<*const Measurement> = const { Cell::new(ptr::null()) };
+        static ACTIVE: RefCell<Option<Arc<Measurement>>> = const { RefCell::new(None) };
+        // Destructor-free: registry cleanup must still work during TLS teardown.
         static IN_REGISTRY: Cell<bool> = const { Cell::new(false) };
     }
 
-    // A scope must be dropped on the thread whose ACTIVE pointer it owns.
+    // A scope must be dropped on the thread whose ACTIVE entry it owns.
     struct Scope(Arc<Measurement>, std::marker::PhantomData<*const ()>);
 
     impl Scope {
         fn enter() -> Self {
-            ACTIVE.with(|active| assert!(active.get().is_null(), "nested allocation measurement"));
+            ACTIVE
+                .with(|active| assert!(active.borrow().is_none(), "nested allocation measurement"));
             let state = Arc::new(Measurement::default());
-            ACTIVE.with(|active| active.set(Arc::as_ptr(&state)));
+            ACTIVE.with(|active| *active.borrow_mut() = Some(state.clone()));
             Self(state, std::marker::PhantomData)
         }
     }
 
     impl Drop for Scope {
         fn drop(&mut self) {
-            ACTIVE.with(|active| active.set(ptr::null()));
+            ACTIVE.with(|active| active.borrow_mut().take());
         }
     }
 
@@ -63,6 +63,7 @@ pub(crate) mod test_alloc {
     // Entries keep the measurement alive after scope/thread exit, and removing
     // one on any thread debits only its owner. User layouts/pointers stay intact.
     static OWNERS: Mutex<BTreeMap<usize, Arc<Measurement>>> = Mutex::new(BTreeMap::new());
+    static HAS_OWNED_BLOCKS: AtomicBool = AtomicBool::new(false);
 
     fn with_registry(op: impl FnOnce(&mut BTreeMap<usize, Arc<Measurement>>)) {
         if IN_REGISTRY.try_with(|active| active.replace(true)) != Ok(false) {
@@ -72,6 +73,9 @@ pub(crate) mod test_alloc {
         // GlobalAlloc, whose methods must not unwind.
         let mut owners = OWNERS.lock().unwrap_or_else(|error| error.into_inner());
         op(&mut owners);
+        // Publish before releasing the lock or returning an allocated pointer.
+        // Any thread that can free an owned block must observe its registration.
+        HAS_OWNED_BLOCKS.store(!owners.is_empty(), Ordering::Release);
         drop(owners);
         IN_REGISTRY.with(|active| active.set(false));
     }
@@ -84,13 +88,12 @@ pub(crate) mod test_alloc {
             }
             ALLOCS.fetch_add(1, Ordering::Relaxed);
             LIVE_BYTES.fetch_add(layout.size() as i64, Ordering::Relaxed);
-            let owner = ACTIVE.try_with(Cell::get).unwrap_or(ptr::null());
-            if !owner.is_null() {
+            let owner = ACTIVE
+                .try_with(|active| active.try_borrow().ok().and_then(|owner| owner.clone()))
+                .ok()
+                .flatten();
+            if let Some(state) = owner {
                 with_registry(|owners| {
-                    // Scope owns this pointer on the current thread. Increment
-                    // before constructing the registry's independent Arc.
-                    unsafe { Arc::increment_strong_count(owner) };
-                    let state = unsafe { Arc::from_raw(owner) };
                     state
                         .live
                         .fetch_add(layout.size() as i64, Ordering::Relaxed);
@@ -103,13 +106,15 @@ pub(crate) mod test_alloc {
         }
 
         unsafe fn dealloc(&self, block: *mut u8, layout: Layout) {
-            with_registry(|owners| {
-                if let Some(owner) = owners.remove(&block.addr()) {
-                    owner
-                        .live
-                        .fetch_sub(layout.size() as i64, Ordering::Relaxed);
-                }
-            });
+            if HAS_OWNED_BLOCKS.load(Ordering::Acquire) {
+                with_registry(|owners| {
+                    if let Some(owner) = owners.remove(&block.addr()) {
+                        owner
+                            .live
+                            .fetch_sub(layout.size() as i64, Ordering::Relaxed);
+                    }
+                });
+            }
             LIVE_BYTES.fetch_sub(layout.size() as i64, Ordering::Relaxed);
             unsafe { System.dealloc(block, layout) };
         }
@@ -153,6 +158,17 @@ pub(crate) mod test_alloc {
         min
     }
 
+    fn live_sample<T>(op: impl FnOnce() -> T) -> ((i64, u64), T) {
+        let scope = Scope::enter();
+        let held = std::hint::black_box(op());
+        let sample = (
+            scope.0.live.load(Ordering::Relaxed),
+            scope.0.allocs.load(Ordering::Relaxed),
+        );
+        drop(scope);
+        (sample, held)
+    }
+
     /// Requested bytes still live and successful allocation/reallocation count
     /// owned by a synchronous call to `op` on this thread, before its return value
     /// is dropped. Frees on any thread debit only the block's originating scope;
@@ -166,13 +182,7 @@ pub(crate) mod test_alloc {
     pub(crate) fn min_live<T>(expected: (i64, u64), mut op: impl FnMut() -> T) -> (i64, u64) {
         let mut best = (i64::MAX, u64::MAX);
         for _ in 0..10_000 {
-            let scope = Scope::enter();
-            let held = std::hint::black_box(op());
-            let sample = (
-                scope.0.live.load(Ordering::Relaxed),
-                scope.0.allocs.load(Ordering::Relaxed),
-            );
-            drop(scope);
+            let (sample, held) = live_sample(&mut op);
             drop(held);
             if sample.0 <= expected.0 && sample.1 <= expected.1 {
                 return sample;
@@ -211,29 +221,29 @@ pub(crate) mod test_alloc {
         let (free_tx, free_rx) = sync_channel(0);
         let (freed_tx, freed_rx) = sync_channel(0);
         let worker = std::thread::spawn(move || {
-            // All blocks predate all measurement windows, including retries.
-            let blocks: Vec<_> = (0..10_000).map(|_| vec![0u8; 4096]).collect();
+            let mut preexisting = Some(std::hint::black_box(vec![0u8; 4096]));
             ready_tx.send(()).unwrap();
-            for preexisting in blocks {
-                if free_rx.recv().is_err() {
-                    break;
+            for free_buffer in [false, true] {
+                free_rx.recv().unwrap();
+                if free_buffer {
+                    drop(preexisting.take());
                 }
-                drop(std::hint::black_box(preexisting));
-                if freed_tx.send(()).is_err() {
-                    break;
-                }
+                freed_tx.send(()).unwrap();
             }
         });
         ready_rx.recv().unwrap();
-        // Every retry has the interfering free, so retrying cannot accidentally
-        // turn this negative control into a passing sample.
-        let sample = min_live((1024, 1), || {
+        // Warm the channels' thread-local parking state outside the sample.
+        free_tx.send(()).unwrap();
+        freed_rx.recv().unwrap();
+        // Exercise the same sample primitive as min_live. This deterministic
+        // negative control needs no warm-up retries or bulk preallocation.
+        let (sample, retained) = live_sample(|| {
             let retained = std::hint::black_box(vec![0u8; 2048]);
             free_tx.send(()).unwrap();
             freed_rx.recv().unwrap();
             retained
         });
-        drop((ready_rx, free_tx, freed_rx));
+        drop(retained);
         worker.join().unwrap();
         assert_eq!(sample, (2048, 1));
         assert!(sample.0 > 1024);
