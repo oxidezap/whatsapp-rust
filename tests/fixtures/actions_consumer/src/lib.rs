@@ -4,11 +4,10 @@ use wa::bot::MessageContext;
 use wa::prelude::MessageBuilderExt;
 use wa::wacore::types::message::{MessageInfo, MessageSource};
 use wa::{
-    Client, EventCreationParams, MessageRef, NewsletterAdminInfo, NewsletterAdminProfile,
-    NewsletterFollower, NewsletterMessage, NewsletterMessageRef, NewsletterMessageType,
-    NewsletterMetadata, NewsletterMyAddOns, NewsletterMyPollVote, NewsletterMyReaction,
-    NewsletterPollVote, NewsletterReactionCount, NewsletterState, NewsletterVerification,
-    PinDuration, RevokeType, StanzaId, anyhow, async_trait, waproto::whatsapp as proto,
+    Client, EventCreationParams, MessageRef, NewsletterMessage, NewsletterMessageRef,
+    NewsletterMessageType, NewsletterMetadata, NewsletterPollVote, NewsletterReactionCount,
+    NewsletterState, NewsletterVerification, PinDuration, RevokeType, StanzaId, anyhow,
+    async_trait, waproto::whatsapp as proto,
 };
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -214,6 +213,10 @@ pub mod removed;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wa::{
+        NewsletterAdminInfo, NewsletterAdminProfile, NewsletterFollower, NewsletterMyAddOns,
+        NewsletterMyPollVote, NewsletterMyReaction,
+    };
 
     #[test]
     fn host_futures_and_mock_construction_are_supported() {
