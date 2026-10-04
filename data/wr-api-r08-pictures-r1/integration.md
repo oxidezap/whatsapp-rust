@@ -34,7 +34,10 @@ All repository callers, including directed tests, metrics controls and the
 profile-picture/privacy-token E2E sources, migrate to the new facade. The old
 picture-consolidation contract's adoption snippets are updated too.
 
-## Consumer fixture modes for R05
+## Consumer fixture modes (handoff to R05)
+
+R05 is the separate consumer CI registry/workflow finding and implementation
+lane; these R08 fixture modes are its integration inputs.
 
 Manifest: `tests/fixtures/pictures_consumer/Cargo.toml` (standalone workspace,
 existing committed lockfile, dependency default-features=false).
@@ -53,8 +56,8 @@ existing committed lockfile, dependency default-features=false).
   metrics version adds `--features metrics`. `cargo test --locked -p whatsapp-rust --test profile_picture_lookup` covers downstream imports/boxing.
 - Rustdoc: `cargo test --locked -p whatsapp-rust --doc` covers the moved lookup example
   and a second removal control on the public `Pictures` documentation. This runs
-  in the existing root Rustdoc job immediately, independently of R05 wiring the
-  standalone fixture's doctests into the central registry.
+  in the existing Build & Test job's workspace doctest step, independently of
+  R05 wiring the standalone fixture's doctests into the central registry.
 
 ## Validation
 

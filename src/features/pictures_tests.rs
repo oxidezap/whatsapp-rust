@@ -541,7 +541,7 @@ fn picture_lookup_special_jids_do_not_discover_privacy_tokens() {
 }
 
 #[tokio::test]
-async fn picture_lookup_regular_jid_still_hits_the_wire_when_disconnected() {
+async fn picture_lookup_regular_jid_is_not_short_circuited_when_disconnected() {
     let client = crate::test_utils::create_test_client().await;
     let err = client
         .pictures()
