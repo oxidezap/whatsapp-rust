@@ -57,7 +57,8 @@ Explain accepted costs in the PR; use the existing label policy only for a
 reviewed increase. A toolchain change needs a matching baseline dispatch on main.
 
 For plugin cost, build `plugins/wam`'s `size_probe_without_wam` and
-`size_probe_with_wam` in release with the same lock, toolchain and flags. Keep
+`size_probe_with_wam` in release with `CARGO_PROFILE_RELEASE_STRIP=false`
+and the same lock, toolchain and flags. Keep
 symbols in the original binaries, compare `.text` with `size`, then run
 `strip --strip-all` on copies and compare their byte lengths. The first probe
 already enables the host; the delta measures installing WAM. This comparison
