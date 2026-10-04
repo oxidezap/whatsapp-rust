@@ -31,18 +31,15 @@ impl MessageOperations for Client {
             wa::Message::text("replacement"),
         ))
         .await?;
-        self.revoke_message_ref(target).await?;
-        self.send_reaction_ref(target, "👍").await?;
-        self.pin_message_ref(target, PinDuration::Days7).await?;
-        self.unpin_message_ref(target).await?;
-        self.keep_message_ref(target, true).await?;
+        self.revoke_message(target).await?;
+        self.send_reaction(target, "👍").await?;
+        self.pin_message(target, PinDuration::Days7).await?;
+        self.unpin_message(target).await?;
+        self.keep_message(target, true).await?;
         self.mark_message_read(target).await?;
         self.mark_message_played(target).await?;
-        let _: StanzaId = self.newsletter().send_reaction_ref(post, "👍").await?;
-        let _: StanzaId = self
-            .newsletter()
-            .send_poll_vote_ref(post, &[[7; 32]])
-            .await?;
+        let _: StanzaId = self.newsletter().send_reaction(post, "👍").await?;
+        let _: StanzaId = self.newsletter().send_poll_vote(post, &[[7; 32]]).await?;
         self.newsletter()
             .edit_message(post, wa::Message::text("replacement"))
             .await?;
@@ -63,11 +60,7 @@ fn boxed_inbound_reaction<'a>(
     client: &'a Client,
     inbound: &'a InboundMessage,
 ) -> Pin<Box<dyn Future<Output = anyhow::Result<SendResult>> + Send + 'a>> {
-    Box::pin(async move {
-        Ok(client
-            .send_reaction_ref(&inbound.message_ref()?, "👍")
-            .await?)
-    })
+    Box::pin(async move { Ok(client.send_reaction(&inbound.message_ref()?, "👍").await?) })
 }
 
 // Callers acquire these sealed results through Client's send APIs.

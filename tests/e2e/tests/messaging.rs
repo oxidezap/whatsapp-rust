@@ -82,7 +82,7 @@ async fn test_message_revoke() -> anyhow::Result<()> {
 
     client_a
         .client
-        .revoke_message(
+        .revoke_message_raw(
             jid_b,
             msg_id.as_str(),
             whatsapp_rust::send::RevokeType::Sender,

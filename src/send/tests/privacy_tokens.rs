@@ -104,7 +104,7 @@ async fn assert_dm_operations(legacy: Option<bool>, nct: bool, migrated: bool) {
                 .await
                 .unwrap(),
             1 => client
-                .send_reaction(
+                .send_reaction_raw(
                     pn.clone(),
                     wa::MessageKey {
                         remote_jid: Some(pn.to_string()),

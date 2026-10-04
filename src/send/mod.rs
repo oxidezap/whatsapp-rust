@@ -4046,6 +4046,7 @@ pub(crate) fn dm_stanza_to(recipient_bare: &Jid, to: &Jid) -> Jid {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    mod action_identity_tests;
     mod creation_tests;
     mod message_reference_tests;
     mod privacy_tokens;
@@ -4753,7 +4754,7 @@ mod tests {
 
         async fn revoke(&self, message_id: &str, revoke_type: RevokeType) -> SendResult {
             self.client
-                .revoke_message(self.group.clone(), message_id, revoke_type)
+                .revoke_message_raw(self.group.clone(), message_id, revoke_type)
                 .await
                 .expect("revoke should reach the wire")
         }
@@ -8830,7 +8831,7 @@ mod tests {
             participant: None,
         };
         let err = client
-            .pin_message(channel, key, PinDuration::Days7)
+            .pin_message_raw(channel, key, PinDuration::Days7)
             .await
             .expect_err("pinning a newsletter message must be rejected");
         assert!(
@@ -9456,7 +9457,7 @@ mod tests {
         let (peer_pn, _peer_lid) = seed_dm_wire_namespace_state(&client).await;
 
         let revoke = client
-            .revoke_message(peer_pn.clone(), "TARGET", RevokeType::Sender)
+            .revoke_message_raw(peer_pn.clone(), "TARGET", RevokeType::Sender)
             .await
             .expect("connected test client should complete the revoke");
         assert_ne!(
@@ -9488,7 +9489,7 @@ mod tests {
             participant: None,
         };
         let pin = client
-            .pin_message(peer_pn.clone(), target.clone(), PinDuration::Days30)
+            .pin_message_raw(peer_pn.clone(), target.clone(), PinDuration::Days30)
             .await
             .expect("connected test client should complete the pin");
         let pinned = pin
@@ -10608,16 +10609,20 @@ mod jid_into_convention {
         let _ = client
             .edit_message_raw(&jid, "ID", wa::Message::default(), EditOptions::default())
             .await;
-        let _ = client.revoke_message(&jid, "ID", RevokeType::Sender).await;
         let _ = client
-            .pin_message(&jid, wa::MessageKey::default(), PinDuration::default())
-            .await;
-        let _ = client.unpin_message(&jid, wa::MessageKey::default()).await;
-        let _ = client
-            .send_reaction(&jid, wa::MessageKey::default(), "x")
+            .revoke_message_raw(&jid, "ID", RevokeType::Sender)
             .await;
         let _ = client
-            .keep_message(&jid, wa::MessageKey::default(), true)
+            .pin_message_raw(&jid, wa::MessageKey::default(), PinDuration::default())
+            .await;
+        let _ = client
+            .unpin_message_raw(&jid, wa::MessageKey::default())
+            .await;
+        let _ = client
+            .send_reaction_raw(&jid, wa::MessageKey::default(), "x")
+            .await;
+        let _ = client
+            .keep_message_raw(&jid, wa::MessageKey::default(), true)
             .await;
         // Owned style: moves, no clone. Each method consumes its own copy so
         // the whole core surface is pinned, not just send_message.
@@ -10635,23 +10640,23 @@ mod jid_into_convention {
             )
             .await;
         let _ = client
-            .revoke_message(jid.clone(), "ID", RevokeType::Sender)
+            .revoke_message_raw(jid.clone(), "ID", RevokeType::Sender)
             .await;
         let _ = client
-            .pin_message(
+            .pin_message_raw(
                 jid.clone(),
                 wa::MessageKey::default(),
                 PinDuration::default(),
             )
             .await;
         let _ = client
-            .unpin_message(jid.clone(), wa::MessageKey::default())
+            .unpin_message_raw(jid.clone(), wa::MessageKey::default())
             .await;
         let _ = client
-            .send_reaction(jid.clone(), wa::MessageKey::default(), "x")
+            .send_reaction_raw(jid.clone(), wa::MessageKey::default(), "x")
             .await;
         let _ = client
-            .keep_message(jid, wa::MessageKey::default(), true)
+            .keep_message_raw(jid, wa::MessageKey::default(), true)
             .await;
     }
 }

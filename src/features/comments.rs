@@ -27,13 +27,40 @@ impl<'a> Comments<'a> {
         Self { client }
     }
 
-    /// Comment on a channel post with a text body.
-    ///
-    /// `parent_key` references the post being commented on and must carry
-    /// `participant` (the post author) so receivers can key the decryption.
-    /// Requires the parent's `messageSecret` (captured when the post was
-    /// received).
+    /// Comment on a Community Announcement Group post with a text body.
+    /// Requires the parent's captured `messageSecret`.
     pub async fn send_text(
+        &self,
+        parent: &crate::MessageRef<'_>,
+        text: &str,
+    ) -> Result<SendResult, SendError> {
+        parent.require_chat_operation()?;
+        self.send_text_raw(
+            parent.chat(),
+            self.client.message_ref_addon_key(parent).await?,
+            text,
+        )
+        .await
+    }
+
+    /// Comment with an arbitrary body, preserving the parent's author scope.
+    pub async fn send_message(
+        &self,
+        parent: &crate::MessageRef<'_>,
+        body: wa::Message,
+    ) -> Result<SendResult, SendError> {
+        parent.require_chat_operation()?;
+        self.send_message_raw(
+            parent.chat(),
+            self.client.message_ref_addon_key(parent).await?,
+            body,
+        )
+        .await
+    }
+
+    /// Explicit raw chat/key interop. `parent_key.participant` is the post
+    /// author used for secret resolution and decryption, not the commenter.
+    pub async fn send_text_raw(
         &self,
         chat: impl Into<Jid>,
         parent_key: wa::MessageKey,
@@ -48,11 +75,11 @@ impl<'a> Comments<'a> {
             }),
             ..Default::default()
         };
-        self.send_message(chat, parent_key, body).await
+        self.send_message_raw(chat, parent_key, body).await
     }
 
-    /// Comment on a channel post with an arbitrary body `Message`.
-    pub async fn send_message(
+    /// Explicit raw chat/key interop with an arbitrary comment body.
+    pub async fn send_message_raw(
         &self,
         chat: impl Into<Jid>,
         mut parent_key: wa::MessageKey,

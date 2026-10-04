@@ -27,7 +27,7 @@ impl Client {
     /// Revoke using the original author/from-me scope. Own messages use a
     /// sender revoke (no participant); other authors require group admin
     /// rights, checked by the server. The reference grants no permissions.
-    pub async fn revoke_message_ref(
+    pub async fn revoke_message(
         &self,
         target: &crate::MessageRef<'_>,
     ) -> Result<SendResult, SendError> {
@@ -45,19 +45,19 @@ impl Client {
                     .clone(),
             }
         };
-        self.revoke_message(target.chat(), target.id().as_str(), kind)
+        self.revoke_message_raw(target.chat(), target.id().as_str(), kind)
             .await
     }
 
-    /// Keep/unkeep the addressed message. The raw chat/key overload remains
-    /// available as `keep_message` for advanced hosts.
-    pub async fn keep_message_ref(
+    /// Keep/unkeep the addressed message. Use [`Client::keep_message_raw`]
+    /// for explicit chat/key interop.
+    pub async fn keep_message(
         &self,
         target: &crate::MessageRef<'_>,
         keep: bool,
     ) -> Result<SendResult, SendError> {
         target.require_chat_operation()?;
-        self.keep_message(
+        self.keep_message_raw(
             target.chat(),
             self.message_ref_addon_key(target).await?,
             keep,
@@ -66,13 +66,13 @@ impl Client {
     }
 
     /// Pin the addressed message with a fresh operation id.
-    pub async fn pin_message_ref(
+    pub async fn pin_message(
         &self,
         target: &crate::MessageRef<'_>,
         duration: PinDuration,
     ) -> Result<SendResult, SendError> {
         target.require_chat_operation()?;
-        self.pin_message(
+        self.pin_message_raw(
             target.chat(),
             self.message_ref_addon_key(target).await?,
             duration,
@@ -81,16 +81,16 @@ impl Client {
     }
 
     /// Unpin the addressed message with a fresh operation id.
-    pub async fn unpin_message_ref(
+    pub async fn unpin_message(
         &self,
         target: &crate::MessageRef<'_>,
     ) -> Result<SendResult, SendError> {
         target.require_chat_operation()?;
-        self.unpin_message(target.chat(), self.message_ref_addon_key(target).await?)
+        self.unpin_message_raw(target.chat(), self.message_ref_addon_key(target).await?)
             .await
     }
 
-    /// Delete a message for everyone in the chat (revoke).
+    /// Explicit raw addressing and revoke scope for advanced hosts.
     ///
     /// This sends a revoke protocol message that removes the message for all participants.
     /// The message will show as "This message was deleted" for recipients.
@@ -104,7 +104,7 @@ impl Client {
     /// The returned [`SendResult`] describes the revoke itself: `message_id`
     /// is the revoke stanza's own fresh id, and `message` the protocol message
     /// it carried, keyed by the message being deleted.
-    pub async fn revoke_message(
+    pub async fn revoke_message_raw(
         &self,
         to: impl Into<Jid>,
         message_id: impl Into<String>,
@@ -159,14 +159,14 @@ impl Client {
             .await
     }
 
-    /// Keep (or un-keep) a message in a disappearing chat for everyone.
+    /// Explicit raw chat/key interop to keep or unkeep a disappearing message.
     ///
     /// Sends a `keepInChatMessage` add-on (WA Web `WAWebKeepInChatMsgAction`):
     /// `keep = true` requests `KEEP_FOR_ALL`, `keep = false` requests
     /// `UNDO_KEEP_FOR_ALL`. `key` is the target (kept) message's key; the keep
     /// message itself is sent with a fresh id. The send path classifies this as a
     /// text add-on and maps the undo case to a sender-revoke edit attribute.
-    pub async fn keep_message(
+    pub async fn keep_message_raw(
         &self,
         chat: impl Into<Jid>,
         key: wa::MessageKey,
@@ -181,11 +181,11 @@ impl Client {
         self.send_message(chat, message).await
     }
 
-    /// Pin a message in a chat for all participants.
+    /// Explicit raw chat/key interop to pin a message for all participants.
     ///
     /// The returned [`SendResult`] describes the pin itself: its own fresh
     /// `message_id`, and in `message` the `pinInChatMessage` that was sent.
-    pub async fn pin_message(
+    pub async fn pin_message_raw(
         &self,
         chat: impl Into<Jid>,
         key: wa::MessageKey,
@@ -200,9 +200,9 @@ impl Client {
         .await
     }
 
-    /// Unpin a previously pinned message. Returns the unpin's own
-    /// [`SendResult`], like [`Client::pin_message`].
-    pub async fn unpin_message(
+    /// Explicit raw chat/key interop to unpin a message. Returns the unpin's
+    /// own [`SendResult`], like [`Client::pin_message`].
+    pub async fn unpin_message_raw(
         &self,
         chat: impl Into<Jid>,
         key: wa::MessageKey,

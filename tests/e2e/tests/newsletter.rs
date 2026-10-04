@@ -446,7 +446,7 @@ async fn test_newsletter_reaction_live_update() -> anyhow::Result<()> {
     client_a
         .client
         .newsletter()
-        .send_reaction(&created.jid, server_id, "👍")
+        .send_reaction_raw(&created.jid, server_id, "👍")
         .await?;
 
     // Wait for the live update notification

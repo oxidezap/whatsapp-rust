@@ -188,10 +188,7 @@ async fn dm_created_poll_quiz_and_event_roundtrip() {
         .events()
         .create(
             &peer,
-            EventCreationParams {
-                name: "Launch".into(),
-                ..Default::default()
-            },
+            EventCreationParams::builder().name("Launch".into()).build(),
         )
         .await
         .unwrap();
@@ -280,10 +277,7 @@ async fn group_created_references_preserve_pn_lid_and_decrypt_real_wire() {
             .events()
             .create(
                 &fixture.group,
-                EventCreationParams {
-                    name: "Launch".into(),
-                    ..Default::default()
-                },
+                EventCreationParams::builder().name("Launch".into()).build(),
             )
             .await
             .unwrap();
