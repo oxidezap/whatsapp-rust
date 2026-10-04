@@ -1272,8 +1272,8 @@ impl Runtime {
     /// four, an incoming offer followed by an outgoing call leaves every byte
     /// the host reads different from what the guest sees, while the guest keeps
     /// executing correctly — `emscripten_stack_get_base` still answers
-    /// `0x24cf60`. `examples/ring_corruption.rs` measures it and
-    /// `agent_docs/voip_oracle_status.md` records what is and is not known about why.
+    /// `0x24cf60`. `examples/ring_corruption.rs` measures the mismatch;
+    /// its cause is not established by this check.
     ///
     /// The check is a slice of the module's own static data, sampled once its
     /// constructors have placed it. Nothing writes over a string literal, so a

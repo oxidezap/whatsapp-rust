@@ -141,7 +141,7 @@ mod tests {
         // `new()` performs zero heap allocations. Reintroducing an `Arc`
         // wrapper changes this sum and fails the test. Compositional, so
         // widths and repacks do not matter. Rebaseline per
-        // [layout asserts](../agent_docs/layout_asserts.md).
+        // [layout asserts](../agent_docs/testing.md).
         assert_eq!(
             size_of::<UnifiedSessionManager>(),
             size_of::<AtomicI64>() + size_of::<Mutex<Option<String>>>() + size_of::<AtomicU64>()

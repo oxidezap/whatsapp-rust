@@ -507,8 +507,7 @@ fn a_module_without_the_queue_reports_it() {
 /// — and the cause was not a race in the engine. A `std::string` built in func
 /// 724's own stack frame was being overwritten by another guest thread's frame,
 /// so its `__is_long_` bit read as set while `__data_` held a neighbour's
-/// local, and `~basic_string` reached `free(1)`. See "A deleter is handed the
-/// integer 1" in `agent_docs/voip_oracle_status.md` for the chain, read out of the bytecode.
+/// local, and `~basic_string` reached `free(1)`. Worker stacks must be distinct.
 ///
 /// The fix is `threads.rs` giving each worker the 64 KiB stack the guest itself
 /// allocated for it, which is what emscripten's `establishStackSpace` does. The

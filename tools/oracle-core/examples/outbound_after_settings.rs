@@ -3,7 +3,7 @@
 //! `settings_probe` establishes that `getVoipParam` is answered from the
 //! `<voip_settings>` blob on an incoming call stanza, and from nowhere else —
 //! the embind surface has a `getVoipParam` and no setter, so a host cannot
-//! configure the engine at all. `agent_docs/voip_oracle_status.md` records `startVoipCall`
+//! configure the engine at all. `tools/oracle-core/tests/signaling.rs` records `startVoipCall`
 //! failing with `make_and_cache_offer failed: 70008`, and the obvious causal
 //! story is that the two are one fact.
 //!
@@ -18,8 +18,7 @@
 //!     identical, 39 log lines each, same states, same offer.
 //!
 //! Send counts use exact host counters even after the argument trace fills.
-//! Earlier measurements using the bounded trace are archived in
-//! `agent_docs/voip_oracle_history.md`.
+//! A bounded argument trace alone cannot establish total send counts.
 //!
 //! ```sh
 //! cargo run --release --example outbound_after_settings
@@ -300,9 +299,8 @@ fn main() -> anyhow::Result<()> {
         }
 
         // The lines this experiment is about, quoted rather than summarised: a
-        // status code that changed is the whole result. `agent_docs/voip_oracle_status.md` was
-        // written when `make_and_cache_offer` failed with 70008, so its absence
-        // has to be visible rather than inferred from a return value.
+        // status code is part of the result. Show `make_and_cache_offer` errors
+        // explicitly rather than inferring their absence from a return value.
         for line in lines.iter().filter(|l| {
             l.contains("make_and_cache_offer")
                 || l.contains("Call start")

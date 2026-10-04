@@ -1,9 +1,8 @@
 # WhatsApp wasm oracle
 
 Unpublished host tooling for captured WhatsApp Web modules. Read `README.md`
-for commands and supported APIs, and `../../agent_docs/voip_conformance.md`
-for the coverage boundary. Historical experiments live in
-`../../agent_docs/voip_oracle_history.md` and `voip_oracle_status.md`.
+for commands and supported APIs, and `../../agent_docs/testing.md`
+for verification and coverage boundaries.
 
 ## Boundaries and verification
 
@@ -58,7 +57,8 @@ for the coverage boundary. Historical experiments live in
   emscripten thread must use `can_block = 0` so waiting can yield to host code.
 - Main-runtime registration is currently disabled by default because synchronous
   proxy draining can deadlock startup. This remains a full-call coverage gap;
-  see the status document. Do not turn a failed drain into evidence of no send.
+  see `RuntimeOptions::register_main_runtime_thread` and `tests/signaling.rs`.
+  Do not turn a failed drain into evidence of no send.
 - Tests starting an engine acquire `common::threaded_guard()` (local and
   cross-process locks). Wait for observable progress/quiescence, not arbitrary
   sleeps. Thread ordering itself is not deterministic.

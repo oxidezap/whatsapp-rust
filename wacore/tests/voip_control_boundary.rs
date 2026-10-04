@@ -115,7 +115,7 @@ fn the_contract_never_names_the_engine() {
         offenders.is_empty(),
         "the neutral contract reached into the engine:\n{}\n\n\
          Move the type into `voip_control`, or gate the file on `voip` and document why in \
-         `agent_docs/subsystem_boundary.md`.",
+         `agent_docs/architecture.md`.",
         offenders.join("\n"),
     );
 }

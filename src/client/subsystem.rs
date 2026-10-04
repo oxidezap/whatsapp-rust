@@ -2,7 +2,7 @@
 //!
 //! The [`subsystems!`] list below is the one place the core is allowed to name
 //! one. A subsystem that passes the cut rule in
-//! `agent_docs/subsystem_boundary.md` implements [`Subsystem`], parks its
+//! `agent_docs/architecture.md` implements [`Subsystem`], parks its
 //! per-client state through the associated type and lists the notification
 //! types it models, so turning it on adds no `Client` field and no `cfg`
 //! anywhere else; `tests/subsystem_boundary.rs` fails on a mention outside that

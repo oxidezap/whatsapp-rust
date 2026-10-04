@@ -1,6 +1,6 @@
 //! A cuttable subsystem stays cut.
 //!
-//! `agent_docs/subsystem_boundary.md` classifies a subsystem as cuttable when
+//! `agent_docs/architecture.md` classifies a subsystem as cuttable when
 //! the core neither holds its state nor runs its code inline, and gives the core
 //! a budget of two mentions for it: the `mod` declaration that brings the files
 //! in, and the entry in the subsystem list that routes to them. The failure
@@ -62,10 +62,9 @@ const CUTTABLE: &[Cuttable] = &[Cuttable {
 
 /// A subsystem the cut rule calls *coupled but disciplined*: it cannot leave the
 /// core, so it keeps gates there, and the only thing worth guarding is that the
-/// count does not creep back up. Weaker than [`Cuttable`] on purpose, and the
-/// batch that wrote `agent_docs/subsystem_boundary.md` needed it: it took VoIP
-/// from 29 gates outside its own files to 5, and nothing but this stops the
-/// next change from spending that back one field at a time.
+/// count does not creep back up. Weaker than [`Cuttable`] on purpose: coupled
+/// subsystems keep their required entry points but cannot add scattered gates
+/// without updating this explicit budget.
 struct Disciplined {
     /// The feature whose gates are counted.
     feature: &'static str,
@@ -175,7 +174,7 @@ fn a_disciplined_subsystem_does_not_creep_back_into_the_core() {
             "`{}` now has {} gates outside the files it owns, budget is {}:\n{}\n\n\
              Raising the budget is a decision, not a formality: the point of the \
              number is that a subsystem that cannot be cut still does not spread. \
-             If the new gate belongs, say why in agent_docs/subsystem_boundary.md \
+             If the new gate belongs, say why in agent_docs/architecture.md \
              and move the budget with it.",
             subsystem.feature,
             gates.len(),

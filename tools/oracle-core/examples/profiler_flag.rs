@@ -27,9 +27,8 @@
 //! back, and the trap count says whether it mattered.
 //!
 //! It is also the smallest run that starts a call, which makes it the A/B
-//! harness for anything touching `threads.rs`. See "Giving each thread its own
-//! stack works, and is still not the fix" in agent_docs/voip_oracle_status.md for the numbers it
-//! produced there.
+//! harness for anything touching `threads.rs`. Report fresh counters for the
+//! pinned capture rather than assuming an earlier run applies.
 //!
 //! ```sh
 //! cargo run --release --example profiler_flag [--verbose-engine] [--enable-asserts]

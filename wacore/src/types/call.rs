@@ -353,7 +353,7 @@ pub struct IncomingCall {
     /// the accessor is gated too. What changes is where it lands. A field that comes and goes with
     /// a feature changes how the type is built and matched; a method that does cannot, so code
     /// that constructs or destructures an `IncomingCall` compiles the same either way. That is the
-    /// half `agent_docs/subsystem_boundary.md` test 4 is about. Unconditional is not the
+    /// half `agent_docs/architecture.md` test 4 is about. Unconditional is not the
     /// alternative -- the type carries a parsed `RelayData`, so making it always present would
     /// link the relay parser into every build.
     #[cfg(feature = "voip-control")]

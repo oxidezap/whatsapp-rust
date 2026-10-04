@@ -193,7 +193,7 @@ impl HostState {
             in_flight: crate::cxa::InFlight::default(),
             // Synchronous main-thread proxy draining can deadlock startup.
             // Keep disabled until draining can run outside the blocking guest call.
-            // Evidence: agent_docs/voip_oracle_status.md.
+            // Evidence: tools/oracle-core/tests/signaling.rs.
             register_main_thread: false,
             threads,
             memory_export: None,

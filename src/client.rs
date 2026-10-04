@@ -597,7 +597,7 @@ pub struct MemoryReport {
     /// What the optional subsystems attached to this build retain. Empty when
     /// none is attached. One field rather than a `cfg`'d field per subsystem,
     /// so the report has one shape whatever was compiled; see
-    /// `agent_docs/subsystem_boundary.md`.
+    /// `agent_docs/architecture.md`.
     pub subsystems: Vec<SubsystemMemory>,
     #[cfg(feature = "plugins")]
     pub plugins: u64,
@@ -2006,7 +2006,7 @@ pub struct Client {
     /// Per-client state of every optional subsystem attached to this build,
     /// each under its own type, in one field rather than one field per
     /// subsystem. Empty, and zero-sized, in a build with none attached; see
-    /// `agent_docs/subsystem_boundary.md`.
+    /// `agent_docs/architecture.md`.
     pub(crate) subsystems: subsystem::Subsystems,
 
     /// Custom handlers for encrypted message types. Set once at `Bot::build` and

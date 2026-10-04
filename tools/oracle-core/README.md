@@ -16,8 +16,8 @@ The modules are not vendored — they are WhatsApp's artifacts, and a copy
 committed here would drift from the capture every offset in this file was read
 out of.
 
-Historical measurements and superseded hypotheses are in the
-[investigation archive](../../agent_docs/voip_oracle_history.md).
+Capture hashes and selectors live in `wasm.lock.json` and `specs/`.
+See [verification instructions](../../agent_docs/testing.md) for coverage limits.
 
 ## Getting set up
 
@@ -78,22 +78,10 @@ and [`unwasm`](https://github.com/oxidezap/unwasm) read the same bytes — an in
 means nothing otherwise. `JgwtTQVeWPm` has since rolled off whatspec's set too;
 the CDN still serves it, which is why the lock records the url.
 
-**What that bump cost, measured.** Four of the six modules are byte-identical
-across the two sets, so only the engine moved. Of its functions, **6,561 carry
-forward one-to-one** under `unwasm`'s fingerprint — which is the tool to reach
-for, since it hashes a body's shape and signature while dropping exactly what a
-rebuild changes. What did not carry is the code WhatsApp actually edited:
-`make_and_cache_offer` and its callers, which is why the offer-guard offsets in
-`signaling.rs` are marked as needing re-derivation rather than carried over.
-
-The newer engine comes up under this host environment and registers its API, so
-the *harness* moves forward unchanged. The recorded positions do not:
-`abi_inference.rs` asks for `infer_index(&bytes, 13_364)` and
-`signaling.rs` reads absolute address `1_719_816` — running the suite against
-the newer engine fails the first of those, and the reads that still succeed are
-answering about different code. Treat a capture bump as a re-derivation of every
-index, slot and address in the tests, `README.md` and `agent_docs/voip_oracle_status.md`, and
-bump the lock only once that is done.
+Function indices, slots, addresses and callback ABIs are capture-specific.
+Use signature/body fingerprints to locate candidates, then re-derive every
+selector and expectation before changing the lock. Matching imports and a
+successful startup alone do not establish compatibility with a new capture.
 
 ## Usage
 
@@ -134,7 +122,7 @@ JgwtTQVeWPm -> traced.wasm (10650966 bytes, was 10650934), markers call env::on_
 `--value FUNC:LOCAL` reports a parameter rather than just presence, which is the
 difference between "`free` trapped" and "`free` was handed `1`". That one
 distinction is what identified the startup failure on this capture — see
-`agent_docs/voip_oracle_status.md`.
+`tests/threading.rs`.
 
 **It marks the call site, not the body**, and that is the point: the previous
 attempt at the same question patched the *bodies* of two functions with ten and
@@ -454,7 +442,7 @@ reject logs after guest-memory corruption.
 ## Known limits
 
 - Full audio/video callback ABIs and end-to-end signaling/IQ equivalence remain
-  work for differential adapters. See the [coverage matrix](../../agent_docs/voip_conformance.md).
+  work for differential adapters. See the [coverage matrix](../../agent_docs/testing.md).
   The 26 ignored signaling scenarios are not proof of conformance.
 - `Refuse` rejects worker creation; `Spawn` permits real concurrent workers.
   `PretendSuccess` is a diagnostic hypothesis and does not run a worker.
@@ -499,10 +487,9 @@ The signaling tests bring up PJSIP's worker pool and are `#[ignore]`d; see
 
 ## Driving the VoIP engine
 
-`agent_docs/voip_oracle_status.md` is the place to start: where an outgoing call currently stops,
-what the engine expects from the environment that a host has to supply, and a
-table of hypotheses already ruled out by measurement — several of them
-expensive, none worth repeating.
+Start with `examples/outgoing_call.rs` and `tests/signaling.rs` for host setup,
+current assertions and explicit unsupported paths. Read `AGENTS.md` before
+enabling main-runtime registration or interpreting an ignored scenario.
 
 Two tools exist because inference from disassembly kept being wrong:
 
@@ -528,8 +515,9 @@ tool; it is not affiliated with, authorised by, or endorsed by WhatsApp or Meta.
 
 `cargo xt mlow verify` re-derives the codec corpus from the pinned
 J/S captures. The lock verifies every output and selector; the capture CI
-runs both modules independently. See [mlow_derivation.md](../../agent_docs/mlow_derivation.md) for the
-recovered layouts, DSP boundaries, migration refusals and measured results.
+runs both modules independently. The recipes in `specs/` carry selectors and
+DSP boundaries; fixture provenance is in
+[`PROVENANCE.md`](../../wacore/src/voip/mlow/testdata/PROVENANCE.md).
 
 ## Task layout and generated specs
 

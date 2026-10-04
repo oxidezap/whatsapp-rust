@@ -1,9 +1,4 @@
-# Connected post-activity retention baseline
-
-This fixture is independent of the memory optimization branches: it runs on
-main without adding arena/cache/lane/Signal/SQLite lifecycle changes. It supplements, rather than
-reinterprets, the reported CodSpeed run (408 simulated CPU / 402 memory results).
-Those results were operation costs/allocation peaks, not connected idle RSS.
+# Connected retention benchmark
 
 ## What is connected, and what is synthetic?
 
@@ -160,72 +155,3 @@ threshold masquerading as a deterministic CI guard.
 pages/arenas for reuse. A lower peak alone does not prove lower retention, and a
 flat RSS alone does not prove that Rust objects stayed live. Report all three
 readings and the control/noise range; never upload RssAnon as a CodSpeed metric.
-
-## Corrected native baseline (2026-10-01)
-
-These are historical measurements of the fixture revision pinned below, before
-its finite-startup barrier. Do not relabel them as measurements of the current
-fixture or compare maintenance costs across the changed setup boundary without
-fresh matched runs.
-
-The first batch's RSS evidence is **invalid/superseded**: its counting allocator
-used trait-default `alloc_zeroed` (eager memset), not System's calloc/lazy-page
-behavior. The following values come from an entirely new batch, not reused or
-relabeled old data. The corrected allocator forwards all four System methods.
-
-Library base: `19eb64cac58bc2e36cc9e2bc3c92fe9af3a78729`; measured fixture:
-`25f0f86f437064a32c3f617b41e20d3c432d40dd`. Linux AArch64, glibc 2.39,
-Rust `1.98.0-nightly (01dfd7924 2026-06-15)`, **dev/unoptimized + debuginfo**,
-minimal features and frozen malloc environment above. Sampling began at
-2026-10-01T12:43:24Z. No compiler/build script or sibling sampler ran concurrently.
-These are fixture-specific debug observations, **not** release optimization gains.
-
-All 12 fresh children (three repeats per backend/mode) exited 0. Actual idle
-intervals were 61,001–61,003 ms. Each activity child delivered/committed all 256
-messages, dispatched the history task, stayed connected with production pong(s),
-and went from 32 running workers to zero without fixture-forced lane clearing.
-Maintenance and teardown were sampled separately. Completed child processes and
-owned SQLite files were absent; shutdown waits for detached client owners.
-
-Median requested Rust bytes (live deltas relative to `runtime_baseline`):
-
-| Backend / mode | Cumulative peak (absolute B) | After activity ΔB | After 61s ΔB | After sweep ΔB |
-| --- | ---: | ---: | ---: | ---: |
-| Memory / control | 1,197,133 | 201,265 | 168,809 | 170,482 |
-| Memory / activity | 4,790,463 | 1,954,893 | 1,580,591 | 1,582,120 |
-| SQLite / control | 1,095,837 | 203,642 | 67,212 | 68,885 |
-| SQLite / activity | 5,241,293 | 1,730,116 | 1,355,663 | 1,357,192 |
-
-RssAnon deltas from runtime baseline (min / median / max KiB):
-
-| Backend / mode | After activity | After 61s and sweep |
-| --- | ---: | ---: |
-| Memory / control | 228 / 232 / 232 | 1,132 / 1,136 / 1,136 |
-| Memory / activity | 4,856 / 4,864 / 4,872 | 4,856 / 4,864 / 4,872 |
-| SQLite / control | 968 / 1,004 / 1,008 | 1,824 / 1,828 / 1,900 |
-| SQLite / activity | 6,356 / 6,388 / 6,468 | 6,356 / 6,388 / 6,468 |
-
-During activity idle, Rust live heap fell 374,302 B (memory) and 374,453–374,755 B
-(SQLite), while RssAnon stayed flat in every activity repeat. Controls had
-startup/periodic changes too: their RssAnon rose 904 KiB (memory) and 824–892 KiB
-(SQLite) during idle despite having no chat workers. Do not attribute every
-change to lane reclamation or treat raw backend cohort differences as gains.
-
-Activity live-delta medians after shutdown were 74,119 / 75,237 B (memory/SQLite),
-and after runtime drop 25,027 / 26,145 B. After-teardown activity RssAnon medians
-remained +3,364 / +5,360 KiB. Negative control live deltas after runtime drop are
-possible because the initialized runtime is part of the reference baseline.
-End-of-life accounting does not require process-global buffers or allocator pages
-to disappear when a client is dropped. Rust counters exclude SQLite C allocations.
-
-[Immutable raw JSONL and full measurement provenance](https://github.com/oxidezap/whatsapp-rust/pull/1590#issuecomment-5932017646)
-are attached to the review. Raw stdout SHA-256:
-`2be094a6ea27c55dbb6c2e38dd0399f5697bf0533a6f8086625d5c4d9a790ef3`.
-The locally preserved raw/summary/provenance files are read-only; each row is
-published only after its child's successful exit. No old RSS table is validated
-by numerical similarity with this corrected batch.
-
-To reproduce a **dev** baseline, omit `--release` from the build command and
-invoke `target/debug/examples/connected_idle --repeats 3` with the same malloc
-and `CARGO_TARGET_DIR` environment. Keep raw JSONL and min/median/max output;
-release builds should establish their own baseline rather than reuse a dev table.

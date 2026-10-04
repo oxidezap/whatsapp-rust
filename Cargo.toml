@@ -182,7 +182,7 @@ client-lifecycle = []
 plugins = ["client-lifecycle"]
 # SHORTCAKE_PASSKEY linking flow. Opt-in so a client that links by QR or pair
 # code carries neither the flow nor any state for it; the core keeps no field
-# and no branch either way. See agent_docs/subsystem_boundary.md.
+# and no branch either way. See agent_docs/architecture.md.
 passkey = []
 # Optional observability. Off by default: no `tracing` dep, zero overhead.
 # Emits tracing spans/events only; the application installs the subscriber

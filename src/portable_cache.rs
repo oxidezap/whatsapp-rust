@@ -2922,7 +2922,7 @@ mod tests {
         assert_eq!(plain.entry_count(), 0);
         // Budget: key + hash + value with no metadata tail. Smaller still
         // satisfies that; larger means metadata crept in. Rebaseline per
-        // [layout asserts](../agent_docs/layout_asserts.md).
+        // [layout asserts](../agent_docs/testing.md).
         assert!(
             size_of::<PlainSlot<String, u32>>() <= 40,
             "plain slot grew to {} B (budget 40)",
@@ -3532,7 +3532,7 @@ mod tests {
     /// nested `Slot { key, hash, entry }` it replaces. Wide keys already
     /// align, so the dispatched slot keeps its size. Budgets, not contracts:
     /// a smaller slot is never a failure. Rebaseline per
-    /// [layout asserts](../agent_docs/layout_asserts.md).
+    /// [layout asserts](../agent_docs/testing.md).
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn flattened_slot_reuses_entry_tail_padding() {
@@ -3556,7 +3556,7 @@ mod tests {
     /// by a digest instead of the spelled-out identity took it from 208 bytes
     /// to under that, and it must not drift back. Relational: the comparison
     /// type carries the budget, so widths and repacks do not matter.
-    /// Rebaseline per [layout asserts](../agent_docs/layout_asserts.md).
+    /// Rebaseline per [layout asserts](../agent_docs/testing.md).
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn dispatch_gate_slot_stays_below_the_spelled_out_identity() {

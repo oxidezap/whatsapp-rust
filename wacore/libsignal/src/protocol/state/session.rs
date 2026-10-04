@@ -1066,7 +1066,7 @@ fn session_pointed_bytes(session: &SessionStructure) -> usize {
 /// Load-time validation is deliberately unchanged: `deserialize` still decodes
 /// every archived state to reject a malformed record there, because deferring
 /// that rejection to a promotion would turn a quarantined row into an error
-/// that strands the address (`agent_docs/signal_durability.md`). The parsed
+/// that strands the address (`agent_docs/architecture.md`). The parsed
 /// tree is then dropped instead of retained.
 #[derive(Clone, PartialEq, Eq)]
 struct ArchivedSession(Box<[u8]>);
@@ -1364,7 +1364,7 @@ impl SessionRecord {
         // decode below is what rejects a malformed one, and dropping it would
         // move that rejection to a later promotion, where an error strands the
         // address instead of quarantining the row (see
-        // `agent_docs/signal_durability.md`). What changes is what is *kept*:
+        // `agent_docs/architecture.md`). What changes is what is *kept*:
         // their untouched encoding rather than the parsed tree, so a record
         // holds a fraction of the bytes and re-serializes byte-for-byte.
         let limit = consts::ARCHIVED_STATES_MAX_LENGTH;
@@ -2245,7 +2245,7 @@ mod tests {
     /// figure must cover the compact form and must no longer be anywhere
     /// near the protobuf one, or the report would be describing memory the
     /// state no longer holds. Budget: rebaseline per
-    /// [layout asserts](../../../../../agent_docs/layout_asserts.md).
+    /// [layout asserts](../../../../../agent_docs/testing.md).
     #[test]
     fn skipped_message_keys_are_reported_at_their_in_memory_cost() {
         const KEYS: usize = 500;

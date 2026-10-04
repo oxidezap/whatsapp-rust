@@ -18,7 +18,7 @@
 //!
 //! # Why a plugin and not a subsystem
 //!
-//! `agent_docs/subsystem_boundary.md` asks four questions of anything that wants
+//! `agent_docs/architecture.md` asks four questions of anything that wants
 //! to be attached to the core, and the first decides this one: a subsystem is
 //! entered on a dispatch key the core already routes on. WAM claims no stanza
 //! tag, no notification type and no IQ namespace on the way in. It wants to

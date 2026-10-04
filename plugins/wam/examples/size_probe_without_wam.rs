@@ -3,7 +3,7 @@
 //! This one builds a client with the plugin host on and no plugin installed;
 //! `size_probe_with_wam.rs` is the same program with one line added. Building
 //! both under the release profile and subtracting is what
-//! `agent_docs/subsystem_boundary.md` asks for, and a pair is the only way to
+//! `agent_docs/architecture.md` asks for, and a pair is the only way to
 //! get it: the `demo` example cannot depend on a plugin crate that depends on
 //! it, so the comparison has to happen on this side of the edge.
 //!

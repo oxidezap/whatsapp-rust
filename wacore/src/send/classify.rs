@@ -225,7 +225,8 @@ pub fn stanza_type_from_message(msg: &wa::Message) -> &'static str {
 /// `WAWebSendMsgMetaNode.genMetaNode`, not record-dependent origin, reporting,
 /// status privacy or business nodes. Normal builders accept it in `extra_nodes`;
 /// the pairwise retry builder inserts it itself. No empty node is emitted.
-/// Protocol evidence and the media-record mapping: `agent_docs/retry_metadata.md`.
+/// Captured-client vectors and their derivation live in
+/// `wacore/tests/fixtures/retry_metadata.json` and `retry_metadata.mjs`.
 /// Unlike `MessageExt::is_view_once`, this requires a media leaf: the mere
 /// presence of a future-proof wrapper does not create a media record.
 pub fn message_meta_from_message(msg: &wa::Message) -> Option<Node> {

@@ -8,11 +8,9 @@
 //!
 //! ## Why a body patch is not enough, and this is
 //!
-//! `agent_docs/voip_oracle_status.md` measured the null-key chain by patching the *bodies* of
-//! `10297` and `10535`, and says why the result is weak: those functions have
-//! ten and three call sites, so a body patch reports whichever call happened to
-//! run rather than the one on the path being traced. Marking the *call site*
-//! answers the question the body patch cannot.
+//! A body patch reports every caller of the function. Mark the specific call
+//! site when the question concerns one path; body markers cannot distinguish
+//! which caller reached it.
 //!
 //! ## How it avoids renumbering anything
 //!

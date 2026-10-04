@@ -1330,7 +1330,7 @@ fn the_engine_starts_an_outgoing_call() {
         // `11223344556677@lid` as `is_self: false` and `99887766554433@lid` as
         // `is_self: true`. The self participant exists. Neither of the two
         // functions that build it logs its "self participant not created"
-        // failure, either. See agent_docs/voip_oracle_status.md for the remaining candidates.
+        // failure, either. See tools/oracle-core/tests/signaling.rs for the remaining candidates.
         //
         // When this assertion starts failing, the blocker is gone: replace it
         // with one that expects an offer on the wire.
@@ -1464,7 +1464,7 @@ fn the_engine_reports_a_self_participant_for_an_outgoing_call() {
     let info = runtime.call_embind("getCallInfo", &[]);
     runtime.refuel();
     let Some(json) = info.as_ref().ok().and_then(|value| value.as_str()) else {
-        // A trap here is the corruption `agent_docs/voip_oracle_status.md` describes, not a new
+        // A trap here is the corruption `tools/oracle-core/tests/signaling.rs` describes, not a new
         // fault. The shared stack is *not* the reason, though it was written
         // down as one here: every guest thread does start from the main
         // thread's stack pointer, but giving each worker its own 4 MiB stack —
@@ -1480,7 +1480,7 @@ fn the_engine_reports_a_self_participant_for_an_outgoing_call() {
         // takes this path — it is a placeholder for the assertion below, not
         // evidence for it.
         eprintln!(
-            "getCallInfo could not answer — see agent_docs/voip_oracle_status.md, threads share one stack: {info:?}"
+            "getCallInfo could not answer — see tools/oracle-core/tests/signaling.rs, threads share one stack: {info:?}"
         );
         return;
     };

@@ -284,6 +284,11 @@ async fn cold_reader_creation_failure_recovers_and_cancelled_reads_keep_their_le
 }
 
 /// Run each arm in a fresh, isolated test process, not under parallel tests.
+/// `SQLITE_READER_MODE=adaptive cargo test --release -p whatsapp-rust-sqlite-storage
+/// --features bundled-sqlite --lib measure_reader_retention -- --ignored --nocapture
+/// --test-threads=1` measures the shipped policy. `baseline` selects the replica
+/// control; `SQLITE_READER_COUNT` and `SQLITE_READER_WARM=scan` select workload.
+/// Build before sampling and keep toolchain/profile/allocator choices identical.
 /// SQLite's global counter includes its C allocations; RssAnon comes from procfs,
 /// independently of page-cache bounds and file-backed resident pages.
 #[cfg(all(target_os = "linux", feature = "bundled-sqlite"))]

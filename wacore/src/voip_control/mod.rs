@@ -10,8 +10,8 @@
 //! The engine-facing half is intentionally not here. `whatsapp-rust`'s resident backend implements
 //! [`VoipMediaBackend`] on top of `wacore::voip::CallEngine` and builds the engine from the neutral
 //! spec across this boundary. Events need no translation: the public event type is the engine's own
-//! event type under its seam name. `agent_docs/subsystem_boundary.md` records the byte cut (a
-//! facade that compiles with `voip` off) and what it took to get there.
+//! event type under its seam name. `wacore/tests/voip_control_boundary.rs` guards
+//! this facade with `voip` disabled.
 
 use std::sync::Arc;
 

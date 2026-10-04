@@ -715,7 +715,7 @@ mod tests {
     /// task to its own locals (152 B). This pins the shape, not the exact
     /// number: a future above the bound means the engine has been inlined
     /// back in. Budget: rebaseline per
-    /// [layout asserts](../../../agent_docs/layout_asserts.md).
+    /// [layout asserts](../../../agent_docs/testing.md).
     #[tokio::test]
     async fn the_server_sync_task_does_not_carry_the_sync_engine() {
         const MAX_SERVER_SYNC_FUTURE_BYTES: usize = 512;

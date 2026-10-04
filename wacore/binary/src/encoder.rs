@@ -1034,7 +1034,7 @@ mod tests {
     /// itself. Budget: at most five bytes per string on the tape, so a
     /// repack that shrinks an entry is fine and only growth fails.
     /// Rebaseline per
-    /// [layout asserts](../../../agent_docs/layout_asserts.md).
+    /// [layout asserts](../../../agent_docs/testing.md).
     #[test]
     fn the_hint_tape_stays_five_bytes_wide() {
         assert!(

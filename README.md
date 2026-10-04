@@ -13,8 +13,8 @@ An async Rust library for WhatsApp Web. Pair a device, send and receive end-to-e
 - QR and pairing-code authentication with persistent sessions.
 - End-to-end encrypted direct and group messaging, media, reactions, receipts, and history sync.
 - Groups, communities, newsletters, status, contacts, and privacy controls.
-- Audio and video calls, both 1:1 and group, plus call links and screen sharing. The optional `voip` feature provides native relay transport and MLOW/Opus audio. Video takes application-supplied H.264 frames ([media API and codec options](agent_docs/voip_audio_codecs.md)).
-- Replaceable storage, transport, HTTP client, and runtime. The default features include SQLite, Tokio WebSocket, ureq, and Tokio. Applications still choose a storage backend. Native plugins are [opt-in](agent_docs/plugin_architecture.md).
+- Audio and video calls, both 1:1 and group, plus call links and screen sharing. The optional `voip` feature provides native relay transport and MLOW/Opus audio. Video takes application-supplied H.264 frames ([media API and codec options](https://github.com/oxidezap/whatsapp-rust-docs)).
+- Replaceable storage, transport, HTTP client, and runtime. The default features include SQLite, Tokio WebSocket, ureq, and Tokio. Applications still choose a storage backend. Native plugins are [opt-in](agent_docs/architecture.md).
 
 ## Quick start
 

@@ -1,6 +1,6 @@
 // Regenerate the golden file using the actual archived modules, not a JS port.
 // Usage: node retry_metadata.mjs /path/to/verified/restored/bundles > retry_metadata.json
-// See agent_docs/retry_metadata.md for archive verification and stub scope.
+// See agent_docs/wa_web_reference.md for archive verification and stub scope.
 import fs from 'node:fs';
 import vm from 'node:vm';
 import crypto from 'node:crypto';

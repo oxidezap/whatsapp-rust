@@ -271,12 +271,11 @@ fn main() -> anyhow::Result<()> {
     // comment used to say: `get_participant` walks the call's group and no jid
     // comparison matches. The self participant is present — `getCallInfo`
     // reports it — so adding our own LID to the list is not the missing piece.
-    // See agent_docs/voip_oracle_status.md.
+    // See tools/oracle-core/tests/signaling.rs.
     // The fifth argument is a *legacy-form* JID in WhatsApp Web, not a LID:
     // `StartCall.js` passes `(g ?? h).toString({legacy: true})`. Passing
-    // `11223344556677@c.us` there was tried and changes nothing — see the
-    // excluded-variants table in agent_docs/voip_oracle_status.md — so both shapes below use the
-    // LID and vary only what the participant list holds.
+    // `11223344556677@c.us` there was tried and changes nothing. The two
+    // shapes below use the LID and vary only the participant list.
     let shapes: [(&str, &str, &str, Vec<String>); 2] = [
         (
             "device in the list",

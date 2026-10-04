@@ -111,7 +111,7 @@ fn main() -> anyhow::Result<()> {
     let started = runtime.call_embind(
         "initVoipStack",
         &[
-            // The self JID. `agent_docs/voip_oracle_status.md` records this build wanting a bare
+            // The self JID. `tools/oracle-core/tests/signaling.rs` records this build wanting a bare
             // LID here where the previous one took a phone number, and the
             // creator check may well be relative to it.
             Value::Str(std::env::var("PROBE_SELF").unwrap_or_else(|_| jid(CALLEE))),
