@@ -26,7 +26,13 @@ pub mod runtime;
 pub mod schedule;
 pub mod shared;
 mod snapshot;
+// Reuse the same local/cross-process engine guard in unit and integration tests.
+#[cfg(test)]
+extern crate self as oracle_core;
 pub mod state;
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_common;
 pub mod threads;
 pub mod wasi;
 

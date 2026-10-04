@@ -62,6 +62,8 @@ struct Capture {
     len: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     float: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nullable: Option<bool>,
 }
 
 fn trace(root: &Path, kind: &str, count: usize, end: usize) -> Result<Value> {
