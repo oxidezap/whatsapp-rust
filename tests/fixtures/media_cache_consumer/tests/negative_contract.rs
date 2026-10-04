@@ -20,9 +20,15 @@ fn old_literals_and_exhaustive_matches_fail_precisely() {
             "ProductAvailability",
         ),
     ];
+    // Keep nested Cargo independent of the running test's artifact directory.
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target"))
+        .join("negative-contract");
     for (feature, code, name) in cases {
         let output = Command::new(env!("CARGO"))
             .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .env("CARGO_TARGET_DIR", &target)
             .args([
                 "check",
                 "--offline",

@@ -84,10 +84,11 @@ expected source file/type and absence of unrelated compiler errors.
 ```text
 cargo test --locked --manifest-path tests/fixtures/media_cache_consumer/Cargo.toml
 RUSTFLAGS='' cargo +1.94.0 test --locked --manifest-path tests/fixtures/media_cache_consumer/Cargo.toml
-cargo check --locked --manifest-path tests/fixtures/media_cache_consumer/Cargo.toml --target wasm32-unknown-unknown --lib
+RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo check --locked --manifest-path tests/fixtures/media_cache_consumer/Cargo.toml --target wasm32-unknown-unknown --lib
 ```
 
 Do not run this fixture with `--all-features`: its `old-*-literal` and
 `exhaustive-product-availability` features are intentionally invalid modes.
-WASM checks compile the host trait and construction functions; subprocess-based
+WASM uses the same browser randomness backend flag as the root WASM workflow.
+The checks compile the host trait and construction functions; subprocess-based
 negative checks run on native only.
