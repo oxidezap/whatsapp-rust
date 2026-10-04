@@ -586,7 +586,9 @@ impl DownloadUtils {
                     .map_err(|_| anyhow!("Invalid media direct path"))?;
                 // Resolve relative paths while keeping the selected HTTPS origin.
                 // Static CDN URLs follow the separate verbatim path above.
-                if url.origin() != base.origin()
+                if url.scheme() != base.scheme()
+                    || url.host() != base.host()
+                    || url.port() != base.port()
                     || !url.username().is_empty()
                     || url.password().is_some()
                 {
