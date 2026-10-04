@@ -48,6 +48,13 @@ allow = [
 ]
 confidence-threshold = 0.8
 
+# fluent-uri's alloc helper. Verified the official 0.2.4 crate's LICENSE
+# (MIT No Attribution) and SPDX metadata; keep this allowance version-scoped.
+[[licenses.exceptions]]
+name = "borrow-or-share"
+version = "=0.2.4"
+allow = ["MIT-0"]
+
 [licenses.private]
 # Workspace members marked `publish = false` (e2e-tests, bench-integration,
 # the metrics plugin, voip-cli) carry no license field by design. They are
