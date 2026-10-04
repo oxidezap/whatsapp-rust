@@ -31,13 +31,12 @@ The registry also forward-registers the fixtures supplied by separately owned,
 unmerged domain PRs. Only those entries carry a temporary `integration_pr` URL.
 While a source manifest is absent, the gate prints `NOT YET INTEGRATED` with its
 PR URL and makes **no execution or coverage claim**. Once the domain fixture is
-present, all registered modes activate and its standalone/lock requirements are
-validated normally. Unknown new manifests still fail; existing required
-registrations never gain a missing-file exemption.
-
-After integrating a domain PR, remove its `integration_pr` marker in the same
-integration commit. This promotes its manifest to required coverage and makes
-future deletion fail the stale-registration check. These are campaign staging
+present, validation **fails until its `integration_pr` marker is removed** in
+that integration commit. This mandatory promotion activates all registered modes
+and normal standalone/lock validation, and makes future deletion fail. An
+integrated fixture can never pass the gate while retaining a staging exemption.
+Unknown new manifests still fail; existing required registrations never gain a
+missing-file exemption. These are campaign staging
 markers, not permanent fixture opt-outs. No API or fixture source is copied into
 the CI-owner branch to fake an integrated validation result.
 

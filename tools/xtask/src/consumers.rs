@@ -186,6 +186,11 @@ fn validate(root: &Path, consumers: &[Consumer]) -> Result<()> {
             );
         }
         if root.join(path).is_file() {
+            ensure!(
+                consumer.integration_pr.is_none(),
+                "{} has arrived: remove integration_pr to promote mandatory coverage before validation",
+                consumer.manifest
+            );
             let text = std::fs::read_to_string(root.join(path))?;
             ensure!(
                 text.lines().any(|line| line.trim() == "[workspace]"),
@@ -344,17 +349,10 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
         .count();
     for consumer in &consumers {
         if let Some(pr) = &consumer.integration_pr {
-            if root.join(&consumer.manifest).is_file() {
-                println!(
-                    "Integrated forward registration: {} ({pr}); promote by removing integration_pr",
-                    consumer.manifest
-                );
-            } else {
-                println!(
-                    "NOT YET INTEGRATED: {} ({pr}); no commands executed or coverage claimed",
-                    consumer.manifest
-                );
-            }
+            println!(
+                "NOT YET INTEGRATED: {} ({pr}); no commands executed or coverage claimed",
+                consumer.manifest
+            );
         }
     }
     let Task::Run {
@@ -592,8 +590,10 @@ mod tests {
         std::fs::write(&path, "[workspace]").unwrap();
         assert!(validate(root.path(), &consumers).is_err()); // Its lock is now mandatory.
         std::fs::write(path.with_file_name("Cargo.lock"), "").unwrap();
+        let error = validate(root.path(), &consumers).unwrap_err().to_string();
+        assert!(error.contains("remove integration_pr")); // Cannot leave an integrated exemption.
+        consumers[1].integration_pr = None; // Promotion is mandatory, not a documentation-only convention.
         validate(root.path(), &consumers).unwrap();
-        consumers[1].integration_pr = None; // Promote after domain integration.
         std::fs::remove_file(path).unwrap();
         assert!(validate(root.path(), &consumers).is_err());
     }
