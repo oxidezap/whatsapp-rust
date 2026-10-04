@@ -254,7 +254,7 @@ impl MessageContext {
 
     /// Revoke the addressed message using its original author/from-me scope.
     /// To revoke this context's message, pass `&self.message_ref()?`.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.revoke_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.revoke_message", level = "debug", skip_all, fields(chat = %target.chat().observe()), err(Debug)))]
     pub async fn revoke_message(
         &self,
         target: &crate::MessageRef<'_>,
@@ -263,6 +263,7 @@ impl MessageContext {
     }
 
     /// Explicit raw content id and revoke scope in this context's chat.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.revoke_message_raw", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
     pub async fn revoke_message_raw(
         &self,
         message_id: impl Into<String>,
