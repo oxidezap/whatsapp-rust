@@ -38,14 +38,15 @@ pub(crate) mod test_alloc {
         static IN_REGISTRY: Cell<bool> = const { Cell::new(false) };
     }
 
-    struct Scope(Arc<Measurement>);
+    // A scope must be dropped on the thread whose ACTIVE pointer it owns.
+    struct Scope(Arc<Measurement>, std::marker::PhantomData<*const ()>);
 
     impl Scope {
         fn enter() -> Self {
             ACTIVE.with(|active| assert!(active.get().is_null(), "nested allocation measurement"));
             let state = Arc::new(Measurement::default());
             ACTIVE.with(|active| active.set(Arc::as_ptr(&state)));
-            Self(state)
+            Self(state, std::marker::PhantomData)
         }
     }
 
@@ -67,8 +68,8 @@ pub(crate) mod test_alloc {
         if IN_REGISTRY.try_with(|active| active.replace(true)) != Ok(false) {
             return;
         }
-        // No user code runs under this lock. Recovering a poisoned lock avoids
-        // unwinding through GlobalAlloc if a test panicked outside the allocator.
+        // No user code runs under this lock; never propagate poisoning through
+        // GlobalAlloc, whose methods must not unwind.
         let mut owners = OWNERS.lock().unwrap_or_else(|error| error.into_inner());
         op(&mut owners);
         drop(owners);
@@ -293,7 +294,17 @@ pub(crate) mod test_alloc {
         });
         assert!(result.is_err());
         assert_eq!(min_live((32, 1), || vec![0u8; 32]), (32, 1));
+        struct AllocateOnExit;
+        impl Drop for AllocateOnExit {
+            fn drop(&mut self) {
+                drop(std::hint::black_box(vec![0u8; 128]));
+            }
+        }
+        thread_local! {
+            static ON_EXIT: AllocateOnExit = const { AllocateOnExit };
+        }
         let value = std::thread::spawn(|| {
+            ON_EXIT.with(|_| ());
             let _scope = Scope::enter();
             vec![0u8; 64]
         })
