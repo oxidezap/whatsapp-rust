@@ -472,10 +472,7 @@ where
                     let err = err.into_anyhow();
                     // Transport error text can include the signed URL too.
                     // Preserve the cause for callers without printing it here.
-                    log::warn!(
-                        "Failed to download {request:?} (HTTP status {:?}). Trying next host.",
-                        crate::error::ErrorChainExt::http_status(&*err)
-                    );
+                    log_download_retry(&request, &err);
                     last_err = Some(err);
                 }
             }
@@ -564,10 +561,7 @@ where
                 }
                 Err(err) => {
                     let err = err.into_anyhow();
-                    log::warn!(
-                        "Failed to stream-download {request:?} (HTTP status {:?}). Trying next host.",
-                        crate::error::ErrorChainExt::http_status(&*err)
-                    );
+                    log_download_retry(&request, &err);
                     last_err = Some(err);
                 }
             }
@@ -1076,6 +1070,21 @@ async fn buffered_download_and_decrypt<W: DownloadWriter + MaybeSend + 'static>(
         (writer, result)
     })
     .await)
+}
+
+// Log only typed classifications: backend error strings may contain signed URLs.
+fn log_download_retry(request: &wacore::download::DownloadRequest, error: &anyhow::Error) {
+    let io_kind = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map(std::io::Error::kind);
+    let media_validation = error
+        .chain()
+        .any(|cause| cause.is::<MediaDecryptionError>());
+    log::warn!(
+        "Failed to download {request:?} (HTTP status {:?}, I/O kind {io_kind:?}, media validation failure {media_validation}). Trying next host.",
+        crate::error::ErrorChainExt::http_status(&**error)
+    );
 }
 
 async fn buffered_download_body(
