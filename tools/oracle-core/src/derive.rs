@@ -224,6 +224,10 @@ pub enum Step {
         at: u32,
         /// Bytes copied per hit.
         len: u32,
+        /// A null base pointer denotes absence: record an empty output without
+        /// reading memory or adding `at`. Address zero remains readable by default.
+        #[serde(default)]
+        nullable: bool,
         /// Required number of hits; extra and missing hits fail the run.
         count: usize,
         /// Prefix for numbered binary outputs.
@@ -761,36 +765,50 @@ impl<'a> Executor<'a> {
         let mut plan = crate::patch::Plan::default();
         let mut spans = Vec::new();
         for step in &spec.steps {
-            let (func, instruction, local, at, len, count, out, scalar, float) = match step {
-                Step::CaptureMemory {
-                    func,
-                    instruction,
-                    local,
-                    at,
-                    len,
-                    count,
-                    out,
-                } => (
-                    func,
-                    *instruction,
-                    *local,
-                    *at,
-                    *len,
-                    *count,
-                    out,
-                    false,
-                    false,
-                ),
-                Step::CaptureValue {
-                    func,
-                    instruction,
-                    local,
-                    float,
-                    count,
-                    out,
-                } => (func, *instruction, *local, 0, 4, *count, out, true, *float),
-                _ => continue,
-            };
+            let (func, instruction, local, at, len, count, out, scalar, float, nullable) =
+                match step {
+                    Step::CaptureMemory {
+                        func,
+                        instruction,
+                        local,
+                        at,
+                        len,
+                        count,
+                        out,
+                        nullable,
+                    } => (
+                        func,
+                        *instruction,
+                        *local,
+                        *at,
+                        *len,
+                        *count,
+                        out,
+                        false,
+                        false,
+                        *nullable,
+                    ),
+                    Step::CaptureValue {
+                        func,
+                        instruction,
+                        local,
+                        float,
+                        count,
+                        out,
+                    } => (
+                        func,
+                        *instruction,
+                        *local,
+                        0,
+                        4,
+                        *count,
+                        out,
+                        true,
+                        *float,
+                        false,
+                    ),
+                    _ => continue,
+                };
             let resolved = resolutions
                 .get(func)
                 .with_context(|| format!("unknown snapshot function {func}"))?;
@@ -810,6 +828,7 @@ impl<'a> Executor<'a> {
                 count,
                 out: out.clone(),
                 scalar,
+                nullable,
             });
         }
         let patched;
@@ -1580,6 +1599,7 @@ mod tests {
                                 count,
                                 out: format!("span{i}"),
                                 scalar: i == 2,
+                                nullable: false,
                             },
                         )
                     })

@@ -70,6 +70,18 @@ fn pitch(run: &Path) -> Result<Value> {
         )
     })
 }
+fn conditional_centroids(bytes: &[u8], present: bool) -> Result<Value> {
+    if present {
+        Ok(Value::Array(unpack(bytes, "544f")?))
+    } else {
+        ensure!(
+            bytes.is_empty(),
+            "absent conditional centroids must have an empty snapshot"
+        );
+        Ok(Value::Null)
+    }
+}
+
 fn lsf_count(run: &Path, count: usize) -> Result<Value> {
     let r = Reader(run);
     records(count, |i| {
@@ -78,11 +90,7 @@ fn lsf_count(run: &Path, count: usize) -> Result<Value> {
             .as_u64()
             .context("condition pointer")?
             != 0;
-        let cond = if conditional {
-            Value::Array(r.array("lsf_cond", i, "544f")?)
-        } else {
-            Value::Null
-        };
+        let cond = conditional_centroids(&r.raw("lsf_cond", i)?, conditional)?;
         Ok(
             json!({"A":r.array("lsf_a",i,"17f")?,"qlsf":r.array("lsf_q",i,"16f")?,"qi":r.array("lsf_qi",i,"17b")?,"bits":r.scalar("lsf_bits",i,"f")?,"RDbest":r.scalar("lsf_rd",i,"f")?,"weights":r.array("lsf_weights",i,"16f")?,"surv":r.int("lsf_surv",i)?,"RDw_adj":r.scalar("lsf_rdw",i,"f")?,"voiced":r.int("lsf_voiced",i)?,"lowRate":r.int("lsf_lowrate",i)?,"cond":cond}),
         )
@@ -252,4 +260,26 @@ pub fn one(
         _ => anyhow::bail!("unknown MLOW trace kind {kind}"),
     };
     write_json(out, &value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_centroids_are_explicit_and_present_centroids_cannot_be_skipped() {
+        assert_eq!(conditional_centroids(&[], false).unwrap(), Value::Null);
+        let present = [0; 2176];
+        assert_eq!(
+            conditional_centroids(&present, true)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            544
+        );
+        assert!(conditional_centroids(&present, false).is_err());
+        assert!(conditional_centroids(&[], true).is_err());
+        assert!(conditional_centroids(&present[..2175], true).is_err());
+    }
 }

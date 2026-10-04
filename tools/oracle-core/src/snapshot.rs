@@ -14,6 +14,7 @@ pub(crate) const MAX_SNAPSHOT_RECORDS: usize = 65_536;
 pub(crate) struct Span {
     pub at: u32,
     pub scalar: bool,
+    pub nullable: bool,
     pub len: u32,
     pub count: usize,
     pub out: String,
@@ -63,8 +64,10 @@ impl Recorder {
             return;
         }
         let result = (|| -> Result<Vec<u8>> {
+            let absent = !span.scalar && span.nullable && *base as u32 == 0;
+            let len = if absent { 0 } else { span.len as usize };
             anyhow::ensure!(
-                captured.bytes + span.len as usize <= 64 * 1024 * 1024,
+                captured.bytes + len <= 64 * 1024 * 1024,
                 "snapshot budget exceeds 64 MiB"
             );
             anyhow::ensure!(
@@ -78,6 +81,9 @@ impl Recorder {
             );
             if span.scalar {
                 return Ok((*base as u32).to_le_bytes().to_vec());
+            }
+            if absent {
+                return Ok(Vec::new());
             }
             let ptr = (*base as u32)
                 .checked_add(span.at)
@@ -124,6 +130,93 @@ pub(crate) fn output_name(prefix: &str, index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn memory_recorder(nullable: bool, at: u32, count: usize) -> Recorder {
+        Recorder::new(
+            "probe::hit".to_owned(),
+            BTreeMap::from([(
+                0,
+                Span {
+                    at,
+                    scalar: false,
+                    nullable,
+                    len: 4,
+                    count,
+                    out: "span".to_owned(),
+                },
+            )]),
+        )
+    }
+
+    #[test]
+    fn nullable_null_records_absence_without_reading_or_offsetting() {
+        // No memory is mapped; even `at` is outside any possible span.
+        let state = crate::state::HostState::default();
+        let recorder = memory_recorder(true, u32::MAX, 1);
+        recorder.record(&state, "probe", "hit", &[0, 0]);
+        assert_eq!(
+            recorder.finish().unwrap(),
+            vec![("span_0000.bin".to_owned(), vec![])]
+        );
+        let required = memory_recorder(false, 0, 1);
+        required.record(&state, "probe", "hit", &[0, 0]);
+        assert!(required.finish().is_err());
+    }
+
+    #[test]
+    fn nullable_capture_preserves_present_memory_and_raw_zero_address_reads() {
+        let (_local, _cross_process) = crate::test_common::threaded_guard();
+        let engine = crate::host::build_engine().unwrap();
+        let memory =
+            wasmtime::SharedMemory::new(&engine, wasmtime::MemoryType::shared(1, 1)).unwrap();
+        let mut state =
+            crate::state::HostState::for_thread(Default::default(), 0, Default::default());
+        state.memory = Some(memory);
+        state.write(0, b"NULL").unwrap();
+        state.write(20, b"data").unwrap();
+        let recorder = memory_recorder(true, 4, 2);
+        recorder.record(&state, "probe", "hit", &[0, 0]);
+        recorder.record(&state, "probe", "hit", &[0, 16]);
+        assert_eq!(
+            recorder.finish().unwrap(),
+            vec![
+                ("span_0000.bin".to_owned(), vec![]),
+                ("span_0001.bin".to_owned(), b"data".to_vec()),
+            ]
+        );
+        assert_eq!(state.read(0, 4).unwrap(), b"NULL");
+        assert_eq!(state.read(20, 4).unwrap(), b"data");
+        let raw = memory_recorder(false, 0, 1);
+        raw.record(&state, "probe", "hit", &[0, 0]);
+        assert_eq!(raw.finish().unwrap()[0].1, b"NULL");
+        let invalid = memory_recorder(true, 0, 1);
+        invalid.record(&state, "probe", "hit", &[0, 65_535]);
+        assert!(invalid.finish().is_err(), "nonnull OOB remains an error");
+        let overflow = memory_recorder(true, u32::MAX, 1);
+        overflow.record(&state, "probe", "hit", &[0, 1]);
+        assert!(
+            overflow.finish().is_err(),
+            "nonnull address overflow remains an error"
+        );
+    }
+
+    #[test]
+    fn absent_records_still_require_exact_hits_and_obey_the_record_budget() {
+        let state = crate::state::HostState::default();
+        let missing = memory_recorder(true, 0, 2);
+        missing.record(&state, "probe", "hit", &[0, 0]);
+        assert!(missing.finish().is_err());
+        let extra = memory_recorder(true, 0, 1);
+        for _ in 0..2 {
+            extra.record(&state, "probe", "hit", &[0, 0]);
+        }
+        assert!(extra.finish().is_err());
+        let bounded = memory_recorder(true, 0, MAX_SNAPSHOT_RECORDS + 1);
+        for _ in 0..=MAX_SNAPSHOT_RECORDS {
+            bounded.record(&state, "probe", "hit", &[0, 0]);
+        }
+        assert!(bounded.finish().is_err());
+    }
     #[test]
     fn records_are_bounded_independently_of_bytes() {
         // 70_000 scalar hits fit the 64 MiB byte budget and the per-span
@@ -135,6 +228,7 @@ mod tests {
                 Span {
                     at: 0,
                     scalar: true,
+                    nullable: false,
                     len: 0,
                     count: 70_000,
                     out: "span".to_owned(),
