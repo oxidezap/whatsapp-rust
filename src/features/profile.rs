@@ -2,11 +2,12 @@
 //!
 //! Provides APIs for changing push name (display name) and status text (about).
 
+use super::chat_actions::AppStateError;
 use crate::client::{Client, ClientError};
 use crate::request::IqError;
 use crate::store::commands::DeviceCommand;
 use anyhow::Result;
-use log::{debug, warn};
+use log::debug;
 use thiserror::Error;
 use wacore::iq::contacts::SetProfilePictureSpec;
 use wacore::iq::profile::SetStatusTextSpec;
@@ -33,6 +34,23 @@ pub enum ProfileError {
     /// Catch-all for internal failures with no dedicated variant.
     #[error("{0}")]
     Internal(#[from] anyhow::Error),
+}
+
+/// Result after the push-name presence was sent and the local name was updated.
+///
+/// A successful presence send is not a server acknowledgement. Cross-device
+/// synchronization can remain pending, for example before pairing supplies keys.
+#[derive(Debug)]
+#[must_use = "check whether push-name app-state synchronization is still pending"]
+#[non_exhaustive]
+pub enum PushNameOutcome {
+    /// The app-state synchronization completed too.
+    Synced,
+    /// Presence was sent and the local name was updated, but app-state sync failed.
+    SyncPending {
+        /// Original failure, retained so the host can decide whether to retry.
+        source: AppStateError,
+    },
 }
 
 /// Feature handle for profile operations.
@@ -69,7 +87,7 @@ impl<'a> Profile<'a> {
     /// and propagates the change via app state sync (`setting_pushName` mutation
     /// in the `critical_block` collection) for cross-device synchronization.
     ///
-    /// Matches WhatsApp Web's `WAWebPushNameBridge` behavior:
+    /// Follows the two operations in WhatsApp Web's `WAWebPushNameBridge`:
     /// 1. Send `<presence name="..."/>` immediately (no type attribute)
     /// 2. Sync via app state mutation to `critical_block` collection
     ///
@@ -77,7 +95,11 @@ impl<'a> Profile<'a> {
     /// ```xml
     /// <presence name="New Name"/>
     /// ```
-    pub async fn set_push_name(&self, name: &str) -> Result<(), ProfileError> {
+    /// Returns [`PushNameOutcome::SyncPending`] if presence was sent but sync
+    /// failed. This is usable during pairing before app-state keys arrive.
+    /// Retry only that step with [`Self::sync_push_name`] once ready. A presence
+    /// transport failure returns an error and leaves the local name unchanged.
+    pub async fn set_push_name(&self, name: &str) -> Result<PushNameOutcome, ProfileError> {
         if name.is_empty() {
             return Err(ProfileError::InvalidArgument(
                 "push name cannot be empty".into(),
@@ -91,15 +113,7 @@ impl<'a> Profile<'a> {
         let node = NodeBuilder::new("presence").attr("name", name).build();
         self.client.send_node(node).await?;
 
-        // Send app state sync mutation for cross-device propagation.
-        // This writes a `setting_pushName` mutation to the `critical_block` collection,
-        // matching WhatsApp Web's WAWebPushNameBridge behavior.
-        if let Err(e) = self.send_push_name_mutation(name).await {
-            // Non-fatal: the presence was already sent so the name change takes
-            // effect immediately. App state sync may fail if keys aren't available
-            // yet (e.g. right after pairing, before initial sync completes).
-            warn!("Failed to send push name app state mutation: {e}");
-        }
+        let sync_result = self.sync_push_name(name).await;
 
         // Persist only after the network send succeeds
         self.client
@@ -107,7 +121,10 @@ impl<'a> Profile<'a> {
             .process_command(DeviceCommand::SetPushName(name.to_string()))
             .await;
 
-        Ok(())
+        Ok(match sync_result {
+            Ok(()) => PushNameOutcome::Synced,
+            Err(source) => PushNameOutcome::SyncPending { source },
+        })
     }
 
     /// Set the user's own profile picture.
@@ -148,8 +165,18 @@ impl<'a> Profile<'a> {
             .await?)
     }
 
-    /// Build and send the `setting_pushName` app state mutation.
-    async fn send_push_name_mutation(&self, name: &str) -> Result<()> {
+    /// Synchronize a push name through app state without resending presence or
+    /// changing the local name.
+    ///
+    /// Use this to retry [`PushNameOutcome::SyncPending`] after keys or the
+    /// connection become available. Pass the pending name only if it is still
+    /// the desired name; do not replay it after a newer name has been set.
+    pub async fn sync_push_name(&self, name: &str) -> Result<(), AppStateError> {
+        if name.is_empty() {
+            return Err(AppStateError::InvalidRequest(
+                "push name cannot be empty".into(),
+            ));
+        }
         use wacore::appstate::schemas;
         use waproto::whatsapp as wa;
 
@@ -172,5 +199,163 @@ impl Client {
     /// Access profile operations.
     pub fn profile(&self) -> Profile<'_> {
         Profile::new(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::{create_iq_test_client, decode_sent_iq};
+
+    #[tokio::test]
+    async fn missing_pairing_keys_returns_pending_and_preserves_presence_and_local_name() {
+        let (client, transport) = create_iq_test_client().await;
+        let outcome = client
+            .profile()
+            .set_push_name("Pending Name")
+            .await
+            .unwrap();
+        let PushNameOutcome::SyncPending { source } = outcome else {
+            panic!("a client without app-state keys cannot report complete sync");
+        };
+        assert!(matches!(source, AppStateError::InvalidRequest(ref reason)
+            if reason == "no app state sync key available"));
+        assert_eq!(client.push_name(), "Pending Name");
+        assert_eq!(transport.sent_count(), 1);
+        let presence = decode_sent_iq(&transport, 0).await;
+        let presence = presence.get();
+        assert_eq!(presence.tag, "presence");
+        assert_eq!(presence.get_attr("name").unwrap().as_str(), "Pending Name");
+        assert!(presence.get_attr("type").is_none());
+
+        let error = client
+            .profile()
+            .sync_push_name("Pending Name")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppStateError::InvalidRequest(_)));
+        assert_eq!(
+            transport.sent_count(),
+            1,
+            "sync retry must not send presence"
+        );
+        assert_eq!(client.push_name(), "Pending Name");
+    }
+
+    #[tokio::test]
+    async fn pending_sync_can_complete_without_resending_presence() {
+        let (client, transport) = create_iq_test_client().await;
+        assert!(matches!(
+            client
+                .profile()
+                .set_push_name("Pairing Name")
+                .await
+                .unwrap(),
+            PushNameOutcome::SyncPending { .. }
+        ));
+        let backend = client.persistence_manager.backend();
+        backend
+            .set_sync_key(
+                b"profile-key",
+                crate::store::traits::AppStateSyncKey {
+                    key_data: vec![5u8; 32],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        backend
+            .set_version(
+                "critical_block",
+                wacore::appstate::hash::HashState {
+                    version: 7,
+                    bootstrapped: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Every retry frame must be an IQ. A resent presence fails immediately.
+        let responses = async {
+            let mut frame = 1;
+            loop {
+                let node = decode_sent_iq(&transport, frame).await;
+                assert_eq!(node.get().tag, "iq");
+                let id = node.get().get_attr("id").unwrap().as_str().into_owned();
+                let response = NodeBuilder::new("iq")
+                    .attr("type", "result")
+                    .attr("id", id.as_str())
+                    .attr("from", "s.whatsapp.net")
+                    .children([NodeBuilder::new("sync")
+                        .children([NodeBuilder::new("collection")
+                            .attr("name", "critical_block")
+                            .build()])
+                        .build()])
+                    .build();
+                crate::test_utils::answer_iq(&client, &id, &response).await;
+                frame += 1;
+            }
+        };
+        let profile = client.profile();
+        tokio::select! {
+            result = profile.sync_push_name("Pairing Name") => result.unwrap(),
+            () = responses => unreachable!(),
+        }
+        assert!(transport.sent_count() > 1);
+        assert_eq!(client.push_name(), "Pairing Name");
+    }
+
+    #[tokio::test]
+    async fn presence_transport_failure_returns_error_without_changing_local_name() {
+        let (client, transport) = create_iq_test_client().await;
+        let original = client.push_name();
+        transport.fail_next_sends(1);
+        let result = client.profile().set_push_name("Unsent Name").await;
+        assert!(matches!(result, Err(ProfileError::Client(_))));
+        assert_eq!(client.push_name(), original);
+        assert_eq!(transport.failed_sends(), 1);
+        assert_eq!(transport.sent_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_names_are_rejected_before_any_network_or_local_changes() {
+        let (client, transport) = create_iq_test_client().await;
+        let original = client.push_name();
+        assert!(matches!(
+            client.profile().set_push_name("").await,
+            Err(ProfileError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            client.profile().sync_push_name("").await,
+            Err(AppStateError::InvalidRequest(_))
+        ));
+        assert_eq!(client.push_name(), original);
+        assert_eq!(transport.sent_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn sync_retry_sends_only_the_push_name_app_state_schema() {
+        let mutation = super::super::chat_actions::capture_app_state_mutation(
+            "critical_block",
+            |client| async move { client.profile().sync_push_name("Retry Name").await },
+        )
+        .await;
+        assert_eq!(mutation.index, vec!["setting_pushName"]);
+        assert_eq!(
+            mutation.operation,
+            waproto::whatsapp::syncd_mutation::SyncdOperation::SET
+        );
+        assert_eq!(
+            mutation
+                .action_value
+                .unwrap()
+                .push_name_setting
+                .as_option()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Retry Name")
+        );
     }
 }

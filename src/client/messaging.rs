@@ -408,7 +408,7 @@ impl Client {
         server_id: u64,
         reaction: &str,
     ) -> Result<String, anyhow::Error> {
-        let request_id = self.generate_message_id();
+        let request_id = self.generate_message_id().into_string();
 
         let stanza = NodeBuilder::new("message")
             .attr("to", to)

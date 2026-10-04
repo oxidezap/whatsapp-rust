@@ -2957,7 +2957,7 @@ impl Client {
                 let result = async {
                     self.ensure_e2e_sessions(std::slice::from_ref(&peer))
                         .await?;
-                    let request_id = self.generate_message_id();
+                    let request_id = self.generate_message_id().into_string();
                     self.send_message_impl(
                         peer,
                         msg,

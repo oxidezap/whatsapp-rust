@@ -325,6 +325,7 @@ pub mod usync;
 pub(crate) mod appstate_known_verbs;
 
 pub mod features;
+pub use features::PushNameOutcome;
 pub use features::{
     AppStateError, AppStateResyncMode, AppStateResyncReport, AppStateSettings,
     BUSINESS_PROFILE_MAX_WEBSITES, Blocking, BlockingError, BlocklistEntry, BotDefault, BotList,

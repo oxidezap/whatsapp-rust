@@ -1670,7 +1670,7 @@ impl Client {
         wacore::telemetry::send("status");
 
         let to = Jid::status_broadcast();
-        let request_id = id_override.unwrap_or_else(|| self.generate_message_id());
+        let request_id = id_override.unwrap_or_else(|| self.generate_message_id().into_string());
 
         // Borrow from the held snapshot: no field clones, the Arc keeps it alive.
         let device_snapshot = self.persistence_manager.get_device_snapshot();
@@ -4946,7 +4946,7 @@ mod tests {
                     fixture.group.clone(),
                     fixture.member.clone(),
                     message.clone(),
-                    id.into(),
+                    crate::MessageId::new(id).unwrap(),
                     1,
                 ))
                 .await

@@ -123,7 +123,7 @@ pub use polls::{CreatedPoll, PollError, PollOptionResult, PollRef, PollVoteCiphe
 
 pub use presence::{Presence, PresenceError, PresencePolicy, PresenceStatus};
 
-pub use profile::{Profile, ProfileError, SetProfilePictureResponse};
+pub use profile::{Profile, ProfileError, PushNameOutcome, SetProfilePictureResponse};
 
 pub use quick_replies::QuickReplies;
 

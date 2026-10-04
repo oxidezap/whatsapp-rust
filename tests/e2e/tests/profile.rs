@@ -45,7 +45,10 @@ async fn test_set_push_name() -> anyhow::Result<()> {
 
     let new_name = "TestBot 🤖";
     info!("Setting push name to '{}'...", new_name);
-    client.client.profile().set_push_name(new_name).await?;
+    assert!(matches!(
+        client.client.profile().set_push_name(new_name).await?,
+        whatsapp_rust::PushNameOutcome::Synced
+    ));
 
     // Verify it was updated locally
     let updated_name = client.client.push_name();
@@ -58,7 +61,10 @@ async fn test_set_push_name() -> anyhow::Result<()> {
     // Set a different name to verify the app state sync can handle consecutive mutations
     let second_name = "RustBot 🦀";
     info!("Setting push name again to '{}'...", second_name);
-    client.client.profile().set_push_name(second_name).await?;
+    assert!(matches!(
+        client.client.profile().set_push_name(second_name).await?,
+        whatsapp_rust::PushNameOutcome::Synced
+    ));
 
     let final_name = client.client.push_name();
     assert_eq!(
@@ -165,7 +171,10 @@ async fn test_set_push_name_special_characters() -> anyhow::Result<()> {
     // Emoji
     let name_emoji = "Bot 🤖🦀";
     info!("Setting push name with emoji: '{}'...", name_emoji);
-    client.client.profile().set_push_name(name_emoji).await?;
+    assert!(matches!(
+        client.client.profile().set_push_name(name_emoji).await?,
+        whatsapp_rust::PushNameOutcome::Synced
+    ));
     let result = client.client.push_name();
     assert_eq!(result, name_emoji, "Push name should support emoji");
     info!("Emoji push name set successfully");
@@ -173,7 +182,10 @@ async fn test_set_push_name_special_characters() -> anyhow::Result<()> {
     // Russian (Cyrillic Unicode)
     let name_russian = "Тест";
     info!("Setting push name with Russian: '{}'...", name_russian);
-    client.client.profile().set_push_name(name_russian).await?;
+    assert!(matches!(
+        client.client.profile().set_push_name(name_russian).await?,
+        whatsapp_rust::PushNameOutcome::Synced
+    ));
     let result = client.client.push_name();
     assert_eq!(result, name_russian, "Push name should support Cyrillic");
     info!("Russian push name set successfully");
@@ -181,7 +193,10 @@ async fn test_set_push_name_special_characters() -> anyhow::Result<()> {
     // Mixed special characters
     let name_mixed = "Test™ User©";
     info!("Setting push name with special chars: '{}'...", name_mixed);
-    client.client.profile().set_push_name(name_mixed).await?;
+    assert!(matches!(
+        client.client.profile().set_push_name(name_mixed).await?,
+        whatsapp_rust::PushNameOutcome::Synced
+    ));
     let result = client.client.push_name();
     assert_eq!(
         result, name_mixed,
@@ -205,7 +220,10 @@ async fn test_set_push_name_long() -> anyhow::Result<()> {
     // WhatsApp allows up to 25 characters for push names
     let long_name = "A".repeat(25);
     info!("Setting push name with {} characters...", long_name.len());
-    client.client.profile().set_push_name(&long_name).await?;
+    assert!(matches!(
+        client.client.profile().set_push_name(&long_name).await?,
+        whatsapp_rust::PushNameOutcome::Synced
+    ));
     let result = client.client.push_name();
     assert_eq!(result, long_name, "Push name should support 25 characters");
     info!("Long push name set successfully");
@@ -228,11 +246,14 @@ async fn test_set_push_name_whitespace_only() -> anyhow::Result<()> {
     // whitespace-only names. Documenting current behavior for now.
     let whitespace_name = "   ";
     info!("Setting whitespace-only push name...");
-    client
-        .client
-        .profile()
-        .set_push_name(whitespace_name)
-        .await?;
+    assert!(matches!(
+        client
+            .client
+            .profile()
+            .set_push_name(whitespace_name)
+            .await?,
+        whatsapp_rust::PushNameOutcome::Synced
+    ));
     let result = client.client.push_name();
     assert_eq!(
         result, whitespace_name,
@@ -303,7 +324,10 @@ async fn test_set_push_name_persists_across_operations() -> anyhow::Result<()> {
     // Set push name
     let push_name = "PersistBot";
     info!("Setting push name to '{}'...", push_name);
-    client.client.profile().set_push_name(push_name).await?;
+    assert!(matches!(
+        client.client.profile().set_push_name(push_name).await?,
+        whatsapp_rust::PushNameOutcome::Synced
+    ));
     let result = client.client.push_name();
     assert_eq!(result, push_name);
     info!("Push name set successfully");

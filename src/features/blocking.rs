@@ -96,37 +96,31 @@ impl<'a> Blocking<'a> {
 
     /// Check if a contact is blocked.
     ///
-    /// Compares only the user part of the JID, ignoring device ID, since blocking
-    /// applies to the entire user account, not individual devices.
+    /// Ignores device IDs while preserving the PN/LID namespace. The other
+    /// namespace is checked only when an explicit LID↔PN mapping is available.
+    /// Non-PN/LID targets are rejected before sending an IQ; mapping lookup
+    /// failures are returned rather than treated as an absent mapping.
     pub async fn is_blocked(&self, jid: &Jid) -> Result<bool, BlockingError> {
-        let blocklist = self.get_blocklist().await?;
         let bare = jid.to_non_ad();
-
-        // Blocks are stored keyed by LID (block() always resolves the input to a LID), so a
-        // PN-input query must resolve to its LID before comparing or it never matches a
-        // LID-keyed entry. Match against the raw user plus the resolved LID and PN. Propagate a
-        // backend failure (swallowing it would fall back to the raw user and re-introduce the
-        // false negative); a genuine absence (Ok(None), incl. a non-LID/PN input) falls back.
-        let mapping = self.client.get_lid_pn_entry(&bare).await?;
-        let mut users: Vec<&str> = vec![bare.user.as_str()];
-        if let Some(entry) = mapping.as_ref() {
-            users.push(&*entry.lid);
-            users.push(&*entry.phone_number);
+        if !(bare.is_lid() || bare.is_pn()) {
+            return Err(BlockingError::InvalidJid(
+                "jid is neither PN nor LID".into(),
+            ));
         }
-
-        Ok(blocklist_contains(&blocklist, &users))
+        let mapping = self.client.get_lid_pn_entry(&bare).await?;
+        let alternative = mapping.map(|entry| {
+            if bare.is_lid() {
+                Jid::pn(&*entry.phone_number)
+            } else {
+                Jid::lid(&*entry.lid)
+            }
+        });
+        let blocklist = self.get_blocklist().await?;
+        Ok(blocklist.into_iter().any(|entry| {
+            let entry = entry.jid.into_non_ad();
+            entry == bare || alternative.as_ref() == Some(&entry)
+        }))
     }
-}
-
-/// Whether any blocklist entry's user part matches one of `candidate_users`.
-///
-/// Blocks are stored keyed by LID, so the caller resolves the queried JID to its
-/// LID/PN pair and passes all of them (raw, LID, PN) to catch a LID-keyed entry from
-/// a PN-input query (and the reverse).
-fn blocklist_contains(blocklist: &[BlocklistEntry], candidate_users: &[&str]) -> bool {
-    blocklist
-        .iter()
-        .any(|e| candidate_users.contains(&e.jid.user.as_str()))
 }
 
 impl Client {
@@ -139,35 +133,114 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+    use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
+    use wacore_binary::builder::NodeBuilder;
 
-    fn lid_entry(user: &str) -> BlocklistEntry {
-        BlocklistEntry {
-            jid: Jid::lid(user.to_string()),
-            timestamp: None,
+    #[tokio::test]
+    async fn invalid_query_rejected_before_iq() {
+        let (client, transport) = create_iq_test_client().await;
+        for target in ["15555550100@g.us", "status@broadcast", "123@newsletter"] {
+            let jid = target.parse().unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client.blocking().is_blocked(&jid),
+            )
+            .await
+            .expect("invalid targets must fail without waiting for an IQ response");
+            assert!(matches!(result, Err(BlockingError::InvalidJid(_))));
         }
+        assert!(transport.sent().is_empty());
     }
 
-    #[test]
-    fn pn_query_matches_lid_keyed_block_only_when_resolved() {
-        // A block stored under the LID (modern WA) must be found once the PN query is
-        // resolved to that LID. Without resolution the LID-keyed block is missed (the bug).
-        let blocklist = vec![lid_entry("100000012345678")];
+    #[tokio::test]
+    async fn mapping_backend_failure_is_returned_before_iq() {
+        let uri = format!(
+            "file:blocking_mapping_failure_{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4()
+        );
+        let backend = std::sync::Arc::new(crate::store::SqliteStore::open(&uri).await.unwrap());
+        let (client, transport) =
+            crate::test_utils::create_iq_test_client_with_backend(backend).await;
+        tokio::task::spawn_blocking(move || {
+            use diesel::{Connection, connection::SimpleConnection};
+            let mut conn = diesel::SqliteConnection::establish(&uri).unwrap();
+            conn.batch_execute("DROP TABLE lid_pn_mapping").unwrap();
+        })
+        .await
+        .unwrap();
 
-        assert!(
-            blocklist_contains(&blocklist, &["559980000001", "100000012345678"]),
-            "resolved PN->LID candidate matches the LID-keyed block"
-        );
-        assert!(
-            !blocklist_contains(&blocklist, &["559980000001"]),
-            "raw PN alone misses the LID-keyed block (the false negative)"
-        );
-        assert!(
-            blocklist_contains(&blocklist, &["100000012345678"]),
-            "a LID query matches directly"
-        );
-        assert!(
-            !blocklist_contains(&blocklist, &["559981111111", "100000099999999"]),
-            "an unrelated contact is not blocked"
-        );
+        for jid in [Jid::pn("15555550100"), Jid::lid("100000000000001")] {
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client.blocking().is_blocked(&jid),
+            )
+            .await
+            .expect("lookup failure must return without waiting for an IQ")
+            .unwrap_err();
+            let BlockingError::Internal(cause) = error else {
+                panic!("expected the mapping backend error, got {error:?}");
+            };
+            assert!(
+                cause
+                    .downcast_ref::<wacore::store::error::StoreError>()
+                    .is_some()
+            );
+        }
+        assert!(transport.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn blocklist_query_preserves_namespace_and_resolves_explicit_mapping() {
+        let (client, transport) = create_iq_test_client().await;
+        let pn = Jid::pn("15555550100");
+        let lid = Jid::lid("100000000000001");
+        let cases = [
+            (pn.clone(), Jid::lid(&*pn.user), false),
+            (lid.clone(), Jid::pn(&*lid.user), false),
+            (
+                pn.clone(),
+                format!("{}@g.us", pn.user).parse().unwrap(),
+                false,
+            ),
+            (pn.with_device(7), pn.with_device(2), true),
+            (lid.with_device(3), lid.with_device(8), true),
+            (pn.clone(), lid.clone(), false),
+            (pn.with_device(4), lid.with_device(2), true),
+            (lid.with_device(5), pn.with_device(3), true),
+        ];
+        for (index, (query, blocked, expected)) in cases.into_iter().enumerate() {
+            if index == 6 {
+                client
+                    .lid_pn_cache
+                    .add(&LidPnEntry::new(
+                        lid.user.to_string(),
+                        pn.user.to_string(),
+                        LearningSource::Usync,
+                    ))
+                    .await;
+            }
+            let task = {
+                let client = client.clone();
+                tokio::spawn(async move { client.blocking().is_blocked(&query).await })
+            };
+            let request = decode_sent_iq(&transport, index).await;
+            let id = request
+                .get()
+                .attrs()
+                .optional_string("id")
+                .unwrap()
+                .into_owned();
+            let response = NodeBuilder::new("iq")
+                .attr("id", id.as_str())
+                .attr("type", "result")
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("item").attr("jid", blocked).build()])
+                    .build()])
+                .build();
+            answer_iq(&client, &id, &response).await;
+            assert_eq!(task.await.unwrap().unwrap(), expected, "case {index}");
+        }
+        assert_eq!(transport.sent().len(), 8);
     }
 }

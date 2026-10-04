@@ -378,20 +378,19 @@ async fn test_delivery_receipts_flushed_on_disconnect() -> anyhow::Result<()> {
         let id = client_a.client.generate_message_id();
         let receipt_waiter = client_b
             .client
-            .wait_for_sent_node(NodeFilter::tag("receipt").attr("id", id.clone()));
+            .wait_for_sent_node(NodeFilter::tag("receipt").attr("id", id.as_str()));
         let text = format!("flush burst {i}");
         let returned_id = client_a
             .client
             .send(
-                whatsapp_rust::SendRequest::new(&jid_b, text_msg(&text)).with_options(
-                    SendOptions::default().with_message_id(whatsapp_rust::MessageId::new(&id)?),
-                ),
+                whatsapp_rust::SendRequest::new(&jid_b, text_msg(&text))
+                    .with_options(SendOptions::default().with_message_id(id.clone())),
             )
             .await?
             .message_id;
         assert_eq!(returned_id, id);
-        receipt_waiters.push((id.clone(), receipt_waiter));
-        msg_ids.push(id);
+        receipt_waiters.push((id.as_str().to_owned(), receipt_waiter));
+        msg_ids.push(id.into_string());
     }
     info!("A sent {N} messages: {msg_ids:?}");
 

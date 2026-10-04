@@ -208,7 +208,12 @@ async fn test_star_message() -> anyhow::Result<()> {
     client_a
         .client
         .chat_actions()
-        .star_message(&jid_b, None, msg_id.as_str(), true)
+        .star_message(&whatsapp_rust::MessageRef::new(
+            &jid_b,
+            msg_id.clone(),
+            None,
+            true,
+        )?)
         .await?;
     info!("Successfully starred message {msg_id}");
 
@@ -244,14 +249,24 @@ async fn test_unstar_message() -> anyhow::Result<()> {
     client_a
         .client
         .chat_actions()
-        .star_message(&jid_b, None, msg_id.as_str(), true)
+        .star_message(&whatsapp_rust::MessageRef::new(
+            &jid_b,
+            msg_id.clone(),
+            None,
+            true,
+        )?)
         .await?;
     info!("Starred message {msg_id}");
 
     client_a
         .client
         .chat_actions()
-        .unstar_message(&jid_b, None, msg_id.as_str(), true)
+        .unstar_message(&whatsapp_rust::MessageRef::new(
+            &jid_b,
+            msg_id.clone(),
+            None,
+            true,
+        )?)
         .await?;
     info!("Successfully unstarred message {msg_id}");
 
@@ -386,7 +401,11 @@ async fn test_delete_message_for_me() -> anyhow::Result<()> {
     client_a
         .client
         .chat_actions()
-        .delete_message_for_me(&jid_b, None, msg_id.as_str(), true, true, None)
+        .delete_message_for_me(
+            &whatsapp_rust::MessageRef::new(&jid_b, msg_id.clone(), None, true)?,
+            true,
+            None,
+        )
         .await?;
     info!("Deleted message {msg_id} for me");
 
