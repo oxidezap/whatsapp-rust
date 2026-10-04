@@ -17,6 +17,7 @@ pub use wacore::store::cache::CacheStore;
 /// Set `timeout` to `None` to disable time-based expiry (entries stay until
 /// evicted by capacity).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CacheEntryConfig {
     /// Expiry timeout duration. `None` means no time-based expiry.
     /// Interpreted as TTL or TTI depending on the builder method used.
@@ -26,6 +27,8 @@ pub struct CacheEntryConfig {
 }
 
 impl CacheEntryConfig {
+    /// Configure expiry and capacity explicitly. `None` disables time-based
+    /// expiry; zero capacity disables local storage.
     pub fn new(timeout: Option<Duration>, capacity: u64) -> Self {
         Self { timeout, capacity }
     }
@@ -83,16 +86,13 @@ impl CacheEntryConfig {
 ///
 /// ```rust,ignore
 /// let redis = Arc::new(MyRedisCacheStore::new("redis://localhost:6379"));
-/// let config = CacheConfig {
-///     cache_stores: CacheStores {
-///         group_cache: Some(redis.clone()),
-///         device_registry_cache: Some(redis.clone()),
-///         ..Default::default()
-///     },
-///     ..Default::default()
-/// };
+/// let stores = CacheStores::default()
+///     .with_group_cache(redis.clone())
+///     .with_device_registry_cache(redis.clone());
+/// let config = CacheConfig::default().with_cache_stores(stores);
 /// ```
 #[derive(Default, Clone)]
+#[non_exhaustive]
 pub struct CacheStores {
     /// Custom store for group metadata cache.
     pub group_cache: Option<Arc<dyn CacheStore>>,
@@ -103,6 +103,24 @@ pub struct CacheStores {
 }
 
 impl CacheStores {
+    /// Override the group metadata cache backend.
+    pub fn with_group_cache(mut self, store: Arc<dyn CacheStore>) -> Self {
+        self.group_cache = Some(store);
+        self
+    }
+
+    /// Override the device registry cache backend.
+    pub fn with_device_registry_cache(mut self, store: Arc<dyn CacheStore>) -> Self {
+        self.device_registry_cache = Some(store);
+        self
+    }
+
+    /// Override the LID-PN mapping cache backend.
+    pub fn with_lid_pn_cache(mut self, store: Arc<dyn CacheStore>) -> Self {
+        self.lid_pn_cache = Some(store);
+        self
+    }
+
     /// Set the same [`CacheStore`] for all pluggable caches at once.
     ///
     /// Coordination caches (`session_locks`, `chat_lanes`, etc.) and the
@@ -125,19 +143,18 @@ impl CacheStores {
 
 /// Configuration for all client caches and resource pools.
 ///
-/// All fields default to WhatsApp Web behavior. Use `..Default::default()` to
-/// override only specific settings.
+/// Start with [`Default`] and use the fluent `with_*` methods for common
+/// overrides, or assign public fields for advanced tuning. Defaults and their
+/// rationale are documented on each field.
 ///
 /// # Example — tune TTL/capacity
 ///
-/// ```rust,ignore
+/// ```rust
 /// use whatsapp_rust::{CacheConfig, CacheEntryConfig};
-/// use std::time::Duration;
 ///
-/// let config = CacheConfig {
-///     group_cache: CacheEntryConfig::new(None, 1_000), // no TTL
-///     ..Default::default()
-/// };
+/// let mut config = CacheConfig::default()
+///     .with_group_cache(CacheEntryConfig::new(None, 1_000)); // no TTL
+/// config.chat_lanes_capacity = 2_000;
 /// ```
 ///
 /// # Example — Redis for group and device registry caches
@@ -147,16 +164,14 @@ impl CacheStores {
 /// use whatsapp_rust::{CacheConfig, CacheStores};
 ///
 /// let redis = Arc::new(MyRedisCacheStore::new("redis://localhost:6379"));
-/// let config = CacheConfig {
-///     cache_stores: CacheStores {
-///         group_cache: Some(redis.clone()),
-///         device_registry_cache: Some(redis.clone()),
-///         ..Default::default()
-///     },
-///     ..Default::default()
-/// };
+/// let config = CacheConfig::default().with_cache_stores(
+///     CacheStores::default()
+///         .with_group_cache(redis.clone())
+///         .with_device_registry_cache(redis.clone()),
+/// );
 /// ```
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct CacheConfig {
     /// Group metadata cache (time_to_live). Default: 1h TTL, 250 entries.
     pub group_cache: CacheEntryConfig,
@@ -320,6 +335,38 @@ pub struct CacheConfig {
     /// objects (mutexes, channel senders, oneshot senders) that cannot be
     /// serialised to an external store.
     pub cache_stores: CacheStores,
+}
+
+impl CacheConfig {
+    /// Configure group metadata expiry and capacity.
+    pub fn with_group_cache(mut self, config: CacheEntryConfig) -> Self {
+        self.group_cache = config;
+        self
+    }
+
+    /// Configure device registry expiry and capacity.
+    pub fn with_device_registry_cache(mut self, config: CacheEntryConfig) -> Self {
+        self.device_registry_cache = config;
+        self
+    }
+
+    /// Configure LID-PN mapping expiry and capacity.
+    pub fn with_lid_pn_cache(mut self, config: CacheEntryConfig) -> Self {
+        self.lid_pn_cache = config;
+        self
+    }
+
+    /// Configure the optional sent-message L1 cache. Zero capacity disables it.
+    pub fn with_recent_messages(mut self, config: CacheEntryConfig) -> Self {
+        self.recent_messages = config;
+        self
+    }
+
+    /// Override pluggable cache backends without changing their expiry settings.
+    pub fn with_cache_stores(mut self, stores: CacheStores) -> Self {
+        self.cache_stores = stores;
+        self
+    }
 }
 
 impl std::fmt::Debug for CacheConfig {

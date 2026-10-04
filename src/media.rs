@@ -10,14 +10,16 @@
 //! ```no_run
 //! # fn build(upload: whatsapp_rust::upload::UploadResponse) {
 //! use whatsapp_rust::media::{self, ImageOptions};
-//! let _msg = media::image_message(upload, ImageOptions { caption: Some("hi".into()), ..Default::default() });
+//! let _msg = media::image_message(upload, ImageOptions::default().with_caption("hi"));
 //! # }
 //! ```
 
 use crate::upload::UploadResponse;
 use waproto::whatsapp as wa;
 
+/// Optional image metadata. An empty configuration uses the default MIME type.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ImageOptions {
     pub caption: Option<String>,
     /// Defaults to `image/jpeg`.
@@ -26,7 +28,9 @@ pub struct ImageOptions {
     pub context_info: Option<Box<wa::ContextInfo>>,
 }
 
+/// Optional video metadata. An empty configuration uses the default MIME type.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct VideoOptions {
     pub caption: Option<String>,
     /// Defaults to `video/mp4`.
@@ -38,7 +42,9 @@ pub struct VideoOptions {
     pub context_info: Option<Box<wa::ContextInfo>>,
 }
 
+/// Optional document metadata. An empty configuration uses the default MIME type.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct DocumentOptions {
     /// Defaults to `application/octet-stream`.
     pub mimetype: Option<String>,
@@ -51,7 +57,9 @@ pub struct DocumentOptions {
     pub context_info: Option<Box<wa::ContextInfo>>,
 }
 
+/// Optional audio metadata. An empty configuration uses the default MIME type.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct AudioOptions {
     /// Defaults to `audio/ogg; codecs=opus`.
     pub mimetype: Option<String>,
@@ -61,6 +69,146 @@ pub struct AudioOptions {
     /// PCM waveform preview bytes (voice notes).
     pub waveform: Option<Vec<u8>>,
     pub context_info: Option<Box<wa::ContextInfo>>,
+}
+
+impl ImageOptions {
+    /// Set the image caption.
+    pub fn with_caption(mut self, caption: impl Into<String>) -> Self {
+        self.caption = Some(caption.into());
+        self
+    }
+
+    /// Override the default MIME type.
+    pub fn with_mimetype(mut self, mimetype: impl Into<String>) -> Self {
+        self.mimetype = Some(mimetype.into());
+        self
+    }
+
+    /// Set a JPEG thumbnail.
+    pub fn with_jpeg_thumbnail(mut self, thumbnail: Vec<u8>) -> Self {
+        self.jpeg_thumbnail = Some(thumbnail);
+        self
+    }
+
+    /// Attach reply, mention or other message context.
+    pub fn with_context_info(mut self, context_info: Box<wa::ContextInfo>) -> Self {
+        self.context_info = Some(context_info);
+        self
+    }
+}
+
+impl VideoOptions {
+    /// Set the video caption.
+    pub fn with_caption(mut self, caption: impl Into<String>) -> Self {
+        self.caption = Some(caption.into());
+        self
+    }
+
+    /// Override the default MIME type.
+    pub fn with_mimetype(mut self, mimetype: impl Into<String>) -> Self {
+        self.mimetype = Some(mimetype.into());
+        self
+    }
+
+    /// Set a JPEG thumbnail.
+    pub fn with_jpeg_thumbnail(mut self, thumbnail: Vec<u8>) -> Self {
+        self.jpeg_thumbnail = Some(thumbnail);
+        self
+    }
+
+    /// Set the clip duration in seconds.
+    pub fn with_duration_seconds(mut self, seconds: u32) -> Self {
+        self.duration_seconds = Some(seconds);
+        self
+    }
+
+    /// Set whether to send as a looping GIF-style clip.
+    pub fn with_gif_playback(mut self, enabled: bool) -> Self {
+        self.gif_playback = Some(enabled);
+        self
+    }
+
+    /// Attach reply, mention or other message context.
+    pub fn with_context_info(mut self, context_info: Box<wa::ContextInfo>) -> Self {
+        self.context_info = Some(context_info);
+        self
+    }
+}
+
+impl DocumentOptions {
+    /// Override the default MIME type.
+    pub fn with_mimetype(mut self, mimetype: impl Into<String>) -> Self {
+        self.mimetype = Some(mimetype.into());
+        self
+    }
+
+    /// Set the file name shown to the recipient.
+    pub fn with_file_name(mut self, file_name: impl Into<String>) -> Self {
+        self.file_name = Some(file_name.into());
+        self
+    }
+
+    /// Set the document title.
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Set the document caption.
+    pub fn with_caption(mut self, caption: impl Into<String>) -> Self {
+        self.caption = Some(caption.into());
+        self
+    }
+
+    /// Set the document page count.
+    pub fn with_page_count(mut self, page_count: u32) -> Self {
+        self.page_count = Some(page_count);
+        self
+    }
+
+    /// Set a JPEG thumbnail.
+    pub fn with_jpeg_thumbnail(mut self, thumbnail: Vec<u8>) -> Self {
+        self.jpeg_thumbnail = Some(thumbnail);
+        self
+    }
+
+    /// Attach reply, mention or other message context.
+    pub fn with_context_info(mut self, context_info: Box<wa::ContextInfo>) -> Self {
+        self.context_info = Some(context_info);
+        self
+    }
+}
+
+impl AudioOptions {
+    /// Override the default MIME type.
+    pub fn with_mimetype(mut self, mimetype: impl Into<String>) -> Self {
+        self.mimetype = Some(mimetype.into());
+        self
+    }
+
+    /// Set the audio duration in seconds.
+    pub fn with_duration_seconds(mut self, seconds: u32) -> Self {
+        self.duration_seconds = Some(seconds);
+        self
+    }
+
+    /// Set the push-to-talk (voice note) flag.
+    pub fn with_ptt(mut self, enabled: bool) -> Self {
+        self.ptt = Some(enabled);
+        self
+    }
+
+    /// Set waveform preview bytes.
+    pub fn with_waveform(mut self, waveform: Vec<u8>) -> Self {
+        self.waveform = Some(waveform);
+        self
+    }
+
+    /// Attach reply, mention or other message context.
+    pub fn with_context_info(mut self, context_info: Box<wa::ContextInfo>) -> Self {
+        self.context_info = Some(context_info);
+        self
+    }
 }
 
 /// Build an image message from an upload result.
@@ -210,12 +358,10 @@ mod tests {
     fn video_carries_sidecar_and_options() {
         let msg = video_message(
             sample_upload(),
-            VideoOptions {
-                caption: Some("c".into()),
-                duration_seconds: Some(12),
-                gif_playback: Some(true),
-                ..Default::default()
-            },
+            VideoOptions::default()
+                .with_caption("c")
+                .with_duration_seconds(12)
+                .with_gif_playback(true),
         );
         let vm = msg.video_message.unwrap();
         assert_eq!(vm.streaming_sidecar.as_deref(), Some(&[9, 9, 9][..]));
@@ -229,11 +375,9 @@ mod tests {
     fn document_and_audio_set_type_specific_fields() {
         let doc = document_message(
             sample_upload(),
-            DocumentOptions {
-                file_name: Some("f.pdf".into()),
-                page_count: Some(3),
-                ..Default::default()
-            },
+            DocumentOptions::default()
+                .with_file_name("f.pdf")
+                .with_page_count(3),
         )
         .document_message
         .unwrap();
@@ -243,11 +387,9 @@ mod tests {
 
         let audio = audio_message(
             sample_upload(),
-            AudioOptions {
-                ptt: Some(true),
-                duration_seconds: Some(5),
-                ..Default::default()
-            },
+            AudioOptions::default()
+                .with_ptt(true)
+                .with_duration_seconds(5),
         )
         .audio_message
         .unwrap();
@@ -262,10 +404,7 @@ mod tests {
 
         let image_msg = image_message(
             sample_upload(),
-            ImageOptions {
-                context_info: Some(context),
-                ..Default::default()
-            },
+            ImageOptions::default().with_context_info(context),
         );
 
         let image = image_msg.image_message.unwrap();
@@ -279,10 +418,7 @@ mod tests {
 
         let video_msg = video_message(
             sample_upload(),
-            VideoOptions {
-                context_info: Some(context),
-                ..Default::default()
-            },
+            VideoOptions::default().with_context_info(context),
         );
 
         let video = video_msg.video_message.unwrap();
