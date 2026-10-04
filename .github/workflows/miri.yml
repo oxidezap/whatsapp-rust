@@ -81,7 +81,7 @@ jobs:
           # teardown and unwinding without recursing through the allocator.
           - name: whatsapp-rust (test_alloc)
             cache-key: sdk-test-alloc
-            args: -p whatsapp-rust --lib test_alloc::
+            args: "-p whatsapp-rust --lib test_alloc::"
     steps:
       - uses: actions/checkout@v7
         with:
