@@ -470,10 +470,11 @@ where
                 Err(err) if err.is_auth() || err.is_not_found() => return Err(err),
                 Err(err) => {
                     let err = err.into_anyhow();
+                    // Transport error text can include the signed URL too.
+                    // Preserve the cause for callers without printing it here.
                     log::warn!(
-                        "Failed to download from URL {}: {:?}. Trying next host.",
-                        request.url,
-                        err
+                        "Failed to download {request:?} (HTTP status {:?}). Trying next host.",
+                        crate::error::ErrorChainExt::http_status(&*err)
                     );
                     last_err = Some(err);
                 }
@@ -564,9 +565,8 @@ where
                 Err(err) => {
                     let err = err.into_anyhow();
                     log::warn!(
-                        "Failed to stream-download from URL {}: {:?}. Trying next host.",
-                        request.url,
-                        err
+                        "Failed to stream-download {request:?} (HTTP status {:?}). Trying next host.",
+                        crate::error::ErrorChainExt::http_status(&*err)
                     );
                     last_err = Some(err);
                 }
