@@ -12,7 +12,7 @@
 //! `InboundMessage::comment_target` (and `MessageContext::comment_target` for
 //! a bot handler).
 
-use wacore_binary::Jid;
+use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
 use crate::client::Client;
