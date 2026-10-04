@@ -112,7 +112,40 @@ string_id!(
     "Identifier of an outgoing stanza, for ACK correlation, not recipient delivery."
 );
 
+// Raw wire fields can be compared without erasing either typed domain.
+impl PartialEq<str> for MessageId {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+impl PartialEq<&str> for MessageId {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+impl PartialEq<String> for MessageId {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other
+    }
+}
+impl PartialEq<MessageId> for String {
+    fn eq(&self, other: &MessageId) -> bool {
+        self == other.as_str()
+    }
+}
+impl PartialEq<MessageId> for &str {
+    fn eq(&self, other: &MessageId) -> bool {
+        *self == other.as_str()
+    }
+}
+
 impl StanzaId {
+    /// Observe a validated emitted message envelope as an ACK correlation id.
+    /// This explicit projection does not identify an operation's original target.
+    pub fn from_message_id(id: &MessageId) -> Self {
+        Self(id.0.clone())
+    }
+
     /// Match a message-class ACK (including a negative ACK). The caller must
     /// still check its chat scope and `error`; a match is not a delivery receipt.
     pub fn matches_message_ack(&self, ack: &ServerAck) -> bool {

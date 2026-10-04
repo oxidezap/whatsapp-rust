@@ -488,6 +488,20 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "1"
         run: cargo build --locked --release --manifest-path tests/fixtures/pictures_consumer/Cargo.toml
+      - name: Test the standalone send/edit request host with requests at MSRV
+        env:
+          CARGO_BUILD_JOBS: "1"
+          RUSTFLAGS: ""
+          CARGO_ENCODED_RUSTFLAGS: ""
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: cargo test --locked --manifest-path tests/fixtures/requests_consumer/Cargo.toml --features requests
+      - name: Test the standalone send/edit request host at MSRV
+        env:
+          CARGO_BUILD_JOBS: "1"
+          RUSTFLAGS: ""
+          CARGO_ENCODED_RUSTFLAGS: ""
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: cargo test --locked --manifest-path tests/fixtures/requests_consumer/Cargo.toml
       - name: Publish test timings
         if: always()
         uses: actions/upload-artifact@v7

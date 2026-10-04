@@ -75,10 +75,10 @@ async fn test_dm_retry_recovers_after_session_deletion() -> anyhow::Result<()> {
         .wait_for_sent_node(NodeFilter::tag("message").attr("id", &message_id));
     client_a
         .client
-        .send_message_with_options(
-            jid_b.clone(),
-            text_msg("retry-recover"),
-            SendOptions::default().with_message_id(message_id.clone()),
+        .send(
+            whatsapp_rust::SendRequest::new(&jid_b, text_msg("retry-recover")).with_options(
+                SendOptions::default().with_message_id(whatsapp_rust::MessageId::new(&message_id)?),
+            ),
         )
         .await?;
 

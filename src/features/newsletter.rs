@@ -348,8 +348,8 @@ pub struct NewsletterPollVote {
 #[non_exhaustive]
 pub struct NewsletterMessage {
     /// Wire message id (the stanza `id`). This is what edit_message / revoke_message
-    /// key on (NOT `server_id`). Empty if the server omitted it.
-    pub message_id: String,
+    /// key on (NOT `server_id`). `None` if the server omitted it.
+    pub message_id: Option<crate::MessageId>,
     /// Server-assigned message ID (monotonic, used for pagination cursors).
     pub server_id: u64,
     /// Message timestamp (Unix seconds).
@@ -444,14 +444,8 @@ impl NewsletterMessage {
         &self,
         chat: &'a Jid,
     ) -> Result<crate::NewsletterMessageRef<'a>, crate::MessageRefError> {
-        crate::NewsletterMessageRef::new(
-            chat,
-            (!self.message_id.is_empty())
-                .then(|| crate::MessageId::new(&self.message_id))
-                .transpose()?,
-            Some(self.server_id.into()),
-        )
-        .map(|r| r.with_from_me(self.is_sender))
+        crate::NewsletterMessageRef::new(chat, self.message_id.clone(), Some(self.server_id.into()))
+            .map(|r| r.with_from_me(self.is_sender))
     }
 }
 
@@ -880,23 +874,23 @@ impl<'a> Newsletter<'a> {
 
     /// Edit using only the target's client content id, never its server id.
     /// The legacy chat/string overload remains an explicit raw escape.
-    pub async fn edit_message_ref(
+    pub async fn edit_message(
         &self,
         target: &crate::NewsletterMessageRef<'_>,
         new_content: wa::Message,
     ) -> Result<(), NewsletterError> {
         let id = target.require_message_id()?;
-        self.edit_message(target.chat(), id.as_str(), new_content)
+        self.edit_message_raw(target.chat(), id.as_str(), new_content)
             .await
     }
 
     /// Revoke using only the target's client content id, never its server id.
-    pub async fn revoke_message_ref(
+    pub async fn revoke_message(
         &self,
         target: &crate::NewsletterMessageRef<'_>,
     ) -> Result<(), NewsletterError> {
         let id = target.require_message_id()?;
-        self.revoke_message(target.chat(), id.as_str()).await
+        self.revoke_message_raw(target.chat(), id.as_str()).await
     }
 
     /// Send a reaction to a newsletter message.
@@ -960,7 +954,7 @@ impl<'a> Newsletter<'a> {
     /// `server_id` (edit/revoke key on the message id, unlike reactions which use
     /// `server_id`). `new_content` is the replacement body (e.g.
     /// `wa::Message { conversation: Some(..), .. }`).
-    pub async fn edit_message(
+    pub async fn edit_message_raw(
         &self,
         jid: &Jid,
         message_id: impl Into<String>,
@@ -974,7 +968,7 @@ impl<'a> Newsletter<'a> {
         let id = message_id.into();
         if id.is_empty() {
             return Err(NewsletterError::InvalidRequest(
-                "newsletter edit needs a target message_id (NewsletterMessage.message_id is empty when the server omits the id)".into(),
+                "newsletter edit needs a target message_id (NewsletterMessage.message_id is None when the server omits the id)".into(),
             ));
         }
         let node = crate::send::build_newsletter_edit_node(
@@ -990,7 +984,7 @@ impl<'a> Newsletter<'a> {
     ///
     /// `message_id` is the target message's id (the `message_id` from
     /// [`NewsletterMessage`]), NOT its `server_id`.
-    pub async fn revoke_message(
+    pub async fn revoke_message_raw(
         &self,
         jid: &Jid,
         message_id: impl Into<String>,
@@ -1003,7 +997,7 @@ impl<'a> Newsletter<'a> {
         let id = message_id.into();
         if id.is_empty() {
             return Err(NewsletterError::InvalidRequest(
-                "newsletter revoke needs a target message_id (NewsletterMessage.message_id is empty when the server omits the id)".into(),
+                "newsletter revoke needs a target message_id (NewsletterMessage.message_id is None when the server omits the id)".into(),
             ));
         }
         let node =
@@ -1544,10 +1538,14 @@ fn parse_newsletter_messages_response(
 
         // The wire `id` (string) is what edit/revoke key on; keep it alongside
         // server_id (which is used for pagination/reactions).
+        // History can still be addressed by server_id without a usable client
+        // id. Project the legacy empty sentinel to absence rather than losing
+        // the entire page; explicit IDs supplied to operations still validate.
         let message_id = msg_node
             .get_attr("id")
-            .map(|v| v.as_str().into_owned())
-            .unwrap_or_default();
+            .filter(|v| !v.as_str().is_empty())
+            .map(|v| crate::MessageId::new(v.as_str()))
+            .transpose()?;
 
         let timestamp = msg_node
             .get_attr("t")
@@ -2752,6 +2750,42 @@ mod tests {
             assert_eq!(target.server_id().unwrap().get(), u64::MAX);
             assert!(std::ptr::eq(target.chat(), &chat));
         }
+    }
+
+    #[test]
+    fn history_client_id_absence_is_not_an_empty_id() {
+        let chat = newsletter_jid();
+        let absent = history_response(vec![
+            NodeBuilder::new("message").attr("server_id", 0u64).build(),
+        ]);
+        let messages = parse_newsletter_messages_response(&absent.as_node_ref()).unwrap();
+        assert_eq!(messages[0].message_id, None);
+        let reference = messages[0].message_ref(&chat).unwrap();
+        assert!(reference.message_id().is_none());
+        assert_eq!(reference.server_id().unwrap().get(), 0);
+        assert_eq!(
+            reference.require_message_id(),
+            Err(crate::MessageRefError::MissingMessageId)
+        );
+        let empty = history_response(vec![
+            NodeBuilder::new("message")
+                .attr("server_id", 1u64)
+                .attr("id", "")
+                .build(),
+        ]);
+        let messages = parse_newsletter_messages_response(&empty.as_node_ref()).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, None);
+        let reference = messages[0].message_ref(&chat).unwrap();
+        assert_eq!(reference.server_id().unwrap().get(), 1);
+        assert_eq!(
+            reference.require_message_id(),
+            Err(crate::MessageRefError::MissingMessageId)
+        );
+        assert_eq!(
+            crate::MessageId::new(""),
+            Err(crate::MessageRefError::EmptyMessageId)
+        );
     }
 
     /// Wrap message nodes in the `<iq><messages>` envelope the server answers

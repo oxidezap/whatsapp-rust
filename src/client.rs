@@ -1529,9 +1529,10 @@ impl AutoReconnect {
 ///
 /// # Sending
 ///
-/// [`Client::send_message`] covers the common path;
-/// [`Client::send_message_with_options`] takes a [`SendOptions`](crate::send::SendOptions)
-/// for message-id pinning, ephemeral expiration, and cache freshness. Domain
+/// [`Client::send_message`] covers the default-content shortcut;
+/// [`Client::send`] takes a [`SendRequest`](crate::SendRequest), with
+/// [`SendOptions`](crate::SendOptions) for message-id pinning, ephemeral
+/// expiration, and cache freshness. Domain
 /// operations hang off accessors such as [`Client::groups`], [`Client::contacts`],
 /// and [`Client::presence`].
 ///

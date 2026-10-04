@@ -11,7 +11,7 @@ fn assert_poll_debug_and_borrowing(created: &CreatedPoll) {
     let result = created.send_result();
     let count = Arc::strong_count(&result.message);
     let reference = created.poll_ref().unwrap();
-    assert_eq!(reference.message().id().as_str(), result.message_id);
+    assert_eq!(reference.message().id(), &result.message_id);
     assert!(reference.message().from_me());
     assert!(std::ptr::eq(reference.message().chat(), &result.to));
     assert!(std::ptr::eq(reference.creator(), created.creator()));
@@ -85,7 +85,7 @@ async fn check_poll(client: &Arc<Client>, created: &CreatedPoll, group: bool) ->
             .decrypt_vote(
                 cipher,
                 reference.secret().as_bytes(),
-                &vote.message_id,
+                vote.message_id.as_str(),
                 reference.creator(),
                 reference.creator()
             )
@@ -100,7 +100,7 @@ async fn check_event(client: &Arc<Client>, created: &CreatedEvent, group: bool) 
     let result = created.send_result();
     let count = Arc::strong_count(&result.message);
     let reference = created.event_ref().unwrap();
-    assert_eq!(reference.message().id().as_str(), result.message_id);
+    assert_eq!(reference.message().id(), &result.message_id);
     assert!(std::ptr::eq(reference.secret(), created.secret()));
     assert_eq!(Arc::strong_count(&result.message), count);
     assert_redacted(created, "CreatedEvent");
@@ -128,7 +128,7 @@ async fn check_event(client: &Arc<Client>, created: &CreatedEvent, group: bool) 
         enc.enc_payload.as_deref().unwrap(),
         enc.enc_iv.as_deref().unwrap(),
         created.secret().as_bytes(),
-        &result.message_id,
+        result.message_id.as_str(),
         &created.creator().to_string(),
         &created.creator().to_string(),
     )
@@ -140,7 +140,7 @@ async fn check_event(client: &Arc<Client>, created: &CreatedEvent, group: bool) 
             enc.enc_payload.as_deref().unwrap(),
             enc.enc_iv.as_deref().unwrap(),
             &[0; 32],
-            &result.message_id,
+            result.message_id.as_str(),
             &created.creator().to_string(),
             &created.creator().to_string(),
         )
@@ -294,7 +294,7 @@ async fn group_created_references_preserve_pn_lid_and_decrypt_real_wire() {
             .polls()
             .vote_raw(
                 &fixture.group,
-                &poll.send_result().message_id,
+                poll.send_result().message_id.as_str(),
                 poll.creator(),
                 poll.secret().as_bytes(),
                 &["Yes".to_owned()],
@@ -306,7 +306,7 @@ async fn group_created_references_preserve_pn_lid_and_decrypt_real_wire() {
             .events()
             .respond_raw(
                 &fixture.group,
-                &event.send_result().message_id,
+                event.send_result().message_id.as_str(),
                 event.creator(),
                 event.secret().as_bytes(),
                 EventResponseType::Going,
@@ -398,6 +398,123 @@ async fn group_created_references_preserve_pn_lid_and_decrypt_real_wire() {
 }
 
 #[tokio::test]
+async fn poll_vote_reference_sender_is_not_the_crypto_creator() {
+    let fixture = GroupSendFixture::new_lid(2).await;
+    let created = fixture
+        .client
+        .polls()
+        .create(&fixture.group, "Question", &["Yes".into(), "No".into()], 1)
+        .await
+        .unwrap();
+    let sender = fixture.client.pn().unwrap().to_non_ad();
+    assert_ne!(&sender, created.creator());
+    let message = crate::MessageRef::new(
+        &fixture.group,
+        created.send_result().message_id.clone(),
+        Some(&sender),
+        true,
+    )
+    .unwrap();
+    let expected_key = message.to_raw_key();
+    let target = crate::PollRef::new(message, created.creator(), created.secret()).unwrap();
+    let result = fixture
+        .client
+        .polls()
+        .vote(&target, &["Yes".into()])
+        .await
+        .unwrap();
+    let update = result.message.poll_update_message.as_option().unwrap();
+    let enc = update.vote.as_option().unwrap();
+    let ciphertext = PollVoteCiphertext {
+        enc_payload: enc.enc_payload.as_deref().unwrap(),
+        enc_iv: enc.enc_iv.as_deref().unwrap(),
+    };
+    let hashes = fixture
+        .client
+        .polls()
+        .decrypt_vote_ref(ciphertext, &target, created.creator())
+        .await
+        .unwrap();
+    assert_eq!(hashes, vec![compute_option_hash("Yes").to_vec()]);
+    assert!(
+        wacore::poll::decrypt_poll_vote_with_secret(
+            ciphertext,
+            created.secret().as_bytes(),
+            created.send_result().message_id.as_str(),
+            &sender.to_non_ad_string(),
+            &created.creator().to_non_ad_string(),
+        )
+        .is_err(),
+        "stanza sender must not replace captured creator in crypto"
+    );
+    assert_eq!(
+        update.poll_creation_message_key.participant, expected_key.participant,
+        "the A06 addressing reference supplies the group participant"
+    );
+}
+
+#[tokio::test]
+async fn bot_creation_requires_known_crypto_namespace_not_a_pn_fallback() {
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+    let bot: Jid = "770000099@bot".parse().unwrap();
+    seed_dm_wire_namespace_state_for_peer_lid(&client, bot.clone()).await;
+    let own_lid = client.lid().unwrap().to_non_ad();
+    let options = ["Yes".into(), "No".into()];
+    let created = client
+        .polls()
+        .create(&bot, "Question", &options, 1)
+        .await
+        .unwrap();
+    assert_eq!(created.creator(), &own_lid);
+    assert!(
+        transport.sent_count() > 0,
+        "known-namespace creation reaches wire"
+    );
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLid(None))
+        .await;
+    let before = transport.sent_count();
+    assert!(matches!(
+        client.polls().create(&bot, "Question", &options, 1).await,
+        Err(crate::PollError::Send(SendError::NotLoggedIn))
+    ));
+    assert_eq!(transport.sent_count(), before);
+    client
+        .send_message(&bot, wa::Message::text("ordinary"))
+        .await
+        .unwrap();
+    assert!(
+        transport.sent_count() > before,
+        "ordinary send does not claim creation metadata"
+    );
+    let pn = client.pn().unwrap().to_non_ad_string();
+    let hashes = [compute_option_hash("Yes").to_vec()];
+    let (payload, iv) = wacore::poll::encrypt_poll_vote_with_secret(
+        &hashes,
+        created.secret().as_bytes(),
+        created.send_result().message_id.as_str(),
+        &pn,
+        &pn,
+    )
+    .unwrap();
+    assert!(
+        wacore::poll::decrypt_poll_vote_with_secret(
+            PollVoteCiphertext {
+                enc_payload: &payload,
+                enc_iv: &iv
+            },
+            created.secret().as_bytes(),
+            created.send_result().message_id.as_str(),
+            &own_lid.to_non_ad_string(),
+            &pn,
+        )
+        .is_err(),
+        "blind PN fallback changes the captured original crypto namespace"
+    );
+}
+
+#[tokio::test]
 async fn malformed_raw_inputs_fail_before_wire_and_debug_has_negative_controls() {
     let (client, transport) = crate::test_utils::create_iq_test_client().await;
     let peer = Jid::pn("15550000001");
@@ -444,7 +561,7 @@ async fn malformed_raw_inputs_fail_before_wire_and_debug_has_negative_controls()
     assert_eq!(transport.sent_count(), 0);
     let secret = MessageSecret::from_bytes([177; 32]);
     let raw = SendResult {
-        message_id: "SECRET-CONTROL".into(),
+        message_id: crate::MessageId::new("SECRET-CONTROL").unwrap(),
         to: peer.clone(),
         recipient_fanout: None,
         message: Arc::new(wa::Message {

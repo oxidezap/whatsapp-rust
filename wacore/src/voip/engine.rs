@@ -879,6 +879,8 @@ fn make_video_plane(
 struct GroupEngineState {
     registry: GroupMediaRegistry,
     local_device: Jid,
+    // Absent allocation differs from a held allocation whose transaction was unlisted.
+    relay_transaction: Option<Option<u32>>,
     local_epoch_transaction: Option<u32>,
     required_epoch_transaction: Option<u32>,
     direct_fallback_active: bool,
@@ -1288,6 +1290,11 @@ impl CallEngine {
         let mut group = GroupEngineState {
             registry,
             local_device: config.self_jid,
+            relay_transaction: config
+                .initial_update
+                .relay
+                .as_ref()
+                .map(|relay| relay.transaction_id),
             local_epoch_transaction: None,
             required_epoch_transaction: config
                 .initial_update
@@ -1313,7 +1320,7 @@ impl CallEngine {
         };
         group.mixer.retain(group.registry.active_participant_ids());
         self.group = Some(group);
-        self.commit_group_allocate(now, &config.initial_update, relay_refresh, true)?;
+        self.commit_group_allocate(now, relay_refresh, true)?;
         self.sync_group_epoch()?;
         Ok(())
     }
@@ -1353,7 +1360,15 @@ impl CallEngine {
         }
         // Validate fallible relay material before advancing the roster transaction. Otherwise a
         // malformed relay could partially commit the roster and make a corrected resend look stale.
-        let relay_refresh = prepare_group_relay_refresh(update)?;
+        let relay_transaction = update.relay.as_ref().map(|relay| relay.transaction_id);
+        let advances_relay = relay_transaction.is_some_and(|incoming| {
+            self.group.as_ref().is_some_and(|group| {
+                group.relay_transaction.is_none_or(|held| {
+                    incoming.is_some_and(|next| held.is_none_or(|previous| next > previous))
+                })
+            })
+        });
+        let relay_refresh = prepare_group_relay_refresh(update)?.filter(|_| advances_relay);
         let established_warp_mi_tag_len = self
             .media
             .as_ref()
@@ -1487,8 +1502,18 @@ impl CallEngine {
                 // an IDR even when no locally queued video happened to require purging.
                 self.require_video_keyframe();
             }
-            self.commit_group_allocate(now, update, relay_refresh, subscriptions_changed)?;
+            self.commit_group_allocate(now, relay_refresh, subscriptions_changed)?;
             self.sync_group_epoch()?;
+        } else if advances_relay {
+            // A committed relay refresh can carry an already-processed roster transaction.
+            // Reallocate/reconnect only; do not replay membership, media-mode or key-epoch effects.
+            self.commit_group_allocate(now, relay_refresh, false)?;
+        }
+        if advances_relay {
+            self.group
+                .as_mut()
+                .ok_or(GroupMediaError::Pipeline)?
+                .relay_transaction = relay_transaction;
         }
         Ok(result)
     }
@@ -1557,7 +1582,6 @@ impl CallEngine {
     fn commit_group_allocate(
         &mut self,
         now: Millis,
-        update: &GroupCallUpdate,
         relay_refresh: Option<GroupRelayRefresh>,
         subscriptions_changed: bool,
     ) -> Result<(), GroupMediaError> {
@@ -1595,7 +1619,9 @@ impl CallEngine {
             self.allocate_deadline = NEVER;
         }
         let group = self.group.as_ref().ok_or(GroupMediaError::Pipeline)?;
-        let pids = remote_group_pids(update, &group.local_device);
+        // The registry already excludes this endpoint and retains authoritative receiver PIDs.
+        // A relay-only control must never rebuild subscriptions from an obsolete raw roster.
+        let pids = group.registry.active_pids();
         let transaction_id = self.tx_ids.next_tx_id();
         let allocate = Bytes::from(stun::build_wasm_group_stun_allocate_request(
             &stun::WasmGroupStunAllocateRequest {
@@ -3798,24 +3824,6 @@ fn group_relay_socket_addr(relay: &GroupCallRelay) -> Result<SocketAddr, GroupMe
     Ok(SocketAddr::new(IpAddr::V4(ip), port))
 }
 
-fn remote_group_pids(update: &GroupCallUpdate, local_device: &Jid) -> Vec<u32> {
-    let mut pids = update
-        .participants
-        .iter()
-        .filter(|participant| participant.is_connected())
-        .flat_map(|participant| {
-            participant
-                .devices
-                .iter()
-                .filter(|device| !group_device_is_local(participant, device, local_device))
-        })
-        .filter_map(|device| device.pid)
-        .collect::<Vec<_>>();
-    pids.sort_unstable();
-    pids.dedup();
-    pids
-}
-
 fn group_roster_contains_participant(update: &GroupCallUpdate, local_device: &Jid) -> bool {
     group_roster_local_device(update, local_device).is_some()
 }
@@ -3961,6 +3969,24 @@ mod encoded_tests {
             None,
             false,
         )
+    }
+
+    fn remote_group_pids(update: &GroupCallUpdate, local_device: &Jid) -> Vec<u32> {
+        let mut pids = update
+            .participants
+            .iter()
+            .filter(|participant| participant.is_connected())
+            .flat_map(|participant| {
+                participant
+                    .devices
+                    .iter()
+                    .filter(|device| !group_device_is_local(participant, device, local_device))
+            })
+            .filter_map(|device| device.pid)
+            .collect::<Vec<_>>();
+        pids.sort_unstable();
+        pids.dedup();
+        pids
     }
 
     fn group_update() -> GroupCallUpdate {
@@ -5331,6 +5357,118 @@ mod encoded_tests {
                 .iter()
                 .any(|output| matches!(output, Output::Event(CallEvent::RelayAllocateTimedOut))),
             "a replacement relay must retain the initial allocation timeout safety net"
+        );
+    }
+
+    #[test]
+    fn committed_relay_only_refresh_migrates_media_without_replaying_the_roster() {
+        let mut engine = group_engine();
+        let mut initial = group_update();
+        initial.media = "video".to_string();
+        initial.relay = Some(group_relay());
+        let mut control = crate::voip_control::group::GroupCallState::new(
+            &initial.call_id,
+            initial.call_creator.clone(),
+        );
+        assert_eq!(
+            control.apply_update(initial.clone()),
+            crate::voip_control::group::GroupStateApply::Applied
+        );
+        let mut latest = initial.clone();
+        latest.transaction_id = 15;
+        latest.participants[1].devices[0].pid = Some(0);
+        let mut added = latest.participants[1].clone();
+        added.jid = Jid::new("15550003333", Server::Lid);
+        added.devices[0].jid = added.jid.clone();
+        added.devices[0].pid = Some(3);
+        latest.participants.push(added);
+        assert_eq!(
+            control.apply_update(latest.clone()),
+            crate::voip_control::group::GroupStateApply::Applied
+        );
+        assert_eq!(
+            engine.apply_group_update(1, &latest).unwrap(),
+            GroupRosterApply::Applied
+        );
+        assert_eq!(
+            engine.apply_group_raw_epoch(7, &[9; 32]).unwrap(),
+            GroupEpochApply::Installed
+        );
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+        let success = allocation_success(&engine);
+        engine.handle_input(1, Input::RelayPacket(&success));
+        let _ = drain(&mut engine);
+        assert!(engine.is_allocated());
+
+        let mut older = initial;
+        older.media = "audio".to_string();
+        older.rekey_requested = true;
+        let relay = older.relay.as_mut().unwrap();
+        relay.transaction_id = Some(8);
+        relay.endpoints[0].ipv4 = Some("203.0.113.8".to_string());
+        relay.endpoints[0].port = Some(3481);
+        relay.tokens[0] = vec![0x48];
+        assert_eq!(
+            control.apply_update(older),
+            crate::voip_control::group::GroupStateApply::Applied
+        );
+        let committed = control.snapshot().unwrap();
+        assert_eq!(committed.transaction_id, 15);
+        assert_eq!(
+            engine.apply_group_update(2_000, committed).unwrap(),
+            GroupRosterApply::Stale
+        );
+        assert_eq!(engine.relay_addr, "203.0.113.8:3481".parse().unwrap());
+        assert!(!engine.is_allocated());
+        let group = engine.group.as_ref().unwrap();
+        assert_eq!(group.registry.roster_transaction(), Some(15));
+        assert_eq!(group.registry.installed_epoch_transaction(), Some(7));
+        assert_eq!(group.registry.active_pids(), [0, 3]);
+        assert!(group.required_epoch_transaction.is_none());
+        assert!(engine.media.as_ref().unwrap().video.is_some());
+        let outputs = drain(&mut engine);
+        assert!(matches!(outputs.first(), Some(Output::ReconnectRelay(_))));
+        let allocation = outputs
+            .iter()
+            .find_map(|output| match output {
+                Output::Transmit(packet) => Some(packet),
+                _ => None,
+            })
+            .expect("replacement allocate");
+        let subscriptions = stun::create_wasm_group_receiver_subscriptions(&[0, 3]);
+        assert!(
+            allocation
+                .windows(subscriptions.len())
+                .any(|window| window == subscriptions),
+            "new credentials retain the complete committed PID0/3 subscription"
+        );
+        assert_eq!(
+            engine.allocate_deadline, NEVER,
+            "redial is not charged to allocation budget"
+        );
+        engine.relay_reconnected(3_000);
+        let replacement_success = allocation_success(&engine);
+        engine.handle_input(3_001, Input::RelayPacket(&replacement_success));
+        let _ = drain(&mut engine);
+        assert!(engine.is_allocated());
+        engine.apply_group_update(3_002, committed).unwrap();
+        assert!(
+            drain(&mut engine).is_empty(),
+            "equal relay allocation cannot reallocate"
+        );
+        let mut next = committed.clone();
+        next.transaction_id = 16;
+        next.relay = Some(group_relay());
+        assert_eq!(
+            engine.apply_group_update(3_003, &next).unwrap(),
+            GroupRosterApply::Applied
+        );
+        assert_eq!(engine.relay_addr, "203.0.113.8:3481".parse().unwrap());
+        assert!(engine.is_allocated());
+        assert!(
+            drain(&mut engine).is_empty(),
+            "fresh roster cannot roll media allocation backwards"
         );
     }
 

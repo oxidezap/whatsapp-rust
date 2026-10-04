@@ -383,10 +383,10 @@ async fn test_delivery_receipts_flushed_on_disconnect() -> anyhow::Result<()> {
         let text = format!("flush burst {i}");
         let returned_id = client_a
             .client
-            .send_message_with_options(
-                jid_b.clone(),
-                text_msg(&text),
-                SendOptions::default().with_message_id(id.clone()),
+            .send(
+                whatsapp_rust::SendRequest::new(&jid_b, text_msg(&text)).with_options(
+                    SendOptions::default().with_message_id(whatsapp_rust::MessageId::new(&id)?),
+                ),
             )
             .await?
             .message_id;
