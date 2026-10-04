@@ -17200,6 +17200,13 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
             let pdo =
                 PdoRetryFixture::encode_phone_response(&mut phone, &receiver, &response).await;
             if offline {
+                // Drain commits and receive processing share one permit in
+                // production. Keeping the live fixture's 64 permits lets the
+                // timer commit overlap a retry's duplicate probe and hook.
+                client
+                    .offline_sync_completed
+                    .store(false, Ordering::Release);
+                client.swap_message_semaphore(1);
                 client.inbound_commit_batch.reset();
             }
             for leg in order {
@@ -17308,7 +17315,8 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
             if with_hook {
                 assert_eq!(
                     hook.calls.load(Ordering::Relaxed),
-                    if variant < 2 { 1 } else { 2 }
+                    if variant < 2 { 1 } else { 2 },
+                    "hook calls: variant={variant}, offline={offline}, with_pdo={with_pdo}, order={order:?}"
                 );
                 assert_eq!(
                     hook.skdm.load(Ordering::Relaxed) != 0,
