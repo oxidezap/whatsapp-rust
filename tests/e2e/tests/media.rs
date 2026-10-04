@@ -390,10 +390,8 @@ async fn test_upload_then_download_to_writer() -> anyhow::Result<()> {
 /// download after the client is gone.
 ///
 /// The hosts are injected from the media conn the mock server handed out, which
-/// is what makes this reach the mock's CDN instead of the real one. Both route
-/// kinds are exercised: with the auth token the session had, and with
-/// `without_auth`, which is the shape a caller outliving its session should use
-/// and the one the official client's download URL builder emits.
+/// is what makes this reach the mock's CDN instead of the real one. The retained
+/// route contains hosts only, so disconnection cannot leave a session token in it.
 #[tokio::test]
 async fn test_download_after_disconnect_with_injected_route() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -438,7 +436,7 @@ async fn test_download_after_disconnect_with_injected_route() -> anyhow::Result<
     let hosts_only = MediaDownloader::new(
         Arc::new(UreqHttpClient::new()),
         Arc::new(TokioRuntime),
-        route.without_auth(),
+        MediaRoute::new(route.hosts),
     );
     let downloaded = hosts_only.download(&params).await?;
     assert_eq!(

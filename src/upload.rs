@@ -330,7 +330,7 @@ async fn upload_media_with_retry_dyn<'a>(
     Err(last_error.unwrap_or_else(|| anyhow!("Failed to upload to all available media hosts")))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct UploadResponse {
     pub url: String,
@@ -344,6 +344,24 @@ pub struct UploadResponse {
     /// Per-64-KiB HMAC table for progressive playback/seek (audio/video only);
     /// pass to `AudioMessage`/`VideoMessage.streaming_sidecar`.
     pub streaming_sidecar: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for UploadResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UploadResponse")
+            .field("url", &"<redacted>")
+            .field("direct_path", &"<redacted>")
+            .field("media_key", &"<redacted>")
+            .field("file_enc_sha256", &self.file_enc_sha256)
+            .field("file_sha256", &self.file_sha256)
+            .field("file_length", &self.file_length)
+            .field("media_key_timestamp", &self.media_key_timestamp)
+            .field(
+                "streaming_sidecar_len",
+                &self.streaming_sidecar.as_ref().map(Vec::len),
+            )
+            .finish()
+    }
 }
 
 impl From<UploadResponse> for wacore::sticker_pack::MediaUploadInfo {
@@ -508,6 +526,29 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn upload_response_debug_redacts_media_secrets() {
+        let response = UploadResponse {
+            url: "https://cdn.example.com/file?auth=synthetic-url-secret".into(),
+            direct_path: "/file?sig=synthetic-path-secret".into(),
+            media_key: [179; 32],
+            file_enc_sha256: [1; 32],
+            file_sha256: [2; 32],
+            file_length: 12345,
+            media_key_timestamp: 6789,
+            streaming_sidecar: Some(vec![17; 10]),
+        };
+        for rendered in [format!("{response:?}"), format!("{response:#?}")] {
+            assert!(!rendered.contains("synthetic-"), "{rendered}");
+            assert!(!rendered.contains("179"), "{rendered}");
+            assert!(rendered.contains("12345"), "{rendered}");
+            assert!(rendered.contains("6789"), "{rendered}");
+        }
+        let converted: wacore::sticker_pack::MediaUploadInfo = response.into();
+        assert_eq!(converted.media_key, [179; 32]);
+        assert_eq!(converted.file_length, 12345);
+    }
+
     use super::*;
     use crate::mediaconn::{MediaConn, MediaConnHost};
     use async_lock::Mutex;

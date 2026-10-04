@@ -28,7 +28,7 @@ pub(crate) fn is_media_auth_error(status_code: u16) -> bool {
 }
 
 /// Media connection with runtime-specific fields.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MediaConn {
     /// Authentication token for media operations.
     pub auth: String,
@@ -40,6 +40,18 @@ pub struct MediaConn {
     pub hosts: Vec<MediaConnHost>,
     /// When this connection info was fetched (runtime-specific).
     pub fetched_at: Instant,
+}
+
+impl std::fmt::Debug for MediaConn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaConn")
+            .field("auth", &"<redacted>")
+            .field("ttl", &self.ttl)
+            .field("auth_ttl", &self.auth_ttl)
+            .field("hosts", &self.hosts)
+            .field("fetched_at", &self.fetched_at)
+            .finish()
+    }
 }
 
 impl MediaConn {
@@ -398,6 +410,24 @@ impl Drop for MediaConnLease {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn media_conn_debug_redacts_auth() {
+        let conn = MediaConn {
+            auth: "synthetic-media-conn-secret".into(),
+            ttl: 12345,
+            auth_ttl: Some(6789),
+            hosts: vec![MediaConnHost::new("cdn.example.com".into())],
+            fetched_at: Instant::now(),
+        };
+        for rendered in [format!("{conn:?}"), format!("{conn:#?}")] {
+            assert!(!rendered.contains(&conn.auth), "{rendered}");
+            assert!(rendered.contains("12345"), "{rendered}");
+            assert!(rendered.contains("cdn.example.com"), "{rendered}");
+            assert!(rendered.contains("6789"), "{rendered}");
+        }
+        assert_eq!(conn.auth, "synthetic-media-conn-secret");
+    }
+
     use super::*;
     use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq, poll_until};
     use crate::transport::mock::CapturingMockTransport;

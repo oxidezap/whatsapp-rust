@@ -91,6 +91,8 @@ smallvec = { workspace = true, features = ["serde"] }
 smoothutf8 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
+# Parse media references without losing signed query parameters or the route origin.
+url = { version = "2.5.8", default-features = false }
 tracing = { workspace = true, optional = true }
 wacore-appstate = { workspace = true }
 wacore-binary = { workspace = true, features = ["serde"] }

@@ -7,6 +7,7 @@ use crate::mediaconn::{MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS, MediaConn, is_media_au
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
 use wacore::runtime::Runtime;
+use wacore::sync_marker::MaybeSend;
 
 pub use wacore::download::{
     DEFAULT_MEDIA_HOSTS, DownloadUtils, DownloadWriter, Downloadable, MediaDecryption,
@@ -22,12 +23,11 @@ const DOWNLOAD_PREALLOC_CAP: u64 = 64 * 1024 * 1024;
 
 impl From<&MediaConn> for MediaRoute {
     fn from(conn: &MediaConn) -> Self {
-        MediaRoute::authenticated(
+        MediaRoute::new(
             conn.hosts
                 .iter()
                 .map(|h| MediaHost::new(h.hostname.clone()))
                 .collect(),
-            conn.auth.clone(),
         )
     }
 }
@@ -238,7 +238,7 @@ impl From<DownloadRequestError> for MediaDownloadError {
 #[derive(Debug)]
 enum DownloadRequestError {
     Auth(anyhow::Error),
-    /// 404/410 — media URL expired or not found. Needs fresh auth + URL re-derivation.
+    /// 404/410 — media URL expired or not found. May need refreshed hosts.
     /// Matches WA Web's `MediaNotFoundError` handling.
     NotFound(anyhow::Error),
     Other(anyhow::Error),
@@ -450,7 +450,7 @@ where
         if requests.is_empty() {
             return Err(DownloadRequestError::no_hosts(last_rejection));
         }
-        let mut retry_with_fresh_auth = false;
+        let mut retry_with_fresh_route = false;
 
         for request in requests {
             match execute_request(request.clone()).await {
@@ -464,7 +464,7 @@ where
                     last_rejection = Some(err.into_anyhow());
                     invalidate_media_conn().await;
                     force_refresh = true;
-                    retry_with_fresh_auth = true;
+                    retry_with_fresh_route = true;
                     break;
                 }
                 Err(err) if err.is_auth() || err.is_not_found() => return Err(err),
@@ -480,7 +480,7 @@ where
             }
         }
 
-        if !retry_with_fresh_auth {
+        if !retry_with_fresh_route {
             break;
         }
     }
@@ -508,7 +508,7 @@ async fn download_to_writer_with_retry<
     mut execute_request: ExecuteRequest,
 ) -> std::result::Result<W, DownloadRequestError>
 where
-    W: DownloadWriter + Send + 'static,
+    W: DownloadWriter + MaybeSend + 'static,
     PrepareRequests: FnMut(bool) -> PrepareRequestsFut,
     PrepareRequestsFut: Future<
         Output = std::result::Result<Vec<wacore::download::DownloadRequest>, DownloadRequestError>,
@@ -533,7 +533,7 @@ where
             let failure = DownloadRequestError::no_hosts(last_rejection);
             return Err(discard_failed_write(runtime, writer, failure).await);
         }
-        let mut retry_with_fresh_auth = false;
+        let mut retry_with_fresh_route = false;
 
         for request in requests {
             let (next_writer, result) = match execute_request(request.clone(), writer).await {
@@ -555,7 +555,7 @@ where
                     last_rejection = Some(err.into_anyhow());
                     invalidate_media_conn().await;
                     force_refresh = true;
-                    retry_with_fresh_auth = true;
+                    retry_with_fresh_route = true;
                     break;
                 }
                 Err(err) if err.is_auth() || err.is_not_found() => {
@@ -573,7 +573,7 @@ where
             }
         }
 
-        if !retry_with_fresh_auth {
+        if !retry_with_fresh_route {
             break;
         }
     }
@@ -666,7 +666,7 @@ impl MediaDownloader {
     }
 
     /// Mirrors [`Client::download`], minus the media-conn refresh: there is no
-    /// session to derive fresh auth from, so a rejected reference is terminal.
+    /// session to refresh hosts from, so a rejected reference is terminal.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -714,7 +714,10 @@ impl MediaDownloader {
             err(Debug)
         )
     )]
-    pub async fn download_to_writer<W: DownloadWriter + Send + 'static>(
+    ///
+    /// Writers must be `Send` on native targets, where processing runs on the
+    /// blocking pool. On wasm32, local writers are processed inline.
+    pub async fn download_to_writer<W: DownloadWriter + MaybeSend + 'static>(
         &self,
         downloadable: &dyn Downloadable,
         writer: W,
@@ -830,7 +833,7 @@ impl Client {
         // trip whose answer is discarded before a byte of it is read.
         let route =
             if downloadable.static_url().is_some() {
-                MediaRoute::unauthenticated(Vec::new())
+                MediaRoute::new(Vec::new())
             } else {
                 MediaRoute::from(&self.refresh_media_conn(force_refresh).await.map_err(
                     |source| DownloadRequestError::Session {
@@ -874,7 +877,10 @@ impl Client {
             err(Debug)
         )
     )]
-    pub async fn download_to_writer<W: DownloadWriter + Send + 'static>(
+    ///
+    /// Writers must be `Send` on native targets, where processing runs on the
+    /// blocking pool. On wasm32, local writers are processed inline.
+    pub async fn download_to_writer<W: DownloadWriter + MaybeSend + 'static>(
         &self,
         downloadable: &dyn Downloadable,
         writer: W,
@@ -962,7 +968,7 @@ fn finish_verified_write<W: DownloadWriter>(
 ///
 /// Retain both failures if cleanup itself is rejected by the sink. The original
 /// classification remains available instead of being overwritten by an I/O error.
-async fn discard_failed_write<W: DownloadWriter + Send + 'static>(
+async fn discard_failed_write<W: DownloadWriter + MaybeSend + 'static>(
     runtime: &Arc<dyn Runtime>,
     mut writer: W,
     failure: DownloadRequestError,
@@ -978,7 +984,7 @@ async fn discard_failed_write<W: DownloadWriter + Send + 'static>(
 
 /// Download + decrypt to a writer. Uses streaming when available,
 /// falls back to buffered otherwise. Returns writer for retry.
-async fn streaming_download_and_decrypt<W: DownloadWriter + Send + 'static>(
+async fn streaming_download_and_decrypt<W: DownloadWriter + MaybeSend + 'static>(
     http_client: &Arc<dyn HttpClient>,
     runtime: &Arc<dyn Runtime>,
     request: &wacore::download::DownloadRequest,
@@ -1041,7 +1047,7 @@ async fn streaming_download_and_decrypt<W: DownloadWriter + Send + 'static>(
 }
 
 /// Buffered fallback when streaming is not available.
-async fn buffered_download_and_decrypt<W: DownloadWriter + Send + 'static>(
+async fn buffered_download_and_decrypt<W: DownloadWriter + MaybeSend + 'static>(
     http_client: &Arc<dyn HttpClient>,
     runtime: &Arc<dyn Runtime>,
     request: &wacore::download::DownloadRequest,
@@ -1194,6 +1200,70 @@ mod tests {
             let _ = stream.write_all(&body);
         });
         format!("http://{addr}")
+    }
+
+    #[cfg(feature = "ureq-client")]
+    #[tokio::test]
+    async fn media_server_receives_existing_query_and_separate_token() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut received = Vec::new();
+            let mut buf = [0; 1024];
+            while !received.windows(4).any(|w| w == b"\r\n\r\n") {
+                let count = stream.read(&mut buf).unwrap();
+                assert_ne!(count, 0);
+                received.extend_from_slice(&buf[..count]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+            String::from_utf8(received).unwrap()
+        });
+        let media = PlaintextDownloadable {
+            direct_path: "/mms/a%2Fb?x=one%26two&plus=%2B#fragment".into(),
+            file_sha256: vec![3; 32],
+        };
+        let mut requests = DownloadUtils::prepare_download_requests(
+            &media,
+            &MediaRoute::new(vec![MediaHost::new(address.to_string())]),
+        )
+        .unwrap();
+        let mut request = requests.remove(0);
+        // The loopback fixture serves HTTP; keep the generated authority, path
+        // and query unchanged. Production route construction still requires HTTPS.
+        request.url = request.url.replacen("https://", "http://", 1);
+        let client = ureq_client().await;
+        assert_eq!(
+            buffered_download_body(&client.http_client, &request)
+                .await
+                .unwrap(),
+            b"ok"
+        );
+        let received = server.join().unwrap();
+        let target = received
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap();
+        let uri: http::Uri = target.parse().unwrap();
+        assert_eq!(uri.path(), "/mms/a%2Fb");
+        let query = uri.query().unwrap();
+        let fields = query.split('&').collect::<Vec<_>>();
+        assert_eq!(&fields[..2], &["x=one%26two", "plus=%2B"]);
+        assert_eq!(fields.len(), 3);
+        assert!(fields[2].starts_with("token="));
+        assert!(!target.contains('#'));
     }
 
     #[cfg(feature = "ureq-client")]
@@ -1620,7 +1690,7 @@ mod tests {
                     let url = request.url.clone();
                     async move {
                         seen_urls.lock().await.push(url.clone());
-                        if url.contains("stale-auth") {
+                        if url.contains("cdn1.example.com") {
                             Err(DownloadRequestError::auth(401))
                         } else {
                             Ok(body)
@@ -1630,7 +1700,7 @@ mod tests {
             },
         )
         .await
-        .expect("download should succeed after refreshing media auth");
+        .expect("download should succeed after refreshing media hosts");
 
         assert_eq!(downloaded, body);
         assert_eq!(*refresh_calls.lock().await, vec![false, true]);
@@ -1638,8 +1708,9 @@ mod tests {
 
         let seen_urls = seen_urls.lock().await.clone();
         assert_eq!(seen_urls.len(), 2);
-        assert!(seen_urls[0].contains("auth=stale-auth"));
-        assert!(seen_urls[1].contains("auth=fresh-auth"));
+        assert!(seen_urls[0].contains("cdn1.example.com"));
+        assert!(seen_urls.iter().all(|url| !url.contains("auth=")));
+        assert!(seen_urls[1].contains("cdn2.example.com"));
     }
 
     // A generic (non-auth, non-404) error on one host must fall through to the
@@ -1835,7 +1906,7 @@ mod tests {
                     async move {
                         seen_urls.lock().await.push(url.clone());
                         writer.seek(SeekFrom::Start(0))?;
-                        if url.contains("stale-auth") {
+                        if url.contains("cdn1.example.com") {
                             Ok((writer, Err(DownloadRequestError::auth(403))))
                         } else {
                             writer.write_all(&body)?;
@@ -1847,7 +1918,7 @@ mod tests {
             },
         )
         .await
-        .expect("streaming download should succeed after refreshing media auth");
+        .expect("streaming download should succeed after refreshing media hosts");
 
         assert_eq!(writer.into_inner(), body);
         assert_eq!(*refresh_calls.lock().await, vec![false, true]);
@@ -1855,8 +1926,9 @@ mod tests {
 
         let seen_urls = seen_urls.lock().await.clone();
         assert_eq!(seen_urls.len(), 2);
-        assert!(seen_urls[0].contains("auth=stale-auth"));
-        assert!(seen_urls[1].contains("auth=fresh-auth"));
+        assert!(seen_urls[0].contains("cdn1.example.com"));
+        assert!(seen_urls.iter().all(|url| !url.contains("auth=")));
+        assert!(seen_urls[1].contains("cdn2.example.com"));
     }
 
     // ── Session-less downloads ──────────────────────────────────────────────
@@ -1952,7 +2024,7 @@ mod tests {
         MediaDownloader::new(
             http,
             Arc::new(crate::TokioRuntime),
-            MediaRoute::unauthenticated(hosts.iter().copied().map(MediaHost::new).collect()),
+            MediaRoute::new(hosts.iter().copied().map(MediaHost::new).collect()),
         )
     }
 
@@ -2453,7 +2525,6 @@ mod tests {
             RoutedHttpClient::new(Vec::new(), (200, Vec::new())),
             Arc::new(crate::TokioRuntime),
         );
-        assert!(downloader.route().auth.is_none());
         assert_eq!(
             downloader
                 .route()
@@ -2568,7 +2639,7 @@ mod tests {
             let urls = http.urls();
             assert_eq!(urls.len(), 4);
             assert!(urls.iter().all(|url| url == &urls[0]));
-            assert!(urls[0].contains("auth=auth"));
+            assert!(!urls[0].contains("auth="));
         }
     }
 
@@ -2756,7 +2827,7 @@ mod tests {
                         };
                         let requests = DownloadUtils::prepare_download_requests(
                             &params,
-                            &MediaRoute::unauthenticated(hosts),
+                            &MediaRoute::new(hosts),
                         )
                         .map_err(DownloadRequestError::Prepare);
                         async move { requests }
@@ -3218,7 +3289,7 @@ mod tests {
 
     #[tokio::test]
     async fn mac_cause_survives_cleanup_for_both_http_modes() {
-        async fn check<W: DownloadWriter + Send + 'static>(
+        async fn check<W: DownloadWriter + MaybeSend + 'static>(
             streaming: bool,
             cleanup_fails: bool,
             writer: W,

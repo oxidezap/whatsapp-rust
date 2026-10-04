@@ -12,7 +12,7 @@ pub mod events;
 #[cfg(feature = "sdk")]
 pub mod creation;
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(feature = "sdk")]
 pub mod download;
 
 #[cfg(feature = "sdk")]
