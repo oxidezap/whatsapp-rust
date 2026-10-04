@@ -565,43 +565,53 @@ impl DownloadUtils {
             BASE64_URL_SAFE_NO_PAD.encode(hash)
         };
 
-        let requests = route
-            .hosts
-            .iter()
-            .map(|host| {
-                let base = url::Url::parse(&format!("https://{}/", host.hostname))
-                    .map_err(|_| anyhow!("Invalid media route host"))?;
-                // Hosts are authorities, not paths, credentials or query strings.
-                if base.host_str().is_none()
-                    || !base.username().is_empty()
-                    || base.password().is_some()
-                    || base.path() != "/"
-                    || base.query().is_some()
-                    || base.fragment().is_some()
-                {
-                    return Err(anyhow!("Invalid media route host"));
-                }
-                let mut url = base
-                    .join(direct_path)
-                    .map_err(|_| anyhow!("Invalid media direct path"))?;
-                // Resolve relative paths while keeping the selected HTTPS origin.
-                // Static CDN URLs follow the separate verbatim path above.
-                if url.scheme() != base.scheme()
-                    || url.host() != base.host()
-                    || url.port() != base.port()
-                    || !url.username().is_empty()
-                    || url.password().is_some()
-                {
-                    return Err(anyhow!("Media direct path changes the route origin"));
-                }
-                url.query_pairs_mut().append_pair("token", &token);
-                Ok(DownloadRequest {
-                    url: url.into(),
-                    decryption: decryption.clone(),
-                })
+        let candidates = route.hosts.iter().map(|host| {
+            let base = url::Url::parse(&format!("https://{}/", host.hostname))
+                .map_err(|_| anyhow!("Invalid media route host"))?;
+            // Hosts are authorities, not paths, credentials or query strings.
+            if base.host_str().is_none()
+                || !base.username().is_empty()
+                || base.password().is_some()
+                || base.path() != "/"
+                || base.query().is_some()
+                || base.fragment().is_some()
+            {
+                return Err(anyhow!("Invalid media route host"));
+            }
+            let mut url = base
+                .join(direct_path)
+                .map_err(|_| anyhow!("Invalid media direct path"))?;
+            // Resolve relative paths while keeping the selected HTTPS origin.
+            // Static CDN URLs follow the separate verbatim path above.
+            if url.scheme() != base.scheme()
+                || url.host() != base.host()
+                || url.port() != base.port()
+                || !url.username().is_empty()
+                || url.password().is_some()
+            {
+                return Err(anyhow!("Media direct path changes the route origin"));
+            }
+            url.query_pairs_mut().append_pair("token", &token);
+            Ok(DownloadRequest {
+                url: url.into(),
+                decryption: decryption.clone(),
             })
-            .collect::<Result<Vec<_>>>()?;
-
+        });
+        let mut requests = Vec::with_capacity(route.hosts.len());
+        let mut last_error = None;
+        for candidate in candidates {
+            match candidate {
+                Ok(request) => requests.push(request),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        // A bad host must not discard a usable fallback. Keep preparation
+        // errors when no candidate can be used, and preserve the empty route.
+        if requests.is_empty()
+            && let Some(error) = last_error
+        {
+            return Err(error);
+        }
         Ok(requests)
     }
 
@@ -1604,6 +1614,48 @@ mod tests {
                 assert!(request.url.contains("x=one%26two&plus=%2B&empty=&token="));
             }
         }
+    }
+
+    #[test]
+    fn adding_a_token_preserves_existing_query_bytes() {
+        let query = "space=a%20b&plus=a+b&lower=%2f&upper=%2F&empty=&flag&dup=1&dup=2";
+        let media = MockDownloadable {
+            direct_path: Some(format!("/media?{query}#fragment")),
+            static_url: None,
+            media_key: Some(vec![1; 32]),
+            file_sha256: Some(vec![2; 32]),
+            file_enc_sha256: Some(vec![3; 32]),
+            media_type: MediaType::Image,
+        };
+        let requests = DownloadUtils::prepare_download_requests(&media, &mock_route()).unwrap();
+        let expected = format!("{query}&token={}", BASE64_URL_SAFE_NO_PAD.encode([3; 32]));
+        for request in requests {
+            let url = url::Url::parse(&request.url).unwrap();
+            assert_eq!(url.query(), Some(expected.as_str()));
+            assert_eq!(url.fragment(), Some("fragment"));
+        }
+    }
+
+    #[test]
+    fn invalid_hosts_do_not_discard_valid_fallbacks() {
+        let media = MockDownloadable {
+            direct_path: Some("/media?x=1".into()),
+            static_url: None,
+            media_key: Some(vec![1; 32]),
+            file_sha256: Some(vec![2; 32]),
+            file_enc_sha256: Some(vec![3; 32]),
+            media_type: MediaType::Image,
+        };
+        let route = MediaRoute::new(vec![
+            MediaHost::new("bad.example/path"),
+            MediaHost::new("cdn1.example.com"),
+            MediaHost::new("bad.example?query"),
+            MediaHost::new("cdn2.example.com"),
+        ]);
+        let requests = DownloadUtils::prepare_download_requests(&media, &route).unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].url.starts_with("https://cdn1.example.com/"));
+        assert!(requests[1].url.starts_with("https://cdn2.example.com/"));
     }
 
     #[test]
