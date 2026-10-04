@@ -141,16 +141,23 @@ async fn typed_cag_reactions_and_comments_keep_parent_author_and_comment_secret(
                     .as_deref()
                     .unwrap();
                 assert_eq!(minted.len(), 32);
-                let stored = fixture
+                // The drain worker may already have persisted earlier comments;
+                // exercise the buffered-first reader, not transient map occupancy.
+                let (comment_author, readable) = fixture
                     .client
-                    .msg_secret_buffer
-                    .lookup_stored(
-                        &fixture.group.to_non_ad_string(),
-                        &modifier,
-                        result.message_id.as_str(),
+                    .resolve_outgoing_addon_parent(
+                        &fixture.group,
+                        &wa::MessageKey {
+                            remote_jid: Some(fixture.group.to_string()),
+                            id: Some(result.message_id.to_string()),
+                            participant: Some(modifier.clone()),
+                            from_me: Some(true),
+                        },
                     )
+                    .await
                     .unwrap();
-                assert_eq!(stored.secret.as_bytes().as_slice(), minted);
+                assert_eq!(comment_author.to_non_ad_string(), modifier);
+                assert_eq!(readable.as_slice(), minted);
                 fixture.client.msg_secret_buffer.wait_flushed().await;
                 let persisted = fixture
                     .client
