@@ -381,9 +381,14 @@ pub struct DownloadRequest {
 
 impl std::fmt::Debug for DownloadRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let url = url::Url::parse(&self.url).ok();
+        let url = fluent_uri::Uri::parse(self.url.as_str()).ok();
         f.debug_struct("DownloadRequest")
-            .field("host", &url.as_ref().and_then(url::Url::host_str))
+            .field(
+                "host",
+                &url.as_ref()
+                    .and_then(|url| url.authority())
+                    .map(|a| a.host()),
+            )
             .field("decryption", &self.decryption)
             .finish()
     }
@@ -566,34 +571,81 @@ impl DownloadUtils {
         };
 
         let candidates = route.hosts.iter().map(|host| {
-            let base = url::Url::parse(&format!("https://{}/", host.hostname))
+            use fluent_uri::{Uri, UriRef, component::Host, pct_enc::EStr};
+
+            let base = Uri::parse(format!("https://{}/", host.hostname))
                 .map_err(|_| anyhow!("Invalid media route host"))?;
-            // Hosts are authorities, not paths, credentials or query strings.
-            if base.host_str().is_none()
-                || !base.username().is_empty()
-                || base.password().is_some()
-                || base.path() != "/"
+            let base_authority = base
+                .authority()
+                .ok_or_else(|| anyhow!("Invalid media route host"))?;
+            // CDN authorities must be DNS names or IP literals, not arbitrary
+            // RFC reg-names that an HTTP backend might interpret differently.
+            let valid_host = match base_authority.host_parsed() {
+                Host::IpvFuture { .. } => false,
+                Host::RegName(name) => {
+                    !name.is_empty()
+                        && name
+                            .as_str()
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+                }
+                _ => true,
+            };
+            if !valid_host
+                || base_authority.userinfo().is_some()
+                || base.path().as_str() != "/"
                 || base.query().is_some()
                 || base.fragment().is_some()
+                || base_authority.port().is_some_and(|port| port.is_empty())
             {
                 return Err(anyhow!("Invalid media route host"));
             }
-            let mut url = base
-                .join(direct_path)
+            let base_port = base_authority
+                .port_to_u16()
+                .map_err(|_| anyhow!("Invalid media route port"))?
+                .unwrap_or(443);
+            // Signed CDN references are already URI-encoded. Reject malformed
+            // escapes, raw whitespace and backslashes instead of repairing them.
+            let url = UriRef::parse(direct_path)
+                .map_err(|_| anyhow!("Invalid media direct path"))?
+                .resolve_against(&base)
                 .map_err(|_| anyhow!("Invalid media direct path"))?;
-            // Resolve relative paths while keeping the selected HTTPS origin.
-            // Static CDN URLs follow the separate verbatim path above.
+            let authority = url
+                .authority()
+                .ok_or_else(|| anyhow!("Media direct path changes the route origin"))?;
             if url.scheme() != base.scheme()
-                || url.host() != base.host()
-                || url.port() != base.port()
-                || !url.username().is_empty()
-                || url.password().is_some()
+                || !authority.host().eq_ignore_ascii_case(base_authority.host())
+                || authority
+                    .port_to_u16()
+                    .map_err(|_| anyhow!("Invalid media direct path port"))?
+                    .unwrap_or(443)
+                    != base_port
+                || authority.userinfo().is_some()
+                || authority.port().is_some_and(|port| port.is_empty())
             {
                 return Err(anyhow!("Media direct path changes the route origin"));
             }
-            url.query_pairs_mut().append_pair("token", &token);
+            // Preserve the signed query byte-for-byte; only our URL-safe base64
+            // token is appended. The URI builder retains the fragment separately.
+            let mut query = url.query().map_or("", |q| q.as_str()).to_owned();
+            if !query.is_empty() {
+                query.push('&');
+            }
+            query.push_str("token=");
+            query.push_str(&token);
+            let url = Uri::builder()
+                .scheme(url.scheme())
+                .authority(authority)
+                .path(url.path())
+                .query(EStr::new(&query).ok_or_else(|| anyhow!("Invalid media query"))?)
+                .optional(
+                    |builder, fragment| builder.fragment(fragment),
+                    url.fragment(),
+                )
+                .build()
+                .map_err(|_| anyhow!("Invalid media download URL"))?;
             Ok(DownloadRequest {
-                url: url.into(),
+                url: url.into_string(),
                 decryption: decryption.clone(),
             })
         });
@@ -1633,6 +1685,100 @@ mod tests {
             let url = url::Url::parse(&request.url).unwrap();
             assert_eq!(url.query(), Some(expected.as_str()));
             assert_eq!(url.fragment(), Some("fragment"));
+        }
+    }
+
+    #[test]
+    fn uri_download_resolution_matches_the_url_oracle() {
+        for (host, path) in [
+            (
+                "cdn.example.com",
+                "/a%2Fb?x=%20&plus=+&dup=1&dup=2#part%20one",
+            ),
+            ("cdn.example.com", "relative/../file?flag&empty=&tail=1&"),
+            ("cdn.example.com", "../file?x=%2f"),
+            ("cdn.example.com", "?x=one%26two#fragment"),
+            ("cdn.example.com", "#fragment"),
+            ("cdn.example.com", ""),
+            ("cdn.example.com", "//cdn.example.com/file"),
+            ("cdn.example.com", "https://CDN.EXAMPLE.COM:443/file?x=1"),
+            ("cdn.example.com:8443", "/file?x=1"),
+            ("[::1]:8443", "https://[::1]:8443/file?x=1#part"),
+            ("127.0.0.1:8080", "/file"),
+        ] {
+            let media = MockDownloadable {
+                direct_path: Some(path.into()),
+                static_url: None,
+                media_key: Some(vec![1; 32]),
+                file_sha256: Some(vec![2; 32]),
+                file_enc_sha256: Some(vec![3; 32]),
+                media_type: MediaType::Image,
+            };
+            let mut oracle = url::Url::parse(&format!("https://{host}/"))
+                .unwrap()
+                .join(path)
+                .unwrap();
+            oracle
+                .query_pairs_mut()
+                .append_pair("token", &BASE64_URL_SAFE_NO_PAD.encode([3; 32]));
+            let requests = DownloadUtils::prepare_download_requests(
+                &media,
+                &MediaRoute::new(vec![MediaHost::new(host)]),
+            )
+            .unwrap();
+            let actual = url::Url::parse(&requests[0].url).unwrap();
+            assert_eq!(actual, oracle, "{host} {path}");
+        }
+    }
+
+    #[test]
+    fn download_references_reject_uri_repairs_and_ambiguous_authorities() {
+        let mut media = MockDownloadable {
+            direct_path: None,
+            static_url: None,
+            media_key: Some(vec![1; 32]),
+            file_sha256: Some(vec![2; 32]),
+            file_enc_sha256: Some(vec![3; 32]),
+            media_type: MediaType::Image,
+        };
+        let route = MediaRoute::new(vec![MediaHost::new("cdn.example.com")]);
+        for path in [
+            "/raw space",
+            "/raw\tcontrol",
+            "/café",
+            "/file?bad=%zz",
+            "/file?bad=%",
+            "https://cdn.example.com:65536/file",
+            "https://cdn.example.com:/file",
+            "https://%63dn.example.com/file",
+            "https://@cdn.example.com/file",
+            "https:///evil.example/file",
+            "https:evil.example/file",
+        ] {
+            media.direct_path = Some(path.into());
+            assert!(
+                DownloadUtils::prepare_download_requests(&media, &route).is_err(),
+                "{path}"
+            );
+        }
+        media.direct_path = Some("/file".into());
+        for host in [
+            "",
+            "cdn.example.com:",
+            "cdn.example.com:65536",
+            "cdn.example.com:port",
+            "%63dn.example.com",
+            "cdn.example.com%2f.evil.example",
+            "[v1.example]",
+            "@cdn.example.com",
+            "cdn.example.com;other",
+            "cdn.example.com\n",
+        ] {
+            let route = MediaRoute::new(vec![MediaHost::new(host)]);
+            assert!(
+                DownloadUtils::prepare_download_requests(&media, &route).is_err(),
+                "{host}"
+            );
         }
     }
 
