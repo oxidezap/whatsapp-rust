@@ -775,7 +775,7 @@ mod tests {
 
     async fn complete_creation(
         client: &Client,
-        transport: &crate::transport::mock::CapturingMockTransport,
+        transport: &std::sync::Arc<crate::transport::mock::CapturingMockTransport>,
     ) {
         use wacore_binary::builder::NodeBuilder;
         let sent = crate::test_utils::decode_sent_iq(transport, 0).await;
