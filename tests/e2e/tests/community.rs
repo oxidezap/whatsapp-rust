@@ -15,7 +15,7 @@ async fn test_community_create() -> anyhow::Result<()> {
     let result = client
         .client
         .community()
-        .create(CreateCommunityOptions::new("Test Community"))
+        .create(CreateCommunityOptions::new("Test Community")?)
         .await?;
 
     assert!(
@@ -57,13 +57,7 @@ async fn test_community_create_with_general_chat() -> anyhow::Result<()> {
     let result = client
         .client
         .community()
-        .create(CreateCommunityOptions {
-            name: "Community With General".to_string(),
-            description: None,
-            closed: false,
-            allow_non_admin_sub_group_creation: false,
-            create_general_chat: true,
-        })
+        .create(CreateCommunityOptions::new("Community With General")?)
         .await?;
 
     info!("Created community: {}", result.metadata.id);
@@ -123,7 +117,7 @@ async fn test_community_get_subgroups() -> anyhow::Result<()> {
     let result = client
         .client
         .community()
-        .create(CreateCommunityOptions::new("Subgroups Test"))
+        .create(CreateCommunityOptions::new("Subgroups Test")?)
         .await?;
 
     let subgroups = client
@@ -156,7 +150,7 @@ async fn test_community_hidden_subgroups_at_create_and_link() -> anyhow::Result<
     let community = client
         .client
         .community()
-        .create(CreateCommunityOptions::new("Hidden Subgroups Test"))
+        .create(CreateCommunityOptions::new("Hidden Subgroups Test")?)
         .await?;
 
     let hidden_options = CreateSubgroupOptions::new(
@@ -250,7 +244,7 @@ async fn test_community_link_subgroup() -> anyhow::Result<()> {
     let community = client
         .client
         .community()
-        .create(CreateCommunityOptions::new("Link Test Community"))
+        .create(CreateCommunityOptions::new("Link Test Community")?)
         .await?;
 
     info!("Created community: {}", community.metadata.id);
@@ -312,7 +306,7 @@ async fn test_community_unlink_subgroup() -> anyhow::Result<()> {
     let community = client
         .client
         .community()
-        .create(CreateCommunityOptions::new("Unlink Test"))
+        .create(CreateCommunityOptions::new("Unlink Test")?)
         .await?;
 
     let group = client
@@ -382,7 +376,7 @@ async fn test_community_deactivate() -> anyhow::Result<()> {
     let community = client
         .client
         .community()
-        .create(CreateCommunityOptions::new("Deactivate Test"))
+        .create(CreateCommunityOptions::new("Deactivate Test")?)
         .await?;
 
     info!("Created community: {}", community.metadata.id);
@@ -429,7 +423,7 @@ async fn test_community_query_linked_group() -> anyhow::Result<()> {
     let community = client
         .client
         .community()
-        .create(CreateCommunityOptions::new("Query Linked Test"))
+        .create(CreateCommunityOptions::new("Query Linked Test")?)
         .await?;
 
     let group = client
@@ -488,7 +482,7 @@ async fn test_community_join_subgroup() -> anyhow::Result<()> {
     let community = client_a
         .client
         .community()
-        .create(CreateCommunityOptions::new("Join Test Community"))
+        .create(CreateCommunityOptions::new("Join Test Community")?)
         .await?;
 
     let group = client_a
@@ -556,7 +550,7 @@ async fn test_community_get_linked_groups_participants() -> anyhow::Result<()> {
     let community = client
         .client
         .community()
-        .create(CreateCommunityOptions::new("Participants Test"))
+        .create(CreateCommunityOptions::new("Participants Test")?)
         .await?;
 
     // Link a subgroup so linked_groups_participants has something to return
@@ -623,7 +617,7 @@ async fn test_community_subgroup_participant_counts() -> anyhow::Result<()> {
     let community = client
         .client
         .community()
-        .create(CreateCommunityOptions::new("Counts Test"))
+        .create(CreateCommunityOptions::new("Counts Test")?)
         .await?;
 
     // Link a subgroup
