@@ -2,7 +2,9 @@
 use whatsapp_rust::prelude::{Client, CreatedEvent, CreatedPoll, Jid, StoredMessageSecret};
 use whatsapp_rust::traits::{MsgSecretEntry, MsgSecretStore};
 use whatsapp_rust::wacore::store::error::{Result, StoreError};
-use whatsapp_rust::{EventCreationParams, EventResponseType, async_trait};
+use whatsapp_rust::{
+    EventCreationParams, EventResponseType, PollError, PollRef, PollVoteCiphertext, async_trait,
+};
 
 pub struct ReadOnlyStore {
     pub bytes: Vec<u8>,
@@ -61,6 +63,30 @@ impl CreationOperations for Client {
             .await?;
         Ok((poll, event))
     }
+}
+
+/// Both public entry points compile for downstream hosts without a session.
+pub async fn decrypt_typed(
+    client: &Client,
+    ciphertext: PollVoteCiphertext<'_>,
+    target: &PollRef<'_>,
+    voter: &Jid,
+) -> std::result::Result<Vec<Vec<u8>>, PollError> {
+    client.polls().decrypt_vote(ciphertext, target, voter).await
+}
+
+pub async fn decrypt_raw(
+    client: &Client,
+    ciphertext: PollVoteCiphertext<'_>,
+    secret: &[u8],
+    message_id: &str,
+    creator: &Jid,
+    voter: &Jid,
+) -> std::result::Result<Vec<Vec<u8>>, PollError> {
+    client
+        .polls()
+        .decrypt_vote_raw(ciphertext, secret, message_id, creator, voter)
+        .await
 }
 
 #[cfg(all(test, feature = "contracts"))]
