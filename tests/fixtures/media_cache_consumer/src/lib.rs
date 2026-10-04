@@ -220,19 +220,23 @@ pub fn business_error_operation(error: &BusinessError) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use whatsapp_rust::futures::FutureExt;
 
     #[test]
     fn construction_reading_and_host_mock_work() {
         configure_bot_cache_example();
         let config = construct_inputs_and_mock();
         let store = config.cache_stores.group_cache.unwrap();
-        whatsapp_rust::futures::executor::block_on(async {
+        // This mock never suspends; no executor feature is needed in the host.
+        async {
             store.set("group", "fixture", b"mock", None).await.unwrap();
             assert!(store.get("group", "fixture").await.unwrap().is_none());
             store.delete("group", "fixture").await.unwrap();
             store.clear("group").await.unwrap();
             assert_eq!(store.entry_count("group").await.unwrap(), 0);
-        });
+        }
+        .now_or_never()
+        .expect("mock cache operations are immediately ready");
     }
 
     #[test]
