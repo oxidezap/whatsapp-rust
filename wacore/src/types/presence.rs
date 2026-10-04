@@ -78,12 +78,16 @@ impl ReceiptType {
         })
     }
 
+    /// Parse the wire `type` value. Empty or `delivery` means delivered.
+    /// This is independent of the externally tagged Serde representation.
     pub fn parse(s: &str) -> Self {
         Self::from_known(s).unwrap_or_else(|| Self::Other(s.to_string()))
     }
 
-    /// Canonical wire `type` value. Inverse of [`Self::parse`] (`Delivered`
-    /// maps to `"delivery"`, though it is sent as a dropped attr in practice).
+    /// Canonical wire `type` value for known variants; the raw payload for `Other`.
+    /// `Delivered` maps to `"delivery"`, though it is sent without a type attribute.
+    /// Parsing an `Other` payload that collides with a known wire value normalizes
+    /// it to that known variant. Use Serde when exact enum roundtrips are required.
     pub fn as_wire_str(&self) -> &str {
         match self {
             Self::Delivered => "delivery",
