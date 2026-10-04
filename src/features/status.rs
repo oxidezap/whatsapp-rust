@@ -302,11 +302,13 @@ mod tests {
     fn options_setters_preserve_all_fields() {
         let id = MessageId::new("STATUS-CONTENT").unwrap();
         let node = wacore_binary::builder::NodeBuilder::new("custom").build();
-        let mut built = StatusSendOptions::default();
-        built.privacy = StatusPrivacySetting::DenyList;
-        built.message_id = Some(id.clone());
-        built.extra_stanza_nodes = vec![node.clone()];
-        built.device_freshness = Freshness::Refresh;
+        let built = StatusSendOptions {
+            privacy: StatusPrivacySetting::DenyList,
+            message_id: Some(id.clone()),
+            stanza_id: None,
+            extra_stanza_nodes: vec![node.clone()],
+            device_freshness: Freshness::Refresh,
+        };
         let chained = StatusSendOptions::default()
             .with_privacy(StatusPrivacySetting::DenyList)
             .with_message_id(id)
