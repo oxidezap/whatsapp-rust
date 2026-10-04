@@ -6,9 +6,7 @@ The delivered head and current-head CI results are recorded in the PR.
 
 ## Consumer contract / migration for the consolidated guide
 
-Use `client.pictures().lookup(ProfilePictureRequest::new(target, size))`.
-R08 moves the canonical lookup off Contacts; `Contacts::lookup_picture` is removed.
-The request, result and `ContactError` contract are unchanged.
+Use `client.contacts().lookup_picture(ProfilePictureRequest::new(target, size))`.
 All types remain exported through `whatsapp_rust` and `whatsapp_rust::features`.
 
 | Removed entry | Replacement |
@@ -17,8 +15,8 @@ All types remain exported through `whatsapp_rust` and `whatsapp_rust::features`.
 | Contacts `lookup_profile_picture_with_options(options)` / `ProfilePictureLookupOptions` | Request with `.existing_id`, `.common_gid`, `.invite`, `.persona_id`, `.timeout` |
 | Contacts `get_profile_picture(jid, preview)` | Request, then **explicit** `.into_found()` only if non-found states may be discarded |
 | Contacts `get_profile_picture_with_timeout(jid, preview, timeout)` | Same, with `.timeout(timeout)` |
-| Groups `lookup_profile_picture` | Group target on Pictures' canonical facade |
-| Groups `lookup_community_profile_picture` | Community target on Pictures' canonical facade |
+| Groups `lookup_profile_picture` | Group target on Contacts' canonical facade |
+| Groups `lookup_community_profile_picture` | Community target on Contacts' canonical facade |
 | `ProfilePictureLookup::RateOverlimit` / `is_rate_overlimit()` | Inspect the error's `server_rejection()` (429, text, type, optional backoff) |
 | Core `parse_response_preserving_rate_limit()` | Ordinary `IqSpec::parse_response()` now preserves the same rejection |
 
@@ -28,7 +26,7 @@ Import `whatsapp_rust::ErrorChainExt` to call `server_rejection()` on the error;
 it is a trait method, not an inherent method.
 
 ```rust,ignore
-let outcome = client.pictures().lookup(
+let outcome = client.contacts().lookup_picture(
     ProfilePictureRequest::new(ProfilePictureTarget::Group(&jid), ProfilePictureType::Full)
         .existing_id(None) // Do not condition on an ID when image bytes are missing.
         .timeout(Some(Duration::from_secs(3))),
