@@ -17,9 +17,9 @@ use crate::send::{SendError, SendResult};
 
 impl Client {
     /// React using the message's chat/author scope. Newsletter reactions use
-    /// `newsletter().send_reaction_ref`; the raw chat/key overload remains
-    /// available as `send_reaction` for advanced hosts.
-    pub async fn send_reaction_ref(
+    /// [`crate::features::Newsletter::send_reaction`]; explicit chat/key interop
+    /// is available through [`Client::send_reaction_raw`].
+    pub async fn send_reaction(
         &self,
         target: &crate::MessageRef<'_>,
         emoji: &str,
@@ -32,10 +32,10 @@ impl Client {
         if target.chat().is_status_broadcast() && key.participant.is_none() {
             key.participant = Some(self.pn().ok_or(SendError::NotLoggedIn)?.to_non_ad_string());
         }
-        self.send_reaction(target.chat(), key, emoji).await
+        self.send_reaction_raw(target.chat(), key, emoji).await
     }
 
-    /// React to a DM, group, or status@broadcast message.
+    /// Explicit raw chat/key interop for DM, group, or status reactions.
     ///
     /// `target_key` references the message being reacted to. For groups and
     /// status it must carry `participant` (the original sender) so the receipt
@@ -51,7 +51,7 @@ impl Client {
     ///
     /// status@broadcast reactions fan out to the status author's devices; the
     /// author is read from `target_key.participant` by the send path.
-    pub async fn send_reaction(
+    pub async fn send_reaction_raw(
         &self,
         chat: impl Into<Jid>,
         target_key: wa::MessageKey,

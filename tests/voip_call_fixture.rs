@@ -472,12 +472,12 @@ async fn peer_video_queue_keeps_sender_state_and_upgrade_token_in_order() -> Res
     let queued: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
     assert_eq!(
         queued.len(),
-        8,
-        "one source event and one legacy event per committed direct state"
+        4,
+        "exactly one identity-bearing event per committed direct state"
     );
     let observed: Vec<_> = queued
-        .chunks_exact(2)
-        .map(|pair| {
+        .iter()
+        .map(|event| {
             let CallEvent::PeerVideoStateChanged {
                 source,
                 call_creator,
@@ -485,20 +485,11 @@ async fn peer_video_queue_keeps_sender_state_and_upgrade_token_in_order() -> Res
                 orientation,
                 upgrade_token,
                 ..
-            } = &pair[0]
+            } = event
             else {
-                panic!("expected source-bearing event, got {:?}", pair[0]);
+                panic!("expected source-bearing event, got {event:?}");
             };
             assert_eq!(call_creator, &creator);
-            assert_eq!(
-                pair[1],
-                CallEvent::VideoStateChanged {
-                    state: *state,
-                    orientation: *orientation,
-                    upgrade_token: *upgrade_token,
-                },
-                "legacy construction remains source-compatible and tokens match exactly"
-            );
             (source.clone(), *state, *orientation, *upgrade_token)
         })
         .collect();
@@ -595,18 +586,14 @@ async fn peer_video_metadata_reports_routed_sender_and_supplied_creator_without_
             upgrade_token: None,
         }
     );
-    assert_eq!(
-        events.try_recv()?,
-        CallEvent::VideoStateChanged {
-            state: VideoState::Stopped,
-            orientation: None,
-            upgrade_token: None,
-        }
+    assert!(
+        matches!(events.try_recv(), Err(async_channel::TryRecvError::Empty)),
+        "the committed notification must not have a compatibility companion"
     );
     fixture.inject(video(VideoState::Unknown(99))).await?;
     assert!(
         matches!(events.try_recv(), Err(async_channel::TryRecvError::Empty)),
-        "an ignored transition must publish neither variant"
+        "an ignored transition must not publish an event"
     );
     assert_eq!(handle.peer_jid(), winner);
     fixture.shutdown().await?;

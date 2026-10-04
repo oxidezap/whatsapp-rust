@@ -9,11 +9,9 @@ use whatsapp_rust::{
 
 fn main() -> anyhow::Result<()> {
     let parent: Jid = black_box("120363000000000011@g.us").parse()?;
-    let metadata = GroupMetadata {
-        parent_group_jid: Some(parent.clone()),
-        is_general_chat: true,
-        ..Default::default()
-    };
+    let mut metadata = GroupMetadata::new("120363000000000021@g.us".parse()?);
+    metadata.parent_group_jid = Some(parent.clone());
+    metadata.is_general_chat = true;
     match black_box(&metadata).hierarchy() {
         GroupHierarchy::Subgroup {
             parent,

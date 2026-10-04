@@ -1065,6 +1065,28 @@ pub(crate) fn infer_stanza_metadata(msg: &wa::Message) -> (Option<EditAttribute>
     )
 }
 
+// Status posts use the outer wire ID as their content ID. Revokes/reactions
+// instead carry their target in an embedded key and need an operation ID.
+fn status_id_override<'a>(
+    message: &wa::Message,
+    options: &'a crate::features::status::StatusSendOptions,
+) -> Result<Option<&'a str>, SendError> {
+    let is_content = wacore::send::status_carries_privacy_meta(message);
+    if (is_content && options.stanza_id.is_some()) || (!is_content && options.message_id.is_some())
+    {
+        return Err(SendError::InvalidRequest(
+            "status posts do not accept a stanza_id override; revokes/reactions do not accept a message_id override".into(),
+        ));
+    }
+    let outer_id = if is_content {
+        options.message_id.as_ref().map(crate::MessageId::as_str)
+    } else {
+        options.stanza_id.as_ref().map(crate::StanzaId::as_str)
+    };
+    validate_status_message_id(message, outer_id)?;
+    Ok(outer_id)
+}
+
 fn validate_status_message_id(
     message: &wa::Message,
     outer_id: Option<&str>,
@@ -1628,7 +1650,7 @@ impl Client {
         &self,
         message: wa::Message,
         recipients: &[Jid],
-        mut options: crate::features::status::StatusSendOptions,
+        options: crate::features::status::StatusSendOptions,
     ) -> Result<SendResult, SendError> {
         use wacore::client::context::GroupRoutingInfo;
         use wacore_binary::builder::NodeBuilder;
@@ -1640,7 +1662,7 @@ impl Client {
             ));
         }
         validate_extra_stanza_nodes(&options.extra_stanza_nodes)?;
-        validate_status_message_id(&message, options.message_id.as_deref())?;
+        let id_override = status_id_override(&message, &options)?.map(str::to_owned);
 
         // Status posts don't go through send_message_with_options, so count them here.
         let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
@@ -1648,10 +1670,7 @@ impl Client {
         wacore::telemetry::send("status");
 
         let to = Jid::status_broadcast();
-        let request_id = options
-            .message_id
-            .take()
-            .unwrap_or_else(|| self.generate_message_id());
+        let request_id = id_override.unwrap_or_else(|| self.generate_message_id());
 
         // Borrow from the held snapshot: no field clones, the Arc keeps it alive.
         let device_snapshot = self.persistence_manager.get_device_snapshot();
@@ -4046,6 +4065,7 @@ pub(crate) fn dm_stanza_to(recipient_bare: &Jid, to: &Jid) -> Jid {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    mod action_identity_tests;
     mod creation_tests;
     mod message_reference_tests;
     mod privacy_tokens;
@@ -4112,6 +4132,78 @@ mod tests {
         ));
         assert!(validate_status_message_id(&revoke, Some("3EB0NEWSTANZAID")).is_ok());
         assert!(validate_status_message_id(&revoke, None).is_ok());
+        assert!(matches!(
+            validate_status_message_id(&revoke, Some("")),
+            Err(SendError::InvalidRequest(_))
+        ));
+
+        let collision = crate::StatusSendOptions::default()
+            .with_stanza_id(crate::StanzaId::new(target_id).unwrap());
+        assert!(matches!(
+            status_id_override(&revoke, &collision),
+            Err(SendError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn status_overrides_keep_content_and_operation_domains_distinct() {
+        use crate::{MessageId, StanzaId, StatusSendOptions};
+        let post = wa::Message::default();
+        let revoke = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::Revoke),
+                key: buffa::MessageField::some(wa::MessageKey {
+                    id: Some("TARGET".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let reaction = wa::Message {
+            reaction_message: buffa::MessageField::some(wa::message::ReactionMessage::default()),
+            ..Default::default()
+        };
+        let content =
+            StatusSendOptions::default().with_message_id(MessageId::new("CONTENT").unwrap());
+        let operation =
+            StatusSendOptions::default().with_stanza_id(StanzaId::new("OPERATION").unwrap());
+        assert_eq!(
+            status_id_override(&post, &content).unwrap(),
+            Some("CONTENT")
+        );
+        for message in [&revoke, &reaction] {
+            assert_eq!(
+                status_id_override(message, &operation).unwrap(),
+                Some("OPERATION")
+            );
+            assert!(matches!(
+                status_id_override(message, &content),
+                Err(SendError::InvalidRequest(_))
+            ));
+        }
+        assert!(matches!(
+            status_id_override(&post, &operation),
+            Err(SendError::InvalidRequest(_))
+        ));
+        let both = content.with_stanza_id(StanzaId::new("OPERATION").unwrap());
+        for message in [&post, &revoke, &reaction] {
+            assert!(
+                status_id_override(message, &StatusSendOptions::default())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(
+                status_id_override(message, &both),
+                Err(SendError::InvalidRequest(_))
+            ));
+            assert!(matches!(
+                validate_status_message_id(message, Some("")),
+                Err(SendError::InvalidRequest(_))
+            ));
+        }
+        assert!(MessageId::new("").is_err());
+        assert!(StanzaId::new("").is_err());
     }
 
     /// A DM that reached none of the recipient's devices must arrive at the
@@ -4753,7 +4845,7 @@ mod tests {
 
         async fn revoke(&self, message_id: &str, revoke_type: RevokeType) -> SendResult {
             self.client
-                .revoke_message(self.group.clone(), message_id, revoke_type)
+                .revoke_message_raw(self.group.clone(), message_id, revoke_type)
                 .await
                 .expect("revoke should reach the wire")
         }
@@ -8830,7 +8922,7 @@ mod tests {
             participant: None,
         };
         let err = client
-            .pin_message(channel, key, PinDuration::Days7)
+            .pin_message_raw(channel, key, PinDuration::Days7)
             .await
             .expect_err("pinning a newsletter message must be rejected");
         assert!(
@@ -9456,7 +9548,7 @@ mod tests {
         let (peer_pn, _peer_lid) = seed_dm_wire_namespace_state(&client).await;
 
         let revoke = client
-            .revoke_message(peer_pn.clone(), "TARGET", RevokeType::Sender)
+            .revoke_message_raw(peer_pn.clone(), "TARGET", RevokeType::Sender)
             .await
             .expect("connected test client should complete the revoke");
         assert_ne!(
@@ -9488,7 +9580,7 @@ mod tests {
             participant: None,
         };
         let pin = client
-            .pin_message(peer_pn.clone(), target.clone(), PinDuration::Days30)
+            .pin_message_raw(peer_pn.clone(), target.clone(), PinDuration::Days30)
             .await
             .expect("connected test client should complete the pin");
         let pinned = pin
@@ -10608,16 +10700,20 @@ mod jid_into_convention {
         let _ = client
             .edit_message_raw(&jid, "ID", wa::Message::default(), EditOptions::default())
             .await;
-        let _ = client.revoke_message(&jid, "ID", RevokeType::Sender).await;
         let _ = client
-            .pin_message(&jid, wa::MessageKey::default(), PinDuration::default())
-            .await;
-        let _ = client.unpin_message(&jid, wa::MessageKey::default()).await;
-        let _ = client
-            .send_reaction(&jid, wa::MessageKey::default(), "x")
+            .revoke_message_raw(&jid, "ID", RevokeType::Sender)
             .await;
         let _ = client
-            .keep_message(&jid, wa::MessageKey::default(), true)
+            .pin_message_raw(&jid, wa::MessageKey::default(), PinDuration::default())
+            .await;
+        let _ = client
+            .unpin_message_raw(&jid, wa::MessageKey::default())
+            .await;
+        let _ = client
+            .send_reaction_raw(&jid, wa::MessageKey::default(), "x")
+            .await;
+        let _ = client
+            .keep_message_raw(&jid, wa::MessageKey::default(), true)
             .await;
         // Owned style: moves, no clone. Each method consumes its own copy so
         // the whole core surface is pinned, not just send_message.
@@ -10635,23 +10731,23 @@ mod jid_into_convention {
             )
             .await;
         let _ = client
-            .revoke_message(jid.clone(), "ID", RevokeType::Sender)
+            .revoke_message_raw(jid.clone(), "ID", RevokeType::Sender)
             .await;
         let _ = client
-            .pin_message(
+            .pin_message_raw(
                 jid.clone(),
                 wa::MessageKey::default(),
                 PinDuration::default(),
             )
             .await;
         let _ = client
-            .unpin_message(jid.clone(), wa::MessageKey::default())
+            .unpin_message_raw(jid.clone(), wa::MessageKey::default())
             .await;
         let _ = client
-            .send_reaction(jid.clone(), wa::MessageKey::default(), "x")
+            .send_reaction_raw(jid.clone(), wa::MessageKey::default(), "x")
             .await;
         let _ = client
-            .keep_message(jid, wa::MessageKey::default(), true)
+            .keep_message_raw(jid, wa::MessageKey::default(), true)
             .await;
     }
 }

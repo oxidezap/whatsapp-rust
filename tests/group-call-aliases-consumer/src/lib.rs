@@ -8,7 +8,7 @@
 //!
 //! ```
 //! use whatsapp_rust::{GroupHierarchy, GroupMetadata};
-//! let metadata = GroupMetadata::default();
+//! let metadata = GroupMetadata::new("120363000000000021@g.us".parse().unwrap());
 //! assert_eq!(metadata.hierarchy(), GroupHierarchy::Standalone);
 //! ```
 //!
@@ -23,7 +23,7 @@
 //! ```
 //! use whatsapp_rust::features::{Community, GroupHierarchy, GroupMetadata};
 //! let _: Option<Community<'_>> = None;
-//! let metadata = GroupMetadata::default();
+//! let metadata = GroupMetadata::new("120363000000000021@g.us".parse().unwrap());
 //! assert_eq!(metadata.hierarchy(), GroupHierarchy::Standalone);
 //! ```
 //!

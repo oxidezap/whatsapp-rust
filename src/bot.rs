@@ -107,7 +107,8 @@ pub enum BotBuilderError {
 /// `message` is `Arc` so cloning the context across spawned tasks only bumps a
 /// refcount, matching the pattern used by serenity's `Context` and matrix-sdk's
 /// `Room`/`Client`.
-#[derive(Clone)]
+#[derive(Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct MessageContext {
     pub message: Arc<wa::Message>,
     pub info: MessageInfo,
@@ -251,29 +252,37 @@ impl MessageContext {
             .await
     }
 
-    /// Delete a message for everyone in the chat.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.revoke_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
+    /// Revoke the addressed message using its original author/from-me scope.
+    /// To revoke this context's message, pass `&self.message_ref()?`.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.revoke_message", level = "debug", skip_all, fields(chat = %target.chat().observe()), err(Debug)))]
     pub async fn revoke_message(
+        &self,
+        target: &crate::MessageRef<'_>,
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
+        self.client.revoke_message(target).await
+    }
+
+    /// Explicit raw content id and revoke scope in this context's chat.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.revoke_message_raw", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
+    pub async fn revoke_message_raw(
         &self,
         message_id: impl Into<String>,
         revoke_type: crate::send::RevokeType,
     ) -> Result<crate::send::SendResult, crate::send::SendError> {
         self.client
-            .revoke_message(&self.info.source.chat, message_id, revoke_type)
+            .revoke_message_raw(&self.info.source.chat, message_id, revoke_type)
             .await
     }
 
     /// React to the incoming message. An empty `emoji` removes a previous
     /// reaction. The target key (including the group/status participant) is
-    /// taken from [`MessageContext::message_key`].
+    /// taken from [`MessageContext::message_ref`].
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.react", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
     pub async fn react(
         &self,
         emoji: &str,
     ) -> Result<crate::send::SendResult, crate::send::SendError> {
-        self.client
-            .send_reaction_ref(&self.message_ref()?, emoji)
-            .await
+        self.client.send_reaction(&self.message_ref()?, emoji).await
     }
 }
 
@@ -1480,11 +1489,11 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// // Disable TTL for group and device caches (good for bots with few groups)
     /// let bot = Bot::builder()
     ///     .with_backend(backend)
-    ///     .with_cache_config(CacheConfig {
-    ///         group_cache: CacheEntryConfig::new(None, 1_000),
-    ///         device_registry_cache: CacheEntryConfig::new(None, 5_000),
-    ///         ..Default::default()
-    ///     })
+    ///     .with_cache_config(
+    ///         CacheConfig::default()
+    ///             .with_group_cache(CacheEntryConfig::new(None, 1_000))
+    ///             .with_device_registry_cache(CacheEntryConfig::new(None, 5_000)),
+    ///     )
     ///     .build()
     ///     .await?;
     /// ```

@@ -6,6 +6,7 @@ use crate::cache::Freshness;
 use crate::client::Client;
 use crate::send::{SendError, SendResult};
 use crate::upload::UploadResponse;
+use crate::{MessageId, StanzaId};
 use wacore_binary::Node;
 
 /// Privacy setting sent in the `<meta>` node of the status stanza.
@@ -31,16 +32,71 @@ pub enum StatusPrivacySetting {
 /// filter `recipients`. Callers must check [`Status::audience`] and supply a
 /// compatible recipient list themselves. If the audience is unknown, do not
 /// infer that all contacts are allowed.
+/// Start from the neutral [`Default`] and chain the `with_*` setters, as with
+/// [`crate::SendOptions`].
+/// Recipients are required separately by every send method; these options do
+/// not infer an audience. Content and operation ID overrides are mutually
+/// exclusive and must match the message being sent.
+///
+/// ```
+/// use whatsapp_rust::{MessageId, StatusPrivacySetting, StatusSendOptions};
+/// let options = StatusSendOptions::default()
+///     .with_privacy(StatusPrivacySetting::AllowList)
+///     .with_message_id(MessageId::new("STATUS-CONTENT")?);
+/// # Ok::<(), whatsapp_rust::MessageRefError>(())
+/// ```
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct StatusSendOptions {
     /// Privacy setting for this status. Sent in the `<meta>` stanza node.
     pub privacy: StatusPrivacySetting,
-    /// Override the generated message ID.
-    pub message_id: Option<String>,
+    /// Override the generated content ID for a status post. Not valid for a
+    /// revoke or reaction; use [`Self::stanza_id`] for those operations.
+    pub message_id: Option<MessageId>,
+    /// Override the outer operation ID for a revoke or raw reaction. Not valid
+    /// for a content post. For revokes this must differ from the target ID.
+    pub stanza_id: Option<StanzaId>,
     /// Extra child nodes appended to the status stanza.
     pub extra_stanza_nodes: Vec<Node>,
     /// Freshness policy for the recipient device lists used by this send.
     pub device_freshness: Freshness,
+}
+
+impl StatusSendOptions {
+    /// See [`Self::privacy`].
+    #[must_use]
+    pub fn with_privacy(mut self, privacy: StatusPrivacySetting) -> Self {
+        self.privacy = privacy;
+        self
+    }
+
+    /// See [`Self::message_id`].
+    #[must_use]
+    pub fn with_message_id(mut self, message_id: MessageId) -> Self {
+        self.message_id = Some(message_id);
+        self
+    }
+
+    /// See [`Self::stanza_id`].
+    #[must_use]
+    pub fn with_stanza_id(mut self, stanza_id: StanzaId) -> Self {
+        self.stanza_id = Some(stanza_id);
+        self
+    }
+
+    /// See [`Self::extra_stanza_nodes`].
+    #[must_use]
+    pub fn with_extra_stanza_nodes(mut self, nodes: Vec<Node>) -> Self {
+        self.extra_stanza_nodes = nodes;
+        self
+    }
+
+    /// See [`Self::device_freshness`].
+    #[must_use]
+    pub fn with_device_freshness(mut self, freshness: Freshness) -> Self {
+        self.device_freshness = freshness;
+        self
+    }
 }
 
 /// High-level API for WhatsApp status/story updates.
@@ -167,13 +223,15 @@ impl<'a> Status<'a> {
     ///
     /// `recipients` should be the same list used when posting the status,
     /// since the revoke must be encrypted to the same set of devices.
+    /// The target is a content [`MessageId`]; an optional outer operation ID
+    /// belongs in [`StatusSendOptions::stanza_id`]. The returned
+    /// [`SendResult::stanza_id`] identifies the revoke, not its target.
     pub async fn revoke(
         &self,
-        message_id: impl Into<String>,
+        message_id: MessageId,
         recipients: &[Jid],
         options: StatusSendOptions,
     ) -> Result<SendResult, SendError> {
-        let message_id = message_id.into();
         let to = Jid::status_broadcast();
 
         let revoke_message = wa::Message {
@@ -181,7 +239,7 @@ impl<'a> Status<'a> {
                 key: buffa::MessageField::some(wa::MessageKey {
                     remote_jid: Some(to.to_string()),
                     from_me: Some(true),
-                    id: Some(message_id),
+                    id: Some(message_id.into_string()),
                     ..Default::default()
                 }),
                 r#type: Some(wa::message::protocol_message::Type::REVOKE),
@@ -238,6 +296,85 @@ mod tests {
     fn test_status_send_options_default() {
         let opts = StatusSendOptions::default();
         assert_eq!(opts.privacy.as_str(), "contacts");
+    }
+
+    #[test]
+    fn options_setters_preserve_all_fields() {
+        let id = MessageId::new("STATUS-CONTENT").unwrap();
+        let node = wacore_binary::builder::NodeBuilder::new("custom").build();
+        let built = StatusSendOptions {
+            privacy: StatusPrivacySetting::DenyList,
+            message_id: Some(id.clone()),
+            stanza_id: None,
+            extra_stanza_nodes: vec![node.clone()],
+            device_freshness: Freshness::Refresh,
+        };
+        let chained = StatusSendOptions::default()
+            .with_privacy(StatusPrivacySetting::DenyList)
+            .with_message_id(id)
+            .with_extra_stanza_nodes(vec![node])
+            .with_device_freshness(Freshness::Refresh);
+        assert_eq!(built.privacy, chained.privacy);
+        assert_eq!(built.message_id, chained.message_id);
+        assert_eq!(built.extra_stanza_nodes, chained.extra_stanza_nodes);
+        assert_eq!(built.device_freshness, chained.device_freshness);
+        assert!(built.stanza_id.is_none());
+        let neutral = StatusSendOptions::default();
+        assert_eq!(neutral.privacy, StatusPrivacySetting::Contacts);
+        assert!(neutral.message_id.is_none());
+        assert!(neutral.stanza_id.is_none());
+        assert!(neutral.extra_stanza_nodes.is_empty());
+        assert_eq!(
+            neutral.device_freshness,
+            StatusSendOptions::default().device_freshness
+        );
+    }
+
+    #[tokio::test]
+    async fn status_requires_explicit_audience_for_posts_and_revokes() {
+        let client = crate::test_utils::create_test_client().await;
+        let status = client.status();
+        assert!(
+            status.audience().is_none(),
+            "unobserved is not an all-contacts audience"
+        );
+        let target = MessageId::new("STATUS-TARGET").unwrap();
+        for privacy in [
+            StatusPrivacySetting::Contacts,
+            StatusPrivacySetting::AllowList,
+            StatusPrivacySetting::DenyList,
+        ] {
+            let options = StatusSendOptions::default().with_privacy(privacy);
+            let posted = status
+                .send_raw(wa::Message::default(), &[], options.clone())
+                .await;
+            let revoked = status.revoke(target.clone(), &[], options.clone()).await;
+            for result in [posted, revoked] {
+                assert!(
+                    matches!(result, Err(SendError::InvalidRequest(ref message)) if message.contains("no recipients"))
+                );
+            }
+            // Privacy never synthesizes or filters this explicit list: both
+            // paths proceed to the same identity check, not an audience error.
+            let recipients = [Jid::pn("15550000001")];
+            assert!(matches!(
+                status
+                    .send_raw(wa::Message::default(), &recipients, options.clone())
+                    .await,
+                Err(SendError::NotLoggedIn)
+            ));
+            assert!(matches!(
+                status.revoke(target.clone(), &recipients, options).await,
+                Err(SendError::NotLoggedIn)
+            ));
+        }
+        let collision =
+            StatusSendOptions::default().with_stanza_id(StanzaId::from_message_id(&target));
+        assert!(matches!(
+            status.revoke(target, &[Jid::pn("15550000001")], collision).await,
+            Err(SendError::InvalidRequest(ref message)) if message.contains("must differ")
+        ));
+        assert!(status.audience().is_none());
     }
 
     #[test]

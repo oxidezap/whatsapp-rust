@@ -4110,7 +4110,7 @@ impl CallHandle {
     /// UPGRADE the call to video (we initiate): attaches the endpoints, enables the media plane,
     /// and sends `<video state=11 dec="H264" device_orientation="0" voip_settings="video">`.
     /// The peer answers with
-    /// `UpgradeAccept`/`Enabled` (surfaced as [`CallEvent::VideoStateChanged`]); media flows as
+    /// `UpgradeAccept`/`Enabled` (surfaced as [`CallEvent::PeerVideoStateChanged`]); media flows as
     /// soon as both planes are up. Also the way to start media on a `.video()` call whose builder
     /// endpoints you skipped.
     pub async fn start_video<S, K>(&self, source: S, sink: K) -> Result<(), CallError>
@@ -4122,7 +4122,7 @@ impl CallHandle {
             .await
     }
 
-    /// ACCEPT the peer's video upgrade request (a `VideoStateChanged { state: UpgradeRequestV2 }`
+    /// ACCEPT the peer's video upgrade request (a `PeerVideoStateChanged { state: UpgradeRequestV2, .. }`
     /// event): the token binds this action to that exact request, then the method attaches the
     /// endpoints, enables the media plane, and answers
     /// `<video state=4 dec="H264,AV1" device_orientation="0">` followed by

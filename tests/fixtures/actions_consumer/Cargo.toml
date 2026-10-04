@@ -1,0 +1,11 @@
+[package]
+name = "actions-consumer"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[workspace]
+
+[dependencies]
+wa = { package = "whatsapp-rust", path = "../../..", default-features = false }

@@ -30,10 +30,9 @@ async fn assert_secret_creation_edit_wire(is_event: bool) {
                 .events()
                 .create(
                     &fixture.group,
-                    crate::EventCreationParams {
-                        name: "Launch".into(),
-                        ..Default::default()
-                    },
+                    crate::EventCreationParams::builder()
+                        .name("Launch".into())
+                        .build(),
                 )
                 .await
                 .unwrap();
@@ -639,10 +638,9 @@ async fn secret_edit_keeps_original_creator_across_actual_group_addressing_modes
         .events()
         .create(
             &original_view.group,
-            crate::EventCreationParams {
-                name: "Launch".into(),
-                ..Default::default()
-            },
+            crate::EventCreationParams::builder()
+                .name("Launch".into())
+                .build(),
         )
         .await
         .unwrap();
@@ -754,10 +752,9 @@ async fn secret_edit_request_uses_captured_creator_and_preserves_borrowed_id_sta
             .events()
             .create(
                 &fixture.group,
-                crate::EventCreationParams {
-                    name: "Launch".into(),
-                    ..Default::default()
-                },
+                crate::EventCreationParams::builder()
+                    .name("Launch".into())
+                    .build(),
             )
             .await
             .unwrap();

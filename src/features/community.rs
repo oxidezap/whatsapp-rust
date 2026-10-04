@@ -316,12 +316,13 @@ impl<'a> Community<'a> {
     ) -> Result<CreateCommunityResult, CommunityError> {
         let name = GroupSubject::new(options.name)
             .map_err(|error| CommunityError::InvalidRequest(error.to_string()))?;
-        let mut create_options = GroupCreateOptions::new(name.into_string());
-        create_options.participants = options
-            .participants
-            .into_iter()
-            .map(GroupParticipantOptions::new)
-            .collect();
+        let mut create_options = GroupCreateOptions::new(name.into_string()).with_participants(
+            options
+                .participants
+                .into_iter()
+                .map(GroupParticipantOptions::new)
+                .collect(),
+        );
         create_options.linked_parent = Some(options.parent_jid);
         create_options.hidden_group = options.visibility == SubgroupVisibility::Hidden;
         let metadata = self

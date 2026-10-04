@@ -27,8 +27,8 @@ async fn test_set_profile_picture() -> anyhow::Result<()> {
     info!("Fetching profile picture for own JID: {}", own_jid);
     let pic = client
         .client
-        .contacts()
-        .lookup_picture(ProfilePictureRequest::new(
+        .pictures()
+        .lookup(ProfilePictureRequest::new(
             ProfilePictureTarget::Contact(&own_jid),
             ProfilePictureType::Full,
         ))
@@ -99,8 +99,8 @@ async fn test_set_profile_picture_then_update() -> anyhow::Result<()> {
     let own_jid = client.client.pn().expect("should have PN after pairing");
     let pic = client
         .client
-        .contacts()
-        .lookup_picture(ProfilePictureRequest::new(
+        .pictures()
+        .lookup(ProfilePictureRequest::new(
             ProfilePictureTarget::Contact(&own_jid),
             ProfilePictureType::Full,
         ))
@@ -158,8 +158,8 @@ async fn test_remove_profile_picture() -> anyhow::Result<()> {
     // Verify the picture is gone
     let pic = client
         .client
-        .contacts()
-        .lookup_picture(ProfilePictureRequest::new(
+        .pictures()
+        .lookup(ProfilePictureRequest::new(
             ProfilePictureTarget::Contact(&own_jid),
             ProfilePictureType::Full,
         ))
@@ -184,8 +184,8 @@ async fn test_get_nonexistent_profile_picture() -> anyhow::Result<()> {
     let own_jid = client.client.pn().expect("should have PN after pairing");
     let pic = client
         .client
-        .contacts()
-        .lookup_picture(ProfilePictureRequest::new(
+        .pictures()
+        .lookup(ProfilePictureRequest::new(
             ProfilePictureTarget::Contact(&own_jid),
             ProfilePictureType::Preview,
         ))
@@ -221,8 +221,8 @@ async fn test_get_contact_profile_picture() -> anyhow::Result<()> {
     let jid_b = client_b.client.pn().expect("B should have PN").to_non_ad();
     let pic = client_a
         .client
-        .contacts()
-        .lookup_picture(ProfilePictureRequest::new(
+        .pictures()
+        .lookup(ProfilePictureRequest::new(
             ProfilePictureTarget::Contact(&jid_b),
             ProfilePictureType::Full,
         ))
@@ -262,8 +262,8 @@ async fn test_lookup_picture_preview_and_full() -> anyhow::Result<()> {
     // Fetch preview
     let preview = client
         .client
-        .contacts()
-        .lookup_picture(ProfilePictureRequest::new(
+        .pictures()
+        .lookup(ProfilePictureRequest::new(
             ProfilePictureTarget::Contact(&own_jid),
             ProfilePictureType::Preview,
         ))
@@ -277,8 +277,8 @@ async fn test_lookup_picture_preview_and_full() -> anyhow::Result<()> {
     // Fetch full
     let full = client
         .client
-        .contacts()
-        .lookup_picture(ProfilePictureRequest::new(
+        .pictures()
+        .lookup(ProfilePictureRequest::new(
             ProfilePictureTarget::Contact(&own_jid),
             ProfilePictureType::Full,
         ))

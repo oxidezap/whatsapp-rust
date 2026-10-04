@@ -22,7 +22,7 @@ use wacore_binary::{Jid, NodeContent, NodeRef, Server};
 /// The public tallies cannot answer whether this account's vote landed: they
 /// are counts across every follower. This is the server's record of the
 /// account's own choice.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 #[non_exhaustive]
 pub struct NewsletterMyAddOns {
     /// The message's server-assigned id.
@@ -36,7 +36,7 @@ pub struct NewsletterMyAddOns {
 }
 
 /// This account's own reaction on a newsletter message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 #[non_exhaustive]
 pub struct NewsletterMyReaction {
     /// The reaction emoji.
@@ -46,7 +46,7 @@ pub struct NewsletterMyReaction {
 }
 
 /// This account's own vote on a newsletter poll.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 #[non_exhaustive]
 pub struct NewsletterMyPollVote {
     /// When the selection was last sent (Unix seconds). This is the `t` of the

@@ -137,11 +137,10 @@ async fn group_send_still_carries_addressing_mode() -> anyhow::Result<()> {
     let group = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "addressing_mode regression".to_string(),
-            participants: vec![GroupParticipantOptions::new(jid_b)],
-            ..Default::default()
-        })
+        .create_group(
+            GroupCreateOptions::new("addressing_mode regression")
+                .with_participant(GroupParticipantOptions::new(jid_b)),
+        )
         .await?;
     let group_jid = group.metadata.id;
 

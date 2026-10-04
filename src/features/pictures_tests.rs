@@ -85,8 +85,8 @@ async fn canonical_roundtrip_route(
             Route::Community => ProfilePictureTarget::Community(&jid),
         };
         task_client
-            .contacts()
-            .lookup_picture(ProfilePictureRequest::new(target, size).existing_id(existing_id))
+            .pictures()
+            .lookup(ProfilePictureRequest::new(target, size).existing_id(existing_id))
             .await
     });
     let sent = decode_sent_iq(&transport, 0).await;
@@ -541,6 +541,20 @@ fn picture_lookup_special_jids_do_not_discover_privacy_tokens() {
 }
 
 #[tokio::test]
+async fn picture_lookup_regular_jid_is_not_short_circuited_when_disconnected() {
+    let client = crate::test_utils::create_test_client().await;
+    let err = client
+        .pictures()
+        .lookup(ProfilePictureRequest::new(
+            ProfilePictureTarget::Contact(&Jid::pn("15550000001")),
+            ProfilePictureType::Full,
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ContactError::Iq(IqError::NotConnected)));
+}
+
+#[tokio::test]
 async fn picture_lookup_psa_is_short_circuited_and_timeout_remains_an_error() {
     let (client, transport) = create_iq_test_client().await;
     let psa = Jid::pn("0");
@@ -550,14 +564,14 @@ async fn picture_lookup_psa_is_short_circuited_and_timeout_remains_an_error() {
     )
     .timeout(Some(Duration::from_millis(1)));
     assert_eq!(
-        client.contacts().lookup_picture(request).await.unwrap(),
+        client.pictures().lookup(request).await.unwrap(),
         ProfilePictureLookup::NotFound
     );
     assert!(transport.sent().is_empty());
     let jid = Jid::pn("15550000001");
     let error = client
-        .contacts()
-        .lookup_picture(
+        .pictures()
+        .lookup(
             ProfilePictureRequest::new(
                 ProfilePictureTarget::Contact(&jid),
                 ProfilePictureType::Full,
@@ -584,8 +598,8 @@ async fn consumer_lookup(
         Some("known-photo")
     };
     let original = client
-        .contacts()
-        .lookup_picture(
+        .pictures()
+        .lookup(
             ProfilePictureRequest::new(
                 ProfilePictureTarget::Group(jid),
                 ProfilePictureType::Preview,
@@ -597,8 +611,8 @@ async fn consumer_lookup(
         return Ok(original);
     }
     let fallback = client
-        .contacts()
-        .lookup_picture(
+        .pictures()
+        .lookup(
             ProfilePictureRequest::new(
                 ProfilePictureTarget::Community(jid),
                 ProfilePictureType::Preview,

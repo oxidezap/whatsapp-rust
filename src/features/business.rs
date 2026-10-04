@@ -320,6 +320,7 @@ pub struct Order {
 
 /// Paging and thumbnail options for [`Business::get_catalog`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CatalogOptions {
     /// Products per page.
     pub limit: u32,
@@ -330,6 +331,33 @@ pub struct CatalogOptions {
     /// Lets the server include products surfaced through Shop as well as the
     /// business's own catalog.
     pub allow_shop_source: bool,
+}
+
+impl CatalogOptions {
+    /// Set the maximum number of products per page.
+    pub fn with_limit(mut self, limit: u32) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Continue from a previous page's cursor.
+    pub fn with_after(mut self, after: impl Into<String>) -> Self {
+        self.after = Some(after.into());
+        self
+    }
+
+    /// Set requested thumbnail dimensions in pixels.
+    pub fn with_image_dimensions(mut self, width: u32, height: u32) -> Self {
+        self.image_width = width;
+        self.image_height = height;
+        self
+    }
+
+    /// Choose whether Shop-sourced products may be included.
+    pub fn with_allow_shop_source(mut self, allow: bool) -> Self {
+        self.allow_shop_source = allow;
+        self
+    }
 }
 
 impl Default for CatalogOptions {
@@ -346,6 +374,7 @@ impl Default for CatalogOptions {
 
 /// Options for [`Business::get_collections`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CollectionOptions {
     /// Collections per page.
     pub collection_limit: u32,
@@ -354,6 +383,33 @@ pub struct CollectionOptions {
     pub after: Option<String>,
     pub image_width: u32,
     pub image_height: u32,
+}
+
+impl CollectionOptions {
+    /// Set the maximum number of collections per page.
+    pub fn with_collection_limit(mut self, limit: u32) -> Self {
+        self.collection_limit = limit;
+        self
+    }
+
+    /// Set the maximum number of products returned inline per collection.
+    pub fn with_item_limit(mut self, limit: u32) -> Self {
+        self.item_limit = limit;
+        self
+    }
+
+    /// Continue from a previous page's cursor.
+    pub fn with_after(mut self, after: impl Into<String>) -> Self {
+        self.after = Some(after.into());
+        self
+    }
+
+    /// Set requested thumbnail dimensions in pixels.
+    pub fn with_image_dimensions(mut self, width: u32, height: u32) -> Self {
+        self.image_width = width;
+        self.image_height = height;
+        self
+    }
 }
 
 impl Default for CollectionOptions {

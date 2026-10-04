@@ -250,7 +250,8 @@ pub enum NewsletterRole {
 }
 
 /// Metadata for a newsletter (channel).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[non_exhaustive]
 pub struct NewsletterMetadata {
     pub jid: Jid,
     pub name: String,
@@ -276,7 +277,8 @@ pub struct NewsletterMetadata {
 ///
 /// `id` is the profile's own identifier, not a JID: the server hands it back as
 /// an opaque string and WA Web never parses it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[non_exhaustive]
 pub struct NewsletterAdminProfile {
     pub id: Option<String>,
     pub name: String,
@@ -285,7 +287,8 @@ pub struct NewsletterAdminProfile {
 }
 
 /// Admin-side information about a newsletter.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, bon::Builder)]
+#[non_exhaustive]
 pub struct NewsletterAdminInfo {
     /// How many admins the newsletter has. The server only answers this for
     /// admins and owners, so it is absent for everyone else.
@@ -297,7 +300,8 @@ pub struct NewsletterAdminInfo {
 }
 
 /// A follower (subscriber) of a newsletter.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[non_exhaustive]
 pub struct NewsletterFollower {
     /// The follower's identity JID — a LID on accounts that have migrated.
     pub jid: Jid,
@@ -315,7 +319,8 @@ pub struct NewsletterFollower {
 }
 
 /// A reaction count on a newsletter message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct NewsletterReactionCount {
     pub code: String,
     pub count: u64,
@@ -326,7 +331,7 @@ pub struct NewsletterReactionCount {
 /// Channel polls are counted server-side, so unlike a DM or group vote (which
 /// arrives encrypted, see [`wacore::poll`]) there is nothing to decrypt here:
 /// the server hands over the totals directly, keyed by option hash.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 #[non_exhaustive]
 pub struct NewsletterPollVote {
     /// SHA-256 of the option name, the same digest
@@ -341,10 +346,9 @@ pub struct NewsletterPollVote {
 /// A message from a newsletter's history.
 ///
 /// `#[non_exhaustive]` because the server keeps adding children to
-/// `<message>`: construct it from a parsed response rather than by struct
-/// literal, so the next counter WhatsApp ships is an added field and not a
-/// break.
-#[derive(Debug, Clone)]
+/// `<message>`. Use parsed responses in production; [`Self::builder`] also
+/// supports host mocks without exhaustive struct literals.
+#[derive(Debug, Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct NewsletterMessage {
     /// Wire message id (the stanza `id`). This is what edit_message / revoke_message
@@ -380,8 +384,10 @@ pub struct NewsletterMessage {
     /// [`NewsletterMediaType::Other`].
     pub media_type: Option<NewsletterMediaType>,
     /// Reaction counts on this message.
+    #[builder(default)]
     pub reactions: Vec<NewsletterReactionCount>,
     /// Per-option vote tallies, for a `poll` message.
+    #[builder(default)]
     pub votes: Vec<NewsletterPollVote>,
     /// How many times the message was forwarded.
     ///
@@ -847,29 +853,25 @@ impl<'a> Newsletter<'a> {
 
     /// React using only the target's server content id. Returns the NEW
     /// operation stanza id for ACK correlation, not a delivery guarantee.
-    pub async fn send_reaction_ref(
+    pub async fn send_reaction(
         &self,
         target: &crate::NewsletterMessageRef<'_>,
         reaction: &str,
     ) -> Result<crate::StanzaId, NewsletterError> {
         let server_id = target.require_server_id()?;
-        let id = self
-            .send_reaction(target.chat(), server_id.get(), reaction)
-            .await?;
-        Ok(crate::StanzaId::new(id)?)
+        self.send_reaction_raw(target.chat(), server_id.get(), reaction)
+            .await
     }
 
     /// Replace a poll selection using only the poll's server content id.
-    pub async fn send_poll_vote_ref(
+    pub async fn send_poll_vote(
         &self,
         target: &crate::NewsletterMessageRef<'_>,
         option_hashes: &[[u8; 32]],
     ) -> Result<crate::StanzaId, NewsletterError> {
         let server_id = target.require_server_id()?;
-        let id = self
-            .send_poll_vote(target.chat(), server_id.get(), option_hashes)
-            .await?;
-        Ok(crate::StanzaId::new(id)?)
+        self.send_poll_vote_raw(target.chat(), server_id.get(), option_hashes)
+            .await
     }
 
     /// Edit using only the target's client content id, never its server id.
@@ -893,26 +895,28 @@ impl<'a> Newsletter<'a> {
         self.revoke_message_raw(target.chat(), id.as_str()).await
     }
 
-    /// Send a reaction to a newsletter message.
+    /// Explicit raw channel/server-content-id interop for reactions.
     ///
     /// `server_id` is the server-assigned ID of the message to react to.
     /// `reaction` is the emoji code (e.g., "👍", "❤️"), or empty to remove.
     ///
     /// Returns the stanza id. Match it against the `id` of the server's ack,
     /// which arrives as [`wacore::types::events::Event::ServerAck`].
-    pub async fn send_reaction(
+    pub async fn send_reaction_raw(
         &self,
         jid: &Jid,
         server_id: u64,
         reaction: &str,
-    ) -> Result<String, NewsletterError> {
-        self.client
+    ) -> Result<crate::StanzaId, NewsletterError> {
+        let id = self
+            .client
             .send_server_reaction(jid, server_id, reaction)
             .await
-            .map_err(NewsletterError::from_anyhow)
+            .map_err(NewsletterError::from_anyhow)?;
+        Ok(crate::StanzaId::new(id)?)
     }
 
-    /// Vote in a newsletter poll.
+    /// Explicit raw channel/server-content-id interop for poll selections.
     ///
     /// `server_id` is the poll's. `option_hashes` is the whole selection, one
     /// [`wacore::poll::compute_option_hash`] per chosen option, the same key
@@ -928,12 +932,12 @@ impl<'a> Newsletter<'a> {
     /// which arrives as [`wacore::types::events::Event::ServerAck`]; the ack
     /// also names the poll's `server_id` on the wire, but that event does not
     /// carry it.
-    pub async fn send_poll_vote(
+    pub async fn send_poll_vote_raw(
         &self,
         jid: &Jid,
         server_id: u64,
         option_hashes: &[[u8; 32]],
-    ) -> Result<String, NewsletterError> {
+    ) -> Result<crate::StanzaId, NewsletterError> {
         if !jid.is_newsletter() {
             return Err(NewsletterError::InvalidRequest(
                 "send_poll_vote is only valid for newsletter (channel) JIDs".into(),
@@ -944,7 +948,7 @@ impl<'a> Newsletter<'a> {
         self.client
             .send_node(build_poll_vote_node(jid, &id, server_id, option_hashes))
             .await?;
-        Ok(id)
+        Ok(crate::StanzaId::new(id)?)
     }
 
     /// Edit a message in a newsletter (channel). Channels are plaintext (not E2E).
@@ -3653,7 +3657,7 @@ mod tests {
 
         let id = client
             .newsletter()
-            .send_poll_vote(&jid, 777, &[option_hash(JUST_THIS_HASH)])
+            .send_poll_vote_raw(&jid, 777, &[option_hash(JUST_THIS_HASH)])
             .await
             .expect("vote is sent");
 
@@ -3674,7 +3678,7 @@ mod tests {
 
         let id = client
             .newsletter()
-            .send_reaction(&jid, 777, "👍")
+            .send_reaction_raw(&jid, 777, "👍")
             .await
             .expect("reaction is sent");
 
@@ -3697,7 +3701,7 @@ mod tests {
 
         let not_a_channel = client
             .newsletter()
-            .send_poll_vote(&group, 777, &[hash])
+            .send_poll_vote_raw(&group, 777, &[hash])
             .await;
         assert!(matches!(
             not_a_channel,
@@ -3706,7 +3710,7 @@ mod tests {
 
         let repeated = client
             .newsletter()
-            .send_poll_vote(&newsletter_jid(), 777, &[hash, hash])
+            .send_poll_vote_raw(&newsletter_jid(), 777, &[hash, hash])
             .await;
         assert!(matches!(repeated, Err(NewsletterError::InvalidRequest(_))));
 

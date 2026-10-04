@@ -355,14 +355,12 @@ async fn test_heavy_group_soak() -> anyhow::Result<()> {
     let g1 = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "Soak Group 1".to_string(),
-            participants: vec![
+        .create_group(
+            GroupCreateOptions::new("Soak Group 1").with_participants(vec![
                 GroupParticipantOptions::new(jid_b.clone()),
                 GroupParticipantOptions::new(jid_c.clone()),
-            ],
-            ..Default::default()
-        })
+            ]),
+        )
         .await?
         .metadata
         .id;
@@ -381,11 +379,10 @@ async fn test_heavy_group_soak() -> anyhow::Result<()> {
     let g2 = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "Soak Group 2".to_string(),
-            participants: vec![GroupParticipantOptions::new(jid_b.clone())],
-            ..Default::default()
-        })
+        .create_group(
+            GroupCreateOptions::new("Soak Group 2")
+                .with_participant(GroupParticipantOptions::new(jid_b.clone())),
+        )
         .await?
         .metadata
         .id;
@@ -500,14 +497,12 @@ async fn test_heavy_mixed_soak() -> anyhow::Result<()> {
     let group_jid = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "Soak Mixed Group".to_string(),
-            participants: vec![
+        .create_group(
+            GroupCreateOptions::new("Soak Mixed Group").with_participants(vec![
                 GroupParticipantOptions::new(jid_b.clone()),
                 GroupParticipantOptions::new(jid_c.clone()),
-            ],
-            ..Default::default()
-        })
+            ]),
+        )
         .await?
         .metadata
         .id;

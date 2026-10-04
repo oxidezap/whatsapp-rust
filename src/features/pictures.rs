@@ -1,9 +1,69 @@
-//! Shared picture lookup construction and interpretation; no mutation APIs.
+//! Multi-domain picture lookup; mutations remain in their domain facades.
 
+use super::contacts::ContactError;
 use crate::{client::Client, request::IqError};
 use std::time::Duration;
-use wacore::iq::contacts::{ProfilePictureLookup, ProfilePictureSpec, ProfilePictureType};
+use wacore::iq::contacts::ProfilePictureSpec;
+
+pub use wacore::iq::contacts::{ProfilePicture, ProfilePictureLookup, ProfilePictureType};
 use wacore_binary::{Jid, JidExt};
+
+/// Read profile pictures for contacts, groups, and community parents.
+///
+/// Setters and removals remain on [`crate::Profile`], [`crate::Groups`], and
+/// [`crate::Community`]. Group batch lookup remains on [`crate::Groups`].
+///
+/// This replaces `Contacts::lookup_picture`; the old entry point is removed:
+/// ```compile_fail,E0599
+/// use whatsapp_rust::{Client, ContactError, ProfilePictureLookup,
+///     ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
+/// use whatsapp_rust::wacore_binary::Jid;
+/// async fn old_lookup(client: &Client, jid: &Jid) -> Result<ProfilePictureLookup, ContactError> {
+///     client.contacts().lookup_picture(ProfilePictureRequest::new(
+///         ProfilePictureTarget::Contact(jid), ProfilePictureType::Full,
+///     )).await
+/// }
+/// ```
+pub struct Pictures<'a> {
+    client: &'a Client,
+}
+
+impl Pictures<'_> {
+    /// Canonical lookup with explicit size/route and preserved rejection metadata.
+    ///
+    /// Found/Unchanged/NotFound/NotAuthorized remain distinct. A 429 is a
+    /// [`ContactError::Iq`] wrapping [`IqError::ServerError`] with its original
+    /// stanza and optional backoff. The existing error contract is preserved.
+    /// There is no automatic community fallback. `into_found()` explicitly
+    /// discards all non-found states; Unchanged says nothing about cached bytes.
+    ///
+    /// ```no_run
+    /// # use whatsapp_rust::{Client, ContactError, ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
+    /// # use whatsapp_rust::wacore_binary::Jid;
+    /// # async fn example(client: &Client, jid: &Jid) -> Result<(), ContactError> {
+    /// let outcome = client.pictures().lookup(ProfilePictureRequest::new(
+    ///     ProfilePictureTarget::Group(jid), ProfilePictureType::Full,
+    /// )).await?;
+    /// // Only when the consumer intentionally needs newly found URLs alone:
+    /// let picture = outcome.into_found();
+    /// # let _ = picture;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn lookup(
+        &self,
+        request: ProfilePictureRequest<'_>,
+    ) -> Result<ProfilePictureLookup, ContactError> {
+        Ok(lookup(self.client, request).await?)
+    }
+}
+
+impl Client {
+    /// Access picture lookup across contacts, groups, and communities.
+    pub fn pictures(&self) -> Pictures<'_> {
+        Pictures { client: self }
+    }
+}
 
 /// Explicit picture route. No route triggers a fallback or metadata query.
 #[derive(Debug, Clone, Copy)]

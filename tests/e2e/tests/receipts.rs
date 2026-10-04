@@ -318,11 +318,10 @@ async fn test_group_delivery_receipt() -> anyhow::Result<()> {
     let group_jid = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "Receipt Test Group".to_string(),
-            participants: vec![GroupParticipantOptions::new(jid_b.clone())],
-            ..Default::default()
-        })
+        .create_group(
+            GroupCreateOptions::new("Receipt Test Group")
+                .with_participant(GroupParticipantOptions::new(jid_b.clone())),
+        )
         .await?
         .metadata
         .id;

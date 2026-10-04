@@ -13,8 +13,8 @@ fn boxed_lookup<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<ProfilePictureLookup, ContactError>> + Send + 'a>> {
     Box::pin(async move {
         client
-            .contacts()
-            .lookup_picture(
+            .pictures()
+            .lookup(
                 ProfilePictureRequest::new(
                     ProfilePictureTarget::Group(jid),
                     ProfilePictureType::Full,

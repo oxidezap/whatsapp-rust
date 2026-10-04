@@ -90,10 +90,7 @@ pub fn boxed<'a>(client: &'a Client, chat: &'a Jid) -> BoxedSend<'a> {
             .events()
             .create(
                 chat,
-                wa::EventCreationParams {
-                    name: "Launch".into(),
-                    ..Default::default()
-                },
+                wa::EventCreationParams::builder().name("Launch".into()).build(),
             )
             .await?;
         let mut update = Message::default();

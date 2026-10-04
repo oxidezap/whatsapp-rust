@@ -8,6 +8,11 @@ use xtask_support::{capture, write};
 
 #[derive(Subcommand)]
 pub enum Task {
+    /// Registered standalone API hosts and drift detection.
+    Consumers {
+        #[command(subcommand)]
+        task: super::consumers::Task,
+    },
     /// Additional first-party workflow tasks, including release preflight and reports.
     Workflow {
         #[command(subcommand)]
@@ -176,6 +181,7 @@ fn timed_report(
 
 pub fn run(root: &Path, task: Task) -> Result<u8> {
     match task {
+        Task::Consumers { task } => return super::consumers::run(root, task),
         Task::Workflow { task } => super::workflow::run_task(root, task)?,
         Task::TestWaprotoFeatures => {
             let mut status = 0;

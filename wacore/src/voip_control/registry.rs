@@ -5570,7 +5570,9 @@ mod tests {
         let (ctl_tx, _ctl_rx) = video_control_channel();
         reg.set_video_channels("CID", generation, event_tx.clone(), ctl_tx, Box::new(|| {}));
 
-        let event = || CallEvent::VideoStateChanged {
+        let event = || CallEvent::PeerVideoStateChanged {
+            source: Jid::new("222222222222222", Server::Lid),
+            call_creator: Jid::new("111111111111111", Server::Lid),
             state: VideoState::Enabled,
             orientation: None,
             upgrade_token: None,
@@ -5590,7 +5592,7 @@ mod tests {
         assert!(permit.send(event()));
         assert!(matches!(
             event_rx.try_recv(),
-            Ok(CallEvent::VideoStateChanged { .. })
+            Ok(CallEvent::PeerVideoStateChanged { .. })
         ));
         assert!(
             reg.reserve_call_event("CID").is_none(),
@@ -5602,7 +5604,7 @@ mod tests {
     }
 
     #[test]
-    fn source_video_events_account_for_both_jids_and_preserve_legacy_at_capacity_one() {
+    fn peer_video_event_accounts_for_both_jids_and_survives_capacity_one() {
         use crate::stats::HeapSize;
 
         for capacity in [1, 2] {
@@ -5623,18 +5625,9 @@ mod tests {
             };
             assert_eq!(sourced.heap_bytes(), expected_heap);
             assert!(expected_heap > 0);
-            let legacy = CallEvent::VideoStateChanged {
-                state: VideoState::Stopped,
-                orientation: Some(2),
-                upgrade_token: None,
-            };
             let permit = reg.reserve_call_event("CID").unwrap();
             assert!(permit.send(sourced.clone()));
-            assert!(permit.send(legacy.clone()));
-            if capacity == 2 {
-                assert_eq!(event_rx.try_recv(), Ok(sourced));
-            }
-            assert_eq!(event_rx.try_recv(), Ok(legacy));
+            assert_eq!(event_rx.try_recv(), Ok(sourced));
             assert!(event_rx.is_empty());
         }
     }

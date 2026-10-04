@@ -1399,7 +1399,16 @@ fn spawn_call_event_listener(
                         "🎥 relay-send backpressure: dropped {video_access_units} complete video AUs / {packets} packets"
                     );
                 }
-                CallEvent::VideoStateChanged {
+                CallEvent::PeerVideoStateChanged { .. } if handle.video_states().is_none() => {
+                    debug!("ignoring queued video state for an ended or replaced call");
+                }
+                CallEvent::PeerVideoStateChanged { source, state, .. }
+                    if handle.group_state().is_some() =>
+                {
+                    // A participant's stop/disable does not change our call-wide video toggle.
+                    info!("🎥 participant {source} video {state:?}");
+                }
+                CallEvent::PeerVideoStateChanged {
                     state: vs,
                     upgrade_token,
                     ..

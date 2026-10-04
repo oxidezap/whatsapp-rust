@@ -22,14 +22,12 @@ async fn test_offline_group_notification() -> anyhow::Result<()> {
     let group_jid = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "Offline Notif Test".to_string(),
-            participants: vec![
+        .create_group(
+            GroupCreateOptions::new("Offline Notif Test").with_participants(vec![
                 GroupParticipantOptions::new(jid_b.clone()),
                 GroupParticipantOptions::new(jid_c.clone()),
-            ],
-            ..Default::default()
-        })
+            ]),
+        )
         .await?
         .metadata
         .id;
@@ -87,14 +85,12 @@ async fn test_mixed_offline_event_ordering() -> anyhow::Result<()> {
     let group_jid = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "Mixed Events Test".to_string(),
-            participants: vec![
+        .create_group(
+            GroupCreateOptions::new("Mixed Events Test").with_participants(vec![
                 GroupParticipantOptions::new(jid_b.clone()),
                 GroupParticipantOptions::new(jid_c.clone()),
-            ],
-            ..Default::default()
-        })
+            ]),
+        )
         .await?
         .metadata
         .id;
@@ -220,14 +216,12 @@ async fn test_offline_group_message_delivery() -> anyhow::Result<()> {
     let group_jid = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "Offline Group Msg Test".to_string(),
-            participants: vec![
+        .create_group(
+            GroupCreateOptions::new("Offline Group Msg Test").with_participants(vec![
                 GroupParticipantOptions::new(jid_b.clone()),
                 GroupParticipantOptions::new(jid_c.clone()),
-            ],
-            ..Default::default()
-        })
+            ]),
+        )
         .await?
         .metadata
         .id;
@@ -307,16 +301,14 @@ async fn test_offline_multi_sender_group_messages() -> anyhow::Result<()> {
     let group1_jid = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "Multi-Sender Group 1".to_string(),
-            participants: vec![
+        .create_group(
+            GroupCreateOptions::new("Multi-Sender Group 1").with_participants(vec![
                 GroupParticipantOptions::new(jid_b.clone()),
                 GroupParticipantOptions::new(jid_c.clone()),
                 GroupParticipantOptions::new(jid_d.clone()),
                 GroupParticipantOptions::new(jid_e.clone()),
-            ],
-            ..Default::default()
-        })
+            ]),
+        )
         .await?
         .metadata
         .id;
@@ -325,15 +317,13 @@ async fn test_offline_multi_sender_group_messages() -> anyhow::Result<()> {
     let group2_jid = client_a
         .client
         .groups()
-        .create_group(GroupCreateOptions {
-            subject: "Multi-Sender Group 2".to_string(),
-            participants: vec![
+        .create_group(
+            GroupCreateOptions::new("Multi-Sender Group 2").with_participants(vec![
                 GroupParticipantOptions::new(jid_b.clone()),
                 GroupParticipantOptions::new(jid_c.clone()),
                 GroupParticipantOptions::new(jid_d.clone()),
-            ],
-            ..Default::default()
-        })
+            ]),
+        )
         .await?
         .metadata
         .id;

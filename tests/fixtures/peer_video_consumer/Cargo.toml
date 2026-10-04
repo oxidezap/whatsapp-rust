@@ -1,0 +1,19 @@
+[package]
+name = "peer-video-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+runtime = ["whatsapp-rust/voip-runtime"]
+removed-video-state = []
+
+[dependencies]
+whatsapp-rust = { path = "../../..", default-features = false, features = ["voip-control"] }
+
+[[bin]]
+name = "removed-video-state"
+path = "src/bin/removed_video_state.rs"
+required-features = ["removed-video-state"]

@@ -1,0 +1,61 @@
+name: API Consumers
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: api-consumers-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "1"
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: ""
+  CARGO_ENCODED_RUSTFLAGS: ""
+
+jobs:
+  consumers:
+    name: Independent API hosts (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [native, msrv]
+    steps:
+      - uses: actions/checkout@v7
+      # xtask has a higher tooling floor than the published crates. Build the
+      # driver once with nightly, then it explicitly selects the host toolchain.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: dtolnay/rust-toolchain@1.94.1
+        if: matrix.lane == 'msrv'
+      - name: Install protoc and cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@3.25.3,cargo-nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "true"
+          key: api-consumers-${{ matrix.lane }}
+      - name: Test registry with the CI profile
+        if: matrix.lane == 'native'
+        run: cargo +nightly-2026-06-16 nextest run --profile ci --locked -p whatsapp-xtask consumers::tests
+      # Both independent runners need their own executable. run also validates
+      # the registry, so no additional lane-independent check step is necessary.
+      - name: Build driver
+        run: cargo +nightly-2026-06-16 build --locked -p whatsapp-xtask
+      - name: Run native hosts and rustdoc negative controls
+        if: matrix.lane == 'native'
+        run: target/debug/whatsapp-xtask ci consumers run --lane native --toolchain nightly-2026-06-16
+      - name: Run hosts at the published MSRV and rustdoc negative controls
+        if: matrix.lane == 'msrv'
+        run: target/debug/whatsapp-xtask ci consumers run --lane msrv --toolchain 1.94.1

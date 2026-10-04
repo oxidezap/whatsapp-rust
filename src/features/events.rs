@@ -12,7 +12,9 @@ use crate::send::{SendError, SendResult};
 super::creation::creation_types!(CreatedEvent, EventRef, event_ref);
 
 /// Parameters for creating an event message. Only `name` is required.
-#[derive(Debug, Clone, Default)]
+/// Use [`Self::builder`]; creation rejects a blank name before sending.
+#[derive(Debug, Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct EventCreationParams {
     pub name: String,
     pub description: Option<String>,
@@ -39,9 +41,8 @@ impl<'a> Events<'a> {
     /// ```no_run
     /// # use whatsapp_rust::{Client, Jid, EventCreationParams, EventResponseType};
     /// # async fn example(client: &Client, chat: &Jid) -> whatsapp_rust::anyhow::Result<()> {
-    /// let created = client.events().create(chat, EventCreationParams {
-    ///     name: "Launch".into(), ..Default::default()
-    /// }).await?;
+    /// let params = EventCreationParams::builder().name("Launch".into()).build();
+    /// let created = client.events().create(chat, params).await?;
     /// client.events().respond(&created.event_ref()?, EventResponseType::Going, None).await?;
     /// # Ok(()) }
     /// ```
@@ -214,16 +215,15 @@ mod tests {
 
     #[test]
     fn build_event_message_maps_fields() {
-        let params = EventCreationParams {
-            name: "Launch".into(),
-            description: Some("desc".into()),
-            start_time: Some(1_700_000_000),
-            end_time: Some(1_700_003_600),
-            join_link: Some("https://call".into()),
-            is_scheduled_call: Some(true),
-            extra_guests_allowed: Some(true),
-            ..Default::default()
-        };
+        let params = EventCreationParams::builder()
+            .name("Launch".into())
+            .description("desc".into())
+            .start_time(1_700_000_000)
+            .end_time(1_700_003_600)
+            .join_link("https://call".into())
+            .is_scheduled_call(true)
+            .extra_guests_allowed(true)
+            .build();
         let msg = build_event_message(params);
         assert_eq!(msg.name.as_deref(), Some("Launch"));
         assert_eq!(msg.description.as_deref(), Some("desc"));

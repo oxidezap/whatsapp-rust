@@ -6,7 +6,7 @@
 //! neutral, engine-free, with every payload naming a neutral type. `crate::voip::CallEvent` is a
 //! re-export, so the historical path still resolves, but the type belongs to the control plane.
 //!
-//! Signaling-born events (`VideoStateChanged`, `GroupUpdated`, `WaitingRoomUpdated`, `HandRaised`,
+//! Signaling-born events (`PeerVideoStateChanged`, `GroupUpdated`, `WaitingRoomUpdated`, `HandRaised`,
 //! `ScreenShareChanged`, `Reaction`) are produced by the signaling handler, not the media engine;
 //! they share this one stream so a consumer has a single ordered view of the call.
 
@@ -54,16 +54,10 @@ pub enum CallEvent {
     MediaSetupFailed(String),
     /// Replacing a migrated relay transport did not finish within the reconnect deadline.
     RelayReconnectTimedOut,
-    /// The peer's `<video state=N>` signaling arrived (upgrade requested/accepted, stopped, ...).
+    /// A committed peer `<video state=N>` notification with its signaling identity.
     ///
-    /// The compatibility spelling of [`Self::PeerVideoStateChanged`]; identity-aware consumers
-    /// should use that one and ignore this. A media backend never raises it.
-    VideoStateChanged {
-        state: VideoState,
-        orientation: Option<u8>,
-        upgrade_token: Option<MediaVideoUpgradeToken>,
-    },
-    /// A committed peer video-state notification with its signaling identity.
+    /// Published once per committed notification after the typed ACK and transition checks.
+    /// A media backend never raises it.
     PeerVideoStateChanged {
         source: Jid,
         call_creator: Jid,
@@ -216,7 +210,6 @@ impl CallEvent {
             | Self::RelayAllocateFailed(_)
             | Self::RelayAllocateTimedOut
             | Self::RelayReconnectTimedOut
-            | Self::VideoStateChanged { .. }
             | Self::WaitingRoomHeartbeatFailed
             | Self::GroupControlRejected { .. }
             | Self::GroupRekeyFailed

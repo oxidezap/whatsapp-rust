@@ -59,7 +59,7 @@ fn operation_key(result: &SendResult, index: usize) -> &wa::MessageKey {
 }
 
 #[tokio::test]
-async fn legacy_and_reference_message_transport_match() {
+async fn raw_and_typed_message_transport_match() {
     let (client, transport) = crate::test_utils::create_iq_test_client().await;
     let (peer, _) = seed_dm_wire_namespace_state(&client).await;
     let target =
@@ -81,18 +81,18 @@ async fn legacy_and_reference_message_transport_match() {
             .await
             .unwrap(),
         client
-            .revoke_message(&peer, "OWN_ORIGINAL", RevokeType::Sender)
+            .revoke_message_raw(&peer, "OWN_ORIGINAL", RevokeType::Sender)
             .await
             .unwrap(),
         client
-            .send_reaction(&peer, raw_key.clone(), "👍")
+            .send_reaction_raw(&peer, raw_key.clone(), "👍")
             .await
             .unwrap(),
         client
-            .pin_message(&peer, raw_key.clone(), PinDuration::Days7)
+            .pin_message_raw(&peer, raw_key.clone(), PinDuration::Days7)
             .await
             .unwrap(),
-        client.keep_message(&peer, raw_key, true).await.unwrap(),
+        client.keep_message_raw(&peer, raw_key, true).await.unwrap(),
     ];
     let typed = vec![
         client
@@ -102,13 +102,13 @@ async fn legacy_and_reference_message_transport_match() {
             ))
             .await
             .unwrap(),
-        client.revoke_message_ref(&target).await.unwrap(),
-        client.send_reaction_ref(&target, "👍").await.unwrap(),
+        client.revoke_message(&target).await.unwrap(),
+        client.send_reaction(&target, "👍").await.unwrap(),
         client
-            .pin_message_ref(&target, PinDuration::Days7)
+            .pin_message(&target, PinDuration::Days7)
             .await
             .unwrap(),
-        client.keep_message_ref(&target, true).await.unwrap(),
+        client.keep_message(&target, true).await.unwrap(),
     ];
     let status = info(&Jid::status_broadcast(), &peer, false);
     let status_ref = MessageRef::from_info(&status).unwrap();
@@ -119,10 +119,10 @@ async fn legacy_and_reference_message_transport_match() {
         participant: Some(peer.to_string()),
     };
     let raw_status = client
-        .send_reaction(Jid::status_broadcast(), status_key, "👍")
+        .send_reaction_raw(Jid::status_broadcast(), status_key, "👍")
         .await
         .unwrap();
-    let typed_status = client.send_reaction_ref(&status_ref, "👍").await.unwrap();
+    let typed_status = client.send_reaction(&status_ref, "👍").await.unwrap();
     client
         .mark_as_played(status_ref.chat(), Some(&peer), &["CONTENT_TARGET"])
         .await
@@ -379,13 +379,10 @@ async fn own_dm_reference_operations_keep_content_and_operation_ids_separate() {
             .edit_message(EditRequest::new(own.clone(), wa::Message::text("changed")))
             .await
             .unwrap(),
-        client.revoke_message_ref(&own).await.unwrap(),
-        client.send_reaction_ref(&own, "👍").await.unwrap(),
-        client
-            .pin_message_ref(&own, PinDuration::Days7)
-            .await
-            .unwrap(),
-        client.keep_message_ref(&own, true).await.unwrap(),
+        client.revoke_message(&own).await.unwrap(),
+        client.send_reaction(&own, "👍").await.unwrap(),
+        client.pin_message(&own, PinDuration::Days7).await.unwrap(),
+        client.keep_message(&own, true).await.unwrap(),
     ];
     let nodes = transport_nodes(&transport);
     let control: Vec<_> = nodes.iter().filter(|n| n.get().tag != "message").collect();
@@ -451,12 +448,12 @@ async fn newsletter_reference_operations_reach_transport_with_distinct_ids() {
     .unwrap();
     let ack_id = client
         .newsletter()
-        .send_reaction_ref(&target, "👍")
+        .send_reaction(&target, "👍")
         .await
         .unwrap();
     let vote_id = client
         .newsletter()
-        .send_poll_vote_ref(&target, &[[7; 32]])
+        .send_poll_vote(&target, &[[7; 32]])
         .await
         .unwrap();
     client
@@ -527,19 +524,13 @@ async fn missing_newsletter_ids_and_invalid_chat_operations_send_nothing() {
         NewsletterMessageRef::new(&channel, Some(MessageId::new("CLIENT").unwrap()), None).unwrap();
     let server_only = NewsletterMessageRef::new(&channel, None, Some(0.into())).unwrap();
     assert!(matches!(
-        client
-            .newsletter()
-            .send_reaction_ref(&client_only, "👍")
-            .await,
+        client.newsletter().send_reaction(&client_only, "👍").await,
         Err(crate::NewsletterError::MessageRef(
             MessageRefError::MissingServerMessageId
         ))
     ));
     assert!(matches!(
-        client
-            .newsletter()
-            .send_poll_vote_ref(&client_only, &[])
-            .await,
+        client.newsletter().send_poll_vote(&client_only, &[]).await,
         Err(crate::NewsletterError::MessageRef(
             MessageRefError::MissingServerMessageId
         ))
@@ -568,18 +559,18 @@ async fn missing_newsletter_ids_and_invalid_chat_operations_send_nothing() {
         Err(SendError::MessageRef(MessageRefError::NotFromMe))
     ));
     assert!(matches!(
-        client.revoke_message_ref(&received).await,
+        client.revoke_message(&received).await,
         Err(SendError::MessageRef(MessageRefError::UnsupportedOrigin))
     ));
     let status = Jid::status_broadcast();
     let reference =
         MessageRef::new(&status, MessageId::new("STATUS").unwrap(), Some(&dm), false).unwrap();
     assert!(matches!(
-        client.pin_message_ref(&reference, PinDuration::Days7).await,
+        client.pin_message(&reference, PinDuration::Days7).await,
         Err(SendError::MessageRef(MessageRefError::UnsupportedOrigin))
     ));
     assert!(matches!(
-        client.keep_message_ref(&reference, true).await,
+        client.keep_message(&reference, true).await,
         Err(SendError::MessageRef(MessageRefError::UnsupportedOrigin))
     ));
     assert_eq!(transport.sent_count(), 0);
@@ -654,24 +645,16 @@ async fn group_reference_operations_encrypt_operation_specific_keys() {
                 .edit_message(EditRequest::new(own.clone(), wa::Message::text("changed")))
                 .await
                 .unwrap(),
-            fixture.client.revoke_message_ref(&own).await.unwrap(),
-            fixture.client.revoke_message_ref(&received).await.unwrap(),
+            fixture.client.revoke_message(&own).await.unwrap(),
+            fixture.client.revoke_message(&received).await.unwrap(),
+            fixture.client.send_reaction(&received, "👍").await.unwrap(),
             fixture
                 .client
-                .send_reaction_ref(&received, "👍")
+                .pin_message(&received, PinDuration::Days7)
                 .await
                 .unwrap(),
-            fixture
-                .client
-                .pin_message_ref(&received, PinDuration::Days7)
-                .await
-                .unwrap(),
-            fixture
-                .client
-                .keep_message_ref(&received, true)
-                .await
-                .unwrap(),
-            fixture.client.unpin_message_ref(&received).await.unwrap(),
+            fixture.client.keep_message(&received, true).await.unwrap(),
+            fixture.client.unpin_message(&received).await.unwrap(),
         ];
         for (i, result) in calls.iter().enumerate() {
             let stanza = fixture.stanza(i + 1).await;
@@ -775,7 +758,7 @@ async fn review_broadcast_list_reaction_rejects_before_identity_or_send() {
     let target =
         MessageRef::new(&chat, MessageId::new("LIST_TARGET").unwrap(), None, true).unwrap();
     assert!(matches!(
-        client.send_reaction_ref(&target, "👍").await,
+        client.send_reaction(&target, "👍").await,
         Err(SendError::MessageRef(MessageRefError::UnsupportedOrigin))
     ));
     assert_eq!(transport.sent_count(), 0);
@@ -840,7 +823,7 @@ async fn review_raw_newsletter_reaction_preserves_status_delegation() {
     let chat = Jid::status_broadcast();
     let id = client
         .newsletter()
-        .send_reaction(&chat, 42, "👍")
+        .send_reaction_raw(&chat, 42, "👍")
         .await
         .unwrap();
     let node = crate::test_utils::decode_sent_iq(&transport, 0).await;
@@ -921,28 +904,16 @@ async fn review_own_group_send_reference_keys_encrypt_original_author() {
                 ))
                 .await
                 .unwrap(),
-            fixture.client.revoke_message_ref(&target).await.unwrap(),
+            fixture.client.revoke_message(&target).await.unwrap(),
+            fixture.client.send_reaction(&target, "👍").await.unwrap(),
             fixture
                 .client
-                .send_reaction_ref(&target, "👍")
+                .pin_message(&target, PinDuration::Days7)
                 .await
                 .unwrap(),
-            fixture
-                .client
-                .pin_message_ref(&target, PinDuration::Days7)
-                .await
-                .unwrap(),
-            fixture.client.unpin_message_ref(&target).await.unwrap(),
-            fixture
-                .client
-                .keep_message_ref(&target, true)
-                .await
-                .unwrap(),
-            fixture
-                .client
-                .keep_message_ref(&target, false)
-                .await
-                .unwrap(),
+            fixture.client.unpin_message(&target).await.unwrap(),
+            fixture.client.keep_message(&target, true).await.unwrap(),
+            fixture.client.keep_message(&target, false).await.unwrap(),
         ];
         let nodes = transport_nodes(&fixture.transport);
         for (index, result) in results.iter().enumerate() {
@@ -1008,13 +979,13 @@ async fn review_own_lid_group_addons_do_not_invent_missing_identity() {
         .await;
     let before = fixture.transport.sent_count();
     for result in [
-        fixture.client.send_reaction_ref(&target, "👍").await,
+        fixture.client.send_reaction(&target, "👍").await,
         fixture
             .client
-            .pin_message_ref(&target, PinDuration::Days7)
+            .pin_message(&target, PinDuration::Days7)
             .await,
-        fixture.client.unpin_message_ref(&target).await,
-        fixture.client.keep_message_ref(&target, true).await,
+        fixture.client.unpin_message(&target).await,
+        fixture.client.keep_message(&target, true).await,
     ] {
         assert!(matches!(
             result,
@@ -1122,7 +1093,7 @@ async fn review_metadata_errors_preserve_source_and_rejection_allocation() {
                     .edit_message(EditRequest::new(target.clone(), wa::Message::text("bad")))
                     .await
             } else {
-                client.pin_message_ref(&target, PinDuration::Days7).await
+                client.pin_message(&target, PinDuration::Days7).await
             }
         });
         let sent = crate::test_utils::decode_sent_iq(&fixture.transport, before).await;
@@ -1193,13 +1164,13 @@ async fn review_own_pn_group_addons_reject_missing_identity() {
     let target = content.message_ref().unwrap();
     let before = fixture.transport.sent_count();
     for result in [
-        fixture.client.send_reaction_ref(&target, "👍").await,
+        fixture.client.send_reaction(&target, "👍").await,
         fixture
             .client
-            .pin_message_ref(&target, PinDuration::Days7)
+            .pin_message(&target, PinDuration::Days7)
             .await,
-        fixture.client.unpin_message_ref(&target).await,
-        fixture.client.keep_message_ref(&target, true).await,
+        fixture.client.unpin_message(&target).await,
+        fixture.client.keep_message(&target, true).await,
     ] {
         assert!(matches!(result, Err(SendError::NotLoggedIn)));
     }
@@ -1246,8 +1217,8 @@ async fn review_own_status_reaction_pn_fallback_matches_raw_fanout() {
     .unwrap();
     let mut key = target.to_raw_key();
     key.participant = Some(pn.to_non_ad_string());
-    let raw = client.send_reaction(&status, key, "👍").await.unwrap();
-    let typed = client.send_reaction_ref(&target, "👍").await.unwrap();
+    let raw = client.send_reaction_raw(&status, key, "👍").await.unwrap();
+    let typed = client.send_reaction(&target, "👍").await.unwrap();
     assert_eq!(operation_key(&raw, 2), operation_key(&typed, 2));
     assert_eq!(
         operation_key(&typed, 2).participant,
@@ -1273,7 +1244,7 @@ async fn status_reference_reaction_and_receipts_keep_author_scope() {
     let (author, _) = seed_dm_wire_namespace_state(&client).await;
     let status = info(&Jid::status_broadcast(), &author, false);
     let target = MessageRef::from_info(&status).unwrap();
-    let result = client.send_reaction_ref(&target, "👍").await.unwrap();
+    let result = client.send_reaction(&target, "👍").await.unwrap();
     assert_eq!(
         result
             .message

@@ -1,9 +1,8 @@
 //! Contact information feature.
 //!
-//! Profile picture types are defined in `wacore::iq::contacts`.
+//! For profile-picture lookup across domains, use [`Client::pictures`].
 //! Usync types are defined in `wacore::iq::usync`.
 
-use super::pictures;
 use crate::client::Client;
 use crate::request::IqError;
 use log::debug;
@@ -15,8 +14,6 @@ use wacore::iq::usync::{
 use wacore_binary::{Jid, JidExt};
 
 // Re-export types from wacore
-pub use super::pictures::{ProfilePictureRequest, ProfilePictureTarget};
-pub use wacore::iq::contacts::{ProfilePicture, ProfilePictureLookup, ProfilePictureType};
 pub use wacore::iq::usync::{
     IsOnWhatsAppResult, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UserInfo, UsernameLookup,
     UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError,
@@ -208,33 +205,6 @@ impl<'a> Contacts<'a> {
         Ok(results)
     }
 
-    /// Canonical lookup with explicit size/route and preserved rejection metadata.
-    ///
-    /// Found/Unchanged/NotFound/NotAuthorized remain distinct. A 429 is an
-    /// `IqError::ServerError` with its original stanza and optional backoff.
-    /// There is no automatic community fallback. `into_found()` explicitly
-    /// discards all non-found states; Unchanged says nothing about cached bytes.
-    ///
-    /// ```no_run
-    /// # use whatsapp_rust::{Client, ContactError, ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
-    /// # use whatsapp_rust::wacore_binary::Jid;
-    /// # async fn example(client: &Client, jid: &Jid) -> Result<(), ContactError> {
-    /// let outcome = client.contacts().lookup_picture(ProfilePictureRequest::new(
-    ///     ProfilePictureTarget::Group(jid), ProfilePictureType::Full,
-    /// )).await?;
-    /// // Only when the consumer intentionally needs newly found URLs alone:
-    /// let picture = outcome.into_found();
-    /// # let _ = picture;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn lookup_picture(
-        &self,
-        request: ProfilePictureRequest<'_>,
-    ) -> Result<ProfilePictureLookup, ContactError> {
-        Ok(pictures::lookup(self.client, request).await?)
-    }
-
     pub async fn get_user_info(
         &self,
         jids: &[Jid],
@@ -322,20 +292,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_profile_picture_struct() {
-        let pic = ProfilePicture {
-            id: "123456789".into(),
-            url: "https://example.com/pic.jpg".to_string(),
-            direct_path: Some("/v/pic.jpg".to_string()),
-            hash: None,
-        };
-
-        assert_eq!(pic.id, "123456789");
-        assert_eq!(pic.url, "https://example.com/pic.jpg");
-        assert!(pic.direct_path.is_some());
-    }
-
-    #[test]
     fn is_on_whatsapp_accepts_pn_and_lid_jids() {
         ensure_is_on_whatsapp_jids_supported(&[Jid::pn("15550000001"), Jid::lid("100000001")])
             .unwrap();
@@ -351,39 +307,6 @@ mod tests {
 
     fn psa_jid() -> Jid {
         Jid::pn("0")
-    }
-
-    #[tokio::test]
-    async fn profile_picture_for_system_jid_short_circuits_without_iq() {
-        let client = crate::test_utils::create_test_client().await;
-
-        let result = client
-            .contacts()
-            .lookup_picture(ProfilePictureRequest::new(
-                ProfilePictureTarget::Contact(&psa_jid()),
-                ProfilePictureType::Full,
-            ))
-            .await;
-
-        assert!(matches!(result, Ok(ProfilePictureLookup::NotFound)));
-    }
-
-    #[tokio::test]
-    async fn profile_picture_for_regular_jid_still_hits_the_wire() {
-        let client = crate::test_utils::create_test_client().await;
-
-        // Disconnected client: reaching the send path is what produces this error,
-        // proving the short-circuit is scoped to the system JID.
-        let err = client
-            .contacts()
-            .lookup_picture(ProfilePictureRequest::new(
-                ProfilePictureTarget::Contact(&Jid::pn("12025550111")),
-                ProfilePictureType::Full,
-            ))
-            .await
-            .unwrap_err();
-
-        assert!(matches!(err, ContactError::Iq(IqError::NotConnected)));
     }
 
     #[tokio::test]

@@ -179,7 +179,7 @@ legacy-session-interop = ["wacore/legacy-session-interop"]
 client-lifecycle = []
 # Build-time native plugin host. Kept opt-in so clients that do not use plugins
 # retain the pre-host binary footprint.
-plugins = ["client-lifecycle", "dep:bon"]
+plugins = ["client-lifecycle"]
 # SHORTCAKE_PASSKEY linking flow. Opt-in so a client that links by QR or pair
 # code carries neither the flow nor any state for it; the core keeps no field
 # and no branch either way. See agent_docs/subsystem_boundary.md.
@@ -272,7 +272,7 @@ async-channel = { workspace = true }
 async-lock = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
-bon = { workspace = true, optional = true }
+bon = { workspace = true }
 buffa = { workspace = true }
 bytes = { workspace = true }
 # `now` rather than `clock`: only `Utc::now()` is used, and `clock` exists to

@@ -47,10 +47,7 @@ impl CreationOperations for Client {
             .events()
             .create(
                 chat,
-                EventCreationParams {
-                    name: "Launch".into(),
-                    ..Default::default()
-                },
+                EventCreationParams::builder().name("Launch".into()).build(),
             )
             .await?;
         self.events()

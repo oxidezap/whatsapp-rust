@@ -1,0 +1,182 @@
+[
+  {
+    "manifest": "tests/client-options-consumer/Cargo.toml",
+    "locked": false,
+    "commands": [{ "lanes": ["native", "msrv"], "mode": "test" }]
+  },
+  {
+    "manifest": "tests/consumers/encapsulation/Cargo.toml",
+    "locked": true,
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["native", "msrv"], "mode": "test", "features": ["plugins"] },
+      { "lanes": ["wasm"], "mode": "check" },
+      { "lanes": ["wasm"], "mode": "check", "features": ["plugins"] }
+    ]
+  },
+  {
+    "manifest": "tests/event-consumer/Cargo.toml",
+    "locked": true,
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["wasm"], "mode": "check", "no_default_features": true }
+    ]
+  },
+  {
+    "manifest": "tests/event-kind-consumer/Cargo.toml",
+    "locked": true,
+    "commands": [{ "lanes": ["native", "msrv"], "mode": "run" }]
+  },
+  {
+    "manifest": "tests/fixtures/creation_consumer/Cargo.toml",
+    "locked": true,
+    "commands": [{ "lanes": ["native", "msrv"], "mode": "test" }]
+  },
+  {
+    "manifest": "tests/fixtures/download_consumer/Cargo.toml",
+    "locked": false,
+    "commands": [{ "lanes": ["native", "msrv"], "mode": "test" }]
+  },
+  {
+    "manifest": "tests/fixtures/lifecycle_consumer/Cargo.toml",
+    "locked": false,
+    "commands": [{ "lanes": ["native", "msrv", "wasm"], "mode": "build", "release": true }]
+  },
+  {
+    "manifest": "tests/fixtures/mex_consumer/Cargo.toml",
+    "locked": false,
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["wasm"], "mode": "build", "release": true, "bin": "size_probe" }
+    ]
+  },
+  {
+    "manifest": "tests/fixtures/pictures_consumer/Cargo.toml",
+    "locked": true,
+    "commands": [{ "lanes": ["native", "msrv", "wasm"], "mode": "build", "release": true }]
+  },
+  {
+    "manifest": "tests/fixtures/requests_consumer/Cargo.toml",
+    "locked": true,
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["native", "msrv"], "mode": "test", "features": ["requests"] },
+      { "lanes": ["wasm"], "mode": "build", "release": true, "features": ["requests"] }
+    ]
+  },
+  {
+    "manifest": "tests/fixtures/voip_control_consumer/Cargo.toml",
+    "locked": false,
+    "commands": [
+      { "lanes": ["native", "msrv", "wasm"], "mode": "build", "release": true },
+      { "lanes": ["native", "msrv", "wasm"], "mode": "build", "release": true, "features": ["runtime"] }
+    ]
+  },
+  {
+    "manifest": "tests/group-call-aliases-consumer/Cargo.toml",
+    "locked": true,
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["native", "msrv"], "mode": "test", "features": ["voip-control"] },
+      { "lanes": ["native", "msrv"], "mode": "test", "features": ["voip-runtime"] }
+    ]
+  },
+  {
+    "manifest": "tests/lifecycle-consumer/Cargo.toml",
+    "locked": false,
+    "commands": [{ "lanes": ["native", "msrv"], "mode": "test" }]
+  },
+  {
+    "manifest": "tests/sqlite-api-consumer/Cargo.toml",
+    "locked": true,
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["wasm"], "mode": "build", "release": true }
+    ]
+  },
+  {
+    "manifest": "tests/fixtures/groups_consumer/Cargo.toml",
+    "locked": true,
+    "integration_pr": "https://github.com/oxidezap/whatsapp-rust/pull/1627",
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["native", "msrv"], "mode": "test", "no_default_features": true },
+      { "lanes": ["wasm"], "mode": "check", "no_default_features": true, "features": ["js"] }
+    ]
+  },
+  {
+    "manifest": "tests/fixtures/peer_video_consumer/Cargo.toml",
+    "locked": false,
+    "integration_pr": "https://github.com/oxidezap/whatsapp-rust/pull/1624",
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["native", "msrv"], "mode": "check", "lib": true, "features": ["runtime"] },
+      { "lanes": ["wasm"], "mode": "check", "lib": true },
+      {
+        "lanes": ["native", "msrv"], "mode": "check",
+        "features": ["removed-video-state"], "bin": "removed-video-state",
+        "expect_failure": { "error_code": "E0599", "contains": ["VideoStateChanged", "CallEvent"] }
+      }
+    ]
+  },
+  {
+    "manifest": "tests/fixtures/media_cache_consumer/Cargo.toml",
+    "locked": true,
+    "integration_pr": "https://github.com/oxidezap/whatsapp-rust/pull/1628",
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["wasm"], "mode": "check", "lib": true }
+    ]
+  },
+  {
+    "manifest": "tests/fixtures/actions_consumer/Cargo.toml",
+    "locked": false,
+    "integration_pr": "https://github.com/oxidezap/whatsapp-rust/pull/1630",
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["wasm"], "mode": "check" }
+    ]
+  },
+  {
+    "manifest": "tests/fixtures/community_consumer/Cargo.toml",
+    "locked": true,
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["wasm"], "mode": "check" }
+    ]
+  },
+  {
+    "manifest": "tests/fixtures/status_consumer/Cargo.toml",
+    "locked": true,
+    "integration_pr": "https://github.com/oxidezap/whatsapp-rust/pull/1632",
+    "commands": [
+      { "lanes": ["native", "msrv"], "mode": "test" },
+      { "lanes": ["wasm"], "mode": "check" },
+      {
+        "lanes": ["native", "msrv"], "mode": "check", "lib": true,
+        "features": ["old-message-id-string"],
+        "expect_failure": { "error_code": "E0308", "contains": ["expected `MessageId`", "found `String`"] }
+      },
+      {
+        "lanes": ["native", "msrv"], "mode": "check", "lib": true,
+        "features": ["old-revoke-string"],
+        "expect_failure": { "error_code": "E0308", "contains": ["expected `MessageId`", "found `&str`"] }
+      },
+      {
+        "lanes": ["native", "msrv"], "mode": "check", "lib": true,
+        "features": ["wrong-message-id-domain"],
+        "expect_failure": { "error_code": "E0308", "contains": ["expected `MessageId`", "found `StanzaId`"] }
+      },
+      {
+        "lanes": ["native", "msrv"], "mode": "check", "lib": true,
+        "features": ["wrong-stanza-id-domain"],
+        "expect_failure": { "error_code": "E0308", "contains": ["expected `StanzaId`", "found `MessageId`"] }
+      },
+      {
+        "lanes": ["native", "msrv"], "mode": "check", "lib": true,
+        "features": ["old-options-literal"],
+        "expect_failure": { "error_code": "E0639", "contains": ["non-exhaustive", "StatusSendOptions"] }
+      }
+    ]
+  }
+]

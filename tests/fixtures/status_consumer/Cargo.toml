@@ -1,0 +1,18 @@
+[package]
+name = "status-consumer"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[workspace]
+
+[features]
+old-message-id-string = []
+old-revoke-string = []
+wrong-message-id-domain = []
+wrong-stanza-id-domain = []
+old-options-literal = []
+
+[dependencies]
+wa = { package = "whatsapp-rust", path = "../../..", default-features = false }

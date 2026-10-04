@@ -1029,21 +1029,13 @@ impl StanzaHandler for CallHandler {
                                 );
                             }
                             let event_delivered = event_permit.as_ref().is_some_and(|permit| {
-                                let sourced = permit.send(CallEvent::PeerVideoStateChanged {
+                                permit.send(CallEvent::PeerVideoStateChanged {
                                     source: routed_call_sender(&call),
                                     call_creator: call.action.call_creator().clone(),
                                     state: *state,
                                     orientation: *orientation,
                                     upgrade_token,
-                                });
-                                // Keep the legacy event last so a custom single-slot queue retains
-                                // its previous behavior. Normal handles have room for both events.
-                                let legacy = permit.send(CallEvent::VideoStateChanged {
-                                    state: *state,
-                                    orientation: *orientation,
-                                    upgrade_token,
-                                });
-                                sourced && legacy
+                                })
                             });
                             if !event_delivered {
                                 warn!("call: video state event receiver closed after typed ack");
@@ -1703,18 +1695,6 @@ mod tests {
 
     fn fake_caller_lid() -> Jid {
         Jid::new("111111111111111", Server::Lid)
-    }
-
-    #[cfg(feature = "voip-control")]
-    fn next_legacy_event(
-        events: &async_channel::Receiver<CallEvent>,
-    ) -> Result<CallEvent, async_channel::TryRecvError> {
-        loop {
-            let event = events.try_recv()?;
-            if !matches!(event, CallEvent::PeerVideoStateChanged { .. }) {
-                return Ok(event);
-            }
-        }
     }
 
     fn offer_stanza() -> wacore_binary::Node {
@@ -3618,7 +3598,7 @@ mod tests {
             fake_caller_lid(),
             fake_caller_lid(),
         ));
-        let (event_tx, event_rx) = async_channel::bounded::<CallEvent>(2);
+        let (event_tx, event_rx) = async_channel::bounded::<CallEvent>(1);
         let (control_tx, _control_rx) = video_control_channel();
         registry.set_video_channels(
             "CALL-ID-0001",
@@ -3656,10 +3636,86 @@ mod tests {
             upgrade_token: Some(_), ..
         }) if source == fake_caller_lid() && call_creator == fake_caller_lid())
         );
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(CallEvent::VideoStateChanged { .. })
-        ));
+        assert!(event_rx.is_empty(), "exactly one committed event");
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn closed_video_receiver_does_not_undo_an_acked_transition() {
+        use wacore::voip_control::CallEvent;
+        use wacore::voip_control::control::VideoControl;
+
+        for close_before_ack in [true, false] {
+            let (client, send_started, release_send) = make_blocking_sending_client().await;
+            let (global_handler, global_rx) = ChannelEventHandler::new();
+            client.subscribe_handler(global_handler).detach();
+            let registry = client.call_registry();
+            let generation = registry.insert(wacore::voip_control::CallSession::new_incoming(
+                "CALL-ID-0001",
+                fake_caller_lid(),
+                fake_caller_lid(),
+            ));
+            let (event_tx, event_rx) = async_channel::bounded::<CallEvent>(1);
+            let (control_tx, control_rx) = video_control_channel();
+            registry.set_video_channels(
+                "CALL-ID-0001",
+                generation,
+                event_tx,
+                control_tx,
+                Box::new(|| {}),
+            );
+            begin_local_upgrade(&registry, generation).await;
+            if close_before_ack {
+                event_rx.close();
+            }
+
+            let mut cancelled = false;
+            {
+                let handling = CallHandler.handle(
+                    client,
+                    node_to_owned_ref(&video_stanza("4")),
+                    &mut cancelled,
+                );
+                tokio::pin!(handling);
+                tokio::select! {
+                    started = send_started.recv() => started.expect("typed ack send started"),
+                    _ = &mut handling => panic!("handler completed before typed ack"),
+                }
+                if !close_before_ack {
+                    event_rx.close();
+                }
+                release_send.send(()).await.expect("release typed ack");
+                tokio::select! {
+                    started = send_started.recv() => started.expect("Enabled send started"),
+                    _ = &mut handling => panic!("handler completed before Enabled announcement"),
+                }
+                release_send.send(()).await.expect("release Enabled send");
+                assert!(handling.await);
+            }
+            assert!(
+                cancelled,
+                "closed receiver does not restore the generic ack"
+            );
+            assert!(matches!(
+                event_rx.try_recv(),
+                Err(async_channel::TryRecvError::Closed)
+            ));
+            assert_eq!(
+                registry.video_states("CALL-ID-0001", generation),
+                Some((VideoState::Enabled, VideoState::Enabled))
+            );
+            assert!(registry.snapshot("CALL-ID-0001").expect("session").is_video);
+            assert!(
+                std::iter::from_fn(|| control_rx.try_recv().ok())
+                    .any(|control| control == VideoControl::Enable)
+            );
+            assert!(matches!(
+                global_rx.try_recv().as_deref(),
+                Ok(Event::IncomingCall(call))
+                    if matches!(call.action, CallAction::VideoState { .. })
+            ));
+            assert!(registry.reserve_call_event("CALL-ID-0001").is_some());
+        }
     }
 
     #[cfg(feature = "voip-control")]
@@ -3694,8 +3750,8 @@ mod tests {
                 )
                 .await
         );
-        let token = match next_legacy_event(&event_rx).expect("upgrade request event") {
-            CallEvent::VideoStateChanged {
+        let token = match event_rx.try_recv().expect("upgrade request event") {
+            CallEvent::PeerVideoStateChanged {
                 state: VideoState::UpgradeRequestV2,
                 upgrade_token: Some(token),
                 ..
@@ -3703,6 +3759,7 @@ mod tests {
             event => panic!("unexpected event: {event:?}"),
         };
         assert!(registry.peer_video_request_is_current("CALL-ID-0001", token));
+        assert!(event_rx.is_empty(), "exactly one request event");
 
         cancelled = false;
         assert!(
@@ -3716,13 +3773,14 @@ mod tests {
         );
         assert!(!registry.peer_video_request_is_current("CALL-ID-0001", token));
         assert!(matches!(
-            next_legacy_event(&event_rx),
-            Ok(CallEvent::VideoStateChanged {
+            event_rx.try_recv(),
+            Ok(CallEvent::PeerVideoStateChanged {
                 state: VideoState::Disabled,
                 upgrade_token: None,
                 ..
             })
         ));
+        assert!(event_rx.is_empty(), "exactly one cancellation event");
     }
 
     #[cfg(feature = "voip-control")]
@@ -3737,7 +3795,7 @@ mod tests {
             fake_caller_lid(),
             fake_caller_lid(),
         ));
-        let (event_tx, _event_rx) = async_channel::bounded::<CallEvent>(1);
+        let (event_tx, event_rx) = async_channel::bounded::<CallEvent>(1);
         let (control_tx, _control_rx) = video_control_channel();
         registry.set_video_channels(
             "CALL-ID-0001",
@@ -3767,11 +3825,23 @@ mod tests {
                 registry.reserve_call_event("CALL-ID-0001").is_none(),
                 "the next transition must not overtake committed effects"
             );
+            assert!(
+                event_rx.is_empty(),
+                "publication must wait for Enabled send"
+            );
             release_send.send(()).await.expect("release Enabled send");
             handling.await
         };
         assert!(handled);
         assert!(cancelled);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(CallEvent::PeerVideoStateChanged {
+                state: VideoState::UpgradeAccept,
+                ..
+            })
+        ));
+        assert!(event_rx.is_empty(), "exactly one event after Enabled send");
         assert!(registry.reserve_call_event("CALL-ID-0001").is_some());
     }
 
@@ -3945,15 +4015,17 @@ mod tests {
                 .await
         );
 
-        let ev = next_legacy_event(&ev_rx).expect("event must be forwarded");
+        let ev = ev_rx.try_recv().expect("event must be forwarded");
         assert!(matches!(
             ev,
-            CallEvent::VideoStateChanged {
+            CallEvent::PeerVideoStateChanged {
+                source, call_creator,
                 state: VideoState::UpgradeAccept,
                 orientation: Some(1),
-                ..
-            }
+                upgrade_token: None,
+            } if source == fake_caller_lid() && call_creator == fake_caller_lid()
         ));
+        assert!(ev_rx.is_empty(), "exactly one committed accept event");
         let ctls: Vec<VideoControl> = std::iter::from_fn(|| ctl_rx.try_recv().ok()).collect();
         assert!(ctls.contains(&VideoControl::SetOrientation(1)));
         assert!(
@@ -4159,8 +4231,17 @@ mod tests {
         assert!(registry.snapshot("CALL-ID-0001").expect("session").is_video);
         assert!(matches!(
             ev_rx.try_recv(),
-            Ok(CallEvent::VideoStateChanged { .. })
+            Ok(CallEvent::PeerVideoStateChanged {
+                source, call_creator,
+                state: VideoState::UpgradeAccept,
+                orientation: Some(1),
+                upgrade_token: None,
+            }) if source == fake_caller_lid() && call_creator == fake_caller_lid()
         ));
+        assert!(
+            ev_rx.is_empty(),
+            "one-slot queue retains the canonical event"
+        );
         assert!(
             std::iter::from_fn(|| ctl_rx.try_recv().ok())
                 .any(|ctl| matches!(ctl, VideoControl::Enable)),
