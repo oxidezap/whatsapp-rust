@@ -124,3 +124,8 @@ required-features = ["sdk"]
 name = "sqlite"
 path = "src/sqlite/probe.rs"
 required-features = ["sqlite"]
+
+[[bin]]
+name = "download_probe"
+path = "src/download/size_probe.rs"
+required-features = ["core"]
