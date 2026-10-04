@@ -7699,6 +7699,167 @@ fn message_texts_for_id(rx: &async_channel::Receiver<Arc<Event>>, id: &str) -> V
     texts
 }
 
+/// Closest safe reporter path: encrypted own-device peers enter the real
+/// receive/commit pipeline, then the exact ciphertexts are redelivered as
+/// old-counter duplicates. This does not emulate the server's 45-minute timer.
+#[tokio::test]
+async fn encrypted_offline_peers_and_redelivered_duplicates_get_individual_receipts() {
+    use crate::types::durability_hook::InboundDurabilityHook;
+    use wacore::types::events::{ChannelEventHandler, InboundMessage};
+
+    struct PausedHook {
+        entered: async_channel::Sender<()>,
+        release: async_channel::Receiver<()>,
+    }
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for PausedHook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            batch: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            assert_eq!(
+                batch
+                    .iter()
+                    .map(|item| item.info.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["PEER_A", "PEER_B", "PEER_C"]
+            );
+            self.entered.send(()).await.unwrap();
+            self.release.recv().await.unwrap();
+            Ok(())
+        }
+    }
+
+    let (client, transport) = capturing_client("offline_peer_redelivery").await;
+    client
+        .persistence_manager
+        .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+            "777000000000081:4@lid".parse().unwrap(),
+        )))
+        .await;
+    let (bundle, receiver) = bobs_prekey_bundle(&client).await;
+    let mut phone = AlicePeer::new("777000000000081:7@lid").await;
+    phone
+        .install_bob_session(&receiver.to_protocol_address(), &bundle)
+        .await;
+    let (entered_tx, entered_rx) = async_channel::bounded(1);
+    let (release_tx, release_rx) = async_channel::bounded(1);
+    client
+        .inbound_durability_hook
+        .set(Arc::new(PausedHook {
+            entered: entered_tx,
+            release: release_rx,
+        }))
+        .ok()
+        .unwrap();
+    let (handler, events) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+    client.inbound_commit_batch.reset();
+    client.swap_message_semaphore(1);
+    let mut stanzas = Vec::new();
+    for id in ["PEER_A", "PEER_B", "PEER_C"] {
+        let ciphertext = phone
+            .encrypt_text(&receiver.to_protocol_address(), "synthetic own-device peer")
+            .await;
+        let enc = enc_payload_from_ciphertext(&ciphertext);
+        assert_eq!(enc.enc_type.as_wire_str(), "pkmsg");
+        let stanza = node_to_arc(
+            NodeBuilder::new("message")
+                .attr("from", &phone.jid)
+                .attr("id", id)
+                .attr("type", "text")
+                .attr("category", "peer")
+                .attr("offline", "9")
+                .attr("t", wacore::time::now_secs().to_string())
+                .children([NodeBuilder::new("enc")
+                    .attr("type", "pkmsg")
+                    .attr("v", "2")
+                    .bytes(enc.ciphertext.to_vec())
+                    .build()])
+                .build(),
+        );
+        let info = client.parse_message_info(stanza.get()).await.unwrap();
+        assert!(info.source.is_from_me && info.is_offline);
+        client.clone().handle_incoming_message(stanza.clone()).await;
+        stanzas.push(stanza);
+    }
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert!(
+        transport.sent().is_empty(),
+        "fresh peers must wait for durable commit"
+    );
+    assert_eq!(client.inbound_commit_batch.pending_stats().0, 3);
+    let flush_client = client.clone();
+    let flush = tokio::spawn(async move {
+        flush_client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await
+    });
+    entered_rx.recv().await.unwrap();
+    // The hook is reached only after durable rows and Signal; receipts/events
+    // remain withheld until the consumer's commit also succeeds.
+    let backend = client.persistence_manager.backend();
+    assert!(
+        backend
+            .get_session(phone.jid.to_protocol_address().as_str())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    for id in ["PEER_A", "PEER_B", "PEER_C"] {
+        assert!(
+            backend
+                .get_pending_inbound(&receiver.to_string(), &phone.jid.to_string(), id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+    assert!(transport.sent().is_empty());
+    assert_eq!(drain_message_events(&events).len(), 0);
+    release_tx.send(()).await.unwrap();
+    assert!(flush.await.unwrap());
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(drain_message_events(&events).len(), 3);
+
+    // Replay the same three pkmsgs through Signal's real duplicate branch.
+    client.inbound_commit_batch.reset();
+    client.swap_message_semaphore(1);
+    let before = transport.sent().len();
+    for stanza in stanzas {
+        client.clone().handle_incoming_message(stanza).await;
+    }
+    assert_eq!(client.offline_receipt_buffer.lock().unwrap().len(), 3);
+    assert_eq!(
+        transport.sent().len(),
+        before,
+        "duplicate peers still buffer"
+    );
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert!(drain_message_events(&events).is_empty());
+    let sent = transport.sent();
+    assert_eq!(sent.len(), 6);
+    for (index, frame) in sent.iter().enumerate() {
+        let bytes = decode_frame(index, frame).unwrap();
+        let node = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
+        assert_eq!(node.tag.as_ref(), "receipt", "no additional transport ack");
+        assert_eq!(
+            node.get_attr("id").unwrap().as_str(),
+            ["PEER_A", "PEER_B", "PEER_C"][index % 3]
+        );
+        assert_eq!(node.get_attr("type").unwrap().as_str(), "peer_msg");
+        assert_eq!(node.get_attr("to").unwrap().as_str(), phone.jid.to_string());
+        assert!(node.get_attr("recipient").is_none());
+        assert!(node.children().is_none(), "no list-item ids");
+    }
+}
+
 #[tokio::test]
 async fn skdm_only_group_session_acknowledged_once_without_message_event() {
     use wacore::messages::MessageUtils;

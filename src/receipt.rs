@@ -324,15 +324,17 @@ fn build_delivery_receipt_node(info: &MessageInfo, active: bool) -> wacore_binar
 }
 
 /// One buffered-offline delivery group: every entry shares identical
-/// receipt-level attrs, derived from the representative `rep`.
+/// receipt-level attrs, derived from the representative `rep`. Peer groups
+/// always contain a single message.
 struct DeliveryReceiptGroup<'a> {
     rep: &'a MessageInfo,
     ids: Vec<&'a str>,
 }
 
-/// Group buffered offline messages so each group maps to ONE aggregate
-/// `<receipt>` (WA Web `sendAggregateOfflineReceipts` groups by chat and
-/// author). The key covers every input that varies the receipt-level attrs
+/// Group buffered offline messages in first-appearance order. Non-peer groups
+/// map to aggregate `<receipt>` stanzas (WA Web `sendAggregateOfflineReceipts`
+/// groups by chat and author); peer groups map to individual receipts.
+/// The key covers every input that varies the receipt-level attrs
 /// for a fixed `active`: the `to` JID, the participant (group/status author),
 /// the type attr, and the self-fanout recipient. Splitting more finely than
 /// WA Web (e.g. on recipient device) is always wire-safe; merging across any
@@ -357,6 +359,15 @@ fn group_delivery_receipts<'a>(
     let mut heads: Vec<(&'a MessageInfo, usize)> = Vec::new();
     let mut slots: Vec<usize> = Vec::with_capacity(infos.len());
     for info in infos {
+        // Aggregate syntax supports peer_msg, but that does not establish that
+        // the server consumes its list ids in this offline flow (issue #1619).
+        // Keep peers buffered until the same durable flush, then preserve each
+        // original id at the receipt root, as on the live peer path.
+        if info.category == MessageCategory::Peer {
+            slots.push(heads.len());
+            heads.push((info, 1));
+            continue;
+        }
         let is_status = info.source.chat.is_status_broadcast();
         let is_group_like = info.source.is_group || is_status;
         let sender_receipt = info.source.is_self_fanout() && info.category != MessageCategory::Peer;
@@ -837,14 +848,11 @@ impl Client {
             .ok()
     }
 
-    /// Buffer an offline-drained message's delivery receipt for the aggregate
-    /// flush at offline-sync completion (WA Web `sendAggregateOfflineReceipts`).
-    /// Returns `false` when the sync already completed, so the caller falls
-    /// back to the live 1:1 receipt. The completed flag is re-checked under
-    /// the buffer lock: the drain finisher (`finish_offline_sync`) flips the
-    /// flag before draining, so a push that wins the lock either lands before
-    /// the drain (and is included) or observes the flag and goes 1:1 — a
-    /// receipt can never strand in the buffer.
+    /// Buffer an offline-drained message's delivery receipt until a durable
+    /// drain flush. Returns `false` once the batcher is live, so the caller
+    /// falls back to the live 1:1 receipt. The batcher mode is checked under
+    /// the buffer lock; the processing permit serializes receipt admission
+    /// with the drain finisher's durable flush and mode transition.
     pub(crate) fn try_buffer_offline_receipt(&self, info: &Arc<MessageInfo>) -> bool {
         let mut buffer = self
             .offline_receipt_buffer
@@ -863,11 +871,12 @@ impl Client {
         true
     }
 
-    /// Drain the offline receipt buffer and send one aggregate `<receipt>`
-    /// per (chat, author, type, recipient) group, chunked at 256 ids. The
-    /// drain `mem::take`s the buffer so no capacity is retained between
-    /// offline windows, and the send runs as an `outbound_flush` task so
-    /// `disconnect()` flushes it like any other receipt (issue #571).
+    /// Drain the offline receipt buffer, sending peer receipts individually
+    /// and other receipts aggregated per (chat, author, type, recipient),
+    /// chunked at 256 ids. The drain `mem::take`s the buffer so no capacity is
+    /// retained between offline windows, and the send runs as an
+    /// `outbound_flush` task so shutdown flushes it like any other receipt
+    /// (issue #571).
     pub(crate) fn flush_offline_receipts(&self) {
         let infos = std::mem::take(
             &mut *self
@@ -890,20 +899,25 @@ impl Client {
             let groups = group_delivery_receipts(&infos, active);
             debug!(
                 target: "Client/Receipt",
-                "Flushing {} offline delivery receipts as {} aggregate stanza group(s)",
+                "Flushing {} offline delivery receipts as {} stanza group(s)",
                 infos.len(),
                 groups.len()
             );
             for group in &groups {
-                for node in build_aggregate_delivery_receipt_nodes(
-                    group.rep, &group.ids, active, &timestamp,
-                ) {
+                let nodes = if group.rep.category == MessageCategory::Peer {
+                    vec![build_delivery_receipt_node(group.rep, active)]
+                } else {
+                    build_aggregate_delivery_receipt_nodes(
+                        group.rep, &group.ids, active, &timestamp,
+                    )
+                };
+                for node in nodes {
                     if let Err(e) = client.send_node(node).await
                         && !matches!(e, crate::client::ClientError::NotConnected)
                     {
                         log::warn!(
                             target: "Client/Receipt",
-                            "Failed to send aggregate delivery receipt for chat {}: {:?}",
+                            "Failed to send offline delivery receipt for chat {}: {:?}",
                             group.rep.source.chat.observe(),
                             e
                         );
@@ -3350,6 +3364,254 @@ mod tests {
         Arc::new(info)
     }
 
+    /// Counterfactual for issue #1619: changing only the offline path must not
+    /// turn the live peer receipts' original ids into aggregate list items.
+    #[tokio::test]
+    async fn offline_peer_receipts_are_sent_individually() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let infos: Vec<_> = ["PEER_A", "PEER_B", "PEER_C"]
+            .into_iter()
+            .map(|id| {
+                let mut info = info_with("99000000000001@lid", "99000000000001:7@lid", false);
+                info.id = id.into();
+                info.category = MessageCategory::Peer;
+                info.source.is_from_me = true;
+                info.source.recipient = Some(jid("99000000000002:9@lid"));
+                Arc::new(info)
+            })
+            .collect();
+
+        // Proven wire control: the live receipt worker sends all three ids
+        // individually, with no additional transport ack.
+        for info in &infos {
+            client.ack_received_message(info);
+        }
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        let live = crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0; 32]);
+        assert_eq!(live.len(), 3);
+
+        client.inbound_commit_batch.reset();
+        client.swap_message_semaphore(1);
+        for info in &infos {
+            let mut offline = (**info).clone();
+            offline.is_offline = true;
+            client.ack_received_message(&Arc::new(offline));
+        }
+        assert_eq!(client.offline_receipt_buffer.lock().unwrap().len(), 3);
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        assert_eq!(
+            transport.sent().len(),
+            3,
+            "no early peer bypass of the buffer"
+        );
+
+        // A failed durable flush cannot release even these already-processed
+        // messages' receipts; the successful retry drains the actual buffer.
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(
+            !client
+                .flush_inbound_commits_under_permit(false, None, None)
+                .await
+        );
+        assert_eq!(client.offline_receipt_buffer.lock().unwrap().len(), 3);
+        assert_eq!(transport.sent().len(), 3);
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert!(
+            client
+                .flush_inbound_commits_under_permit(true, None, None)
+                .await
+        );
+        assert_eq!(
+            client.outbound_flush.pending(),
+            1,
+            "one tracked flush owns the batch"
+        );
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        assert_eq!(client.outbound_flush.pending(), 0);
+        assert_eq!(client.offline_receipt_buffer.lock().unwrap().capacity(), 0);
+
+        let frames = crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0; 32]);
+        assert_eq!(
+            frames.len(),
+            6,
+            "offline peers A/B/C each need their own receipt"
+        );
+        for (frame, id) in frames
+            .iter()
+            .zip(["PEER_A", "PEER_B", "PEER_C"].into_iter().cycle())
+        {
+            let node = wacore_binary::marshal::unmarshal_packed_ref(frame).unwrap();
+            assert_eq!(node.tag.as_ref(), "receipt", "no extra transport ack");
+            assert_eq!(node.get_attr("id").unwrap().as_str(), id);
+            assert_eq!(node.get_attr("type").unwrap().as_str(), "peer_msg");
+            assert_eq!(
+                node.get_attr("to").unwrap().as_str(),
+                "99000000000001:7@lid"
+            );
+            assert!(node.get_attr("recipient").is_none());
+            assert!(node.get_attr("participant").is_none());
+            assert!(
+                node.get_attr("t").is_none(),
+                "individual receipt convention"
+            );
+            assert!(node.children().is_none(), "no aggregate list");
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_offline_receipts_keep_routing_and_aggregation_through_shutdown() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        client.set_force_active_delivery_receipts(true);
+        client.inbound_commit_batch.reset();
+        client.swap_message_semaphore(1);
+        let own = "99000000000001:7@lid";
+        let chat = "99000000000001@lid";
+        let mut peer_a = (*offline_info("PEER_A", chat, own, false)).clone();
+        peer_a.category = MessageCategory::Peer;
+        peer_a.source.is_from_me = true;
+        peer_a.source.recipient = Some(jid("99000000000002:9@lid"));
+        let mut peer_b = peer_a.clone();
+        peer_b.id = "PEER_B".into();
+        let mut peer_c = peer_a.clone();
+        peer_c.id = "PEER_C".into();
+        peer_c.source.chat = jid("120363000000000081@g.us");
+        peer_c.source.is_group = true;
+        let mut fanout = peer_a.clone();
+        fanout.id = "FANOUT_A".into();
+        fanout.category = MessageCategory::Empty;
+        let mut fanout_b = fanout.clone();
+        fanout_b.id = "FANOUT_B".into();
+        let mut other_recipient = fanout.clone();
+        other_recipient.id = "FANOUT_C".into();
+        other_recipient.source.recipient = Some(jid("99000000000003:11@lid"));
+        for info in [
+            offline_info("NORMAL_A", chat, own, false),
+            Arc::new(peer_a),
+            offline_info("NORMAL_B", chat, own, false),
+            Arc::new(peer_b),
+            Arc::new(peer_c),
+            offline_info("NORMAL_C", chat, own, false),
+            Arc::new(fanout),
+            Arc::new(fanout_b),
+            Arc::new(other_recipient),
+        ] {
+            client.ack_received_message(&info);
+        }
+        assert_eq!(client.offline_receipt_buffer.lock().unwrap().len(), 9);
+        assert!(transport.sent().is_empty());
+        let report = client.shutdown().await;
+        assert_eq!(report.inbound, crate::flush_scope::DrainOutcome::Completed);
+        assert_eq!(report.outbound, crate::flush_scope::DrainOutcome::Completed);
+        assert!(report.device.is_ok());
+        assert_eq!(client.outbound_flush.pending(), 0);
+        let frames = crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0; 32]);
+        let nodes: Vec<_> = frames
+            .iter()
+            .map(|frame| wacore_binary::marshal::unmarshal_packed_ref(frame).unwrap())
+            .collect();
+        assert_eq!(nodes.len(), 6);
+        assert!(nodes.iter().all(|node| node.tag.as_ref() == "receipt"));
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.get_attr("id").unwrap().as_str())
+                .collect::<Vec<_>>(),
+            [
+                "NORMAL_A", "PEER_A", "PEER_B", "PEER_C", "FANOUT_A", "FANOUT_C"
+            ]
+        );
+        let list_ids = |index: usize| {
+            nodes[index]
+                .get_optional_child("list")
+                .unwrap()
+                .children()
+                .unwrap()
+                .iter()
+                .map(|item| item.get_attr("id").unwrap().as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(list_ids(0), ["NORMAL_B", "NORMAL_C"]);
+        assert!(nodes[0].get_attr("type").is_none());
+        assert_eq!(list_ids(4), ["FANOUT_B"]);
+        let timestamp = nodes[0].get_attr("t").unwrap().as_str();
+        assert!(timestamp.parse::<i64>().is_ok());
+        for (index, recipient) in [(4, "99000000000002@lid"), (5, "99000000000003@lid")] {
+            assert_eq!(nodes[index].get_attr("to").unwrap().as_str(), own);
+            assert_eq!(nodes[index].get_attr("type").unwrap().as_str(), "sender");
+            assert_eq!(
+                nodes[index].get_attr("recipient").unwrap().as_str(),
+                recipient
+            );
+            assert_eq!(nodes[index].get_attr("t").unwrap().as_str(), timestamp);
+        }
+        for node in &nodes[1..4] {
+            assert_eq!(node.get_attr("type").unwrap().as_str(), "peer_msg");
+            assert!(node.children().is_none());
+            assert!(node.get_attr("t").is_none());
+            assert!(node.get_attr("recipient").is_none());
+        }
+        assert_eq!(nodes[1].get_attr("to").unwrap().as_str(), own);
+        assert_eq!(nodes[2].get_attr("to").unwrap().as_str(), own);
+        assert!(nodes[1].get_attr("participant").is_none());
+        assert_eq!(
+            nodes[3].get_attr("to").unwrap().as_str(),
+            "120363000000000081@g.us"
+        );
+        assert_eq!(nodes[3].get_attr("participant").unwrap().as_str(), own);
+    }
+
+    #[tokio::test]
+    async fn offline_peer_receipts_drop_on_closed_scope_and_reset() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        client.inbound_commit_batch.reset();
+        let mut info = (*offline_info(
+            "OLD_PEER",
+            "99000000000001@lid",
+            "99000000000001:7@lid",
+            false,
+        ))
+        .clone();
+        info.category = MessageCategory::Peer;
+        client.ack_received_message(&Arc::new(info.clone()));
+        client.outbound_flush.close();
+        client.flush_offline_receipts();
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        assert!(transport.sent().is_empty());
+        assert_eq!(client.outbound_flush.pending(), 0);
+        assert_eq!(client.offline_receipt_buffer.lock().unwrap().capacity(), 0);
+
+        client.ack_received_message(&Arc::new(info.clone()));
+        assert_eq!(client.offline_receipt_buffer.lock().unwrap().len(), 1);
+        client.clear_offline_receipt_buffer();
+        client.inbound_commit_batch.reset();
+        client.outbound_flush.reopen();
+        info.id = "NEW_PEER".into();
+        client.ack_received_message(&Arc::new(info));
+        assert!(
+            client
+                .flush_inbound_commits_under_permit(true, None, None)
+                .await
+        );
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        let frames = crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0; 32]);
+        assert_eq!(
+            frames.len(),
+            1,
+            "no stale receipt leaks into the next offline window"
+        );
+        let node = wacore_binary::marshal::unmarshal_packed_ref(&frames[0]).unwrap();
+        assert_eq!(node.tag.as_ref(), "receipt");
+        assert_eq!(node.get_attr("id").unwrap().as_str(), "NEW_PEER");
+        assert_eq!(node.get_attr("type").unwrap().as_str(), "peer_msg");
+        assert!(node.children().is_none());
+    }
+
     #[test]
     fn aggregate_delivery_receipts_group_by_chat_author_and_type() {
         let group_chat = "120363000000000001@g.us";
@@ -3361,6 +3623,8 @@ mod tests {
         peer.id = "M6".into();
         peer.source.is_from_me = true;
         peer.category = MessageCategory::Peer;
+        let mut peer2 = peer.clone();
+        peer2.id = "M7".into();
 
         let infos = vec![
             offline_info(
@@ -3379,17 +3643,20 @@ mod tests {
             offline_info("M4", group_chat, "5511888880000@s.whatsapp.net", true),
             offline_info("M5", group_chat, "5511777770000@s.whatsapp.net", true),
             Arc::new(peer),
+            Arc::new(peer2),
         ];
 
         let groups = group_delivery_receipts(&infos, true);
 
-        // DM sender, group author A, group author B, and the peer-typed DM
-        // must each get their own stanza; same (chat, author, type) coalesce.
-        assert_eq!(groups.len(), 4);
+        // Ordinary DM/group receipts coalesce, but even peers with identical
+        // receipt attrs must retain separate original ids (the old singleton
+        // peer fixture masked this distinction).
+        assert_eq!(groups.len(), 5);
         assert_eq!(groups[0].ids, vec!["M1", "M2"]);
         assert_eq!(groups[1].ids, vec!["M3", "M4"]);
         assert_eq!(groups[2].ids, vec!["M5"]);
         assert_eq!(groups[3].ids, vec!["M6"]);
+        assert_eq!(groups[4].ids, vec!["M7"]);
         assert_eq!(
             delivery_receipt_type(groups[3].rep, true),
             Some("peer_msg"),

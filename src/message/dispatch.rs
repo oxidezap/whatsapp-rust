@@ -359,10 +359,9 @@ impl Client {
     /// [`crate::flush_scope::FlushGuard`], and `flush()` still waits because
     /// the guard rides the queue until the send completes.
     ///
-    /// Offline-drained messages are buffered instead and flushed as aggregate
-    /// `<receipt>` stanzas when the offline sync completes, collapsing a
-    /// reconnect backlog of N receipts into ~1 stanza per (chat, author)
-    /// (WA Web `sendAggregateOfflineReceipts`). Live messages stay 1:1.
+    /// Offline-drained messages are buffered until a durable drain flush.
+    /// Ordinary receipts aggregate per (chat, author) (WA Web
+    /// `sendAggregateOfflineReceipts`); peer receipts and live messages stay 1:1.
     fn spawn_delivery_receipt(self: &Arc<Self>, info: &Arc<MessageInfo>) {
         if info.is_offline && self.try_buffer_offline_receipt(info) {
             return;
