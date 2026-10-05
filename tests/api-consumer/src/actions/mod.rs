@@ -233,6 +233,23 @@ pub fn mock_history() -> NewsletterMessage {
 pub mod construction;
 pub mod removed;
 
+/// Construct a detached range from addressing metadata alone, without a client.
+pub fn range_from_metadata(
+    info: &MessageInfo,
+) -> anyhow::Result<whatsapp_rust::SyncActionMessageRange> {
+    Ok(whatsapp_rust::message_range(
+        42,
+        Some(7),
+        std::iter::once((MessageRef::from_info(info)?, 41)),
+    ))
+}
+
+/// The context/result raw-key accessors remain available for explicit interop.
+pub fn retained_key_accessors(ctx: &MessageContext, sent: &whatsapp_rust::SendResult) {
+    let _: proto::MessageKey = ctx.message_key();
+    let _: proto::MessageKey = sent.message_key();
+}
+
 #[cfg(all(test, feature = "contracts"))]
 mod tests {
     use super::*;
@@ -240,6 +257,28 @@ mod tests {
         NewsletterAdminInfo, NewsletterAdminProfile, NewsletterFollower, NewsletterMyAddOns,
         NewsletterMyPollVote, NewsletterMyReaction,
     };
+
+    #[test]
+    fn message_range_outlives_addressing_metadata() {
+        let range = {
+            let info = mock_info();
+            range_from_metadata(&info).unwrap()
+        };
+        assert_eq!(range.last_message_timestamp, Some(42));
+        assert_eq!(range.last_system_message_timestamp, Some(7));
+        assert_eq!(range.messages.len(), 1);
+        assert_eq!(range.messages[0].timestamp, Some(41));
+        let key = range.messages[0].key.as_option().unwrap();
+        assert_eq!(key.id.as_deref(), Some("COMMENT"));
+        assert_eq!(key.remote_jid.as_deref(), Some("120363000000000001@g.us"));
+        assert_eq!(key.participant.as_deref(), Some("100000000000001@lid"));
+        assert_eq!(key.from_me, Some(false));
+        assert!(
+            whatsapp_rust::message_range(0, None, [])
+                .messages
+                .is_empty()
+        );
+    }
 
     #[test]
     fn host_futures_and_mock_construction_are_supported() {

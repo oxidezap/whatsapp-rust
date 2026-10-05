@@ -578,7 +578,7 @@ pub use features::{
     SubgroupFailure, SubgroupKind, SubgroupVisibility, SyncActionMessageRange, TcToken,
     TcTokenError, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UnlinkSubgroupsResult, UserInfo,
     UsernameLookup, UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError,
-    VariantProperty, VerifiedName, message_key, message_range,
+    VariantProperty, VerifiedName, message_range,
 };
 pub use features::{CreatedEvent, CreatedPoll, EventRef, MexDoc, MexOperation, PollRef};
 

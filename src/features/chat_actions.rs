@@ -49,38 +49,25 @@ pub type SyncActionMessageRange = wa::sync_action_value::SyncActionMessageRange;
 
 /// Enables multi-device conflict resolution. `None` is safe for clients without
 /// a complete message database; callers with one can populate the range.
-pub fn message_range(
+///
+/// Consumes typed references and their timestamps in iteration order. Keys use
+/// [`MessageRef::to_raw_key`], preserving referential author/from-me scope.
+/// The returned range owns its keys and does not retain the references.
+pub fn message_range<'a>(
     last_message_timestamp: i64,
     last_system_message_timestamp: Option<i64>,
-    messages: Vec<(wa::MessageKey, i64)>,
+    messages: impl IntoIterator<Item = (MessageRef<'a>, i64)>,
 ) -> SyncActionMessageRange {
     SyncActionMessageRange {
         last_message_timestamp: Some(last_message_timestamp),
         last_system_message_timestamp,
         messages: messages
             .into_iter()
-            .map(|(key, ts)| wa::sync_action_value::SyncActionMessage {
-                key: buffa::MessageField::some(key),
+            .map(|(reference, ts)| wa::sync_action_value::SyncActionMessage {
+                key: buffa::MessageField::some(reference.to_raw_key()),
                 timestamp: Some(ts),
             })
             .collect(),
-    }
-}
-
-/// Raw key construction for advanced hosts. Prefer
-/// [`crate::MessageRef::to_raw_key`] to retain received author/from-me scope;
-/// sender revokes and group edits must still use their operation-specific APIs.
-pub fn message_key(
-    id: impl Into<String>,
-    remote_jid: &Jid,
-    from_me: bool,
-    participant: Option<&Jid>,
-) -> wa::MessageKey {
-    wa::MessageKey {
-        id: Some(id.into()),
-        remote_jid: Some(remote_jid.to_string()),
-        from_me: Some(from_me),
-        participant: participant.map(|j| j.to_string()),
     }
 }
 
@@ -1134,6 +1121,83 @@ where
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    #[test]
+    fn message_range_preserves_referential_keys_and_iteration_order() {
+        // Use the addressing cases covered by the action-index fixtures below.
+        // Ranges retain known own authors and device suffixes, unlike indices.
+        let cases = [
+            (
+                "12025550111@s.whatsapp.net",
+                Some("12025550111:7@s.whatsapp.net"),
+                false,
+                None,
+            ),
+            ("12025550111@lid", Some("12025550111@lid"), false, None),
+            (
+                "120000000001@g.us",
+                Some("12025550111@s.whatsapp.net"),
+                false,
+                Some("12025550111@s.whatsapp.net"),
+            ),
+            (
+                "120000000001@g.us",
+                Some("100000000001:9@lid"),
+                false,
+                Some("100000000001:9@lid"),
+            ),
+            (
+                "120000000001@g.us",
+                Some("100000000001:9@lid"),
+                true,
+                Some("100000000001:9@lid"),
+            ),
+            ("120000000001@g.us", None, true, None),
+            ("12025550111@s.whatsapp.net", None, true, None),
+        ];
+        let chats: Vec<Jid> = cases.iter().map(|c| c.0.parse().unwrap()).collect();
+        let senders: Vec<Option<Jid>> = cases
+            .iter()
+            .map(|c| c.1.map(|s| s.parse().unwrap()))
+            .collect();
+        let timestamps = [9, -3, 0, i64::MAX, 5, i64::MIN, 9];
+        let entries = cases.iter().enumerate().map(|(i, case)| {
+            let reference = MessageRef::new(
+                &chats[i],
+                crate::MessageId::new(format!("range-{i}")).unwrap(),
+                senders[i].as_ref(),
+                case.2,
+            )
+            .unwrap();
+            (reference, timestamps[i])
+        });
+        let range = message_range(1234, Some(-7), entries);
+        assert_eq!(range.last_message_timestamp, Some(1234));
+        assert_eq!(range.last_system_message_timestamp, Some(-7));
+        assert_eq!(range.messages.len(), cases.len());
+        for (i, message) in range.messages.iter().enumerate() {
+            assert_eq!(message.timestamp, Some(timestamps[i]));
+            assert_eq!(
+                message.key.as_option().unwrap(),
+                &wa::MessageKey {
+                    remote_jid: Some(cases[i].0.into()),
+                    id: Some(format!("range-{i}")),
+                    from_me: Some(cases[i].2),
+                    participant: cases[i].3.map(str::to_owned),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn message_range_preserves_empty_ranges_and_optional_timestamp() {
+        for system_timestamp in [None, Some(0), Some(-1)] {
+            let range = message_range(-5, system_timestamp, []);
+            assert_eq!(range.last_message_timestamp, Some(-5));
+            assert_eq!(range.last_system_message_timestamp, system_timestamp);
+            assert!(range.messages.is_empty());
+        }
+    }
 
     #[test]
     fn build_index_matches_legacy_shapes() {

@@ -2,6 +2,22 @@
 //! arguments compile in `Host::actions`. Nightly rustdoc verifies E0599; stable
 //! runs these as compile-fail tests but ignores error-code annotations.
 //!
+//! Ranges accept typed references; the free raw-key factory is removed from
+//! both public export paths. Context and send-result methods remain available.
+//!
+//! ```compile_fail,E0432
+//! use whatsapp_rust::message_key;
+//! ```
+//!
+//! ```compile_fail,E0432
+//! use whatsapp_rust::features::message_key;
+//! ```
+//!
+//! ```compile_fail,E0271
+//! use whatsapp_rust::{message_range, waproto::whatsapp::MessageKey};
+//! let _ = message_range(1, None, vec![(MessageKey::default(), 1)]);
+//! ```
+//!
 //! ```compile_fail,E0599
 //! use whatsapp_rust::{Client, MessageRef};
 //! async fn old(c: &Client, t: &MessageRef<'_>) { let _ = c.send_reaction_ref(t, "👍").await; }
