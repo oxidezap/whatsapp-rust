@@ -110,7 +110,7 @@ impl ExpectedMediaHashes {
 ///
 /// [`Client`] downloads return [`ClientDownloadError`], which also represents
 /// session acquisition/refresh failures. This downloader never asks for a session.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum MediaDownloadError {
     /// The CDN rejected the reference itself (401/403/404/410). The direct path
@@ -145,7 +145,7 @@ pub enum MediaDownloadError {
 /// Final failure of a [`Client`] download, after any applicable refresh and host
 /// failover. Local sink failures stop immediately. Unlike [`MediaDownloadError`],
 /// this includes the session operation needed to obtain a CDN route.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum ClientDownloadError {
     /// The reference is still rejected after any applicable refresh. Static
@@ -187,6 +187,96 @@ pub enum ClientDownloadError {
         failure: Box<ClientDownloadError>,
         cleanup: std::io::Error,
     },
+}
+
+// Opaque adapter errors may repeat signed URLs in any source or context. Keep
+// those causes intact for callers, but only format typed facts in diagnostics.
+pub(crate) struct MediaErrorDiagnostic<'a>(pub &'a (dyn std::error::Error + 'static));
+
+impl std::fmt::Debug for MediaErrorDiagnostic<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::error::ErrorChainExt;
+        let io_kind = ErrorChainExt::sources(self.0)
+            .find_map(|e| e.downcast_ref::<std::io::Error>())
+            .map(std::io::Error::kind);
+        let media_validation =
+            ErrorChainExt::sources(self.0).any(|e| e.is::<MediaDecryptionError>());
+        f.debug_struct("MediaFailure")
+            .field("http_status", &self.0.http_status())
+            .field("io_kind", &io_kind)
+            .field("media_validation", &media_validation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for MediaDownloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReferenceRejected(e) => f
+                .debug_tuple("ReferenceRejected")
+                .field(&MediaErrorDiagnostic(e.as_ref()))
+                .finish(),
+            Self::HostsUnreachable(e) => f
+                .debug_tuple("HostsUnreachable")
+                .field(&MediaErrorDiagnostic(e.as_ref()))
+                .finish(),
+            Self::WriterIo(e) => f
+                .debug_tuple("WriterIo")
+                .field(&MediaErrorDiagnostic(e.as_ref()))
+                .finish(),
+            Self::Other(e) => f
+                .debug_tuple("Other")
+                .field(&MediaErrorDiagnostic(e.as_ref()))
+                .finish(),
+            Self::NoHosts => f.write_str("NoHosts"),
+            Self::WriterCleanup { failure, cleanup } => f
+                .debug_struct("WriterCleanup")
+                .field("failure", failure)
+                .field("cleanup_kind", &cleanup.kind())
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ClientDownloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReferenceRejected(e) => f
+                .debug_tuple("ReferenceRejected")
+                .field(&MediaErrorDiagnostic(e.as_ref()))
+                .finish(),
+            Self::HostsUnreachable(e) => f
+                .debug_tuple("HostsUnreachable")
+                .field(&MediaErrorDiagnostic(e.as_ref()))
+                .finish(),
+            Self::WriterIo(e) => f
+                .debug_tuple("WriterIo")
+                .field(&MediaErrorDiagnostic(e.as_ref()))
+                .finish(),
+            Self::NoHostsAfterRefresh(e) => f
+                .debug_tuple("NoHostsAfterRefresh")
+                .field(&MediaErrorDiagnostic(e.as_ref()))
+                .finish(),
+            Self::Preparation(e) => f
+                .debug_tuple("Preparation")
+                .field(&MediaErrorDiagnostic(e.as_ref()))
+                .finish(),
+            Self::NoHosts => f.write_str("NoHosts"),
+            Self::MediaSession {
+                force_refresh,
+                source,
+            } => f
+                .debug_struct("MediaSession")
+                .field("force_refresh", force_refresh)
+                .field("source", &MediaErrorDiagnostic(source))
+                .finish(),
+            Self::WriterCleanup { failure, cleanup } => f
+                .debug_struct("WriterCleanup")
+                .field("failure", failure)
+                .field("cleanup_kind", &cleanup.kind())
+                .finish(),
+        }
+    }
 }
 
 impl From<DownloadRequestError> for ClientDownloadError {
@@ -792,30 +882,35 @@ impl Client {
     /// only affects localized pack names; `"en"` mirrors whatsmeow's default.
     #[cfg_attr(
         feature = "tracing",
-        tracing::instrument(
-            name = "wa.media.fetch_sticker_pack",
-            level = "debug",
-            skip_all,
-            err(Debug)
-        )
+        tracing::instrument(name = "wa.media.fetch_sticker_pack", level = "debug", skip_all,)
     )]
     pub async fn fetch_sticker_pack(
         &self,
         pack_id: &str,
         locale: &str,
     ) -> Result<wacore::sticker_pack::StickerPack> {
-        let url = wacore::sticker_pack::sticker_pack_data_url(pack_id, locale);
-        let response = self
-            .http_client
-            .execute(crate::http::HttpRequest::get(&url))
-            .await
-            .map_err(|e| anyhow!("sticker pack request failed: {e}"))?;
-        if response.status_code != HTTP_STATUS_OK {
-            let status = response.status_code;
-            return Err(HttpStatusError { status }
-                .into_error(format!("sticker pack endpoint returned status {status}")));
+        async {
+            let url = wacore::sticker_pack::sticker_pack_data_url(pack_id, locale);
+            let response = self
+                .http_client
+                .execute(crate::http::HttpRequest::get(&url))
+                .await
+                .map_err(|e| e.context("sticker pack request failed"))?;
+            if response.status_code != HTTP_STATUS_OK {
+                let status = response.status_code;
+                return Err(HttpStatusError { status }
+                    .into_error(format!("sticker pack endpoint returned status {status}")));
+            }
+            wacore::sticker_pack::parse_sticker_pack_response(&response.body)
         }
-        wacore::sticker_pack::parse_sticker_pack_response(&response.body)
+        .await
+        .inspect_err(|_error| {
+            #[cfg(feature = "tracing")]
+            tracing::error!(
+                error = ?MediaErrorDiagnostic(_error.as_ref()),
+                "sticker pack fetch failed"
+            );
+        })
     }
 
     async fn prepare_requests(
@@ -1128,6 +1223,234 @@ mod tests {
     use std::sync::Arc;
     use wacore::time::Instant;
     use waproto::whatsapp as wa;
+
+    #[cfg(feature = "tracing")]
+    mod diagnostics {
+        use super::*;
+        use std::error::Error;
+        use tracing::instrument::WithSubscriber;
+
+        const TOKEN: &str = "synthetic-auth-token-do-not-log";
+        const CONTEXT: &str = "synthetic-backend-context-do-not-log";
+
+        #[derive(Debug)]
+        struct BackendFailure {
+            url: String,
+            status: HttpStatusError,
+        }
+        impl std::fmt::Display for BackendFailure {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "transport rejected signed URL {}", self.url)
+            }
+        }
+        impl Error for BackendFailure {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                Some(&self.status)
+            }
+        }
+
+        struct FailingHttp;
+        impl FailingHttp {
+            fn error(url: String) -> anyhow::Error {
+                anyhow::Error::new(BackendFailure {
+                    url: format!("{url}&auth={TOKEN}"),
+                    status: HttpStatusError { status: 503 },
+                })
+                .context(CONTEXT)
+            }
+        }
+        #[async_trait::async_trait]
+        impl HttpClient for FailingHttp {
+            async fn execute(
+                &self,
+                request: crate::http::HttpRequest,
+            ) -> Result<crate::http::HttpResponse> {
+                Err(Self::error(request.url))
+            }
+            fn execute_upload(
+                &self,
+                request: crate::http::HttpRequest,
+                _body: Box<dyn std::io::Read + Send>,
+                _len: u64,
+            ) -> Result<crate::http::HttpResponse> {
+                Err(Self::error(request.url))
+            }
+        }
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        async fn capture_failure<E: Error + 'static>(future: impl Future<Output = E>, span: &str) {
+            let capture = Capture::default();
+            let writer = capture.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(move || writer.clone())
+                .finish();
+            let error = future.with_subscriber(subscriber).await;
+            assert_eq!(error.http_status(), Some(503));
+            let backend = error
+                .sources()
+                .find_map(|e| e.downcast_ref::<BackendFailure>())
+                .unwrap();
+            assert!(backend.url.contains(TOKEN));
+            let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+            assert!(output.contains(span), "missing span: {output}");
+            assert!(output.contains("503"), "missing HTTP status: {output}");
+            for secret in [TOKEN, CONTEXT, "https://", "auth="] {
+                assert!(!output.contains(secret), "leaked {secret}: {output}");
+            }
+        }
+
+        #[tokio::test]
+        async fn public_media_entries_redact_tracing_and_preserve_sources() {
+            let client = crate::test_utils::create_test_client_with_http(
+                "media-diagnostics",
+                Arc::new(FailingHttp),
+            )
+            .await;
+            *client.media_conn.write().await = Some(media_conn(TOKEN, &["cdn.example.com"]));
+            let route = MediaDownloader::new(
+                Arc::new(FailingHttp),
+                Arc::new(crate::TokioRuntime),
+                MediaRoute::from(&media_conn(TOKEN, &["cdn.example.com"])),
+            );
+            let (mut params, _) = encrypted_params(b"diagnostic media");
+            params.direct_path = format!("/media?signature={TOKEN}");
+            capture_failure(
+                async { route.download(&params).await.unwrap_err() },
+                "wa.media.download_via_route",
+            )
+            .await;
+            capture_failure(
+                async {
+                    route
+                        .download_to_writer(&params, Cursor::new(Vec::new()))
+                        .await
+                        .unwrap_err()
+                },
+                "wa.media.download_via_route_to_writer",
+            )
+            .await;
+            capture_failure(
+                async { client.download(&params).await.unwrap_err() },
+                "wa.media.download",
+            )
+            .await;
+            capture_failure(
+                async {
+                    client
+                        .download_to_writer(&params, Cursor::new(Vec::new()))
+                        .await
+                        .unwrap_err()
+                },
+                "wa.media.download_to_writer",
+            )
+            .await;
+            // anyhow itself does not implement Error. A transparent typed wrapper
+            // lets this same assertion traverse the public source chain.
+            #[derive(Debug)]
+            struct Returned(anyhow::Error);
+            impl std::fmt::Display for Returned {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    std::fmt::Display::fmt(&self.0, f)
+                }
+            }
+            impl Error for Returned {
+                fn source(&self) -> Option<&(dyn Error + 'static)> {
+                    Some(self.0.as_ref())
+                }
+            }
+            capture_failure(
+                async {
+                    Returned(
+                        client
+                            .upload(
+                                b"media".to_vec(),
+                                MediaType::Image,
+                                crate::upload::UploadOptions::default(),
+                            )
+                            .await
+                            .unwrap_err(),
+                    )
+                },
+                "wa.media.upload",
+            )
+            .await;
+            let mut encrypted = Vec::new();
+            let info = wacore::upload::encrypt_media_streaming(
+                &mut Cursor::new(b"media"),
+                &mut encrypted,
+                MediaType::Image,
+            )
+            .unwrap();
+            capture_failure(
+                async {
+                    Returned(
+                        client
+                            .upload_stream(bytes::Bytes::from(encrypted), info, MediaType::Image)
+                            .await
+                            .unwrap_err(),
+                    )
+                },
+                "wa.media.upload_stream",
+            )
+            .await;
+            capture_failure(
+                async { Returned(client.fetch_sticker_pack("test", "en").await.unwrap_err()) },
+                "wa.media.fetch_sticker_pack",
+            )
+            .await;
+        }
+
+        #[test]
+        fn download_error_debug_redacts_nested_causes_and_cleanup() {
+            let cause = || FailingHttp::error(format!("https://cdn.example.com/?auth={TOKEN}"));
+            let cleanup = || std::io::Error::other(CONTEXT);
+            let errors: Vec<Box<dyn Error>> = vec![
+                Box::new(MediaDownloadError::ReferenceRejected(cause())),
+                Box::new(MediaDownloadError::HostsUnreachable(cause())),
+                Box::new(MediaDownloadError::WriterIo(cause())),
+                Box::new(MediaDownloadError::Other(cause())),
+                Box::new(MediaDownloadError::WriterCleanup {
+                    failure: Box::new(MediaDownloadError::HostsUnreachable(cause())),
+                    cleanup: cleanup(),
+                }),
+                Box::new(ClientDownloadError::ReferenceRejected(cause())),
+                Box::new(ClientDownloadError::HostsUnreachable(cause())),
+                Box::new(ClientDownloadError::WriterIo(cause())),
+                Box::new(ClientDownloadError::NoHostsAfterRefresh(cause())),
+                Box::new(ClientDownloadError::Preparation(cause())),
+                Box::new(ClientDownloadError::MediaSession {
+                    force_refresh: true,
+                    source: crate::request::IqError::ParseError(cause()),
+                }),
+                Box::new(ClientDownloadError::WriterCleanup {
+                    failure: Box::new(ClientDownloadError::HostsUnreachable(cause())),
+                    cleanup: cleanup(),
+                }),
+            ];
+            for error in errors {
+                for rendered in [format!("{error:?}"), format!("{error:#?}")] {
+                    assert!(rendered.contains("503"), "{rendered}");
+                    assert!(!rendered.contains(TOKEN), "{rendered}");
+                    assert!(!rendered.contains(CONTEXT), "{rendered}");
+                }
+                assert!(ErrorChainExt::sources(error.as_ref()).any(|e| e.is::<BackendFailure>()));
+            }
+        }
+    }
 
     struct PlaintextDownloadable {
         direct_path: String,

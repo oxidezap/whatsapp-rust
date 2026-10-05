@@ -518,6 +518,21 @@ fn cbc_decrypt_blocks(cbc: &mut cbc::Decryptor<aes::Aes256>, buf: &mut [u8]) {
 
 pub struct DownloadUtils;
 
+// IPv6 permits multiple spellings for one address. Parse only bracketed IP
+// literals; DNS names keep their existing case-insensitive comparison.
+fn same_media_host(left: &str, right: &str) -> bool {
+    if left.eq_ignore_ascii_case(right) {
+        return true;
+    }
+    let parse = |host: &str| {
+        host.strip_prefix('[')?
+            .strip_suffix(']')?
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+    };
+    matches!((parse(left), parse(right)), (Some(left), Some(right)) if left == right)
+}
+
 impl DownloadUtils {
     pub fn prepare_download_requests(
         downloadable: &dyn Downloadable,
@@ -614,7 +629,7 @@ impl DownloadUtils {
                 .authority()
                 .ok_or_else(|| anyhow!("Media direct path changes the route origin"))?;
             if url.scheme() != base.scheme()
-                || !authority.host().eq_ignore_ascii_case(base_authority.host())
+                || !same_media_host(authority.host(), base_authority.host())
                 || authority
                     .port_to_u16()
                     .map_err(|_| anyhow!("Invalid media direct path port"))?
@@ -1802,6 +1817,57 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[0].url.starts_with("https://cdn1.example.com/"));
         assert!(requests[1].url.starts_with("https://cdn2.example.com/"));
+    }
+
+    #[test]
+    fn ipv6_origins_compare_addresses_without_rewriting_signed_urls() {
+        let query = "sig=%2f%2F&plus=+&flag&dup=1&dup=2";
+        for (host, reference) in [
+            ("[0:0:0:0:0:0:0:1]:8443", "https://[::1]:8443"),
+            ("[::1]:8443", "https://[0:0:0:0:0:0:0:1]:8443"),
+            ("[2001:db8::a]", "https://[2001:0DB8:0:0:0:0:0:000A]:443"),
+            ("[::ffff:192.0.2.1]", "https://[0:0:0:0:0:ffff:c000:201]"),
+        ] {
+            let media = MockDownloadable {
+                direct_path: Some(format!("{reference}/file%2Fname?{query}#part%20one")),
+                static_url: None,
+                media_key: Some(vec![1; 32]),
+                file_sha256: Some(vec![2; 32]),
+                file_enc_sha256: Some(vec![3; 32]),
+                media_type: MediaType::Image,
+            };
+            let route = MediaRoute::new(vec![MediaHost::new(host)]);
+            let requests = DownloadUtils::prepare_download_requests(&media, &route).unwrap();
+            assert_eq!(
+                requests[0].url,
+                format!(
+                    "{reference}/file%2Fname?{query}&token={}#part%20one",
+                    BASE64_URL_SAFE_NO_PAD.encode([3; 32])
+                )
+            );
+        }
+        for reference in [
+            "https://[::2]:8443/file",
+            "https://[::1]:8444/file",
+            "http://[::1]:8443/file",
+            "https://secret@[::1]:8443/file",
+            "https://[::1]:/file",
+            "https://127.0.0.1:8443/file",
+        ] {
+            let media = MockDownloadable {
+                direct_path: Some(reference.into()),
+                static_url: None,
+                media_key: Some(vec![1; 32]),
+                file_sha256: Some(vec![2; 32]),
+                file_enc_sha256: Some(vec![3; 32]),
+                media_type: MediaType::Image,
+            };
+            let route = MediaRoute::new(vec![MediaHost::new("[0:0:0:0:0:0:0:1]:8443")]);
+            assert!(
+                DownloadUtils::prepare_download_requests(&media, &route).is_err(),
+                "{reference}"
+            );
+        }
     }
 
     #[test]

@@ -423,52 +423,62 @@ impl Client {
     ///
     /// Only needed for new or modified media. To forward existing media unchanged,
     /// reuse the original message's CDN fields directly, no round-trip required.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.upload", level = "debug", skip_all, fields(kind = ?media_type, len = data.len()), err(Debug)))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.upload", level = "debug", skip_all, fields(kind = ?media_type, len = data.len())))]
     pub async fn upload(
         &self,
         data: Vec<u8>,
         media_type: MediaType,
         options: UploadOptions,
     ) -> Result<UploadResponse> {
-        let file_length = data.len() as u64;
-        let media_key = options.media_key;
-        let sidecar = options.streaming_sidecar;
-        let enc = wacore::runtime::blocking(&*self.runtime, move || {
-            wacore::upload::encrypt_media_with_key_and_sidecar(
-                &data,
+        async {
+            let file_length = data.len() as u64;
+            let media_key = options.media_key;
+            let sidecar = options.streaming_sidecar;
+            let enc = wacore::runtime::blocking(&*self.runtime, move || {
+                wacore::upload::encrypt_media_with_key_and_sidecar(
+                    &data,
+                    media_type,
+                    media_key.as_ref(),
+                    sidecar,
+                )
+            })
+            .await?;
+
+            let ciphertext_len = enc.data_to_upload.len() as u64;
+            let crypto = UploadCrypto {
+                media_key: enc.media_key,
+                file_sha256: enc.file_sha256,
+                file_enc_sha256: enc.file_enc_sha256,
+                streaming_sidecar: enc.streaming_sidecar,
+            };
+            // Bytes so each retry/resume attempt slices with a refcount bump instead of
+            // copying the whole (multi-MB) ciphertext per attempt.
+            let ciphertext = bytes::Bytes::from(enc.data_to_upload);
+
+            upload_media_with_retry(
+                crypto,
                 media_type,
-                media_key.as_ref(),
-                sidecar,
+                file_length,
+                ciphertext_len,
+                wacore::time::now_secs(),
+                |force| async move { self.refresh_media_conn(force).await.map_err(Into::into) },
+                || async { self.invalidate_media_conn().await },
+                |request| async move { self.http_client.execute(request).await },
+                |request, offset, _remaining| {
+                    let body = ciphertext.slice(offset as usize..);
+                    async move { self.http_client.execute(request.with_body(body)).await }
+                },
             )
-        })
-        .await?;
-
-        let ciphertext_len = enc.data_to_upload.len() as u64;
-        let crypto = UploadCrypto {
-            media_key: enc.media_key,
-            file_sha256: enc.file_sha256,
-            file_enc_sha256: enc.file_enc_sha256,
-            streaming_sidecar: enc.streaming_sidecar,
-        };
-        // Bytes so each retry/resume attempt slices with a refcount bump instead of
-        // copying the whole (multi-MB) ciphertext per attempt.
-        let ciphertext = bytes::Bytes::from(enc.data_to_upload);
-
-        upload_media_with_retry(
-            crypto,
-            media_type,
-            file_length,
-            ciphertext_len,
-            wacore::time::now_secs(),
-            |force| async move { self.refresh_media_conn(force).await.map_err(Into::into) },
-            || async { self.invalidate_media_conn().await },
-            |request| async move { self.http_client.execute(request).await },
-            |request, offset, _remaining| {
-                let body = ciphertext.slice(offset as usize..);
-                async move { self.http_client.execute(request.with_body(body)).await }
-            },
-        )
+            .await
+        }
         .await
+        .inspect_err(|_error| {
+            #[cfg(feature = "tracing")]
+            tracing::error!(
+                error = ?crate::download::MediaErrorDiagnostic(_error.as_ref()),
+                "media upload failed"
+            );
+        })
     }
 
     /// Uploads already-encrypted media streamed from `source`, keeping memory
@@ -477,7 +487,7 @@ impl Client {
     /// storage of your choice, then pass that storage as `source` plus the
     /// returned [`wacore::upload::EncryptedMediaInfo`]. The caller owns where the
     /// ciphertext lives (temp file, memory, …); this method never touches disk.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.upload_stream", level = "debug", skip_all, fields(kind = ?media_type), err(Debug)))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.upload_stream", level = "debug", skip_all, fields(kind = ?media_type)))]
     pub async fn upload_stream<S>(
         &self,
         source: S,
@@ -487,40 +497,50 @@ impl Client {
     where
         S: wacore::upload::UploadSource + 'static,
     {
-        let file_length = info.file_length;
-        let ciphertext_len = source.len();
-        let crypto = UploadCrypto {
-            media_key: info.media_key,
-            file_sha256: info.file_sha256,
-            file_enc_sha256: info.file_enc_sha256,
-            streaming_sidecar: info.streaming_sidecar,
-        };
-        let source = std::sync::Arc::new(source);
+        async {
+            let file_length = info.file_length;
+            let ciphertext_len = source.len();
+            let crypto = UploadCrypto {
+                media_key: info.media_key,
+                file_sha256: info.file_sha256,
+                file_enc_sha256: info.file_enc_sha256,
+                streaming_sidecar: info.streaming_sidecar,
+            };
+            let source = std::sync::Arc::new(source);
 
-        upload_media_with_retry(
-            crypto,
-            media_type,
-            file_length,
-            ciphertext_len,
-            wacore::time::now_secs(),
-            |force| async move { self.refresh_media_conn(force).await.map_err(Into::into) },
-            || async { self.invalidate_media_conn().await },
-            |request| async move { self.http_client.execute(request).await },
-            |request, offset, remaining| {
-                let source = std::sync::Arc::clone(&source);
-                let http = std::sync::Arc::clone(&self.http_client);
-                async move {
-                    // reader_from may open/seek a file, so run it in the blocking
-                    // task with execute_upload, not on the async worker.
-                    wacore::runtime::blocking(&*self.runtime, move || {
-                        let reader = source.reader_from(offset)?;
-                        http.execute_upload(request, reader, remaining)
-                    })
-                    .await
-                }
-            },
-        )
+            upload_media_with_retry(
+                crypto,
+                media_type,
+                file_length,
+                ciphertext_len,
+                wacore::time::now_secs(),
+                |force| async move { self.refresh_media_conn(force).await.map_err(Into::into) },
+                || async { self.invalidate_media_conn().await },
+                |request| async move { self.http_client.execute(request).await },
+                |request, offset, remaining| {
+                    let source = std::sync::Arc::clone(&source);
+                    let http = std::sync::Arc::clone(&self.http_client);
+                    async move {
+                        // reader_from may open/seek a file, so run it in the blocking
+                        // task with execute_upload, not on the async worker.
+                        wacore::runtime::blocking(&*self.runtime, move || {
+                            let reader = source.reader_from(offset)?;
+                            http.execute_upload(request, reader, remaining)
+                        })
+                        .await
+                    }
+                },
+            )
+            .await
+        }
         .await
+        .inspect_err(|_error| {
+            #[cfg(feature = "tracing")]
+            tracing::error!(
+                error = ?crate::download::MediaErrorDiagnostic(_error.as_ref()),
+                "media upload failed"
+            );
+        })
     }
 }
 

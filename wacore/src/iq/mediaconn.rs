@@ -235,7 +235,7 @@ impl ProtocolNode for MediaConnHostExtended {
 }
 
 /// Media connection response containing auth token and hosts.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MediaConnResponse {
     pub auth: String,
     pub ttl: u64,
@@ -245,7 +245,7 @@ pub struct MediaConnResponse {
 }
 
 /// Extended media connection response with all server-side attributes.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MediaConnResponseExtended {
     pub auth: String,
     pub ttl: u64,
@@ -254,6 +254,32 @@ pub struct MediaConnResponseExtended {
     pub ip_token: Option<String>,
     pub set_ip_token: Option<u64>,
     pub hosts: Vec<MediaConnHostExtended>,
+}
+
+impl std::fmt::Debug for MediaConnResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaConnResponse")
+            .field("auth", &"[REDACTED]")
+            .field("ttl", &self.ttl)
+            .field("auth_ttl", &self.auth_ttl)
+            .field("max_buckets", &self.max_buckets)
+            .field("hosts", &self.hosts)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for MediaConnResponseExtended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaConnResponseExtended")
+            .field("auth", &"[REDACTED]")
+            .field("ttl", &self.ttl)
+            .field("auth_ttl", &self.auth_ttl)
+            .field("max_buckets", &self.max_buckets)
+            .field("ip_token", &self.ip_token.as_ref().map(|_| "[REDACTED]"))
+            .field("set_ip_token", &self.set_ip_token)
+            .field("hosts", &self.hosts)
+            .finish()
+    }
 }
 
 impl MediaConnResponseExtended {
@@ -404,6 +430,39 @@ impl IqSpec for MediaConnSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_debug_redacts_tokens_in_nested_objects() {
+        let response = MediaConnResponse {
+            auth: "synthetic-auth-secret".into(),
+            ttl: 3600,
+            auth_ttl: Some(1800),
+            max_buckets: Some(12),
+            hosts: vec![MediaConnHost::new("cdn.example.com".into())],
+        };
+        let extended = MediaConnResponseExtended {
+            auth: "synthetic-auth-secret".into(),
+            ttl: 3600,
+            auth_ttl: Some(1800),
+            max_buckets: Some(12),
+            ip_token: Some("synthetic-ip-secret".into()),
+            set_ip_token: Some(1),
+            hosts: vec![MediaConnHostExtended::simple(
+                "cdn.example.com".into(),
+                HostType::Primary,
+            )],
+        };
+        let nested = Some((response, vec![extended]));
+        for rendered in [format!("{nested:?}"), format!("{nested:#?}")] {
+            assert!(!rendered.contains("synthetic-"), "{rendered}");
+            assert!(rendered.contains("cdn.example.com"), "{rendered}");
+            assert!(rendered.contains("3600"), "{rendered}");
+            assert!(rendered.contains("1800"), "{rendered}");
+        }
+        let (response, extended) = nested.unwrap();
+        assert_eq!(response.auth, "synthetic-auth-secret");
+        assert_eq!(extended[0].ip_token.as_deref(), Some("synthetic-ip-secret"));
+    }
 
     #[test]
     fn test_media_conn_spec_build_iq() {
