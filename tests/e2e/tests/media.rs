@@ -243,7 +243,7 @@ async fn test_upload_then_download_image() -> anyhow::Result<()> {
             &upload.file_enc_sha256,
             upload.file_length,
             MediaType::Image,
-        ))
+        )?)
         .await?;
 
     assert_eq!(
@@ -276,7 +276,7 @@ async fn test_upload_then_download_video() -> anyhow::Result<()> {
             &upload.file_enc_sha256,
             upload.file_length,
             MediaType::Video,
-        ))
+        )?)
         .await?;
 
     assert_eq!(downloaded, original);
@@ -306,7 +306,7 @@ async fn test_upload_then_download_document() -> anyhow::Result<()> {
             &upload.file_enc_sha256,
             upload.file_length,
             MediaType::Document,
-        ))
+        )?)
         .await?;
 
     assert_eq!(downloaded, original);
@@ -372,7 +372,7 @@ async fn test_upload_then_download_to_writer() -> anyhow::Result<()> {
                 &upload.file_enc_sha256,
                 upload.file_length,
                 MediaType::Image,
-            ),
+            )?,
             cursor,
         )
         .await?;
@@ -416,7 +416,7 @@ async fn test_download_after_disconnect_with_injected_route() -> anyhow::Result<
         &upload.file_enc_sha256,
         upload.file_length,
         MediaType::Image,
-    );
+    )?;
 
     client.disconnect().await;
 
@@ -851,7 +851,7 @@ async fn test_upload_download_large_file() -> anyhow::Result<()> {
             &upload.file_enc_sha256,
             upload.file_length,
             MediaType::Document,
-        ))
+        )?)
         .await?;
 
     assert_eq!(downloaded.len(), original.len());
@@ -889,7 +889,7 @@ async fn test_multiple_uploads_reuse_media_conn() -> anyhow::Result<()> {
                 &resp.file_enc_sha256,
                 resp.file_length,
                 MediaType::Image,
-            ))
+            )?)
             .await?;
         assert_eq!(downloaded, data);
     }
