@@ -73,19 +73,22 @@ impl Client {
     /// Synchronous and taken under one short lock, so two callers racing on
     /// an empty cache cannot both come away as leader. The lock is never held
     /// across an await.
-    fn claim_media_conn_flight(&self) -> MediaConnClaim {
+    fn claim_media_conn_flight(&self, generation: u64) -> Result<MediaConnClaim, IqError> {
         let mut slot = self
             .media_conn_flight
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        match &*slot {
-            Some(flight) => {
+        // Check under the slot lock so a retired caller cannot replace a newer flight.
+        self.check_media_conn_generation(generation)?;
+        Ok(match &*slot {
+            Some(flight) if flight.generation == generation => {
                 flight.waiters.fetch_add(1, Ordering::AcqRel);
                 MediaConnClaim::Joined(flight.clone())
             }
-            None => {
+            _ => {
                 let (release, released) = async_channel::bounded(1);
                 let flight = Arc::new(MediaConnFlight {
+                    generation,
                     waiters: AtomicUsize::new(0),
                     result: std::sync::Mutex::new(None),
                     released,
@@ -97,19 +100,13 @@ impl Client {
                     _release: release,
                 })
             }
-        }
+        })
     }
 
-    /// The one round trip a flight performs, shared by every caller that
-    /// joined it.
-    ///
-    /// The store is generation-gated, not last-writer-wins: a fetch that
-    /// started earlier may complete later (a forced refresh bypasses the
-    /// flight and runs alongside it), and publishing its answer then would
-    /// clobber credentials a newer fetch already replaced. The fetch's own
-    /// callers still get its result; only the shared cache keeps the newest
-    /// starter's.
-    async fn fetch_media_conn(&self) -> Result<MediaConn, IqError> {
+    /// Publish only inside the connection generation that requested the token.
+    /// The sequence also prevents an older response from replacing a newer fetch.
+    async fn fetch_media_conn(&self, generation: u64) -> Result<MediaConn, IqError> {
+        self.check_media_conn_generation(generation)?;
         let seq = self.media_conn_seq.fetch_add(1, Ordering::AcqRel);
         let response = self.execute(MediaConnSpec::new()).await?;
 
@@ -141,6 +138,7 @@ impl Client {
                 }
             }
         }
+        self.check_media_conn_generation(generation)?;
         if seq + 1 == self.media_conn_seq.load(Ordering::Acquire) {
             *write_guard = Some(new_conn.clone());
         }
@@ -170,23 +168,21 @@ impl Client {
         )
     )]
     pub async fn refresh_media_conn(&self, force: bool) -> Result<MediaConn, IqError> {
-        // A forced refresh carries out-of-band knowledge that the cache is
-        // bad (a 401/403 on the token it holds), so it never joins a flight:
-        // that flight's request may have been issued before the rejection,
-        // and reusing its answer would risk the rejected generation again.
-        // This keeps the old contract exactly: force always sends.
-        if force {
-            return self.fetch_media_conn().await;
-        }
-
-        if let Some(conn) = self.cached_media_conn().await {
+        let generation = self.connection_generation.load(Ordering::Acquire);
+        // Force bypasses the cached value, but shares a pending replacement.
+        // A later force after that flight completes still sends a fresh IQ.
+        if !force && let Some(conn) = self.cached_media_conn().await {
+            self.check_media_conn_generation(generation)?;
             return Ok(conn);
         }
 
         loop {
-            match self.claim_media_conn_flight() {
+            self.check_media_conn_generation(generation)?;
+            match self.claim_media_conn_flight(generation)? {
                 MediaConnClaim::Joined(flight) => {
-                    match flight.wait().await {
+                    let outcome = flight.wait().await;
+                    self.check_media_conn_generation(generation)?;
+                    match outcome {
                         // The flight's answer, no cache round trip: a waiter
                         // re-read could miss on an invalidate racing the
                         // release and serialize the whole burst into fresh
@@ -204,11 +200,12 @@ impl Client {
                     // A flight that finished between the miss above and this
                     // claim already refreshed the cache; fetching again would
                     // be the duplicate this flight exists to prevent.
-                    if let Some(conn) = self.cached_media_conn().await {
+                    if !force && let Some(conn) = self.cached_media_conn().await {
+                        self.check_media_conn_generation(generation)?;
                         drop(lease);
                         return Ok(conn);
                     }
-                    match self.fetch_media_conn().await {
+                    match self.fetch_media_conn(generation).await {
                         Ok(conn) => {
                             lease.finish(|| MediaFlightOutcome::Refreshed(conn.clone()));
                             return Ok(conn);
@@ -220,6 +217,14 @@ impl Client {
                     }
                 }
             }
+        }
+    }
+
+    fn check_media_conn_generation(&self, generation: u64) -> Result<(), IqError> {
+        if self.connection_generation.load(Ordering::Acquire) == generation {
+            Ok(())
+        } else {
+            Err(IqError::NotConnected)
         }
     }
 }
@@ -309,6 +314,7 @@ impl FailureClass {
 /// The shared side of the one in-flight refresh. One slot, not a registry:
 /// every caller wants the same connection, so there is nothing to key by.
 pub(crate) struct MediaConnFlight {
+    generation: u64,
     /// Callers admitted while the leader runs, counted under the slot lock.
     /// A waiter cancelled before the leader finishes stays counted, so the
     /// leader can publish an answer nobody reads. That costs one small enum,
@@ -668,77 +674,26 @@ mod tests {
         assert_eq!(recovered.auth, "recovered-auth");
     }
 
-    /// A forced refresh never joins a running flight: it carries out-of-band
-    /// knowledge that the cache is bad (a 401/403 on the token it holds), so
-    /// it always sends its own request, exactly as before single-flight.
     #[tokio::test]
-    async fn a_forced_refresh_bypasses_a_running_flight() {
+    async fn forced_refresh_joins_a_running_flight_but_bypasses_a_completed_cache() {
         let (client, transport) = create_iq_test_client().await;
-
-        // Park a non-force refresh mid-flight: one IQ on the wire, unanswered.
-        let first = tokio::spawn({
-            let client = client.clone();
-            async move { client.refresh_media_conn(false).await }
-        });
-        quiesce(&transport).await;
-
-        // The forced refresh must send its own IQ, not join frame 0.
-        let forced = tokio::spawn({
-            let client = client.clone();
-            async move { client.refresh_media_conn(true).await }
-        });
-        let sent = decode_sent_iq(&transport, 1).await;
-        let forced_id = request_id(&sent);
-        answer_iq(
-            &client,
-            &forced_id,
-            &media_conn_result(&forced_id, "forced-auth", 3600),
-        )
-        .await;
-
-        let sent_first = decode_sent_iq(&transport, 0).await;
-        let first_id = request_id(&sent_first);
-        answer_iq(
-            &client,
-            &first_id,
-            &media_conn_result(&first_id, "flight-auth", 3600),
-        )
-        .await;
-
-        let (first_conn, forced_conn) = tokio::time::timeout(Duration::from_secs(5), async {
-            (
-                first.await.expect("the first task stays alive"),
-                forced.await.expect("the forced task stays alive"),
-            )
-        })
-        .await
-        .expect("both refreshes complete");
-        assert!(
-            matches!(first_conn, Ok(ref c) if c.auth == "flight-auth"),
-            "the parked flight answers with its own fetch"
-        );
-        assert!(
-            matches!(forced_conn, Ok(ref c) if c.auth == "forced-auth"),
-            "the forced refresh answers with its own request"
-        );
+        let mut first = std::pin::pin!(client.refresh_media_conn(false));
+        drive_pending_until(first.as_mut(), || transport.sent().len() == 1).await;
+        let mut forced = std::pin::pin!(client.refresh_media_conn(true));
+        assert!(futures::poll!(&mut forced).is_pending());
+        assert_eq!(transport.sent().len(), 1);
+        answer_frame(&client, &transport, 0, "shared-auth", 3600).await;
+        assert_eq!(first.await.unwrap().auth, "shared-auth");
+        assert_eq!(forced.await.unwrap().auth, "shared-auth");
+        let mut later = std::pin::pin!(client.refresh_media_conn(true));
+        drive_pending_until(later.as_mut(), || transport.sent().len() == 2).await;
         assert_eq!(
             transport.sent().len(),
             2,
-            "force sends its own request instead of joining"
+            "a later force still bypasses the cache"
         );
-        // The older flight completes last (its frame is answered second) and
-        // must not clobber the forced credentials: the cache keeps the newest
-        // starter's answer, while the older flight's own caller still gets
-        // what it fetched.
-        assert_eq!(
-            client
-                .cached_media_conn()
-                .await
-                .expect("the forced fetch publishes")
-                .auth,
-            "forced-auth",
-            "an older flight completing last must not overwrite the forced refresh"
-        );
+        answer_frame(&client, &transport, 1, "later-auth", 3600).await;
+        assert_eq!(later.await.unwrap().auth, "later-auth");
     }
 
     /// An older fetch parked between lock acquisition and publication must
@@ -758,7 +713,11 @@ mod tests {
         // lock (its sequence check has not run yet).
         let older = tokio::spawn({
             let client = client.clone();
-            async move { client.refresh_media_conn(false).await }
+            async move {
+                client
+                    .fetch_media_conn(client.connection_generation.load(Ordering::Acquire))
+                    .await
+            }
         });
         answer_frame(&client, &transport, 0, "older-auth", 3600).await;
         poll_until("the older fetch parks at publication", || {
@@ -770,7 +729,11 @@ mod tests {
         // one is parked, but cannot publish yet: the older fetch holds the lock.
         let newer = tokio::spawn({
             let client = client.clone();
-            async move { client.refresh_media_conn(true).await }
+            async move {
+                client
+                    .fetch_media_conn(client.connection_generation.load(Ordering::Acquire))
+                    .await
+            }
         });
         let sent = decode_sent_iq(&transport, 1).await;
         let newer_id = request_id(&sent);
@@ -812,6 +775,151 @@ mod tests {
                 .expect("the newer fetch publishes")
                 .auth,
             "forced-auth"
+        );
+    }
+    // Poll every caller to its first suspension before releasing any IQ response.
+    // This measures an overlapping burst without relying on scheduler timing.
+    #[tokio::test]
+    async fn forced_refresh_burst_shares_one_iq() {
+        let (client, transport) = create_iq_test_client().await;
+        let mut burst = std::pin::pin!(futures::future::join_all(
+            (0..BURST).map(|_| client.refresh_media_conn(true))
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                assert!(futures::poll!(&mut burst).is_pending());
+                let waiters = client
+                    .media_conn_flight
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map_or(0, |flight| flight.waiters.load(Ordering::Acquire));
+                if transport.sent().len() + waiters == BURST {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every caller reaches the wire or joins the flight");
+        assert_eq!(
+            transport.sent().len(),
+            1,
+            "forced refreshes must share one IQ"
+        );
+        answer_frame(&client, &transport, 0, "fresh-auth", 3600).await;
+        assert!(
+            burst
+                .await
+                .into_iter()
+                .all(|r| r.unwrap().auth == "fresh-auth")
+        );
+    }
+
+    async fn drive_pending_until<F: Future>(
+        mut future: std::pin::Pin<&mut F>,
+        ready: impl Fn() -> bool,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                assert!(futures::poll!(future.as_mut()).is_pending());
+                if ready() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the operation reaches its deterministic gate");
+    }
+
+    #[tokio::test]
+    async fn failed_forced_burst_shares_refusal_preserves_cache_and_allows_retry() {
+        let (client, transport) = create_iq_test_client().await;
+        *client.media_conn.write().await = Some(MediaConn {
+            auth: "usable-auth".into(),
+            ttl: 3600,
+            auth_ttl: None,
+            hosts: vec![MediaConnHost::new("cdn.example.com".into())],
+            fetched_at: Instant::now(),
+        });
+        let mut burst = std::pin::pin!(futures::future::join_all(
+            (0..BURST).map(|_| client.refresh_media_conn(true))
+        ));
+        drive_pending_until(burst.as_mut(), || {
+            transport.sent().len() == 1
+                && client
+                    .media_conn_flight
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|f| f.waiters.load(Ordering::Acquire) == BURST - 1)
+        })
+        .await;
+        // A normal caller, including an upload, can still use unexpired auth.
+        assert_eq!(
+            client.refresh_media_conn(false).await.unwrap().auth,
+            "usable-auth"
+        );
+        let sent = decode_sent_iq(&transport, 0).await;
+        let id = request_id(&sent);
+        answer_iq(&client, &id, &media_conn_error(&id, 429)).await;
+        for result in burst.await {
+            assert!(matches!(
+                result,
+                Err(IqError::ServerError { code: 429, .. })
+            ));
+        }
+        assert_eq!(transport.sent().len(), 1);
+        assert_eq!(
+            client.refresh_media_conn(false).await.unwrap().auth,
+            "usable-auth"
+        );
+        let mut retry = std::pin::pin!(client.refresh_media_conn(true));
+        drive_pending_until(retry.as_mut(), || transport.sent().len() == 2).await;
+        answer_frame(&client, &transport, 1, "recovered-auth", 3600).await;
+        assert_eq!(retry.await.unwrap().auth, "recovered-auth");
+    }
+
+    #[tokio::test]
+    async fn cancelled_forced_leader_releases_waiters_and_cancelled_waiter_leaves_leader() {
+        let (client, transport) = create_iq_test_client().await;
+        let mut leader = Box::pin(client.refresh_media_conn(true));
+        drive_pending_until(leader.as_mut(), || transport.sent().len() == 1).await;
+        let mut cancelled = Box::pin(client.refresh_media_conn(true));
+        assert!(futures::poll!(&mut cancelled).is_pending());
+        drop(cancelled);
+        let mut survivor = Box::pin(client.refresh_media_conn(true));
+        assert!(futures::poll!(&mut survivor).is_pending());
+        assert_eq!(transport.sent().len(), 1);
+        drop(leader);
+        drive_pending_until(survivor.as_mut(), || transport.sent().len() == 2).await;
+        answer_frame(&client, &transport, 1, "survivor-auth", 3600).await;
+        assert_eq!(survivor.await.unwrap().auth, "survivor-auth");
+        assert!(client.media_conn_flight.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn retired_connection_flight_cannot_answer_or_publish_into_new_generation() {
+        let (client, transport) = create_iq_test_client().await;
+        let mut old = Box::pin(client.refresh_media_conn(true));
+        drive_pending_until(old.as_mut(), || transport.sent().len() == 1).await;
+        let mut old_waiter = Box::pin(client.refresh_media_conn(true));
+        assert!(futures::poll!(&mut old_waiter).is_pending());
+        client.connection_generation.fetch_add(1, Ordering::AcqRel);
+        let mut current = Box::pin(client.refresh_media_conn(true));
+        drive_pending_until(current.as_mut(), || transport.sent().len() == 2).await;
+        answer_frame(&client, &transport, 0, "retired-auth", 3600).await;
+        assert!(matches!(old.await, Err(IqError::NotConnected)));
+        assert!(matches!(old_waiter.await, Err(IqError::NotConnected)));
+        assert!(client.cached_media_conn().await.is_none());
+        // Dropping the retired lease must not retire the new generation's slot.
+        assert!(client.media_conn_flight.lock().unwrap().is_some());
+        answer_frame(&client, &transport, 1, "current-auth", 3600).await;
+        assert_eq!(current.await.unwrap().auth, "current-auth");
+        assert_eq!(
+            client.cached_media_conn().await.unwrap().auth,
+            "current-auth"
         );
     }
 }

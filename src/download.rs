@@ -1,7 +1,7 @@
 use crate::client::Client;
 use crate::http::{
     HTTP_STATUS_GONE, HTTP_STATUS_NOT_FOUND, HTTP_STATUS_OK, HTTP_STATUS_REDIRECTION_START,
-    HttpClient, HttpStatusError,
+    HTTP_STATUS_UNAUTHORIZED, HttpClient, HttpStatusError,
 };
 use crate::mediaconn::{MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS, MediaConn, is_media_auth_error};
 use anyhow::{Result, anyhow};
@@ -358,8 +358,7 @@ impl From<DownloadRequestError> for MediaDownloadError {
 #[derive(Debug)]
 enum DownloadRequestError {
     Auth(anyhow::Error),
-    /// 404/410 — media URL expired or not found. May need refreshed hosts.
-    /// Matches WA Web's `MediaNotFoundError` handling.
+    /// 404/410: the media reference expired or was not found.
     NotFound(anyhow::Error),
     Other(anyhow::Error),
     WriterIo(anyhow::Error),
@@ -459,9 +458,16 @@ impl DownloadRequestError {
         matches!(self, Self::Auth(_))
     }
 
-    /// Returns true for 404/410 (expired URL) — should trigger auth refresh like auth errors.
     fn is_not_found(&self) -> bool {
         matches!(self, Self::NotFound(_))
+    }
+
+    /// A download's signed reference can expire independently of upload auth.
+    /// WA Web treats 403/404/410 as terminal download errors; refreshing hosts
+    /// cannot re-sign that reference. Retain our bounded 401 recovery only.
+    fn should_refresh_route(&self) -> bool {
+        matches!(self, Self::Auth(error) if error.downcast_ref::<HttpStatusError>()
+            .is_some_and(|status| status.status == HTTP_STATUS_UNAUTHORIZED))
     }
 
     fn no_hosts(previous_rejection: Option<anyhow::Error>) -> Self {
@@ -576,9 +582,7 @@ where
             match execute_request(request.clone()).await {
                 Ok(data) => return Ok(data),
                 Err(err @ DownloadRequestError::WriterIo(_)) => return Err(err),
-                Err(err)
-                    if (err.is_auth() || err.is_not_found()) && attempt < max_refresh_attempts =>
-                {
+                Err(err) if err.should_refresh_route() && attempt < max_refresh_attempts => {
                     // An empty refreshed route is not the same as never making
                     // a request: retain the rejection that triggered this refresh.
                     last_rejection = Some(err.into_anyhow());
@@ -667,9 +671,7 @@ where
                 Err(err @ DownloadRequestError::WriterIo(_)) => {
                     return Err(discard_failed_write(runtime, writer, err).await);
                 }
-                Err(err)
-                    if (err.is_auth() || err.is_not_found()) && attempt < max_refresh_attempts =>
-                {
+                Err(err) if err.should_refresh_route() && attempt < max_refresh_attempts => {
                     last_rejection = Some(err.into_anyhow());
                     invalidate_media_conn().await;
                     force_refresh = true;
@@ -1680,7 +1682,7 @@ mod tests {
             let err = result.expect_err("a non-2xx CDN response must fail the download");
             assert!(
                 err.is_auth(),
-                "{status} must classify as an auth error so the media conn is refreshed, got {err:?}"
+                "{status} must retain its auth classification, got {err:?}"
             );
         }
     }
@@ -1696,21 +1698,21 @@ mod tests {
                 .expect_err("a non-2xx CDN response must fail the download");
             assert!(
                 err.is_not_found(),
-                "{status} must classify as expired so the URL is re-derived, got {err:?}"
+                "{status} must classify as an expired reference, got {err:?}"
             );
         }
     }
 
-    /// The chain the two tests above only prove one link of: a real CDN 403 must
+    /// The chain the two tests above only prove one link of: a real CDN 401 must
     /// reach `invalidate_media_conn()` and let the forced-refresh attempt
-    /// succeed. Before the fix the 403 arrived as an opaque transport error, so
+    /// succeed. Before the fix the 401 arrived as an opaque transport error, so
     /// this loop rotated hosts on the same dead auth token and never refreshed.
     #[cfg(feature = "ureq-client")]
     #[tokio::test]
-    async fn stale_auth_403_invalidates_the_media_conn_and_the_retry_recovers() {
+    async fn stale_auth_401_invalidates_the_media_conn_and_the_retry_recovers() {
         let body = b"download me".to_vec();
         let file_sha256 = plaintext_sha256(&body);
-        let stale_host = spawn_cdn_status_server(403, "Forbidden");
+        let stale_host = spawn_cdn_status_server(401, "Unauthorized");
         let fresh_host = spawn_cdn_server(200, "OK", body.clone());
         let client = ureq_client().await;
         let invalidations = Arc::new(Mutex::new(0usize));
@@ -1773,7 +1775,7 @@ mod tests {
         assert_eq!(
             *invalidations.lock().await,
             1,
-            "a 403 must invalidate the cached media conn"
+            "a 401 must invalidate the cached media conn"
         );
         assert_eq!(
             *attempts.lock().await,
@@ -1802,12 +1804,8 @@ mod tests {
             (410, "Gone"),
             (429, "Too Many Requests"),
         ] {
-            // Each server answers once. 403 and 410 make the loop refresh the
-            // media conn and try again, so the retry needs a host of its own —
-            // still refusing, which is the case where the caller finally sees
-            // the error.
+            // These refusals are terminal: no refreshed route is requested.
             let first = spawn_cdn_status_server(status, reason);
-            let refreshed = spawn_cdn_status_server(status, reason);
             let client = ureq_client().await;
 
             // Use the same final conversion as Client::download, retaining
@@ -1815,11 +1813,8 @@ mod tests {
             let err = download_media_with_retry(
                 MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS,
                 move |force| {
-                    let url = if force {
-                        refreshed.clone()
-                    } else {
-                        first.clone()
-                    };
+                    assert!(!force, "a terminal CDN refusal must not refresh hosts");
+                    let url = first.clone();
                     async move { Ok(vec![plaintext_request(url)]) }
                 },
                 || async {},
@@ -2273,7 +2268,7 @@ mod tests {
                         seen_urls.lock().await.push(url.clone());
                         writer.seek(SeekFrom::Start(0))?;
                         if url.contains("cdn1.example.com") {
-                            Ok((writer, Err(DownloadRequestError::auth(403))))
+                            Ok((writer, Err(DownloadRequestError::auth(401))))
                         } else {
                             writer.write_all(&body)?;
                             writer.seek(SeekFrom::Start(0))?;
@@ -3095,7 +3090,7 @@ mod tests {
     #[tokio::test]
     async fn client_distinguishes_preparation_route_and_session_failures() {
         let (mut params, _) = encrypted_params(b"unrequested");
-        let http = RoutedHttpClient::new(Vec::new(), (403, Vec::new()));
+        let http = RoutedHttpClient::new(Vec::new(), (401, Vec::new()));
         let client =
             crate::test_utils::create_test_client_with_http("download-errors", http.clone()).await;
         for to_writer in [false, true] {
@@ -3144,7 +3139,7 @@ mod tests {
     #[tokio::test]
     async fn client_rejection_after_refresh_preserves_final_classification_and_status() {
         let (params, _) = encrypted_params(b"revoked");
-        let http = RoutedHttpClient::new(Vec::new(), (410, Vec::new()));
+        let http = RoutedHttpClient::new(Vec::new(), (401, Vec::new()));
         let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
         let conn = media_conn("fresh-or-stale", &["cdn.example.com"]);
         for to_writer in [false, true] {
@@ -3210,7 +3205,7 @@ mod tests {
             let error = ClientDownloadError::from(error);
             assert!(matches!(error, ClientDownloadError::ReferenceRejected(_)));
             let cause: &(dyn std::error::Error + 'static) = &error;
-            assert_eq!(cause.http_status(), Some(410));
+            assert_eq!(cause.http_status(), Some(401));
             assert_eq!(*calls.lock().unwrap(), vec![false, true]);
             assert_eq!(invalidations.load(std::sync::atomic::Ordering::Relaxed), 1);
         }
@@ -3220,7 +3215,7 @@ mod tests {
     async fn client_empty_refreshed_route_keeps_the_prior_rejection_and_clears_writer() {
         let (params, _) = encrypted_params(b"revoked");
         let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
-        for status in [403, 410] {
+        for status in [401] {
             for streaming in [false, true] {
                 for to_writer in [false, true] {
                     let http = if streaming {
@@ -3894,5 +3889,102 @@ mod tests {
         // not only readable in the message.
         let cause: &(dyn std::error::Error + 'static) = err.as_ref();
         assert_eq!(cause.http_status(), Some(404), "got: {err:?}");
+    }
+    struct GatedExpiredHttp {
+        inner: Arc<RoutedHttpClient>,
+        entered: async_channel::Sender<()>,
+        release: async_channel::Receiver<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpClient for GatedExpiredHttp {
+        async fn execute(
+            &self,
+            request: crate::http::HttpRequest,
+        ) -> Result<crate::http::HttpResponse> {
+            if !request.url.contains("/mms/") {
+                self.entered.send(()).await.unwrap();
+                self.release.recv().await.unwrap();
+            }
+            self.inner.execute(request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_download_burst_preserves_upload_connection() {
+        for status in [403, 404, 410] {
+            let http = RoutedHttpClient::new(
+                vec![(
+                    "/mms/",
+                    200,
+                    br#"{"url":"https://cdn.example.com/sent","direct_path":"/sent"}"#.to_vec(),
+                )],
+                (status, Vec::new()),
+            );
+            let (entered, arrivals) = async_channel::unbounded();
+            let (release, gate) = async_channel::unbounded();
+            let gated = Arc::new(GatedExpiredHttp {
+                inner: http.clone(),
+                entered,
+                release: gate,
+            });
+            let client =
+                crate::test_utils::create_test_client_with_http("expired-burst", gated).await;
+            *client.media_conn.write().await =
+                Some(media_conn("upload-auth", &["cdn.example.com"]));
+            let (params, _) = encrypted_params(b"expired sticker");
+            let downloads = futures::future::join_all((0..4).map(|i| {
+                let client = &client;
+                let params = &params;
+                async move {
+                    if i % 2 == 0 {
+                        client.download(params).await.map(|_| ())
+                    } else {
+                        client
+                            .download_to_writer(params, Cursor::new(Vec::new()))
+                            .await
+                            .map(|_| ())
+                    }
+                }
+            }));
+            let mut downloads = std::pin::pin!(downloads);
+            assert!(futures::poll!(&mut downloads).is_pending());
+            for _ in 0..4 {
+                arrivals
+                    .try_recv()
+                    .expect("all four downloads reached the CDN gate");
+                release.try_send(()).unwrap();
+            }
+            // Downloads are released together before polling the upload. The
+            // baseline clears its auth and tries an IQ on this offline fixture.
+            let (errors, upload) = futures::join!(
+                downloads,
+                client.upload(
+                    b"send sticker".to_vec(),
+                    MediaType::Sticker,
+                    crate::upload::UploadOptions::default()
+                )
+            );
+            for error in errors {
+                let error = error.unwrap_err();
+                let cause: &(dyn std::error::Error + 'static) = &error;
+                assert_eq!(cause.http_status(), Some(status), "{error:?}");
+            }
+            assert_eq!(
+                upload
+                    .expect("expired downloads must not clear upload auth")
+                    .direct_path,
+                "/sent"
+            );
+            assert_eq!(
+                client.media_conn.read().await.as_ref().unwrap().auth,
+                "upload-auth"
+            );
+            assert_eq!(
+                http.urls().len(),
+                5,
+                "four downloads and one upload, no CDN retry"
+            );
+        }
     }
 }
