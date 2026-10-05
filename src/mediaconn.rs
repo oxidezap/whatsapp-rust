@@ -191,8 +191,8 @@ impl Client {
                         Some(MediaFlightOutcome::Failed(class)) => {
                             return Err(class.into_error());
                         }
-                        // The leader died before deciding: nothing was asked,
-                        // so this caller asks for itself.
+                        // Cancellation left no result. This caller can take
+                        // over instead of remaining parked on the retired flight.
                         None => {}
                     }
                 }

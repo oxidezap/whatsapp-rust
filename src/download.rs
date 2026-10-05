@@ -3215,85 +3215,82 @@ mod tests {
     async fn client_empty_refreshed_route_keeps_the_prior_rejection_and_clears_writer() {
         let (params, _) = encrypted_params(b"revoked");
         let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
-        for status in [401] {
-            for streaming in [false, true] {
-                for to_writer in [false, true] {
-                    let http = if streaming {
-                        RoutedHttpClient::streaming(Vec::new(), (status, Vec::new()))
+        let status = 401;
+        for streaming in [false, true] {
+            for to_writer in [false, true] {
+                let http = if streaming {
+                    RoutedHttpClient::streaming(Vec::new(), (status, Vec::new()))
+                } else {
+                    RoutedHttpClient::new(Vec::new(), (status, Vec::new()))
+                };
+                let calls = std::sync::Mutex::new(Vec::new());
+                let prepare = |force| {
+                    calls.lock().unwrap().push(force);
+                    let hosts = if force {
+                        Vec::new()
                     } else {
-                        RoutedHttpClient::new(Vec::new(), (status, Vec::new()))
+                        vec![MediaHost::new("cdn.example.com")]
                     };
-                    let calls = std::sync::Mutex::new(Vec::new());
-                    let prepare = |force| {
-                        calls.lock().unwrap().push(force);
-                        let hosts = if force {
-                            Vec::new()
-                        } else {
-                            vec![MediaHost::new("cdn.example.com")]
-                        };
-                        let requests = DownloadUtils::prepare_download_requests(
-                            &params,
-                            &MediaRoute::new(hosts),
-                        )
-                        .map_err(DownloadRequestError::Prepare);
-                        async move { requests }
-                    };
-                    let sink = SharedWriter::new();
-                    sink.with(|w| w.write_all(b"old destination").unwrap());
-                    let error = if to_writer {
-                        let result = download_to_writer_with_retry(
-                            MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS,
-                            &runtime,
-                            sink.clone(),
-                            prepare,
-                            || async {},
-                            |request, writer| {
-                                let http: Arc<dyn HttpClient> = http.clone();
-                                let runtime = runtime.clone();
-                                async move {
-                                    streaming_download_and_decrypt(
-                                        &http,
-                                        &runtime,
-                                        &request,
-                                        ExpectedMediaHashes::default(),
-                                        writer,
-                                    )
-                                    .await
-                                }
-                            },
-                        )
-                        .await;
-                        assert!(sink.contents().is_empty());
-                        result.unwrap_err()
-                    } else {
-                        download_media_with_retry(
-                            MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS,
-                            prepare,
-                            || async {},
-                            |request| {
-                                let http: Arc<dyn HttpClient> = http.clone();
-                                let runtime = runtime.clone();
-                                async move {
-                                    execute_request_into_memory(
-                                        &http,
-                                        &runtime,
-                                        &request,
-                                        ExpectedMediaHashes::default(),
-                                        0,
-                                    )
-                                    .await
-                                }
-                            },
-                        )
-                        .await
-                        .unwrap_err()
-                    };
-                    let error = ClientDownloadError::from(error);
-                    assert!(matches!(error, ClientDownloadError::NoHostsAfterRefresh(_)));
-                    assert_eq!(error.http_status(), Some(status));
-                    assert_eq!(http.urls().len(), 1);
-                    assert_eq!(*calls.lock().unwrap(), vec![false, true]);
-                }
+                    let requests =
+                        DownloadUtils::prepare_download_requests(&params, &MediaRoute::new(hosts))
+                            .map_err(DownloadRequestError::Prepare);
+                    async move { requests }
+                };
+                let sink = SharedWriter::new();
+                sink.with(|w| w.write_all(b"old destination").unwrap());
+                let error = if to_writer {
+                    let result = download_to_writer_with_retry(
+                        MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS,
+                        &runtime,
+                        sink.clone(),
+                        prepare,
+                        || async {},
+                        |request, writer| {
+                            let http: Arc<dyn HttpClient> = http.clone();
+                            let runtime = runtime.clone();
+                            async move {
+                                streaming_download_and_decrypt(
+                                    &http,
+                                    &runtime,
+                                    &request,
+                                    ExpectedMediaHashes::default(),
+                                    writer,
+                                )
+                                .await
+                            }
+                        },
+                    )
+                    .await;
+                    assert!(sink.contents().is_empty());
+                    result.unwrap_err()
+                } else {
+                    download_media_with_retry(
+                        MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS,
+                        prepare,
+                        || async {},
+                        |request| {
+                            let http: Arc<dyn HttpClient> = http.clone();
+                            let runtime = runtime.clone();
+                            async move {
+                                execute_request_into_memory(
+                                    &http,
+                                    &runtime,
+                                    &request,
+                                    ExpectedMediaHashes::default(),
+                                    0,
+                                )
+                                .await
+                            }
+                        },
+                    )
+                    .await
+                    .unwrap_err()
+                };
+                let error = ClientDownloadError::from(error);
+                assert!(matches!(error, ClientDownloadError::NoHostsAfterRefresh(_)));
+                assert_eq!(error.http_status(), Some(status));
+                assert_eq!(http.urls().len(), 1);
+                assert_eq!(*calls.lock().unwrap(), vec![false, true]);
             }
         }
     }
