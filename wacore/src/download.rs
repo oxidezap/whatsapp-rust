@@ -27,6 +27,16 @@ const WITHHELD: usize = MEDIA_MAC_SIZE + AES_BLOCK_SIZE;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum DownloadPreparationError {
+    #[error("media_key must contain 32 bytes")]
+    InvalidMediaKeyLength,
+    #[error("file_sha256 must contain 32 bytes")]
+    InvalidPlaintextHashLength,
+    #[error("file_enc_sha256 must contain 32 bytes")]
+    InvalidEncryptedHashLength,
+    #[error("this media type requires plaintext metadata")]
+    RequiresPlaintext,
+    #[error("this media type requires encrypted metadata")]
+    RequiresEncryption,
     #[error("Missing media_key for encrypted media")]
     MissingMediaKey,
     #[error("Missing file_sha256 for unencrypted media")]
@@ -563,10 +573,55 @@ fn same_media_host(left: &str, right: &str) -> bool {
 }
 
 impl DownloadUtils {
+    /// Checks transport metadata before acquiring a CDN route or sending HTTP.
+    /// Optional hashes remain optional; present hashes must be SHA-256 digests.
+    /// Raw transport keys retain their HKDF input contract. The SDK's owned
+    /// parameter container separately guarantees a 32-byte media key.
+    pub fn validate_download_metadata(
+        downloadable: &dyn Downloadable,
+    ) -> std::result::Result<(), DownloadPreparationError> {
+        let encrypted = downloadable.is_encrypted();
+        let media_type = downloadable.app_info();
+        if encrypted && !media_type.is_encrypted() {
+            return Err(DownloadPreparationError::RequiresPlaintext);
+        }
+        if !encrypted && media_type == MediaType::MusicArtwork {
+            return Err(DownloadPreparationError::RequiresEncryption);
+        }
+        if encrypted && downloadable.media_key().is_none() {
+            return Err(DownloadPreparationError::MissingMediaKey);
+        }
+        if !encrypted && downloadable.file_sha256().is_none() {
+            return Err(DownloadPreparationError::MissingPlaintextHash);
+        }
+        if downloadable
+            .file_sha256()
+            .is_some_and(|hash| hash.len() != 32)
+        {
+            return Err(DownloadPreparationError::InvalidPlaintextHashLength);
+        }
+        if downloadable
+            .file_enc_sha256()
+            .is_some_and(|hash| hash.len() != 32)
+        {
+            return Err(DownloadPreparationError::InvalidEncryptedHashLength);
+        }
+        if downloadable.static_url().is_none() {
+            if downloadable.direct_path().is_none() {
+                return Err(DownloadPreparationError::MissingDirectPath);
+            }
+            if encrypted && downloadable.file_enc_sha256().is_none() {
+                return Err(DownloadPreparationError::MissingEncryptedHash);
+            }
+        }
+        Ok(())
+    }
+
     pub fn prepare_download_requests(
         downloadable: &dyn Downloadable,
         route: &MediaRoute,
     ) -> Result<Vec<DownloadRequest>> {
+        Self::validate_download_metadata(downloadable)?;
         let is_encrypted = downloadable.is_encrypted();
         let media_type = downloadable.app_info();
 
@@ -1941,6 +1996,73 @@ mod tests {
     }
 
     #[test]
+    fn transport_validation_preserves_optional_metadata_and_raw_keys() {
+        let mut media = MockDownloadable {
+            direct_path: None,
+            static_url: Some("https://cdn.example/static?signature=unchanged#fragment".into()),
+            media_key: Some(vec![1; 16]),
+            file_sha256: None,
+            file_enc_sha256: None,
+            media_type: MediaType::Image,
+        };
+        let route = MediaRoute::new(Vec::new());
+        let request = DownloadUtils::prepare_download_requests(&media, &route)
+            .unwrap()
+            .remove(0);
+        assert_eq!(request.url, media.static_url.as_deref().unwrap());
+        assert!(
+            matches!(request.decryption, MediaDecryption::Encrypted { media_key, .. } if media_key.len() == 16)
+        );
+
+        media.static_url = None;
+        media.direct_path = Some("/file".into());
+        media.file_enc_sha256 = Some(vec![3; 32]);
+        // A plaintext hash has always been optional for encrypted references.
+        assert!(DownloadUtils::prepare_download_requests(&media, &mock_route()).is_ok());
+
+        media.media_type = MediaType::NewsletterMusicArtwork;
+        media.file_sha256 = Some(vec![2; 32]);
+        let request = DownloadUtils::prepare_download_requests(&media, &mock_route())
+            .unwrap()
+            .remove(0);
+        assert!(matches!(
+            request.decryption,
+            MediaDecryption::Plaintext { .. }
+        ));
+    }
+
+    #[test]
+    fn transport_validation_rejects_present_invalid_hashes_and_incompatible_modes() {
+        let mut media = MockDownloadable {
+            direct_path: Some("/file".into()),
+            static_url: None,
+            media_key: Some(vec![1; 32]),
+            file_sha256: Some(vec![2; 32]),
+            file_enc_sha256: Some(vec![3; 32]),
+            media_type: MediaType::Image,
+        };
+        for length in [0, 31, 33] {
+            media.file_sha256 = Some(vec![2; length]);
+            assert_eq!(
+                DownloadUtils::validate_download_metadata(&media),
+                Err(DownloadPreparationError::InvalidPlaintextHashLength)
+            );
+            media.file_sha256 = Some(vec![2; 32]);
+            media.file_enc_sha256 = Some(vec![3; length]);
+            assert_eq!(
+                DownloadUtils::validate_download_metadata(&media),
+                Err(DownloadPreparationError::InvalidEncryptedHashLength)
+            );
+            media.file_enc_sha256 = Some(vec![3; 32]);
+        }
+        media.media_type = MediaType::ProductCatalogImage;
+        assert_eq!(
+            DownloadUtils::validate_download_metadata(&media),
+            Err(DownloadPreparationError::RequiresPlaintext)
+        );
+    }
+
+    #[test]
     fn prepare_requests_encrypted() {
         let d = MockDownloadable {
             direct_path: Some("/v/t1/media.enc".into()),
@@ -2024,7 +2146,7 @@ mod tests {
             let d = MockDownloadable {
                 direct_path: Some("/v/t1/media.enc".into()),
                 static_url: None,
-                media_key: Some(vec![1; 32]),
+                media_key: media_type.is_encrypted().then(|| vec![1; 32]),
                 file_sha256: Some(vec![2; 32]),
                 file_enc_sha256: Some(vec![3; 32]),
                 media_type,

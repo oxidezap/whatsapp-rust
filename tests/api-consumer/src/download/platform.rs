@@ -130,3 +130,43 @@ pub use browser::*;
 /// ```
 #[cfg(not(target_arch = "wasm32"))]
 pub struct NativeBounds;
+
+/// Validated metadata construction works on native and WASM hosts.
+/// Callers inspect metadata through the read-only Downloadable trait.
+pub fn validated_params() -> Result<(), whatsapp_rust::download::DownloadPreparationError> {
+    use whatsapp_rust::download::{DownloadParams, MediaType};
+    let encrypted = DownloadParams::encrypted(
+        "/file",
+        &[1; 32],
+        &[2; 32],
+        &[3; 32],
+        16,
+        MediaType::MusicArtwork,
+    )?;
+    assert_eq!(encrypted.media_key(), Some(&[1; 32][..]));
+    let plaintext =
+        DownloadParams::plaintext("/file", &[2; 32], 16, MediaType::NewsletterMusicArtwork)?;
+    assert!(plaintext.media_key().is_none());
+    assert!(!plaintext.is_encrypted());
+    Ok(())
+}
+
+/// DownloadParams cannot be invalidated after construction.
+///
+/// ```compile_fail,E0616
+/// use whatsapp_rust::download::{DownloadParams, MediaType};
+/// let mut params = DownloadParams::encrypted("/file", &[1; 32], &[2; 32], &[3; 32], 16, MediaType::Image).unwrap();
+/// params.media_key = None;
+/// ```
+///
+/// Raw struct literals are no longer a second construction interface.
+///
+/// ```compile_fail,E0451
+/// use whatsapp_rust::download::{DownloadParams, MediaType};
+/// let params = DownloadParams {
+///     direct_path: "/file".into(), media_key: None,
+///     file_sha256: vec![2; 32], file_enc_sha256: None,
+///     file_length: 16, media_type: MediaType::Image,
+/// };
+/// ```
+pub struct ValidatedMetadata;

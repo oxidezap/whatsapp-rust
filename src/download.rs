@@ -10,8 +10,8 @@ use wacore::runtime::Runtime;
 use wacore::sync_marker::MaybeSend;
 
 pub use wacore::download::{
-    DEFAULT_MEDIA_HOSTS, DownloadUtils, DownloadWriter, Downloadable, MediaDecryption,
-    MediaDecryptionError, MediaHost, MediaRoute, MediaType,
+    DEFAULT_MEDIA_HOSTS, DownloadPreparationError, DownloadUtils, DownloadWriter, Downloadable,
+    MediaDecryption, MediaDecryptionError, MediaHost, MediaRoute, MediaType,
 };
 
 /// Cap on the speculative capacity pre-allocated for the in-memory download
@@ -32,19 +32,23 @@ impl From<&MediaConn> for MediaRoute {
     }
 }
 
-/// `Downloadable` built from raw CDN fields, for re-downloading media without
-/// the original message in hand.
+/// Validated, owned CDN metadata for re-downloading media without its message.
+///
+/// Use [`Self::encrypted`] or [`Self::plaintext`]. Both copy their input slices
+/// and validate them before returning. Fields are private so callers cannot
+/// invalidate those guarantees; [`Downloadable`] supplies read-only access.
 pub struct DownloadParams {
-    pub direct_path: String,
-    pub media_key: Option<Vec<u8>>,
-    pub file_sha256: Vec<u8>,
-    pub file_enc_sha256: Option<Vec<u8>>,
-    pub file_length: u64,
-    pub media_type: MediaType,
+    direct_path: String,
+    media_key: Option<Vec<u8>>,
+    file_sha256: Vec<u8>,
+    file_enc_sha256: Option<Vec<u8>>,
+    file_length: u64,
+    media_type: MediaType,
 }
 
 impl DownloadParams {
-    /// Params for encrypted media. Slices are copied into the owned struct.
+    /// Encrypted metadata with a 32-byte key and two SHA-256 digests.
+    /// Explicitly plaintext media types are rejected locally.
     pub fn encrypted(
         direct_path: impl Into<String>,
         media_key: &[u8],
@@ -52,15 +56,52 @@ impl DownloadParams {
         file_enc_sha256: &[u8],
         file_length: u64,
         media_type: MediaType,
-    ) -> Self {
-        Self {
+    ) -> std::result::Result<Self, DownloadPreparationError> {
+        if !media_type.is_encrypted() {
+            return Err(DownloadPreparationError::RequiresPlaintext);
+        }
+        if media_key.len() != 32 {
+            return Err(DownloadPreparationError::InvalidMediaKeyLength);
+        }
+        if file_sha256.len() != 32 {
+            return Err(DownloadPreparationError::InvalidPlaintextHashLength);
+        }
+        if file_enc_sha256.len() != 32 {
+            return Err(DownloadPreparationError::InvalidEncryptedHashLength);
+        }
+        Ok(Self {
             direct_path: direct_path.into(),
             media_key: Some(media_key.to_vec()),
             file_sha256: file_sha256.to_vec(),
             file_enc_sha256: Some(file_enc_sha256.to_vec()),
             file_length,
             media_type,
+        })
+    }
+
+    /// Plaintext metadata with a SHA-256 digest and no cryptographic key.
+    /// Ordinary image/video types can describe newsletter media; MusicArtwork
+    /// requires encryption, while NewsletterMusicArtwork is plaintext.
+    pub fn plaintext(
+        direct_path: impl Into<String>,
+        file_sha256: &[u8],
+        file_length: u64,
+        media_type: MediaType,
+    ) -> std::result::Result<Self, DownloadPreparationError> {
+        if media_type == MediaType::MusicArtwork {
+            return Err(DownloadPreparationError::RequiresEncryption);
         }
+        if file_sha256.len() != 32 {
+            return Err(DownloadPreparationError::InvalidPlaintextHashLength);
+        }
+        Ok(Self {
+            direct_path: direct_path.into(),
+            media_key: None,
+            file_sha256: file_sha256.to_vec(),
+            file_enc_sha256: None,
+            file_length,
+            media_type,
+        })
     }
 }
 
@@ -227,7 +268,7 @@ impl std::fmt::Debug for MediaErrorDiagnostic<'_> {
             });
         let iq_code = self.0.server_rejection().map(|rejection| rejection.code);
         let preparation = ErrorChainExt::sources(self.0)
-            .find_map(|e| e.downcast_ref::<wacore::download::DownloadPreparationError>());
+            .find_map(|e| e.downcast_ref::<DownloadPreparationError>());
         f.debug_struct("MediaFailure")
             .field("preparation", &preparation)
             .field("iq_kind", &iq_kind)
@@ -948,6 +989,8 @@ impl Client {
         downloadable: &dyn Downloadable,
         force_refresh: bool,
     ) -> std::result::Result<Vec<wacore::download::DownloadRequest>, DownloadRequestError> {
+        DownloadUtils::validate_download_metadata(downloadable)
+            .map_err(|error| DownloadRequestError::Prepare(error.into()))?;
         // A static URL is fetched verbatim, so the media-conn IQ would be a round
         // trip whose answer is discarded before a byte of it is read.
         let route =
@@ -2404,7 +2447,8 @@ mod tests {
             &enc.file_enc_sha256,
             data.len() as u64,
             MediaType::Image,
-        );
+        )
+        .unwrap();
         (params, enc.data_to_upload)
     }
 
@@ -2429,7 +2473,7 @@ mod tests {
                 } else {
                     RoutedHttpClient::new(Vec::new(), (200, encrypted))
                 };
-                let dl = downloader(http, &["cdn.example.com"]);
+                let dl = downloader(http.clone(), &["cdn.example.com"]);
                 let error = if to_writer {
                     let sink = SharedWriter::new();
                     sink.with(|w| w.write_all(b"old destination contents").unwrap());
@@ -2448,7 +2492,12 @@ mod tests {
                         .await
                         .expect_err("valid HMAC must not excuse a declared hash mismatch")
                 };
-                assert!(matches!(error, MediaDownloadError::HostsUnreachable(_)));
+                if malformed_length {
+                    assert!(matches!(error, MediaDownloadError::Other(_)));
+                    assert!(http.urls().is_empty());
+                } else {
+                    assert!(matches!(error, MediaDownloadError::HostsUnreachable(_)));
+                }
             }
         }
     }
@@ -2606,7 +2655,8 @@ mod tests {
             &good.file_enc_sha256,
             original.len() as u64,
             MediaType::Image,
-        );
+        )
+        .unwrap();
 
         // Far longer than the real media, and longer than one 8KB decrypt chunk,
         // so the plaintext is already in the writer when the MAC check fails.
@@ -2752,7 +2802,8 @@ mod tests {
             reference.file_enc_sha256.as_deref().unwrap_or_default(),
             12,
             MediaType::Image,
-        );
+        )
+        .unwrap();
         let forged = forged_body(&vec![0x11; 32 * 1024], &media_key);
         let http = RoutedHttpClient::streaming(vec![("only-host", 200, forged)], (500, Vec::new()));
 
@@ -2967,6 +3018,48 @@ mod tests {
     // Regression: a `static_url` download used to fetch a media conn over the
     // wire and then throw it away, which also made the download impossible
     // offline. A disconnected client makes the discarded IQ observable.
+    #[tokio::test]
+    async fn metadata_validation_precedes_media_connection_lookup() {
+        let client =
+            crate::test_utils::create_test_client_with_name("invalid_metadata_no_iq").await;
+        for static_url in [None, Some("https://cdn.example/static".to_owned())] {
+            for encrypted_hash in [false, true] {
+                let mut message = wa::message::ImageMessage {
+                    direct_path: Some("/file".into()),
+                    static_url: static_url.clone(),
+                    media_key: Some(vec![1; 32]),
+                    file_sha256: Some(vec![2; 32]),
+                    file_enc_sha256: Some(vec![3; 32]),
+                    ..Default::default()
+                };
+                let expected = if encrypted_hash {
+                    message.file_enc_sha256 = Some(vec![3; 31]);
+                    DownloadPreparationError::InvalidEncryptedHashLength
+                } else {
+                    message.file_sha256 = Some(Vec::new());
+                    DownloadPreparationError::InvalidPlaintextHashLength
+                };
+                let error = client.prepare_requests(&message, false).await.unwrap_err();
+                let DownloadRequestError::Prepare(source) = error else {
+                    panic!("metadata validation must precede the offline IQ path: {error:?}");
+                };
+                assert_eq!(
+                    source.downcast_ref::<DownloadPreparationError>(),
+                    Some(&expected)
+                );
+            }
+        }
+        // Missing optional hashes and a non-32-byte raw transport key remain
+        // valid for the static-URL path; the owned container has stricter keys.
+        let optional = wa::message::ImageMessage {
+            static_url: Some("https://cdn.example/static?signature=unchanged#part".into()),
+            media_key: Some(vec![1; 16]),
+            ..Default::default()
+        };
+        let requests = client.prepare_requests(&optional, false).await.unwrap();
+        assert_eq!(requests[0].url, optional.static_url.as_deref().unwrap());
+    }
+
     #[tokio::test]
     async fn static_url_download_asks_for_no_media_conn() {
         let client = crate::test_utils::create_test_client_with_name("static_url_no_iq").await;
