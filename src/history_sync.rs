@@ -374,6 +374,13 @@ impl Client {
             .await;
         }
 
+        // Exercise shutdown between the receipt decision and payload acquisition
+        // without relying on scheduler timing in the regression test.
+        #[cfg(test)]
+        if tests::SHUTDOWN_BEFORE_PAYLOAD.with(|requested| requested.replace(false)) {
+            self.signal_shutdown_sync();
+        }
+
         if self.is_shutting_down() {
             log::debug!(
                 "Aborting history sync {} before payload acquisition during shutdown (early receipt attempted: {})",
@@ -842,6 +849,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use waproto::whatsapp as wa;
     use waproto::whatsapp::message::HistorySyncNotification;
+
+    std::thread_local! {
+        pub(super) static SHUTDOWN_BEFORE_PAYLOAD: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
 
     struct RecordingAdmission {
         decision: HistorySyncDecision,
@@ -1929,6 +1941,49 @@ mod tests {
         assert!(hook.unwrap().captured.lock().unwrap().is_empty());
         assert_eq!(history_receipts(&transport, "HIST_SHUTDOWN").await, 0);
         assert_eq!(client.history_sync_activity.snapshot().tasks, 0);
+    }
+
+    #[tokio::test]
+    async fn history_sync_shutdown_after_receipt_decision_reports_attempt() {
+        use crate::test_utils::log_capture;
+
+        if log_capture::delegated_to_child(
+            "history_sync::tests::history_sync_shutdown_after_receipt_decision_reports_attempt",
+        ) {
+            return;
+        }
+
+        for hook_registered in [false, true] {
+            let logs = log_capture::session();
+            let (client, transport, hook) =
+                history_receipt_client(hook_registered.then_some(false)).await;
+            let (_, notification) = recent_history_chunk();
+            SHUTDOWN_BEFORE_PAYLOAD.with(|requested| requested.set(true));
+            client
+                .process_history_sync_task(
+                    "HIST_SHUTDOWN_AFTER_RECEIPT".to_owned(),
+                    notification.into(),
+                )
+                .await;
+
+            assert_eq!(
+                history_receipts(&transport, "HIST_SHUTDOWN_AFTER_RECEIPT").await,
+                usize::from(!hook_registered)
+            );
+            if let Some(hook) = hook {
+                assert!(hook.captured.lock().unwrap().is_empty());
+            }
+            let records = logs.records_for("whatsapp_rust::history_sync");
+            assert!(records.contains(&(
+                log::Level::Debug,
+                format!(
+                    "Aborting history sync HIST_SHUTDOWN_AFTER_RECEIPT before payload acquisition during shutdown (early receipt attempted: {})",
+                    !hook_registered
+                ),
+            )), "missing shutdown diagnostic: {records:?}");
+            assert_eq!(client.history_sync_activity.snapshot().tasks, 0);
+            assert_eq!(client.history_sync_activity.snapshot().payload_bytes, 0);
+        }
     }
 
     #[tokio::test]
