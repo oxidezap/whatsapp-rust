@@ -363,11 +363,16 @@ impl Client {
             notification.sync_type
         );
 
-        self.send_protocol_receipt(
-            message_id.clone(),
-            crate::types::presence::ReceiptType::HistorySync,
-        )
-        .await;
+        // With a durability hook the receipt waits until the hook has captured
+        // the chunk, so a chunk lost on the way is uploaded again.
+        let durability_hook = self.inbound_durability_hook();
+        if durability_hook.is_none() {
+            self.send_protocol_receipt(
+                message_id.clone(),
+                crate::types::presence::ReceiptType::HistorySync,
+            )
+            .await;
+        }
 
         if self.is_shutting_down() {
             log::debug!(
@@ -421,6 +426,30 @@ impl Client {
             }
         };
         tracker.set_payload_bytes(payload_bytes);
+
+        if let Some(hook) = durability_hook {
+            if let Err(e) = hook
+                .on_history_sync(
+                    self.clone(),
+                    &message_id,
+                    notification.sync_type,
+                    &compressed_data,
+                )
+                .await
+            {
+                log::error!(
+                    "History sync {} was not captured; withholding its receipt: {:?}",
+                    message_id,
+                    e
+                );
+                return;
+            }
+            self.send_protocol_receipt(
+                message_id.clone(),
+                crate::types::presence::ReceiptType::HistorySync,
+            )
+            .await;
+        }
 
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let own_pn = device_snapshot.pn.as_ref().map(|jid| jid.to_non_ad());
@@ -1526,6 +1555,174 @@ mod tests {
         assert_eq!(entries[0].sender, entries[0].chat);
         assert_eq!(entries[1].chat.as_ref(), SECOND_CHAT);
         assert_eq!(entries[1].sender, entries[1].chat);
+    }
+
+    /// Captures every history-sync chunk the hook is handed, and how many
+    /// frames had reached the wire when it was.
+    struct HistoryCaptureHook {
+        transport: Arc<crate::transport::mock::CapturingMockTransport>,
+        fail: bool,
+        captured: std::sync::Mutex<Vec<CapturedChunk>>,
+    }
+
+    struct CapturedChunk {
+        message_id: String,
+        sync_type: Option<wa::message::HistorySyncType>,
+        compressed: Vec<u8>,
+        frames_sent_before: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::types::durability_hook::InboundDurabilityHook for HistoryCaptureHook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[crate::types::durability_hook::InboundMessage],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn on_history_sync(
+            &self,
+            _: Arc<Client>,
+            message_id: &str,
+            sync_type: Option<wa::message::HistorySyncType>,
+            compressed: &[u8],
+        ) -> anyhow::Result<()> {
+            self.captured.lock().unwrap().push(CapturedChunk {
+                message_id: message_id.to_owned(),
+                sync_type,
+                compressed: compressed.to_vec(),
+                frames_sent_before: self.transport.sent().len(),
+            });
+            if self.fail {
+                anyhow::bail!("the capture store is unavailable");
+            }
+            Ok(())
+        }
+    }
+
+    /// A connected client that knows its own number, so it can send receipts,
+    /// with `hook` installed when given.
+    async fn history_receipt_client(
+        fail: Option<bool>,
+    ) -> (
+        Arc<Client>,
+        Arc<crate::transport::mock::CapturingMockTransport>,
+        Option<Arc<HistoryCaptureHook>>,
+    ) {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        client
+            .persistence_manager
+            .process_command(wacore::store::commands::DeviceCommand::SetId(Some(
+                "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+            )))
+            .await;
+        let hook = fail.map(|fail| {
+            Arc::new(HistoryCaptureHook {
+                transport: transport.clone(),
+                fail,
+                captured: std::sync::Mutex::new(Vec::new()),
+            })
+        });
+        if let Some(hook) = &hook {
+            client
+                .inbound_durability_hook
+                .set(hook.clone())
+                .ok()
+                .unwrap();
+        }
+        (client, transport, hook)
+    }
+
+    fn recent_history_chunk() -> (Vec<u8>, HistorySyncNotification) {
+        let compressed = compress_history_sync(&wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::RECENT,
+            ..Default::default()
+        });
+        let notification = HistorySyncNotification {
+            file_length: Some(compressed.len() as u64),
+            sync_type: Some(wa::message::HistorySyncType::RECENT),
+            initial_hist_bootstrap_inline_payload: Some(compressed.clone()),
+            ..Default::default()
+        };
+        (compressed, notification)
+    }
+
+    /// The `hist_sync` receipts that reached the wire for `message_id`.
+    async fn history_receipts(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        message_id: &str,
+    ) -> usize {
+        let mut receipts = 0;
+        for index in 0..transport.sent().len() {
+            let frame = crate::test_utils::decode_sent_iq(transport, index).await;
+            let node = frame.get();
+            let mut attrs = node.attrs();
+            if node.tag.as_ref() == "receipt"
+                && attrs.optional_string("type").as_deref() == Some("hist_sync")
+                && attrs.optional_string("id").as_deref() == Some(message_id)
+            {
+                receipts += 1;
+            }
+        }
+        receipts
+    }
+
+    #[tokio::test]
+    async fn history_sync_receipt_is_sent_without_a_durability_hook() {
+        let (client, transport, _) = history_receipt_client(None).await;
+        let (_, notification) = recent_history_chunk();
+
+        client
+            .process_history_sync_task("HIST_NO_HOOK".to_string(), notification.into())
+            .await;
+
+        assert_eq!(history_receipts(&transport, "HIST_NO_HOOK").await, 1);
+    }
+
+    #[tokio::test]
+    async fn history_sync_receipt_waits_until_the_durability_hook_captured_the_chunk() {
+        let (client, transport, hook) = history_receipt_client(Some(false)).await;
+        let hook = hook.unwrap();
+        let (compressed, notification) = recent_history_chunk();
+
+        client
+            .process_history_sync_task("HIST_CAPTURED".to_string(), notification.into())
+            .await;
+
+        {
+            let captured = hook.captured.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0].message_id, "HIST_CAPTURED");
+            assert_eq!(
+                captured[0].sync_type,
+                Some(wa::message::HistorySyncType::RECENT)
+            );
+            assert_eq!(captured[0].compressed, compressed);
+            assert_eq!(
+                captured[0].frames_sent_before, 0,
+                "nothing, the receipt included, may be sent before the chunk is captured"
+            );
+        }
+        assert_eq!(history_receipts(&transport, "HIST_CAPTURED").await, 1);
+    }
+
+    #[tokio::test]
+    async fn history_sync_receipt_is_withheld_when_the_durability_hook_fails() {
+        let (client, transport, hook) = history_receipt_client(Some(true)).await;
+        let (_, notification) = recent_history_chunk();
+
+        client
+            .process_history_sync_task("HIST_LOST".to_string(), notification.into())
+            .await;
+
+        assert_eq!(hook.unwrap().captured.lock().unwrap().len(), 1);
+        assert_eq!(
+            history_receipts(&transport, "HIST_LOST").await,
+            0,
+            "the phone must upload a chunk that was not captured again"
+        );
     }
 
     #[tokio::test]

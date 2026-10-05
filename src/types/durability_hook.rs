@@ -2,6 +2,7 @@ use crate::client::Client;
 use anyhow::Result;
 use std::sync::Arc;
 pub use wacore::types::events::InboundMessage;
+use waproto::whatsapp as wa;
 
 /// Hook invoked for every decrypted inbound user message before it is
 /// acknowledged to the server, turning the consumer from at-most-once into
@@ -65,4 +66,34 @@ pub trait InboundDurabilityHook: wacore::sync_marker::MaybeSendSync {
     /// carries the exact same items: what this method committed is what event
     /// consumers observe.
     async fn on_messages(&self, client: Arc<Client>, batch: &[InboundMessage]) -> Result<()>;
+
+    /// Durably capture one history-sync chunk before its `hist_sync` receipt
+    /// is sent. `compressed` is the chunk exactly as the phone uploaded it
+    /// (zlib-compressed `HistorySync`), whether it arrived inline or as a
+    /// downloaded blob.
+    ///
+    /// Without a hook the SDK sends the receipt as soon as it starts on the
+    /// chunk, before the blob is even downloaded, so a failed download, a
+    /// failed write or a crash loses that part of the history for good: the
+    /// phone considers it delivered and never uploads it again. With a hook the
+    /// receipt waits for this method. Return `Ok(())` only once the capture is
+    /// durable; on `Err` (or a crash, or a failed download) no receipt is sent
+    /// and the phone uploads the chunk again.
+    ///
+    /// At-least-once, like [`on_messages`](Self::on_messages): the same chunk
+    /// can arrive more than once, so the capture MUST be idempotent by
+    /// `message_id`. Chunks the SDK does not process (history sync skipped, or
+    /// rejected by the admission policy) are acknowledged without calling the
+    /// hook. The default implementation accepts every chunk without storing it;
+    /// the receipt then still waits for the chunk to be downloaded.
+    async fn on_history_sync(
+        &self,
+        client: Arc<Client>,
+        message_id: &str,
+        sync_type: Option<wa::message::HistorySyncType>,
+        compressed: &[u8],
+    ) -> Result<()> {
+        let _ = (client, message_id, sync_type, compressed);
+        Ok(())
+    }
 }
