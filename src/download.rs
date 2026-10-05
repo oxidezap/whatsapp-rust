@@ -3015,9 +3015,6 @@ mod tests {
         assert!(http.urls().is_empty());
     }
 
-    // Regression: a `static_url` download used to fetch a media conn over the
-    // wire and then throw it away, which also made the download impossible
-    // offline. A disconnected client makes the discarded IQ observable.
     #[tokio::test]
     async fn metadata_validation_precedes_media_connection_lookup() {
         let client =
@@ -3060,6 +3057,9 @@ mod tests {
         assert_eq!(requests[0].url, optional.static_url.as_deref().unwrap());
     }
 
+    // Regression: a `static_url` download used to fetch a media conn over the
+    // wire and then throw it away, which also made the download impossible
+    // offline. A disconnected client makes the discarded IQ observable.
     #[tokio::test]
     async fn static_url_download_asks_for_no_media_conn() {
         let client = crate::test_utils::create_test_client_with_name("static_url_no_iq").await;
