@@ -452,16 +452,15 @@ mod tests {
                 HostType::Primary,
             )],
         };
-        let nested = Some((response, vec![extended]));
+        let nested = Some((&response, vec![&extended]));
         for rendered in [format!("{nested:?}"), format!("{nested:#?}")] {
             assert!(!rendered.contains("synthetic-"), "{rendered}");
             assert!(rendered.contains("cdn.example.com"), "{rendered}");
             assert!(rendered.contains("3600"), "{rendered}");
             assert!(rendered.contains("1800"), "{rendered}");
         }
-        let (response, extended) = nested.unwrap();
         assert_eq!(response.auth, "synthetic-auth-secret");
-        assert_eq!(extended[0].ip_token.as_deref(), Some("synthetic-ip-secret"));
+        assert_eq!(extended.ip_token.as_deref(), Some("synthetic-ip-secret"));
     }
 
     #[test]
