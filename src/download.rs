@@ -3905,83 +3905,106 @@ mod tests {
             }
             self.inner.execute(request).await
         }
+
+        fn supports_streaming(&self) -> bool {
+            self.inner.supports_streaming()
+        }
+
+        fn execute_streaming(
+            &self,
+            request: crate::http::HttpRequest,
+        ) -> Result<wacore::net::StreamingHttpResponse> {
+            self.entered.send_blocking(()).unwrap();
+            self.release.recv_blocking().unwrap();
+            self.inner.execute_streaming(request)
+        }
     }
 
     #[tokio::test]
     async fn expired_download_burst_preserves_upload_connection() {
-        for status in [403, 404, 410] {
-            let http = RoutedHttpClient::new(
-                vec![(
+        for streaming in [false, true] {
+            for status in [403, 404, 410] {
+                let routes = vec![(
                     "/mms/",
                     200,
                     br#"{"url":"https://cdn.example.com/sent","direct_path":"/sent"}"#.to_vec(),
-                )],
-                (status, Vec::new()),
-            );
-            let (entered, arrivals) = async_channel::unbounded();
-            let (release, gate) = async_channel::unbounded();
-            let gated = Arc::new(GatedExpiredHttp {
-                inner: http.clone(),
-                entered,
-                release: gate,
-            });
-            let client =
-                crate::test_utils::create_test_client_with_http("expired-burst", gated).await;
-            *client.media_conn.write().await =
-                Some(media_conn("upload-auth", &["cdn.example.com"]));
-            let (params, _) = encrypted_params(b"expired sticker");
-            let downloads = futures::future::join_all((0..4).map(|i| {
-                let client = &client;
-                let params = &params;
-                async move {
-                    if i % 2 == 0 {
-                        client.download(params).await.map(|_| ())
-                    } else {
-                        client
-                            .download_to_writer(params, Cursor::new(Vec::new()))
-                            .await
-                            .map(|_| ())
+                )];
+                let http = if streaming {
+                    RoutedHttpClient::streaming(routes, (status, Vec::new()))
+                } else {
+                    RoutedHttpClient::new(routes, (status, Vec::new()))
+                };
+                let (entered, arrivals) = async_channel::unbounded();
+                let (release, gate) = async_channel::unbounded();
+                let gated = Arc::new(GatedExpiredHttp {
+                    inner: http.clone(),
+                    entered,
+                    release: gate,
+                });
+                let client =
+                    crate::test_utils::create_test_client_with_http("expired-burst", gated).await;
+                *client.media_conn.write().await =
+                    Some(media_conn("upload-auth", &["cdn.example.com"]));
+                let (params, _) = encrypted_params(b"expired sticker");
+                let downloads = futures::future::join_all((0..4).map(|i| {
+                    let client = &client;
+                    let params = &params;
+                    async move {
+                        if i % 2 == 0 {
+                            client.download(params).await.map(|_| ())
+                        } else {
+                            client
+                                .download_to_writer(params, Cursor::new(Vec::new()))
+                                .await
+                                .map(|_| ())
+                        }
                     }
+                }));
+                let mut downloads = std::pin::pin!(downloads);
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    for _ in 0..4 {
+                        tokio::select! {
+                            _ = &mut downloads => panic!("downloads must wait for the CDN gate"),
+                            arrival = arrivals.recv() => arrival.unwrap(),
+                        }
+                    }
+                })
+                .await
+                .expect("all four downloads reached the CDN gate");
+                for _ in 0..4 {
+                    release.try_send(()).unwrap();
                 }
-            }));
-            let mut downloads = std::pin::pin!(downloads);
-            assert!(futures::poll!(&mut downloads).is_pending());
-            for _ in 0..4 {
-                arrivals
-                    .try_recv()
-                    .expect("all four downloads reached the CDN gate");
-                release.try_send(()).unwrap();
+                // Downloads are released together before polling the upload. The
+                // baseline clears its auth and tries an IQ on this offline fixture.
+                let (errors, upload) = futures::join!(
+                    downloads,
+                    client.upload(
+                        b"send sticker".to_vec(),
+                        MediaType::Sticker,
+                        crate::upload::UploadOptions::default()
+                    )
+                );
+                for error in errors {
+                    let error = error.unwrap_err();
+                    let cause: &(dyn std::error::Error + 'static) = &error;
+                    assert_eq!(cause.http_status(), Some(status), "{error:?}");
+                }
+                assert_eq!(
+                    upload
+                        .expect("expired downloads must not clear upload auth")
+                        .direct_path,
+                    "/sent"
+                );
+                assert_eq!(
+                    client.media_conn.read().await.as_ref().unwrap().auth,
+                    "upload-auth"
+                );
+                assert_eq!(
+                    http.urls().len(),
+                    5,
+                    "four downloads and one upload, no CDN retry"
+                );
             }
-            // Downloads are released together before polling the upload. The
-            // baseline clears its auth and tries an IQ on this offline fixture.
-            let (errors, upload) = futures::join!(
-                downloads,
-                client.upload(
-                    b"send sticker".to_vec(),
-                    MediaType::Sticker,
-                    crate::upload::UploadOptions::default()
-                )
-            );
-            for error in errors {
-                let error = error.unwrap_err();
-                let cause: &(dyn std::error::Error + 'static) = &error;
-                assert_eq!(cause.http_status(), Some(status), "{error:?}");
-            }
-            assert_eq!(
-                upload
-                    .expect("expired downloads must not clear upload auth")
-                    .direct_path,
-                "/sent"
-            );
-            assert_eq!(
-                client.media_conn.read().await.as_ref().unwrap().auth,
-                "upload-auth"
-            );
-            assert_eq!(
-                http.urls().len(),
-                5,
-                "four downloads and one upload, no CDN retry"
-            );
         }
     }
 }
