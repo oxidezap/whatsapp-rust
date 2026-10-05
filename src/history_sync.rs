@@ -364,7 +364,7 @@ impl Client {
         );
 
         // With a durability hook the receipt waits until the hook has captured
-        // the chunk, so a chunk lost on the way is uploaded again.
+        // the chunk. Download or capture failures leave it unacknowledged.
         let durability_hook = self.inbound_durability_hook();
         if durability_hook.is_none() {
             self.send_protocol_receipt(
@@ -376,8 +376,9 @@ impl Client {
 
         if self.is_shutting_down() {
             log::debug!(
-                "Aborting history sync {} after receipt during shutdown",
-                message_id
+                "Aborting history sync {} before payload acquisition during shutdown (early receipt attempted: {})",
+                message_id,
+                durability_hook.is_none()
             );
             return;
         }
@@ -1562,6 +1563,8 @@ mod tests {
     struct HistoryCaptureHook {
         transport: Arc<crate::transport::mock::CapturingMockTransport>,
         fail: bool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
         captured: std::sync::Mutex<Vec<CapturedChunk>>,
     }
 
@@ -1595,6 +1598,8 @@ mod tests {
                 compressed: compressed.to_vec(),
                 frames_sent_before: self.transport.sent().len(),
             });
+            self.entered.notify_one();
+            self.release.acquire().await.unwrap().forget();
             if self.fail {
                 anyhow::bail!("the capture store is unavailable");
             }
@@ -1611,7 +1616,34 @@ mod tests {
         Arc<crate::transport::mock::CapturingMockTransport>,
         Option<Arc<HistoryCaptureHook>>,
     ) {
-        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        history_receipt_client_with_http(fail, Arc::new(crate::test_utils::MockHttpClient)).await
+    }
+
+    async fn history_receipt_client_with_http(
+        fail: Option<bool>,
+        http: Arc<dyn crate::http::HttpClient>,
+    ) -> (
+        Arc<Client>,
+        Arc<crate::transport::mock::CapturingMockTransport>,
+        Option<Arc<HistoryCaptureHook>>,
+    ) {
+        use crate::transport::mock::CapturingMockTransportFactory;
+        use wacore::handshake::NoiseCipher;
+
+        let client = crate::test_utils::create_test_client_with_http("history-receipt", http).await;
+        let transport = CapturingMockTransportFactory::new().transport();
+        *client.noise_socket.lock().unwrap() =
+            Some(Arc::new(crate::socket::NoiseSocket::with_observers(
+                client.runtime.clone(),
+                transport.clone(),
+                NoiseCipher::new(&[0; 32]).unwrap(),
+                NoiseCipher::new(&[0; 32]).unwrap(),
+                crate::socket::noise_socket::SendObservers::with_stats(client.stats.clone())
+                    .with_sent_frames(client.sent_frame_tap.clone()),
+            )));
+        client.set_connected_for_test(true);
+        client.is_running.store(true, Ordering::Release);
+        client.enter_live_mode_for_tests();
         client
             .persistence_manager
             .process_command(wacore::store::commands::DeviceCommand::SetId(Some(
@@ -1622,6 +1654,8 @@ mod tests {
             Arc::new(HistoryCaptureHook {
                 transport: transport.clone(),
                 fail,
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(1),
                 captured: std::sync::Mutex::new(Vec::new()),
             })
         });
@@ -1721,8 +1755,180 @@ mod tests {
         assert_eq!(
             history_receipts(&transport, "HIST_LOST").await,
             0,
-            "the phone must upload a chunk that was not captured again"
+            "a failed capture must not acknowledge the chunk"
         );
+    }
+
+    /// A real encrypted history download whose response is released by the test.
+    struct HistoryBlobHttp {
+        body: Vec<u8>,
+        status: u16,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+        requests: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::http::HttpClient for HistoryBlobHttp {
+        async fn execute(
+            &self,
+            request: crate::http::HttpRequest,
+        ) -> anyhow::Result<crate::http::HttpResponse> {
+            self.requests.lock().unwrap().push(request.url);
+            self.entered.notify_one();
+            self.release.acquire().await.unwrap().forget();
+            Ok(crate::http::HttpResponse {
+                status_code: self.status,
+                body: self.body.clone(),
+            })
+        }
+    }
+
+    fn external_history_chunk(
+        status: u16,
+    ) -> (Vec<u8>, HistorySyncNotification, Arc<HistoryBlobHttp>) {
+        let (compressed, mut notification) = recent_history_chunk();
+        let encrypted =
+            wacore::upload::encrypt_media(&compressed, wacore::download::MediaType::History)
+                .unwrap();
+        notification.initial_hist_bootstrap_inline_payload = None;
+        notification.direct_path = Some("/history-fixture".to_owned());
+        notification.media_key = Some(encrypted.media_key.to_vec());
+        notification.file_sha256 = Some(encrypted.file_sha256.to_vec());
+        notification.file_enc_sha256 = Some(encrypted.file_enc_sha256.to_vec());
+        let http = Arc::new(HistoryBlobHttp {
+            body: encrypted.data_to_upload,
+            status,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        (compressed, notification, http)
+    }
+
+    async fn set_history_media_conn(client: &Client) {
+        *client.media_conn.write().await = Some(crate::mediaconn::MediaConn {
+            auth: "history-test-auth".to_owned(),
+            ttl: 3600,
+            auth_ttl: None,
+            hosts: vec![wacore::iq::mediaconn::MediaConnHost::new(
+                "history.example.com".to_owned(),
+            )],
+            fetched_at: wacore::time::Instant::now(),
+        });
+    }
+
+    #[tokio::test]
+    async fn history_sync_blob_receipt_waits_for_download_and_capture() {
+        for capture_fails in [false, true] {
+            let (compressed, notification, http) = external_history_chunk(200);
+            let (client, transport, hook) =
+                history_receipt_client_with_http(Some(capture_fails), http.clone()).await;
+            set_history_media_conn(&client).await;
+            let hook = hook.unwrap();
+            hook.release.try_acquire().unwrap().forget();
+            let mut task = Box::pin(
+                client.process_history_sync_task("HIST_BLOB".to_owned(), notification.into()),
+            );
+            tokio::select! {
+                _ = http.entered.notified() => {},
+                _ = &mut task => panic!("history completed before download release"),
+            }
+            assert_eq!(history_receipts(&transport, "HIST_BLOB").await, 0);
+            assert!(hook.captured.lock().unwrap().is_empty());
+            http.release.add_permits(1);
+            tokio::select! {
+                _ = hook.entered.notified() => {},
+                _ = &mut task => panic!("history completed before capture release"),
+            }
+            assert_eq!(history_receipts(&transport, "HIST_BLOB").await, 0);
+            {
+                let captured = hook.captured.lock().unwrap();
+                assert_eq!(captured.len(), 1);
+                assert_eq!(captured[0].message_id, "HIST_BLOB");
+                assert_eq!(
+                    captured[0].sync_type,
+                    Some(wa::message::HistorySyncType::RECENT)
+                );
+                assert_eq!(captured[0].compressed, compressed);
+                assert_eq!(captured[0].frames_sent_before, 0);
+            }
+            hook.release.add_permits(1);
+            task.await;
+            assert_eq!(
+                history_receipts(&transport, "HIST_BLOB").await,
+                usize::from(!capture_fails)
+            );
+            let requests = http.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("https://history.example.com/history-fixture?"));
+            assert_eq!(client.history_sync_activity.snapshot().tasks, 0);
+            assert_eq!(client.history_sync_activity.snapshot().payload_bytes, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn history_sync_failed_blob_download_never_calls_capture_or_sends_receipt() {
+        // One failing host exhausts failover without a media-connection refresh.
+        let (_, notification, http) = external_history_chunk(500);
+        let (client, transport, hook) =
+            history_receipt_client_with_http(Some(false), http.clone()).await;
+        set_history_media_conn(&client).await;
+        http.release.add_permits(1);
+        client
+            .process_history_sync_task("HIST_BLOB_GONE".to_owned(), notification.into())
+            .await;
+        assert_eq!(http.requests.lock().unwrap().len(), 1);
+        assert!(hook.unwrap().captured.lock().unwrap().is_empty());
+        assert_eq!(history_receipts(&transport, "HIST_BLOB_GONE").await, 0);
+        assert_eq!(client.history_sync_activity.snapshot().tasks, 0);
+    }
+
+    #[tokio::test]
+    async fn history_sync_cancelled_download_or_capture_leaves_no_receipt() {
+        for cancel_during_capture in [false, true] {
+            let (_, notification, http) = external_history_chunk(200);
+            let (client, transport, hook) =
+                history_receipt_client_with_http(Some(false), http.clone()).await;
+            set_history_media_conn(&client).await;
+            let hook = hook.unwrap();
+            hook.release.try_acquire().unwrap().forget();
+            let mut task = Box::pin(
+                client.process_history_sync_task("HIST_CANCELLED".to_owned(), notification.into()),
+            );
+            tokio::select! {
+                _ = http.entered.notified() => {},
+                _ = &mut task => panic!("history completed before download release"),
+            }
+            if cancel_during_capture {
+                http.release.add_permits(1);
+                tokio::select! {
+                    _ = hook.entered.notified() => {},
+                    _ = &mut task => panic!("history completed before capture release"),
+                }
+            }
+            drop(task);
+            assert_eq!(
+                hook.captured.lock().unwrap().len(),
+                usize::from(cancel_during_capture)
+            );
+            assert_eq!(history_receipts(&transport, "HIST_CANCELLED").await, 0);
+            assert_eq!(client.history_sync_activity.snapshot().tasks, 0);
+            assert_eq!(client.history_sync_activity.snapshot().payload_bytes, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn history_sync_shutdown_before_processing_does_not_capture_or_acknowledge() {
+        let (client, transport, hook) = history_receipt_client(Some(false)).await;
+        let (_, notification) = recent_history_chunk();
+        client.signal_shutdown_sync();
+        client
+            .process_history_sync_task("HIST_SHUTDOWN".to_owned(), notification.into())
+            .await;
+        assert!(hook.unwrap().captured.lock().unwrap().is_empty());
+        assert_eq!(history_receipts(&transport, "HIST_SHUTDOWN").await, 0);
+        assert_eq!(client.history_sync_activity.snapshot().tasks, 0);
     }
 
     #[tokio::test]

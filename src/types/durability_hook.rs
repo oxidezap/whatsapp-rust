@@ -72,20 +72,27 @@ pub trait InboundDurabilityHook: wacore::sync_marker::MaybeSendSync {
     /// (zlib-compressed `HistorySync`), whether it arrived inline or as a
     /// downloaded blob.
     ///
-    /// Without a hook the SDK sends the receipt as soon as it starts on the
-    /// chunk, before the blob is even downloaded, so a failed download, a
-    /// failed write or a crash loses that part of the history for good: the
-    /// phone considers it delivered and never uploads it again. With a hook the
-    /// receipt waits for this method. Return `Ok(())` only once the capture is
-    /// durable; on `Err` (or a crash, or a failed download) no receipt is sent
-    /// and the phone uploads the chunk again.
+    /// Return `Ok(())` only after the capture is durable. The SDK awaits this
+    /// method before attempting the receipt. Download failures, hook errors,
+    /// and cancellation before this method returns leave the chunk without a
+    /// `hist_sync` receipt. The SDK does not retry the hook or persist a replay
+    /// buffer for history chunks; withholding a receipt does not itself
+    /// guarantee that the phone will redeliver the chunk.
     ///
-    /// At-least-once, like [`on_messages`](Self::on_messages): the same chunk
-    /// can arrive more than once, so the capture MUST be idempotent by
-    /// `message_id`. Chunks the SDK does not process (history sync skipped, or
-    /// rejected by the admission policy) are acknowledged without calling the
-    /// hook. The default implementation accepts every chunk without storing it;
-    /// the receipt then still waits for the chunk to be downloaded.
+    /// Duplicate notifications can invoke this hook again, including after a
+    /// successful capture whose receipt failed to send. Make capture idempotent
+    /// by `message_id`. Downloaded bytes are decrypted but still compressed;
+    /// capture runs before decompression and protobuf validation.
+    ///
+    /// History tasks can call this hook concurrently. A slow hook holds a history
+    /// worker slot. Shutdown does not join these detached tasks or cancel an
+    /// already-running hook; use [`Client::shutdown_signal`] if the capture needs
+    /// to observe shutdown, and make partial writes safe against cancellation.
+    ///
+    /// Chunks the SDK does not process (history sync skipped, or rejected by the
+    /// admission policy) are acknowledged without calling the hook. Without a
+    /// hook the receipt is attempted before download. The default implementation
+    /// stores nothing, but still delays the receipt until after download.
     async fn on_history_sync(
         &self,
         client: Arc<Client>,
