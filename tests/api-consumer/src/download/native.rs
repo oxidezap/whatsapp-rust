@@ -184,6 +184,38 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn plaintext_params_download_verified_bytes_and_rewind_the_writer() {
+        let data = b"external destination";
+        let hash = wacore::upload::encrypt_media(data, MediaType::Image)
+            .unwrap()
+            .file_sha256;
+        for streaming in [false, true] {
+            let downloader = MediaDownloader::new(
+                Arc::new(AcceptedBody(streaming)),
+                Arc::new(TokioRuntime),
+                MediaRoute::new(vec![whatsapp_rust::download::MediaHost::new(
+                    "cdn.example.com",
+                )]),
+            );
+            for kind in [
+                MediaType::Image,
+                MediaType::NewsletterMusicArtwork,
+                MediaType::ProductCatalogImage,
+            ] {
+                let params =
+                    DownloadParams::plaintext("/file", &hash, data.len() as u64, kind).unwrap();
+                assert_eq!(downloader.download(&params).await.unwrap(), data);
+                let writer = downloader
+                    .download_to_writer(&params, Cursor::new(vec![0xff; 128]))
+                    .await
+                    .unwrap();
+                assert_eq!(writer.position(), 0);
+                assert_eq!(writer.into_inner(), data);
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct DestinationFault {
         sink: HostWriter,
