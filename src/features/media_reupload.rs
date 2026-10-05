@@ -8,7 +8,6 @@ use futures::FutureExt;
 use futures::future::{Shared, WeakShared};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use thiserror::Error;
 pub use wacore::media_retry::MediaRetryResult;
 use wacore::media_retry::{
     build_media_retry_receipt, encrypt_media_retry_receipt, parse_media_retry_notification,
@@ -23,25 +22,44 @@ const MEDIA_REUPLOAD_CONCURRENCY: usize = 32;
 
 /// Failure of a media reupload. Shared operations preserve the original cause
 /// for every subscriber, including transport and parsing failures.
-#[derive(Debug, Clone, Error)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum MediaReuploadError {
-    #[error("{0}")]
-    Client(#[source] Arc<ClientError>),
+    Client(Arc<ClientError>),
     /// Reupload requires the local account's LID. There is no PN fallback.
-    #[error("local LID is unavailable")]
     NotLoggedIn,
     /// Another target or media key already owns this wire ID.
-    #[error("conflicting media reupload for message {0}")]
     Conflict(MessageId),
-    #[error("media retry receipt ACK timed out")]
     AckTimeout,
-    #[error("media retry receipt rejected: {0}")]
     Rejected(String),
-    #[error("media retry notification timed out")]
     Timeout,
-    #[error("{0}")]
-    Internal(#[source] Arc<anyhow::Error>),
+    Internal(Arc<anyhow::Error>),
+}
+
+impl std::fmt::Display for MediaReuploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client(error) => std::fmt::Display::fmt(error, f),
+            Self::NotLoggedIn => f.write_str("local LID is unavailable"),
+            Self::Conflict(id) => write!(f, "conflicting media reupload for message {id}"),
+            Self::AckTimeout => f.write_str("media retry receipt ACK timed out"),
+            Self::Rejected(reason) => write!(f, "media retry receipt rejected: {reason}"),
+            Self::Timeout => f.write_str("media retry notification timed out"),
+            Self::Internal(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl std::error::Error for MediaReuploadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Expose the original typed cause, not the Arc used to share it.
+        // A derived source on Arc<ClientError> exposes the Arc as the cause.
+        match self {
+            Self::Client(error) => Some(error.as_ref()),
+            Self::Internal(error) => Some(error.as_ref().as_ref()),
+            _ => None,
+        }
+    }
 }
 
 impl From<ClientError> for MediaReuploadError {

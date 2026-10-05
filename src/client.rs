@@ -641,6 +641,9 @@ pub struct MemoryReport {
     /// Waiters parked on outgoing nodes, the pre-encryption counterpart of
     /// [`Self::node_waiters`]. Each retains a filter and a oneshot sender.
     pub sent_node_waiters: usize,
+    /// Distinct pending media reuploads, shared by identical subscribers.
+    /// Counts operations, not subscribers; each retains one target and media key.
+    pub media_reuploads: usize,
     pub pending_retries: usize,
     /// Numbers with a `refresh_lid` re-resolve in flight. Bounded by the
     /// number of distinct peers acked at once; a value that stays high
@@ -835,6 +838,7 @@ impl MemoryReport {
             ("response_waiters", n(self.response_waiters)),
             ("node_waiters", n(self.node_waiters)),
             ("sent_node_waiters", n(self.sent_node_waiters)),
+            ("media_reuploads", n(self.media_reuploads)),
             ("pending_retries", n(self.pending_retries)),
             ("pending_lid_refreshes", n(self.pending_lid_refreshes)),
             ("presence_subscriptions", n(self.presence_subscriptions)),
@@ -939,6 +943,7 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "  response_waiters:       {}", self.response_waiters)?;
         writeln!(f, "  node_waiters:           {}", self.node_waiters)?;
         writeln!(f, "  sent_node_waiters:      {}", self.sent_node_waiters)?;
+        writeln!(f, "  media_reuploads:        {}", self.media_reuploads)?;
         writeln!(f, "  pending_retries:        {}", self.pending_retries)?;
         writeln!(f, "  history_payload_ids:    {}", self.history_payload_ids)?;
         writeln!(

@@ -112,6 +112,39 @@ async fn active_incoming_waiter_survives_both_reconnect_modes() {
 use crate::transport::mock::CapturingMockTransport;
 use crate::{MediaRetryResult, MediaReuploadError, MediaReuploadRequest, MessageId, MessageRef};
 
+#[test]
+fn shared_reupload_errors_keep_the_original_typed_cause() {
+    use std::error::Error;
+
+    let error = MediaReuploadError::from(ClientError::NotConnected);
+    let cloned = error.clone();
+    let source = error
+        .source()
+        .unwrap()
+        .downcast_ref::<ClientError>()
+        .unwrap();
+    let shared_source = cloned
+        .source()
+        .unwrap()
+        .downcast_ref::<ClientError>()
+        .unwrap();
+    assert!(std::ptr::eq(source, shared_source));
+
+    let error = MediaReuploadError::from(anyhow::Error::new(std::io::Error::other("fixture")));
+    let cloned = error.clone();
+    let source = error
+        .source()
+        .unwrap()
+        .downcast_ref::<std::io::Error>()
+        .unwrap();
+    let shared_source = cloned
+        .source()
+        .unwrap()
+        .downcast_ref::<std::io::Error>()
+        .unwrap();
+    assert!(std::ptr::eq(source, shared_source));
+}
+
 async fn reupload_fixture() -> (Arc<Client>, Arc<CapturingMockTransport>) {
     let client = create_test_client().await;
     client
@@ -193,6 +226,7 @@ async fn identical_reuploads_share_receipt_and_survive_one_cancellation() {
         Jid::lid("10000000001")
     );
     assert_eq!(client.media_reuploads.lock().unwrap().len(), 1);
+    assert_eq!(client.memory_report().await.media_reuploads, 1);
     assert_eq!(counts(&client).0, 2);
     drop(first);
     assert_eq!(
@@ -208,6 +242,7 @@ async fn identical_reuploads_share_receipt_and_survive_one_cancellation() {
     assert_eq!(transport.sent().len(), 1);
     assert_eq!(counts(&client), (0, 0));
     assert!(client.media_reuploads.lock().unwrap().is_empty());
+    assert_eq!(client.memory_report().await.media_reuploads, 0);
 }
 
 #[tokio::test]

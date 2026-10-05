@@ -392,6 +392,11 @@ impl Client {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .len();
+        let media_reuploads = self
+            .media_reuploads
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
         let pending_lid_refreshes_count = self
             .pending_lid_refreshes
             .lock()
@@ -610,6 +615,7 @@ impl Client {
             response_waiters,
             node_waiters: self.node_waiter_count.load(Ordering::Relaxed),
             sent_node_waiters: self.sent_node_waiter_count.load(Ordering::Relaxed),
+            media_reuploads,
             pending_retries: pending_retries_count,
             pending_lid_refreshes: pending_lid_refreshes_count,
             history_payload_ids,
