@@ -325,6 +325,7 @@ pub mod usync;
 pub(crate) mod appstate_known_verbs;
 
 pub mod features;
+pub use features::PushNameOutcome;
 pub use features::{
     AppStateError, AppStateResyncMode, AppStateResyncReport, AppStateSettings,
     BUSINESS_PROFILE_MAX_WEBSITES, Blocking, BlockingError, BlocklistEntry, BotDefault, BotList,
@@ -332,7 +333,7 @@ pub use features::{
     BotThemeMode, Bots, Business, BusinessCategory, BusinessError, BusinessHourMode, BusinessHours,
     BusinessHoursConfig, BusinessHoursUpdate, BusinessProfile, BusinessProfileUpdate,
     BusinessProfileUpdateError, CappingMvStatus, CappingOteStatus, CappingStatus, Catalog,
-    CatalogOptions, ChatActions, ChatStateError, ChatStateType, Chatstate, Collection,
+    CatalogOptions, ChatActions, ChatActivity, ChatStateError, Chatstate, Collection,
     CollectionOptions, Collections, Comments, Community, CommunityConfigurationStep,
     CommunityError, CommunitySubgroup, ContactError, Contacts, CoverPhotoUpload,
     CreateCommunityOptions, CreateCommunityResult, CreateGroupResult, CreateSubgroupOptions,

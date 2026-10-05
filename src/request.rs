@@ -259,23 +259,15 @@ impl Client {
         self.get_request_utils().generate_request_id()
     }
 
-    /// Generates a unique message ID that conforms to the WhatsApp protocol format.
+    /// Generate a content identifier in the WhatsApp protocol format.
     ///
-    /// This is an advanced function that allows library users to generate message IDs
-    /// that are compatible with the WhatsApp protocol. The generated ID includes
-    /// timestamp, user JID, and random components to ensure uniqueness.
-    ///
-    /// # Advanced Use Case
-    ///
-    /// This function is intended for advanced users who need to build custom protocol
-    /// interactions or manage message IDs manually. Most users should use higher-level
-    /// methods like `send_message` which handle ID generation automatically.
-    ///
-    /// # Returns
-    ///
-    /// A string containing the generated message ID in the format expected by WhatsApp.
-    pub fn generate_message_id(&self) -> String {
-        self.generate_message_id_at(wacore::time::now_secs_u64())
+    /// [`Client::send`] generates an ID automatically. Use this method when
+    /// the ID must be known before constructing a [`crate::SendRequest`], then
+    /// pass it to [`crate::SendOptions::with_message_id`]. An edit or revoke
+    /// retains its target's content ID and uses a separate [`crate::StanzaId`].
+    pub fn generate_message_id(&self) -> crate::MessageId {
+        crate::MessageId::try_from(self.generate_message_id_at(wacore::time::now_secs_u64()))
+            .expect("generated message IDs are nonempty")
     }
 
     /// Same as [`Self::generate_message_id`], but against a caller-supplied
@@ -795,6 +787,24 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use wacore_binary::builder::NodeBuilder;
+
+    #[tokio::test]
+    async fn generated_message_id_retains_the_wire_format() {
+        let client = crate::test_utils::create_test_client().await;
+        let first: crate::MessageId = client.generate_message_id();
+        let second = client.generate_message_id();
+        assert_eq!(first.as_str().len(), 22);
+        assert!(first.as_str().starts_with("3EB0"));
+        assert!(
+            first
+                .as_str()
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte))
+        );
+        assert_ne!(first, second);
+        let options = crate::SendOptions::default().with_message_id(first.clone());
+        assert_eq!(options.message_id.as_ref(), Some(&first));
+    }
 
     #[tokio::test]
     async fn send_iq_node_rejects_non_iq_stanzas() {

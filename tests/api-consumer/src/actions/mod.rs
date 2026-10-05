@@ -40,6 +40,17 @@ impl Host for Client {
         target: &MessageRef<'_>,
         post: &NewsletterMessageRef<'_>,
     ) -> anyhow::Result<()> {
+        self.chat_actions().star_message(target).await?;
+        self.chat_actions().unstar_message(target).await?;
+        self.chat_actions()
+            .delete_message_for_me(target, false, None)
+            .await?;
+        self.labels()
+            .add_message_label("synthetic", target.chat(), target.id())
+            .await?;
+        self.labels()
+            .remove_message_label("synthetic", target.chat(), target.id())
+            .await?;
         self.send_reaction(target, "👍").await?;
         self.keep_message(target, true).await?;
         self.pin_message(target, PinDuration::Days7).await?;

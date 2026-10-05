@@ -4,6 +4,7 @@
 //! - `regular_low`: archive, pin, markChatAsRead, lock
 //! - `regular_high`: mute, star, deleteChat, deleteMessageForMe
 
+use crate::MessageRef;
 use crate::appstate_sync::Mutation;
 use crate::client::Client;
 use crate::client::{AppStateDispatchOutcome, fingerprint_id, redact_jid};
@@ -17,7 +18,7 @@ use wacore::types::events::{
     DeleteMessageForMeUpdate, Event, LockChatUpdate, MarkChatAsReadUpdate, MuteUpdate, PinUpdate,
     StarUpdate, UserStatusMuteUpdate,
 };
-use wacore_binary::{Jid, JidExt};
+use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 
 /// Error returned by app-state (syncd) requests — the shared failure domain of
@@ -443,19 +444,21 @@ fn parse_message_key_fields(kind: &str, index: &[String]) -> Option<(String, boo
     Some((message_id, from_me, participant_jid))
 }
 
-/// Validate and own only the index args that must outlive the call: the chat JID
-/// and (optional) participant JID. `messageId` and `fromMe` are passed through by
-/// the caller without copying. Mirrors WAWebSyncdActionUtils.buildMessageKey.
-fn message_key_owned(
-    chat_jid: &Jid,
-    participant_jid: Option<&Jid>,
-    from_me: bool,
-) -> Result<(String, Option<String>)> {
-    // syncKeyToMsgKey rejects group non-fromMe without valid participant
-    if chat_jid.is_group() && !from_me && participant_jid.is_none() {
-        anyhow::bail!("participant_jid is required for group messages not sent by us");
-    }
-    Ok((chat_jid.to_string(), participant_jid.map(|j| j.to_string())))
+/// Project the syncd message key without changing its identity namespace.
+fn message_key_owned(target: &MessageRef<'_>) -> (String, Option<String>) {
+    // WAWebSyncdActionUtils.buildMessageKey omits our own participant. A DM's
+    // sender is addressing metadata, not a participant in its syncd index.
+    // Group authors use account identities, as in WAWebWidFactory.asUserWidOrThrow:
+    // strip the transport device without converting between PN and LID.
+    let participant = if target.from_me() {
+        None
+    } else {
+        target.receipt_sender()
+    };
+    (
+        target.chat().to_string(),
+        participant.map(Jid::to_non_ad_string),
+    )
 }
 
 /// The `"1"`/`"0"` wire string for a `fromMe` flag (no allocation).
@@ -595,37 +598,14 @@ impl<'a> ChatActions<'a> {
         self.send_lock_mutation(jid, false).await
     }
 
-    /// `participant_jid`: required for group messages from others, `None` otherwise.
-    pub async fn star_message(
-        &self,
-        chat_jid: &Jid,
-        participant_jid: Option<&Jid>,
-        message_id: &str,
-        from_me: bool,
-    ) -> Result<(), AppStateError> {
-        debug!(
-            "Starring message {} in {}",
-            fingerprint_id(message_id),
-            redact_jid(chat_jid)
-        );
-        self.send_star_mutation(chat_jid, participant_jid, message_id, from_me, true)
-            .await
+    /// Star a message using its received or sent reference.
+    pub async fn star_message(&self, target: &MessageRef<'_>) -> Result<(), AppStateError> {
+        self.send_star_mutation(target, true).await
     }
 
-    pub async fn unstar_message(
-        &self,
-        chat_jid: &Jid,
-        participant_jid: Option<&Jid>,
-        message_id: &str,
-        from_me: bool,
-    ) -> Result<(), AppStateError> {
-        debug!(
-            "Unstarring message {} in {}",
-            fingerprint_id(message_id),
-            redact_jid(chat_jid)
-        );
-        self.send_star_mutation(chat_jid, participant_jid, message_id, from_me, false)
-            .await
+    /// Remove a message's star without reconstructing its author scope.
+    pub async fn unstar_message(&self, target: &MessageRef<'_>) -> Result<(), AppStateError> {
+        self.send_star_mutation(target, false).await
     }
 
     /// Distinct from `readMessages` IQ receipts — this syncs state across linked devices.
@@ -733,22 +713,13 @@ impl<'a> ChatActions<'a> {
     }
 
     /// Deletes locally only (not for everyone).
-    /// `participant_jid`: required for group messages from others, `None` otherwise.
     pub async fn delete_message_for_me(
         &self,
-        chat_jid: &Jid,
-        participant_jid: Option<&Jid>,
-        message_id: &str,
-        from_me: bool,
+        target: &MessageRef<'_>,
         delete_media: bool,
         message_timestamp: Option<i64>,
     ) -> Result<(), AppStateError> {
-        debug!(
-            "Deleting message {} for me in {}",
-            fingerprint_id(message_id),
-            redact_jid(chat_jid)
-        );
-        let (chat, participant) = message_key_owned(chat_jid, participant_jid, from_me)?;
+        let (chat, participant) = message_key_owned(target);
         let value = wa::SyncActionValue {
             delete_message_for_me_action: buffa::MessageField::some(
                 wa::sync_action_value::DeleteMessageForMeAction {
@@ -764,8 +735,8 @@ impl<'a> ChatActions<'a> {
                 &schemas::DELETE_MESSAGE_FOR_ME,
                 &[
                     chat.as_str(),
-                    message_id,
-                    bool_str(from_me),
+                    target.id().as_str(),
+                    bool_str(target.from_me()),
                     participant.as_deref().unwrap_or("0"),
                 ],
                 &value,
@@ -925,13 +896,10 @@ impl<'a> ChatActions<'a> {
 
     async fn send_star_mutation(
         &self,
-        chat_jid: &Jid,
-        participant_jid: Option<&Jid>,
-        message_id: &str,
-        from_me: bool,
+        target: &MessageRef<'_>,
         starred: bool,
     ) -> Result<(), AppStateError> {
-        let (chat, participant) = message_key_owned(chat_jid, participant_jid, from_me)?;
+        let (chat, participant) = message_key_owned(target);
         let value = wa::SyncActionValue {
             star_action: buffa::MessageField::some(wa::sync_action_value::StarAction {
                 starred: Some(starred),
@@ -944,8 +912,8 @@ impl<'a> ChatActions<'a> {
                 &schemas::STAR,
                 &[
                     chat.as_str(),
-                    message_id,
-                    bool_str(from_me),
+                    target.id().as_str(),
+                    bool_str(target.from_me()),
                     participant.as_deref().unwrap_or("0"),
                 ],
                 &value,
@@ -1285,6 +1253,118 @@ mod registry_tests {
             collection_patch_name(schemas::CONTACT.collection),
             WAPatchName::CriticalUnblockLow
         );
+    }
+
+    #[tokio::test]
+    async fn referenced_message_actions_preserve_syncd_indices() {
+        // Original WAWebSyncdActionUtils.buildMessageKey and
+        // WAWebSyncdUtils.constructMsgKeySegmentsFromMsgKey use the same tail.
+        for (chat, sender, from_me, participant) in [
+            (
+                "12025550111@s.whatsapp.net",
+                "12025550111@s.whatsapp.net",
+                false,
+                "0",
+            ),
+            ("12025550111@lid", "12025550111@lid", false, "0"),
+            (
+                "120000000001@g.us",
+                "12025550111@s.whatsapp.net",
+                false,
+                "12025550111@s.whatsapp.net",
+            ),
+            (
+                "120000000001@g.us",
+                "100000000001@lid",
+                false,
+                "100000000001@lid",
+            ),
+            ("120000000001@g.us", "100000000001@lid", true, "0"),
+            (
+                "120000000001@g.us",
+                "12025550111:7@s.whatsapp.net",
+                false,
+                "12025550111@s.whatsapp.net",
+            ),
+            (
+                "120000000001@g.us",
+                "100000000001:9@lid",
+                false,
+                "100000000001@lid",
+            ),
+            ("120000000001@g.us", "100000000001:9@lid", true, "0"),
+        ] {
+            for operation in 0..3 {
+                let mutation =
+                    capture_app_state_mutation("regular_high", move |client| async move {
+                        let chat: Jid = chat.parse().unwrap();
+                        let sender: Jid = sender.parse().unwrap();
+                        let target = MessageRef::new(
+                            &chat,
+                            crate::MessageId::new("original-ID").unwrap(),
+                            Some(&sender),
+                            from_me,
+                        )
+                        .unwrap();
+                        match operation {
+                            0 => client.chat_actions().star_message(&target).await,
+                            1 => client.chat_actions().unstar_message(&target).await,
+                            _ => {
+                                client
+                                    .chat_actions()
+                                    .delete_message_for_me(&target, true, Some(1234))
+                                    .await
+                            }
+                        }
+                    })
+                    .await;
+                assert_eq!(
+                    mutation.index,
+                    [
+                        if operation == 2 {
+                            "deleteMessageForMe"
+                        } else {
+                            "star"
+                        },
+                        chat,
+                        "original-ID",
+                        if from_me { "1" } else { "0" },
+                        participant
+                    ]
+                );
+                assert_eq!(mutation.operation, wa::syncd_mutation::SyncdOperation::SET);
+                let value = mutation.action_value.as_ref().unwrap();
+                if operation == 2 {
+                    let action = value.delete_message_for_me_action.as_option().unwrap();
+                    assert_eq!(action.delete_media, Some(true));
+                    assert_eq!(action.message_timestamp, Some(1234));
+                } else {
+                    assert_eq!(
+                        value.star_action.as_option().unwrap().starred,
+                        Some(operation == 0)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn app_state_reference_rejects_missing_group_sender_and_newsletters() {
+        let group: Jid = "120000000001@g.us".parse().unwrap();
+        let newsletter: Jid = "120000000001@newsletter".parse().unwrap();
+        assert!(matches!(
+            MessageRef::new(&group, crate::MessageId::new("ID").unwrap(), None, false),
+            Err(crate::MessageRefError::MissingSender)
+        ));
+        assert!(matches!(
+            MessageRef::new(
+                &newsletter,
+                crate::MessageId::new("ID").unwrap(),
+                None,
+                true
+            ),
+            Err(crate::MessageRefError::ExpectedChat)
+        ));
     }
 
     /// The question this feature turns on: deleting a contact is a syncd

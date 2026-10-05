@@ -1,30 +1,32 @@
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Presence {
+/// Global online/offline availability, shared by incoming events and outgoing presence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
+#[non_exhaustive]
+pub enum PresenceStatus {
+    #[wire = "available"]
     Available,
+    #[wire = "unavailable"]
     Unavailable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ChatPresence {
-    Composing,
-    Paused,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum ChatPresenceMedia {
-    #[serde(rename = "")]
+/// Activity within one chat, independently of global availability.
+///
+/// Serde names describe activity, not literal stanza tags. Recording audio projects
+/// to `<composing media="audio"/>`; idle projects to `<paused/>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ChatActivity {
+    Typing,
+    RecordingAudio,
     #[default]
-    Text,
-    #[serde(rename = "audio")]
-    Audio,
+    Idle,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(from = "String")]
+/// Receipt semantics. Serde uses Rust variant names, independently of wire `type` values.
+/// Unknown values retain their payload in `{ "Other": "..." }`, even for known-name collisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ReceiptType {
     Delivered,
@@ -76,12 +78,16 @@ impl ReceiptType {
         })
     }
 
+    /// Parse the wire `type` value. Empty or `delivery` means delivered.
+    /// This is independent of the externally tagged Serde representation.
     pub fn parse(s: &str) -> Self {
         Self::from_known(s).unwrap_or_else(|| Self::Other(s.to_string()))
     }
 
-    /// Canonical wire `type` value. Inverse of [`Self::parse`] (`Delivered`
-    /// maps to `"delivery"`, though it is sent as a dropped attr in practice).
+    /// Canonical wire `type` value for known variants; the raw payload for `Other`.
+    /// `Delivered` maps to `"delivery"`, though it is sent without a type attribute.
+    /// Parsing an `Other` payload that collides with a known wire value normalizes
+    /// it to that known variant. Use Serde when exact enum roundtrips are required.
     pub fn as_wire_str(&self) -> &str {
         match self {
             Self::Delivered => "delivery",
@@ -98,57 +104,6 @@ impl ReceiptType {
             Self::PeerMsg => "peer_msg",
             Self::HistorySync => "hist_sync",
             Self::Other(s) => s,
-        }
-    }
-
-    /// Serde variant name (`"ReadSelf"`, not the wire `"read-self"`). The
-    /// [`Serialize`] impl is built on this rather than the reverse, so the
-    /// accessor cannot drift from the serialized form.
-    pub fn variant_name(&self) -> &'static str {
-        match self {
-            Self::Delivered => "Delivered",
-            Self::Sent => "Sent",
-            Self::Sender => "Sender",
-            Self::Retry => "Retry",
-            Self::EncRekeyRetry => "EncRekeyRetry",
-            Self::Read => "Read",
-            Self::ReadSelf => "ReadSelf",
-            Self::Played => "Played",
-            Self::PlayedSelf => "PlayedSelf",
-            Self::ServerError => "ServerError",
-            Self::Inactive => "Inactive",
-            Self::PeerMsg => "PeerMsg",
-            Self::HistorySync => "HistorySync",
-            Self::Other(_) => "Other",
-        }
-    }
-}
-
-impl Serialize for ReceiptType {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // Indices follow declaration order so the output stays byte-identical
-        // to the derive this replaced.
-        let index = match self {
-            Self::Delivered => 0,
-            Self::Sent => 1,
-            Self::Sender => 2,
-            Self::Retry => 3,
-            Self::EncRekeyRetry => 4,
-            Self::Read => 5,
-            Self::ReadSelf => 6,
-            Self::Played => 7,
-            Self::PlayedSelf => 8,
-            Self::ServerError => 9,
-            Self::Inactive => 10,
-            Self::PeerMsg => 11,
-            Self::HistorySync => 12,
-            Self::Other(_) => 13,
-        };
-        match self {
-            Self::Other(inner) => {
-                serializer.serialize_newtype_variant("ReceiptType", index, "Other", inner)
-            }
-            _ => serializer.serialize_unit_variant("ReceiptType", index, self.variant_name()),
         }
     }
 }
@@ -191,6 +146,7 @@ mod tests {
         // hyphen/underscore variants against drift.
         let variants = [
             ReceiptType::Delivered,
+            ReceiptType::Sent,
             ReceiptType::Sender,
             ReceiptType::Retry,
             ReceiptType::EncRekeyRetry,
@@ -237,11 +193,6 @@ mod tests {
     fn unit_variants_serialize_to_their_variant_name() {
         for (variant, expected) in &UNIT_VARIANTS {
             assert_eq!(
-                variant.variant_name(),
-                *expected,
-                "name drift for {variant:?}"
-            );
-            assert_eq!(
                 serde_json::to_value(variant).expect("serialization is infallible"),
                 serde_json::Value::String((*expected).to_string()),
                 "serialized form drift for {variant:?}"
@@ -252,7 +203,6 @@ mod tests {
     #[test]
     fn other_serializes_as_a_newtype_variant() {
         let other = ReceiptType::Other("custom-type".to_string());
-        assert_eq!(other.variant_name(), "Other");
         assert_eq!(
             serde_json::to_value(&other).expect("serialization is infallible"),
             serde_json::json!({ "Other": "custom-type" })
@@ -268,16 +218,40 @@ mod tests {
     }
 
     #[test]
-    fn variant_name_does_not_leak_the_wire_form() {
-        // The two mappings differ on purpose; guard against one being wired
-        // to the other.
-        assert_eq!(ReceiptType::ReadSelf.variant_name(), "ReadSelf");
-        assert_eq!(ReceiptType::ReadSelf.as_wire_str(), "read-self");
-        assert_eq!(ReceiptType::Delivered.variant_name(), "Delivered");
-        assert_eq!(ReceiptType::Delivered.as_wire_str(), "delivery");
+    fn serde_roundtrip_preserves_every_variant_and_other_payload() {
+        for (variant, _) in &UNIT_VARIANTS {
+            let json = serde_json::to_string(variant).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ReceiptType>(&json).unwrap(),
+                *variant
+            );
+        }
+        for payload in [
+            "",
+            "custom-type",
+            "ReadSelf",
+            "Delivered",
+            "Other",
+            "read-self",
+            "delivery",
+        ] {
+            let variant = ReceiptType::Other(payload.to_owned());
+            let json = serde_json::to_value(&variant).unwrap();
+            assert_eq!(json, serde_json::json!({ "Other": payload }));
+            assert_eq!(
+                serde_json::from_value::<ReceiptType>(json).unwrap(),
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn serde_names_are_separate_from_wire_values() {
         assert_eq!(
-            ReceiptType::Other("custom-type".to_string()).variant_name(),
-            "Other"
+            ReceiptType::parse("ReadSelf"),
+            ReceiptType::Other("ReadSelf".into())
         );
+        assert_eq!(ReceiptType::parse("read-self"), ReceiptType::ReadSelf);
+        assert!(serde_json::from_str::<ReceiptType>(r#""read-self""#).is_err());
     }
 }

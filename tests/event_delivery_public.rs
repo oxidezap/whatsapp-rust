@@ -3,6 +3,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
+use whatsapp_rust::ChatActivity;
 use whatsapp_rust::bot::{Bot, BotRunOutcome};
 use whatsapp_rust::handlers::chatstate::ChatstateHandler;
 use whatsapp_rust::handlers::traits::StanzaHandler;
@@ -12,7 +13,6 @@ use whatsapp_rust::transport::{Transport, TransportEvent, TransportFactory};
 use whatsapp_rust::types::events::{
     ChannelEventHandler, Event, EventHandler, EventInterest, EventKind,
 };
-use whatsapp_rust::wacore::iq::chatstate::ReceivedChatState;
 use whatsapp_rust::wacore::runtime::{AbortHandle, BoxFuture, Runtime};
 use whatsapp_rust::wacore::store::in_memory::InMemoryBackend;
 use whatsapp_rust::{
@@ -131,13 +131,9 @@ async fn chatstate_compatibility_view_uses_the_same_bus_fact() {
     let bus_subscription =
         client.subscribe(EventInterest::of(&[EventKind::ChatPresence]), bus.clone());
     for (state, media, expected) in [
-        ("composing", None, ReceivedChatState::Typing),
-        (
-            "composing",
-            Some("audio"),
-            ReceivedChatState::RecordingAudio,
-        ),
-        ("paused", None, ReceivedChatState::Idle),
+        ("composing", None, ChatActivity::Typing),
+        ("composing", Some("audio"), ChatActivity::RecordingAudio),
+        ("paused", None, ChatActivity::Idle),
     ] {
         dispatch(&client, state, media).await;
         let observed = receive(&rx).await;
@@ -231,7 +227,7 @@ async fn ordered_delivery_preserves_accepted_order_and_drops_newest() {
     );
     let subscription = client.subscribe_handler(handler.clone());
     dispatch(&client, "composing", None).await;
-    assert_eq!(receive(&started).await, ReceivedChatState::Typing);
+    assert_eq!(receive(&started).await, ChatActivity::Typing);
     dispatch(&client, "composing", Some("audio")).await;
     dispatch(&client, "paused", None).await;
     dispatch(&client, "composing", None).await; // newest is rejected
@@ -239,7 +235,7 @@ async fn ordered_delivery_preserves_accepted_order_and_drops_newest() {
     assert_eq!(handler.stats().dropped_full, 1);
     assert_eq!(handler.stats().callbacks_active, 1);
     assert!(started.try_recv().is_err());
-    for state in [ReceivedChatState::RecordingAudio, ReceivedChatState::Idle] {
+    for state in [ChatActivity::RecordingAudio, ChatActivity::Idle] {
         release.send(()).await.unwrap();
         assert_eq!(receive(&started).await, state);
         assert_eq!(handler.stats().callbacks_active, 1);
@@ -643,11 +639,11 @@ async fn bot_driver_abort_preserves_independent_client_subscription() {
     let handle = bot.spawn();
     dispatch(&client, "composing", None).await;
     receive(&probe.started).await;
-    assert_eq!(receive(&rx).await, ReceivedChatState::Typing);
+    assert_eq!(receive(&rx).await, ChatActivity::Typing);
     handle.abort();
     assert!(observe_driver_cancellation(&client, &probe).await);
     dispatch(&client, "paused", None).await;
-    assert_eq!(receive(&rx).await, ReceivedChatState::Idle);
+    assert_eq!(receive(&rx).await, ChatActivity::Idle);
     assert!(probe.started.try_recv().is_err());
     drop(subscription);
     drop(handle);

@@ -256,7 +256,7 @@ impl<'a> Labels<'a> {
         &self,
         label_id: &str,
         chat_jid: &Jid,
-        message_id: &str,
+        message_id: &crate::MessageId,
     ) -> Result<(), AppStateError> {
         self.send_message_association(label_id, chat_jid, message_id, true)
             .await
@@ -267,7 +267,7 @@ impl<'a> Labels<'a> {
         &self,
         label_id: &str,
         chat_jid: &Jid,
-        message_id: &str,
+        message_id: &crate::MessageId,
     ) -> Result<(), AppStateError> {
         self.send_message_association(label_id, chat_jid, message_id, false)
             .await
@@ -305,7 +305,7 @@ impl<'a> Labels<'a> {
         &self,
         label_id: &str,
         chat_jid: &Jid,
-        message_id: &str,
+        message_id: &crate::MessageId,
         labeled: bool,
     ) -> Result<(), AppStateError> {
         if label_id.is_empty() {
@@ -313,17 +313,12 @@ impl<'a> Labels<'a> {
                 "label_id cannot be empty".into(),
             ));
         }
-        if message_id.is_empty() {
-            return Err(AppStateError::InvalidRequest(
-                "message_id cannot be empty".into(),
-            ));
-        }
         debug!(
             "{} label {} {} message {} in {}",
             if labeled { "Adding" } else { "Removing" },
             fingerprint_id(label_id),
             if labeled { "to" } else { "from" },
-            fingerprint_id(message_id),
+            fingerprint_id(message_id.as_str()),
             redact_jid(chat_jid),
         );
         let chat = chat_jid.to_string();
@@ -335,7 +330,7 @@ impl<'a> Labels<'a> {
                 // `label_message` carrying a set `fromMe` or a participant, and
                 // guessing one would key the association off a row the server
                 // does not have.
-                &[label_id, chat.as_str(), message_id, "0", "0"],
+                &[label_id, chat.as_str(), message_id.as_str(), "0", "0"],
                 &association_value(labeled),
             )
             .await
@@ -500,7 +495,7 @@ mod tests {
             move |client| async move {
                 client
                     .labels()
-                    .add_message_label("5", &chat, "3EB0MSGID")
+                    .add_message_label("5", &chat, &crate::MessageId::new("3EB0MSGID").unwrap())
                     .await
             }
         })
@@ -532,7 +527,7 @@ mod tests {
             move |client| async move {
                 client
                     .labels()
-                    .remove_message_label("5", &chat, "3EB0MSGID")
+                    .remove_message_label("5", &chat, &crate::MessageId::new("3EB0MSGID").unwrap())
                     .await
             }
         })
@@ -563,7 +558,7 @@ mod tests {
                 move |client| async move {
                     client
                         .labels()
-                        .add_message_label("5", &chat, "3EB0MSGID")
+                        .add_message_label("5", &chat, &crate::MessageId::new("3EB0MSGID").unwrap())
                         .await
                 }
             },
@@ -609,29 +604,17 @@ mod tests {
 
         let err = client
             .labels()
-            .add_message_label("", &jid, "MSGID")
+            .add_message_label("", &jid, &crate::MessageId::new("MSGID").unwrap())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("label_id cannot be empty"));
 
-        let err = client
-            .labels()
-            .add_message_label("5", &jid, "")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("message_id cannot be empty"));
+        assert!(crate::MessageId::new("").is_err());
 
         assert!(
             client
                 .labels()
-                .remove_message_label("", &jid, "MSGID")
-                .await
-                .is_err()
-        );
-        assert!(
-            client
-                .labels()
-                .remove_message_label("5", &jid, "")
+                .remove_message_label("", &jid, &crate::MessageId::new("MSGID").unwrap())
                 .await
                 .is_err()
         );

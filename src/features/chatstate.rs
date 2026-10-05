@@ -3,7 +3,7 @@
 use crate::client::{Client, ClientError};
 use log::debug;
 use thiserror::Error;
-use wacore::WireEnum;
+pub use wacore::types::presence::ChatActivity;
 use wacore_binary::Jid;
 use wacore_binary::builder::NodeBuilder;
 
@@ -14,18 +14,6 @@ pub enum ChatStateError {
     /// Connection/transport failure sending the `<chatstate>` stanza.
     #[error("{0}")]
     Client(#[from] ClientError),
-}
-
-/// Chat state type for typing indicators.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
-#[non_exhaustive]
-pub enum ChatStateType {
-    #[wire = "composing"]
-    Composing,
-    #[wire = "recording"]
-    Recording,
-    #[wire = "paused"]
-    Paused,
 }
 
 /// Feature handle for chat state operations.
@@ -39,8 +27,8 @@ impl<'a> Chatstate<'a> {
     }
 
     /// Send a chat state update to a recipient.
-    pub async fn send(&self, to: &Jid, state: ChatStateType) -> Result<(), ChatStateError> {
-        debug!(target: "Chatstate", "Sending {} to {}", state, to);
+    pub async fn send(&self, to: &Jid, state: ChatActivity) -> Result<(), ChatStateError> {
+        debug!(target: "Chatstate", "Sending {:?} to {}", state, to);
 
         let node = self.build_chatstate_node(to, state);
         self.client.send_node(node).await?;
@@ -48,29 +36,21 @@ impl<'a> Chatstate<'a> {
     }
 
     pub async fn send_composing(&self, to: &Jid) -> Result<(), ChatStateError> {
-        self.send(to, ChatStateType::Composing).await
+        self.send(to, ChatActivity::Typing).await
     }
 
     pub async fn send_recording(&self, to: &Jid) -> Result<(), ChatStateError> {
-        self.send(to, ChatStateType::Recording).await
+        self.send(to, ChatActivity::RecordingAudio).await
     }
 
     pub async fn send_paused(&self, to: &Jid) -> Result<(), ChatStateError> {
-        self.send(to, ChatStateType::Paused).await
+        self.send(to, ChatActivity::Idle).await
     }
 
-    fn build_chatstate_node(&self, to: &Jid, state: ChatStateType) -> wacore_binary::Node {
-        let child = match state {
-            ChatStateType::Composing => NodeBuilder::new("composing").build(),
-            ChatStateType::Recording => {
-                NodeBuilder::new("composing").attr("media", "audio").build()
-            }
-            ChatStateType::Paused => NodeBuilder::new("paused").build(),
-        };
-
+    fn build_chatstate_node(&self, to: &Jid, state: ChatActivity) -> wacore_binary::Node {
         NodeBuilder::new("chatstate")
             .attr("to", to)
-            .children([child])
+            .children([state.into_child_node()])
             .build()
     }
 }
@@ -86,13 +66,36 @@ impl Client {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_chat_state_type_string_enum() {
-        assert_eq!(ChatStateType::Composing.as_str(), "composing");
-        assert_eq!(ChatStateType::Recording.to_string(), "recording");
-        assert_eq!(
-            ChatStateType::try_from("paused").unwrap(),
-            ChatStateType::Paused
-        );
+    #[tokio::test]
+    async fn sends_semantic_activity_as_chatstate_payload() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let to: Jid = "12025550100@s.whatsapp.net".parse().unwrap();
+        for activity in [
+            ChatActivity::Typing,
+            ChatActivity::RecordingAudio,
+            ChatActivity::Idle,
+        ] {
+            client.chatstate().send(&to, activity).await.unwrap();
+        }
+        let frames = crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0u8; 32]);
+        assert_eq!(frames.len(), 3);
+        for (frame, (tag, media)) in frames.iter().zip([
+            ("composing", None),
+            ("composing", Some("audio")),
+            ("paused", None),
+        ]) {
+            let unpacked = wacore_binary::util::unpack(frame).unwrap();
+            let owned = wacore_binary::OwnedNodeRef::new(unpacked.into_owned()).unwrap();
+            let node = owned.get();
+            assert_eq!(node.tag, "chatstate");
+            assert_eq!(node.get_attr("to").unwrap().to_string(), to.to_string());
+            let children = node.children().unwrap();
+            assert_eq!(children.len(), 1);
+            assert_eq!(children[0].tag, tag);
+            assert_eq!(
+                children[0].get_attr("media").map(|v| v.as_str()).as_deref(),
+                media
+            );
+        }
     }
 }

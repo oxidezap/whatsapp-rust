@@ -6287,13 +6287,14 @@ async fn concurrent_first_readers_agree_on_one_instance() {
 }
 
 fn test_chatstate_stanza() -> wacore::iq::chatstate::ChatstateStanza {
-    use wacore::iq::chatstate::{ChatstateSource, ChatstateStanza, ReceivedChatState};
+    use wacore::iq::chatstate::{ChatstateSource, ChatstateStanza};
+    use wacore::types::presence::ChatActivity;
 
     ChatstateStanza {
         source: ChatstateSource::User {
             from: "15550001111@s.whatsapp.net".parse().expect("valid jid"),
         },
-        state: ReceivedChatState::Typing,
+        state: ChatActivity::Typing,
     }
 }
 
@@ -6364,8 +6365,8 @@ async fn chatstate_dispatch_reaches_every_registered_handler() {
 async fn chatstate_bus_adapter_preserves_parsed_states_and_subscription_lifetime() {
     use crate::handlers::chatstate::ChatstateHandler;
     use crate::handlers::traits::StanzaHandler;
-    use wacore::iq::chatstate::ReceivedChatState;
     use wacore::types::events::{ChannelEventHandler, EventInterest, EventKind};
+    use wacore::types::presence::ChatActivity;
     let client = crate::test_utils::create_test_client().await;
     let (tx, rx) = async_channel::unbounded();
     let subscription = client.subscribe_chatstate_handler(Arc::new(move |event| {
@@ -6375,13 +6376,9 @@ async fn chatstate_bus_adapter_preserves_parsed_states_and_subscription_lifetime
     let _bus_subscription = client.subscribe(EventInterest::of(&[EventKind::ChatPresence]), bus);
     for group in [false, true] {
         for (tag, media, expected) in [
-            ("composing", None, ReceivedChatState::Typing),
-            (
-                "composing",
-                Some("audio"),
-                ReceivedChatState::RecordingAudio,
-            ),
-            ("paused", None, ReceivedChatState::Idle),
+            ("composing", None, ChatActivity::Typing),
+            ("composing", Some("audio"), ChatActivity::RecordingAudio),
+            ("paused", None, ChatActivity::Idle),
         ] {
             let chat = if group {
                 "120363000001@g.us"

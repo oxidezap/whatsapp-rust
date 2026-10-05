@@ -1,8 +1,8 @@
 use crate::client::{Client, ClientError};
 use log::{debug, warn};
 use thiserror::Error;
-use wacore::WireEnum;
 use wacore::iq::tctoken::build_tc_token_node;
+pub use wacore::types::presence::PresenceStatus;
 use wacore_binary::Jid;
 use wacore_binary::Node;
 use wacore_binary::builder::NodeBuilder;
@@ -18,25 +18,6 @@ pub enum PresenceError {
     /// Catch-all for internal failures with no dedicated variant.
     #[error("{0}")]
     Other(#[from] anyhow::Error),
-}
-
-/// Presence status for online/offline state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
-#[non_exhaustive]
-pub enum PresenceStatus {
-    #[wire = "available"]
-    Available,
-    #[wire = "unavailable"]
-    Unavailable,
-}
-
-impl From<crate::types::presence::Presence> for PresenceStatus {
-    fn from(p: crate::types::presence::Presence) -> Self {
-        match p {
-            crate::types::presence::Presence::Available => PresenceStatus::Available,
-            crate::types::presence::Presence::Unavailable => PresenceStatus::Unavailable,
-        }
-    }
 }
 
 /// Who announces the account's own `available` presence.
@@ -107,12 +88,11 @@ impl<'a> Presence<'a> {
 
         // Track receipt activity like whatsmeow: available -> active receipts,
         // unavailable -> back to inactive (a forced value is preserved).
-        match status {
-            PresenceStatus::Available => {
-                self.client.send_unified_session().await;
-                self.client.mark_receipts_active_on_presence();
-            }
-            PresenceStatus::Unavailable => self.client.mark_receipts_inactive_on_presence(),
+        if status == PresenceStatus::Available {
+            self.client.send_unified_session().await;
+            self.client.mark_receipts_active_on_presence();
+        } else {
+            self.client.mark_receipts_inactive_on_presence();
         }
 
         let presence_type = status.as_str();

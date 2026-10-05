@@ -192,7 +192,7 @@ pub struct MessageRetransmission {
     pub(crate) chat: Jid,
     pub(crate) requester: Jid,
     pub(crate) message: wa::Message,
-    pub(crate) message_id: String,
+    pub(crate) message_id: crate::MessageId,
     pub(crate) retry_count: u8,
     pub(crate) recipient: Option<Jid>,
     pub(crate) group_metadata_freshness: Freshness,
@@ -204,7 +204,7 @@ impl MessageRetransmission {
         chat: Jid,
         requester: Jid,
         message: wa::Message,
-        message_id: String,
+        message_id: crate::MessageId,
         retry_count: u8,
     ) -> Self {
         Self {
@@ -242,7 +242,7 @@ impl MessageRetransmission {
         &self.message
     }
 
-    pub fn message_id(&self) -> &str {
+    pub fn message_id(&self) -> &crate::MessageId {
         &self.message_id
     }
 

@@ -118,6 +118,20 @@ pub fn result_ids(result: &SendResult) -> (&MessageId, StanzaId) {
     (&result.message_id, result.stanza_id())
 }
 
+/// Generated IDs can be passed directly to send options and retransmission.
+pub fn generated_id_requests(client: &Client, chat: &Jid) -> whatsapp_rust::MessageRetransmission {
+    let id: MessageId = client.generate_message_id();
+    let _send = SendRequest::new(chat, Message::text("hello"))
+        .with_options(SendOptions::default().with_message_id(id.clone()));
+    whatsapp_rust::MessageRetransmission::new(
+        chat.clone(),
+        chat.with_device(1),
+        Message::text("hello"),
+        id,
+        1,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +142,28 @@ mod tests {
         assert_host::<Client>();
         let _ = boxed;
         let _ = result_ids;
+    }
+
+    #[test]
+    fn retransmission_retains_the_original_content_identifier() {
+        let wire_id = "original-ünïcødé-content-id".to_owned();
+        let id = MessageId::try_from(wire_id.clone()).unwrap();
+        let request = whatsapp_rust::MessageRetransmission::new(
+            Jid::pn("15550000001"),
+            Jid::pn_device("15550000001", 7),
+            Message::text("original"),
+            id.clone(),
+            2,
+        );
+        let actual: &MessageId = request.message_id();
+        assert_eq!(actual, &id);
+        assert_eq!(actual.as_str().as_bytes(), wire_id.as_bytes());
+        assert_eq!(request.retry_count(), 2);
+        assert_ne!(
+            StanzaId::new("new-operation").unwrap().as_str(),
+            actual.as_str()
+        );
+        let _ = generated_id_requests;
     }
 
     #[test]

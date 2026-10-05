@@ -7,6 +7,7 @@ use log::debug;
 use std::sync::Arc;
 use wacore::stanza::wire_tags::StanzaTag;
 use wacore::types::events::{Event, PresenceUpdate};
+use wacore::types::presence::PresenceStatus;
 
 /// Handler for `<presence>` stanzas.
 ///
@@ -60,11 +61,57 @@ impl StanzaHandler for PresenceHandler {
         client.core.event_bus.dispatch(Event::Presence(
             PresenceUpdate::builder()
                 .from(from_jid)
-                .unavailable(unavailable)
+                .status(if unavailable {
+                    PresenceStatus::Unavailable
+                } else {
+                    PresenceStatus::Available
+                })
                 .maybe_last_seen(last_seen)
                 .build(),
         ));
 
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wacore::types::events::{ChannelEventHandler, EventInterest, EventKind};
+    use wacore_binary::builder::NodeBuilder;
+
+    #[tokio::test]
+    async fn availability_event_retains_identity_and_last_seen() {
+        let client = crate::test_utils::create_test_client().await;
+        let (handler, events) = ChannelEventHandler::with_capacity(4);
+        let _subscription = client.subscribe(EventInterest::of(&[EventKind::Presence]), handler);
+        let from = "12025550100@s.whatsapp.net";
+        for (wire_type, status) in [
+            (None, PresenceStatus::Available),
+            (Some("available"), PresenceStatus::Available),
+            (Some("unavailable"), PresenceStatus::Unavailable),
+            (Some("future-value"), PresenceStatus::Available),
+        ] {
+            let mut node = NodeBuilder::new("presence")
+                .attr("from", from)
+                .attr("last", "1700000000");
+            if let Some(value) = wire_type {
+                node = node.attr("type", value);
+            }
+            PresenceHandler
+                .handle(
+                    client.clone(),
+                    crate::test_utils::node_to_owned_ref(&node.build()),
+                    &mut false,
+                )
+                .await;
+            let event = events.recv().await.unwrap();
+            let Event::Presence(update) = &*event else {
+                panic!("presence event")
+            };
+            assert_eq!(update.from.to_string(), from);
+            assert_eq!(update.status, status);
+            assert_eq!(update.last_seen.unwrap().timestamp(), 1700000000);
+        }
     }
 }

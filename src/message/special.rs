@@ -206,7 +206,7 @@ impl Client {
     ) {
         let weak = Arc::downgrade(self);
         let runtime = self.runtime.clone();
-        let message_id = self.generate_message_id();
+        let message_id = self.generate_message_id_at(wacore::time::now_secs_u64());
         self.runtime
             .spawn(Box::pin(async move {
                 let mut attempt = 0;

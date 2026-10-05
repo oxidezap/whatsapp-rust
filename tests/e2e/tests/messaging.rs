@@ -129,7 +129,10 @@ async fn test_message_has_push_name() -> anyhow::Result<()> {
     // set_push_name() sends a presence stanza AND an app state mutation IQ.
     // The IQ round-trip ensures the mock server has stored the name before we proceed.
     let push_name = "SenderBot";
-    client_a.client.profile().set_push_name(push_name).await?;
+    assert!(matches!(
+        client_a.client.profile().set_push_name(push_name).await?,
+        whatsapp_rust::PushNameOutcome::Synced
+    ));
     info!("Client A set push name to '{push_name}'");
 
     let jid_b = client_b.jid().await;

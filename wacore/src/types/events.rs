@@ -1,7 +1,7 @@
 use crate::stanza::BusinessSubscription;
 use crate::types::call::{CallEndedElsewhere, IncomingCall, MissedCall};
 use crate::types::message::MessageInfo;
-use crate::types::presence::{ChatPresence, ChatPresenceMedia, ReceiptType};
+use crate::types::presence::{ChatActivity, PresenceStatus, ReceiptType};
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use portable_atomic::{AtomicU64, Ordering};
@@ -2507,8 +2507,7 @@ impl ServerAck {
 #[non_exhaustive]
 pub struct ChatPresenceUpdate {
     pub source: crate::types::message::MessageSource,
-    pub state: ChatPresence,
-    pub media: ChatPresenceMedia,
+    pub state: ChatActivity,
 }
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
@@ -2516,7 +2515,8 @@ pub struct ChatPresenceUpdate {
 pub struct PresenceUpdate {
     /// The contact whose presence changed.
     pub from: Jid,
-    pub unavailable: bool,
+    /// Global availability, directly reusable with `client.presence().set` in the SDK.
+    pub status: PresenceStatus,
     pub last_seen: Option<DateTime<Utc>>,
 }
 

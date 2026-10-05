@@ -946,9 +946,14 @@ impl<'a> Newsletter<'a> {
         validate_poll_vote(option_hashes)?;
         let id = self.client.generate_message_id();
         self.client
-            .send_node(build_poll_vote_node(jid, &id, server_id, option_hashes))
+            .send_node(build_poll_vote_node(
+                jid,
+                id.as_str(),
+                server_id,
+                option_hashes,
+            ))
             .await?;
-        Ok(crate::StanzaId::new(id)?)
+        Ok(crate::StanzaId::from_message_id(&id))
     }
 
     /// Edit a message in a newsletter (channel). Channels are plaintext (not E2E).

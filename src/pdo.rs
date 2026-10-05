@@ -341,7 +341,7 @@ impl Client {
                 })
                 .await;
         }
-        let request_id = self.generate_message_id();
+        let request_id = self.generate_message_id_at(wacore::time::now_secs_u64());
         let mut admission = None;
         self.pdo_requested
             .upsert_with_by_ref(
@@ -790,7 +790,7 @@ impl Client {
         // id, and a reply that beats the send's return would otherwise find the
         // request recorded with no id at all -- unrecognisable, and so unable to
         // free the ask it answers.
-        let request_id = self.generate_message_id();
+        let request_id = self.generate_message_id_at(wacore::time::now_secs_u64());
 
         let proc = self.get_app_state_processor();
         if !proc.mark_recovery_requested(collection).await {
@@ -828,7 +828,7 @@ impl Client {
         to: Jid,
         msg: &wa::Message,
     ) -> Result<String, anyhow::Error> {
-        let msg_id = self.generate_message_id();
+        let msg_id = self.generate_message_id_at(wacore::time::now_secs_u64());
         self.send_peer_message_with_id(to, msg, &msg_id).await?;
         Ok(msg_id)
     }

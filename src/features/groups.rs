@@ -3146,7 +3146,9 @@ impl<'a> Groups<'a> {
         // as an extra node — otherwise the member_label appdata/tag_reason attrs
         // never reach the wire.
         let (_edit, meta) = crate::send::infer_stanza_metadata(&msg);
-        let message_id = self.client.generate_message_id();
+        let message_id = self
+            .client
+            .generate_message_id_at(wacore::time::now_secs_u64());
         self.client
             .send_message_impl(
                 group_jid.clone(),

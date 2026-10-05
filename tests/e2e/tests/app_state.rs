@@ -41,7 +41,10 @@ async fn test_push_name_survives_reconnect() -> anyhow::Result<()> {
     client.wait_for_app_state_sync().await?;
 
     let name = "ReconnectTest";
-    client.client.profile().set_push_name(name).await?;
+    assert!(matches!(
+        client.client.profile().set_push_name(name).await?,
+        whatsapp_rust::PushNameOutcome::Synced
+    ));
     assert_eq!(client.client.push_name(), name);
     info!("Push name set to '{name}'");
 
@@ -157,7 +160,12 @@ async fn test_cross_collection_mutations() -> anyhow::Result<()> {
     client_a
         .client
         .chat_actions()
-        .star_message(&jid_b, None, msg_id.as_str(), true)
+        .star_message(&whatsapp_rust::MessageRef::new(
+            &jid_b,
+            msg_id.clone(),
+            None,
+            true,
+        )?)
         .await?;
     info!("Star (regular_high) succeeded");
 
@@ -201,22 +209,13 @@ async fn test_star_received_message() -> anyhow::Result<()> {
         })
         .await?;
 
-    let msg_id = if let Some(m) = event
+    let received = event
         .messages()
         .find(|m| m.message.conversation.as_deref() == Some("Star me from the other side!"))
-    {
-        m.info.id.clone()
-    } else {
-        panic!("Expected Message event");
-    };
-    info!("Client B received message with id: {msg_id}");
-
-    // B stars the message (from_me=false — B received it, didn't send it)
-    client_b
-        .client
-        .chat_actions()
-        .star_message(&jid_a, None, &msg_id, false)
-        .await?;
+        .expect("Expected Message event");
+    let target = whatsapp_rust::MessageRef::from_info(&received.info)?;
+    let msg_id = target.id();
+    client_b.client.chat_actions().star_message(&target).await?;
     info!("Client B starred received message {msg_id} (from_me=false)");
 
     client_a.disconnect().await;
@@ -262,7 +261,10 @@ async fn test_multi_device_app_state_sync() -> anyhow::Result<()> {
     // Use a unique push name each run so the test is idempotent even if the
     // mock server persists push_name state across sessions (like the real server).
     let new_name = format!("MultiDev_{}", wacore::time::now_millis());
-    client_a1.client.profile().set_push_name(&new_name).await?;
+    assert!(matches!(
+        client_a1.client.profile().set_push_name(&new_name).await?,
+        whatsapp_rust::PushNameOutcome::Synced
+    ));
     info!("A1 set push name to '{new_name}'");
 
     // A2 should receive SelfPushNameUpdated via ib dirty → re-sync → critical_block patch
@@ -347,11 +349,14 @@ async fn test_missing_key_request_rebuilds_primary_session() -> anyhow::Result<(
             .attr("to", requester_lid.to_string()),
     );
     let updated_name = e2e_tests::unique_push_name("key_recovery_update");
-    client_b
-        .client
-        .profile()
-        .set_push_name(&updated_name)
-        .await?;
+    assert!(matches!(
+        client_b
+            .client
+            .profile()
+            .set_push_name(&updated_name)
+            .await?,
+        whatsapp_rust::PushNameOutcome::Synced
+    ));
 
     tokio::time::timeout(tokio::time::Duration::from_secs(10), primary_request)
         .await

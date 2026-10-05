@@ -483,7 +483,7 @@ impl Client {
         let route = validate_retransmission(
             &request.chat,
             &request.requester,
-            &request.message_id,
+            request.message_id.as_str(),
             request.retry_count,
             request.recipient.as_ref(),
         )?;
@@ -550,6 +550,7 @@ impl Client {
             recipient,
             group_metadata_freshness: _,
         } = request;
+        let message_id = message_id.into_string();
         let pre_encoded = Arc::new(waproto::codec::message_to_vec(&message));
         self.add_recent_message(&chat, &message_id, &message, Some(Arc::clone(&pre_encoded)))
             .await;
@@ -2287,7 +2288,7 @@ mod tests {
                         requester.clone(),
                         requester.clone(),
                         image.clone(),
-                        id.to_string(),
+                        crate::MessageId::new(id).unwrap(),
                         1,
                     ))
                     .await
@@ -2405,8 +2406,14 @@ mod tests {
             client.wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", id));
         client
             .retransmit_message(
-                MessageRetransmission::new(chat.clone(), requester.clone(), message, id.into(), 1)
-                    .with_recipient(chat.clone()),
+                MessageRetransmission::new(
+                    chat.clone(),
+                    requester.clone(),
+                    message,
+                    crate::MessageId::new(id).unwrap(),
+                    1,
+                )
+                .with_recipient(chat.clone()),
             )
             .await
             .unwrap();
@@ -5170,7 +5177,7 @@ mod tests {
             chat,
             requester,
             wa::Message::default(),
-            "PEER-RETRY-1".to_string(),
+            crate::MessageId::new("PEER-RETRY-1").unwrap(),
             1,
         );
 
@@ -5194,14 +5201,14 @@ mod tests {
                 chat.clone(),
                 requester,
                 wa::Message::default(),
-                "DIRECT-CHAT-MISMATCH-1".to_string(),
+                crate::MessageId::new("DIRECT-CHAT-MISMATCH-1").unwrap(),
                 1,
             ),
             MessageRetransmission::new(
                 chat.clone(),
                 bot_requester,
                 wa::Message::default(),
-                "DIRECT-RECIPIENT-MISMATCH-1".to_string(),
+                crate::MessageId::new("DIRECT-RECIPIENT-MISMATCH-1").unwrap(),
                 1,
             )
             .with_recipient(Jid::pn("12025550106")),
@@ -5223,7 +5230,7 @@ mod tests {
             chat.clone(),
             Jid::pn_device("12025550109", 7),
             wa::Message::default(),
-            "DIRECT-RECIPIENT-SOURCE-1".to_string(),
+            crate::MessageId::new("DIRECT-RECIPIENT-SOURCE-1").unwrap(),
             1,
         )
         .with_recipient(chat);
@@ -5283,7 +5290,7 @@ mod tests {
                 chat.clone(),
                 requester,
                 message,
-                message_id.to_string(),
+                crate::MessageId::new(message_id).unwrap(),
                 1,
             ))
             .await;
