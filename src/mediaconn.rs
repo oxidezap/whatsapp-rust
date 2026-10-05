@@ -65,7 +65,19 @@ impl MediaConn {
 
 impl Client {
     pub(crate) async fn invalidate_media_conn(&self) {
-        *self.media_conn.write().await = None;
+        let mut cached = self.media_conn.write().await;
+        if cached.take().is_some() {
+            // A CDN auth rejection fences out the query already in flight.
+            // It must neither satisfy the forced retry nor republish the
+            // rejected credentials if that retry is cancelled before starting.
+            self.media_conn_seq.fetch_add(1, Ordering::AcqRel);
+            self.media_conn_flight
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take();
+        }
+        // An empty cache was already invalidated. Further concurrent refusals
+        // share the replacement instead of retiring it once per caller.
     }
 
     /// Claim the in-flight refresh, or become its leader.
@@ -118,9 +130,8 @@ impl Client {
             fetched_at: Instant::now(),
         };
 
-        // Nothing started after this fetch: its answer is still the newest.
-        // Otherwise a newer fetch owns the cache (or will, when it lands)
-        // and this result is only good for its own callers.
+        // No fetch or auth invalidation followed this query: it can publish.
+        // Otherwise its result is only good for its original callers.
         //
         // The check runs under the publication lock, not before it: a fetch
         // that passed the check and then waited on the lock could otherwise
@@ -921,5 +932,71 @@ mod tests {
             client.cached_media_conn().await.unwrap().auth,
             "current-auth"
         );
+    }
+    #[tokio::test]
+    async fn auth_rejection_retires_the_old_flight_and_shares_its_replacement() {
+        let (client, transport) = create_iq_test_client().await;
+        *client.media_conn.write().await = Some(MediaConn {
+            auth: "rejected-auth".into(),
+            ttl: 3600,
+            auth_ttl: None,
+            hosts: vec![MediaConnHost::new("cdn.example.com".into())],
+            fetched_at: Instant::now(),
+        });
+        let mut old = Box::pin(client.refresh_media_conn(true));
+        drive_pending_until(old.as_mut(), || transport.sent().len() == 1).await;
+        // Upload/download 401 recovery invalidates before requesting a forced retry.
+        client.invalidate_media_conn().await;
+        let mut retry = Box::pin(client.refresh_media_conn(true));
+        drive_pending_until(retry.as_mut(), || {
+            let waiters = client
+                .media_conn_flight
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(0, |f| f.waiters.load(Ordering::Acquire));
+            transport.sent().len() + waiters == 2
+        })
+        .await;
+        assert_eq!(
+            transport.sent().len(),
+            2,
+            "a rejection must retire the earlier IQ"
+        );
+        // Another rejection of the already-invalidated cache joins the replacement.
+        client.invalidate_media_conn().await;
+        let mut concurrent = Box::pin(client.refresh_media_conn(true));
+        assert!(futures::poll!(&mut concurrent).is_pending());
+        assert_eq!(transport.sent().len(), 2);
+        answer_frame(&client, &transport, 0, "rejected-auth", 3600).await;
+        assert_eq!(old.await.unwrap().auth, "rejected-auth");
+        assert!(client.cached_media_conn().await.is_none());
+        answer_frame(&client, &transport, 1, "fresh-auth", 3600).await;
+        assert_eq!(retry.await.unwrap().auth, "fresh-auth");
+        assert_eq!(concurrent.await.unwrap().auth, "fresh-auth");
+        assert_eq!(client.cached_media_conn().await.unwrap().auth, "fresh-auth");
+    }
+    #[tokio::test]
+    async fn invalidated_flight_cannot_restore_auth_before_a_replacement_starts() {
+        let (client, transport) = create_iq_test_client().await;
+        *client.media_conn.write().await = Some(MediaConn {
+            auth: "rejected-auth".into(),
+            ttl: 3600,
+            auth_ttl: None,
+            hosts: vec![MediaConnHost::new("cdn.example.com".into())],
+            fetched_at: Instant::now(),
+        });
+        let mut old = Box::pin(client.refresh_media_conn(true));
+        drive_pending_until(old.as_mut(), || transport.sent().len() == 1).await;
+        client.invalidate_media_conn().await;
+        // The operation that observed the auth rejection may be cancelled
+        // before it starts its replacement. The older query must stay fenced.
+        answer_frame(&client, &transport, 0, "rejected-auth", 3600).await;
+        assert_eq!(old.await.unwrap().auth, "rejected-auth");
+        assert!(client.cached_media_conn().await.is_none());
+        let mut next = Box::pin(client.refresh_media_conn(false));
+        drive_pending_until(next.as_mut(), || transport.sent().len() == 2).await;
+        answer_frame(&client, &transport, 1, "fresh-auth", 3600).await;
+        assert_eq!(next.await.unwrap().auth, "fresh-auth");
     }
 }
