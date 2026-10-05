@@ -202,12 +202,12 @@ pub(crate) struct MediaErrorDiagnostic<'a>(pub &'a (dyn std::error::Error + 'sta
 impl std::fmt::Debug for MediaErrorDiagnostic<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use crate::error::ErrorChainExt;
+        use crate::request::IqError;
         let io_kind = ErrorChainExt::sources(self.0)
             .find_map(|e| e.downcast_ref::<std::io::Error>())
             .map(std::io::Error::kind);
         let media_validation =
             ErrorChainExt::sources(self.0).any(|e| e.is::<MediaDecryptionError>());
-        use crate::request::IqError;
         let iq_kind = ErrorChainExt::sources(self.0)
             .find_map(|e| e.downcast_ref::<IqError>())
             .map(|e| match e {
@@ -226,7 +226,10 @@ impl std::fmt::Debug for MediaErrorDiagnostic<'_> {
                 IqError::ParseError(_) => "parse",
             });
         let iq_code = self.0.server_rejection().map(|rejection| rejection.code);
+        let preparation = ErrorChainExt::sources(self.0)
+            .find_map(|e| e.downcast_ref::<wacore::download::DownloadPreparationError>());
         f.debug_struct("MediaFailure")
+            .field("preparation", &preparation)
             .field("iq_kind", &iq_kind)
             .field("iq_code", &iq_code)
             .field("http_status", &self.0.http_status())
@@ -2823,6 +2826,49 @@ mod tests {
 
     // A reference too incomplete to build a URL from never contacts a host, so
     // it must not be reported as though every host had failed.
+    #[tokio::test]
+    async fn preparation_diagnostics_preserve_safe_reasons_without_reference_text() {
+        use wacore::download::DownloadPreparationError;
+        for (path, host, expected) in [
+            (
+                "/file?auth=synthetic-secret",
+                "cdn.example.com",
+                DownloadPreparationError::MissingEncryptedHash,
+            ),
+            (
+                "/file",
+                "cdn.example.com/synthetic-secret",
+                DownloadPreparationError::InvalidRouteHost,
+            ),
+            (
+                "https://other.example/file?auth=synthetic-secret",
+                "cdn.example.com",
+                DownloadPreparationError::OriginChanged,
+            ),
+        ] {
+            let (mut params, _) = encrypted_params(b"not fetched");
+            params.direct_path = path.into();
+            if expected == DownloadPreparationError::MissingEncryptedHash {
+                params.file_enc_sha256 = None;
+            }
+            let http = RoutedHttpClient::new(Vec::new(), (200, Vec::new()));
+            let error = downloader(http.clone(), &[host])
+                .download(&params)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                ErrorChainExt::sources(&error)
+                    .find_map(|e| e.downcast_ref::<DownloadPreparationError>()),
+                Some(&expected)
+            );
+            for rendered in [format!("{error}"), format!("{error:?}")] {
+                assert!(rendered.contains(&format!("{expected:?}")), "{rendered}");
+                assert!(!rendered.contains("synthetic-secret"), "{rendered}");
+            }
+            assert!(http.urls().is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn media_downloader_separates_an_unbuildable_reference_from_a_dead_host() {
         let params = DownloadParams {

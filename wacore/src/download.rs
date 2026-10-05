@@ -22,6 +22,35 @@ const STREAM_CHUNK_SIZE: usize = 8 * 1024;
 /// ciphertext block plus the trailing MAC rather than more ciphertext.
 const WITHHELD: usize = MEDIA_MAC_SIZE + AES_BLOCK_SIZE;
 
+/// A local reason a media reference could not become a download request.
+/// Contains no URL, token or caller-provided text, so diagnostics can retain it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum DownloadPreparationError {
+    #[error("Missing media_key for encrypted media")]
+    MissingMediaKey,
+    #[error("Missing file_sha256 for unencrypted media")]
+    MissingPlaintextHash,
+    #[error("Missing file_enc_sha256")]
+    MissingEncryptedHash,
+    #[error("Missing direct_path")]
+    MissingDirectPath,
+    #[error("Invalid media route host")]
+    InvalidRouteHost,
+    #[error("Invalid media route port")]
+    InvalidRoutePort,
+    #[error("Invalid media direct path")]
+    InvalidDirectPath,
+    #[error("Invalid media direct path port")]
+    InvalidDirectPathPort,
+    #[error("Media direct path changes the route origin")]
+    OriginChanged,
+    #[error("Invalid media query")]
+    InvalidQuery,
+    #[error("Invalid media download URL")]
+    InvalidUrl,
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum MediaDecryptionError {
@@ -544,7 +573,7 @@ impl DownloadUtils {
         let decryption = if is_encrypted {
             let media_key = downloadable
                 .media_key()
-                .ok_or_else(|| anyhow!("Missing media_key for encrypted media"))?
+                .ok_or(DownloadPreparationError::MissingMediaKey)?
                 .to_vec();
             MediaDecryption::Encrypted {
                 media_key,
@@ -553,7 +582,7 @@ impl DownloadUtils {
         } else {
             let file_sha256 = downloadable
                 .file_sha256()
-                .ok_or_else(|| anyhow!("Missing file_sha256 for unencrypted media"))?
+                .ok_or(DownloadPreparationError::MissingPlaintextHash)?
                 .to_vec();
             MediaDecryption::Plaintext { file_sha256 }
         };
@@ -569,30 +598,30 @@ impl DownloadUtils {
 
         let direct_path = downloadable
             .direct_path()
-            .ok_or_else(|| anyhow!("Missing direct_path"))?;
+            .ok_or(DownloadPreparationError::MissingDirectPath)?;
 
         // Encrypted media uses file_enc_sha256 as URL token,
         // unencrypted (newsletter) uses file_sha256 instead.
         let token = if is_encrypted {
             let hash = downloadable
                 .file_enc_sha256()
-                .ok_or_else(|| anyhow!("Missing file_enc_sha256"))?;
+                .ok_or(DownloadPreparationError::MissingEncryptedHash)?;
             BASE64_URL_SAFE_NO_PAD.encode(hash)
         } else {
             let hash = downloadable
                 .file_sha256()
-                .ok_or_else(|| anyhow!("Missing file_sha256 for unencrypted media"))?;
+                .ok_or(DownloadPreparationError::MissingPlaintextHash)?;
             BASE64_URL_SAFE_NO_PAD.encode(hash)
         };
 
-        let candidates = route.hosts.iter().map(|host| {
+        let candidates = route.hosts.iter().map(|host| -> Result<DownloadRequest> {
             use fluent_uri::{Uri, UriRef, component::Host, pct_enc::EStr};
 
             let base = Uri::parse(format!("https://{}/", host.hostname))
-                .map_err(|_| anyhow!("Invalid media route host"))?;
+                .map_err(|_| DownloadPreparationError::InvalidRouteHost)?;
             let base_authority = base
                 .authority()
-                .ok_or_else(|| anyhow!("Invalid media route host"))?;
+                .ok_or(DownloadPreparationError::InvalidRouteHost)?;
             // CDN authorities must be DNS names or IP literals, not arbitrary
             // RFC reg-names that an HTTP backend might interpret differently.
             let valid_host = match base_authority.host_parsed() {
@@ -613,32 +642,32 @@ impl DownloadUtils {
                 || base.fragment().is_some()
                 || base_authority.port().is_some_and(|port| port.is_empty())
             {
-                return Err(anyhow!("Invalid media route host"));
+                return Err(DownloadPreparationError::InvalidRouteHost.into());
             }
             let base_port = base_authority
                 .port_to_u16()
-                .map_err(|_| anyhow!("Invalid media route port"))?
+                .map_err(|_| DownloadPreparationError::InvalidRoutePort)?
                 .unwrap_or(443);
             // Signed CDN references are already URI-encoded. Reject malformed
             // escapes, raw whitespace and backslashes instead of repairing them.
             let url = UriRef::parse(direct_path)
-                .map_err(|_| anyhow!("Invalid media direct path"))?
+                .map_err(|_| DownloadPreparationError::InvalidDirectPath)?
                 .resolve_against(&base)
-                .map_err(|_| anyhow!("Invalid media direct path"))?;
+                .map_err(|_| DownloadPreparationError::InvalidDirectPath)?;
             let authority = url
                 .authority()
-                .ok_or_else(|| anyhow!("Media direct path changes the route origin"))?;
+                .ok_or(DownloadPreparationError::OriginChanged)?;
             if url.scheme() != base.scheme()
                 || !same_media_host(authority.host(), base_authority.host())
                 || authority
                     .port_to_u16()
-                    .map_err(|_| anyhow!("Invalid media direct path port"))?
+                    .map_err(|_| DownloadPreparationError::InvalidDirectPathPort)?
                     .unwrap_or(443)
                     != base_port
                 || authority.userinfo().is_some()
                 || authority.port().is_some_and(|port| port.is_empty())
             {
-                return Err(anyhow!("Media direct path changes the route origin"));
+                return Err(DownloadPreparationError::OriginChanged.into());
             }
             // Preserve the signed query byte-for-byte; only our URL-safe base64
             // token is appended. The URI builder retains the fragment separately.
@@ -652,13 +681,13 @@ impl DownloadUtils {
                 .scheme(url.scheme())
                 .authority(authority)
                 .path(url.path())
-                .query(EStr::new(&query).ok_or_else(|| anyhow!("Invalid media query"))?)
+                .query(EStr::new(&query).ok_or(DownloadPreparationError::InvalidQuery)?)
                 .optional(
                     |builder, fragment| builder.fragment(fragment),
                     url.fragment(),
                 )
                 .build()
-                .map_err(|_| anyhow!("Invalid media download URL"))?;
+                .map_err(|_| DownloadPreparationError::InvalidUrl)?;
             Ok(DownloadRequest {
                 url: url.into_string(),
                 decryption: decryption.clone(),
