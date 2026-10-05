@@ -836,7 +836,7 @@ impl DownloadUtils {
         let expected_mac_full = hmac.finalize().into_bytes();
         let expected_mac = &expected_mac_full[..MEDIA_MAC_SIZE];
         if subtle::ConstantTimeEq::ct_eq(&*mac_bytes, expected_mac).unwrap_u8() == 0 {
-            return Err(anyhow!("MAC mismatch"));
+            return Err(MediaDecryptionError::InvalidMac.into());
         }
         if let Some((hasher, expected)) = encrypted_hasher.zip(expected_enc_sha256)
             && hasher.finalize().as_slice() != expected

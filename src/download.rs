@@ -201,7 +201,28 @@ impl std::fmt::Debug for MediaErrorDiagnostic<'_> {
             .map(std::io::Error::kind);
         let media_validation =
             ErrorChainExt::sources(self.0).any(|e| e.is::<MediaDecryptionError>());
+        use crate::request::IqError;
+        let iq_kind = ErrorChainExt::sources(self.0)
+            .find_map(|e| e.downcast_ref::<IqError>())
+            .map(|e| match e {
+                IqError::Timeout => "timeout",
+                IqError::NotConnected => "not_connected",
+                IqError::Socket(_) => "socket",
+                IqError::EncryptSend(_) => "encrypt_send",
+                IqError::ClientState(_) => "client_state",
+                IqError::Disconnected(_) => "disconnected",
+                IqError::ServerError { .. } => "server_rejection",
+                IqError::UnexpectedResponseType { .. } => "unexpected_response_type",
+                IqError::InternalChannelClosed => "channel_closed",
+                IqError::Unclassified(_) => "unclassified",
+                IqError::DuplicateRequestId(_) => "duplicate_request_id",
+                IqError::EncodeError(_) => "encode",
+                IqError::ParseError(_) => "parse",
+            });
+        let iq_code = self.0.server_rejection().map(|rejection| rejection.code);
         f.debug_struct("MediaFailure")
+            .field("iq_kind", &iq_kind)
+            .field("iq_code", &iq_code)
             .field("http_status", &self.0.http_status())
             .field("io_kind", &io_kind)
             .field("media_validation", &media_validation)
@@ -3268,6 +3289,17 @@ mod tests {
         assert_eq!(rejection.code, 429);
         assert_eq!(rejection.error_type, Some("wait"));
         assert_eq!(rejection.backoff, Some(17));
+        let diagnostic = format!("{error:?}");
+        assert!(diagnostic.contains("server_rejection"), "{diagnostic}");
+        assert!(diagnostic.contains("429"), "{diagnostic}");
+        assert!(!diagnostic.contains("rate limited"), "{diagnostic}");
+        let timeout = ClientDownloadError::MediaSession {
+            force_refresh: false,
+            source: crate::request::IqError::Timeout,
+        };
+        let diagnostic = format!("{timeout:?}");
+        assert!(diagnostic.contains("timeout"), "{diagnostic}");
+        assert!(diagnostic.contains("iq_code: None"), "{diagnostic}");
         let ClientDownloadError::MediaSession {
             source: crate::request::IqError::ServerError { response, .. },
             ..
@@ -3604,19 +3636,17 @@ mod tests {
         }
     }
 
-    fn assert_mac_cause(cause: &anyhow::Error, streaming: bool) {
-        // The existing streaming core returns anyhow!("MAC mismatch"), whereas
-        // buffered verification returns InvalidMac. Check the real root types,
-        // not a typed MAC variant that streaming never supplied.
-        if streaming {
-            assert_eq!(cause.downcast_ref::<&'static str>(), Some(&"MAC mismatch"));
-        } else {
-            assert!(matches!(
-                cause.downcast_ref::<MediaDecryptionError>(),
-                Some(MediaDecryptionError::InvalidMac)
-            ));
-        }
+    fn assert_mac_cause(cause: &anyhow::Error) {
+        assert!(matches!(
+            cause.downcast_ref::<MediaDecryptionError>(),
+            Some(MediaDecryptionError::InvalidMac)
+        ));
         assert_eq!(cause.chain().count(), 1);
+        let diagnostic = format!("{:?}", MediaErrorDiagnostic(cause.as_ref()));
+        assert!(
+            diagnostic.contains("media_validation: true"),
+            "{diagnostic}"
+        );
     }
 
     #[tokio::test]
@@ -3655,7 +3685,7 @@ mod tests {
             let DownloadRequestError::Other(cause) = &error else {
                 panic!("unexpected executor failure {error:?}")
             };
-            assert_mac_cause(cause, streaming);
+            assert_mac_cause(cause);
             let error = discard_failed_write(&runtime, writer, error).await;
             let failure = if cleanup_fails {
                 let DownloadRequestError::Cleanup { failure, cleanup } = error else {
@@ -3671,7 +3701,7 @@ mod tests {
             let DownloadRequestError::Other(cause) = failure else {
                 panic!("cleanup changed the integrity classification: {failure:?}");
             };
-            assert_mac_cause(&cause, streaming);
+            assert_mac_cause(&cause);
         }
         for streaming in [true, false] {
             let sink = SharedWriter::new();
@@ -3714,7 +3744,7 @@ mod tests {
                 let ClientDownloadError::HostsUnreachable(cause) = *failure else {
                     panic!("cleanup replaced the download cause: {failure:?}");
                 };
-                assert_mac_cause(&cause, true);
+                assert_mac_cause(&cause);
                 assert_eq!(cleanup.kind(), std::io::ErrorKind::PermissionDenied);
             } else {
                 let error = downloader(http, &["cdn.example.com"])
@@ -3727,7 +3757,7 @@ mod tests {
                 let MediaDownloadError::HostsUnreachable(cause) = *failure else {
                     panic!("cleanup replaced the download cause: {failure:?}");
                 };
-                assert_mac_cause(&cause, true);
+                assert_mac_cause(&cause);
                 assert_eq!(cleanup.kind(), std::io::ErrorKind::PermissionDenied);
             }
             assert!(
