@@ -110,31 +110,34 @@ impl ExpectedMediaHashes {
 ///
 /// [`Client`] downloads return [`ClientDownloadError`], which also represents
 /// session acquisition/refresh failures. This downloader never asks for a session.
+///
+/// `Display` and `Debug` omit opaque cause text, which may contain signed URLs.
+/// Inspect [`std::error::Error::source`] explicitly to recover the original cause.
 #[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum MediaDownloadError {
     /// The CDN rejected the reference itself (401/403/404/410). The direct path
     /// or its token is expired or revoked; another host cannot serve it either.
-    #[error("the CDN rejected the media reference: {0}")]
+    #[error("the CDN rejected the media reference: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
     ReferenceRejected(#[source] anyhow::Error),
     /// Every host in the route failed for a reason other than the reference:
     /// transport failure, unexpected status, or a body that failed to verify.
-    #[error("every media host failed: {0}")]
+    #[error("every media host failed: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
     HostsUnreachable(#[source] anyhow::Error),
     /// The local destination could not be truncated, written or rewound.
     /// This is terminal: switching CDN hosts cannot repair the sink.
-    #[error("local media writer failed: {0}")]
+    #[error("local media writer failed: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
     WriterIo(#[source] anyhow::Error),
     /// The route named no hosts, so nothing was ever contacted.
     #[error("the media route names no hosts")]
     NoHosts,
     /// No host was contacted and none could be: the reference is too incomplete
     /// to build a URL from, so the fix is the metadata, not the network.
-    #[error("{0}")]
+    #[error("{:?}", MediaErrorDiagnostic(.0.as_ref()))]
     Other(#[from] anyhow::Error),
     /// Cleanup failed; `failure` preserves the original classification and source
     /// chain, while `cleanup` explains why the sink may retain unverified bytes.
-    #[error("{failure}; failed to clear the writer: {cleanup}")]
+    #[error("{failure}; failed to clear the writer: {:?}", .cleanup.kind())]
     WriterCleanup {
         #[source]
         failure: Box<MediaDownloadError>,
@@ -145,34 +148,37 @@ pub enum MediaDownloadError {
 /// Final failure of a [`Client`] download, after any applicable refresh and host
 /// failover. Local sink failures stop immediately. Unlike [`MediaDownloadError`],
 /// this includes the session operation needed to obtain a CDN route.
+///
+/// Like [`MediaDownloadError`], both diagnostic formats redact opaque causes;
+/// the original errors remain accessible through the standard source chain.
 #[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum ClientDownloadError {
     /// The reference is still rejected after any applicable refresh. Static
     /// URLs have no refreshable route, so their first rejection is final.
-    #[error("the CDN rejected the media reference: {0}")]
+    #[error("the CDN rejected the media reference: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
     ReferenceRejected(#[source] anyhow::Error),
     /// Every host failed (transport, status, or integrity); the last cause is
     /// retained, including its HTTP status or decryption error when available.
-    #[error("every media host failed: {0}")]
+    #[error("every media host failed: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
     HostsUnreachable(#[source] anyhow::Error),
     /// The local destination could not be truncated, written or rewound.
     /// No further host or media-session refresh is attempted for this failure.
-    #[error("local media writer failed: {0}")]
+    #[error("local media writer failed: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
     WriterIo(#[source] anyhow::Error),
     /// The obtained route has no hosts. No HTTP request was executed.
     #[error("the media route names no hosts")]
     NoHosts,
     /// A forced refresh after rejection yielded no hosts. The prior rejection
     /// remains the source: unlike `NoHosts`, an HTTP exchange already occurred.
-    #[error("the refreshed media route names no hosts after CDN rejection: {0}")]
+    #[error("the refreshed media route names no hosts after CDN rejection: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
     NoHostsAfterRefresh(#[source] anyhow::Error),
     /// Metadata could not be turned into a request.
-    #[error("could not prepare the media reference: {0}")]
+    #[error("could not prepare the media reference: {:?}", MediaErrorDiagnostic(.0.as_ref()))]
     Preparation(#[source] anyhow::Error),
     /// Failed to obtain a session route, or refresh it after a CDN rejection.
     /// The IQ error retains rejection metadata, timeout and transport causes.
-    #[error("failed to obtain media session (forced refresh: {force_refresh}): {source}")]
+    #[error("failed to obtain media session (forced refresh: {force_refresh}): {:?}", MediaErrorDiagnostic(.source))]
     MediaSession {
         force_refresh: bool,
         #[source]
@@ -181,7 +187,7 @@ pub enum ClientDownloadError {
     /// Failure cleanup was attempted but failed. Follow `failure` (also the
     /// standard source chain) for the download cause, and inspect `cleanup` for
     /// the sink error. The destination must not be treated as verified media.
-    #[error("{failure}; failed to clear the writer: {cleanup}")]
+    #[error("{failure}; failed to clear the writer: {:?}", .cleanup.kind())]
     WriterCleanup {
         #[source]
         failure: Box<ClientDownloadError>,
@@ -1463,7 +1469,11 @@ mod tests {
                 }),
             ];
             for error in errors {
-                for rendered in [format!("{error:?}"), format!("{error:#?}")] {
+                for rendered in [
+                    format!("{error}"),
+                    format!("{error:?}"),
+                    format!("{error:#?}"),
+                ] {
                     assert!(rendered.contains("503"), "{rendered}");
                     assert!(!rendered.contains(TOKEN), "{rendered}");
                     assert!(!rendered.contains(CONTEXT), "{rendered}");
@@ -2835,7 +2845,9 @@ mod tests {
             "a reference that cannot build a URL is not a host failure, got {err:?}"
         );
         assert!(
-            err.to_string().contains("Missing file_enc_sha256"),
+            ErrorChainExt::sources(&err)
+                .skip(1)
+                .any(|cause| cause.to_string().contains("Missing file_enc_sha256")),
             "the cause must survive the classification, got: {err}"
         );
         assert!(http.urls().is_empty());
@@ -3289,10 +3301,11 @@ mod tests {
         assert_eq!(rejection.code, 429);
         assert_eq!(rejection.error_type, Some("wait"));
         assert_eq!(rejection.backoff, Some(17));
-        let diagnostic = format!("{error:?}");
-        assert!(diagnostic.contains("server_rejection"), "{diagnostic}");
-        assert!(diagnostic.contains("429"), "{diagnostic}");
-        assert!(!diagnostic.contains("rate limited"), "{diagnostic}");
+        for diagnostic in [format!("{error}"), format!("{error:?}")] {
+            assert!(diagnostic.contains("server_rejection"), "{diagnostic}");
+            assert!(diagnostic.contains("429"), "{diagnostic}");
+            assert!(!diagnostic.contains("rate limited"), "{diagnostic}");
+        }
         let timeout = ClientDownloadError::MediaSession {
             force_refresh: false,
             source: crate::request::IqError::Timeout,
