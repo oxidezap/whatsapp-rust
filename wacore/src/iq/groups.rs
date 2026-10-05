@@ -1079,7 +1079,6 @@ impl ProtocolNode for GroupMetadataResponse {
     }
 
     fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
-        use wacore_binary::NodeContentRef;
         if node.tag != "group" && node.tag != "community" {
             return Err(anyhow!(
                 "expected <group> or <community>, got <{}>",
@@ -1163,17 +1162,13 @@ impl ProtocolNode for GroupMetadataResponse {
 
         let member_add_mode = node
             .get_optional_child_by_tag(&["member_add_mode"])
-            .and_then(|n| match n.content.as_ref() {
-                Some(NodeContentRef::String(s)) => MemberAddMode::try_from(s.as_ref()).ok(),
-                _ => None,
-            });
+            .and_then(|n| n.content_as_string())
+            .and_then(|s| MemberAddMode::try_from(s.as_str()).ok());
 
         let member_link_mode = node
             .get_optional_child_by_tag(&["member_link_mode"])
-            .and_then(|n| match n.content.as_ref() {
-                Some(NodeContentRef::String(s)) => MemberLinkMode::try_from(s.as_ref()).ok(),
-                _ => None,
-            });
+            .and_then(|n| n.content_as_string())
+            .and_then(|s| MemberLinkMode::try_from(s.as_str()).ok());
 
         let description_node = node.get_optional_child_by_tag(&["description"]);
         let description = description_node
@@ -1220,12 +1215,8 @@ impl ProtocolNode for GroupMetadataResponse {
 
         let member_share_history_mode = node
             .get_optional_child_by_tag(&["member_share_group_history_mode"])
-            .and_then(|n| match n.content.as_ref() {
-                Some(NodeContentRef::String(s)) => {
-                    MemberShareHistoryMode::try_from(s.as_ref()).ok()
-                }
-                _ => None,
-            });
+            .and_then(|n| n.content_as_string())
+            .and_then(|s| MemberShareHistoryMode::try_from(s.as_str()).ok());
 
         let growth_locked = node.get_optional_child_by_tag(&["growth_locked"]).map(|n| {
             let mut attrs = n.attrs();
@@ -6563,6 +6554,37 @@ mod tests {
 
         assert!(!response.is_parent_group);
         assert!(!response.allow_non_admin_sub_group_creation);
+    }
+
+    /// Mode values are not in the token dictionary, so on the wire they
+    /// arrive as raw bytes (BINARY_8), not as `String` content.
+    #[test]
+    fn test_group_info_response_parses_modes_from_bytes_content() {
+        let node = NodeBuilder::new("group")
+            .attr("id", "120363000000000001")
+            .attr("subject", "test")
+            .attr("creation", "1700000000")
+            .children([
+                NodeBuilder::new("member_link_mode")
+                    .bytes(b"admin_link".to_vec())
+                    .build(),
+                NodeBuilder::new("member_add_mode")
+                    .bytes(b"admin_add".to_vec())
+                    .build(),
+                NodeBuilder::new("member_share_group_history_mode")
+                    .bytes(b"all_member_share".to_vec())
+                    .build(),
+            ])
+            .build();
+
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
+
+        assert_eq!(response.member_link_mode, Some(MemberLinkMode::AdminLink));
+        assert_eq!(response.member_add_mode, Some(MemberAddMode::AdminAdd));
+        assert_eq!(
+            response.member_share_history_mode,
+            Some(MemberShareHistoryMode::AllMemberShare)
+        );
     }
 
     /// Mirrors the wire-format shape of a real `<create>` IQ result for a LID
