@@ -95,7 +95,7 @@ pub use labels::Labels;
 
 pub(crate) use media_reupload::MediaReuploadInFlight;
 pub use media_reupload::{
-    MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest,
+    MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadPhase, MediaReuploadRequest,
 };
 
 pub use message_edit::{EncryptedEdit, MessageEditError, SecretEncKind, SecretEncrypted};
