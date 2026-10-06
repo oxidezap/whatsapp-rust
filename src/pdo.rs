@@ -23,9 +23,9 @@ use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
 #[derive(Clone, Debug)]
-pub struct PendingPdoRequest {
-    pub message_info: Arc<MessageInfo>,
-    pub requested_at: wacore::time::Instant,
+pub(crate) struct PendingPdoRequest {
+    pub(crate) message_info: Arc<MessageInfo>,
+    pub(crate) requested_at: wacore::time::Instant,
 }
 
 const PDO_IN_FLIGHT: u8 = 0;
@@ -864,7 +864,7 @@ impl Client {
     /// * `response` - The PDO response message
     /// * `info` - The MessageInfo for the PDO response message itself
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.pdo.handle_response", level = "debug", skip_all, fields(sender = %pdo_msg_info.source.sender.observe())))]
-    pub async fn handle_pdo_response(
+    pub(crate) async fn handle_pdo_response(
         self: &Arc<Self>,
         response: &wa::message::PeerDataOperationRequestResponseMessage,
         pdo_msg_info: &MessageInfo,
