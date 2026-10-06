@@ -262,7 +262,22 @@ pub(crate) use mex_request;
 const NEW_CHAT_THREAD_CAPPING_TYPE: &str = "INDIVIDUAL_NEW_CHAT_THREAD";
 
 /// Where the account stands against the cap.
+/// Unknown wire values are preserved by all capping classifications. Consumers
+/// must allow additional recognized variants in future releases.
+///
+/// ```
+/// use whatsapp_rust::{CappingStatus, CappingOteStatus, CappingMvStatus};
+/// let status = CappingStatus::from("FUTURE_CAP");
+/// match &status {
+///     CappingStatus::Other(value) => assert_eq!(value, "FUTURE_CAP"),
+///     _ => panic!("unexpected classification"),
+/// }
+/// assert_eq!(status.as_str(), "FUTURE_CAP");
+/// assert_eq!(CappingOteStatus::from("FUTURE_OTE").as_str(), "FUTURE_OTE");
+/// assert_eq!(CappingMvStatus::from("FUTURE_MV").as_str(), "FUTURE_MV");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
+#[non_exhaustive]
 pub enum CappingStatus {
     #[wire = "NONE"]
     None,
@@ -278,6 +293,7 @@ pub enum CappingStatus {
 
 /// Eligibility for the one-time extension that lifts the cap for a cycle.
 #[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
+#[non_exhaustive]
 pub enum CappingOteStatus {
     #[wire = "NOT_ELIGIBLE"]
     NotEligible,
@@ -293,6 +309,7 @@ pub enum CappingOteStatus {
 
 /// Meta Verified subscription state, which is what lifts the cap permanently.
 #[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
+#[non_exhaustive]
 pub enum CappingMvStatus {
     #[wire = "NOT_ELIGIBLE"]
     NotEligible,
@@ -983,13 +1000,25 @@ mod tests {
     #[test]
     fn new_chat_capping_keeps_unknown_status_values() {
         let capping = decode_new_chat_message_capping(Some(json!({
-            "xwa2_message_capping_info": { "capping_status": "THIRD_WARNING" }
+            "xwa2_message_capping_info": {
+                "capping_status": "THIRD_WARNING",
+                "ote_status": "FUTURE_OTE",
+                "mv_status": "FUTURE_MV"
+            }
         })))
         .expect("capping payload");
 
         assert_eq!(
             capping.capping_status,
             Some(CappingStatus::Other("THIRD_WARNING".to_string()))
+        );
+        assert_eq!(
+            capping.ote_status,
+            Some(CappingOteStatus::Other("FUTURE_OTE".to_string()))
+        );
+        assert_eq!(
+            capping.mv_status,
+            Some(CappingMvStatus::Other("FUTURE_MV".to_string()))
         );
     }
 
