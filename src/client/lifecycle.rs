@@ -898,7 +898,12 @@ impl Client {
                 let pause_generation = self.pause_generation.load(Ordering::SeqCst);
                 let delay = admission.delay();
                 if !self
-                    .wait_for_connect_admission(delay, pause_generation, &shutdown)
+                    .wait_for_connect_admission(
+                        admission.as_ref(),
+                        delay,
+                        pause_generation,
+                        &shutdown,
+                    )
                     .await
                 {
                     if self.is_paused()
@@ -1147,7 +1152,8 @@ impl Client {
     /// ordinary teardown wake. The generation catches a rapid pause/resume.
     async fn wait_for_connect_admission(
         &self,
-        delay: Duration,
+        admission: &dyn crate::ConnectAdmission,
+        mut delay: Duration,
         pause_generation: u64,
         shutdown: &wacore::runtime::ShutdownSignal,
     ) -> bool {
@@ -1157,23 +1163,32 @@ impl Client {
                 && !self.is_paused()
                 && self.pause_generation.load(Ordering::SeqCst) == pause_generation
         };
-        if delay.is_zero() {
-            return can_dial();
-        }
-        let sleep = self.runtime.sleep(delay).fuse();
-        let stopped = wacore::runtime::wait_for_shutdown(shutdown).fuse();
-        futures::pin_mut!(sleep, stopped);
         loop {
-            // Register before checking: pause/resume and supervision-stop
-            // notifications must not be lost between the check and select.
-            let changed = self.session_state_notifier.listen();
+            if !delay.is_zero() {
+                let sleep = self.runtime.sleep(delay).fuse();
+                let stopped = wacore::runtime::wait_for_shutdown(shutdown).fuse();
+                futures::pin_mut!(sleep, stopped);
+                loop {
+                    // Register before checking; unrelated wakes retain this timer.
+                    let changed = self.session_state_notifier.listen();
+                    if !can_dial() {
+                        return false;
+                    }
+                    futures::select! {
+                        _ = sleep => break,
+                        _ = stopped => return false,
+                        _ = changed.fuse() => {}
+                    }
+                }
+            }
             if !can_dial() {
                 return false;
             }
-            futures::select! {
-                _ = sleep => return can_dial(),
-                _ = stopped => return false,
-                _ = changed.fuse() => {}
+            // Keep the reservation and pause generation across extensions.
+            // Calling delay() again would book another slot in host budgets.
+            delay = admission.recheck();
+            if delay.is_zero() {
+                return can_dial();
             }
         }
     }

@@ -2,11 +2,13 @@ use std::time::Duration;
 
 /// Optional host-owned pacing of [`Client::run`](crate::Client::run) dials.
 ///
-/// The run loop consults this policy once before starting each connect attempt,
+/// The run loop calls [`delay`](Self::delay) once before each connect attempt,
 /// including the first and forced reconnects, after its ordinary reconnect
 /// backoff and pause gate. It serves the returned delay **before** calling
 /// [`Client::connect`](crate::Client::connect), outside the transport/version
-/// connect timeouts. Zero proceeds without sleeping or consulting again.
+/// connect timeouts. It then calls [`recheck`](Self::recheck), including when
+/// the initial delay is zero, so a host can extend a wait after learning of a
+/// shared cooldown. Existing policies need only implement `delay`.
 /// Direct calls to `connect()` do not consult this policy.
 ///
 /// Shutdown or a pause (even one already resumed) abandons the wait without a
@@ -17,7 +19,7 @@ use std::time::Duration;
 /// cancellation/refund callback; hosts must account for abandoned reservations.
 /// The SDK still owns WhatsApp's backoff, stable reset, and rate-limit penalties.
 ///
-/// This synchronous callback runs inline. It must return promptly without I/O,
+/// These synchronous callbacks run inline. They must return promptly without I/O,
 /// blocking, or awaiting. Shutdown cannot interrupt a blocking callback; panics
 /// propagate to the caller driving the run loop, with no recovery guarantee.
 /// Share a policy across builders to coordinate a host-wide budget; no limiter
@@ -50,4 +52,19 @@ use std::time::Duration;
 pub trait ConnectAdmission: wacore::sync_marker::MaybeSendSync {
     /// Reserve a run-loop attempt and return how long to delay it.
     fn delay(&self) -> Duration;
+
+    /// Recheck an existing reservation before dialing, without reserving again.
+    ///
+    /// Called after the initial delay, even if zero, and after every positive
+    /// extension returned here. Return zero to proceed, or a positive duration
+    /// to wait before checking again. The default preserves one-shot policies.
+    /// Extensions remain outside connect timeouts and are cancelled by shutdown,
+    /// supervision stop, or pause just like the initial wait. Resume reserves a
+    /// new attempt through `delay`.
+    ///
+    /// This is a synchronous snapshot, not atomic exclusion with the dial:
+    /// a host update after the final zero cannot revoke that permission.
+    fn recheck(&self) -> Duration {
+        Duration::ZERO
+    }
 }

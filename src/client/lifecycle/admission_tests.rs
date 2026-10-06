@@ -10,6 +10,10 @@ impl ConnectAdmission for Wait {
 }
 
 async fn client() -> Arc<Client> {
+    client_with_policy(Wait).await
+}
+
+async fn client_with_policy(policy: impl ConnectAdmission + 'static) -> Arc<Client> {
     Client::builder()
         .with_runtime(crate::runtime_impl::TokioRuntime)
         .with_persistence_manager(Arc::new(
@@ -19,11 +23,59 @@ async fn client() -> Arc<Client> {
         ))
         .with_http_client(crate::test_utils::MockHttpClient)
         .with_transport_factory(crate::transport::mock::MockTransportFactory::new())
-        .with_connect_admission(Wait)
+        .with_connect_admission(policy)
         .build()
         .await
         .unwrap()
         .into_client()
+}
+
+struct Extend(Arc<std::sync::atomic::AtomicUsize>);
+impl ConnectAdmission for Extend {
+    fn delay(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn recheck(&self) -> Duration {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Duration::from_secs(900)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_extension_retains_timer_on_unrelated_wakes_and_cancels_on_stop() {
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let client = client_with_policy(Extend(checks.clone())).await;
+    client.auto_reconnect_errors.store(5, Ordering::Relaxed);
+    client
+        .backoff_reset_suppressed
+        .store(true, Ordering::Relaxed);
+    let runner = client.clone();
+    let run = tokio::spawn(async move { runner.run().await });
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+    for _ in 0..2 {
+        tokio::time::advance(Duration::from_secs(300)).await;
+        client.notify_connection_shutdown();
+        client.notify_session_state();
+        tokio::task::yield_now().await;
+        crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        assert!(!client.is_connecting.load(Ordering::Relaxed));
+        assert_eq!(client.stats().reconnects, 0);
+        assert_eq!(client.stats().reconnect_errors, 5);
+        assert!(client.backoff_reset_suppressed.load(Ordering::Relaxed));
+    }
+    tokio::time::advance(Duration::from_secs(300)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        checks.load(Ordering::SeqCst),
+        2,
+        "wakes must not restart the timer"
+    );
+    client.stop_supervision_loop();
+    assert!(matches!(run.await.unwrap(), RunCompletionReason::Stopped));
+    assert_eq!(client.stats().reconnects, 0);
+    assert_eq!(client.stats().reconnect_errors, 5);
+    client.shutdown().await;
 }
 
 #[tokio::test]

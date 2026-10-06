@@ -17,6 +17,21 @@ impl ConnectAdmission for Policy {
     }
 }
 
+pub struct RecheckingPolicy(pub Policy);
+impl ConnectAdmission for RecheckingPolicy {
+    fn delay(&self) -> Duration {
+        self.0.delay()
+    }
+    fn recheck(&self) -> Duration {
+        // Reading the same host state remains valid with wasm's local Rc.
+        #[cfg(target_arch = "wasm32")]
+        let calls = self.0.0.get();
+        #[cfg(not(target_arch = "wasm32"))]
+        let calls = self.0.0.load(std::sync::atomic::Ordering::Relaxed);
+        Duration::from_millis(calls as u64)
+    }
+}
+
 pub fn builder(policy: Arc<dyn ConnectAdmission>) -> whatsapp_rust::ClientBuilder {
     Client::builder().with_connect_admission_arc(policy)
 }
@@ -40,5 +55,17 @@ fn shared_policy_is_object_safe() {
     let policy = Policy(std::sync::atomic::AtomicUsize::new(0));
     let boxed: Box<dyn ConnectAdmission> = Box::new(policy);
     assert_eq!(boxed.delay(), Duration::ZERO);
+    assert_eq!(boxed.recheck(), Duration::ZERO);
     let _ = builder(Arc::from(boxed));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn rechecking_policy_is_object_safe() {
+    let policy = Policy(std::sync::atomic::AtomicUsize::new(0));
+    let shared: Arc<dyn ConnectAdmission> = Arc::new(RecheckingPolicy(policy));
+    assert_eq!(shared.delay(), Duration::ZERO);
+    assert_eq!(shared.recheck(), Duration::from_millis(1));
+    assert_eq!(shared.recheck(), Duration::from_millis(1));
+    let _ = builder(shared);
 }

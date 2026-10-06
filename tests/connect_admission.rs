@@ -72,6 +72,13 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(delays: Option<Vec<Duration>>, fallback: Duration) -> Self {
+        Self::with_policy(delays, fallback, None).await
+    }
+    async fn with_policy(
+        delays: Option<Vec<Duration>>,
+        fallback: Duration,
+        policy: Option<Arc<dyn ConnectAdmission>>,
+    ) -> Self {
         let decisions = Arc::new(AtomicUsize::new(0));
         let dials = Arc::new(AtomicUsize::new(0));
         let order = Arc::new(Mutex::new(Vec::new()));
@@ -94,7 +101,9 @@ impl Fixture {
                 entered: enter_tx,
                 release: release_rx,
             });
-        if let Some(delays) = delays {
+        if let Some(policy) = policy {
+            builder = builder.with_connect_admission_arc(policy);
+        } else if let Some(delays) = delays {
             // The Arc setter also proves a shared trait object works publicly.
             builder = builder.with_connect_admission_arc(Arc::new(Policy {
                 calls: decisions.clone(),
@@ -146,6 +155,229 @@ async fn scheduled() {
     // merely because the observer is waiting for a factory call that is forbidden.
     for _ in 0..10 {
         tokio::task::yield_now().await;
+    }
+}
+
+struct CooldownPolicy {
+    initial_delay: Duration,
+    deadline: Mutex<tokio::time::Instant>,
+    reservations: AtomicUsize,
+    rechecks: AtomicUsize,
+}
+impl CooldownPolicy {
+    fn new(initial_delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            initial_delay,
+            deadline: Mutex::new(tokio::time::Instant::now()),
+            reservations: AtomicUsize::new(0),
+            rechecks: AtomicUsize::new(0),
+        })
+    }
+    fn hold_for(&self, duration: Duration) {
+        *self.deadline.lock().unwrap() = tokio::time::Instant::now() + duration;
+    }
+}
+impl ConnectAdmission for CooldownPolicy {
+    fn delay(&self) -> Duration {
+        self.reservations.fetch_add(1, Ordering::SeqCst);
+        self.initial_delay
+    }
+    fn recheck(&self) -> Duration {
+        self.rechecks.fetch_add(1, Ordering::SeqCst);
+        self.deadline
+            .lock()
+            .unwrap()
+            .saturating_duration_since(tokio::time::Instant::now())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn connect_admission_rechecks_cooldown_without_reserving_again() {
+    let policy = CooldownPolicy::new(Duration::from_secs(10));
+    let f = Fixture::with_policy(None, Duration::ZERO, Some(policy.clone())).await;
+    let run = f.run();
+    scheduled().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    policy.hold_for(Duration::from_secs(25)); // A push-back moves admission to t=30.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    scheduled().await;
+    f.no_attempt();
+    assert_eq!(policy.rechecks.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_secs(19)).await;
+    scheduled().await;
+    f.no_attempt();
+    policy.hold_for(Duration::from_secs(11)); // Another push-back moves it to t=40.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    scheduled().await;
+    f.no_attempt();
+    assert_eq!(policy.rechecks.load(Ordering::SeqCst), 2);
+    tokio::time::advance(Duration::from_secs(9)).await;
+    scheduled().await;
+    f.no_attempt();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    scheduled().await;
+    assert_eq!(f.dials.load(Ordering::SeqCst), 1);
+    assert_eq!(policy.reservations.load(Ordering::SeqCst), 1);
+    assert_eq!(policy.rechecks.load(Ordering::SeqCst), 3);
+    f.stop(run).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn connect_admission_zero_reservation_rechecks_and_keeps_full_transport_budget() {
+    let policy = CooldownPolicy::new(Duration::ZERO);
+    policy.hold_for(Duration::from_secs(60));
+    let f = Fixture::with_policy(None, Duration::ZERO, Some(policy.clone())).await;
+    f.client.set_auto_reconnect(false);
+    let run = f.run();
+    scheduled().await;
+    f.no_attempt();
+    tokio::time::advance(Duration::from_secs(59)).await;
+    scheduled().await;
+    f.no_attempt();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    scheduled().await;
+    assert_eq!(f.dials.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_secs(19)).await;
+    scheduled().await;
+    assert!(!run.is_finished());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(
+        matches!(run.await.unwrap(), RunCompletionReason::AutoReconnectDisabled {
+        connect_error: Some(ConnectError::Timeout { stage: whatsapp_rust::ConnectStage::Transport, timeout }), ..
+    } if timeout == Duration::from_secs(20))
+    );
+    assert_eq!(policy.reservations.load(Ordering::SeqCst), 1);
+    assert_eq!(policy.rechecks.load(Ordering::SeqCst), 2);
+    f.client.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn connect_admission_shutdown_cancels_cooldown_extension() {
+    let policy = CooldownPolicy::new(Duration::from_secs(10));
+    policy.hold_for(Duration::from_secs(900));
+    let f = Fixture::with_policy(None, Duration::ZERO, Some(policy.clone())).await;
+    let run = f.run();
+    scheduled().await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    scheduled().await;
+    assert_eq!(policy.rechecks.load(Ordering::SeqCst), 1);
+    f.stop(run).await;
+    f.no_attempt();
+    assert_eq!(policy.reservations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn connect_admission_pause_resume_abandons_cooldown_extension() {
+    for rapid in [false, true] {
+        let policy = CooldownPolicy::new(Duration::from_secs(10));
+        policy.hold_for(Duration::from_secs(900));
+        let f = Fixture::with_policy(None, Duration::ZERO, Some(policy.clone())).await;
+        let run = f.run();
+        scheduled().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        scheduled().await;
+        assert_eq!(policy.rechecks.load(Ordering::SeqCst), 1);
+        f.client.pause().await;
+        if !rapid {
+            scheduled().await;
+            tokio::time::advance(Duration::from_secs(1000)).await;
+            scheduled().await;
+            f.no_attempt();
+            assert_eq!(policy.reservations.load(Ordering::SeqCst), 1);
+        }
+        policy.hold_for(Duration::ZERO);
+        f.client.resume();
+        scheduled().await;
+        f.no_attempt();
+        assert_eq!(policy.reservations.load(Ordering::SeqCst), 2);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        scheduled().await;
+        assert_eq!(f.dials.load(Ordering::SeqCst), 1);
+        assert_eq!(f.client.stats().reconnects, 0);
+        f.release.send(()).await.unwrap();
+        scheduled().await;
+        assert_eq!(f.client.stats().reconnect_errors, 1);
+        f.stop(run).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn connect_admission_legacy_constant_delay_still_dials_once() {
+    let f = Fixture::new(Some(vec![]), Duration::from_millis(50)).await;
+    let run = f.run();
+    f.admitted.recv().await.unwrap();
+    tokio::time::advance(Duration::from_millis(50)).await;
+    scheduled().await;
+    assert_eq!(f.dials.load(Ordering::SeqCst), 1);
+    assert_eq!(f.decisions.load(Ordering::SeqCst), 1);
+    f.stop(run).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn connect_admission_rechecks_normal_and_forced_reconnects() {
+    for forced in [false, true] {
+        let policy = CooldownPolicy::new(Duration::ZERO);
+        let f = Fixture::with_policy(None, Duration::ZERO, Some(policy.clone())).await;
+        let run = f.run();
+        f.entered.recv().await.unwrap();
+        policy.hold_for(Duration::from_secs(60));
+        if forced {
+            f.client.reconnect_immediately().await;
+        }
+        f.release.send(()).await.unwrap();
+        scheduled().await;
+        tokio::time::advance(Duration::from_millis(1101)).await;
+        scheduled().await;
+        assert_eq!(policy.reservations.load(Ordering::SeqCst), 2);
+        assert_eq!(policy.rechecks.load(Ordering::SeqCst), 2);
+        assert_eq!(f.dials.load(Ordering::SeqCst), 1);
+        assert_eq!(f.client.stats().reconnects, 0);
+        assert_eq!(f.client.stats().reconnect_errors, u32::from(!forced));
+        tokio::time::advance(Duration::from_millis(58899)).await;
+        scheduled().await;
+        assert_eq!(f.dials.load(Ordering::SeqCst), 2);
+        assert_eq!(f.client.stats().reconnects, 1);
+        assert_eq!(policy.reservations.load(Ordering::SeqCst), 2);
+        f.stop(run).await;
+    }
+}
+
+struct StopOnRecheck {
+    client: Mutex<std::sync::Weak<Client>>,
+    extension: Duration,
+}
+impl ConnectAdmission for StopOnRecheck {
+    fn delay(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn recheck(&self) -> Duration {
+        self.client
+            .lock()
+            .unwrap()
+            .upgrade()
+            .unwrap()
+            .signal_shutdown_sync();
+        self.extension
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn connect_admission_checks_shutdown_after_inline_recheck() {
+    for extension in [Duration::ZERO, Duration::from_secs(900)] {
+        let policy = Arc::new(StopOnRecheck {
+            client: Mutex::new(std::sync::Weak::new()),
+            extension,
+        });
+        let f = Fixture::with_policy(None, Duration::ZERO, Some(policy.clone())).await;
+        *policy.client.lock().unwrap() = Arc::downgrade(&f.client);
+        let run = f.run();
+        scheduled().await;
+        assert!(run.is_finished());
+        assert!(matches!(
+            run.await.unwrap(),
+            RunCompletionReason::ShutdownRequested
+        ));
+        f.no_attempt();
     }
 }
 
