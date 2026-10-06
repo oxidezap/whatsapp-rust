@@ -18,6 +18,20 @@ const HEADER: &str = "\
 /// The fixed part of the model: the index-part union and the schema record.
 const INDEX_PART_AND_SCHEMA: &str = "\
 /// One component of a mutation index key.
+///
+/// Consumers must allow new index-part variants.
+///
+/// ```compile_fail,E0004
+/// use wacore_appstate::schemas::IndexPart;
+/// fn exhaustive(part: IndexPart) {
+///     match part {
+///         IndexPart::Literal { .. } | IndexPart::Jid { .. }
+///         | IndexPart::BoolString { .. } | IndexPart::JidOrZero { .. }
+///         | IndexPart::Enum { .. } | IndexPart::StringPart { .. }
+///         | IndexPart::Unknown { .. } => (),
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum IndexPart {
@@ -41,6 +55,13 @@ pub enum IndexPart {
 }
 
 /// A syncd action schema.
+///
+/// Use [`Schema::new`] or copy a registry entry, leaving room for new metadata.
+///
+/// ```compile_fail,E0639
+/// use wacore_appstate::schemas::{Schema, ALL};
+/// let schema = Schema { ..ALL[0] };
+/// ```
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct Schema {
@@ -309,8 +330,17 @@ fn render_enum<'a>(
         .collect();
 
     let mut s = format!(
-        "{doc}\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n#[non_exhaustive]\npub enum {name} {{\n"
+        "{doc}\n///\n/// Consumers must allow new catalog variants.\n///\n\
+         /// ```compile_fail,E0004\n/// use wacore_appstate::schemas::{name};\n\
+         /// fn exhaustive(value: {name}) {{\n///     match value {{\n"
     );
+    for (_, variant) in &variants {
+        s.push_str(&format!("///         {name}::{variant} => (),\n"));
+    }
+    s.push_str(&format!(
+        "///     }}\n/// }}\n/// ```\n\
+         #[derive(Debug, Clone, Copy, PartialEq, Eq)]\n#[non_exhaustive]\npub enum {name} {{\n"
+    ));
     for (_, variant) in &variants {
         s.push_str(&format!("    {variant},\n"));
     }

@@ -6,6 +6,21 @@
 #![allow(clippy::all)]
 
 /// A syncd collection (mutation bucket / priority).
+///
+/// Consumers must allow new catalog variants.
+///
+/// ```compile_fail,E0004
+/// use wacore_appstate::schemas::Collection;
+/// fn exhaustive(value: Collection) {
+///     match value {
+///         Collection::Regular => (),
+///         Collection::RegularLow => (),
+///         Collection::RegularHigh => (),
+///         Collection::CriticalBlock => (),
+///         Collection::CriticalUnblockLow => (),
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Collection {
@@ -29,6 +44,21 @@ impl Collection {
 }
 
 /// The index scope an action applies to.
+///
+/// Consumers must allow new catalog variants.
+///
+/// ```compile_fail,E0004
+/// use wacore_appstate::schemas::Scope;
+/// fn exhaustive(value: Scope) {
+///     match value {
+///         Scope::Account => (),
+///         Scope::Chat => (),
+///         Scope::ChatMessageRange => (),
+///         Scope::ChatOrContact => (),
+///         Scope::Message => (),
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Scope {
@@ -52,6 +82,20 @@ impl Scope {
 }
 
 /// One component of a mutation index key.
+///
+/// Consumers must allow new index-part variants.
+///
+/// ```compile_fail,E0004
+/// use wacore_appstate::schemas::IndexPart;
+/// fn exhaustive(part: IndexPart) {
+///     match part {
+///         IndexPart::Literal { .. } | IndexPart::Jid { .. }
+///         | IndexPart::BoolString { .. } | IndexPart::JidOrZero { .. }
+///         | IndexPart::Enum { .. } | IndexPart::StringPart { .. }
+///         | IndexPart::Unknown { .. } => (),
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum IndexPart {
@@ -75,6 +119,13 @@ pub enum IndexPart {
 }
 
 /// A syncd action schema.
+///
+/// Use [`Schema::new`] or copy a registry entry, leaving room for new metadata.
+///
+/// ```compile_fail,E0639
+/// use wacore_appstate::schemas::{Schema, ALL};
+/// let schema = Schema { ..ALL[0] };
+/// ```
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct Schema {
