@@ -41,7 +41,7 @@ jobs:
       - name: Install wasm-bindgen test runner
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20
         with:
-          tool: wasm-bindgen-cli@0.2.127
+          tool: wasm-bindgen-cli@0.2.129
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
@@ -66,7 +66,7 @@ jobs:
           cargo build -p whatsapp-rust --lib --release
           --target wasm32-unknown-unknown
           --no-default-features
-      - name: Check isolated standalone API profiles for wasm32
+      - name: Build and execute isolated API consumers for wasm32
         env:
           CARGO_BUILD_JOBS: "1"
         run: cargo xt ci consumers run --lane wasm --toolchain nightly-2026-06-16
@@ -83,26 +83,6 @@ jobs:
           cargo build -p whatsapp-rust-sqlite-storage --lib --release
           --target wasm32-unknown-unknown
           --no-default-features --features wacore/js
-      - name: Run durability probe ID regression on wasm32
-        env:
-          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
-          CARGO_TARGET_DIR: target
-          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
-        run: >
-          cargo test --locked --manifest-path tools/durability-wasm-harness/Cargo.toml
-          --target wasm32-unknown-unknown --test probe -- --nocapture
-      - name: Run sqlite retry timer test on wasm32
-        env:
-          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
-          CARGO_TARGET_DIR: target
-        run: |
-          wasm_test_json="$RUNNER_TEMP/sqlite-wasm-retry-test.json"
-          cargo test --manifest-path tools/sqlite-wasm-retry-harness/Cargo.toml \
-            --target wasm32-unknown-unknown --test timer --no-run --message-format=json \
-            > "$wasm_test_json"
-          wasm_test_path="$(jq -r 'select(.profile.test == true and (.executable // null) != null) | .executable' "$wasm_test_json" | tail -n 1)"
-          test -n "$wasm_test_path"
-          wasm-bindgen-test-runner "$wasm_test_path" --nocapture
       # r2d2's pool and tokio's `spawn_blocking` both panic on a page, and both
       # compile there, so nothing but this check keeps them from creeping back into
       # the store once the shim exists.

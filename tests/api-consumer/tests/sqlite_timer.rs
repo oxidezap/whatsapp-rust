@@ -22,10 +22,14 @@ async fn retry_backoff_installs_and_cancels_the_real_timer() {
     let clear_fn: js_sys::Function = original_clear.clone().dyn_into().expect("clear fn");
     let global_for_set = global.clone();
     let set_count = set_calls.clone();
-    let set_hook = Closure::wrap(Box::new(move |handler: JsValue, timeout: JsValue| -> JsValue {
-        set_count.set(set_count.get() + 1);
-        set_fn.call2(&global_for_set, &handler, &timeout).expect("set")
-    }) as Box<dyn FnMut(JsValue, JsValue) -> JsValue>);
+    let set_hook = Closure::wrap(
+        Box::new(move |handler: JsValue, timeout: JsValue| -> JsValue {
+            set_count.set(set_count.get() + 1);
+            set_fn
+                .call2(&global_for_set, &handler, &timeout)
+                .expect("set")
+        }) as Box<dyn FnMut(JsValue, JsValue) -> JsValue>,
+    );
     let global_for_clear = global.clone();
     let clear_count = clear_calls.clone();
     let clear_hook = Closure::wrap(Box::new(move |handle: JsValue| {

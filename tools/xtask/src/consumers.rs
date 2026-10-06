@@ -77,6 +77,10 @@ struct Invocation {
     #[serde(default)]
     bin: Option<String>,
     #[serde(default)]
+    test: Option<String>,
+    #[serde(default)]
+    wasm_test: bool,
+    #[serde(default)]
     lib: bool,
     /// A directed negative binary must fail for this diagnostic, not a missing dependency.
     #[serde(default)]
@@ -254,13 +258,25 @@ fn validate(root: &Path, consumers: &[Consumer]) -> Result<()> {
             }
             ensure!(
                 !invocation.lanes.contains(&Lane::Wasm)
-                    || matches!(invocation.mode, Mode::Check | Mode::Build),
-                "{}: WASM modes must be check/build, not unconfigured cross-target execution",
+                    || matches!(invocation.mode, Mode::Check | Mode::Build)
+                    || invocation.wasm_test,
+                "{}: WASM execution requires an explicit test runner",
                 consumer.manifest
             );
             ensure!(
-                !invocation.lib || invocation.bin.is_none(),
-                "{}: select lib or bin, not both",
+                !invocation.wasm_test
+                    || (invocation.lanes == [Lane::Wasm]
+                        && invocation.mode == Mode::Test
+                        && invocation.test.is_some()),
+                "{}: configured WASM execution must select a named test on the WASM lane only",
+                consumer.manifest
+            );
+            ensure!(
+                usize::from(invocation.lib)
+                    + usize::from(invocation.bin.is_some())
+                    + usize::from(invocation.test.is_some())
+                    <= 1,
+                "{}: select one lib, bin or test target",
                 consumer.manifest
             );
             ensure!(
@@ -337,6 +353,9 @@ impl Invocation {
         if let Some(bin) = &self.bin {
             args.extend(["--bin".into(), bin.clone()]);
         }
+        if let Some(test) = &self.test {
+            args.extend(["--test".into(), test.clone()]);
+        }
         if self.lib {
             args.push("--lib".into());
         }
@@ -345,6 +364,73 @@ impl Invocation {
         }
         args
     }
+}
+
+fn verify_wasm_runner(version: &str, output: &str) -> Result<()> {
+    ensure!(
+        output.split_whitespace().last() == Some(version),
+        "wasm-bindgen-test-runner must match the consumer's wasm-bindgen {version}, got {output:?}"
+    );
+    Ok(())
+}
+
+fn wasm_sdk_source(
+    root: &Path,
+    consumer: &Consumer,
+    invocation: &Invocation,
+    toolchain: Option<&str>,
+) -> Result<std::path::PathBuf> {
+    let mut metadata = Command::new("cargo");
+    if let Some(toolchain) = toolchain {
+        metadata.arg(format!("+{toolchain}"));
+    }
+    metadata
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--filter-platform",
+            "wasm32-unknown-unknown",
+            "--manifest-path",
+            &consumer.manifest,
+            "--features",
+            &invocation.features.join(","),
+        ])
+        .current_dir(root);
+    if consumer.locked {
+        metadata.arg("--locked");
+    }
+    if invocation.no_default_features {
+        metadata.arg("--no-default-features");
+    }
+    let resolved: serde_json::Value =
+        serde_json::from_slice(&xtask_support::capture(&mut metadata)?.stdout)?;
+    let packages = resolved["packages"]
+        .as_array()
+        .context("consumer packages")?;
+    let package = |name: &str| {
+        packages
+            .iter()
+            .find(|p| p["name"] == name)
+            .with_context(|| format!("WASM execution requires {name} in the consumer graph"))
+    };
+    let version = package("wasm-bindgen")?["version"]
+        .as_str()
+        .context("wasm-bindgen version")?;
+    let runner = xtask_support::capture(Command::new("wasm-bindgen-test-runner").arg("--version"))?;
+    verify_wasm_runner(version, std::str::from_utf8(&runner.stdout)?)?;
+    // Resolve from the consumer graph so package qualification includes the
+    // distributed source, never a copied implementation or checkout fallback.
+    let manifest = package("whatsapp-rust")?["manifest_path"]
+        .as_str()
+        .context("SDK manifest")?;
+    let source = Path::new(manifest).parent().context("SDK directory")?;
+    ensure!(
+        source.join("src/client/durability_probe_id.rs").is_file(),
+        "SDK probe source is missing"
+    );
+    println!("WASM SDK source: {}", source.display());
+    Ok(source.to_owned())
 }
 
 pub fn run(root: &Path, task: Task) -> Result<u8> {
@@ -414,6 +500,17 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
                         ""
                     },
                 );
+            if invocation.wasm_test {
+                command
+                    .env(
+                        "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER",
+                        "wasm-bindgen-test-runner",
+                    )
+                    .env(
+                        "WHATSAPP_SDK_SOURCE_ROOT",
+                        wasm_sdk_source(root, consumer, invocation, toolchain.as_deref())?,
+                    );
+            }
             let code = if let Some(expected) = &invocation.expect_failure {
                 // Structured diagnostics tie the code and API fragments to one
                 // primary error, independent of ANSI or unrelated stderr text.
@@ -630,6 +727,27 @@ mod tests {
         assert!(validate(root.path(), &consumers).is_err());
         consumers[0].commands[0].lanes = vec![Lane::Native];
         consumers[0].locked = true;
+        assert!(validate(root.path(), &consumers).is_err());
+    }
+
+    #[test]
+    fn wasm_execution_requires_a_named_target_and_matching_runner() {
+        let (root, mut consumers) = fixture();
+        consumers[0].commands.push(
+            serde_json::from_str(
+                r#"{"lanes":["wasm"],"mode":"test","test":"timer","wasm_test":true}"#,
+            )
+            .unwrap(),
+        );
+        validate(root.path(), &consumers).unwrap();
+        verify_wasm_runner("0.2.129", "wasm-bindgen-test-runner 0.2.129\n").unwrap();
+        assert!(verify_wasm_runner("0.2.129", "wasm-bindgen-test-runner 0.2.127").is_err());
+        let test = consumers[0].commands.last_mut().unwrap();
+        test.test = None;
+        assert!(validate(root.path(), &consumers).is_err());
+        let test = consumers[0].commands.last_mut().unwrap();
+        test.test = Some("timer".into());
+        test.lanes.push(Lane::Native);
         assert!(validate(root.path(), &consumers).is_err());
     }
 }

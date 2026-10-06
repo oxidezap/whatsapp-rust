@@ -88,6 +88,11 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-semver-checks
+      - name: Install WASM consumer test runner
+        if: matrix.lane == 'wasm'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.129
       - name: Cache Rust build (registry + target)
         uses: Swatinem/rust-cache@v2
         with:

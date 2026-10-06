@@ -25,6 +25,7 @@ voip-mlow = ["voip-control", "whatsapp-rust/voip-mlow"]
 requests = ["sdk"]
 js = ["wacore/js"]
 sqlite = ["sdk", "whatsapp-rust/sqlite-storage", "dep:whatsapp-rust-sqlite-storage", "dep:tokio"]
+wasm-execution = ["sqlite", "js", "whatsapp-rust-sqlite-storage/test-util", "dep:getrandom", "dep:rand", "dep:portable-atomic", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-test"]
 
 removed-video-state = ["voip-control"]
 
@@ -75,6 +76,22 @@ whatsapp-rust-sqlite-storage = { path = "../../storages/sqlite-storage", default
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 whatsapp-rust-sqlite-storage = { path = "../../storages/sqlite-storage", default-features = false, features = ["wasm-test"], optional = true }
+getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
+rand = { version = "0.10", optional = true }
+portable-atomic = { version = "1", default-features = false, features = ["fallback"], optional = true }
+js-sys = { version = "=0.3.106", optional = true }
+wasm-bindgen = { version = "=0.2.129", optional = true }
+wasm-bindgen-test = { version = "=0.3.79", optional = true }
+
+[[test]]
+name = "durability_probe"
+path = "tests/durability_probe.rs"
+required-features = ["wasm-execution"]
+
+[[test]]
+name = "sqlite_timer"
+path = "tests/sqlite_timer.rs"
+required-features = ["wasm-execution"]
 
 [[bin]]
 name = "encapsulation_probe"
