@@ -364,7 +364,6 @@ mod tests {
     use super::*;
     use crate::features::chat_actions::capture_app_state_mutation as capture;
     use std::sync::{Arc, Mutex};
-    use wacore::appstate::patch_decode::WAPatchName;
     use wacore::appstate::schemas_unlisted::LABEL_MESSAGE;
     use wacore::types::events::{CoreEventBus, EventHandler, EventInterest};
 
@@ -574,12 +573,11 @@ mod tests {
     #[tokio::test]
     async fn message_label_index_and_value_match_the_wire() {
         let chat: Jid = "12025550111@s.whatsapp.net".parse().expect("test JID");
-        let collection =
-            crate::features::chat_actions::collection_patch_name(LABEL_MESSAGE.collection);
-        assert_eq!(collection, WAPatchName::Regular);
+        let collection = LABEL_MESSAGE.collection.as_str();
+        assert_eq!(collection, "regular");
         assert_eq!(LABEL_MESSAGE.version, 3);
 
-        let added = capture(collection.as_str(), {
+        let added = capture(collection, {
             let chat = chat.clone();
             move |client| async move {
                 client
@@ -611,7 +609,7 @@ mod tests {
             "the association rides on SyncActionValue.labelAssociationAction"
         );
 
-        let removed = capture(collection.as_str(), {
+        let removed = capture(collection, {
             let chat = chat.clone();
             move |client| async move {
                 client
@@ -640,18 +638,15 @@ mod tests {
     #[tokio::test]
     async fn message_label_round_trips_through_the_inbound_dispatch() {
         let chat: Jid = "12025550111@s.whatsapp.net".parse().expect("test JID");
-        let mutation = capture(
-            crate::features::chat_actions::collection_patch_name(LABEL_MESSAGE.collection).as_str(),
-            {
-                let chat = chat.clone();
-                move |client| async move {
-                    client
-                        .labels()
-                        .add_message_label("5", &chat, &crate::MessageId::new("3EB0MSGID").unwrap())
-                        .await
-                }
-            },
-        )
+        let mutation = capture(LABEL_MESSAGE.collection.as_str(), {
+            let chat = chat.clone();
+            move |client| async move {
+                client
+                    .labels()
+                    .add_message_label("5", &chat, &crate::MessageId::new("3EB0MSGID").unwrap())
+                    .await
+            }
+        })
         .await;
 
         let (outcome, events) = run(&mutation);

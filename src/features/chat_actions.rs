@@ -11,7 +11,6 @@ use crate::client::{AppStateDispatchOutcome, fingerprint_id, redact_jid};
 use anyhow::Result;
 use log::debug;
 use thiserror::Error;
-use wacore::appstate::patch_decode::WAPatchName;
 use wacore::appstate::schemas::{self, IndexPart, Schema};
 use wacore::types::events::{
     ArchiveUpdate, ClearChatUpdate, ContactRemoved, ContactUpdate, DeleteChatUpdate,
@@ -487,19 +486,6 @@ pub(crate) fn build_action_index(schema: &Schema, args: &[&str]) -> Result<Vec<u
     Ok(serde_json::to_vec(&parts)?)
 }
 
-/// Map a generated `Collection` to our `WAPatchName` (total — every generated
-/// collection has a `WAPatchName` counterpart).
-pub(crate) fn collection_patch_name(c: schemas::Collection) -> WAPatchName {
-    use schemas::Collection;
-    match c {
-        Collection::Regular => WAPatchName::Regular,
-        Collection::RegularLow => WAPatchName::RegularLow,
-        Collection::RegularHigh => WAPatchName::RegularHigh,
-        Collection::CriticalBlock => WAPatchName::CriticalBlock,
-        Collection::CriticalUnblockLow => WAPatchName::CriticalUnblockLow,
-    }
-}
-
 /// Access via `client.chat_actions()`.
 pub struct ChatActions<'a> {
     client: &'a Client,
@@ -919,7 +905,7 @@ impl Client {
     /// chat-action and label features.
     pub(crate) async fn send_app_state_mutation(
         &self,
-        collection: WAPatchName,
+        collection: &str,
         index: &[u8],
         value: &wa::SyncActionValue,
         version: i32,
@@ -947,7 +933,7 @@ impl Client {
 
         let (mutation, _) = encode_record(operation, index, value, &keys, &key_id, &iv, version);
 
-        self.send_app_state_patch(collection.as_str(), vec![mutation])
+        self.send_app_state_patch(collection, vec![mutation])
             .await?;
         Ok(())
     }
@@ -1033,7 +1019,7 @@ impl Client {
         operation: wa::syncd_mutation::SyncdOperation,
     ) -> Result<(), AppStateError> {
         let index = build_action_index(schema, index_args)?;
-        let collection = collection_patch_name(schema.collection);
+        let collection = schema.collection.as_str();
         self.send_app_state_mutation(collection, &index, value, schema.version as i32, operation)
             .await
     }
@@ -1289,22 +1275,6 @@ mod registry_tests {
     }
 
     #[test]
-    fn collection_mapping() {
-        use schemas::Collection;
-        // Every generated collection has a WAPatchName counterpart (total map).
-        for c in [
-            Collection::Regular,
-            Collection::RegularLow,
-            Collection::RegularHigh,
-            Collection::CriticalBlock,
-            Collection::CriticalUnblockLow,
-        ] {
-            // Round-trips through the wire name.
-            assert_eq!(collection_patch_name(c).as_str(), c.as_str());
-        }
-    }
-
-    #[test]
     fn contact_action_index_and_collection() {
         // WAWebContactSync writes ["contact", jid] to critical_unblock_low.
         let index = build_action_index(&schemas::CONTACT, &["5511999@s.whatsapp.net"]).unwrap();
@@ -1313,10 +1283,7 @@ mod registry_tests {
             parts,
             vec!["contact".to_string(), "5511999@s.whatsapp.net".to_string()]
         );
-        assert_eq!(
-            collection_patch_name(schemas::CONTACT.collection),
-            WAPatchName::CriticalUnblockLow
-        );
+        assert_eq!(schemas::CONTACT.collection.as_str(), "critical_unblock_low");
     }
 
     #[tokio::test]
@@ -1442,9 +1409,9 @@ mod registry_tests {
     #[tokio::test]
     async fn remove_contact_sends_a_remove_and_save_contact_a_set() {
         let jid: Jid = "12025550111@s.whatsapp.net".parse().expect("test JID");
-        let collection = collection_patch_name(schemas::CONTACT.collection);
+        let collection = schemas::CONTACT.collection.as_str();
 
-        let removed = capture_app_state_mutation(collection.as_str(), {
+        let removed = capture_app_state_mutation(collection, {
             let jid = jid.clone();
             move |client| async move { client.chat_actions().remove_contact(&jid).await }
         })
@@ -1456,7 +1423,7 @@ mod registry_tests {
         );
         assert_eq!(removed.index, vec!["contact", "12025550111@s.whatsapp.net"]);
 
-        let saved = capture_app_state_mutation(collection.as_str(), {
+        let saved = capture_app_state_mutation(collection, {
             let jid = jid.clone();
             move |client| async move {
                 client
@@ -1488,13 +1455,10 @@ mod registry_tests {
     #[tokio::test]
     async fn contact_removal_round_trips_to_an_event() {
         let jid: Jid = "12025550111@s.whatsapp.net".parse().expect("test JID");
-        let mutation = capture_app_state_mutation(
-            collection_patch_name(schemas::CONTACT.collection).as_str(),
-            {
-                let jid = jid.clone();
-                move |client| async move { client.chat_actions().remove_contact(&jid).await }
-            },
-        )
+        let mutation = capture_app_state_mutation(schemas::CONTACT.collection.as_str(), {
+            let jid = jid.clone();
+            move |client| async move { client.chat_actions().remove_contact(&jid).await }
+        })
         .await;
 
         let sent_at = mutation
@@ -1627,13 +1591,10 @@ mod registry_tests {
     #[tokio::test]
     async fn lock_chat_round_trips_to_an_event() {
         let jid: Jid = "12025550111@s.whatsapp.net".parse().expect("test JID");
-        let mutation = capture_app_state_mutation(
-            collection_patch_name(schemas::LOCK_CHAT.collection).as_str(),
-            {
-                let jid = jid.clone();
-                move |client| async move { client.chat_actions().lock_chat(&jid).await }
-            },
-        )
+        let mutation = capture_app_state_mutation(schemas::LOCK_CHAT.collection.as_str(), {
+            let jid = jid.clone();
+            move |client| async move { client.chat_actions().lock_chat(&jid).await }
+        })
         .await;
 
         let parts = &mutation.index;

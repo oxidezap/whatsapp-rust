@@ -198,11 +198,9 @@ mod tests {
     /// `WAWebDisableLinkPreviewsSync.getMutation`.
     #[tokio::test]
     async fn link_preview_setting_matches_wa_webs_builder_on_the_wire() {
-        let collection = crate::features::chat_actions::collection_patch_name(
-            schemas::DISABLE_LINK_PREVIEWS.collection,
-        );
+        let collection = schemas::DISABLE_LINK_PREVIEWS.collection.as_str();
         for disabled in [true, false] {
-            let mutation = capture(collection.as_str(), move |client| async move {
+            let mutation = capture(collection, move |client| async move {
                 client
                     .app_state_settings()
                     .set_link_previews_disabled(disabled)

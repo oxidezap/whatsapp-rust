@@ -263,10 +263,9 @@ mod tests {
     /// wire, against `WAWebQuickRepliesSync`'s two builders.
     #[tokio::test]
     async fn quick_reply_verbs_match_wa_webs_builders_on_the_wire() {
-        let collection =
-            crate::features::chat_actions::collection_patch_name(schemas::QUICK_REPLY.collection);
+        let collection = schemas::QUICK_REPLY.collection.as_str();
 
-        let set = capture(collection.as_str(), |client| async move {
+        let set = capture(collection, |client| async move {
             client
                 .quick_replies()
                 .set_quick_reply(
@@ -292,7 +291,7 @@ mod tests {
         assert_eq!(act.count, Some(3));
         assert_eq!(act.deleted, Some(false));
 
-        let deleted = capture(collection.as_str(), |client| async move {
+        let deleted = capture(collection, |client| async move {
             client
                 .quick_replies()
                 .delete_quick_reply("1700000000")
@@ -321,8 +320,7 @@ mod tests {
     #[tokio::test]
     async fn quick_reply_round_trips_through_the_inbound_dispatch() {
         let mutation = capture(
-            crate::features::chat_actions::collection_patch_name(schemas::QUICK_REPLY.collection)
-                .as_str(),
+            schemas::QUICK_REPLY.collection.as_str(),
             |client| async move {
                 client
                     .quick_replies()

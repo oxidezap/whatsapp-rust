@@ -19,6 +19,7 @@ const HEADER: &str = "\
 const INDEX_PART_AND_SCHEMA: &str = "\
 /// One component of a mutation index key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IndexPart {
     /// Fixed wire name at position 0.
     Literal { value: &'static str },
@@ -41,6 +42,7 @@ pub enum IndexPart {
 
 /// A syncd action schema.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct Schema {
     /// Registry key (e.g. \"Agent\").
     pub key: &'static str,
@@ -60,6 +62,48 @@ pub struct Schema {
     /// Index position holding the chat JID, if any.
     pub chat_jid_index: Option<i64>,
     pub index_parts: &'static [IndexPart],
+}
+
+impl Schema {
+    /// Construct a schema with no optional metadata.
+    ///
+    /// Public fields remain readable and writable for host-defined actions.
+    ///
+    /// ```
+    /// use wacore_appstate::schemas::{Collection, IndexPart, Schema, Scope};
+    /// const CUSTOM: Schema = Schema::new(
+    ///     \"Custom\", \"custom\", \"Host\", Collection::Regular, 1, Scope::Account,
+    ///     &[IndexPart::Literal { value: \"custom\" }],
+    /// );
+    /// let mut action = CUSTOM;
+    /// action.value_field = Some(\"customAction\");
+    /// let Schema { name, value_field, .. } = action;
+    /// assert_eq!(name, \"custom\");
+    /// assert_eq!(value_field, Some(\"customAction\"));
+    /// ```
+    pub const fn new(
+        key: &'static str,
+        name: &'static str,
+        module: &'static str,
+        collection: Collection,
+        version: u32,
+        scope: Scope,
+        index_parts: &'static [IndexPart],
+    ) -> Self {
+        Self {
+            key,
+            name,
+            module,
+            collection,
+            version,
+            scope,
+            value_field: None,
+            value_proto_type: None,
+            value_enum_fields: &[],
+            chat_jid_index: None,
+            index_parts,
+        }
+    }
 }
 
 ";
@@ -264,8 +308,9 @@ fn render_enum<'a>(
         .map(|v| (v, unique_type_ident(&pascal_case(v), &mut used, "V")))
         .collect();
 
-    let mut s =
-        format!("{doc}\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum {name} {{\n");
+    let mut s = format!(
+        "{doc}\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n#[non_exhaustive]\npub enum {name} {{\n"
+    );
     for (_, variant) in &variants {
         s.push_str(&format!("    {variant},\n"));
     }
