@@ -37,6 +37,15 @@ use wacore_binary::{Node, NodeContent, NodeRef};
 ///     _ => panic!("unexpected classification"),
 /// }
 /// ```
+/// An exhaustive downstream match would prevent recognizing new host types:
+/// ```compile_fail
+/// use wacore::iq::mediaconn::HostType;
+/// fn exhaustive(host: HostType) {
+///     match host {
+///         HostType::Primary | HostType::Fallback | HostType::Other(_) => {}
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
 #[non_exhaustive]
 pub enum HostType {
