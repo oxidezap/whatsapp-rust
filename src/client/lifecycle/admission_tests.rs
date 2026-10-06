@@ -30,7 +30,7 @@ async fn client_with_policy(policy: impl ConnectAdmission + 'static) -> Arc<Clie
         .into_client()
 }
 
-struct Extend(Arc<std::sync::atomic::AtomicUsize>);
+struct Extend(Arc<AtomicUsize>);
 impl ConnectAdmission for Extend {
     fn delay(&self) -> Duration {
         Duration::ZERO
@@ -43,7 +43,7 @@ impl ConnectAdmission for Extend {
 
 #[tokio::test(start_paused = true)]
 async fn admission_extension_retains_timer_on_unrelated_wakes_and_cancels_on_stop() {
-    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let checks = Arc::new(AtomicUsize::new(0));
     let client = client_with_policy(Extend(checks.clone())).await;
     client.auto_reconnect_errors.store(5, Ordering::Relaxed);
     client
