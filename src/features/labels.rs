@@ -41,12 +41,12 @@ pub(crate) fn dispatch_label_mutation_outcome(
         return AppStateDispatchOutcome::Unclaimed;
     }
 
-    let ts = m
-        .action_value
-        .as_ref()
-        .and_then(|v| v.timestamp)
-        .unwrap_or(0);
-    let time = wacore::time::from_millis_or_now(ts);
+    let ts = m.action_value.as_ref().and_then(|v| v.timestamp);
+    let action_timestamp = ts.and_then(wacore::time::from_millis);
+    // Preserve the legacy epoch fallback for absence and local dispatch time
+    // for an unrepresentable value. Only `action_timestamp` preserves absence;
+    // its presence does not distinguish replayed mutations from live changes.
+    let time = wacore::time::from_millis_or_now(ts.unwrap_or(0));
 
     let Some(label_id) = m.index.get(1).cloned() else {
         log::warn!("Skipping label mutation '{kind}': missing label id in index");
@@ -62,6 +62,7 @@ pub(crate) fn dispatch_label_mutation_outcome(
                     LabelEditUpdate::builder()
                         .label_id(label_id)
                         .timestamp(time)
+                        .maybe_action_timestamp(action_timestamp)
                         .action(Box::new(act))
                         .from_full_sync(event_full_sync)
                         .build(),
@@ -91,6 +92,7 @@ pub(crate) fn dispatch_label_mutation_outcome(
                         .chat_jid(chat_jid)
                         .message_id(message_id)
                         .timestamp(time)
+                        .maybe_action_timestamp(action_timestamp)
                         .action(Box::new(act))
                         .from_full_sync(event_full_sync)
                         .build(),
@@ -112,6 +114,7 @@ pub(crate) fn dispatch_label_mutation_outcome(
                         .label_id(label_id)
                         .chat_jid(chat_jid)
                         .timestamp(time)
+                        .maybe_action_timestamp(action_timestamp)
                         .action(Box::new(act))
                         .from_full_sync(event_full_sync)
                         .build(),
@@ -393,6 +396,74 @@ mod tests {
         let outcome = dispatch_label_mutation_outcome(&bus, &mut m.clone(), false);
         let events = rec.events.lock().unwrap().clone();
         (outcome, events)
+    }
+
+    #[test]
+    fn label_timestamps_preserve_presence_and_legacy_fallbacks() {
+        let epoch = wacore::time::from_millis(0).unwrap();
+        let valid = wacore::time::from_millis(1_700_000_000_123).unwrap();
+        for (raw, expected) in [
+            (None, None),
+            (Some(0), Some(epoch)),
+            (Some(1_700_000_000_123), Some(valid)),
+            (Some(i64::MIN), None),
+            (Some(i64::MAX), None),
+        ] {
+            for from_full_sync in [false, true] {
+                for kind in ["label_edit", "label_jid", "label_message"] {
+                    let mut mutation = set_mutation(
+                        vec![kind, "5", "12025550111@s.whatsapp.net", "MSGID", "0", "0"],
+                        wa::SyncActionValue::default(),
+                    );
+                    let value = mutation.action_value.as_mut().unwrap();
+                    value.timestamp = raw;
+                    value.label_edit_action = buffa::MessageField::some(Default::default());
+                    value.label_association_action = buffa::MessageField::some(Default::default());
+                    let bus = CoreEventBus::new();
+                    let rec = Arc::new(Recorder::default());
+                    bus.subscribe_handler(rec.clone()).detach();
+                    let before = wacore::time::now_utc();
+                    let outcome =
+                        dispatch_label_mutation_outcome(&bus, &mut mutation, from_full_sync);
+                    let after = wacore::time::now_utc();
+                    let events = rec.events.lock().unwrap();
+                    assert_eq!(events.len(), 1, "{kind} {raw:?}");
+                    let (name, timestamp, full_sync, json) = match &*events[0] {
+                        Event::LabelEditUpdate(u) => (
+                            "LabelEditUpdate",
+                            u.timestamp,
+                            u.from_full_sync,
+                            serde_json::to_value(u).unwrap(),
+                        ),
+                        Event::LabelAssociationUpdate(u) => (
+                            "LabelAssociationUpdate",
+                            u.timestamp,
+                            u.from_full_sync,
+                            serde_json::to_value(u).unwrap(),
+                        ),
+                        Event::MessageLabelAssociationUpdate(u) => (
+                            "MessageLabelAssociationUpdate",
+                            u.timestamp,
+                            u.from_full_sync,
+                            serde_json::to_value(u).unwrap(),
+                        ),
+                        other => panic!("unexpected event: {other:?}"),
+                    };
+                    assert_eq!(outcome, AppStateDispatchOutcome::Event(name));
+                    assert_eq!(full_sync, from_full_sync);
+                    assert_eq!(
+                        json.get("action_timestamp"),
+                        Some(&serde_json::to_value(expected).unwrap()),
+                        "{kind} {raw:?}"
+                    );
+                    match raw {
+                        None | Some(0) => assert_eq!(timestamp, epoch),
+                        Some(1_700_000_000_123) => assert_eq!(timestamp, valid),
+                        _ => assert!(timestamp >= before && timestamp <= after),
+                    }
+                }
+            }
+        }
     }
 
     #[test]
