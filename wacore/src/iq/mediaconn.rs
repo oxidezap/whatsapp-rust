@@ -25,7 +25,20 @@ use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Server};
 use wacore_binary::{Node, NodeContent, NodeRef};
 
+/// Media host classification. Unrecognized wire values remain available in
+/// [`HostType::Other`]; future releases may recognize additional classifications.
+///
+/// ```
+/// use wacore::iq::mediaconn::HostType;
+/// let host_type = HostType::from("future-host");
+/// assert_eq!(host_type.as_str(), "future-host");
+/// match host_type {
+///     HostType::Other(value) => assert_eq!(value, "future-host"),
+///     _ => panic!("unexpected classification"),
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
+#[non_exhaustive]
 pub enum HostType {
     #[wire = "primary"]
     #[wire_default]
