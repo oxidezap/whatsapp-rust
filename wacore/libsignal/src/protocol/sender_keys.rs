@@ -609,21 +609,32 @@ impl SenderKeyState {
                     MessageField::some(key)
                 });
         // Index once: a full skipped-key backlog must not make storage quadratic.
-        // Keep the first occurrence, matching the decoder's existing selection.
+        // Each occurrence owns its future fields, even when iteration and seed
+        // are identical. Consume matching occurrences in their original order.
         let mut original = std::collections::BTreeMap::new();
-        for key in std::mem::take(&mut state.sender_message_keys) {
-            original
-                .entry((key.iteration.unwrap_or_default(), key.seed.clone()))
-                .or_insert(key);
+        for (index, key) in std::mem::take(&mut state.sender_message_keys)
+            .into_iter()
+            .enumerate()
+        {
+            original.insert(
+                (key.iteration.unwrap_or_default(), key.seed.clone(), index),
+                key,
+            );
         }
         state.sender_message_keys = self
             .message_keys
             .iter()
             .map(|key| {
                 let seed = bytes::Bytes::copy_from_slice(&key.seed);
-                let mut stored = original
-                    .get(&(key.iteration, Some(seed.clone())))
-                    .cloned()
+                let first = original
+                    .range(
+                        (key.iteration, Some(seed.clone()), 0)
+                            ..=(key.iteration, Some(seed.clone()), usize::MAX),
+                    )
+                    .next()
+                    .map(|(identity, _)| identity.clone());
+                let mut stored = first
+                    .and_then(|identity| original.remove(&identity))
                     .unwrap_or_default();
                 stored.iteration = Some(key.iteration);
                 stored.seed = Some(seed);
@@ -746,17 +757,36 @@ impl SenderKeyState {
         let len = keys.len();
         if len > consts::MAX_MESSAGE_KEYS + consts::MESSAGE_KEY_PRUNE_THRESHOLD {
             let excess = len - consts::MAX_MESSAGE_KEYS;
-            keys.drain(..excess);
             if let Some(future) = self.future.as_mut() {
+                // Count expired occurrences once. A set of survivors cannot
+                // distinguish identical keys carrying different future data.
+                let mut expired = std::collections::BTreeMap::new();
+                for key in &keys[..excess] {
+                    *expired.entry((key.iteration, key.seed)).or_insert(0usize) += 1;
+                }
                 std::sync::Arc::make_mut(future)
                     .sender_message_keys
                     .retain(|old| {
-                        keys.iter().any(|key| {
-                            old.iteration.unwrap_or_default() == key.iteration
-                                && old.seed.as_deref() == Some(key.seed.as_slice())
-                        })
+                        let Some(seed) = old
+                            .seed
+                            .as_deref()
+                            .and_then(|seed| <[u8; 32]>::try_from(seed).ok())
+                        else {
+                            return true;
+                        };
+                        let Some(count) =
+                            expired.get_mut(&(old.iteration.unwrap_or_default(), seed))
+                        else {
+                            return true;
+                        };
+                        if *count == 0 {
+                            return true;
+                        }
+                        *count -= 1;
+                        false
                     });
             }
+            keys.drain(..excess);
         }
     }
 
@@ -769,12 +799,13 @@ impl SenderKeyState {
             .position(|x| x.iteration == iteration)?;
         let smk = std::sync::Arc::make_mut(&mut self.message_keys).remove(index);
         if let Some(future) = self.future.as_mut() {
-            std::sync::Arc::make_mut(future)
-                .sender_message_keys
-                .retain(|old| {
-                    old.iteration.unwrap_or_default() != smk.iteration
-                        || old.seed.as_deref() != Some(smk.seed.as_slice())
-                });
+            let future = std::sync::Arc::make_mut(future);
+            if let Some(index) = future.sender_message_keys.iter().position(|old| {
+                old.iteration.unwrap_or_default() == smk.iteration
+                    && old.seed.as_deref() == Some(smk.seed.as_slice())
+            }) {
+                future.sender_message_keys.remove(index);
+            }
         }
         Some(SenderMessageKey::new(smk.iteration, smk.seed))
     }
@@ -2213,6 +2244,105 @@ mod tests {
         assert_eq!(
             loaded.serialize().expect("fixture encode"),
             pb.encode_to_vec()
+        );
+    }
+
+    #[test]
+    fn duplicate_skipped_keys_keep_each_occurrences_future_fields() {
+        let mut record = record_with_state(42, 0x55);
+        let state = record.sender_key_state_mut().expect("fixture state");
+        state.add_skipped_message_key(7, [0x66; 32]);
+        state.add_skipped_message_key(7, [0x66; 32]);
+        let mut expected = record.as_protobuf();
+        for (index, key) in expected.sender_key_states[0]
+            .sender_message_keys
+            .iter_mut()
+            .enumerate()
+        {
+            key.__buffa_unknown_fields.push(buffa::UnknownField {
+                number: 200,
+                data: buffa::UnknownFieldData::Varint(index as u64 + 1),
+            });
+        }
+        let original = expected.encode_to_vec();
+        let mut loaded = SenderKeyRecord::deserialize(&original).expect("fixture decode");
+        let untouched = loaded.clone();
+        assert_eq!(loaded.serialize().expect("fixture encode"), original);
+
+        loaded
+            .sender_key_state_mut()
+            .expect("fixture state")
+            .remove_sender_message_key(7)
+            .expect("first occurrence");
+        expected.sender_key_states[0].sender_message_keys.remove(0);
+        assert_eq!(
+            loaded.serialize().expect("fixture encode"),
+            expected.encode_to_vec()
+        );
+
+        loaded
+            .sender_key_state_mut()
+            .expect("fixture state")
+            .add_skipped_message_key(7, [0x66; 32]);
+        let mut fresh = expected.sender_key_states[0].sender_message_keys[0].clone();
+        fresh.__buffa_unknown_fields.clear();
+        expected.sender_key_states[0]
+            .sender_message_keys
+            .push(fresh);
+        loaded
+            .sender_key_state_mut()
+            .expect("fixture state")
+            .remove_sender_message_key(7)
+            .expect("second occurrence");
+        expected.sender_key_states[0].sender_message_keys.remove(0);
+        assert_eq!(
+            loaded.serialize().expect("fixture encode"),
+            expected.encode_to_vec()
+        );
+        assert_eq!(untouched.serialize().expect("fixture encode"), original);
+    }
+
+    #[test]
+    fn pruning_duplicate_skipped_keys_expires_only_prefix_occurrences() {
+        let mut record = record_with_state(42, 0x55);
+        let count = consts::MAX_MESSAGE_KEYS + consts::MESSAGE_KEY_PRUNE_THRESHOLD;
+        let state = record.sender_key_state_mut().expect("fixture state");
+        for index in 0..count {
+            state.add_skipped_message_key(index as u32, [0x66; 32]);
+        }
+        let mut expected = record.as_protobuf();
+        let keys = &mut expected.sender_key_states[0].sender_message_keys;
+        keys[100].iteration = keys[0].iteration;
+        for (index, value) in [(0, 11), (100, 22)] {
+            keys[index]
+                .__buffa_unknown_fields
+                .push(buffa::UnknownField {
+                    number: 200,
+                    data: buffa::UnknownFieldData::Varint(value),
+                });
+        }
+        let mut fresh = keys[1].clone();
+        fresh.iteration = Some(count as u32);
+        let mut loaded =
+            SenderKeyRecord::deserialize(&expected.encode_to_vec()).expect("fixture decode");
+        loaded
+            .sender_key_state_mut()
+            .expect("fixture state")
+            .add_skipped_message_key(count as u32, [0x66; 32]);
+        let keys = &mut expected.sender_key_states[0].sender_message_keys;
+        keys.push(fresh);
+        keys.drain(..keys.len() - consts::MAX_MESSAGE_KEYS);
+        assert_eq!(
+            loaded.serialize().expect("fixture encode"),
+            expected.encode_to_vec()
+        );
+        assert_eq!(
+            loaded
+                .sender_key_state()
+                .expect("fixture state")
+                .message_keys
+                .len(),
+            consts::MAX_MESSAGE_KEYS
         );
     }
 
