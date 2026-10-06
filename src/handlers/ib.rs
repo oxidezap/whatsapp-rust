@@ -292,7 +292,24 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                 // Present in some sessions; safe to ignore for now until feature implemented.
                 debug!("Received thread metadata, ignoring for now.");
             }
-            InfoBulletinType::Tos | InfoBulletinType::RecoveryNonce | InfoBulletinType::Unknown => {
+            InfoBulletinType::Tos => {
+                // WAWebTos.maybeUpdateServer can synchronize locally accepted
+                // notices through a separate IQ. We do not model that state;
+                // keep the missing behavior visible without inventing acceptance.
+                warn!(
+                    "Known ib child <tos>: local terms-of-service acceptance synchronization is not implemented"
+                );
+            }
+            InfoBulletinType::RecoveryNonce => {
+                // WA Web 2.3000.1047483476 resolves a pending CTWA nonce waiter
+                // for use_case=547 and warns on unsolicited/unsupported pushes.
+                // This workflow is not implemented here. Neither bulletin needs
+                // an ACK, and the recovery code must never enter this diagnostic.
+                warn!(
+                    "Known ib child <recovery_nonce>: CTWA access-token nonce recovery is not implemented"
+                );
+            }
+            InfoBulletinType::Unknown => {
                 warn!("Unhandled ib child: <{}>", child.tag);
             }
         }
@@ -412,6 +429,73 @@ mod tests {
 
     fn ib_with(child: wacore_binary::Node) -> wacore_binary::Node {
         NodeBuilder::new("ib").children([child]).build()
+    }
+
+    #[tokio::test]
+    async fn known_unsupported_bulletins_are_not_reported_as_unknown() {
+        if crate::test_utils::log_capture::delegated_to_child(
+            "handlers::ib::tests::known_unsupported_bulletins_are_not_reported_as_unknown",
+        ) {
+            return;
+        }
+        let logs = crate::test_utils::log_capture::session();
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        let _subscription = client.subscribe_handler(collector.clone());
+        let snapshot = client.persistence_manager.get_device_snapshot();
+
+        // Fictional values deliberately appear in attributes and content, so
+        // dumping a bulletin in either a log or an event fails this test.
+        for child in [
+            NodeBuilder::new("recovery_nonce")
+                .attr("code", "synthetic-secret-code")
+                .attr("use_case", "547")
+                .bytes(b"synthetic-secret-body".to_vec())
+                .build(),
+            NodeBuilder::new("recovery_nonce")
+                .attr("code", "synthetic-other-secret")
+                .attr("use_case", "999")
+                .build(),
+            NodeBuilder::new("recovery_nonce").build(),
+            NodeBuilder::new("tos")
+                .children([NodeBuilder::new("notice")
+                    .attr("id", "synthetic-notice")
+                    .build()])
+                .build(),
+            NodeBuilder::new("tos").build(),
+            NodeBuilder::new("sonar")
+                .attr("code", "synthetic-unknown-secret")
+                .build(),
+            NodeBuilder::new("unknown").build(),
+        ] {
+            let node = crate::test_utils::node_to_owned_ref(&ib_with(child));
+            let mut cancelled = false;
+            assert!(IbHandler.handle(client.clone(), node, &mut cancelled).await);
+            assert!(!cancelled);
+        }
+
+        let records = logs.records_for("whatsapp_rust::handlers::ib");
+        assert_eq!(records, vec![
+            (log::Level::Warn, "Known ib child <recovery_nonce>: CTWA access-token nonce recovery is not implemented".into()),
+            (log::Level::Warn, "Known ib child <recovery_nonce>: CTWA access-token nonce recovery is not implemented".into()),
+            (log::Level::Warn, "Known ib child <recovery_nonce>: CTWA access-token nonce recovery is not implemented".into()),
+            (log::Level::Warn, "Known ib child <tos>: local terms-of-service acceptance synchronization is not implemented".into()),
+            (log::Level::Warn, "Known ib child <tos>: local terms-of-service acceptance synchronization is not implemented".into()),
+            (log::Level::Warn, "Unhandled ib child: <sonar>".into()),
+            (log::Level::Warn, "Unhandled ib child: <unknown>".into()),
+        ]);
+        assert!(
+            collector.events().is_empty(),
+            "no public nonce or acceptance event"
+        );
+        assert!(
+            transport.sent().is_empty(),
+            "IB requires no ACK; do not invent a ToS acceptance IQ"
+        );
+        assert!(
+            Arc::ptr_eq(&snapshot, &client.persistence_manager.get_device_snapshot()),
+            "unsupported bulletins must not mutate device state"
+        );
     }
 
     fn client_expiration(t: Option<i64>) -> wacore_binary::Node {
