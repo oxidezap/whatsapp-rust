@@ -14,6 +14,13 @@
 //!     client.register_chatstate_handler(Arc::new(|_| {}));
 //! }
 //! ```
+//!
+//! An incoming chatstate does not offer an outgoing conversion:
+//! ```compile_fail,E0277
+//! use whatsapp_rust::wacore::{iq::chatstate::ChatstateStanza, protocol::ProtocolNode};
+//! fn requires_outgoing<T: ProtocolNode>() {}
+//! requires_outgoing::<ChatstateStanza>();
+//! ```
 
 #[cfg(all(test, feature = "native"))]
 #[path = "../../../event_delivery_public.rs"]
@@ -39,6 +46,23 @@ pub async fn relay_presence_and_activity(
 #[cfg(test)]
 mod presence_contracts {
     use wacore::types::presence::ReceiptType;
+
+    #[test]
+    fn incoming_chatstate_has_a_typed_parser_and_activity_can_be_relayed() {
+        use whatsapp_rust::wacore::iq::chatstate::{ChatstateSource, ChatstateStanza};
+        use whatsapp_rust::{ChatActivity, NodeBuilder};
+
+        let node = NodeBuilder::new("chatstate")
+            .attr("from", "12025550111@s.whatsapp.net")
+            .children([NodeBuilder::new("composing").attr("media", "audio").build()])
+            .build();
+        let incoming = ChatstateStanza::parse(&node.as_node_ref()).unwrap();
+        assert!(matches!(incoming.source, ChatstateSource::User { .. }));
+        assert_eq!(incoming.state, ChatActivity::RecordingAudio);
+        let outgoing = incoming.state.into_child_node();
+        assert_eq!(outgoing.tag, "composing");
+        assert_eq!(outgoing.attrs.get("media").unwrap().as_str(), "audio");
+    }
 
     #[test]
     fn persisted_receipts_keep_existing_json_and_roundtrip() {
