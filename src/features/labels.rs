@@ -410,15 +410,33 @@ mod tests {
             (Some(i64::MAX), None),
         ] {
             for from_full_sync in [false, true] {
-                for kind in ["label_edit", "label_jid", "label_message"] {
-                    let mut mutation = set_mutation(
-                        vec![kind, "5", "12025550111@s.whatsapp.net", "MSGID", "0", "0"],
-                        wa::SyncActionValue::default(),
-                    );
+                for index in [
+                    vec!["label_edit", "5"],
+                    vec!["label_jid", "5", "12025550111@s.whatsapp.net"],
+                    vec![
+                        "label_message",
+                        "5",
+                        "12025550111@s.whatsapp.net",
+                        "MSGID",
+                        "0",
+                        "0",
+                    ],
+                ] {
+                    let kind = index[0];
+                    let mut mutation = set_mutation(index, wa::SyncActionValue::default());
                     let value = mutation.action_value.as_mut().unwrap();
                     value.timestamp = raw;
-                    value.label_edit_action = buffa::MessageField::some(Default::default());
-                    value.label_association_action = buffa::MessageField::some(Default::default());
+                    if kind == "label_edit" {
+                        value.label_edit_action = buffa::MessageField::some(Default::default());
+                    } else {
+                        value.label_association_action =
+                            buffa::MessageField::some(Default::default());
+                        value
+                            .label_association_action
+                            .as_option_mut()
+                            .unwrap()
+                            .labeled = Some(true);
+                    }
                     let bus = CoreEventBus::new();
                     let rec = Arc::new(Recorder::default());
                     bus.subscribe_handler(rec.clone()).detach();
