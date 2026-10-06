@@ -185,22 +185,23 @@ fn assert_resolution(
 }
 
 pub fn run(root: &Path, lane: Lane, toolchain: &str) -> Result<u8> {
-    let meta = metadata(root)?;
-    let packages = published(&meta)?;
-    let order = publication_order(&meta, &packages)?;
     let stage = tempfile::Builder::new()
         .prefix("whatsapp-package-consumers-")
         .tempdir_in(root.parent().context("checkout parent")?)?;
-    let stage = stage.path().canonicalize()?;
-    ensure!(
-        !stage.starts_with(root),
-        "package qualification must run outside the checkout"
-    );
+    let (root, staged) = qualification_paths(root, stage.path())?;
+    let meta = metadata(&root)?;
+    let packages = published(&meta)?;
+    let order = publication_order(&meta, &packages)?;
     // Keep the owner alive until the consumers finish.
-    run_staged(root, root, &stage, lane, toolchain, &packages, &order)
+    run_staged(&root, &root, &staged, lane, toolchain, &packages, &order)
 }
 
 pub fn frozen(root: &Path, baseline: &str, lane: Lane, toolchain: &str) -> Result<u8> {
+    let stage = tempfile::Builder::new()
+        .prefix("whatsapp-frozen-consumers-")
+        .tempdir_in(root.parent().context("checkout parent")?)?;
+    let (root, staged) = qualification_paths(root, stage.path())?;
+    let root = &root;
     let source = tempfile::tempdir_in(root.parent().context("checkout parent")?)?;
     let archive = capture(
         Command::new("git")
@@ -217,18 +218,25 @@ pub fn frozen(root: &Path, baseline: &str, lane: Lane, toolchain: &str) -> Resul
     let meta = metadata(root)?;
     let packages = published(&meta)?;
     let order = publication_order(&meta, &packages)?;
-    let stage = tempfile::Builder::new()
-        .prefix("whatsapp-frozen-consumers-")
-        .tempdir_in(root.parent().context("checkout parent")?)?;
     run_staged(
         root,
         source.path(),
-        stage.path(),
+        &staged,
         lane,
         toolchain,
         &packages,
         &order,
     )
+}
+
+fn qualification_paths(root: &Path, stage: &Path) -> Result<(PathBuf, PathBuf)> {
+    let root = root.canonicalize()?;
+    let stage = stage.canonicalize()?;
+    ensure!(
+        !stage.starts_with(&root),
+        "package qualification must run outside the checkout"
+    );
+    Ok((root, stage))
 }
 
 fn run_staged(
@@ -372,6 +380,30 @@ fn run_staged(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_checkout_and_stage_accept_packages_but_reject_checkout_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkout");
+        let stage = dir.path().join("stage");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&stage).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+        let (checkout, staged) =
+            qualification_paths(&alias.join("checkout"), &alias.join("stage")).unwrap();
+        for (path, accepted) in [
+            (stage.join("Cargo.toml"), true),
+            (root.join("Cargo.toml"), false),
+        ] {
+            let meta = serde_json::json!({"packages":[{"name":"sdk", "version":"1.0.0-rc.1", "manifest_path":path}]});
+            assert_eq!(
+                assert_resolution(&meta, &packages(), &staged, &checkout).is_ok(),
+                accepted
+            );
+        }
+        assert!(qualification_paths(&root, &alias.join("checkout")).is_err());
+    }
     fn packages() -> BTreeMap<String, Package> {
         BTreeMap::from([(
             "sdk".into(),

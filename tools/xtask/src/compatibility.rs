@@ -82,13 +82,24 @@ pub fn controls(root: &Path, lane: Lane, toolchain: &str) -> Result<()> {
             original.matches(before).count() == 1,
             "mutation anchor changed: {file}; update the control explicitly"
         );
-        std::fs::write(&path, original.replace(before, after))?;
-        let result = check()?;
-        std::fs::write(path, original)?;
+        let result =
+            with_mutated_source(&path, &original, &original.replace(before, after), check)?;
         consumers::verify_mutation(&result, code, needle, "src/encapsulation/mod.rs")?;
         println!("{lane:?} control caught {needle} ({code}) in the external host");
     }
     Ok(())
+}
+
+fn with_mutated_source<T>(
+    path: &Path,
+    original: &str,
+    mutated: &str,
+    check: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    std::fs::write(path, mutated)?;
+    let result = check();
+    std::fs::write(path, original).context("restore mutation control source")?;
+    result
 }
 
 #[derive(Deserialize)]
@@ -284,17 +295,7 @@ fn baseline_manifest_contracts(
         let before = manifest_at(root, baseline, relative)?;
         let after: toml::Value = toml::from_str(&std::fs::read_to_string(path)?)?;
         feature_contract(&before, &after, profile)?;
-        let old_floor = before["package"]
-            .get("rust-version")
-            .and_then(toml::Value::as_str)
-            .or_else(|| {
-                workspace
-                    .get("workspace")?
-                    .get("package")?
-                    .get("rust-version")?
-                    .as_str()
-            })
-            .context("baseline must declare an MSRV")?;
+        let old_floor = baseline_msrv(&before, &workspace)?;
         let current_floor = package["rust_version"].as_str().context("published MSRV")?;
         ensure!(
             old_floor == current_floor,
@@ -303,6 +304,28 @@ fn baseline_manifest_contracts(
         );
     }
     Ok(())
+}
+
+fn baseline_msrv<'a>(before: &'a toml::Value, workspace: &'a toml::Value) -> Result<&'a str> {
+    let package = before
+        .get("package")
+        .context("baseline manifest must declare a package")?;
+    match package.get("rust-version") {
+        Some(toml::Value::String(version)) => Ok(version),
+        None => anyhow::bail!("baseline package must declare an MSRV"),
+        Some(value) => {
+            ensure!(
+                value.get("workspace").and_then(toml::Value::as_bool) == Some(true),
+                "baseline MSRV must be a version string or inherit from the workspace"
+            );
+            workspace
+                .get("workspace")
+                .and_then(|workspace| workspace.get("package"))
+                .and_then(|package| package.get("rust-version"))
+                .and_then(toml::Value::as_str)
+                .context("baseline workspace must declare an MSRV")
+        }
+    }
 }
 
 pub fn run(root: &Path, release: bool, lane: Lane, toolchain: &str) -> Result<u8> {
@@ -403,6 +426,41 @@ pub fn run(root: &Path, release: bool, lane: Lane, toolchain: &str) -> Result<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_control_restores_source_and_preserves_spawn_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.rs");
+        let error = with_mutated_source(&path, "original", "mutated", || -> Result<()> {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "mutated");
+            anyhow::bail!("could not spawn cargo")
+        })
+        .unwrap_err();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "original");
+        assert_eq!(error.to_string(), "could not spawn cargo");
+    }
+
+    #[test]
+    fn baseline_msrv_requires_a_package_and_valid_explicit_or_inherited_version() {
+        let workspace: toml::Value =
+            toml::from_str("[workspace.package]\nrust-version = '1.94'").unwrap();
+        for (manifest, expected) in [
+            ("[package]\nrust-version = '1.93'", "1.93"),
+            ("[package]\nrust-version.workspace = true", "1.94"),
+        ] {
+            assert_eq!(
+                baseline_msrv(&toml::from_str(manifest).unwrap(), &workspace).unwrap(),
+                expected
+            );
+        }
+        for manifest in [
+            "[workspace]",
+            "[package]",
+            "[package]\nrust-version = 194",
+            "[package]\nrust-version.workspace = false",
+        ] {
+            assert!(baseline_msrv(&toml::from_str(manifest).unwrap(), &workspace).is_err());
+        }
+    }
     fn policy() -> Policy {
         serde_json::from_str(r#"{"phase":"preparing","baseline":null,"profiles":[{"package":"sdk","name":"minimal","defaults":false,"features":["host"],"wasm":true}]}"#).unwrap()
     }

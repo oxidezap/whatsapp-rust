@@ -53,6 +53,9 @@ jobs:
   compatibility:
     name: Compatibility and packages (${{ matrix.lane }})
     runs-on: ubuntu-latest
+    env:
+      LANE: ${{ matrix.lane }}
+      TOOLCHAIN: ${{ matrix.toolchain }}
     strategy:
       fail-fast: false
       matrix:
@@ -68,6 +71,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
@@ -92,15 +96,15 @@ jobs:
         run: cargo +nightly-2026-06-16 build --locked -p whatsapp-xtask
       - name: Validate contracts before release
         if: inputs.release-check
-        run: target/debug/whatsapp-xtask ci compatibility --release --lane ${{ matrix.lane }} --toolchain ${{ matrix.toolchain }}
+        run: target/debug/whatsapp-xtask ci compatibility --release --lane "$LANE" --toolchain "$TOOLCHAIN"
       - name: Validate candidate or frozen contracts
         if: ${{ !inputs.release-check }}
-        run: target/debug/whatsapp-xtask ci compatibility --lane ${{ matrix.lane }} --toolchain ${{ matrix.toolchain }}
+        run: target/debug/whatsapp-xtask ci compatibility --lane "$LANE" --toolchain "$TOOLCHAIN"
       - name: Qualify distributed artifacts outside the checkout
-        run: target/debug/whatsapp-xtask ci package-consumers --lane ${{ matrix.lane }} --toolchain ${{ matrix.toolchain }}
+        run: target/debug/whatsapp-xtask ci package-consumers --lane "$LANE" --toolchain "$TOOLCHAIN"
       - name: Prove SDK and host breaks fail downstream compilation
         if: matrix.lane != 'msrv'
-        run: target/debug/whatsapp-xtask ci compatibility-controls --lane ${{ matrix.lane }} --toolchain ${{ matrix.toolchain }}
+        run: target/debug/whatsapp-xtask ci compatibility-controls --lane "$LANE" --toolchain "$TOOLCHAIN"
       - name: Record exact source commit
         env:
           EXPECTED_SHA: ${{ github.sha }}
