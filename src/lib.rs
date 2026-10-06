@@ -527,7 +527,7 @@ pub mod pdo;
 pub mod prekeys;
 mod receipt;
 mod retry;
-pub mod unified_session;
+pub(crate) mod unified_session;
 
 pub mod appstate_sync;
 mod history_sync;
