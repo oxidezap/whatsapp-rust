@@ -7096,14 +7096,12 @@ mod tests {
         // is the one that has to hold when nothing else ends the call, which is exactly an
         // `accept()` awaiting its own setup.
         let client = make_client().await;
-        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
         let error = match spawn_call_via_backend(
             &client,
             mk_session(),
             Arc::new(NeverConnects),
-            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
         )
         .await
@@ -7267,7 +7265,12 @@ mod tests {
         }
 
         let (client, _count) = make_sending_client().await;
-        let (handle, call_id) = place_dormant_outgoing(&client).await;
+        let (handle, call_id) = place_dormant_outgoing_with_media(
+            &client,
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
+            None,
+        )
+        .await;
         client.set_relay_transport_provider(Arc::new(Hands));
 
         let res = attach_outgoing_relay(&client, &call_id, &sample_relay()).await;
@@ -7337,13 +7340,11 @@ mod tests {
             &sample_relay(),
         )
         .expect("sample spec");
-        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
         let drive = open_registered_media(
             &client,
             &registration,
             spec,
-            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
             None,
             None,
@@ -7457,14 +7458,12 @@ mod tests {
             relay_rx: Mutex::new(Some(relay_rx)),
             connects: connects.clone(),
         };
-        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
         let handle = spawn_call_via_backend(
             &client,
             mk_session(),
             Arc::new(factory),
-            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
         )
         .await
@@ -7519,8 +7518,6 @@ mod tests {
             relay_rx: Mutex::new(Some(relay_rx)),
             connects: Arc::new(AtomicUsize::new(0)),
         };
-        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
         let mut session =
             wacore::voip_control::CallSession::new_outgoing("CID-FACADE", caller(), caller());
@@ -7530,7 +7527,7 @@ mod tests {
             &client,
             session,
             Arc::new(factory),
-            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
         )
         .await
@@ -7575,13 +7572,12 @@ mod tests {
             relay_rx: Mutex::new(Some(relay_rx)),
             connects: Arc::new(AtomicUsize::new(0)),
         };
-        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+
         let handle = spawn_call_via_backend(
             &client,
             mk_session(),
             Arc::new(factory),
-            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
         )
         .await
@@ -8443,33 +8439,30 @@ mod tests {
         let client = make_client().await;
         let spawn = |_client: &Client| {
             let (_relay_tx, relay_rx) = async_channel::unbounded();
-            let factory = MockFactory {
+            MockFactory {
                 sent: Arc::new(Mutex::new(Vec::new())),
                 relay_rx: Mutex::new(Some(relay_rx)),
                 connects: Arc::new(AtomicUsize::new(0)),
-            };
-            let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-            let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
-            (factory, Arc::new(mic_rx), Arc::new(spk_tx))
+            }
         };
 
-        let (f1, mic1, spk1) = spawn(&client);
+        let f1 = spawn(&client);
         let stale = spawn_call_via_backend(
             &client,
             mk_session(),
             Arc::new(f1),
-            pcm_audio(mic1, spk1),
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
         )
         .await
         .expect("first spawn_call");
         // A same-call-id re-offer replaces the first (new generation, aborts its task).
-        let (f2, mic2, spk2) = spawn(&client);
+        let f2 = spawn(&client);
         let live = spawn_call_via_backend(
             &client,
             mk_session(),
             Arc::new(f2),
-            pcm_audio(mic2, spk2),
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
         )
         .await
@@ -8515,32 +8508,29 @@ mod tests {
         let client = make_client().await;
         let spawn = |_client: &Client| {
             let (_relay_tx, relay_rx) = async_channel::unbounded();
-            let factory = MockFactory {
+            MockFactory {
                 sent: Arc::new(Mutex::new(Vec::new())),
                 relay_rx: Mutex::new(Some(relay_rx)),
                 connects: Arc::new(AtomicUsize::new(0)),
-            };
-            let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-            let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
-            (factory, Arc::new(mic_rx), Arc::new(spk_tx))
+            }
         };
 
-        let (f1, mic1, spk1) = spawn(&client);
+        let f1 = spawn(&client);
         let stale = spawn_call_via_backend(
             &client,
             mk_session(),
             Arc::new(f1),
-            pcm_audio(mic1, spk1),
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
         )
         .await
         .expect("first spawn_call");
-        let (f2, mic2, spk2) = spawn(&client);
+        let f2 = spawn(&client);
         let _live = spawn_call_via_backend(
             &client,
             mk_session(),
             Arc::new(f2),
-            pcm_audio(mic2, spk2),
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
         )
         .await
@@ -8565,14 +8555,13 @@ mod tests {
             relay_rx: Mutex::new(Some(relay_rx)),
             connects: Arc::new(AtomicUsize::new(0)),
         };
-        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+
         let handle = Arc::new(
             spawn_call_via_backend(
                 &client,
                 mk_session(),
                 Arc::new(factory),
-                pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+                encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
                 None,
             )
             .await
@@ -9513,19 +9502,19 @@ mod tests {
     /// Place a dormant outgoing call (offer sent, relay not yet arrived) and return its handle. Shares
     /// the place_call machinery the offer-send test uses; the call lands in pending_outgoing_calls.
     async fn place_dormant_outgoing(client: &Arc<Client>) -> (CallHandle, String) {
-        place_dormant_outgoing_with_video(client, None).await
+        place_dormant_outgoing_with_media(client, encoded_audio(AudioFormat::OPUS_16KHZ_60MS), None)
+            .await
     }
 
-    async fn place_dormant_outgoing_with_video(
+    async fn place_dormant_outgoing_with_media(
         client: &Arc<Client>,
+        audio: AudioEndpoints,
         video: Option<VideoEndpoints>,
     ) -> (CallHandle, String) {
         let peer_user = Jid::new("333333333333333", Server::Lid);
         let device = peer_lid();
         seed_peer_session(client, &device).await;
         let own_lid = client.lid().expect("own lid");
-        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
         let call_id = "00abcdef0123456789abcdef0123beef".to_string();
         let handle = place_call(
             client,
@@ -9535,7 +9524,7 @@ mod tests {
             &own_lid,
             std::slice::from_ref(&device),
             std::slice::from_ref(&device),
-            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            audio,
             video,
         )
         .await
@@ -9673,8 +9662,6 @@ mod tests {
             relay_rx: Mutex::new(Some(relay_rx)),
             sent: Arc::new(Mutex::new(Vec::new())),
         };
-        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
         // The bridge registers the entry, then the production open parks inside the gated connect().
         let drive = tokio::spawn({
@@ -9684,7 +9671,7 @@ mod tests {
                     &client,
                     mk_session(),
                     Arc::new(factory),
-                    pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+                    encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
                     None,
                 )
                 .await
@@ -9755,8 +9742,6 @@ mod tests {
             relay_rx: Mutex::new(Some(relay_rx)),
             sent: Arc::new(Mutex::new(Vec::new())),
         };
-        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
         // Disconnect clears is_connected before the connect path runs.
         client.set_connected_for_test(false);
@@ -9765,7 +9750,7 @@ mod tests {
             &client,
             mk_session(),
             Arc::new(factory),
-            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
         )
         .await;
@@ -9794,8 +9779,6 @@ mod tests {
             relay_rx: Mutex::new(Some(relay_rx)),
             sent: Arc::new(Mutex::new(Vec::new())),
         });
-        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
         // Drive the production open in the background; it parks in the gated connect.
         let drive = tokio::spawn({
@@ -9806,7 +9789,7 @@ mod tests {
                     &client,
                     mk_session(),
                     factory,
-                    pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+                    encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
                     None,
                 )
                 .await
@@ -9855,8 +9838,6 @@ mod tests {
             relay_rx: Mutex::new(Some(relay_rx)),
             sent: Arc::new(Mutex::new(Vec::new())),
         });
-        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
         // Drive the production open in the background; it parks in the gated connect.
         let drive = tokio::spawn({
@@ -9867,7 +9848,7 @@ mod tests {
                     &client,
                     mk_session(),
                     factory,
-                    pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+                    encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
                     None,
                 )
                 .await
@@ -9921,8 +9902,6 @@ mod tests {
             relay_rx: Mutex::new(Some(relay_rx)),
             sent: Arc::new(Mutex::new(Vec::new())),
         });
-        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
         // Drive the production open in the background; it parks in the gated connect.
         let drive = tokio::spawn({
@@ -9933,7 +9912,7 @@ mod tests {
                     &client,
                     mk_session(),
                     factory,
-                    pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+                    encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
                     None,
                 )
                 .await
@@ -10003,14 +9982,13 @@ mod tests {
     #[tokio::test]
     async fn connect_failure_reaps_registry_and_resolves_wait_ended() {
         let client = make_client().await;
-        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+
         // CallHandle has no Debug, so match on the Result rather than expect_err.
         let res = spawn_call_via_backend(
             &client,
             mk_session(),
             Arc::new(FailingFactory),
-            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
         )
         .await;
@@ -10031,15 +10009,13 @@ mod tests {
         let mut registration = RegisteredCall::new(&client, mk_session()).await;
         let mut teardown = AnswerTeardown::new(&client, &registration);
         teardown.arm();
-        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
         let result = spawn_answered_via_backend(
             &client,
             &mut registration,
             teardown,
             Arc::new(FailingFactory),
-            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
         )
         .await;
@@ -10668,15 +10644,13 @@ mod tests {
             relay_rx: Mutex::new(Some(relay_rx)),
             sent: Arc::new(Mutex::new(Vec::new())),
         };
-        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
         let spawn = spawn_answered_via_backend(
             &client,
             &mut registration,
             teardown,
             Arc::new(factory),
-            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
         );
         let replace = async {
@@ -10760,8 +10734,7 @@ mod tests {
             relay_rx: Mutex::new(Some(relay_rx)),
             sent: Arc::new(Mutex::new(Vec::new())),
         };
-        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+
         let terminate_waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
 
         let result = tokio::time::timeout(
@@ -10771,7 +10744,7 @@ mod tests {
                 &mut registration,
                 teardown,
                 Arc::new(factory),
-                pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+                encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
                 None,
             ),
         )
@@ -11184,6 +11157,7 @@ mod tests {
 
     /// A live handle over a mock relay + a sending client, for the video handshake tests. The
     /// returned relay sender is a keepalive: dropping it disconnects the relay and ends the call.
+    /// Encoded audio keeps these control tests independent of the optional PCM codec.
     async fn sending_handle() -> (
         Arc<Client>,
         Arc<AtomicUsize>,
@@ -11197,13 +11171,12 @@ mod tests {
             relay_rx: Mutex::new(Some(relay_rx)),
             connects: Arc::new(AtomicUsize::new(0)),
         };
-        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+
         let handle = spawn_call_via_backend(
             &client,
             mk_session(),
             Arc::new(factory),
-            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
         )
         .await
@@ -11378,32 +11351,29 @@ mod tests {
         let client = make_client().await;
         let spawn = |_client: &Client| {
             let (_relay_tx, relay_rx) = async_channel::unbounded();
-            let factory = MockFactory {
+            MockFactory {
                 sent: Arc::new(Mutex::new(Vec::new())),
                 relay_rx: Mutex::new(Some(relay_rx)),
                 connects: Arc::new(AtomicUsize::new(0)),
-            };
-            let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-            let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
-            (factory, Arc::new(mic_rx), Arc::new(spk_tx))
+            }
         };
 
-        let (f1, mic1, spk1) = spawn(&client);
+        let f1 = spawn(&client);
         let stale = spawn_call_via_backend(
             &client,
             mk_session(),
             Arc::new(f1),
-            pcm_audio(mic1, spk1),
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
         )
         .await
         .expect("first spawn_call");
-        let (f2, mic2, spk2) = spawn(&client);
+        let f2 = spawn(&client);
         let live = spawn_call_via_backend(
             &client,
             mk_session(),
             Arc::new(f2),
-            pcm_audio(mic2, spk2),
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
             None,
         )
         .await
@@ -12476,9 +12446,12 @@ mod tests {
     async fn dormant_stop_video_clears_pending_endpoints() {
         let (client, _sent) = make_sending_client().await;
         let (source, sink) = video_endpoints();
-        let (handle, call_id) =
-            place_dormant_outgoing_with_video(&client, Some(VideoEndpoints::new(source, sink)))
-                .await;
+        let (handle, call_id) = place_dormant_outgoing_with_media(
+            &client,
+            encoded_audio(AudioFormat::OPUS_16KHZ_60MS),
+            Some(VideoEndpoints::new(source, sink)),
+        )
+        .await;
         assert!(
             client
                 .voip_state()
