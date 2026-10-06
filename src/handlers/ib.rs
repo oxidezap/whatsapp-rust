@@ -296,8 +296,10 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                 // WAWebTos.maybeUpdateServer can synchronize locally accepted
                 // notices through a separate IQ. We do not model that state;
                 // keep the missing behavior visible without inventing acceptance.
-                warn!(
-                    "Known ib child <tos>: local terms-of-service acceptance synchronization is not implemented"
+                log_unsupported_capability(
+                    &client,
+                    WARNED_TOS,
+                    "Known ib child <tos>: local terms-of-service acceptance synchronization is not implemented",
                 );
             }
             InfoBulletinType::RecoveryNonce => {
@@ -305,13 +307,38 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                 // for use_case=547 and warns on unsolicited/unsupported pushes.
                 // This workflow is not implemented here. Neither bulletin needs
                 // an ACK, and the recovery code must never enter this diagnostic.
-                warn!(
-                    "Known ib child <recovery_nonce>: CTWA access-token nonce recovery is not implemented"
+                log_unsupported_capability(
+                    &client,
+                    WARNED_RECOVERY_NONCE,
+                    "Known ib child <recovery_nonce>: CTWA access-token nonce recovery is not implemented",
                 );
             }
             InfoBulletinType::Unknown => {
                 warn!("Unhandled ib child: <{}>", child.tag);
             }
+        }
+    }
+}
+
+const WARNED_TOS: u8 = 1;
+const WARNED_RECOVERY_NONCE: u8 = 2;
+
+fn log_unsupported_capability(client: &Client, bit: u8, message: &'static str) {
+    use std::sync::atomic::Ordering;
+
+    // Capability support does not change on reconnect. Keep the first warning
+    // for each Client's lifetime, then retain subsequent arrivals at DEBUG.
+    // Only diagnostic bookkeeping is shared; no payload or state is published.
+    let warned = &client.unsupported_ib_warnings;
+    if warned.load(Ordering::Relaxed) & bit != 0 {
+        debug!("{message}");
+    } else if log::log_enabled!(log::Level::Warn) {
+        // Do not spend the first warning while WARN is filtered out. A racing
+        // caller may have warned since the load; fetch_or elects just one.
+        if warned.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+            warn!("{message}; further occurrences for this client are logged at DEBUG");
+        } else {
+            debug!("{message}");
         }
     }
 }
@@ -439,71 +466,78 @@ mod tests {
             return;
         }
         let logs = crate::test_utils::log_capture::session();
-        let (client, transport) = crate::test_utils::create_iq_test_client().await;
-        let collector = Arc::new(TestEventCollector::default());
-        let _subscription = client.subscribe_handler(collector.clone());
-        let snapshot = client.persistence_manager.get_device_snapshot();
+        // Each client must announce each missing capability independently.
+        for client_index in 0..2 {
+            let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            let collector = Arc::new(TestEventCollector::default());
+            let _subscription = client.subscribe_handler(collector.clone());
+            let snapshot = client.persistence_manager.get_device_snapshot();
 
-        // Fictional values deliberately appear in attributes and content, so
-        // dumping a bulletin in either a log or an event fails this test.
-        for child in [
-            NodeBuilder::new("recovery_nonce")
-                .attr("code", "synthetic-secret-code")
-                .attr("use_case", "547")
-                .bytes(b"synthetic-secret-body".to_vec())
-                .build(),
-            NodeBuilder::new("recovery_nonce")
-                .attr("code", "synthetic-other-secret")
-                .attr("use_case", "999")
-                .build(),
-            NodeBuilder::new("recovery_nonce").build(),
-            NodeBuilder::new("tos")
-                .children([NodeBuilder::new("notice")
-                    .attr("id", "synthetic-notice")
-                    .build()])
-                .build(),
-            NodeBuilder::new("tos").build(),
-            NodeBuilder::new("sonar")
-                .attr("code", "synthetic-unknown-secret")
-                .build(),
-            NodeBuilder::new("unknown").build(),
-        ] {
-            let bulletin = NodeBuilder::new("ib")
-                .attr("id", "synthetic-ib")
-                .attr("from", "s.whatsapp.net")
-                .children([child])
-                .build();
-            let node = crate::test_utils::node_to_owned_ref(&bulletin);
-            // Even with enough addressing for an ACK, the dispatcher must
-            // leave it unsent. Returning handled below also avoids a NACK.
-            assert!(!client.should_ack(node.get()));
-            let mut cancelled = false;
-            assert!(IbHandler.handle(client.clone(), node, &mut cancelled).await);
-            assert!(!cancelled);
+            // Fictional values deliberately appear in attributes and content, so
+            // dumping a bulletin in either a log or an event fails this test.
+            for child in [
+                NodeBuilder::new("recovery_nonce")
+                    .attr("code", "synthetic-secret-code")
+                    .attr("use_case", "547")
+                    .bytes(b"synthetic-secret-body".to_vec())
+                    .build(),
+                NodeBuilder::new("recovery_nonce")
+                    .attr("code", "synthetic-other-secret")
+                    .attr("use_case", "999")
+                    .build(),
+                NodeBuilder::new("recovery_nonce").build(),
+                NodeBuilder::new("tos")
+                    .children([NodeBuilder::new("notice")
+                        .attr("id", "synthetic-notice")
+                        .build()])
+                    .build(),
+                NodeBuilder::new("tos").build(),
+                NodeBuilder::new("sonar")
+                    .attr("code", "synthetic-unknown-secret")
+                    .build(),
+                NodeBuilder::new("sonar").build(),
+                NodeBuilder::new("unknown").build(),
+            ] {
+                let bulletin = NodeBuilder::new("ib")
+                    .attr("id", "synthetic-ib")
+                    .attr("from", "s.whatsapp.net")
+                    .children([child])
+                    .build();
+                let node = crate::test_utils::node_to_owned_ref(&bulletin);
+                // Even with enough addressing for an ACK, the dispatcher must
+                // leave it unsent. Returning handled below also avoids a NACK.
+                assert!(!client.should_ack(node.get()));
+                let mut cancelled = false;
+                assert!(IbHandler.handle(client.clone(), node, &mut cancelled).await);
+                assert!(!cancelled);
+            }
+
+            let records = logs.records_for("whatsapp_rust::handlers::ib");
+            let expected = vec![
+                (log::Level::Warn, "Known ib child <recovery_nonce>: CTWA access-token nonce recovery is not implemented; further occurrences for this client are logged at DEBUG".into()),
+                (log::Level::Debug, "Known ib child <recovery_nonce>: CTWA access-token nonce recovery is not implemented".into()),
+                (log::Level::Debug, "Known ib child <recovery_nonce>: CTWA access-token nonce recovery is not implemented".into()),
+                (log::Level::Warn, "Known ib child <tos>: local terms-of-service acceptance synchronization is not implemented; further occurrences for this client are logged at DEBUG".into()),
+                (log::Level::Debug, "Known ib child <tos>: local terms-of-service acceptance synchronization is not implemented".into()),
+                (log::Level::Warn, "Unhandled ib child: <sonar>".into()),
+                (log::Level::Warn, "Unhandled ib child: <sonar>".into()),
+                (log::Level::Warn, "Unhandled ib child: <unknown>".into()),
+            ];
+            assert_eq!(&records[client_index * expected.len()..], expected);
+
+            assert!(
+                collector.events().is_empty(),
+                "no public nonce or acceptance event"
+            );
+            assert!(
+                transport.sent().is_empty(),
+                "IB requires no ACK; do not invent a ToS acceptance IQ"
+            );
+            assert!(
+                Arc::ptr_eq(&snapshot, &client.persistence_manager.get_device_snapshot()),
+                "unsupported bulletins must not mutate device state"
+            );
         }
-
-        let records = logs.records_for("whatsapp_rust::handlers::ib");
-        assert_eq!(records, vec![
-            (log::Level::Warn, "Known ib child <recovery_nonce>: CTWA access-token nonce recovery is not implemented".into()),
-            (log::Level::Warn, "Known ib child <recovery_nonce>: CTWA access-token nonce recovery is not implemented".into()),
-            (log::Level::Warn, "Known ib child <recovery_nonce>: CTWA access-token nonce recovery is not implemented".into()),
-            (log::Level::Warn, "Known ib child <tos>: local terms-of-service acceptance synchronization is not implemented".into()),
-            (log::Level::Warn, "Known ib child <tos>: local terms-of-service acceptance synchronization is not implemented".into()),
-            (log::Level::Warn, "Unhandled ib child: <sonar>".into()),
-            (log::Level::Warn, "Unhandled ib child: <unknown>".into()),
-        ]);
-        assert!(
-            collector.events().is_empty(),
-            "no public nonce or acceptance event"
-        );
-        assert!(
-            transport.sent().is_empty(),
-            "IB requires no ACK; do not invent a ToS acceptance IQ"
-        );
-        assert!(
-            Arc::ptr_eq(&snapshot, &client.persistence_manager.get_device_snapshot()),
-            "unsupported bulletins must not mutate device state"
-        );
     }
 
     fn client_expiration(t: Option<i64>) -> wacore_binary::Node {

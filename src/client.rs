@@ -2205,6 +2205,9 @@ pub struct Client {
     /// Router for dispatching stanzas to their appropriate handlers
     pub(crate) stanza_router: crate::handlers::router::StanzaRouter,
 
+    /// Missing IB capabilities already warned about, retained across reconnects.
+    pub(crate) unsupported_ib_warnings: AtomicU8,
+
     /// Whether to send ACKs synchronously or in a background task
     pub(crate) synchronous_ack: bool,
 

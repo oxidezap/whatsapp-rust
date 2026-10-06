@@ -769,6 +769,7 @@ impl Client {
                 .max_capacity(cache_config.group_devices_memo_capacity)
                 .build(),
             stanza_router: Self::create_stanza_router(),
+            unsupported_ib_warnings: AtomicU8::new(0),
             synchronous_ack: false,
             http_client,
             override_version,
