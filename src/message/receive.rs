@@ -1949,8 +1949,10 @@ impl Client {
         // `WAWebHandleHistorySyncNotification` gates on `isMePrimaryNonLid`.
         if let Some(history_sync) = history_sync_taken {
             if info.source.is_from_me {
-                self.handle_history_sync(info.id.to_string(), history_sync)
-                    .await;
+                // This uncommon notification's future carries the detached
+                // history metadata. Keep it out of every ordinary chat lane,
+                // as with the PDO recovery future above.
+                Box::pin(self.handle_history_sync(info.id.to_string(), history_sync)).await;
             } else {
                 warn!(
                     "[msg:{}] Dropping history_sync_notification from non-self sender {}",
