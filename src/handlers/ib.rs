@@ -468,7 +468,15 @@ mod tests {
                 .build(),
             NodeBuilder::new("unknown").build(),
         ] {
-            let node = crate::test_utils::node_to_owned_ref(&ib_with(child));
+            let bulletin = NodeBuilder::new("ib")
+                .attr("id", "synthetic-ib")
+                .attr("from", "s.whatsapp.net")
+                .children([child])
+                .build();
+            let node = crate::test_utils::node_to_owned_ref(&bulletin);
+            // Even with enough addressing for an ACK, the dispatcher must
+            // leave it unsent. Returning handled below also avoids a NACK.
+            assert!(!client.should_ack(node.get()));
             let mut cancelled = false;
             assert!(IbHandler.handle(client.clone(), node, &mut cancelled).await);
             assert!(!cancelled);
