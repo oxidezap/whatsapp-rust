@@ -126,6 +126,7 @@ impl UnifiedSessionManager {
     }
 
     /// Reset state on disconnect (keeps sequence counter).
+    #[cfg(test)]
     pub(crate) async fn reset(&self) {
         self.server_time_offset_ms.store(0, Ordering::Relaxed);
         *self.last_sent_id.lock().await = None;
