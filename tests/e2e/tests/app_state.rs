@@ -188,7 +188,6 @@ async fn test_star_received_message() -> anyhow::Result<()> {
     let client_a = TestClient::connect("e2e_as_star_recv_a").await?;
     let mut client_b = TestClient::connect("e2e_as_star_recv_b").await?;
 
-    let jid_a = client_a.client.pn().expect("A should have JID").to_non_ad();
     let jid_b = client_b.client.pn().expect("B should have JID").to_non_ad();
 
     client_b.wait_for_app_state_sync().await?;
@@ -214,6 +213,7 @@ async fn test_star_received_message() -> anyhow::Result<()> {
         .find(|m| m.message.conversation.as_deref() == Some("Star me from the other side!"))
         .expect("Expected Message event");
     let target = whatsapp_rust::MessageRef::from_info(&received.info)?;
+    assert!(!target.from_me(), "B must star an incoming message from A");
     let msg_id = target.id();
     client_b.client.chat_actions().star_message(&target).await?;
     info!("Client B starred received message {msg_id} (from_me=false)");
