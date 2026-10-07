@@ -154,9 +154,11 @@ pub fn install_memory_watch(store: &mut Store<HostState>) {
             if strict {
                 context.data().shared.scheduler.release(thread);
             }
-            if matches!(hook, CallHook::CallingHost) {
+            if !strict && matches!(hook, CallHook::CallingHost) {
                 // Typed imports such as emscripten_get_now bypass host_func.
                 // They must still let a waiting guest thread take its turn.
+                // Strict turns stay released throughout host execution and
+                // are acquired only on return to wasm, above.
                 context.data().shared.scheduler.yield_point(thread);
             }
         }

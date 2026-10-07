@@ -236,6 +236,71 @@ mod tests {
     }
 
     #[test]
+    fn strict_typed_host_call_does_not_reacquire_the_guest_turn() {
+        use wasm_encoder::{
+            CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
+            ImportSection, Instruction, Module, TypeSection,
+        };
+
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+        let mut imports = ImportSection::new();
+        imports.import("test", "probe", EntityType::Function(0));
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        let mut exports = ExportSection::new();
+        exports.export("run", ExportKind::Func, 1);
+        let mut function = Function::new([]);
+        function.instruction(&Instruction::Call(0));
+        function.instruction(&Instruction::End);
+        let mut code = CodeSection::new();
+        code.function(&function);
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&imports)
+            .section(&functions)
+            .section(&exports)
+            .section(&code);
+
+        let engine = wasmtime::Engine::default();
+        let module = wasmtime::Module::new(&engine, module.finish()).unwrap();
+        let mut store = wasmtime::Store::new(&engine, crate::state::HostState::default());
+        let shared = std::sync::Arc::clone(&store.data().shared);
+        shared.scheduler.enable();
+        shared.demand_strict_turns();
+        // Keep the waiter signal set across the boundary, without an OS race
+        // against the 25 ms strict timeout. We test turn ownership inside the
+        // actual typed import; no timeout or scheduling operation is replaced.
+        shared.scheduler.waiting.store(1, Ordering::SeqCst);
+        crate::host::install_memory_watch(&mut store);
+        let mut linker = wasmtime::Linker::new(&engine);
+        linker
+            .func_wrap(
+                "test",
+                "probe",
+                |caller: wasmtime::Caller<'_, crate::state::HostState>| {
+                    let scheduler = &caller.data().shared.scheduler;
+                    assert_ne!(
+                        scheduler.state.lock().unwrap().holder,
+                        Some(caller.data().thread_id),
+                        "strict host execution must leave the guest turn released"
+                    );
+                    scheduler.waiting.store(0, Ordering::SeqCst);
+                },
+            )
+            .unwrap();
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        instance
+            .get_typed_func::<(), ()>(&mut store, "run")
+            .unwrap()
+            .call(&mut store, ())
+            .unwrap();
+        assert_eq!(shared.scheduler.forced_turns(), 0);
+        assert_eq!(shared.scheduler.state.lock().unwrap().holder, None);
+    }
+
+    #[test]
     fn clock_import_yields_to_a_waiting_thread() {
         use std::sync::Arc;
         use wasm_encoder::{
