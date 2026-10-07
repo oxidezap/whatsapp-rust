@@ -3,8 +3,10 @@ use anyhow::{Context, Result, ensure};
 use clap::{Subcommand, ValueEnum};
 use serde::Deserialize;
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::path::{Component, Path};
 use std::process::Command;
+use std::time::Instant;
 
 const REGISTRY: &str = "tools/xtask/consumers.json";
 // These are the only test manifests belonging to the root workspace, not API hosts.
@@ -433,6 +435,31 @@ fn wasm_sdk_source(
     Ok(source.to_owned())
 }
 
+fn configure_cargo(command: &mut Command, root: &Path, lane: Lane, build_jobs: Option<&OsStr>) {
+    command
+        .current_dir(root)
+        // Keep the conservative default for callers without a memory budget,
+        // but let CI choose parallel compilation within each isolated profile.
+        // Cargo owns validation, including relative job counts such as -1.
+        .env("CARGO_BUILD_JOBS", build_jobs.unwrap_or(OsStr::new("1")))
+        // Many independent profiles compile the generated protocol crate.
+        // Debug symbols and incremental state dwarf these contract tests.
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_PROFILE_DEV_DEBUG", "0")
+        .env("CARGO_PROFILE_TEST_DEBUG", "0")
+        .env("CARGO_TARGET_DIR", root.join("target/consumers"))
+        // Do not leak host nightly flags into the MSRV or WASM hosts.
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env(
+            "RUSTFLAGS",
+            if lane == Lane::Wasm {
+                "--cfg getrandom_backend=\"wasm_js\""
+            } else {
+                ""
+            },
+        );
+}
+
 pub fn run(root: &Path, task: Task) -> Result<u8> {
     let consumers: Vec<Consumer> = serde_json::from_slice(&std::fs::read(root.join(REGISTRY))?)?;
     validate(root, &consumers)?;
@@ -461,6 +488,13 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
     }
     let mut count = 0;
     let mut first_failure = 0;
+    let build_jobs = std::env::var_os("CARGO_BUILD_JOBS");
+    if !dry_run {
+        println!(
+            "[{lane:?}] Cargo build jobs: {:?}",
+            build_jobs.as_deref().unwrap_or(OsStr::new("1"))
+        );
+    }
     for consumer in &consumers {
         if manifest.as_ref().is_some_and(|m| m != &consumer.manifest) {
             continue;
@@ -480,26 +514,8 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
                 continue;
             }
             let mut command = Command::new("cargo");
-            command
-                .args(&args)
-                .current_dir(root)
-                .env("CARGO_BUILD_JOBS", "1")
-                // Many independent profiles compile the generated protocol crate.
-                // Debug symbols and incremental state dwarf these contract tests.
-                .env("CARGO_INCREMENTAL", "0")
-                .env("CARGO_PROFILE_DEV_DEBUG", "0")
-                .env("CARGO_PROFILE_TEST_DEBUG", "0")
-                .env("CARGO_TARGET_DIR", root.join("target/consumers"))
-                // Do not leak host nightly flags into the MSRV or WASM hosts.
-                .env_remove("CARGO_ENCODED_RUSTFLAGS")
-                .env(
-                    "RUSTFLAGS",
-                    if lane == Lane::Wasm {
-                        "--cfg getrandom_backend=\"wasm_js\""
-                    } else {
-                        ""
-                    },
-                );
+            command.args(&args);
+            configure_cargo(&mut command, root, lane, build_jobs.as_deref());
             if invocation.wasm_test {
                 command
                     .env(
@@ -511,6 +527,9 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
                         wasm_sdk_source(root, consumer, invocation, toolchain.as_deref())?,
                     );
             }
+            // Host tooling measures Cargo wall time, not the SDK's pluggable clock.
+            #[allow(clippy::disallowed_methods)]
+            let started = Instant::now();
             let code = if let Some(expected) = &invocation.expect_failure {
                 // Structured diagnostics tie the code and API fragments to one
                 // primary error, independent of ANSI or unrelated stderr text.
@@ -539,6 +558,10 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
                         .with_context(|| format!("execute {}", consumer.manifest))?,
                 )
             };
+            println!(
+                "[{lane:?}] finished in {:.3}s; validation status: {code}",
+                started.elapsed().as_secs_f64()
+            );
             if code != 0 {
                 eprintln!(
                     "consumer failed: {} ({:?}, {lane:?})",
@@ -561,6 +584,59 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compilation_budget_preserves_lane_isolation() {
+        let root = Path::new("isolated-host");
+        for lane in [Lane::Native, Lane::Msrv, Lane::Wasm] {
+            for jobs in [
+                None,
+                Some("1"),
+                Some("2"),
+                Some("4"),
+                Some("-1"),
+                Some("invalid"),
+            ] {
+                let mut command = Command::new("cargo");
+                command.args(["+host-toolchain", "test", "--locked"]);
+                command.env("RUSTFLAGS", "nightly-only");
+                command.env("CARGO_ENCODED_RUSTFLAGS", "nightly-only");
+                configure_cargo(&mut command, root, lane, jobs.map(OsStr::new));
+                let env = command
+                    .get_envs()
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                assert_eq!(
+                    env[OsStr::new("CARGO_BUILD_JOBS")],
+                    Some(OsStr::new(jobs.unwrap_or("1")))
+                );
+                assert_eq!(env[OsStr::new("CARGO_ENCODED_RUSTFLAGS")], None);
+                assert_eq!(
+                    env[OsStr::new("RUSTFLAGS")],
+                    Some(OsStr::new(if lane == Lane::Wasm {
+                        "--cfg getrandom_backend=\"wasm_js\""
+                    } else {
+                        ""
+                    }))
+                );
+                for name in [
+                    "CARGO_INCREMENTAL",
+                    "CARGO_PROFILE_DEV_DEBUG",
+                    "CARGO_PROFILE_TEST_DEBUG",
+                ] {
+                    assert_eq!(env[OsStr::new(name)], Some(OsStr::new("0")));
+                }
+                assert_eq!(
+                    env[OsStr::new("CARGO_TARGET_DIR")],
+                    Some(root.join("target/consumers").as_os_str())
+                );
+                assert_eq!(command.get_current_dir(), Some(root));
+                assert_eq!(
+                    command.get_args().collect::<Vec<_>>(),
+                    ["+host-toolchain", "test", "--locked"]
+                );
+            }
+        }
+    }
+
     fn fixture() -> (tempfile::TempDir, Vec<Consumer>) {
         let root = tempfile::tempdir().unwrap();
         for path in WORKSPACE_TESTS
