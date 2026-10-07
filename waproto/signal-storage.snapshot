@@ -55,3 +55,5 @@ wire .whatsapp.SignedPreKeyRecordStructure.privateKey number=Some(3) type=Some(T
 wire .whatsapp.SignedPreKeyRecordStructure.publicKey number=Some(2) type=Some(TYPE_BYTES) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
 wire .whatsapp.SignedPreKeyRecordStructure.signature number=Some(4) type=Some(TYPE_BYTES) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
 wire .whatsapp.SignedPreKeyRecordStructure.timestamp number=Some(5) type=Some(TYPE_FIXED64) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
+wire .whatsapp.IdentityKeyPairStructure.privateKey number=Some(2) type=Some(TYPE_BYTES) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
+wire .whatsapp.IdentityKeyPairStructure.publicKey number=Some(1) type=Some(TYPE_BYTES) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None

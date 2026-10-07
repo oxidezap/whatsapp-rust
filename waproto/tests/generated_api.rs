@@ -36,6 +36,7 @@ fn signal_projection_guard_rejects_additive_known_fields() {
         .collect();
     signal_storage::check(&baseline).expect("current Signal projections match");
     for (root, nested) in [
+        ("IdentityKeyPairStructure", &[][..]),
         ("SessionStructure", &[][..]),
         ("SessionStructure", &["Chain", "MessageKey"][..]),
         ("SenderKeyStateStructure", &[][..]),

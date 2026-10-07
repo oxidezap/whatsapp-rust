@@ -91,6 +91,9 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
     for item in items {
         match item {
             syn::Item::Mod(m) if !m.ident.to_string().starts_with("__") => {
+                // Keep owned/view source scopes distinct: their canonical
+                // public paths overlap, but either module can lose visibility.
+                api.insert(format!("module {scope}::{} {}", m.ident, tokens(&m.vis)));
                 if let Some((_, items)) = &m.content {
                     inventory(items, &format!("{scope}::{}", m.ident), api);
                 }
@@ -282,4 +285,46 @@ pub fn check_api(expected: &str, actual: &BTreeSet<String>) -> io::Result<()> {
         missing.len(),
         missing.into_iter().take(20).collect::<Vec<_>>().join("\n")
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_visibility_is_part_of_the_frozen_api() {
+        let collect = |source: &str| {
+            let file = syn::parse_file(source).unwrap();
+            let mut api = BTreeSet::new();
+            inventory(&file.items, "whatsapp", &mut api);
+            api
+        };
+        let baseline = collect("pub mod outer { pub mod inner { pub struct Message; } }");
+        let expected = baseline.iter().cloned().collect::<Vec<_>>().join("\n");
+        check_api(&expected, &baseline).unwrap();
+        for visibility in ["", "pub(crate)", "pub(super)"] {
+            for source in [
+                format!("{visibility} mod outer {{ pub mod inner {{ pub struct Message; }} }}"),
+                format!("pub mod outer {{ {visibility} mod inner {{ pub struct Message; }} }}"),
+            ] {
+                check_api(&expected, &collect(&source))
+                    .expect_err("public children do not compensate for an inaccessible module");
+            }
+        }
+        check_api(
+            &expected,
+            &collect("pub mod outer { pub mod inner { pub struct Message; } pub mod added {} }"),
+        )
+        .expect("new public modules remain additive");
+
+        let views =
+            syn::parse_file("pub mod outer { pub mod inner { pub struct Message; } }").unwrap();
+        let mut combined = baseline.clone();
+        inventory(&views.items, "whatsapp::__buffa::view", &mut combined);
+        let expected = combined.iter().cloned().collect::<Vec<_>>().join("\n");
+        let mut candidate = collect("mod outer { pub mod inner { pub struct Message; } }");
+        inventory(&views.items, "whatsapp::__buffa::view", &mut candidate);
+        check_api(&expected, &candidate)
+            .expect_err("a visible view module cannot mask a private owned module");
+    }
 }
