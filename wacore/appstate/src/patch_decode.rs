@@ -373,18 +373,25 @@ mod tests {
     /// caller, which is the cycle the shared order exists to rule out.
     #[test]
     fn every_collection_has_its_own_rank() {
-        let mut ranks: Vec<u8> = SHUFFLED
+        let mut ranks: Vec<u8> = crate::schemas::COLLECTIONS
             .iter()
-            .map(|name| name.reservation_rank())
+            .map(|name| {
+                name.as_str()
+                    .parse::<WAPatchName>()
+                    .unwrap()
+                    .reservation_rank()
+            })
             .collect();
+        ranks.push(WAPatchName::Unknown.reservation_rank());
+        let collection_count = ranks.len();
         ranks.sort_unstable();
         ranks.dedup();
 
-        assert_eq!(ranks.len(), SHUFFLED.len(), "ranks collide");
+        assert_eq!(ranks.len(), collection_count, "ranks collide");
         assert_eq!(
-            ranks.last().copied(),
-            Some(SHUFFLED.len() as u8 - 1),
-            "the ranks are contiguous from zero, so a new one is visibly appended"
+            ranks.last().copied().map(usize::from),
+            Some(collection_count - 1),
+            "the ranks cover the entire catalog and the fallback contiguously"
         );
     }
 

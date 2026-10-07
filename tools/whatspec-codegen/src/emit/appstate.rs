@@ -540,13 +540,10 @@ fn main() {
     fn runtime_unknown_sentinel_cannot_alias_a_catalog_collection() {
         let mut fixture = ir(vec![]);
         fixture.collections.push("unknown".into());
-        assert!(
-            generate(&fixture)
-                .err()
-                .expect("the runtime sentinel is not a collection")
-                .to_string()
-                .contains("reserved")
-        );
+        let Err(error) = generate(&fixture) else {
+            panic!("the runtime sentinel is not a collection");
+        };
+        assert!(error.to_string().contains("reserved"));
     }
 
     #[test]
