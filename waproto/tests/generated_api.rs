@@ -43,6 +43,8 @@ fn signal_projection_guard_rejects_additive_known_fields() {
         ("SenderKeyStateStructure", &["SenderMessageKey"][..]),
         ("PreKeyRecordStructure", &[][..]),
     ] {
+        // Descriptor fixtures have no application-message wrapper in waproto::codec.
+        #[allow(clippy::disallowed_methods)]
         let mut descriptor =
             FileDescriptorSet::decode_from_slice(include_bytes!("../src/whatsapp.desc"))
                 .expect("committed descriptor");
