@@ -1,4 +1,4 @@
-//! Synthetic schema evolution fixtures, emitted by the same build and policy as production.
+//! Test-only schema fixtures, emitted with the production generator and policy.
 use super::{emission, names};
 use buffa::Message;
 use buffa_descriptor::generated::descriptor::*;

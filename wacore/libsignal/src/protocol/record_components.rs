@@ -3,8 +3,10 @@
 //! These types keep codec-generated structures private while providing a
 //! stable representation for record handoff. Conversion validates fixed-width
 //! key material and emits public keys in their canonical serialized form. The
-//! explicit field mappings are intentional: a generated schema change must
-//! fail to compile here instead of silently dropping protocol state.
+//! explicit field mappings are intentional: `waproto/signal-storage.snapshot`
+//! rejects descriptor changes during code generation until these projections
+//! and their preservation tests are updated together. Public generated types
+//! are non-exhaustive, so struct literals can no longer enforce that tripwire.
 
 use std::fmt;
 
