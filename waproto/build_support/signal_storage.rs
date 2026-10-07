@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use std::io;
 
 const ROOTS: &[&str] = &[
+    "IdentityKeyPairStructure",
     "PreKeyRecordStructure",
     "SignedPreKeyRecordStructure",
     "RecordStructure",
