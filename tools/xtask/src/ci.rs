@@ -71,6 +71,9 @@ pub enum Task {
         out_dir: PathBuf,
         #[arg(long)]
         skip_build: bool,
+        /// Measure the linked binary and dependency count without bloat/llvm-lines.
+        #[arg(long)]
+        gate_only: bool,
     },
     /// Write the size gate and report; budget failure stays in gate.txt for the workflow.
     BinarySizeReport {
@@ -295,7 +298,8 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
         Task::MeasureBinarySize {
             out_dir,
             skip_build,
-        } => super::size::measure(root, &out_dir, skip_build)?,
+            gate_only,
+        } => super::size::measure(root, &out_dir, skip_build, gate_only)?,
         Task::BinarySizeReport {
             head,
             base,
