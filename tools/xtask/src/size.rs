@@ -610,6 +610,11 @@ mod tests {
         assert!(diagnostic.contains("--skip-build --out-dir size-diagnostics"));
         assert!(!diagnostic.contains("--gate-only"));
         assert!(!diagnostic.contains("--out-dir size-out"));
+        assert!(step("Generate report and evaluate gate").contains("id: report"));
+        let comment = step("Post sticky PR comment");
+        // A fresh FAIL report must replace an older PASS even if diagnostics or
+        // uploads fail. The status function avoids the implicit success() guard.
+        assert!(comment.contains("if: ${{ !cancelled() && steps.report.outcome == 'success' && github.event.pull_request.head.repo.full_name == github.repository }}"));
         let enforce = step("Enforce size budget");
         assert!(enforce.contains("if: ${{ always() && !cancelled() }}"));
         assert!(enforce.contains("ci workflow size-gate"));

@@ -107,6 +107,7 @@ jobs:
         run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-override
       # No GH_TOKEN here: the report script is PR-controlled code.
       - name: Generate report and evaluate gate
+        id: report
         env:
           BASE_DIR: ${{ steps.baseline.outputs.dir }}
           ALLOW_SIZE_INCREASE: ${{ steps.override.outputs.allow }}
@@ -150,7 +151,7 @@ jobs:
           retention-days: 90
       # Fork PRs run with a read-only token, so they only get the job summary.
       - name: Post sticky PR comment
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: ${{ !cancelled() && steps.report.outcome == 'success' && github.event.pull_request.head.repo.full_name == github.repository }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
