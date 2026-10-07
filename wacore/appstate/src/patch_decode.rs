@@ -5,57 +5,7 @@ use std::str::FromStr;
 use wacore_binary::node::{Node, NodeRef};
 use waproto::whatsapp as wa;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum WAPatchName {
-    CriticalBlock,
-    CriticalUnblockLow,
-    RegularLow,
-    RegularHigh,
-    Regular,
-    Unknown,
-}
-
-impl WAPatchName {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::CriticalBlock => "critical_block",
-            Self::CriticalUnblockLow => "critical_unblock_low",
-            Self::RegularLow => "regular_low",
-            Self::RegularHigh => "regular_high",
-            Self::Regular => "regular",
-            Self::Unknown => "unknown",
-        }
-    }
-
-    /// Rank in the order batched syncs reserve collections in, which is also the
-    /// order the collections reach the wire. The ranks reproduce [`Self::as_str`]
-    /// order, and the match is exhaustive so a new variant has to be given a
-    /// rank rather than silently landing anywhere.
-    pub const fn reservation_rank(self) -> u8 {
-        match self {
-            Self::CriticalBlock => 0,
-            Self::CriticalUnblockLow => 1,
-            Self::Regular => 2,
-            Self::RegularHigh => 3,
-            Self::RegularLow => 4,
-            Self::Unknown => 5,
-        }
-    }
-}
-
-impl FromStr for WAPatchName {
-    type Err = ();
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "critical_block" => Self::CriticalBlock,
-            "critical_unblock_low" => Self::CriticalUnblockLow,
-            "regular_low" => Self::RegularLow,
-            "regular_high" => Self::RegularHigh,
-            "regular" => Self::Regular,
-            _ => Self::Unknown,
-        })
-    }
-}
+pub use crate::schemas::WAPatchName;
 
 #[derive(Debug, Clone)]
 pub struct PatchList {
@@ -408,21 +358,14 @@ mod tests {
         assert_eq!(names, by_name, "the ranks are the `as_str` order");
     }
 
-    /// Exhaustive on purpose: a seventh collection stops this compiling, which
-    /// is what puts whoever adds it in front of the pinned order above. The
-    /// rank itself cannot be forgotten, because `reservation_rank` is a match
-    /// over the enum.
+    /// Catalog growth must reach runtime parsing without a second name list.
     #[test]
-    fn the_pinned_order_covers_every_collection() {
-        for name in SHUFFLED {
-            match name {
-                WAPatchName::CriticalBlock
-                | WAPatchName::CriticalUnblockLow
-                | WAPatchName::Regular
-                | WAPatchName::RegularHigh
-                | WAPatchName::RegularLow
-                | WAPatchName::Unknown => {}
-            }
+    fn every_generated_collection_round_trips_through_sync() {
+        for collection in crate::schemas::COLLECTIONS {
+            let name = collection.as_str();
+            let runtime = WAPatchName::from_str(name).unwrap();
+            assert_ne!(runtime, WAPatchName::Unknown);
+            assert_eq!(runtime.as_str(), name);
         }
     }
 

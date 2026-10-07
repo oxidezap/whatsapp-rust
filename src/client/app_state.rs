@@ -6025,6 +6025,24 @@ mod send_patch_response_tests {
     async fn send_after_an_empty_sync(
         version: Option<wacore::appstate::hash::HashState>,
     ) -> (Result<()>, bool, usize) {
+        send_named_after_an_empty_sync(COLLECTION, version).await
+    }
+
+    #[tokio::test]
+    async fn every_catalog_collection_bootstraps_and_sends_under_its_wire_name() {
+        for collection in wacore::appstate::schemas::COLLECTIONS {
+            let (result, first_was_patch, patches) =
+                send_named_after_an_empty_sync(collection.as_str(), None).await;
+            result.expect("catalog collection should bootstrap and send");
+            assert!(!first_was_patch);
+            assert!(patches > 0);
+        }
+    }
+
+    async fn send_named_after_an_empty_sync(
+        collection: &'static str,
+        version: Option<wacore::appstate::hash::HashState>,
+    ) -> (Result<()>, bool, usize) {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         client.is_logged_in.store(true, Ordering::Relaxed);
         client.authenticated_generation.store(
@@ -6044,7 +6062,7 @@ mod send_patch_response_tests {
             .expect("test backend should accept a sync key");
         if let Some(version) = version {
             backend
-                .set_version(COLLECTION, version)
+                .set_version(collection, version)
                 .await
                 .expect("test backend should accept a version");
         }
@@ -6056,7 +6074,7 @@ mod send_patch_response_tests {
             let client = Arc::clone(&client);
             tokio::spawn(async move {
                 client
-                    .send_app_state_patch(COLLECTION, vec![wa::SyncdMutation::default()])
+                    .send_app_state_patch(collection, vec![wa::SyncdMutation::default()])
                     .await
             })
         };
@@ -6076,6 +6094,17 @@ mod send_patch_response_tests {
                         .optional_string("id")
                         .expect("every IQ carries an id")
                         .into_owned();
+                    let requested = node
+                        .get_optional_child_by_tag(&["sync", "collection"])
+                        .expect("sync request collection")
+                        .attrs()
+                        .optional_string("name")
+                        .unwrap()
+                        .into_owned();
+                    assert_eq!(
+                        requested, collection,
+                        "bootstrap and patch must retain the catalog name"
+                    );
                     let is_patch = node
                         .get_optional_child_by_tag(&["sync", "collection", "patch"])
                         .is_some();
@@ -6089,7 +6118,7 @@ mod send_patch_response_tests {
                     // nothing in it -- WA Web writes version 0 with an empty
                     // ltHash and the collection is synced from then on -- and
                     // what it sends a collection already at its head.
-                    let response = empty_sync_result(&id, COLLECTION);
+                    let response = empty_sync_result(&id, collection);
                     crate::test_utils::answer_iq(&client, &id, &response).await;
                     frame += 1;
                 }

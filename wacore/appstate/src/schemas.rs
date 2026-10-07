@@ -43,6 +43,58 @@ impl Collection {
     }
 }
 
+/// Runtime sync collection, derived from the same catalog as [`Collection`].
+/// Unlisted wire names retain the legacy [`Self::Unknown`] fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum WAPatchName {
+    CriticalBlock,
+    CriticalUnblockLow,
+    Regular,
+    RegularHigh,
+    RegularLow,
+    Unknown,
+}
+
+impl WAPatchName {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CriticalBlock => "critical_block",
+            Self::CriticalUnblockLow => "critical_unblock_low",
+            Self::Regular => "regular",
+            Self::RegularHigh => "regular_high",
+            Self::RegularLow => "regular_low",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Total reservation order, sorted by the exact wire name.
+    pub const fn reservation_rank(self) -> u8 {
+        match self {
+            Self::CriticalBlock => 0,
+            Self::CriticalUnblockLow => 1,
+            Self::Regular => 2,
+            Self::RegularHigh => 3,
+            Self::RegularLow => 4,
+            Self::Unknown => 5,
+        }
+    }
+}
+
+impl std::str::FromStr for WAPatchName {
+    type Err = ();
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "critical_block" => Self::CriticalBlock,
+            "critical_unblock_low" => Self::CriticalUnblockLow,
+            "regular" => Self::Regular,
+            "regular_high" => Self::RegularHigh,
+            "regular_low" => Self::RegularLow,
+            _ => Self::Unknown,
+        })
+    }
+}
+
 /// The index scope an action applies to.
 ///
 /// Consumers must allow new catalog variants.

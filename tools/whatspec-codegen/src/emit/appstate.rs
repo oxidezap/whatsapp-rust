@@ -149,6 +149,7 @@ pub fn generate(ir: &AppstateIr) -> Result<Generated> {
         ir.collections.iter().map(String::as_str),
     );
     out.push_str(&collection_enum);
+    out.push_str(&render_patch_names(&collection_variants)?);
     let scopes: BTreeSet<&str> = ir.actions.values().map(|a| a.scope.as_str()).collect();
     let (scope_enum, scope_variants) = render_enum(
         "/// The index scope an action applies to.",
@@ -362,6 +363,56 @@ fn render_enum<'a>(
     (s, map)
 }
 
+/// The sync engine must know every collection the action catalog can name.
+/// Keep its legacy Unknown sentinel for names absent from the pinned catalog.
+fn render_patch_names(collections: &BTreeMap<String, String>) -> Result<String> {
+    anyhow::ensure!(
+        !collections.contains_key("unknown"),
+        "collection `unknown` is reserved for the runtime sentinel"
+    );
+    let mut used = HashSet::from(["Unknown".to_owned()]);
+    let mut names = BTreeMap::new();
+    for (wire, variant) in collections {
+        names.insert(
+            wire.as_str(),
+            unique_type_ident(variant, &mut used, "Collection"),
+        );
+    }
+    names.insert("unknown", "Unknown".to_owned());
+    anyhow::ensure!(names.len() <= 256, "collection reservation ranks exceed u8");
+    let mut out = String::from(
+        "/// Runtime sync collection, derived from the same catalog as [`Collection`].\n\
+         /// Unlisted wire names retain the legacy [`Self::Unknown`] fallback.\n\
+         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\n\
+         #[non_exhaustive]\npub enum WAPatchName {\n",
+    );
+    for variant in names.values() {
+        out.push_str(&format!("    {variant},\n"));
+    }
+    out.push_str("}\n\nimpl WAPatchName {\n    pub fn as_str(&self) -> &'static str {\n        match self {\n");
+    for (wire, variant) in &names {
+        out.push_str(&format!(
+            "            Self::{variant} => {},\n",
+            rust_lit(wire)
+        ));
+    }
+    out.push_str("        }\n    }\n\n    /// Total reservation order, sorted by the exact wire name.\n    pub const fn reservation_rank(self) -> u8 {\n        match self {\n");
+    for (rank, variant) in names.values().enumerate() {
+        out.push_str(&format!("            Self::{variant} => {rank},\n"));
+    }
+    out.push_str("        }\n    }\n}\n\nimpl std::str::FromStr for WAPatchName {\n    type Err = ();\n    fn from_str(value: &str) -> Result<Self, Self::Err> {\n        Ok(match value {\n");
+    for (wire, variant) in &names {
+        if wire != &"unknown" {
+            out.push_str(&format!(
+                "            {} => Self::{variant},\n",
+                rust_lit(wire)
+            ));
+        }
+    }
+    out.push_str("            _ => Self::Unknown,\n        })\n    }\n}\n\n");
+    Ok(out)
+}
+
 fn render_index_part(part: &IndexPart) -> String {
     match part {
         IndexPart::Literal { value } => {
@@ -427,6 +478,75 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn new_catalog_collection_survives_runtime_sync_conversion() {
+        let mut fixture = ir(vec![(
+            "Future",
+            action("futureAction", "account", Some("future_sync_bucket")),
+        )]);
+        fixture.collections.push("future_sync_bucket".into());
+        fixture.collections.push("z_future_bucket".into());
+        let mut code = emitted(&fixture);
+        code.push_str(
+            r#"
+fn main() {
+    let schema = by_name("Future").unwrap();
+    let runtime = schema.collection.as_str().parse::<WAPatchName>().unwrap();
+    assert_ne!(runtime, WAPatchName::Unknown);
+    assert_eq!(runtime.as_str(), "future_sync_bucket");
+    assert_eq!("unlisted_runtime_bucket".parse::<WAPatchName>().unwrap(), WAPatchName::Unknown);
+    let mut names: Vec<_> = COLLECTIONS.iter()
+        .map(|c| c.as_str().parse::<WAPatchName>().unwrap()).collect();
+    names.push(WAPatchName::Unknown);
+    names.sort_by_key(|n| n.reservation_rank());
+    let sorted: Vec<_> = names.iter().map(WAPatchName::as_str).collect();
+    let mut expected = sorted.clone();
+    expected.sort_unstable();
+    expected.dedup();
+    assert_eq!(sorted, expected);
+}
+"#,
+        );
+        let dir =
+            std::env::temp_dir().join(format!("whatspec-appstate-runtime-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("probe.rs");
+        let executable = dir.join(format!("probe{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&source, code).unwrap();
+        let output = std::process::Command::new("rustc")
+            .args(["--edition=2024", "--crate-name", "collection_probe"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = std::process::Command::new(&executable).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn runtime_unknown_sentinel_cannot_alias_a_catalog_collection() {
+        let mut fixture = ir(vec![]);
+        fixture.collections.push("unknown".into());
+        assert!(
+            generate(&fixture)
+                .err()
+                .expect("the runtime sentinel is not a collection")
+                .to_string()
+                .contains("reserved")
+        );
     }
 
     #[test]
