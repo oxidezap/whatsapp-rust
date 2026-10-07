@@ -5816,6 +5816,7 @@ dependencies = [
  "scheduled-thread-pool",
  "serde_json",
  "sha2 0.11.0",
+ "sqlite-wasm-rs",
  "thiserror 2.0.21",
  "tokio",
  "wacore",
