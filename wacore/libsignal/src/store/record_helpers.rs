@@ -107,11 +107,21 @@ pub fn prekey_structure_to_record(
 pub fn prekey_record_to_structure(
     record: &PreKeyRecord,
 ) -> Result<wa::PreKeyRecordStructure, SignalProtocolError> {
-    // Re-derived from the parsed key pair rather than copied field-by-field, so
-    // a structure that reached the record with malformed key bytes cannot be
-    // written back out to the store.
+    // Validate and normalize the represented keys without rebuilding the whole
+    // protobuf: rebuilding would discard retained fields from a newer schema.
     let key_pair = record.key_pair()?;
-    Ok(new_pre_key_record(record.id()?.into(), &key_pair))
+    let id = record.id()?;
+    let mut structure = record.as_storage().clone();
+    structure.id = Some(id.into());
+    if let Some(public_key) = structure.public_key.as_mut() {
+        public_key.clear();
+        public_key.extend_from_slice(key_pair.public_key.public_key_bytes());
+    }
+    if let Some(private_key) = structure.private_key.as_mut() {
+        private_key.clear();
+        private_key.extend_from_slice(key_pair.private_key.serialize().as_ref());
+    }
+    Ok(structure)
 }
 
 pub fn signed_prekey_structure_to_record(
@@ -230,6 +240,32 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn prekey_store_round_trip_preserves_future_fields_and_normalizes_keys() {
+        use buffa::Message as _;
+
+        let key_pair = KeyPair::generate(&mut rand::rng());
+        for tagged in [false, true] {
+            let mut original = new_pre_key_record(42, &key_pair);
+            if tagged {
+                original.public_key = Some(key_pair.public_key.serialize().to_vec());
+            }
+            let future_fields = [0xa0, 0x06, 7, 0xaa, 0x06, 2, 0x12, 0x34];
+            let mut wire = original.encode_to_vec();
+            wire.extend_from_slice(&future_fields);
+            let original = wa::PreKeyRecordStructure::decode_from_slice(&wire).unwrap();
+            let record = prekey_structure_to_record(original).unwrap();
+            let restored = prekey_record_to_structure(&record).unwrap();
+            let mut expected = new_pre_key_record(42, &key_pair).encode_to_vec();
+            expected.extend_from_slice(&future_fields);
+            assert_eq!(restored.encode_to_vec(), expected);
+
+            let mut malformed = restored;
+            malformed.private_key = Some(vec![1; 31]);
+            assert!(prekey_record_to_structure(&PreKeyRecord::from_storage(malformed)).is_err());
+        }
     }
 
     /// The property the two encodings used to break: bytes written by the store
