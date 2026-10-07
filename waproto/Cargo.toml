@@ -43,6 +43,12 @@ prettyplease = "0.2"
 
 [dev-dependencies]
 serde_json = { workspace = true, features = ["std"] }
+buffa-build = { workspace = true }
+buffa-descriptor = { workspace = true }
+heck = { workspace = true }
+syn = { version = "2", features = ["full", "visit-mut"] }
+quote = "1"
+prettyplease = "0.2"
 
 [lints]
 workspace = true
