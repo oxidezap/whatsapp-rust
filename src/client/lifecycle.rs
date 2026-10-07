@@ -734,6 +734,7 @@ impl Client {
             chatstate_events_built: AtomicU32::new(0),
             custom_enc_handlers: std::sync::OnceLock::new(),
             inbound_durability_hook: std::sync::OnceLock::new(),
+            history_sync_capture_hook: std::sync::OnceLock::new(),
             retry_admission: std::sync::OnceLock::new(),
             history_sync_admission,
             connect_admission,

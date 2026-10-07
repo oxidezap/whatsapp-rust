@@ -363,10 +363,10 @@ impl Client {
             notification.sync_type
         );
 
-        // With a durability hook the receipt waits until the hook has captured
+        // With a capture hook the receipt waits until the hook has captured
         // the chunk. Download or capture failures leave it unacknowledged.
-        let durability_hook = self.inbound_durability_hook();
-        if durability_hook.is_none() {
+        let capture_hook = self.history_sync_capture_hook.get().cloned();
+        if capture_hook.is_none() {
             self.send_protocol_receipt(
                 message_id.clone(),
                 crate::types::presence::ReceiptType::HistorySync,
@@ -385,7 +385,7 @@ impl Client {
             log::debug!(
                 "Aborting history sync {} before payload acquisition during shutdown (early receipt attempted: {})",
                 message_id,
-                durability_hook.is_none()
+                capture_hook.is_none()
             );
             return;
         }
@@ -435,7 +435,7 @@ impl Client {
         };
         tracker.set_payload_bytes(payload_bytes);
 
-        if let Some(hook) = durability_hook {
+        if let Some(hook) = capture_hook {
             if let Err(e) = hook
                 .on_history_sync(
                     self.clone(),
@@ -1588,15 +1588,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::types::durability_hook::InboundDurabilityHook for HistoryCaptureHook {
-        async fn on_messages(
-            &self,
-            _: Arc<Client>,
-            _: &[crate::types::durability_hook::InboundMessage],
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
+    impl crate::types::durability_hook::HistorySyncCaptureHook for HistoryCaptureHook {
         async fn on_history_sync(
             &self,
             _: Arc<Client>,
@@ -1673,7 +1665,7 @@ mod tests {
         });
         if let Some(hook) = &hook {
             client
-                .inbound_durability_hook
+                .history_sync_capture_hook
                 .set(hook.clone())
                 .ok()
                 .unwrap();
@@ -1716,7 +1708,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_sync_receipt_is_sent_without_a_durability_hook() {
+    async fn history_sync_receipt_is_sent_without_a_capture_hook() {
         let (client, transport, _) = history_receipt_client(None).await;
         let (_, notification) = recent_history_chunk();
 
@@ -1728,7 +1720,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_sync_receipt_waits_until_the_durability_hook_captured_the_chunk() {
+    async fn history_sync_receipt_waits_until_the_capture_hook_captured_the_chunk() {
         let (client, transport, hook) = history_receipt_client(Some(false)).await;
         let hook = hook.unwrap();
         let (compressed, notification) = recent_history_chunk();
@@ -1755,7 +1747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_sync_receipt_is_withheld_when_the_durability_hook_fails() {
+    async fn history_sync_receipt_is_withheld_when_the_capture_hook_fails() {
         let (client, transport, hook) = history_receipt_client(Some(true)).await;
         let (_, notification) = recent_history_chunk();
 
@@ -1769,6 +1761,122 @@ mod tests {
             0,
             "a failed capture must not acknowledge the chunk"
         );
+    }
+
+    struct MessageOnlyHook;
+
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for MessageOnlyHook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[crate::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            panic!("history must not invoke the message commit hook");
+        }
+    }
+
+    #[tokio::test]
+    async fn message_only_hook_keeps_history_receipt_before_download() {
+        let (_, notification, http) = external_history_chunk(200);
+        let (client, transport, _) = history_receipt_client_with_http(None, http.clone()).await;
+        client
+            .inbound_durability_hook
+            .set(Arc::new(MessageOnlyHook))
+            .ok()
+            .unwrap();
+        set_history_media_conn(&client).await;
+        let mut task = Box::pin(
+            client.process_history_sync_task("HIST_MESSAGE_ONLY".to_owned(), notification.into()),
+        );
+        tokio::select! {
+            _ = http.entered.notified() => {},
+            _ = &mut task => panic!("history completed before download release"),
+        }
+        assert_eq!(history_receipts(&transport, "HIST_MESSAGE_ONLY").await, 1);
+        http.release.add_permits(1);
+        task.await;
+        assert_eq!(history_receipts(&transport, "HIST_MESSAGE_ONLY").await, 1);
+    }
+
+    #[tokio::test]
+    async fn both_hooks_keep_history_receipt_after_capture_completion() {
+        let (client, transport, hook) = history_receipt_client(Some(false)).await;
+        client
+            .inbound_durability_hook
+            .set(Arc::new(MessageOnlyHook))
+            .ok()
+            .unwrap();
+        let hook = hook.unwrap();
+        hook.release.try_acquire().unwrap().forget();
+        let (_, notification) = recent_history_chunk();
+        let mut task = Box::pin(
+            client.process_history_sync_task("HIST_BOTH_HOOKS".to_owned(), notification.into()),
+        );
+        tokio::select! {
+            _ = hook.entered.notified() => {},
+            _ = &mut task => panic!("history completed before capture release"),
+        }
+        assert_eq!(history_receipts(&transport, "HIST_BOTH_HOOKS").await, 0);
+        hook.release.add_permits(1);
+        task.await;
+        assert_eq!(history_receipts(&transport, "HIST_BOTH_HOOKS").await, 1);
+    }
+
+    #[tokio::test]
+    async fn capture_gets_unvalidated_bytes_again_on_duplicate_notification() {
+        let (client, transport, hook) = history_receipt_client(Some(false)).await;
+        let hook = hook.unwrap();
+        hook.release.add_permits(1);
+        let invalid = vec![0xff];
+        for _ in 0..2 {
+            let notification = HistorySyncNotification {
+                initial_hist_bootstrap_inline_payload: Some(invalid.clone()),
+                ..Default::default()
+            };
+            client
+                .process_history_sync_task("HIST_UNVALIDATED".to_owned(), notification.into())
+                .await;
+        }
+        {
+            let captured = hook.captured.lock().unwrap();
+            assert_eq!(
+                captured.len(),
+                2,
+                "deduplication belongs to the capture store"
+            );
+            assert!(captured.iter().all(|chunk| chunk.compressed == invalid));
+        }
+        assert_eq!(history_receipts(&transport, "HIST_UNVALIDATED").await, 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_join_or_cancel_an_entered_history_capture() {
+        let (client, transport, hook) = history_receipt_client(Some(false)).await;
+        let hook = hook.unwrap();
+        hook.release.try_acquire().unwrap().forget();
+        let (_, notification) = recent_history_chunk();
+        let history_client = client.clone();
+        let task = tokio::spawn(async move {
+            history_client
+                .process_history_sync_task("HIST_ENTERED_SHUTDOWN".to_owned(), notification.into())
+                .await;
+        });
+        hook.entered.notified().await;
+        assert_eq!(
+            history_receipts(&transport, "HIST_ENTERED_SHUTDOWN").await,
+            0
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), client.shutdown())
+            .await
+            .expect("shutdown does not join an entered history callback");
+        assert!(
+            !task.is_finished(),
+            "shutdown must not abort the running capture"
+        );
+        hook.release.add_permits(1);
+        task.await.unwrap();
+        assert_eq!(client.history_sync_activity.snapshot().tasks, 0);
     }
 
     /// A real encrypted history download whose response is released by the test.

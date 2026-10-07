@@ -13,6 +13,10 @@
 //! `(info.source.chat, info.source.sender, info.id)`, since stanza ids are only
 //! unique within a chat/sender.
 //!
+//! This message-only hook leaves history receipt ordering unchanged. History
+//! capture is a separate opt-in through `with_history_sync_capture_hook`; see
+//! [`whatsapp_rust::HistorySyncCaptureHook`] for its contract.
+//!
 //!   cargo run --example durability_hook
 
 use std::collections::HashSet;

@@ -3800,6 +3800,7 @@ fn client_size_pins_runtime_cache_config_saving() {
         // stay unchanged, just as for the other feature-sized attachments.
         expected += size_of::<Arc<bench_startup::StartupTasks>>();
     }
+    expected += size_of::<std::sync::OnceLock<Arc<dyn crate::HistorySyncCaptureHook>>>();
     assert_eq!(
         size_of::<Client>(),
         expected,
