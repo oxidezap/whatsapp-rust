@@ -1099,21 +1099,25 @@ where
     V: Clone + Send + Sync + 'static,
     H: BuildHasher,
 {
+    #[cfg(feature = "bench-harness")]
     pub fn max_capacity(mut self, cap: u64) -> Self {
         self.max_capacity = Some(cap);
         self
     }
 
+    #[cfg(feature = "bench-harness")]
     pub fn time_to_live(mut self, ttl: Duration) -> Self {
         self.ttl = Some(ttl);
         self
     }
 
+    #[cfg(feature = "bench-harness")]
     pub fn time_to_idle(mut self, tti: Duration) -> Self {
         self.tti = Some(tti);
         self
     }
 
+    #[cfg(feature = "bench-harness")]
     pub fn evict_guard(mut self, guard: fn(&V) -> bool) -> Self {
         self.evict_guard = Some(guard);
         self
@@ -1540,7 +1544,7 @@ where
     /// The configured capacity, or `None` when unbounded. `Some(0)` is the
     /// off switch: `insert` short-circuits, so the cache never holds anything
     /// and a caller can skip work that only makes sense when it does.
-    #[cfg_attr(not(any(test, feature = "bench-harness")), allow(dead_code))]
+    #[cfg(feature = "bench-harness")]
     pub fn configured_capacity(&self) -> Option<u64> {
         self.max_capacity
     }
