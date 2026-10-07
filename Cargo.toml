@@ -445,28 +445,31 @@ name = "inbound_stanza"
 harness = false
 required-features = ["bench-harness"]
 
-# The `Cache<Jid, _>` lookup shape `chat_lanes` runs per inbound message. No
-# `required-features`: it reaches only the public cache, so it builds (and is
-# regression-gated) in a plain `cargo bench`.
+# These benchmarks use internal cache types. Select bench-harness explicitly,
+# as the CodSpeed client shard does; a self dev-dependency also enables that
+# fixture in ordinary examples and changes the shipping demo's feature graph.
 [[bench]]
 name = "jid_keyed_cache"
 harness = false
+required-features = ["bench-harness"]
 
 # USync normalization + spec build: pure `wacore`/`wacore-binary` calls, no
-# runtime, no `bench-harness`. Same plain-`cargo bench` reasoning as above.
+# runtime or `bench-harness`; this remains available in plain `cargo bench`.
 [[bench]]
 name = "client_usync"
 harness = false
 
-# Warm `LidPnCache` hit/miss through the public cache only. Same reasoning.
+# Warm `LidPnCache` hit/miss through the benchmark-only cache facade.
 [[bench]]
 name = "client_identity_cache"
 harness = false
+required-features = ["bench-harness"]
 
-# `Cache` write/evict/sweep terms around the read path. Same reasoning.
+# Internal `Cache` write/evict/sweep terms around the read path.
 [[bench]]
 name = "client_cache_maint"
 harness = false
+required-features = ["bench-harness"]
 
 [profile.release]
 opt-level = 3
