@@ -20,10 +20,10 @@
 
 #[path = "build_support/emission.rs"]
 mod emission;
-#[path = "build_support/evolution.rs"]
-mod evolution;
 #[path = "build_support/names.rs"]
 mod names;
+#[path = "build_support/signal_storage.rs"]
+mod signal_storage;
 
 use buffa::Message as _;
 use buffa_descriptor::generated::descriptor::{
@@ -68,6 +68,7 @@ fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_support");
     println!("cargo:rerun-if-changed=api.snapshot");
+    println!("cargo:rerun-if-changed=signal-storage.snapshot");
 
     ensure_proto_descriptor_hash()?;
 
@@ -88,6 +89,7 @@ fn main() -> std::io::Result<()> {
     // Local persisted fields target the frozen names, so an upstream rename
     // cannot detach a persistence extension from its message.
     apply_local_fields(&mut fds)?;
+    signal_storage::check(&names::wire_api(&fds))?;
 
     // Emit the wire-tag consts (field numbers) for hand-written partial decoders.
     generate_tags(&fds, &out_path.join("tags.rs"))?;
@@ -251,7 +253,6 @@ fn main() -> std::io::Result<()> {
     let snapshot = api.iter().cloned().collect::<Vec<_>>().join("\n") + "\n";
     std::fs::write(out_path.join("api.snapshot"), snapshot)?;
     emission::check_api(include_str!("api.snapshot"), &api)?;
-    evolution::generate(&out_path.join("evolution"))?;
 
     Ok(())
 }

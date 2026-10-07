@@ -1,6 +1,17 @@
 //! Compile the *same external consumer* against both generations. The fixtures
-//! are emitted in build.rs, using the resolved production generator dependency,
-//! and use the production buffa dependency requirement and workspace lock.
+//! are emitted only when this test runs, using the production generator and
+//! runtime dependency requirements and workspace lock.
+
+#[allow(dead_code)]
+#[path = "../build_support/emission.rs"]
+mod emission;
+#[path = "../build_support/evolution.rs"]
+mod evolution;
+#[allow(dead_code)]
+#[path = "../build_support/names.rs"]
+mod names;
+#[path = "../build_support/signal_storage.rs"]
+mod signal_storage;
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -10,6 +21,74 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn signal_projection_guard_rejects_additive_known_fields() {
+    use buffa::Message as _;
+    use buffa_descriptor::generated::descriptor::{
+        FieldDescriptorProto, FileDescriptorSet, field_descriptor_proto,
+    };
+
+    let baseline: std::collections::BTreeSet<String> = include_str!("../api.snapshot")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    signal_storage::check(&baseline).expect("current Signal projections match");
+    for (root, nested) in [
+        ("SessionStructure", &[][..]),
+        ("SessionStructure", &["Chain", "MessageKey"][..]),
+        ("SenderKeyStateStructure", &[][..]),
+        ("SenderKeyStateStructure", &["SenderChainKey"][..]),
+        ("SenderKeyStateStructure", &["SenderMessageKey"][..]),
+        ("PreKeyRecordStructure", &[][..]),
+    ] {
+        let mut descriptor =
+            FileDescriptorSet::decode_from_slice(include_bytes!("../src/whatsapp.desc"))
+                .expect("committed descriptor");
+        let mut message = descriptor
+            .file
+            .iter_mut()
+            .flat_map(|file| &mut file.message_type)
+            .find(|message| message.name.as_deref() == Some(root))
+            .expect("persisted record");
+        for nested in nested {
+            message = message
+                .nested_type
+                .iter_mut()
+                .find(|message| message.name.as_deref() == Some(nested))
+                .expect("nested persisted record");
+        }
+        // A present-empty message must not disappear through semantic equality
+        // or a projection unaware of this new generated field.
+        message.field.push(FieldDescriptorProto {
+            name: Some("futureState".into()),
+            number: Some(1000),
+            label: Some(field_descriptor_proto::Label::LABEL_OPTIONAL),
+            r#type: Some(field_descriptor_proto::Type::TYPE_MESSAGE),
+            type_name: Some(".whatsapp.SessionStructure".into()),
+            ..Default::default()
+        });
+        let mut candidate = baseline.clone();
+        candidate.extend(names::wire_api(&descriptor));
+        emission::check_api(include_str!("../api.snapshot"), &candidate)
+            .expect("general public API deliberately permits additions");
+        let error = signal_storage::check(&candidate)
+            .expect_err("Signal additions require coordinated projection changes");
+        assert!(error.to_string().contains("futureState"));
+    }
+}
+
+#[test]
+fn signal_projection_guard_allows_unrelated_schema_evolution() {
+    let mut candidate = include_str!("../api.snapshot")
+        .lines()
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    candidate.insert("wire .whatsapp.Message.futureState number=Some(1000)".into());
+    signal_storage::check(&candidate).expect("ordinary message evolution remains additive");
+    candidate.retain(|line| !line.starts_with("wire .whatsapp.SessionStructure.rootKey "));
+    signal_storage::check(&candidate).expect_err("removing represented state must also fail");
 }
 
 #[test]
@@ -70,7 +149,8 @@ serde_json = "1"
         runtime["features"]
     );
     std::fs::write(scratch.0.join("Cargo.toml"), manifest).unwrap();
-    let generated = PathBuf::from(env!("OUT_DIR")).join("evolution");
+    let generated = scratch.0.join("evolution");
+    evolution::generate(&generated).expect("generate evolution fixtures only for tests");
     let source = format!(
         r#"#![allow(non_camel_case_types, unreachable_patterns)]
 pub use buffa::*;
