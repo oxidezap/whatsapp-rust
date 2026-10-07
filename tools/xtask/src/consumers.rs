@@ -530,7 +530,7 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
             // Host tooling measures Cargo wall time, not the SDK's pluggable clock.
             #[allow(clippy::disallowed_methods)]
             let started = Instant::now();
-            let code = if let Some(expected) = &invocation.expect_failure {
+            let (code, elapsed) = if let Some(expected) = &invocation.expect_failure {
                 // Structured diagnostics tie the code and API fragments to one
                 // primary error, independent of ANSI or unrelated stderr text.
                 command
@@ -539,9 +539,10 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
                 let output = command
                     .output()
                     .with_context(|| format!("execute {}", consumer.manifest))?;
+                let elapsed = started.elapsed();
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 eprint!("{stderr}");
-                match expected.verify(
+                let code = match expected.verify(
                     output.status.success(),
                     &String::from_utf8_lossy(&output.stdout),
                 ) {
@@ -550,17 +551,18 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
                         eprintln!("{error:#}");
                         1
                     }
-                }
+                };
+                (code, elapsed)
             } else {
-                xtask_support::exit_code(
-                    command
-                        .status()
-                        .with_context(|| format!("execute {}", consumer.manifest))?,
-                )
+                let status = command
+                    .status()
+                    .with_context(|| format!("execute {}", consumer.manifest))?;
+                let elapsed = started.elapsed();
+                (xtask_support::exit_code(status), elapsed)
             };
             println!(
                 "[{lane:?}] finished in {:.3}s; validation status: {code}",
-                started.elapsed().as_secs_f64()
+                elapsed.as_secs_f64()
             );
             if code != 0 {
                 eprintln!(
