@@ -78,7 +78,7 @@ impl Drop for ChatstateRegistration {
 /// Parses incoming chatstate stanzas using the `ProtocolNode` pattern
 /// and dispatches events to registered handlers.
 #[derive(Default)]
-pub struct ChatstateHandler;
+pub(crate) struct ChatstateHandler;
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]

@@ -6,14 +6,14 @@ use std::sync::Arc;
 ///
 /// The router maintains a registry of handlers keyed by XML tag and efficiently
 /// dispatches incoming nodes to the correct handler based on the node's tag.
-pub struct StanzaRouter {
+pub(crate) struct StanzaRouter {
     /// Map of XML tag -> handler for fast lookups
     handlers: HashMap<&'static str, Arc<dyn StanzaHandler>>,
 }
 
 impl StanzaRouter {
     /// Create a new empty router.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             handlers: HashMap::new(),
         }
@@ -27,7 +27,7 @@ impl StanzaRouter {
     /// # Panics
     /// Panics if a handler is already registered for the same tag to prevent
     /// accidental overwrites during initialization.
-    pub fn register(&mut self, handler: Arc<dyn StanzaHandler>) {
+    pub(crate) fn register(&mut self, handler: Arc<dyn StanzaHandler>) {
         let tag = handler.tag();
         if self.handlers.insert(tag, handler).is_some() {
             panic!("Handler for tag '{}' already registered", tag);
@@ -44,7 +44,7 @@ impl StanzaRouter {
     /// Returns `true` if a handler was found and successfully processed the node,
     /// `false` if no handler was registered for the node's tag or the handler
     /// indicated it couldn't process the node.
-    pub async fn dispatch(
+    pub(crate) async fn dispatch(
         &self,
         client: Arc<Client>,
         node: Arc<wacore_binary::OwnedNodeRef>,
@@ -61,12 +61,13 @@ impl StanzaRouter {
     ///
     /// A tag with no handler is one [`dispatch`](Self::dispatch) would report
     /// unhandled, which is what makes the caller nack it.
-    pub fn models(&self, tag: &str) -> bool {
+    pub(crate) fn models(&self, tag: &str) -> bool {
         self.handlers.contains_key(tag)
     }
 
     /// Get the number of registered handlers (useful for testing).
-    pub fn handler_count(&self) -> usize {
+    #[cfg(test)]
+    fn handler_count(&self) -> usize {
         self.handlers.len()
     }
 }

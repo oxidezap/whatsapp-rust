@@ -1,0 +1,923 @@
+//! LID-PN (Linked ID to Phone Number) Cache
+//!
+//! This module implements a cache for mapping between WhatsApp's Linked IDs (LIDs)
+//! and phone numbers. The cache is used for Signal address resolution - WhatsApp Web
+//! uses LID-based addresses for Signal sessions when available.
+//!
+//! The cache maintains bidirectional mappings:
+//! - LID -> Entry (for getting phone number from LID)
+//! - Phone Number -> Entry (for getting LID from phone number)
+//!
+//! When multiple LIDs exist for the same phone number (rare), the most recent one
+//! (by `created_at` timestamp) is considered "current".
+//!
+//! Both maps are unbounded by default and never expire. WA Web
+//! (`WAWebLidPnCache`) uses plain `Map`s, so a mapping learned at startup or
+//! via usync stays available for every subsequent Signal-address resolution.
+//! A custom `CacheEntryConfig` can impose a capacity bound if memory pressure
+//! requires it, accepting the trade-off that capacity-LRU eviction silently
+//! downgrades Signal addresses to `@c.us`.
+
+use std::sync::Arc;
+
+use wacore_binary::CompactString;
+
+use crate::cache_config::{CacheConfig, CacheEntryConfig};
+use crate::cache_store::TypedCache;
+#[cfg(test)]
+use wacore::types::LearningSource;
+use wacore::types::LidPnEntry;
+
+/// Namespaces used in the custom store.
+const NS_LID: &str = "lid_pn_by_lid";
+const NS_PN: &str = "lid_pn_by_pn";
+
+/// An integer key allocates nothing and stays `Display` for the store path.
+#[inline]
+fn pack_contact_hash(hash: [u8; 3]) -> u32 {
+    u32::from_be_bytes([0, hash[0], hash[1], hash[2]])
+}
+
+#[inline]
+fn contact_hash_key(user: &str) -> u32 {
+    pack_contact_hash(wacore::crypto::contact_notification_hash(user))
+}
+
+/// Cache for LID to Phone Number mappings.
+///
+/// This cache maintains bidirectional mappings between LIDs and phone numbers,
+/// similar to WhatsApp Web's LidPnCache class. It provides fast lookups for
+/// Signal address resolution.
+///
+/// The cache is thread-safe and can be shared across async tasks.
+pub struct LidPnCache {
+    /// LID -> Entry mapping. `Arc` so the hot `get_*` lookups clone a refcount,
+    /// not the entry's strings; only the owned-`LidPnEntry` accessors deep-clone.
+    /// Keys are `Arc<str>` sharing the entry's own allocations — each identifier
+    /// is stored once per mapping, not once as key and again inside the entry
+    /// (this cache is unbounded by design, so per-entry bytes compound).
+    lid_to_entry: TypedCache<Arc<str>, Arc<LidPnEntry>>,
+    /// Phone number -> Entry mapping (stores the most recent LID for that PN)
+    pn_to_entry: TypedCache<Arc<str>, Arc<LidPnEntry>>,
+    /// Serializes mapping writers. Reads remain lock-free; the guard exists so
+    /// an authoritative device refresh can compare topology and publish its
+    /// mappings plus registry snapshot without a concurrent writer slipping
+    /// between those steps.
+    mutation: async_lock::Mutex<()>,
+    pub(crate) identity_continuity: wacore::store::signal_cache::IdentityContinuity,
+    /// Device-topology tracker (attached by Client construction): a mapping
+    /// change alters which canonical record either key resolves to, so adds
+    /// record both identifiers. Recording lives here, at the write
+    /// chokepoint, so callers cannot forget it.
+    topology: std::sync::OnceLock<Arc<crate::client::device_topology::DeviceTopology>>,
+    /// Contact hash -> LID, for the `<devices>` `<update hash>` notification
+    /// whose 3-byte hash is the only identifier it carries. Both sides of a pair
+    /// are indexed because the hashed id is LID-namespaced only for migrated
+    /// contacts, and both resolve to the LID. Always in-process: derived state
+    /// each process rebuilds from its own warm-up. A 3-byte hash collides for
+    /// ~1 pair in a few thousand contacts, where the newest write wins.
+    contact_hash_to_lid: TypedCache<u32, Arc<str>>,
+    /// PN -> the LID this process durably persisted for it. Lets the learn hot
+    /// path skip a re-persist without swallowing the first live persist of a
+    /// mapping an offline replay only warmed in memory. Keyed by the pair so a
+    /// remap (or a stale detached write that marks late) only matches its own
+    /// LID, never a newer un-persisted one. `Arc<str>` value: the hot-path check
+    /// clones a refcount and compares in place, no payload copy. In-memory only;
+    /// mappings loaded from persistent storage are marked during warm-up.
+    persisted: TypedCache<Arc<str>, Arc<str>>,
+}
+
+/// What [`LidPnCache::memory_stats`] reports: one figure per internal map.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LidPnMemory {
+    /// LID → entry, charged with the entry payloads.
+    pub lid: wacore::stats::CollectionStats,
+    /// PN → entry; bytes cover only entries the LID map no longer shares.
+    pub pn: wacore::stats::CollectionStats,
+    /// Contact hash → LID, structural bytes only (the LID is the entry's).
+    pub contact_hash: wacore::stats::CollectionStats,
+    /// PN → persisted LID, structural bytes only (both strings are the entry's).
+    pub persisted: wacore::stats::CollectionStats,
+}
+
+/// Proof that LID/PN mapping mutations are serialized.
+pub(crate) struct LidPnMutationGuard<'a> {
+    _guard: async_lock::MutexGuard<'a, ()>,
+}
+
+impl Default for LidPnCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LidPnCache {
+    /// Create a new empty cache with default settings (no time-based expiry,
+    /// effectively unbounded — matches `WAWebLidPnCache`).
+    pub fn new() -> Self {
+        Self::with_config(&CacheConfig::default().lid_pn_cache, None)
+    }
+
+    /// Create a new cache with custom configuration (uses time_to_idle semantics
+    /// when a timeout is set; default config has none).
+    ///
+    /// When `store` is `Some`, both internal maps use the custom backend.
+    /// When `store` is `None`, both maps use in-process caches.
+    pub fn with_config(
+        config: &CacheEntryConfig,
+        store: Option<Arc<dyn wacore::store::CacheStore>>,
+    ) -> Self {
+        // Eviction and external writers can change resolution without add().
+        // Historical sends cannot prove alias continuity in those configurations.
+        let identity_continuity =
+            if store.is_none() && config.timeout.is_none() && config.capacity == u64::MAX {
+                wacore::store::signal_cache::IdentityContinuity::default()
+            } else {
+                wacore::store::signal_cache::IdentityContinuity::unavailable()
+            };
+        match store {
+            Some(s) => Self {
+                lid_to_entry: TypedCache::from_store(s.clone(), NS_LID, config.timeout),
+                pn_to_entry: TypedCache::from_store(s, NS_PN, config.timeout),
+                mutation: async_lock::Mutex::new(()),
+                identity_continuity,
+                // Always in-memory: tracks per-process persist state, never the
+                // mapping itself, so it must not go through the shared store.
+                persisted: TypedCache::from_local(config.build_with_tti()),
+                contact_hash_to_lid: TypedCache::from_local(config.build_with_tti()),
+                topology: std::sync::OnceLock::new(),
+            },
+            None => Self {
+                lid_to_entry: TypedCache::from_local(config.build_with_tti()),
+                pn_to_entry: TypedCache::from_local(config.build_with_tti()),
+                mutation: async_lock::Mutex::new(()),
+                identity_continuity,
+                persisted: TypedCache::from_local(config.build_with_tti()),
+                contact_hash_to_lid: TypedCache::from_local(config.build_with_tti()),
+                topology: std::sync::OnceLock::new(),
+            },
+        }
+    }
+
+    /// Attach the device-topology tracker. Mapping writes before the attach
+    /// (none in practice: Client construction attaches before warm-up) are
+    /// simply not scoped.
+    pub(crate) fn attach_topology(
+        &self,
+        topology: Arc<crate::client::device_topology::DeviceTopology>,
+    ) {
+        let _ = self.topology.set(topology);
+    }
+
+    pub(crate) async fn lock_mutation(&self) -> LidPnMutationGuard<'_> {
+        LidPnMutationGuard {
+            _guard: self.mutation.lock().await,
+        }
+    }
+
+    /// Test-only clones of the backing custom stores, one per direction map.
+    #[cfg(test)]
+    pub(crate) fn custom_stores_for_tests(&self) -> Vec<Arc<dyn wacore::store::CacheStore>> {
+        [
+            self.lid_to_entry.custom_store_for_tests(),
+            self.pn_to_entry.custom_store_for_tests(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// Approximate entry counts plus estimated retained bytes for the LID and
+    /// PN maps. Bytes are `0` when backed by a custom store (entries live
+    /// outside this process).
+    ///
+    /// `add()` stores the same `Arc<LidPnEntry>` under both directions, so the
+    /// payload is attributed to the LID map; the PN side counts only entries
+    /// the LID map no longer holds (transient eviction asymmetry), keeping
+    /// every entry counted exactly once. `Arc<T>`'s `HeapSize` already
+    /// includes `size_of::<LidPnEntry>()`.
+    pub async fn memory_stats(&self) -> LidPnMemory {
+        use wacore::stats::HeapSize;
+        // Dedup by heap address as `usize`, not `*const LidPnEntry`: a raw-pointer
+        // set is `!Send`, and held across the two `.await`s below it would make
+        // `Client::memory_report()` `!Send` (unusable off a single thread). The cast
+        // is a plain address on every target (`LidPnEntry: Sized` → thin pointer).
+        let mut lid_ptrs: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut lid = self
+            .lid_to_entry
+            .memory_stats(|_, v| {
+                lid_ptrs.insert(Arc::as_ptr(v) as usize);
+                v.heap_bytes()
+            })
+            .await;
+        lid.bytes += self.identity_continuity.estimated_heap_bytes() as u64;
+        let pn = self
+            .pn_to_entry
+            .memory_stats(|_, v| {
+                if lid_ptrs.contains(&(Arc::as_ptr(v) as usize)) {
+                    0
+                } else {
+                    v.heap_bytes()
+                }
+            })
+            .await;
+        // Both side maps hold only `Arc<str>`s the entries above already own
+        // (`contact_hash_to_lid` clones the entry's LID; `persisted` takes the
+        // entry's own pair), so their payload is charged once, at the entry.
+        // What they add is table structure, which `memory_stats` charges
+        // itself — and that is the part that grows with the contact count for
+        // the whole process lifetime, which is why they are reported at all.
+        let contact_hash = self.contact_hash_to_lid.structural_stats().await;
+        let persisted = self.persisted.structural_stats().await;
+        LidPnMemory {
+            lid,
+            pn,
+            contact_hash,
+            persisted,
+        }
+    }
+
+    /// Sweep entries past the configured idle timeout (a no-op for the
+    /// default, unbounded configuration, and for store-backed maps). Driven by
+    /// [`Client::run_cache_maintenance`].
+    ///
+    /// [`Client::run_cache_maintenance`]: crate::client::Client::run_cache_maintenance
+    pub async fn run_pending_tasks(&self) {
+        self.lid_to_entry.run_pending_tasks().await;
+        self.pn_to_entry.run_pending_tasks().await;
+        self.contact_hash_to_lid.run_pending_tasks().await;
+        self.persisted.run_pending_tasks().await;
+    }
+
+    /// Get the current LID for a phone number.
+    ///
+    /// Returns the LID user part if a mapping exists, None otherwise.
+    /// The cache holds `Arc<LidPnEntry>`; return the LID user as an (inline for
+    /// typical ~15-digit LIDs) `CompactString` instead of deep-cloning a `String`.
+    pub async fn get_current_lid(&self, phone: &str) -> Option<CompactString> {
+        self.pn_to_entry
+            .get(phone)
+            .await
+            .map(|e| CompactString::from(&*e.lid))
+    }
+
+    /// Whether the learn fast path can skip re-recording `phone <-> lid`: the
+    /// pair is durably persisted AND resolvable in BOTH cache directions.
+    /// Requiring both directions means skipping never leaves the reverse
+    /// (LID -> PN) lookup cold under a configured eviction; that lookup
+    /// (`get_phone_number`, e.g. in PN->LID session migration) has no backend
+    /// fallback. All checks compare in place over the Arc-shared values, no
+    /// payload clone.
+    pub(crate) async fn can_skip_relearn(&self, phone: &str, lid: &str) -> bool {
+        self.is_persisted(phone, lid).await
+            && self
+                .pn_to_entry
+                .get(phone)
+                .await
+                .is_some_and(|e| &*e.lid == lid)
+            && self
+                .lid_to_entry
+                .get(lid)
+                .await
+                .is_some_and(|e| &*e.phone_number == phone)
+    }
+
+    /// Get the phone number for a LID.
+    ///
+    /// Returns the phone number user part if a mapping exists, None otherwise.
+    pub async fn get_phone_number(&self, lid: &str) -> Option<String> {
+        self.lid_to_entry
+            .get(lid)
+            .await
+            .map(|e| e.phone_number.to_string())
+    }
+
+    /// Get the full entry for a LID.
+    pub async fn get_entry_by_lid(&self, lid: &str) -> Option<LidPnEntry> {
+        self.lid_to_entry.get(lid).await.map(|e| (*e).clone())
+    }
+
+    /// Get the full entry for a phone number.
+    pub async fn get_entry_by_phone(&self, phone: &str) -> Option<LidPnEntry> {
+        self.pn_to_entry.get(phone).await.map(|e| (*e).clone())
+    }
+
+    /// Add or update a mapping in the cache.
+    ///
+    /// For the LID -> Entry map, this always updates.
+    /// For the PN -> Entry map, this only updates if the new entry has a
+    /// newer or equal `created_at` timestamp (matching WhatsApp Web behavior).
+    ///
+    /// The writer guard keeps the get-then-insert sequence ordered within this
+    /// client, including when the cache uses an external backend.
+    pub async fn add(&self, entry: &LidPnEntry) {
+        let guard = self.lock_mutation().await;
+        self.add_guarded(entry, &guard).await;
+    }
+
+    pub(crate) async fn add_guarded(&self, entry: &LidPnEntry, guard: &LidPnMutationGuard<'_>) {
+        self.add_guarded_impl(entry, guard, true).await;
+    }
+
+    /// The write behind [`add_guarded`](Self::add_guarded). `record_topology`
+    /// is `false` only for the startup warm-up, which records the whole batch
+    /// as one scoped change instead of one lock round trip per entry. Scoped,
+    /// not global: the warm-up task runs concurrently with the first live
+    /// refreshes, and a global change would restart every one of them.
+    async fn add_guarded_impl(
+        &self,
+        entry: &LidPnEntry,
+        _guard: &LidPnMutationGuard<'_>,
+        record_topology: bool,
+    ) {
+        let previous_pn = self.pn_to_entry.get(&*entry.phone_number).await;
+        let should_update_pn = match &previous_pn {
+            Some(existing) => existing.created_at <= entry.created_at,
+            None => true,
+        };
+        let previous_lid = self.lid_to_entry.get(&*entry.lid).await;
+        let mapping_changed = previous_lid
+            .as_ref()
+            .is_none_or(|existing| existing.phone_number != entry.phone_number)
+            || (should_update_pn
+                && previous_pn
+                    .as_ref()
+                    .is_none_or(|existing| existing.lid != entry.lid));
+        let _identity_change = mapping_changed.then(|| {
+            self.identity_continuity.changing(
+                [
+                    Some(&*entry.lid),
+                    Some(&*entry.phone_number),
+                    previous_pn.as_ref().map(|previous| &*previous.lid),
+                    previous_lid
+                        .as_ref()
+                        .map(|previous| &*previous.phone_number),
+                ]
+                .into_iter()
+                .flatten(),
+            )
+        });
+
+        // One shared copy of the entry; the keys clone the entry's own
+        // Arc<str> allocations, so each identifier lives once per mapping.
+        let shared = Arc::new(entry.clone());
+        self.lid_to_entry
+            .insert(shared.lid.clone(), Arc::clone(&shared))
+            .await;
+
+        self.contact_hash_to_lid
+            .insert(contact_hash_key(&shared.lid), Arc::clone(&shared.lid))
+            .await;
+
+        // Update PN -> Entry map (only if newer or equal timestamp)
+        if should_update_pn {
+            // A losing older entry must not point this number's hash at a
+            // superseded LID.
+            self.contact_hash_to_lid
+                .insert(
+                    contact_hash_key(&shared.phone_number),
+                    Arc::clone(&shared.lid),
+                )
+                .await;
+            self.pn_to_entry
+                .insert(shared.phone_number.clone(), shared)
+                .await;
+        }
+
+        if record_topology && let Some(topology) = self.topology.get() {
+            topology.record([&*entry.lid, &*entry.phone_number]);
+        }
+    }
+
+    /// Resolve the contact a `<devices>` `<update hash>` refers to.
+    pub(crate) async fn lid_for_contact_hash(&self, hash: [u8; 3]) -> Option<Arc<str>> {
+        self.contact_hash_to_lid.get(&pack_contact_hash(hash)).await
+    }
+
+    /// Whether this process has durably persisted exactly `phone -> lid`.
+    /// Pair-keyed so a remap, or a stale detached write marking late, never
+    /// reports a newer un-persisted LID as persisted. Clones no payload.
+    pub(crate) async fn is_persisted(&self, phone: &str, lid: &str) -> bool {
+        self.persisted
+            .get(phone)
+            .await
+            .is_some_and(|stored| stored.as_ref() == lid)
+    }
+
+    /// Takes the entry's own identifiers: this map holds one pair per
+    /// persisted contact for the process lifetime, so re-allocating both
+    /// strings here would duplicate every mapping's payload a third time.
+    pub(crate) async fn mark_persisted(&self, phone: &Arc<str>, lid: &Arc<str>) {
+        self.persisted
+            .insert(Arc::clone(phone), Arc::clone(lid))
+            .await;
+    }
+
+    /// Warm up the cache with entries from persistent storage.
+    ///
+    /// This should be called during client initialization to populate
+    /// the cache from the database.
+    pub async fn warm_up(&self, entries: impl IntoIterator<Item = LidPnEntry>) {
+        let start = wacore::time::Instant::now();
+        let mut count = 0;
+        let guard = self.lock_mutation().await;
+        let mut touched: Vec<Arc<str>> = Vec::new();
+
+        for entry in entries {
+            self.add_guarded_impl(&entry, &guard, false).await;
+            touched.push(Arc::clone(&entry.lid));
+            touched.push(Arc::clone(&entry.phone_number));
+            // `warm_up` only accepts durable rows. Mark the pair that won the
+            // PN-side timestamp resolution so a live re-learn neither writes
+            // it again nor repeats discovery migrations.
+            if self
+                .pn_to_entry
+                .get(&*entry.phone_number)
+                .await
+                .is_some_and(|current| current.lid == entry.lid)
+            {
+                self.mark_persisted(&entry.phone_number, &entry.lid).await;
+            }
+            count += 1;
+        }
+        // One record for the batch; see `add_guarded_impl`. A batch wider
+        // than the log's bound overflows it, which poisons every memo once,
+        // exactly what per-entry records would have done. An empty batch
+        // changed nothing and records nothing: a generation bump with no
+        // users would still send every memo through a restamp.
+        if !touched.is_empty()
+            && let Some(topology) = self.topology.get()
+        {
+            topology.record(touched.iter().map(|id| &**id));
+        }
+
+        log::debug!(
+            "LID-PN cache warmed up with {} entries in {:?}",
+            count,
+            start.elapsed()
+        );
+    }
+
+    /// Clear all entries from the cache.
+    ///
+    /// Awaits the actual clear operation on custom backends (unlike
+    /// `invalidate_all` which is fire-and-forget).
+    #[cfg_attr(not(any(test, feature = "bench-harness")), allow(dead_code))]
+    pub async fn clear(&self) {
+        let _guard = self.lock_mutation().await;
+        let _identity_change = self.identity_continuity.changing([]);
+        self.lid_to_entry.clear().await;
+        self.pn_to_entry.clear().await;
+        self.persisted.clear().await;
+        self.contact_hash_to_lid.clear().await;
+        if let Some(topology) = self.topology.get() {
+            topology.record_global();
+        }
+    }
+
+    /// Get the number of LID entries in the cache.
+    #[cfg_attr(not(any(test, feature = "bench-harness")), allow(dead_code))]
+    pub async fn lid_count(&self) -> u64 {
+        self.lid_to_entry.run_pending_tasks().await;
+        self.lid_to_entry.entry_count()
+    }
+
+    /// Get the number of phone number entries in the cache.
+    #[cfg_attr(not(any(test, feature = "bench-harness")), allow(dead_code))]
+    pub async fn pn_count(&self) -> u64 {
+        self.pn_to_entry.run_pending_tasks().await;
+        self.pn_to_entry.entry_count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evictable_alias_cache_cannot_authorize_historical_sends() {
+        for config in [
+            CacheEntryConfig::new(None, 1),
+            CacheEntryConfig::new(Some(std::time::Duration::from_secs(60)), u64::MAX),
+        ] {
+            let cache = LidPnCache::with_config(&config, None);
+            assert_eq!(cache.identity_continuity.snapshot(), None);
+        }
+        assert!(LidPnCache::new().identity_continuity.snapshot().is_some());
+    }
+
+    #[tokio::test]
+    async fn alias_journal_records_both_ends_of_replaced_mappings() {
+        let cache = LidPnCache::new();
+        let original = LidPnEntry::new("100000000000001", "15550000001", LearningSource::Usync);
+        cache.add(&original).await;
+        let sent = cache.identity_continuity.snapshot();
+        let mut replacement = original.clone();
+        replacement.lid = "100000000000002".into();
+        cache.add(&replacement).await;
+        replacement.phone_number = "15550000002".into();
+        cache.add(&replacement).await;
+        for user in [
+            "100000000000001",
+            "100000000000002",
+            "15550000001",
+            "15550000002",
+        ] {
+            assert!(!cache.identity_continuity.unchanged_for(sent, [user]));
+        }
+        assert!(
+            cache
+                .identity_continuity
+                .unchanged_for(sent, ["15550000003"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_basic_operations() {
+        let cache = LidPnCache::new();
+
+        // Initially empty
+        assert!(cache.get_current_lid("559980000001").await.is_none());
+        assert!(cache.get_phone_number("100000012345678").await.is_none());
+
+        // Add a mapping
+        let entry = LidPnEntry::new(
+            "100000012345678".to_string(),
+            "559980000001".to_string(),
+            LearningSource::Usync,
+        );
+        cache.add(&entry).await;
+
+        // Should be retrievable both ways
+        assert_eq!(
+            cache.get_current_lid("559980000001").await.as_deref(),
+            Some("100000012345678")
+        );
+        assert_eq!(
+            cache.get_phone_number("100000012345678").await,
+            Some("559980000001".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_conflict_resolution() {
+        let cache = LidPnCache::new();
+
+        // Add old mapping
+        let old_entry = LidPnEntry::with_timestamp(
+            "100000012345678".to_string(),
+            "559980000001".to_string(),
+            1000,
+            LearningSource::Other,
+        );
+        cache.add(&old_entry).await;
+
+        assert_eq!(
+            cache.get_current_lid("559980000001").await.as_deref(),
+            Some("100000012345678")
+        );
+
+        // Add newer mapping for same phone (different LID)
+        let new_entry = LidPnEntry::with_timestamp(
+            "100000087654321".to_string(),
+            "559980000001".to_string(),
+            2000,
+            LearningSource::Usync,
+        );
+        cache.add(&new_entry).await;
+
+        // Should return the newer LID for PN lookup
+        assert_eq!(
+            cache.get_current_lid("559980000001").await.as_deref(),
+            Some("100000087654321")
+        );
+
+        // Both LIDs should still be in the LID -> Entry map
+        assert_eq!(
+            cache.get_phone_number("100000012345678").await,
+            Some("559980000001".to_string())
+        );
+        assert_eq!(
+            cache.get_phone_number("100000087654321").await,
+            Some("559980000001".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_older_entry_does_not_override() {
+        let cache = LidPnCache::new();
+
+        // Add new mapping first
+        let new_entry = LidPnEntry::with_timestamp(
+            "100000087654321".to_string(),
+            "559980000001".to_string(),
+            2000,
+            LearningSource::Usync,
+        );
+        cache.add(&new_entry).await;
+
+        // Try to add older mapping
+        let old_entry = LidPnEntry::with_timestamp(
+            "100000012345678".to_string(),
+            "559980000001".to_string(),
+            1000,
+            LearningSource::Other,
+        );
+        cache.add(&old_entry).await;
+
+        // PN -> LID should still return the newer one
+        assert_eq!(
+            cache.get_current_lid("559980000001").await.as_deref(),
+            Some("100000087654321")
+        );
+
+        // The number's contact hash follows the same winner, or a device
+        // update naming that number would refresh the superseded LID.
+        let phone_hash = wacore::crypto::contact_notification_hash("559980000001");
+        assert_eq!(
+            cache.lid_for_contact_hash(phone_hash).await.as_deref(),
+            Some("100000087654321")
+        );
+        // Each LID still resolves to itself: the loser is a real contact too.
+        for lid in ["100000087654321", "100000012345678"] {
+            assert_eq!(
+                cache
+                    .lid_for_contact_hash(wacore::crypto::contact_notification_hash(lid))
+                    .await
+                    .as_deref(),
+                Some(lid)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_warm_up() {
+        let cache = LidPnCache::new();
+
+        let entries = vec![
+            LidPnEntry::with_timestamp(
+                "lid1".to_string(),
+                "pn1".to_string(),
+                1,
+                LearningSource::Other,
+            ),
+            LidPnEntry::with_timestamp(
+                "lid2".to_string(),
+                "pn2".to_string(),
+                2,
+                LearningSource::Usync,
+            ),
+            LidPnEntry::with_timestamp(
+                "lid3".to_string(),
+                "pn3".to_string(),
+                3,
+                LearningSource::PeerPnMessage,
+            ),
+        ];
+
+        cache.warm_up(entries).await;
+
+        assert_eq!(cache.lid_count().await, 3);
+        assert_eq!(cache.pn_count().await, 3);
+
+        assert_eq!(cache.get_current_lid("pn1").await.as_deref(), Some("lid1"));
+        assert_eq!(cache.get_current_lid("pn2").await.as_deref(), Some("lid2"));
+        assert_eq!(cache.get_current_lid("pn3").await.as_deref(), Some("lid3"));
+        assert!(cache.can_skip_relearn("pn1", "lid1").await);
+        assert!(cache.can_skip_relearn("pn2", "lid2").await);
+        assert!(cache.can_skip_relearn("pn3", "lid3").await);
+    }
+
+    /// The startup warm-up races the first live refreshes, so it must record
+    /// the batch as a scoped change: a refresh of a user it did not touch
+    /// keeps its result, one of a user it did recomputes.
+    #[tokio::test]
+    async fn warm_up_records_a_scoped_change() {
+        let cache = LidPnCache::new();
+        let topology = crate::client::device_topology::DeviceTopology::new();
+        cache.attach_topology(Arc::clone(&topology));
+        let before = topology.current();
+
+        cache
+            .warm_up([LidPnEntry::with_timestamp(
+                "lid1".to_string(),
+                "pn1".to_string(),
+                1,
+                LearningSource::Other,
+            )])
+            .await;
+
+        use crate::client::member_index::MemberIndex;
+        let members = |user: &str| MemberIndex::from_users([user]);
+        assert!(topology.unchanged_for(before, &members("unrelated")));
+        assert!(!topology.unchanged_for(before, &members("pn1")));
+        assert!(!topology.unchanged_for(before, &members("lid1")));
+    }
+
+    #[tokio::test]
+    async fn test_clear() {
+        let cache = LidPnCache::new();
+
+        let entry = LidPnEntry::new(
+            "100000012345678".to_string(),
+            "559980000001".to_string(),
+            LearningSource::Usync,
+        );
+        cache.add(&entry).await;
+
+        assert_eq!(cache.lid_count().await, 1);
+        assert_eq!(cache.pn_count().await, 1);
+
+        cache.clear().await;
+        assert_eq!(cache.lid_count().await, 0);
+        assert_eq!(cache.pn_count().await, 0);
+        assert!(cache.get_current_lid("559980000001").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn persisted_marker_is_pair_specific() {
+        let cache = LidPnCache::new();
+        let pn = "559980000099";
+        let (lid_a, lid_b) = ("100000000000001", "100000000000002");
+        assert!(!cache.is_persisted(pn, lid_a).await);
+        cache
+            .mark_persisted(&Arc::from(pn), &Arc::from(lid_a))
+            .await;
+        assert!(cache.is_persisted(pn, lid_a).await);
+        // A remap to a new LID is not persisted (even a stale mark of the old
+        // LID never satisfies the new pair), so it re-persists.
+        assert!(!cache.is_persisted(pn, lid_b).await);
+    }
+
+    #[tokio::test]
+    async fn skip_requires_both_cache_directions() {
+        let cache = LidPnCache::new();
+        let (pn, lid) = ("559980000099", "100000000000001");
+        cache
+            .add(&LidPnEntry::new(
+                lid.to_string(),
+                pn.to_string(),
+                LearningSource::PeerPnMessage,
+            ))
+            .await;
+        cache.mark_persisted(&Arc::from(pn), &Arc::from(lid)).await;
+        assert!(cache.can_skip_relearn(pn, lid).await);
+
+        // Evict the reverse (LID -> PN) entry: the fast path must stop skipping
+        // so the next live message re-warms it (get_phone_number has no fallback).
+        cache.lid_to_entry.invalidate(lid).await;
+        assert!(
+            !cache.can_skip_relearn(pn, lid).await,
+            "skip must require the reverse map, not just PN -> LID"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbounded_table_resolves_all_four_indexes() {
+        let cache = LidPnCache::new();
+        let entry = LidPnEntry::with_timestamp(
+            "100000012345678".to_string(),
+            "559980000001".to_string(),
+            1000,
+            LearningSource::Usync,
+        );
+        cache.add(&entry).await;
+        cache.mark_persisted(&entry.phone_number, &entry.lid).await;
+
+        assert_eq!(
+            cache.get_current_lid("559980000001").await.as_deref(),
+            Some("100000012345678")
+        );
+        assert_eq!(
+            cache.get_phone_number("100000012345678").await.as_deref(),
+            Some("559980000001")
+        );
+        for user in ["100000012345678", "559980000001"] {
+            let hash = wacore::crypto::contact_notification_hash(user);
+            assert_eq!(
+                cache.lid_for_contact_hash(hash).await.as_deref(),
+                Some("100000012345678")
+            );
+        }
+        assert!(cache.is_persisted("559980000001", "100000012345678").await);
+        assert!(
+            cache
+                .can_skip_relearn("559980000001", "100000012345678")
+                .await
+        );
+        assert_eq!(cache.lid_count().await, 1);
+        assert_eq!(cache.pn_count().await, 1);
+        cache.run_pending_tasks().await;
+        assert_eq!(cache.lid_count().await, 1);
+        assert_eq!(
+            cache.get_current_lid("559980000001").await.as_deref(),
+            Some("100000012345678"),
+            "maintenance must not drop unbounded entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_table_still_evicts_and_expiring_table_still_expires() {
+        let evicting = LidPnCache::with_config(&CacheEntryConfig::new(None, 1), None);
+        evicting
+            .add(&LidPnEntry::with_timestamp(
+                "100000000000001".to_string(),
+                "15550000001".to_string(),
+                1,
+                LearningSource::Usync,
+            ))
+            .await;
+        evicting
+            .add(&LidPnEntry::with_timestamp(
+                "100000000000002".to_string(),
+                "15550000002".to_string(),
+                2,
+                LearningSource::Usync,
+            ))
+            .await;
+        assert_eq!(
+            evicting.lid_count().await,
+            1,
+            "capacity-1 LID map keeps the managed eviction policy"
+        );
+
+        let expiring = LidPnCache::with_config(
+            &CacheEntryConfig::new(Some(std::time::Duration::from_millis(50)), 1_000),
+            None,
+        );
+        expiring
+            .add(&LidPnEntry::new(
+                "100000000000003".to_string(),
+                "15550000003".to_string(),
+                LearningSource::Usync,
+            ))
+            .await;
+        assert!(expiring.get_current_lid("15550000003").await.is_some());
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            expiring.get_current_lid("15550000003").await.is_none(),
+            "idle expiry still applies on the managed path"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbounded_replacement_keeps_pn_winner_rule() {
+        let cache = LidPnCache::new();
+        cache
+            .add(&LidPnEntry::with_timestamp(
+                "100000000000001".to_string(),
+                "15550000004".to_string(),
+                2000,
+                LearningSource::Usync,
+            ))
+            .await;
+        cache
+            .add(&LidPnEntry::with_timestamp(
+                "100000000000002".to_string(),
+                "15550000004".to_string(),
+                1000,
+                LearningSource::Other,
+            ))
+            .await;
+        assert_eq!(
+            cache.get_current_lid("15550000004").await.as_deref(),
+            Some("100000000000001"),
+            "an older PN mapping must not displace the winner"
+        );
+        let phone_hash = wacore::crypto::contact_notification_hash("15550000004");
+        assert_eq!(
+            cache.lid_for_contact_hash(phone_hash).await.as_deref(),
+            Some("100000000000001")
+        );
+        assert_eq!(
+            cache.get_phone_number("100000000000002").await.as_deref(),
+            Some("15550000004"),
+            "the losing LID stays resolvable"
+        );
+    }
+
+    #[test]
+    fn test_learning_source_serialization() {
+        let sources = [
+            (LearningSource::Usync, "usync"),
+            (LearningSource::PeerPnMessage, "peer_pn_message"),
+            (LearningSource::PeerLidMessage, "peer_lid_message"),
+            (LearningSource::RecipientLatestLid, "recipient_latest_lid"),
+            (LearningSource::MigrationSyncLatest, "migration_sync_latest"),
+            (LearningSource::MigrationSyncOld, "migration_sync_old"),
+            (LearningSource::BlocklistActive, "blocklist_active"),
+            (LearningSource::BlocklistInactive, "blocklist_inactive"),
+            (LearningSource::Pairing, "pairing"),
+            (LearningSource::DeviceNotification, "device_notification"),
+            (LearningSource::Other, "other"),
+        ];
+
+        for (source, expected_str) in sources {
+            assert_eq!(source.as_str(), expected_str);
+            assert_eq!(LearningSource::parse(expected_str), source);
+        }
+
+        // Unknown string should map to Other
+        assert_eq!(LearningSource::parse("unknown"), LearningSource::Other);
+    }
+}

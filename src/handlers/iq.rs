@@ -14,7 +14,7 @@ use wacore::xml::DisplayableNodeRef;
 /// - Feature queries
 /// - Settings updates
 #[derive(Default)]
-pub struct IqHandler;
+pub(crate) struct IqHandler;
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]

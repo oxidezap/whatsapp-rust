@@ -1,7 +1,4 @@
 pub use crate::transport::Transport;
-pub use bytes::BytesMut;
-pub use std::sync::Arc;
-pub use std::sync::atomic::AtomicU32;
 pub use wacore::handshake::{NoiseCipher, NoiseError};
 pub use wacore::libsignal::crypto::GcmInPlaceBuffer;
 pub use wacore::runtime::Runtime;
@@ -11,8 +8,10 @@ pub use wacore::socket::noise_socket::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
     use std::future::Future;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use wacore::framing::FRAME_LENGTH_SIZE;
 
     #[tokio::test]

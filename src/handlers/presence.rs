@@ -13,7 +13,7 @@ use wacore::types::presence::PresenceStatus;
 ///
 /// Parses incoming presence updates and dispatches `Event::Presence` via the event bus.
 #[derive(Default)]
-pub struct PresenceHandler;
+pub(crate) struct PresenceHandler;
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]

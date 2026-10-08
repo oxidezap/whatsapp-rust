@@ -84,10 +84,7 @@ mod tests {
     impl HttpClient for Rejected {
         async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
             assert_eq!(request.url, "https://cdn.example.com/static");
-            Ok(HttpResponse {
-                status_code: 410,
-                body: Vec::new(),
-            })
+            Ok(HttpResponse::new(410, Vec::new()))
         }
     }
 
@@ -169,19 +166,16 @@ mod tests {
     #[async_trait]
     impl HttpClient for AcceptedBody {
         async fn execute(&self, _: HttpRequest) -> Result<HttpResponse> {
-            Ok(HttpResponse {
-                status_code: 200,
-                body: b"external destination".to_vec(),
-            })
+            Ok(HttpResponse::new(200, b"external destination".to_vec()))
         }
         fn supports_streaming(&self) -> bool {
             self.0
         }
         fn execute_streaming(&self, _: HttpRequest) -> Result<wacore::net::StreamingHttpResponse> {
-            Ok(wacore::net::StreamingHttpResponse {
-                status_code: 200,
-                body: Box::new(Cursor::new(b"external destination".to_vec())),
-            })
+            Ok(wacore::net::StreamingHttpResponse::new(
+                200,
+                Box::new(Cursor::new(b"external destination".to_vec())),
+            ))
         }
     }
 

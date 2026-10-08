@@ -10,21 +10,14 @@ use xtask_support::{capture, run};
 
 #[derive(Subcommand)]
 pub enum Task {
+    /// Bind successful qualification evidence to the caller's exact commit.
+    QualificationSha,
     /// Read the installed libc version for the benchmark cache key.
     LibcVersion,
     /// Wait for the local self-signed mock service used by E2E/bench jobs.
     WaitForMock,
     /// Reject direct native pool references outside the SQLite platform shim.
     GuardSqliteShim,
-    /// Run semver-checks while streaming its merged output into semver.log.
-    SemverCheck,
-    /// Append an informational semver result and bounded log tail to the job summary.
-    SemverSummary {
-        #[arg(long)]
-        outcome: String,
-        #[arg(long, default_value = "semver.log")]
-        log: PathBuf,
-    },
     /// Validate a release version before publishing and emit version/tag outputs.
     ReleaseVersion,
     /// Create the requested release tag only if it is absent remotely.
@@ -184,44 +177,21 @@ fn install_libc_debug() -> Result<()> {
 }
 pub fn run_task(root: &Path, task: Task) -> Result<()> {
     match task {
-        Task::SemverCheck => {
-            use std::io::Read;
-            let (mut reader, writer) = std::io::pipe()?;
-            let mut command = Command::new("cargo");
-            command
-                .args([
-                    "semver-checks",
-                    "check-release",
-                    "--color",
-                    "never",
-                    "-p",
-                    "wacore",
-                    "-p",
-                    "wacore-binary",
-                    "-p",
-                    "waproto",
-                ])
-                .current_dir(root)
-                .stdout(writer.try_clone()?)
-                .stderr(writer);
-            let mut child = command.spawn()?;
-            drop(command);
-            let mut log = std::fs::File::create(root.join("semver.log"))?;
-            let mut stdout = std::io::stdout().lock();
-            let mut buffer = [0u8; 8192];
-            loop {
-                let n = reader.read(&mut buffer)?;
-                if n == 0 {
-                    break;
-                }
-                log.write_all(&buffer[..n])?;
-                stdout.write_all(&buffer[..n])?;
-                stdout.flush()?;
-            }
+        Task::QualificationSha => {
+            let expected = env("EXPECTED_SHA")?;
+            let actual = String::from_utf8(
+                capture(
+                    Command::new("git")
+                        .args(["rev-parse", "HEAD"])
+                        .current_dir(root),
+                )?
+                .stdout,
+            )?;
             ensure!(
-                child.wait()?.success(),
-                "semver-checks reported a failure; see semver.log"
+                actual.trim() == expected,
+                "qualification checkout does not match requested SHA"
             );
+            summary(format!("Qualified commit: `{expected}`\n").as_bytes())?;
         }
         Task::LibcVersion => {
             let v = String::from_utf8(
@@ -267,21 +237,6 @@ pub fn run_task(root: &Path, task: Task) -> Result<()> {
                 "use crate::pool instead of direct native pool APIs:\n{}",
                 violations.join("\n")
             );
-        }
-        Task::SemverSummary { outcome, log } => {
-            let verdict = if outcome == "success" {
-                "No breaking changes detected against the last published release."
-            } else {
-                "Breaking changes detected. This does not block the PR — bump the\nminor version if the break is intended."
-            };
-            let tail = match std::fs::read(log) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(200000)..])
-                    .into_owned(),
-                Err(_) => {
-                    "cargo-semver-checks did not run; see the failed setup step above.\n".into()
-                }
-            };
-            summary(format!("## cargo-semver-checks (informational)\n\n{verdict}\n\n<details><summary>Output (tail; full log in the semver-checks-log artifact)</summary>\n\n```\n{tail}```\n\n</details>\n").as_bytes())?;
         }
         Task::ReleaseVersion => {
             let text = std::fs::read_to_string(root.join("Cargo.toml"))?;

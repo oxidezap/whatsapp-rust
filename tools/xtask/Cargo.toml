@@ -14,6 +14,10 @@ serde_json = { workspace = true, features = ["std", "float_roundtrip"] }
 xtask-support.workspace = true
 regex = "1"
 tempfile = "3"
+toml = "1"
+semver = "1"
+tar = "0.4"
+flate2.workspace = true
 
 [lints]
 workspace = true

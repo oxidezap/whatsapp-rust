@@ -11,7 +11,7 @@ use wacore::stanza::wire_tags::StanzaTag;
 /// - Read receipts
 /// - Played receipts (for voice messages and media)
 #[derive(Default)]
-pub struct ReceiptHandler;
+pub(crate) struct ReceiptHandler;
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]

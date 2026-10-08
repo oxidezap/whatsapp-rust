@@ -2778,7 +2778,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36c791ecdf977c99f45f23280405d7723727470f6689a5e6dbf513ac547ae10d"
 dependencies = [
  "serde",
- "toml",
+ "toml 0.9.12+spec-1.1.0",
 ]
 
 [[package]]
@@ -4849,6 +4849,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml"
+version = "1.1.6+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "920602543f0911ab71da12c50d59701da54c196d1a2bf5cb4b75667f137a406a"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime 1.1.1+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 1.0.4",
+]
+
+[[package]]
 name = "toml_datetime"
 version = "0.7.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5198,6 +5213,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "wacore",
  "wacore-appstate",
  "wacore-binary",
  "wacore-derive",
@@ -5553,7 +5569,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "sha2 0.10.9",
- "toml",
+ "toml 0.9.12+spec-1.1.0",
  "wasmtime-environ",
  "windows-sys 0.61.2",
  "zstd 0.13.3",
@@ -5804,6 +5820,7 @@ dependencies = [
  "scheduled-thread-pool",
  "serde_json",
  "sha2 0.11.0",
+ "sqlite-wasm-rs",
  "thiserror 2.0.21",
  "tokio",
  "wacore",
@@ -5874,10 +5891,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "flate2",
  "regex",
+ "semver",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
+ "toml 1.1.6+spec-1.1.0",
  "xtask-support",
 ]
 

@@ -16,7 +16,7 @@ use wacore_binary::Node;
 /// Fields are held inline rather than behind `Arc`: the manager is not
 /// `Clone`, exposes no field handles, and every op borrows `&self` from the
 /// `Client` (itself always behind `Arc`), so no independent owner exists.
-pub struct UnifiedSessionManager {
+pub(crate) struct UnifiedSessionManager {
     server_time_offset_ms: AtomicI64,
     last_sent_id: Mutex<Option<String>>,
     sequence: AtomicU64,
@@ -29,7 +29,7 @@ impl Default for UnifiedSessionManager {
 }
 
 impl UnifiedSessionManager {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             server_time_offset_ms: AtomicI64::new(0),
             last_sent_id: Mutex::new(None),
@@ -37,16 +37,18 @@ impl UnifiedSessionManager {
         }
     }
 
-    pub fn server_time_offset_ms(&self) -> i64 {
+    #[cfg(test)]
+    pub(crate) fn server_time_offset_ms(&self) -> i64 {
         self.server_time_offset_ms.load(Ordering::Relaxed)
     }
 
-    pub fn sequence(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn sequence(&self) -> u64 {
         self.sequence.load(Ordering::Relaxed)
     }
 
     /// Update server time offset from node's `t` attribute (Unix timestamp in seconds).
-    pub fn update_server_time_offset(&self, node: &wacore_binary::NodeRef<'_>) {
+    pub(crate) fn update_server_time_offset(&self, node: &wacore_binary::NodeRef<'_>) {
         if let Some(t_val) = node.get_attr("t").map(|v| v.as_str())
             && let Ok(server_time) = t_val.parse::<i64>()
             && server_time > 0
@@ -65,7 +67,7 @@ impl UnifiedSessionManager {
     ///
     /// This gives a more accurate clock skew estimate by assuming the server
     /// timestamp corresponds to the midpoint of the round trip.
-    pub fn update_server_time_offset_with_rtt(
+    pub(crate) fn update_server_time_offset_with_rtt(
         &self,
         node: &wacore_binary::NodeRef<'_>,
         start_time_ms: i64,
@@ -83,13 +85,13 @@ impl UnifiedSessionManager {
         }
     }
 
-    pub fn calculate_session_id(&self) -> String {
+    pub(crate) fn calculate_session_id(&self) -> String {
         let offset = self.server_time_offset_ms.load(Ordering::Relaxed);
         UnifiedSession::calculate_id(offset)
     }
 
     /// Prepare to send unified session. Returns None if duplicate (already sent this ID).
-    pub async fn prepare_send(&self) -> Option<(Node, u64)> {
+    pub(crate) async fn prepare_send(&self) -> Option<(Node, u64)> {
         let session_id = self.calculate_session_id();
 
         {
@@ -119,12 +121,13 @@ impl UnifiedSessionManager {
     }
 
     /// Clear last sent ID to allow retry on failure.
-    pub async fn clear_last_sent(&self) {
+    pub(crate) async fn clear_last_sent(&self) {
         *self.last_sent_id.lock().await = None;
     }
 
     /// Reset state on disconnect (keeps sequence counter).
-    pub async fn reset(&self) {
+    #[cfg(test)]
+    pub(crate) async fn reset(&self) {
         self.server_time_offset_ms.store(0, Ordering::Relaxed);
         *self.last_sent_id.lock().await = None;
     }

@@ -28,6 +28,7 @@ pub(crate) struct ProbeBackend {
     pub(crate) entered: Option<async_channel::Sender<()>>,
     pub(crate) gate_method: &'static str,
     fail_save: bool,
+    pub(crate) fail_maintenance: bool,
 }
 
 impl ProbeBackend {
@@ -44,6 +45,7 @@ impl ProbeBackend {
                 entered: None,
                 gate_method: "save",
                 fail_save: false,
+                fail_maintenance: false,
             },
             dropped,
         )
@@ -75,6 +77,11 @@ impl DeviceStore for ProbeBackend {
     }
     async fn maintenance(&self) -> Result<()> {
         self.before_call("maintenance").await;
+        if self.fail_maintenance {
+            return Err(wacore::store::error::StoreError::Validation(
+                "synthetic maintenance failure".into(),
+            ));
+        }
         self.backend.maintenance().await
     }
     async fn load(&self) -> Result<Option<wacore::store::Device>> {

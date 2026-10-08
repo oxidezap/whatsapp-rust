@@ -8,6 +8,10 @@ on:
   pull_request:
     branches: [main]
   workflow_call:
+    inputs:
+      release-check:
+        type: boolean
+        default: false
   workflow_dispatch:
   # RUSTSEC advisories land against a lockfile that has not changed, so the
   # audit needs a clock of its own rather than only PR triggers.
@@ -46,18 +50,36 @@ jobs:
       - name: Audit host tooling dependencies
         run: cargo deny --locked --manifest-path tools/oracle-task/Cargo.toml --all-features check
 
-  semver-checks:
-    name: Semver Checks (informational)
+  compatibility:
+    name: Compatibility and packages (${{ matrix.lane }})
     runs-on: ubuntu-latest
-    # Advisory only. The workspace is pre-1.0 and intentionally breaks API
-    # between minors; this job exists to make the break visible in the summary,
-    # not to block the PR.
-    continue-on-error: true
+    env:
+      LANE: ${{ matrix.lane }}
+      TOOLCHAIN: ${{ matrix.toolchain }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: native
+            toolchain: nightly-2026-06-16
+          - lane: msrv
+            toolchain: 1.94.1
+          - lane: wasm
+            toolchain: 1.94.1
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
+          targets: wasm32-unknown-unknown
+      - uses: dtolnay/rust-toolchain@1.94.1
+        if: matrix.lane != 'native'
+        with:
+          targets: wasm32-unknown-unknown
       - name: Install protoc
         uses: taiki-e/install-action@v2
         with:
@@ -66,23 +88,29 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-semver-checks
+      - name: Install WASM consumer test runner
+        if: matrix.lane == 'wasm'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.129
       - name: Cache Rust build (registry + target)
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "true"
-      - name: Check API against the last published release
-        id: semver
+      - name: Build the qualification driver
+        run: cargo +nightly-2026-06-16 build --locked -p whatsapp-xtask
+      - name: Validate contracts before release
+        if: inputs.release-check
+        run: target/debug/whatsapp-xtask ci compatibility --release --lane "$LANE" --toolchain "$TOOLCHAIN"
+      - name: Validate candidate or frozen contracts
+        if: ${{ !inputs.release-check }}
+        run: target/debug/whatsapp-xtask ci compatibility --lane "$LANE" --toolchain "$TOOLCHAIN"
+      - name: Qualify distributed artifacts outside the checkout
+        run: target/debug/whatsapp-xtask ci package-consumers --lane "$LANE" --toolchain "$TOOLCHAIN"
+      - name: Prove SDK and host breaks fail downstream compilation
+        if: matrix.lane != 'msrv'
+        run: target/debug/whatsapp-xtask ci compatibility-controls --lane "$LANE" --toolchain "$TOOLCHAIN"
+      - name: Record exact source commit
         env:
-          # Plain output: the progress spinner's escape codes are most of the
-          # log's bytes and render as noise once captured to a file.
-          CARGO_TERM_COLOR: never
-        run: cargo xt ci workflow semver-check
-      - name: Publish report to the job summary
-        if: always()
-        run: cargo xt ci workflow semver-summary --outcome '${{ steps.semver.outcome }}'
-      - name: Upload the full semver-checks log
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: semver-checks-log
-          path: semver.log
+          EXPECTED_SHA: ${{ github.sha }}
+        run: target/debug/whatsapp-xtask ci workflow qualification-sha

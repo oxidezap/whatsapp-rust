@@ -46,6 +46,16 @@ jobs:
     name: Validate independent API consumers
     uses: ./.github/workflows/consumers.yml
 
+  validate-compatibility:
+    name: Validate release contracts and packaged consumers
+    uses: ./.github/workflows/supply-chain.yml
+    with:
+      release-check: true
+
+  validate-wasm:
+    name: Validate WASM execution
+    uses: ./.github/workflows/wasm.yml
+
   validate-e2e:
     name: Validate E2E
     uses: ./.github/workflows/e2e.yml
@@ -53,7 +63,7 @@ jobs:
 
   publish:
     name: Publish to crates.io
-    needs: [preflight, validate, validate-consumers, validate-e2e]
+    needs: [preflight, validate, validate-consumers, validate-e2e, validate-compatibility, validate-wasm]
     runs-on: ubuntu-latest
     environment: release
     steps:

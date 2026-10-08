@@ -36,6 +36,15 @@ use waproto::whatsapp as wa;
 /// memory retention cannot provide crash durability. A consumer must make its
 /// own commit durable before returning `Ok(())`.
 ///
+/// The builder checks the backend's individual `ProtocolStore` pending-inbound
+/// store/read/delete and participant lookup operations, rejecting unsupported backends with
+/// [`ClientBuilderError::UnsupportedDurabilityBackend`](crate::ClientBuilderError::UnsupportedDurabilityBackend).
+/// Custom batched overrides must preserve those operations' semantics; the
+/// construction probe does not certify an arbitrary batch implementation.
+///
+/// History capture is configured independently through [`HistorySyncCaptureHook`].
+/// Registering this hook alone does not change history receipt ordering.
+///
 /// Retries can repeat a successful consumer commit whose receipt or cleanup
 /// failed, and batch boundaries can change. Make commits idempotent by source
 /// and id — `(info.source.chat, info.source.sender, info.id)` — while preserving

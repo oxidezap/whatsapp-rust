@@ -1,7 +1,7 @@
-//! Chatstate protocol types following the ProtocolNode pattern.
+//! Parsing incoming chatstate stanzas.
 //!
 //! This module provides type-safe structures for parsing incoming `<chatstate>` stanzas
-//! (typing indicators) following the patterns defined in `wacore/src/protocol.rs`.
+//! (typing indicators). Outgoing chatstates use [`ChatActivity::into_child_node`].
 //!
 //! ## Wire Format
 //!
@@ -19,7 +19,6 @@
 //! </chatstate>
 //! ```
 
-use crate::protocol::ProtocolNode;
 use crate::types::presence::ChatActivity;
 use anyhow::Result;
 use thiserror::Error;
@@ -104,6 +103,19 @@ pub enum ChatstateSource {
 
 /// Parsed chatstate stanza.
 ///
+/// This is an incoming-only type. Use [`Self::parse`] to read a stanza and
+/// [`ChatActivity::into_child_node`] to build an outgoing activity child.
+/// It does not implement the bidirectional [`crate::protocol::ProtocolNode`]
+/// contract:
+///
+/// ```compile_fail
+/// use wacore::iq::chatstate::ChatstateStanza;
+/// use wacore::protocol::ProtocolNode;
+///
+/// fn requires_outgoing<T: ProtocolNode>() {}
+/// requires_outgoing::<ChatstateStanza>();
+/// ```
+///
 /// Wire format:
 /// ```xml
 /// <!-- 1:1 chat -->
@@ -157,21 +169,6 @@ impl ChatstateStanza {
             .unwrap_or(ChatActivity::Idle);
 
         Ok(Self { source, state })
-    }
-}
-
-impl ProtocolNode for ChatstateStanza {
-    fn tag(&self) -> &'static str {
-        "chatstate"
-    }
-
-    fn into_node(self) -> Node {
-        // Chatstate stanzas are incoming-only; outgoing uses features/chatstate.rs
-        unimplemented!("ChatstateStanza is incoming-only")
-    }
-
-    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
-        Self::parse(node).map_err(Into::into)
     }
 }
 
@@ -239,7 +236,7 @@ mod tests {
             .children([NodeBuilder::new("composing").build()])
             .build();
 
-        let stanza = ChatstateStanza::try_from_node(&node).unwrap();
+        let stanza = ChatstateStanza::parse(&node.as_node_ref()).unwrap();
         assert!(matches!(stanza.source, ChatstateSource::User { .. }));
         assert_eq!(stanza.state, ChatActivity::Typing);
 
@@ -255,7 +252,7 @@ mod tests {
             .children([NodeBuilder::new("composing").attr("media", "audio").build()])
             .build();
 
-        let stanza = ChatstateStanza::try_from_node(&node).unwrap();
+        let stanza = ChatstateStanza::parse(&node.as_node_ref()).unwrap();
         assert_eq!(stanza.state, ChatActivity::RecordingAudio);
     }
 
@@ -266,7 +263,7 @@ mod tests {
             .children([NodeBuilder::new("paused").build()])
             .build();
 
-        let stanza = ChatstateStanza::try_from_node(&node).unwrap();
+        let stanza = ChatstateStanza::parse(&node.as_node_ref()).unwrap();
         assert_eq!(stanza.state, ChatActivity::Idle);
     }
 
@@ -278,7 +275,7 @@ mod tests {
             .children([NodeBuilder::new("composing").build()])
             .build();
 
-        let stanza = ChatstateStanza::try_from_node(&node).unwrap();
+        let stanza = ChatstateStanza::parse(&node.as_node_ref()).unwrap();
         assert!(matches!(stanza.source, ChatstateSource::Group { .. }));
         assert_eq!(stanza.state, ChatActivity::Typing);
 
@@ -296,7 +293,7 @@ mod tests {
             .children([NodeBuilder::new("composing").attr("media", "audio").build()])
             .build();
 
-        let stanza = ChatstateStanza::try_from_node(&node).unwrap();
+        let stanza = ChatstateStanza::parse(&node.as_node_ref()).unwrap();
         assert!(matches!(stanza.source, ChatstateSource::Group { .. }));
         assert_eq!(stanza.state, ChatActivity::RecordingAudio);
     }
@@ -340,7 +337,7 @@ mod tests {
             .attr("from", "1234567890@s.whatsapp.net")
             .build();
 
-        let stanza = ChatstateStanza::try_from_node(&node).unwrap();
+        let stanza = ChatstateStanza::parse(&node.as_node_ref()).unwrap();
         assert_eq!(stanza.state, ChatActivity::Idle);
     }
 
@@ -351,7 +348,7 @@ mod tests {
             .children([NodeBuilder::new("unknown_state").build()])
             .build();
 
-        let stanza = ChatstateStanza::try_from_node(&node).unwrap();
+        let stanza = ChatstateStanza::parse(&node.as_node_ref()).unwrap();
         assert_eq!(stanza.state, ChatActivity::Idle);
     }
 

@@ -2835,7 +2835,15 @@ pub struct DeleteMessageForMeUpdate {
 pub struct LabelEditUpdate {
     /// The label identifier (the index key, not a JID).
     pub label_id: String,
+    /// Legacy action time: the Unix epoch when absent, local dispatch time
+    /// when the carried value is outside `DateTime`'s range.
     pub timestamp: DateTime<Utc>,
+    /// The mutation's timestamp in milliseconds, converted without a fallback.
+    /// `None` when absent or outside `DateTime`'s range; explicit zero is
+    /// `Some` of the Unix epoch. This is not a server receipt time and does
+    /// not classify a mutation as replayed or live. See `from_full_sync` for
+    /// whether the event was dispatched during a full sync.
+    pub action_timestamp: Option<DateTime<Utc>>,
     pub action: Box<wa::sync_action_value::LabelEditAction>,
     pub from_full_sync: bool,
 }
@@ -2849,7 +2857,15 @@ pub struct LabelAssociationUpdate {
     pub label_id: String,
     /// The chat the label was associated with or removed from.
     pub chat_jid: Jid,
+    /// Legacy action time: the Unix epoch when absent, local dispatch time
+    /// when the carried value is outside `DateTime`'s range.
     pub timestamp: DateTime<Utc>,
+    /// The mutation's timestamp in milliseconds, converted without a fallback.
+    /// `None` when absent or outside `DateTime`'s range; explicit zero is
+    /// `Some` of the Unix epoch. This is not a server receipt time and does
+    /// not classify a mutation as replayed or live. See `from_full_sync` for
+    /// whether the event was dispatched during a full sync.
+    pub action_timestamp: Option<DateTime<Utc>>,
     pub action: Box<wa::sync_action_value::LabelAssociationAction>,
     pub from_full_sync: bool,
 }
@@ -2866,7 +2882,15 @@ pub struct MessageLabelAssociationUpdate {
     pub chat_jid: Jid,
     /// The labelled message's id.
     pub message_id: String,
+    /// Legacy action time: the Unix epoch when absent, local dispatch time
+    /// when the carried value is outside `DateTime`'s range.
     pub timestamp: DateTime<Utc>,
+    /// The mutation's timestamp in milliseconds, converted without a fallback.
+    /// `None` when absent or outside `DateTime`'s range; explicit zero is
+    /// `Some` of the Unix epoch. This is not a server receipt time and does
+    /// not classify a mutation as replayed or live. See `from_full_sync` for
+    /// whether the event was dispatched during a full sync.
+    pub action_timestamp: Option<DateTime<Utc>>,
     pub action: Box<wa::sync_action_value::LabelAssociationAction>,
     pub from_full_sync: bool,
 }

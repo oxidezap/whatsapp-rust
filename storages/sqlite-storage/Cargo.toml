@@ -11,7 +11,8 @@ description = "SQLite storage backend for whatsapp-rust"
 # `libsqlite3-sys` is pulled only to activate its `bundled` feature (compile
 # SQLite in-tree); there is no direct `use`, so static analysers flag it.
 [package.metadata.cargo-machete]
-ignored = ["libsqlite3-sys"]
+# Diesel uses sqlite-wasm-rs; the direct edge constrains its WASM host ABI.
+ignored = ["libsqlite3-sys", "sqlite-wasm-rs"]
 
 [features]
 default = ["bundled-sqlite"]
@@ -51,6 +52,11 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # Tokio's timer requires a runtime time driver, which the single-agent browser
 # target does not provide. This future wraps the platform's real setTimeout.
 gloo-timers = { version = "0.4", features = ["futures"] }
+
+# 0.6 defaults to caller-provided host hooks. Keep the validated JS-backed
+# 0.5 ABI when fresh downstream resolution widens Diesel's transitive range.
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+sqlite-wasm-rs = { version = "0.5.5", default-features = false }
 
 [[bench]]
 name = "signal_flush"

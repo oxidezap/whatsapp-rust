@@ -1912,10 +1912,10 @@ mod tests {
             self.requests.lock().unwrap().push(request.url);
             self.entered.notify_one();
             self.release.acquire().await.unwrap().forget();
-            Ok(crate::http::HttpResponse {
-                status_code: self.status,
-                body: self.body.clone(),
-            })
+            Ok(crate::http::HttpResponse::new(
+                self.status,
+                self.body.clone(),
+            ))
         }
     }
 

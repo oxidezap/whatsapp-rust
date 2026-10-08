@@ -3,6 +3,7 @@
 use super::*;
 use crate::cache_config::CacheConfig;
 pub use crate::flush_scope::DrainOutcome;
+use crate::keepalive::client_log;
 pub use crate::msg_secret_buffer::SecretFlushReport;
 use wacore::net::DisconnectReason;
 
@@ -770,6 +771,7 @@ impl Client {
                 .max_capacity(cache_config.group_devices_memo_capacity)
                 .build(),
             stanza_router: Self::create_stanza_router(),
+            unsupported_ib_warnings: AtomicU8::new(0),
             synchronous_ack: false,
             http_client,
             override_version,
@@ -843,22 +845,30 @@ impl Client {
     // Deliberately NOT instrumented: this span would live for the entire client
     // lifetime, distorting duration/throughput metrics just like the removed
     // keepalive-loop span. Identity (lid/pn) attribution comes from the
-    // per-operation spans (send/request), which record it themselves.
+    // per-operation spans and fresh identity fields on each direct loop event.
     pub async fn run(self: &Arc<Self>) -> RunCompletionReason {
         #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle
             && !lifecycle.wait_until_active().await
         {
-            warn!("Client `run` rejected before construction completed.");
+            client_log!(
+                self,
+                warn,
+                "Client `run` rejected before construction completed."
+            );
             return RunCompletionReason::ShutdownRequested;
         }
         let shutdown = self.shutdown_signal();
         if shutdown.is_fired() {
-            warn!("Client `run` called after shutdown.");
+            client_log!(self, warn, "Client `run` called after shutdown.");
             return RunCompletionReason::ShutdownRequested;
         }
         if self.is_running.swap(true, Ordering::SeqCst) {
-            warn!("Client `run` method called while already running.");
+            client_log!(
+                self,
+                warn,
+                "Client `run` method called while already running."
+            );
             return RunCompletionReason::AlreadyRunning;
         }
         if self.enable_auto_reconnect.is_terminal() {
@@ -889,7 +899,7 @@ impl Client {
             // that true for both. `continue` re-tests `is_running`, so a
             // `shutdown()` during the pause ends the session from here.
             if self.paused.load(Ordering::Relaxed) {
-                info!("Session paused; not connecting until resumed.");
+                client_log!(self, info, "Session paused; not connecting until resumed.");
                 self.wait_while_paused().await;
                 continue;
             }
@@ -946,22 +956,34 @@ impl Client {
                         // The loop is about to exit on the same shutdown, so this
                         // is the teardown reporting itself, not a failure.
                         ConnectError::Shutdown => {
-                            debug!("Connect abandoned, the client is shutting down.");
+                            client_log!(
+                                self,
+                                debug,
+                                "Connect abandoned, the client is shutting down."
+                            );
                         }
                         // The other requested refusal, and the same shape: the
                         // loop is about to park on the pause that caused it, so
                         // this is the teardown reporting itself.
                         ConnectError::Paused => {
-                            debug!("Connect abandoned, the session is paused.");
+                            client_log!(self, debug, "Connect abandoned, the session is paused.");
                             // Retracted by a pause, so no backoff is owed even
                             // if a resume has already cleared the flag this
                             // branch cannot see any more.
                             self.pause_teardown_pending.store(true, Ordering::Relaxed);
                         }
                         ConnectError::Handshake(e) if e.is_transient() => {
-                            debug!("Transient connect failure, will retry: {connect_err:#}");
+                            client_log!(
+                                self,
+                                debug,
+                                "Transient connect failure, will retry: {connect_err:#}"
+                            );
                         }
-                        _ => error!("Failed to connect: {connect_err:#}. Will retry..."),
+                        _ => client_log!(
+                            self,
+                            error,
+                            "Failed to connect: {connect_err:#}. Will retry..."
+                        ),
                     }
                     last_connect_error = Some(connect_err);
                     last_protocol_reason = self.take_protocol_terminal_reason();
@@ -1007,13 +1029,17 @@ impl Client {
                     && !self.is_running.load(Ordering::Relaxed))
             {
                 self.clear_connection_backoff_state();
-                info!("Disconnect requested, shutting down without reconnecting.");
+                client_log!(
+                    self,
+                    info,
+                    "Disconnect requested, shutting down without reconnecting."
+                );
                 completion = RunCompletionReason::ShutdownRequested;
                 break;
             }
 
             if !self.enable_auto_reconnect.load(Ordering::Relaxed) {
-                info!("Auto-reconnect disabled, shutting down.");
+                client_log!(self, info, "Auto-reconnect disabled, shutting down.");
                 self.stop_supervision_loop();
                 completion = RunCompletionReason::AutoReconnectDisabled {
                     connection: last_disconnect_reason,
@@ -1026,7 +1052,11 @@ impl Client {
             // If this was an expected disconnect (e.g., 515 after pairing), reconnect immediately
             if self.expected_disconnect.load(Ordering::Relaxed) {
                 self.clear_connection_backoff_state();
-                info!("Expected disconnect (e.g., 515), reconnecting immediately...");
+                client_log!(
+                    self,
+                    info,
+                    "Expected disconnect (e.g., 515), reconnecting immediately..."
+                );
                 continue;
             }
 
@@ -1079,7 +1109,9 @@ impl Client {
             // algo: { type: "fibonacci", first: 1000, second: 1000 }
             // jitter: 0.1, max: 9e5
             let delay = fibonacci_backoff(error_count);
-            info!(
+            client_log!(
+                self,
+                info,
                 "Will attempt to reconnect in {:?} (attempt {})",
                 delay,
                 error_count + 1
@@ -1108,7 +1140,7 @@ impl Client {
             futures::select! {
                 _ = self.runtime.sleep(delay).fuse() => {}
                 _ = shutdown_fired.fuse() => {
-                    debug!("Shutdown signalled during reconnect backoff, exiting run loop.");
+                    client_log!(self, debug, "Shutdown signalled during reconnect backoff, exiting run loop.");
                 }
                 _ = reconnect_disabled.fuse() => {
                     self.stop_supervision_loop();
@@ -1120,13 +1152,13 @@ impl Client {
                     break;
                 }
                 _ = pause_changed.fuse() => {
-                    debug!("Pause state changed during reconnect backoff, re-reading it.");
+                    client_log!(self, debug, "Pause state changed during reconnect backoff, re-reading it.");
                 }
             }
         }
         #[cfg(feature = "client-lifecycle")]
         self.shutdown_lifecycle().await;
-        info!("Client run loop has shut down.");
+        client_log!(self, info, "Client run loop has shut down.");
         if matches!(completion, RunCompletionReason::Stopped) && shutdown.is_fired() {
             RunCompletionReason::ShutdownRequested
         } else {
@@ -1378,7 +1410,7 @@ impl Client {
     )]
     async fn connect_graph(self: &Arc<Self>) -> Result<Connection<'_>, ConnectError> {
         #[cfg(feature = "tracing")]
-        self.record_identity_on_span(&tracing::Span::current());
+        self.record_identity_on_current_span("wa.conn.connect", module_path!());
 
         if self.is_connecting.swap(true, Ordering::SeqCst) {
             return Err(ConnectError::AlreadyConnected);
@@ -1602,9 +1634,11 @@ impl Client {
     /// ```
     #[cfg_attr(
         feature = "tracing",
-        tracing::instrument(name = "wa.conn.logout", level = "info", skip_all)
+        tracing::instrument(name = "wa.conn.logout", level = "info", skip_all, fields(lid = tracing::field::Empty, pn = tracing::field::Empty))
     )]
     pub async fn logout(self: &Arc<Self>) -> LogoutReport {
+        #[cfg(feature = "tracing")]
+        self.record_identity_on_current_span("wa.conn.logout", module_path!());
         use wacore::iq::devices::RemoveCompanionDeviceSpec;
 
         self.enable_auto_reconnect.store(false, Ordering::Relaxed);
@@ -1623,7 +1657,11 @@ impl Client {
                     Ok(jid) => match self.execute(RemoveCompanionDeviceSpec::new(&jid)).await {
                         Ok(()) => DeregistrationOutcome::Confirmed,
                         Err(source) => {
-                            warn!("Failed to send logout IQ: {source}");
+                            crate::keepalive::client_log!(
+                                self,
+                                warn,
+                                "Failed to send logout IQ: {source}"
+                            );
                             DeregistrationOutcome::Failed { source }
                         }
                     },
@@ -1662,9 +1700,11 @@ impl Client {
     /// run loop in place, which is what makes them reversible.
     #[cfg_attr(
         feature = "tracing",
-        tracing::instrument(name = "wa.conn.shutdown", level = "info", skip_all)
+        tracing::instrument(name = "wa.conn.shutdown", level = "info", skip_all, fields(lid = tracing::field::Empty, pn = tracing::field::Empty))
     )]
     pub async fn shutdown(self: &Arc<Self>) -> ShutdownReport {
+        #[cfg(feature = "tracing")]
+        self.record_identity_on_current_span("wa.conn.shutdown", module_path!());
         info!("Disconnecting client intentionally.");
         wacore::telemetry::set_connected(false);
         self.publish_terminal_verdict();
@@ -1749,9 +1789,11 @@ impl Client {
     /// - Testing offline message delivery
     #[cfg_attr(
         feature = "tracing",
-        tracing::instrument(name = "wa.conn.reconnect", level = "info", skip_all)
+        tracing::instrument(name = "wa.conn.reconnect", level = "info", skip_all, fields(lid = tracing::field::Empty, pn = tracing::field::Empty))
     )]
     pub async fn reconnect(self: &Arc<Self>) {
+        #[cfg(feature = "tracing")]
+        self.record_identity_on_current_span("wa.conn.reconnect", module_path!());
         info!("Reconnecting: dropping transport for auto-reconnect.");
         #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle {
@@ -1775,9 +1817,11 @@ impl Client {
     /// [`crate::ConnectAdmission`] policy still reserves that run-loop attempt.
     #[cfg_attr(
         feature = "tracing",
-        tracing::instrument(name = "wa.conn.reconnect_immediately", level = "info", skip_all)
+        tracing::instrument(name = "wa.conn.reconnect_immediately", level = "info", skip_all, fields(lid = tracing::field::Empty, pn = tracing::field::Empty))
     )]
     pub async fn reconnect_immediately(self: &Arc<Self>) {
+        #[cfg(feature = "tracing")]
+        self.record_identity_on_current_span("wa.conn.reconnect_immediately", module_path!());
         info!("Reconnecting immediately (expected disconnect).");
         #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle {
@@ -1845,9 +1889,11 @@ impl Client {
     /// across the pause that a network drop would not also have taken.
     #[cfg_attr(
         feature = "tracing",
-        tracing::instrument(name = "wa.conn.pause", level = "info", skip_all)
+        tracing::instrument(name = "wa.conn.pause", level = "info", skip_all, fields(lid = tracing::field::Empty, pn = tracing::field::Empty))
     )]
     pub async fn pause(self: &Arc<Self>) {
+        #[cfg(feature = "tracing")]
+        self.record_identity_on_current_span("wa.conn.pause", module_path!());
         // Deliberately NOT serialised against `resume` with a lock. The obvious
         // way to keep a resume from cutting across this teardown is to hold one
         // for the whole of it — and that parks `resume` behind an untimed
@@ -2035,10 +2081,12 @@ impl Client {
 
     #[cfg_attr(
         feature = "tracing",
-        tracing::instrument(name = "wa.conn.cleanup", level = "debug", skip_all)
+        tracing::instrument(name = "wa.conn.cleanup", level = "debug", skip_all, fields(lid = tracing::field::Empty, pn = tracing::field::Empty))
     )]
     #[cfg(not(feature = "client-lifecycle"))]
     pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) -> DrainOutcome {
+        #[cfg(feature = "tracing")]
+        self.record_identity_on_current_span("wa.conn.cleanup", module_path!());
         let outcome = self.cleanup_connection_state_inner().await;
         self.clear_connection_scoped_pair_code().await;
         outcome
@@ -2059,10 +2107,12 @@ impl Client {
 
     #[cfg_attr(
         feature = "tracing",
-        tracing::instrument(name = "wa.conn.cleanup", level = "debug", skip_all)
+        tracing::instrument(name = "wa.conn.cleanup", level = "debug", skip_all, fields(lid = tracing::field::Empty, pn = tracing::field::Empty))
     )]
     #[cfg(feature = "client-lifecycle")]
     pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) -> DrainOutcome {
+        #[cfg(feature = "tracing")]
+        self.record_identity_on_current_span("wa.conn.cleanup", module_path!());
         if self.lifecycle.is_none() {
             let outcome = self.cleanup_connection_state_inner().await;
             self.clear_connection_scoped_pair_code().await;
@@ -2084,7 +2134,11 @@ impl Client {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(panic)) => std::panic::resume_unwind(panic),
             Err(_) => {
-                error!("Detached connection cleanup stopped before completion");
+                client_log!(
+                    self,
+                    error,
+                    "Detached connection cleanup stopped before completion"
+                );
                 DrainOutcome::Unobserved
             }
         };

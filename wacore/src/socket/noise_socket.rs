@@ -130,9 +130,9 @@ pub trait SendObserver: crate::sync_marker::MaybeSendSync {
 }
 
 /// A job sent to the dedicated sender task.
-pub struct SendJob {
-    pub plaintext: bytes::Bytes,
-    pub response_tx: oneshot::Sender<SendResult>,
+struct SendJob {
+    plaintext: bytes::Bytes,
+    response_tx: oneshot::Sender<SendResult>,
 }
 
 struct ObservedSendJob {

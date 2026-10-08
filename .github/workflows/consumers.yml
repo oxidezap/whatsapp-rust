@@ -55,7 +55,13 @@ jobs:
         run: cargo +nightly-2026-06-16 build --locked -p whatsapp-xtask
       - name: Run isolated native profiles and shared negative controls
         if: matrix.lane == 'native'
+        # Bound compilation within a profile; the registry stays sequential.
+        # Keep this step-local so scheduling does not change the Rust cache key.
+        env:
+          CARGO_BUILD_JOBS: "2"
         run: target/debug/whatsapp-xtask ci consumers run --lane native --toolchain nightly-2026-06-16
       - name: Run isolated MSRV profiles and shared negative controls
         if: matrix.lane == 'msrv'
+        env:
+          CARGO_BUILD_JOBS: "2"
         run: target/debug/whatsapp-xtask ci consumers run --lane msrv --toolchain 1.94.1

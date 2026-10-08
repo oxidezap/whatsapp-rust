@@ -479,6 +479,7 @@ impl IncomingCall {
     /// The media block is parser output, not something a consumer composes, so it is
     /// `#[non_exhaustive]` and its field is `pub(crate)`. A dependent crate's tests still need a
     /// call that carries a capability, and [`Self::new_for_test`] alone cannot build one.
+    #[cfg(any(test, feature = "test-util"))]
     #[cfg(feature = "voip-control")]
     #[doc(hidden)]
     #[must_use]
@@ -492,9 +493,9 @@ impl IncomingCall {
         })))
     }
 
-    /// Minimal constructor for in-tree tests in dependent crates; `#[non_exhaustive]` blocks the
-    /// struct literal cross-crate, so this is the supported way to build one outside `wacore`. The
-    /// optional/media fields default to absent; mutate the public fields after for other shapes.
+    /// Minimal constructor for dependent-crate tests using the `test-util` feature.
+    /// Optional/media fields default to absent; use the builder for ordinary construction.
+    #[cfg(any(test, feature = "test-util"))]
     #[doc(hidden)]
     pub fn new_for_test(
         from: Jid,
