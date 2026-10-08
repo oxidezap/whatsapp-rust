@@ -39,8 +39,6 @@ jobs:
     if: github.event_name == 'pull_request'
     name: Binary Size (PR)
     runs-on: ubuntu-latest
-    env:
-      BASE_SHA: ${{ github.event.pull_request.base.sha }}
     permissions:
       contents: read
       actions: read
@@ -72,6 +70,10 @@ jobs:
       # measure_binary_size builds an example, which pulls the cpal dev-dependency (alsa-sys).
       - name: Install ALSA dev headers
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev unzip
+      - name: Bind baseline to the measured merge commit
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-base
       - name: Measure binary size
         run: |
           cargo run --locked --quiet -p whatsapp-xtask -- ci measure-binary-size --gate-only --out-dir size-out

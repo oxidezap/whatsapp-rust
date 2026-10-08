@@ -26,6 +26,8 @@ pub enum Task {
     GithubRelease,
     /// Validate a main dispatch's compiler before it reaches rustup or the measurement process.
     SizeToolchain,
+    /// Bind the size baseline to the checked-out PR merge commit's first parent.
+    SizeBase,
     /// Download the PR base's validated main measurement, independent of graph publication.
     SizeBaseline {
         #[arg(long, default_value = "size-out")]
@@ -77,6 +79,23 @@ fn quiet(command: &mut Command) -> Result<bool> {
 }
 fn env(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| format!("{name} must be set"))
+}
+fn measured_merge_base<'a>(commit: &'a str, head: &str) -> Result<&'a str> {
+    // Read the raw object: revision walking hides parents at a shallow boundary.
+    let parents: Vec<_> = commit
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.strip_prefix("parent "))
+        .collect();
+    ensure!(
+        parents.len() == 2
+            && parents
+                .iter()
+                .all(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            && parents[1] == head,
+        "size measurement must check out the expected PR merge commit"
+    );
+    Ok(parents[0])
 }
 fn version_valid(version: &str) -> bool {
     regex::Regex::new(r"^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$")
@@ -298,6 +317,22 @@ pub fn run_task(root: &Path, task: Task) -> Result<()> {
             output("toolchain", selected)?;
             output("publish", if publish { "true" } else { "false" })?;
         }
+        Task::SizeBase => {
+            let commit = capture(
+                Command::new("git")
+                    .args(["cat-file", "commit", "HEAD"])
+                    .current_dir(root),
+            )?;
+            let commit = std::str::from_utf8(&commit.stdout)?;
+            let base = measured_merge_base(commit, &env("PR_HEAD_SHA")?)?;
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(env("GITHUB_ENV")?)?,
+                "BASE_SHA={base}"
+            )?;
+            println!("Measured PR merge baseline: {base}");
+        }
         Task::SizeBaseline { head, out_dir } => {
             let repo = env("GITHUB_REPOSITORY")?;
             super::size_baseline::download(
@@ -397,6 +432,82 @@ pub fn run_task(root: &Path, task: Task) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn size_baseline_uses_the_measured_merge_parent_even_with_a_stale_event() {
+        let base = "21b7359c22a5f363abd9db97cd615494e05c0b95";
+        let head = "ac19e21e9b3a6e07e0933560d003c07803aff547";
+        let stale = "edaa64b68d0de24bdb6848b98a824a32e276c55c";
+        let object = format!(
+            "tree {}\nparent {base}\nparent {head}\nauthor synthetic\n\nparent {stale}\n",
+            "0".repeat(40)
+        );
+        assert_eq!(measured_merge_base(&object, head).unwrap(), base);
+        assert!(measured_merge_base(&object, stale).is_err());
+        assert!(measured_merge_base(&format!("parent {head}\n\nmessage"), head).is_err());
+        assert!(
+            measured_merge_base(&format!("parent invalid\nparent {head}\n\nmessage"), head)
+                .is_err()
+        );
+    }
+    #[test]
+    fn size_base_reads_parents_from_a_shallow_checkout() {
+        let repo = tempfile::tempdir().unwrap();
+        run(Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(repo.path()))
+        .unwrap();
+        let tree = capture(
+            Command::new("git")
+                .arg("mktree")
+                .stdin(Stdio::null())
+                .current_dir(repo.path()),
+        )
+        .unwrap();
+        let base = "1".repeat(40);
+        let head = "2".repeat(40);
+        let object = format!(
+            "tree {}\nparent {base}\nparent {head}\nauthor Synthetic <synthetic@example.invalid> 0 +0000\ncommitter Synthetic <synthetic@example.invalid> 0 +0000\n\nmerge fixture\n",
+            std::str::from_utf8(&tree.stdout).unwrap().trim()
+        );
+        let mut child = Command::new("git")
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .current_dir(repo.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(object.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let sha = std::str::from_utf8(&output.stdout).unwrap();
+        std::fs::write(repo.path().join(".git/HEAD"), sha).unwrap();
+        std::fs::write(repo.path().join(".git/shallow"), sha).unwrap();
+        let walked = capture(
+            Command::new("git")
+                .args(["rev-list", "--parents", "-1", "HEAD"])
+                .current_dir(repo.path()),
+        )
+        .unwrap();
+        assert_eq!(
+            walked.stdout, output.stdout,
+            "history walking hides the parents"
+        );
+        let raw = capture(
+            Command::new("git")
+                .args(["cat-file", "commit", "HEAD"])
+                .current_dir(repo.path()),
+        )
+        .unwrap();
+        assert_eq!(
+            measured_merge_base(std::str::from_utf8(&raw.stdout).unwrap(), &head).unwrap(),
+            base
+        );
+    }
     #[test]
     fn size_compiler_override_is_dispatch_only_and_does_not_publish() {
         let default = "nightly-2026-06-16";
