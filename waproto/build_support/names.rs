@@ -5,6 +5,7 @@
 use buffa_descriptor::generated::descriptor::{
     DescriptorProto, EnumDescriptorProto, FileDescriptorSet,
 };
+use buffa_descriptor::{features, features::ResolvedFeatures};
 use std::io;
 
 pub struct TypeName<'a> {
@@ -325,10 +326,14 @@ pub fn wire_api(fds: &FileDescriptorSet) -> std::collections::BTreeSet<String> {
     fn messages(
         items: &[DescriptorProto],
         scope: &str,
+        parent_features: &ResolvedFeatures,
         out: &mut std::collections::BTreeSet<String>,
     ) {
+        use buffa_descriptor::generated::descriptor::field_descriptor_proto::{Label, Type};
         for message in items {
             let path = format!("{scope}.{}", message.name.as_deref().unwrap_or_default());
+            let message_features =
+                features::resolve_child(parent_features, features::message_features(message));
             for field in &message.field {
                 let oneof = field
                     .oneof_index
@@ -338,8 +343,36 @@ pub fn wire_api(fds: &FileDescriptorSet) -> std::collections::BTreeSet<String> {
                     "wire {path}.{} number={:?} type={:?} label={:?} target={:?} default={:?} oneof={oneof:?}",
                     field.name.as_deref().unwrap_or_default(), field.number, field.r#type, field.label, field.type_name, field.default_value,
                 ));
+                if field.label == Some(Label::LABEL_REPEATED)
+                    && !matches!(
+                        field.r#type,
+                        None | Some(
+                            Type::TYPE_STRING
+                                | Type::TYPE_BYTES
+                                | Type::TYPE_MESSAGE
+                                | Type::TYPE_GROUP
+                        )
+                    )
+                {
+                    // Use the generator's feature resolver for syntax defaults
+                    // and inherited editions settings. Legacy packed wins.
+                    let resolved =
+                        features::resolve_child(&message_features, features::field_features(field));
+                    let packed = field
+                        .options
+                        .as_option()
+                        .and_then(|options| options.packed)
+                        .unwrap_or(
+                            resolved.repeated_field_encoding
+                                == features::RepeatedFieldEncoding::Packed,
+                        );
+                    out.insert(format!(
+                        "packed {path}.{}={packed}",
+                        field.name.as_deref().unwrap_or_default(),
+                    ));
+                }
             }
-            messages(&message.nested_type, &path, out);
+            messages(&message.nested_type, &path, &message_features, out);
         }
     }
     let mut out = std::collections::BTreeSet::new();
@@ -347,8 +380,90 @@ pub fn wire_api(fds: &FileDescriptorSet) -> std::collections::BTreeSet<String> {
         messages(
             &file.message_type,
             &format!(".{}", file.package.as_deref().unwrap_or_default()),
+            &features::for_file(file),
             &mut out,
         );
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use buffa_descriptor::generated::descriptor::{
+        FeatureSet, FieldDescriptorProto, FieldOptions, FileDescriptorProto, MessageOptions,
+        feature_set::RepeatedFieldEncoding,
+        field_descriptor_proto::{Label, Type},
+    };
+
+    fn fixture(syntax: &str, packed: Option<bool>) -> FileDescriptorSet {
+        FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                package: Some("contract".into()),
+                syntax: Some(syntax.into()),
+                message_type: vec![DescriptorProto {
+                    name: Some("Record".into()),
+                    field: vec![FieldDescriptorProto {
+                        name: Some("values".into()),
+                        number: Some(1),
+                        label: Some(Label::LABEL_REPEATED),
+                        r#type: Some(Type::TYPE_UINT32),
+                        options: buffa::MessageField::some(FieldOptions {
+                            packed,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn packed_inventory_resolves_defaults_and_overrides() {
+        for (syntax, explicit, packed) in [
+            ("proto2", None, false),
+            ("proto3", None, true),
+            ("proto2", Some(true), true),
+            ("proto3", Some(false), false),
+        ] {
+            let api = wire_api(&fixture(syntax, explicit));
+            assert!(api.contains(&format!("packed .contract.Record.values={packed}")));
+        }
+        let mut nested = fixture("proto3", None);
+        let mut child = nested.file[0].message_type.pop().unwrap();
+        child.name = Some("Child".into());
+        nested.file[0].message_type.push(DescriptorProto {
+            name: Some("Parent".into()),
+            options: buffa::MessageField::some(MessageOptions {
+                features: buffa::MessageField::some(FeatureSet {
+                    repeated_field_encoding: Some(RepeatedFieldEncoding::EXPANDED),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            nested_type: vec![child],
+            ..Default::default()
+        });
+        assert!(wire_api(&nested).contains("packed .contract.Parent.Child.values=false"));
+        nested.file[0].message_type[0].nested_type[0].field[0]
+            .options
+            .as_option_mut()
+            .unwrap()
+            .packed = Some(true);
+        assert!(wire_api(&nested).contains("packed .contract.Parent.Child.values=true"));
+    }
+
+    #[test]
+    fn changing_packed_encoding_fails_api_compatibility() {
+        let baseline = wire_api(&fixture("proto2", Some(true)));
+        let expected = baseline.iter().cloned().collect::<Vec<_>>().join("\n");
+        super::super::emission::check_api(&expected, &wire_api(&fixture("proto2", None)))
+            .expect_err("removing packed changes encoded wire bytes");
+        super::super::emission::check_api(&expected, &wire_api(&fixture("proto3", None)))
+            .expect("equivalent effective packing remains compatible");
+    }
 }
