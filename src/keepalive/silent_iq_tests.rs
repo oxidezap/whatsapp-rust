@@ -322,10 +322,16 @@ async fn keepalive_reconnects_when_its_ping_write_never_completes() {
     }
     let (client, transport) = wedged_client().await;
     let started = tokio::time::Instant::now();
-    tokio::time::timeout(Duration::from_secs(600), start_keepalive(&client))
-        .await
-        .expect("the keepalive must give up on a ping it cannot even write")
-        .unwrap();
+    let shutdown = client.connection_shutdown_signal();
+    let keepalive = start_keepalive(&client);
+    let detected_after = tokio::time::timeout(Duration::from_secs(600), async {
+        wacore::runtime::wait_for_shutdown(&shutdown).await;
+        let detected_after = started.elapsed();
+        keepalive.await.unwrap();
+        detected_after
+    })
+    .await
+    .expect("the keepalive must give up on a ping it cannot even write");
     assert!(
         transport.disconnects_started() >= 1,
         "the keepalive must have torn the wedged connection down"
@@ -334,8 +340,13 @@ async fn keepalive_reconnects_when_its_ping_write_never_completes() {
     // watchdog fires on the tick after that ping's deadline: at most two
     // intervals and two answer deadlines, not three unanswered pings.
     assert!(
-        started.elapsed() <= 2 * (KEEP_ALIVE_INTERVAL_MAX + KEEP_ALIVE_RESPONSE_DEADLINE),
-        "took {:?}",
-        started.elapsed()
+        detected_after <= 2 * (KEEP_ALIVE_INTERVAL_MAX + KEEP_ALIVE_RESPONSE_DEADLINE),
+        "detection took {detected_after:?}"
+    );
+    // The mock also stalls disconnect. Its separate close deadline must not
+    // count as time spent detecting the dead socket (Tokio rounds to a tick).
+    assert!(
+        started.elapsed() - detected_after
+            <= Client::TRANSPORT_CLOSE_TIMEOUT + Duration::from_millis(1)
     );
 }
