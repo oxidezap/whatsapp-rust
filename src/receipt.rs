@@ -3041,7 +3041,7 @@ mod tests {
                 ReceiptType::Delivered,
             ),
         ] {
-            let (client, collector) = setup_client_with_collector().await;
+            let (client, collector) = setup_client_with_identities().await;
             client
                 .handle_receipt(node_to_arc(
                     NodeBuilder::new("receipt")
@@ -3179,7 +3179,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_receipt_aggregate_classifies_each_actor_without_stanza_recipient() {
-        let (client, collector) = setup_client_with_collector().await;
+        let (client, collector) = setup_client_with_identities().await;
         client
             .handle_receipt(node_to_arc(
                 NodeBuilder::new("receipt")
