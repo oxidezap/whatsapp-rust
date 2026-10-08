@@ -4516,6 +4516,17 @@ impl Client {
             return report("chat_actions", m, chat_outcome, effect_detail);
         }
 
+        // Labels have their own index shape. Sublist deletion is a Remove,
+        // so this handler must also run before the Set-only gate.
+        let outcome = crate::features::labels::dispatch_label_mutation_outcome(
+            &self.core.event_bus,
+            m,
+            event_full_sync,
+        );
+        if outcome != AppStateDispatchOutcome::Unclaimed {
+            return report("labels", m, outcome, effect_detail);
+        }
+
         // All remaining mutations only care about Set operations
         if m.operation != wa::syncd_mutation::SyncdOperation::Set {
             return report("none", m, AppStateDispatchOutcome::Unclaimed, effect_detail);
@@ -4565,17 +4576,6 @@ impl Client {
         );
         if outcome != AppStateDispatchOutcome::Unclaimed {
             return report("call_log", m, outcome, effect_detail);
-        }
-
-        // Label mutations have their own index shape (labelId, not a chat JID at
-        // index[1]), so they are dispatched separately from chat actions.
-        let outcome = crate::features::labels::dispatch_label_mutation_outcome(
-            &self.core.event_bus,
-            m,
-            event_full_sync,
-        );
-        if outcome != AppStateDispatchOutcome::Unclaimed {
-            return report("labels", m, outcome, effect_detail);
         }
 
         // Quick replies and account-level syncd settings key on their own index
@@ -8778,6 +8778,71 @@ mod critical_bootstrap_tests {
             client.needs_initial_full_sync.is_armed(),
             "and the replacement inherits the work through the gate"
         );
+    }
+
+    #[tokio::test]
+    async fn label_sublist_set_and_remove_reach_the_event_bus() {
+        use std::sync::{Arc, Mutex};
+        use wacore::types::events::{Event, EventHandler, EventInterest};
+
+        struct Recorder(Mutex<Vec<Arc<Event>>>);
+        impl EventHandler for Recorder {
+            fn handle_event(&self, event: Arc<Event>) {
+                self.0.lock().unwrap().push(event);
+            }
+            fn interest(&self) -> EventInterest {
+                EventInterest::ALL
+            }
+        }
+
+        let client = crate::test_utils::create_test_client().await;
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        let _subscription = client.core.event_bus.subscribe_handler(recorder.clone());
+        for operation in [
+            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::Remove,
+        ] {
+            let mut value = wa::SyncActionValue::default().with_timestamp(0);
+            if operation == wa::syncd_mutation::SyncdOperation::Set {
+                value
+                    .label_sublist_action
+                    .get_or_insert_default()
+                    .sub_list_id = Some(2);
+            }
+            let mut mutation = crate::appstate_sync::Mutation {
+                index: vec![
+                    "label_sublist".into(),
+                    "11".into(),
+                    "12025550111@s.whatsapp.net".into(),
+                ],
+                operation,
+                action_value: Some(value),
+            };
+            // Recovery may log a snapshot at TRACE without claiming full-sync
+            // event provenance. The label handler must use event_full_sync.
+            let outcome = client
+                .dispatch_app_state_mutation_inner(&mut mutation, false, true, None)
+                .await;
+            assert_eq!(
+                outcome,
+                AppStateDispatchOutcome::Event("LabelSublistUpdate")
+            );
+        }
+        let events = recorder.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        let set = serde_json::to_value(&*events[0]).unwrap();
+        let remove = serde_json::to_value(&*events[1]).unwrap();
+        assert_eq!(
+            set["LabelSublistUpdate"]["change"],
+            serde_json::json!({"Upsert": {"sub_list_id": 2}})
+        );
+        assert_eq!(remove["LabelSublistUpdate"]["change"], "Remove");
+        for event in [set, remove] {
+            let update = &event["LabelSublistUpdate"];
+            assert_eq!(update["predefined_id"], 11);
+            assert_eq!(update["action_timestamp"], "1970-01-01T00:00:00Z");
+            assert_eq!(update["from_full_sync"], false);
+        }
     }
 
     #[tokio::test]
