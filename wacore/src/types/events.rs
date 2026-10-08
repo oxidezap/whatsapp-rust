@@ -2900,11 +2900,11 @@ pub enum LabelSublistChange {
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct LabelSublistUpdate {
-    /// Signed decimal ID from index[1], in `LabelEditAction.predefined_id`'s
+    /// Signed decimal ID from `index[1]`, in `LabelEditAction.predefined_id`'s
     /// numeric namespace. This is neither the label's ID nor its `ListType`.
     /// Unknown IDs are retained without filtering against known definitions.
     pub predefined_id: i32,
-    /// JID from index[2], preserving PN/LID identity without guessing a mapping.
+    /// JID from `index[2]`, preserving PN/LID identity without guessing a mapping.
     pub chat_jid: Jid,
     pub change: LabelSublistChange,
     /// Carried milliseconds converted without a fallback. `None` means absent
