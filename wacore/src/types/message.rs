@@ -174,6 +174,9 @@ pub struct MessageSource {
     pub addressing_mode: Option<AddressingMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_alt: Option<Jid>,
+    /// Explicit alternate identity of the recipient, not of `sender`.
+    /// Self-synced LID DMs populate this from a valid `peer_recipient_pn`
+    /// without changing `chat`. An omitted PN is not inferred from the cache.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recipient_alt: Option<Jid>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -467,9 +470,9 @@ pub struct MessageInfo {
     /// struct.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_name_serial: Option<i64>,
-    /// Envelope `peer_recipient_pn` attr. Present on companion-device
-    /// self-synced DM stanzas to identify the peer's PN (so the receipt
-    /// goes to the right routing target).
+    /// Raw parsed envelope `peer_recipient_pn`. For a valid self-synced LID
+    /// DM, `source.recipient_alt` associates this PN with the explicit peer.
+    /// This field alone does not establish an identity pair or change routing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_recipient_pn: Option<Jid>,
     /// Broadcast-contact-list recipients from `<participants><to jid>` on an

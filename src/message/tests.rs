@@ -25,6 +25,96 @@ fn mock_http_client() -> Arc<dyn crate::http::HttpClient> {
 }
 
 #[tokio::test]
+async fn self_sync_recipient_pair_warms_then_persists_without_inferring_missing_pn() {
+    use wacore::store::commands::DeviceCommand;
+    let client = crate::test_utils::create_test_client_with_name("self_sync_recipient_pair").await;
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetId(Some(Jid::pn("15550000001"))))
+        .await;
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLid(Some(Jid::lid("100000000000001"))))
+        .await;
+    let lid = "100000000000002";
+    let pn = "15550000002";
+    let envelope = |offline: bool, include_pn: bool| {
+        let mut node = NodeBuilder::new("message")
+            .attr("id", "SELF-SYNC-PAIR")
+            .attr("from", "100000000000001:2@lid")
+            .attr("recipient", Jid::lid(lid))
+            .attr("peer_recipient_username", "synthetic_user")
+            .attr("t", "1700000000")
+            .children([NodeBuilder::new("enc")
+                .attr("type", "msg")
+                .bytes(vec![1, 2, 3])
+                .build()]);
+        if offline {
+            node = node.attr("offline", "1");
+        }
+        if include_pn {
+            node = node.attr("peer_recipient_pn", Jid::pn(pn));
+        }
+        node_to_arc(node.build())
+    };
+    client
+        .classify_incoming_message(&envelope(true, false))
+        .await;
+    assert!(client.lid_pn_cache.get_phone_number(lid).await.is_none());
+    client
+        .classify_incoming_message(&envelope(true, true))
+        .await;
+    assert_eq!(
+        client.lid_pn_cache.get_phone_number(lid).await.as_deref(),
+        Some(pn)
+    );
+    assert_eq!(
+        client.lid_pn_cache.get_current_lid(pn).await.as_deref(),
+        Some(lid)
+    );
+    let backend = client.persistence_manager.backend();
+    assert!(backend.get_lid_mapping(lid).await.unwrap().is_none());
+    let absent = envelope(true, false);
+    let info = client.parse_message_info(absent.get()).await.unwrap();
+    assert!(
+        info.source.recipient_alt.is_none(),
+        "known cache must not disclose an omitted PN"
+    );
+    client
+        .ab_props()
+        .apply_props(
+            false,
+            [
+                (
+                    wacore::iq::abprops::web::USERNAME_CONTACT_DISPLAY.code,
+                    "1".into(),
+                ),
+                (
+                    wacore::iq::abprops::web::ENABLE_CALLING_PHONE_NUMBER_PRIVACY.code,
+                    "1".into(),
+                ),
+            ]
+            .into_iter(),
+        )
+        .await;
+    client
+        .classify_incoming_message(&envelope(false, true))
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(Some(mapping)) = backend.get_lid_mapping(lid).await {
+                assert_eq!(mapping.phone_number, pn);
+                assert_eq!(mapping.learning_source, "peer_lid_message");
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("live mapping persisted");
+}
+
+#[tokio::test]
 async fn test_parse_message_info_for_status_broadcast() {
     let backend = Arc::new(
         SqliteStore::open("file:memdb_status_test?mode=memory&cache=shared")
@@ -16443,6 +16533,41 @@ mod pdo_alias_tests {
     #[tokio::test]
     async fn pdo_alias_recovery_first() {
         arrival_order(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn self_sync_recipient_alias_deduplicates_pdo_in_both_orders() {
+        for recovery_first in [false, true] {
+            let (client, events) = client().await;
+            let node = NodeBuilder::new("message")
+                .attr("id", ID)
+                .attr("from", OWN)
+                .attr("recipient", LID)
+                .attr("peer_recipient_pn", PN)
+                .attr("t", "1700000000")
+                .build();
+            let info = Arc::new(
+                wacore::messages::parse_message_info(
+                    &node.as_node_ref(),
+                    &OWN.parse().unwrap(),
+                    None,
+                )
+                .unwrap(),
+            );
+            let response = response(&info);
+            if recovery_first {
+                client
+                    .handle_pdo_response(&response, &MessageInfo::default())
+                    .await;
+            }
+            retry(&client, &info).await;
+            if !recovery_first {
+                client
+                    .handle_pdo_response(&response, &MessageInfo::default())
+                    .await;
+            }
+            assert_eq!(message_events_for_id(&events, ID), (1, 1));
+        }
     }
     #[tokio::test]
     async fn pdo_alias_queued_late_filter() {

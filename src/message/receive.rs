@@ -220,6 +220,14 @@ impl Client {
             info.is_offline,
         )
         .await;
+        if info.source.is_self_fanout() {
+            self.cache_lid_pn_from_message(
+                &info.source.chat,
+                info.source.recipient_alt.as_ref(),
+                info.is_offline,
+            )
+            .await;
+        }
         let sender_encryption_jid = self.resolve_encryption_jid(&info.source.sender).await;
 
         let unavailable_node = nr.get_optional_child("unavailable");

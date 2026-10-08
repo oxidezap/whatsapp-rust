@@ -1370,6 +1370,7 @@ pub fn parse_message_info(
     let addressing_mode = attrs
         .optional_string(MessageAttr::AddressingMode)
         .and_then(|s| AddressingMode::try_from(s.as_ref()).ok());
+    let peer_recipient_pn = attrs.optional_jid(MessageAttr::PeerRecipientPn);
 
     let mut source = if from.server == Server::Broadcast {
         let participant = attrs.required_jid(MessageAttr::Participant)?;
@@ -1418,6 +1419,15 @@ pub fn parse_message_info(
         }
     } else if from.matches_user_or_lid(own_jid, own_lid) {
         let recipient = attrs.optional_jid_result(MessageAttr::Recipient)?;
+        // The peer PN names the explicit LID recipient, never the own sender
+        // or a recipient-less self-note. Keep the wire chat for routing; an
+        // absent PN remains absent even when a username or cached pair exists.
+        let recipient_alt = recipient
+            .as_ref()
+            .filter(|jid| jid.server.is_lid_family() && !jid.user.is_empty())
+            .and(peer_recipient_pn.as_ref())
+            .filter(|jid| jid.server.is_pn_family() && !jid.user.is_empty())
+            .cloned();
         let chat = recipient
             .as_ref()
             .map(|r| r.to_non_ad())
@@ -1435,6 +1445,7 @@ pub fn parse_message_info(
             sender: from.clone(),
             is_from_me: true,
             recipient,
+            recipient_alt,
             sender_alt,
             ..Default::default()
         }
@@ -1516,7 +1527,6 @@ pub fn parse_message_info(
         .get_optional_child("verified_name")
         .and_then(|vn| crate::stanza::business::VerifiedName::try_from_node(vn).ok())
         .map(Box::new);
-    let peer_recipient_pn = attrs.optional_jid(MessageAttr::PeerRecipientPn);
 
     // <meta> child attrs (WAWebHandleMsgParser b()) and <reporting> children
     // (I() function). Both are optional; absence is the common case.
@@ -1812,6 +1822,114 @@ mod parse_message_info_tests {
     use std::str::FromStr;
     use wacore_binary::Jid;
     use wacore_binary::builder::NodeBuilder;
+
+    #[test]
+    fn self_sync_recipient_alias_is_explicit_and_scoped_to_lid_dm() {
+        let own_pn = Jid::pn("15550000001");
+        let own_lid = Jid::lid("100000000000001");
+        for (from, recipient, alternate, expected) in [
+            (
+                "100000000000001:2@lid",
+                Some("100000000000002@lid"),
+                Some("15550000002@s.whatsapp.net"),
+                true,
+            ),
+            (
+                "15550000001:2@s.whatsapp.net",
+                Some("100000000000002@hosted.lid"),
+                Some("15550000002@hosted"),
+                true,
+            ),
+            (
+                "100000000000001:2@lid",
+                Some("100000000000002@lid"),
+                None,
+                false,
+            ),
+            (
+                "100000000000001:2@lid",
+                Some("100000000000002@lid"),
+                Some("invalid"),
+                false,
+            ),
+            (
+                "100000000000001:2@lid",
+                Some("100000000000002@lid"),
+                Some("100000000000003@lid"),
+                false,
+            ),
+            (
+                "100000000000001:2@lid",
+                Some("100000000000002@lid"),
+                Some("@s.whatsapp.net"),
+                false,
+            ),
+            (
+                "100000000000001:2@lid",
+                Some("15550000002@s.whatsapp.net"),
+                Some("15550000003@s.whatsapp.net"),
+                false,
+            ),
+            (
+                "100000000000001:2@lid",
+                None,
+                Some("15550000002@s.whatsapp.net"),
+                false,
+            ),
+            (
+                "100000000000001:2@lid",
+                Some("status@broadcast"),
+                Some("15550000002@s.whatsapp.net"),
+                false,
+            ),
+            (
+                "120363000000001@g.us",
+                None,
+                Some("15550000002@s.whatsapp.net"),
+                false,
+            ),
+            (
+                "status@broadcast",
+                None,
+                Some("15550000002@s.whatsapp.net"),
+                false,
+            ),
+            (
+                "100000000000002@lid",
+                None,
+                Some("15550000002@s.whatsapp.net"),
+                false,
+            ),
+        ] {
+            let mut node = NodeBuilder::new("message")
+                .attr("id", "SELF-SYNC-ALIAS")
+                .attr("from", from)
+                .attr("participant", &own_lid)
+                .attr("peer_recipient_username", "synthetic_user")
+                .attr("t", "1700000000");
+            if let Some(recipient) = recipient {
+                node = node.attr("recipient", recipient);
+            }
+            if let Some(alternate) = alternate {
+                node = node.attr("peer_recipient_pn", alternate);
+            }
+            let node = node.build();
+            let info = parse_message_info(&node.as_node_ref(), &own_pn, Some(&own_lid)).unwrap();
+            assert_eq!(
+                info.source.recipient_alt,
+                expected.then(|| alternate.unwrap().parse().unwrap()),
+                "{from} {recipient:?} {alternate:?}"
+            );
+            if expected {
+                assert_eq!(
+                    info.source.chat,
+                    recipient.unwrap().parse::<Jid>().unwrap().to_non_ad()
+                );
+                assert_eq!(info.source.sender, from.parse::<Jid>().unwrap());
+                assert_eq!(info.source.recipient_alt, info.peer_recipient_pn);
+            }
+        }
+    }
 
     #[test]
     fn invalid_routing_and_identity_attributes_are_rejected() {
