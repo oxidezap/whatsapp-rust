@@ -126,4 +126,8 @@ impl PreKeyRecord {
     pub fn serialize(&self) -> Result<Vec<u8>> {
         Ok(waproto::codec::pre_key_record_to_vec(&self.pre_key))
     }
+
+    pub(crate) fn as_storage(&self) -> &PreKeyRecordStructure {
+        &self.pre_key
+    }
 }

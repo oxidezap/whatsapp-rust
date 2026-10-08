@@ -595,6 +595,8 @@ impl SenderKeyState {
         self.signing_key_memo.get().is_some()
     }
 
+    #[cold]
+    #[inline(never)]
     fn preserved_protobuf(&self) -> Option<SenderKeyStateStructure> {
         let mut state = (**self.future.as_ref()?).clone();
         state.sender_key_id = self.sender_key_id;
@@ -609,21 +611,40 @@ impl SenderKeyState {
                     MessageField::some(key)
                 });
         // Index once: a full skipped-key backlog must not make storage quadratic.
-        // Keep the first occurrence, matching the decoder's existing selection.
-        let mut original = std::collections::BTreeMap::new();
-        for key in std::mem::take(&mut state.sender_message_keys) {
-            original
-                .entry((key.iteration.unwrap_or_default(), key.seed.clone()))
-                .or_insert(key);
-        }
+        // Each occurrence owns its future fields, even when iteration and seed
+        // are identical. Consume matching occurrences in their original order.
+        let mut original: Vec<_> = std::mem::take(&mut state.sender_message_keys)
+            .into_iter()
+            .enumerate()
+            .map(|(index, key)| {
+                (
+                    key.iteration.unwrap_or_default(),
+                    key.seed.clone(),
+                    index,
+                    Some(key),
+                )
+            })
+            .collect();
+        original.sort_unstable_by(|a, b| (a.0, &a.1, a.2).cmp(&(b.0, &b.1, b.2)));
         state.sender_message_keys = self
             .message_keys
             .iter()
             .map(|key| {
                 let seed = bytes::Bytes::copy_from_slice(&key.seed);
+                let identity = (key.iteration, Some(key.seed.as_slice()));
+                // Consumed slots form a prefix inside each identity's run, so
+                // partition_point stays logarithmic even for all-equal keys.
+                let first = original.partition_point(|entry| {
+                    match (entry.0, entry.1.as_deref()).cmp(&identity) {
+                        std::cmp::Ordering::Less => true,
+                        std::cmp::Ordering::Equal => entry.3.is_none(),
+                        std::cmp::Ordering::Greater => false,
+                    }
+                });
                 let mut stored = original
-                    .get(&(key.iteration, Some(seed.clone())))
-                    .cloned()
+                    .get_mut(first)
+                    .filter(|entry| (entry.0, entry.1.as_deref()) == identity)
+                    .and_then(|entry| entry.3.take())
                     .unwrap_or_default();
                 stored.iteration = Some(key.iteration);
                 stored.seed = Some(seed);
@@ -672,7 +693,9 @@ impl SenderKeyState {
 
     #[allow(clippy::disallowed_methods)]
     fn encoded_len(&self) -> usize {
-        if let Some(state) = self.preserved_protobuf() {
+        if self.future.is_some()
+            && let Some(state) = self.preserved_protobuf()
+        {
             return state.encoded_len() as usize;
         }
         use record_encoding::{bytes_len, nested_len, seed_record_len, uint32_len};
@@ -697,7 +720,9 @@ impl SenderKeyState {
 
     #[allow(clippy::disallowed_methods)]
     fn encode_into(&self, out: &mut Vec<u8>) {
-        if let Some(state) = self.preserved_protobuf() {
+        if self.future.is_some()
+            && let Some(state) = self.preserved_protobuf()
+        {
             state.encode(out);
             return;
         }
@@ -746,17 +771,46 @@ impl SenderKeyState {
         let len = keys.len();
         if len > consts::MAX_MESSAGE_KEYS + consts::MESSAGE_KEY_PRUNE_THRESHOLD {
             let excess = len - consts::MAX_MESSAGE_KEYS;
-            keys.drain(..excess);
             if let Some(future) = self.future.as_mut() {
+                // Count expired occurrences once. A set of survivors cannot
+                // distinguish identical keys carrying different future data.
+                let mut expired: Vec<_> = keys[..excess]
+                    .iter()
+                    .map(|key| ((key.iteration, key.seed), 1usize))
+                    .collect();
+                expired.sort_unstable_by_key(|entry| entry.0);
+                expired.dedup_by(|next, previous| {
+                    if next.0 != previous.0 {
+                        return false;
+                    }
+                    previous.1 += next.1;
+                    true
+                });
                 std::sync::Arc::make_mut(future)
                     .sender_message_keys
                     .retain(|old| {
-                        keys.iter().any(|key| {
-                            old.iteration.unwrap_or_default() == key.iteration
-                                && old.seed.as_deref() == Some(key.seed.as_slice())
-                        })
+                        let Some(seed) = old
+                            .seed
+                            .as_deref()
+                            .and_then(|seed| <[u8; 32]>::try_from(seed).ok())
+                        else {
+                            return true;
+                        };
+                        let Ok(index) = expired.binary_search_by_key(
+                            &(old.iteration.unwrap_or_default(), seed),
+                            |entry| entry.0,
+                        ) else {
+                            return true;
+                        };
+                        let count = &mut expired[index].1;
+                        if *count == 0 {
+                            return true;
+                        }
+                        *count -= 1;
+                        false
                     });
             }
+            keys.drain(..excess);
         }
     }
 
@@ -769,12 +823,13 @@ impl SenderKeyState {
             .position(|x| x.iteration == iteration)?;
         let smk = std::sync::Arc::make_mut(&mut self.message_keys).remove(index);
         if let Some(future) = self.future.as_mut() {
-            std::sync::Arc::make_mut(future)
-                .sender_message_keys
-                .retain(|old| {
-                    old.iteration.unwrap_or_default() != smk.iteration
-                        || old.seed.as_deref() != Some(smk.seed.as_slice())
-                });
+            let future = std::sync::Arc::make_mut(future);
+            if let Some(index) = future.sender_message_keys.iter().position(|old| {
+                old.iteration.unwrap_or_default() == smk.iteration
+                    && old.seed.as_deref() == Some(smk.seed.as_slice())
+            }) {
+                future.sender_message_keys.remove(index);
+            }
         }
         Some(SenderMessageKey::new(smk.iteration, smk.seed))
     }
@@ -1136,7 +1191,7 @@ impl SenderKeyRecord {
         {
             let mut proto = SenderKeyRecordStructure::default();
             proto.sender_key_states = states;
-            proto.__buffa_unknown_fields = self.future.clone();
+            proto.__buffa_unknown_fields = self.future.clone().into();
             proto
         }
     }
@@ -1174,16 +1229,19 @@ impl SenderKeyRecord {
         // Retain lengths on the stack so sizing never rescans a backlog during
         // the write pass or adds a heap allocation per flush.
         let mut state_lengths = [0; consts::MAX_SENDER_KEY_STATES];
-        // Retain rare future-field reconstructions for both sizing and writing.
-        // Ordinary states keep their allocation-free compact encoding path.
-        let preserved: [Option<SenderKeyStateStructure>; consts::MAX_SENDER_KEY_STATES] =
-            std::array::from_fn(|index| {
-                self.states.get(index).and_then(|s| s.preserved_protobuf())
-            });
+        // A protobuf state is large even when absent. Keep its temporary slots
+        // off the ordinary flush path; only future-bearing records reconstruct
+        // them, once for both sizing and writing.
+        let preserved = if self.states.iter().any(|state| state.future.is_some()) {
+            self.preserved_states()
+        } else {
+            Vec::new()
+        };
         let mut states_len = 0;
         for (index, state) in self.states.iter().enumerate() {
-            let len = preserved[index]
-                .as_ref()
+            let len = preserved
+                .get(index)
+                .and_then(Option::as_ref)
                 .map_or_else(|| state.encoded_len(), |pb| pb.encoded_len() as usize);
             state_lengths[index] = len;
             states_len += record_encoding::nested_len(len);
@@ -1193,7 +1251,7 @@ impl SenderKeyRecord {
         );
         for (index, state) in self.states.iter().enumerate() {
             record_encoding::write_nested(1, state_lengths[index], &mut buf);
-            if let Some(pb) = &preserved[index] {
+            if let Some(pb) = preserved.get(index).and_then(Option::as_ref) {
                 // No codec wrapper exists for this nested storage message.
                 #[allow(clippy::disallowed_methods)]
                 pb.encode(&mut buf);
@@ -1213,6 +1271,15 @@ impl SenderKeyRecord {
         }
         self.future.write_to(&mut buf);
         Ok(buf)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn preserved_states(&self) -> Vec<Option<SenderKeyStateStructure>> {
+        self.states
+            .iter()
+            .map(|state| state.preserved_protobuf())
+            .collect()
     }
 
     /// Retained in-memory bytes of every state this record holds.
@@ -2213,6 +2280,144 @@ mod tests {
         assert_eq!(
             loaded.serialize().expect("fixture encode"),
             pb.encode_to_vec()
+        );
+    }
+
+    #[test]
+    fn duplicate_skipped_keys_keep_each_occurrences_future_fields() {
+        let mut record = record_with_state(42, 0x55);
+        let state = record.sender_key_state_mut().expect("fixture state");
+        state.add_skipped_message_key(7, [0x66; 32]);
+        state.add_skipped_message_key(7, [0x66; 32]);
+        let mut expected = record.as_protobuf();
+        for (index, key) in expected.sender_key_states[0]
+            .sender_message_keys
+            .iter_mut()
+            .enumerate()
+        {
+            key.__buffa_unknown_fields.push(buffa::UnknownField {
+                number: 200,
+                data: buffa::UnknownFieldData::Varint(index as u64 + 1),
+            });
+        }
+        let original = expected.encode_to_vec();
+        let mut loaded = SenderKeyRecord::deserialize(&original).expect("fixture decode");
+        let untouched = loaded.clone();
+        assert_eq!(loaded.serialize().expect("fixture encode"), original);
+
+        loaded
+            .sender_key_state_mut()
+            .expect("fixture state")
+            .remove_sender_message_key(7)
+            .expect("first occurrence");
+        expected.sender_key_states[0].sender_message_keys.remove(0);
+        assert_eq!(
+            loaded.serialize().expect("fixture encode"),
+            expected.encode_to_vec()
+        );
+
+        loaded
+            .sender_key_state_mut()
+            .expect("fixture state")
+            .add_skipped_message_key(7, [0x66; 32]);
+        let mut fresh = expected.sender_key_states[0].sender_message_keys[0].clone();
+        fresh.__buffa_unknown_fields.clear();
+        expected.sender_key_states[0]
+            .sender_message_keys
+            .push(fresh);
+        loaded
+            .sender_key_state_mut()
+            .expect("fixture state")
+            .remove_sender_message_key(7)
+            .expect("second occurrence");
+        expected.sender_key_states[0].sender_message_keys.remove(0);
+        assert_eq!(
+            loaded.serialize().expect("fixture encode"),
+            expected.encode_to_vec()
+        );
+        assert_eq!(untouched.serialize().expect("fixture encode"), original);
+    }
+
+    #[test]
+    fn pruning_duplicate_skipped_keys_expires_only_prefix_occurrences() {
+        let mut record = record_with_state(42, 0x55);
+        let count = consts::MAX_MESSAGE_KEYS + consts::MESSAGE_KEY_PRUNE_THRESHOLD;
+        let state = record.sender_key_state_mut().expect("fixture state");
+        for index in 0..count {
+            state.add_skipped_message_key(index as u32, [0x66; 32]);
+        }
+        let mut expected = record.as_protobuf();
+        let keys = &mut expected.sender_key_states[0].sender_message_keys;
+        for key in keys
+            .iter_mut()
+            .take(consts::MESSAGE_KEY_PRUNE_THRESHOLD + 1)
+        {
+            key.iteration = Some(0);
+        }
+        keys[100].iteration = keys[0].iteration;
+        for (index, value) in [(0, 11), (100, 22)] {
+            keys[index]
+                .__buffa_unknown_fields
+                .push(buffa::UnknownField {
+                    number: 200,
+                    data: buffa::UnknownFieldData::Varint(value),
+                });
+        }
+        let mut fresh = keys[1].clone();
+        fresh.iteration = Some(count as u32);
+        let mut loaded =
+            SenderKeyRecord::deserialize(&expected.encode_to_vec()).expect("fixture decode");
+        loaded
+            .sender_key_state_mut()
+            .expect("fixture state")
+            .add_skipped_message_key(count as u32, [0x66; 32]);
+        let keys = &mut expected.sender_key_states[0].sender_message_keys;
+        keys.push(fresh);
+        keys.drain(..keys.len() - consts::MAX_MESSAGE_KEYS);
+        assert_eq!(
+            loaded.serialize().expect("fixture encode"),
+            expected.encode_to_vec()
+        );
+        assert_eq!(
+            loaded
+                .sender_key_state()
+                .expect("fixture state")
+                .message_keys
+                .len(),
+            consts::MAX_MESSAGE_KEYS
+        );
+    }
+
+    #[test]
+    fn all_equal_future_backlog_keeps_occurrence_order() {
+        let mut record = record_with_state(42, 0x55);
+        let state = record.sender_key_state_mut().expect("fixture state");
+        for _ in 0..consts::MAX_MESSAGE_KEYS {
+            state.add_skipped_message_key(7, [0x66; 32]);
+        }
+        let mut expected = record.as_protobuf();
+        for (index, key) in expected.sender_key_states[0]
+            .sender_message_keys
+            .iter_mut()
+            .enumerate()
+        {
+            key.__buffa_unknown_fields.push(buffa::UnknownField {
+                number: 200,
+                data: buffa::UnknownFieldData::Varint(index as u64),
+            });
+        }
+        let original = expected.encode_to_vec();
+        let mut loaded = SenderKeyRecord::deserialize(&original).expect("fixture decode");
+        assert_eq!(loaded.serialize().expect("fixture encode"), original);
+        loaded
+            .sender_key_state_mut()
+            .expect("fixture state")
+            .remove_sender_message_key(7)
+            .expect("first occurrence");
+        expected.sender_key_states[0].sender_message_keys.remove(0);
+        assert_eq!(
+            loaded.serialize().expect("fixture encode"),
+            expected.encode_to_vec()
         );
     }
 

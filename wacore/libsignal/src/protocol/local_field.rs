@@ -68,7 +68,10 @@ pub(crate) fn encode_store_incarnation(bytes: &mut Vec<u8>, incarnation: &[u8; 1
 }
 
 /// Keep future record data without replaying an old local lease/incarnation.
-pub(crate) fn future_record_fields(fields: buffa::UnknownFields) -> buffa::UnknownFields {
+pub(crate) fn future_record_fields(
+    fields: impl Into<buffa::UnknownFields>,
+) -> buffa::UnknownFields {
+    let fields: buffa::UnknownFields = fields.into();
     let mut future = buffa::UnknownFields::new();
     for field in fields {
         if field.number != COUNTER_RESERVATION_FIELD && field.number != STORE_INCARNATION_FIELD {
