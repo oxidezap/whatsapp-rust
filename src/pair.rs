@@ -1,7 +1,8 @@
 use crate::client::Client;
 use crate::lid_pn_cache::LearningSource;
 use crate::types::events::{Event, PairError, PairSuccess};
-use log::{debug, error, info, warn};
+use futures::FutureExt;
+use log::{error, info, warn};
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -52,11 +53,21 @@ impl Client {
     }
 }
 
+#[cfg(test)]
+pub(crate) async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
+    let shutdown = client.connection_shutdown_signal();
+    handle_iq_scoped(client, node, &shutdown).await
+}
+
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(name = "wa.pair.handle_iq", level = "debug", skip_all)
 )]
-pub(crate) async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
+pub(crate) async fn handle_iq_scoped(
+    client: &Arc<Client>,
+    node: &NodeRef<'_>,
+    connection_shutdown: &wacore::runtime::ShutdownSignal,
+) -> bool {
     // Server JID is "s.whatsapp.net" (no @ prefix for server-only JIDs)
     if node.get_attr("from").is_none_or(|v| v != SERVER_JID) {
         return false;
@@ -66,6 +77,8 @@ pub(crate) async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool 
         for child in children {
             let handled = match child.tag.as_ref() {
                 "pair-device" => {
+                    let connection_shutdown = connection_shutdown.clone();
+                    let shutdown = client.shutdown_signal();
                     if let Some(ack_node) = PairUtils::build_ack_node_ref(node)
                         && let Err(e) = client.send_node(ack_node).await
                     {
@@ -93,23 +106,30 @@ pub(crate) async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool 
                     // in that window would find no sender and be dropped —
                     // leaving the code already on screen keyed to a secret the
                     // server has retired.
-                    *client.pairing_cancellation_tx.lock().await = Some(stop_tx);
-                    *client.pairing_qr_refresh_tx.lock().await = Some(refresh_tx);
-                    let client_clone = client.clone();
+                    {
+                        let mut stop = client.pairing_cancellation_tx.lock().await;
+                        let mut refresh = client.pairing_qr_refresh_tx.lock().await;
+                        if shutdown.is_fired() || connection_shutdown.is_fired() {
+                            return true;
+                        }
+                        *stop = Some(stop_tx);
+                        *refresh = Some(refresh_tx);
+                    }
+                    let weak_client = Arc::downgrade(client);
+                    let runtime = client.runtime.clone();
 
                     client
                         .runtime
                         .spawn(Box::pin(async move {
+                            let stopped = || {
+                                shutdown.is_fired()
+                                    || connection_shutdown.is_fired()
+                                    || stop_rx.is_closed()
+                                    || !stop_rx.is_empty()
+                            };
                             let mut is_first = true;
 
                             'refs: for pairing_ref in refs {
-                                // Guard: pairing may complete before this task gets polled
-                                // (single-threaded runtimes, fast auto-pair, mock servers)
-                                if client_clone.is_logged_in() {
-                                    info!("Already logged in, stopping QR rotation.");
-                                    return;
-                                }
-
                                 let ttl = if is_first {
                                     is_first = false;
                                     std::time::Duration::from_secs(60)
@@ -133,10 +153,20 @@ pub(crate) async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool 
                                 // let a refresh extend a ref past the deadline
                                 // the server set. `started` only feeds the
                                 // advisory countdown on the event.
-                                let sleep = client_clone.runtime.sleep(ttl);
+                                let sleep = runtime.sleep(ttl);
                                 futures::pin_mut!(sleep);
 
                                 loop {
+                                    if stopped() {
+                                        return;
+                                    }
+                                    let Some(client_clone) = weak_client.upgrade() else {
+                                        return;
+                                    };
+                                    // Pairing may finish before the first poll or a refresh.
+                                    if client_clone.is_logged_in() {
+                                        return;
+                                    }
                                     let snapshot =
                                         client_clone.persistence_manager.get_device_snapshot();
                                     let code = PairUtils::make_qr_data(
@@ -154,42 +184,36 @@ pub(crate) async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool 
                                             .timeout(ttl.saturating_sub(started.elapsed()))
                                             .build(),
                                     ));
+                                    drop(snapshot);
+                                    drop(client_clone);
 
-                                    let stop = stop_rx.recv();
-                                    let refresh = refresh_rx.recv();
-                                    futures::pin_mut!(stop);
-                                    futures::pin_mut!(refresh);
-                                    let outcome = futures::future::select(
-                                        sleep.as_mut(),
-                                        futures::future::select(stop, refresh),
-                                    )
-                                    .await;
-                                    match outcome {
-                                        futures::future::Either::Left(_) => {
-                                            if client_clone.is_logged_in() {
-                                                info!(
-                                                    "Logged in during QR timeout, stopping rotation."
-                                                );
-                                                return;
-                                            }
-                                            continue 'refs;
-                                        }
-                                        futures::future::Either::Right((
-                                            futures::future::Either::Left(_),
-                                            _,
-                                        )) => {
-                                            info!("Pairing complete. Stopping QR code rotation.");
-                                            return;
-                                        }
-                                        // Same ref and deadline, rebuilt payload.
-                                        futures::future::Either::Right((
-                                            futures::future::Either::Right(_),
-                                            _,
-                                        )) => continue,
-                                }
+                                    let stop = stop_rx.recv().fuse();
+                                    let refresh = refresh_rx.recv().fuse();
+                                    let terminal =
+                                        wacore::runtime::wait_for_shutdown(&shutdown).fuse();
+                                    let disconnected =
+                                        wacore::runtime::wait_for_shutdown(&connection_shutdown)
+                                            .fuse();
+                                    let tick = sleep.as_mut().fuse();
+                                    futures::pin_mut!(stop, refresh, terminal, disconnected, tick);
+                                    futures::select_biased! {
+                                        _ = terminal => return,
+                                        _ = disconnected => return,
+                                        _ = stop => return,
+                                        _ = tick => continue 'refs,
+                                        result = refresh => {
+                                            if result.is_err() { return; }
+                                        },
+                                    }
                                 }
                             }
 
+                            if stopped() {
+                                return;
+                            }
+                            let Some(client_clone) = weak_client.upgrade() else {
+                                return;
+                            };
                             if client_clone.is_logged_in() {
                                 return;
                             }
@@ -206,11 +230,24 @@ pub(crate) async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool 
                             // route the eventual `primary_hello` to a session
                             // that no longer exists. QR-only callers keep the
                             // self-disconnect they rely on to get fresh refs.
-                            let pair_code_outstanding = client_clone
-                                .pair_code_state
-                                .lock()
-                                .await
-                                .is_outstanding(wacore::time::Instant::now());
+                            let state = client_clone.pair_code_state.lock().fuse();
+                            let terminal = wacore::runtime::wait_for_shutdown(&shutdown).fuse();
+                            let disconnected =
+                                wacore::runtime::wait_for_shutdown(&connection_shutdown).fuse();
+                            let stop = stop_rx.recv().fuse();
+                            futures::pin_mut!(state, terminal, disconnected, stop);
+                            let state = futures::select_biased! {
+                                _ = terminal => return,
+                                _ = disconnected => return,
+                                _ = stop => return,
+                                state = state => state,
+                            };
+                            let pair_code_outstanding =
+                                state.is_outstanding(wacore::time::Instant::now());
+                            drop(state);
+                            if stopped() {
+                                return;
+                            }
 
                             info!(
                                 "All QR codes for this session have expired\
@@ -233,7 +270,7 @@ pub(crate) async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool 
                     true
                 }
                 "pair-success" => {
-                    handle_pair_success(client, node, child).await;
+                    handle_pair_success(client, node, child, connection_shutdown).await;
                     true
                 }
                 _ => false,
@@ -255,7 +292,13 @@ async fn handle_pair_success<'a>(
     client: &Arc<Client>,
     request_node: &NodeRef<'a>,
     success_node: &NodeRef<'a>,
+    connection_shutdown: &wacore::runtime::ShutdownSignal,
 ) {
+    let terminal_shutdown = client.shutdown_signal();
+    let stopped = || connection_shutdown.is_fired() || terminal_shutdown.is_fired();
+    if stopped() {
+        return;
+    }
     client.update_server_time_offset(request_node);
 
     let req_id = match request_node.get_attr("id").map(|v| v.as_str()) {
@@ -312,6 +355,9 @@ async fn handle_pair_success<'a>(
     // and verifying against the old value and then completing against the new
     // one would persist a paired device whose ADV signatures cannot validate.
     let mut pair_code_state = client.pair_code_state.lock().await;
+    if stopped() {
+        return;
+    }
 
     let device_snapshot = client.persistence_manager.get_device_snapshot();
     let device_state = DeviceState {
@@ -332,17 +378,6 @@ async fn handle_pair_success<'a>(
             // is the same mistake in the other direction: a rejected response
             // would take the displayed code down with it, and nothing puts one
             // back.
-            *pair_code_state = wacore::pair_code::PairCodeState::Completed;
-            drop(pair_code_state);
-            if let Some(tx) = client.pairing_cancellation_tx.lock().await.take() {
-                let _ = tx.try_send(());
-                debug!("Sent QR rotation stop signal");
-            } else {
-                debug!(
-                    "QR rotation channel not yet stored — is_logged_in guard will stop the task"
-                );
-            }
-
             let signed_identity_for_event = match waproto::codec::adv_signed_device_identity_decode(
                 self_signed_identity_bytes.as_slice(),
             ) {
@@ -366,57 +401,47 @@ async fn handle_pair_success<'a>(
                 }
             };
 
-            client
-                .persistence_manager
-                .process_command(crate::store::commands::DeviceCommand::SetId(Some(
-                    jid.clone(),
-                )))
-                .await;
-            client
-                .persistence_manager
-                .process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
-                    signed_identity_for_event.clone(),
-                )))
-                .await;
-            client
-                .persistence_manager
-                .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
-                    lid.clone(),
-                )))
-                .await;
-
-            // The primary reports whether the account is 1:1-LID-migrated via
-            // <client-props> (WA Web HandlePairSuccess -> setIsLidMigrated).
-            // This gates outbound DM wire addressing between LID and PN.
-            // Pairing a different account must not inherit the previous
-            // account's state, but a same-account relink whose pair-success
-            // omitted client-props must not lose it either.
+            let mut qr_cancellation = client.pairing_cancellation_tx.lock().await;
+            if stopped() {
+                return;
+            }
+            // Publish the identity as one mutation, after checking the scope
+            // inside the device lock. Keep pairing state locked until publication
+            // so teardown/re-pair cannot interleave a replacement pairing.
             let props_migrated = PairUtils::extract_pairing_props(success_node)
                 .is_some_and(|props| props.is_chat_db_lid_migrated.unwrap_or(false));
-            let account_changed = device_snapshot
-                .pn
-                .as_ref()
-                .is_none_or(|prev| prev.user != jid.user);
-            if let Some(lid_migrated) =
-                PairUtils::lid_migrated_update(props_migrated, account_changed)
-            {
-                info!("Account 1:1-LID-migrated (pair-success client-props): {lid_migrated}");
-                client
-                    .persistence_manager
-                    .process_command(crate::store::commands::DeviceCommand::SetLidMigrated(
-                        lid_migrated,
-                    ))
-                    .await;
-            }
-
-            // A prior pairing's `server_has_prekeys=true` would make
-            // `upload_pre_keys_at_login` skip and leave the server bundle stale.
-            // Reset it so the next connect re-uploads, matching WA Web where a
-            // freshly registered device always uploads its prekeys.
-            client
+            let committed = client
                 .persistence_manager
-                .modify_device(|d| d.server_has_prekeys = false)
+                .modify_device(|device| {
+                    if stopped() {
+                        return false;
+                    }
+                    let account_changed =
+                        device.pn.as_ref().is_none_or(|prev| prev.user != jid.user);
+                    if let Some(migrated) =
+                        PairUtils::lid_migrated_update(props_migrated, account_changed)
+                    {
+                        device.lid_migrated = migrated;
+                    }
+                    device.pn = Some(jid.clone());
+                    device.account = Some(Arc::new(signed_identity_for_event.clone()));
+                    device.lid = Some(lid.clone());
+                    device.server_has_prekeys = false;
+                    if !business_name.is_empty() {
+                        device.push_name = business_name.clone();
+                    }
+                    *pair_code_state = wacore::pair_code::PairCodeState::Completed;
+                    true
+                })
                 .await;
+            if committed && let Some(tx) = qr_cancellation.take() {
+                let _ = tx.try_send(());
+            }
+            drop(qr_cancellation);
+            drop(pair_code_state);
+            if !committed || stopped() {
+                return;
+            }
 
             // Add the own LID-PN mapping to the cache so that when sending DMs to self,
             // we can find the existing LID-based session instead of creating a new PN-based one.
@@ -438,18 +463,8 @@ async fn handle_pair_success<'a>(
                 }
             }
 
-            if !business_name.is_empty() {
-                info!("✅ Setting push_name during pairing");
-                client
-                    .persistence_manager
-                    .process_command(crate::store::commands::DeviceCommand::SetPushName(
-                        business_name.clone(),
-                    ))
-                    .await;
-            } else {
-                info!(
-                    "⚠️ business_name not found in pair-success, push_name remains unset for now."
-                );
+            if stopped() {
+                return;
             }
 
             let response_node = PairUtils::build_pair_success_response(
@@ -463,11 +478,19 @@ async fn handle_pair_success<'a>(
                 return;
             }
 
+            if stopped() {
+                return;
+            }
+            let connection_for_unified = connection_shutdown.clone();
             let client_for_unified = client.clone();
             client
                 .runtime
                 .spawn(Box::pin(async move {
-                    client_for_unified.send_unified_session().await;
+                    if !connection_for_unified.is_fired()
+                        && !client_for_unified.shutdown_signal().is_fired()
+                    {
+                        client_for_unified.send_unified_session().await;
+                    }
                 }))
                 .detach();
 
@@ -504,6 +527,9 @@ async fn handle_pair_success<'a>(
                 error!("Failed to send pair error node: {send_err}");
             }
 
+            if stopped() {
+                return;
+            }
             let pair_error_event = PairError::builder()
                 .id(jid)
                 .lid(lid)
@@ -567,10 +593,289 @@ mod tests {
     use wacore_binary::Node;
     use wacore_binary::builder::NodeBuilder;
 
+    // Primary-side fixture messages have decode-only production codecs.
+    #[allow(clippy::disallowed_methods)]
+    fn signed_pair_success(client: &Client) -> Node {
+        use buffa::Message;
+        use hmac::{KeyInit, Mac};
+        use waproto::whatsapp as wa;
+        let device = client.persistence_manager.get_device_snapshot();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let mut details = wa::ADVDeviceIdentity::default();
+        details.key_index = Some(1);
+        let details = details.encode_to_vec();
+        let signature = account
+            .private_key
+            .calculate_signature(
+                &[
+                    &[6, 0][..],
+                    &details,
+                    device.identity_key.public_key.public_key_bytes(),
+                ]
+                .concat(),
+                &mut rng,
+            )
+            .unwrap();
+        let mut identity = wa::ADVSignedDeviceIdentity::default();
+        identity.details = Some(details);
+        identity.account_signature_key = Some(account.public_key.public_key_bytes().to_vec());
+        identity.account_signature = Some(signature.to_vec());
+        let identity = waproto::codec::adv_signed_device_identity_to_vec(&identity);
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&device.adv_secret_key).unwrap();
+        mac.update(&identity);
+        let mut payload = wa::ADVSignedDeviceIdentityHMAC::default();
+        payload.details = Some(identity);
+        payload.hmac = Some(mac.finalize().into_bytes().to_vec());
+        let payload = payload.encode_to_vec();
+        NodeBuilder::new("iq")
+            .attrs([
+                ("from", "s.whatsapp.net"),
+                ("type", "set"),
+                ("id", "signed-success"),
+            ])
+            .children([NodeBuilder::new("pair-success")
+                .children([
+                    NodeBuilder::new("device-identity").bytes(payload).build(),
+                    NodeBuilder::new("device")
+                        .attr("jid", "15550001111:1@s.whatsapp.net")
+                        .build(),
+                ])
+                .build()])
+            .build()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn signed_pair_success_commits_only_on_its_original_connection() {
+        for replace in [false, true] {
+            let (client, transport) = create_iq_test_client().await;
+            let collector = Arc::new(TestEventCollector::default());
+            client.subscribe_handler(collector.clone()).detach();
+            let iq = signed_pair_success(&client);
+            let node = iq.as_node_ref();
+            let shutdown = client.connection_shutdown_signal();
+            let state = client.pair_code_state.lock().await;
+            let pending = handle_iq_scoped(&client, &node, &shutdown);
+            futures::pin_mut!(pending);
+            assert!(futures::poll!(&mut pending).is_pending());
+            if replace {
+                client.notify_connection_shutdown();
+                client.reset_connection_shutdown();
+            }
+            drop(state);
+            assert!(pending.await);
+            let device = client.persistence_manager.get_device_snapshot();
+            assert_eq!(device.pn.is_some(), !replace);
+            assert_eq!(device.account.is_some(), !replace);
+            assert_eq!(client.expected_disconnect.load(Ordering::Relaxed), !replace);
+            assert_eq!(transport.sent().is_empty(), replace);
+            assert_eq!(
+                collector
+                    .events()
+                    .iter()
+                    .any(|e| matches!(&**e, Event::PairSuccess(_))),
+                !replace
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pair_success_waiting_for_device_cannot_publish_after_reconnect() {
+        let (client, transport) = create_iq_test_client().await;
+        let iq = signed_pair_success(&client);
+        let node = iq.as_node_ref();
+        let shutdown = client.connection_shutdown_signal();
+        let mut device_lock = Box::pin(
+            client
+                .persistence_manager
+                .modify_device_async(|_| Box::pin(futures::future::pending::<()>())),
+        );
+        assert!(futures::poll!(&mut device_lock).is_pending());
+        let pending = handle_iq_scoped(&client, &node, &shutdown);
+        futures::pin_mut!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        client.notify_connection_shutdown();
+        client.reset_connection_shutdown();
+        drop(device_lock);
+        assert!(pending.await);
+        let device = client.persistence_manager.get_device_snapshot();
+        assert!(device.pn.is_none());
+        assert!(device.account.is_none());
+        assert!(!matches!(
+            *client.pair_code_state.lock().await,
+            PairCodeState::Completed
+        ));
+        assert!(!client.expected_disconnect.load(Ordering::Relaxed));
+        assert!(transport.sent().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pair_success_waiting_for_state_cannot_reply_on_a_new_connection() {
+        let (client, transport) = create_iq_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        let iq = NodeBuilder::new("iq")
+            .attrs([
+                ("from", "s.whatsapp.net"),
+                ("type", "set"),
+                ("id", "stale-success"),
+            ])
+            .children([NodeBuilder::new("pair-success")
+                .children([NodeBuilder::new("device-identity").bytes(vec![0]).build()])
+                .build()])
+            .build();
+        let node = iq.as_node_ref();
+        let shutdown = client.connection_shutdown_signal();
+        let state = client.pair_code_state.lock().await;
+        let pending = handle_iq_scoped(&client, &node, &shutdown);
+        futures::pin_mut!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        client.notify_connection_shutdown();
+        client.reset_connection_shutdown();
+        drop(state);
+        assert!(pending.await);
+        assert!(
+            transport.sent().is_empty(),
+            "old pair-success must not reply on the new socket"
+        );
+        assert!(collector.events().is_empty());
+        assert!(!client.expected_disconnect.load(Ordering::Relaxed));
+        assert!(
+            client
+                .persistence_manager
+                .get_device_snapshot()
+                .pn
+                .is_none()
+        );
+    }
+
     /// The six refs the server hands out in one `<pair-device>`, and the
     /// rotation budget they buy: WA Web `Handle/PairDevice.js` waits 60s on the
     /// first (`u = 6e4`) and 20s on each of the rest (`c = 20 * 1e3`).
     const QR_REFS: usize = 6;
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_wins_over_ready_qr_tick_and_refresh() {
+        for elapsed in [0, 60, 80] {
+            let (client, _transport) = create_iq_test_client().await;
+            let collector = Arc::new(TestEventCollector::default());
+            client.subscribe_handler(collector.clone()).detach();
+            assert!(handle_iq(&client, &pair_device_iq().as_node_ref()).await);
+            if elapsed > 0 {
+                poll_until("first QR", || qr_codes_seen(&collector) == 1).await;
+                tokio::time::advance(std::time::Duration::from_secs(elapsed)).await;
+            }
+            client.refresh_pairing_qr().await;
+            client.signal_shutdown_sync();
+            let seen = collector.events().len();
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(std::time::Duration::from_secs(180)).await;
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(collector.events().len(), seen, "elapsed={elapsed}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retired_qr_rotation_does_not_stop_new_session_at_exhaustion() {
+        let (client, _transport) = create_iq_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        assert!(handle_iq(&client, &pair_device_iq().as_node_ref()).await);
+        poll_until("first QR", || qr_codes_seen(&collector) == 1).await;
+        client.notify_connection_shutdown();
+        client.reset_connection_shutdown();
+        for _ in 0..QR_REFS {
+            tokio::time::advance(std::time::Duration::from_secs(61)).await;
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert_eq!(qr_codes_seen(&collector), 1);
+        assert!(!client.shutdown_signal().is_fired());
+        assert!(handle_iq(&client, &pair_device_iq().as_node_ref()).await);
+        poll_until("new session QR", || qr_codes_seen(&collector) == 2).await;
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopped_qr_task_cannot_start_on_a_replacement_connection() {
+        let (client, _transport) = create_iq_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        assert!(handle_iq(&client, &pair_device_iq().as_node_ref()).await);
+        client.notify_connection_shutdown();
+        client.reset_connection_shutdown();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(qr_codes_seen(&collector), 0);
+        assert!(!client.shutdown_signal().is_fired());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replacement_refs_cancel_the_old_rotation_before_its_first_poll() {
+        let (client, _transport) = create_iq_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        // Omit the ACK ID so neither call yields to the transport task.
+        let mut iq = pair_device_iq();
+        iq.attrs.0.retain(|(key, _)| key != "id");
+        assert!(handle_iq(&client, &iq.as_node_ref()).await);
+        assert!(handle_iq(&client, &iq.as_node_ref()).await);
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(qr_codes_seen(&collector), 1);
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_qr_rotation_releases_client_and_store() {
+        let (client, transport) = create_iq_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        let iq = pair_device_iq();
+        assert!(handle_iq(&client, &iq.as_node_ref()).await);
+        poll_until("first QR", || qr_codes_seen(&collector) == 1).await;
+        let weak = Arc::downgrade(&client);
+        let released = client.store_release();
+        client.shutdown().await;
+        client.shutdown().await;
+        let seen = collector.events().len();
+        drop(client);
+        drop(transport);
+        poll_until("client release after shutdown", || weak.upgrade().is_none()).await;
+        assert!(released.wait().now_or_never().is_some());
+        tokio::time::advance(std::time::Duration::from_secs(180)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(collector.events().len(), seen);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_client_during_qr_rotation_releases_store() {
+        let (client, transport) = create_iq_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        assert!(handle_iq(&client, &pair_device_iq().as_node_ref()).await);
+        poll_until("first QR", || qr_codes_seen(&collector) == 1).await;
+        let weak = Arc::downgrade(&client);
+        let released = client.store_release();
+        drop(client);
+        drop(transport);
+        poll_until("client release on drop", || weak.upgrade().is_none()).await;
+        assert!(released.wait().now_or_never().is_some());
+        poll_until("all dropped-client tasks to exit", || {
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks()
+                == 0
+        })
+        .await;
+    }
 
     fn qr_codes_seen(collector: &Arc<TestEventCollector>) -> usize {
         collector
