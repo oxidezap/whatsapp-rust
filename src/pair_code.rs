@@ -950,11 +950,43 @@ async fn report_stage_two_failure(
 /// on `primary_hello_received` and regenerating the code when it fires
 /// (`Link/DevicePhoneNumberCodeScreen.react.js`).
 fn start_pair_success_timeout(client: Arc<Client>, pairing_ref: Vec<u8>, attempt: u32) {
-    let timeout = PairCodeUtils::primary_hello_pair_success_timeout();
-    client.clone().runtime.spawn_detached(Box::pin(async move {
-        client.runtime.sleep(timeout).await;
+    use futures::FutureExt;
 
-        if !retire_stage_two_flow(&client, &pairing_ref, attempt).await {
+    let timeout = PairCodeUtils::primary_hello_pair_success_timeout();
+    let shutdown = client.shutdown_signal();
+    let connection_shutdown = client.connection_shutdown_signal();
+    let weak_client = Arc::downgrade(&client);
+    let runtime = client.runtime.clone();
+    client.runtime.spawn_detached(Box::pin(async move {
+        let terminal = wacore::runtime::wait_for_shutdown(&shutdown).fuse();
+        let disconnected = wacore::runtime::wait_for_shutdown(&connection_shutdown).fuse();
+        let sleep = runtime.sleep(timeout).fuse();
+        futures::pin_mut!(terminal, disconnected, sleep);
+        futures::select_biased! {
+            _ = terminal => return,
+            _ = disconnected => return,
+            _ = sleep => {},
+        }
+        let Some(client) = weak_client.upgrade() else {
+            return;
+        };
+
+        // Cancellation is safe while waiting for the state lock. Once retirement
+        // starts, its state change and ADV-secret publication must finish together.
+        let state = client.pair_code_state.lock().fuse();
+        futures::pin_mut!(state);
+        let state = futures::select_biased! {
+            _ = terminal => return,
+            _ = disconnected => return,
+            state = state => state,
+        };
+        if shutdown.is_fired() || connection_shutdown.is_fired() {
+            return;
+        }
+        if !retire_stage_two_flow_locked(&client, state, &pairing_ref, attempt).await {
+            return;
+        }
+        if shutdown.is_fired() || connection_shutdown.is_fired() {
             return;
         }
 
@@ -981,7 +1013,16 @@ fn start_pair_success_timeout(client: Arc<Client>, pairing_ref: Vec<u8>, attempt
 /// The state is cleared before the caller's event goes out, so a consumer
 /// acting on it is not turned away by the very flow it was told to replace.
 async fn retire_stage_two_flow(client: &Arc<Client>, pairing_ref: &[u8], attempt: u32) -> bool {
-    let mut state = client.pair_code_state.lock().await;
+    let state = client.pair_code_state.lock().await;
+    retire_stage_two_flow_locked(client, state, pairing_ref, attempt).await
+}
+
+async fn retire_stage_two_flow_locked(
+    client: &Arc<Client>,
+    mut state: async_lock::MutexGuard<'_, PairCodeState>,
+    pairing_ref: &[u8],
+    attempt: u32,
+) -> bool {
     let still_ours = matches!(
         &*state,
         PairCodeState::WaitingForPhoneConfirmation {
@@ -2606,6 +2647,85 @@ mod tests {
         assert!(
             !is_waiting(&client).await,
             "the abandoned flow must not reject the replacement it just asked for"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pair_success_timer_does_not_retain_a_dropped_client() {
+        let (client, transport) = create_iq_test_client().await;
+        let weak = Arc::downgrade(&client);
+        let released = client.store_release();
+        start_pair_success_timeout(client.clone(), vec![1, 2, 3, 4], 0);
+        tokio::task::yield_now().await;
+        drop(client);
+        drop(transport);
+        poll_until("pair-code client release", || weak.upgrade().is_none()).await;
+        assert!(futures::FutureExt::now_or_never(released.wait()).is_some());
+        poll_until("all pair-code tasks to exit", || {
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks()
+                == 0
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn old_pair_success_timer_cannot_retire_a_replacement_connection() {
+        let (client, _transport) = create_iq_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        let pairing_ref = vec![1, 2, 3, 4];
+        set_waiting(&client, pairing_ref.clone(), live_window(), 0).await;
+        start_pair_success_timeout(client.clone(), pairing_ref, 0);
+        tokio::task::yield_now().await;
+        client.notify_connection_shutdown();
+        client.reset_connection_shutdown();
+        advance_past(PairCodeUtils::primary_hello_pair_success_timeout()).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(is_waiting(&client).await);
+        assert!(
+            collector
+                .events()
+                .iter()
+                .all(|e| !matches!(&**e, Event::PairingCodeRefresh(_)))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnected_pair_success_timer_cannot_commit_after_waiting_for_state() {
+        let (client, _transport) = create_iq_test_client().await;
+        let pairing_ref = vec![1, 2, 3, 4];
+        set_waiting(&client, pairing_ref.clone(), live_window(), 0).await;
+        let secret = client
+            .persistence_manager
+            .get_device_snapshot()
+            .adv_secret_key;
+        let owners = Arc::strong_count(&client);
+        let state = client.pair_code_state.lock().await;
+        start_pair_success_timeout(client.clone(), pairing_ref, 0);
+        tokio::task::yield_now().await;
+        advance_past(PairCodeUtils::primary_hello_pair_success_timeout()).await;
+        poll_until("timer waiting for state", || {
+            Arc::strong_count(&client) > owners
+        })
+        .await;
+        client.notify_connection_shutdown();
+        client.reset_connection_shutdown();
+        drop(state);
+        poll_until("retired timer to release client", || {
+            Arc::strong_count(&client) == owners
+        })
+        .await;
+        assert!(is_waiting(&client).await);
+        assert_eq!(
+            client
+                .persistence_manager
+                .get_device_snapshot()
+                .adv_secret_key,
+            secret
         );
     }
 
