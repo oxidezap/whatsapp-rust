@@ -9,6 +9,7 @@
 
 use buffa::Message;
 use rand::{CryptoRng, Rng};
+use std::sync::Arc;
 
 use crate::protocol::{
     KeyPair, PrivateKey, PublicKey, Result, SignalProtocolError, stores::IdentityKeyPairStructure,
@@ -79,6 +80,10 @@ impl TryFrom<&[u8]> for IdentityKey {
 pub struct IdentityKeyPair {
     identity_key: IdentityKey,
     private_key: PrivateKey,
+    // Wire-only future state stays out of the existing serde object contract.
+    // The descriptor guard separately rejects newly known storage fields.
+    #[serde(skip)]
+    unknown_fields: Option<Arc<buffa::UnknownFields>>,
 }
 
 impl IdentityKeyPair {
@@ -87,6 +92,7 @@ impl IdentityKeyPair {
         Self {
             identity_key,
             private_key,
+            unknown_fields: None,
         }
     }
 
@@ -94,10 +100,7 @@ impl IdentityKeyPair {
     pub fn generate<R: CryptoRng + Rng>(csprng: &mut R) -> Self {
         let keypair = KeyPair::generate(csprng);
 
-        Self {
-            identity_key: keypair.public_key.into(),
-            private_key: keypair.private_key,
-        }
+        Self::from(keypair)
     }
 
     /// Return the public identity of this user.
@@ -126,6 +129,9 @@ impl IdentityKeyPair {
             let mut proto = IdentityKeyPairStructure::default();
             proto.public_key = Some(self.identity_key.serialize().to_vec());
             proto.private_key = Some(self.private_key.serialize().to_vec());
+            if let Some(fields) = &self.unknown_fields {
+                proto.__buffa_unknown_fields = fields.as_ref().clone().into();
+            }
             proto
         };
 
@@ -155,6 +161,8 @@ impl TryFrom<&[u8]> for IdentityKeyPair {
                     .as_ref()
                     .ok_or(SignalProtocolError::InvalidProtobufEncoding)?,
             )?,
+            unknown_fields: (!structure.__buffa_unknown_fields.is_empty())
+                .then(|| Arc::new(structure.__buffa_unknown_fields.into())),
         })
     }
 }
@@ -170,15 +178,49 @@ impl TryFrom<PrivateKey> for IdentityKeyPair {
 
 impl From<KeyPair> for IdentityKeyPair {
     fn from(value: KeyPair) -> Self {
-        Self {
-            identity_key: value.public_key.into(),
-            private_key: value.private_key,
-        }
+        Self::new(value.public_key.into(), value.private_key)
     }
 }
 
 impl From<IdentityKeyPair> for KeyPair {
     fn from(value: IdentityKeyPair) -> Self {
         Self::new(value.identity_key.into(), value.private_key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_wire_round_trip_retains_unknown_fields_after_clone() {
+        let original = IdentityKeyPair::generate(&mut rand::rng());
+        let known = original.serialize();
+        let mut future = known.to_vec();
+        // Repeated unknown varints, bytes, and a nested unknown group.
+        future.extend_from_slice(&[
+            0xa0, 0x06, 7, 0xa0, 0x06, 9, 0xaa, 0x06, 2, 0x12, 0x34, 0xb3, 0x06, 8, 1, 0xb4, 0x06,
+        ]);
+        let restored =
+            IdentityKeyPair::try_from(future.as_slice()).expect("future identity record");
+        assert_eq!(restored.serialize().as_ref(), future);
+        assert_eq!(restored.identity_key(), original.identity_key());
+        assert_eq!(
+            restored.private_key().serialize(),
+            original.private_key().serialize()
+        );
+        let cloned = restored.clone();
+        drop(restored);
+        assert_eq!(cloned.serialize().as_ref(), future);
+        assert_eq!(
+            serde_json::to_value(&cloned).expect("future identity JSON"),
+            serde_json::to_value(&original).expect("known identity JSON")
+        );
+        assert!(
+            IdentityKeyPair::try_from(known.as_ref())
+                .expect("known identity record")
+                .unknown_fields
+                .is_none()
+        );
     }
 }

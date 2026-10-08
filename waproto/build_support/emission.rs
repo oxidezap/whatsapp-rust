@@ -342,13 +342,21 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
             }
             syn::Item::Impl(i) if i.trait_.is_some() => {
                 let (_, path, _) = i.trait_.as_ref().expect("trait implementation");
-                api.insert(format!(
+                let owner = format!(
                     "impl {public_scope}::{} {} for {} {}",
                     tokens(&i.generics),
                     tokens(path),
                     tokens(&i.self_ty),
                     tokens(&i.generics.where_clause)
-                ));
+                );
+                api.insert(owner.clone());
+                for item in &i.items {
+                    if let syn::ImplItem::Type(associated) = item {
+                        let mut associated = associated.clone();
+                        associated.attrs.clear();
+                        api.insert(format!("associated {owner} {}", tokens(&associated)));
+                    }
+                }
             }
             syn::Item::Impl(i) if i.trait_.is_none() => {
                 for item in &i.items {
@@ -487,6 +495,29 @@ pub fn check_api(expected: &str, actual: &BTreeSet<String>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn associated_type_mappings_are_part_of_the_frozen_api() {
+        let collect = |source: &str| {
+            let file = syn::parse_file(source).unwrap();
+            let mut api = BTreeSet::new();
+            inventory(&file.items, "whatsapp", &mut api);
+            api
+        };
+        let baseline =
+            collect("impl HasMessageView for Message { type View<'a> = MessageView<'a>; }");
+        let expected = baseline.iter().cloned().collect::<Vec<_>>().join("\n");
+        for changed in [
+            "impl HasMessageView for Message { type View<'a> = OtherView<'a>; }",
+            "impl HasMessageView for Message { type View<'a> = MessageView<'static>; }",
+            "impl HasMessageView for Message {}",
+        ] {
+            check_api(&expected, &collect(changed)).expect_err("associated mappings are API");
+        }
+        check_api(&expected, &collect(
+            "impl HasMessageView for Message { type View<'a> = MessageView<'a>; type Added = (); }",
+        )).expect("new associated declarations remain additive");
+    }
 
     #[test]
     fn module_visibility_is_part_of_the_frozen_api() {
