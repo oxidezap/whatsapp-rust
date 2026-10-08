@@ -2460,6 +2460,13 @@ pub struct UndecryptableMessage {
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct Receipt {
+    /// `sender` identifies the receipt actor, not the author of the referenced
+    /// message. For Status, `chat` stays `status@broadcast`, `sender` comes from
+    /// `participant`, and an explicit `recipient` names the post author.
+    /// `is_from_me` on Status describes our receipt, not our post; own reads and
+    /// plays use the corresponding self receipt type. An absent/invalid Status
+    /// participant retains the broadcast sender fallback without a sender alias.
+    /// Missing aliases and post authors are not filled from cached identities.
     pub source: crate::types::message::MessageSource,
     pub message_ids: Vec<MessageId>,
     pub timestamp: DateTime<Utc>,
