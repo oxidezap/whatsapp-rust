@@ -21,6 +21,7 @@ runtime libraries do not depend on this crate.
 | `cargo xt ci test-feature-packages PACKAGES...` | Test native feature sets for each package |
 | `cargo xt ci sync-bartender-image --check` | Check canonical service image pins (`--write` updates) |
 | `cargo xt ci measure-binary-size --out-dir DIR` | Measure release binary and attribution |
+| `cargo xt ci measure-binary-size --gate-only --out-dir DIR` | Measure the same release binary and dependency count without bloat/llvm-lines |
 | `cargo xt ci binary-size-report --head DIR --base DIR --out-dir DIR` | Render report and absolute-budget gate |
 | `cargo xt ci workflow --help` | Workflow setup, readiness, summary and release tasks |
 | `cargo xt sha256 FILE` / `cargo xt sha256 --hex HEX` | Reproducible content hashes |
@@ -39,6 +40,13 @@ tools outside `default-members`.
 Metadata commands write only machine-readable results to stdout. Timed tests
 require `NEXTEST_PROFILE` and `TEST_TIMINGS_DIR`. GitHub workflow tasks use the
 same scoped environment inputs as their previous inline implementations.
+
+Binary-size measurement is complete by default. `--gate-only` retains stripped
+bytes, `.text`, allocated sections, dependency count and provenance, and marks
+heavy diagnostics as omitted. It still builds the release demo. PRs collect
+full diagnostics only after a failed budget, using `--skip-build` with a separate
+output directory; the original gate remains authoritative. Main measurements
+keep full attribution and LLVM-line metrics.
 
 `cargo xt ci consumers run --lane native` runs the standalone public API profiles
 in `tests/api-consumer`; `--lane msrv --toolchain 1.94.1` and `--lane wasm`

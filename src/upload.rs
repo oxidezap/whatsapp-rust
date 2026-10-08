@@ -598,10 +598,10 @@ mod tests {
     }
 
     fn ok_json(url: &str, direct_path: &str) -> HttpResponse {
-        HttpResponse {
-            status_code: 200,
-            body: format!(r#"{{"url":"{url}","direct_path":"{direct_path}"}}"#).into_bytes(),
-        }
+        HttpResponse::new(
+            200,
+            format!(r#"{{"url":"{url}","direct_path":"{direct_path}"}}"#).into_bytes(),
+        )
     }
 
     /// Resume check is skipped below the 5 MiB threshold, so a check call here
@@ -656,10 +656,7 @@ mod tests {
                     async move {
                         seen_urls.lock().await.push(request.url.clone());
                         if request.url.contains("stale-auth") {
-                            Ok(HttpResponse {
-                                status_code: 401,
-                                body: b"expired".to_vec(),
-                            })
+                            Ok(HttpResponse::new(401, b"expired".to_vec()))
                         } else {
                             Ok(ok_json(
                                 "https://cdn2.example.com/file",
@@ -714,10 +711,7 @@ mod tests {
                     async move {
                         seen_urls.lock().await.push(request.url.clone());
                         if request.url.contains("cdn1.example.com") {
-                            Ok(HttpResponse {
-                                status_code: 500,
-                                body: b"try another host".to_vec(),
-                            })
+                            Ok(HttpResponse::new(500, b"try another host".to_vec()))
                         } else {
                             Ok(ok_json(
                                 "https://cdn2.example.com/file",
@@ -768,10 +762,7 @@ mod tests {
             || async {},
             unreachable_check,
             move |_request: HttpRequest, _offset, _remaining| async move {
-                Ok(HttpResponse {
-                    status_code: 507,
-                    body: b"insufficient storage".to_vec(),
-                })
+                Ok(HttpResponse::new(507, b"insufficient storage".to_vec()))
             },
         )
         .await
@@ -817,10 +808,10 @@ mod tests {
             },
             || async {},
             move |_req| async move {
-                Ok(HttpResponse {
-                    status_code: 200,
-                    body: format!(r#"{{"resume":"{offset}"}}"#).into_bytes(),
-                })
+                Ok(HttpResponse::new(
+                    200,
+                    format!(r#"{{"resume":"{offset}"}}"#).into_bytes(),
+                ))
             },
             {
                 let captured = Arc::clone(&captured);

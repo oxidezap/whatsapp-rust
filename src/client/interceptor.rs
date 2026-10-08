@@ -7,7 +7,7 @@
 //! But it leaves no room for a consumer that *can* act on it. A stanza this
 //! version does not model gets nacked whether or not the application would have
 //! known what to do with it, and there is no way to say otherwise:
-//! [`StanzaRouter::register`] panics on a duplicate tag, so even a handler for
+//! The internal router rejects duplicate tags, so even a handler for
 //! an existing tag cannot be replaced.
 //!
 //! An interceptor is that room. It runs where dispatch would have, and either
@@ -68,8 +68,6 @@
 //! `<receipt>`, `<notification>` and `<call>` are not in that group: the client
 //! answers those with a transport `<ack>` already, so a claim leaves the ack
 //! exactly where it was.
-//!
-//! [`StanzaRouter::register`]: crate::handlers::router::StanzaRouter::register
 //!
 //! # Cost
 //!

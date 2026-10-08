@@ -20,7 +20,7 @@ use crate::store::persistence_manager::PersistenceManager;
 use crate::sync_task::MajorSyncTask;
 use crate::transport::TransportFactory;
 use crate::types::connect_admission::ConnectAdmission;
-use crate::types::durability_hook::InboundDurabilityHook;
+use crate::types::durability_hook::{HistorySyncCaptureHook, InboundDurabilityHook};
 use crate::types::enc_handler::EncHandler;
 use crate::types::history_sync_admission::HistorySyncAdmission;
 use wacore::handshake::NoiseCertPolicy;
@@ -187,6 +187,7 @@ pub struct ClientBuilder {
     options: ClientOptions,
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
+    history_sync_capture_hook: Option<Arc<dyn HistorySyncCaptureHook>>,
     history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
     connect_admission: Option<Arc<dyn ConnectAdmission>>,
     task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
@@ -221,6 +222,7 @@ impl ClientBuilder {
             options: ClientOptions::default(),
             custom_enc_handlers: HashMap::new(),
             inbound_durability_hook: None,
+            history_sync_capture_hook: None,
             history_sync_admission: None,
             connect_admission: None,
             task_instrument: None,
@@ -385,6 +387,26 @@ impl ClientBuilder {
         hook: Arc<dyn InboundDurabilityHook>,
     ) -> Self {
         self.inbound_durability_hook = Some(hook);
+        self
+    }
+
+    /// Await history capture before its receipt, independently of message durability.
+    /// See [`HistorySyncCaptureHook`] for input, cancellation and replay limits.
+    pub fn with_history_sync_capture_hook<H>(mut self, hook: H) -> Self
+    where
+        H: HistorySyncCaptureHook + 'static,
+    {
+        self.history_sync_capture_hook = Some(Arc::new(hook));
+        self
+    }
+
+    /// Register an already-shared capture hook, preserving its Arc identity.
+    /// The last registration wins, as with [`Self::with_history_sync_capture_hook`].
+    pub fn with_history_sync_capture_hook_arc(
+        mut self,
+        hook: Arc<dyn HistorySyncCaptureHook>,
+    ) -> Self {
+        self.history_sync_capture_hook = Some(hook);
         self
     }
 
@@ -728,6 +750,9 @@ impl ClientBuilder {
         }
         if let Some(hook) = self.inbound_durability_hook {
             let _ = client.inbound_durability_hook.set(hook);
+        }
+        if let Some(hook) = self.history_sync_capture_hook {
+            let _ = client.history_sync_capture_hook.set(hook);
         }
         if options.skip_history_sync {
             client.set_skip_history_sync(true);
@@ -1125,6 +1150,100 @@ mod tests {
             1,
             "only the unrelated row should remain"
         );
+    }
+
+    struct CaptureOnly;
+
+    #[async_trait::async_trait]
+    impl HistorySyncCaptureHook for CaptureOnly {
+        async fn on_history_sync(
+            &self,
+            _: Arc<Client>,
+            _: &str,
+            _: Option<waproto::whatsapp::message::HistorySyncType>,
+            _: &[u8],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MessageCommit;
+
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for MessageCommit {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[crate::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_only_builds_without_pending_inbound_operations() {
+        use diesel::{Connection, RunQueryDsl, SqliteConnection};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let db = format!(
+            "file:capture_only_{}_{}?mode=memory&cache=shared",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        );
+        let backend: Arc<dyn crate::store::traits::Backend> =
+            Arc::new(crate::store::SqliteStore::open(&db).await.unwrap());
+        let mut sql = SqliteConnection::establish(&db).unwrap();
+        // Disable only pending-inbound operations in this synthetic database.
+        // Capture has no dependency on that table, whereas message commit does.
+        diesel::sql_query("ALTER TABLE pending_inbound_messages RENAME TO unavailable_pending")
+            .execute(&mut sql)
+            .unwrap();
+        assert!(
+            backend
+                .store_pending_inbound("chat", "sender", "id", b"body")
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .get_pending_inbound("chat", "sender", "id")
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .delete_pending_inbound("chat", "sender", "id")
+                .await
+                .is_err()
+        );
+        let persistence = Arc::new(PersistenceManager::new(backend).await.unwrap());
+        let hook: Arc<dyn HistorySyncCaptureHook> = Arc::new(CaptureOnly);
+        let builder = || {
+            ClientBuilder::new()
+                .with_runtime(TokioRuntime)
+                .with_persistence_manager(persistence.clone())
+                .with_transport_factory(MockTransportFactory::new())
+                .with_http_client(MockHttpClient)
+        };
+        let build = builder()
+            .with_history_sync_capture_hook(CaptureOnly)
+            .with_history_sync_capture_hook_arc(hook.clone())
+            .build()
+            .await
+            .expect("capture-only must not probe pending-inbound storage");
+        let (client, _receiver) = build.into_parts();
+        assert!(client.inbound_durability_hook.get().is_none());
+        assert!(Arc::ptr_eq(
+            client.history_sync_capture_hook.get().unwrap(),
+            &hook
+        ));
+        assert!(matches!(
+            builder()
+                .with_history_sync_capture_hook_arc(hook)
+                .with_inbound_durability_hook(MessageCommit)
+                .build()
+                .await,
+            Err(ClientBuilderError::UnsupportedDurabilityBackend(_))
+        ));
     }
 
     #[tokio::test]

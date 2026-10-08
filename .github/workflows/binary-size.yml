@@ -57,15 +57,6 @@ jobs:
         with:
           tool: protoc@${{ env.PROTOC_VERSION }},cargo-binstall
 
-      - name: Install cargo-bloat and cargo-llvm-lines
-        env:
-          # binstall can fall back to compilation before sccache is installed.
-          RUSTC_WRAPPER: ""
-        run: >
-          cargo binstall --no-confirm
-          cargo-bloat@${{ env.CARGO_BLOAT_VERSION }}
-          cargo-llvm-lines@${{ env.CARGO_LLVM_LINES_VERSION }}
-
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
 
@@ -83,16 +74,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev unzip
       - name: Measure binary size
         run: |
-          cargo run --locked --quiet -p whatsapp-xtask -- ci measure-binary-size --out-dir size-out
+          cargo run --locked --quiet -p whatsapp-xtask -- ci measure-binary-size --gate-only --out-dir size-out
           git diff --exit-code
-
-      - name: Upload size artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: size-metrics
-          path: size-out/
-          if-no-files-found: error
-          retention-days: 90
 
       - name: Download validated PR base measurement
         id: baseline
@@ -124,20 +107,57 @@ jobs:
         run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-override
       # No GH_TOKEN here: the report script is PR-controlled code.
       - name: Generate report and evaluate gate
+        id: report
         env:
           BASE_DIR: ${{ steps.baseline.outputs.dir }}
           ALLOW_SIZE_INCREASE: ${{ steps.override.outputs.allow }}
         run: |
           cargo run --locked --quiet -p whatsapp-xtask -- ci binary-size-report --head size-out --out-dir size-out
           cargo run --locked --quiet -p whatsapp-xtask -- ci workflow append-summary size-out/report.md
+      # This probe selects diagnostics; the unconditional final enforcement
+      # below still fails the job on the canonical size-out/gate.txt result.
+      - name: Check whether size diagnostics are needed
+        id: budget
+        continue-on-error: true
+        run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-gate
+      - name: Install cargo-bloat and cargo-llvm-lines for a failed budget
+        if: steps.budget.outcome == 'failure'
+        env:
+          RUSTC_WRAPPER: ""
+        run: >
+          cargo binstall --no-confirm
+          cargo-bloat@${{ env.CARGO_BLOAT_VERSION }}
+          cargo-llvm-lines@${{ env.CARGO_LLVM_LINES_VERSION }}
+      - name: Diagnose the measured binary
+        if: steps.budget.outcome == 'failure'
+        run: |
+          cargo run --locked --quiet -p whatsapp-xtask -- ci measure-binary-size --skip-build --out-dir size-diagnostics
+          git diff --exit-code
+      - name: Upload size artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: size-metrics
+          path: size-out/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Upload size diagnostics
+        if: ${{ !cancelled() && steps.budget.outcome == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: size-diagnostics
+          path: size-diagnostics/
+          if-no-files-found: error
+          retention-days: 90
       # Fork PRs run with a read-only token, so they only get the job summary.
       - name: Post sticky PR comment
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: ${{ !cancelled() && steps.report.outcome == 'success' && github.event.pull_request.head.repo.full_name == github.repository }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-comment
       - name: Enforce size budget
+        if: ${{ always() && !cancelled() }}
         run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-gate
   binary-size-push:
     # Dispatch only publishes from main so stray branches can't pollute the series.

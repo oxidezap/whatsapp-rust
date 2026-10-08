@@ -453,7 +453,7 @@ pub use client::{
 };
 pub use client::{NodeFilter, NodeWaiter};
 pub use types::connect_admission::ConnectAdmission;
-pub use types::durability_hook::InboundDurabilityHook;
+pub use types::durability_hook::{HistorySyncCaptureHook, InboundDurabilityHook};
 pub use types::history_sync_admission::{
     HistorySyncAdmission, HistorySyncDecision, HistorySyncMetadata,
 };
@@ -527,7 +527,7 @@ pub mod pdo;
 pub mod prekeys;
 mod receipt;
 mod retry;
-pub mod unified_session;
+pub(crate) mod unified_session;
 
 pub mod appstate_sync;
 mod history_sync;

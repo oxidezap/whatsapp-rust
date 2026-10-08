@@ -7,7 +7,7 @@ use wacore_binary::OwnedNodeRef;
 
 /// Handler for `<success>` stanzas.
 #[derive(Default)]
-pub struct SuccessHandler;
+pub(crate) struct SuccessHandler;
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -33,7 +33,7 @@ impl StanzaHandler for SuccessHandler {
 
 /// Handler for `<failure>` stanzas.
 #[derive(Default)]
-pub struct FailureHandler;
+pub(crate) struct FailureHandler;
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -59,7 +59,7 @@ impl StanzaHandler for FailureHandler {
 
 /// Handler for `<stream:error>` stanzas.
 #[derive(Default)]
-pub struct StreamErrorHandler;
+pub(crate) struct StreamErrorHandler;
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -85,7 +85,7 @@ impl StanzaHandler for StreamErrorHandler {
 
 /// Handler for `<ack>` stanzas.
 #[derive(Default)]
-pub struct AckHandler;
+pub(crate) struct AckHandler;
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]

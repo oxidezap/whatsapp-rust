@@ -56,7 +56,7 @@ impl Client {
     feature = "tracing",
     tracing::instrument(name = "wa.pair.handle_iq", level = "debug", skip_all)
 )]
-pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
+pub(crate) async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
     // Server JID is "s.whatsapp.net" (no @ prefix for server-only JIDs)
     if node.get_attr("from").is_none_or(|v| v != SERVER_JID) {
         return false;

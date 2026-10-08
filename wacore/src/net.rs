@@ -18,8 +18,16 @@ pub const WHATSAPP_WEB_WS_URL: &str = "wss://web.whatsapp.com/ws/chat";
 /// survivor, where a single-URL dial fails outright.
 pub const WHATSAPP_WEB_WS_URL_FALLBACK: &str = "wss://web.whatsapp.com:5222/ws/chat";
 
-/// Both chat endpoints WA Web dials, primary first.
-pub const WHATSAPP_WEB_WS_URLS: [&str; 2] = [WHATSAPP_WEB_WS_URL, WHATSAPP_WEB_WS_URL_FALLBACK];
+/// Default chat endpoints, primary first. The number of endpoints may grow.
+///
+/// ```
+/// use wacore::net::WHATSAPP_WEB_WS_URLS;
+/// let endpoints: &[&str] = WHATSAPP_WEB_WS_URLS;
+/// for endpoint in endpoints {
+///     assert!(endpoint.starts_with("wss://"));
+/// }
+/// ```
+pub const WHATSAPP_WEB_WS_URLS: &[&str] = &[WHATSAPP_WEB_WS_URL, WHATSAPP_WEB_WS_URL_FALLBACK];
 
 /// Appends an `ED` edge-routing query parameter to a chat URL.
 ///
@@ -82,6 +90,7 @@ pub const WHATSAPP_WEB_ORIGIN: &str = "https://web.whatsapp.com";
 /// Rust variant naming.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DisconnectReason {
     /// The peer sent a WebSocket Close frame. `code` is the RFC 6455 close
     /// code (1000 = normal closure); `reason` is the optional UTF-8 text.
@@ -135,6 +144,10 @@ impl DisconnectReason {
 }
 
 /// An event produced by the transport layer.
+///
+/// This intentionally closed contract carries connection establishment, bytes,
+/// and termination. Transport-specific termination details belong in the
+/// extensible [`DisconnectReason`], not additional event variants.
 #[derive(Debug, Clone)]
 pub enum TransportEvent {
     /// The transport has successfully connected.
@@ -302,8 +315,10 @@ impl TransportFactory for RacingTransportFactory {
     }
 }
 
-/// A simple structure to represent an HTTP request
+/// An HTTP request. Construct with [`HttpRequest::get`] or [`HttpRequest::post`]
+/// and set the public fields or use the `with_*` methods as needed.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct HttpRequest {
     pub url: String,
     pub method: String, // "GET" or "POST"
@@ -341,14 +356,20 @@ impl HttpRequest {
     }
 }
 
-/// A simple structure for the HTTP response
+/// A buffered HTTP response. Hosts construct this with [`HttpResponse::new`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct HttpResponse {
     pub status_code: u16,
     pub body: Vec<u8>,
 }
 
 impl HttpResponse {
+    /// Return the status and body of a completed exchange, including 4xx/5xx.
+    pub fn new(status_code: u16, body: Vec<u8>) -> Self {
+        Self { status_code, body }
+    }
+
     pub fn body_string(&self) -> Result<String> {
         Ok(String::from_utf8(self.body.clone())?)
     }
@@ -356,9 +377,18 @@ impl HttpResponse {
 
 /// An HTTP response with a streaming body reader instead of a buffered `Vec<u8>`.
 /// Used for large downloads where buffering the entire response would be wasteful.
+#[non_exhaustive]
 pub struct StreamingHttpResponse {
     pub status_code: u16,
     pub body: Box<dyn std::io::Read + Send>,
+}
+
+impl StreamingHttpResponse {
+    /// Return a response's status and body reader, including for 4xx/5xx.
+    /// Errors encountered while reading the body remain reader errors.
+    pub fn new(status_code: u16, body: Box<dyn std::io::Read + Send>) -> Self {
+        Self { status_code, body }
+    }
 }
 
 /// A streaming request body: a reader whose total length is known up front, so
@@ -368,16 +398,34 @@ pub type UploadBody = Box<dyn std::io::Read + Send>;
 
 /// Trait for executing HTTP requests in a runtime-agnostic way.
 ///
-/// **A completed exchange is `Ok`, whatever the status.** `Err` means the
-/// exchange never happened — DNS, connect, TLS, timeout, a body that broke the
-/// declared cap. Implementations MUST NOT map 4xx/5xx to an error: media
-/// download and upload read `status_code` to tell a stale media-auth token
-/// (401/403) and an expired URL (404/410) — both of which need a refreshed
-/// media connection before the retry — apart from a host-level failure that
-/// should simply move to the next CDN host. An implementation that hides the
-/// status behind an opaque error makes every one of those retries repeat the
-/// same dead auth token. Some HTTP crates default the other way: `ureq`'s
-/// `http_status_as_error` is the known case.
+/// A received HTTP response returns `Ok` with its status, including 4xx/5xx.
+/// Implementations must not turn an HTTP status into an opaque error. The SDK
+/// decides whether to retry according to the operation being performed.
+/// DNS, connect, TLS and request timeout failures return `Err`.
+///
+/// Successful buffered responses must contain the complete body; body read
+/// failures or exceeded body limits return `Err`. For non-success responses,
+/// hosts may bound the diagnostic body and keep partial bytes after a read
+/// failure, preserving the status in `Ok`. Callers must not assume an error
+/// body is complete. The bundled ureq host uses this bounded, best-effort
+/// behavior. For streaming responses, body read failures come from the reader.
+///
+/// Some HTTP libraries treat non-success statuses as errors by default; hosts
+/// must disable that behavior, for example with ureq's `http_status_as_error`.
+///
+/// ```
+/// use wacore::net::{HttpResponse, StreamingHttpResponse};
+/// let response = HttpResponse::new(503, b"retry later".to_vec());
+/// assert_eq!(response.status_code, 503);
+/// assert_eq!(response.body, b"retry later");
+/// let mut response = StreamingHttpResponse::new(
+///     404, Box::new(std::io::Cursor::new(b"not found")),
+/// );
+/// let mut body = String::new();
+/// response.body.read_to_string(&mut body).unwrap();
+/// assert_eq!(response.status_code, 404);
+/// assert_eq!(body, "not found");
+/// ```
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait HttpClient: crate::sync_marker::MaybeSendSync {

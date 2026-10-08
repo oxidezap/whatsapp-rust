@@ -28,7 +28,7 @@ const LANE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60
 /// race conditions where a later message could be processed before the PreKey
 /// message that establishes the Signal session.
 #[derive(Default)]
-pub struct MessageHandler;
+pub(crate) struct MessageHandler;
 
 impl MessageHandler {
     #[cfg_attr(

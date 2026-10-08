@@ -837,29 +837,25 @@ pub trait AppSyncStore: Send + Sync {
     /// Persist one applied patch as a unit: the collection's new version, the
     /// index MACs the patch removed and the MACs it added.
     ///
-    /// The default issues the three single-purpose writes in that order, so a
-    /// backend without transactions keeps its current behaviour. A backend
-    /// with them should override this with one: a paged incremental sync
-    /// commits hundreds of small patches, and on SQLite each write was its own
-    /// permit, `spawn_blocking` and WAL commit — two thirds of what a small
-    /// patch cost to persist.
+    /// Required atomic operation: the version and MAC changes must become visible
+    /// together within this backend's device scope. Apply removals before additions
+    /// when an index occurs in both. Even after an error or cancellation, storage
+    /// must contain either the previous state or the complete new patch, never a
+    /// new version paired with only some of its MAC changes.
+    ///
+    /// Use one transaction or one shared state lock, not separate get/set calls,
+    /// a non-transactional batch, or a later flush. `Ok` confirms the backend's
+    /// persistence boundary. An error is not a rollback guarantee: a post-commit
+    /// durability barrier can fail after the complete patch became visible. Keep
+    /// that cause observable; do not report such a failure as success. Recovering
+    /// delivery after a post-commit failure requires more than atomicity alone.
     async fn commit_patch(
         &self,
         name: &str,
         state: HashState,
         removed_index_macs: &[Vec<u8>],
         added: &[AppStateMutationMAC],
-    ) -> Result<()> {
-        let version = state.version;
-        self.set_version(name, state).await?;
-        if !removed_index_macs.is_empty() {
-            self.delete_mutation_macs(name, removed_index_macs).await?;
-        }
-        if !added.is_empty() {
-            self.put_mutation_macs(name, version, added).await?;
-        }
-        Ok(())
-    }
+    ) -> Result<()>;
 
     /// Delete every mutation MAC for a collection. Called on snapshot re-sync so the
     /// MAC store is rebuilt from the snapshot, matching the ltHash baseline; leftover
@@ -1061,33 +1057,16 @@ pub trait ProtocolStore: Send + Sync {
     /// concurrent writers (post-send issuance, history sync) converge regardless
     /// of ordering and never regress the sender bucket.
     ///
-    /// Must be atomic w.r.t. [`put_tc_token`](Self::put_tc_token): the sender-side
-    /// issuance path and the notification writer both touch the same row, so a
-    /// non-atomic read-modify-write could drop a real token for a placeholder.
-    /// The default is a read-modify-write for third-party backends; the built-in
-    /// stores override it with a single atomic upsert.
-    async fn touch_tc_token_sender_timestamp(
-        &self,
-        jid: &str,
-        sender_timestamp: i64,
-    ) -> Result<()> {
-        let entry = match self.get_tc_token(jid).await? {
-            Some(existing) => TcTokenEntry {
-                sender_timestamp: Some(
-                    existing
-                        .sender_timestamp
-                        .map_or(sender_timestamp, |e| e.max(sender_timestamp)),
-                ),
-                ..existing
-            },
-            None => TcTokenEntry {
-                token: Vec::new(),
-                token_timestamp: sender_timestamp,
-                sender_timestamp: Some(sender_timestamp),
-            },
-        };
-        self.put_tc_token(jid, &entry).await
-    }
+    /// Required atomic merge, serialized against all writers of this row, including
+    /// [`store_received_tc_token`](Self::store_received_tc_token) and
+    /// [`put_tc_token`](Self::put_tc_token). Preserve the received token's bytes and
+    /// timestamp; a new placeholder uses `sender_timestamp` for its token timestamp.
+    /// A read followed by a write can lose a concurrent token or sender update.
+    /// Use a transaction, conditional update/CAS retry, or a lock shared by every
+    /// writer in the backend's device scope. An adapter-local lock is insufficient
+    /// if another adapter or process can write the same row.
+    async fn touch_tc_token_sender_timestamp(&self, jid: &str, sender_timestamp: i64)
+    -> Result<()>;
 
     /// Store a token received from a contact, preserving any existing
     /// `sender_timestamp`. The symmetric counterpart of
@@ -1097,36 +1076,19 @@ pub trait ProtocolStore: Send + Sync {
     ///
     /// **Newer-wins**: the token pair is overwritten only when the stored token
     /// is a byte-less placeholder or the incoming `token_timestamp` is at least
-    /// as new — a stale write must not clobber a fresher real token. Doing this
-    /// in the store (atomically for the built-in backends) is what lets the
-    /// concurrent history-sync and privacy-notification writers converge without
-    /// a lock. Same atomicity requirement as the sender bucket — the default
-    /// read-modify-write here is a best-effort for third-party backends.
+    /// as new; a stale write must not clobber a fresher real token. Equal timestamps
+    /// accept the incoming bytes. On insertion, `sender_timestamp` is `None`.
+    ///
+    /// Required atomic merge with the same backend-wide serialization requirement
+    /// as [`touch_tc_token_sender_timestamp`](Self::touch_tc_token_sender_timestamp).
+    /// The comparison and preservation must observe the row at the atomic update,
+    /// not a stale snapshot obtained through a separate read.
     async fn store_received_tc_token(
         &self,
         jid: &str,
         token: &[u8],
         token_timestamp: i64,
-    ) -> Result<()> {
-        let existing = self.get_tc_token(jid).await?;
-        // Keep a fresher real token; a placeholder never blocks the first real one.
-        if let Some(existing) = &existing
-            && !existing.token.is_empty()
-            && token_timestamp < existing.token_timestamp
-        {
-            return Ok(());
-        }
-        let sender_timestamp = existing.and_then(|existing| existing.sender_timestamp);
-        self.put_tc_token(
-            jid,
-            &TcTokenEntry {
-                token: token.to_vec(),
-                token_timestamp,
-                sender_timestamp,
-            },
-        )
-        .await
-    }
+    ) -> Result<()>;
 
     // --- Sent Message Store (retry support, matches WA Web's getMessageTable) ---
 

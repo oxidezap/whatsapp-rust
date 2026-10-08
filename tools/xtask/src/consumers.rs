@@ -3,8 +3,10 @@ use anyhow::{Context, Result, ensure};
 use clap::{Subcommand, ValueEnum};
 use serde::Deserialize;
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::path::{Component, Path};
 use std::process::Command;
+use std::time::Instant;
 
 const REGISTRY: &str = "tools/xtask/consumers.json";
 // These are the only test manifests belonging to the root workspace, not API hosts.
@@ -77,6 +79,10 @@ struct Invocation {
     #[serde(default)]
     bin: Option<String>,
     #[serde(default)]
+    test: Option<String>,
+    #[serde(default)]
+    wasm_test: bool,
+    #[serde(default)]
     lib: bool,
     /// A directed negative binary must fail for this diagnostic, not a missing dependency.
     #[serde(default)]
@@ -140,6 +146,24 @@ impl ExpectedFailure {
         }
         Ok(())
     }
+}
+
+pub(crate) fn verify_mutation(
+    output: &std::process::Output,
+    code: &str,
+    needle: &str,
+    source: &str,
+) -> Result<()> {
+    ExpectedFailure {
+        error_code: code.into(),
+        contains: vec![needle.into()],
+        source: Some(source.into()),
+    }
+    .verify(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+    )
+    .with_context(|| String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
 fn manifest_key(path: &Path) -> Result<String> {
@@ -236,13 +260,25 @@ fn validate(root: &Path, consumers: &[Consumer]) -> Result<()> {
             }
             ensure!(
                 !invocation.lanes.contains(&Lane::Wasm)
-                    || matches!(invocation.mode, Mode::Check | Mode::Build),
-                "{}: WASM modes must be check/build, not unconfigured cross-target execution",
+                    || matches!(invocation.mode, Mode::Check | Mode::Build)
+                    || invocation.wasm_test,
+                "{}: WASM execution requires an explicit test runner",
                 consumer.manifest
             );
             ensure!(
-                !invocation.lib || invocation.bin.is_none(),
-                "{}: select lib or bin, not both",
+                !invocation.wasm_test
+                    || (invocation.lanes == [Lane::Wasm]
+                        && invocation.mode == Mode::Test
+                        && invocation.test.is_some()),
+                "{}: configured WASM execution must select a named test on the WASM lane only",
+                consumer.manifest
+            );
+            ensure!(
+                usize::from(invocation.lib)
+                    + usize::from(invocation.bin.is_some())
+                    + usize::from(invocation.test.is_some())
+                    <= 1,
+                "{}: select one lib, bin or test target",
                 consumer.manifest
             );
             ensure!(
@@ -319,6 +355,9 @@ impl Invocation {
         if let Some(bin) = &self.bin {
             args.extend(["--bin".into(), bin.clone()]);
         }
+        if let Some(test) = &self.test {
+            args.extend(["--test".into(), test.clone()]);
+        }
         if self.lib {
             args.push("--lib".into());
         }
@@ -327,6 +366,98 @@ impl Invocation {
         }
         args
     }
+}
+
+fn verify_wasm_runner(version: &str, output: &str) -> Result<()> {
+    ensure!(
+        output.split_whitespace().last() == Some(version),
+        "wasm-bindgen-test-runner must match the consumer's wasm-bindgen {version}, got {output:?}"
+    );
+    Ok(())
+}
+
+fn wasm_sdk_source(
+    root: &Path,
+    consumer: &Consumer,
+    invocation: &Invocation,
+    toolchain: Option<&str>,
+) -> Result<std::path::PathBuf> {
+    let mut metadata = Command::new("cargo");
+    if let Some(toolchain) = toolchain {
+        metadata.arg(format!("+{toolchain}"));
+    }
+    metadata
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--filter-platform",
+            "wasm32-unknown-unknown",
+            "--manifest-path",
+            &consumer.manifest,
+            "--features",
+            &invocation.features.join(","),
+        ])
+        .current_dir(root);
+    if consumer.locked {
+        metadata.arg("--locked");
+    }
+    if invocation.no_default_features {
+        metadata.arg("--no-default-features");
+    }
+    let resolved: serde_json::Value =
+        serde_json::from_slice(&xtask_support::capture(&mut metadata)?.stdout)?;
+    let packages = resolved["packages"]
+        .as_array()
+        .context("consumer packages")?;
+    let package = |name: &str| {
+        packages
+            .iter()
+            .find(|p| p["name"] == name)
+            .with_context(|| format!("WASM execution requires {name} in the consumer graph"))
+    };
+    let version = package("wasm-bindgen")?["version"]
+        .as_str()
+        .context("wasm-bindgen version")?;
+    let runner = xtask_support::capture(Command::new("wasm-bindgen-test-runner").arg("--version"))?;
+    verify_wasm_runner(version, std::str::from_utf8(&runner.stdout)?)?;
+    // Resolve from the consumer graph so package qualification includes the
+    // distributed source, never a copied implementation or checkout fallback.
+    let manifest = package("whatsapp-rust")?["manifest_path"]
+        .as_str()
+        .context("SDK manifest")?;
+    let source = Path::new(manifest).parent().context("SDK directory")?;
+    ensure!(
+        source.join("src/client/durability_probe_id.rs").is_file(),
+        "SDK probe source is missing"
+    );
+    println!("WASM SDK source: {}", source.display());
+    Ok(source.to_owned())
+}
+
+fn configure_cargo(command: &mut Command, root: &Path, lane: Lane, build_jobs: Option<&OsStr>) {
+    command
+        .current_dir(root)
+        // Keep the conservative default for callers without a memory budget,
+        // but let CI choose parallel compilation within each isolated profile.
+        // Cargo owns validation, including relative job counts such as -1.
+        .env("CARGO_BUILD_JOBS", build_jobs.unwrap_or(OsStr::new("1")))
+        // Many independent profiles compile the generated protocol crate.
+        // Debug symbols and incremental state dwarf these contract tests.
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_PROFILE_DEV_DEBUG", "0")
+        .env("CARGO_PROFILE_TEST_DEBUG", "0")
+        .env("CARGO_TARGET_DIR", root.join("target/consumers"))
+        // Do not leak host nightly flags into the MSRV or WASM hosts.
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env(
+            "RUSTFLAGS",
+            if lane == Lane::Wasm {
+                "--cfg getrandom_backend=\"wasm_js\""
+            } else {
+                ""
+            },
+        );
 }
 
 pub fn run(root: &Path, task: Task) -> Result<u8> {
@@ -357,6 +488,13 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
     }
     let mut count = 0;
     let mut first_failure = 0;
+    let build_jobs = std::env::var_os("CARGO_BUILD_JOBS");
+    if !dry_run {
+        println!(
+            "[{lane:?}] Cargo build jobs: {:?}",
+            build_jobs.as_deref().unwrap_or(OsStr::new("1"))
+        );
+    }
     for consumer in &consumers {
         if manifest.as_ref().is_some_and(|m| m != &consumer.manifest) {
             continue;
@@ -376,22 +514,23 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
                 continue;
             }
             let mut command = Command::new("cargo");
-            command
-                .args(&args)
-                .current_dir(root)
-                .env("CARGO_BUILD_JOBS", "1")
-                .env("CARGO_TARGET_DIR", root.join("target/consumers"))
-                // Do not leak host nightly flags into the MSRV or WASM hosts.
-                .env_remove("CARGO_ENCODED_RUSTFLAGS")
-                .env(
-                    "RUSTFLAGS",
-                    if lane == Lane::Wasm {
-                        "--cfg getrandom_backend=\"wasm_js\""
-                    } else {
-                        ""
-                    },
-                );
-            let code = if let Some(expected) = &invocation.expect_failure {
+            command.args(&args);
+            configure_cargo(&mut command, root, lane, build_jobs.as_deref());
+            if invocation.wasm_test {
+                command
+                    .env(
+                        "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER",
+                        "wasm-bindgen-test-runner",
+                    )
+                    .env(
+                        "WHATSAPP_SDK_SOURCE_ROOT",
+                        wasm_sdk_source(root, consumer, invocation, toolchain.as_deref())?,
+                    );
+            }
+            // Host tooling measures Cargo wall time, not the SDK's pluggable clock.
+            #[allow(clippy::disallowed_methods)]
+            let started = Instant::now();
+            let (code, elapsed) = if let Some(expected) = &invocation.expect_failure {
                 // Structured diagnostics tie the code and API fragments to one
                 // primary error, independent of ANSI or unrelated stderr text.
                 command
@@ -400,9 +539,10 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
                 let output = command
                     .output()
                     .with_context(|| format!("execute {}", consumer.manifest))?;
+                let elapsed = started.elapsed();
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 eprint!("{stderr}");
-                match expected.verify(
+                let code = match expected.verify(
                     output.status.success(),
                     &String::from_utf8_lossy(&output.stdout),
                 ) {
@@ -411,14 +551,19 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
                         eprintln!("{error:#}");
                         1
                     }
-                }
+                };
+                (code, elapsed)
             } else {
-                xtask_support::exit_code(
-                    command
-                        .status()
-                        .with_context(|| format!("execute {}", consumer.manifest))?,
-                )
+                let status = command
+                    .status()
+                    .with_context(|| format!("execute {}", consumer.manifest))?;
+                let elapsed = started.elapsed();
+                (xtask_support::exit_code(status), elapsed)
             };
+            println!(
+                "[{lane:?}] finished in {:.3}s; validation status: {code}",
+                elapsed.as_secs_f64()
+            );
             if code != 0 {
                 eprintln!(
                     "consumer failed: {} ({:?}, {lane:?})",
@@ -441,6 +586,59 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compilation_budget_preserves_lane_isolation() {
+        let root = Path::new("isolated-host");
+        for lane in [Lane::Native, Lane::Msrv, Lane::Wasm] {
+            for jobs in [
+                None,
+                Some("1"),
+                Some("2"),
+                Some("4"),
+                Some("-1"),
+                Some("invalid"),
+            ] {
+                let mut command = Command::new("cargo");
+                command.args(["+host-toolchain", "test", "--locked"]);
+                command.env("RUSTFLAGS", "nightly-only");
+                command.env("CARGO_ENCODED_RUSTFLAGS", "nightly-only");
+                configure_cargo(&mut command, root, lane, jobs.map(OsStr::new));
+                let env = command
+                    .get_envs()
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                assert_eq!(
+                    env[OsStr::new("CARGO_BUILD_JOBS")],
+                    Some(OsStr::new(jobs.unwrap_or("1")))
+                );
+                assert_eq!(env[OsStr::new("CARGO_ENCODED_RUSTFLAGS")], None);
+                assert_eq!(
+                    env[OsStr::new("RUSTFLAGS")],
+                    Some(OsStr::new(if lane == Lane::Wasm {
+                        "--cfg getrandom_backend=\"wasm_js\""
+                    } else {
+                        ""
+                    }))
+                );
+                for name in [
+                    "CARGO_INCREMENTAL",
+                    "CARGO_PROFILE_DEV_DEBUG",
+                    "CARGO_PROFILE_TEST_DEBUG",
+                ] {
+                    assert_eq!(env[OsStr::new(name)], Some(OsStr::new("0")));
+                }
+                assert_eq!(
+                    env[OsStr::new("CARGO_TARGET_DIR")],
+                    Some(root.join("target/consumers").as_os_str())
+                );
+                assert_eq!(command.get_current_dir(), Some(root));
+                assert_eq!(
+                    command.get_args().collect::<Vec<_>>(),
+                    ["+host-toolchain", "test", "--locked"]
+                );
+            }
+        }
+    }
+
     fn fixture() -> (tempfile::TempDir, Vec<Consumer>) {
         let root = tempfile::tempdir().unwrap();
         for path in WORKSPACE_TESTS
@@ -601,12 +799,55 @@ mod tests {
         assert!(validate(root.path(), &consumers).is_err());
     }
     #[test]
+    fn named_tests_are_explicit_and_target_selectors_are_exclusive() {
+        let (root, mut consumers) = fixture();
+        consumers[0].commands[0].test = Some("event_delivery".into());
+        assert!(validate(root.path(), &consumers).is_ok());
+        let args = consumers[0].commands[0].args(&consumers[0], Lane::Native);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--test", "event_delivery"])
+        );
+        consumers[0].commands[0].lib = true;
+        assert!(validate(root.path(), &consumers).is_err());
+        consumers[0].commands[0].lib = false;
+        consumers[0].commands[0].bin = Some("probe".into());
+        assert!(validate(root.path(), &consumers).is_err());
+        assert!(
+            serde_json::from_str::<Invocation>(
+                r#"{"lanes":["native"],"mode":"test","test":"event_delivery","unknown":true}"#
+            )
+            .is_err()
+        );
+    }
+    #[test]
     fn refuses_wasm_test_run_and_missing_locks() {
         let (root, mut consumers) = fixture();
         consumers[0].commands[0].lanes = vec![Lane::Native, Lane::Wasm];
         assert!(validate(root.path(), &consumers).is_err());
         consumers[0].commands[0].lanes = vec![Lane::Native];
         consumers[0].locked = true;
+        assert!(validate(root.path(), &consumers).is_err());
+    }
+
+    #[test]
+    fn wasm_execution_requires_a_named_target_and_matching_runner() {
+        let (root, mut consumers) = fixture();
+        consumers[0].commands.push(
+            serde_json::from_str(
+                r#"{"lanes":["wasm"],"mode":"test","test":"timer","wasm_test":true}"#,
+            )
+            .unwrap(),
+        );
+        validate(root.path(), &consumers).unwrap();
+        verify_wasm_runner("0.2.129", "wasm-bindgen-test-runner 0.2.129\n").unwrap();
+        assert!(verify_wasm_runner("0.2.129", "wasm-bindgen-test-runner 0.2.127").is_err());
+        let test = consumers[0].commands.last_mut().unwrap();
+        test.test = None;
+        assert!(validate(root.path(), &consumers).is_err());
+        let test = consumers[0].commands.last_mut().unwrap();
+        test.test = Some("timer".into());
+        test.lanes.push(Lane::Native);
         assert!(validate(root.path(), &consumers).is_err());
     }
 }

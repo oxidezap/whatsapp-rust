@@ -178,8 +178,23 @@ pub fn parse_jid_ref(s: &str) -> Option<JidRef<'_>> {
 ///
 /// Maps to the wire protocol's AD_JID domain type (u8) and the `@server` suffix
 /// in JID string representation.
+///
+/// New supported namespaces may gain variants. Unknown namespaces are rejected
+/// by parsing; they are never mapped into a known identity class.
+///
+/// ```
+/// use wacore_binary::Server;
+/// let server = Server::try_from("lid").unwrap();
+/// let phone_namespace = match server {
+///     Server::Pn | Server::Hosted => true,
+///     _ => false,
+/// };
+/// assert!(!phone_namespace);
+/// assert!(Server::try_from("future.invalid").is_err());
+/// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum Server {
     #[default]
     Pn = 0,

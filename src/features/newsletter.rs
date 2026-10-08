@@ -36,7 +36,7 @@ pub enum NewsletterError {
     /// A MEX (GraphQL) query/mutation failed or returned malformed data.
     #[error("{0}")]
     Mex(#[from] MexError),
-    /// An IQ (message history, live updates) failed.
+    /// An IQ (message history, live updates, add-ons) failed, including parsing its response.
     #[error("{0}")]
     Iq(#[from] IqError),
     /// Connection/transport failure sending a plaintext stanza (edit/revoke).
@@ -1037,8 +1037,9 @@ impl<'a> Newsletter<'a> {
     /// recent messages.
     ///
     /// Only messages the account has an add-on on are returned, up to `limit`
-    /// of them. A response WA Web's parser would reject is
-    /// [`NewsletterError::InvalidRequest`] rather than a shorter list.
+    /// of them. A malformed response returns [`NewsletterError::Iq`] wrapping
+    /// [`IqError::ParseError`], preserving the parser's cause. A non-newsletter
+    /// JID returns [`NewsletterError::InvalidRequest`] before sending anything.
     pub async fn get_my_addons(
         &self,
         jid: &Jid,
@@ -1052,12 +1053,7 @@ impl<'a> Newsletter<'a> {
         self.client
             .execute(MyAddOnsSpec::new(jid, limit))
             .await
-            .map_err(|err| match err {
-                // A malformed server response is `InvalidRequest` across
-                // `NewsletterError`, as the history parser reports it.
-                IqError::ParseError(err) => NewsletterError::InvalidRequest(err.to_string()),
-                other => other.into(),
-            })
+            .map_err(NewsletterError::from)
     }
 }
 
@@ -2142,10 +2138,10 @@ mod tests {
             assert_eq!(addons[0].server_id, 777);
         }
 
-        /// A malformed answer is `InvalidRequest`, the variant `NewsletterError`
-        /// files a bad server response under, not the IQ layer's parse error.
         #[tokio::test]
-        async fn a_malformed_answer_is_an_invalid_request() {
+        async fn a_malformed_answer_preserves_the_iq_parse_cause() {
+            use crate::ErrorChainExt;
+            use std::error::Error;
             let (client, transport) = crate::test_utils::create_iq_test_client().await;
             let jid = newsletter_jid();
 
@@ -2168,10 +2164,26 @@ mod tests {
                 .build();
             crate::test_utils::answer_iq(&client, &id, &without_my_addons).await;
 
-            assert!(matches!(
-                request.await.expect("task"),
-                Err(NewsletterError::InvalidRequest(_))
-            ));
+            let error = request
+                .await
+                .expect("task")
+                .expect_err("malformed response");
+            let NewsletterError::Iq(IqError::ParseError(parse)) = &error else {
+                panic!("expected IQ parse error, got {error:?}");
+            };
+            let iq_source = error
+                .source()
+                .expect("IQ cause")
+                .downcast_ref::<IqError>()
+                .expect("typed IQ cause");
+            let parser_source = iq_source.source().expect("parser cause");
+            let stored_parser: &(dyn Error + 'static) = parse.as_ref();
+            assert!(std::ptr::addr_eq(parser_source, stored_parser));
+            assert_eq!(error.server_rejection(), None);
+            assert_eq!(error.http_status(), None);
+            assert!(!error.is_timeout());
+            assert!(!error.is_transport_unavailable());
+            assert!(error.store_failure().is_none());
         }
 
         #[tokio::test]

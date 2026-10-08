@@ -273,7 +273,7 @@ impl HttpClient for UreqHttpClient {
             let status_code = response.status().as_u16();
             let body = read_body(response, max_body_bytes)?;
 
-            Ok(HttpResponse { status_code, body })
+            Ok(HttpResponse::new(status_code, body))
         })
         .await?
     }
@@ -312,10 +312,7 @@ impl HttpClient for UreqHttpClient {
         // sizes the initial allocation, not the total read.
         let reader = std::io::Read::take(response.into_body().into_reader(), self.max_body_bytes);
 
-        Ok(StreamingHttpResponse {
-            status_code,
-            body: Box::new(reader),
-        })
+        Ok(StreamingHttpResponse::new(status_code, Box::new(reader)))
     }
 
     fn supports_upload_streaming(&self) -> bool {
@@ -352,7 +349,7 @@ impl HttpClient for UreqHttpClient {
         let status_code = response.status().as_u16();
         let body = read_body(response, self.max_body_bytes)?;
 
-        Ok(HttpResponse { status_code, body })
+        Ok(HttpResponse::new(status_code, body))
     }
 
     /// An empty pool before the first request, the configured cap after it.
@@ -431,12 +428,7 @@ mod tests {
         const SIZE: usize = 12 * 1024 * 1024;
         let url = spawn_fixed_size_server(SIZE);
         let resp = UreqHttpClient::new()
-            .execute(HttpRequest {
-                method: "GET".into(),
-                url,
-                headers: std::collections::HashMap::new(),
-                body: None,
-            })
+            .execute(HttpRequest::get(url))
             .await
             .expect("body must fit under the configured cap");
         assert_eq!(resp.status_code, 200);
@@ -449,12 +441,7 @@ mod tests {
         let url = spawn_fixed_size_server(SIZE);
         UreqHttpClient::new()
             .with_max_body_bytes(1024)
-            .execute(HttpRequest {
-                method: "GET".into(),
-                url,
-                headers: std::collections::HashMap::new(),
-                body: None,
-            })
+            .execute(HttpRequest::get(url))
             .await
             .expect_err("1 KiB cap must reject a 4 MiB body");
     }
@@ -470,12 +457,7 @@ mod tests {
         let read = tokio::task::spawn_blocking(move || {
             let mut resp = UreqHttpClient::new()
                 .with_max_body_bytes(CAP)
-                .execute_streaming(HttpRequest {
-                    method: "GET".into(),
-                    url,
-                    headers: std::collections::HashMap::new(),
-                    body: None,
-                })
+                .execute_streaming(HttpRequest::get(url))
                 .expect("streaming GET should start");
             let mut sink = std::io::sink();
             std::io::copy(&mut resp.body, &mut sink).expect("draining the reader should not error")
@@ -550,12 +532,7 @@ mod tests {
 
         let resp = client
             .execute_upload(
-                HttpRequest {
-                    method: "POST".into(),
-                    url,
-                    headers: std::collections::HashMap::new(),
-                    body: None,
-                },
+                HttpRequest::post(url),
                 Box::new(std::io::Cursor::new(payload.clone())),
                 payload.len() as u64,
             )
@@ -587,12 +564,7 @@ mod tests {
 
         let resp = client
             .execute_upload(
-                HttpRequest {
-                    method: "POST".into(),
-                    url,
-                    headers: std::collections::HashMap::new(),
-                    body: None,
-                },
+                HttpRequest::post(url),
                 Box::new(std::io::Cursor::new(payload.clone())),
                 payload.len() as u64,
             )
@@ -788,22 +760,16 @@ mod tests {
     async fn a_rejected_request_leaves_the_pool_reported_empty() {
         let client = UreqHttpClient::new();
         client
-            .execute(HttpRequest {
-                method: "PATCH".into(),
-                url: "http://127.0.0.1:0/never".into(),
-                headers: std::collections::HashMap::new(),
-                body: None,
+            .execute({
+                let mut request = HttpRequest::get("http://127.0.0.1:0/never");
+                request.method = "PATCH".into();
+                request
             })
             .await
             .expect_err("PATCH is not supported");
         client
             .execute_upload(
-                HttpRequest {
-                    method: "GET".into(),
-                    url: "http://127.0.0.1:0/never".into(),
-                    headers: std::collections::HashMap::new(),
-                    body: None,
-                },
+                HttpRequest::get("http://127.0.0.1:0/never"),
                 Box::new(std::io::Cursor::new(vec![1u8])),
                 1,
             )
@@ -1094,19 +1060,11 @@ mod tests {
     }
 
     fn get(url: String) -> HttpRequest {
-        HttpRequest {
-            method: "GET".into(),
-            url,
-            headers: std::collections::HashMap::new(),
-            body: None,
-        }
+        HttpRequest::get(url)
     }
 
-    /// Regression (#1185): a CDN 403/404 is a *response*, not a transport error.
-    /// `download.rs` classifies the status itself — 401/403 into a media-auth
-    /// refresh, 404/410 into a URL re-derivation — so swallowing the status into
-    /// an opaque `Err` makes both paths unreachable and every host retry carries
-    /// the same stale auth token.
+    /// A completed exchange preserves its status so the SDK can apply the
+    /// calling operation's error and retry policy.
     #[tokio::test(flavor = "current_thread")]
     async fn execute_surfaces_non_2xx_status_instead_of_erroring() {
         for (status, reason) in [
@@ -1156,12 +1114,7 @@ mod tests {
         let payload = vec![7u8; 128];
         let resp = UreqHttpClient::new()
             .execute_upload(
-                HttpRequest {
-                    method: "POST".into(),
-                    url,
-                    headers: std::collections::HashMap::new(),
-                    body: None,
-                },
+                HttpRequest::post(url),
                 Box::new(std::io::Cursor::new(payload.clone())),
                 payload.len() as u64,
             )
@@ -1388,12 +1341,7 @@ mod tests {
     fn upload_streaming_rejects_non_post() {
         let client = UreqHttpClient::new();
         let err = client.execute_upload(
-            HttpRequest {
-                method: "GET".into(),
-                url: "http://127.0.0.1:0/never".into(),
-                headers: std::collections::HashMap::new(),
-                body: None,
-            },
+            HttpRequest::get("http://127.0.0.1:0/never"),
             Box::new(std::io::Cursor::new(vec![1u8, 2, 3])),
             3,
         );

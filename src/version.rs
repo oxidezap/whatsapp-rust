@@ -272,20 +272,14 @@ mod tests {
         async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
             *self.url.lock().unwrap() = Some(request.url.clone());
             *self.seen.lock().unwrap() = Some(request.headers);
-            Ok(HttpResponse {
-                status_code: 200,
-                body: b"client_revision:12345;".to_vec(),
-            })
+            Ok(HttpResponse::new(200, b"client_revision:12345;".to_vec()))
         }
     }
 
     #[async_trait::async_trait]
     impl HttpClient for StatusOnlyHttpClient {
         async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse> {
-            Ok(HttpResponse {
-                status_code: self.0,
-                body: b"<html>error</html>".to_vec(),
-            })
+            Ok(HttpResponse::new(self.0, b"<html>error</html>".to_vec()))
         }
     }
 

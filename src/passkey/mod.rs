@@ -42,6 +42,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 /// WebAuthn user-verification requirement from the server's request options.
+/// This closed set expresses the supported WebAuthn requirements. Unknown
+/// requirements are rejected rather than weakening user verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserVerification {
     Required,
@@ -67,7 +69,10 @@ impl UserVerification {
 /// A WebAuthn assertion request, parsed from the server's
 /// `<passkey_request_options>` (a standard `PublicKeyCredentialRequestOptions`
 /// JSON). `challenge` and `allow_credentials` are already base64url-decoded.
+/// Construct through [`parse_request_options`] so the original options remain
+/// available to the authenticator as request fields evolve.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AssertionRequest {
     /// Server challenge (raw bytes).
     pub challenge: Vec<u8>,
@@ -83,13 +88,27 @@ pub struct AssertionRequest {
 }
 
 /// The result of a WebAuthn assertion, packaged for the `<passkey_prologue>` IQ.
+/// Construct with [`Assertion::new`]; the host is responsible for obtaining a
+/// valid assertion from its authenticator.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Assertion {
     /// UTF-8 JSON for `<webauthn_assertion>`:
     /// `{id, rawId(b64url), type:"public-key", response:{clientDataJSON, authenticatorData, signature, userHandle}}`.
     pub assertion_json: Vec<u8>,
     /// Raw credential rawId bytes for `<credential_id>`.
     pub credential_id: Vec<u8>,
+}
+
+impl Assertion {
+    /// Package the authenticator's assertion JSON and raw credential ID.
+    /// This does not validate or sign the assertion.
+    pub fn new(assertion_json: Vec<u8>, credential_id: Vec<u8>) -> Self {
+        Self {
+            assertion_json,
+            credential_id,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -114,6 +133,19 @@ pub enum PasskeyError {
 /// stores it as `Arc<dyn PasskeyAuthenticator>` and drives it across threads) but
 /// drops the bound on wasm32, where a browser authenticator may hold `!Send` JS
 /// handles, matching the sibling extension points (`Transport`, `EventHandler`).
+///
+/// A synthetic host can exercise construction without authenticating:
+/// ```
+/// use whatsapp_rust::passkey::{Assertion, CallbackAuthenticator, parse_request_options};
+/// let request = parse_request_options(r#"{"challenge":"AQID"}"#).unwrap();
+/// assert_eq!(request.challenge, [1, 2, 3]);
+/// let _host = CallbackAuthenticator::new(|request| {
+///     Box::pin(async move {
+///         // Replace these fixture bytes with the platform authenticator's result.
+///         Ok(Assertion::new(b"{}".to_vec(), request.challenge))
+///     })
+/// });
+/// ```
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait PasskeyAuthenticator: wacore::sync_marker::MaybeSendSync {
@@ -388,10 +420,10 @@ mod tests {
     async fn callback_authenticator_invokes_closure() {
         let auth = CallbackAuthenticator::new(|req: AssertionRequest| {
             Box::pin(async move {
-                Ok(Assertion {
-                    assertion_json: req.raw_options_json.into_bytes(),
-                    credential_id: req.challenge,
-                })
+                Ok(Assertion::new(
+                    req.raw_options_json.into_bytes(),
+                    req.challenge,
+                ))
             })
         });
         let req = AssertionRequest {
