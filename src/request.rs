@@ -345,6 +345,9 @@ impl Client {
 
     // Typed execution defers only the outcome counter until its parser finishes;
     // tracing, wire observers and the measured exchange remain shared with raw IQs.
+    // A rejection can be a normal typed outcome (e.g. a missing picture); only
+    // the caller knows whether it warrants a warning or error. Keep its diagnostic
+    // at DEBUG here, independently of the subscriber's span filtering.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -357,7 +360,7 @@ impl Client {
                 lid = tracing::field::Empty,
                 pn = tracing::field::Empty
             ),
-            err(Debug)
+            err(Debug, level = "debug")
         )
     )]
     async fn send_iq_inner(
@@ -366,7 +369,7 @@ impl Client {
         record_outcome: bool,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
         #[cfg(feature = "tracing")]
-        self.record_identity_on_span(&tracing::Span::current());
+        self.record_identity_on_current_span("wa.iq", module_path!());
 
         let iq_timeout = query.timeout.unwrap_or(DEFAULT_IQ_TIMEOUT);
         let req_id = query
@@ -404,7 +407,7 @@ impl Client {
     /// wait. See [`IqOnSent`] for why a caller would want one.
     #[cfg_attr(
         feature = "tracing",
-        tracing::instrument(name = "wa.iq.node", level = "debug", skip_all, err(Debug))
+        tracing::instrument(name = "wa.iq.node", level = "debug", skip_all, fields(lid = tracing::field::Empty, pn = tracing::field::Empty), err(Debug, level = "debug"))
     )]
     pub(crate) async fn send_iq_node_then(
         &self,
@@ -413,7 +416,7 @@ impl Client {
         on_sent: Option<IqOnSent<'_>>,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
         #[cfg(feature = "tracing")]
-        self.record_identity_on_span(&tracing::Span::current());
+        self.record_identity_on_current_span("wa.iq.node", module_path!());
 
         if node.tag.as_ref() != IQ_TAG {
             return Err(IqError::ParseError(anyhow::anyhow!(
@@ -1196,3 +1199,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "tracing"))]
+pub(crate) mod tracing_tests;

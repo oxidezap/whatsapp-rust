@@ -21,6 +21,7 @@ uuid = { workspace = true, features = ["v4"] }
 wacore = { path = "../../wacore", features = ["test-util"] }
 wacore-binary = { path = "../../wacore/binary" }
 whatsapp-rust = { path = "../..", default-features = false, features = [
+    "bench-harness",
     "danger-skip-tls-verify",
     "tokio-runtime",
     "tokio-native",

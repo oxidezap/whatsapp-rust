@@ -2402,7 +2402,7 @@ mod tests {
         ) -> Result<crate::http::HttpResponse> {
             self.record(&request.url);
             let (status_code, body) = self.respond(&request.url);
-            Ok(crate::http::HttpResponse { status_code, body })
+            Ok(crate::http::HttpResponse::new(status_code, body))
         }
 
         // Implemented so `download_to_writer` exercises the streaming branch
@@ -2417,10 +2417,10 @@ mod tests {
         ) -> Result<wacore::net::StreamingHttpResponse> {
             self.record(&request.url);
             let (status_code, body) = self.respond(&request.url);
-            Ok(wacore::net::StreamingHttpResponse {
+            Ok(wacore::net::StreamingHttpResponse::new(
                 status_code,
-                body: Box::new(Cursor::new(body)),
-            })
+                Box::new(Cursor::new(body)),
+            ))
         }
     }
 
@@ -3687,10 +3687,10 @@ mod tests {
         ) -> Result<wacore::net::StreamingHttpResponse> {
             if self.all_hosts || request.url.contains("first.example.com") {
                 self.inner.record(&request.url);
-                return Ok(wacore::net::StreamingHttpResponse {
-                    status_code: 200,
-                    body: Box::new(FailingNetworkReader),
-                });
+                return Ok(wacore::net::StreamingHttpResponse::new(
+                    200,
+                    Box::new(FailingNetworkReader),
+                ));
             }
             self.inner.execute_streaming(request)
         }
@@ -3932,10 +3932,10 @@ mod tests {
             request: crate::http::HttpRequest,
         ) -> Result<crate::http::HttpResponse> {
             *self.seen_url.lock().await = Some(request.url);
-            Ok(crate::http::HttpResponse {
-                status_code: self.status,
-                body: self.body.clone(),
-            })
+            Ok(crate::http::HttpResponse::new(
+                self.status,
+                self.body.clone(),
+            ))
         }
     }
 

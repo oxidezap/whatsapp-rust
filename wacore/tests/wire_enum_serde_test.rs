@@ -32,6 +32,60 @@ use wacore::types::message::{AddressingMode, EditAttribute, MessageCategory};
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::jid::Jid;
 
+mod tag_contract {
+    #[derive(wacore::WireEnum)]
+    #[wire(tag = "type")]
+    enum Closed {
+        #[wire = "known"]
+        #[wire_alias = "legacy"]
+        Known,
+    }
+
+    #[derive(wacore::WireEnum)]
+    #[wire(tag = "type")]
+    #[non_exhaustive]
+    pub(crate) enum Open {
+        #[wire = "known"]
+        #[wire_alias = "legacy"]
+        Known,
+        #[wire_fallback]
+        Unknown { tag: String },
+    }
+
+    #[test]
+    fn tag_contract_does_not_change_wire_aliases_fallback_or_serde() {
+        let closed = ClosedTag::try_from("legacy").unwrap();
+        // Intentionally exhaustive: closed source enums keep closed tags.
+        let canonical = match closed {
+            ClosedTag::Known => "known",
+        };
+        assert_eq!(Closed::Known.wire_tag(), canonical);
+        assert_eq!(Closed::Known.tag_name(), canonical);
+        assert_eq!(serde_json::to_value(closed).unwrap(), "known");
+        assert!(ClosedTag::try_from("future").is_err());
+        assert_eq!(OpenTag::from("legacy"), OpenTag::Known);
+        assert_eq!(Open::Known.wire_tag(), canonical);
+        assert_eq!(Open::Known.tag_name(), canonical);
+
+        let unknown = OpenTag::from("future");
+        assert_eq!(unknown, OpenTag::Unknown("future".into()));
+        assert_eq!(serde_json::to_value(&unknown).unwrap(), "future");
+        assert_eq!(
+            serde_json::from_str::<OpenTag>("\"future\"").unwrap(),
+            unknown
+        );
+        let action = Open::Unknown {
+            tag: "future".into(),
+        };
+        assert_eq!(action.wire_tag(), "future");
+        assert_eq!(action.tag_name(), "future");
+        assert_eq!(
+            serde_json::to_value(action).unwrap(),
+            serde_json::json!({"type": "future"})
+        );
+    }
+}
+
 fn assert_roundtrip<T>(values: &[T])
 where
     T: serde::Serialize + for<'de> serde::Deserialize<'de> + PartialEq + std::fmt::Debug + Clone,

@@ -3,7 +3,6 @@
 #![recursion_limit = "512"]
 
 use log::{error, info, warn};
-use std::collections::HashMap;
 use std::sync::Arc;
 use wacore::net::{HttpClient, HttpRequest};
 use wacore::proto_helpers::MessageExt;
@@ -176,12 +175,8 @@ fn main() {
                                 // Set only in mock mode; otherwise manual scan below.
                                 if let Some(url) = admin_scan_url.as_ref() {
                                     let http = UreqHttpClient::new();
-                                    let req = HttpRequest {
-                                        url: url.clone(),
-                                        method: "POST".into(),
-                                        headers: HashMap::new(),
-                                        body: Some(code.as_bytes().to_vec().into()),
-                                    };
+                                    let req = HttpRequest::post(url.clone())
+                                        .with_body(code.as_bytes().to_vec());
                                     match http.execute(req).await {
                                         Ok(resp) if (200..300).contains(&resp.status_code) => {
                                             info!("Auto-paired with mock server via {url}");

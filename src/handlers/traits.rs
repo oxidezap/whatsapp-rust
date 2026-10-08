@@ -8,7 +8,7 @@ use wacore_binary::OwnedNodeRef;
 /// Each handler is responsible for processing a specific top-level XML tag (e.g., "message", "iq", "receipt").
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait StanzaHandler: Send + Sync {
+pub(crate) trait StanzaHandler: Send + Sync {
     /// Returns the XML tag this handler is responsible for (e.g., "message", "iq").
     fn tag(&self) -> &'static str;
 

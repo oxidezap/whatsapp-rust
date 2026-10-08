@@ -1,5 +1,8 @@
 //! External public-API contracts. Each profile compiles separately without defaults.
 
+#[cfg(feature = "core")]
+pub mod derive_contract;
+
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub mod client_options;
 

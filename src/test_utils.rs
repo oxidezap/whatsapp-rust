@@ -194,10 +194,7 @@ pub struct MockHttpClient;
 #[async_trait::async_trait]
 impl HttpClient for MockHttpClient {
     async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse, anyhow::Error> {
-        Ok(HttpResponse {
-            status_code: 200,
-            body: Vec::new(),
-        })
+        Ok(HttpResponse::new(200, Vec::new()))
     }
 }
 
@@ -566,6 +563,7 @@ pub mod log_capture {
         "whatsapp_rust::client::lifecycle",
         "whatsapp_rust::history_sync",
         "whatsapp_rust::message::receive",
+        "whatsapp_rust::handlers::ib",
     ];
 
     #[derive(Default)]

@@ -413,10 +413,7 @@ mod tests {
     #[whatsapp_rust::async_trait]
     impl HttpClient for TestHttpClient {
         async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse> {
-            Ok(HttpResponse {
-                status_code: 200,
-                body: Vec::new(),
-            })
+            Ok(HttpResponse::new(200, Vec::new()))
         }
     }
 

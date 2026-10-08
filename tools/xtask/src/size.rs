@@ -20,7 +20,7 @@ const CRATES: &[&str] = &[
     "std",
 ];
 const GATED: &[(&str, i64)] = &[("bin size (stripped)", 64 * 1024), ("bin .text", 32 * 1024)];
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct Metric {
     name: String,
     unit: String,
@@ -80,37 +80,129 @@ fn llvm_total(output: &str) -> Result<(i64, i64)> {
     }
     anyhow::bail!("no TOTAL row in cargo llvm-lines output")
 }
-pub fn measure(root: &Path, out: &Path, skip: bool) -> Result<()> {
-    let lock = std::fs::read(root.join("Cargo.lock"))?;
+trait MeasurementTools {
+    fn run(&mut self, command: &mut Command) -> Result<()>;
+    fn text(&mut self, root: &Path, program: &str, args: &[&str]) -> Result<String>;
+}
+struct SystemTools;
+impl MeasurementTools for SystemTools {
+    fn run(&mut self, command: &mut Command) -> Result<()> {
+        run(command)
+    }
+    fn text(&mut self, root: &Path, program: &str, args: &[&str]) -> Result<String> {
+        text(root, program, args)
+    }
+}
+
+pub fn measure(root: &Path, out: &Path, skip: bool, gate_only: bool) -> Result<()> {
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or(root.join("target"));
+    measure_with(
+        root,
+        out,
+        &target.join("release/examples/demo"),
+        skip,
+        gate_only,
+        &mut SystemTools,
+    )
+}
+
+fn measure_with(
+    root: &Path,
+    out: &Path,
+    binary: &Path,
+    skip: bool,
+    gate_only: bool,
+    tools: &mut impl MeasurementTools,
+) -> Result<()> {
     std::fs::create_dir_all(out)?;
+    // A failed measurement must not expose a previous head's evidence or PASS.
+    // This also removes attribution when reusing a directory in gate-only mode.
+    for name in [
+        "size-meta.json",
+        "size-metrics.json",
+        "size-attribution.json",
+        "report.md",
+        "gate.txt",
+    ] {
+        match std::fs::remove_file(out.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let lock = std::fs::read(root.join("Cargo.lock"))?;
     if !skip {
-        run(&mut command(
+        tools.run(&mut command(
             root,
             "cargo",
             &["build", "--release", "--example", "demo"],
         ))?;
     }
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or(root.join("target"));
-    let binary = target.join("release/examples/demo");
     ensure!(
         binary.is_file(),
         "demo binary missing: {}",
         binary.display()
     );
     let temporary = tempfile::NamedTempFile::new_in(out)?;
-    std::fs::copy(&binary, temporary.path())?;
-    run(Command::new("strip")
-        .arg("--strip-all")
-        .arg(temporary.path()))?;
+    std::fs::copy(binary, temporary.path())?;
+    tools.run(
+        Command::new("strip")
+            .arg("--strip-all")
+            .arg(temporary.path()),
+    )?;
     let stripped = temporary.as_file().metadata()?.len();
     let bin = binary.to_str().context("binary path encoding")?;
     let (text_size, allocated) = sections(
-        &text(root, "size", &["-A", "-d", bin])?,
-        &text(root, "size", &["-d", bin])?,
+        &tools.text(root, "size", &["-A", "-d", bin])?,
+        &tools.text(root, "size", &["-d", bin])?,
     )?;
-    let bloat: Value = serde_json::from_str(&text(
+    let mut metrics = vec![
+        metric("bin size (stripped)", "bytes", i64::try_from(stripped)?),
+        metric("bin .text", "bytes", text_size),
+        metric("bin allocated (text+data+bss)", "bytes", allocated),
+    ];
+    let bloat = if gate_only {
+        None
+    } else {
+        Some(diagnostics(root, &mut metrics, tools)?)
+    };
+    let count = std::fs::read_to_string(root.join("Cargo.lock"))?
+        .lines()
+        .filter(|l| l.starts_with("name = "))
+        .count();
+    metrics.push(metric(
+        "deps crates (Cargo.lock)",
+        "crates",
+        i64::try_from(count)?,
+    ));
+    let meta = json!({
+        "commit": tools.text(root, "git", &["rev-parse", "HEAD"])?.trim(),
+        "rustc": tools.text(root, "rustc", &["--version"])?.trim(),
+        "diagnostics": if gate_only { "omitted" } else { "complete" },
+    });
+    ensure!(
+        std::fs::read(root.join("Cargo.lock"))? == lock,
+        "measurement changed Cargo.lock; refusing inconsistent size artifacts"
+    );
+    write_json(&out.join("size-metrics.json"), &metrics)?;
+    if let Some(bloat) = bloat {
+        write_json(&out.join("size-attribution.json"), &bloat)?;
+    }
+    write_json(&out.join("size-meta.json"), &meta)?;
+    for m in metrics {
+        println!("{}: {} {}", m.name, m.value, m.unit);
+    }
+    Ok(())
+}
+
+fn diagnostics(
+    root: &Path,
+    metrics: &mut Vec<Metric>,
+    tools: &mut impl MeasurementTools,
+) -> Result<Value> {
+    let bloat: Value = serde_json::from_str(&tools.text(
         root,
         "cargo",
         &[
@@ -136,11 +228,6 @@ pub fn measure(root: &Path, out: &Path, skip: bool) -> Result<()> {
             c["size"].as_i64().context("crate size")?,
         );
     }
-    let mut metrics = vec![
-        metric("bin size (stripped)", "bytes", i64::try_from(stripped)?),
-        metric("bin .text", "bytes", text_size),
-        metric("bin allocated (text+data+bss)", "bytes", allocated),
-    ];
     for name in CRATES {
         if let Some(size) = sizes.get(name) {
             metrics.push(metric(format!(".text {name}"), "bytes", *size));
@@ -156,7 +243,7 @@ pub fn measure(root: &Path, out: &Path, skip: bool) -> Result<()> {
             .sum(),
     ));
     for (package, label) in [("wacore", "wacore"), ("whatsapp-rust", "whatsapp-rust lib")] {
-        let (lines, copies) = llvm_total(&text(
+        let (lines, copies) = llvm_total(&tools.text(
             root,
             "cargo",
             &["llvm-lines", "-p", package, "--lib", "--release"],
@@ -168,27 +255,7 @@ pub fn measure(root: &Path, out: &Path, skip: bool) -> Result<()> {
             copies,
         ));
     }
-    let count = std::fs::read_to_string(root.join("Cargo.lock"))?
-        .lines()
-        .filter(|l| l.starts_with("name = "))
-        .count();
-    metrics.push(metric(
-        "deps crates (Cargo.lock)",
-        "crates",
-        i64::try_from(count)?,
-    ));
-    let meta = json!({"commit":text(root,"git",&["rev-parse","HEAD"])?.trim(),"rustc":text(root,"rustc",&["--version"])?.trim()});
-    ensure!(
-        std::fs::read(root.join("Cargo.lock"))? == lock,
-        "measurement changed Cargo.lock; refusing inconsistent size artifacts"
-    );
-    write_json(&out.join("size-metrics.json"), &metrics)?;
-    write_json(&out.join("size-attribution.json"), &bloat)?;
-    write_json(&out.join("size-meta.json"), &meta)?;
-    for m in metrics {
-        println!("{}: {} {}", m.name, m.value, m.unit);
-    }
-    Ok(())
+    Ok(bloat)
 }
 fn bytes(n: i64) -> String {
     let sign = if n < 0 { "-" } else { "" };
@@ -247,6 +314,14 @@ fn validate_metrics(metrics: &[Metric]) -> Result<()> {
 struct Metadata {
     commit: String,
     rustc: String,
+    #[serde(default)]
+    diagnostics: Option<DiagnosticCoverage>,
+}
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum DiagnosticCoverage {
+    Complete,
+    Omitted,
 }
 #[derive(Debug)]
 pub(super) struct CompilerMismatch;
@@ -384,16 +459,18 @@ fn render(
             "|---|---:|---:|---:|".into(),
         ]);
         lines.extend(main_rows);
-        lines.extend([
-            "".into(),
-            "<details>".into(),
-            "<summary>.text per crate</summary>".into(),
-            "".into(),
-            "| Crate | main | PR | Δ |".into(),
-            "|---|---:|---:|---:|".into(),
-        ]);
-        lines.extend(crate_rows);
-        lines.extend(["".into(), "</details>".into()]);
+        if !crate_rows.is_empty() {
+            lines.extend([
+                "".into(),
+                "<details>".into(),
+                "<summary>.text per crate</summary>".into(),
+                "".into(),
+                "| Crate | main | PR | Δ |".into(),
+                "|---|---:|---:|---:|".into(),
+            ]);
+            lines.extend(crate_rows);
+            lines.extend(["".into(), "</details>".into()]);
+        }
     }
     let status = if failures.is_empty() {
         "PASS"
@@ -421,6 +498,10 @@ pub fn report(head_dir: &Path, base_dir: Option<&Path>, out: &Path) -> Result<()
     let base_meta = metadata(base_dir)?;
     let allow = std::env::var("ALLOW_SIZE_INCREASE").as_deref() == Ok("true");
     let (mut lines, failures, status) = render(&head, Some(&base), allow)?;
+    if meta.diagnostics == Some(DiagnosticCoverage::Omitted) {
+        lines.push(String::new());
+        lines.push("Heavy diagnostics were omitted from this gate-only measurement. The size gate uses the linked binary measurements above.".into());
+    }
     if let Ok(rows) = movers(head_dir, base_dir)
         && !rows.is_empty()
     {
@@ -479,7 +560,256 @@ mod tests {
                 .iter()
                 .all(|line| line.contains("cargo run --locked --quiet -p whatsapp-xtask --"))
         );
-        assert_eq!(workflow.matches("git diff --exit-code").count(), 2);
+        assert_eq!(workflow.matches("git diff --exit-code").count(), 3);
+    }
+    #[test]
+    fn gate_only_is_an_explicit_parser_opt_in() {
+        use clap::Parser;
+        for (flags, expected_gate, expected_skip) in [
+            (vec![], false, false),
+            (vec!["--gate-only"], true, false),
+            (vec!["--skip-build"], false, true),
+            (vec!["--gate-only", "--skip-build"], true, true),
+        ] {
+            let mut args = vec!["xt", "ci", "measure-binary-size"];
+            args.extend(flags);
+            let crate::Task::Ci {
+                task:
+                    crate::ci::Task::MeasureBinarySize {
+                        gate_only,
+                        skip_build,
+                        ..
+                    },
+            } = crate::Args::try_parse_from(args).unwrap().task
+            else {
+                panic!("wrong measurement command");
+            };
+            assert_eq!((gate_only, skip_build), (expected_gate, expected_skip));
+        }
+    }
+
+    #[test]
+    fn workflow_keeps_the_original_gate_authoritative_after_diagnostic_failures() {
+        let workflow = include_str!("../../../.github/workflows/binary-size.yml");
+        let (pr, push) = workflow.split_once("  binary-size-push:").unwrap();
+        let steps = pr.split("\n      - ").collect::<Vec<_>>();
+        let step = |name: &str| {
+            *steps
+                .iter()
+                .find(|s| s.starts_with(&format!("name: {name}\n")))
+                .unwrap()
+        };
+        let initial = step("Measure binary size");
+        assert!(initial.contains("--gate-only --out-dir size-out"));
+        assert!(!initial.contains("--skip-build"));
+        let probe = step("Check whether size diagnostics are needed");
+        assert!(probe.contains("continue-on-error: true"));
+        assert!(probe.contains("ci workflow size-gate"));
+        let diagnostic = step("Diagnose the measured binary");
+        assert!(diagnostic.contains("if: steps.budget.outcome == 'failure'"));
+        assert!(diagnostic.contains("--skip-build --out-dir size-diagnostics"));
+        assert!(!diagnostic.contains("--gate-only"));
+        assert!(!diagnostic.contains("--out-dir size-out"));
+        assert!(step("Generate report and evaluate gate").contains("id: report"));
+        let comment = step("Post sticky PR comment");
+        // A fresh FAIL report must replace an older PASS even if diagnostics or
+        // uploads fail. The status function avoids the implicit success() guard.
+        assert!(comment.contains("if: ${{ !cancelled() && steps.report.outcome == 'success' && github.event.pull_request.head.repo.full_name == github.repository }}"));
+        let enforce = step("Enforce size budget");
+        assert!(enforce.contains("if: ${{ always() && !cancelled() }}"));
+        assert!(enforce.contains("ci workflow size-gate"));
+        assert!(!enforce.contains("continue-on-error"));
+        assert!(!push.contains("--gate-only"));
+        assert!(!push.contains("--skip-build"));
+        assert!(push.contains("cargo-bloat@${{ env.CARGO_BLOAT_VERSION }}"));
+        assert!(push.contains("cargo-llvm-lines@${{ env.CARGO_LLVM_LINES_VERSION }}"));
+    }
+
+    #[cfg(target_os = "linux")]
+    mod measurement_contracts {
+        use super::*;
+
+        // Use real strip/size on one ELF binary. Only Cargo and provenance tools
+        // are substituted, so these tests need no full SDK release rebuild.
+        #[derive(Default)]
+        struct Tools {
+            calls: Vec<String>,
+            fail: Option<&'static str>,
+        }
+        impl MeasurementTools for Tools {
+            fn run(&mut self, command: &mut Command) -> Result<()> {
+                if command.get_program() == "cargo" {
+                    let args = command
+                        .get_args()
+                        .map(|a| a.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        args,
+                        ["build", "--release", "--example", "demo", "--locked"]
+                    );
+                    assert!(command.get_envs().any(|(key, value)| {
+                        key == "CARGO_PROFILE_RELEASE_STRIP"
+                            && value == Some(std::ffi::OsStr::new("false"))
+                    }));
+                    self.calls.push("build".into());
+                    ensure!(self.fail != Some("build"), "build failed");
+                    Ok(())
+                } else {
+                    run(command)
+                }
+            }
+            fn text(&mut self, root: &Path, program: &str, args: &[&str]) -> Result<String> {
+                match program {
+                    "cargo" => {
+                        let call = if args[0] == "llvm-lines" {
+                            format!("llvm-lines:{}", args[2])
+                        } else {
+                            args[0].to_owned()
+                        };
+                        self.calls.push(call.clone());
+                        ensure!(self.fail != Some(call.as_str()), "{call} failed");
+                        if args[0] == "bloat" {
+                            Ok(r#"{"crates":[{"name":"wacore","size":1234}]}"#.into())
+                        } else {
+                            Ok(" 123 4 (TOTAL)\n".into())
+                        }
+                    }
+                    "git" => Ok("47e1b5b41b63c23b59372828901ea945c8149565\n".into()),
+                    "rustc" => Ok("rustc 1.98.0-nightly\n".into()),
+                    _ => text(root, program, args),
+                }
+            }
+        }
+        fn fixture() -> (tempfile::TempDir, PathBuf) {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("Cargo.lock"), "name = \"fixture\"\n").unwrap();
+            let binary = root.path().join("demo");
+            std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+            (root, binary)
+        }
+        #[test]
+        fn gate_only_preserves_real_binary_metrics_and_removes_stale_diagnostics() {
+            let (root, binary) = fixture();
+            let before = xtask_support::sha256(&std::fs::read(&binary).unwrap());
+            let out = root.path().join("out");
+            let mut full_tools = Tools::default();
+            measure_with(root.path(), &out, &binary, false, false, &mut full_tools).unwrap();
+            let full = metrics(&out).unwrap();
+            assert_eq!(
+                full_tools.calls,
+                [
+                    "build",
+                    "bloat",
+                    "llvm-lines:wacore",
+                    "llvm-lines:whatsapp-rust"
+                ]
+            );
+            assert!(out.join("size-attribution.json").exists());
+            assert_eq!(
+                read_json(&out.join("size-meta.json")).unwrap()["diagnostics"],
+                "complete"
+            );
+            write(&out.join("gate.txt"), b"PASS\n").unwrap();
+            let mut gate_tools = Tools {
+                fail: Some("bloat"),
+                ..Tools::default()
+            };
+            measure_with(root.path(), &out, &binary, false, true, &mut gate_tools).unwrap();
+            let cheap = metrics(&out).unwrap();
+            assert_eq!(cheap.len(), 4);
+            assert_eq!(
+                cheap,
+                full.into_iter()
+                    .filter(|m| m.name.starts_with("bin ") || m.name == "deps crates (Cargo.lock)")
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(gate_tools.calls, ["build"]);
+            assert!(!out.join("size-attribution.json").exists());
+            assert!(!out.join("gate.txt").exists());
+            assert_eq!(
+                read_json(&out.join("size-meta.json")).unwrap()["diagnostics"],
+                "omitted"
+            );
+            assert_eq!(
+                before,
+                xtask_support::sha256(&std::fs::read(&binary).unwrap())
+            );
+            report(&out, Some(&out), &out).unwrap();
+            let report = std::fs::read_to_string(out.join("report.md")).unwrap();
+            assert!(report.contains("Heavy diagnostics were omitted"));
+            assert!(report.contains("bin size (stripped)"));
+            assert!(!report.contains(".text per crate"));
+        }
+        #[test]
+        fn full_measurement_preserves_build_and_heavy_tool_failures() {
+            let (root, binary) = fixture();
+            let out = root.path().join("out");
+            for fail in [
+                "build",
+                "bloat",
+                "llvm-lines:wacore",
+                "llvm-lines:whatsapp-rust",
+            ] {
+                write(&out.join("gate.txt"), b"PASS\n").unwrap();
+                write(&out.join("size-meta.json"), b"stale").unwrap();
+                let mut tools = Tools {
+                    fail: Some(fail),
+                    ..Tools::default()
+                };
+                assert!(
+                    measure_with(root.path(), &out, &binary, false, false, &mut tools).is_err()
+                );
+                assert!(!out.join("gate.txt").exists());
+                assert!(!out.join("size-meta.json").exists());
+            }
+        }
+        #[test]
+        fn separate_diagnostics_cannot_replace_a_failed_canonical_gate() {
+            let (root, binary) = fixture();
+            let out = root.path().join("size-out");
+            measure_with(
+                root.path(),
+                &out,
+                &binary,
+                false,
+                true,
+                &mut Tools::default(),
+            )
+            .unwrap();
+            write(
+                &out.join("gate.txt"),
+                b"FAIL\nOriginal size budget exceeded\n",
+            )
+            .unwrap();
+            let names = ["size-meta.json", "size-metrics.json", "gate.txt"];
+            let before = names.map(|n| std::fs::read(out.join(n)).unwrap());
+            for fail in [None, Some("bloat"), Some("llvm-lines:whatsapp-rust")] {
+                let mut tools = Tools {
+                    fail,
+                    ..Tools::default()
+                };
+                let result = measure_with(
+                    root.path(),
+                    &root.path().join("size-diagnostics"),
+                    &binary,
+                    true,
+                    false,
+                    &mut tools,
+                );
+                assert_eq!(result.is_err(), fail.is_some());
+                assert!(!tools.calls.iter().any(|c| c == "build"));
+                assert_eq!(names.map(|n| std::fs::read(out.join(n)).unwrap()), before);
+                assert!(
+                    crate::workflow::run_task(
+                        root.path(),
+                        crate::workflow::Task::SizeGate {
+                            file: out.join("gate.txt")
+                        }
+                    )
+                    .is_err()
+                );
+            }
+        }
     }
     #[test]
     fn gate_requires_complete_baseline_even_with_override() {
@@ -501,6 +831,7 @@ mod tests {
         let mut duplicate = head.clone();
         duplicate.push(head[0].clone());
         assert!(render(&head, Some(&duplicate), true).is_err());
+        assert!(render(&duplicate, Some(&head), true).is_err());
     }
     #[test]
     fn missing_baseline_cannot_leave_a_previous_passing_gate() {
@@ -559,6 +890,21 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(out.join("gate.txt")).unwrap(),
             "PASS\n"
+        );
+        assert!(
+            validate_baseline(
+                &head,
+                &base,
+                Some("0000000000000000000000000000000000000000")
+            )
+            .is_err()
+        );
+        write_json(&base.join("size-metrics.json"), &json!([])).unwrap();
+        assert!(report(&head, Some(&base), &out).is_err());
+        assert!(
+            std::fs::read_to_string(out.join("gate.txt"))
+                .unwrap()
+                .starts_with("FAIL\n")
         );
     }
     #[test]

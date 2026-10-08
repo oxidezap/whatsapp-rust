@@ -717,6 +717,33 @@ impl AppSyncStore for InMemoryBackend {
         Ok(())
     }
 
+    async fn commit_patch(
+        &self,
+        name: &str,
+        state: HashState,
+        removed_index_macs: &[Vec<u8>],
+        added: &[AppStateMutationMAC],
+    ) -> Result<()> {
+        let mut s = self.state.lock().await;
+        s.versions.insert(name.to_string(), state);
+        for index_mac in removed_index_macs {
+            s.mutation_macs.remove(&MutationMacKeyRef {
+                collection: name,
+                index_mac,
+            });
+        }
+        for m in added {
+            s.mutation_macs.insert(
+                MutationMacKey {
+                    collection: name.into(),
+                    index_mac: m.index_mac.as_slice().into(),
+                },
+                m.value_mac.as_slice().into(),
+            );
+        }
+        Ok(())
+    }
+
     async fn clear_mutation_macs(&self, name: &str) -> Result<()> {
         self.state
             .lock()

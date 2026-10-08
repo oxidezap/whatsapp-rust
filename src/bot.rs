@@ -9,7 +9,7 @@ use crate::store::error::StoreError;
 use crate::store::persistence_manager::PersistenceManager;
 use crate::store::traits::Backend;
 use crate::types::connect_admission::ConnectAdmission;
-use crate::types::durability_hook::InboundDurabilityHook;
+use crate::types::durability_hook::{HistorySyncCaptureHook, InboundDurabilityHook};
 use crate::types::enc_handler::EncHandler;
 use crate::types::events::{Event, EventHandler, EventInterest, EventKind, Subscription};
 use crate::types::history_sync_admission::HistorySyncAdmission;
@@ -1276,6 +1276,25 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
+    /// Await history capture before its receipt, independently of message durability.
+    /// See [`HistorySyncCaptureHook`] for input, cancellation and replay limits.
+    pub fn with_history_sync_capture_hook<Hc>(mut self, hook: Hc) -> Self
+    where
+        Hc: HistorySyncCaptureHook + 'static,
+    {
+        self.client_builder = self.client_builder.with_history_sync_capture_hook(hook);
+        self
+    }
+
+    /// Register an already-shared history capture hook.
+    pub fn with_history_sync_capture_hook_arc(
+        mut self,
+        hook: Arc<dyn HistorySyncCaptureHook>,
+    ) -> Self {
+        self.client_builder = self.client_builder.with_history_sync_capture_hook_arc(hook);
+        self
+    }
+
     /// Register a synchronous policy that can reject inbound history-sync
     /// notifications before they create history-sync work.
     pub fn with_history_sync_admission<A>(mut self, admission: A) -> Self
@@ -1608,10 +1627,7 @@ mod tests {
     impl HttpClient for MockHttpClient {
         async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse> {
             // Return a mock response for version fetching
-            Ok(HttpResponse {
-                status_code: 200,
-                body: br#"self.__swData=JSON.parse(/*BTDS*/"{\"dynamic_data\":{\"SiteData\":{\"server_revision\":1026131876,\"client_revision\":1026131876}}}");"#.to_vec(),
-            })
+            Ok(HttpResponse::new(200, br#"self.__swData=JSON.parse(/*BTDS*/"{\"dynamic_data\":{\"SiteData\":{\"server_revision\":1026131876,\"client_revision\":1026131876}}}");"#.to_vec()))
         }
     }
 
@@ -2302,6 +2318,38 @@ mod tests {
             .expect("Failed to build bot");
 
         assert!(!bot.client().skip_history_sync_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_bot_builder_history_capture_is_independent_and_preserves_arc() {
+        struct Capture;
+        #[async_trait::async_trait]
+        impl HistorySyncCaptureHook for Capture {
+            async fn on_history_sync(
+                &self,
+                _: Arc<Client>,
+                _: &str,
+                _: Option<wa::message::HistorySyncType>,
+                _: &[u8],
+            ) -> Result<()> {
+                Ok(())
+            }
+        }
+        let hook: Arc<dyn HistorySyncCaptureHook> = Arc::new(Capture);
+        let bot = Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_runtime(TokioRuntime)
+            .with_history_sync_capture_hook(Capture)
+            .with_history_sync_capture_hook_arc(hook.clone())
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+        assert!(client.inbound_durability_hook.get().is_none());
+        assert!(Arc::ptr_eq(
+            client.history_sync_capture_hook.get().unwrap(),
+            &hook
+        ));
     }
 
     #[tokio::test]

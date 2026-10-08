@@ -6,7 +6,6 @@
 // `#[cfg(test)]`, so clippy's allow-print-in-tests does not reach it.
 #![allow(clippy::print_stderr)]
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use wacore::net::{HttpClient, HttpRequest};
@@ -53,12 +52,7 @@ fn spawn_qr_autoresponder_http(
         let http = UreqHttpClient::new();
         while let Ok(event) = event_rx.recv().await {
             if let Event::PairingQrCode(qr) = &*event {
-                let req = HttpRequest {
-                    url: url.clone(),
-                    method: "POST".into(),
-                    headers: HashMap::new(),
-                    body: Some(qr.code.as_bytes().to_vec().into()),
-                };
+                let req = HttpRequest::post(url.clone()).with_body(qr.code.as_bytes().to_vec());
                 match http.execute(req).await {
                     Ok(resp) if (200..300).contains(&resp.status_code) => return,
                     Ok(resp) => {

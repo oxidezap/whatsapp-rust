@@ -31,6 +31,7 @@ mod tests {
 
     #[derive(Default, Clone)]
     struct MockBackend {
+        token_store: Arc<wacore::store::InMemoryBackend>,
         versions: Arc<Mutex<HashMap<String, HashState>>>,
         macs: MockMacMap,
         keys: Arc<Mutex<HashMap<Vec<u8>, AppStateSyncKey>>>,
@@ -186,6 +187,28 @@ mod tests {
         async fn delete_mutation_macs(&self, _: &str, _: &[Vec<u8>]) -> StoreResult<()> {
             Ok(())
         }
+        async fn commit_patch(
+            &self,
+            name: &str,
+            state: HashState,
+            removed_index_macs: &[Vec<u8>],
+            added: &[AppStateMutationMAC],
+        ) -> StoreResult<()> {
+            // Acquire both locks before any mutation; cancellation while acquiring
+            // the second one still leaves the previous cursor and MACs intact.
+            let mut versions = self.versions.lock().await;
+            let mut macs = self.macs.lock().await;
+            versions.insert(name.to_string(), state);
+            for index in removed_index_macs {
+                macs.remove(&(name.to_string(), index.clone()));
+            }
+            for m in added {
+                macs.insert((name.to_string(), m.index_mac.clone()), m.value_mac.clone());
+            }
+            self.set_version_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
         async fn clear_mutation_macs(&self, name: &str) -> StoreResult<()> {
             if *self.fail_clear_macs.lock().await {
                 return Err(wacore::store::error::StoreError::Io(std::io::Error::other(
@@ -251,25 +274,50 @@ mod tests {
         }
         async fn get_tc_token(
             &self,
-            _: &str,
+            jid: &str,
         ) -> StoreResult<Option<wacore::store::traits::TcTokenEntry>> {
-            Ok(None)
+            self.token_store.get_tc_token(jid).await
         }
         async fn put_tc_token(
             &self,
-            _: &str,
-            _: &wacore::store::traits::TcTokenEntry,
+            jid: &str,
+            entry: &wacore::store::traits::TcTokenEntry,
         ) -> StoreResult<()> {
-            Ok(())
+            self.token_store.put_tc_token(jid, entry).await
         }
-        async fn delete_tc_token(&self, _: &str) -> StoreResult<()> {
-            Ok(())
+        async fn touch_tc_token_sender_timestamp(
+            &self,
+            jid: &str,
+            sender_timestamp: i64,
+        ) -> StoreResult<()> {
+            self.token_store
+                .touch_tc_token_sender_timestamp(jid, sender_timestamp)
+                .await
+        }
+        async fn store_received_tc_token(
+            &self,
+            jid: &str,
+            token: &[u8],
+            token_timestamp: i64,
+        ) -> StoreResult<()> {
+            self.token_store
+                .store_received_tc_token(jid, token, token_timestamp)
+                .await
+        }
+        async fn delete_tc_token(&self, jid: &str) -> StoreResult<()> {
+            self.token_store.delete_tc_token(jid).await
         }
         async fn get_all_tc_token_jids(&self) -> StoreResult<Vec<String>> {
-            Ok(vec![])
+            self.token_store.get_all_tc_token_jids().await
         }
-        async fn delete_expired_tc_tokens(&self, _: i64, _: i64) -> StoreResult<u32> {
-            Ok(0)
+        async fn delete_expired_tc_tokens(
+            &self,
+            token_cutoff: i64,
+            sender_cutoff: i64,
+        ) -> StoreResult<u32> {
+            self.token_store
+                .delete_expired_tc_tokens(token_cutoff, sender_cutoff)
+                .await
         }
         async fn store_sent_message(&self, _: &str, _: &str, _: &[u8]) -> StoreResult<()> {
             Ok(())

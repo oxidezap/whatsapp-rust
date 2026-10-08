@@ -25,10 +25,14 @@ use waproto::whatsapp as wa;
 /// stanza ids are only unique within a `(chat, sender)`, so two chats can
 /// reuse the same id.
 ///
-/// Durable replay across process crashes requires a backend that implements the
-/// `ProtocolStore` pending-inbound methods (the bundled `SqliteStore` does).
-/// With a backend that does not, the hook still runs and still gates the ack for
-/// the live attempt, but a crash mid-commit cannot be replayed.
+/// The builder checks the backend's individual `ProtocolStore` pending-inbound
+/// store/read/delete operations and rejects unsupported backends with
+/// [`ClientBuilderError::UnsupportedDurabilityBackend`](crate::ClientBuilderError::UnsupportedDurabilityBackend).
+/// Custom batched overrides must preserve those operations' semantics; the
+/// construction probe does not certify an arbitrary batch implementation.
+///
+/// History capture is configured independently through [`HistorySyncCaptureHook`].
+/// Registering this hook alone does not change history receipt ordering.
 ///
 /// The hook is awaited inside the receive pipeline, so a slow hook backpressures
 /// inbound processing (the same trade-off as whatsmeow's synchronous ack). Do
@@ -66,7 +70,27 @@ pub trait InboundDurabilityHook: wacore::sync_marker::MaybeSendSync {
     /// carries the exact same items: what this method committed is what event
     /// consumers observe.
     async fn on_messages(&self, client: Arc<Client>, batch: &[InboundMessage]) -> Result<()>;
+}
 
+/// Optional capture of history-sync bytes before attempting their receipt.
+///
+/// Register with [`crate::ClientBuilder::with_history_sync_capture_hook`] or
+/// [`crate::bot::BotBuilder::with_history_sync_capture_hook`]. This hook does not
+/// enable message durability or require pending-inbound storage. Consumers
+/// migrating from `InboundDurabilityHook::on_history_sync` must implement this
+/// trait and register it separately, even when one object implements both hooks.
+///
+/// ```
+/// use std::sync::Arc;
+/// use whatsapp_rust::{ClientBuilder, HistorySyncCaptureHook};
+///
+/// fn capture_history(builder: ClientBuilder, capture: Arc<dyn HistorySyncCaptureHook>) -> ClientBuilder {
+///     builder.with_history_sync_capture_hook_arc(capture)
+/// }
+/// ```
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+pub trait HistorySyncCaptureHook: wacore::sync_marker::MaybeSendSync {
     /// Durably capture one history-sync chunk before its `hist_sync` receipt
     /// is sent. `compressed` is the chunk exactly as the phone uploaded it
     /// (zlib-compressed `HistorySync`), whether it arrived inline or as a
@@ -91,16 +115,13 @@ pub trait InboundDurabilityHook: wacore::sync_marker::MaybeSendSync {
     ///
     /// Chunks the SDK does not process (history sync skipped, or rejected by the
     /// admission policy) are acknowledged without calling the hook. Without a
-    /// hook the receipt is attempted before download. The default implementation
-    /// stores nothing, but still delays the receipt until after download.
+    /// capture hook the receipt is attempted before download, including when only
+    /// an [`InboundDurabilityHook`] is registered. There is no default capture.
     async fn on_history_sync(
         &self,
         client: Arc<Client>,
         message_id: &str,
         sync_type: Option<wa::message::HistorySyncType>,
         compressed: &[u8],
-    ) -> Result<()> {
-        let _ = (client, message_id, sync_type, compressed);
-        Ok(())
-    }
+    ) -> Result<()>;
 }

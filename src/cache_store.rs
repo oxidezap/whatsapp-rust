@@ -1,7 +1,7 @@
 //! Typed cache wrapper that dispatches to either the in-process
-//! [`Cache`] or a custom [`CacheStore`] backend (e.g., Redis).
+//! cache or a custom [`CacheStore`] backend (e.g., Redis).
 //!
-//! [`TypedCache`] presents the same interface regardless of the backing store.
+//! The internal typed wrapper presents the same interface regardless of the backing store.
 //! Keys are serialised via [`Display`]; values are serialised with `serde_json`
 //! only on the custom-store path — the in-process path has zero extra overhead.
 
@@ -35,7 +35,7 @@ enum Inner<K, V> {
 /// The in-process path has **zero extra overhead** — values are stored in
 /// memory without any serialisation.  The custom-store path serialises values
 /// with `serde_json` and keys via [`Display`].
-pub struct TypedCache<K, V> {
+pub(crate) struct TypedCache<K, V> {
     inner: Inner<K, V>,
 }
 
@@ -158,40 +158,6 @@ where
         }
     }
 
-    /// Remove all entries.
-    ///
-    /// For the in-process backend this is synchronous.
-    /// For the custom backend this spawns a fire-and-forget task via
-    /// [`tokio::runtime::Handle::try_current`] (requires `tokio-runtime`
-    /// feature) to avoid panicking if called outside a Tokio runtime.
-    /// Without `tokio-runtime`, the clear is skipped with a warning.
-    pub fn invalidate_all(&self) {
-        match &self.inner {
-            Inner::Local(cache) => cache.invalidate_all(),
-            Inner::Custom {
-                store, namespace, ..
-            } => {
-                let _store = store.clone();
-                let _ns = *namespace;
-                #[cfg(all(not(target_arch = "wasm32"), feature = "tokio-runtime"))]
-                match tokio::runtime::Handle::try_current() {
-                    Ok(handle) => {
-                        handle.spawn(async move {
-                            if let Err(e) = _store.clear(_ns).await {
-                                log::warn!("TypedCache[{_ns}]: clear() error: {e}");
-                            }
-                        });
-                    }
-                    Err(_) => {
-                        log::warn!("TypedCache[{_ns}]: clear() skipped: no runtime");
-                    }
-                }
-                #[cfg(all(not(target_arch = "wasm32"), not(feature = "tokio-runtime")))]
-                log::warn!("TypedCache[{_ns}]: clear() skipped: tokio-runtime feature not enabled");
-            }
-        }
-    }
-
     /// Remove all entries, awaiting completion for custom backends.
     pub async fn clear(&self) {
         match &self.inner {
@@ -214,16 +180,6 @@ where
     pub async fn run_pending_tasks(&self) {
         if let Inner::Local(cache) = &self.inner {
             cache.run_pending_tasks().await;
-        }
-    }
-
-    /// Iterate the in-process backend's entries. `None` for custom stores,
-    /// whose entries live outside this process (memory reports treat them as
-    /// zero retained bytes for the same reason).
-    pub fn iter_local(&self) -> Option<std::vec::IntoIter<(Arc<K>, V)>> {
-        match &self.inner {
-            Inner::Local(cache) => Some(cache.iter()),
-            Inner::Custom { .. } => None,
         }
     }
 
@@ -253,25 +209,10 @@ where
     }
 
     /// Approximate entry count (sync). Returns `0` for custom backends.
-    ///
-    /// For diagnostics that need custom backend counts, use
-    /// [`entry_count_async`](Self::entry_count_async) instead.
     pub fn entry_count(&self) -> u64 {
         match &self.inner {
             Inner::Local(cache) => cache.entry_count(),
             Inner::Custom { .. } => 0,
-        }
-    }
-
-    /// Approximate entry count, delegating to the custom backend if available.
-    /// The in-process count is awaited, so unlike
-    /// [`entry_count`](Self::entry_count) it never reads `0` under write load.
-    pub async fn entry_count_async(&self) -> u64 {
-        match &self.inner {
-            Inner::Local(cache) => cache.entry_count_async().await,
-            Inner::Custom {
-                store, namespace, ..
-            } => store.entry_count(namespace).await.unwrap_or(0),
         }
     }
 }
