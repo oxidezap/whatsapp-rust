@@ -42,10 +42,195 @@ impl VisitMut for Extensible {
     }
 }
 
+struct ColdStorage {
+    depth: usize,
+}
+impl VisitMut for ColdStorage {
+    fn visit_item_mod_mut(&mut self, item: &mut syn::ItemMod) {
+        self.depth += 1;
+        visit_mut::visit_item_mod_mut(self, item);
+        self.depth -= 1;
+    }
+    fn visit_field_mut(&mut self, field: &mut syn::Field) {
+        if field
+            .ident
+            .as_ref()
+            .is_some_and(|name| name == "__buffa_unknown_fields")
+        {
+            let prefix = "super::".repeat(self.depth);
+            field.ty = syn::parse_str(&format!("{prefix}__unknown_storage::Storage"))
+                .expect("internal storage path");
+        }
+        visit_mut::visit_field_mut(self, field);
+    }
+    fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
+        visit_mut::visit_expr_mut(self, expr);
+        let syn::Expr::MethodCall(call) = expr else {
+            return;
+        };
+        if call.method != "push" || call.args.len() != 1 {
+            return;
+        }
+        let syn::Expr::Field(field) = &*call.receiver else {
+            return;
+        };
+        if !matches!(&field.member, syn::Member::Named(name) if name == "__buffa_unknown_fields") {
+            return;
+        }
+        let syn::Expr::Try(attempt) = &call.args[0] else {
+            return;
+        };
+        let syn::Expr::Call(decode) = &*attempt.expr else {
+            return;
+        };
+        let syn::Expr::Path(path) = &*decode.func else {
+            return;
+        };
+        if !path
+            .path
+            .segments
+            .last()
+            .is_some_and(|p| p.ident == "decode_unknown_field")
+        {
+            return;
+        }
+        let receiver = &call.receiver;
+        let args = &decode.args;
+        *expr = syn::parse_quote!(#receiver.merge_unknown(#args)?);
+    }
+}
+
 fn protect(attrs: &mut Vec<syn::Attribute>) {
     if !attrs.iter().any(|a| a.path().is_ident("non_exhaustive")) {
         attrs.push(syn::parse_quote!(#[non_exhaustive]));
     }
+}
+
+// Nested messages otherwise repeat sizeable codecs in their parents. Keep
+// the small-message case available for inlining and share larger codecs.
+fn share_large_codecs(items: &mut [syn::Item]) {
+    let large: BTreeSet<_> = items
+        .iter()
+        .filter_map(|item| {
+            let syn::Item::Struct(item) = item else {
+                return None;
+            };
+            (item
+                .fields
+                .iter()
+                .filter(|field| {
+                    field
+                        .ident
+                        .as_ref()
+                        .is_none_or(|id| id != "__buffa_unknown_fields")
+                })
+                .count()
+                >= 8)
+                .then(|| item.ident.clone())
+        })
+        .collect();
+    for item in items {
+        match item {
+            syn::Item::Mod(module) => {
+                if let Some((_, items)) = &mut module.content {
+                    share_large_codecs(items);
+                }
+            }
+            syn::Item::Impl(item) => {
+                let Some((_, trait_path, _)) = &item.trait_ else {
+                    continue;
+                };
+                if !trait_path
+                    .segments
+                    .last()
+                    .is_some_and(|s| s.ident == "Message")
+                {
+                    continue;
+                }
+                let syn::Type::Path(ty) = &*item.self_ty else {
+                    continue;
+                };
+                if !ty.path.get_ident().is_some_and(|id| large.contains(id)) {
+                    continue;
+                }
+                for member in &mut item.items {
+                    if let syn::ImplItem::Fn(method) = member
+                        && (method.sig.ident == "compute_size"
+                            || method.sig.ident == "write_to"
+                            || method.sig.ident == "merge_field")
+                    {
+                        method.attrs.retain(|attr| !attr.path().is_ident("inline"));
+                        method.attrs.push(syn::parse_quote!(#[inline(never)]));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn share_message_clones(items: &mut Vec<syn::Item>, scope: &str) {
+    let mut clones = Vec::new();
+    for item in items.iter_mut() {
+        if let syn::Item::Mod(module) = item
+            && let Some((_, children)) = &mut module.content
+        {
+            share_message_clones(children, &format!("{scope}::{}", module.ident));
+        }
+        let syn::Item::Struct(message) = item else {
+            continue;
+        };
+        let name = message.ident.to_string();
+        let selected = match scope {
+            "" => [
+                "Message",
+                "ContextInfo",
+                "BotMetadata",
+                "MessageContextInfo",
+            ]
+            .contains(&name.as_str()),
+            "::message" => [
+                "ImageMessage",
+                "VideoMessage",
+                "InteractiveMessage",
+                "HighlyStructuredMessage",
+            ]
+            .contains(&name.as_str()),
+            _ => false,
+        };
+        if !selected {
+            continue;
+        }
+        for attribute in &mut message.attrs {
+            if attribute.path().is_ident("derive") {
+                let traits = attribute
+                    .parse_args_with(
+                        syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+                    )
+                    .expect("derive list");
+                let traits: Vec<_> = traits
+                    .into_iter()
+                    .filter(|p| !p.is_ident("Clone"))
+                    .collect();
+                *attribute = syn::parse_quote!(#[derive(#(#traits),*)]);
+            }
+        }
+        let name = &message.ident;
+        let fields: Vec<_> = message
+            .fields
+            .iter()
+            .map(|field| field.ident.as_ref().expect("named protobuf field"))
+            .collect();
+        clones.push(syn::parse_quote! {
+            impl ::core::clone::Clone for #name {
+                #[inline(never)]
+                fn clone(&self) -> Self {
+                    Self { #(#fields: ::core::clone::Clone::clone(&self.#fields)),* }
+                }
+            }
+        });
+    }
+    items.extend(clones);
 }
 
 pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
@@ -61,6 +246,18 @@ pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
         let source = std::fs::read_to_string(&path)?;
         let mut file = syn::parse_file(&source).map_err(io::Error::other)?;
         Extensible { serde }.visit_file_mut(&mut file);
+        if serde {
+            share_large_codecs(&mut file.items);
+            ColdStorage { depth: 0 }.visit_file_mut(&mut file);
+            let body = syn::parse_file(include_str!("unknown_storage.rs")).expect("storage syntax");
+            let body = body.items;
+            file.items
+                .push(syn::parse_quote!(#[doc(hidden)] pub mod __unknown_storage { #(#body)* }));
+        }
+
+        if serde {
+            share_message_clones(&mut file.items, "");
+        }
         let implementation = match suffix {
             ".__oneof" => "::__buffa::oneof",
             ".__view" => "::__buffa::view",

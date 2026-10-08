@@ -595,6 +595,8 @@ impl SenderKeyState {
         self.signing_key_memo.get().is_some()
     }
 
+    #[cold]
+    #[inline(never)]
     fn preserved_protobuf(&self) -> Option<SenderKeyStateStructure> {
         let mut state = (**self.future.as_ref()?).clone();
         state.sender_key_id = self.sender_key_id;
@@ -691,7 +693,9 @@ impl SenderKeyState {
 
     #[allow(clippy::disallowed_methods)]
     fn encoded_len(&self) -> usize {
-        if let Some(state) = self.preserved_protobuf() {
+        if self.future.is_some()
+            && let Some(state) = self.preserved_protobuf()
+        {
             return state.encoded_len() as usize;
         }
         use record_encoding::{bytes_len, nested_len, seed_record_len, uint32_len};
@@ -716,7 +720,9 @@ impl SenderKeyState {
 
     #[allow(clippy::disallowed_methods)]
     fn encode_into(&self, out: &mut Vec<u8>) {
-        if let Some(state) = self.preserved_protobuf() {
+        if self.future.is_some()
+            && let Some(state) = self.preserved_protobuf()
+        {
             state.encode(out);
             return;
         }
@@ -1185,7 +1191,7 @@ impl SenderKeyRecord {
         {
             let mut proto = SenderKeyRecordStructure::default();
             proto.sender_key_states = states;
-            proto.__buffa_unknown_fields = self.future.clone();
+            proto.__buffa_unknown_fields = self.future.clone().into();
             proto
         }
     }
@@ -1223,16 +1229,19 @@ impl SenderKeyRecord {
         // Retain lengths on the stack so sizing never rescans a backlog during
         // the write pass or adds a heap allocation per flush.
         let mut state_lengths = [0; consts::MAX_SENDER_KEY_STATES];
-        // Retain rare future-field reconstructions for both sizing and writing.
-        // Ordinary states keep their allocation-free compact encoding path.
-        let preserved: [Option<SenderKeyStateStructure>; consts::MAX_SENDER_KEY_STATES] =
-            std::array::from_fn(|index| {
-                self.states.get(index).and_then(|s| s.preserved_protobuf())
-            });
+        // A protobuf state is large even when absent. Keep its temporary slots
+        // off the ordinary flush path; only future-bearing records reconstruct
+        // them, once for both sizing and writing.
+        let preserved = if self.states.iter().any(|state| state.future.is_some()) {
+            self.preserved_states()
+        } else {
+            Vec::new()
+        };
         let mut states_len = 0;
         for (index, state) in self.states.iter().enumerate() {
-            let len = preserved[index]
-                .as_ref()
+            let len = preserved
+                .get(index)
+                .and_then(Option::as_ref)
                 .map_or_else(|| state.encoded_len(), |pb| pb.encoded_len() as usize);
             state_lengths[index] = len;
             states_len += record_encoding::nested_len(len);
@@ -1242,7 +1251,7 @@ impl SenderKeyRecord {
         );
         for (index, state) in self.states.iter().enumerate() {
             record_encoding::write_nested(1, state_lengths[index], &mut buf);
-            if let Some(pb) = &preserved[index] {
+            if let Some(pb) = preserved.get(index).and_then(Option::as_ref) {
                 // No codec wrapper exists for this nested storage message.
                 #[allow(clippy::disallowed_methods)]
                 pb.encode(&mut buf);
@@ -1262,6 +1271,15 @@ impl SenderKeyRecord {
         }
         self.future.write_to(&mut buf);
         Ok(buf)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn preserved_states(&self) -> Vec<Option<SenderKeyStateStructure>> {
+        self.states
+            .iter()
+            .map(|state| state.preserved_protobuf())
+            .collect()
     }
 
     /// Retained in-memory bytes of every state this record holds.
