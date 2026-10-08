@@ -3668,7 +3668,7 @@ attribute whatsapp::MerkleMembershipProofOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::MerkleMembershipProofView # [derive (Clone , Debug , Default)]
 attribute whatsapp::Message # [cfg_attr (feature = "serde-deserialize" , derive (serde :: Deserialize))]
 attribute whatsapp::Message # [cfg_attr (feature = "serde-deserialize" , serde (default))]
-attribute whatsapp::Message # [derive (PartialEq , Default)]
+attribute whatsapp::Message # [derive (PartialEq)]
 attribute whatsapp::Message # [derive (serde :: Serialize)]
 attribute whatsapp::MessageAddOn # [cfg_attr (feature = "serde-deserialize" , derive (serde :: Deserialize))]
 attribute whatsapp::MessageAddOn # [cfg_attr (feature = "serde-deserialize" , serde (default))]
@@ -23668,6 +23668,7 @@ impl whatsapp:: :: core :: default :: Default for KeepType
 impl whatsapp:: :: core :: default :: Default for MENTION_MENTION_TYPE 
 impl whatsapp:: :: core :: default :: Default for MediaKeyDomain 
 impl whatsapp:: :: core :: default :: Default for MediaVisibility 
+impl whatsapp:: :: core :: default :: Default for Message 
 impl whatsapp:: :: core :: default :: Default for MutationProps 
 impl whatsapp:: :: core :: default :: Default for PrivacySystemMessage 
 impl whatsapp:: :: core :: default :: Default for SessionTransparencyType 

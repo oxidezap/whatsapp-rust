@@ -169,13 +169,13 @@ fn share_large_codecs(items: &mut [syn::Item]) {
     }
 }
 
-fn share_message_clones(items: &mut Vec<syn::Item>, scope: &str) {
-    let mut clones = Vec::new();
+fn share_message_impls(items: &mut Vec<syn::Item>, scope: &str) {
+    let mut implementations = Vec::new();
     for item in items.iter_mut() {
         if let syn::Item::Mod(module) = item
             && let Some((_, children)) = &mut module.content
         {
-            share_message_clones(children, &format!("{scope}::{}", module.ident));
+            share_message_impls(children, &format!("{scope}::{}", module.ident));
         }
         let syn::Item::Struct(message) = item else {
             continue;
@@ -201,6 +201,8 @@ fn share_message_clones(items: &mut Vec<syn::Item>, scope: &str) {
         if !selected {
             continue;
         }
+        let share_default = scope.is_empty() && name == "Message";
+        let mut derived_default = false;
         for attribute in &mut message.attrs {
             if attribute.path().is_ident("derive") {
                 let traits = attribute
@@ -210,7 +212,14 @@ fn share_message_clones(items: &mut Vec<syn::Item>, scope: &str) {
                     .expect("derive list");
                 let traits: Vec<_> = traits
                     .into_iter()
-                    .filter(|p| !p.is_ident("Clone"))
+                    .filter(|p| {
+                        if share_default && p.is_ident("Default") {
+                            derived_default = true;
+                            false
+                        } else {
+                            !p.is_ident("Clone")
+                        }
+                    })
                     .collect();
                 *attribute = syn::parse_quote!(#[derive(#(#traits),*)]);
             }
@@ -221,7 +230,7 @@ fn share_message_clones(items: &mut Vec<syn::Item>, scope: &str) {
             .iter()
             .map(|field| field.ident.as_ref().expect("named protobuf field"))
             .collect();
-        clones.push(syn::parse_quote! {
+        implementations.push(syn::parse_quote! {
             impl ::core::clone::Clone for #name {
                 #[inline(never)]
                 fn clone(&self) -> Self {
@@ -229,8 +238,20 @@ fn share_message_clones(items: &mut Vec<syn::Item>, scope: &str) {
                 }
             }
         });
+        // Keep generator-provided protobuf defaults intact. Only a derived
+        // Default is equivalent to applying Rust Default to every field.
+        if derived_default {
+            implementations.push(syn::parse_quote! {
+                impl ::core::default::Default for #name {
+                    #[inline(never)]
+                    fn default() -> Self {
+                        Self { #(#fields: ::core::default::Default::default()),* }
+                    }
+                }
+            });
+        }
     }
-    items.extend(clones);
+    items.extend(implementations);
 }
 
 pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
@@ -256,7 +277,7 @@ pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
         }
 
         if serde {
-            share_message_clones(&mut file.items, "");
+            share_message_impls(&mut file.items, "");
         }
         let implementation = match suffix {
             ".__oneof" => "::__buffa::oneof",
