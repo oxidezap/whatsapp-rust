@@ -53,11 +53,21 @@ impl Client {
     }
 }
 
+#[cfg(test)]
+pub(crate) async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
+    let shutdown = client.connection_shutdown_signal();
+    handle_iq_scoped(client, node, &shutdown).await
+}
+
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(name = "wa.pair.handle_iq", level = "debug", skip_all)
 )]
-pub(crate) async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
+pub(crate) async fn handle_iq_scoped(
+    client: &Arc<Client>,
+    node: &NodeRef<'_>,
+    connection_shutdown: &wacore::runtime::ShutdownSignal,
+) -> bool {
     // Server JID is "s.whatsapp.net" (no @ prefix for server-only JIDs)
     if node.get_attr("from").is_none_or(|v| v != SERVER_JID) {
         return false;
@@ -67,8 +77,7 @@ pub(crate) async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool 
         for child in children {
             let handled = match child.tag.as_ref() {
                 "pair-device" => {
-                    // Capture before the ACK can yield to connection teardown.
-                    let connection_shutdown = client.connection_shutdown_signal();
+                    let connection_shutdown = connection_shutdown.clone();
                     let shutdown = client.shutdown_signal();
                     if let Some(ack_node) = PairUtils::build_ack_node_ref(node)
                         && let Err(e) = client.send_node(ack_node).await

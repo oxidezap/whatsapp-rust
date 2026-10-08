@@ -590,21 +590,34 @@ impl Drop for ClaimGuard {
 /// `stage` attribute, mirroring WA Web `handleAltDeviceLinkingNotification`:
 /// `primary_hello` completes stage 2; `refresh_code` asks the companion to
 /// regenerate the code it is displaying.
-#[cfg_attr(
-    feature = "tracing",
-    tracing::instrument(name = "wa.pair.code_notification", level = "debug", skip_all)
-)]
+#[cfg(test)]
 pub(crate) async fn handle_pair_code_notification(
     client: &Arc<Client>,
     node: &NodeRef<'_>,
 ) -> bool {
+    let shutdown = client.connection_shutdown_signal();
+    handle_pair_code_notification_scoped(client, node, &shutdown).await
+}
+
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.pair.code_notification", level = "debug", skip_all)
+)]
+pub(crate) async fn handle_pair_code_notification_scoped(
+    client: &Arc<Client>,
+    node: &NodeRef<'_>,
+    shutdown: &wacore::runtime::ShutdownSignal,
+) -> bool {
+    if shutdown.is_fired() {
+        return true;
+    }
     let Some(reg_node) = node.get_optional_child_by_tag(&["link_code_companion_reg"]) else {
         return false;
     };
 
     match reg_node.get_attr("stage").map(|v| v.as_str()).as_deref() {
-        Some("primary_hello") => handle_primary_hello(client, reg_node).await,
-        Some("refresh_code") => handle_refresh_code(client, reg_node).await,
+        Some("primary_hello") => handle_primary_hello(client, reg_node, shutdown).await,
+        Some("refresh_code") => handle_refresh_code(client, reg_node, shutdown).await,
         other => {
             warn!(
                 target: "Client/PairCode",
@@ -617,7 +630,11 @@ pub(crate) async fn handle_pair_code_notification(
 
 /// Stage 2: the user entered the code on their phone. The notification carries
 /// the primary's encrypted ephemeral public key and identity public key.
-async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> bool {
+async fn handle_primary_hello(
+    client: &Arc<Client>,
+    reg_node: &NodeRef<'_>,
+    shutdown: &wacore::runtime::ShutdownSignal,
+) -> bool {
     // Extract primary's wrapped ephemeral public key (80 bytes: salt + iv + encrypted key)
     let primary_wrapped_ephemeral = match reg_node
         .get_optional_child_by_tag(&["link_code_pairing_wrapped_primary_ephemeral_pub"])
@@ -676,6 +693,9 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
     //
     // The lock still serializes stage 2 end to end — see `run_stage_two`.
     let mut state_guard = client.pair_code_state.lock().await;
+    if shutdown.is_fired() || client.shutdown_signal().is_fired() {
+        return true;
+    }
     let (pairing_ref, phone_jid, pair_code, ephemeral_keypair, attempt) = match &mut *state_guard {
         PairCodeState::WaitingForPhoneConfirmation {
             pairing_ref,
@@ -746,7 +766,13 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
     // starts on the notification. Waiting for a successful `companion_finish`
     // would leave a failed stage 2 with no timeout at all — the case that most
     // needs the consumer to hear about it.
-    start_pair_success_timeout(Arc::clone(&client), pairing_ref.clone(), attempt);
+    start_pair_success_timeout(
+        Arc::clone(&client),
+        pairing_ref.clone(),
+        attempt,
+        shutdown.clone(),
+    );
+    let shutdown = shutdown.clone();
     client.clone().runtime.spawn_detached(Box::pin(async move {
         run_stage_two(
             client,
@@ -757,6 +783,7 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
             primary_wrapped_ephemeral,
             primary_identity_pub,
             attempt,
+            shutdown,
         )
         .await;
     }));
@@ -789,8 +816,12 @@ async fn run_stage_two(
     primary_wrapped_ephemeral: Vec<u8>,
     primary_identity_pub: [u8; 32],
     attempt: u32,
+    shutdown: wacore::runtime::ShutdownSignal,
 ) {
     let state_guard = client.pair_code_state.lock().await;
+    if shutdown.is_fired() || client.shutdown_signal().is_fired() {
+        return;
+    }
     // The flow can be retired while this task waits for the lock — by
     // pair-success, a cancellation, or a replacement code. Matching the ref
     // rather than the variant is what tells a replacement apart from our own
@@ -823,6 +854,9 @@ async fn run_stage_two(
             return;
         }
     };
+    if shutdown.is_fired() || client.shutdown_signal().is_fired() {
+        return;
+    }
 
     // Get device keys
     let device_snapshot = client.persistence_manager.get_device_snapshot();
@@ -850,6 +884,9 @@ async fn run_stage_two(
         .await;
 
     // Build and send stage 2 IQ
+    if shutdown.is_fired() || client.shutdown_signal().is_fired() {
+        return;
+    }
     let req_id = client.generate_request_id();
     let identity_pub: [u8; 32] = device_snapshot
         .identity_key
@@ -887,7 +924,7 @@ async fn run_stage_two(
             // The timeout that answers for this send was armed by the caller,
             // on acceptance.
         }
-        Err(e) => report_stage_two_failure(&client, &pairing_ref, attempt, e).await,
+        Err(e) => report_stage_two_failure(&client, &pairing_ref, attempt, e, &shutdown).await,
     }
 }
 
@@ -917,6 +954,7 @@ async fn report_stage_two_failure(
     pairing_ref: &[u8],
     attempt: u32,
     error: IqError,
+    shutdown: &wacore::runtime::ShutdownSignal,
 ) {
     if error.is_timeout() {
         warn!(
@@ -927,7 +965,10 @@ async fn report_stage_two_failure(
     }
 
     error!(target: "Client/PairCode", "companion_finish failed: {error}");
-    if !retire_stage_two_flow(client, pairing_ref, attempt).await {
+    if !retire_stage_two_flow(client, pairing_ref, attempt, shutdown).await {
+        return;
+    }
+    if shutdown.is_fired() || client.shutdown_signal().is_fired() {
         return;
     }
 
@@ -949,12 +990,16 @@ async fn report_stage_two_failure(
 /// WA Web treats that silence as the failure signal, arming a one-minute timer
 /// on `primary_hello_received` and regenerating the code when it fires
 /// (`Link/DevicePhoneNumberCodeScreen.react.js`).
-fn start_pair_success_timeout(client: Arc<Client>, pairing_ref: Vec<u8>, attempt: u32) {
+fn start_pair_success_timeout(
+    client: Arc<Client>,
+    pairing_ref: Vec<u8>,
+    attempt: u32,
+    connection_shutdown: wacore::runtime::ShutdownSignal,
+) {
     use futures::FutureExt;
 
     let timeout = PairCodeUtils::primary_hello_pair_success_timeout();
     let shutdown = client.shutdown_signal();
-    let connection_shutdown = client.connection_shutdown_signal();
     let weak_client = Arc::downgrade(&client);
     let runtime = client.runtime.clone();
     client.runtime.spawn_detached(Box::pin(async move {
@@ -1012,8 +1057,16 @@ fn start_pair_success_timeout(client: Arc<Client>, pairing_ref: Vec<u8>, attempt
 ///
 /// The state is cleared before the caller's event goes out, so a consumer
 /// acting on it is not turned away by the very flow it was told to replace.
-async fn retire_stage_two_flow(client: &Arc<Client>, pairing_ref: &[u8], attempt: u32) -> bool {
+async fn retire_stage_two_flow(
+    client: &Arc<Client>,
+    pairing_ref: &[u8],
+    attempt: u32,
+    shutdown: &wacore::runtime::ShutdownSignal,
+) -> bool {
     let state = client.pair_code_state.lock().await;
+    if shutdown.is_fired() || client.shutdown_signal().is_fired() {
+        return false;
+    }
     retire_stage_two_flow_locked(client, state, pairing_ref, attempt).await
 }
 
@@ -1077,7 +1130,11 @@ async fn replace_adv_secret_key(client: &Arc<Client>) {
 /// `refreshAltLinkingCode` / `forceManualRefresh`). Surfaces a
 /// [`Event::PairingCodeRefresh`] so the consumer re-requests a code, but only
 /// when the notification's ref matches the flow currently in progress.
-async fn handle_refresh_code(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> bool {
+async fn handle_refresh_code(
+    client: &Arc<Client>,
+    reg_node: &NodeRef<'_>,
+    shutdown: &wacore::runtime::ShutdownSignal,
+) -> bool {
     let notif_ref = match reg_node
         .get_optional_child_by_tag(&["link_code_pairing_ref"])
         .and_then(|n| match n.content.as_ref() {
@@ -1104,6 +1161,9 @@ async fn handle_refresh_code(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> bo
     // `force_manual_refresh` path.
     let matches_current = {
         let mut state_guard = client.pair_code_state.lock().await;
+        if shutdown.is_fired() || client.shutdown_signal().is_fired() {
+            return true;
+        }
         let matches = matches!(
             &*state_guard,
             PairCodeState::WaitingForPhoneConfirmation { pairing_ref, .. }
@@ -2006,6 +2066,7 @@ mod tests {
             &[1, 2, 3, 4],
             1,
             crate::test_utils::server_error_iq(500, "internal-server-error", None, None),
+            &client.connection_shutdown_signal(),
         )
         .await;
 
@@ -2033,6 +2094,7 @@ mod tests {
             &[1, 2, 3, 4],
             1,
             crate::test_utils::server_error_iq(400, "bad-request", None, None),
+            &client.connection_shutdown_signal(),
         )
         .await;
 
@@ -2600,6 +2662,7 @@ mod tests {
             vec![7u8; 80],
             [9u8; 32],
             1,
+            client.connection_shutdown_signal(),
         )
         .await;
 
@@ -2612,6 +2675,32 @@ mod tests {
             transport.sent().is_empty(),
             "no companion_finish may go out for a ref nobody is holding"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_stage_two_cannot_use_a_matching_ref_on_a_new_connection() {
+        let (client, transport) = create_iq_test_client().await;
+        let pairing_ref = vec![1, 2, 3, 4];
+        let shutdown = client.connection_shutdown_signal();
+        client.notify_connection_shutdown();
+        client.reset_connection_shutdown();
+        set_waiting(&client, pairing_ref.clone(), live_window(), 1).await;
+        let secret = adv(&client);
+        run_stage_two(
+            client.clone(),
+            pairing_ref,
+            "15551234567".to_string(),
+            "ABCD1234".to_string(),
+            KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>()),
+            vec![7u8; 80],
+            [9u8; 32],
+            1,
+            shutdown,
+        )
+        .await;
+        assert_eq!(adv(&client), secret);
+        assert!(transport.sent().is_empty());
+        assert!(is_waiting(&client).await);
     }
 
     /// Regression: `companion_finish` leaving the socket is not the end of the
@@ -2655,7 +2744,12 @@ mod tests {
         let (client, transport) = create_iq_test_client().await;
         let weak = Arc::downgrade(&client);
         let released = client.store_release();
-        start_pair_success_timeout(client.clone(), vec![1, 2, 3, 4], 0);
+        start_pair_success_timeout(
+            client.clone(),
+            vec![1, 2, 3, 4],
+            0,
+            client.connection_shutdown_signal(),
+        );
         tokio::task::yield_now().await;
         drop(client);
         drop(transport);
@@ -2671,13 +2765,44 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn delayed_primary_hello_cannot_arm_a_timer_for_the_new_connection() {
+        let (client, transport) = create_iq_test_client().await;
+        let pairing_ref = vec![1, 2, 3, 4];
+        set_waiting(&client, pairing_ref.clone(), live_window(), 0).await;
+        let notification = primary_hello_notif(&pairing_ref);
+        let node = notification.as_node_ref();
+        let shutdown = client.connection_shutdown_signal();
+        let state = client.pair_code_state.lock().await;
+        let pending = handle_pair_code_notification_scoped(&client, &node, &shutdown);
+        futures::pin_mut!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        client.notify_connection_shutdown();
+        client.reset_connection_shutdown();
+        drop(state);
+        assert!(pending.await);
+        assert!(matches!(
+            &*client.pair_code_state.lock().await,
+            PairCodeState::WaitingForPhoneConfirmation {
+                primary_hello_attempt_count: 0,
+                ..
+            }
+        ));
+        assert!(transport.sent().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn old_pair_success_timer_cannot_retire_a_replacement_connection() {
         let (client, _transport) = create_iq_test_client().await;
         let collector = Arc::new(crate::test_utils::TestEventCollector::default());
         client.subscribe_handler(collector.clone()).detach();
         let pairing_ref = vec![1, 2, 3, 4];
         set_waiting(&client, pairing_ref.clone(), live_window(), 0).await;
-        start_pair_success_timeout(client.clone(), pairing_ref, 0);
+        start_pair_success_timeout(
+            client.clone(),
+            pairing_ref,
+            0,
+            client.connection_shutdown_signal(),
+        );
         tokio::task::yield_now().await;
         client.notify_connection_shutdown();
         client.reset_connection_shutdown();
@@ -2705,7 +2830,12 @@ mod tests {
             .adv_secret_key;
         let owners = Arc::strong_count(&client);
         let state = client.pair_code_state.lock().await;
-        start_pair_success_timeout(client.clone(), pairing_ref, 0);
+        start_pair_success_timeout(
+            client.clone(),
+            pairing_ref,
+            0,
+            client.connection_shutdown_signal(),
+        );
         tokio::task::yield_now().await;
         advance_past(PairCodeUtils::primary_hello_pair_success_timeout()).await;
         poll_until("timer waiting for state", || {
