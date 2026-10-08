@@ -5361,6 +5361,9 @@ mod tests {
         use wacore::types::jid::cmp_for_lock_order;
 
         let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        // The detached startup warm-up records topology changes. Let it finish
+        // before seeding mappings so it cannot invalidate this test's memo.
+        client.bench_startup.wait().await;
         let own = Jid::from_str("5511000000001@s.whatsapp.net").unwrap();
         client
             .persistence_manager

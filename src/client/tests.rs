@@ -3795,13 +3795,9 @@ fn client_size_pins_runtime_cache_config_saving() {
     if cfg!(feature = "plugins") {
         expected += size_of::<Option<Arc<()>>>();
     }
-    #[cfg(feature = "bench-harness")]
-    {
-        // Only the benchmark carries this one-pointer attachment (4368 ->
-        // 4376 B on x86_64 defaults). The fixed base and production budgets
-        // stay unchanged, just as for the other feature-sized attachments.
-        expected += size_of::<Arc<bench_startup::StartupTasks>>();
-    }
+    // Benchmarks and tests track startup tasks; production builds without
+    // the benchmark feature do not carry this attachment.
+    expected += size_of::<Arc<bench_startup::StartupTasks>>();
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::HistorySyncCaptureHook>>>();
     expected += size_of::<Arc<crate::message::retention::InboundRetention>>();
     assert_eq!(

@@ -1836,7 +1836,7 @@ pub struct Client {
     /// Connection generation counter - incremented on each new connection.
     /// Used to detect stale post-login tasks from previous connections.
     pub(crate) connection_generation: Arc<AtomicU64>,
-    #[cfg(feature = "bench-harness")]
+    #[cfg(any(feature = "bench-harness", test))]
     pub(crate) bench_startup: Arc<bench_startup::StartupTasks>,
 
     /// Cache for recent messages (serialized bytes) for retry functionality.
