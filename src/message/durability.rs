@@ -109,6 +109,12 @@ pub(super) struct PendingReplay {
     pub(super) keys: Vec<(String, String, String)>,
 }
 
+// Keep the string comparisons out of the stable sort's generated inner loops.
+#[inline(never)]
+fn compare_pending_senders(a: &str, b: &str, preferred: &str) -> std::cmp::Ordering {
+    (a != preferred, a).cmp(&(b != preferred, b))
+}
+
 impl Client {
     /// Load all matching original keys before decrypting another delivery.
     /// Other namespaces/participants are filtered before decoding; their rows
@@ -143,7 +149,7 @@ impl Client {
                         .is_ok_and(|stored| stored.to_non_ad() == info.source.sender.to_non_ad())
         });
         // Prefer the exact spelling when recorded sequences are equivalent.
-        rows.sort_by(|a, b| (a.0 != sender, &a.0).cmp(&(b.0 != sender, &b.0)));
+        rows.sort_by(|a, b| compare_pending_senders(&a.0, &b.0, &sender));
         let mut replay = PendingReplay {
             items: Vec::new(),
             keys: Vec::new(),

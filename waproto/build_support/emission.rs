@@ -186,6 +186,7 @@ fn share_message_impls(items: &mut Vec<syn::Item>, scope: &str) {
                 "MessageContextInfo",
                 "AIRichResponseSubMessage",
                 "SyncActionValue",
+                "WebMessageInfo",
             ]
             .contains(&name.as_str()),
             "::message" => [
@@ -202,8 +203,6 @@ fn share_message_impls(items: &mut Vec<syn::Item>, scope: &str) {
         if !selected {
             continue;
         }
-        let share_default = scope.is_empty()
-            && matches!(name.as_str(), "Message" | "ContextInfo" | "SyncActionValue");
         let mut derived_default = false;
         for attribute in &mut message.attrs {
             if attribute.path().is_ident("derive") {
@@ -215,7 +214,7 @@ fn share_message_impls(items: &mut Vec<syn::Item>, scope: &str) {
                 let traits: Vec<_> = traits
                     .into_iter()
                     .filter(|p| {
-                        if share_default && p.is_ident("Default") {
+                        if p.is_ident("Default") {
                             derived_default = true;
                             false
                         } else {

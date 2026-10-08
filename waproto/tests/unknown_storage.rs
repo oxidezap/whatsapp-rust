@@ -79,10 +79,22 @@ fn shared_message_clones_keep_unknown_wire_after_original_is_dropped() {
     check::<waproto::whatsapp::ContextInfo>();
     check::<waproto::whatsapp::BotMetadata>();
     check::<waproto::whatsapp::MessageContextInfo>();
+    check::<waproto::whatsapp::AIRichResponseSubMessage>();
+    check::<waproto::whatsapp::SyncActionValue>();
+    check::<waproto::whatsapp::WebMessageInfo>();
+    check::<waproto::whatsapp::MessageKey>();
     check::<waproto::whatsapp::message::ImageMessage>();
     check::<waproto::whatsapp::message::VideoMessage>();
     check::<waproto::whatsapp::message::InteractiveMessage>();
     check::<waproto::whatsapp::message::HighlyStructuredMessage>();
+    check::<waproto::whatsapp::message::ProtocolMessage>();
+    check::<waproto::whatsapp::message::ExtendedTextMessage>();
+    check::<waproto::whatsapp::message::PeerDataOperationRequestMessage>();
+    check::<waproto::whatsapp::message::PeerDataOperationRequestResponseMessage>();
+    check::<waproto::whatsapp::message::AudioMessage>();
+    check::<waproto::whatsapp::message::StickerMessage>();
+    check::<waproto::whatsapp::message::DocumentMessage>();
+    check::<waproto::whatsapp::message::ProductMessage>();
 
     let mut message = waproto::whatsapp::Message::default();
     message.conversation = Some("synthetic clone fixture".into());
