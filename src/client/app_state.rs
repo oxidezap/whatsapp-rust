@@ -4786,7 +4786,9 @@ mod tests {
             let fp = fingerprint_id(id);
             assert!(fp.starts_with("id#"), "{id} fingerprints, got {fp}");
             assert_eq!(fp.len(), 3 + 16);
-            assert!(!fp.contains(id));
+            // A random hex digest can contain a short hex id such as "abc"
+            // by coincidence; that is not evidence that the input leaked.
+            assert!(fp[3..].bytes().all(|byte| byte.is_ascii_hexdigit()));
         }
         // Stable within the process; distinct inputs diverge (including the
         // old head/tail-collision pair, which a prefix scheme conflated).
@@ -4795,7 +4797,7 @@ mod tests {
             fingerprint_id("ABCD1111WXYZ"),
             fingerprint_id("ABCD2222WXYZ")
         );
-        // No byte of the input survives, whatever its length or charset.
+        // These complete identifiers cannot occur in the hex projection.
         for id in ["MSGID123", "3EB0284A7C9112345678", "a\u{1F600}bcdefghij"] {
             let fp = fingerprint_id(id);
             assert!(!fp.contains(id));
