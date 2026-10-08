@@ -2,7 +2,7 @@ name: CodSpeed
 
 on:
   push:
-    branches: [main]
+    branches: [main, qualify/a02-current-cpu-oct08]
     paths-ignore: ["**.md", "docs/**"]
   pull_request:
     branches: [main]
@@ -32,6 +32,7 @@ env:
 
 jobs:
   benchmarks:
+    if: github.ref != 'refs/heads/qualify/a02-current-cpu-oct08'
     name: Run CodSpeed benchmarks (${{ matrix.shard.name }})
     runs-on: ubuntu-24.04
     # The slowest shard finishes in ~13min. The cap exists because the CodSpeed
@@ -173,7 +174,7 @@ jobs:
     # `credentials.password` rejects the empty string while the job template is
     # being prepared, so the job fails before any step runs and a step-level
     # `if:` cannot save it — the guard has to sit here. Same condition as e2e.yml.
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    if: ${{ github.ref != 'refs/heads/qualify/a02-current-cpu-oct08' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-24.04
     # These benches drive the real client (connect/reconnect handshakes) under
     # Valgrind, so they are slow; cap the job so a stuck run can't hang CI
@@ -289,7 +290,8 @@ jobs:
           run: cargo codspeed run -p bench-integration
 
   a02-cpu-pair:
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.before == '345ed71c443f189153b91617a77e5297babf5478' && github.event.pull_request.number == 1694 && github.head_ref == 'experiment/a02-shared-signing' && github.run_attempt == 1
+    # Run the current fixed pair once, isolated from the four PR CI matrices.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/qualify/a02-current-cpu-oct08' && github.event.before == '0000000000000000000000000000000000000000' && github.run_attempt == 1
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -299,17 +301,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: bac94e7c3c83fb7a283f3b551b233c476b283cfa
+          ref: edaa64b68d0de24bdb6848b98a824a32e276c55c
           path: _a02_pair/base
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
-          ref: 8d184150bec8c65ef9aca9d84349dc831710f566
+          ref: 0ed9f79739ef89ebfca0d36fba4c93f0d0f28cdc
           path: _a02_pair/head
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.sha }}
           path: _a02_tools
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
@@ -395,7 +397,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: a02-cpu-pair-${{ github.run_id }}
+          name: a02-current-cpu-pair-${{ github.run_id }}
           path: |
             _a02_profiles/base/profile.*.out/**
             _a02_profiles/head/profile.*.out/**
@@ -403,28 +405,3 @@ jobs:
             _a02_profiles/preflight/*
           if-no-files-found: error
           include-hidden-files: true
-
-  a02-cpu-pair-revalidate:
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.before == 'a5e0f2f661cb89d7f6719d7015b49ae8c6f8d026' && github.event.pull_request.number == 1694 && github.head_ref == 'experiment/a02-shared-signing'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-06-16
-      - name: Retrieve the preserved pair without repeating measurements
-        uses: actions/download-artifact@v8
-        with:
-          name: a02-cpu-pair-37625866250
-          run-id: 37625866250
-          github-token: ${{ github.token }}
-          path: _a02_profiles
-      - name: Validate the original measurements
-        run: cargo xt ci codspeed-pair validate

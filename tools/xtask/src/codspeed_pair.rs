@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use xtask_support::capture;
 
-const BASE: &str = "bac94e7c3c83fb7a283f3b551b233c476b283cfa";
-const HEAD: &str = "8d184150bec8c65ef9aca9d84349dc831710f566";
+const BASE: &str = "edaa64b68d0de24bdb6848b98a824a32e276c55c";
+const HEAD: &str = "0ed9f79739ef89ebfca0d36fba4c93f0d0f28cdc";
 const CONTRACTS: &[&str] = &[
     "runtime.sha256",
     "cpu-contract.txt",
