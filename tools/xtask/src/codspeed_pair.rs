@@ -1,7 +1,7 @@
 //! Contracts for the fixed, upload-disabled A02 benchmark comparison.
 use anyhow::{Context, Result, ensure};
 use clap::{Subcommand, ValueEnum};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -58,6 +58,12 @@ pub enum Task {
         side: Side,
     },
     Validate,
+    /// Validate an existing pair and print its captured counters, without rerunning it.
+    Summarize,
+    /// Print existing size artifact metadata and attribution without building.
+    InspectSize {
+        directory: PathBuf,
+    },
 }
 
 fn env_path(key: &str) -> Result<PathBuf> {
@@ -207,7 +213,16 @@ fn measured(profile: &Path) -> Result<Vec<String>> {
             "missing measured benchmark: {required}"
         );
     }
-    let mut instrumented = BTreeSet::new();
+    let instrumented = counters(profile)?;
+    ensure!(
+        names.iter().all(|name| instrumented.contains_key(name)),
+        "missing nonempty instrumented benchmark profile"
+    );
+    Ok(names)
+}
+
+fn counters(profile: &Path) -> Result<BTreeMap<String, BTreeMap<String, u64>>> {
+    let mut instrumented = BTreeMap::new();
     for entry in std::fs::read_dir(profile)? {
         let path = entry?.path();
         if !path.is_file()
@@ -238,21 +253,24 @@ fn measured(profile: &Path) -> Result<Vec<String>> {
                     !costs.is_empty() && costs.len() <= fields.len(),
                     "profile event columns differ"
                 );
-                if fields
-                    .iter()
-                    .zip(costs)
-                    .any(|(field, cost)| *field == "Ir" && cost > 0)
-                {
-                    instrumented.insert(name.to_owned());
+                let counts: BTreeMap<_, _> = fields
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, field)| !matches!(*field, "sysTime" | "sysCpuTime"))
+                    .map(|(index, field)| {
+                        (field.to_owned(), costs.get(index).copied().unwrap_or(0))
+                    })
+                    .collect();
+                if counts.get("Ir").is_some_and(|count| *count > 0) {
+                    ensure!(
+                        instrumented.insert(name.to_owned(), counts).is_none(),
+                        "duplicate instrumented benchmark profile: {name}"
+                    );
                 }
             }
         }
     }
-    ensure!(
-        names.iter().all(|name| instrumented.contains(name)),
-        "missing nonempty instrumented benchmark profile"
-    );
-    Ok(names)
+    Ok(instrumented)
 }
 fn validate(root: &Path) -> Result<()> {
     let base = profile(&root.join("base"))?;
@@ -360,6 +378,44 @@ pub fn run(task: Task) -> Result<()> {
             }
         }
         Task::Validate => validate(&profiles)?,
+        Task::Summarize => {
+            validate(&profiles)?;
+            for side in ["base", "head"] {
+                let path = profile(&profiles.join(side))?;
+                let contracts: BTreeMap<_, _> = CONTRACTS
+                    .iter()
+                    .copied()
+                    .chain(["source-commit.txt", "runner-version.txt"])
+                    .map(|name| Ok((name, std::fs::read_to_string(path.join(name))?)))
+                    .collect::<Result<_>>()?;
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "side": side,
+                        "contracts": contracts,
+                        "captured_callgrind_counters": counters(&path)?,
+                        "measurement": "existing CodSpeed Simulation artifact; no new execution"
+                    })
+                );
+            }
+        }
+        Task::InspectSize { directory } => {
+            for name in [
+                "size-meta.json",
+                "size-metrics.json",
+                "size-attribution.json",
+            ] {
+                let path = directory.join(name);
+                if name == "size-attribution.json" && !path.exists() {
+                    continue;
+                }
+                let contents: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+                println!(
+                    "{}",
+                    serde_json::json!({"artifact_file":path,"contents":contents})
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -387,6 +443,28 @@ mod tests {
         REQUIRED.iter().map(|name| format!(
             "part: 1\ndesc: Trigger: Client Request: {name}\nevents: Ir Dr\nsummary: 0\ntotals: 12\n"
         )).collect()
+    }
+    #[test]
+    fn counters_use_closing_totals_and_reject_duplicate_measurements() {
+        let directory = tempfile::tempdir().unwrap();
+        write(directory.path().join("1.out"), nonempty_profile()).unwrap();
+        let costs = counters(directory.path()).unwrap();
+        assert_eq!(costs[REQUIRED[0]]["Ir"], 12);
+        assert_eq!(costs[REQUIRED[0]]["Dr"], 0);
+        write(
+            directory.path().join("1.out"),
+            format!(
+                "part: 1\ndesc: Trigger: Client Request: {}\nevents: Ir sysTime Ct sysCpuTime Cl\nsummary: 0\ntotals: 12 1000 13 2000 14\n",
+                REQUIRED[0]
+            ),
+        ).unwrap();
+        let costs = counters(directory.path()).unwrap();
+        assert_eq!(costs[REQUIRED[0]]["Ct"], 13);
+        assert_eq!(costs[REQUIRED[0]]["Cl"], 14);
+        assert!(!costs[REQUIRED[0]].contains_key("sysTime"));
+        assert!(!costs[REQUIRED[0]].contains_key("sysCpuTime"));
+        write(directory.path().join("2.out"), nonempty_profile()).unwrap();
+        assert!(counters(directory.path()).is_err());
     }
     #[test]
     fn pair_rejects_changed_contracts_missing_measurements_and_empty_profiles() {

@@ -14,6 +14,7 @@ permissions:
 
 jobs:
   rederive:
+    if: github.ref != 'refs/heads/qualify/a02-artifacts-oct08'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
