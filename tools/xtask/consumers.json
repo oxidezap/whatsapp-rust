@@ -24,6 +24,12 @@
         "lib": true
       },
       {
+        "lanes": ["native", "msrv"],
+        "mode": "test",
+        "features": ["event-fixtures"],
+        "test": "event_delivery"
+      },
+      {
         "lanes": [
           "native",
           "msrv"

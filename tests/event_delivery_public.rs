@@ -5,8 +5,6 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 use whatsapp_rust::ChatActivity;
 use whatsapp_rust::bot::{Bot, BotRunOutcome};
-use whatsapp_rust::handlers::chatstate::ChatstateHandler;
-use whatsapp_rust::handlers::traits::StanzaHandler;
 use whatsapp_rust::http::{HttpClient, HttpRequest, HttpResponse};
 use whatsapp_rust::store::persistence_manager::PersistenceManager;
 use whatsapp_rust::transport::{Transport, TransportEvent, TransportFactory};
@@ -68,11 +66,7 @@ async fn dispatch(client: &Arc<Client>, state: &'static str, media: Option<&str>
     let packed = wacore_binary::marshal::marshal(&node).unwrap();
     let bytes = wacore_binary::util::unpack(&packed).unwrap();
     let owned = Arc::new(whatsapp_rust::OwnedNodeRef::new(bytes.into_owned()).unwrap());
-    assert!(
-        ChatstateHandler
-            .handle(client.clone(), owned, &mut false)
-            .await
-    );
+    whatsapp_rust::bench_support::process_stanza(client, owned).await;
 }
 async fn receive<T>(receiver: &async_channel::Receiver<T>) -> T {
     tokio::time::timeout(Duration::from_secs(5), receiver.recv())

@@ -751,6 +751,43 @@ impl Client {
         }
     }
 
+    #[cfg(feature = "tracing")]
+    pub(crate) fn log_engine_maintenance_error(
+        identity: Option<IdentityTags>,
+        e: &crate::store::error::StoreError,
+    ) {
+        // A detached task may run under a different subscriber than its caller.
+        // Keep the legacy logger when tracing is disabled at emission time.
+        let mut traced = false;
+        tracing::warn!(
+            target: "Client/Keepalive",
+            lid = {
+                traced = true;
+                identity.as_ref().and_then(|tags| tags.lid.as_deref())
+            },
+            pn = identity.as_ref().and_then(|tags| tags.pn.as_deref()),
+            "Storage maintenance error: {e}"
+        );
+        if !traced {
+            log::warn!(target: "Client/Keepalive", "Storage maintenance error: {e}");
+        }
+    }
+
+    /// An instrumented method's span may be filtered out while its caller's
+    /// span is enabled. Check the defining module too: a host can reuse the
+    /// documented operation name and target without owning our callsite.
+    #[cfg(feature = "tracing")]
+    pub(crate) fn record_identity_on_current_span(&self, operation: &str, target: &str) {
+        let span = tracing::Span::current();
+        if span.metadata().is_some_and(|metadata| {
+            metadata.name() == operation
+                && metadata.target() == target
+                && metadata.module_path() == Some(target)
+        }) {
+            self.record_identity_on_span(&span);
+        }
+    }
+
     /// Shared so every identity-tagged span leaves a field absent (not `""`) when unknown —
     /// duplicating this per call site would drift out of sync. Skips the snapshot read when
     /// the span is disabled.

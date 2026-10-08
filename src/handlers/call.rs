@@ -50,7 +50,7 @@ pub(crate) mod pending_offers;
 /// learns caller identity and dispatches. On `Offer` it emits the `<receipt><offer/></receipt>`
 /// ack-of-offer so the caller's signaling layer knows the device received the ring.
 #[derive(Default)]
-pub struct CallHandler;
+pub(crate) struct CallHandler;
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]

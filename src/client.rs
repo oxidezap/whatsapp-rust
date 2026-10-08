@@ -2107,6 +2107,10 @@ pub struct Client {
     pub(crate) inbound_durability_hook:
         std::sync::OnceLock<Arc<dyn crate::types::durability_hook::InboundDurabilityHook>>,
 
+    /// History capture is independent of message durability and immutable after build.
+    pub(crate) history_sync_capture_hook:
+        std::sync::OnceLock<Arc<dyn crate::types::durability_hook::HistorySyncCaptureHook>>,
+
     /// Optional retry-receipt admission policy (see
     /// [`crate::types::retry_admission::RetryAdmission`]): an operator opt-in to
     /// drop some group/status retries. `None` (default) keeps WA Web behavior

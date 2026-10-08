@@ -49,6 +49,14 @@ use waproto::whatsapp as wa;
 /// *scale*, so a single width could not distinguish "expensive" from "grows".
 pub const GROUP_SIZES: &[usize] = &[8, 32, 128, 512];
 
+/// Feed a decoded synthetic stanza through the real client dispatcher.
+///
+/// This fixture preserves parser, interceptor and observer behavior without exposing
+/// built-in handlers in production. It does not exercise the Noise read loop.
+pub async fn process_stanza(client: &Arc<Client>, node: Arc<wacore_binary::OwnedNodeRef>) {
+    client.process_node(node).await;
+}
+
 /// Discards every frame. The noise socket still encrypts and frames the stanza
 /// before handing it over, so the send path is complete up to the syscall.
 struct SinkTransport;

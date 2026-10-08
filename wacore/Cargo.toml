@@ -122,6 +122,10 @@ futures = { workspace = true, features = ["executor"] }
 # actually interleave a lease insert with the lock-free gate query.
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Keep this path-only: package normalization must omit the local self edge.
+wacore = { path = ".", default-features = false, features = ["bench-internals"] }
+
 [[bench]]
 name = "reporting_token_benchmark"
 harness = false

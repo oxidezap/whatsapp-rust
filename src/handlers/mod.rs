@@ -1,13 +1,13 @@
-pub mod basic;
-pub mod call;
+pub(crate) mod basic;
+pub(crate) mod call;
 pub mod chatstate;
-pub mod ib;
-pub mod iq;
+pub(crate) mod ib;
+pub(crate) mod iq;
 #[macro_use]
 mod macros;
-pub mod message;
-pub mod notification;
-pub mod presence;
-pub mod receipt;
-pub mod router;
-pub mod traits;
+pub(crate) mod message;
+pub(crate) mod notification;
+pub(crate) mod presence;
+pub(crate) mod receipt;
+pub(crate) mod router;
+pub(crate) mod traits;

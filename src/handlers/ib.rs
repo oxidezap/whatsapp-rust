@@ -22,7 +22,7 @@ use wacore::store::device::{ClientExpirationUpdate, ServerClientExpiration};
 /// - Offline sync previews and completion notifications
 /// - Thread metadata
 #[derive(Default)]
-pub struct IbHandler;
+pub(crate) struct IbHandler;
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
