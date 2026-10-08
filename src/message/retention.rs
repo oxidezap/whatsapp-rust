@@ -268,7 +268,7 @@ impl InboundRetention {
         if let Some(stanza) = stanzas.get_mut(&key(&first.info)) {
             merge_parts(&mut stanza.items, replay.items);
             stanza.pending_keys.extend(replay.keys);
-            stanza.pending_keys.sort();
+            stanza.pending_keys.sort_unstable();
             stanza.pending_keys.dedup();
         }
     }

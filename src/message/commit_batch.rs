@@ -1180,7 +1180,7 @@ impl Client {
                     item.info.id.to_string(),
                 )
             }));
-            settled_keys.sort();
+            settled_keys.sort_unstable();
             settled_keys.dedup();
             let delete_keys: Vec<_> = settled_keys
                 .iter()

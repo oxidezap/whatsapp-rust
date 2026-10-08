@@ -106,26 +106,23 @@ fn protect(attrs: &mut Vec<syn::Attribute>) {
     }
 }
 
-// Nested messages otherwise repeat sizeable codecs in their parents. Keep
-// the small-message case available for inlining and share larger codecs.
-fn share_large_codecs(items: &mut [syn::Item]) {
-    let large: BTreeSet<_> = items
+// Share nonempty codecs across parents, including wrappers with few fields.
+// Field count alone misses the code duplicated by nested message fields.
+fn share_codecs(items: &mut [syn::Item]) {
+    let nonempty: BTreeSet<_> = items
         .iter()
         .filter_map(|item| {
             let syn::Item::Struct(item) = item else {
                 return None;
             };
-            (item
-                .fields
+            item.fields
                 .iter()
-                .filter(|field| {
+                .any(|field| {
                     field
                         .ident
                         .as_ref()
                         .is_none_or(|id| id != "__buffa_unknown_fields")
                 })
-                .count()
-                >= 8)
                 .then(|| item.ident.clone())
         })
         .collect();
@@ -133,7 +130,7 @@ fn share_large_codecs(items: &mut [syn::Item]) {
         match item {
             syn::Item::Mod(module) => {
                 if let Some((_, items)) = &mut module.content {
-                    share_large_codecs(items);
+                    share_codecs(items);
                 }
             }
             syn::Item::Impl(item) => {
@@ -150,7 +147,7 @@ fn share_large_codecs(items: &mut [syn::Item]) {
                 let syn::Type::Path(ty) = &*item.self_ty else {
                     continue;
                 };
-                if !ty.path.get_ident().is_some_and(|id| large.contains(id)) {
+                if !ty.path.get_ident().is_some_and(|id| nonempty.contains(id)) {
                     continue;
                 }
                 for member in &mut item.items {
@@ -169,13 +166,13 @@ fn share_large_codecs(items: &mut [syn::Item]) {
     }
 }
 
-fn share_message_clones(items: &mut Vec<syn::Item>, scope: &str) {
-    let mut clones = Vec::new();
+fn share_message_impls(items: &mut Vec<syn::Item>, scope: &str) {
+    let mut implementations = Vec::new();
     for item in items.iter_mut() {
         if let syn::Item::Mod(module) = item
             && let Some((_, children)) = &mut module.content
         {
-            share_message_clones(children, &format!("{scope}::{}", module.ident));
+            share_message_impls(children, &format!("{scope}::{}", module.ident));
         }
         let syn::Item::Struct(message) = item else {
             continue;
@@ -187,6 +184,8 @@ fn share_message_clones(items: &mut Vec<syn::Item>, scope: &str) {
                 "ContextInfo",
                 "BotMetadata",
                 "MessageContextInfo",
+                "AIRichResponseSubMessage",
+                "SyncActionValue",
             ]
             .contains(&name.as_str()),
             "::message" => [
@@ -194,6 +193,8 @@ fn share_message_clones(items: &mut Vec<syn::Item>, scope: &str) {
                 "VideoMessage",
                 "InteractiveMessage",
                 "HighlyStructuredMessage",
+                "ProtocolMessage",
+                "ExtendedTextMessage",
             ]
             .contains(&name.as_str()),
             _ => false,
@@ -201,6 +202,9 @@ fn share_message_clones(items: &mut Vec<syn::Item>, scope: &str) {
         if !selected {
             continue;
         }
+        let share_default = scope.is_empty()
+            && matches!(name.as_str(), "Message" | "ContextInfo" | "SyncActionValue");
+        let mut derived_default = false;
         for attribute in &mut message.attrs {
             if attribute.path().is_ident("derive") {
                 let traits = attribute
@@ -210,7 +214,14 @@ fn share_message_clones(items: &mut Vec<syn::Item>, scope: &str) {
                     .expect("derive list");
                 let traits: Vec<_> = traits
                     .into_iter()
-                    .filter(|p| !p.is_ident("Clone"))
+                    .filter(|p| {
+                        if share_default && p.is_ident("Default") {
+                            derived_default = true;
+                            false
+                        } else {
+                            !p.is_ident("Clone")
+                        }
+                    })
                     .collect();
                 *attribute = syn::parse_quote!(#[derive(#(#traits),*)]);
             }
@@ -221,7 +232,7 @@ fn share_message_clones(items: &mut Vec<syn::Item>, scope: &str) {
             .iter()
             .map(|field| field.ident.as_ref().expect("named protobuf field"))
             .collect();
-        clones.push(syn::parse_quote! {
+        implementations.push(syn::parse_quote! {
             impl ::core::clone::Clone for #name {
                 #[inline(never)]
                 fn clone(&self) -> Self {
@@ -229,8 +240,20 @@ fn share_message_clones(items: &mut Vec<syn::Item>, scope: &str) {
                 }
             }
         });
+        // Only replace a derived Default: generator-provided protobuf defaults
+        // can differ from each field's Rust default and must remain intact.
+        if derived_default {
+            implementations.push(syn::parse_quote! {
+                impl ::core::default::Default for #name {
+                    #[inline(never)]
+                    fn default() -> Self {
+                        Self { #(#fields: ::core::default::Default::default()),* }
+                    }
+                }
+            });
+        }
     }
-    items.extend(clones);
+    items.extend(implementations);
 }
 
 pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
@@ -247,7 +270,7 @@ pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
         let mut file = syn::parse_file(&source).map_err(io::Error::other)?;
         Extensible { serde }.visit_file_mut(&mut file);
         if serde {
-            share_large_codecs(&mut file.items);
+            share_codecs(&mut file.items);
             ColdStorage { depth: 0 }.visit_file_mut(&mut file);
             let body = syn::parse_file(include_str!("unknown_storage.rs")).expect("storage syntax");
             let body = body.items;
@@ -256,7 +279,7 @@ pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
         }
 
         if serde {
-            share_message_clones(&mut file.items, "");
+            share_message_impls(&mut file.items, "");
         }
         let implementation = match suffix {
             ".__oneof" => "::__buffa::oneof",
