@@ -996,13 +996,29 @@ fn start_pair_success_timeout(
     attempt: u32,
     connection_shutdown: wacore::runtime::ShutdownSignal,
 ) {
+    client.runtime.spawn_detached(Box::pin(pair_success_timeout(
+        &client,
+        pairing_ref,
+        attempt,
+        connection_shutdown,
+    )));
+}
+
+// Capture ownership and connection before the task's first poll. Returning the
+// future also lets regression tests drive sleep and lock waits independently.
+fn pair_success_timeout(
+    client: &Arc<Client>,
+    pairing_ref: Vec<u8>,
+    attempt: u32,
+    connection_shutdown: wacore::runtime::ShutdownSignal,
+) -> impl Future<Output = ()> + use<> {
     use futures::FutureExt;
 
     let timeout = PairCodeUtils::primary_hello_pair_success_timeout();
     let shutdown = client.shutdown_signal();
-    let weak_client = Arc::downgrade(&client);
+    let weak_client = Arc::downgrade(client);
     let runtime = client.runtime.clone();
-    client.runtime.spawn_detached(Box::pin(async move {
+    async move {
         let terminal = wacore::runtime::wait_for_shutdown(&shutdown).fuse();
         let disconnected = wacore::runtime::wait_for_shutdown(&connection_shutdown).fuse();
         let sleep = runtime.sleep(timeout).fuse();
@@ -1044,7 +1060,7 @@ fn start_pair_success_timeout(
                 .force_manual(false)
                 .build(),
         ));
-    }));
+    }
 }
 
 /// Retire a flow whose stage 2 will not complete, and return whether this
@@ -2828,27 +2844,18 @@ mod tests {
             .persistence_manager
             .get_device_snapshot()
             .adv_secret_key;
-        let owners = Arc::strong_count(&client);
         let state = client.pair_code_state.lock().await;
-        start_pair_success_timeout(
-            client.clone(),
-            pairing_ref,
-            0,
-            client.connection_shutdown_signal(),
-        );
-        tokio::task::yield_now().await;
-        advance_past(PairCodeUtils::primary_hello_pair_success_timeout()).await;
-        poll_until("timer waiting for state", || {
-            Arc::strong_count(&client) > owners
-        })
-        .await;
+        let timer =
+            pair_success_timeout(&client, pairing_ref, 0, client.connection_shutdown_signal());
+        futures::pin_mut!(timer);
+        assert!(futures::poll!(&mut timer).is_pending());
+        tokio::time::advance(PairCodeUtils::primary_hello_pair_success_timeout()).await;
+        assert!(futures::poll!(&mut timer).is_pending());
         client.notify_connection_shutdown();
         client.reset_connection_shutdown();
+        // Cancellation must finish even while the state remains locked.
+        assert!(futures::poll!(&mut timer).is_ready());
         drop(state);
-        poll_until("retired timer to release client", || {
-            Arc::strong_count(&client) == owners
-        })
-        .await;
         assert!(is_waiting(&client).await);
         assert_eq!(
             client

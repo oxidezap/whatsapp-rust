@@ -593,6 +593,8 @@ mod tests {
     use wacore_binary::Node;
     use wacore_binary::builder::NodeBuilder;
 
+    // Primary-side fixture messages have decode-only production codecs.
+    #[allow(clippy::disallowed_methods)]
     fn signed_pair_success(client: &Client) -> Node {
         use buffa::Message;
         use hmac::{KeyInit, Mac};
@@ -617,13 +619,13 @@ mod tests {
                 &mut rng,
             )
             .unwrap();
-        let identity = wa::ADVSignedDeviceIdentity {
-            details: Some(details),
-            account_signature_key: Some(account.public_key.public_key_bytes().to_vec()),
-            account_signature: Some(signature.to_vec()),
-            ..Default::default()
-        }
-        .encode_to_vec();
+        let identity =
+            waproto::codec::adv_signed_device_identity_to_vec(&wa::ADVSignedDeviceIdentity {
+                details: Some(details),
+                account_signature_key: Some(account.public_key.public_key_bytes().to_vec()),
+                account_signature: Some(signature.to_vec()),
+                ..Default::default()
+            });
         let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&device.adv_secret_key).unwrap();
         mac.update(&identity);
         let payload = wa::ADVSignedDeviceIdentityHMAC {
