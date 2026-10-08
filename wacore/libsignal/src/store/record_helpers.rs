@@ -114,12 +114,13 @@ pub fn prekey_record_to_structure(
     let mut structure = record.as_storage().clone();
     structure.id = Some(id.into());
     if let Some(public_key) = structure.public_key.as_mut() {
-        public_key.clear();
-        public_key.extend_from_slice(key_pair.public_key.public_key_bytes());
+        // Validation above accepts raw and type-prefixed public keys. Reuse
+        // either buffer for the normalized raw key without growing it.
+        public_key.truncate(key_pair.public_key.public_key_bytes().len());
+        public_key.copy_from_slice(key_pair.public_key.public_key_bytes());
     }
     if let Some(private_key) = structure.private_key.as_mut() {
-        private_key.clear();
-        private_key.extend_from_slice(key_pair.private_key.serialize().as_ref());
+        private_key.copy_from_slice(key_pair.private_key.serialize().as_ref());
     }
     Ok(structure)
 }
@@ -252,6 +253,11 @@ mod tests {
             if tagged {
                 original.public_key = Some(key_pair.public_key.serialize().to_vec());
             }
+            // Storage may contain unclamped bits. Export must still normalize
+            // them even when it reuses the retained protobuf's key buffers.
+            let private_key = original.private_key.as_mut().unwrap();
+            private_key[0] |= 7;
+            private_key[31] = (private_key[31] | 128) & !64;
             let future_fields = [0xa0, 0x06, 7, 0xaa, 0x06, 2, 0x12, 0x34];
             let mut wire = original.encode_to_vec();
             wire.extend_from_slice(&future_fields);
