@@ -298,7 +298,7 @@ impl Client {
 
         // Prefer the peer's explicit PN when a LID DM response crosses namespaces.
         // In self-sync, sender_alt identifies us; only recipient_alt names the peer.
-        let cache_chat = if !info.source.is_group && info.source.chat.is_lid() {
+        let cache_chat = if !info.source.is_group && info.source.chat.server.is_lid_family() {
             let peer_alt = if info.source.is_from_me {
                 &info.source.recipient_alt
             } else {
@@ -2690,6 +2690,81 @@ mod tests {
                     rx.try_recv().is_err(),
                     "completed owner still rejects stale aliases"
                 );
+                crate::test_utils::decode_sent_iq(&transport, 0).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn hosted_lid_pdo_preserves_explicit_peer_alias_and_metadata() {
+            use wacore::types::events::ChannelEventHandler;
+            use wacore::types::message::{AddressingMode, MessageSource, SenderMessageId};
+            for explicit_alias in [true, false] {
+                let (client, transport, _) = manual_retry_client().await;
+                let peer_lid: Jid = "777000000000101@hosted.lid".parse().unwrap();
+                let peer_pn: Jid = "12025550101@hosted".parse().unwrap();
+                let own_pn: Jid = "12025550100@s.whatsapp.net".parse().unwrap();
+                let info = Arc::new(MessageInfo {
+                    id: "HOSTED_ALIAS_PDO".into(),
+                    push_name: "original hosted self-sync metadata".into(),
+                    source: MessageSource {
+                        chat: peer_lid.clone(),
+                        sender: "777000000000100@lid".parse().unwrap(),
+                        sender_alt: Some(own_pn.clone()),
+                        recipient_alt: explicit_alias.then_some(peer_pn.clone()),
+                        is_from_me: true,
+                        addressing_mode: Some(AddressingMode::Lid),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+                client
+                    .send_pdo_placeholder_resend_request(&info)
+                    .await
+                    .unwrap();
+                let request_id = client
+                    .pdo_requested
+                    .get(&SenderMessageId::new(
+                        info.source.chat.clone(),
+                        info.id.clone(),
+                        info.source.sender.clone(),
+                    ))
+                    .await
+                    .unwrap()
+                    .request_id
+                    .clone();
+                let response_chat = if explicit_alias { peer_pn } else { peer_lid };
+                let key = ChatMessageId::new(response_chat.clone(), info.id.clone());
+                assert!(client.pdo_pending_requests.get(&key).await.is_some());
+                assert!(
+                    client
+                        .pdo_pending_requests
+                        .get(&ChatMessageId::new(own_pn, info.id.clone(),))
+                        .await
+                        .is_none()
+                );
+                let (handler, rx) = ChannelEventHandler::new();
+                client.core.event_bus.subscribe_handler(handler).detach();
+                let response =
+                    make_placeholder_response(&response_chat.to_string(), true, &info.id, None);
+                client
+                    .handle_placeholder_resend_response(&response, &request_id)
+                    .await;
+                assert!(client.pdo_pending_requests.get(&key).await.is_none());
+                let mut delivered = 0;
+                while let Ok(event) = rx.try_recv() {
+                    for message in event.messages() {
+                        assert_eq!(message.info.push_name, info.push_name);
+                        assert_eq!(message.info.source.chat, info.source.chat);
+                        assert_eq!(message.info.source.sender, info.source.sender);
+                        assert_eq!(message.info.source.recipient_alt, info.source.recipient_alt);
+                        assert_eq!(
+                            message.info.unavailable_request_id.as_deref(),
+                            Some(request_id.as_str())
+                        );
+                        delivered += 1;
+                    }
+                }
+                assert_eq!(delivered, 1);
                 crate::test_utils::decode_sent_iq(&transport, 0).await;
             }
         }
