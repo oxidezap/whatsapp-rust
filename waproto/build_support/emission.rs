@@ -48,7 +48,119 @@ impl VisitMut for Extensible {
 struct ColdStorage {
     depth: usize,
 }
+
+fn boxed_decode(block: &syn::Block, depth: usize) -> Option<syn::Block> {
+    let [
+        syn::Stmt::Local(local),
+        syn::Stmt::Expr(syn::Expr::Try(merge), _),
+        assignment,
+    ] = block.stmts.as_slice()
+    else {
+        return None;
+    };
+    let syn::Pat::Ident(binding) = &local.pat else {
+        return None;
+    };
+    let syn::Expr::Call(default) = &*local.init.as_ref()?.expr else {
+        return None;
+    };
+    let syn::Expr::Path(default_path) = &*default.func else {
+        return None;
+    };
+    if !default.args.is_empty()
+        || !default_path
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .eq(["core", "default", "Default", "default"])
+    {
+        return None;
+    }
+    let syn::Expr::Call(call) = &*merge.expr else {
+        return None;
+    };
+    let syn::Expr::Path(path) = &*call.func else {
+        return None;
+    };
+    if call.args.len() != 3
+        || !path.path.segments.iter().map(|s| s.ident.to_string()).eq([
+            "buffa",
+            "Message",
+            "merge_length_delimited",
+        ])
+    {
+        return None;
+    }
+    let syn::Expr::Reference(reference) = &call.args[0] else {
+        return None;
+    };
+    let syn::Expr::Path(value) = &*reference.expr else {
+        return None;
+    };
+    if reference.mutability.is_none() || !value.path.is_ident(&binding.ident) {
+        return None;
+    }
+    struct Unbox<'a> {
+        name: &'a syn::Ident,
+        replaced: usize,
+    }
+    impl VisitMut for Unbox<'_> {
+        fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
+            if let syn::Expr::Call(call) = expr
+                && let syn::Expr::Path(path) = &*call.func
+                && path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .eq(["buffa", "alloc", "boxed", "Box", "new"])
+                && call.args.len() == 1
+                && let syn::Expr::Path(value) = &call.args[0]
+                && value.path.is_ident(self.name)
+            {
+                let name = self.name;
+                *expr = syn::parse_quote!(#name);
+                self.replaced += 1;
+            } else {
+                visit_mut::visit_expr_mut(self, expr);
+            }
+        }
+    }
+    let mut assignment = assignment.clone();
+    let mut unbox = Unbox {
+        name: &binding.ident,
+        replaced: 0,
+    };
+    unbox.visit_stmt_mut(&mut assignment);
+    if unbox.replaced == 0 {
+        return None;
+    }
+    assert_eq!(
+        unbox.replaced, 1,
+        "one destination for decoded boxed message"
+    );
+    let name = &binding.ident;
+    let buf = &call.args[1];
+    let ctx = &call.args[2];
+    let helper: syn::Path = syn::parse_str(&format!(
+        "{}__unknown_storage::decode_boxed",
+        "super::".repeat(depth),
+    ))
+    .expect("internal boxed decoder path");
+    Some(syn::parse_quote!({
+        let #name = #helper(#buf, #ctx)?;
+        #assignment
+    }))
+}
+
 impl VisitMut for ColdStorage {
+    fn visit_block_mut(&mut self, block: &mut syn::Block) {
+        visit_mut::visit_block_mut(self, block);
+        if let Some(replacement) = boxed_decode(block, self.depth) {
+            *block = replacement;
+        }
+    }
     fn visit_item_mod_mut(&mut self, item: &mut syn::ItemMod) {
         self.depth += 1;
         visit_mut::visit_item_mod_mut(self, item);

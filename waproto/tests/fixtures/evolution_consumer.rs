@@ -1,6 +1,17 @@
 use evolution_fixture::{Message, MessageView, ViewEncode};
 
 #[test]
+fn failed_new_oneof_message_keeps_the_previous_alternative() {
+    use evolution_fixture::v1;
+    let mut record = v1::Record::default().with_choice(v1::record::Choice::Text("before".into()));
+    assert!(record.merge_from_slice(&[0x3a, 2, 0x08, 0x80]).is_err());
+    assert_eq!(
+        record.choice,
+        Some(v1::record::Choice::Text("before".into()))
+    );
+}
+
+#[test]
 fn repeated_nested_message_occurrences_merge_existing_fields() {
     use evolution_fixture::v1;
     // Separate occurrences of child set separate fields of the same message.

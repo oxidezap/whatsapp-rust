@@ -1,6 +1,18 @@
 use ::buffa::alloc::boxed::Box;
 use ::core::mem::ManuallyDrop;
 
+#[inline(never)]
+pub(super) fn decode_boxed<T: ::buffa::Message>(
+    buf: &mut impl ::buffa::bytes::Buf,
+    ctx: ::buffa::DecodeContext<'_>,
+) -> Result<Box<T>, ::buffa::DecodeError> {
+    // Decode into the eventual oneof allocation rather than moving a complete
+    // child from a stack temporary after a successful merge.
+    let mut value = Box::<T>::default();
+    T::merge_length_delimited(&mut value, buf, ctx)?;
+    Ok(value)
+}
+
 // Parents share a child's allocation/default initialization together with its
 // decoder. Keep the existing buffer specialization and merge-in-place behavior.
 #[inline(never)]
