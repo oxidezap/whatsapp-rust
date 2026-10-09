@@ -290,11 +290,18 @@ fn projection(known: &[u8], map: GroupMap) -> Projection {
         if group == 0 {
             continue;
         }
-        let index = result.iter().position(|(id, _)| *id == group).unwrap_or_else(|| {
-            result.push((group, Vec::new()));
-            result.len() - 1
-        });
-        canonical_record(group, raw, |bytes| result[index].1.extend_from_slice(bytes));
+        if let Some((_, bytes)) = result.iter_mut().find(|(id, _)| *id == group) {
+            canonical_record(group, raw, |record| bytes.extend_from_slice(record));
+        } else {
+            let bytes = if group & (1 << 31) == 0 {
+                raw.to_vec()
+            } else {
+                let mut bytes = Vec::new();
+                canonical_record(group, raw, |record| bytes.extend_from_slice(record));
+                bytes
+            };
+            result.push((group, bytes));
+        }
     }
     result
 }
