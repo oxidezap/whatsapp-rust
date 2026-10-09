@@ -416,3 +416,41 @@ fn removing_raw_unknowns_discards_the_journal_without_changing_empty_equality() 
     empty.__buffa_unknown_fields.hash(&mut right);
     assert_eq!(left.finish(), right.finish());
 }
+
+#[test]
+fn nested_future_records_reuse_prepared_output_across_encoding_passes() {
+    use evolution_fixture::{SizeCache, v1, v2};
+    let mut wire = vec![0x10, 1, 0x10, 0];
+    for _ in 0..24 {
+        let mut parent = vec![0x10, 1, 0x42];
+        evolution_fixture::encoding::encode_varint(wire.len() as u64, &mut parent);
+        parent.extend_from_slice(&wire);
+        parent.extend_from_slice(&[0x10, 0]);
+        wire = parent;
+    }
+    let expected = v2::Record::decode_from_slice(&wire).unwrap();
+    let owned = v1::Record::decode_from_slice(&wire).unwrap();
+    let view = v1::RecordView::decode_view(&wire).unwrap();
+    for bytes in [
+        owned.encode_to_vec(),
+        view.encode_to_vec(),
+        view.to_owned_message().unwrap().encode_to_vec(),
+    ] {
+        assert_eq!(v2::Record::decode_from_slice(&bytes).unwrap(), expected);
+    }
+    // A preceding/following normal codec must consume exactly its own slots;
+    // clearing a reused traversal cache must also discard prepared output.
+    let plain = v1::Record::default().with_name("plain");
+    let mut cache = SizeCache::new();
+    for _ in 0..2 {
+        let size = plain.compute_size(&mut cache)
+            + owned.compute_size(&mut cache)
+            + plain.compute_size(&mut cache);
+        let mut encoded = Vec::new();
+        plain.write_to(&mut cache, &mut encoded);
+        owned.write_to(&mut cache, &mut encoded);
+        plain.write_to(&mut cache, &mut encoded);
+        assert_eq!(encoded.len(), size as usize);
+        cache.clear();
+    }
+}
