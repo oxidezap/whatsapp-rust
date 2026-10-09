@@ -1873,6 +1873,7 @@ mod tests {
                 panic!("expected a media epoch");
             };
             assert_eq!(epoch.transaction_id, transaction_id);
+            assert_eq!(epoch.raw_epoch_for_test(), key);
         }
         registry.remove_if_current(call_id, generation);
     }
