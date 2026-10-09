@@ -263,6 +263,12 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
             let write_buf = argument(&write, 2);
             for member in &mut item.items {
                 if let syn::ImplItem::Fn(f) = member {
+                    if f.sig.ident == "compute_size" || f.sig.ident == "write_to" {
+                        // Journal dispatch is shared even for small messages;
+                        // inlining it into every parent repeats cold machinery.
+                        f.attrs.retain(|attr| !attr.path().is_ident("inline"));
+                        f.attrs.push(syn::parse_quote!(#[inline(never)]));
+                    }
                     if f.sig.ident == "compute_size" {
                         f.block = syn::parse_quote!({
                             if self.__buffa_unknown_fields.active() {
@@ -357,6 +363,8 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     continue;
                 };
                 if f.sig.ident == merge_name {
+                    f.attrs.retain(|attr| !attr.path().is_ident("inline"));
+                    f.attrs.push(syn::parse_quote!(#[inline(never)]));
                     f.block = if view {
                         syn::parse_quote!({
                             if !self.__buffa_unknown_fields.active() {
