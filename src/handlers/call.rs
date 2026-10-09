@@ -204,15 +204,17 @@ impl StanzaHandler for CallHandler {
                     // dead (no relay, not connectable). Don't ack or ring it -- surface a non-ringing
                     // missed-call so a consumer can't auto-accept it (WA Web drops the stale notice
                     // rather than ringing; its cancel_call + missed_call for offerReceivedWhileOffline).
-                    client
-                        .core
-                        .event_bus
-                        .dispatch(Event::MissedCall(MissedCall::new(
-                            call.from.clone(),
-                            call.action.call_id().to_string(),
-                            call.timestamp,
-                            MissedReason::Offline,
-                        )));
+                    if let Some(timestamp) = call.timestamp {
+                        client
+                            .core
+                            .event_bus
+                            .dispatch(Event::MissedCall(MissedCall::new(
+                                call.from.clone(),
+                                call.action.call_id().to_string(),
+                                timestamp,
+                                MissedReason::Offline,
+                            )));
+                    }
                 } else {
                     // Signal-only clients have no VoIP registry; keep the offer's
                     // liveness through the receipt and identity-learning awaits.
@@ -507,11 +509,11 @@ impl StanzaHandler for CallHandler {
                     #[cfg(feature = "voip-control")]
                     if let CallAction::Terminate { reason, .. } = &call.action
                         && client.call_registry().take_ringing(call.action.call_id())
+                        && let Some(ts) = call.timestamp
                     {
                         // Shared provenance for whichever outcome this reason maps to.
                         let from = call.from.clone();
                         let cid = call.action.call_id().to_string();
-                        let ts = call.timestamp;
                         let outcome = match reason.as_deref() {
                             None
                             | Some(TERMINATE_REASON_TIMEOUT)
@@ -1761,6 +1763,119 @@ mod tests {
         assert!(validate_group_epoch_key(&[0; 32]).is_ok());
         assert!(validate_group_epoch_key(&[0; 31]).is_err());
         assert!(validate_group_epoch_key(&[0; 33]).is_err());
+    }
+
+    #[cfg(feature = "voip-engine-wacore")]
+    #[tokio::test]
+    async fn timestampless_rekey_decrypts_and_reaches_group_media() {
+        use wacore::libsignal::protocol::{
+            GenericSignedPreKey, IdentityKey, PreKeyBundle, SignedPreKeyStore, UsePQRatchet,
+            process_prekey_bundle,
+        };
+        use wacore::types::jid::JidExt;
+        use wacore::voip_control::{CallSession, control::GroupControl};
+
+        let client = make_client().await;
+        let sender_client = make_client().await;
+        let creator = fake_caller_lid();
+        let sender = creator.clone().with_device(1);
+        let recipient = Jid::new("222222222222222", Server::Lid).with_device(2);
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        let receiver_adapter = client.signal_adapter();
+        let signed = receiver_adapter
+            .signed_pre_key_store
+            .get_signed_pre_key(1.into())
+            .await
+            .expect("receiver signed prekey");
+        let bundle = PreKeyBundle::new(
+            snapshot.core.registration_id,
+            2u32.into(),
+            None,
+            1u32.into(),
+            signed.public_key().unwrap(),
+            signed.signature().unwrap(),
+            IdentityKey::new(snapshot.core.identity_key.public_key),
+        )
+        .unwrap();
+        let mut sender_adapter = sender_client.signal_adapter();
+        process_prekey_bundle(
+            &recipient.to_protocol_address(),
+            &mut sender_adapter.session_store,
+            &mut sender_adapter.identity_store,
+            &bundle,
+            &mut rand::make_rng::<rand::rngs::StdRng>(),
+            UsePQRatchet::No,
+        )
+        .await
+        .unwrap();
+
+        let call_id = "REKEY-NO-T";
+        let registry = client.call_registry();
+        let generation = registry
+            .insert_call_link_checked(CallSession::new_outgoing(
+                call_id,
+                Jid::new(call_id, Server::Call),
+                creator.clone(),
+            ))
+            .unwrap();
+        let (tx, rx) = async_channel::bounded(4);
+        assert!(registry.set_group_control_sender(call_id, generation, None, tx));
+
+        // Two real Signal envelopes cross the stanza parser, authorization,
+        // decryption and generation-scoped media mailbox. No live account is used.
+        for transaction_id in [7, 8] {
+            let key = vec![transaction_id as u8; 32];
+            let plaintext = MessageUtils::encode_and_pad(&waproto::whatsapp::Message {
+                call: Some(waproto::whatsapp::message::Call {
+                    call_key: Some(key.clone()),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            });
+            let (enc_type, ciphertext) = sender_client
+                .signal()
+                .encrypt_message(&recipient, &plaintext)
+                .await
+                .unwrap();
+            let stanza = NodeBuilder::new("call")
+                .attr("from", sender.clone())
+                .attr("id", format!("REKEY-{transaction_id}"))
+                .children([NodeBuilder::new("enc_rekey")
+                    .attr("call-id", call_id)
+                    .attr("call-creator", creator.clone())
+                    .attr("transaction-id", transaction_id.to_string())
+                    .children([
+                        NodeBuilder::new("encopt").attr("keygen", "2").build(),
+                        NodeBuilder::new("enc")
+                            .attr("type", enc_type.as_wire_str())
+                            .attr("v", "2")
+                            .bytes(ciphertext)
+                            .build(),
+                    ])
+                    .build()])
+                .build();
+            let mut cancelled = false;
+            let mut malformed = stanza.clone();
+            malformed.attrs.insert("t", "invalid");
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&malformed),
+                    &mut cancelled,
+                )
+                .await;
+            assert!(rx.try_recv().is_err(), "invalid t must not rotate keys");
+            CallHandler
+                .handle(client.clone(), node_to_owned_ref(&stanza), &mut cancelled)
+                .await;
+            let GroupControl::RawEpoch(epoch) = rx.try_recv().expect("rekey reached media") else {
+                panic!("expected a media epoch");
+            };
+            assert_eq!(epoch.transaction_id, transaction_id);
+            assert_eq!(epoch.raw_epoch_for_test(), key);
+        }
+        registry.remove_if_current(call_id, generation);
     }
 
     #[cfg(feature = "voip-control")]
