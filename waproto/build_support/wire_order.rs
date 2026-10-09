@@ -9,6 +9,167 @@ use ::core::mem::ManuallyDrop;
 type GroupMap = fn(u32) -> u32;
 type Projection = Vec<(u32, Vec<u8>)>;
 
+// Enum-only owners need no per-type copy of protobuf sizing and writing code.
+// The stack projection retains field presence, including present zero values.
+#[cold]
+#[inline(never)]
+pub(crate) fn enum_snapshot(
+    fields: &[(u32, Option<i32>)],
+    ctx: Option<DecodeContext<'_>>,
+) -> Result<Vec<u8>, DecodeError> {
+    let len: usize = fields
+        .iter()
+        .filter_map(|(tag, value)| {
+            value.map(|value| {
+                ::buffa::encoding::varint_len(u64::from(*tag) << 3)
+                    + ::buffa::types::int32_encoded_len(value) as usize
+            })
+        })
+        .sum();
+    if let Some(ctx) = ctx {
+        ctx.register_element_memory(len)?;
+    }
+    let mut bytes = Vec::with_capacity(len);
+    for &(tag, value) in fields {
+        if let Some(value) = value {
+            ::buffa::types::put_int32_field(tag, value, &mut bytes);
+        }
+    }
+    Ok(bytes)
+}
+
+// The occurrence algorithm is shared through an erased adapter only after a
+// future field activates the journal. Known-only decoding keeps its generated
+// static codec; hundreds of message types need not repeat this cold algorithm.
+pub(crate) trait OwnedCodec {
+    fn storage(&mut self) -> &mut Storage;
+    fn groups(&self) -> GroupMap;
+    fn known(&self, ctx: DecodeContext<'_>) -> Result<Vec<u8>, DecodeError>;
+    fn merge_slice(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut &[u8],
+        ctx: DecodeContext<'_>,
+    ) -> Result<(), DecodeError>;
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn begin_owned(
+    codec: &mut dyn OwnedCodec,
+    ctx: DecodeContext<'_>,
+) -> Result<(), DecodeError> {
+    let known = codec.known(ctx)?;
+    let map = codec.groups();
+    codec.storage().begin(&known, map, ctx)
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn merge_owned_known(
+    codec: &mut dyn OwnedCodec,
+    tag: ::buffa::encoding::Tag,
+    buf: &mut dyn Buf,
+    ctx: DecodeContext<'_>,
+) -> Result<(), DecodeError> {
+    let map = codec.groups();
+    let group = map(tag.field_number());
+    let previous = codec.storage().len();
+    debug_assert_ne!(group, 0);
+    let known = codec.known(ctx)?;
+    codec.storage().reconcile(&known, map, ctx)?;
+    let mut input = buf;
+    let mut captured = Capture::new(&mut input, tag, ctx)?;
+    ::buffa::encoding::skip_field_depth(tag, &mut captured, ctx.depth())?;
+    let raw = captured.finish()?;
+    let mut payload = raw.as_slice();
+    ::buffa::encoding::Tag::decode(&mut payload)?;
+    // Generated decoders receive their existing slice specialization. Erasing
+    // their input buffer would instantiate a second recursive codec tree.
+    codec.merge_slice(tag, &mut payload, ctx)?;
+    let known = codec.known(ctx)?;
+    codec
+        .storage()
+        .finish(group, Some(raw), &known, map, previous, ctx)
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn finish_owned_unknown(
+    codec: &mut dyn OwnedCodec,
+    previous: usize,
+    ctx: DecodeContext<'_>,
+) -> Result<(), DecodeError> {
+    if codec.storage().len() != previous {
+        let map = codec.groups();
+        let known = codec.known(ctx)?;
+        codec.storage().reconcile(&known, map, ctx)?;
+        codec
+            .storage()
+            .finish(0, None, &known, map, previous, ctx)?;
+    }
+    Ok(())
+}
+
+pub(crate) trait ViewCodec<'a> {
+    fn storage(&mut self) -> &mut ViewStorage<'a>;
+    fn groups(&self) -> GroupMap;
+    fn known(&self, ctx: DecodeContext<'_>) -> Result<Vec<u8>, DecodeError>;
+    fn merge(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before: &'a [u8],
+        ctx: DecodeContext<'_>,
+    ) -> Result<&'a [u8], DecodeError>;
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn begin_view<'a>(
+    codec: &mut dyn ViewCodec<'a>,
+    ctx: DecodeContext<'_>,
+) -> Result<(), DecodeError> {
+    let known = codec.known(ctx)?;
+    let map = codec.groups();
+    codec.storage().begin(&known, map, ctx)
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn merge_view<'a>(
+    codec: &mut dyn ViewCodec<'a>,
+    tag: ::buffa::encoding::Tag,
+    cur: &'a [u8],
+    before: &'a [u8],
+    ctx: DecodeContext<'_>,
+) -> Result<&'a [u8], DecodeError> {
+    let map = codec.groups();
+    let group = map(tag.field_number());
+    let previous = codec.storage().len();
+    if group != 0 {
+        let known = codec.known(ctx)?;
+        codec.storage().reconcile(&known, map, ctx)?;
+    }
+    let rest = codec.merge(tag, cur, before, ctx)?;
+    let count = codec.storage().len();
+    if group != 0 || count != previous {
+        let known = codec.known(ctx)?;
+        if group == 0 {
+            codec.storage().reconcile(&known, map, ctx)?;
+        }
+        codec.storage().finish(
+            group,
+            &before[..before.len() - rest.len()],
+            &known,
+            map,
+            previous,
+            ctx,
+        )?;
+    }
+    Ok(rest)
+}
+
 // A journal must not recursively rebuild its children in both encoding passes.
 // Reserve codec-private entries in the public traversal cache for its prepared
 // output. Parent and sibling codecs only see their own entries, in the same
