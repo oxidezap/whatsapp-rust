@@ -1,6 +1,60 @@
 use evolution_fixture::{Message, MessageView, ViewEncode};
 
 #[test]
+fn packed_child_values_fit_the_schema_aware_completion_reservation() {
+    use evolution_fixture::{v1, v2, DecodeOptions};
+    let mut wire = vec![0xc0, 0x3e, 7, 0x3a, 0x84, 4, 0x82, 2, 0x80, 4];
+    wire.extend(std::iter::repeat_n(0, 512));
+    let expected = v2::Record::decode_from_slice(&wire).unwrap();
+    let options = DecodeOptions::new().with_element_memory_limit(128 * 1024);
+    let owned = options.decode_from_slice::<v1::Record>(&wire).unwrap();
+    let view = options.decode_view::<v1::RecordView<'_>>(&wire).unwrap();
+    for bytes in [owned.encode_to_vec(), view.encode_to_vec(), view.to_owned_message().unwrap().encode_to_vec()] {
+        assert_eq!(v2::Record::decode_from_slice(&bytes).unwrap(), expected);
+    }
+}
+
+#[test]
+fn pending_singular_snapshot_covers_expanding_packed_enum_values() {
+    use evolution_fixture::{v1, v2, DecodeOptions};
+    let mut wire = vec![0xc0, 0x3e, 7, 0x18, 0, 0x12, 0x80, 0x0a];
+    // 256 five-byte int32 encodings become ten-byte canonical negative values.
+    for _ in 0..256 {
+        wire.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x0f]);
+    }
+    wire.extend_from_slice(&[0x18, 1]);
+    let expected = v2::RepeatedRecord::decode_from_slice(&wire).unwrap();
+    let options = DecodeOptions::new().with_element_memory_limit(128 * 1024);
+    let owned = options.decode_from_slice::<v1::RepeatedRecord>(&wire).unwrap();
+    let view = options.decode_view::<v1::RepeatedRecordView<'_>>(&wire).unwrap();
+    for output in [owned.encode_to_vec(), view.encode_to_vec(), view.to_owned_message().unwrap().encode_to_vec()] {
+        assert_eq!(v2::RepeatedRecord::decode_from_slice(&output).unwrap(), expected);
+    }
+}
+
+#[test]
+fn event_budget_failure_keeps_the_completed_later_known_occurrence() {
+    use evolution_fixture::{v1, v2, DecodeContext};
+    let first = [0xc0, 0x3e, 7];
+    let later = [0x10, 0, 0x10, 1, 0x10, 2];
+    for allowance in 0..600 {
+        let unknown = core::cell::Cell::new(usize::MAX);
+        let budget = core::cell::Cell::new(allowance);
+        let mut owned = v1::EnumRecord::decode_from_slice(&first).unwrap();
+        let _ = owned.merge_to_limit(&mut &later[..], DecodeContext::new(100, &unknown).with_element_memory(&budget), 0);
+        if owned.mode == Some(v1::record::Mode::OTHER) {
+            assert_eq!(v2::EnumRecord::decode_from_slice(&owned.encode_to_vec()).unwrap().mode, Some(v2::record::Mode::OTHER), "owned budget {allowance}");
+        }
+        let budget = core::cell::Cell::new(allowance);
+        let mut view = v1::EnumRecordView::decode_view(&first).unwrap();
+        let _ = view.merge_into_view(&later, DecodeContext::new(100, &unknown).with_element_memory(&budget));
+        if view.mode == Some(v1::record::Mode::OTHER) {
+            assert_eq!(v2::EnumRecord::decode_from_slice(&view.encode_to_vec()).unwrap().mode, Some(v2::record::Mode::OTHER), "view budget {allowance}");
+        }
+    }
+}
+
+#[test]
 fn every_budget_boundary_keeps_materialized_future_enum_last() {
     use evolution_fixture::{v1, v2, DecodeContext};
     let first = [0xc0, 0x3e, 7];
@@ -38,7 +92,9 @@ fn failed_final_baseline_budget_keeps_owned_enum_winner() {
     let budget = core::cell::Cell::new(used - 1);
     assert!(retained.merge_to_limit(&mut &later[..], DecodeContext::new(100, &unknown).with_element_memory(&budget), 0).is_err());
     let restored = v2::EnumRecord::decode_from_slice(&retained.encode_to_vec()).unwrap();
-    assert_eq!(restored.mode, Some(v2::record::Mode::NEW));
+    // Prepayment may reject the final occurrence before it is materialized.
+    let expected = if retained.__buffa_unknown_fields.len() == 2 { v2::record::Mode::NEW } else { v2::record::Mode::READY };
+    assert_eq!(restored.mode, Some(expected));
     retained.merge_from_slice(&[0x10, 2]).unwrap();
     assert_eq!(v2::EnumRecord::decode_from_slice(&retained.encode_to_vec()).unwrap().mode, Some(v2::record::Mode::OTHER));
 }
@@ -57,9 +113,10 @@ fn failed_final_baseline_budget_keeps_view_enum_winner() {
     let budget = core::cell::Cell::new(used - 1);
     assert!(retained.merge_into_view(&later, DecodeContext::new(100, &unknown).with_element_memory(&budget)).is_err());
     let restored = v2::EnumRecord::decode_from_slice(&retained.encode_to_vec()).unwrap();
-    assert_eq!(restored.mode, Some(v2::record::Mode::NEW));
+    let expected = if retained.__buffa_unknown_fields.len() == 2 { v2::record::Mode::NEW } else { v2::record::Mode::READY };
+    assert_eq!(restored.mode, Some(expected));
     let owned = retained.to_owned_message().unwrap();
-    assert_eq!(v2::EnumRecord::decode_from_slice(&owned.encode_to_vec()).unwrap().mode, Some(v2::record::Mode::NEW));
+    assert_eq!(v2::EnumRecord::decode_from_slice(&owned.encode_to_vec()).unwrap().mode, Some(expected));
     retained.merge_into_view(&[0x10, 2], DecodeContext::new(100, &unknown)).unwrap();
     assert_eq!(v2::EnumRecord::decode_from_slice(&retained.encode_to_vec()).unwrap().mode, Some(v2::record::Mode::OTHER));
 }

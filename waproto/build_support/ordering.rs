@@ -113,16 +113,29 @@ impl VisitMut for PushViewDecoded {
     }
 }
 
-pub fn apply(file: &mut syn::File, view: bool) {
-    transform(&mut file.items, view, 0);
+pub fn apply(file: &mut syn::File, view: bool, growth: &super::wire_growth::Bounds) {
+    transform(&mut file.items, view, 0, "", growth);
 }
 
-fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
+fn transform(
+    items: &mut Vec<syn::Item>,
+    view: bool,
+    depth: usize,
+    scope: &str,
+    growth: &super::wire_growth::Bounds,
+) {
     for item in items.iter_mut() {
         if let syn::Item::Mod(module) = item
             && let Some((_, children)) = &mut module.content
         {
-            transform(children, view, depth + 1);
+            let name = module.ident.to_string();
+            transform(
+                children,
+                view,
+                depth + 1,
+                &format!("{scope}{}::", name.trim_start_matches("r#")),
+                growth,
+            );
         }
     }
     let mut selected: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
@@ -385,9 +398,24 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     }),
                 )
             };
+            let owner = if view {
+                name.strip_suffix("View").expect("view suffix")
+            } else {
+                &name
+            };
+            let field_growth = growth
+                .get(&format!("{scope}{owner}"))
+                .expect("generated owner descriptor");
+            let growth_cases = field_growth
+                .iter()
+                .filter(|(_, ratio)| **ratio != 2)
+                .map(|(tag, ratio)| quote!(#tag => #ratio,));
             helpers.push(syn::parse_quote! {
                 impl #impl_generics #ty #where_clause {
                     #codecs
+                    fn __wire_growth(tag: u32) -> usize {
+                        match tag { #(#growth_cases)* _ => 2 }
+                    }
                     #[cold]
                     pub(crate) fn __wire_known(&self) -> ::buffa::alloc::vec::Vec<u8> {
                         self.__wire_snapshot(None).expect("unbudgeted wire projection")
@@ -688,6 +716,7 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     impl #impl_generics #runtime::ViewCodec<'a> for #runtime::Adapter<'_, #ty> #where_clause {
                         fn storage(&mut self) -> &mut #runtime::ViewStorage<'a> { &mut self.0.__buffa_unknown_fields }
                         fn groups(&self) -> fn(u32) -> u32 { <#ty>::__wire_group }
+                        fn growth(&self, tag: u32) -> usize { <#ty>::__wire_growth(tag) }
                         fn known(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> { self.0.__wire_known_for_decode(ctx) }
                         fn merge(&mut self, tag: ::buffa::encoding::Tag, cur: &'a [u8], before: &'a [u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> { self.0.__wire_merge(tag, cur, before, ctx) }
                     }
@@ -697,6 +726,7 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     impl #impl_generics #runtime::OwnedCodec for #runtime::Adapter<'_, #ty> #where_clause {
                         fn storage(&mut self) -> &mut #runtime::Storage { &mut self.0.__buffa_unknown_fields }
                         fn groups(&self) -> fn(u32) -> u32 { <#ty>::__wire_group }
+                        fn growth(&self, tag: u32) -> usize { <#ty>::__wire_growth(tag) }
                         fn known(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> { self.0.__wire_known_for_decode(ctx) }
                         fn merge_slice(&mut self, tag: ::buffa::encoding::Tag, buf: &mut &[u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<(), ::buffa::DecodeError> { self.0.__wire_merge(tag, buf, ctx) }
                     }
