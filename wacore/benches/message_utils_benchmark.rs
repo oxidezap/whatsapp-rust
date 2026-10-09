@@ -20,16 +20,14 @@ fn main() {
 // so changes to occurrence retention have separate encode/decode measurements.
 fn oneof_wire(shape: &str) -> Vec<u8> {
     use buffa::Message as _;
-    let mut image = wa::message::ImageMessage::default();
-    image.caption = Some("Synthetic image caption".into());
-    image.jpeg_thumbnail = Some(vec![0x5a; 64]);
-    let mut quoted = wa::Message::default();
-    quoted.conversation = Some("Synthetic quoted text".into());
-    let mut context = wa::ContextInfo::default();
-    context.quoted_message = Some(quoted).into();
-    image.context_info = Some(context).into();
-    let mut header = wa::message::interactive_message::Header::default();
-    header.title = Some("Synthetic header".into());
+    let quoted = wa::Message::default().with_conversation("Synthetic quoted text");
+    let context = wa::ContextInfo::default().with_quoted_message(quoted);
+    let image = wa::message::ImageMessage::default()
+        .with_caption("Synthetic image caption")
+        .with_jpeg_thumbnail(vec![0x5a; 64])
+        .with_context_info(context);
+    let mut header =
+        wa::message::interactive_message::Header::default().with_title("Synthetic header");
     header.media =
         Some(wa::message::interactive_message::header::Media::ImageMessage(Box::new(image)));
     let known = header.encode_to_vec();
