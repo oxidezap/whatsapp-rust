@@ -727,15 +727,14 @@ impl SenderKeyState {
             return;
         }
         use record_encoding::{
-            bytes_len, write_bytes, write_nested, write_seed_record, write_uint32,
+            bytes_len, write_bytes, write_nested, write_seed_entry, write_uint32,
         };
 
         if let Some(id) = self.sender_key_id {
             write_uint32(1, id, out);
         }
         if let Some(chain) = &self.sender_chain {
-            write_nested(2, record_encoding::seed_record_len(chain.iteration), out);
-            write_seed_record(chain.iteration, &chain.chain_key, out);
+            write_seed_entry(2, chain.iteration, &chain.chain_key, out);
         }
         if let Some(key) = self.sender_signing_key.as_option() {
             let len = key.public.as_deref().map_or(0, bytes_len)
@@ -749,8 +748,7 @@ impl SenderKeyState {
             }
         }
         for key in self.message_keys.iter() {
-            write_nested(4, record_encoding::seed_record_len(key.iteration), out);
-            write_seed_record(key.iteration, &key.seed, out);
+            write_seed_entry(4, key.iteration, &key.seed, out);
         }
     }
 
@@ -896,9 +894,26 @@ mod record_encoding {
         out.extend_from_slice(bytes);
     }
 
-    pub(super) fn write_seed_record(iteration: u32, seed: &[u8; 32], out: &mut Vec<u8>) {
-        write_uint32(1, iteration, out);
-        write_bytes(2, seed, out);
+    pub(super) fn write_seed_entry(field: u32, iteration: u32, seed: &[u8; 32], out: &mut Vec<u8>) {
+        use bytes::BufMut as _;
+
+        // Both callers use one-byte tags. The longest entry has a five-byte
+        // iteration and a 32-byte seed; appending it once avoids repeatedly
+        // checking/growing the final Vec for each small header component.
+        debug_assert!(matches!(field, 2 | 4));
+        let mut entry = [0u8; 42];
+        let len = {
+            let mut remaining = entry.as_mut_slice();
+            Tag::new(field, WireType::LengthDelimited).encode(&mut remaining);
+            encode_varint(seed_record_len(iteration) as u64, &mut remaining);
+            Tag::new(1, WireType::Varint).encode(&mut remaining);
+            encode_varint(u64::from(iteration), &mut remaining);
+            Tag::new(2, WireType::LengthDelimited).encode(&mut remaining);
+            remaining.put_u8(32);
+            remaining.put_slice(seed);
+            42 - remaining.len()
+        };
+        out.extend_from_slice(&entry[..len]);
     }
 }
 
