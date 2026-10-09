@@ -1,0 +1,606 @@
+//! Cold occurrence journal for messages with singular enums or oneofs.
+//! Generated codecs keep their ordinary path when no unknown field was read.
+
+use ::buffa::alloc::{borrow::Cow, boxed::Box, vec::Vec};
+use ::buffa::bytes::Buf;
+use ::buffa::{DecodeContext, DecodeError, EncodeSink, UnknownField, UnknownFields};
+
+type GroupMap = fn(u32) -> u32;
+type Projection = Vec<(u32, Vec<u8>)>;
+
+#[derive(Clone, PartialEq, Hash)]
+enum Event<'a> {
+    Known(u32, Cow<'a, [u8]>),
+    Unknown(usize),
+}
+
+#[derive(Clone, Default, PartialEq, Hash)]
+struct Order<'a> {
+    events: Vec<Event<'a>>,
+    baseline: Projection,
+    forced: Vec<u32>,
+    unknown_count: usize,
+}
+
+fn records(mut bytes: &[u8]) -> impl Iterator<Item = (u32, &[u8])> {
+    ::core::iter::from_fn(move || {
+        if bytes.is_empty() {
+            return None;
+        }
+        let start = bytes;
+        let tag = ::buffa::encoding::Tag::decode(&mut bytes).expect("generated field tag");
+        ::buffa::encoding::skip_field_depth(tag, &mut bytes, u32::MAX)
+            .expect("generated field payload");
+        Some((tag.field_number(), &start[..start.len() - bytes.len()]))
+    })
+}
+
+fn projection(known: &[u8], map: GroupMap) -> Projection {
+    let mut result: Projection = Vec::new();
+    for (tag, raw) in records(known) {
+        let group = map(tag);
+        if group == 0 {
+            continue;
+        }
+        if let Some((_, bytes)) = result.iter_mut().find(|(id, _)| *id == group) {
+            bytes.extend_from_slice(raw);
+        } else {
+            result.push((group, raw.to_vec()));
+        }
+    }
+    result
+}
+
+fn projection_charge(known: &[u8], map: GroupMap, copies: usize) -> usize {
+    let mut groups = Vec::new();
+    let mut bytes = 0usize;
+    for (tag, raw) in records(known) {
+        let group = map(tag);
+        if group != 0 {
+            bytes = bytes.saturating_add(raw.len().saturating_mul(copies));
+            if !groups.contains(&group) {
+                groups.push(group);
+            }
+        }
+    }
+    bytes.saturating_add(groups.len().saturating_mul(
+        ::core::mem::size_of::<(u32, Vec<u8>)>() + ::core::mem::size_of::<Event<'_>>(),
+    ))
+}
+
+fn event_charge(count: usize) -> usize {
+    count.saturating_mul(::core::mem::size_of::<Event<'_>>())
+}
+
+fn value(values: &Projection, group: u32) -> &[u8] {
+    values
+        .iter()
+        .find(|(id, _)| *id == group)
+        .map_or(&[], |(_, bytes)| bytes)
+}
+
+impl<'a> Order<'a> {
+    fn unchanged(&self, known: &[u8], map: GroupMap) -> bool {
+        if !self.forced.is_empty() {
+            return false;
+        }
+        let mut count = 0;
+        for (tag, raw) in records(known) {
+            let group = map(tag);
+            if group != 0 {
+                count += 1;
+                if value(&self.baseline, group) != raw {
+                    return false;
+                }
+            }
+        }
+        count == self.baseline.len()
+    }
+    fn begin(known: &[u8], map: GroupMap, count: usize) -> Self {
+        let baseline = projection(known, map);
+        let mut events = Vec::new();
+        for (group, bytes) in &baseline {
+            events.push(Event::Known(*group, Cow::Owned(bytes.clone())));
+        }
+        events.extend((0..count).map(Event::Unknown));
+        Self {
+            events,
+            baseline,
+            forced: Vec::new(),
+            unknown_count: count,
+        }
+    }
+
+    fn changed(&self, current: &Projection) -> Vec<u32> {
+        let mut ids = self.forced.clone();
+        for (group, _) in self.baseline.iter().chain(current.iter()) {
+            if !ids.contains(group) && value(&self.baseline, *group) != value(current, *group) {
+                ids.push(*group);
+            }
+        }
+        ids
+    }
+
+    fn reconcile(
+        &mut self,
+        known: &[u8],
+        map: GroupMap,
+        ctx: DecodeContext<'_>,
+    ) -> Result<(), DecodeError> {
+        if self.unchanged(known, map) {
+            return Ok(());
+        }
+        ctx.register_element_memory(projection_charge(known, map, 2))?;
+        let current = projection(known, map);
+        let changed = self.changed(&current);
+        self.events
+            .retain(|event| !matches!(event, Event::Known(group, _) if changed.contains(group)));
+        for group in changed {
+            let bytes = value(&current, group);
+            if !bytes.is_empty() {
+                self.events
+                    .push(Event::Known(group, Cow::Owned(bytes.to_vec())));
+            }
+        }
+        self.baseline = current;
+        self.forced.clear();
+        Ok(())
+    }
+
+    fn append_unknown(&mut self, count: usize) {
+        self.events
+            .extend((self.unknown_count..count).map(Event::Unknown));
+        self.unknown_count = count;
+    }
+
+    fn write(&self, known: &[u8], unknown: &[u8], map: GroupMap) -> Vec<u8> {
+        let (current, changed) = if self.unchanged(known, map) {
+            (Vec::new(), Vec::new())
+        } else {
+            let current = projection(known, map);
+            let changed = self.changed(&current);
+            (current, changed)
+        };
+        let mut unknown = records(unknown);
+        let mut result = Vec::new();
+        for (tag, raw) in records(known) {
+            if map(tag) == 0 {
+                result.extend_from_slice(raw);
+            }
+        }
+        for event in &self.events {
+            match event {
+                Event::Unknown(_) => {
+                    result.extend_from_slice(unknown.next().expect("retained unknown occurrence").1)
+                }
+                Event::Known(group, bytes) if !changed.contains(group) => {
+                    result.extend_from_slice(bytes)
+                }
+                Event::Known(_, _) => {}
+            }
+        }
+        for group in changed {
+            result.extend_from_slice(value(&current, group));
+        }
+        result
+    }
+
+    fn owned(&self) -> Order<'static> {
+        Order {
+            events: self
+                .events
+                .iter()
+                .map(|event| match event {
+                    Event::Unknown(index) => Event::Unknown(*index),
+                    Event::Known(group, bytes) => Event::Known(*group, Cow::Owned(bytes.to_vec())),
+                })
+                .collect(),
+            baseline: self.baseline.clone(),
+            forced: self.forced.clone(),
+            unknown_count: self.unknown_count,
+        }
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Hash)]
+struct State {
+    fields: UnknownFields,
+    order: Option<Order<'static>>,
+}
+
+/// Internal storage; raw unknown-field mutation deliberately drops the journal.
+#[derive(Clone, Default, PartialEq, Hash)]
+pub struct Storage(Option<Box<State>>);
+
+impl ::core::fmt::Debug for Storage {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        ::core::fmt::Debug::fmt(&**self, f)
+    }
+}
+impl ::core::ops::Deref for Storage {
+    type Target = UnknownFields;
+    fn deref(&self) -> &Self::Target {
+        static EMPTY: UnknownFields = UnknownFields::new();
+        self.0.as_ref().map_or(&EMPTY, |state| &state.fields)
+    }
+}
+impl ::core::ops::DerefMut for Storage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        let state = self.0.get_or_insert_with(Box::default);
+        state.order = None;
+        &mut state.fields
+    }
+}
+impl From<UnknownFields> for Storage {
+    fn from(fields: UnknownFields) -> Self {
+        if fields.is_empty() {
+            Self::default()
+        } else {
+            Self(Some(Box::new(State {
+                fields,
+                order: None,
+            })))
+        }
+    }
+}
+impl From<Storage> for UnknownFields {
+    fn from(storage: Storage) -> Self {
+        storage
+            .0
+            .map_or_else(UnknownFields::new, |state| state.fields)
+    }
+}
+impl PartialEq<UnknownFields> for Storage {
+    fn eq(&self, other: &UnknownFields) -> bool {
+        &**self == other
+    }
+}
+impl PartialEq<Storage> for UnknownFields {
+    fn eq(&self, other: &Storage) -> bool {
+        self == &**other
+    }
+}
+impl<'a> IntoIterator for &'a Storage {
+    type Item = &'a UnknownField;
+    type IntoIter = ::core::slice::Iter<'a, UnknownField>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+impl IntoIterator for Storage {
+    type Item = UnknownField;
+    type IntoIter = <UnknownFields as IntoIterator>::IntoIter;
+    fn into_iter(self) -> Self::IntoIter {
+        UnknownFields::from(self).into_iter()
+    }
+}
+impl Storage {
+    #[inline]
+    pub fn active(&self) -> bool {
+        self.0.as_ref().is_some_and(|state| state.order.is_some())
+    }
+    #[cold]
+    pub(super) fn push_decoded(
+        &mut self,
+        field: UnknownField,
+        ctx: DecodeContext<'_>,
+    ) -> Result<(), DecodeError> {
+        if self.0.is_none() {
+            ctx.register_element_memory(::core::mem::size_of::<State>())?;
+        }
+        self.0.get_or_insert_with(Box::default).fields.push(field);
+        Ok(())
+    }
+    #[cold]
+    pub fn merge_unknown(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl Buf,
+        ctx: DecodeContext<'_>,
+    ) -> Result<(), DecodeError> {
+        self.push_decoded(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?, ctx)
+    }
+    #[cold]
+    pub fn begin(
+        &mut self,
+        known: &[u8],
+        map: GroupMap,
+        ctx: DecodeContext<'_>,
+    ) -> Result<(), DecodeError> {
+        ctx.register_element_memory(
+            projection_charge(known, map, 2).saturating_add(event_charge(self.len())),
+        )?;
+        let state = self.0.get_or_insert_with(Box::default);
+        state.order = Some(Order::begin(known, map, state.fields.len()));
+        Ok(())
+    }
+    #[cold]
+    pub fn reconcile(
+        &mut self,
+        known: &[u8],
+        map: GroupMap,
+        ctx: DecodeContext<'_>,
+    ) -> Result<(), DecodeError> {
+        if let Some(order) = self.0.as_mut().and_then(|state| state.order.as_mut()) {
+            order.reconcile(known, map, ctx)?;
+        }
+        Ok(())
+    }
+    #[cold]
+    pub fn finish(
+        &mut self,
+        group: u32,
+        raw: Option<Vec<u8>>,
+        known: &[u8],
+        map: GroupMap,
+        previous: usize,
+        ctx: DecodeContext<'_>,
+    ) -> Result<(), DecodeError> {
+        let state = self.0.as_mut().expect("decoded unknown storage");
+        let order = state.order.as_mut().expect("started occurrence journal");
+        if group != 0 && previous == state.fields.len() {
+            ctx.register_element_memory(
+                projection_charge(known, map, 1).saturating_add(event_charge(1)),
+            )?;
+            order.events.push(Event::Known(
+                group,
+                Cow::Owned(raw.expect("captured known occurrence")),
+            ));
+            order.baseline = projection(known, map);
+        }
+        ctx.register_element_memory(event_charge(state.fields.len() - order.unknown_count))?;
+        order.append_unknown(state.fields.len());
+        Ok(())
+    }
+    #[cold]
+    pub fn compose(&self, known: &[u8], map: GroupMap) -> Vec<u8> {
+        let state = self.0.as_ref().expect("active occurrence journal");
+        let mut unknown = Vec::new();
+        state.fields.write_to(&mut unknown);
+        state
+            .order
+            .as_ref()
+            .expect("active occurrence journal")
+            .write(known, &unknown, map)
+    }
+    pub fn force(&mut self, group: u32) {
+        if let Some(order) = self.0.as_mut().and_then(|state| state.order.as_mut())
+            && !order.forced.contains(&group)
+        {
+            order.forced.push(group);
+        }
+    }
+    pub fn clear(&mut self) {
+        self.0 = None;
+    }
+    /// Rebase only representation differences during view conversion; retain
+    /// forced or value-observable edits instead of blessing them as received.
+    pub fn rebase(&mut self, view_known: &[u8], owned_known: &[u8], map: GroupMap) {
+        if let Some(order) = self.0.as_mut().and_then(|state| state.order.as_mut()) {
+            order.forced = order.changed(&projection(view_known, map));
+            order.baseline = projection(owned_known, map);
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct ViewState<'a> {
+    fields: ::buffa::UnknownFieldsView<'a>,
+    count: usize,
+    order: Option<Order<'a>>,
+}
+#[derive(Clone, Default)]
+pub struct ViewStorage<'a>(Option<Box<ViewState<'a>>>);
+impl ::core::fmt::Debug for ViewStorage<'_> {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("ViewStorage")
+            .field("unknown_fields", &self.0.as_ref().map(|s| &s.fields))
+            .finish()
+    }
+}
+impl<'a> ViewStorage<'a> {
+    pub fn is_empty(&self) -> bool {
+        self.0.as_ref().is_none_or(|state| state.fields.is_empty())
+    }
+    pub fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, |state| state.count)
+    }
+    pub fn active(&self) -> bool {
+        self.0.as_ref().is_some_and(|state| state.order.is_some())
+    }
+    pub fn force(&mut self, group: u32) {
+        if let Some(order) = self.0.as_mut().and_then(|state| state.order.as_mut())
+            && !order.forced.contains(&group)
+        {
+            order.forced.push(group);
+        }
+    }
+    pub fn encoded_len(&self) -> usize {
+        self.0
+            .as_ref()
+            .map_or(0, |state| state.fields.encoded_len())
+    }
+    pub fn write_to(&self, buf: &mut impl EncodeSink) {
+        if let Some(state) = &self.0 {
+            state.fields.write_to(buf);
+        }
+    }
+    pub fn push_record(
+        &mut self,
+        tail: &'a [u8],
+        len: usize,
+        ctx: DecodeContext<'_>,
+    ) -> Result<(), DecodeError> {
+        if let Some(state) = &mut self.0 {
+            state.order = None;
+        }
+        self.push_decoded_record(tail, len, ctx)
+    }
+    pub(super) fn push_decoded_record(
+        &mut self,
+        tail: &'a [u8],
+        len: usize,
+        ctx: DecodeContext<'_>,
+    ) -> Result<(), DecodeError> {
+        if self.0.is_none() {
+            ctx.register_element_memory(::core::mem::size_of::<ViewState<'_>>())?;
+        }
+        let state = self.0.get_or_insert_with(Box::default);
+        state.fields.push_record(tail, len, ctx)?;
+        state.count += 1;
+        Ok(())
+    }
+    pub fn push_varint(
+        &mut self,
+        field: u32,
+        value: u64,
+        ctx: DecodeContext<'_>,
+    ) -> Result<(), DecodeError> {
+        if let Some(state) = &mut self.0 {
+            state.order = None;
+        }
+        self.push_decoded_varint(field, value, ctx)
+    }
+    pub(super) fn push_decoded_varint(
+        &mut self,
+        field: u32,
+        value: u64,
+        ctx: DecodeContext<'_>,
+    ) -> Result<(), DecodeError> {
+        if self.0.is_none() {
+            ctx.register_element_memory(::core::mem::size_of::<ViewState<'_>>())?;
+        }
+        let state = self.0.get_or_insert_with(Box::default);
+        state.fields.push_varint(field, value, ctx)?;
+        state.count += 1;
+        Ok(())
+    }
+    pub fn to_owned(&self) -> Result<Storage, DecodeError> {
+        self.0.as_ref().map_or_else(
+            || Ok(Storage::default()),
+            |state| {
+                Ok(Storage(Some(Box::new(State {
+                    fields: state.fields.to_owned()?,
+                    order: state.order.as_ref().map(Order::owned),
+                }))))
+            },
+        )
+    }
+    pub fn begin(
+        &mut self,
+        known: &[u8],
+        map: GroupMap,
+        ctx: DecodeContext<'_>,
+    ) -> Result<(), DecodeError> {
+        ctx.register_element_memory(
+            projection_charge(known, map, 2).saturating_add(event_charge(self.len())),
+        )?;
+        let state = self.0.get_or_insert_with(Box::default);
+        state.order = Some(Order::begin(known, map, state.count));
+        Ok(())
+    }
+    pub fn reconcile(
+        &mut self,
+        known: &[u8],
+        map: GroupMap,
+        ctx: DecodeContext<'_>,
+    ) -> Result<(), DecodeError> {
+        if let Some(order) = self.0.as_mut().and_then(|state| state.order.as_mut()) {
+            order.reconcile(known, map, ctx)?;
+        }
+        Ok(())
+    }
+    pub fn finish(
+        &mut self,
+        group: u32,
+        raw: &'a [u8],
+        known: &[u8],
+        map: GroupMap,
+        previous: usize,
+        ctx: DecodeContext<'_>,
+    ) -> Result<(), DecodeError> {
+        let state = self.0.as_mut().expect("decoded unknown storage");
+        let order = state.order.as_mut().expect("started occurrence journal");
+        if group != 0 && previous == state.count {
+            // Charge the borrowed occurrence's eventual owned copy as well.
+            ctx.register_element_memory(
+                projection_charge(known, map, 1)
+                    .saturating_add(raw.len())
+                    .saturating_add(event_charge(1)),
+            )?;
+            order.events.push(Event::Known(group, Cow::Borrowed(raw)));
+            order.baseline = projection(known, map);
+        }
+        ctx.register_element_memory(event_charge(state.count - order.unknown_count))?;
+        order.append_unknown(state.count);
+        Ok(())
+    }
+    pub fn compose(&self, known: &[u8], map: GroupMap) -> Vec<u8> {
+        let state = self.0.as_ref().expect("active occurrence journal");
+        let mut unknown = Vec::new();
+        state.fields.write_to(&mut unknown);
+        state
+            .order
+            .as_ref()
+            .expect("active occurrence journal")
+            .write(known, &unknown, map)
+    }
+}
+
+/// Records only fields read after a message's first unknown occurrence.
+pub struct Capture<'a, 'c> {
+    inner: &'a mut dyn Buf,
+    bytes: Vec<u8>,
+    ctx: DecodeContext<'c>,
+    exhausted: bool,
+}
+impl<'a, 'c> Capture<'a, 'c> {
+    pub fn new(
+        inner: &'a mut impl Buf,
+        tag: ::buffa::encoding::Tag,
+        ctx: DecodeContext<'c>,
+    ) -> Result<Self, DecodeError> {
+        ctx.register_element_memory(5)?;
+        let mut bytes = Vec::new();
+        tag.encode(&mut bytes);
+        Ok(Self {
+            inner,
+            bytes,
+            ctx,
+            exhausted: false,
+        })
+    }
+    pub fn finish(self) -> Result<Vec<u8>, DecodeError> {
+        if self.exhausted {
+            Err(DecodeError::ElementMemoryLimitExceeded)
+        } else {
+            Ok(self.bytes)
+        }
+    }
+}
+impl Buf for Capture<'_, '_> {
+    fn remaining(&self) -> usize {
+        self.inner.remaining()
+    }
+    fn chunk(&self) -> &[u8] {
+        self.inner.chunk()
+    }
+    fn advance(&mut self, mut count: usize) {
+        assert!(
+            count <= self.inner.remaining(),
+            "captured buffer advance exceeds input"
+        );
+        if self.ctx.register_element_memory(count).is_err() {
+            self.exhausted = true;
+        }
+        while count > 0 {
+            let chunk = self.inner.chunk();
+            let len = count.min(chunk.len());
+            if !self.exhausted {
+                self.bytes.extend_from_slice(&chunk[..len]);
+            }
+            self.inner.advance(len);
+            count -= len;
+        }
+    }
+}

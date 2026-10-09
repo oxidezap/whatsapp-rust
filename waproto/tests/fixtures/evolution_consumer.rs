@@ -1,4 +1,4 @@
-use evolution_fixture::{Message, MessageView};
+use evolution_fixture::{Message, MessageView, ViewEncode};
 macro_rules! consumer {
     ($test:ident, $version:ident) => {
         #[test]
@@ -47,6 +47,66 @@ consumer!(old_schema, v1);
 consumer!(new_schema, v2);
 
 #[test]
+fn old_representation_retains_occurrence_order() {
+    use evolution_fixture::{v1, v2};
+    for (first, second) in [
+        (vec![0x10, 0, 0x10, 1], vec![0x10, 1, 0x10, 0]),
+        (
+            vec![0x1a, 1, b'a', 0x2a, 1, b'b'],
+            vec![0x2a, 1, b'b', 0x1a, 1, b'a'],
+        ),
+    ] {
+        assert_ne!(
+            v1::Record::decode_from_slice(&first).unwrap(),
+            v1::Record::decode_from_slice(&second).unwrap()
+        );
+        assert_ne!(
+            v2::Record::decode_from_slice(&first).unwrap(),
+            v2::Record::decode_from_slice(&second).unwrap()
+        );
+    }
+}
+
+#[test]
+fn untouched_mixed_enum_occurrences_keep_their_winner() {
+    use evolution_fixture::{v1, v2};
+    for wire in [[0x10, 0, 0x10, 1], [0x10, 1, 0x10, 0]] {
+        let expected = v2::Record::decode_from_slice(&wire).unwrap();
+        let owned = v1::Record::decode_from_slice(&wire).unwrap();
+        let view = v1::RecordView::decode_view(&wire).unwrap();
+        let handle = v1::RecordOwnedView::decode(wire.to_vec().into()).unwrap();
+        for roundtrip in [
+            owned.encode_to_vec(),
+            view.encode_to_vec(),
+            handle.to_owned_message().encode_to_vec(),
+        ] {
+            assert_eq!(v2::Record::decode_from_slice(&roundtrip).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
+fn untouched_mixed_oneof_occurrences_keep_their_winner() {
+    use evolution_fixture::{v1, v2};
+    for wire in [
+        [0x1a, 1, b'a', 0x2a, 1, b'b'],
+        [0x2a, 1, b'b', 0x1a, 1, b'a'],
+    ] {
+        let expected = v2::Record::decode_from_slice(&wire).unwrap();
+        let owned = v1::Record::decode_from_slice(&wire).unwrap();
+        let view = v1::RecordView::decode_view(&wire).unwrap();
+        let handle = v1::RecordOwnedView::decode(wire.to_vec().into()).unwrap();
+        for roundtrip in [
+            owned.encode_to_vec(),
+            view.encode_to_vec(),
+            handle.to_owned_message().encode_to_vec(),
+        ] {
+            assert_eq!(v2::Record::decode_from_slice(&roundtrip).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
 fn new_fields_enum_values_and_oneofs_survive_an_old_reader() {
     use evolution_fixture::{v1, v2};
     let mut newer = v2::Record::default().with_name("before");
@@ -63,4 +123,281 @@ fn new_fields_enum_values_and_oneofs_survive_an_old_reader() {
     assert!(
         matches!(restored.choice, Some(v2::record::Choice::Bytes(bytes)) if bytes == [1, 2, 3])
     );
+}
+
+#[test]
+fn editing_a_retained_future_enum_wins_for_a_new_reader() {
+    use evolution_fixture::{v1, v2};
+    let mut newer = v2::Record::default().with_name("fixture");
+    newer.mode = Some(v2::record::Mode::NEW);
+    newer.extra = Some(7);
+    let wire = newer.encode_to_vec();
+    let mut view = v1::RecordView::decode_view(&wire).unwrap();
+    view.mode = Some(v1::record::Mode::READY);
+    let restored = v2::Record::decode_from_slice(&view.encode_to_vec()).unwrap();
+    assert_eq!(restored.mode, Some(v2::record::Mode::READY));
+    assert_eq!(restored.extra, Some(7));
+    let readers = [
+        v1::Record::decode_from_slice(&wire).unwrap(),
+        v1::RecordView::decode_view(&wire)
+            .unwrap()
+            .to_owned_message()
+            .unwrap(),
+        v1::RecordOwnedView::decode(wire.into())
+            .unwrap()
+            .to_owned_message(),
+    ];
+    for mut older in readers {
+        older.mode = Some(v1::record::Mode::READY);
+        let restored = v2::Record::decode_from_slice(&older.encode_to_vec()).unwrap();
+        assert_eq!(restored.mode, Some(v2::record::Mode::READY));
+        assert_eq!(restored.extra, Some(7));
+    }
+}
+
+#[test]
+fn editing_a_retained_future_oneof_wins_for_a_new_reader() {
+    use evolution_fixture::{v1, v2};
+    let mut newer = v2::Record::default().with_name("fixture");
+    newer.choice = Some(v2::record::Choice::Bytes(vec![1, 2, 3]));
+    newer.extra = Some(7);
+    let wire = newer.encode_to_vec();
+    let mut view = v1::RecordView::decode_view(&wire).unwrap();
+    view.choice = Some(v1::record::ChoiceView::Text("edited"));
+    let restored = v2::Record::decode_from_slice(&view.encode_to_vec()).unwrap();
+    assert!(matches!(restored.choice, Some(v2::record::Choice::Text(text)) if text == "edited"));
+    assert_eq!(restored.extra, Some(7));
+    let readers = [
+        v1::Record::decode_from_slice(&wire).unwrap(),
+        v1::RecordView::decode_view(&wire)
+            .unwrap()
+            .to_owned_message()
+            .unwrap(),
+        v1::RecordOwnedView::decode(wire.into())
+            .unwrap()
+            .to_owned_message(),
+    ];
+    for mut older in readers {
+        older.choice = Some(v1::record::Choice::Text("edited".into()));
+        let restored = v2::Record::decode_from_slice(&older.encode_to_vec()).unwrap();
+        assert!(
+            matches!(restored.choice, Some(v2::record::Choice::Text(text)) if text == "edited")
+        );
+        assert_eq!(restored.extra, Some(7));
+    }
+}
+
+#[test]
+fn unrelated_edits_and_view_conversion_keep_each_received_winner() {
+    use evolution_fixture::{v1, v2};
+    for wire in [
+        vec![0x10, 0, 0x10, 1, 0x1a, 1, b'a', 0x2a, 1, b'b'],
+        vec![0x10, 1, 0x10, 0, 0x2a, 1, b'b', 0x1a, 1, b'a'],
+    ] {
+        let mut expected = v2::Record::decode_from_slice(&wire).unwrap();
+        expected.name = Some("edited".into());
+        let mut owned = v1::Record::decode_from_slice(&wire).unwrap();
+        owned.name = Some("edited".into());
+        let mut view = v1::RecordView::decode_view(&wire).unwrap();
+        view.name = Some("edited");
+        let mut handle = v1::RecordOwnedView::decode(wire.clone().into())
+            .unwrap()
+            .to_owned_message();
+        handle.name = Some("edited".into());
+        for bytes in [
+            owned.encode_to_vec(),
+            view.encode_to_vec(),
+            view.to_owned_message().unwrap().encode_to_vec(),
+            handle.encode_to_vec(),
+        ] {
+            assert_eq!(v2::Record::decode_from_slice(&bytes).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
+fn changed_values_override_future_occurrences_after_all_conversion_paths() {
+    use evolution_fixture::{v1, v2};
+    for wire in [
+        vec![0x10, 0, 0x10, 1, 0x1a, 1, b'a', 0x2a, 1, b'b'],
+        vec![0x10, 1, 0x10, 0, 0x2a, 1, b'b', 0x1a, 1, b'a'],
+    ] {
+        let mut owned = v1::Record::decode_from_slice(&wire).unwrap();
+        owned.mode = Some(v1::record::Mode::OTHER);
+        owned.choice = Some(v1::record::Choice::Text("edited".into()));
+        let mut view = v1::RecordView::decode_view(&wire).unwrap();
+        view.mode = Some(v1::record::Mode::OTHER);
+        view.choice = Some(v1::record::ChoiceView::Text("edited"));
+        let mut handle = v1::RecordOwnedView::decode(wire.clone().into())
+            .unwrap()
+            .to_owned_message();
+        handle.mode = Some(v1::record::Mode::OTHER);
+        handle.choice = Some(v1::record::Choice::Text("edited".into()));
+        for bytes in [
+            owned.encode_to_vec(),
+            view.encode_to_vec(),
+            view.to_owned_message().unwrap().encode_to_vec(),
+            handle.encode_to_vec(),
+        ] {
+            let decoded = v2::Record::decode_from_slice(&bytes).unwrap();
+            assert_eq!(decoded.mode, Some(v2::record::Mode::OTHER));
+            assert!(
+                matches!(decoded.choice, Some(v2::record::Choice::Text(text)) if text == "edited")
+            );
+        }
+    }
+}
+
+#[test]
+fn setters_override_even_when_public_assignment_cannot_observe_a_change() {
+    use evolution_fixture::{v1, v2};
+    let wire = [0x10, 0, 0x10, 1, 0x1a, 1, b'a', 0x2a, 1, b'b'];
+    let mut assigned = v1::Record::decode_from_slice(&wire).unwrap();
+    assigned.mode = Some(v1::record::Mode::READY);
+    assigned.choice = Some(v1::record::Choice::Text("a".into()));
+    assert_eq!(
+        v2::Record::decode_from_slice(&assigned.encode_to_vec()).unwrap(),
+        v2::Record::decode_from_slice(&wire).unwrap()
+    );
+    let assigned = assigned
+        .with_mode(v1::record::Mode::READY)
+        .with_choice(v1::record::Choice::Text("a".into()));
+    let decoded = v2::Record::decode_from_slice(&assigned.encode_to_vec()).unwrap();
+    assert_eq!(decoded.mode, Some(v2::record::Mode::READY));
+    assert!(matches!(decoded.choice, Some(v2::record::Choice::Text(text)) if text == "a"));
+    let view = v1::RecordView::decode_view(&wire)
+        .unwrap()
+        .with_mode(v1::record::Mode::READY)
+        .with_choice(v1::record::ChoiceView::Text("a"));
+    for bytes in [
+        view.encode_to_vec(),
+        view.to_owned_message().unwrap().encode_to_vec(),
+    ] {
+        let decoded = v2::Record::decode_from_slice(&bytes).unwrap();
+        assert_eq!(decoded.mode, Some(v2::record::Mode::READY));
+        assert!(matches!(decoded.choice, Some(v2::record::Choice::Text(text)) if text == "a"));
+    }
+}
+
+#[test]
+fn clearing_the_known_projection_keeps_unrecognized_data() {
+    use evolution_fixture::{v1, v2};
+    let wire = [0x10, 1, 0x10, 0, 0x2a, 1, b'b', 0x1a, 1, b'a', 0x20, 7];
+    let mut owned = v1::Record::decode_from_slice(&wire).unwrap();
+    owned.mode = None;
+    owned.choice = None;
+    let decoded = v2::Record::decode_from_slice(&owned.encode_to_vec()).unwrap();
+    assert_eq!(decoded.mode, Some(v2::record::Mode::NEW));
+    assert_eq!(decoded.extra, Some(7));
+    assert!(matches!(decoded.choice, Some(v2::record::Choice::Bytes(ref bytes)) if bytes == b"b"));
+    let mut view = v1::RecordView::decode_view(&wire).unwrap();
+    view.mode = None;
+    view.choice = None;
+    for bytes in [
+        view.encode_to_vec(),
+        view.to_owned_message().unwrap().encode_to_vec(),
+    ] {
+        assert_eq!(v2::Record::decode_from_slice(&bytes).unwrap(), decoded);
+    }
+}
+
+#[test]
+fn nested_oneof_occurrences_do_not_merge_across_a_future_alternative() {
+    use evolution_fixture::{v1, v2};
+    // detail(left=1), future bytes="b", detail(right=2): the new schema resets
+    // detail when switching away from bytes, while the old typed projection
+    // alone merges left and right. Replay must preserve the new interpretation.
+    let wire = [0x3a, 2, 8, 1, 0x2a, 1, b'b', 0x3a, 2, 16, 2];
+    let expected = v2::Record::decode_from_slice(&wire).unwrap();
+    let owned = v1::Record::decode_from_slice(&wire).unwrap();
+    let view = v1::RecordView::decode_view(&wire).unwrap();
+    let handle = v1::RecordOwnedView::decode(wire.to_vec().into()).unwrap();
+    for bytes in [
+        owned.encode_to_vec(),
+        view.encode_to_vec(),
+        view.to_owned_message().unwrap().encode_to_vec(),
+        handle.to_owned_message().encode_to_vec(),
+    ] {
+        assert_eq!(v2::Record::decode_from_slice(&bytes).unwrap(), expected);
+    }
+}
+
+#[test]
+fn view_conversion_canonicalization_is_not_a_user_edit() {
+    use evolution_fixture::{v1, v2};
+    // The child's unknown varint uses an overlong encoding. Owned conversion
+    // canonicalizes it, but must not move detail after a later future choice.
+    for wire in [
+        vec![0x3a, 3, 0x20, 0x81, 0, 0x2a, 1, b'b'],
+        vec![0x2a, 1, b'b', 0x3a, 3, 0x20, 0x81, 0],
+    ] {
+        let expected = v2::Record::decode_from_slice(&wire).unwrap();
+        let owned = v1::Record::decode_from_slice(&wire).unwrap();
+        let view = v1::RecordView::decode_view(&wire).unwrap();
+        let handle = v1::RecordOwnedView::decode(wire.clone().into()).unwrap();
+        for bytes in [
+            owned.encode_to_vec(),
+            view.encode_to_vec(),
+            view.to_owned_message().unwrap().encode_to_vec(),
+            handle.to_owned_message().encode_to_vec(),
+        ] {
+            assert_eq!(v2::Record::decode_from_slice(&bytes).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
+fn edits_are_committed_before_a_later_wire_merge() {
+    use evolution_fixture::{v1, v2};
+    let first = [0x1a, 1, b'a', 0x2a, 1, b'b'];
+    let later = [0x2a, 1, b'c', 0x1a, 1, b'd'];
+    let mut owned = v1::Record::decode_from_slice(&first).unwrap();
+    owned.choice = Some(v1::record::Choice::Text("edited".into()));
+    owned.merge_from_slice(&later).unwrap();
+    let decoded = v2::Record::decode_from_slice(&owned.encode_to_vec()).unwrap();
+    assert!(matches!(decoded.choice, Some(v2::record::Choice::Text(text)) if text == "d"));
+}
+
+#[test]
+fn occurrence_capture_crosses_buffer_chunks_and_rejects_truncation() {
+    use evolution_fixture::{bytes::Buf, v1, v2};
+    let wire = [0x2a, 1, b'b', 0x1a, 5, b'h', b'e', b'l', b'l', b'o'];
+    let mut chunks = wire[..6].chain(&wire[6..]);
+    let decoded = v1::Record::decode(&mut chunks).unwrap();
+    let cloned = decoded.clone();
+    drop(decoded);
+    assert_eq!(
+        v2::Record::decode_from_slice(&cloned.encode_to_vec()).unwrap(),
+        v2::Record::decode_from_slice(&wire).unwrap()
+    );
+    assert!(v1::Record::decode_from_slice(&wire[..8]).is_err());
+}
+
+#[test]
+fn occurrence_metadata_obeys_the_existing_decode_memory_budget() {
+    use evolution_fixture::{DecodeError, DecodeOptions, v1};
+    let bounded = DecodeOptions::new().with_element_memory_limit(512);
+    let mut wire = Vec::new();
+    for _ in 0..100 {
+        wire.extend_from_slice(&[0x20, 7]);
+    }
+    assert!(matches!(
+        bounded.decode_from_slice::<v1::Record>(&wire),
+        Err(DecodeError::ElementMemoryLimitExceeded)
+    ));
+    assert!(matches!(
+        bounded.decode_view::<v1::RecordView<'_>>(&wire),
+        Err(DecodeError::ElementMemoryLimitExceeded)
+    ));
+    assert!(
+        DecodeOptions::new()
+            .with_element_memory_limit(0)
+            .decode_from_slice::<v1::Record>(&[0x10, 0])
+            .is_ok()
+    );
+    let allowed = DecodeOptions::new().with_element_memory_limit(32 * 1024);
+    let owned = allowed.decode_from_slice::<v1::Record>(&wire).unwrap();
+    let view = allowed.decode_view::<v1::RecordView<'_>>(&wire).unwrap();
+    assert_eq!(owned.encode_to_vec(), wire);
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), wire);
 }

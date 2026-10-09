@@ -38,6 +38,11 @@ fn schema(new: bool) -> FileDescriptorSet {
         Type::TYPE_STRING,
     ));
     let mut mode_field = field("mode", 2, Type::TYPE_ENUM);
+    record.enum_type[0].value.push(EnumValueDescriptorProto {
+        name: Some("OTHER".into()),
+        number: Some(2),
+        ..Default::default()
+    });
     mode_field.type_name = Some(format!(".contract.{message}.{mode}"));
     mode_field.default_value = Some(if new { "READY_NOW" } else { "READY" }.into());
     record.field.push(mode_field);
@@ -46,11 +51,22 @@ fn schema(new: bool) -> FileDescriptorSet {
     record.field.push(text);
     record.nested_type.push(DescriptorProto {
         name: Some("Child".into()),
+        field: vec![
+            field("left", 1, Type::TYPE_UINT32),
+            field("right", 2, Type::TYPE_UINT32),
+        ],
         ..Default::default()
     });
+    let mut back = field("next", 8, Type::TYPE_MESSAGE);
+    back.type_name = Some(format!(".contract.{message}"));
+    record.field.push(back);
     let mut child = field("child", 6, Type::TYPE_MESSAGE);
     child.type_name = Some(format!(".contract.{message}.Child"));
     record.field.push(child);
+    let mut detail = field("detail", 7, Type::TYPE_MESSAGE);
+    detail.type_name = Some(format!(".contract.{message}.Child"));
+    detail.oneof_index = Some(0);
+    record.field.push(detail);
     if new {
         record.field.push(field("extra", 4, Type::TYPE_UINT32));
         let mut bytes = field("bytes", 5, Type::TYPE_BYTES);
