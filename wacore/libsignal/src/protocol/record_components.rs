@@ -17,9 +17,9 @@ use crate::core::curve::PublicKey;
 use crate::protocol::error::{Result, SignalProtocolError};
 use crate::protocol::ratchet::MessageKeyGenerator;
 use crate::protocol::ratchet::keys::MessageKeys;
-use crate::protocol::stores::{
-    SenderKeyStateStructure, SessionStructure, sender_key_state_structure, session_structure,
-};
+#[cfg(test)]
+use crate::protocol::stores::sender_key_state_structure;
+use crate::protocol::stores::{SenderKeyStateStructure, SessionStructure, session_structure};
 
 const PRIVATE_KEY_BYTES: usize = 32;
 const SYMMETRIC_KEY_BYTES: usize = 32;
@@ -704,6 +704,34 @@ pub(crate) fn session_components_from_structure(
     })
 }
 
+pub(crate) fn validate_sender_state_components(
+    mut value: SenderKeyStateComponents,
+) -> Result<SenderKeyStateComponents> {
+    value.chain_key.seed = exact_bytes(
+        value.chain_key.seed,
+        SYMMETRIC_KEY_BYTES,
+        "sender chain seed",
+    )?;
+    value.signing_key.public =
+        normalize_public_key(value.signing_key.public, "sender signing public key")?;
+    value.signing_key.private = optional_exact_bytes(
+        value.signing_key.private,
+        PRIVATE_KEY_BYTES,
+        "sender signing private key",
+    )?;
+    for key in &mut value.message_keys {
+        key.seed = exact_bytes(
+            std::mem::take(&mut key.seed),
+            SYMMETRIC_KEY_BYTES,
+            "sender message-key seed",
+        )?;
+    }
+    Ok(value)
+}
+
+// Keep the original protobuf conversion as a differential reference for the
+// compact importer, including validation order and public-key normalization.
+#[cfg(test)]
 pub(crate) fn sender_state_structure_from_components(
     value: SenderKeyStateComponents,
 ) -> Result<SenderKeyStateStructure> {
@@ -1430,6 +1458,107 @@ mod tests {
         );
         assert_eq!(components.previous_sessions.len(), 1);
         assert!(components.previous_sessions[0].sender_chain.is_none());
+    }
+
+    #[test]
+    fn compact_sender_import_matches_protobuf_reference() {
+        use crate::protocol::stores::SenderKeyRecordStructure;
+        use buffa::Message as _;
+
+        for count in [0, 1, 256, crate::protocol::consts::MAX_MESSAGE_KEYS] {
+            for raw_public in [false, true] {
+                let mut components = sender_key_record();
+                let state = &mut components.states[0];
+                state.key_id = u32::MAX;
+                state.chain_key.iteration = u32::MAX;
+                if raw_public {
+                    state.signing_key.public.remove(0);
+                }
+                state.message_keys = (0..count)
+                    .map(|index| SenderMessageKeyComponents {
+                        iteration: if index % 2 == 0 { 0 } else { u32::MAX },
+                        seed: vec![index as u8; 32],
+                    })
+                    .collect();
+                let mut reference = SenderKeyRecordStructure::default();
+                reference.sender_key_states = components
+                    .states
+                    .iter()
+                    .cloned()
+                    .map(sender_state_structure_from_components)
+                    .collect::<Result<_>>()
+                    .expect("valid reference components");
+                let imported =
+                    SenderKeyRecord::from_components(components).expect("valid compact components");
+                assert_eq!(
+                    imported.serialize().expect("serialize compact record"),
+                    reference.encode_to_vec()
+                );
+                assert_eq!(imported.reserved_iteration(), 0);
+                let expected = reference
+                    .sender_key_states
+                    .into_iter()
+                    .map(sender_state_components_from_structure)
+                    .collect::<Result<Vec<_>>>()
+                    .expect("export reference");
+                assert_eq!(
+                    imported
+                        .into_components()
+                        .expect("export compact record")
+                        .states,
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_sender_import_preserves_validation_precedence() {
+        for faults in 1..16 {
+            let mut state = sender_key_record().states.remove(0);
+            if faults & 1 != 0 {
+                state.chain_key.seed.clear();
+            }
+            if faults & 2 != 0 {
+                state.signing_key.public.clear();
+            }
+            if faults & 4 != 0 {
+                state.signing_key.private = Some(Vec::new());
+            }
+            if faults & 8 != 0 {
+                state.message_keys[0].seed.truncate(31);
+            }
+            let expected = sender_state_structure_from_components(state.clone())
+                .expect_err("invalid reference components")
+                .to_string();
+            let actual = SenderKeyRecord::from_components(SenderKeyRecordComponents {
+                states: vec![state],
+            })
+            .err()
+            .expect("invalid compact components")
+            .to_string();
+            assert_eq!(actual, expected, "fault mask {faults}");
+        }
+    }
+
+    #[test]
+    fn compact_sender_import_ignores_out_of_window_states_before_validation() {
+        let mut components = sender_key_record();
+        let state = components.states[0].clone();
+        components.states = vec![state; crate::protocol::consts::MAX_SENDER_KEY_STATES + 1];
+        components
+            .states
+            .last_mut()
+            .expect("extra state")
+            .chain_key
+            .seed
+            .clear();
+        let imported =
+            SenderKeyRecord::from_components(components).expect("out-of-window state is ignored");
+        assert_eq!(
+            imported.into_components().expect("export").states.len(),
+            crate::protocol::consts::MAX_SENDER_KEY_STATES
+        );
     }
 
     #[test]

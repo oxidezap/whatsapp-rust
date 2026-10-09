@@ -15,7 +15,7 @@ use crate::protocol::counter_lease::CounterLease;
 use crate::protocol::crypto::hmac_sha256;
 use crate::protocol::record_components::{
     SenderKeyRecordComponents, SenderKeyStateComponents, SenderMessageKeyComponents,
-    sender_state_components_from_structure, sender_state_structure_from_components,
+    sender_state_components_from_structure, validate_sender_state_components,
 };
 #[cfg(test)]
 use crate::protocol::stores::SenderKeyRecordStructure;
@@ -399,6 +399,41 @@ impl SenderKeyState {
             signing_key_memo: std::sync::OnceLock::new(),
             verifying_key_memo: std::sync::OnceLock::new(),
         }
+    }
+
+    fn from_components(value: SenderKeyStateComponents) -> Result<Self, SignalProtocolError> {
+        let value = validate_sender_state_components(value)?;
+        // Components have no future fields. Import directly into the compact
+        // state instead of allocating protobuf chain/backlog records and then
+        // immediately extracting their validated fixed-size seeds again.
+        let sender_chain = SenderChainKey::new(
+            value.chain_key.iteration,
+            value
+                .chain_key
+                .seed
+                .try_into()
+                .expect("validated chain seed"),
+        );
+        let mut signing = sender_key_state_structure::SenderSigningKey::default();
+        signing.public = Some(value.signing_key.public.into());
+        signing.private = value.signing_key.private.map(Into::into);
+        let message_keys = value
+            .message_keys
+            .into_iter()
+            .map(|key| StoredMessageKey {
+                iteration: key.iteration,
+                seed: key.seed.try_into().expect("validated message-key seed"),
+            })
+            .collect();
+        Ok(Self {
+            future: None,
+            sender_key_id: Some(value.key_id),
+            sender_signing_key: MessageField::some(signing),
+            message_keys: std::sync::Arc::new(message_keys),
+            sender_chain: Some(sender_chain),
+            signing_key_memo: std::sync::OnceLock::new(),
+            verifying_key_memo: std::sync::OnceLock::new(),
+        })
     }
 
     pub fn message_version(&self) -> u32 {
@@ -963,8 +998,7 @@ impl SenderKeyRecord {
             .states
             .into_iter()
             .take(consts::MAX_SENDER_KEY_STATES)
-            .map(sender_state_structure_from_components)
-            .map(|state| state.map(SenderKeyState::from_protobuf))
+            .map(SenderKeyState::from_components)
             .collect::<Result<VecDeque<_>, _>>()?;
 
         Ok(Self {
