@@ -924,6 +924,9 @@ mod record_encoding {
         out.extend_from_slice(bytes);
     }
 
+    // Keep the fixed tag and stack-buffer bounds visible in the backlog loop;
+    // a call per key otherwise reverses the gain from batching these writes.
+    #[inline(always)]
     pub(super) fn write_seed_entry(field: u32, iteration: u32, seed: &[u8; 32], out: &mut Vec<u8>) {
         use bytes::BufMut as _;
 

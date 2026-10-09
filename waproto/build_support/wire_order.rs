@@ -41,6 +41,10 @@ pub(crate) fn enum_snapshot(
 // The occurrence algorithm is shared through an erased adapter only after a
 // future field activates the journal. Known-only decoding keeps its generated
 // static codec; hundreds of message types need not repeat this cold algorithm.
+// Erase a borrow rather than the owner. A vtable for the owner also retains its
+// full destructor even though this runtime never owns or drops the message.
+pub(crate) struct Adapter<'a, T>(pub(crate) &'a mut T);
+
 pub(crate) trait OwnedCodec {
     fn storage(&mut self) -> &mut Storage;
     fn groups(&self) -> GroupMap;

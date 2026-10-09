@@ -445,27 +445,27 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                             if !self.__buffa_unknown_fields.active() {
                                 let rest = self.__wire_merge(tag, cur, before_tag, ctx)?;
                                 if !self.__buffa_unknown_fields.is_empty() {
-                                    #runtime::begin_view(self, ctx)?;
+                                    #runtime::begin_view(&mut #runtime::Adapter(self), ctx)?;
                                 }
                                 return Ok(rest);
                             }
-                            #runtime::merge_view(self, tag, cur, before_tag, ctx)
+                            #runtime::merge_view(&mut #runtime::Adapter(self), tag, cur, before_tag, ctx)
                         })
                     } else {
                         syn::parse_quote!({
                             if !self.__buffa_unknown_fields.active() {
                                 self.__wire_merge(tag, buf, ctx)?;
                                 if !self.__buffa_unknown_fields.is_empty() {
-                                    #runtime::begin_owned(self, ctx)?;
+                                    #runtime::begin_owned(&mut #runtime::Adapter(self), ctx)?;
                                 }
                                 return Ok(());
                             }
                             if Self::__wire_group(tag.field_number()) != 0 {
-                                #runtime::merge_owned_known(self, tag, buf, ctx)
+                                #runtime::merge_owned_known(&mut #runtime::Adapter(self), tag, buf, ctx)
                             } else {
                                 let previous = self.__buffa_unknown_fields.len();
                                 self.__wire_merge(tag, buf, ctx)?;
-                                #runtime::finish_owned_unknown(self, previous, ctx)
+                                #runtime::finish_owned_unknown(&mut #runtime::Adapter(self), previous, ctx)
                             }
                         })
                     };
@@ -493,20 +493,20 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
             });
             helpers.push(if view {
                 syn::parse_quote! {
-                    impl #impl_generics #runtime::ViewCodec<'a> for #ty #where_clause {
-                        fn storage(&mut self) -> &mut #runtime::ViewStorage<'a> { &mut self.__buffa_unknown_fields }
-                        fn groups(&self) -> fn(u32) -> u32 { Self::__wire_group }
-                        fn known(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> { self.__wire_known_for_decode(ctx) }
-                        fn merge(&mut self, tag: ::buffa::encoding::Tag, cur: &'a [u8], before: &'a [u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> { self.__wire_merge(tag, cur, before, ctx) }
+                    impl #impl_generics #runtime::ViewCodec<'a> for #runtime::Adapter<'_, #ty> #where_clause {
+                        fn storage(&mut self) -> &mut #runtime::ViewStorage<'a> { &mut self.0.__buffa_unknown_fields }
+                        fn groups(&self) -> fn(u32) -> u32 { <#ty>::__wire_group }
+                        fn known(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> { self.0.__wire_known_for_decode(ctx) }
+                        fn merge(&mut self, tag: ::buffa::encoding::Tag, cur: &'a [u8], before: &'a [u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> { self.0.__wire_merge(tag, cur, before, ctx) }
                     }
                 }
             } else {
                 syn::parse_quote! {
-                    impl #impl_generics #runtime::OwnedCodec for #ty #where_clause {
-                        fn storage(&mut self) -> &mut #runtime::Storage { &mut self.__buffa_unknown_fields }
-                        fn groups(&self) -> fn(u32) -> u32 { Self::__wire_group }
-                        fn known(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> { self.__wire_known_for_decode(ctx) }
-                        fn merge_slice(&mut self, tag: ::buffa::encoding::Tag, buf: &mut &[u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<(), ::buffa::DecodeError> { self.__wire_merge(tag, buf, ctx) }
+                    impl #impl_generics #runtime::OwnedCodec for #runtime::Adapter<'_, #ty> #where_clause {
+                        fn storage(&mut self) -> &mut #runtime::Storage { &mut self.0.__buffa_unknown_fields }
+                        fn groups(&self) -> fn(u32) -> u32 { <#ty>::__wire_group }
+                        fn known(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> { self.0.__wire_known_for_decode(ctx) }
+                        fn merge_slice(&mut self, tag: ::buffa::encoding::Tag, buf: &mut &[u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<(), ::buffa::DecodeError> { self.0.__wire_merge(tag, buf, ctx) }
                     }
                 }
             });
