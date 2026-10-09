@@ -535,6 +535,14 @@ fn consecutive_future_fields_reuse_the_unchanged_oneof_projection() {
         .merge_group(&mut group_wire.as_slice(), ctx, 99)
         .unwrap();
     assert_eq!(group.encode_to_vec(), wire);
+    // An empty group does not modify or allocate anything, even when merging
+    // into an owner whose retained projection was paid by an earlier decode.
+    let memory_limit = core::cell::Cell::new(0);
+    let ctx = DecodeContext::new(100, &unknown_limit).with_element_memory(&memory_limit);
+    group
+        .merge_group(&mut [0x9c, 0x06].as_slice(), ctx, 99)
+        .unwrap();
+    assert_eq!(group.encode_to_vec(), wire);
 }
 
 #[test]
