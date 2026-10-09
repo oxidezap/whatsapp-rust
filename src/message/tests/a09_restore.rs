@@ -74,11 +74,12 @@ async fn refused_snapshot_restore_cannot_reenter_an_owned_hook_commit() {
         .await
         .unwrap();
     drop(refused); // The old snapshot owns no identity and must not downgrade it.
+    assert!(!client.inbound_commit_batch.has_entries());
     assert!(
-        !client
+        client
             .flush_inbound_commits_under_permit(false, None, None)
             .await,
-        "an ownerless restoration must not admit a second hook commit"
+        "an obsolete snapshot must leave an empty, successfully flushed batch"
     );
     assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
     hook.release.notify_one();

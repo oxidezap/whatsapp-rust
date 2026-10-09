@@ -322,6 +322,13 @@ impl Drop for ReinsertGuard<'_> {
         // Nothing newer can normally exist (the permit serializes drain
         // flushes), but keep arrival order if it ever does.
         restored.append(&mut state.entries);
+        let before_filter = restored.len();
+        // A newer producer already retains these parts, or has completed
+        // them. An old snapshot must not outlive that ownership and later
+        // delete a new delivery's pending row through an ownerless commit.
+        self.batcher
+            .retention
+            .restore_batched(&mut restored, self.retained.as_ref());
         state.bytes = restored
             .iter()
             .map(|i| waproto::codec::message_encoded_len(&i.message))
@@ -330,10 +337,20 @@ impl Drop for ReinsertGuard<'_> {
         // the next enqueue arms a fresh one, and the drain-end/teardown
         // flushes cover the gap regardless.
         state.timer_armed = false;
-        self.batcher
-            .retention
-            .batched(&restored, self.retained.as_ref());
         state.entries = restored;
+        if state.entries.len() != before_filter {
+            // A batch ticket covers all its entries. A partial restoration
+            // cannot acknowledge the entries now owned by another producer.
+            for ticket in [state.commit_ticket.take(), self.commit_ticket.take()]
+                .into_iter()
+                .flatten()
+            {
+                ticket.mark_dropped();
+            }
+        }
+        if state.entries.is_empty() {
+            return;
+        }
         if let Some(ticket) = self.commit_ticket.take() {
             if state.commit_ticket.is_some() {
                 ticket.mark_dropped();
@@ -1290,6 +1307,77 @@ mod tests {
 
     struct RecordingHook {
         batches: Mutex<Vec<Vec<String>>>,
+    }
+
+    #[tokio::test]
+    async fn refused_old_snapshot_is_not_restored_after_successor_completes() {
+        let batcher = InboundCommitBatcher::default();
+        let retained = &batcher.retention;
+        let first = item("restored-owner");
+        retained.begin(&first.info, retained.admit(100)).await;
+        retained.stage(std::slice::from_ref(&first), false).unwrap();
+        let (old_items, _) = retained.seal(&first.info, true);
+        retained.begin(&first.info, retained.admit(200)).await;
+        assert!(retained.commit_active(&old_items).is_none());
+        let ticket = InboundCommitTicket::new();
+        let old = ReinsertGuard {
+            batcher: &batcher,
+            items: Some(Arc::clone(&old_items)),
+            commit_ticket: Some(ticket.clone()),
+            retained: None,
+        };
+        let (new_items, _) = retained.seal(&first.info, false);
+        let mut successor = retained.commit_active(&new_items).unwrap();
+        successor.complete();
+        drop(successor);
+        drop(old);
+        assert!(batcher.lock().entries.is_empty());
+        assert_eq!(batcher.lock().bytes, 0);
+        assert_eq!(ticket.state(), InboundCommitTicketState::Dropped);
+        assert!(retained.commit_active(&old_items).is_none());
+
+        retained.begin(&first.info, retained.admit(300)).await;
+        retained.stage(std::slice::from_ref(&first), false).unwrap();
+        let (next, _) = retained.seal(&first.info, false);
+        let owner = retained.commit_active(&next).unwrap();
+        drop(ReinsertGuard {
+            batcher: &batcher,
+            items: Some(old_items),
+            commit_ticket: None,
+            retained: None,
+        });
+        assert!(batcher.lock().entries.is_empty());
+        assert!(owner.owns(&first.info));
+    }
+
+    #[tokio::test]
+    async fn refused_snapshot_keeps_the_new_producer_and_unrelated_batch() {
+        let batcher = InboundCommitBatcher::default();
+        let retained = &batcher.retention;
+        let first = item("old-producer");
+        let other = item("other-producer");
+        for item in [&first, &other] {
+            retained.begin(&item.info, retained.admit(100)).await;
+            retained.stage(std::slice::from_ref(item), false).unwrap();
+            retained.seal(&item.info, true);
+        }
+        retained.begin(&first.info, retained.admit(200)).await;
+        let ticket = InboundCommitTicket::new();
+        drop(ReinsertGuard {
+            batcher: &batcher,
+            items: Some(Arc::from([first.clone(), other.clone()])),
+            commit_ticket: Some(ticket.clone()),
+            retained: None,
+        });
+        assert!(retained.is_collecting(&first.info));
+        assert_eq!(ticket.state(), InboundCommitTicketState::Dropped);
+        let state = batcher.lock();
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].info.id, other.info.id);
+        assert_eq!(
+            state.bytes,
+            waproto::codec::message_encoded_len(&other.message)
+        );
     }
 
     #[async_trait::async_trait]

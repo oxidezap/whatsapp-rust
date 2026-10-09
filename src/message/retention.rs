@@ -312,6 +312,34 @@ impl InboundRetention {
             stanza.state = State::Batched;
         }
     }
+    pub(crate) fn restore_batched(
+        &self,
+        items: &mut Vec<InboundMessage>,
+        owner: Option<&RetentionCommit>,
+    ) {
+        if !self.is_active() {
+            return;
+        }
+        let mut stanzas = lock(&self.stanzas);
+        items.retain(|item| {
+            let key = key(&item.info);
+            let Some(stanza) = stanzas.get_mut(&key) else {
+                return false;
+            };
+            match stanza.state {
+                State::Collecting => return false,
+                State::Committing(_) => {
+                    if !owner.is_some_and(|owner| owner.owns_stanza(&key, stanza)) {
+                        return false;
+                    }
+                    stanza.commit_waiters.clear();
+                }
+                _ => {}
+            }
+            stanza.state = State::Batched;
+            true
+        });
+    }
     #[inline]
     pub(crate) fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
@@ -336,12 +364,11 @@ impl InboundRetention {
             if keys.contains(&key) {
                 continue;
             }
-            if let Some(stanza) = stanzas.get(&key) {
-                if matches!(stanza.state, State::Committing(_) | State::Collecting) {
-                    return None;
-                }
-                keys.push(key);
+            let stanza = stanzas.get(&key)?;
+            if matches!(stanza.state, State::Committing(_) | State::Collecting) {
+                return None;
             }
+            keys.push(key);
         }
         // A restored entry can be committed again without a new producer.
         // Give each acquisition its own authority over Drop and completion.
