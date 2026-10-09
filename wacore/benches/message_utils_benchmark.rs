@@ -15,6 +15,64 @@ fn main() {
     divan::main();
 }
 
+// Exercise both the ordinary oneof codec and the occurrence journal. The
+// nested message reserves traversal-cache entries; title is outside the oneof.
+fn oneof_wire(shape: &str) -> Vec<u8> {
+    use buffa::Message as _;
+    let mut image = wa::message::ImageMessage::default();
+    image.caption = Some("Synthetic image caption".into());
+    image.jpeg_thumbnail = Some(vec![0x5a; 64]);
+    let header = wa::message::interactive_message::Header::default()
+        .with_title("Synthetic header")
+        .with_media(image);
+    let known = header.encode_to_vec();
+    let future = [0xc2, 0x3e, 4, 11, 22, 33, 44];
+    match shape {
+        "known" => known,
+        "future_first" => [future.as_slice(), known.as_slice()].concat(),
+        "future_last" => [known.as_slice(), future.as_slice()].concat(),
+        _ => unreachable!(),
+    }
+}
+
+#[divan::bench(args = ["known", "future_first", "future_last"])]
+fn bench_oneof_owned_encode(bencher: divan::Bencher, shape: &str) {
+    use buffa::Message as _;
+    let wire = oneof_wire(shape);
+    let message = wa::message::interactive_message::Header::decode_from_slice(&wire).unwrap();
+    bencher.bench(|| black_box(black_box(&message).encode_to_vec()));
+}
+
+#[divan::bench(args = ["known", "future_first", "future_last"])]
+fn bench_oneof_view_encode(bencher: divan::Bencher, shape: &str) {
+    use buffa::{MessageView as _, ViewEncode as _};
+    let wire = oneof_wire(shape);
+    let message = wa::message::interactive_message::HeaderView::decode_view(&wire).unwrap();
+    bencher.bench(|| black_box(black_box(&message).encode_to_vec()));
+}
+
+#[divan::bench(args = ["known", "future_first", "future_last"])]
+fn bench_oneof_owned_decode(bencher: divan::Bencher, shape: &str) {
+    use buffa::Message as _;
+    let wire = oneof_wire(shape);
+    bencher.bench(|| {
+        black_box(
+            wa::message::interactive_message::Header::decode_from_slice(black_box(&wire)).unwrap(),
+        )
+    });
+}
+
+#[divan::bench(args = ["known", "future_first", "future_last"])]
+fn bench_oneof_view_decode(bencher: divan::Bencher, shape: &str) {
+    use buffa::MessageView as _;
+    let wire = oneof_wire(shape);
+    bencher.bench(|| {
+        black_box(
+            wa::message::interactive_message::HeaderView::decode_view(black_box(&wire)).unwrap(),
+        )
+    });
+}
+
 /// Track clone ownership and allocation cost separately from encode/decode.
 /// Unknown records are synthetic and include an owned payload inside a group.
 #[divan::bench(args = ["empty", "text", "future_field", "future_group"])]
