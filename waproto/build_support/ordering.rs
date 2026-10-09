@@ -275,8 +275,7 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                                 && conditional.else_branch.is_none()
                             {
                                 let condition = &conditional.cond;
-                                *conditional.cond =
-                                    syn::parse_quote!(!__wire_active && #condition);
+                                *conditional.cond = syn::parse_quote!(!__wire_active && #condition);
                             } else {
                                 let original = statement.clone();
                                 *statement = syn::parse_quote!(if !__wire_active { #original });
