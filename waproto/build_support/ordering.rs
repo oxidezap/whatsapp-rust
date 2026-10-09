@@ -474,15 +474,20 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     retained.sig.ident = format_ident!("__wire_merge_field");
                     retained
                         .sig
-                        .inputs
-                        .push(syn::parse_quote!(check_current: bool));
+                        .generics
+                        .params
+                        .push(syn::parse_quote!(const CHECK_CURRENT: bool));
+                    retained
+                        .block
+                        .stmts
+                        .insert(0, syn::parse_quote!(let check_current = CHECK_CURRENT;));
                     retained_merge = Some(retained);
                     f.block = if view {
                         syn::parse_quote!({
-                            self.__wire_merge_field(tag, cur, before_tag, ctx, true)
+                            self.__wire_merge_field::<true>(tag, cur, before_tag, ctx)
                         })
                     } else {
-                        syn::parse_quote!({ self.__wire_merge_field(tag, buf, ctx, true) })
+                        syn::parse_quote!({ self.__wire_merge_field::<true>(tag, buf, ctx) })
                     };
                 } else if view && f.sig.ident == "to_owned_from_source" {
                     let body = f.block.clone();
@@ -511,7 +516,7 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                         while !cur.is_empty() {
                             let before_tag = cur;
                             let tag = ::buffa::encoding::Tag::decode(&mut cur)?;
-                            cur = self.__wire_merge_field(tag, cur, before_tag, ctx, false)?;
+                            cur = self.__wire_merge_field::<false>(tag, cur, before_tag, ctx)?;
                         }
                         Ok(())
                     }
@@ -524,7 +529,7 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                         }
                         while buf.remaining() > limit {
                             let tag = ::buffa::encoding::Tag::decode(buf)?;
-                            self.__wire_merge_field(tag, buf, ctx, false)?;
+                            self.__wire_merge_field::<false>(tag, buf, ctx)?;
                         }
                         Ok(())
                     }
@@ -551,7 +556,7 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                                 #runtime::reconcile_owned(&mut #runtime::Adapter(self), ctx)?;
                             }
                             first = false;
-                            self.__wire_merge_field(tag, buf, ctx, false)?;
+                            self.__wire_merge_field::<false>(tag, buf, ctx)?;
                         }
                     }
                 });
