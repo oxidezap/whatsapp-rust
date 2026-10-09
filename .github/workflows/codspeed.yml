@@ -2,7 +2,7 @@ name: CodSpeed
 
 on:
   push:
-    branches: [main, qualify/ownership-v25-cpu-oct09]
+    branches: [main, qualify/integrated-v28-cpu-oct09]
     paths-ignore: ["**.md", "docs/**"]
   pull_request:
     branches: [main]
@@ -32,7 +32,7 @@ env:
 
 jobs:
   benchmarks:
-    if: github.ref != 'refs/heads/qualify/ownership-v25-cpu-oct09'
+    if: github.ref != 'refs/heads/qualify/integrated-v28-cpu-oct09'
     name: Run CodSpeed benchmarks (${{ matrix.shard.name }})
     runs-on: ubuntu-24.04
     # The slowest shard finishes in ~13min. The cap exists because the CodSpeed
@@ -174,7 +174,7 @@ jobs:
     # `credentials.password` rejects the empty string while the job template is
     # being prepared, so the job fails before any step runs and a step-level
     # `if:` cannot save it — the guard has to sit here. Same condition as e2e.yml.
-    if: ${{ github.ref != 'refs/heads/qualify/ownership-v25-cpu-oct09' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ github.ref != 'refs/heads/qualify/integrated-v28-cpu-oct09' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-24.04
     # These benches drive the real client (connect/reconnect handshakes) under
     # Valgrind, so they are slow; cap the job so a stuck run can't hang CI
@@ -291,7 +291,7 @@ jobs:
 
   a02-cpu-pair:
     # Each candidate shares one host with its fixed main baseline.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/qualify/ownership-v25-cpu-oct09' && github.event.before == '0000000000000000000000000000000000000000' && github.run_attempt == 1
+    if: github.event_name == 'push' && github.ref == 'refs/heads/qualify/integrated-v28-cpu-oct09' && github.event.before == '0000000000000000000000000000000000000000' && github.run_attempt == 1
     name: Paired CPU (${{ matrix.pr }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -300,11 +300,11 @@ jobs:
       matrix:
         include:
           - pr: 1676
-            head: 0007f27fd247a1aad140dc40be3dc5756b412bcb
+            head: ea42c40333650bab54c40dedd64e1a2c8ad3934b
           - pr: 1694
-            head: ba86779119c0b0c3c45c81a9cc8c81f474af513a
+            head: 2110ddf87f909a953266bbcb0e4971a968fb3b19
           - pr: 1679
-            head: 5c8e36a4dc0aedc2e02ef920e7326b1821758e57
+            head: 8948ac3a5d4c94381b4f1d25f50b808ef5173b88
     env:
       A02_PAIR_HEAD_SHA: ${{ matrix.head }}
       CODSPEED_SKIP_UPLOAD: "true"
@@ -313,7 +313,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 6d22cb3caa154ca73c1223ac66eefe9fc7540bd8
+          ref: 2ebadf581855fe5897b0f6cf9e5ae7fbd95130f4
           path: _a02_pair/base
           persist-credentials: false
       - uses: actions/checkout@v7
@@ -378,7 +378,7 @@ jobs:
           run: |
             set -e
             "$GITHUB_WORKSPACE/_a02_tools/target/debug/whatsapp-xtask" ci codspeed-pair capture --side base
-            cargo codspeed run -p wacore --bench appstate_sync_benchmark bench_collect_unique_index_macs_duplicates
+            cargo codspeed run -p wacore --bench appstate_sync_benchmark bench_collect_unique_index_macs
             cargo codspeed run -p wacore --bench sender_key_derivation_benchmark store_round_trip_rebuilt
             cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark bench_sender_key_
             cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark bench_session_
@@ -397,7 +397,7 @@ jobs:
           run: |
             set -e
             "$GITHUB_WORKSPACE/_a02_tools/target/debug/whatsapp-xtask" ci codspeed-pair capture --side head
-            cargo codspeed run -p wacore --bench appstate_sync_benchmark bench_collect_unique_index_macs_duplicates
+            cargo codspeed run -p wacore --bench appstate_sync_benchmark bench_collect_unique_index_macs
             cargo codspeed run -p wacore --bench sender_key_derivation_benchmark store_round_trip_rebuilt
             cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark bench_sender_key_
             cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark bench_session_

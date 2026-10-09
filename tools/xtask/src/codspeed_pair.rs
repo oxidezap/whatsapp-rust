@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use xtask_support::capture;
 
-const BASE: &str = "6d22cb3caa154ca73c1223ac66eefe9fc7540bd8";
+const BASE: &str = "2ebadf581855fe5897b0f6cf9e5ae7fbd95130f4";
 const HEAD: &str = env!("A02_PAIR_HEAD_SHA");
 const CONTRACTS: &[&str] = &[
     "runtime.sha256",
@@ -29,6 +29,7 @@ const ENVIRONMENT: &[&str] = &[
     "CARGO_ENCODED_RUSTFLAGS",
 ];
 const REQUIRED: &[&str] = &[
+    "bench_collect_unique_index_macs[",
     "bench_collect_unique_index_macs_duplicates",
     "store_round_trip_rebuilt",
     "bench_sender_key_serialize_without_backlog",
