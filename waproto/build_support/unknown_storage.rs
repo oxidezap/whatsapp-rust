@@ -1,6 +1,17 @@
 use ::buffa::alloc::boxed::Box;
 use ::core::mem::ManuallyDrop;
 
+// Parents share a child's allocation/default initialization together with its
+// decoder. Keep the existing buffer specialization and merge-in-place behavior.
+#[inline(never)]
+pub(super) fn merge_message<T: ::buffa::Message, P: ::buffa::ProtoBox<T>>(
+    field: &mut ::buffa::MessageField<T, P>,
+    buf: &mut impl ::buffa::bytes::Buf,
+    ctx: ::buffa::DecodeContext<'_>,
+) -> Result<(), ::buffa::DecodeError> {
+    T::merge_length_delimited(field.get_or_insert_default(), buf, ctx)
+}
+
 /// Unknown records allocate only when present; ordinary messages carry one pointer.
 #[derive(Default)]
 pub struct Storage(ManuallyDrop<Option<Box<::buffa::UnknownFields>>>);
