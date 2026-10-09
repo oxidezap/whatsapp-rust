@@ -1240,40 +1240,59 @@ impl SenderKeyRecord {
         let incarnation_len = incarnation
             .map(|_| super::local_field::STORE_INCARNATION_ENCODED_LEN)
             .unwrap_or(0);
-        // Construction and deserialization cap the history at this limit.
-        // Retain lengths on the stack so sizing never rescans a backlog during
-        // the write pass or adds a heap allocation per flush.
-        let mut state_lengths = [0; consts::MAX_SENDER_KEY_STATES];
-        // A protobuf state is large even when absent. Keep its temporary slots
-        // off the ordinary flush path; only future-bearing records reconstruct
-        // them, once for both sizing and writing.
-        let preserved = if self.states.iter().any(|state| state.future.is_some()) {
-            self.preserved_states()
+        let single = (self.states.len() == 1)
+            .then(|| &self.states[0])
+            .filter(|state| state.future.is_none());
+        let mut buf = if let Some(state) = single {
+            // The usual record owns one state. Avoid history bookkeeping and
+            // template lookup while retaining the same per-state encoder.
+            let len = state.encoded_len();
+            let mut buf = Vec::with_capacity(
+                record_encoding::nested_len(len)
+                    + reservation_len
+                    + incarnation_len
+                    + self.future.encoded_len(),
+            );
+            record_encoding::write_nested(1, len, &mut buf);
+            state.encode_into(&mut buf);
+            buf
         } else {
-            Vec::new()
-        };
-        let mut states_len = 0;
-        for (index, state) in self.states.iter().enumerate() {
-            let len = preserved
-                .get(index)
-                .and_then(Option::as_ref)
-                .map_or_else(|| state.encoded_len(), |pb| pb.encoded_len() as usize);
-            state_lengths[index] = len;
-            states_len += record_encoding::nested_len(len);
-        }
-        let mut buf = Vec::with_capacity(
-            states_len + reservation_len + incarnation_len + self.future.encoded_len(),
-        );
-        for (index, state) in self.states.iter().enumerate() {
-            record_encoding::write_nested(1, state_lengths[index], &mut buf);
-            if let Some(pb) = preserved.get(index).and_then(Option::as_ref) {
-                // No codec wrapper exists for this nested storage message.
-                #[allow(clippy::disallowed_methods)]
-                pb.encode(&mut buf);
+            // Construction and deserialization cap the history at this limit.
+            // Retain lengths on the stack so sizing never rescans a backlog during
+            // the write pass or adds a heap allocation per flush.
+            let mut state_lengths = [0; consts::MAX_SENDER_KEY_STATES];
+            // A protobuf state is large even when absent. Keep its temporary slots
+            // off the ordinary flush path; only future-bearing records reconstruct
+            // them, once for both sizing and writing.
+            let preserved = if self.states.iter().any(|state| state.future.is_some()) {
+                self.preserved_states()
             } else {
-                state.encode_into(&mut buf);
+                Vec::new()
+            };
+            let mut states_len = 0;
+            for (index, state) in self.states.iter().enumerate() {
+                let len = preserved
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .map_or_else(|| state.encoded_len(), |pb| pb.encoded_len() as usize);
+                state_lengths[index] = len;
+                states_len += record_encoding::nested_len(len);
             }
-        }
+            let mut buf = Vec::with_capacity(
+                states_len + reservation_len + incarnation_len + self.future.encoded_len(),
+            );
+            for (index, state) in self.states.iter().enumerate() {
+                record_encoding::write_nested(1, state_lengths[index], &mut buf);
+                if let Some(pb) = preserved.get(index).and_then(Option::as_ref) {
+                    // No codec wrapper exists for this nested storage message.
+                    #[allow(clippy::disallowed_methods)]
+                    pb.encode(&mut buf);
+                } else {
+                    state.encode_into(&mut buf);
+                }
+            }
+            buf
+        };
         // Append the local-only reservation as a top-level field the generated
         // decoder skips. Emitted only when non-zero, so legacy/unreserved records
         // stay byte-identical. Mirrors SessionRecord::serialize_into.
@@ -2192,6 +2211,12 @@ mod tests {
                                 expected
                             );
                         }
+                        record.states.truncate(1);
+                        record.lease = CounterLease::default();
+                        assert_eq!(
+                            record.serialize().expect("serialize single state"),
+                            record.as_protobuf().encode_to_vec()
+                        );
                     }
                 }
             }
