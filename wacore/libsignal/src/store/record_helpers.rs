@@ -264,8 +264,8 @@ mod tests {
             let original = wa::PreKeyRecordStructure::decode_from_slice(&wire).unwrap();
             let record = prekey_structure_to_record(original).unwrap();
             let restored = prekey_record_to_structure(&record).unwrap();
-            let mut expected = future_fields.to_vec();
-            expected.extend_from_slice(&new_pre_key_record(42, &key_pair).encode_to_vec());
+            let mut expected = new_pre_key_record(42, &key_pair).encode_to_vec();
+            expected.extend_from_slice(&future_fields);
             assert_eq!(restored.encode_to_vec(), expected);
 
             let mut malformed = restored;

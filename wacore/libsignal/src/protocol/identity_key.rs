@@ -201,13 +201,9 @@ mod tests {
         future.extend_from_slice(&[
             0xa0, 0x06, 7, 0xa0, 0x06, 9, 0xaa, 0x06, 2, 0x12, 0x34, 0xb3, 0x06, 8, 1, 0xb4, 0x06,
         ]);
-        // The compatibility encoder emits retained fields before typed fields;
-        // their values and relative order must still survive exactly.
-        let mut expected = future[known.len()..].to_vec();
-        expected.extend_from_slice(&known);
         let restored =
             IdentityKeyPair::try_from(future.as_slice()).expect("future identity record");
-        assert_eq!(restored.serialize().as_ref(), expected);
+        assert_eq!(restored.serialize().as_ref(), future);
         assert_eq!(restored.identity_key(), original.identity_key());
         assert_eq!(
             restored.private_key().serialize(),
@@ -215,7 +211,7 @@ mod tests {
         );
         let cloned = restored.clone();
         drop(restored);
-        assert_eq!(cloned.serialize().as_ref(), expected);
+        assert_eq!(cloned.serialize().as_ref(), future);
         assert_eq!(
             serde_json::to_value(&cloned).expect("future identity JSON"),
             serde_json::to_value(&original).expect("known identity JSON")
