@@ -1,8 +1,8 @@
-name: Inspect qualification artifacts
+name: Inspect qualification CPU profiles
 
 on:
   push:
-    branches: [qualify/a02-artifacts-oct08]
+    branches: [qualify/inspect-v17-cpu-profiles-oct09]
 
 permissions:
   contents: read
@@ -10,43 +10,26 @@ permissions:
 
 jobs:
   inspect:
-    if: github.run_attempt == 1
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    env:
-      CARGO_INCREMENTAL: 0
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        pr: [1676, 1694, 1679]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
-      - name: Download measured A09 size
+      - name: Download preserved CPU pair
         uses: actions/download-artifact@v8
         with:
-          name: size-metrics
-          run-id: 37815206863
+          name: cpu-pair-${{ matrix.pr }}-37918372525
+          run-id: 37918372525
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: _size_metrics
+          path: _profiles
           digest-mismatch: error
-      - name: Download A09 size attribution
-        uses: actions/download-artifact@v8
-        with:
-          name: size-diagnostics
-          run-id: 37815206863
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: _size_diagnostics
-          digest-mismatch: error
-      - name: Print preserved size evidence
+      - name: Inspect original captured profiles
         run: |
-          cargo run --locked -p whatsapp-xtask -- ci codspeed-pair inspect-size _size_metrics
-          cargo run --locked -p whatsapp-xtask -- ci codspeed-pair inspect-size _size_diagnostics
-      - name: Download completed CPU pair
-        uses: actions/download-artifact@v8
-        with:
-          name: a02-current-cpu-pair-37821884070
-          run-id: 37821884070
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: _a02_profiles
-          digest-mismatch: error
-      - name: Validate and print captured CPU counters
-        run: cargo run --locked -p whatsapp-xtask -- ci codspeed-pair summarize
+          rustc --edition 2024 tools/inspect_cpu_profile.rs -o /tmp/inspect-cpu-profile
+          /tmp/inspect-cpu-profile _profiles plaintext_ownership_controls
