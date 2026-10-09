@@ -2454,11 +2454,15 @@ mod tests {
         let wire = pb.encode_to_vec();
         let mut loaded =
             SenderKeyRecord::deserialize(&wire).expect("valid synthetic sender-key fixture");
+        // The direct record encoder appends top-level future fields, whereas
+        // generated encoders emit them first. Compare the complete protobuf,
+        // including all nested unknown values and their occurrence order.
         assert_eq!(
-            loaded
-                .serialize()
-                .expect("valid synthetic sender-key fixture"),
-            wire
+            waproto::codec::sender_key_record_decode(
+                &loaded.serialize().expect("synthetic sender-key encode")
+            )
+            .expect("synthetic sender-key decode"),
+            pb
         );
         assert!(loaded.estimated_size() >= 5 * 8192);
         assert!(!format!("{loaded:?}").contains("LengthDelimited"));
