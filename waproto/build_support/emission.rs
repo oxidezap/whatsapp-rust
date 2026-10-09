@@ -209,6 +209,7 @@ fn share_message_impls(items: &mut Vec<syn::Item>, scope: &str) {
         if !selected {
             continue;
         }
+        let pin_root_clone = scope.is_empty() && name == "Message";
         let mut derived_default = false;
         for attribute in &mut message.attrs {
             if attribute.path().is_ident("derive") {
@@ -239,7 +240,7 @@ fn share_message_impls(items: &mut Vec<syn::Item>, scope: &str) {
             .collect();
         // The root Message clone is pinned once by build/pin_clone.rs before
         // this pass. That transformer rejects missing or duplicate derives.
-        if !share_default {
+        if !pin_root_clone {
             implementations.push(syn::parse_quote! {
                 impl ::core::clone::Clone for #name {
                     #[inline(never)]
