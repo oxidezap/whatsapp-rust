@@ -22,6 +22,7 @@ use crate::transport::TransportFactory;
 use crate::types::connect_admission::ConnectAdmission;
 use crate::types::durability_hook::{HistorySyncCaptureHook, InboundDurabilityHook};
 use crate::types::enc_handler::EncHandler;
+use crate::types::group_notification_durability::GroupNotificationDurabilityHook;
 use crate::types::history_sync_admission::HistorySyncAdmission;
 use wacore::handshake::NoiseCertPolicy;
 use wacore::iq::abprops::AbProp;
@@ -188,6 +189,7 @@ pub struct ClientBuilder {
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
     history_sync_capture_hook: Option<Arc<dyn HistorySyncCaptureHook>>,
+    group_notification_durability_hook: Option<Arc<dyn GroupNotificationDurabilityHook>>,
     history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
     connect_admission: Option<Arc<dyn ConnectAdmission>>,
     task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
@@ -223,6 +225,7 @@ impl ClientBuilder {
             custom_enc_handlers: HashMap::new(),
             inbound_durability_hook: None,
             history_sync_capture_hook: None,
+            group_notification_durability_hook: None,
             history_sync_admission: None,
             connect_admission: None,
             task_instrument: None,
@@ -387,6 +390,25 @@ impl ClientBuilder {
         hook: Arc<dyn InboundDurabilityHook>,
     ) -> Self {
         self.inbound_durability_hook = Some(hook);
+        self
+    }
+
+    /// Persist each complete group notification before effects and ACK.
+    /// See [`GroupNotificationDurabilityHook`] for cancellation and replay limits.
+    pub fn with_group_notification_durability_hook<Gh>(mut self, hook: Gh) -> Self
+    where
+        Gh: GroupNotificationDurabilityHook + 'static,
+    {
+        self.group_notification_durability_hook = Some(Arc::new(hook));
+        self
+    }
+
+    /// Register an already-shared hook. The last registration wins.
+    pub fn with_group_notification_durability_hook_arc(
+        mut self,
+        hook: Arc<dyn GroupNotificationDurabilityHook>,
+    ) -> Self {
+        self.group_notification_durability_hook = Some(hook);
         self
     }
 
@@ -750,6 +772,9 @@ impl ClientBuilder {
         }
         if let Some(hook) = self.inbound_durability_hook {
             let _ = client.inbound_durability_hook.set(hook);
+        }
+        if let Some(hook) = self.group_notification_durability_hook {
+            let _ = client.group_notification_durability_hook.set(hook);
         }
         if let Some(hook) = self.history_sync_capture_hook {
             let _ = client.history_sync_capture_hook.set(hook);

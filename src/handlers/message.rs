@@ -1,5 +1,5 @@
 use super::traits::StanzaHandler;
-use crate::client::{ChatLane, Client, QueuedChatMessage};
+use crate::client::{ChatLane, Client, NotificationScope, QueuedChatMessage};
 use async_trait::async_trait;
 use log::warn;
 use std::sync::Arc;
@@ -31,14 +31,23 @@ const LANE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60
 pub(crate) struct MessageHandler;
 
 impl MessageHandler {
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(name = "wa.recv.message_enqueue", level = "debug", skip_all)
-    )]
     pub(crate) async fn handle_inline(
         client: Arc<Client>,
         node: Arc<wacore_binary::OwnedNodeRef>,
         cancelled: &mut bool,
+    ) -> bool {
+        Self::handle_inline_scoped(client, node, cancelled, None).await
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.message_enqueue", level = "debug", skip_all)
+    )]
+    pub(crate) async fn handle_inline_scoped(
+        client: Arc<Client>,
+        node: Arc<wacore_binary::OwnedNodeRef>,
+        cancelled: &mut bool,
+        scope: Option<NotificationScope<'_>>,
     ) -> bool {
         let chat_jid = match node.attrs().optional_jid("from") {
             // Normalize AD metadata so the same chat always maps to one lane
@@ -66,6 +75,13 @@ impl MessageHandler {
         // Lock serializes enqueue order for this chat, the replacement
         // below included (see `create_chat_lane` for why it outlives the lane).
         let _guard = lane.enqueue_lock.lock().await;
+
+        // A lane lookup or enqueue lock can resume after reconnection. Do not
+        // admit an old notification to a worker created by the new connection.
+        if scope.is_some_and(|scope| !scope.is_current(&client)) {
+            *cancelled = true;
+            return true;
+        }
 
         let node = match lane.try_enqueue(node) {
             Ok(()) => return true,
@@ -101,6 +117,10 @@ impl MessageHandler {
                     .await
             }
         };
+        if scope.is_some_and(|scope| !scope.is_current(&client)) {
+            *cancelled = true;
+            return true;
+        }
         if let Err(e) = fresh.try_enqueue(node) {
             warn!("Failed to enqueue message for processing: {e}");
             *cancelled = true;
@@ -226,6 +246,12 @@ async fn process_queued(
     // Two clock reads per message, kept: sampling or gating on lane
     // backlog would stop reporting the single pathological message
     // this guard exists to catch.
+    if msg_node.tag() == StanzaTag::Notification.as_str() {
+        client
+            .process_queued_group_notification(msg_node, spawn_generation)
+            .await;
+        return true;
+    }
     let start = wacore::time::Instant::now();
     // Awaited inline (not boxed): the future lives in this
     // once-per-chat worker task instead of a fresh ~9 KB heap box

@@ -67,7 +67,9 @@
 //!
 //! `<receipt>`, `<notification>` and `<call>` are not in that group: the client
 //! answers those with a transport `<ack>` already, so a claim leaves the ack
-//! exactly where it was.
+//! exactly where it was. When a group notification durability hook is configured,
+//! its commit gate runs first: a failed or stale capture reaches neither
+//! interceptors nor the ACK path.
 //!
 //! # Cost
 //!

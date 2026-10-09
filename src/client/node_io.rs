@@ -479,14 +479,38 @@ impl Client {
 
         // Wrap in Arc once - all handlers will share this same allocation
         let node_arc = Arc::new(node);
-        self.process_node_scoped(node_arc, shutdown).await;
+        self.process_node_scoped(node_arc, shutdown, true).await;
     }
 
     /// Process a node wrapped in Arc. Handlers receive the Arc and can share/store it cheaply.
     #[cfg(any(test, feature = "bench-harness", feature = "test-support"))]
     pub(crate) async fn process_node(self: &Arc<Self>, node: Arc<wacore_binary::OwnedNodeRef>) {
         let shutdown = self.connection_shutdown_signal();
-        self.process_node_scoped(node, &shutdown).await;
+        self.process_node_scoped(node, &shutdown, false).await;
+    }
+
+    pub(crate) fn process_queued_group_notification(
+        self: &Arc<Self>,
+        node: Arc<wacore_binary::OwnedNodeRef>,
+        generation: u64,
+    ) -> wacore::runtime::BoxFuture<'_, ()> {
+        Box::pin(async move {
+            let shutdown = self.connection_shutdown_signal();
+            NotificationScope::new(generation, &shutdown)
+                .run(
+                    self,
+                    self.dispatch_node_scoped(node, &shutdown, Some(StanzaTag::Notification)),
+                )
+                .await;
+        })
+    }
+
+    fn queues_group_notification(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
+        self.group_notification_durability_hook.get().is_some()
+            && node.tag == StanzaTag::Notification.as_str()
+            && node.attrs().optional_string("type").as_deref()
+                == Some(NotificationType::WGp2.as_str())
+            && node.attrs().optional_jid("from").is_some()
     }
 
     #[cfg_attr(
@@ -497,12 +521,16 @@ impl Client {
         self: &Arc<Self>,
         node: Arc<wacore_binary::OwnedNodeRef>,
         shutdown: &wacore::runtime::ShutdownSignal,
+        enqueue_group: bool,
     ) {
         use wacore::xml::DisplayableNodeRef;
         let nr = node.get();
         // Classified once; every gate below dispatches on the enum instead of
         // re-comparing the tag string.
         let tag = StanzaTag::try_from(nr.tag.as_ref()).ok();
+        let group_scope = (enqueue_group && self.queues_group_notification(nr)).then(|| {
+            NotificationScope::new(self.connection_generation.load(Ordering::Acquire), shutdown)
+        });
 
         // --- Offline Sync Tracking ---
         if tag == Some(StanzaTag::InfoBanner) {
@@ -606,9 +634,6 @@ impl Client {
             debug!(target: "Client/Recv","{}", DisplayableNodeRef(nr));
         }
 
-        // Prepare deferred ACK cancellation flag (sent after dispatch unless cancelled)
-        let mut cancelled = false;
-
         // Emit raw node before any early returns so all decoded stanzas
         // (including IQ responses and xmlstreamend) reach external observers
         if self.raw_node_forwarding_enabled() {
@@ -660,6 +685,37 @@ impl Client {
             return;
         }
 
+        if let Some(scope) = group_scope {
+            // Account for arrival and notify raw observers before enqueueing.
+            // Host storage may pause this group's worker, but must not delay
+            // offline pull-batch accounting or another group's admissions.
+            let mut cancelled = false;
+            scope
+                .run(
+                    self,
+                    crate::handlers::message::MessageHandler::handle_inline_scoped(
+                        Arc::clone(self),
+                        node,
+                        &mut cancelled,
+                        Some(scope),
+                    ),
+                )
+                .await;
+            return;
+        }
+        self.dispatch_node_scoped(node, shutdown, tag).await;
+    }
+
+    async fn dispatch_node_scoped(
+        self: &Arc<Self>,
+        node: Arc<wacore_binary::OwnedNodeRef>,
+        shutdown: &wacore::runtime::ShutdownSignal,
+        tag: Option<StanzaTag>,
+    ) {
+        use wacore::xml::DisplayableNodeRef;
+        let nr = node.get();
+        let mut cancelled = false;
+
         // Most messages do not need a transport <ack> from this generic gate.
         // Move those nodes into their chat lane instead of retaining a second
         // Arc in this dispatcher while decryption starts. Besides removing an
@@ -669,6 +725,21 @@ impl Client {
         // encoded, preserving the existing acknowledgement semantics.
         let should_ack = self.should_ack(nr);
         let deferred_ack_node = should_ack.then(|| Arc::clone(&node));
+
+        // A claimed group notification still owes an ACK, so persistence must
+        // precede both interceptors and the built-in group effects.
+        let group_capture_generation = if tag == Some(StanzaTag::Notification) {
+            match crate::handlers::notification::NotificationHandler::capture_group(
+                self, &node, shutdown,
+            )
+            .await
+            {
+                Ok(generation) => generation,
+                Err(()) => return,
+            }
+        } else {
+            None
+        };
 
         // An interceptor runs before the built-in pipeline so a consumer can
         // act on a stanza this version does not model, instead of watching it
@@ -700,9 +771,18 @@ impl Client {
             });
             if !shutdown.is_fired()
                 && let Some(node) = ack
+                && group_capture_generation.is_none_or(|generation| {
+                    self.connection_generation.load(Ordering::Acquire) == generation
+                })
             {
                 self.maybe_deferred_ack(node).await;
             }
+            return;
+        }
+
+        if group_capture_generation.is_some_and(|generation| {
+            self.connection_generation.load(Ordering::Acquire) != generation
+        }) {
             return;
         }
 
@@ -765,6 +845,9 @@ impl Client {
 
         if !cancelled
             && !shutdown.is_fired()
+            && group_capture_generation.is_none_or(|generation| {
+                self.connection_generation.load(Ordering::Acquire) == generation
+            })
             && let Some(node) = deferred_ack_node
         {
             self.maybe_deferred_ack(node).await;
@@ -806,6 +889,7 @@ impl Client {
                 | StanzaTag::InfoBanner,
             ) => true,
             Ok(StanzaTag::Status) => is_status_broadcast_stanza(node),
+            Ok(StanzaTag::Notification) => self.queues_group_notification(node),
             Ok(StanzaTag::Receipt) => {
                 !self.synchronous_ack
                     && !self.raw_node_forwarding_enabled()

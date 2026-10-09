@@ -89,12 +89,27 @@ impl Client {
 
     /// Redistribution must not inherit delivery marks from an earlier pass.
     pub(crate) async fn reset_sender_key_device_tracking(&self, group_jid: &str) -> Result<()> {
+        self.reset_sender_key_device_tracking_scoped(group_jid, None)
+            .await
+    }
+
+    async fn reset_sender_key_device_tracking_scoped(
+        &self,
+        group_jid: &str,
+        scope: Option<super::NotificationScope<'_>>,
+    ) -> Result<()> {
+        if scope.is_some_and(|scope| !scope.is_current(self)) {
+            return Ok(());
+        }
         if let Err(clear_error) = self
             .persistence_manager
             .clear_sender_key_devices(group_jid)
             .await
         {
             // Cold marks preserve the reset when row deletion is unavailable.
+            if scope.is_some_and(|scope| !scope.is_current(self)) {
+                return Ok(());
+            }
             let rows = self
                 .persistence_manager
                 .get_sender_key_devices(group_jid)
@@ -106,6 +121,9 @@ impl Client {
                     )
                 })?;
             if !rows.is_empty() {
+                if scope.is_some_and(|scope| !scope.is_current(self)) {
+                    return Ok(());
+                }
                 let entries: Vec<(&str, bool)> = rows
                     .iter()
                     .map(|(device_jid, _)| (device_jid.as_str(), false))
@@ -126,7 +144,9 @@ impl Client {
                 rows.len()
             );
         }
-        self.sender_key_device_cache.invalidate(group_jid).await;
+        if scope.is_none_or(|scope| scope.is_current(self)) {
+            self.sender_key_device_cache.invalidate(group_jid).await;
+        }
         Ok(())
     }
 
@@ -136,17 +156,30 @@ impl Client {
     /// the group and wipe `sender_key_devices` so the next send takes the
     /// `force_skdm=true` path (`!key_exists`) and redistributes to all
     /// remaining participants.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.rotate_sender_key_on_remove", level = "debug", skip_all, fields(removed = removed_user_ids.len())))]
     pub(crate) async fn rotate_sender_key_on_participant_remove(
         &self,
         group_jid: &Jid,
         removed_user_ids: &[&str],
+    ) {
+        self.rotate_sender_key_on_participant_remove_scoped(group_jid, removed_user_ids, None)
+            .await;
+    }
+
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.rotate_sender_key_on_remove", level = "debug", skip_all, fields(removed = removed_user_ids.len())))]
+    pub(crate) async fn rotate_sender_key_on_participant_remove_scoped(
+        &self,
+        group_jid: &Jid,
+        removed_user_ids: &[&str],
+        scope: Option<super::NotificationScope<'_>>,
     ) {
         if removed_user_ids.is_empty() {
             return;
         }
         let group_id = group_jid.to_string();
         let distribution_guard = self.group_distribution_lock(group_jid).await;
+        if scope.is_some_and(|scope| !scope.is_current(self)) {
+            return;
+        }
 
         // Read failure → rotate anyway. Better to pay the redistribute cost
         // than leave the sender key in place after a removal we couldn't audit.
@@ -176,8 +209,11 @@ impl Client {
             return;
         }
 
-        self.rotate_own_sender_key_state(&group_id).await;
+        self.rotate_own_sender_key_state(&group_id, scope).await;
         drop(distribution_guard);
+        if scope.is_some_and(|scope| !scope.is_current(self)) {
+            return;
+        }
         self.flush_signal_cache_batch_safe_logged("rotate_on_participant_remove", None)
             .await;
     }
@@ -187,6 +223,12 @@ impl Client {
     /// `force_skdm=true` path and regenerates + redistributes a fresh key.
     /// Used by the removal audit and by the `<modify>` (number/LID migration)
     /// path, which WA Web (`modifyParticipantInfo`) rotates unconditionally.
+    #[cfg(test)]
+    pub(crate) async fn force_rotate_own_sender_key(&self, group_jid: &Jid) {
+        self.force_rotate_own_sender_key_scoped(group_jid, None)
+            .await;
+    }
+
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -195,22 +237,37 @@ impl Client {
             skip_all
         )
     )]
-    pub(crate) async fn force_rotate_own_sender_key(&self, group_jid: &Jid) {
+    pub(crate) async fn force_rotate_own_sender_key_scoped(
+        &self,
+        group_jid: &Jid,
+        scope: Option<super::NotificationScope<'_>>,
+    ) {
         let group_id = group_jid.to_string();
         let distribution_guard = self.group_distribution_lock(group_jid).await;
-        self.rotate_own_sender_key_state(&group_id).await;
+        self.rotate_own_sender_key_state(&group_id, scope).await;
         drop(distribution_guard);
+
+        if scope.is_some_and(|scope| !scope.is_current(self)) {
+            return;
+        }
 
         self.flush_signal_cache_batch_safe_logged("force_rotate_own_sender_key", None)
             .await;
     }
 
     /// A send must not publish a new distribution between the audit and reset.
-    async fn rotate_own_sender_key_state(&self, group_id: &str) {
+    async fn rotate_own_sender_key_state(
+        &self,
+        group_id: &str,
+        scope: Option<super::NotificationScope<'_>>,
+    ) {
         use wacore::libsignal::store::sender_key_name::SenderKeyName;
         use wacore::types::jid::JidExt;
         let snapshot = self.persistence_manager.get_device_snapshot();
         for own_jid in snapshot.lid.iter().chain(snapshot.pn.iter()) {
+            if scope.is_some_and(|scope| !scope.is_current(self)) {
+                return;
+            }
             let sk_name =
                 SenderKeyName::from_parts(group_id, own_jid.to_protocol_address().as_str());
             self.signal_cache
@@ -218,7 +275,10 @@ impl Client {
                 .await;
         }
 
-        if let Err(e) = self.reset_sender_key_device_tracking(group_id).await {
+        if let Err(e) = self
+            .reset_sender_key_device_tracking_scoped(group_id, scope)
+            .await
+        {
             log::warn!("rotate_own_sender_key_state: reset failed for {group_id}: {e}");
         }
     }

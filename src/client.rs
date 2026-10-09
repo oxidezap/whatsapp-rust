@@ -24,6 +24,8 @@ mod lifecycle;
 pub(crate) mod member_index;
 mod messaging;
 mod node_io;
+mod notification_scope;
+pub(crate) use notification_scope::NotificationScope;
 pub(crate) mod offline_resume;
 mod sender_keys;
 mod sessions;
@@ -2106,6 +2108,10 @@ pub struct Client {
     /// at-most-once behavior with zero overhead.
     pub(crate) inbound_durability_hook:
         std::sync::OnceLock<Arc<dyn crate::types::durability_hook::InboundDurabilityHook>>,
+
+    /// Optional whole-envelope group capture before effects and ACK; fixed at build.
+    pub(crate) group_notification_durability_hook:
+        std::sync::OnceLock<Arc<dyn crate::GroupNotificationDurabilityHook>>,
 
     /// History capture is independent of message durability and immutable after build.
     pub(crate) history_sync_capture_hook:

@@ -12,6 +12,7 @@ use crate::types::connect_admission::ConnectAdmission;
 use crate::types::durability_hook::{HistorySyncCaptureHook, InboundDurabilityHook};
 use crate::types::enc_handler::EncHandler;
 use crate::types::events::{Event, EventHandler, EventInterest, EventKind, Subscription};
+use crate::types::group_notification_durability::GroupNotificationDurabilityHook;
 use crate::types::history_sync_admission::HistorySyncAdmission;
 use crate::types::message::MessageInfo;
 use log::{info, warn};
@@ -1271,6 +1272,29 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         Dh: InboundDurabilityHook + 'static,
     {
         self.client_builder = self.client_builder.with_inbound_durability_hook(hook);
+        self
+    }
+
+    /// Persist each complete group notification before effects and ACK.
+    /// See [`GroupNotificationDurabilityHook`] for cancellation and replay limits.
+    pub fn with_group_notification_durability_hook<Gh>(mut self, hook: Gh) -> Self
+    where
+        Gh: GroupNotificationDurabilityHook + 'static,
+    {
+        self.client_builder = self
+            .client_builder
+            .with_group_notification_durability_hook(hook);
+        self
+    }
+
+    /// Register an already-shared hook. The last registration wins.
+    pub fn with_group_notification_durability_hook_arc(
+        mut self,
+        hook: Arc<dyn GroupNotificationDurabilityHook>,
+    ) -> Self {
+        self.client_builder = self
+            .client_builder
+            .with_group_notification_durability_hook_arc(hook);
         self
     }
 
