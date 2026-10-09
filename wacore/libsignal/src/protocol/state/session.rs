@@ -141,11 +141,48 @@ impl SkippedKey {
         }
     }
 
-    /// A chain's backlog as protobuf entries, every seed-only key sliced out
-    /// of one shared buffer: a store flush re-encodes the backlog of every
-    /// dirty chain, and after an offline drain that is hundreds of keys, so an
-    /// allocation per key per flush was the dominant flush cost. Legacy keys
-    /// keep their boxed protobuf and clone it as before.
+    #[allow(clippy::disallowed_methods)]
+    fn wire_len(&self) -> usize {
+        use buffa::encoding::varint_len;
+        use waproto::tags::session_structure::chain::message_key as tags;
+        match self {
+            Self::Seed { index, .. } => {
+                varint_len(u64::from(tags::INDEX) << 3)
+                    + varint_len(u64::from(*index))
+                    + varint_len((u64::from(tags::SEED) << 3) | 2)
+                    + 1
+                    + 32
+            }
+            Self::Legacy(pb) => pb.encoded_len() as usize,
+        }
+    }
+
+    fn wire_entry_len(&self) -> usize {
+        use buffa::encoding::varint_len;
+        let len = self.wire_len();
+        varint_len((u64::from(waproto::tags::session_structure::chain::MESSAGE_KEYS) << 3) | 2)
+            + varint_len(len as u64)
+            + len
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn write_wire_entry(&self, output: &mut Vec<u8>) {
+        use buffa::encoding::{Tag, WireType, encode_varint};
+        use waproto::tags::session_structure::chain as tags;
+        Tag::new(tags::MESSAGE_KEYS, WireType::LengthDelimited).encode(output);
+        encode_varint(self.wire_len() as u64, output);
+        match self {
+            Self::Seed { index, seed } => {
+                buffa::types::put_uint32_field(tags::message_key::INDEX, *index, output);
+                buffa::types::put_bytes_field(tags::message_key::SEED, seed, output);
+            }
+            Self::Legacy(pb) => pb.encode(output),
+        }
+    }
+
+    /// A chain's backlog for protobuf-based component and archive conversion.
+    /// Seed-only entries share one buffer; legacy keys retain their complete
+    /// protobuf. Store serialization writes compact seeds directly instead.
     fn to_pb_list(keys: &[Self]) -> Vec<session_structure::chain::MessageKey> {
         let seed_count = keys
             .iter()
@@ -284,22 +321,68 @@ impl SessionState {
         Self { session, skipped }
     }
 
-    /// Whether any receiver chain holds a skipped key, i.e. whether encoding
-    /// this state needs the backlog reassembled into the protobuf.
+    /// Whether encoding must insert a compact receiver-chain backlog.
     fn has_skipped_keys(&self) -> bool {
         self.skipped
             .iter()
             .any(|keys| keys.as_ref().is_some_and(|keys| !keys.is_empty()))
     }
 
-    /// The protobuf with the skipped keys put back, for encoding. Borrowed
-    /// when there is nothing to put back, which is every chain of an in-order
-    /// conversation; a clone with the backlog reassembled otherwise.
-    fn protobuf(&self) -> std::borrow::Cow<'_, SessionStructure> {
-        if !self.has_skipped_keys() {
-            return std::borrow::Cow::Borrowed(&self.session);
+    /// Reinsert the compact backlog into the generated wire projection without
+    /// materializing a protobuf and reference-counted seed slice for every key.
+    /// This reads our own generated output; unexpected shapes fall back to the
+    /// ordinary protobuf reconstruction at the call site.
+    #[allow(clippy::disallowed_methods)]
+    fn encode_skipped(&self) -> Option<Vec<u8>> {
+        use buffa::encoding::{Tag, WireType, decode_varint, encode_varint, skip_field_depth};
+        use waproto::tags::session_structure as tags;
+
+        let base = self.session.encode_to_vec();
+        let mut remaining = base.as_slice();
+        let mut output = Vec::with_capacity(base.len());
+        let mut chain_index = 0;
+        while !remaining.is_empty() {
+            let before = remaining;
+            let tag = Tag::decode(&mut remaining).ok()?;
+            if tag.field_number() != tags::RECEIVER_CHAINS
+                || tag.wire_type() != WireType::LengthDelimited
+                || chain_index >= self.session.receiver_chains.len()
+            {
+                skip_field_depth(tag, &mut remaining, buffa::RECURSION_LIMIT).ok()?;
+                output.extend_from_slice(&before[..before.len() - remaining.len()]);
+                continue;
+            }
+            let len = usize::try_from(decode_varint(&mut remaining).ok()?).ok()?;
+            let payload = remaining.get(..len)?;
+            remaining = remaining.get(len..)?;
+            let chain = &self.session.receiver_chains[chain_index];
+            let keys = self.skipped.get(chain_index).and_then(Option::as_deref);
+            chain_index += 1;
+            let Some(keys) = keys.filter(|keys| !keys.is_empty()) else {
+                output.extend_from_slice(&before[..before.len() - remaining.len()]);
+                continue;
+            };
+            if !chain.message_keys.is_empty() {
+                return None;
+            }
+            let extra: usize = keys.iter().map(SkippedKey::wire_entry_len).sum();
+            let new_len = len.checked_add(extra)?;
+            // Unknown records remain after the generated fields, in their
+            // existing order, including duplicate tags. Only the first N root
+            // chain occurrences belong to the generated receiver_chains Vec.
+            let split = payload
+                .len()
+                .checked_sub(chain.__buffa_unknown_fields.encoded_len())?;
+            output.reserve(new_len + 10);
+            tag.encode(&mut output);
+            encode_varint(new_len as u64, &mut output);
+            output.extend_from_slice(&payload[..split]);
+            for key in keys.iter() {
+                key.write_wire_entry(&mut output);
+            }
+            output.extend_from_slice(&payload[split..]);
         }
-        std::borrow::Cow::Owned(self.to_protobuf())
+        (chain_index == self.session.receiver_chains.len()).then_some(output)
     }
 
     /// The protobuf with the skipped keys put back, owned.
@@ -1669,12 +1752,25 @@ impl SessionRecord {
         }
 
         let mut cache = buffa::SizeCache::new();
-        // Borrowed unless a receiver chain holds skipped keys, in which case
-        // the backlog is reassembled into a clone for the encoder.
-        let current = self.current_session.as_ref().map(|s| s.protobuf());
-        let current_msg_len = current
-            .as_deref()
-            .map(|s| s.compute_size(&mut cache) as usize);
+        enum Current<'a> {
+            Borrowed(&'a SessionStructure),
+            Wire(Vec<u8>),
+        }
+        let current = self.current_session.as_ref().map(|state| {
+            if state.has_skipped_keys() {
+                Current::Wire(
+                    state
+                        .encode_skipped()
+                        .unwrap_or_else(|| state.to_protobuf().encode_to_vec()),
+                )
+            } else {
+                Current::Borrowed(&state.session)
+            }
+        });
+        let current_msg_len = current.as_ref().map(|s| match s {
+            Current::Borrowed(proto) => proto.compute_size(&mut cache) as usize,
+            Current::Wire(bytes) => bytes.len(),
+        });
         let current_len = current_msg_len
             .map(|msg_len| 1 + varint_len(msg_len as u64) + msg_len)
             .unwrap_or(0);
@@ -1709,10 +1805,19 @@ impl SessionRecord {
             current_len + previous_len + reserved_len + incarnation_len + self.future.encoded_len(),
         );
 
-        if let Some(session) = current.as_deref()
+        if let Some(session) = current.as_ref()
             && let Some(msg_len) = current_msg_len
         {
-            write_len_delimited(1, session, msg_len, &mut cache, buf);
+            match session {
+                Current::Borrowed(proto) => {
+                    write_len_delimited(1, *proto, msg_len, &mut cache, buf)
+                }
+                Current::Wire(bytes) => {
+                    Tag::new(1, WireType::LengthDelimited).encode(buf);
+                    encode_varint(msg_len as u64, buf);
+                    buf.extend_from_slice(bytes);
+                }
+            }
         }
         for archived in self.previous_sessions.iter() {
             let bytes = archived.as_bytes();
@@ -2305,6 +2410,70 @@ mod tests {
             restored.receiver_chains[0].message_keys[0].encode_to_vec(),
             wire
         );
+    }
+
+    #[test]
+    fn skipped_wire_projection_matches_generated_encoding() {
+        let boundaries = [0, 127, 128, 16383, 16384, 0x0fff_ffff, u32::MAX];
+        for count in [1, 3, 127, 128, 512] {
+            let mut proto = make_cache_shape_session(17, 0, 0);
+            for chain_index in 0..3 {
+                let mut chain = make_cache_shape_chain(chain_index, 0);
+                for index in 0..count {
+                    let mut key = session_structure::chain::MessageKey::default();
+                    key.index = Some(boundaries[index % boundaries.len()]);
+                    key.seed = Some(bytes::Bytes::from_static(&[0x42; 32]));
+                    if index % 5 == 0 {
+                        key.cipher_key = Some(bytes::Bytes::from_static(&[0x37; 32]));
+                        key.__buffa_unknown_fields.push(buffa::UnknownField {
+                            number: 201,
+                            data: buffa::UnknownFieldData::Varint(9),
+                        });
+                    }
+                    chain.message_keys.push(key);
+                }
+                // Even explicitly supplied unknown occurrences with a known
+                // field number must retain their exact position at the tail.
+                chain.__buffa_unknown_fields.push(buffa::UnknownField {
+                    number: waproto::tags::session_structure::chain::MESSAGE_KEYS,
+                    data: buffa::UnknownFieldData::LengthDelimited(vec![]),
+                });
+                proto.receiver_chains.push(chain);
+            }
+            proto.__buffa_unknown_fields.push(buffa::UnknownField {
+                number: waproto::tags::session_structure::RECEIVER_CHAINS,
+                data: buffa::UnknownFieldData::LengthDelimited(vec![]),
+            });
+            proto.__buffa_unknown_fields.push(buffa::UnknownField {
+                number: 202,
+                data: buffa::UnknownFieldData::Varint(42),
+            });
+            let expected = proto.encode_to_vec();
+            let state = SessionState::from_session_structure(proto);
+            assert!(state.has_skipped_keys());
+            assert_eq!(state.encode_skipped().unwrap(), expected);
+            assert_eq!(state.to_protobuf().encode_to_vec(), expected);
+            let record = SessionRecord::new(state);
+            let mut reference = waproto::whatsapp::RecordStructure::default();
+            reference.current_session =
+                MessageField::some(record.current_session.as_ref().unwrap().to_protobuf());
+            assert_eq!(record.serialize().unwrap(), reference.encode_to_vec());
+        }
+    }
+
+    #[test]
+    fn skipped_wire_projection_falls_back_for_unexpected_inline_keys() {
+        let mut state = SessionState::from_session_structure(make_cache_shape_session(3, 1, 1));
+        assert!(state.has_skipped_keys());
+        state.session.receiver_chains[0]
+            .message_keys
+            .push(session_structure::chain::MessageKey::default());
+        assert!(state.encode_skipped().is_none());
+        let expected = state.to_protobuf();
+        let record = SessionRecord::new(state);
+        let mut reference = waproto::whatsapp::RecordStructure::default();
+        reference.current_session = MessageField::some(expected);
+        assert_eq!(record.serialize().unwrap(), reference.encode_to_vec());
     }
 
     /// Every walker charges only what hangs off a slot, and the owner charges

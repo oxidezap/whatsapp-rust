@@ -1,4 +1,84 @@
 use evolution_fixture::{Message, MessageView, ViewEncode};
+
+#[test]
+fn enum_only_projection_preserves_each_winner_across_owners() {
+    use evolution_fixture::{v1, v2};
+    for (wire, expected) in [
+        (vec![0x10, 0, 0x10, 1], v2::record::Mode::NEW),
+        (vec![0x10, 1, 0x10, 0], v2::record::Mode::READY),
+    ] {
+        let owned = v1::EnumRecord::decode_from_slice(&wire).unwrap();
+        let view = v1::EnumRecordView::decode_view(&wire).unwrap();
+        let handle =
+            v1::EnumRecordOwnedView::decode(evolution_fixture::bytes::Bytes::from(wire.clone()))
+                .unwrap();
+        let cloned = handle.clone();
+        drop(handle);
+        for output in [
+            owned.encode_to_vec(),
+            view.encode_to_vec(),
+            view.to_owned_message().unwrap().encode_to_vec(),
+            cloned.to_owned_message().encode_to_vec(),
+        ] {
+            assert_eq!(
+                v2::EnumRecord::decode_from_slice(&output).unwrap().mode,
+                Some(expected)
+            );
+        }
+    }
+}
+
+#[test]
+fn enum_only_projection_keeps_group_edits_separate() {
+    use evolution_fixture::{v1, v2};
+    let wire = [0x10, 0, 0x18, 1, 0x10, 1, 0x18, 0];
+    let original = v1::EnumRecord::decode_from_slice(&wire).unwrap();
+    let check = |bytes: Vec<u8>, mode, other| {
+        let decoded = v2::EnumRecord::decode_from_slice(&bytes).unwrap();
+        assert_eq!((decoded.mode, decoded.other), (Some(mode), Some(other)));
+    };
+    let mut unrelated = original.clone();
+    unrelated.label = Some(42);
+    check(
+        unrelated.encode_to_vec(),
+        v2::record::Mode::NEW,
+        v2::record::Mode::READY,
+    );
+    let mut edited = original.clone();
+    edited.other = Some(v1::record::Mode::OTHER);
+    check(
+        edited.encode_to_vec(),
+        v2::record::Mode::NEW,
+        v2::record::Mode::OTHER,
+    );
+    let forced = original.clone().with_mode(v1::record::Mode::READY);
+    check(
+        forced.encode_to_vec(),
+        v2::record::Mode::READY,
+        v2::record::Mode::READY,
+    );
+    let mut cleared = original;
+    cleared.mode = None;
+    check(
+        cleared.encode_to_vec(),
+        v2::record::Mode::NEW,
+        v2::record::Mode::READY,
+    );
+    let view = v1::EnumRecordView::decode_view(&wire)
+        .unwrap()
+        .with_mode(v1::record::Mode::NEGATIVE);
+    check(
+        view.encode_to_vec(),
+        v2::record::Mode::NEGATIVE,
+        v2::record::Mode::READY,
+    );
+    check(
+        view.to_owned_message().unwrap().encode_to_vec(),
+        v2::record::Mode::NEGATIVE,
+        v2::record::Mode::READY,
+    );
+}
+
 macro_rules! consumer {
     ($test:ident, $version:ident) => {
         #[test]

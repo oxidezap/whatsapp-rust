@@ -14,8 +14,8 @@ use sha2::Sha256;
 use crate::protocol::counter_lease::CounterLease;
 use crate::protocol::crypto::hmac_sha256;
 use crate::protocol::record_components::{
-    SenderKeyRecordComponents, sender_state_components_from_structure,
-    sender_state_structure_from_components,
+    SenderKeyRecordComponents, SenderKeyStateComponents, SenderMessageKeyComponents,
+    sender_state_components_from_structure, sender_state_structure_from_components,
 };
 #[cfg(test)]
 use crate::protocol::stores::SenderKeyRecordStructure;
@@ -674,11 +674,29 @@ impl SenderKeyState {
         }
     }
 
-    fn into_protobuf(self) -> SenderKeyStateStructure {
+    fn into_components(self) -> Result<SenderKeyStateComponents, SignalProtocolError> {
         if let Some(state) = self.preserved_protobuf() {
-            return state;
+            return sender_state_components_from_structure(state);
         }
-        {
+        let (header, message_keys) = self.into_header();
+        let mut components = sender_state_components_from_structure(header)?;
+        components.message_keys = message_keys
+            .iter()
+            .map(|key| SenderMessageKeyComponents {
+                iteration: key.iteration,
+                seed: key.seed.to_vec(),
+            })
+            .collect();
+        Ok(components)
+    }
+
+    fn into_header(
+        self,
+    ) -> (
+        SenderKeyStateStructure,
+        std::sync::Arc<Vec<StoredMessageKey>>,
+    ) {
+        let header = {
             let mut proto_ = SenderKeyStateStructure::default();
             proto_.sender_key_id = self.sender_key_id;
             proto_.sender_chain_key = self
@@ -691,9 +709,19 @@ impl SenderKeyState {
                 .sender_signing_key
                 .map(std::sync::Arc::unwrap_or_clone)
                 .into();
-            proto_.sender_message_keys = StoredMessageKey::as_protobuf_list(&self.message_keys);
             proto_
+        };
+        (header, self.message_keys)
+    }
+
+    #[cfg(test)]
+    fn into_protobuf(self) -> SenderKeyStateStructure {
+        if let Some(state) = self.preserved_protobuf() {
+            return state;
         }
+        let (mut header, keys) = self.into_header();
+        header.sender_message_keys = StoredMessageKey::as_protobuf_list(&keys);
+        header
     }
 
     #[allow(clippy::disallowed_methods)]
@@ -732,15 +760,14 @@ impl SenderKeyState {
             return;
         }
         use record_encoding::{
-            bytes_len, write_bytes, write_nested, write_seed_record, write_uint32,
+            bytes_len, write_bytes, write_nested, write_seed_entry, write_uint32,
         };
 
         if let Some(id) = self.sender_key_id {
             write_uint32(1, id, out);
         }
         if let Some(chain) = &self.sender_chain {
-            write_nested(2, record_encoding::seed_record_len(chain.iteration), out);
-            write_seed_record(chain.iteration, &chain.chain_key, out);
+            write_seed_entry(2, chain.iteration, &chain.chain_key, out);
         }
         if let Some(key) = self.sender_signing_key.as_deref() {
             let len = key.public.as_deref().map_or(0, bytes_len)
@@ -754,8 +781,7 @@ impl SenderKeyState {
             }
         }
         for key in self.message_keys.iter() {
-            write_nested(4, record_encoding::seed_record_len(key.iteration), out);
-            write_seed_record(key.iteration, &key.seed, out);
+            write_seed_entry(4, key.iteration, &key.seed, out);
         }
     }
 
@@ -901,9 +927,26 @@ mod record_encoding {
         out.extend_from_slice(bytes);
     }
 
-    pub(super) fn write_seed_record(iteration: u32, seed: &[u8; 32], out: &mut Vec<u8>) {
-        write_uint32(1, iteration, out);
-        write_bytes(2, seed, out);
+    pub(super) fn write_seed_entry(field: u32, iteration: u32, seed: &[u8; 32], out: &mut Vec<u8>) {
+        use bytes::BufMut as _;
+
+        // Both callers use one-byte tags. The longest entry has a five-byte
+        // iteration and a 32-byte seed; appending it once avoids repeatedly
+        // checking/growing the final Vec for each small header component.
+        debug_assert!(matches!(field, 2 | 4));
+        let mut entry = [0u8; 42];
+        let len = {
+            let mut remaining = entry.as_mut_slice();
+            Tag::new(field, WireType::LengthDelimited).encode(&mut remaining);
+            encode_varint(seed_record_len(iteration) as u64, &mut remaining);
+            Tag::new(1, WireType::Varint).encode(&mut remaining);
+            encode_varint(u64::from(iteration), &mut remaining);
+            Tag::new(2, WireType::LengthDelimited).encode(&mut remaining);
+            remaining.put_u8(32);
+            remaining.put_slice(seed);
+            42 - remaining.len()
+        };
+        out.extend_from_slice(&entry[..len]);
     }
 }
 
@@ -967,8 +1010,7 @@ impl SenderKeyRecord {
         let states = self
             .states
             .into_iter()
-            .map(SenderKeyState::into_protobuf)
-            .map(sender_state_components_from_structure)
+            .map(SenderKeyState::into_components)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(SenderKeyRecordComponents { states })
     }
@@ -1230,40 +1272,59 @@ impl SenderKeyRecord {
         let incarnation_len = incarnation
             .map(|_| super::local_field::STORE_INCARNATION_ENCODED_LEN)
             .unwrap_or(0);
-        // Construction and deserialization cap the history at this limit.
-        // Retain lengths on the stack so sizing never rescans a backlog during
-        // the write pass or adds a heap allocation per flush.
-        let mut state_lengths = [0; consts::MAX_SENDER_KEY_STATES];
-        // A protobuf state is large even when absent. Keep its temporary slots
-        // off the ordinary flush path; only future-bearing records reconstruct
-        // them, once for both sizing and writing.
-        let preserved = if self.states.iter().any(|state| state.future.is_some()) {
-            self.preserved_states()
+        let single = (self.states.len() == 1)
+            .then(|| &self.states[0])
+            .filter(|state| state.future.is_none());
+        let mut buf = if let Some(state) = single {
+            // The usual record owns one state. Avoid history bookkeeping and
+            // template lookup while retaining the same per-state encoder.
+            let len = state.encoded_len();
+            let mut buf = Vec::with_capacity(
+                record_encoding::nested_len(len)
+                    + reservation_len
+                    + incarnation_len
+                    + self.future.encoded_len(),
+            );
+            record_encoding::write_nested(1, len, &mut buf);
+            state.encode_into(&mut buf);
+            buf
         } else {
-            Vec::new()
-        };
-        let mut states_len = 0;
-        for (index, state) in self.states.iter().enumerate() {
-            let len = preserved
-                .get(index)
-                .and_then(Option::as_ref)
-                .map_or_else(|| state.encoded_len(), |pb| pb.encoded_len() as usize);
-            state_lengths[index] = len;
-            states_len += record_encoding::nested_len(len);
-        }
-        let mut buf = Vec::with_capacity(
-            states_len + reservation_len + incarnation_len + self.future.encoded_len(),
-        );
-        for (index, state) in self.states.iter().enumerate() {
-            record_encoding::write_nested(1, state_lengths[index], &mut buf);
-            if let Some(pb) = preserved.get(index).and_then(Option::as_ref) {
-                // No codec wrapper exists for this nested storage message.
-                #[allow(clippy::disallowed_methods)]
-                pb.encode(&mut buf);
+            // Construction and deserialization cap the history at this limit.
+            // Retain lengths on the stack so sizing never rescans a backlog during
+            // the write pass or adds a heap allocation per flush.
+            let mut state_lengths = [0; consts::MAX_SENDER_KEY_STATES];
+            // A protobuf state is large even when absent. Keep its temporary slots
+            // off the ordinary flush path; only future-bearing records reconstruct
+            // them, once for both sizing and writing.
+            let preserved = if self.states.iter().any(|state| state.future.is_some()) {
+                self.preserved_states()
             } else {
-                state.encode_into(&mut buf);
+                Vec::new()
+            };
+            let mut states_len = 0;
+            for (index, state) in self.states.iter().enumerate() {
+                let len = preserved
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .map_or_else(|| state.encoded_len(), |pb| pb.encoded_len() as usize);
+                state_lengths[index] = len;
+                states_len += record_encoding::nested_len(len);
             }
-        }
+            let mut buf = Vec::with_capacity(
+                states_len + reservation_len + incarnation_len + self.future.encoded_len(),
+            );
+            for (index, state) in self.states.iter().enumerate() {
+                record_encoding::write_nested(1, state_lengths[index], &mut buf);
+                if let Some(pb) = preserved.get(index).and_then(Option::as_ref) {
+                    // No codec wrapper exists for this nested storage message.
+                    #[allow(clippy::disallowed_methods)]
+                    pb.encode(&mut buf);
+                } else {
+                    state.encode_into(&mut buf);
+                }
+            }
+            buf
+        };
         // Append the local-only reservation as a top-level field the generated
         // decoder skips. Emitted only when non-zero, so legacy/unreserved records
         // stay byte-identical. Mirrors SessionRecord::serialize_into.
@@ -1499,6 +1560,41 @@ mod tests {
         let expected = proto.encode_to_vec();
         let state = SenderKeyState::from_protobuf(proto);
         assert_eq!(state.into_protobuf().encode_to_vec(), expected);
+    }
+
+    #[test]
+    fn direct_components_match_generated_projection_for_shared_backlogs() {
+        for count in [0, 1, 256] {
+            let mut record = record_with_state(7, 0x42);
+            let state = record.states.front_mut().unwrap();
+            for index in 0..count {
+                state.add_skipped_message_key(index, [0x31; 32]);
+            }
+            for future in [false, true] {
+                let mut proto = state.as_protobuf();
+                if future {
+                    proto.__buffa_unknown_fields.push(buffa::UnknownField {
+                        number: 200,
+                        data: buffa::UnknownFieldData::Varint(17),
+                    });
+                }
+                let shared = SenderKeyState::from_protobuf(proto.clone());
+                let retained = shared.clone();
+                let expected = sender_state_components_from_structure(proto).unwrap();
+                assert_eq!(shared.into_components().unwrap(), expected);
+                assert_eq!(retained.into_components().unwrap(), expected);
+            }
+        }
+        let malformed = SenderKeyStateStructure::default();
+        assert_eq!(
+            SenderKeyState::from_protobuf(malformed.clone())
+                .into_components()
+                .unwrap_err()
+                .to_string(),
+            sender_state_components_from_structure(malformed)
+                .unwrap_err()
+                .to_string()
+        );
     }
 
     /// An injected derivation has to be indistinguishable from the one the
@@ -2286,6 +2382,12 @@ mod tests {
                                 expected
                             );
                         }
+                        record.states.truncate(1);
+                        record.lease = CounterLease::default();
+                        assert_eq!(
+                            record.serialize().expect("serialize single state"),
+                            record.as_protobuf().encode_to_vec()
+                        );
                     }
                 }
             }
