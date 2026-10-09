@@ -15,6 +15,32 @@
 //! Unknown protobuf fields survive wire decode/encode; they are deliberately
 //! omitted from the derived-serde bridge representation.
 //!
+//! For singular enums and oneofs, binary decoding also retains the order of
+//! known and unknown occurrences. An untouched field keeps the received winner
+//! when a newer schema reads it again, even when another field is edited.
+//! Assigning a different public field value replaces its known projection;
+//! assigning the same value is indistinguishable from leaving it untouched.
+//! Use the `with_*` setter to request replacement explicitly, including with
+//! the same value. These setters are available on owned messages and views.
+//!
+//! Assigning `None` clears the known projection but retains unrecognized data:
+//! an older schema cannot identify which future tags belong to a oneof. Build
+//! a fresh message when the intention is to discard all received future state.
+//! Direct mutation of the hidden unknown-field container discards its order
+//! journal. The journal is omitted from serde together with unknown fields, so
+//! the serde bridge is not a lossless transport for a newer binary schema.
+//!
+//! Order bookkeeping is allocated only after an unknown field is received and
+//! is charged to the existing decode element-memory budget. Borrowed views
+//! retain subsequent known occurrences as slices of the input buffer.
+//! Equality and hashing include this retained order: identical known fields
+//! can have different meanings for a future schema. Converting the hidden
+//! container into raw `UnknownFields` deliberately discards that distinction.
+//! During encoding, a future-bearing message uses transient traversal-cache
+//! space (four bytes per three prepared output bytes) so nested messages are
+//! prepared once and replayed by the write pass. That cache is not retained in
+//! the message and does not affect messages without an occurrence journal.
+//!
 //! The Rust source (`whatsapp.rs`) is produced by `build.rs` from the
 //! pre-compiled descriptor set `whatsapp.desc`, and written to `OUT_DIR` —
 //! not tracked in git. To regenerate the descriptor after editing

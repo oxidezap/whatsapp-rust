@@ -20,8 +20,8 @@ fn future() -> UnknownFields {
 
 #[test]
 fn storage_keeps_layout_and_owned_unknown_records() {
-    assert_eq!(size_of::<Storage>(), size_of::<UnknownFields>());
-    assert_eq!(align_of::<Storage>(), align_of::<UnknownFields>());
+    assert_eq!(size_of::<Storage>(), size_of::<usize>());
+    assert_eq!(align_of::<Storage>(), align_of::<usize>());
     let mut storage = Storage::from(future());
     let cloned = storage.clone();
     storage.clear();
@@ -40,6 +40,7 @@ fn empty_retained_capacity_and_replaced_owners_drop_once() {
         let mut storage = Storage::from(future());
         storage.retain(|_| false);
         assert!(storage.is_empty());
+        assert_eq!(storage, Storage::default());
         let empty = std::mem::replace(&mut storage, Storage::from(future()));
         drop(empty);
         let owned = UnknownFields::from(std::mem::take(&mut storage));

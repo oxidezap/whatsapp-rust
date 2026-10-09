@@ -84,7 +84,32 @@ pub(crate) fn future_record_fields(
 /// Estimate decoder-grown unknown storage, including recursively owned payloads.
 /// buffa exposes live entries but not Vec capacity; round slots up to the
 /// decoder's geometric allocation bound. Payload Vec capacities are exact.
-pub(crate) fn unknown_fields_retained(fields: &buffa::UnknownFields) -> usize {
+pub(crate) fn unknown_fields_retained(fields: &impl UnknownStorage) -> usize {
+    fields.allocated_header_bytes() + unknown_records_retained(fields.records())
+}
+
+pub(crate) trait UnknownStorage {
+    fn records(&self) -> &buffa::UnknownFields;
+    fn allocated_header_bytes(&self) -> usize;
+}
+impl UnknownStorage for buffa::UnknownFields {
+    fn records(&self) -> &buffa::UnknownFields {
+        self
+    }
+    fn allocated_header_bytes(&self) -> usize {
+        0
+    }
+}
+impl UnknownStorage for waproto::whatsapp::__unknown_storage::Storage {
+    fn records(&self) -> &buffa::UnknownFields {
+        self
+    }
+    fn allocated_header_bytes(&self) -> usize {
+        self.allocated_header_bytes()
+    }
+}
+
+fn unknown_records_retained(fields: &buffa::UnknownFields) -> usize {
     if fields.is_empty() {
         return 0;
     }
@@ -98,4 +123,29 @@ pub(crate) fn unknown_fields_retained(fields: &buffa::UnknownFields) -> usize {
                 _ => 0,
             })
             .sum::<usize>()
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    use waproto::whatsapp::__unknown_storage::Storage;
+
+    #[test]
+    fn compact_generated_storage_counts_its_heap_header_once() {
+        let empty = Storage::default();
+        assert_eq!(unknown_fields_retained(&empty), 0);
+        let mut raw = buffa::UnknownFields::new();
+        raw.push(buffa::UnknownField {
+            number: 1000,
+            data: buffa::UnknownFieldData::LengthDelimited(vec![1, 2, 3]),
+        });
+        let raw_bytes = unknown_fields_retained(&raw);
+        let compact = Storage::from(raw);
+        assert_eq!(
+            unknown_fields_retained(&compact),
+            size_of::<buffa::UnknownFields>() + raw_bytes
+        );
+        let raw = buffa::UnknownFields::from(compact);
+        assert_eq!(unknown_fields_retained(&raw), raw_bytes);
+    }
 }

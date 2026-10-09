@@ -9,6 +9,9 @@ use std::path::Path;
 use quote::ToTokens;
 use syn::visit_mut::{self, VisitMut};
 
+#[path = "ordering.rs"]
+mod ordering;
+
 struct Extensible {
     serde: bool,
 }
@@ -78,6 +81,9 @@ impl VisitMut for ColdStorage {
             return;
         }
         let syn::Expr::Try(attempt) = &call.args[0] else {
+            let receiver = &call.receiver;
+            let args = &call.args;
+            *expr = syn::parse_quote!(#receiver.push_decoded(#args, ctx)?);
             return;
         };
         let syn::Expr::Call(decode) = &*attempt.expr else {
@@ -271,10 +277,19 @@ pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
         if serde {
             share_codecs(&mut file.items);
             ColdStorage { depth: 0 }.visit_file_mut(&mut file);
+            ordering::apply(&mut file, false);
             let body = syn::parse_file(include_str!("unknown_storage.rs")).expect("storage syntax");
             let body = body.items;
             file.items
                 .push(syn::parse_quote!(#[doc(hidden)] pub mod __unknown_storage { #(#body)* }));
+            let body = syn::parse_file(include_str!("wire_order.rs")).expect("wire-order syntax");
+            let body = body.items;
+            file.items
+                .push(syn::parse_quote!(#[doc(hidden)] pub mod __wire_order { #(#body)* }));
+        }
+
+        if suffix == ".__view" {
+            ordering::apply(&mut file, true);
         }
 
         if serde {
@@ -362,6 +377,14 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
                     api.insert(format!("variant {public_scope}::{name}::{}", tokens(&v)));
                 }
             }
+            // Adapters into the hidden journal runtime are crate-private,
+            // just like the runtime module excluded above.
+            syn::Item::Impl(i)
+                if i.trait_.as_ref().is_some_and(|(_, path, _)| {
+                    path.segments
+                        .iter()
+                        .any(|segment| segment.ident == "__wire_order")
+                }) => {}
             syn::Item::Impl(i) if i.trait_.is_some() => {
                 let (_, path, _) = i.trait_.as_ref().expect("trait implementation");
                 let owner = format!(
