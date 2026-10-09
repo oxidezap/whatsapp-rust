@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use xtask_support::capture;
 
-// Isolated codec comparison: v34 and both candidates retain identical wire semantics.
-// The same 63 benchmark lines are added to all three sources.
-const BASE: &str = "2b5a20abce32cf39d40baa2b73595a638b53fc5a";
+// Isolated codec comparison: v38 and the candidate retain identical wire semantics.
+// The same 67 benchmark lines are added to both sources.
+const BASE: &str = "9ea2cbacaf920558d22d56bd501bd3072e0b97fa";
 const HEAD: &str = env!("A02_PAIR_HEAD_SHA");
 const CONTRACTS: &[&str] = &[
     "runtime.sha256",
