@@ -23,10 +23,11 @@ fn bench_protobuf_clone(bencher: divan::Bencher, shape: &str) {
     let message = match shape {
         "empty" => wa::Message::default(),
         "text" => text_message(),
-        "future_field" => wa::Message::decode_from_slice(&[0xc2, 0x3e, 4, 11, 22, 33, 44]).unwrap(),
+        "future_field" => wa::Message::decode_from_slice(&[0xc2, 0x3e, 4, 11, 22, 33, 44])
+            .expect("synthetic future-field clone fixture decodes"),
         "future_group" => {
             wa::Message::decode_from_slice(&[0xc3, 0x3e, 0x0a, 4, 11, 22, 33, 44, 0xc4, 0x3e])
-                .unwrap()
+                .expect("synthetic future-group clone fixture decodes")
         }
         _ => unreachable!(),
     };
