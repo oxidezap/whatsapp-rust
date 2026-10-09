@@ -536,19 +536,11 @@ fn clone_storage(storage: &Storage) -> Storage {
 }
 
 impl Drop for Storage {
-    #[inline]
+    #[inline(never)]
     fn drop(&mut self) {
-        // The helper empties the option. Its recursive drop must stay shared;
-        // automatic field drop would emit a second copy in every owner.
-        if self.0.is_some() {
-            drop_storage(&mut self.0);
-        }
+        // Share the empty check as well as destruction of the retained state.
+        *self.0 = None;
     }
-}
-#[cold]
-#[inline(never)]
-fn drop_storage(state: &mut Option<Box<State>>) {
-    *state = None;
 }
 
 impl PartialEq for Storage {

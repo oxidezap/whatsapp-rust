@@ -37,19 +37,12 @@ fn equal_nonempty(left: &Storage, right: &Storage) -> bool {
 }
 
 impl Drop for Storage {
-    #[inline]
+    #[inline(never)]
     fn drop(&mut self) {
-        // The shared helper consumes the allocation. Suppress automatic field
-        // drop so each generated message does not also repeat its cold glue.
-        if self.0.is_some() {
-            drop_nonempty(&mut self.0);
-        }
+        // Keep even the empty check shared: recursively inlined parent drops
+        // otherwise repeat it at every nested message field.
+        *self.0 = None;
     }
-}
-#[cold]
-#[inline(never)]
-fn drop_nonempty(fields: &mut Option<Box<::buffa::UnknownFields>>) {
-    *fields = None;
 }
 impl ::core::hash::Hash for Storage {
     fn hash<H: ::core::hash::Hasher>(&self, state: &mut H) {

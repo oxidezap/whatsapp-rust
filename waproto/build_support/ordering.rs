@@ -524,6 +524,13 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                         })
                     };
                     let mut retained = f.clone();
+                    // Batch and fresh entry points already own the loop. Fold
+                    // this dispatch into them while sharing the actual field
+                    // decoder and the cold journal operations.
+                    retained
+                        .attrs
+                        .retain(|attr| !attr.path().is_ident("inline"));
+                    retained.attrs.push(syn::parse_quote!(#[inline]));
                     let split: syn::Stmt = if view {
                         syn::parse_quote! {
                             if Self::__wire_group(tag.field_number()) & (1 << 31) != 0 && tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
