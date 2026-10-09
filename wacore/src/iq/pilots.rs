@@ -5,7 +5,16 @@
 use crate::request::InfoQuery;
 use wacore_binary::{Jid, NodeContent, NodeRef, builder::NodeBuilder};
 
-pub(super) fn build_set_subject(iq_to: &Jid, subject_element_value: &str) -> InfoQuery<'static> {
+pub(super) struct SetSubjectRequest<'a> {
+    pub(super) iq_to: &'a Jid,
+    pub(super) subject_element_value: &'a str,
+}
+
+pub(super) fn build_set_subject(request: SetSubjectRequest<'_>) -> InfoQuery<'static> {
+    let SetSubjectRequest {
+        iq_to,
+        subject_element_value,
+    } = request;
     InfoQuery::set_ref(
         "w:g2",
         iq_to,
@@ -26,12 +35,20 @@ pub(super) fn parse_set_subject_payload(_response: &NodeRef<'_>) -> SetSubjectSu
     SetSubjectSuccess::Success
 }
 
-pub(super) fn build_accept_group_add(
-    iq_to: &Jid,
-    accept_code: &str,
-    accept_expiration: i64,
-    accept_admin: &Jid,
-) -> InfoQuery<'static> {
+pub(super) struct AcceptGroupAddRequest<'a> {
+    pub(super) iq_to: &'a Jid,
+    pub(super) accept_code: &'a str,
+    pub(super) accept_expiration: i64,
+    pub(super) accept_admin: &'a Jid,
+}
+
+pub(super) fn build_accept_group_add(request: AcceptGroupAddRequest<'_>) -> InfoQuery<'static> {
+    let AcceptGroupAddRequest {
+        iq_to,
+        accept_code,
+        accept_expiration,
+        accept_admin,
+    } = request;
     InfoQuery::set_ref(
         "w:g2",
         iq_to,

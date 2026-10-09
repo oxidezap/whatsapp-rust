@@ -95,7 +95,8 @@ pub fn generate(json: &str, wa_version: &str) -> Result<String> {
             "unsupported pilot child shape"
         );
         let target = argument(&req.target_arg_path)?;
-        let mut params = vec![format!("{target}: &Jid")];
+        let mut params = vec![format!("pub(super) {target}: &'a Jid")];
+        let mut bindings = vec![target.clone()];
         let mut builder = format!("NodeBuilder::new({})", rust_str(&child.tag));
         for attr in &child.attrs {
             ensure!(
@@ -104,12 +105,14 @@ pub fn generate(json: &str, wa_version: &str) -> Result<String> {
             );
             let arg = argument(&attr.arg_path)?;
             let ty = match attr.kind.as_str() {
-                "string" => "&str",
+                "string" => "&'a str",
                 "integer" => "i64",
-                "user_jid" => "&Jid",
+                "user_jid" => "&'a Jid",
                 other => bail!("unsupported pilot attribute kind {other}"),
             };
-            params.push(format!("{arg}: {ty}"));
+            ensure!(!bindings.contains(&arg), "duplicate pilot argument {arg}");
+            bindings.push(arg.clone());
+            params.push(format!("pub(super) {arg}: {ty}"));
             builder.push_str(&format!(".attr({}, {arg})", rust_str(&attr.name)));
         }
         if let Some(content) = &child.content {
@@ -117,11 +120,16 @@ pub fn generate(json: &str, wa_version: &str) -> Result<String> {
             let arg = argument(&content.arg_path)?;
             // The public subject API supplies UTF-8 text. Keep NodeContent::String
             // and its wire encoding, without a temporary byte-vector conversion.
-            params.push(format!("{arg}: &str"));
+            ensure!(!bindings.contains(&arg), "duplicate pilot argument {arg}");
+            bindings.push(arg.clone());
+            params.push(format!("pub(super) {arg}: &'a str"));
             builder.push_str(&format!(".string_content({arg})"));
         }
         let name = snake_case(pilot);
-        out.push_str(&format!("pub(super) fn build_{name}({}) -> InfoQuery<'static> {{\nInfoQuery::set_ref({}, {target}, Some(NodeContent::Nodes(vec![{builder}.build()])))\n}}\n\n", params.join(", "), rust_str(&req.namespace)));
+        // Named borrowed inputs bind the SDK adapter to argPath identities.
+        // Positional arguments would silently keep the old mapping after a
+        // same-typed source argument rename or reorder.
+        out.push_str(&format!("pub(super) struct {pilot}Request<'a> {{\n{}\n}}\n\npub(super) fn build_{name}(request: {pilot}Request<'_>) -> InfoQuery<'static> {{\nlet {pilot}Request {{ {} }} = request;\nInfoQuery::set_ref({}, {target}, Some(NodeContent::Nodes(vec![{builder}.build()])))\n}}\n\n", params.join(",\n"), bindings.join(", "), rust_str(&req.namespace)));
         emit_success(op, pilot, &name, &mut out)?;
     }
     Ok(out)
@@ -283,7 +291,8 @@ mod tests {
         let input = fixture();
         let output = emit(&input).unwrap();
         assert_eq!(output, emit(&input).unwrap());
-        assert!(output.contains("destination: &Jid, input_value: i64"));
+        assert!(output.contains("pub(super) destination: &'a Jid"));
+        assert!(output.contains("pub(super) input_value: i64"));
         assert!(output.contains("InfoQuery::set_ref(\"test:wire\", destination"));
         assert!(
             output.contains("NodeBuilder::new(\"source_tag\").attr(\"source_attr\", input_value)")
@@ -318,6 +327,10 @@ mod tests {
             ("/request/children/0/attrs/0/required", json!(false)),
             ("/request/children/0/attrs/0/kind", json!("future")),
             ("/request/children/0/attrs/0/argPath", json!([])),
+            (
+                "/request/children/0/attrs/0/argPath",
+                json!([{"key":"destination"}]),
+            ),
             ("/request/target", json!("server")),
         ] {
             let mut v = fixture();

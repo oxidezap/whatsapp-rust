@@ -2070,7 +2070,10 @@ impl IqSpec for SetGroupSubjectIq {
     type Response = ();
 
     fn build_iq(&self) -> InfoQuery<'static> {
-        super::pilots::build_set_subject(&self.group_jid, self.subject.as_str())
+        super::pilots::build_set_subject(super::pilots::SetSubjectRequest {
+            iq_to: &self.group_jid,
+            subject_element_value: self.subject.as_str(),
+        })
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
@@ -3325,12 +3328,12 @@ impl IqSpec for AcceptGroupInviteV4Iq {
     type Response = JoinGroupResult;
 
     fn build_iq(&self) -> InfoQuery<'static> {
-        super::pilots::build_accept_group_add(
-            &self.group_jid,
-            &self.code,
-            self.expiration,
-            &self.admin_jid,
-        )
+        super::pilots::build_accept_group_add(super::pilots::AcceptGroupAddRequest {
+            iq_to: &self.group_jid,
+            accept_code: &self.code,
+            accept_expiration: self.expiration,
+            accept_admin: &self.admin_jid,
+        })
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
