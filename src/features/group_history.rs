@@ -1031,6 +1031,16 @@ mod tests {
                 proto.limit_sharing = buffa::MessageField::some(Default::default());
                 proto
             },
+            {
+                let mut proto = wa::MessageContextInfo::default();
+                proto.tee_context_anchor_message_id = Some(String::new());
+                proto
+            },
+            {
+                let mut proto = wa::MessageContextInfo::default();
+                proto.acp2_setting = buffa::MessageField::some(Default::default());
+                proto
+            },
         ] {
             content.message_context_info = buffa::MessageField::some(context);
             assert!(!is_shareable_history_text(&content));
@@ -1051,6 +1061,16 @@ mod tests {
         content.ephemeral_message = buffa::MessageField::none();
         content.conversation = Some(String::new());
         assert!(!is_shareable_history_text(&content));
+    }
+
+    #[test]
+    fn new_capture_message_fields_are_not_forwarded_as_plain_history_text() {
+        // conversation="x" plus an empty field 132, 133 or 134. Presence of
+        // the new payload is enough to reject it from the text-only path.
+        for tag in [0xa2, 0xaa, 0xb2] {
+            let content = waproto::codec::message_decode(&[0x0a, 1, b'x', tag, 8, 0]).unwrap();
+            assert!(!is_shareable_history_text(&content));
+        }
     }
 
     #[test]

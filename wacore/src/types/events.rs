@@ -321,6 +321,7 @@ pub enum EventKind {
     ReachoutTimelockUpdate,
     CallLogHistory,
     UnarchiveChatsSettingUpdate,
+    LabelSublistUpdate,
     // Append new kinds here. The list and capacity guard are generated/derived.
 }
 }
@@ -1294,6 +1295,9 @@ pub enum Event {
     /// (`setting_unarchiveChats` syncd mutation,
     /// `UnarchiveChatsSetting.unarchiveChats`).
     UnarchiveChatsSettingUpdate(UnarchiveChatsSettingUpdate),
+
+    /// A chat's sublist entry was upserted or removed (`label_sublist`).
+    LabelSublistUpdate(LabelSublistUpdate),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1414,6 +1418,7 @@ impl Event {
             Event::CallLogSync(_) => EventKind::CallLogSync,
             Event::CallLogHistory(_) => EventKind::CallLogHistory,
             Event::UnarchiveChatsSettingUpdate(_) => EventKind::UnarchiveChatsSettingUpdate,
+            Event::LabelSublistUpdate(_) => EventKind::LabelSublistUpdate,
             Event::ClientExpirationChanged(_) => EventKind::ClientExpirationChanged,
             Event::OfflineSyncInterrupted(_) => EventKind::OfflineSyncInterrupted,
             Event::LockChatUpdate(_) => EventKind::LockChatUpdate,
@@ -2877,6 +2882,47 @@ pub struct LabelAssociationUpdate {
     pub from_full_sync: bool,
 }
 
+/// A change to the entry keyed by `(predefined_id, chat_jid)` in a sublist.
+/// This does not assign or remove the parent label and does not reorder lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub enum LabelSublistChange {
+    /// Replace the entry's sublist ID, including when it already exists.
+    /// Unknown numeric IDs are retained; zero is a value, not a removal.
+    Upsert { sub_list_id: i32 },
+    /// Delete the entry. The wire does not carry its previous sublist ID.
+    Remove,
+}
+
+/// An inbound `label_sublist` mutation, distinct from [`LabelAssociationUpdate`].
+///
+/// Apply this as an upsert or removal keyed by `(predefined_id, chat_jid)` to
+/// make repeated delivery idempotent. It describes the received mutation, not
+/// a comparison against a stored previous value; delivery is not exactly once.
+/// The SDK keeps no sublist membership store and does not synthesize removals
+/// when a parent label is deleted or a snapshot omits an entry.
+///
+/// WhatsApp Web's AI handoff/responding filters use thread-control state;
+/// this event alone does not describe membership of those computed lists.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct LabelSublistUpdate {
+    /// Signed decimal ID from `index[1]`, in `LabelEditAction.predefined_id`'s
+    /// numeric namespace. This is neither the label's ID nor its `ListType`.
+    /// Unknown IDs are retained without filtering against known definitions.
+    pub predefined_id: i32,
+    /// JID from `index[2]`, preserving PN/LID identity without guessing a mapping.
+    pub chat_jid: Jid,
+    pub change: LabelSublistChange,
+    /// Carried milliseconds converted without a fallback. `None` means absent
+    /// or outside `DateTime`'s range; explicit zero is `Some` of the Unix epoch.
+    /// This is not a server receipt time or a replay/live classifier.
+    pub action_timestamp: Option<DateTime<Utc>>,
+    /// Whether dispatch came from a full sync. `false` can also describe
+    /// recovery/replay and does not guarantee a live change.
+    pub from_full_sync: bool,
+}
+
 /// A label was associated with or removed from a single message on a linked
 /// device (`label_message`). `action.labeled == Some(true)` means the label was
 /// added.
@@ -3155,15 +3201,13 @@ mod tests {
         assert_eq!(EventKind::ReachoutTimelockUpdate as u8, 76);
         assert_eq!(EventKind::CallLogHistory as u8, 77);
         assert_eq!(EventKind::UnarchiveChatsSettingUpdate as u8, 78);
+        assert_eq!(EventKind::LabelSublistUpdate as u8, 79);
     }
 
     #[test]
     fn event_kind_list_is_discriminant_ordered() {
-        assert_eq!(EventKind::ALL.len(), 79);
-        assert_eq!(
-            EventKind::ALL.last(),
-            Some(&EventKind::UnarchiveChatsSettingUpdate)
-        );
+        assert_eq!(EventKind::ALL.len(), 80);
+        assert_eq!(EventKind::ALL.last(), Some(&EventKind::LabelSublistUpdate));
         assert!(EventKind::ALL.len() <= EventKind::CAPACITY as usize);
         for (i, &kind) in EventKind::ALL.iter().enumerate() {
             assert_eq!(kind as u8 as usize, i);

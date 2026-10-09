@@ -205,6 +205,16 @@ pub fn generate(ir: &AppstateIr) -> Result<Generated> {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            // The new NoteSync builder uses a conditional expression for
+            // NoteType. The catalog loses its enum metadata even though the
+            // builder still writes UNSTRUCTURED/STRUCTURED. Verified in set
+            // 05609307e68b, WAWebNoteSync, bundle 9b681e073f14, 2851495..2856843.
+            _ if key == "NoteEdit"
+                && action.module == "WAWebNoteSync"
+                && action.value_proto_type.as_deref() == Some("SyncActionValue.NoteEditAction") =>
+            {
+                "&[(\"type\", \"NoteEditAction.NoteType\")]".to_string()
+            }
             _ => "&[]".to_string(),
         };
         let index_parts = action
@@ -679,6 +689,17 @@ fn main() {
         assert!(code.contains(
             "value_enum_fields: &[(\"settingKey\", \"SettingsSyncAction.SettingKey\")],"
         ));
+    }
+
+    #[test]
+    fn note_type_metadata_survives_the_conditional_builder() {
+        let mut a = action("note_edit", "account", Some("regular_low"));
+        a.module = "WAWebNoteSync".into();
+        a.value_proto_type = Some("SyncActionValue.NoteEditAction".into());
+        let mut fixture = ir(vec![("NoteEdit", a)]);
+        fixture.collections.push("regular_low".into());
+        let code = emitted(&fixture);
+        assert!(code.contains("value_enum_fields: &[(\"type\", \"NoteEditAction.NoteType\")],"));
     }
 
     #[test]

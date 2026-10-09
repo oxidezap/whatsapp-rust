@@ -175,8 +175,19 @@ pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<IndexMa
         return out;
     }
 
+    let mut indices = mutations.iter().filter_map(mutation_index_mac_array);
+    let Some(first) = indices.next() else {
+        return Vec::new();
+    };
+    // A run of one index needs one output slot, regardless of patch width.
+    // Defer the wide allocation until a second distinct index requires sort.
+    let Some(second) = indices.find(|mac| *mac != first) else {
+        return vec![first];
+    };
     let mut macs: Vec<IndexMac> = Vec::with_capacity(mutations.len());
-    macs.extend(mutations.iter().filter_map(mutation_index_mac_array));
+    macs.push(first);
+    macs.push(second);
+    macs.extend(indices);
     macs.sort_unstable();
     macs.dedup();
     macs
@@ -1608,6 +1619,25 @@ mod dedup_tests {
                 *b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             ]
         );
+    }
+
+    #[test]
+    fn large_repeated_prefix_preserves_later_indices_and_skips_invalid_ones() {
+        for distinct in [false, true] {
+            let mut mutations = build(1000, 1);
+            mutations[0] = wa::SyncdMutation::default();
+            mutations[100] = mutation(&[1; 31]);
+            mutations[500] = mutation(&[1; 33]);
+            if distinct {
+                mutations[998] = mutation(&mac_bytes(1));
+                mutations.push(mutation(&mac_bytes(0)));
+                mutations.push(mutation(&mac_bytes(2)));
+            }
+            let mut got = collect_unique_index_macs(&mutations);
+            got.sort_unstable();
+            assert_eq!(got, expected(if distinct { 3 } else { 1 }));
+        }
+        assert!(collect_unique_index_macs(&vec![wa::SyncdMutation::default(); 1000]).is_empty());
     }
 }
 

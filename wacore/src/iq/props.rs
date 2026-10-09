@@ -39,11 +39,54 @@ use crate::iq::abprops;
 
 /// AB props this client still references but which the current WA Web bundle no
 /// longer ships, so they are absent from the generated [`crate::iq::abprops`]
-/// registry. The server never sends them, so gating on them always falls to the
-/// callsite default. Kept as explicit consts to preserve that behavior and to
-/// flag them for removal if the gated feature is reworked.
+/// registry. Retaining the historical values preserves callers and their
+/// defaults; absence from a Web capture says nothing about server delivery.
 pub mod stale {
     use crate::iq::abprops::{AbDefault, AbProp, AbPropType};
+
+    // Public constants retained from whatspec 1a441f0, absent from the new capture.
+    // No claim about server delivery follows from that absence.
+    pub const AI_3P_AGENT_LINK_ENABLED: AbProp = AbProp {
+        name: "ai_3p_agent_link_enabled",
+        code: 31064,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+
+    pub const LISTS_SMB_WEB_ENABLED: AbProp = AbProp {
+        name: "lists_smb_web_enabled",
+        code: 24732,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+
+    pub const SCHEDULED_COMPANION_CONTACT_REFRESH_DAYS: AbProp = AbProp {
+        name: "scheduled_companion_contact_refresh_days",
+        code: 34960,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+
+    pub const SCHEDULED_COMPANION_CONTACT_REFRESH_HOURS: AbProp = AbProp {
+        name: "scheduled_companion_contact_refresh_hours",
+        code: 35018,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+
+    pub const SMOOTHIE_PERFORMANCE_MSG_SEND: AbProp = AbProp {
+        name: "smoothie_performance_msg_send",
+        code: 17942,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(true),
+    };
+
+    pub const UPDATED_HARMFUL_DOCUMENT_DIALOG: AbProp = AbProp {
+        name: "updated_harmful_document_dialog",
+        code: 15022,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
 
     pub const PRIVACY_TOKEN_ONLY_CHECK_LID: AbProp = AbProp {
         name: "privacy_token_only_check_lid",

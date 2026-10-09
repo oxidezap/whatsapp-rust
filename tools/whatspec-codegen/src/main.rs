@@ -260,8 +260,9 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
         serde_json::from_str(&ir.text("srvreq/index.json")?).context("parsing the srvreq IR")?;
     let stanza: ir::StanzaIr =
         serde_json::from_str(&ir.text("stanza/index.json")?).context("parsing the stanza IR")?;
-    let mex: ir::MexIr =
+    let mut mex: ir::MexIr =
         serde_json::from_str(&ir.text("mex/index.json")?).context("parsing the mex IR")?;
+    emit::mex::preserve_compatibility(&mut mex)?;
     let tokens: ir::TokensIr =
         serde_json::from_str(&ir.text("tokens/index.json")?).context("parsing the tokens IR")?;
     let wam: ir::WamIr =
