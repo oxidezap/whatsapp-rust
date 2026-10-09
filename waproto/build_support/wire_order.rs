@@ -328,18 +328,31 @@ fn canonical_len(group: u32, raw: &[u8]) -> usize {
 }
 
 fn projection_charge(known: &[u8], map: GroupMap, copies: usize) -> usize {
-    let mut groups = Vec::new();
+    // Generated group IDs are dense and start at one. Avoid a temporary heap
+    // allocation just to count the usual handful of distinct groups, while
+    // retaining a fallback for schemas with more groups than the inline mask.
+    let mut groups = 0u64;
+    let mut large_groups = Vec::new();
+    let mut count = 0usize;
     let mut bytes = 0usize;
     for (tag, raw) in records(known) {
         let group = map(tag);
         if group != 0 {
             bytes = bytes.saturating_add(canonical_len(group, raw).saturating_mul(copies));
-            if !groups.contains(&group) {
-                groups.push(group);
+            let index = group & !(1 << 31);
+            if index < u64::BITS {
+                let bit = 1u64 << index;
+                if groups & bit == 0 {
+                    groups |= bit;
+                    count += 1;
+                }
+            } else if !large_groups.contains(&index) {
+                large_groups.push(index);
+                count += 1;
             }
         }
     }
-    bytes.saturating_add(groups.len().saturating_mul(
+    bytes.saturating_add(count.saturating_mul(
         ::core::mem::size_of::<(u32, Vec<u8>)>() + ::core::mem::size_of::<Event<'_>>(),
     ))
 }
@@ -997,5 +1010,23 @@ impl Buf for Capture<'_, '_> {
             self.inner.advance(len);
             count -= len;
         }
+    }
+}
+
+#[cfg(test)]
+mod projection_charge_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_groups_and_mask_spill_are_charged_once() {
+        let wire = [8, 0, 16, 0, 8, 0];
+        let map: GroupMap = |tag| match tag {
+            1 => (1 << 31) | 63,
+            2 => 64,
+            _ => 0,
+        };
+        let headers = 2 * (::core::mem::size_of::<(u32, Vec<u8>)>() + ::core::mem::size_of::<Event<'_>>());
+        assert_eq!(projection_charge(&wire, map, 2), 12 + headers);
+        assert_eq!(projection_charge(&[], map, 2), 0);
     }
 }
