@@ -8,7 +8,7 @@ use std::process::{Command, Output, Stdio};
 use xtask_support::capture;
 
 // Runtime is main #1708; the only added file content is the common random-MAC benchmark.
-const BASE: &str = "2d87ae79df3a93b3c42adf742ee305824c2255a5";
+const BASE: &str = "9836703f72f9bcc0dc46a766d960aa6672466044";
 const HEAD: &str = env!("A02_PAIR_HEAD_SHA");
 const CONTRACTS: &[&str] = &[
     "runtime.sha256",
