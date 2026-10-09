@@ -73,6 +73,37 @@ pub(crate) trait OwnedCodec {
         buf: &mut &[u8],
         ctx: DecodeContext<'_>,
     ) -> Result<(), DecodeError>;
+    fn merge_batch_slice(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut &[u8],
+        ctx: DecodeContext<'_>,
+    ) -> Result<(), DecodeError>;
+}
+
+// Share the tag loop while preserving the existing &[u8] field specialization.
+// Erasing Buf itself would instantiate another recursive tree of child codecs.
+#[inline(never)]
+pub(crate) fn merge_owned_slice_batch(
+    codec: &mut dyn OwnedCodec,
+    buf: &mut &[u8],
+    ctx: DecodeContext<'_>,
+    limit: usize,
+) -> Result<(), DecodeError> {
+    if codec.storage().active() {
+        reconcile_owned(codec, ctx)?;
+    }
+    let result = (|| {
+        while buf.len() > limit {
+            let tag = ::buffa::encoding::Tag::decode(buf)?;
+            codec.merge_batch_slice(tag, buf, ctx)?;
+        }
+        Ok(())
+    })();
+    let completed = if codec.storage().active() {
+        complete_owned_batch(codec, ctx)
+    } else { Ok(()) };
+    result.and(completed)
 }
 
 #[cold]

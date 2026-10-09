@@ -653,6 +653,14 @@ fn transform(
                 syn::parse_quote! {
                     fn merge_to_limit(&mut self, buf: &mut impl ::buffa::bytes::Buf, ctx: ::buffa::DecodeContext<'_>, limit: usize) -> ::core::result::Result<(), ::buffa::DecodeError> {
                         if buf.remaining() <= limit { return Ok(()); }
+                        let remaining = buf.remaining();
+                        if buf.chunk().len() == remaining {
+                            let mut slice = buf.chunk();
+                            let result = #runtime::merge_owned_slice_batch(&mut #runtime::Adapter(self), &mut slice, ctx, limit);
+                            let consumed = remaining - slice.len();
+                            buf.advance(consumed);
+                            return result;
+                        }
                         if buf.remaining() > limit && self.__buffa_unknown_fields.active() {
                             #runtime::reconcile_owned(&mut #runtime::Adapter(self), ctx)?;
                         }
@@ -729,6 +737,7 @@ fn transform(
                         fn growth(&self, tag: u32) -> usize { <#ty>::__wire_growth(tag) }
                         fn known(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> { self.0.__wire_known_for_decode(ctx) }
                         fn merge_slice(&mut self, tag: ::buffa::encoding::Tag, buf: &mut &[u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<(), ::buffa::DecodeError> { self.0.__wire_merge(tag, buf, ctx) }
+                        fn merge_batch_slice(&mut self, tag: ::buffa::encoding::Tag, buf: &mut &[u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<(), ::buffa::DecodeError> { self.0.__wire_merge_field(tag, buf, ctx, false) }
                     }
                 }
             });
