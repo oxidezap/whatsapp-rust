@@ -545,6 +545,107 @@ fn consecutive_future_fields_reuse_the_unchanged_oneof_projection() {
     assert_eq!(group.encode_to_vec(), wire);
 }
 
+fn check_repeated_enum_order(wire: &[u8]) {
+    use evolution_fixture::{v1, v2};
+    let owned = v1::RepeatedRecord::decode_from_slice(wire).unwrap();
+    let view = v1::RepeatedRecordView::decode_view(wire).unwrap();
+    let values: Vec<_> = [
+        owned.encode_to_vec(),
+        view.encode_to_vec(),
+        view.to_owned_message().unwrap().encode_to_vec(),
+    ]
+    .into_iter()
+    .map(|bytes| v2::RepeatedRecord::decode_from_slice(&bytes).unwrap().modes)
+    .collect();
+    let expected = v2::RepeatedRecord::decode_from_slice(wire).unwrap().modes;
+    assert_eq!(values, vec![expected; 3]);
+}
+
+#[test]
+fn repeated_future_enum_keeps_unpacked_positions() {
+    check_repeated_enum_order(&[0x08, 0, 0x08, 1, 0x08, 2]);
+}
+
+#[test]
+fn repeated_future_enum_keeps_packed_positions() {
+    check_repeated_enum_order(&[0x0a, 3, 0, 1, 2]);
+}
+
+#[test]
+fn repeated_future_enum_keeps_mixed_records_and_clones() {
+    use evolution_fixture::{v1, v2};
+    let wire = [0x0a, 3, 0, 1, 2, 0x08, 1, 0x0a, 2, 2, 0];
+    check_repeated_enum_order(&wire);
+    let owned = v1::RepeatedRecord::decode_from_slice(&wire).unwrap().clone();
+    let view = v1::RepeatedRecordView::decode_view(&wire).unwrap().clone();
+    let expected = v2::RepeatedRecord::decode_from_slice(&wire).unwrap().modes;
+    for encoded in [owned.encode_to_vec(), view.encode_to_vec()] {
+        assert_eq!(v2::RepeatedRecord::decode_from_slice(&encoded).unwrap().modes, expected);
+    }
+}
+
+#[test]
+fn repeated_future_enum_preserves_declared_packed_field() {
+    use evolution_fixture::{v1, v2};
+    let wire = [0x12, 3, 0, 1, 2, 0x10, 1, 0x12, 2, 2, 0];
+    let owned = v1::RepeatedRecord::decode_from_slice(&wire).unwrap();
+    let view = v1::RepeatedRecordView::decode_view(&wire).unwrap();
+    let expected = v2::RepeatedRecord::decode_from_slice(&wire).unwrap().packed_modes;
+    for encoded in [owned.encode_to_vec(), view.encode_to_vec(), view.to_owned_message().unwrap().encode_to_vec()] {
+        assert_eq!(v2::RepeatedRecord::decode_from_slice(&encoded).unwrap().packed_modes, expected);
+    }
+}
+
+#[test]
+fn repeated_future_enum_public_edits_and_explicit_replacement() {
+    use evolution_fixture::{v1, v2};
+    let wire = [0x0a, 3, 0, 1, 2];
+    let mut owned = v1::RepeatedRecord::decode_from_slice(&wire).unwrap();
+    let mut view = v1::RepeatedRecordView::decode_view(&wire).unwrap();
+    owned.modes.reverse();
+    view.modes = owned.modes.clone().into();
+    for encoded in [owned.encode_to_vec(), view.encode_to_vec(), view.to_owned_message().unwrap().encode_to_vec()] {
+        assert_eq!(v2::RepeatedRecord::decode_from_slice(&encoded).unwrap().modes, vec![v2::record::Mode::NEW, v2::record::Mode::OTHER, v2::record::Mode::READY]);
+    }
+    let owned = v1::RepeatedRecord::decode_from_slice(&wire).unwrap();
+    let values = owned.modes.clone();
+    let replaced = owned.with_modes(values);
+    assert_eq!(v2::RepeatedRecord::decode_from_slice(&replaced.encode_to_vec()).unwrap().modes, vec![v2::record::Mode::NEW, v2::record::Mode::READY, v2::record::Mode::OTHER]);
+}
+
+#[test]
+fn repeated_future_enum_reconciles_edits_between_decode_calls() {
+    use evolution_fixture::{DecodeContext, v1, v2};
+    let wire = [0x0a, 3, 0, 1, 2];
+    let mut owned = v1::RepeatedRecord::decode_from_slice(&wire).unwrap();
+    let mut view = v1::RepeatedRecordView::decode_view(&wire).unwrap();
+    owned.modes.reverse();
+    view.modes = owned.modes.clone().into();
+    let appended = [0x0a, 1, 0];
+    owned.merge_from_slice(&appended).unwrap();
+    let unknown_limit = core::cell::Cell::new(1024 * 1024);
+    view.merge_into_view(&appended, DecodeContext::new(100, &unknown_limit)).unwrap();
+    for encoded in [owned.encode_to_vec(), view.encode_to_vec(), view.to_owned_message().unwrap().encode_to_vec()] {
+        assert_eq!(v2::RepeatedRecord::decode_from_slice(&encoded).unwrap().modes, vec![v2::record::Mode::NEW, v2::record::Mode::OTHER, v2::record::Mode::READY, v2::record::Mode::READY]);
+    }
+}
+
+#[test]
+fn repeated_future_enum_packed_boundaries_and_memory_budget() {
+    use evolution_fixture::{DecodeError, DecodeOptions, v1};
+    for wire in [&[0x0a, 1, 0x80][..], &[0x0a, 3, 0][..]] {
+        assert!(v1::RepeatedRecord::decode_from_slice(wire).is_err());
+        assert!(v1::RepeatedRecordView::decode_view(wire).is_err());
+    }
+    let wire = [0x0a, 3, 0, 1, 2];
+    let zero = DecodeOptions::new().with_element_memory_limit(0);
+    assert!(matches!(zero.decode_from_slice::<v1::RepeatedRecord>(&wire), Err(DecodeError::ElementMemoryLimitExceeded)));
+    assert!(matches!(zero.decode_view::<v1::RepeatedRecordView<'_>>(&wire), Err(DecodeError::ElementMemoryLimitExceeded)));
+    let allowed = DecodeOptions::new().with_element_memory_limit(4096);
+    assert!(allowed.decode_from_slice::<v1::RepeatedRecord>(&wire).is_ok());
+    assert!(allowed.decode_view::<v1::RepeatedRecordView<'_>>(&wire).is_ok());
+}
+
 #[test]
 fn decode_batches_reconcile_edits_before_unrelated_fields() {
     use evolution_fixture::{DecodeContext, v1, v2};

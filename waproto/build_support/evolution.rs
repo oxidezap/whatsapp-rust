@@ -94,12 +94,28 @@ fn schema(new: bool) -> FileDescriptorSet {
         field: vec![field("label", 1, Type::TYPE_UINT32), enum_mode, enum_other],
         ..Default::default()
     };
+    let mut modes = field("modes", 1, Type::TYPE_ENUM);
+    modes.type_name = Some(format!(".contract.{message}.{mode}"));
+    modes.label = Some(Label::LABEL_REPEATED);
+    let mut packed_modes = modes.clone();
+    packed_modes.name = Some("packed_modes".into());
+    packed_modes.json_name = Some("packedModes".into());
+    packed_modes.number = Some(2);
+    packed_modes.options = ::buffa::MessageField::some(FieldOptions {
+        packed: Some(true),
+        ..Default::default()
+    });
+    let repeated_record = DescriptorProto {
+        name: Some("RepeatedRecord".into()),
+        field: vec![modes, packed_modes],
+        ..Default::default()
+    };
     FileDescriptorSet {
         file: vec![FileDescriptorProto {
             name: Some("contract.proto".into()),
             package: Some("contract".into()),
             syntax: Some("proto2".into()),
-            message_type: vec![record, enum_record],
+            message_type: vec![record, enum_record, repeated_record],
             ..Default::default()
         }],
         ..Default::default()
