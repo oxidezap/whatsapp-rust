@@ -81,6 +81,9 @@ impl VisitMut for ColdStorage {
             return;
         }
         let syn::Expr::Try(attempt) = &call.args[0] else {
+            let receiver = &call.receiver;
+            let args = &call.args;
+            *expr = syn::parse_quote!(#receiver.push_decoded(#args, ctx)?);
             return;
         };
         let syn::Expr::Call(decode) = &*attempt.expr else {
