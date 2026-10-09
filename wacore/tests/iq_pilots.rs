@@ -115,8 +115,8 @@ fn failed_approval_gate_falls_through_to_bare_success() {
         Some(NodeContent::Nodes(vec![])),
         Some(NodeContent::Nodes(vec![approval(), approval()])),
         Some(NodeContent::Nodes(vec![NodeBuilder::new("future").build()])),
-        Some(NodeContent::Bytes(vec![0xff].into())),
-        Some(NodeContent::Bytes(vec![].into())),
+        Some(NodeContent::Bytes(vec![0xff])),
+        Some(NodeContent::Bytes(vec![])),
     ] {
         let response = result(content);
         assert_eq!(
