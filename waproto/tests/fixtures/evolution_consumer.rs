@@ -401,3 +401,18 @@ fn occurrence_metadata_obeys_the_existing_decode_memory_budget() {
     assert_eq!(owned.encode_to_vec(), wire);
     assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), wire);
 }
+
+#[test]
+fn removing_raw_unknowns_discards_the_journal_without_changing_empty_equality() {
+    use evolution_fixture::v1;
+    use std::hash::{Hash, Hasher};
+    let mut record = v1::Record::decode_from_slice(&[0x10, 1]).unwrap();
+    record.__buffa_unknown_fields.retain(|_| false);
+    let empty = v1::Record::default();
+    assert_eq!(record, empty);
+    let mut left = std::collections::hash_map::DefaultHasher::new();
+    let mut right = std::collections::hash_map::DefaultHasher::new();
+    record.__buffa_unknown_fields.hash(&mut left);
+    empty.__buffa_unknown_fields.hash(&mut right);
+    assert_eq!(left.finish(), right.finish());
+}
