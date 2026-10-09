@@ -6,6 +6,20 @@ The pin and emitters live under `tools/whatspec-codegen`; inspect the current
 manifest and emitter selection instead of copying catalog counts into guides.
 Never hand-edit generated Rust, token dictionaries, protobufs or descriptors.
 
+The private IQ pilots consume only SetSubject and AcceptGroupAdd requests and
+ordered success payloads. The consumer emitter derives wire names, argument
+bindings and unique-child gates from IR and rejects unsupported request shapes,
+new success payloads or changed envelope guards. Public specs supply named,
+borrowed inputs so an argument rename requires an adapter update, and map the
+private outcomes. Keep legacy group/community result
+extensions in the handwritten adapter.
+
+This boundary does not replace the full RPC parser: `IqSpec::parse_response`
+has no actual request ID, and the runtime converts errors before calling it.
+Keep those paths unchanged; never synthesize correlation context from response
+attributes. Adopting upstream's complete contextual parser needs a separately
+reviewed integration of the actual sent ID/target and error handling.
+
 Locally persisted protobuf fields belong in `LOCAL_FIELDS` in `waproto/build.rs`;
 retained whole messages belong in the proto emitter's `LOCAL_BLOCKS`. Unlisted
 app-state schemas and stale props use their hand-written sibling files. Select
