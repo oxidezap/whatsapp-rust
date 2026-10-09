@@ -2,7 +2,7 @@ name: CodSpeed
 
 on:
   push:
-    branches: [main, qualify/proto-order-v16-cpu-oct09]
+    branches: [main, qualify/proto-order-v17-cpu-oct09]
     paths-ignore: ["**.md", "docs/**"]
   pull_request:
     branches: [main]
@@ -32,7 +32,7 @@ env:
 
 jobs:
   benchmarks:
-    if: github.ref != 'refs/heads/qualify/proto-order-v16-cpu-oct09'
+    if: github.ref != 'refs/heads/qualify/proto-order-v17-cpu-oct09'
     name: Run CodSpeed benchmarks (${{ matrix.shard.name }})
     runs-on: ubuntu-24.04
     # The slowest shard finishes in ~13min. The cap exists because the CodSpeed
@@ -174,7 +174,7 @@ jobs:
     # `credentials.password` rejects the empty string while the job template is
     # being prepared, so the job fails before any step runs and a step-level
     # `if:` cannot save it — the guard has to sit here. Same condition as e2e.yml.
-    if: ${{ github.ref != 'refs/heads/qualify/proto-order-v16-cpu-oct09' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ github.ref != 'refs/heads/qualify/proto-order-v17-cpu-oct09' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-24.04
     # These benches drive the real client (connect/reconnect handshakes) under
     # Valgrind, so they are slow; cap the job so a stuck run can't hang CI
@@ -291,7 +291,7 @@ jobs:
 
   a02-cpu-pair:
     # Each candidate shares one host with its fixed main baseline.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/qualify/proto-order-v16-cpu-oct09' && github.event.before == '0000000000000000000000000000000000000000' && github.run_attempt == 1
+    if: github.event_name == 'push' && github.ref == 'refs/heads/qualify/proto-order-v17-cpu-oct09' && github.event.before == '0000000000000000000000000000000000000000' && github.run_attempt == 1
     name: Paired CPU (${{ matrix.pr }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -300,11 +300,11 @@ jobs:
       matrix:
         include:
           - pr: 1676
-            head: 1be987bbdfeb74d19df917c41f5e3d5d75e3ad7f
+            head: 24997f9c225f88d429709258091fe5f54c717bd5
           - pr: 1694
-            head: 37ca06ff1f7e0390036f911bae7cc9950da12552
+            head: fa3cdc1373413c77b409ee52dca656d468c73e28
           - pr: 1679
-            head: 53c6630a092f03a9d8c01a47b5e0047062f02499
+            head: b13b6d38a98413e1e7a27a886396fabe13609a9d
     env:
       A02_PAIR_HEAD_SHA: ${{ matrix.head }}
       CODSPEED_SKIP_UPLOAD: "true"
