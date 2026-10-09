@@ -12,7 +12,8 @@ use crate::appstate::keys::ExpandedAppStateKeys;
 use crate::appstate::patch_decode::{CollectionSyncError, PatchList, WAPatchName};
 use crate::appstate::processor::AppStateMutationMAC;
 use crate::appstate::{
-    collect_key_id_refs_from_patch_list, expand_app_state_keys, process_patch, process_snapshot,
+    collect_key_id_refs_from_patch_list, expand_app_state_keys, process_patch,
+    process_snapshot_tolerating,
 };
 use crate::store::traits::Backend;
 use waproto::whatsapp as wa;
@@ -270,6 +271,10 @@ struct RecoveryRequest {
     /// Set once an answer carrying this id has been taken up, so a repeat of
     /// that answer is refused before it costs a decode.
     answering: bool,
+    /// The caller's connection generation when the ask was made. Opaque here;
+    /// it lets an answer that outlived that connection be told apart from one
+    /// that did not, since the marker itself survives a reconnect.
+    generation: u64,
 }
 
 /// What became of a collection the primary sent back.
@@ -304,6 +309,14 @@ pub struct AppStateProcessor {
     /// the run that asked is long over. What each entry carries, and why, is on
     /// [`RecoveryRequest`].
     recovery_requested: Arc<Mutex<HashMap<String, RecoveryRequest>>>,
+    /// Collections whose next snapshot may disagree with its aggregate MAC,
+    /// granted once peer recovery has failed for them.
+    ///
+    /// Per processor, so per account, and spent by the first snapshot of the
+    /// collection that is processed after the grant, whether or not it applies:
+    /// the aggregate MAC is the only check against a snapshot with records left
+    /// out, so it is waived for the one attempt that needed it and no other.
+    snapshot_mac_tolerated: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Expanded app-state keys, bounded and keyed by raw key id.
@@ -362,6 +375,7 @@ impl AppStateProcessor {
             mutation_persistence: None,
             key_cache: Arc::new(Mutex::new(KeyCache::default())),
             recovery_requested: Arc::new(Mutex::new(HashMap::new())),
+            snapshot_mac_tolerated: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -433,7 +447,7 @@ impl AppStateProcessor {
     ///
     /// `false` means one is already outstanding and the caller should not send:
     /// the reply that is already coming answers this ask too.
-    pub async fn mark_recovery_requested(&self, collection: &str) -> bool {
+    pub async fn mark_recovery_requested(&self, collection: &str, generation: u64) -> bool {
         let mut outstanding = self.recovery_requested.lock().await;
         if let Some(request) = outstanding.get(collection)
             && request.asked_at.elapsed()
@@ -451,9 +465,30 @@ impl AppStateProcessor {
                 asked_at: crate::time::Instant::now(),
                 request_id: None,
                 answering: false,
+                generation,
             },
         );
         true
+    }
+
+    /// Lets the next snapshot of `collection` through a MAC mismatch, once.
+    ///
+    /// See [`process_snapshot_tolerating`] for what is still checked.
+    pub async fn tolerate_next_snapshot_mac_mismatch(&self, collection: &str) {
+        self.snapshot_mac_tolerated
+            .lock()
+            .await
+            .insert(collection.to_string());
+    }
+
+    /// Withdraws a grant from [`Self::tolerate_next_snapshot_mac_mismatch`]
+    /// that no snapshot spent.
+    ///
+    /// For when the attempt it was granted for ends without processing one --
+    /// a refused or stale snapshot, a failed request -- so a snapshot fetched
+    /// later, for some other reason, does not inherit it.
+    pub async fn revoke_snapshot_mac_tolerance(&self, collection: &str) {
+        self.snapshot_mac_tolerated.lock().await.remove(collection);
     }
 
     /// How many recovery requests are outstanding, for the memory report.
@@ -508,13 +543,24 @@ impl AppStateProcessor {
     /// marker would suppress every retry for the rest of the window over an ask
     /// that has already been answered -- badly, but answered.
     pub async fn take_recovery_request_by_id(&self, request_id: &str) -> Option<String> {
+        self.take_recovery_request_with_generation_by_id(request_id)
+            .await
+            .map(|(collection, _)| collection)
+    }
+
+    /// [`Self::take_recovery_request_by_id`], also returning the generation the
+    /// ask was marked with.
+    pub async fn take_recovery_request_with_generation_by_id(
+        &self,
+        request_id: &str,
+    ) -> Option<(String, u64)> {
         let mut outstanding = self.recovery_requested.lock().await;
         let collection = outstanding
             .iter()
             .find(|(_, request)| request.request_id.as_deref() == Some(request_id))
             .map(|(name, _)| name.clone())?;
-        outstanding.remove(&collection);
-        Some(collection)
+        let request = outstanding.remove(&collection)?;
+        Some((collection, request.generation))
     }
 
     /// Whether a recovery for this collection is outstanding, without taking it.
@@ -1014,6 +1060,12 @@ impl AppStateProcessor {
         if snapshot_fresh && let Some(snapshot) = pl.snapshot.take() {
             let keys_map = Arc::clone(&keys_map);
             let collection_name_owned = collection_name.to_string();
+            // Taken, not read: spent by this attempt whatever comes of it.
+            let tolerate_mac_mismatch = self
+                .snapshot_mac_tolerated
+                .lock()
+                .await
+                .remove(collection_name);
 
             // Offload CPU-intensive snapshot processing to a blocking thread. The
             // snapshot moves into the closure (its 'static bound used to force a
@@ -1021,12 +1073,13 @@ impl AppStateProcessor {
             // because the caller still reads pl.snapshot (get_missing_key_ids).
             let result = crate::runtime::blocking(&*self.runtime, move || {
                 let mut snapshot_state = HashState::default();
-                let result = process_snapshot(
+                let result = process_snapshot_tolerating(
                     &snapshot,
                     &mut snapshot_state,
                     |key_id| lookup_app_state_key(&keys_map, key_id),
                     validate_macs,
                     &collection_name_owned,
+                    tolerate_mac_mismatch,
                 )?;
                 Ok::<_, crate::appstate::AppStateError>((result, snapshot_state, snapshot))
             })

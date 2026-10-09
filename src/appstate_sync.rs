@@ -1352,6 +1352,33 @@ mod tests {
         );
     }
 
+    /// The marker keeps the generation it was asked on, so an answer that
+    /// outlives its connection can be refused the unverified fallback.
+    #[tokio::test]
+    async fn a_recovery_request_remembers_the_generation_it_was_asked_on() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+
+        assert!(processor.mark_recovery_requested("regular_low", 7).await);
+        processor
+            .note_recovery_request_id("regular_low", "req-7")
+            .await;
+        assert_eq!(
+            processor
+                .take_recovery_request_with_generation_by_id("req-7")
+                .await,
+            Some(("regular_low".to_string(), 7))
+        );
+        assert_eq!(
+            processor
+                .take_recovery_request_with_generation_by_id("req-7")
+                .await,
+            None,
+            "taken once"
+        );
+    }
+
     /// One reply per request, and none at all for a request nobody made.
     #[tokio::test]
     async fn a_recovery_request_is_taken_once() {
@@ -1365,11 +1392,11 @@ mod tests {
         );
 
         assert!(
-            processor.mark_recovery_requested("regular_low").await,
+            processor.mark_recovery_requested("regular_low", 0).await,
             "the first ask is a new one"
         );
         assert!(
-            !processor.mark_recovery_requested("regular_low").await,
+            !processor.mark_recovery_requested("regular_low", 0).await,
             "a second ask while one is outstanding is suppressed: the reply already coming answers it"
         );
         assert!(processor.take_recovery_request("regular_low").await);
@@ -1381,7 +1408,7 @@ mod tests {
         // And an answer is claimed, not merely recognised: a response repeating
         // its result, or a second copy of it, would otherwise each inflate and
         // decode a whole collection against the one ask.
-        assert!(processor.mark_recovery_requested("regular_low").await);
+        assert!(processor.mark_recovery_requested("regular_low", 0).await);
         processor
             .note_recovery_request_id("regular_low", "req-1")
             .await;

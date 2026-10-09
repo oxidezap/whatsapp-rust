@@ -245,9 +245,38 @@ pub struct PatchProcessingResult {
 pub fn process_snapshot<F>(
     snapshot: &wa::SyncdSnapshot,
     initial_state: &mut HashState,
+    get_keys: F,
+    validate_macs: bool,
+    collection_name: &str,
+) -> Result<ProcessedSnapshot, AppStateError>
+where
+    F: FnMut(&[u8]) -> Result<Arc<ExpandedAppStateKeys>, AppStateError>,
+{
+    process_snapshot_tolerating(
+        snapshot,
+        initial_state,
+        get_keys,
+        validate_macs,
+        collection_name,
+        false,
+    )
+}
+
+/// [`process_snapshot`], optionally letting the snapshot through a MAC mismatch.
+///
+/// The last resort once peer recovery has failed: without it the collection
+/// stays at version 0 for good. Every record is still decoded with its own
+/// index and value MACs checked, so what gets through is a snapshot whose
+/// records are each authentic and whose aggregate the server disagrees with.
+/// The aggregate is the only check against records left out, so the caller
+/// grants this for one snapshot of one collection, never as a standing rule.
+pub fn process_snapshot_tolerating<F>(
+    snapshot: &wa::SyncdSnapshot,
+    initial_state: &mut HashState,
     mut get_keys: F,
     validate_macs: bool,
     collection_name: &str,
+    tolerate_mac_mismatch: bool,
 ) -> Result<ProcessedSnapshot, AppStateError>
 where
     F: FnMut(&[u8]) -> Result<Arc<ExpandedAppStateKeys>, AppStateError>,
@@ -387,7 +416,16 @@ where
                 fold.unkeyed,
                 key_probe
             );
-            return Err(AppStateError::SnapshotMACMismatch);
+            if !tolerate_mac_mismatch {
+                return Err(AppStateError::SnapshotMACMismatch);
+            }
+            warn!(
+                target: "AppState",
+                "Snapshot {} v{} applied despite the MAC mismatch: peer recovery failed, \
+                 and each record is still checked on its own",
+                collection_name,
+                version
+            );
         }
         trace!(
             target: "AppState",
@@ -1202,6 +1240,45 @@ mod tests {
             matches!(err, AppStateError::SnapshotMACMissing),
             "no key id means nothing to compare against, not a differing MAC, got {err:?}"
         );
+    }
+
+    #[test]
+    fn tolerated_collection_applies_a_snapshot_whose_mac_differs() {
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let key_id = b"test_key_id".to_vec();
+        let record = create_encrypted_record(
+            wa::syncd_mutation::SyncdOperation::SET,
+            &[1u8; 32],
+            &keys,
+            &key_id,
+            1234567890,
+        );
+        let snapshot = wa::SyncdSnapshot {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            records: vec![record],
+            mac: Some(vec![9u8; 32]),
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+        };
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
+        let name = "regular_low";
+
+        let err = process_snapshot(&snapshot, &mut HashState::default(), get_keys, true, name)
+            .expect_err("an untolerated mismatch must still fail");
+        assert!(matches!(err, AppStateError::SnapshotMACMismatch));
+
+        let result = process_snapshot_tolerating(
+            &snapshot,
+            &mut HashState::default(),
+            get_keys,
+            true,
+            name,
+            true,
+        )
+        .expect("a tolerated mismatch applies");
+        assert_eq!(result.mutations.len(), 1);
     }
 
     /// Deterministic reproduction of the fresh-pairing race that PR #972 works

@@ -18,5 +18,5 @@ pub use keys::{ExpandedAppStateKeys, expand_app_state_keys};
 pub use lthash::{LTHash, WAPATCH_INTEGRITY};
 pub use processor::{
     PatchMacVerdict, PatchProcessingResult, ProcessedSnapshot, process_patch, process_snapshot,
-    validate_patch_macs, validate_snapshot_mac,
+    process_snapshot_tolerating, validate_patch_macs, validate_snapshot_mac,
 };

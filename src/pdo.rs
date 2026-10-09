@@ -799,7 +799,10 @@ impl Client {
         let request_id = self.generate_message_id_at(wacore::time::now_secs_u64());
 
         let proc = self.get_app_state_processor();
-        if !proc.mark_recovery_requested(collection).await {
+        if !proc
+            .mark_recovery_requested(collection, self.current_generation())
+            .await
+        {
             // One is already outstanding, and the reply that is coming answers
             // this ask too. Suppressing the duplicate is also what keeps the
             // marker honest: a second send that failed would otherwise withdraw
@@ -940,13 +943,23 @@ impl Client {
             // end, or a usable recovery is dropped and the collection stays
             // behind the MAC failure it started at.
             let proc = self.get_app_state_processor();
-            if let Some(name) = proc.claim_recovery_request_by_id(request_id).await {
-                proc.take_recovery_request_by_id(request_id).await;
-                warn!(
-                    "Snapshot recovery response for {name} carries no result; it may be asked for again"
-                );
+            if proc
+                .claim_recovery_request_by_id(request_id)
+                .await
+                .is_some()
+                && let Some((name, asked_on)) = proc
+                    .take_recovery_request_with_generation_by_id(request_id)
+                    .await
+            {
+                warn!("Snapshot recovery response for {name} carries no result");
+                self.fall_back_to_unverified_snapshot(&name, asked_on);
             }
         }
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.connection_generation
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Apply a collection the primary sent back after a snapshot we refused.
@@ -978,16 +991,23 @@ impl Client {
             // one's decoder is still working against -- and that task, finding
             // no marker at the end, would drop a usable recovery.
             let proc = self.get_app_state_processor();
-            let Some(name) = proc.claim_recovery_request_by_id(request_id).await else {
+            if proc
+                .claim_recovery_request_by_id(request_id)
+                .await
+                .is_none()
+            {
                 warn!(
                     "Ignoring a snapshot recovery with no collection: nothing here is waiting on that ask"
                 );
                 return;
-            };
-            proc.take_recovery_request_by_id(request_id).await;
-            warn!(
-                "Snapshot recovery response for {name} carries no collection; it may be asked for again"
-            );
+            }
+            if let Some((name, asked_on)) = proc
+                .take_recovery_request_with_generation_by_id(request_id)
+                .await
+            {
+                warn!("Snapshot recovery response for {name} carries no collection");
+                self.fall_back_to_unverified_snapshot(&name, asked_on);
+            }
             return;
         };
 
@@ -1048,13 +1068,17 @@ impl Client {
             wacore::history_sync::MAX_DECOMPRESSED
         };
         if blob.len() as u64 > max_wire {
-            self.get_app_state_processor()
-                .take_recovery_request_by_id(request_id)
+            let taken = self
+                .get_app_state_processor()
+                .take_recovery_request_with_generation_by_id(request_id)
                 .await;
             warn!(
                 "Snapshot recovery for {asked} is {} bytes on the wire, over the {max_wire} this path allows; refusing it",
                 blob.len()
             );
+            if let Some((_, asked_on)) = taken {
+                self.fall_back_to_unverified_snapshot(&asked, asked_on);
+            }
             return;
         }
         let payload = blob.to_vec();
@@ -1069,60 +1093,25 @@ impl Client {
             // way.
             let decoded = wacore::runtime::blocking(&*client.runtime, move || {
                 let bytes = if compressed {
-                    let mut reader = wacore_binary::zlib_pool::InflateReader::new(
-                        &payload,
-                        wacore::history_sync::MAX_DECOMPRESSED,
-                    );
-                    let mut plain = Vec::new();
-                    loop {
-                        match reader.ensure(1) {
-                            Ok(true) => {}
-                            // `ensure(1)` answers false only with nothing left.
-                            Ok(false) => break,
-                            Err(e) => return Err(format!("failed to decompress: {e}")),
-                        }
-                        let taken = {
-                            let chunk = reader.available();
-                            plain.extend_from_slice(chunk);
-                            chunk.len()
-                        };
-                        if taken == 0 {
-                            break;
-                        }
-                        reader.consume(taken);
+                    match inflate_zlib(&payload) {
+                        Ok(plain) => std::borrow::Cow::Owned(plain),
+                        Err(zlib) => match inflate_gzip(&payload) {
+                            Some(plain) => std::borrow::Cow::Owned(plain),
+                            None => {
+                                return Err(format!(
+                                    "{zlib} (header {:02x?}, not gzip either)",
+                                    &payload[..payload.len().min(4)]
+                                ));
+                            }
+                        },
                     }
-                    // Running out is not ending. A payload cut short after a
-                    // parseable prefix would otherwise be applied as the whole
-                    // collection, and a short collection cannot be told from a
-                    // real one -- nothing here knows how many records to expect.
-                    if !reader.stream_ended() {
-                        return Err("is a truncated compressed stream".to_string());
-                    }
-                    // And ending is not all of it. A complete stream followed by
-                    // a second member or by trailing bytes leaves the reader
-                    // done with input to spare, and taking the first member for
-                    // the collection is the same silent short read the check
-                    // above refuses -- reached from the other direction.
-                    let (read, whole) = reader.compressed_progress();
-                    if read != whole {
-                        return Err(format!(
-                            "carries {} byte(s) after its compressed stream",
-                            whole - read
-                        ));
-                    }
-                    std::borrow::Cow::Owned(plain)
                 } else {
-                    // Already bounded: the raw blob was measured against the
-                    // same ceiling before it was copied, which is what an
-                    // uncompressed reply needs -- the decode allocates a record
-                    // graph from whatever arrives.
                     std::borrow::Cow::Borrowed(&payload[..])
                 };
                 waproto::codec::syncd_snapshot_recovery_decode(&bytes)
                     .map_err(|e| format!("failed to decode: {e}"))
             })
             .await;
-
             let recovery = match decoded {
                 Ok(recovery) => recovery,
                 Err(e) => {
@@ -1132,10 +1121,14 @@ impl Client {
                     // -- and leaving the marker would suppress every retry for
                     // the rest of the window over a question already answered.
                     let proc = client.get_app_state_processor();
-                    match proc.take_recovery_request_by_id(&request_id).await {
-                        Some(name) => warn!(
-                            "Snapshot recovery response for {name} {e}; the collection may be asked for again"
-                        ),
+                    match proc
+                        .take_recovery_request_with_generation_by_id(&request_id)
+                        .await
+                    {
+                        Some((name, asked_on)) => {
+                            warn!("Snapshot recovery response for {name} {e}");
+                            client.fall_back_to_unverified_snapshot(&name, asked_on);
+                        }
                         None => warn!("Snapshot recovery response {e}"),
                     }
                     return;
@@ -1147,11 +1140,16 @@ impl Client {
             match recovery.collection_name.as_deref() {
                 Some(named) if named == asked => {}
                 other => {
-                    proc.take_recovery_request_by_id(&request_id).await;
+                    let taken = proc
+                        .take_recovery_request_with_generation_by_id(&request_id)
+                        .await;
                     warn!(
                         "Snapshot recovery answering the ask for {asked} names {}; refusing it",
                         other.unwrap_or("nothing")
                     );
+                    if let Some((_, asked_on)) = taken {
+                        client.fall_back_to_unverified_snapshot(&asked, asked_on);
+                    }
                     return;
                 }
             }
@@ -1160,7 +1158,10 @@ impl Client {
             // registry wholesale -- so a task that started before one and
             // applied after it would write beside the new connection's own sync
             // and dispatch events for a session that has since been replaced.
-            if client.connection_generation.load(std::sync::atomic::Ordering::Acquire) != generation
+            if client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != generation
             {
                 // Spent, like every other ending that is not an apply. The ask
                 // was answered; dropping the answer because the connection went
@@ -4063,5 +4064,119 @@ mod tests {
             client.pdo_requested.get(&gate_key).await.is_some(),
             "memo must survive a content-less response"
         );
+    }
+}
+
+/// Inflates a zlib stream, refusing one that is cut short or followed by more
+/// bytes.
+fn inflate_zlib(payload: &[u8]) -> Result<Vec<u8>, String> {
+    let mut reader = wacore_binary::zlib_pool::InflateReader::new(
+        payload,
+        wacore::history_sync::MAX_DECOMPRESSED,
+    );
+    let mut plain = Vec::new();
+    loop {
+        match reader.ensure(1) {
+            Ok(true) => {}
+            // `ensure(1)` answers false only with nothing left.
+            Ok(false) => break,
+            Err(e) => return Err(format!("failed to decompress: {e}")),
+        }
+        let taken = {
+            let chunk = reader.available();
+            plain.extend_from_slice(chunk);
+            chunk.len()
+        };
+        if taken == 0 {
+            break;
+        }
+        reader.consume(taken);
+    }
+    // Running out is not ending. A payload cut short after a
+    // parseable prefix would otherwise be applied as the whole
+    // collection, and a short collection cannot be told from a
+    // real one -- nothing here knows how many records to expect.
+    if !reader.stream_ended() {
+        return Err("is a truncated compressed stream".to_string());
+    }
+    // And ending is not all of it. A complete stream followed by
+    // a second member or by trailing bytes leaves the reader
+    // done with input to spare, and taking the first member for
+    // the collection is the same silent short read the check
+    // above refuses -- reached from the other direction.
+    let (read, whole) = reader.compressed_progress();
+    if read != whole {
+        return Err(format!(
+            "carries {} byte(s) after its compressed stream",
+            whole - read
+        ));
+    }
+    Ok(plain)
+}
+
+/// The primary's reply flagged compressed but sent as gzip (`1f 8b 08 00`),
+/// not zlib. Bounded like the zlib path, and whole or nothing like it too.
+fn inflate_gzip(payload: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let max = wacore::history_sync::MAX_DECOMPRESSED;
+    let mut decoder = flate2::bufread::GzDecoder::new(payload);
+    let mut plain = Vec::new();
+    (&mut decoder).take(max + 1).read_to_end(&mut plain).ok()?;
+    if plain.is_empty() || plain.len() as u64 > max {
+        return None;
+    }
+    // The reader stops after the first member, so a stream that ends before
+    // the payload does would hand a parseable prefix over as the whole
+    // collection. It reads from the slice itself, and what it leaves of it has
+    // to be nothing.
+    if !decoder.into_inner().is_empty() {
+        return None;
+    }
+    info!(
+        "Snapshot recovery payload is gzip, not zlib (header {:02x?})",
+        &payload[..payload.len().min(4)]
+    );
+    Some(plain)
+}
+
+#[cfg(test)]
+mod inflate_gzip_tests {
+    use super::inflate_gzip;
+    use std::io::Write;
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    #[test]
+    fn inflates_a_whole_gzip_stream() {
+        assert_eq!(
+            inflate_gzip(&gzip(b"records")).as_deref(),
+            Some(&b"records"[..])
+        );
+    }
+
+    #[test]
+    fn refuses_a_second_member() {
+        let mut payload = gzip(b"first half");
+        payload.extend(gzip(b"second half"));
+        assert_eq!(inflate_gzip(&payload), None);
+    }
+
+    #[test]
+    fn refuses_trailing_bytes() {
+        let mut payload = gzip(b"records");
+        payload.push(0);
+        assert_eq!(inflate_gzip(&payload), None);
+    }
+
+    #[test]
+    fn refuses_a_truncated_stream() {
+        let data: Vec<u8> = (0..4096u32).flat_map(|i| i.to_le_bytes()).collect();
+        let payload = gzip(&data);
+        assert_eq!(inflate_gzip(&payload[..payload.len() - 4]), None);
+        assert_eq!(inflate_gzip(&payload[..payload.len() / 2]), None);
     }
 }
