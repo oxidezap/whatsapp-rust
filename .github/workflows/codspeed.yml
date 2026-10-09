@@ -300,11 +300,11 @@ jobs:
       matrix:
         include:
           - pr: 1676
-            head: c2d89ebb156de7334dde836d105d6bc5d4987100
+            head: cc84d7388b00c1ecc1d5f7a1e8d5dd87e3169918
           - pr: 1694
-            head: 2bb326e5ac8b90bc01eb664cb41b3412197590c7
+            head: e7b9239ac0a859c6c13789ef2dbf83a8e9c2b64d
           - pr: 1679
-            head: f2cbfd0afe8f2eeef245cdf0fed3c73813ccefcd
+            head: 3b4e7e543d3252f4846537ffb0661689b3089075
     env:
       A02_PAIR_HEAD_SHA: ${{ matrix.head }}
       CODSPEED_SKIP_UPLOAD: "true"
