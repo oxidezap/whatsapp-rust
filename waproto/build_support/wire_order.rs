@@ -209,15 +209,54 @@ struct State {
 }
 
 /// Internal storage; raw unknown-field mutation deliberately drops the journal.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct Storage(Option<Box<State>>);
 
-impl PartialEq for Storage {
-    fn eq(&self, other: &Self) -> bool {
-        **self == **other
-            && self.0.as_ref().and_then(|state| state.order.as_ref())
-                == other.0.as_ref().and_then(|state| state.order.as_ref())
+impl Clone for Storage {
+    #[inline]
+    fn clone(&self) -> Self {
+        if self.0.is_none() {
+            Self::default()
+        } else {
+            clone_storage(self)
+        }
     }
+}
+#[cold]
+#[inline(never)]
+fn clone_storage(storage: &Storage) -> Storage {
+    Storage(storage.0.clone())
+}
+
+impl Drop for Storage {
+    #[inline]
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            drop_storage(&mut self.0);
+        }
+    }
+}
+#[cold]
+#[inline(never)]
+fn drop_storage(state: &mut Option<Box<State>>) {
+    *state = None;
+}
+
+impl PartialEq for Storage {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        if self.0.is_none() && other.0.is_none() {
+            return true;
+        }
+        equal_storage(self, other)
+    }
+}
+#[cold]
+#[inline(never)]
+fn equal_storage(left: &Storage, right: &Storage) -> bool {
+    **left == **right
+        && left.0.as_ref().and_then(|state| state.order.as_ref())
+            == right.0.as_ref().and_then(|state| state.order.as_ref())
 }
 impl ::core::hash::Hash for Storage {
     fn hash<H: ::core::hash::Hasher>(&self, state: &mut H) {
@@ -261,9 +300,10 @@ impl From<UnknownFields> for Storage {
     }
 }
 impl From<Storage> for UnknownFields {
-    fn from(storage: Storage) -> Self {
+    fn from(mut storage: Storage) -> Self {
         storage
             .0
+            .take()
             .map_or_else(UnknownFields::new, |state| state.fields)
     }
 }
@@ -318,6 +358,7 @@ impl Storage {
         self.push_decoded(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?, ctx)
     }
     #[cold]
+    #[inline(never)]
     pub fn begin(
         &mut self,
         known: &[u8],
@@ -332,6 +373,7 @@ impl Storage {
         Ok(())
     }
     #[cold]
+    #[inline(never)]
     pub fn reconcile(
         &mut self,
         known: &[u8],
@@ -344,6 +386,7 @@ impl Storage {
         Ok(())
     }
     #[cold]
+    #[inline(never)]
     pub fn finish(
         &mut self,
         group: u32,
@@ -370,6 +413,7 @@ impl Storage {
         Ok(())
     }
     #[cold]
+    #[inline(never)]
     pub fn compose(&self, known: &[u8], map: GroupMap) -> Vec<u8> {
         let state = self.0.as_ref().expect("active occurrence journal");
         let mut unknown = Vec::new();
@@ -406,8 +450,23 @@ struct ViewState<'a> {
     count: usize,
     order: Option<Order<'a>>,
 }
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct ViewStorage<'a>(Option<Box<ViewState<'a>>>);
+impl Clone for ViewStorage<'_> {
+    #[inline]
+    fn clone(&self) -> Self {
+        if self.0.is_none() {
+            Self::default()
+        } else {
+            clone_view_storage(self)
+        }
+    }
+}
+#[cold]
+#[inline(never)]
+fn clone_view_storage<'a>(storage: &ViewStorage<'a>) -> ViewStorage<'a> {
+    ViewStorage(storage.0.clone())
+}
 impl ::core::fmt::Debug for ViewStorage<'_> {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
         f.debug_struct("ViewStorage")
@@ -492,6 +551,8 @@ impl<'a> ViewStorage<'a> {
         state.count += 1;
         Ok(())
     }
+    #[cold]
+    #[inline(never)]
     pub fn to_owned(&self) -> Result<Storage, DecodeError> {
         self.0.as_ref().map_or_else(
             || Ok(Storage::default()),
@@ -503,6 +564,8 @@ impl<'a> ViewStorage<'a> {
             },
         )
     }
+    #[cold]
+    #[inline(never)]
     pub fn begin(
         &mut self,
         known: &[u8],
@@ -516,6 +579,8 @@ impl<'a> ViewStorage<'a> {
         state.order = Some(Order::begin(known, map, state.count));
         Ok(())
     }
+    #[cold]
+    #[inline(never)]
     pub fn reconcile(
         &mut self,
         known: &[u8],
@@ -527,6 +592,8 @@ impl<'a> ViewStorage<'a> {
         }
         Ok(())
     }
+    #[cold]
+    #[inline(never)]
     pub fn finish(
         &mut self,
         group: u32,
@@ -552,6 +619,8 @@ impl<'a> ViewStorage<'a> {
         order.append_unknown(state.count);
         Ok(())
     }
+    #[cold]
+    #[inline(never)]
     pub fn compose(&self, known: &[u8], map: GroupMap) -> Vec<u8> {
         let state = self.0.as_ref().expect("active occurrence journal");
         let mut unknown = Vec::new();
