@@ -1,6 +1,18 @@
 use evolution_fixture::{Message, MessageView, ViewEncode};
 
 #[test]
+fn repeated_nested_message_occurrences_merge_existing_fields() {
+    use evolution_fixture::v1;
+    // Separate occurrences of child set separate fields of the same message.
+    let wire = [0x32, 2, 0x08, 1, 0x32, 2, 0x10, 2];
+    let record = v1::Record::decode_from_slice(&wire).unwrap();
+    assert_eq!(record.child.left, Some(1));
+    assert_eq!(record.child.right, Some(2));
+    let view = v1::RecordView::decode_view(&wire).unwrap();
+    assert_eq!(record, view.to_owned_message().unwrap());
+}
+
+#[test]
 fn enum_only_projection_preserves_each_winner_across_owners() {
     use evolution_fixture::{v1, v2};
     for (wire, expected) in [

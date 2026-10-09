@@ -9302,7 +9302,7 @@ attribute whatsapp::AIRichResponseMessageType # [repr (i32)]
 attribute whatsapp::AIRichResponseMessageView # [derive (Clone , Debug , Default)]
 attribute whatsapp::AIRichResponseSubMessage # [cfg_attr (feature = "serde-deserialize" , derive (serde :: Deserialize))]
 attribute whatsapp::AIRichResponseSubMessage # [cfg_attr (feature = "serde-deserialize" , serde (default))]
-attribute whatsapp::AIRichResponseSubMessage # [derive (Clone , PartialEq , Default)]
+attribute whatsapp::AIRichResponseSubMessage # [derive (PartialEq)]
 attribute whatsapp::AIRichResponseSubMessage # [derive (serde :: Serialize)]
 attribute whatsapp::AIRichResponseSubMessageOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::AIRichResponseSubMessageType # [cfg_attr (all (feature = "serde-deserialize" , feature = "serde-enum-repr") , derive (serde_repr :: Deserialize_repr))]
@@ -9532,7 +9532,7 @@ attribute whatsapp::BotMessageSharingInfoOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::BotMessageSharingInfoView # [derive (Clone , Debug , Default)]
 attribute whatsapp::BotMetadata # [cfg_attr (feature = "serde-deserialize" , derive (serde :: Deserialize))]
 attribute whatsapp::BotMetadata # [cfg_attr (feature = "serde-deserialize" , serde (default))]
-attribute whatsapp::BotMetadata # [derive (PartialEq , Default)]
+attribute whatsapp::BotMetadata # [derive (PartialEq)]
 attribute whatsapp::BotMetadata # [derive (serde :: Serialize)]
 attribute whatsapp::BotMetadataOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::BotMetadataView # [derive (Clone , Debug , Default)]
@@ -9797,7 +9797,7 @@ attribute whatsapp::ConsumerApplicationOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::ConsumerApplicationView # [derive (Clone , Debug , Default)]
 attribute whatsapp::ContextInfo # [cfg_attr (feature = "serde-deserialize" , derive (serde :: Deserialize))]
 attribute whatsapp::ContextInfo # [cfg_attr (feature = "serde-deserialize" , serde (default))]
-attribute whatsapp::ContextInfo # [derive (PartialEq , Default)]
+attribute whatsapp::ContextInfo # [derive (PartialEq)]
 attribute whatsapp::ContextInfo # [derive (serde :: Serialize)]
 attribute whatsapp::ContextInfoOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::ContextInfoView # [derive (Clone , Debug , Default)]
@@ -10602,7 +10602,7 @@ attribute whatsapp::MessageAssociationOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::MessageAssociationView # [derive (Clone , Debug , Default)]
 attribute whatsapp::MessageContextInfo # [cfg_attr (feature = "serde-deserialize" , derive (serde :: Deserialize))]
 attribute whatsapp::MessageContextInfo # [cfg_attr (feature = "serde-deserialize" , serde (default))]
-attribute whatsapp::MessageContextInfo # [derive (PartialEq , Default)]
+attribute whatsapp::MessageContextInfo # [derive (PartialEq)]
 attribute whatsapp::MessageContextInfo # [derive (serde :: Serialize)]
 attribute whatsapp::MessageContextInfoOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::MessageContextInfoView # [derive (Clone , Debug , Default)]
@@ -11153,7 +11153,7 @@ attribute whatsapp::SyncActionDataOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::SyncActionDataView # [derive (Clone , Debug , Default)]
 attribute whatsapp::SyncActionValue # [cfg_attr (feature = "serde-deserialize" , derive (serde :: Deserialize))]
 attribute whatsapp::SyncActionValue # [cfg_attr (feature = "serde-deserialize" , serde (default))]
-attribute whatsapp::SyncActionValue # [derive (Clone , PartialEq , Default)]
+attribute whatsapp::SyncActionValue # [derive (PartialEq)]
 attribute whatsapp::SyncActionValue # [derive (serde :: Serialize)]
 attribute whatsapp::SyncActionValueOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::SyncActionValueView # [derive (Clone , Debug , Default)]
@@ -11300,7 +11300,7 @@ attribute whatsapp::WebLinkRenderConfig # [derive (Clone , Copy , PartialEq , Eq
 attribute whatsapp::WebLinkRenderConfig # [repr (i32)]
 attribute whatsapp::WebMessageInfo # [cfg_attr (feature = "serde-deserialize" , derive (serde :: Deserialize))]
 attribute whatsapp::WebMessageInfo # [cfg_attr (feature = "serde-deserialize" , serde (default))]
-attribute whatsapp::WebMessageInfo # [derive (Clone , PartialEq , Default)]
+attribute whatsapp::WebMessageInfo # [derive (PartialEq)]
 attribute whatsapp::WebMessageInfo # [derive (serde :: Serialize)]
 attribute whatsapp::WebMessageInfoOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::WebMessageInfoView # [derive (Clone , Debug , Default)]
@@ -13020,7 +13020,7 @@ attribute whatsapp::message::EventResponseMessageOwnedView # [derive (Clone , De
 attribute whatsapp::message::EventResponseMessageView # [derive (Clone , Debug , Default)]
 attribute whatsapp::message::ExtendedTextMessage # [cfg_attr (feature = "serde-deserialize" , derive (serde :: Deserialize))]
 attribute whatsapp::message::ExtendedTextMessage # [cfg_attr (feature = "serde-deserialize" , serde (default))]
-attribute whatsapp::message::ExtendedTextMessage # [derive (Clone , PartialEq , Default)]
+attribute whatsapp::message::ExtendedTextMessage # [derive (PartialEq)]
 attribute whatsapp::message::ExtendedTextMessage # [derive (serde :: Serialize)]
 attribute whatsapp::message::ExtendedTextMessageOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::message::ExtendedTextMessageView # [derive (Clone , Debug , Default)]
@@ -13050,7 +13050,7 @@ attribute whatsapp::message::GroupInviteMessageOwnedView # [derive (Clone , Debu
 attribute whatsapp::message::GroupInviteMessageView # [derive (Clone , Debug , Default)]
 attribute whatsapp::message::HighlyStructuredMessage # [cfg_attr (feature = "serde-deserialize" , derive (serde :: Deserialize))]
 attribute whatsapp::message::HighlyStructuredMessage # [cfg_attr (feature = "serde-deserialize" , serde (default))]
-attribute whatsapp::message::HighlyStructuredMessage # [derive (PartialEq , Default)]
+attribute whatsapp::message::HighlyStructuredMessage # [derive (PartialEq)]
 attribute whatsapp::message::HighlyStructuredMessage # [derive (serde :: Serialize)]
 attribute whatsapp::message::HighlyStructuredMessageOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::message::HighlyStructuredMessageView # [derive (Clone , Debug , Default)]
@@ -13081,7 +13081,7 @@ attribute whatsapp::message::HistorySyncType # [derive (Clone , Copy , PartialEq
 attribute whatsapp::message::HistorySyncType # [repr (i32)]
 attribute whatsapp::message::ImageMessage # [cfg_attr (feature = "serde-deserialize" , derive (serde :: Deserialize))]
 attribute whatsapp::message::ImageMessage # [cfg_attr (feature = "serde-deserialize" , serde (default))]
-attribute whatsapp::message::ImageMessage # [derive (PartialEq , Default)]
+attribute whatsapp::message::ImageMessage # [derive (PartialEq)]
 attribute whatsapp::message::ImageMessage # [derive (serde :: Serialize)]
 attribute whatsapp::message::ImageMessageOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::message::ImageMessageView # [derive (Clone , Debug , Default)]
@@ -13100,7 +13100,7 @@ attribute whatsapp::message::InsightDeliveryState # [derive (Clone , Copy , Part
 attribute whatsapp::message::InsightDeliveryState # [repr (i32)]
 attribute whatsapp::message::InteractiveMessage # [cfg_attr (feature = "serde-deserialize" , derive (serde :: Deserialize))]
 attribute whatsapp::message::InteractiveMessage # [cfg_attr (feature = "serde-deserialize" , serde (default))]
-attribute whatsapp::message::InteractiveMessage # [derive (PartialEq , Default)]
+attribute whatsapp::message::InteractiveMessage # [derive (PartialEq)]
 attribute whatsapp::message::InteractiveMessage # [derive (serde :: Serialize)]
 attribute whatsapp::message::InteractiveMessageOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::message::InteractiveMessageView # [derive (Clone , Debug , Default)]
@@ -13325,7 +13325,7 @@ attribute whatsapp::message::ProductMessageOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::message::ProductMessageView # [derive (Clone , Debug , Default)]
 attribute whatsapp::message::ProtocolMessage # [cfg_attr (feature = "serde-deserialize" , derive (serde :: Deserialize))]
 attribute whatsapp::message::ProtocolMessage # [cfg_attr (feature = "serde-deserialize" , serde (default))]
-attribute whatsapp::message::ProtocolMessage # [derive (Clone , PartialEq , Default)]
+attribute whatsapp::message::ProtocolMessage # [derive (PartialEq)]
 attribute whatsapp::message::ProtocolMessage # [derive (serde :: Serialize)]
 attribute whatsapp::message::ProtocolMessageOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::message::ProtocolMessageView # [derive (Clone , Debug , Default)]
@@ -13505,7 +13505,7 @@ attribute whatsapp::message::VideoEndCardOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::message::VideoEndCardView # [derive (Clone , Debug , Default)]
 attribute whatsapp::message::VideoMessage # [cfg_attr (feature = "serde-deserialize" , derive (serde :: Deserialize))]
 attribute whatsapp::message::VideoMessage # [cfg_attr (feature = "serde-deserialize" , serde (default))]
-attribute whatsapp::message::VideoMessage # [derive (PartialEq , Default)]
+attribute whatsapp::message::VideoMessage # [derive (PartialEq)]
 attribute whatsapp::message::VideoMessage # [derive (serde :: Serialize)]
 attribute whatsapp::message::VideoMessageOwnedView # [derive (Clone , Debug)]
 attribute whatsapp::message::VideoMessageView # [derive (Clone , Debug , Default)]
@@ -29837,10 +29837,13 @@ impl whatsapp:: :: buffa :: MessageName for WrapTransportSigningPublicKeyInput
 impl whatsapp:: :: buffa :: MessageName for WrapTransportSigningPublicKeyResult 
 impl whatsapp:: :: buffa :: MessageName for WrapTransportSigningSecretKeyInput 
 impl whatsapp:: :: buffa :: MessageName for WrapTransportSigningSecretKeyResult 
+impl whatsapp:: :: core :: clone :: Clone for AIRichResponseSubMessage 
 impl whatsapp:: :: core :: clone :: Clone for BotMetadata 
 impl whatsapp:: :: core :: clone :: Clone for ContextInfo 
 impl whatsapp:: :: core :: clone :: Clone for Message 
 impl whatsapp:: :: core :: clone :: Clone for MessageContextInfo 
+impl whatsapp:: :: core :: clone :: Clone for SyncActionValue 
+impl whatsapp:: :: core :: clone :: Clone for WebMessageInfo 
 impl whatsapp:: :: core :: convert :: AsRef < :: buffa :: OwnedView < ACP2SettingView < 'static > > > for ACP2SettingOwnedView 
 impl whatsapp:: :: core :: convert :: AsRef < :: buffa :: OwnedView < ADVDeviceIdentityView < 'static > > > for ADVDeviceIdentityOwnedView 
 impl whatsapp:: :: core :: convert :: AsRef < :: buffa :: OwnedView < ADVKeyIndexListView < 'static > > > for ADVKeyIndexListOwnedView 
@@ -30851,8 +30854,10 @@ impl whatsapp:: :: core :: convert :: From < WrapTransportSigningSecretKeyInputO
 impl whatsapp:: :: core :: convert :: From < WrapTransportSigningSecretKeyResultOwnedView > for :: buffa :: OwnedView < WrapTransportSigningSecretKeyResultView < 'static > > 
 impl whatsapp:: :: core :: default :: Default for ADVEncryptionType 
 impl whatsapp:: :: core :: default :: Default for AIRichResponseMessageType 
+impl whatsapp:: :: core :: default :: Default for AIRichResponseSubMessage 
 impl whatsapp:: :: core :: default :: Default for AIRichResponseSubMessageType 
 impl whatsapp:: :: core :: default :: Default for AISubscriptionRequestType 
+impl whatsapp:: :: core :: default :: Default for BotMetadata 
 impl whatsapp:: :: core :: default :: Default for BotMetricsEntryPoint 
 impl whatsapp:: :: core :: default :: Default for BotMetricsThreadEntryPoint 
 impl whatsapp:: :: core :: default :: Default for BotSessionSource 
@@ -30860,6 +30865,7 @@ impl whatsapp:: :: core :: default :: Default for COMMAND_COMMAND_TYPE
 impl whatsapp:: :: core :: default :: Default for CONSUMER_APPLICATION_METADATA_SPECIAL_TEXT_SIZE 
 impl whatsapp:: :: core :: default :: Default for CONSUMER_APPLICATION_STATUS_TEXT_MESAGE_FONT_TYPE 
 impl whatsapp:: :: core :: default :: Default for CollectionName 
+impl whatsapp:: :: core :: default :: Default for ContextInfo 
 impl whatsapp:: :: core :: default :: Default for EXTENDED_CONTENT_MESSAGE_CTA_BUTTON_TYPE 
 impl whatsapp:: :: core :: default :: Default for EXTENDED_CONTENT_MESSAGE_EXTENDED_CONTENT_TYPE 
 impl whatsapp:: :: core :: default :: Default for EXTENDED_CONTENT_MESSAGE_XMA_DATACLASS_TYPE 
@@ -30870,10 +30876,13 @@ impl whatsapp:: :: core :: default :: Default for MENTION_MENTION_TYPE
 impl whatsapp:: :: core :: default :: Default for MediaKeyDomain 
 impl whatsapp:: :: core :: default :: Default for MediaVisibility 
 impl whatsapp:: :: core :: default :: Default for Message 
+impl whatsapp:: :: core :: default :: Default for MessageContextInfo 
 impl whatsapp:: :: core :: default :: Default for MutationProps 
 impl whatsapp:: :: core :: default :: Default for PrivacySystemMessage 
 impl whatsapp:: :: core :: default :: Default for SessionTransparencyType 
+impl whatsapp:: :: core :: default :: Default for SyncActionValue 
 impl whatsapp:: :: core :: default :: Default for WebLinkRenderConfig 
+impl whatsapp:: :: core :: default :: Default for WebMessageInfo 
 impl whatsapp:: :: core :: fmt :: Debug for ACP2Setting 
 impl whatsapp:: :: core :: fmt :: Debug for ADVDeviceIdentity 
 impl whatsapp:: :: core :: fmt :: Debug for ADVKeyIndexList 
@@ -34355,9 +34364,11 @@ impl whatsapp::message:: :: buffa :: MessageName for TemplateMessage
 impl whatsapp::message:: :: buffa :: MessageName for URLMetadata 
 impl whatsapp::message:: :: buffa :: MessageName for VideoEndCard 
 impl whatsapp::message:: :: buffa :: MessageName for VideoMessage 
+impl whatsapp::message:: :: core :: clone :: Clone for ExtendedTextMessage 
 impl whatsapp::message:: :: core :: clone :: Clone for HighlyStructuredMessage 
 impl whatsapp::message:: :: core :: clone :: Clone for ImageMessage 
 impl whatsapp::message:: :: core :: clone :: Clone for InteractiveMessage 
+impl whatsapp::message:: :: core :: clone :: Clone for ProtocolMessage 
 impl whatsapp::message:: :: core :: clone :: Clone for VideoMessage 
 impl whatsapp::message:: :: core :: convert :: AsRef < :: buffa :: OwnedView < AlbumMessageView < 'static > > > for AlbumMessageOwnedView 
 impl whatsapp::message:: :: core :: convert :: AsRef < :: buffa :: OwnedView < AppStateFatalExceptionNotificationView < 'static > > , > for AppStateFatalExceptionNotificationOwnedView 
@@ -34698,11 +34709,17 @@ impl whatsapp::message:: :: core :: convert :: From < TemplateMessageOwnedView >
 impl whatsapp::message:: :: core :: convert :: From < URLMetadataOwnedView > for :: buffa :: OwnedView < URLMetadataView < 'static > > 
 impl whatsapp::message:: :: core :: convert :: From < VideoEndCardOwnedView > for :: buffa :: OwnedView < VideoEndCardView < 'static > > 
 impl whatsapp::message:: :: core :: convert :: From < VideoMessageOwnedView > for :: buffa :: OwnedView < VideoMessageView < 'static > > 
+impl whatsapp::message:: :: core :: default :: Default for ExtendedTextMessage 
+impl whatsapp::message:: :: core :: default :: Default for HighlyStructuredMessage 
 impl whatsapp::message:: :: core :: default :: Default for HistorySyncType 
+impl whatsapp::message:: :: core :: default :: Default for ImageMessage 
 impl whatsapp::message:: :: core :: default :: Default for InsightDeliveryState 
+impl whatsapp::message:: :: core :: default :: Default for InteractiveMessage 
 impl whatsapp::message:: :: core :: default :: Default for PeerDataOperationRequestType 
 impl whatsapp::message:: :: core :: default :: Default for PollContentType 
 impl whatsapp::message:: :: core :: default :: Default for PollType 
+impl whatsapp::message:: :: core :: default :: Default for ProtocolMessage 
+impl whatsapp::message:: :: core :: default :: Default for VideoMessage 
 impl whatsapp::message:: :: core :: fmt :: Debug for AlbumMessage 
 impl whatsapp::message:: :: core :: fmt :: Debug for AppStateFatalExceptionNotification 
 impl whatsapp::message:: :: core :: fmt :: Debug for AppStateSyncKey 

@@ -68,6 +68,30 @@ impl VisitMut for ColdStorage {
     }
     fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
         visit_mut::visit_expr_mut(self, expr);
+        if let syn::Expr::Call(call) = expr
+            && let syn::Expr::Path(path) = &*call.func
+            && path
+                .path
+                .segments
+                .iter()
+                .map(|part| part.ident.to_string())
+                .eq(["buffa", "Message", "merge_length_delimited"])
+            && call.args.len() == 3
+            && let syn::Expr::MethodCall(field) = &call.args[0]
+            && field.method == "get_or_insert_default"
+            && field.args.is_empty()
+        {
+            let receiver = &field.receiver;
+            let buf = &call.args[1];
+            let ctx = &call.args[2];
+            let helper: syn::Path = syn::parse_str(&format!(
+                "{}__unknown_storage::merge_message",
+                "super::".repeat(self.depth),
+            ))
+            .expect("internal nested-message helper path");
+            *expr = syn::parse_quote!(#helper(&mut #receiver, #buf, #ctx));
+            return;
+        }
         let syn::Expr::MethodCall(call) = expr else {
             return;
         };
@@ -112,26 +136,23 @@ fn protect(attrs: &mut Vec<syn::Attribute>) {
     }
 }
 
-// Nested messages otherwise repeat sizeable codecs in their parents. Keep
-// the small-message case available for inlining and share larger codecs.
-fn share_large_codecs(items: &mut [syn::Item]) {
-    let large: BTreeSet<_> = items
+// Share nonempty codecs across parents, including wrappers with few fields.
+// Field count alone misses the code duplicated by nested message fields.
+fn share_codecs(items: &mut [syn::Item]) {
+    let nonempty: BTreeSet<_> = items
         .iter()
         .filter_map(|item| {
             let syn::Item::Struct(item) = item else {
                 return None;
             };
-            (item
-                .fields
+            item.fields
                 .iter()
-                .filter(|field| {
+                .any(|field| {
                     field
                         .ident
                         .as_ref()
                         .is_none_or(|id| id != "__buffa_unknown_fields")
                 })
-                .count()
-                >= 8)
                 .then(|| item.ident.clone())
         })
         .collect();
@@ -139,7 +160,7 @@ fn share_large_codecs(items: &mut [syn::Item]) {
         match item {
             syn::Item::Mod(module) => {
                 if let Some((_, items)) = &mut module.content {
-                    share_large_codecs(items);
+                    share_codecs(items);
                 }
             }
             syn::Item::Impl(item) => {
@@ -156,7 +177,7 @@ fn share_large_codecs(items: &mut [syn::Item]) {
                 let syn::Type::Path(ty) = &*item.self_ty else {
                     continue;
                 };
-                if !ty.path.get_ident().is_some_and(|id| large.contains(id)) {
+                if !ty.path.get_ident().is_some_and(|id| nonempty.contains(id)) {
                     continue;
                 }
                 for member in &mut item.items {
@@ -193,6 +214,9 @@ fn share_message_impls(items: &mut Vec<syn::Item>, scope: &str) {
                 "ContextInfo",
                 "BotMetadata",
                 "MessageContextInfo",
+                "AIRichResponseSubMessage",
+                "SyncActionValue",
+                "WebMessageInfo",
             ]
             .contains(&name.as_str()),
             "::message" => [
@@ -200,6 +224,8 @@ fn share_message_impls(items: &mut Vec<syn::Item>, scope: &str) {
                 "VideoMessage",
                 "InteractiveMessage",
                 "HighlyStructuredMessage",
+                "ProtocolMessage",
+                "ExtendedTextMessage",
             ]
             .contains(&name.as_str()),
             _ => false,
@@ -207,7 +233,7 @@ fn share_message_impls(items: &mut Vec<syn::Item>, scope: &str) {
         if !selected {
             continue;
         }
-        let share_default = scope.is_empty() && name == "Message";
+        let pin_root_clone = scope.is_empty() && name == "Message";
         let mut derived_default = false;
         for attribute in &mut message.attrs {
             if attribute.path().is_ident("derive") {
@@ -219,7 +245,7 @@ fn share_message_impls(items: &mut Vec<syn::Item>, scope: &str) {
                 let traits: Vec<_> = traits
                     .into_iter()
                     .filter(|p| {
-                        if share_default && p.is_ident("Default") {
+                        if p.is_ident("Default") {
                             derived_default = true;
                             false
                         } else {
@@ -238,7 +264,7 @@ fn share_message_impls(items: &mut Vec<syn::Item>, scope: &str) {
             .collect();
         // The root Message clone is pinned once by build/pin_clone.rs before
         // this pass. That transformer rejects missing or duplicate derives.
-        if !share_default {
+        if !pin_root_clone {
             implementations.push(syn::parse_quote! {
                 impl ::core::clone::Clone for #name {
                     #[inline(never)]
@@ -251,9 +277,16 @@ fn share_message_impls(items: &mut Vec<syn::Item>, scope: &str) {
         // Keep generator-provided protobuf defaults intact. Only a derived
         // Default is equivalent to applying Rust Default to every field.
         if derived_default {
+            // The root decoder benefits from folding initialization into its
+            // final output slot; keep outlining defaults of nested owners.
+            let inline: syn::Attribute = if pin_root_clone {
+                syn::parse_quote!(#[inline])
+            } else {
+                syn::parse_quote!(#[inline(never)])
+            };
             implementations.push(syn::parse_quote! {
                 impl ::core::default::Default for #name {
-                    #[inline(never)]
+                    #inline
                     fn default() -> Self {
                         Self { #(#fields: ::core::default::Default::default()),* }
                     }
@@ -278,7 +311,7 @@ pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
         let mut file = syn::parse_file(&source).map_err(io::Error::other)?;
         Extensible { serde }.visit_file_mut(&mut file);
         if serde {
-            share_large_codecs(&mut file.items);
+            share_codecs(&mut file.items);
             ColdStorage { depth: 0 }.visit_file_mut(&mut file);
             ordering::apply(&mut file, false);
             let body = syn::parse_file(include_str!("unknown_storage.rs")).expect("storage syntax");
