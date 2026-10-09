@@ -17,7 +17,8 @@ fn main() {
 
 // The nested image and quoted message exercise traversal-cache entries. The
 // synthetic future field appears on either side of a known oneof alternative,
-// so changes to occurrence retention have separate encode/decode measurements.
+// to measure both decode positions. Encode measures the known fixture because
+// the current generated owned and borrowed codecs discard unknown fields.
 #[allow(clippy::field_reassign_with_default)] // Also works with non-exhaustive generated messages.
 fn oneof_wire(shape: &str) -> Vec<u8> {
     use buffa::Message as _;
@@ -42,21 +43,23 @@ fn oneof_wire(shape: &str) -> Vec<u8> {
     }
 }
 
-#[divan::bench(args = ["known", "future_first", "future_last"])]
-fn bench_oneof_owned_encode(bencher: divan::Bencher, shape: &str) {
+#[divan::bench]
+fn bench_oneof_owned_encode(bencher: divan::Bencher) {
     use buffa::Message as _;
-    let wire = oneof_wire(shape);
+    let wire = oneof_wire("known");
     let message = wa::message::interactive_message::Header::decode_from_slice(&wire)
         .expect("valid synthetic oneof fixture");
+    assert_eq!(message.encode_to_vec(), wire);
     bencher.bench(|| black_box(black_box(&message).encode_to_vec()));
 }
 
-#[divan::bench(args = ["known", "future_first", "future_last"])]
-fn bench_oneof_view_encode(bencher: divan::Bencher, shape: &str) {
+#[divan::bench]
+fn bench_oneof_view_encode(bencher: divan::Bencher) {
     use buffa::{MessageView as _, ViewEncode as _};
-    let wire = oneof_wire(shape);
+    let wire = oneof_wire("known");
     let message = wa::message::interactive_message::HeaderView::decode_view(&wire)
         .expect("valid synthetic oneof fixture");
+    assert_eq!(message.encode_to_vec(), wire);
     bencher.bench(|| black_box(black_box(&message).encode_to_vec()));
 }
 
