@@ -422,6 +422,8 @@ impl Runtime {
     /// `_embind_initialize_bindings`. Calling only the first finds an empty API
     /// and looks like a module with no embind surface at all.
     pub fn run_ctors(&mut self) -> Result<()> {
+        let shared = std::sync::Arc::clone(self.shared());
+        let _phase = shared.scheduler.diagnostic_phase("ctors");
         let mut ran = false;
 
         for name in ["__wasm_call_ctors", "_initialize"] {
@@ -1155,6 +1157,8 @@ impl Runtime {
     /// Must be called before the subsystem being investigated initialises, or
     /// its startup lines are lost.
     pub fn attach_log_ring(&mut self, bytes: u32) -> Result<()> {
+        let shared = std::sync::Arc::clone(self.shared());
+        let _phase = shared.scheduler.diagnostic_phase("attach_log_ring");
         let buffer = self.malloc(bytes)?;
         self.call_embind(
             "initLogRingBuffer",
