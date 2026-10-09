@@ -9,6 +9,35 @@ use ::core::mem::ManuallyDrop;
 type GroupMap = fn(u32) -> u32;
 type Projection = Vec<(u32, Vec<u8>)>;
 
+// Enum-only owners need no per-type copy of protobuf sizing and writing code.
+// The stack projection retains field presence, including present zero values.
+#[cold]
+#[inline(never)]
+pub(crate) fn enum_snapshot(
+    fields: &[(u32, Option<i32>)],
+    ctx: Option<DecodeContext<'_>>,
+) -> Result<Vec<u8>, DecodeError> {
+    let len: usize = fields
+        .iter()
+        .filter_map(|(tag, value)| {
+            value.map(|value| {
+                ::buffa::encoding::varint_len(u64::from(*tag) << 3)
+                    + ::buffa::types::int32_encoded_len(value) as usize
+            })
+        })
+        .sum();
+    if let Some(ctx) = ctx {
+        ctx.register_element_memory(len)?;
+    }
+    let mut bytes = Vec::with_capacity(len);
+    for &(tag, value) in fields {
+        if let Some(value) = value {
+            ::buffa::types::put_int32_field(tag, value, &mut bytes);
+        }
+    }
+    Ok(bytes)
+}
+
 // The occurrence algorithm is shared through an erased adapter only after a
 // future field activates the journal. Known-only decoding keeps its generated
 // static codec; hundreds of message types need not repeat this cold algorithm.

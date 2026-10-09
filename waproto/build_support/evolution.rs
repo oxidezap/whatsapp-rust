@@ -43,6 +43,11 @@ fn schema(new: bool) -> FileDescriptorSet {
         number: Some(2),
         ..Default::default()
     });
+    record.enum_type[0].value.push(EnumValueDescriptorProto {
+        name: Some("NEGATIVE".into()),
+        number: Some(-1),
+        ..Default::default()
+    });
     mode_field.type_name = Some(format!(".contract.{message}.{mode}"));
     mode_field.default_value = Some(if new { "READY_NOW" } else { "READY" }.into());
     record.field.push(mode_field);
@@ -78,12 +83,23 @@ fn schema(new: bool) -> FileDescriptorSet {
             ..Default::default()
         });
     }
+    let mut enum_mode = field("mode", 2, Type::TYPE_ENUM);
+    enum_mode.type_name = Some(format!(".contract.{message}.{mode}"));
+    let mut enum_other = enum_mode.clone();
+    enum_other.name = Some("other".into());
+    enum_other.json_name = Some("other".into());
+    enum_other.number = Some(3);
+    let enum_record = DescriptorProto {
+        name: Some("EnumRecord".into()),
+        field: vec![field("label", 1, Type::TYPE_UINT32), enum_mode, enum_other],
+        ..Default::default()
+    };
     FileDescriptorSet {
         file: vec![FileDescriptorProto {
             name: Some("contract.proto".into()),
             package: Some("contract".into()),
             syntax: Some("proto2".into()),
-            message_type: vec![record],
+            message_type: vec![record, enum_record],
             ..Default::default()
         }],
         ..Default::default()

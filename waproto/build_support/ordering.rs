@@ -9,6 +9,7 @@ struct Probe {
     fields: BTreeSet<String>,
     enumeration: bool,
     choice: bool,
+    enum_number: Option<u32>,
 }
 impl VisitMut for Probe {
     fn visit_expr_field_mut(&mut self, expr: &mut syn::ExprField) {
@@ -27,6 +28,20 @@ impl VisitMut for Probe {
     fn visit_expr_match_mut(&mut self, expr: &mut syn::ExprMatch) {
         self.choice = true;
         visit_mut::visit_expr_match_mut(self, expr);
+    }
+    fn visit_expr_call_mut(&mut self, expr: &mut syn::ExprCall) {
+        if let syn::Expr::Path(path) = &*expr.func
+            && path
+                .path
+                .segments
+                .last()
+                .is_some_and(|part| part.ident == "put_int32_field")
+            && let Some(syn::Expr::Lit(literal)) = expr.args.first()
+            && let syn::Lit::Int(number) = &literal.lit
+        {
+            self.enum_number = Some(number.base10_parse().expect("generated field number"));
+        }
+        visit_mut::visit_expr_call_mut(self, expr);
     }
 }
 
@@ -111,6 +126,7 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
         }
     }
     let mut selected: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
+    let mut enum_fields = BTreeMap::new();
     for item in items.iter() {
         let syn::Item::Impl(item) = item else {
             continue;
@@ -122,6 +138,7 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
             continue;
         };
         let mut groups = BTreeMap::new();
+        let mut numbers = BTreeMap::new();
         for statement in &write.block.stmts {
             // Repeated fields have a different mutation contract; singular
             // values and oneofs are emitted as individual conditional blocks.
@@ -136,11 +153,20 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     .next()
                     .expect("one projected field")
                     .clone();
+                if !probe.choice
+                    && let Some(number) = probe.enum_number
+                {
+                    numbers.insert(name.clone(), number);
+                }
                 groups.insert(name, groups.len() as u32 + 1);
             }
         }
         if !groups.is_empty() {
-            selected.insert(type_name(item).expect("generated type"), groups);
+            let name = type_name(item).expect("generated type");
+            if numbers.len() == groups.len() {
+                enum_fields.insert(name.clone(), numbers);
+            }
+            selected.insert(name, groups);
         }
     }
     if selected.is_empty() {
@@ -150,6 +176,7 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
     let runtime: syn::Path =
         syn::parse_str(&format!("{prefix}__wire_order")).expect("runtime path");
     let mut helpers = Vec::new();
+    let mut enum_values = BTreeMap::new();
     for item in items.iter() {
         let syn::Item::Struct(owner) = item else {
             continue;
@@ -158,6 +185,20 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
             continue;
         };
         let name = &owner.ident;
+        if let Some(numbers) = enum_fields.get(&name.to_string()) {
+            let values: Vec<_> = owner.fields.iter().filter_map(|field| {
+                let field_name = field.ident.as_ref()?;
+                let number = numbers.get(&field_name.to_string())?;
+                let optional = matches!(&field.ty, syn::Type::Path(path) if path.path.segments.last().is_some_and(|part| part.ident == "Option"));
+                let value = if optional {
+                    quote!(self.#field_name.as_ref().map(|value| value.to_i32()))
+                } else {
+                    quote!(Some(self.#field_name.to_i32()))
+                };
+                Some(quote!((#number, #value)))
+            }).collect();
+            enum_values.insert(name.to_string(), values);
+        }
         let (impl_generics, ty_generics, where_clause) = owner.generics.split_for_impl();
         for field in &owner.fields {
             let Some(field_name) = &field.ident else {
@@ -300,10 +341,33 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     f.block.stmts.insert(0, syn::parse_quote!(let __wire_active = self.__buffa_unknown_fields.active();));
                 }
             }
+            let (codecs, projection) = if let Some(values) = enum_values.get(&name) {
+                (
+                    quote!(),
+                    quote!({
+                        #[allow(unused_imports)]
+                        use ::buffa::Enumeration as _;
+                        #runtime::enum_snapshot(&[#(#values),*], ctx)
+                    }),
+                )
+            } else {
+                (
+                    quote!(#compute #write),
+                    quote!({
+                        let mut cache = ::buffa::SizeCache::new();
+                        let size = self.__wire_compute(&mut cache);
+                        if let Some(ctx) = ctx {
+                            ctx.register_element_memory(size as usize)?;
+                        }
+                        let mut bytes = ::buffa::alloc::vec::Vec::with_capacity(size as usize);
+                        self.__wire_write(&mut cache, &mut bytes);
+                        Ok(bytes)
+                    }),
+                )
+            };
             helpers.push(syn::parse_quote! {
                 impl #impl_generics #ty #where_clause {
-                    #compute
-                    #write
+                    #codecs
                     #[cold]
                     pub(crate) fn __wire_known(&self) -> ::buffa::alloc::vec::Vec<u8> {
                         self.__wire_snapshot(None).expect("unbudgeted wire projection")
@@ -314,14 +378,7 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     }
                     #[cold]
                     #[inline(never)]
-                    fn __wire_snapshot(&self, ctx: ::core::option::Option<::buffa::DecodeContext<'_>>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> {
-                        let mut cache = ::buffa::SizeCache::new();
-                        let size = self.__wire_compute(&mut cache);
-                        if let Some(ctx) = ctx { ctx.register_element_memory(size as usize)?; }
-                        let mut bytes = ::buffa::alloc::vec::Vec::with_capacity(size as usize);
-                        self.__wire_write(&mut cache, &mut bytes);
-                        Ok(bytes)
-                    }
+                    fn __wire_snapshot(&self, ctx: ::core::option::Option<::buffa::DecodeContext<'_>>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> #projection
                 }
             });
         }
