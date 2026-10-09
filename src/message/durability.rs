@@ -62,16 +62,21 @@ pub(super) fn extend_pending_record(
     proposed: &[u8],
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let original_parts = pending_parts(existing)?;
-    let existing_messages = decode_pending_parts(existing)?;
+    let mut scratch = Vec::new();
+    // Replay selection already treats SKDM as a carrier, not a new user
+    // payload. Extension must use that same occurrence identity while keeping
+    // each original row's bytes, including its carrier and unknown fields.
+    let existing_fingerprints: Vec<_> = decode_pending_parts(existing)?
+        .iter()
+        .map(|message| MessageDispatch::fingerprint_into(message, &mut scratch))
+        .collect();
     let proposed_parts = pending_parts(proposed)?;
-    let mut canonical = Vec::new();
     let mut next = 0;
     let mut merged = Vec::with_capacity(proposed_parts.len());
     for part in proposed_parts {
-        let matches = if let Some(message) = existing_messages.get(next) {
-            canonical.clear();
-            waproto::codec::message_encode_into(message, &mut canonical);
-            canonical == part
+        let matches = if let Some(expected) = existing_fingerprints.get(next) {
+            let message = waproto::codec::message_decode(part)?;
+            *expected == MessageDispatch::fingerprint_into(&message, &mut scratch)
         } else {
             false
         };
@@ -314,6 +319,64 @@ mod tests {
         let mut oversized = PARTS_HEADER.to_vec();
         oversized.extend_from_slice(&u64::MAX.to_be_bytes());
         assert!(decode_pending_parts(&oversized).is_err());
+    }
+
+    #[test]
+    fn pending_extension_uses_replay_carrier_equivalence_and_keeps_bytes() {
+        let original = [10, 1, b'b', 0xc0, 0x3e, 7];
+        let with_carrier = [&original[..], &[0x12, 0]].concat();
+        let first = [10, 1, b'a'];
+        let proposed = encode_pending_parts(&[&first, &with_carrier]);
+        let extended = extend_pending_record(&original, &proposed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pending_parts(&extended).unwrap(),
+            [&first[..], &original[..]]
+        );
+        assert!(
+            extend_pending_record(&original, &with_carrier)
+                .unwrap()
+                .is_none()
+        );
+        let duplicate = encode_pending_parts(&[&original, &original]);
+        assert!(extend_pending_record(&duplicate, &proposed).is_err());
+        assert!(extend_pending_record(&original, &first).is_err());
+    }
+
+    #[tokio::test]
+    async fn restarted_alias_replay_with_carrier_difference_reaches_hook() {
+        let client = create_test_client_with_failing_http("durability_carrier_alias").await;
+        let mut info = (*test_info("CARRIER_ALIAS")).clone();
+        info.source.is_group = true;
+        let info = Arc::new(info);
+        let backend = client.persistence_manager.backend();
+        let original = [10, 1, b'b', 0xc0, 0x3e, 7];
+        let with_carrier = [&original[..], &[0x12, 0]].concat();
+        let combined = encode_pending_parts(&[&[10, 1, b'a'], &with_carrier]);
+        for (sender, bytes) in [
+            ("200@s.whatsapp.net", &original[..]),
+            ("200:1@s.whatsapp.net", &combined[..]),
+        ] {
+            backend
+                .store_pending_inbound("100@g.us", sender, &info.id, bytes)
+                .await
+                .unwrap();
+        }
+        let hook = counting_hook(true);
+        assert!(client.inbound_durability_hook.set(hook.clone()).is_ok());
+        assert!(client.ack_or_replay_to_hook(&info).await);
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hook.messages.load(Ordering::SeqCst), 2);
+        for sender in ["200@s.whatsapp.net", "200:1@s.whatsapp.net"] {
+            assert!(
+                backend
+                    .get_pending_inbound("100@g.us", sender, &info.id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[test]
