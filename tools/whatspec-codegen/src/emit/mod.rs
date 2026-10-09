@@ -6,6 +6,7 @@
 pub mod abprops;
 pub mod appstate;
 pub mod enums;
+pub mod iq_pilots;
 pub mod iq_targets;
 pub mod join_shapes;
 pub mod mex;
