@@ -1153,19 +1153,20 @@ pub fn is_sender_key_distribution_only(msg: &mut wa::Message) -> bool {
     // Slow path: temporarily take out the carrier fields and compare the rest to
     // default to catch all current and future fields, then restore them. This
     // avoids deep-cloning the whole Message just to clear three fields.
-    let skdm = msg.sender_key_distribution_message.take();
-    let fast = msg.fast_ratchet_key_sender_key_distribution_message.take();
-    let ctx = msg.message_context_info.take();
+    // Keep the MessageField boxes: taking their inner values would free each
+    // box and allocate it again when the carrier fields are restored.
+    let skdm = std::mem::take(&mut msg.sender_key_distribution_message);
+    let fast = std::mem::take(&mut msg.fast_ratchet_key_sender_key_distribution_message);
+    let ctx = std::mem::take(&mut msg.message_context_info);
 
     // proto fields only encode when non-default, so encoded length 0 means all
     // remaining fields are at default — i.e. the message has no user content.
     let mut cache = buffa::SizeCache::new();
     let only = waproto::codec::message_compute_size(msg, &mut cache) == 0;
 
-    msg.sender_key_distribution_message = skdm.map(buffa::MessageField::some).unwrap_or_default();
-    msg.fast_ratchet_key_sender_key_distribution_message =
-        fast.map(buffa::MessageField::some).unwrap_or_default();
-    msg.message_context_info = ctx.map(buffa::MessageField::some).unwrap_or_default();
+    msg.sender_key_distribution_message = skdm;
+    msg.fast_ratchet_key_sender_key_distribution_message = fast;
+    msg.message_context_info = ctx;
 
     only
 }
