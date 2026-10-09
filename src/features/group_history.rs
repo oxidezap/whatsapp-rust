@@ -442,6 +442,9 @@ fn is_shareable_history_text(content: &waproto::whatsapp::Message) -> bool {
                 music_message => is_unset,
                 status_link_preview_metadata => is_unset,
                 bot_platform_registration_success_message => is_unset,
+                newsletter_scheduled_message => is_unset,
+                acp2_setting_message => is_unset,
+                audio_sticker_message => is_unset,
             ]
         )
         && content
@@ -470,6 +473,8 @@ fn is_shareable_history_text(content: &waproto::whatsapp::Message) -> bool {
                         tee_bot_metadata => is_none,
                         account_encryption_attestation => is_unset,
                         associated_primary_identity_key => is_none,
+                        tee_context_anchor_message_id => is_none,
+                        acp2_setting => is_unset,
                     ]
                 )
             })
@@ -1096,6 +1101,14 @@ mod tests {
                 limit_sharing: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             },
+            wa::MessageContextInfo {
+                tee_context_anchor_message_id: Some(String::new()),
+                ..Default::default()
+            },
+            wa::MessageContextInfo {
+                acp2_setting: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            },
         ] {
             content.message_context_info = buffa::MessageField::some(context);
             assert!(!is_shareable_history_text(&content));
@@ -1113,6 +1126,19 @@ mod tests {
         content.ephemeral_message = buffa::MessageField::none();
         content.conversation = Some(String::new());
         assert!(!is_shareable_history_text(&content));
+    }
+
+    #[test]
+    fn new_capture_message_fields_are_not_forwarded_as_plain_history_text() {
+        use buffa::Message as _;
+        use waproto::whatsapp as wa;
+
+        // conversation="x" plus an empty field 132, 133 or 134. Presence of
+        // the new payload is enough to reject it from the text-only path.
+        for tag in [0xa2, 0xaa, 0xb2] {
+            let content = wa::Message::decode_from_slice(&[0x0a, 1, b'x', tag, 8, 0]).unwrap();
+            assert!(!is_shareable_history_text(&content));
+        }
     }
 
     #[test]

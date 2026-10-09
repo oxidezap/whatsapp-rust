@@ -112,7 +112,9 @@ pub const fn companion_web_client_type_for_platform(
         | P::VR
         | P::CLOUD_API
         | P::SMARTGLASSES
-        | P::WAIL => C::OtherWebClient,
+        | P::WAIL
+        | P::WASS
+        | P::BUSINESS_BACK_OFFICE => C::OtherWebClient,
     }
 }
 
@@ -329,6 +331,8 @@ mod tests {
             P::CLOUD_API,
             P::SMARTGLASSES,
             P::WAIL,
+            P::WASS,
+            P::BUSINESS_BACK_OFFICE,
         ] {
             assert_eq!(
                 companion_web_client_type_for_platform(pt),

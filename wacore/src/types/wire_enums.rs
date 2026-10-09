@@ -1,4 +1,4 @@
-//! Auto-generated protocol enums (WhatsApp 2.3000.1045368834). DO NOT EDIT.
+//! Auto-generated protocol enums (WhatsApp 2.3000.1047483476). DO NOT EDIT.
 //!
 //! Protocol enums generated from the whatspec enum catalog.
 //!
@@ -127,6 +127,8 @@ pub enum EncMediaType {
     NativeFlowResponse,
     #[wire = "group_history"]
     GroupHistory,
+    #[wire = "music"]
+    Music,
     /// A value this build does not model, kept verbatim.
     #[wire_fallback]
     Unknown(String),

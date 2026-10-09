@@ -40,6 +40,7 @@
 use std::collections::BTreeMap;
 
 pub mod generated;
+mod unlisted;
 
 #[cfg(feature = "parity")]
 pub mod call_sites;
