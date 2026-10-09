@@ -89,9 +89,18 @@ fn schema(new: bool) -> FileDescriptorSet {
     enum_other.name = Some("other".into());
     enum_other.json_name = Some("other".into());
     enum_other.number = Some(3);
+    let mut enum_type = enum_mode.clone();
+    enum_type.name = Some("type".into());
+    enum_type.json_name = Some("type".into());
+    enum_type.number = Some(4);
     let enum_record = DescriptorProto {
         name: Some("EnumRecord".into()),
-        field: vec![field("label", 1, Type::TYPE_UINT32), enum_mode, enum_other],
+        field: vec![
+            field("label", 1, Type::TYPE_UINT32),
+            enum_mode,
+            enum_other,
+            enum_type,
+        ],
         ..Default::default()
     };
     let mut modes = field("modes", 1, Type::TYPE_ENUM);

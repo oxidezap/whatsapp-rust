@@ -647,6 +647,38 @@ fn repeated_future_enum_packed_boundaries_and_memory_budget() {
 }
 
 #[test]
+fn repeated_future_enum_long_lists_have_linear_decode_budget() {
+    use evolution_fixture::{DecodeOptions, v1, v2};
+    for field in [1, 2] {
+        for packed in [false, true] {
+            let mut wire = vec![field << 3, 1];
+            if packed {
+                wire.extend_from_slice(&[(field << 3) | 2, 0x80, 4]);
+                wire.extend(std::iter::repeat_n(0, 512));
+            } else {
+                for _ in 0..512 { wire.extend_from_slice(&[field << 3, 0]); }
+            }
+            let options = DecodeOptions::new().with_element_memory_limit(128 * 1024);
+            let owned = options.decode_from_slice::<v1::RepeatedRecord>(&wire).unwrap();
+            let view = options.decode_view::<v1::RepeatedRecordView<'_>>(&wire).unwrap();
+            let expected = v2::RepeatedRecord::decode_from_slice(&wire).unwrap();
+            for encoded in [owned.encode_to_vec(), view.encode_to_vec(), view.to_owned_message().unwrap().encode_to_vec()] {
+                assert_eq!(v2::RepeatedRecord::decode_from_slice(&encoded).unwrap(), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_identifier_setter_replaces_a_same_value_explicitly() {
+    use evolution_fixture::{v1, v2};
+    let wire = [0x20, 0, 0x20, 1];
+    let owned = v1::EnumRecord::decode_from_slice(&wire).unwrap().with_type(v1::record::Mode::READY);
+    let restored = v2::EnumRecord::decode_from_slice(&owned.encode_to_vec()).unwrap();
+    assert_eq!(restored.r#type, Some(v2::record::Mode::READY));
+}
+
+#[test]
 fn decode_batches_reconcile_edits_before_unrelated_fields() {
     use evolution_fixture::{DecodeContext, v1, v2};
     let received = [0x1a, 1, b'a', 0x2a, 1, b'b'];

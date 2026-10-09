@@ -58,6 +58,37 @@ fn repeated_bot_selection_retains_future_value_positions() {
 }
 
 #[test]
+fn repeated_bot_selection_long_list_fits_linear_memory_budget() {
+    use waproto::buffa::{DecodeOptions, ViewEncode};
+    let mut wire = vec![0x08, 2, 0x0a, 0x80, 4];
+    wire.extend(std::iter::repeat_n(0, 512));
+    let mut expected = vec![0x08, 2];
+    for _ in 0..512 {
+        expected.extend_from_slice(&[0x08, 0]);
+    }
+    let options = DecodeOptions::new().with_element_memory_limit(128 * 1024);
+    let owned = options
+        .decode_from_slice::<wa::BotModeSelectionMetadata>(&wire)
+        .unwrap();
+    let view = options
+        .decode_view::<wa::BotModeSelectionMetadataView<'_>>(&wire)
+        .unwrap();
+    assert_eq!(owned.mode.len(), 512);
+    assert_eq!(owned.encode_to_vec(), expected);
+    assert_eq!(view.encode_to_vec(), expected);
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
+}
+
+#[test]
+fn protocol_type_setter_keeps_same_value_replacement_after_future_type() {
+    let wire = [0x10, 0, 0x10, 99];
+    let message = wa::message::ProtocolMessage::decode_from_slice(&wire)
+        .unwrap()
+        .with_type(wa::message::protocol_message::Type::REVOKE);
+    assert_eq!(message.encode_to_vec(), [0x10, 99, 0x10, 0]);
+}
+
+#[test]
 fn replacing_a_future_closed_enum_value_preserves_the_explicit_edit() {
     let mut message = wa::ADVDeviceIdentity::decode_from_slice(&[0x20, 99]).unwrap();
     message.account_type = Some(wa::ADVEncryptionType::HOSTED);
