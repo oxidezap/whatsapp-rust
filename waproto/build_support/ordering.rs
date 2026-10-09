@@ -271,8 +271,16 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     for statement in &mut f.block.stmts {
                         let probe = fields(statement);
                         if probe.fields.iter().any(|field| groups.contains_key(field)) {
-                            let original = statement.clone();
-                            *statement = syn::parse_quote!(if !__wire_active { #original });
+                            if let syn::Stmt::Expr(syn::Expr::If(conditional), _) = statement
+                                && conditional.else_branch.is_none()
+                            {
+                                let condition = &conditional.cond;
+                                conditional.cond =
+                                    Box::new(syn::parse_quote!(!__wire_active && #condition));
+                            } else {
+                                let original = statement.clone();
+                                *statement = syn::parse_quote!(if !__wire_active { #original });
+                            }
                         } else if probe.fields.contains("__buffa_unknown_fields") {
                             assert!(!unknown, "one generated unknown-field statement");
                             unknown = true;
