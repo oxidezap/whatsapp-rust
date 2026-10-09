@@ -18,14 +18,16 @@ fn main() {
 // The nested image and quoted message exercise traversal-cache entries. The
 // synthetic future field appears on either side of a known oneof alternative,
 // so changes to occurrence retention have separate encode/decode measurements.
+#[allow(clippy::field_reassign_with_default)] // Also works with non-exhaustive generated messages.
 fn oneof_wire(shape: &str) -> Vec<u8> {
     use buffa::Message as _;
     let quoted = wa::Message::default().with_conversation("Synthetic quoted text");
-    let context = wa::ContextInfo::default().with_quoted_message(quoted);
-    let image = wa::message::ImageMessage::default()
+    let mut context = wa::ContextInfo::default();
+    context.quoted_message = Some(quoted).into();
+    let mut image = wa::message::ImageMessage::default()
         .with_caption("Synthetic image caption")
-        .with_jpeg_thumbnail(vec![0x5a; 64])
-        .with_context_info(context);
+        .with_jpeg_thumbnail(vec![0x5a; 64]);
+    image.context_info = Some(context).into();
     let mut header =
         wa::message::interactive_message::Header::default().with_title("Synthetic header");
     header.media =
