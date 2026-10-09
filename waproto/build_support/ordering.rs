@@ -306,17 +306,18 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     #write
                     #[cold]
                     pub(crate) fn __wire_known(&self) -> ::buffa::alloc::vec::Vec<u8> {
-                        let mut cache = ::buffa::SizeCache::new();
-                        let size = self.__wire_compute(&mut cache);
-                        let mut bytes = ::buffa::alloc::vec::Vec::with_capacity(size as usize);
-                        self.__wire_write(&mut cache, &mut bytes);
-                        bytes
+                        self.__wire_snapshot(None).expect("unbudgeted wire projection")
                     }
                     #[cold]
                     fn __wire_known_for_decode(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> {
+                        self.__wire_snapshot(Some(ctx))
+                    }
+                    #[cold]
+                    #[inline(never)]
+                    fn __wire_snapshot(&self, ctx: ::core::option::Option<::buffa::DecodeContext<'_>>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> {
                         let mut cache = ::buffa::SizeCache::new();
                         let size = self.__wire_compute(&mut cache);
-                        ctx.register_element_memory(size as usize)?;
+                        if let Some(ctx) = ctx { ctx.register_element_memory(size as usize)?; }
                         let mut bytes = ::buffa::alloc::vec::Vec::with_capacity(size as usize);
                         self.__wire_write(&mut cache, &mut bytes);
                         Ok(bytes)
