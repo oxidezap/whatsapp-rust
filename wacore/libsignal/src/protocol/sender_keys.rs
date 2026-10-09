@@ -107,11 +107,8 @@ impl StoredMessageKey {
         }
     }
 
-    /// The backlog as protobuf entries, with every seed a slice of one shared
-    /// buffer: a store flush re-encodes the whole backlog of every dirty state,
-    /// and a busy group's out-of-order window is hundreds of keys, so one
-    /// allocation per key per flush was the dominant flush cost. `Bytes::slice`
-    /// is a refcount bump.
+    /// Generated-code reference for the differential serializer tests.
+    #[cfg(test)]
     fn as_protobuf_list(keys: &[Self]) -> Vec<sender_key_state_structure::SenderMessageKey> {
         let mut seeds = bytes::BytesMut::with_capacity(keys.len() * 32);
         for key in keys {
@@ -1441,7 +1438,7 @@ mod tests {
     fn direct_components_match_generated_projection_for_shared_backlogs() {
         for count in [0, 1, 256] {
             let mut record = record_with_state(7, 0x42);
-            let state = record.states.front_mut().unwrap();
+            let state = record.states.front_mut().expect("fixture sender state");
             for index in 0..count {
                 state.add_skipped_message_key(index, [0x31; 32]);
             }
@@ -1455,19 +1452,23 @@ mod tests {
                 }
                 let shared = SenderKeyState::from_protobuf(proto.clone());
                 let retained = shared.clone();
-                let expected = sender_state_components_from_structure(proto).unwrap();
-                assert_eq!(shared.into_components().unwrap(), expected);
-                assert_eq!(retained.into_components().unwrap(), expected);
+                let expected =
+                    sender_state_components_from_structure(proto).expect("valid fixture");
+                assert_eq!(shared.into_components().expect("shared export"), expected);
+                assert_eq!(
+                    retained.into_components().expect("retained export"),
+                    expected
+                );
             }
         }
         let malformed = SenderKeyStateStructure::default();
         assert_eq!(
             SenderKeyState::from_protobuf(malformed.clone())
                 .into_components()
-                .unwrap_err()
+                .expect_err("missing chain")
                 .to_string(),
             sender_state_components_from_structure(malformed)
-                .unwrap_err()
+                .expect_err("missing chain")
                 .to_string()
         );
     }
