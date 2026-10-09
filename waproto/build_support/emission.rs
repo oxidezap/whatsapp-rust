@@ -9,6 +9,9 @@ use std::path::Path;
 use quote::ToTokens;
 use syn::visit_mut::{self, VisitMut};
 
+#[path = "ordering.rs"]
+mod ordering;
+
 struct Extensible {
     serde: bool,
 }
@@ -78,6 +81,9 @@ impl VisitMut for ColdStorage {
             return;
         }
         let syn::Expr::Try(attempt) = &call.args[0] else {
+            let receiver = &call.receiver;
+            let args = &call.args;
+            *expr = syn::parse_quote!(#receiver.push_decoded(#args, ctx)?);
             return;
         };
         let syn::Expr::Call(decode) = &*attempt.expr else {
@@ -270,10 +276,19 @@ pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
         if serde {
             share_large_codecs(&mut file.items);
             ColdStorage { depth: 0 }.visit_file_mut(&mut file);
+            ordering::apply(&mut file, false);
             let body = syn::parse_file(include_str!("unknown_storage.rs")).expect("storage syntax");
             let body = body.items;
             file.items
                 .push(syn::parse_quote!(#[doc(hidden)] pub mod __unknown_storage { #(#body)* }));
+            let body = syn::parse_file(include_str!("wire_order.rs")).expect("wire-order syntax");
+            let body = body.items;
+            file.items
+                .push(syn::parse_quote!(#[doc(hidden)] pub mod __wire_order { #(#body)* }));
+        }
+
+        if suffix == ".__view" {
+            ordering::apply(&mut file, true);
         }
 
         if serde {
