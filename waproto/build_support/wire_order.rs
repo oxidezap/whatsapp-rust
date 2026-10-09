@@ -484,8 +484,10 @@ impl<'a> Order<'a> {
             let changed = self.changed(&current);
             (current, changed)
         };
+        // The current fields provide an initial size without traversing the
+        // journal. Older retained occurrences can still grow the output.
+        let mut result = Vec::with_capacity(known.len().saturating_add(unknown.len()));
         let mut unknown = records(unknown);
-        let mut result = Vec::new();
         for (tag, raw) in records(known) {
             if map(tag) == 0 {
                 result.extend_from_slice(raw);
