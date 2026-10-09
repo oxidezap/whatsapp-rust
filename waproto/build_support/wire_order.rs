@@ -105,7 +105,7 @@ pub(crate) fn merge_owned_known(
     // Generated decoders receive their existing slice specialization. Erasing
     // their input buffer would instantiate a second recursive codec tree.
     codec.merge_slice(tag, &mut payload, ctx)?;
-    let known = codec.known(ctx)?;
+    let known = if group & (1 << 31) == 0 { codec.known(ctx)? } else { Vec::new() };
     codec
         .storage()
         .finish(group, Some(raw), &known, map, previous, ctx)
@@ -185,7 +185,7 @@ pub(crate) fn merge_view<'a>(
     let rest = codec.merge(tag, cur, before, ctx)?;
     let count = codec.storage().len();
     if group != 0 || count != previous {
-        let known = if group != 0 || check_current {
+        let known = if (group != 0 && group & (1 << 31) == 0) || (group == 0 && check_current) {
             codec.known(ctx)?
         } else {
             Vec::new()
@@ -290,13 +290,41 @@ fn projection(known: &[u8], map: GroupMap) -> Projection {
         if group == 0 {
             continue;
         }
-        if let Some((_, bytes)) = result.iter_mut().find(|(id, _)| *id == group) {
-            bytes.extend_from_slice(raw);
-        } else {
-            result.push((group, raw.to_vec()));
-        }
+        let index = result.iter().position(|(id, _)| *id == group).unwrap_or_else(|| {
+            result.push((group, Vec::new()));
+            result.len() - 1
+        });
+        canonical_record(group, raw, |bytes| result[index].1.extend_from_slice(bytes));
     }
     result
+}
+
+// A repeated enum baseline uses canonical unpacked records regardless of its
+// declared packing. Appending one decoded value then touches only that value;
+// a growing packed length prefix never requires copying the preceding list.
+fn canonical_record(group: u32, mut raw: &[u8], mut visit: impl FnMut(&[u8])) {
+    if group & (1 << 31) == 0 {
+        visit(raw);
+        return;
+    }
+    let tag = ::buffa::encoding::Tag::decode(&mut raw).expect("validated enum tag");
+    if tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
+        raw = ::buffa::types::borrow_bytes(&mut raw).expect("validated packed enum");
+    }
+    while !raw.is_empty() {
+        let value = ::buffa::encoding::decode_varint(&mut raw).expect("validated enum value") as i32;
+        let mut bytes = [0; 15];
+        let mut output = bytes.as_mut_slice();
+        ::buffa::types::put_int32_field(tag.field_number(), value, &mut output);
+        let len = 15 - output.len();
+        visit(&bytes[..len]);
+    }
+}
+
+fn canonical_len(group: u32, raw: &[u8]) -> usize {
+    let mut len = 0;
+    canonical_record(group, raw, |bytes| len += bytes.len());
+    len
 }
 
 fn projection_charge(known: &[u8], map: GroupMap, copies: usize) -> usize {
@@ -305,7 +333,7 @@ fn projection_charge(known: &[u8], map: GroupMap, copies: usize) -> usize {
     for (tag, raw) in records(known) {
         let group = map(tag);
         if group != 0 {
-            bytes = bytes.saturating_add(raw.len().saturating_mul(copies));
+            bytes = bytes.saturating_add(canonical_len(group, raw).saturating_mul(copies));
             if !groups.contains(&group) {
                 groups.push(group);
             }
@@ -336,6 +364,7 @@ impl<'a> Order<'a> {
         for (tag, raw) in records(known) {
             let group = map(tag);
             if group != 0 {
+                if group & (1 << 31) != 0 { return self.unchanged_repeated(known, map); }
                 count += 1;
                 if value(&self.baseline, group) != raw {
                     return self.unchanged_repeated(known, map);
@@ -352,8 +381,12 @@ impl<'a> Order<'a> {
         self.baseline.iter().all(|(group, baseline)| {
             let mut offset = 0;
             for (_, raw) in records(known).filter(|(tag, _)| map(*tag) == *group) {
-                if baseline.get(offset..offset + raw.len()) != Some(raw) { return false; }
-                offset += raw.len();
+                let mut equal = true;
+                canonical_record(*group, raw, |bytes| {
+                    equal &= baseline.get(offset..offset + bytes.len()) == Some(bytes);
+                    offset += bytes.len();
+                });
+                if !equal { return false; }
             }
             offset == baseline.len()
         })
@@ -413,6 +446,18 @@ impl<'a> Order<'a> {
         self.events
             .extend((self.unknown_count..count).map(Event::Unknown));
         self.unknown_count = count;
+    }
+
+    fn append_repeated(&mut self, group: u32, raw: &[u8], ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+        let index = self.baseline.iter().position(|(id, _)| *id == group);
+        let header = if index.is_none() { ::core::mem::size_of::<(u32, Vec<u8>)>() } else { 0 };
+        ctx.register_element_memory(header.saturating_add(canonical_len(group, raw)))?;
+        let index = index.unwrap_or_else(|| {
+            self.baseline.push((group, Vec::new()));
+            self.baseline.len() - 1
+        });
+        canonical_record(group, raw, |bytes| self.baseline[index].1.extend_from_slice(bytes));
+        Ok(())
     }
 
     fn write(&self, known: &[u8], unknown: &[u8], map: GroupMap) -> Vec<u8> {
@@ -666,11 +711,13 @@ impl Storage {
             ctx.register_element_memory(
                 projection_charge(known, map, 1).saturating_add(event_charge(1)),
             )?;
-            order.events.push(Event::Known(
-                group,
-                Cow::Owned(raw.expect("captured known occurrence")),
-            ));
-            order.baseline = projection(known, map);
+            let raw = raw.expect("captured known occurrence");
+            if group & (1 << 31) != 0 {
+                order.append_repeated(group, &raw, ctx)?;
+            } else {
+                order.baseline = projection(known, map);
+            }
+            order.events.push(Event::Known(group, Cow::Owned(raw)));
         }
         ctx.register_element_memory(event_charge(state.fields.len() - order.unknown_count))?;
         order.append_unknown(state.fields.len());
@@ -878,8 +925,12 @@ impl<'a> ViewStorage<'a> {
                     .saturating_add(owned_copy)
                     .saturating_add(event_charge(1)),
             )?;
+            if group & (1 << 31) != 0 {
+                order.append_repeated(group, &raw, ctx)?;
+            } else {
+                order.baseline = projection(known, map);
+            }
             order.events.push(Event::Known(group, raw));
-            order.baseline = projection(known, map);
         }
         ctx.register_element_memory(event_charge(state.count - order.unknown_count))?;
         order.append_unknown(state.count);

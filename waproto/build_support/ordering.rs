@@ -688,7 +688,9 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     continue;
                 };
                 if let Some(field) = method.sig.ident.to_string().strip_prefix("with_")
-                    && let Some(group) = groups.get(field)
+                    && let Some((_, group)) = groups
+                        .iter()
+                        .find(|(name, _)| name.trim_start_matches("r#") == field)
                 {
                     let last = method.block.stmts.pop().expect("setter returns self");
                     method
