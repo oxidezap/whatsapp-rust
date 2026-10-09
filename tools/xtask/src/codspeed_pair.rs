@@ -8,8 +8,8 @@ use std::process::{Command, Output, Stdio};
 use xtask_support::capture;
 
 // Isolated codec comparison: v38 and the candidate retain identical wire semantics.
-// The same 67 benchmark lines are added to both sources.
-const BASE: &str = "9ea2cbacaf920558d22d56bd501bd3072e0b97fa";
+// The same 69 benchmark lines are added to both sources.
+const BASE: &str = "5e6e153759bd1c21101358c556f26f667369e2f8";
 const HEAD: &str = env!("A02_PAIR_HEAD_SHA");
 const CONTRACTS: &[&str] = &[
     "runtime.sha256",
