@@ -1,6 +1,6 @@
 //! Retained public contracts from whatspec 1a441f0. The new locked capture
 //! omits these definitions; that does not establish server-side retirement.
-use crate::{Channel, EventFields, WamEvent, enums};
+use crate::{Channel, EventFields, WamEvent};
 
 /// `RINGTONE_ENTRY_TYPE` (`WAWebWamEnumRingtoneEntryType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -44,7 +44,7 @@ pub struct RingtoneScreen {
     /// `ringtoneSelectionCancelled` (id 4).
     pub ringtone_selection_cancelled: Option<bool>,
     /// `ringtoneSource` (id 5).
-    pub ringtone_source: Option<enums::RingtoneEntryType>,
+    pub ringtone_source: Option<RingtoneEntryType>,
     /// `ringtoneSubscribeSelected` (id 6).
     pub ringtone_subscribe_selected: Option<bool>,
 }
