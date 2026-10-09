@@ -14,7 +14,7 @@ struct Probe {
 impl VisitMut for Probe {
     fn visit_expr_field_mut(&mut self, expr: &mut syn::ExprField) {
         if let syn::Expr::Path(base) = &*expr.base
-            && base.path.is_ident("self")
+            && (base.path.is_ident("self") || base.path.is_ident("view"))
             && let syn::Member::Named(name) = &expr.member
         {
             self.fields.insert(name.to_string());
@@ -137,15 +137,33 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
         let Some(write) = method(item, "write_to") else {
             continue;
         };
+        let owner_name = type_name(item).expect("generated type");
+        let repeated_fields: BTreeSet<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                syn::Item::Struct(owner) if owner.ident == owner_name => Some(owner),
+                _ => None,
+            })
+            .flat_map(|owner| owner.fields.iter())
+            .filter_map(|field| {
+                let syn::Type::Path(path) = &field.ty else {
+                    return None;
+                };
+                path.path
+                    .segments
+                    .last()
+                    .filter(|part| part.ident == "Vec" || part.ident == "RepeatedView")?;
+                field.ident.as_ref().map(ToString::to_string)
+            })
+            .collect();
         let mut groups = BTreeMap::new();
         let mut numbers = BTreeMap::new();
         for statement in &write.block.stmts {
-            // Repeated fields have a different mutation contract; singular
-            // values and oneofs are emitted as individual conditional blocks.
-            if matches!(statement, syn::Stmt::Expr(syn::Expr::ForLoop(_), _)) {
-                continue;
-            }
             let probe = fields(statement);
+            let repeated = probe
+                .fields
+                .iter()
+                .any(|field| repeated_fields.contains(field));
             if (probe.enumeration || probe.choice) && probe.fields.len() == 1 {
                 let name = probe
                     .fields
@@ -153,12 +171,14 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     .next()
                     .expect("one projected field")
                     .clone();
-                if !probe.choice
+                if !repeated
+                    && !probe.choice
                     && let Some(number) = probe.enum_number
                 {
                     numbers.insert(name.clone(), number);
                 }
-                groups.insert(name, groups.len() as u32 + 1);
+                let group = groups.len() as u32 + 1;
+                groups.insert(name, group | if repeated { 1 << 31 } else { 0 });
             }
         }
         if !groups.is_empty() {
@@ -419,6 +439,38 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                 PushDecoded.visit_impl_item_fn_mut(&mut merge);
             } else {
                 PushViewDecoded.visit_impl_item_fn_mut(&mut merge);
+                for statement in &mut merge.block.stmts {
+                    if let syn::Stmt::Expr(syn::Expr::Match(m), _) = statement {
+                        for arm in &mut m.arms {
+                            struct RepeatedUnknown;
+                            impl VisitMut for RepeatedUnknown {
+                                fn visit_expr_method_call_mut(
+                                    &mut self,
+                                    call: &mut syn::ExprMethodCall,
+                                ) {
+                                    visit_mut::visit_expr_method_call_mut(self, call);
+                                    if call.method == "push_decoded_record" {
+                                        call.method = format_ident!("push_decoded_varint");
+                                        call.args = syn::parse_quote!(
+                                            tag.field_number(),
+                                            __raw as u64,
+                                            ctx
+                                        );
+                                    }
+                                }
+                            }
+                            let mut probe = Probe::default();
+                            probe.visit_expr_mut(&mut arm.body.clone());
+                            if probe.fields.iter().any(|field| {
+                                groups
+                                    .get(field)
+                                    .is_some_and(|group| group & (1 << 31) != 0)
+                            }) {
+                                RepeatedUnknown.visit_expr_mut(&mut arm.body);
+                            }
+                        }
+                    }
+                }
             }
             merge.sig.ident = format_ident!("__wire_merge");
             // Both the ordinary decoder and the retained-occurrence adapter
@@ -434,6 +486,7 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                 ),
             );
             let mut retained_merge = None;
+            let mut repeated_merge = None;
             for member in &mut item.items {
                 let syn::ImplItem::Fn(f) = member else {
                     continue;
@@ -471,11 +524,53 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                         })
                     };
                     let mut retained = f.clone();
+                    let split: syn::Stmt = if view {
+                        syn::parse_quote! {
+                            if Self::__wire_group(tag.field_number()) & (1 << 31) != 0 && tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
+                                if check_current && self.__buffa_unknown_fields.active() {
+                                    #runtime::reconcile_view(&mut #runtime::Adapter(self), ctx)?;
+                                }
+                                let mut rest = cur;
+                                let mut packed = ::buffa::types::borrow_bytes(&mut rest)?;
+                                let element_tag = ::buffa::encoding::Tag::new(tag.field_number(), ::buffa::encoding::WireType::Varint);
+                                while !packed.is_empty() {
+                                    packed = self.__wire_merge_element(element_tag, packed, packed, ctx, false)?;
+                                }
+                                return Ok(rest);
+                            }
+                        }
+                    } else {
+                        syn::parse_quote! {
+                            if Self::__wire_group(tag.field_number()) & (1 << 31) != 0 && tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
+                                if check_current && self.__buffa_unknown_fields.active() {
+                                    #runtime::reconcile_owned(&mut #runtime::Adapter(self), ctx)?;
+                                }
+                                let len = ::buffa::encoding::decode_varint(buf)?;
+                                let len = usize::try_from(len).map_err(|_| ::buffa::DecodeError::MessageTooLarge)?;
+                                if ::buffa::bytes::Buf::remaining(buf) < len { return Err(::buffa::DecodeError::UnexpectedEof); }
+                                let mut packed = ::buffa::bytes::Buf::take(&mut *buf, len);
+                                let element_tag = ::buffa::encoding::Tag::new(tag.field_number(), ::buffa::encoding::WireType::Varint);
+                                while ::buffa::bytes::Buf::has_remaining(&packed) {
+                                    self.__wire_merge_element(element_tag, &mut packed, ctx, false)?;
+                                }
+                                return Ok(());
+                            }
+                        }
+                    };
+                    if groups.values().any(|group| group & (1 << 31) != 0) {
+                        retained.block.stmts.insert(0, split);
+                    }
                     retained.sig.ident = format_ident!("__wire_merge_field");
                     retained
                         .sig
                         .inputs
                         .push(syn::parse_quote!(check_current: bool));
+                    if groups.values().any(|group| group & (1 << 31) != 0) {
+                        let mut element = retained.clone();
+                        element.block.stmts.remove(0);
+                        element.sig.ident = format_ident!("__wire_merge_element");
+                        repeated_merge = Some(element);
+                    }
                     retained_merge = Some(retained);
                     f.block = if view {
                         syn::parse_quote!({
@@ -560,6 +655,7 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                 impl #impl_generics #ty #where_clause {
                     #merge
                     #retained_merge
+                    #repeated_merge
                     #[inline]
                     fn __wire_group(tag: u32) -> u32 {
                         match tag { #(#cases)* _ => 0 }

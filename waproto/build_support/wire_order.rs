@@ -193,9 +193,20 @@ pub(crate) fn merge_view<'a>(
         if group == 0 && check_current {
             codec.storage().reconcile(&known, map, ctx)?;
         }
+        let raw = if group & (1 << 31) != 0 {
+            let mut raw = Vec::new();
+            let len = ::buffa::encoding::varint_len(u64::from(tag.field_number()) << 3) + cur.len() - rest.len();
+            ctx.register_element_memory(len)?;
+            raw.reserve_exact(len);
+            tag.encode(&mut raw);
+            raw.extend_from_slice(&cur[..cur.len() - rest.len()]);
+            Cow::Owned(raw)
+        } else {
+            Cow::Borrowed(&before[..before.len() - rest.len()])
+        };
         codec.storage().finish(
             group,
-            &before[..before.len() - rest.len()],
+            raw,
             &known,
             map,
             previous,
@@ -327,11 +338,25 @@ impl<'a> Order<'a> {
             if group != 0 {
                 count += 1;
                 if value(&self.baseline, group) != raw {
-                    return false;
+                    return self.unchanged_repeated(known, map);
                 }
             }
         }
         count == self.baseline.len()
+    }
+    #[cold]
+    fn unchanged_repeated(&self, known: &[u8], map: GroupMap) -> bool {
+        if records(known).any(|(tag, _)| map(tag) != 0 && !self.baseline.iter().any(|(group, _)| *group == map(tag))) {
+            return false;
+        }
+        self.baseline.iter().all(|(group, baseline)| {
+            let mut offset = 0;
+            for (_, raw) in records(known).filter(|(tag, _)| map(*tag) == *group) {
+                if baseline.get(offset..offset + raw.len()) != Some(raw) { return false; }
+                offset += raw.len();
+            }
+            offset == baseline.len()
+        })
     }
     fn begin(known: &[u8], map: GroupMap, count: usize) -> Self {
         let baseline = projection(known, map);
@@ -836,7 +861,7 @@ impl<'a> ViewStorage<'a> {
     pub fn finish(
         &mut self,
         group: u32,
-        raw: &'a [u8],
+        raw: Cow<'a, [u8]>,
         known: &[u8],
         map: GroupMap,
         previous: usize,
@@ -845,13 +870,15 @@ impl<'a> ViewStorage<'a> {
         let state = self.0.as_mut().expect("decoded unknown storage");
         let order = state.order.as_mut().expect("started occurrence journal");
         if group != 0 && previous == state.count {
-            // Charge the borrowed occurrence's eventual owned copy as well.
+            // Borrowed occurrences need an eventual owned copy. Synthetic
+            // repeated-enum records were already charged when materialized.
+            let owned_copy = if matches!(&raw, Cow::Borrowed(_)) { raw.len() } else { 0 };
             ctx.register_element_memory(
                 projection_charge(known, map, 1)
-                    .saturating_add(raw.len())
+                    .saturating_add(owned_copy)
                     .saturating_add(event_charge(1)),
             )?;
-            order.events.push(Event::Known(group, Cow::Borrowed(raw)));
+            order.events.push(Event::Known(group, raw));
             order.baseline = projection(known, map);
         }
         ctx.register_element_memory(event_charge(state.count - order.unknown_count))?;
