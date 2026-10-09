@@ -300,6 +300,55 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
             let compute_cache = argument(&compute, 1);
             let write_cache = argument(&write, 1);
             let write_buf = argument(&write, 2);
+            let mut field_codecs = Vec::new();
+            let mut field_calls = BTreeMap::new();
+            if !enum_values.contains_key(&name) {
+                for (is_compute, helper) in [(true, &mut compute), (false, &mut write)] {
+                    for statement in &mut helper.block.stmts {
+                        let probe = fields(statement);
+                        let Some(field) = probe
+                            .fields
+                            .iter()
+                            .find(|field| groups.contains_key(*field))
+                        else {
+                            continue;
+                        };
+                        assert_eq!(probe.fields.len(), 1, "one generated field per codec block");
+                        let ident = format_ident!(
+                            "__wire_{}_{}",
+                            if is_compute { "size" } else { "write" },
+                            field.trim_start_matches("r#")
+                        );
+                        let mut codec = helper.sig.clone();
+                        codec.ident = ident.clone();
+                        let original = statement.clone();
+                        let block = if is_compute {
+                            codec.output = syn::parse_quote!(-> u64);
+                            quote!({
+                                #[allow(unused_imports)]
+                                use ::buffa::{Enumeration as _, Message as _, MessageView as _, ViewEncode as _};
+                                let mut size = 0u64;
+                                #original
+                                size
+                            })
+                        } else {
+                            quote!({
+                                #[allow(unused_imports)]
+                                use ::buffa::{Enumeration as _, Message as _, MessageView as _, ViewEncode as _};
+                                #original
+                            })
+                        };
+                        field_codecs.push(quote!(#[inline(never)] #codec #block));
+                        let call: syn::Stmt = if is_compute {
+                            syn::parse_quote!(size += self.#ident(#compute_cache);)
+                        } else {
+                            syn::parse_quote!(self.#ident(#write_cache, #write_buf);)
+                        };
+                        field_calls.insert((is_compute, field.clone()), call.clone());
+                        *statement = call;
+                    }
+                }
+            }
             for member in &mut item.items {
                 if let syn::ImplItem::Fn(f) = member {
                     let is_compute = f.sig.ident == "compute_size";
@@ -307,11 +356,28 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                         continue;
                     }
                     f.attrs.retain(|attr| !attr.path().is_ident("inline"));
-                    f.attrs.push(syn::parse_quote!(#[inline(never)]));
+                    // Field bodies are already shared with the projection.
+                    // Let the thin dispatch fold into its caller instead of
+                    // adding a second mandatory call around those helpers.
+                    f.attrs.push(if field_calls.is_empty() {
+                        syn::parse_quote!(#[inline(never)])
+                    } else {
+                        syn::parse_quote!(#[inline])
+                    });
                     let mut unknown = false;
                     for statement in &mut f.block.stmts {
                         let probe = fields(statement);
                         if probe.fields.iter().any(|field| groups.contains_key(field)) {
+                            if let Some(call) = probe
+                                .fields
+                                .iter()
+                                .find_map(|field| field_calls.get(&(is_compute, field.clone())))
+                            {
+                                // Preserve the normal traversal position. The
+                                // projection calls this same field body with
+                                // its own cache, rather than another copy.
+                                *statement = call.clone();
+                            }
                             if let syn::Stmt::Expr(syn::Expr::If(conditional), _) = statement
                                 && conditional.else_branch.is_none()
                             {
@@ -367,6 +433,7 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
             };
             helpers.push(syn::parse_quote! {
                 impl #impl_generics #ty #where_clause {
+                    #(#field_codecs)*
                     #codecs
                     #[cold]
                     pub(crate) fn __wire_known(&self) -> ::buffa::alloc::vec::Vec<u8> {
