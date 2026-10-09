@@ -530,7 +530,11 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     retained
                         .attrs
                         .retain(|attr| !attr.path().is_ident("inline"));
-                    retained.attrs.push(syn::parse_quote!(#[inline]));
+                    retained.attrs.push(if view {
+                        syn::parse_quote!(#[inline(always)])
+                    } else {
+                        syn::parse_quote!(#[inline])
+                    });
                     let split: syn::Stmt = if view {
                         syn::parse_quote! {
                             if Self::__wire_group(tag.field_number()) & (1 << 31) != 0 && tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
