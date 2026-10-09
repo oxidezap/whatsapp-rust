@@ -180,11 +180,9 @@ impl SkippedKey {
         }
     }
 
-    /// A chain's backlog as protobuf entries, every seed-only key sliced out
-    /// of one shared buffer: a store flush re-encodes the backlog of every
-    /// dirty chain, and after an offline drain that is hundreds of keys, so an
-    /// allocation per key per flush was the dominant flush cost. Legacy keys
-    /// keep their boxed protobuf and clone it as before.
+    /// A chain's backlog for protobuf-based component and archive conversion.
+    /// Seed-only entries share one buffer; legacy keys retain their complete
+    /// protobuf. Store serialization writes compact seeds directly instead.
     fn to_pb_list(keys: &[Self]) -> Vec<session_structure::chain::MessageKey> {
         let seed_count = keys
             .iter()
@@ -323,8 +321,7 @@ impl SessionState {
         Self { session, skipped }
     }
 
-    /// Whether any receiver chain holds a skipped key, i.e. whether encoding
-    /// this state needs the backlog reassembled into the protobuf.
+    /// Whether encoding must insert a compact receiver-chain backlog.
     fn has_skipped_keys(&self) -> bool {
         self.skipped
             .iter()

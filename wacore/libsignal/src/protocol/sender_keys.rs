@@ -14,8 +14,8 @@ use sha2::Sha256;
 use crate::protocol::counter_lease::CounterLease;
 use crate::protocol::crypto::hmac_sha256;
 use crate::protocol::record_components::{
-    SenderKeyRecordComponents, sender_state_components_from_structure,
-    sender_state_structure_from_components,
+    SenderKeyRecordComponents, SenderKeyStateComponents, SenderMessageKeyComponents,
+    sender_state_components_from_structure, sender_state_structure_from_components,
 };
 #[cfg(test)]
 use crate::protocol::stores::SenderKeyRecordStructure;
@@ -672,11 +672,11 @@ impl SenderKeyState {
         }
     }
 
-    fn into_protobuf(self) -> SenderKeyStateStructure {
+    fn into_components(self) -> Result<SenderKeyStateComponents, SignalProtocolError> {
         if let Some(state) = self.preserved_protobuf() {
-            return state;
+            return sender_state_components_from_structure(state);
         }
-        {
+        let header = {
             let mut proto_ = SenderKeyStateStructure::default();
             proto_.sender_key_id = self.sender_key_id;
             proto_.sender_chain_key = self
@@ -686,9 +686,21 @@ impl SenderKeyState {
                     MessageField::some(chain.as_protobuf())
                 });
             proto_.sender_signing_key = self.sender_signing_key;
-            proto_.sender_message_keys = StoredMessageKey::as_protobuf_list(&self.message_keys);
             proto_
-        }
+        };
+        let mut components = sender_state_components_from_structure(header)?;
+        // Compact keys already carry a validated u32 and a 32-byte seed.
+        // Export their final Vec directly instead of constructing, slicing,
+        // validating and discarding a protobuf for each shared backlog entry.
+        components.message_keys = self
+            .message_keys
+            .iter()
+            .map(|key| SenderMessageKeyComponents {
+                iteration: key.iteration,
+                seed: key.seed.to_vec(),
+            })
+            .collect();
+        Ok(components)
     }
 
     #[allow(clippy::disallowed_methods)]
@@ -977,8 +989,7 @@ impl SenderKeyRecord {
         let states = self
             .states
             .into_iter()
-            .map(SenderKeyState::into_protobuf)
-            .map(sender_state_components_from_structure)
+            .map(SenderKeyState::into_components)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(SenderKeyRecordComponents { states })
     }
@@ -1425,6 +1436,41 @@ mod tests {
     // module itself no longer encodes anything.
     use crate::protocol::KeyPair;
     use buffa::Message;
+
+    #[test]
+    fn direct_components_match_generated_projection_for_shared_backlogs() {
+        for count in [0, 1, 256] {
+            let mut record = record_with_state(7, 0x42);
+            let state = record.states.front_mut().unwrap();
+            for index in 0..count {
+                state.add_skipped_message_key(index, [0x31; 32]);
+            }
+            for future in [false, true] {
+                let mut proto = state.as_protobuf();
+                if future {
+                    proto.__buffa_unknown_fields.push(buffa::UnknownField {
+                        number: 200,
+                        data: buffa::UnknownFieldData::Varint(17),
+                    });
+                }
+                let shared = SenderKeyState::from_protobuf(proto.clone());
+                let retained = shared.clone();
+                let expected = sender_state_components_from_structure(proto).unwrap();
+                assert_eq!(shared.into_components().unwrap(), expected);
+                assert_eq!(retained.into_components().unwrap(), expected);
+            }
+        }
+        let malformed = SenderKeyStateStructure::default();
+        assert_eq!(
+            SenderKeyState::from_protobuf(malformed.clone())
+                .into_components()
+                .unwrap_err()
+                .to_string(),
+            sender_state_components_from_structure(malformed)
+                .unwrap_err()
+                .to_string()
+        );
+    }
 
     /// An injected derivation has to be indistinguishable from the one the
     /// state would have produced, or the API trades correctness for speed.
