@@ -975,14 +975,19 @@ impl Client {
             batcher: &self.inbound_commit_batch,
             items: is_drain.then(|| Arc::clone(&items)),
             commit_ticket,
-            retained: self.inbound_commit_batch.retention.commit(&items),
+            retained: None,
         };
-        let Some(retained) = &reinsert.retained else {
-            return false;
+        let items = if self.inbound_commit_batch.retention.is_active() {
+            reinsert.retained = self.inbound_commit_batch.retention.commit_active(&items);
+            let Some(retained) = &reinsert.retained else {
+                return false;
+            };
+            retained.canonical_items(items)
+        } else {
+            items
         };
-        let items = retained.canonical_items(items);
         let items = if self.dispatch_gate_enabled() {
-            self.dedup_batch_with_retention(items, Some(retained))
+            self.dedup_batch_with_retention(items, reinsert.retained.as_ref())
         } else {
             items
         };
@@ -1171,8 +1176,8 @@ impl Client {
             let mut settled_keys = reinsert
                 .retained
                 .as_ref()
-                .expect("retention commit acquired")
-                .pending_keys();
+                .map(retention::RetentionCommit::pending_keys)
+                .unwrap_or_default();
             settled_keys.extend(arrived.iter().chain(items.iter()).map(|item| {
                 (
                     item.info.source.chat.to_string(),
@@ -1203,11 +1208,9 @@ impl Client {
         }
 
         reinsert.mark_durable();
-        reinsert
-            .retained
-            .as_mut()
-            .expect("retention commit acquired")
-            .complete();
+        if let Some(retained) = &mut reinsert.retained {
+            retained.complete();
+        }
         #[cfg(test)]
         self.inbound_commit_batch
             .publication_reached

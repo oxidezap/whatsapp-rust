@@ -313,14 +313,22 @@ impl InboundRetention {
         }
     }
     #[inline]
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+    #[cfg(test)]
     pub(crate) fn commit(self: &Arc<Self>, items: &[InboundMessage]) -> Option<RetentionCommit> {
-        if !self.active.load(Ordering::Acquire) {
+        if !self.is_active() {
             return Some(RetentionCommit(None));
         }
         self.commit_active(items)
     }
 
-    fn commit_active(self: &Arc<Self>, items: &[InboundMessage]) -> Option<RetentionCommit> {
+    pub(crate) fn commit_active(
+        self: &Arc<Self>,
+        items: &[InboundMessage],
+    ) -> Option<RetentionCommit> {
+        debug_assert!(self.is_active());
         let mut stanzas = lock(&self.stanzas);
         let mut keys = Vec::new();
         for item in items {
