@@ -42,6 +42,30 @@ impl VisitMut for Extensible {
     }
 }
 
+// Protobuf singular fields and oneofs use the last value on the wire. Retained
+// future values must precede typed fields so a caller's explicit edit wins when
+// a newer reader recognizes both. Apply this to owned messages and views.
+struct UnknownFieldsFirst;
+
+impl VisitMut for UnknownFieldsFirst {
+    fn visit_impl_item_fn_mut(&mut self, method: &mut syn::ImplItemFn) {
+        if method.sig.ident == "write_to"
+            && let Some(index) = method.block.stmts.iter().position(|statement| {
+                matches!(statement,
+                    syn::Stmt::Expr(syn::Expr::MethodCall(call), _)
+                    if call.method == "write_to"
+                        && matches!(&*call.receiver, syn::Expr::Field(field)
+                            if matches!(&field.member, syn::Member::Named(name)
+                                if name == "__buffa_unknown_fields")))
+            })
+        {
+            let unknown = method.block.stmts.remove(index);
+            method.block.stmts.insert(0, unknown);
+        }
+        visit_mut::visit_impl_item_fn_mut(self, method);
+    }
+}
+
 struct ColdStorage {
     depth: usize,
 }
@@ -268,6 +292,7 @@ pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
         let source = std::fs::read_to_string(&path)?;
         let mut file = syn::parse_file(&source).map_err(io::Error::other)?;
         Extensible { serde }.visit_file_mut(&mut file);
+        UnknownFieldsFirst.visit_file_mut(&mut file);
         if serde {
             share_codecs(&mut file.items);
             ColdStorage { depth: 0 }.visit_file_mut(&mut file);
