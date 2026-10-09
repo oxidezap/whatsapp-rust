@@ -239,17 +239,15 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
             compute.sig.ident = format_ident!("__wire_compute");
             write.sig.ident = format_ident!("__wire_write");
             for helper in [&mut compute, &mut write] {
-                helper
-                    .sig
-                    .inputs
-                    .push(syn::parse_quote!(__include_unknown: bool));
-                for statement in &mut helper.block.stmts {
+                // Only selected fields participate in mutation detection. The
+                // remaining fields keep their original generated codec and
+                // traversal-cache entries, avoiding a second whole-message
+                // encoder and copies of unrelated payloads during decoding.
+                helper.block.stmts.retain(|statement| {
                     let probe = fields(statement);
-                    if probe.fields.len() == 1 && probe.fields.contains("__buffa_unknown_fields") {
-                        let original = statement.clone();
-                        *statement = syn::parse_quote!(if __include_unknown { #original });
-                    }
-                }
+                    probe.fields.is_empty()
+                        || probe.fields.iter().any(|field| groups.contains_key(field))
+                });
                 helper.block.stmts.insert(
                     0,
                     syn::parse_quote!(
@@ -263,29 +261,36 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
             let write_buf = argument(&write, 2);
             for member in &mut item.items {
                 if let syn::ImplItem::Fn(f) = member {
-                    if f.sig.ident == "compute_size" || f.sig.ident == "write_to" {
-                        // Journal dispatch is shared even for small messages;
-                        // inlining it into every parent repeats cold machinery.
-                        f.attrs.retain(|attr| !attr.path().is_ident("inline"));
-                        f.attrs.push(syn::parse_quote!(#[inline(never)]));
+                    let is_compute = f.sig.ident == "compute_size";
+                    if !is_compute && f.sig.ident != "write_to" {
+                        continue;
                     }
-                    if f.sig.ident == "compute_size" {
-                        f.block = syn::parse_quote!({
-                            if self.__buffa_unknown_fields.active() {
-                                let bytes = self.__buffa_unknown_fields.compose(&self.__wire_known(), Self::__wire_group);
-                                return #runtime::cache_output(&bytes, #compute_cache);
-                            }
-                            self.__wire_compute(#compute_cache, true)
-                        });
-                    } else if f.sig.ident == "write_to" {
-                        f.block = syn::parse_quote!({
-                            if self.__buffa_unknown_fields.active() {
-                                #runtime::write_cached(#write_cache, #write_buf);
+                    f.attrs.retain(|attr| !attr.path().is_ident("inline"));
+                    f.attrs.push(syn::parse_quote!(#[inline(never)]));
+                    let mut unknown = false;
+                    for statement in &mut f.block.stmts {
+                        let probe = fields(statement);
+                        if probe.fields.iter().any(|field| groups.contains_key(field)) {
+                            let original = statement.clone();
+                            *statement = syn::parse_quote!(if !__wire_active { #original });
+                        } else if probe.fields.contains("__buffa_unknown_fields") {
+                            assert!(!unknown, "one generated unknown-field statement");
+                            unknown = true;
+                            let original = statement.clone();
+                            *statement = if is_compute {
+                                syn::parse_quote!(if __wire_active {
+                                    let bytes = self.__buffa_unknown_fields.compose(&self.__wire_known(), Self::__wire_group);
+                                    size += #runtime::cache_output(&bytes, #compute_cache) as u64;
+                                } else { #original })
                             } else {
-                                self.__wire_write(#write_cache, #write_buf, true);
-                            }
-                        });
+                                syn::parse_quote!(if __wire_active {
+                                    #runtime::write_cached(#write_cache, #write_buf);
+                                } else { #original })
+                            };
+                        }
                     }
+                    assert!(unknown, "generated codec retains unknown fields");
+                    f.block.stmts.insert(0, syn::parse_quote!(let __wire_active = self.__buffa_unknown_fields.active();));
                 }
             }
             helpers.push(syn::parse_quote! {
@@ -295,18 +300,18 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     #[cold]
                     pub(crate) fn __wire_known(&self) -> ::buffa::alloc::vec::Vec<u8> {
                         let mut cache = ::buffa::SizeCache::new();
-                        let size = self.__wire_compute(&mut cache, false);
+                        let size = self.__wire_compute(&mut cache);
                         let mut bytes = ::buffa::alloc::vec::Vec::with_capacity(size as usize);
-                        self.__wire_write(&mut cache, &mut bytes, false);
+                        self.__wire_write(&mut cache, &mut bytes);
                         bytes
                     }
                     #[cold]
                     fn __wire_known_for_decode(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> {
                         let mut cache = ::buffa::SizeCache::new();
-                        let size = self.__wire_compute(&mut cache, false);
+                        let size = self.__wire_compute(&mut cache);
                         ctx.register_element_memory(size as usize)?;
                         let mut bytes = ::buffa::alloc::vec::Vec::with_capacity(size as usize);
-                        self.__wire_write(&mut cache, &mut bytes, false);
+                        self.__wire_write(&mut cache, &mut bytes);
                         Ok(bytes)
                     }
                 }

@@ -374,6 +374,22 @@ fn occurrence_capture_crosses_buffer_chunks_and_rejects_truncation() {
 }
 
 #[test]
+fn cloned_owned_view_keeps_borrowed_occurrences_after_original_drop() {
+    use evolution_fixture::{v1, v2};
+    let wire = [0x2a, 1, b'b', 0x3a, 2, 16, 2];
+    let expected = v2::Record::decode_from_slice(&wire).unwrap();
+    let handle = v1::RecordOwnedView::decode(wire.to_vec().into()).unwrap();
+    let cloned = handle.clone();
+    drop(handle);
+    for bytes in [
+        cloned.view().encode_to_vec(),
+        cloned.to_owned_message().encode_to_vec(),
+    ] {
+        assert_eq!(v2::Record::decode_from_slice(&bytes).unwrap(), expected);
+    }
+}
+
+#[test]
 fn occurrence_metadata_obeys_the_existing_decode_memory_budget() {
     use evolution_fixture::{DecodeError, DecodeOptions, v1};
     let bounded = DecodeOptions::new().with_element_memory_limit(512);
