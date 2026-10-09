@@ -343,6 +343,36 @@ pub fn wire_api(fds: &FileDescriptorSet) -> std::collections::BTreeSet<String> {
                     "wire {path}.{} number={:?} type={:?} label={:?} target={:?} default={:?} oneof={oneof:?}",
                     field.name.as_deref().unwrap_or_default(), field.number, field.r#type, field.label, field.type_name, field.default_value,
                 ));
+                if matches!(field.r#type, Some(Type::TYPE_MESSAGE | Type::TYPE_GROUP)) {
+                    let map_field = message.nested_type.iter().any(|nested| {
+                        nested.options.as_option().and_then(|o| o.map_entry) == Some(true)
+                            && nested.name.as_deref().is_some_and(|name| {
+                                field
+                                    .type_name
+                                    .as_deref()
+                                    .is_some_and(|target| target.ends_with(&format!(".{name}")))
+                            })
+                    });
+                    // Match buffa's effective_type/effective_type_in_map_entry:
+                    // legacy groups stay groups, while map envelopes and the
+                    // inherited default for map values remain length-prefixed.
+                    let mut parent = message_features;
+                    if message.options.as_option().and_then(|o| o.map_entry) == Some(true) {
+                        parent.message_encoding = features::MessageEncoding::LengthPrefixed;
+                    }
+                    let encoding = if field.r#type == Some(Type::TYPE_GROUP) {
+                        features::MessageEncoding::Delimited
+                    } else if map_field {
+                        features::MessageEncoding::LengthPrefixed
+                    } else {
+                        features::resolve_child(&parent, features::field_features(field))
+                            .message_encoding
+                    };
+                    out.insert(format!(
+                        "message-encoding {path}.{}={encoding:?}",
+                        field.name.as_deref().unwrap_or_default(),
+                    ));
+                }
                 if field.label == Some(Label::LABEL_REPEATED)
                     && !matches!(
                         field.r#type,
@@ -391,8 +421,9 @@ pub fn wire_api(fds: &FileDescriptorSet) -> std::collections::BTreeSet<String> {
 mod tests {
     use super::*;
     use buffa_descriptor::generated::descriptor::{
-        FeatureSet, FieldDescriptorProto, FieldOptions, FileDescriptorProto, MessageOptions,
-        feature_set::RepeatedFieldEncoding,
+        Edition, FeatureSet, FieldDescriptorProto, FieldOptions, FileDescriptorProto, FileOptions,
+        MessageOptions,
+        feature_set::{MessageEncoding, RepeatedFieldEncoding},
         field_descriptor_proto::{Label, Type},
     };
 
@@ -465,5 +496,126 @@ mod tests {
             .expect_err("removing packed changes encoded wire bytes");
         super::super::emission::check_api(&expected, &wire_api(&fixture("proto3", None)))
             .expect("equivalent effective packing remains compatible");
+    }
+
+    fn message_fixture(syntax: &str) -> FileDescriptorSet {
+        let mut fds = fixture(syntax, None);
+        let file = &mut fds.file[0];
+        if syntax == "editions" {
+            file.edition = Some(Edition::EDITION_2023);
+        }
+        let field = &mut file.message_type[0].field[0];
+        field.r#type = Some(Type::TYPE_MESSAGE);
+        field.label = Some(Label::LABEL_OPTIONAL);
+        field.type_name = Some(".contract.Child".into());
+        file.message_type.push(DescriptorProto {
+            name: Some("Child".into()),
+            ..Default::default()
+        });
+        fds
+    }
+
+    #[test]
+    fn message_encoding_inventory_resolves_inheritance_and_overrides() {
+        let entry = "message-encoding .contract.Record.values=LengthPrefixed";
+        for syntax in ["proto2", "proto3", "editions"] {
+            assert!(wire_api(&message_fixture(syntax)).contains(entry));
+        }
+        let mut fds = message_fixture("editions");
+        let expected = wire_api(&fds).into_iter().collect::<Vec<_>>().join("\n");
+        let mut explicit = fds.clone();
+        explicit.file[0].message_type[0].field[0]
+            .options
+            .as_option_mut()
+            .unwrap()
+            .features = buffa::MessageField::some(FeatureSet {
+            message_encoding: Some(MessageEncoding::LENGTH_PREFIXED),
+            ..Default::default()
+        });
+        super::super::emission::check_api(&expected, &wire_api(&explicit))
+            .expect("equivalent resolved encoding stays compatible");
+        fds.file[0].options = buffa::MessageField::some(FileOptions {
+            features: buffa::MessageField::some(FeatureSet {
+                message_encoding: Some(MessageEncoding::DELIMITED),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(wire_api(&fds).contains("message-encoding .contract.Record.values=Delimited"));
+        super::super::emission::check_api(&expected, &wire_api(&fds))
+            .expect_err("group and length-prefixed encodings are not wire-compatible");
+        let mut record = fds.file[0].message_type.remove(0);
+        record.options = buffa::MessageField::some(MessageOptions {
+            features: buffa::MessageField::some(FeatureSet {
+                message_encoding: Some(MessageEncoding::LENGTH_PREFIXED),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let parent_options = std::mem::take(&mut record.options);
+        fds.file[0].message_type.push(DescriptorProto {
+            name: Some("Parent".into()),
+            options: parent_options,
+            nested_type: vec![record],
+            ..Default::default()
+        });
+        let field = "message-encoding .contract.Parent.Record.values=";
+        assert!(wire_api(&fds).contains(&format!("{field}LengthPrefixed")));
+        fds.file[0].message_type[1].nested_type[0].field[0]
+            .options
+            .as_option_mut()
+            .unwrap()
+            .features = buffa::MessageField::some(FeatureSet {
+            message_encoding: Some(MessageEncoding::DELIMITED),
+            ..Default::default()
+        });
+        assert!(wire_api(&fds).contains(&format!("{field}Delimited")));
+    }
+
+    #[test]
+    fn message_encoding_preserves_legacy_groups_and_map_encoding() {
+        let mut group = message_fixture("proto2");
+        group.file[0].message_type[0].field[0].r#type = Some(Type::TYPE_GROUP);
+        assert!(wire_api(&group).contains("message-encoding .contract.Record.values=Delimited"));
+
+        let mut map = message_fixture("editions");
+        map.file[0].options = buffa::MessageField::some(FileOptions {
+            features: buffa::MessageField::some(FeatureSet {
+                message_encoding: Some(MessageEncoding::DELIMITED),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let record = &mut map.file[0].message_type[0];
+        record.field[0].label = Some(Label::LABEL_REPEATED);
+        record.field[0].type_name = Some(".contract.Record.ItemsEntry".into());
+        record.nested_type.push(DescriptorProto {
+            name: Some("ItemsEntry".into()),
+            options: buffa::MessageField::some(MessageOptions {
+                map_entry: Some(true),
+                ..Default::default()
+            }),
+            field: vec![
+                FieldDescriptorProto {
+                    name: Some("key".into()),
+                    number: Some(1),
+                    label: Some(Label::LABEL_OPTIONAL),
+                    r#type: Some(Type::TYPE_STRING),
+                    ..Default::default()
+                },
+                FieldDescriptorProto {
+                    name: Some("value".into()),
+                    number: Some(2),
+                    label: Some(Label::LABEL_OPTIONAL),
+                    r#type: Some(Type::TYPE_MESSAGE),
+                    type_name: Some(".contract.Child".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let api = wire_api(&map);
+        assert!(api.contains("message-encoding .contract.Record.values=LengthPrefixed"));
+        assert!(api.contains("message-encoding .contract.Record.ItemsEntry.value=LengthPrefixed"));
     }
 }
