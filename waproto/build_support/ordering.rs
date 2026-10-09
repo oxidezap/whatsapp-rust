@@ -364,6 +364,11 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                 PushViewDecoded.visit_impl_item_fn_mut(&mut merge);
             }
             merge.sig.ident = format_ident!("__wire_merge");
+            // Both the ordinary decoder and the retained-occurrence adapter
+            // call this codec. Inlining small codecs into both routes repeats
+            // their nested decode trees, despite the outer dispatch being cold.
+            merge.attrs.retain(|attr| !attr.path().is_ident("inline"));
+            merge.attrs.push(syn::parse_quote!(#[inline(never)]));
             merge.block.stmts.insert(
                 0,
                 syn::parse_quote!(
