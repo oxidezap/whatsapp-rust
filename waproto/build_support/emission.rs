@@ -399,10 +399,18 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
                 );
                 api.insert(owner.clone());
                 for item in &i.items {
-                    if let syn::ImplItem::Type(associated) = item {
-                        let mut associated = associated.clone();
-                        associated.attrs.clear();
-                        api.insert(format!("associated {owner} {}", tokens(&associated)));
+                    match item {
+                        syn::ImplItem::Type(associated) => {
+                            let mut associated = associated.clone();
+                            associated.attrs.clear();
+                            api.insert(format!("associated {owner} {}", tokens(&associated)));
+                        }
+                        syn::ImplItem::Const(associated) => {
+                            let mut associated = associated.clone();
+                            associated.attrs.clear();
+                            api.insert(format!("associated {owner} {}", tokens(&associated)));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -543,6 +551,29 @@ pub fn check_api(expected: &str, actual: &BTreeSet<String>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trait_constant_values_and_types_are_part_of_the_frozen_api() {
+        let collect = |source: &str| {
+            let file = syn::parse_file(source).unwrap();
+            let mut api = BTreeSet::new();
+            inventory(&file.items, "whatsapp", &mut api);
+            api
+        };
+        let source = "impl MessageName for Message { const FULL_NAME: &'static str = \"whatsapp.Message\"; }";
+        let baseline = collect(source);
+        let expected = baseline.iter().cloned().collect::<Vec<_>>().join("\n");
+        for changed in [
+            "impl MessageName for Message { const FULL_NAME: &'static str = \"whatsapp.Other\"; }",
+            "impl MessageName for Message { const FULL_NAME: &[u8] = b\"whatsapp.Message\"; }",
+            "impl MessageName for Message {}",
+        ] {
+            check_api(&expected, &collect(changed)).expect_err("trait constants are API");
+        }
+        check_api(&expected, &collect(
+            "impl MessageName for Message { const FULL_NAME: &'static str = \"whatsapp.Message\"; const ADDED: u32 = 1; }",
+        )).expect("new associated constants remain additive");
+    }
 
     #[test]
     fn associated_type_mappings_are_part_of_the_frozen_api() {

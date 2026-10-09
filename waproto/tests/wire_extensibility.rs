@@ -44,6 +44,19 @@ fn unknown_closed_enum_value_survives_roundtrip() {
 }
 
 #[test]
+fn replacing_a_future_closed_enum_value_preserves_the_explicit_edit() {
+    let mut message = wa::ADVDeviceIdentity::decode_from_slice(&[0x20, 99]).unwrap();
+    message.account_type = Some(wa::ADVEncryptionType::HOSTED);
+    assert_eq!(message.encode_to_vec(), [0x20, 99, 0x20, 1]);
+    assert_eq!(
+        wa::ADVDeviceIdentity::decode_from_slice(&message.encode_to_vec())
+            .unwrap()
+            .account_type,
+        Some(wa::ADVEncryptionType::HOSTED),
+    );
+}
+
+#[test]
 fn local_seed_and_future_persisted_fields_survive() {
     use wa::session_structure::chain::MessageKey;
     assert_eq!(
