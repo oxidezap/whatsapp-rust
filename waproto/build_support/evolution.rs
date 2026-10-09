@@ -117,9 +117,11 @@ fn schema(new: bool) -> FileDescriptorSet {
         packed: Some(true),
         ..Default::default()
     });
+    let mut state = field("state", 3, Type::TYPE_ENUM);
+    state.type_name = Some(format!(".contract.{message}.{mode}"));
     let repeated_record = DescriptorProto {
         name: Some("RepeatedRecord".into()),
-        field: vec![modes, packed_modes],
+        field: vec![modes, packed_modes, state],
         ..Default::default()
     };
     FileDescriptorSet {
