@@ -1,8 +1,9 @@
 use ::buffa::alloc::boxed::Box;
+use ::core::mem::ManuallyDrop;
 
 /// Unknown records allocate only when present; ordinary messages carry one pointer.
 #[derive(Default)]
-pub struct Storage(Option<Box<::buffa::UnknownFields>>);
+pub struct Storage(ManuallyDrop<Option<Box<::buffa::UnknownFields>>>);
 
 impl ::core::fmt::Debug for Storage {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
@@ -27,6 +28,8 @@ fn equal_nonempty(left: &Storage, right: &Storage) -> bool {
 impl Drop for Storage {
     #[inline]
     fn drop(&mut self) {
+        // The shared helper consumes the allocation. Suppress automatic field
+        // drop so each generated message does not also repeat its cold glue.
         if self.0.is_some() {
             drop_nonempty(&mut self.0);
         }
@@ -55,7 +58,7 @@ impl Clone for Storage {
 #[cold]
 #[inline(never)]
 fn clone_nonempty(value: &::buffa::UnknownFields) -> Storage {
-    Storage(Some(Box::new(value.clone())))
+    Storage(ManuallyDrop::new(Some(Box::new(value.clone()))))
 }
 impl ::core::ops::Deref for Storage {
     type Target = ::buffa::UnknownFields;
@@ -76,7 +79,7 @@ impl From<::buffa::UnknownFields> for Storage {
         if value.is_empty() {
             Self::default()
         } else {
-            Self(Some(Box::new(value)))
+            Self(ManuallyDrop::new(Some(Box::new(value))))
         }
     }
 }
@@ -147,13 +150,13 @@ impl Storage {
     }
     #[inline]
     pub fn write_to(&self, buf: &mut impl ::buffa::EncodeSink) {
-        if let Some(fields) = &self.0 {
+        if let Some(fields) = &*self.0 {
             write_unknown(fields, buf);
         }
     }
     #[inline]
     pub fn clear(&mut self) {
-        self.0 = None;
+        *self.0 = None;
     }
     #[cold]
     #[inline(never)]

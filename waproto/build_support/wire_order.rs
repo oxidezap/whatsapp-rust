@@ -4,6 +4,7 @@
 use ::buffa::alloc::{borrow::Cow, boxed::Box, vec::Vec};
 use ::buffa::bytes::Buf;
 use ::buffa::{DecodeContext, DecodeError, EncodeSink, UnknownField, UnknownFields};
+use ::core::mem::ManuallyDrop;
 
 type GroupMap = fn(u32) -> u32;
 type Projection = Vec<(u32, Vec<u8>)>;
@@ -352,7 +353,7 @@ struct State {
 
 /// Internal storage; raw unknown-field mutation deliberately drops the journal.
 #[derive(Default)]
-pub struct Storage(Option<Box<State>>);
+pub struct Storage(ManuallyDrop<Option<Box<State>>>);
 
 impl Clone for Storage {
     #[inline]
@@ -373,6 +374,8 @@ fn clone_storage(storage: &Storage) -> Storage {
 impl Drop for Storage {
     #[inline]
     fn drop(&mut self) {
+        // The helper empties the option. Its recursive drop must stay shared;
+        // automatic field drop would emit a second copy in every owner.
         if self.0.is_some() {
             drop_storage(&mut self.0);
         }
@@ -434,10 +437,10 @@ impl From<UnknownFields> for Storage {
         if fields.is_empty() {
             Self::default()
         } else {
-            Self(Some(Box::new(State {
+            Self(ManuallyDrop::new(Some(Box::new(State {
                 fields,
                 order: None,
-            })))
+            }))))
         }
     }
 }
@@ -574,7 +577,7 @@ impl Storage {
         }
     }
     pub fn clear(&mut self) {
-        self.0 = None;
+        *self.0 = None;
     }
     /// Rebase only representation differences during view conversion; retain
     /// forced or value-observable edits instead of blessing them as received.
@@ -699,10 +702,10 @@ impl<'a> ViewStorage<'a> {
         self.0.as_ref().map_or_else(
             || Ok(Storage::default()),
             |state| {
-                Ok(Storage(Some(Box::new(State {
+                Ok(Storage(ManuallyDrop::new(Some(Box::new(State {
                     fields: state.fields.to_owned()?,
                     order: state.order.as_ref().map(Order::owned),
-                }))))
+                })))))
             },
         )
     }
