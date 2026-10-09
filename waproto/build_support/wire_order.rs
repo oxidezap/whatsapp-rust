@@ -372,6 +372,7 @@ fn value(values: &Projection, group: u32) -> &[u8] {
 }
 
 impl<'a> Order<'a> {
+    #[inline(always)]
     fn unchanged(&self, known: &[u8], map: GroupMap) -> bool {
         if !self.forced.is_empty() {
             return false;
