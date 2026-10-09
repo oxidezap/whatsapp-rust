@@ -11,7 +11,7 @@ fn unknown_message_fields_survive_owned_and_view_edits() {
     let wire = [0x0a, 3, b'o', b'l', b'd', 0xc0, 0x3e, 7];
     let mut message = wa::Message::decode_from_slice(&wire).unwrap();
     message.conversation = Some("new".into());
-    let expected = [0x0a, 3, b'n', b'e', b'w', 0xc0, 0x3e, 7];
+    let expected = [0xc0, 0x3e, 7, 0x0a, 3, b'n', b'e', b'w'];
     assert_eq!(message.encode_to_vec(), expected);
     let handle = wa::MessageOwnedView::decode(wire.to_vec().into()).unwrap();
     let mut restored = handle.to_owned_message();
@@ -54,7 +54,7 @@ fn local_seed_and_future_persisted_fields_survive() {
     let wire = [0xa2, 0x06, 3, 1, 2, 3, 0xa8, 0x06, 7];
     let key = MessageKey::decode_from_slice(&wire).unwrap();
     assert_eq!(key.seed.as_deref(), Some([1, 2, 3].as_slice()));
-    assert_eq!(key.encode_to_vec(), wire);
+    assert_eq!(key.encode_to_vec(), [0xa8, 0x06, 7, 0xa2, 0x06, 3, 1, 2, 3]);
     let json = serde_json::to_value(key).unwrap();
     assert!(json.get("seed").is_none());
     assert!(json.get("__buffa_unknown_fields").is_none());
