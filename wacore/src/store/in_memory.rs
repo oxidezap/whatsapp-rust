@@ -1174,6 +1174,22 @@ impl ProtocolStore for InMemoryBackend {
             .map(|(bytes, _)| bytes.clone()))
     }
 
+    async fn get_pending_inbound_for_message(
+        &self,
+        chat: &str,
+        id: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .pending_inbound
+            .iter()
+            .filter(|((stored_chat, _, stored_id), _)| stored_chat == chat && stored_id == id)
+            .map(|((_, sender, _), (bytes, _))| (sender.clone(), bytes.clone()))
+            .collect())
+    }
+
     async fn delete_pending_inbound(&self, chat: &str, sender: &str, id: &str) -> Result<()> {
         let key = (chat.to_string(), sender.to_string(), id.to_string());
         self.state.lock().await.pending_inbound.remove(&key);
@@ -1641,6 +1657,44 @@ mod tests {
     #[test]
     fn in_memory_backend_implements_backend() {
         is_backend::<InMemoryBackend>();
+    }
+
+    #[tokio::test]
+    async fn pending_message_lookup_keeps_original_keys_and_bytes() {
+        let backend = InMemoryBackend::new();
+        for sender in ["100:75@lid", "100@lid", "100@s.whatsapp.net"] {
+            backend
+                .store_pending_inbound("group", sender, "id", &[0, 255, 7])
+                .await
+                .unwrap();
+        }
+        backend
+            .store_pending_inbound("group", "100@lid", "other", b"other")
+            .await
+            .unwrap();
+        backend
+            .store_pending_inbound("other", "100@lid", "id", b"other")
+            .await
+            .unwrap();
+        let mut rows = backend
+            .get_pending_inbound_for_message("group", "id")
+            .await
+            .unwrap();
+        rows.sort();
+        assert_eq!(
+            rows,
+            ["100:75@lid", "100@lid", "100@s.whatsapp.net"]
+                .map(|sender| (sender.to_owned(), vec![0, 255, 7]))
+        );
+        for (sender, bytes) in rows {
+            assert_eq!(
+                backend
+                    .get_pending_inbound("group", &sender, "id")
+                    .await
+                    .unwrap(),
+                Some(bytes)
+            );
+        }
     }
 
     /// The batch read returns only what exists, keyed as requested: a send's

@@ -479,18 +479,29 @@ pub(crate) struct ChatLane {
 }
 
 impl ChatLane {
+    #[cfg(test)]
     pub(crate) fn try_enqueue(
         &self,
         node: Arc<wacore_binary::OwnedNodeRef>,
     ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
+        self.try_enqueue_admitted(node, None)
+    }
+
+    pub(crate) fn try_enqueue_admitted(
+        &self,
+        node: Arc<wacore_binary::OwnedNodeRef>,
+        admission: Option<crate::message::retention::InboundAdmission>,
+    ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
         self.queue_tx.try_send(QueuedChatMessage {
             node,
             lane_liveness: Arc::clone(&self.enqueue_lock),
+            admission,
         })
     }
 }
 
 pub(crate) struct QueuedChatMessage {
+    pub admission: Option<crate::message::retention::InboundAdmission>,
     pub node: Arc<wacore_binary::OwnedNodeRef>,
     pub lane_liveness: Arc<Mutex<()>>,
 }
@@ -573,6 +584,11 @@ pub struct MemoryReport {
     /// `InboundCommitBatcher::pending_stats`). Live traffic commits
     /// immediately, so outside an offline drain this is normally zero.
     pub inbound_commit_batch: CollectionStats,
+    /// Admitted durability-mode stanzas, including queued frames, processing,
+    /// and retained failures. Bytes count original decoded-frame lengths, not
+    /// protobuf heap. This reservation overlaps queue/batch storage and is
+    /// excluded from heap totals. One oversized frame can occupy an empty budget.
+    pub inbound_retention: CollectionStats,
     /// Delivery receipts held back during an offline drain, to be flushed as
     /// aggregate `<receipt>` stanzas (WA Web `sendAggregateOfflineReceipts`).
     ///
@@ -613,10 +629,9 @@ pub struct MemoryReport {
     /// Incoming offers still inside the handler, awaiting signaling or identity work.
     pub pending_call_offers: u64,
     /// Inbound messages queued behind their chat's lane worker, summed over
-    /// every lane. The lanes are capacity-bounded; their queues are not, and
-    /// each queued message retains its whole frame, so a worker that is stuck
-    /// (a slow durability hook, a hung decrypt) shows up here as a backlog
-    /// that grows with the chat's inbound rate.
+    /// every lane. With a durability hook, admission bounds queued and processing
+    /// stanzas together with retained failures. Without one, lane queues remain
+    /// unbounded. Each queued message retains its whole frame.
     pub chat_lane_backlog: u64,
     pub group_distribution_locks: u64,
     /// Cumulative capacity evictions; poll successive reports to derive a rate.
@@ -994,6 +1009,7 @@ impl std::fmt::Display for MemoryReport {
         )?;
         writeln!(f, "--- Transient retention ---")?;
         line(f, collections[COMMIT_BATCH].0, &self.inbound_commit_batch)?;
+        line(f, "inbound_retention:", &self.inbound_retention)?;
         line(
             f,
             collections[OFFLINE_RECEIPTS].0,
@@ -1255,11 +1271,10 @@ pub enum SignalMaintenanceError {
     /// A Signal primitive failed (e.g. signing the new signed pre-key).
     #[error("{0}")]
     Signal(#[from] wacore::libsignal::protocol::SignalProtocolError),
-    /// The inbound drain batch could not be committed, so the Signal cache was
-    /// left unflushed on purpose and the server redelivers those messages.
-    #[error(
-        "inbound drain batch commit failed; Signal cache left unflushed so the server redelivers"
-    )]
+    /// The inbound drain batch could not be committed, so its Signal cache
+    /// advances were deliberately left unflushed. This does not guarantee
+    /// another server delivery.
+    #[error("inbound drain batch commit failed; Signal cache left unflushed")]
     DrainCommitFailed,
     /// The client is going away while an inbound drain is active; flushing
     /// there would persist ratchet advances whose messages have no durable row.
@@ -2099,11 +2114,10 @@ pub struct Client {
     /// `OnceLock::get` (no lock) and no per-node guard acquisition.
     pub(crate) custom_enc_handlers: std::sync::OnceLock<HashMap<String, Arc<dyn EncHandler>>>,
 
-    /// Optional inbound durability hook. When set, the transport ack for a
-    /// decrypted user message is deferred until the hook commits it, converting
-    /// the consumer to at-least-once delivery. Set once at `Bot::build` and read
-    /// lock-free on the receive path. `None` (default) keeps the current
-    /// at-most-once behavior with zero overhead.
+    /// Consumer commit barrier for supported inbound delivery receipts.
+    /// Immutable after construction and read lock-free on the receive path.
+    /// `None` keeps the existing message-processing path; the trait documents
+    /// the conditional recovery contract when a hook is installed.
     pub(crate) inbound_durability_hook:
         std::sync::OnceLock<Arc<dyn crate::types::durability_hook::InboundDurabilityHook>>,
 

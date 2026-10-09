@@ -2,6 +2,7 @@
 
 use super::*;
 use smallvec::SmallVec;
+use wacore::types::events::BatchOrigin;
 
 /// Parsed session envelope with explicit retry/ownership semantics.
 ///
@@ -123,6 +124,19 @@ impl Client {
         self.handle_incoming_message_scoped(node, generation).await
     }
 
+    #[cfg(any(test, feature = "bench-harness"))]
+    pub(crate) async fn handle_incoming_message_scoped(
+        self: Arc<Self>,
+        node: Arc<OwnedNodeRef>,
+        lane_generation: u64,
+    ) {
+        let Ok(admission) = self.admit_inbound_stanza(&node) else {
+            return;
+        };
+        self.handle_incoming_message_admitted(node, lane_generation, admission)
+            .await;
+    }
+
     /// `lane_generation` is the generation the CALLER validated (the chat-lane
     /// worker's spawn generation) — not re-read here, so a teardown bump that
     /// lands mid-classification still trips the post-permit re-check instead
@@ -131,10 +145,11 @@ impl Client {
         feature = "tracing",
         tracing::instrument(name = "wa.recv.incoming", level = "debug", skip_all)
     )]
-    pub(crate) async fn handle_incoming_message_scoped(
+    pub(crate) async fn handle_incoming_message_admitted(
         self: Arc<Self>,
         node: Arc<OwnedNodeRef>,
         lane_generation: u64,
+        admission: Option<retention::InboundAdmission>,
     ) {
         // Classification is not side-effect-free (newsletter dispatch,
         // unavailable-only acks, PDO scheduling), so a stale stanza must be
@@ -155,8 +170,26 @@ impl Client {
         };
         // node is no longer borrowed here -- drop it before the heavy phase
         drop(node);
-        self.process_classified_message(classified, lane_generation)
-            .await;
+        if self.inbound_durability_hook().is_none() {
+            self.process_admitted_message(classified, lane_generation, admission)
+                .await;
+            return;
+        }
+        self.start_inbound_recovery();
+        // Own the producer beyond cancellation of a lane's waiter. Shutdown
+        // and teardown can be bounded without dropping decrypted local parts
+        // halfway through a multi-payload stanza.
+        let (completed, completion) = futures::channel::oneshot::channel();
+        let runtime = self.runtime.clone();
+        runtime
+            .spawn(Box::pin(async move {
+                self.clone()
+                    .process_admitted_message(classified, lane_generation, admission)
+                    .await;
+                let _ = completed.send(());
+            }))
+            .detach();
+        let _ = completion.await;
     }
 
     #[cfg_attr(
@@ -469,15 +502,26 @@ impl Client {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) async fn process_classified_message(
+        self: Arc<Self>,
+        msg: ClassifiedMessage,
+        lane_generation: u64,
+    ) {
+        self.process_admitted_message(msg, lane_generation, None)
+            .await;
+    }
+
     /// Phase 2: acquire permit, decrypt payloads, flush. No node borrows.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.recv.process", level = "debug", skip_all)
     )]
-    pub(crate) async fn process_classified_message(
+    async fn process_admitted_message(
         self: Arc<Self>,
         msg: ClassifiedMessage,
         lane_generation: u64,
+        admission: Option<retention::InboundAdmission>,
     ) {
         let ClassifiedMessage {
             info,
@@ -502,6 +546,18 @@ impl Client {
             );
         }
 
+        let _durability_chat = if self.inbound_durability_hook().is_some() {
+            Some(
+                self.inbound_commit_batch
+                    .retention
+                    .chat_gate(&info)
+                    .lock_arc()
+                    .await,
+            )
+        } else {
+            None
+        };
+
         // Acquire the global processing permit (1 during offline sync, N after).
         // The helper re-acquires across a 1→N semaphore swap (offline→online):
         // without that, a task waiting on the old 1-permit semaphore would be
@@ -509,11 +565,12 @@ impl Client {
         // distribution) — and a lost SKDM fails ALL subsequent skmsg from that
         // sender with "No sender key state".
         let _global_permit = self.acquire_message_processing_permit().await;
+        let was_draining = self.inbound_commit_batch.is_active();
         if self.connection_generation.load(Ordering::Acquire) != lane_generation {
             // Teardown bumped the generation while this stanza waited for the
             // permit; its cache settle must be the LAST Signal-cache activity
             // of the connection. Decrypting now would advance ratchets with
-            // no committable entry — bail unacked, the server redelivers.
+            // no committable entry — bail without a receipt.
             log::debug!(
                 "Connection torn down while awaiting the processing permit; leaving message {} for redelivery",
                 info.id
@@ -523,8 +580,7 @@ impl Client {
             // any node it set aside: staying silent would leave a stanza whose
             // malformed `<enc>` was reported and whose decryptable siblings
             // were not, which is the one shape this event promises not to
-            // produce. The stanza is unacked and will come back, and the event
-            // repeats with it.
+            // produce. If another delivery arrives, the event repeats with it.
             for payload in session_payloads
                 .iter()
                 .chain(&group_payloads)
@@ -540,6 +596,45 @@ impl Client {
             return;
         }
 
+        let _collection;
+        if self.inbound_durability_hook().is_some() {
+            let fresh = self
+                .inbound_commit_batch
+                .retention
+                .begin(&info, admission)
+                .await;
+            _collection = Some(self.inbound_commit_batch.retention.collection_guard(&info));
+            if self.connection_generation.load(Ordering::Acquire) != lane_generation {
+                for payload in session_payloads
+                    .iter()
+                    .chain(&group_payloads)
+                    .chain(&bot_payloads)
+                {
+                    self.report_enc_decrypt_failure(
+                        &info,
+                        payload.enc_index,
+                        payload.enc_type.as_wire_str(),
+                        EncDecryptFailureReason::NotAttempted,
+                    );
+                }
+                return;
+            }
+            self.inbound_commit_batch.remove_retained_identity(&info);
+            if fresh {
+                match self.load_pending_inbound(&info).await {
+                    Ok(replay) => self.inbound_commit_batch.retention.seed_replay(replay),
+                    Err(error) => {
+                        log::warn!(
+                            "Pending inbound lookup failed before decrypt; preserving all records and withholding receipt: {error:?}"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
+        // The guard restores partial plaintext on cancellation or an early
+        // return; sealing transfers recovery ownership to the commit path.
         log::debug!(
             "Starting PASS 1: Processing {} session establishment messages (pkmsg/msg)",
             session_payloads.len()
@@ -735,6 +830,25 @@ impl Client {
         // permit + per-chat enqueue lock acquired upstream.
         for payload in bot_payloads {
             self.handle_msmsg_payload(&info, payload).await;
+        }
+
+        let (items, receipt) = self
+            .inbound_commit_batch
+            .retention
+            .seal(&info, was_draining);
+        if !items.is_empty() {
+            // Seal after every payload has entered the shared pipeline.
+            if was_draining {
+                self.commit_or_batch_inbound_items(items, false).await;
+            } else {
+                // A reconnect can re-arm the shared drain while an older live
+                // producer finishes. Keep that producer's immediate commit
+                // inside its chat gate instead of moving it into the new drain.
+                self.commit_inbound_batch(items, BatchOrigin::Live, None)
+                    .await;
+            }
+        } else if receipt {
+            self.ack_received_message(&info);
         }
 
         // Live: coalesce the receive-side flush. A lost advance re-derives

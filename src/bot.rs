@@ -1259,15 +1259,13 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
-    /// Register an inbound durability hook for at-least-once delivery.
+    /// Await a consumer commit before receipts for supported inbound messages.
     ///
-    /// By default the client acks a message as soon as it is decrypted
-    /// (at-most-once): a crash or failed commit before the consumer persists it
-    /// loses the message. With a hook registered, the ack is deferred until the
-    /// hook commits the message; on failure the message is redelivered on the
-    /// next connect. The hook must be idempotent (dedupe by `(chat, sender, id)`,
-    /// since stanza ids are only unique within a chat/sender). See
-    /// [`InboundDurabilityHook`] for the full contract and caveats.
+    /// Buffer and hook failures retain admitted plaintext for local retry while
+    /// this Client lives. This does not guarantee another server delivery or
+    /// crash durability before a pending copy is stored. Commits must be
+    /// idempotent by source and id while preserving distinct payload parts;
+    /// see [`InboundDurabilityHook`] for scope, bounds and recovery limits.
     pub fn with_inbound_durability_hook<Dh>(mut self, hook: Dh) -> Self
     where
         Dh: InboundDurabilityHook + 'static,

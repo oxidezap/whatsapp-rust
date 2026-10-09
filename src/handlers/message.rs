@@ -40,6 +40,19 @@ impl MessageHandler {
         node: Arc<wacore_binary::OwnedNodeRef>,
         cancelled: &mut bool,
     ) -> bool {
+        let admission = match client.admit_inbound_stanza(&node) {
+            Ok(admission) => admission,
+            Err(()) => {
+                // Never await capacity in the read loop: IQ replies and control
+                // traffic may be needed by the workers consuming that capacity.
+                *cancelled = true;
+                client.notify_connection_shutdown();
+                log::warn!(
+                    "Inbound durability admission exhausted; ending this connection without acknowledging the unprocessed stanza"
+                );
+                return true;
+            }
+        };
         let chat_jid = match node.attrs().optional_jid("from") {
             // Normalize AD metadata so the same chat always maps to one lane
             Some(jid) if jid.device > 0 || jid.agent > 0 => jid.to_non_ad(),
@@ -67,12 +80,12 @@ impl MessageHandler {
         // below included (see `create_chat_lane` for why it outlives the lane).
         let _guard = lane.enqueue_lock.lock().await;
 
-        let node = match lane.try_enqueue(node) {
+        let (node, admission) = match lane.try_enqueue_admitted(node, admission) {
             Ok(()) => return true,
             // The worker went idle and closed its queue (see
             // `LANE_IDLE_TIMEOUT`). Replace the lane; the successor worker
             // starts only once the idle one has finished draining.
-            Err(async_channel::TrySendError::Closed(queued)) => queued.node,
+            Err(async_channel::TrySendError::Closed(queued)) => (queued.node, queued.admission),
             Err(e) => {
                 warn!("Failed to enqueue message for processing: {e}");
                 // Cancel ack so server redelivers
@@ -101,7 +114,7 @@ impl MessageHandler {
                     .await
             }
         };
-        if let Err(e) = fresh.try_enqueue(node) {
+        if let Err(e) = fresh.try_enqueue_admitted(node, admission) {
             warn!("Failed to enqueue message for processing: {e}");
             *cancelled = true;
         }
@@ -211,6 +224,7 @@ async fn process_queued(
     client: &Arc<Client>,
     QueuedChatMessage {
         node: msg_node,
+        admission,
         lane_liveness, // Prevents capacity eviction until processing finishes.
     }: QueuedChatMessage,
     spawn_generation: u64,
@@ -231,7 +245,7 @@ async fn process_queued(
     // once-per-chat worker task instead of a fresh ~9 KB heap box
     // per message, which dominated per-message allocation churn.
     Arc::clone(client)
-        .handle_incoming_message_scoped(msg_node, spawn_generation)
+        .handle_incoming_message_admitted(msg_node, spawn_generation, admission)
         .await;
     let elapsed = start.elapsed();
     if elapsed.as_millis() as u64 > MAX_MESSAGE_DELAY_MS {
@@ -395,11 +409,15 @@ mod tests {
         }
     }
 
-    // Exact and width independent: the entry must stay two handles.
-    // Rebaseline per [layout asserts](../../agent_docs/testing.md).
+    // Two handles plus the optional lifetime reservation carried through
+    // queueing, processing and retained recovery. No arbitrary padding budget.
     #[test]
-    fn queued_chat_message_keeps_two_handles() {
-        assert_eq!(size_of::<QueuedChatMessage>(), 2 * size_of::<usize>());
+    fn queued_chat_message_accounts_for_its_admission_reservation() {
+        assert_eq!(
+            size_of::<QueuedChatMessage>(),
+            2 * size_of::<usize>()
+                + size_of::<Option<crate::message::retention::InboundAdmission>>()
+        );
     }
 
     #[cfg(feature = "bench-harness")]
@@ -488,6 +506,7 @@ mod tests {
 
         // 2. process_queued future
         let queued = QueuedChatMessage {
+            admission: None,
             node: Arc::clone(&dummy_node),
             lane_liveness: Arc::new(async_lock::Mutex::new(())),
         };

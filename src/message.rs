@@ -724,6 +724,7 @@ mod dispatch;
 mod durability;
 mod msg_secret;
 mod receive;
+pub(crate) mod retention;
 mod retry;
 mod special;
 

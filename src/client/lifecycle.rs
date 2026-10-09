@@ -1456,16 +1456,13 @@ impl Client {
         );
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
-        // Uncommitted batch entries were never acked; the server redelivers
-        // them on this fresh connection. The cache decision is coupled to the
-        // drop: entries present here mean their cache-only ratchet advances
-        // have no rows (e.g. a stanza that outlived the teardown settle and
-        // enqueued late), and flushing those later would make each redelivery
-        // an ackable duplicate — so the cache falls with them. With nothing
-        // dropped, anything resident is state a failed teardown flush
-        // deliberately retained (committed/acked, never redelivered) for the
-        // next successful flush to persist.
-        if self.inbound_commit_batch.reset() {
+        // Durability mode retains pending plaintext and Signal state across
+        // connections. Legacy mode drops uncommitted entries; their cached
+        // ratchet advances must be discarded with them, not flushed alone.
+        if self
+            .inbound_commit_batch
+            .reset_for_reconnect(self.inbound_durability_hook().is_some())
+        {
             log::warn!(
                 "connect: dropping unflushed Signal state along with late uncommitted drain entries"
             );
@@ -1721,14 +1718,13 @@ impl Client {
         // already-processed backlog (issue #571 semantics). close() only stops
         // outbound task spawns, not buffering, so a message still in flight can
         // re-buffer after this drain; those entries are dropped by the
-        // connection-state reset (clear_offline_receipt_buffer) and the server
-        // redelivers their messages on the next connect, where they are
-        // re-acked fresh.
+        // connection-state reset (clear_offline_receipt_buffer). If a later
+        // delivery arrives, its processing decides whether to receipt it.
         //
         // Commit any accumulated drain batch first so its acks land in this
         // receipt drain. Bounded like the outbound flush below: on timeout the
-        // entries simply stay unacked and the server redelivers them — and the
-        // buffered receipts stay unsent too, because their SKDM/session state
+        // failed commits leave receipts unsent, including already-buffered
+        // receipts, because their SKDM/session state
         // may not be durable yet (receipting an SKDM whose sender key only
         // lives in the cache would lose it to a crash with no redelivery).
         let inbound = self
@@ -2314,11 +2310,12 @@ impl Client {
         self.abandon_offline_sync_if_interrupted(closed_generation);
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
-        // Same rule as receipts: uncommitted entries drop here and the server
-        // redelivers them on the next connect. The cache falls with dropped
-        // entries (rowless advances — including a timed-out settle's restored
-        // batch); with nothing dropped it survives for the next flush.
-        if self.inbound_commit_batch.reset() {
+        // Durability mode preserves plaintext and ratchets. Legacy mode drops
+        // uncommitted entries together with their unflushed cache advances.
+        if self
+            .inbound_commit_batch
+            .reset_for_reconnect(self.inbound_durability_hook().is_some())
+        {
             log::warn!(
                 "cleanup_connection_state: dropping unflushed Signal state along with late uncommitted drain entries"
             );
