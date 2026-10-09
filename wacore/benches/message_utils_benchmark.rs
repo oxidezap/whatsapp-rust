@@ -22,6 +22,11 @@ fn oneof_wire(shape: &str) -> Vec<u8> {
     let mut image = wa::message::ImageMessage::default();
     image.caption = Some("Synthetic image caption".into());
     image.jpeg_thumbnail = Some(vec![0x5a; 64]);
+    let mut quoted = wa::Message::default();
+    quoted.conversation = Some("Synthetic quoted text".into());
+    let mut context = wa::ContextInfo::default();
+    context.quoted_message = Some(quoted).into();
+    image.context_info = Some(context).into();
     let header = wa::message::interactive_message::Header::default()
         .with_title("Synthetic header")
         .with_media(image);
