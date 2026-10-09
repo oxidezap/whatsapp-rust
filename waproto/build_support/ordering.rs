@@ -502,6 +502,36 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     });
                 }
             }
+            // A fresh owner has no public edits to reconcile. Keep the merge
+            // entry points below for callers extending an existing value.
+            item.items.push(if view {
+                syn::parse_quote! {
+                    fn decode_view_ctx(buf: &'a [u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+                        let mut message = Self::default();
+                        let mut cur = buf;
+                        while !cur.is_empty() {
+                            let before_tag = cur;
+                            let tag = ::buffa::encoding::Tag::decode(&mut cur)?;
+                            cur = message.__wire_merge_field::<false>(tag, cur, before_tag, ctx)?;
+                        }
+                        Ok(message)
+                    }
+                }
+            } else {
+                syn::parse_quote! {
+                    fn decode(buf: &mut impl ::buffa::bytes::Buf) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+                        let limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+                        let element_budget = ::core::cell::Cell::new(::buffa::DEFAULT_ELEMENT_MEMORY_LIMIT);
+                        let ctx = ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &limit).with_element_memory(&element_budget);
+                        let mut message = Self::default();
+                        while buf.has_remaining() {
+                            let tag = ::buffa::encoding::Tag::decode(buf)?;
+                            message.__wire_merge_field::<false>(tag, buf, ctx)?;
+                        }
+                        Ok(message)
+                    }
+                }
+            });
             // One exclusive borrow covers the whole loop: public fields cannot
             // change between its iterations. Reconcile edits at the first
             // field, then reuse the baseline maintained by each known merge.
