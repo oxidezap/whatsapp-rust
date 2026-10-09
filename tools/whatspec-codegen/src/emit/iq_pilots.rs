@@ -147,9 +147,13 @@ fn emit_success(op: &Value, pilot: &str, name: &str, out: &mut String) -> Result
     let mut cases = Vec::new();
     let mut seen_error = false;
     for variant in variants {
-        if variant["kind"] != "success" {
-            seen_error = true;
-            continue;
+        match variant["kind"].as_str() {
+            Some("success") => {}
+            Some("error" | "client_error" | "server_error") => {
+                seen_error = true;
+                continue;
+            }
+            _ => bail!("unsupported pilot outcome kind: {}", variant["kind"]),
         }
         ensure!(
             !seen_error,
@@ -361,5 +365,72 @@ mod tests {
             *v["stanzas"][0].pointer_mut(pointer).unwrap() = replacement;
             assert!(emit(&v).is_err(), "accepted {pointer}");
         }
+    }
+
+    #[test]
+    fn only_known_error_kinds_can_be_delegated_to_runtime() {
+        let expected = emit(&fixture()).unwrap();
+        for kind in ["error", "client_error", "server_error"] {
+            let mut v = fixture();
+            v["stanzas"][0]["response"]["variants"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"kind":kind}));
+            assert_eq!(emit(&v).unwrap(), expected);
+        }
+        for outcome in [
+            json!({"kind":"future"}),
+            json!({"kind":"conditional_success"}),
+            json!({"kind":null}),
+            json!({"kind":true}),
+            json!({}),
+        ] {
+            let mut v = fixture();
+            v["stanzas"][0]["response"]["variants"]
+                .as_array_mut()
+                .unwrap()
+                .push(outcome);
+            assert!(
+                emit(&v)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unsupported pilot outcome kind")
+            );
+        }
+    }
+
+    #[test]
+    fn success_dispatch_requires_order_fallback_and_exact_child_guards() {
+        let mut v = fixture();
+        v["stanzas"][0]["response"]["variants"]
+            .as_array_mut()
+            .unwrap()
+            .insert(1, json!({"kind":"error"}));
+        assert!(
+            emit(&v)
+                .unwrap_err()
+                .to_string()
+                .contains("success after an error")
+        );
+        let mut v = fixture();
+        v["stanzas"][0]["response"]["variants"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(
+            emit(&v)
+                .unwrap_err()
+                .to_string()
+                .contains("no bare success fallback")
+        );
+        let mut v = fixture();
+        v["stanzas"][0]["response"]["variants"][0]["assertions"][4]["value"] =
+            json!("extra operand");
+        assert!(
+            emit(&v)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported child guard")
+        );
     }
 }
