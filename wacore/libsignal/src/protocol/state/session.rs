@@ -2294,8 +2294,6 @@ mod tests {
             SkippedKey::Seed { .. }
         ));
         let mut wire = seed_only.encode_to_vec();
-        let mut expected = vec![0xa8, 0x06, 9];
-        expected.extend_from_slice(&wire);
         wire.extend_from_slice(&[0xa8, 0x06, 9]); // future field 101
         let key = session_structure::chain::MessageKey::decode_from_slice(&wire).unwrap();
         let mut chain = session_structure::Chain::default();
@@ -2305,7 +2303,7 @@ mod tests {
         let restored = SessionStructure::from(SessionState::from_session_structure(session));
         assert_eq!(
             restored.receiver_chains[0].message_keys[0].encode_to_vec(),
-            expected
+            wire
         );
     }
 
