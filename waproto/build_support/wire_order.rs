@@ -82,7 +82,9 @@ pub(crate) fn reconcile_owned(
 #[cold]
 #[inline(never)]
 pub(crate) fn complete_owned_batch(codec: &mut dyn OwnedCodec, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+    let reserved = ::core::cell::Cell::new(codec.storage().take_completion_credit());
     if !codec.storage().needs_baseline() { return Ok(()); }
+    let ctx = ctx.with_element_memory(&reserved);
     let known = codec.known(ctx)?;
     let map = codec.groups();
     codec.storage().complete_batch(&known, map, ctx)
@@ -111,6 +113,9 @@ pub(crate) fn merge_owned_known(
     let raw = captured.finish()?;
     let mut payload = raw.as_slice();
     ::buffa::encoding::Tag::decode(&mut payload)?;
+    if !check_current {
+        codec.storage().reserve_baseline(group, raw.len(), ctx)?;
+    }
     // Generated decoders receive their existing slice specialization. Erasing
     // their input buffer would instantiate a second recursive codec tree.
     codec.merge_slice(tag, &mut payload, ctx)?;
@@ -177,7 +182,9 @@ pub(crate) fn reconcile_view<'a>(
 #[cold]
 #[inline(never)]
 pub(crate) fn complete_view_batch<'a>(codec: &mut dyn ViewCodec<'a>, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+    let reserved = ::core::cell::Cell::new(codec.storage().take_completion_credit());
     if !codec.storage().needs_baseline() { return Ok(()); }
+    let ctx = ctx.with_element_memory(&reserved);
     let known = codec.known(ctx)?;
     let map = codec.groups();
     codec.storage().complete_batch(&known, map, ctx)
@@ -199,6 +206,11 @@ pub(crate) fn merge_view<'a>(
     if group != 0 && check_current {
         let known = codec.known(ctx)?;
         codec.storage().reconcile(&known, map, ctx)?;
+    }
+    if group != 0 && !check_current {
+        let mut after = cur;
+        ::buffa::encoding::skip_field_depth(tag, &mut after, ctx.depth())?;
+        codec.storage().reserve_baseline(group, before.len() - after.len(), ctx)?;
     }
     let rest = codec.merge(tag, cur, before, ctx)?;
     let count = codec.storage().len();
@@ -287,6 +299,7 @@ struct Order<'a> {
     forced: Vec<u32>,
     unknown_count: usize,
     baseline_pending: bool,
+    completion_credit: usize,
 }
 
 fn records(mut bytes: &[u8]) -> impl Iterator<Item = (u32, &[u8])> {
@@ -375,6 +388,29 @@ fn value(values: &Projection, group: u32) -> &[u8] {
 }
 
 impl<'a> Order<'a> {
+    fn reserve_baseline(&mut self, group: u32, raw_len: usize, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+        if group & (1 << 31) != 0 && !self.baseline_pending {
+            return Ok(());
+        }
+        // Reserve before mutation: completed occurrences must remain encodable
+        // even if a later decode exhausts the caller's budget. A canonical
+        // int32 can grow from five wire bytes to ten; two copies cover the
+        // temporary encoding and the final projection. Existing values are
+        // charged once per batch, not once per fragment.
+        let header = ::core::mem::size_of::<(u32, Vec<u8>)>() + ::core::mem::size_of::<Event<'_>>();
+        let initial = if self.completion_credit == 0 {
+            self.baseline.iter().fold(0usize, |total, (_, bytes)| {
+                total.saturating_add(bytes.len().saturating_add(20).saturating_mul(2)).saturating_add(header)
+            })
+        } else { 0 };
+        let new_group = !self.baseline.iter().any(|(id, _)| *id == group)
+            && !self.events.iter().any(|event| matches!(event, Event::Known(id, _) if *id == group));
+        let charge = initial.saturating_add(raw_len.saturating_mul(4))
+            .saturating_add(if new_group { header } else { 0 });
+        ctx.register_element_memory(charge)?;
+        self.completion_credit = self.completion_credit.saturating_add(charge);
+        Ok(())
+    }
     fn unchanged(&self, known: &[u8], map: GroupMap) -> bool {
         if !self.forced.is_empty() {
             return false;
@@ -423,6 +459,7 @@ impl<'a> Order<'a> {
             forced: Vec::new(),
             unknown_count: count,
             baseline_pending: false,
+            completion_credit: 0,
         }
     }
 
@@ -507,6 +544,11 @@ impl<'a> Order<'a> {
                 Event::Known(_, _) => {}
             }
         }
+        // A decoded unknown can exhaust the event budget before its index is
+        // appended. Decode then stops, so these records are the received tail.
+        for (_, raw) in unknown {
+            result.extend_from_slice(raw);
+        }
         for group in changed {
             result.extend_from_slice(value(&current, group));
         }
@@ -527,6 +569,7 @@ impl<'a> Order<'a> {
             forced: self.forced.clone(),
             unknown_count: self.unknown_count,
             baseline_pending: self.baseline_pending,
+            completion_credit: self.completion_credit,
         }
     }
 }
@@ -711,7 +754,11 @@ impl Storage {
         map: GroupMap,
         ctx: DecodeContext<'_>,
     ) -> Result<(), DecodeError> {
-        if let Some(order) = self.0.as_mut().and_then(|state| state.order.as_mut()) {
+        if let Some(state) = self.0.as_mut()
+            && let Some(order) = state.order.as_mut()
+        {
+            ctx.register_element_memory(event_charge(state.fields.len() - order.unknown_count))?;
+            order.append_unknown(state.fields.len());
             order.reconcile(known, map, ctx)?;
         }
         Ok(())
@@ -759,6 +806,12 @@ impl Storage {
     }
     pub fn needs_baseline(&self) -> bool {
         self.0.as_ref().and_then(|state| state.order.as_ref()).is_some_and(|order| order.baseline_pending)
+    }
+    fn reserve_baseline(&mut self, group: u32, raw_len: usize, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+        self.0.as_mut().and_then(|state| state.order.as_mut()).expect("active journal").reserve_baseline(group, raw_len, ctx)
+    }
+    fn take_completion_credit(&mut self) -> usize {
+        self.0.as_mut().and_then(|state| state.order.as_mut()).map_or(0, |order| ::core::mem::take(&mut order.completion_credit))
     }
     #[cold]
     #[inline(never)]
@@ -935,7 +988,11 @@ impl<'a> ViewStorage<'a> {
         map: GroupMap,
         ctx: DecodeContext<'_>,
     ) -> Result<(), DecodeError> {
-        if let Some(order) = self.0.as_mut().and_then(|state| state.order.as_mut()) {
+        if let Some(state) = self.0.as_mut()
+            && let Some(order) = state.order.as_mut()
+        {
+            ctx.register_element_memory(event_charge(state.count - order.unknown_count))?;
+            order.append_unknown(state.count);
             order.reconcile(known, map, ctx)?;
         }
         Ok(())
@@ -987,6 +1044,12 @@ impl<'a> ViewStorage<'a> {
     }
     pub fn needs_baseline(&self) -> bool {
         self.0.as_ref().and_then(|state| state.order.as_ref()).is_some_and(|order| order.baseline_pending)
+    }
+    fn reserve_baseline(&mut self, group: u32, raw_len: usize, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+        self.0.as_mut().and_then(|state| state.order.as_mut()).expect("active journal").reserve_baseline(group, raw_len, ctx)
+    }
+    fn take_completion_credit(&mut self) -> usize {
+        self.0.as_mut().and_then(|state| state.order.as_mut()).map_or(0, |order| ::core::mem::take(&mut order.completion_credit))
     }
     #[cold]
     #[inline(never)]
