@@ -1,7 +1,7 @@
 name: Inspect existing CodSpeed profiles
 on:
   push:
-    branches: [qualify/profile-functions-v54-oct09]
+    branches: [qualify/profile-functions-v59-oct09]
 permissions:
   contents: read
   actions: read
@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      A02_PAIR_HEAD_SHA: 2037acbc80cb800605e36a999acb0d848b92b6a4
+      A02_PAIR_HEAD_SHA: 4d650dd727c72d0ba81e0922e1d051966cdf4d41
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -18,8 +18,8 @@ jobs:
           toolchain: nightly-2026-06-16
       - uses: actions/download-artifact@v8
         with:
-          name: cpu-pair-current-fresh-v54-37966682008
-          run-id: 37966682008
+          name: cpu-pair-view-batch-canonical-v59-37973954881
+          run-id: 37973954881
           github-token: ${{ github.token }}
           path: _a02_profiles
       - name: Validate existing pair and print exclusive function costs

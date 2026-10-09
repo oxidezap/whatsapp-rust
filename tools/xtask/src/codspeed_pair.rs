@@ -314,7 +314,7 @@ fn function_costs(text: &str) -> Result<BTreeMap<String, BTreeMap<String, u64>>>
         else {
             continue;
         };
-        if !name.contains("bench_oneof_") || !name.contains("_decode[") {
+        if !name.contains("bench_oneof_") {
             continue;
         }
         let positions = part
