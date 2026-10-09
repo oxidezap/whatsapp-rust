@@ -20,6 +20,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     profiles(Path::new(&args[1]), &mut paths)?;
     paths.sort();
     let mut matched = 0usize;
+    let mut paired = BTreeMap::<(String, String), BTreeMap<String, u64>>::new();
     for path in paths {
         let contents = std::fs::read_to_string(&path)?;
         for part in contents.split("part:").skip(1) {
@@ -86,6 +87,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             if sum != total {
                 return Err(format!("self cost {sum} differs from total {total}").into());
             }
+            let side = if path.components().any(|p| p.as_os_str() == "base") {
+                "base"
+            } else {
+                "head"
+            };
+            if paired
+                .insert((name.to_owned(), side.to_owned()), own.clone())
+                .is_some()
+            {
+                return Err("duplicate side/benchmark profile".into());
+            }
             println!(
                 "PROFILE {}\n{name}: {total} Ir\nSelf instructions:",
                 path.display()
@@ -105,6 +117,32 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if matched == 0 {
         return Err("no matching instrumented profiles".into());
+    }
+    for ((name, side), base) in &paired {
+        if side != "base" {
+            continue;
+        }
+        let Some(head) = paired.get(&(name.clone(), "head".into())) else {
+            continue;
+        };
+        let mut changes = BTreeMap::<String, (u64, u64)>::new();
+        for (name, cost) in base {
+            changes.entry(name.clone()).or_default().0 = *cost;
+        }
+        for (name, cost) in head {
+            changes.entry(name.clone()).or_default().1 = *cost;
+        }
+        let mut rows: Vec<_> = changes.into_iter().collect();
+        rows.sort_by_key(|(_, (b, h))| std::cmp::Reverse(*h as i64 - *b as i64));
+        let delta = head.values().sum::<u64>() as i64 - base.values().sum::<u64>() as i64;
+        println!("DELTA {name}: {delta:+} Ir\nLargest self-cost increases:");
+        for (function, (b, h)) in rows.iter().filter(|(_, (b, h))| h > b).take(30) {
+            println!("{b}\t{h}\t{:+}\t{function}", *h as i64 - *b as i64);
+        }
+        println!("Largest self-cost decreases:");
+        for (function, (b, h)) in rows.iter().rev().filter(|(_, (b, h))| h < b).take(20) {
+            println!("{b}\t{h}\t{:+}\t{function}", *h as i64 - *b as i64);
+        }
     }
     println!("Validated {matched} matching profiles: self instructions equal each captured total.");
     Ok(())

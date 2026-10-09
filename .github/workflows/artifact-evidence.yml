@@ -2,7 +2,7 @@ name: Inspect qualification CPU profiles
 
 on:
   push:
-    branches: [qualify/inspect-v17-cpu-profiles-oct09]
+    branches: [qualify/inspect-v21-cpu-profiles-oct09]
 
 permissions:
   contents: read
@@ -24,8 +24,8 @@ jobs:
       - name: Download preserved CPU pair
         uses: actions/download-artifact@v8
         with:
-          name: cpu-pair-${{ matrix.pr }}-37918372525
-          run-id: 37918372525
+          name: cpu-pair-${{ matrix.pr }}-37925499616
+          run-id: 37925499616
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: _profiles
           digest-mismatch: error
@@ -33,3 +33,4 @@ jobs:
         run: |
           rustc --edition 2024 tools/inspect_cpu_profile.rs -o /tmp/inspect-cpu-profile
           /tmp/inspect-cpu-profile _profiles plaintext_ownership_controls
+          /tmp/inspect-cpu-profile _profiles bench_collect_unique_index_macs_duplicates
