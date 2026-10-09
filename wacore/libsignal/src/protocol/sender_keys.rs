@@ -15,7 +15,8 @@ use crate::protocol::counter_lease::CounterLease;
 use crate::protocol::crypto::hmac_sha256;
 use crate::protocol::record_components::{
     SenderKeyRecordComponents, SenderKeyStateComponents, SenderMessageKeyComponents,
-    sender_state_components_from_structure, sender_state_structure_from_components,
+    sender_components_from_compact_header, sender_state_components_from_structure,
+    validate_sender_state_components,
 };
 #[cfg(test)]
 use crate::protocol::stores::SenderKeyRecordStructure;
@@ -232,6 +233,7 @@ impl SenderChainKey {
         hmac_sha256(&self.chain_key, &label)
     }
 
+    #[cfg(test)]
     pub(crate) fn as_protobuf(&self) -> sender_key_state_structure::SenderChainKey {
         use bytes::Bytes;
         {
@@ -401,6 +403,41 @@ impl SenderKeyState {
             signing_key_memo: std::sync::OnceLock::new(),
             verifying_key_memo: std::sync::OnceLock::new(),
         }
+    }
+
+    fn from_components(value: SenderKeyStateComponents) -> Result<Self, SignalProtocolError> {
+        let value = validate_sender_state_components(value)?;
+        // Components have no future fields. Import directly into the compact
+        // state instead of allocating protobuf chain/backlog records and then
+        // immediately extracting their validated fixed-size seeds again.
+        let sender_chain = SenderChainKey::new(
+            value.chain_key.iteration,
+            value
+                .chain_key
+                .seed
+                .try_into()
+                .expect("validated chain seed"),
+        );
+        let mut signing = sender_key_state_structure::SenderSigningKey::default();
+        signing.public = Some(value.signing_key.public.into());
+        signing.private = value.signing_key.private.map(Into::into);
+        let message_keys = value
+            .message_keys
+            .into_iter()
+            .map(|key| StoredMessageKey {
+                iteration: key.iteration,
+                seed: key.seed.try_into().expect("validated message-key seed"),
+            })
+            .collect();
+        Ok(Self {
+            future: None,
+            sender_key_id: Some(value.key_id),
+            sender_signing_key: Some(std::sync::Arc::new(signing)),
+            message_keys: std::sync::Arc::new(message_keys),
+            sender_chain: Some(sender_chain),
+            signing_key_memo: std::sync::OnceLock::new(),
+            verifying_key_memo: std::sync::OnceLock::new(),
+        })
     }
 
     pub fn message_version(&self) -> u32 {
@@ -675,9 +712,16 @@ impl SenderKeyState {
         if let Some(state) = self.preserved_protobuf() {
             return sender_state_components_from_structure(state);
         }
-        let (header, message_keys) = self.into_header();
-        let mut components = sender_state_components_from_structure(header)?;
-        components.message_keys = message_keys
+        let mut components = sender_components_from_compact_header(
+            self.sender_key_id,
+            self.sender_chain,
+            self.sender_signing_key.map(std::sync::Arc::unwrap_or_clone),
+        )?;
+        // Compact keys already carry a validated u32 and a 32-byte seed.
+        // Export their final Vec directly instead of constructing, slicing,
+        // validating and discarding a protobuf for each shared backlog entry.
+        components.message_keys = self
+            .message_keys
             .iter()
             .map(|key| SenderMessageKeyComponents {
                 iteration: key.iteration,
@@ -687,6 +731,7 @@ impl SenderKeyState {
         Ok(components)
     }
 
+    #[cfg(test)]
     fn into_header(
         self,
     ) -> (
@@ -984,8 +1029,7 @@ impl SenderKeyRecord {
             .states
             .into_iter()
             .take(consts::MAX_SENDER_KEY_STATES)
-            .map(sender_state_structure_from_components)
-            .map(|state| state.map(SenderKeyState::from_protobuf))
+            .map(SenderKeyState::from_components)
             .collect::<Result<VecDeque<_>, _>>()?;
 
         Ok(Self {
@@ -1560,6 +1604,52 @@ mod tests {
         let expected = proto.encode_to_vec();
         let state = SenderKeyState::from_protobuf(proto);
         assert_eq!(state.into_protobuf().encode_to_vec(), expected);
+    }
+
+    #[test]
+    fn compact_component_export_preserves_header_validation() {
+        use bytes::Bytes;
+        let fixture = record_with_state(7, 0x42)
+            .states
+            .pop_front()
+            .expect("fixture state")
+            .as_protobuf();
+        for id in [None, Some(0), Some(u32::MAX)] {
+            for chain_present in [false, true] {
+                for signing_present in [false, true] {
+                    for public_len in [0, 31, 32, 33] {
+                        for private_len in [None, Some(0), Some(32)] {
+                            let mut proto = fixture.clone();
+                            proto.sender_key_id = id;
+                            if !chain_present {
+                                proto.sender_chain_key = MessageField::none();
+                            }
+                            if !signing_present {
+                                proto.sender_signing_key = MessageField::none();
+                            } else {
+                                let signing = proto
+                                    .sender_signing_key
+                                    .as_option_mut()
+                                    .expect("fixture signing key");
+                                signing.public = if public_len == 0 {
+                                    None
+                                } else {
+                                    Some(Bytes::from(vec![5; public_len]))
+                                };
+                                signing.private =
+                                    private_len.map(|length| Bytes::from(vec![0x31; length]));
+                            }
+                            let state = SenderKeyState::from_protobuf(proto);
+                            let expected =
+                                sender_state_components_from_structure(state.as_protobuf())
+                                    .map_err(|error| error.to_string());
+                            let actual = state.into_components().map_err(|error| error.to_string());
+                            assert_eq!(actual, expected);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
