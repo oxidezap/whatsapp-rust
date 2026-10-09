@@ -150,6 +150,7 @@ fn emit_success(op: &Value, pilot: &str, name: &str, out: &mut String) -> Result
         match variant["kind"].as_str() {
             Some("success") => {}
             Some("error" | "client_error" | "server_error") => {
+                validate_delegated_error(variant)?;
                 seen_error = true;
                 continue;
             }
@@ -256,6 +257,62 @@ fn emit_success(op: &Value, pilot: &str, name: &str, out: &mut String) -> Result
     Ok(())
 }
 
+fn validate_delegated_error(variant: &Value) -> Result<()> {
+    ensure!(
+        variant["assertions"]
+            == serde_json::json!([
+                {"kind":"tag","name":"iq"},
+                {"kind":"reference","name":"id","referencePath":["id"]},
+                {"kind":"reference","name":"from","referencePath":["to"]},
+                {"kind":"attr","name":"type","value":"error"}
+            ]),
+        "delegated error envelope changed; review the request-layer boundary"
+    );
+    let fields = variant["fields"]
+        .as_array()
+        .context("missing delegated error fields")?;
+    ensure!(
+        fields.len() == 2
+            && fields[0]
+                == serde_json::json!({
+                    "method":"attrString", "name":"type", "wireName":"type", "type":"string",
+                    "parserRequired":true, "literalValue":"error"
+                }),
+        "delegated error payload changed"
+    );
+    let mut payload = fields[1]
+        .as_object()
+        .context("missing error union")?
+        .clone();
+    ensure!(
+        payload.remove("name").is_some_and(|v| v.is_string()),
+        "missing error union name"
+    );
+    let arms = payload
+        .remove("unionVariants")
+        .context("missing error union arms")?;
+    ensure!(
+        Value::Object(payload)
+            == serde_json::json!({
+                "method":"", "type":"union", "parserRequired":true, "sourcePath":["error"]
+            }),
+        "delegated error child changed"
+    );
+    let arms = arms.as_array().context("invalid error union arms")?;
+    ensure!(
+        !arms.is_empty()
+            && arms.iter().all(|arm| arm["assertions"]
+                .as_array()
+                .is_some_and(|assertions| assertions
+                    .contains(&serde_json::json!({"kind":"tag","name":"error"})))),
+        "delegated error arm is not an error child"
+    );
+    // Codes, text and nested error details remain the request layer's concern.
+    // It rejects every type=error IQ, including unknown/malformed error children;
+    // these checks prevent an IR outcome moving onto its type=result path.
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +345,21 @@ mod tests {
 
     fn emit(v: &Value) -> Result<String> {
         generate(&v.to_string(), "test")
+    }
+
+    fn error_outcome(kind: &str) -> Value {
+        let mut v = fixture()["stanzas"][0]["response"]["variants"][1].clone();
+        v["kind"] = json!(kind);
+        v["assertions"][3]["value"] = json!("error");
+        v["fields"][0]["literalValue"] = json!("error");
+        v["fields"].as_array_mut().unwrap().push(json!({
+            "method":"", "name":"errorUnion", "type":"union", "parserRequired":true,
+            "sourcePath":["error"], "unionVariants":[{
+                "name":"FutureError", "assertions":[{"kind":"tag","name":"error"}],
+                "fields":[]
+            }]
+        }));
+        v
     }
 
     #[test]
@@ -375,7 +447,7 @@ mod tests {
             v["stanzas"][0]["response"]["variants"]
                 .as_array_mut()
                 .unwrap()
-                .push(json!({"kind":kind}));
+                .push(error_outcome(kind));
             assert_eq!(emit(&v).unwrap(), expected);
         }
         for outcome in [
@@ -405,7 +477,7 @@ mod tests {
         v["stanzas"][0]["response"]["variants"]
             .as_array_mut()
             .unwrap()
-            .insert(1, json!({"kind":"error"}));
+            .insert(1, error_outcome("error"));
         assert!(
             emit(&v)
                 .unwrap_err()
@@ -432,5 +504,31 @@ mod tests {
                 .to_string()
                 .contains("unsupported child guard")
         );
+    }
+
+    #[test]
+    fn delegated_errors_cannot_move_onto_the_success_path() {
+        for kind in ["error", "client_error", "server_error"] {
+            for (pointer, replacement) in [
+                ("/assertions/3/value", json!("result")),
+                ("/assertions", json!([])),
+                ("/fields/0/literalValue", json!("result")),
+                ("/fields/1/sourcePath", json!(["result"])),
+                (
+                    "/fields/1/unionVariants/0/assertions",
+                    json!([{"kind":"tag","name":"result"}]),
+                ),
+                ("/fields", json!([])),
+            ] {
+                let mut v = fixture();
+                let mut error = error_outcome(kind);
+                *error.pointer_mut(pointer).unwrap() = replacement;
+                v["stanzas"][0]["response"]["variants"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(error);
+                assert!(emit(&v).is_err(), "accepted {kind} {pointer}");
+            }
+        }
     }
 }
