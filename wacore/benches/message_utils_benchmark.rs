@@ -34,6 +34,77 @@ fn bench_protobuf_clone(bencher: divan::Bencher, shape: &str) {
     bencher.bench(|| black_box(black_box(&message).clone()));
 }
 
+// The nested image and quoted message exercise traversal-cache entries. The
+// synthetic future field appears on either side of a known oneof alternative,
+// to measure both decode positions. Encode measures the known fixture.
+#[allow(clippy::field_reassign_with_default)] // Also works with non-exhaustive generated messages.
+fn oneof_wire(shape: &str) -> Vec<u8> {
+    use buffa::Message as _;
+    let quoted = wa::Message::default().with_conversation("Synthetic quoted text");
+    let mut context = wa::ContextInfo::default();
+    context.quoted_message = Some(quoted).into();
+    let mut image = wa::message::ImageMessage::default()
+        .with_caption("Synthetic image caption")
+        .with_jpeg_thumbnail(vec![0x5a; 64]);
+    image.context_info = Some(context).into();
+    let mut header =
+        wa::message::interactive_message::Header::default().with_title("Synthetic header");
+    header.media =
+        Some(wa::message::interactive_message::header::Media::ImageMessage(Box::new(image)));
+    let known = header.encode_to_vec();
+    let future = [0xc2, 0x3e, 4, 11, 22, 33, 44];
+    match shape {
+        "known" => known,
+        "future_first" => [future.as_slice(), known.as_slice()].concat(),
+        "future_last" => [known.as_slice(), future.as_slice()].concat(),
+        _ => unreachable!("declared benchmark shape"),
+    }
+}
+
+#[divan::bench]
+fn bench_oneof_owned_encode(bencher: divan::Bencher) {
+    use buffa::Message as _;
+    let wire = oneof_wire("known");
+    let message = wa::message::interactive_message::Header::decode_from_slice(&wire)
+        .expect("valid synthetic oneof fixture");
+    assert_eq!(message.encode_to_vec(), wire);
+    bencher.bench(|| black_box(black_box(&message).encode_to_vec()));
+}
+
+#[divan::bench]
+fn bench_oneof_view_encode(bencher: divan::Bencher) {
+    use buffa::{MessageView as _, ViewEncode as _};
+    let wire = oneof_wire("known");
+    let message = wa::message::interactive_message::HeaderView::decode_view(&wire)
+        .expect("valid synthetic oneof fixture");
+    assert_eq!(message.encode_to_vec(), wire);
+    bencher.bench(|| black_box(black_box(&message).encode_to_vec()));
+}
+
+#[divan::bench(args = ["known", "future_first", "future_last"])]
+fn bench_oneof_owned_decode(bencher: divan::Bencher, shape: &str) {
+    use buffa::Message as _;
+    let wire = oneof_wire(shape);
+    bencher.bench(|| {
+        black_box(
+            wa::message::interactive_message::Header::decode_from_slice(black_box(&wire))
+                .expect("valid synthetic oneof fixture"),
+        )
+    });
+}
+
+#[divan::bench(args = ["known", "future_first", "future_last"])]
+fn bench_oneof_view_decode(bencher: divan::Bencher, shape: &str) {
+    use buffa::MessageView as _;
+    let wire = oneof_wire(shape);
+    bencher.bench(|| {
+        black_box(
+            wa::message::interactive_message::HeaderView::decode_view(black_box(&wire))
+                .expect("valid synthetic oneof fixture"),
+        )
+    });
+}
+
 fn setup_device_list(users: usize, devices_per_user: u16) -> Vec<Jid> {
     let mut out = Vec::with_capacity(users * devices_per_user as usize);
     for u in 0..users {
