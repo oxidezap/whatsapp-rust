@@ -1,6 +1,47 @@
 use evolution_fixture::{Message, MessageView, ViewEncode};
 
 #[test]
+fn fragmented_oneof_baseline_is_built_once_per_batch() {
+    use evolution_fixture::{v1, DecodeOptions};
+    let mut wire = vec![0xc0, 0x3e, 7];
+    for _ in 0..512 {
+        wire.extend_from_slice(&[0x3a, 2, 0x18, 0]);
+    }
+    let options = DecodeOptions::new().with_element_memory_limit(128 * 1024);
+    let owned = options.decode_from_slice::<v1::Record>(&wire).unwrap();
+    let view = options.decode_view::<v1::RecordView<'_>>(&wire).unwrap();
+    assert_eq!(owned.encode_to_vec(), wire);
+    assert_eq!(view.encode_to_vec(), wire);
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), wire);
+    let Some(v1::record::Choice::Detail(child)) = &owned.choice else { panic!("detail") };
+    assert_eq!(child.values.len(), 512);
+
+    let mut edited = owned.clone();
+    let Some(v1::record::Choice::Detail(child)) = &mut edited.choice else { panic!("detail") };
+    child.left = Some(9);
+    let output = edited.encode_to_vec();
+    let restored = v1::Record::decode_from_slice(&output).unwrap();
+    let Some(v1::record::Choice::Detail(child)) = &restored.choice else { panic!("detail") };
+    assert_eq!(child.left, Some(9));
+    assert_eq!(child.values.len(), 512);
+}
+
+#[test]
+fn unknown_only_batch_does_not_recopy_a_large_unchanged_baseline() {
+    use evolution_fixture::{v1, DecodeOptions};
+    let mut record = v1::Record::default();
+    let length = if cfg!(miri) { 4 * 1024 } else { 60 * 1024 };
+    record.choice = Some(v1::record::Choice::Text("x".repeat(length)));
+    let mut wire = record.encode_to_vec();
+    wire.extend_from_slice(&[0xc0, 0x3e, 7]);
+    let options = DecodeOptions::new().with_element_memory_limit(4 * length + 1024);
+    let owned = options.decode_from_slice::<v1::Record>(&wire).unwrap();
+    let view = options.decode_view::<v1::RecordView<'_>>(&wire).unwrap();
+    assert_eq!(owned.encode_to_vec(), wire);
+    assert_eq!(view.encode_to_vec(), wire);
+}
+
+#[test]
 fn repeated_nested_message_occurrences_merge_existing_fields() {
     use evolution_fixture::v1;
     // Separate occurrences of child set separate fields of the same message.
@@ -10,6 +51,22 @@ fn repeated_nested_message_occurrences_merge_existing_fields() {
     assert_eq!(record.child.right, Some(2));
     let view = v1::RecordView::decode_view(&wire).unwrap();
     assert_eq!(record, view.to_owned_message().unwrap());
+}
+
+#[test]
+fn failed_fragment_batch_preserves_completed_occurrences() {
+    use evolution_fixture::{v1, DecodeContext};
+    let first = [0xc0, 0x3e, 7, 0x3a, 2, 0x08, 1];
+    let later = [0x3a, 2, 0x10, 2, 0x3a, 3, 0x08];
+    let expected = [&first[..], &later[..4]].concat();
+    let mut owned = v1::Record::decode_from_slice(&first).unwrap();
+    assert!(owned.merge_from_slice(&later).is_err());
+    assert_eq!(owned.encode_to_vec(), expected);
+    let mut view = v1::RecordView::decode_view(&first).unwrap();
+    let limit = core::cell::Cell::new(usize::MAX);
+    assert!(view.merge_into_view(&later, DecodeContext::new(100, &limit)).is_err());
+    assert_eq!(view.encode_to_vec(), expected);
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
 }
 
 #[test]

@@ -594,34 +594,51 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
             }
             // One exclusive borrow covers the whole loop: public fields cannot
             // change between its iterations. Reconcile edits at the first
-            // field, then reuse the baseline maintained by each known merge.
+            // field, then rebuild the baseline once when the batch ends.
+            // Rebuilding a message-valued oneof after every fragment copies
+            // its growing repeated fields quadratically. Retain raw events
+            // throughout the batch, including before an eventual decode error.
             // Direct single-field calls still check on every invocation.
             item.items.push(if view {
                 syn::parse_quote! {
                     fn merge_into_view(&mut self, buf: &'a [u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<(), ::buffa::DecodeError> {
                         let mut cur = buf;
+                        if cur.is_empty() { return Ok(()); }
                         if !cur.is_empty() && self.__buffa_unknown_fields.active() {
                             #runtime::reconcile_view(&mut #runtime::Adapter(self), ctx)?;
                         }
-                        while !cur.is_empty() {
-                            let before_tag = cur;
-                            let tag = ::buffa::encoding::Tag::decode(&mut cur)?;
-                            cur = self.__wire_merge_field(tag, cur, before_tag, ctx, false)?;
-                        }
-                        Ok(())
+                        let result = (|| {
+                            while !cur.is_empty() {
+                                let before_tag = cur;
+                                let tag = ::buffa::encoding::Tag::decode(&mut cur)?;
+                                cur = self.__wire_merge_field(tag, cur, before_tag, ctx, false)?;
+                            }
+                            Ok(())
+                        })();
+                        let completed = if self.__buffa_unknown_fields.active() {
+                            #runtime::complete_view_batch(&mut #runtime::Adapter(self), ctx)
+                        } else { Ok(()) };
+                        result.and(completed)
                     }
                 }
             } else {
                 syn::parse_quote! {
                     fn merge_to_limit(&mut self, buf: &mut impl ::buffa::bytes::Buf, ctx: ::buffa::DecodeContext<'_>, limit: usize) -> ::core::result::Result<(), ::buffa::DecodeError> {
+                        if buf.remaining() <= limit { return Ok(()); }
                         if buf.remaining() > limit && self.__buffa_unknown_fields.active() {
                             #runtime::reconcile_owned(&mut #runtime::Adapter(self), ctx)?;
                         }
-                        while buf.remaining() > limit {
-                            let tag = ::buffa::encoding::Tag::decode(buf)?;
-                            self.__wire_merge_field(tag, buf, ctx, false)?;
-                        }
-                        Ok(())
+                        let result = (|| {
+                            while buf.remaining() > limit {
+                                let tag = ::buffa::encoding::Tag::decode(buf)?;
+                                self.__wire_merge_field(tag, buf, ctx, false)?;
+                            }
+                            Ok(())
+                        })();
+                        let completed = if self.__buffa_unknown_fields.active() {
+                            #runtime::complete_owned_batch(&mut #runtime::Adapter(self), ctx)
+                        } else { Ok(()) };
+                        result.and(completed)
                     }
                 }
             });
@@ -630,7 +647,7 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     fn merge_group(&mut self, buf: &mut impl ::buffa::bytes::Buf, ctx: ::buffa::DecodeContext<'_>, field_number: u32) -> ::core::result::Result<(), ::buffa::DecodeError> {
                         let ctx = ctx.descend()?;
                         let mut first = true;
-                        loop {
+                        let result = (|| { loop {
                             if !buf.has_remaining() {
                                 return Err(::buffa::DecodeError::UnexpectedEof);
                             }
@@ -647,7 +664,11 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                             }
                             first = false;
                             self.__wire_merge_field(tag, buf, ctx, false)?;
-                        }
+                        } })();
+                        let completed = if !first && self.__buffa_unknown_fields.active() {
+                            #runtime::complete_owned_batch(&mut #runtime::Adapter(self), ctx)
+                        } else { Ok(()) };
+                        result.and(completed)
                     }
                 });
             }
