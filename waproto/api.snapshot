@@ -39145,6 +39145,7 @@ method whatsapp::BotAgentMetadataOwnedView fn from_owned (msg : & whatsapp::BotA
 method whatsapp::BotAgentMetadataOwnedView fn into_bytes (self) -> :: buffa :: bytes :: Bytes
 method whatsapp::BotAgentMetadataOwnedView fn to_owned_message (& self) -> whatsapp::BotAgentMetadata
 method whatsapp::BotAgentMetadataOwnedView fn view (& self) -> & BotAgentMetadataView < '_ >
+method whatsapp::BotCapabilityMetadata fn with_capabilities (mut self , value : impl Into < :: buffa :: alloc :: vec :: Vec < bot_capability_metadata :: BotCapabilityType , > >) -> Self
 method whatsapp::BotCapabilityMetadataOwnedView fn bytes (& self) -> & :: buffa :: bytes :: Bytes
 method whatsapp::BotCapabilityMetadataOwnedView fn capabilities (& self ,) -> & :: buffa :: RepeatedView < '_ , whatsapp::bot_capability_metadata::BotCapabilityType , >
 method whatsapp::BotCapabilityMetadataOwnedView fn decode (bytes : :: buffa :: bytes :: Bytes ,) -> :: core :: result :: Result < Self , :: buffa :: DecodeError >
@@ -39153,6 +39154,7 @@ method whatsapp::BotCapabilityMetadataOwnedView fn from_owned (msg : & whatsapp:
 method whatsapp::BotCapabilityMetadataOwnedView fn into_bytes (self) -> :: buffa :: bytes :: Bytes
 method whatsapp::BotCapabilityMetadataOwnedView fn to_owned_message (& self) -> whatsapp::BotCapabilityMetadata
 method whatsapp::BotCapabilityMetadataOwnedView fn view (& self) -> & BotCapabilityMetadataView < '_ >
+method whatsapp::BotCapabilityMetadataView < 'a > fn with_capabilities (mut self , value : impl Into < :: buffa :: RepeatedView < 'a , whatsapp::bot_capability_metadata::BotCapabilityType , > >) -> Self
 method whatsapp::BotCommandMetadata fn with_command_description (mut self , value : impl Into < :: buffa :: alloc :: string :: String > ,) -> Self
 method whatsapp::BotCommandMetadata fn with_command_name (mut self , value : impl Into < :: buffa :: alloc :: string :: String > ,) -> Self
 method whatsapp::BotCommandMetadata fn with_command_prompt (mut self , value : impl Into < :: buffa :: alloc :: string :: String > ,) -> Self
@@ -39426,6 +39428,7 @@ method whatsapp::BotMetricsMetadataOwnedView fn to_owned_message (& self) -> wha
 method whatsapp::BotMetricsMetadataOwnedView fn view (& self) -> & BotMetricsMetadataView < '_ >
 method whatsapp::BotMetricsMetadataView < 'a > fn with_destination_entry_point (mut self , value : impl Into < whatsapp::BotMetricsEntryPoint >) -> Self
 method whatsapp::BotMetricsMetadataView < 'a > fn with_thread_origin (mut self , value : impl Into < whatsapp::BotMetricsThreadEntryPoint >) -> Self
+method whatsapp::BotModeSelectionMetadata fn with_mode (mut self , value : impl Into < :: buffa :: alloc :: vec :: Vec < bot_mode_selection_metadata :: BotUserSelectionMode , > >) -> Self
 method whatsapp::BotModeSelectionMetadataOwnedView fn bytes (& self) -> & :: buffa :: bytes :: Bytes
 method whatsapp::BotModeSelectionMetadataOwnedView fn decode (bytes : :: buffa :: bytes :: Bytes ,) -> :: core :: result :: Result < Self , :: buffa :: DecodeError >
 method whatsapp::BotModeSelectionMetadataOwnedView fn decode_with_options (bytes : :: buffa :: bytes :: Bytes , opts : & :: buffa :: DecodeOptions ,) -> :: core :: result :: Result < Self , :: buffa :: DecodeError >
@@ -39435,6 +39438,7 @@ method whatsapp::BotModeSelectionMetadataOwnedView fn mode (& self ,) -> & :: bu
 method whatsapp::BotModeSelectionMetadataOwnedView fn override_mode (& self) -> & :: buffa :: RepeatedView < '_ , u32 >
 method whatsapp::BotModeSelectionMetadataOwnedView fn to_owned_message (& self) -> whatsapp::BotModeSelectionMetadata
 method whatsapp::BotModeSelectionMetadataOwnedView fn view (& self) -> & BotModeSelectionMetadataView < '_ >
+method whatsapp::BotModeSelectionMetadataView < 'a > fn with_mode (mut self , value : impl Into < :: buffa :: RepeatedView < 'a , whatsapp::bot_mode_selection_metadata::BotUserSelectionMode , > >) -> Self
 method whatsapp::BotModelMetadata fn with_model_name_override (mut self , value : impl Into < :: buffa :: alloc :: string :: String > ,) -> Self
 method whatsapp::BotModelMetadata fn with_model_type (mut self , value : impl Into < bot_model_metadata :: ModelType > ,) -> Self
 method whatsapp::BotModelMetadata fn with_premium_model_status (mut self , value : impl Into < bot_model_metadata :: PremiumModelStatus > ,) -> Self
@@ -49926,6 +49930,7 @@ method whatsapp::sync_action_value::StatusPostOptInNotificationPreferencesAction
 method whatsapp::sync_action_value::StatusPostOptInNotificationPreferencesActionOwnedView fn to_owned_message (& self ,) -> whatsapp::sync_action_value::StatusPostOptInNotificationPreferencesAction
 method whatsapp::sync_action_value::StatusPostOptInNotificationPreferencesActionOwnedView fn view (& self) -> & StatusPostOptInNotificationPreferencesActionView < '_ >
 method whatsapp::sync_action_value::StatusPrivacyAction fn with_mode (mut self , value : impl Into < :: buffa :: EnumValue < whatsapp::sync_action_value::status_privacy_action::StatusDistributionMode , > , > ,) -> Self
+method whatsapp::sync_action_value::StatusPrivacyAction fn with_modes (mut self , value : impl Into < :: buffa :: alloc :: vec :: Vec < :: buffa :: EnumValue < whatsapp::sync_action_value::status_privacy_action::StatusDistributionMode , > , > >) -> Self
 method whatsapp::sync_action_value::StatusPrivacyAction fn with_share_to_fb (mut self , value : bool) -> Self
 method whatsapp::sync_action_value::StatusPrivacyAction fn with_share_to_ig (mut self , value : bool) -> Self
 method whatsapp::sync_action_value::StatusPrivacyActionOwnedView fn bytes (& self) -> & :: buffa :: bytes :: Bytes
@@ -49942,6 +49947,7 @@ method whatsapp::sync_action_value::StatusPrivacyActionOwnedView fn to_owned_mes
 method whatsapp::sync_action_value::StatusPrivacyActionOwnedView fn user_jid (& self) -> & :: buffa :: RepeatedView < '_ , & '_ str >
 method whatsapp::sync_action_value::StatusPrivacyActionOwnedView fn view (& self) -> & StatusPrivacyActionView < '_ >
 method whatsapp::sync_action_value::StatusPrivacyActionView < 'a > fn with_mode (mut self , value : impl Into < :: buffa :: EnumValue < whatsapp::sync_action_value::status_privacy_action::StatusDistributionMode , > >) -> Self
+method whatsapp::sync_action_value::StatusPrivacyActionView < 'a > fn with_modes (mut self , value : impl Into < :: buffa :: RepeatedView < 'a , :: buffa :: EnumValue < whatsapp::sync_action_value::status_privacy_action::StatusDistributionMode , > , > >) -> Self
 method whatsapp::sync_action_value::StickerAction fn with_device_id_hint (mut self , value : u32) -> Self
 method whatsapp::sync_action_value::StickerAction fn with_direct_path (mut self , value : impl Into < :: buffa :: alloc :: string :: String > ,) -> Self
 method whatsapp::sync_action_value::StickerAction fn with_file_enc_sha256 (mut self , value : impl Into < :: buffa :: alloc :: vec :: Vec < u8 > > ,) -> Self

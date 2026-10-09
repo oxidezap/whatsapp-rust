@@ -44,6 +44,20 @@ fn unknown_closed_enum_value_survives_roundtrip() {
 }
 
 #[test]
+fn repeated_bot_selection_retains_future_value_positions() {
+    use waproto::buffa::ViewEncode;
+    let expected = [0x08, 0, 0x08, 2, 0x08, 1];
+    for wire in [expected.as_slice(), &[0x0a, 3, 0, 2, 1]] {
+        let owned = wa::BotModeSelectionMetadata::decode_from_slice(wire).unwrap();
+        let view = wa::BotModeSelectionMetadataView::decode_view(wire).unwrap();
+        assert_eq!(owned.mode.len(), 2);
+        assert_eq!(owned.encode_to_vec(), expected);
+        assert_eq!(view.encode_to_vec(), expected);
+        assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
+    }
+}
+
+#[test]
 fn replacing_a_future_closed_enum_value_preserves_the_explicit_edit() {
     let mut message = wa::ADVDeviceIdentity::decode_from_slice(&[0x20, 99]).unwrap();
     message.account_type = Some(wa::ADVEncryptionType::HOSTED);
