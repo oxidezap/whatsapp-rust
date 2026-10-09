@@ -65,6 +65,7 @@ pub(crate) struct Adapter<'a, T>(pub(crate) &'a mut T);
 pub(crate) trait OwnedCodec {
     fn storage(&mut self) -> &mut Storage;
     fn groups(&self) -> GroupMap;
+    fn growth(&self, tag: u32) -> usize;
     fn known(&self, ctx: DecodeContext<'_>) -> Result<Vec<u8>, DecodeError>;
     fn merge_slice(
         &mut self,
@@ -134,7 +135,8 @@ pub(crate) fn merge_owned_known(
         reserve_record(group, &raw, false, ctx)?
     } else { 0 });
     if !check_current {
-        codec.storage().reserve_baseline(group, raw.len(), ctx)?;
+        let encoded_bound = raw.len().saturating_mul(codec.growth(tag.field_number()));
+        codec.storage().reserve_baseline(group, encoded_bound, ctx)?;
     }
     // Generated decoders receive their existing slice specialization. Erasing
     // their input buffer would instantiate a second recursive codec tree.
@@ -168,6 +170,7 @@ pub(crate) fn finish_owned_unknown(
 pub(crate) trait ViewCodec<'a> {
     fn storage(&mut self) -> &mut ViewStorage<'a>;
     fn groups(&self) -> GroupMap;
+    fn growth(&self, tag: u32) -> usize;
     fn known(&self, ctx: DecodeContext<'_>) -> Result<Vec<u8>, DecodeError>;
     fn merge(
         &mut self,
@@ -235,7 +238,8 @@ pub(crate) fn merge_view<'a>(
         let record_len = raw.len().saturating_add(if group & (1 << 31) != 0 {
             ::buffa::encoding::varint_len(u64::from(tag.field_number()) << 3)
         } else { 0 });
-        codec.storage().reserve_baseline(group, record_len, ctx)?;
+        let encoded_bound = record_len.saturating_mul(codec.growth(tag.field_number()));
+        codec.storage().reserve_baseline(group, encoded_bound, ctx)?;
         reserve_record(group, raw, true, ctx)?
     } else { 0 });
     let rest = codec.merge(tag, cur, before, ctx)?;
@@ -415,13 +419,13 @@ fn value(values: &Projection, group: u32) -> &[u8] {
 }
 
 impl<'a> Order<'a> {
-    fn reserve_baseline(&mut self, group: u32, raw_len: usize, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+    fn reserve_baseline(&mut self, group: u32, encoded_bound: usize, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
         if group & (1 << 31) != 0 && !self.baseline_pending {
             return Ok(());
         }
         // Reserve before mutation: completed occurrences must remain encodable
         // even if a later decode exhausts the caller's budget. A canonical
-        // int32 can grow from five wire bytes to ten; two copies cover the
+        // field's schema bounds packed and signed-integer growth; two copies cover the
         // temporary encoding and the final projection. Existing values are
         // charged once per batch, not once per fragment.
         let header = ::core::mem::size_of::<(u32, Vec<u8>)>() + ::core::mem::size_of::<Event<'_>>();
@@ -432,7 +436,7 @@ impl<'a> Order<'a> {
         } else { 0 };
         let new_group = !self.baseline.iter().any(|(id, _)| *id == group)
             && !self.events.iter().any(|event| matches!(event, Event::Known(id, _) if *id == group));
-        let charge = initial.saturating_add(raw_len.saturating_mul(4))
+        let charge = initial.saturating_add(encoded_bound.saturating_mul(2))
             .saturating_add(if new_group { header } else { 0 });
         ctx.register_element_memory(charge)?;
         self.completion_credit = self.completion_credit.saturating_add(charge);

@@ -129,6 +129,24 @@ fn protocol_type_setter_keeps_same_value_replacement_after_future_type() {
 }
 
 #[test]
+fn image_header_accepts_packed_scan_lengths_within_decode_budget() {
+    use waproto::buffa::{DecodeOptions, ViewEncode};
+    // Future field, imageMessage, then 512 packed values of unpacked scanLengths.
+    let mut wire = vec![0xc0, 0x3e, 7, 0x22, 0x84, 4, 0xb2, 1, 0x80, 4];
+    wire.extend(std::iter::repeat_n(0, 512));
+    let options = DecodeOptions::new().with_element_memory_limit(128 * 1024);
+    let owned = options
+        .decode_from_slice::<wa::message::interactive_message::Header>(&wire)
+        .unwrap();
+    let view = options
+        .decode_view::<wa::message::interactive_message::HeaderView<'_>>(&wire)
+        .unwrap();
+    assert_eq!(owned.encode_to_vec(), wire);
+    assert_eq!(view.encode_to_vec(), wire);
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), wire);
+}
+
+#[test]
 fn failed_protocol_event_reservation_keeps_completed_later_type() {
     use waproto::buffa::{DecodeContext, ViewEncode};
     let first = [0xc0, 0x3e, 7];

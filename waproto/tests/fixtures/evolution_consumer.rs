@@ -1,6 +1,20 @@
 use evolution_fixture::{Message, MessageView, ViewEncode};
 
 #[test]
+fn packed_child_values_fit_the_schema_aware_completion_reservation() {
+    use evolution_fixture::{v1, v2, DecodeOptions};
+    let mut wire = vec![0xc0, 0x3e, 7, 0x3a, 0x84, 4, 0x82, 2, 0x80, 4];
+    wire.extend(std::iter::repeat_n(0, 512));
+    let expected = v2::Record::decode_from_slice(&wire).unwrap();
+    let options = DecodeOptions::new().with_element_memory_limit(128 * 1024);
+    let owned = options.decode_from_slice::<v1::Record>(&wire).unwrap();
+    let view = options.decode_view::<v1::RecordView<'_>>(&wire).unwrap();
+    for bytes in [owned.encode_to_vec(), view.encode_to_vec(), view.to_owned_message().unwrap().encode_to_vec()] {
+        assert_eq!(v2::Record::decode_from_slice(&bytes).unwrap(), expected);
+    }
+}
+
+#[test]
 fn pending_singular_snapshot_covers_expanding_packed_enum_values() {
     use evolution_fixture::{v1, v2, DecodeOptions};
     let mut wire = vec![0xc0, 0x3e, 7, 0x18, 0, 0x12, 0x80, 0x0a];
