@@ -20,4 +20,5 @@ fn incoming_call_uses_the_public_forward_compatible_builder() {
     assert_eq!(call.participant, Some(participant));
     assert_eq!(call.action.call_id(), "CALL-ID-0001");
     assert_eq!(call.ringing_generation(), None);
+    assert_eq!(call.timestamp.unwrap().timestamp(), 1_700_000_000);
 }

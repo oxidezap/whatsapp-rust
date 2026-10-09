@@ -309,8 +309,13 @@ pub struct IncomingCall {
     /// Companion recipient metadata copied from the outer `<call>` wrapper.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recipient: Option<Jid>,
-    #[serde(with = "chrono::serde::ts_seconds")]
-    pub timestamp: DateTime<Utc>,
+    /// Server timestamp, absent on mid-call `enc_rekey` stanzas that omit `t`.
+    /// Key rotation is ordered by its transaction id and does not need a date.
+    #[serde(
+        with = "chrono::serde::ts_seconds_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub timestamp: Option<DateTime<Utc>>,
     pub offline: bool,
     pub action: CallAction,
     /// The offer's `username` attribute, used to enforce calling phone-number
