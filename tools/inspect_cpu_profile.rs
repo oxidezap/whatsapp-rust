@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     paths.sort();
     let mut matched = 0usize;
     for path in paths {
-        let contents = std::fs::read_to_string(path)?;
+        let contents = std::fs::read_to_string(&path)?;
         for part in contents.split("part:").skip(1) {
             let Some(name) = part
                 .lines()
