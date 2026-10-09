@@ -1130,13 +1130,10 @@ mod tests {
 
     #[test]
     fn new_capture_message_fields_are_not_forwarded_as_plain_history_text() {
-        use buffa::Message as _;
-        use waproto::whatsapp as wa;
-
         // conversation="x" plus an empty field 132, 133 or 134. Presence of
         // the new payload is enough to reject it from the text-only path.
         for tag in [0xa2, 0xaa, 0xb2] {
-            let content = wa::Message::decode_from_slice(&[0x0a, 1, b'x', tag, 8, 0]).unwrap();
+            let content = waproto::codec::message_decode(&[0x0a, 1, b'x', tag, 8, 0]).unwrap();
             assert!(!is_shareable_history_text(&content));
         }
     }

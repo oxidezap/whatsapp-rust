@@ -1,4 +1,6 @@
 //! Fixed wire fixtures from the previous schema, independent of regenerated output.
+#![allow(clippy::disallowed_methods)] // Test the generated codec directly.
+
 use buffa::Message as _;
 use waproto::whatsapp as wa;
 
