@@ -39,3 +39,33 @@ fn absent_bundle_families_keep_their_public_types() {
     let _ = wa::ExtendedContentMessage::default();
     let _ = wa::SubProtocol::default();
 }
+
+#[test]
+fn message_clone_preserves_retained_and_new_fields_without_aliasing() {
+    // Retained field 117 contains a nested conversation, and new field 132
+    // contains an empty FutureProofMessage. Both must survive Clone unchanged.
+    let bytes = [0xaa, 0x07, 5, 0x0a, 3, 0x0a, 1, b'x', 0xa2, 0x08, 0];
+    let original = wa::Message::decode_from_slice(&bytes).unwrap();
+    let mut cloned = original.clone();
+    assert_eq!(cloned, original);
+    assert_eq!(cloned.encode_to_vec(), bytes);
+    assert!(cloned.newsletter_scheduled_message.is_set());
+    cloned
+        .newsletter_admin_profile_message_v2
+        .as_option_mut()
+        .unwrap()
+        .message
+        .as_option_mut()
+        .unwrap()
+        .conversation = Some("changed".to_owned());
+    assert_eq!(
+        original
+            .newsletter_admin_profile_message_v2
+            .message
+            .conversation
+            .as_deref(),
+        Some("x")
+    );
+    cloned.clone_from(&original);
+    assert_eq!(cloned, original);
+}

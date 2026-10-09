@@ -23,6 +23,9 @@ use buffa_descriptor::generated::descriptor::{
     DescriptorProto, FieldDescriptorProto, FileDescriptorSet, field_descriptor_proto,
 };
 
+#[path = "build/pin_clone.rs"]
+mod pin_clone;
+
 /// A field this crate persists that the upstream proto does not declare.
 struct LocalField {
     /// Message path inside the `whatsapp` package, e.g. `Outer.Inner`.
@@ -71,6 +74,7 @@ fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=src/whatsapp.desc.sha256");
     println!("cargo:rerun-if-changed=src/whatsapp.proto");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build/pin_clone.rs");
 
     ensure_proto_descriptor_hash()?;
 
@@ -239,6 +243,11 @@ fn main() -> std::io::Result<()> {
         .out_dir(&out_path)
         .compile()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    let generated = out_path.join("whatsapp.rs");
+    let source = std::fs::read_to_string(&generated)?;
+    let source = pin_clone::generate(&source).map_err(std::io::Error::other)?;
+    std::fs::write(generated, source)?;
 
     Ok(())
 }
