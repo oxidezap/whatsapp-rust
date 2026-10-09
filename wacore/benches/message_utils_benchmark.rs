@@ -15,27 +15,9 @@ fn main() {
     divan::main();
 }
 
-/// Track clone ownership and allocation cost separately from encode/decode.
-/// Unknown records are synthetic and include an owned payload inside a group.
-#[divan::bench(args = ["empty", "text", "future_field", "future_group"])]
-fn bench_protobuf_clone(bencher: divan::Bencher, shape: &str) {
-    use buffa::Message as _;
-    let message = match shape {
-        "empty" => wa::Message::default(),
-        "text" => text_message(),
-        "future_field" => wa::Message::decode_from_slice(&[0xc2, 0x3e, 4, 11, 22, 33, 44]).unwrap(),
-        "future_group" => {
-            wa::Message::decode_from_slice(&[0xc3, 0x3e, 0x0a, 4, 11, 22, 33, 44, 0xc4, 0x3e])
-                .unwrap()
-        }
-        _ => unreachable!(),
-    };
-    bencher.bench(|| black_box(black_box(&message).clone()));
-}
-
 // The nested image and quoted message exercise traversal-cache entries. The
 // synthetic future field appears on either side of a known oneof alternative,
-// to measure both decode positions. Encode measures the known fixture.
+// so changes to occurrence retention have separate encode/decode measurements.
 #[allow(clippy::field_reassign_with_default)] // Also works with non-exhaustive generated messages.
 fn oneof_wire(shape: &str) -> Vec<u8> {
     use buffa::Message as _;
@@ -60,23 +42,21 @@ fn oneof_wire(shape: &str) -> Vec<u8> {
     }
 }
 
-#[divan::bench]
-fn bench_oneof_owned_encode(bencher: divan::Bencher) {
+#[divan::bench(args = ["known", "future_first", "future_last"])]
+fn bench_oneof_owned_encode(bencher: divan::Bencher, shape: &str) {
     use buffa::Message as _;
-    let wire = oneof_wire("known");
+    let wire = oneof_wire(shape);
     let message = wa::message::interactive_message::Header::decode_from_slice(&wire)
         .expect("valid synthetic oneof fixture");
-    assert_eq!(message.encode_to_vec(), wire);
     bencher.bench(|| black_box(black_box(&message).encode_to_vec()));
 }
 
-#[divan::bench]
-fn bench_oneof_view_encode(bencher: divan::Bencher) {
+#[divan::bench(args = ["known", "future_first", "future_last"])]
+fn bench_oneof_view_encode(bencher: divan::Bencher, shape: &str) {
     use buffa::{MessageView as _, ViewEncode as _};
-    let wire = oneof_wire("known");
+    let wire = oneof_wire(shape);
     let message = wa::message::interactive_message::HeaderView::decode_view(&wire)
         .expect("valid synthetic oneof fixture");
-    assert_eq!(message.encode_to_vec(), wire);
     bencher.bench(|| black_box(black_box(&message).encode_to_vec()));
 }
 
@@ -102,6 +82,25 @@ fn bench_oneof_view_decode(bencher: divan::Bencher, shape: &str) {
                 .expect("valid synthetic oneof fixture"),
         )
     });
+}
+
+/// Track clone ownership and allocation cost separately from encode/decode.
+/// Unknown records are synthetic and include an owned payload inside a group.
+#[divan::bench(args = ["empty", "text", "future_field", "future_group"])]
+fn bench_protobuf_clone(bencher: divan::Bencher, shape: &str) {
+    use buffa::Message as _;
+    let message = match shape {
+        "empty" => wa::Message::default(),
+        "text" => text_message(),
+        "future_field" => wa::Message::decode_from_slice(&[0xc2, 0x3e, 4, 11, 22, 33, 44])
+            .expect("synthetic future-field clone fixture decodes"),
+        "future_group" => {
+            wa::Message::decode_from_slice(&[0xc3, 0x3e, 0x0a, 4, 11, 22, 33, 44, 0xc4, 0x3e])
+                .expect("synthetic future-group clone fixture decodes")
+        }
+        _ => unreachable!(),
+    };
+    bencher.bench(|| black_box(black_box(&message).clone()));
 }
 
 fn setup_device_list(users: usize, devices_per_user: u16) -> Vec<Jid> {
