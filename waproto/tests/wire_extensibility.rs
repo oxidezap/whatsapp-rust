@@ -129,6 +129,37 @@ fn protocol_type_setter_keeps_same_value_replacement_after_future_type() {
 }
 
 #[test]
+fn failed_protocol_batch_keeps_future_type_after_revoke() {
+    use waproto::buffa::{DecodeContext, ViewEncode};
+    let first = [0xc0, 0x3e, 7];
+    let later = [0x10, 0, 0x10, 99];
+    let expected = [&first[..], &later[..]].concat();
+    for allowance in 0..400 {
+        let unknown = core::cell::Cell::new(usize::MAX);
+        let budget = core::cell::Cell::new(allowance);
+        let mut owned = wa::message::ProtocolMessage::decode_from_slice(&first).unwrap();
+        let _ = owned.merge_to_limit(
+            &mut &later[..],
+            DecodeContext::new(100, &unknown).with_element_memory(&budget),
+            0,
+        );
+        if owned.__buffa_unknown_fields.len() == 2 {
+            assert_eq!(owned.encode_to_vec(), expected, "owned budget {allowance}");
+        }
+        let budget = core::cell::Cell::new(allowance);
+        let mut view = wa::message::ProtocolMessageView::decode_view(&first).unwrap();
+        let _ = view.merge_into_view(
+            &later,
+            DecodeContext::new(100, &unknown).with_element_memory(&budget),
+        );
+        if view.__buffa_unknown_fields.len() == 2 {
+            assert_eq!(view.encode_to_vec(), expected, "view budget {allowance}");
+            assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
+        }
+    }
+}
+
+#[test]
 fn replacing_a_future_closed_enum_value_preserves_the_explicit_edit() {
     let mut message = wa::ADVDeviceIdentity::decode_from_slice(&[0x20, 99]).unwrap();
     message.account_type = Some(wa::ADVEncryptionType::HOSTED);
