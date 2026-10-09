@@ -2,7 +2,7 @@ name: CodSpeed
 
 on:
   push:
-    branches: [main, qualify/gates-stack-cpu-oct09]
+    branches: [main, qualify/shared-slice-v64-cpu-oct09]
     paths-ignore: ["**.md", "docs/**"]
   pull_request:
     branches: [main]
@@ -32,7 +32,7 @@ env:
 
 jobs:
   benchmarks:
-    if: github.ref != 'refs/heads/qualify/gates-stack-cpu-oct09'
+    if: github.ref != 'refs/heads/qualify/shared-slice-v64-cpu-oct09'
     name: Run CodSpeed benchmarks (${{ matrix.shard.name }})
     runs-on: ubuntu-24.04
     # The slowest shard finishes in ~13min. The cap exists because the CodSpeed
@@ -174,7 +174,7 @@ jobs:
     # `credentials.password` rejects the empty string while the job template is
     # being prepared, so the job fails before any step runs and a step-level
     # `if:` cannot save it — the guard has to sit here. Same condition as e2e.yml.
-    if: ${{ github.ref != 'refs/heads/qualify/gates-stack-cpu-oct09' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ github.ref != 'refs/heads/qualify/shared-slice-v64-cpu-oct09' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-24.04
     # These benches drive the real client (connect/reconnect handshakes) under
     # Valgrind, so they are slow; cap the job so a stuck run can't hang CI
@@ -291,7 +291,7 @@ jobs:
 
   a02-cpu-pair:
     # Current production compositions, changing only the pinned benchmark fixture.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/qualify/gates-stack-cpu-oct09' && github.event.before == '0000000000000000000000000000000000000000' && github.run_attempt == 1
+    if: github.event_name == 'push' && github.ref == 'refs/heads/qualify/shared-slice-v64-cpu-oct09' && github.event.before == '0000000000000000000000000000000000000000' && github.run_attempt == 1
     name: Paired CPU (${{ matrix.pr }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -299,12 +299,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - pr: gates-1676
-            head: 4ab2f27d5c8475b05b2fbd28fc9f076d3ce53fa6
-          - pr: gates-1694
-            head: e2c80ba188df6c040c0747b84ffd72d0d8cb1f33
-          - pr: gates-1679
-            head: ed778338c8626dec67b4f4f1767c97ab2531a20c
+          - pr: schema-growth-1676
+            head: 9fbb6ac5c25328fc165e3eaaf4a62b3a83efbb74
+          - pr: shared-slice-v64
+            head: cccbe532e3fb9559ec14fba1b593a7e0f030362a
     env:
       A02_PAIR_HEAD_SHA: ${{ matrix.head }}
       CODSPEED_SKIP_UPLOAD: "true"
