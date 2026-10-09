@@ -8,6 +8,46 @@ use ::buffa::{DecodeContext, DecodeError, EncodeSink, UnknownField, UnknownField
 type GroupMap = fn(u32) -> u32;
 type Projection = Vec<(u32, Vec<u8>)>;
 
+// A journal must not recursively rebuild its children in both encoding passes.
+// Reserve codec-private entries in the public traversal cache for its prepared
+// output. Parent and sibling codecs only see their own entries, in the same
+// reserve/set/consume order. Three bytes per entry keep every value below
+// MAX_MESSAGE_BYTES, including buffa's debug validation of cached values.
+// This scratch storage belongs to one encode, never to the retained message.
+#[cold]
+#[inline(never)]
+pub fn cache_output(bytes: &[u8], cache: &mut ::buffa::SizeCache) -> u32 {
+    let len = ::buffa::saturate_size(bytes.len() as u64);
+    if len > ::buffa::MAX_MESSAGE_BYTES {
+        return len;
+    }
+    let slot = cache.reserve();
+    cache.set(slot, len);
+    for chunk in bytes.chunks(3) {
+        let mut word = [0; 4];
+        word[..chunk.len()].copy_from_slice(chunk);
+        let slot = cache.reserve();
+        cache.set(slot, u32::from_le_bytes(word));
+    }
+    len
+}
+
+#[cold]
+#[inline(never)]
+pub fn write_cached(cache: &mut ::buffa::SizeCache, sink: &mut impl EncodeSink) {
+    let mut remaining = cache.consume_next() as usize;
+    let mut scratch = [0; 192];
+    while remaining != 0 {
+        let len = remaining.min(scratch.len());
+        for chunk in scratch[..len].chunks_mut(3) {
+            let word = cache.consume_next().to_le_bytes();
+            chunk.copy_from_slice(&word[..chunk.len()]);
+        }
+        sink.put_slice(&scratch[..len]);
+        remaining -= len;
+    }
+}
+
 #[derive(Clone, PartialEq, Hash)]
 enum Event<'a> {
     Known(u32, Cow<'a, [u8]>),

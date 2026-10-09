@@ -36,6 +36,10 @@
 //! Equality and hashing include this retained order: identical known fields
 //! can have different meanings for a future schema. Converting the hidden
 //! container into raw `UnknownFields` deliberately discards that distinction.
+//! During encoding, a future-bearing message uses transient traversal-cache
+//! space (four bytes per three prepared output bytes) so nested messages are
+//! prepared once and replayed by the write pass. That cache is not retained in
+//! the message and does not affect messages without an occurrence journal.
 //!
 //! The Rust source (`whatsapp.rs`) is produced by `build.rs` from the
 //! pre-compiled descriptor set `whatsapp.desc`, and written to `OUT_DIR` —
