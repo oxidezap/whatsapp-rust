@@ -19,29 +19,19 @@ fn setup_mutations(n: usize) -> Vec<wa::SyncdMutation> {
         .map(|i| {
             let mut index_mac = vec![0u8; 32];
             index_mac[..8].copy_from_slice(&i.to_le_bytes());
-            {
-                let mut proto = wa::SyncdMutation::default();
-                proto.operation = Some(wa::syncd_mutation::SyncdOperation::Set.into());
-                proto.record = buffa::MessageField::some({
-                    let mut proto = wa::SyncdRecord::default();
-                    proto.index = buffa::MessageField::some({
-                        let mut proto = wa::SyncdIndex::default();
-                        proto.blob = Some(index_mac);
-                        proto
-                    });
-                    proto.value = buffa::MessageField::some({
-                        let mut proto = wa::SyncdValue::default();
-                        proto.blob = Some(vec![0x5A; 48]);
-                        proto
-                    });
-                    proto.key_id = buffa::MessageField::some({
-                        let mut proto = wa::KeyId::default();
-                        proto.id = Some(b"AAAA".to_vec());
-                        proto
-                    });
-                    proto
-                });
-                proto
+            wa::SyncdMutation {
+                operation: Some(wa::syncd_mutation::SyncdOperation::Set.into()),
+                record: buffa::MessageField::some(wa::SyncdRecord {
+                    index: buffa::MessageField::some(wa::SyncdIndex {
+                        blob: Some(index_mac),
+                    }),
+                    value: buffa::MessageField::some(wa::SyncdValue {
+                        blob: Some(vec![0x5A; 48]),
+                    }),
+                    key_id: buffa::MessageField::some(wa::KeyId {
+                        id: Some(b"AAAA".to_vec()),
+                    }),
+                }),
             }
         })
         .collect()

@@ -5296,7 +5296,6 @@ dependencies = [
  "portable-atomic",
  "rand 0.10.3",
  "serde",
- "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
  "subtle",
@@ -5361,13 +5360,12 @@ dependencies = [
  "buffa-descriptor",
  "bytes",
  "heck",
- "prettyplease 0.2.37",
- "quote",
+ "prettyplease 0.3.0",
  "serde",
  "serde_json",
  "serde_repr",
  "sha2 0.11.0",
- "syn 2.0.119",
+ "syn 3.0.6",
 ]
 
 [[package]]

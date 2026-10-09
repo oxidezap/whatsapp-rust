@@ -4,27 +4,19 @@ use waproto::whatsapp as wa;
 
 // Helper to build a SyncdRecord with provided key id and value blob (iv+ciphertext+valuemac appended later in logic)
 fn make_record(key_id: &[u8], value_with_mac: Vec<u8>, index_mac: Vec<u8>) -> wa::SyncdRecord {
-    {
-        let mut proto = wa::SyncdRecord::default();
-        proto.index = {
-            let mut proto = wa::SyncdIndex::default();
-            proto.blob = Some(index_mac);
-            proto
+    wa::SyncdRecord {
+        index: wa::SyncdIndex {
+            blob: Some(index_mac),
         }
-        .into();
-        proto.value = {
-            let mut proto = wa::SyncdValue::default();
-            proto.blob = Some(value_with_mac);
-            proto
+        .into(),
+        value: wa::SyncdValue {
+            blob: Some(value_with_mac),
         }
-        .into();
-        proto.key_id = {
-            let mut proto = wa::KeyId::default();
-            proto.id = Some(key_id.to_vec());
-            proto
+        .into(),
+        key_id: wa::KeyId {
+            id: Some(key_id.to_vec()),
         }
-        .into();
-        proto
+        .into(),
     }
 }
 
@@ -70,17 +62,13 @@ fn snapshot_and_patch_mac_roundtrip() {
     let index_mac1 = vec![9u8; 32];
     let index_mac2 = vec![8u8; 32];
 
-    let mutation1 = {
-        let mut proto = wa::SyncdMutation::default();
-        proto.operation = Some(wa::syncd_mutation::SyncdOperation::SET.into());
-        proto.record = make_record(key_id, value_blob1.clone(), index_mac1.clone()).into();
-        proto
+    let mutation1 = wa::SyncdMutation {
+        operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+        record: make_record(key_id, value_blob1.clone(), index_mac1.clone()).into(),
     };
-    let mutation2 = {
-        let mut proto = wa::SyncdMutation::default();
-        proto.operation = Some(wa::syncd_mutation::SyncdOperation::SET.into());
-        proto.record = make_record(key_id, value_blob2.clone(), index_mac2.clone()).into();
-        proto
+    let mutation2 = wa::SyncdMutation {
+        operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+        record: make_record(key_id, value_blob2.clone(), index_mac2.clone()).into(),
     };
 
     let mutations = vec![mutation1.clone(), mutation2.clone()];
@@ -94,23 +82,18 @@ fn snapshot_and_patch_mac_roundtrip() {
     let snapshot_mac = state.generate_snapshot_mac("regular_high", &keys.snapshot_mac);
 
     // Now build a patch referencing snapshot MAC and containing same mutations to compute patch MAC
-    let patch = {
-        let mut proto = wa::SyncdPatch::default();
-        proto.version = {
-            let mut proto = wa::SyncdVersion::default();
-            proto.version = Some(state.version);
-            proto
+    let patch = wa::SyncdPatch {
+        version: wa::SyncdVersion {
+            version: Some(state.version),
         }
-        .into();
-        proto.mutations = mutations.clone();
-        proto.snapshot_mac = Some(snapshot_mac.clone());
-        proto.key_id = {
-            let mut proto = wa::KeyId::default();
-            proto.id = Some(key_id.to_vec());
-            proto
+        .into(),
+        mutations: mutations.clone(),
+        snapshot_mac: Some(snapshot_mac.clone()),
+        key_id: wa::KeyId {
+            id: Some(key_id.to_vec()),
         }
-        .into();
-        proto
+        .into(),
+        ..Default::default()
     };
 
     let patch_mac = generate_patch_mac(&patch, "regular_high", &keys.patch_mac, state.version);

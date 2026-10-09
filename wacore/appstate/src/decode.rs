@@ -210,24 +210,16 @@ mod tests {
         value_blob.extend_from_slice(&value_mac);
 
         let index_bytes = action_data.index.as_deref().unwrap_or(&[]);
-        {
-            let mut proto = wa::SyncdRecord::default();
-            proto.index = buffa::MessageField::some({
-                let mut proto = wa::SyncdIndex::default();
-                proto.blob = Some(generate_index_mac(index_bytes, &keys.index));
-                proto
-            });
-            proto.value = buffa::MessageField::some({
-                let mut proto = wa::SyncdValue::default();
-                proto.blob = Some(value_blob);
-                proto
-            });
-            proto.key_id = buffa::MessageField::some({
-                let mut proto = wa::KeyId::default();
-                proto.id = Some(key_id.to_vec());
-                proto
-            });
-            proto
+        wa::SyncdRecord {
+            index: buffa::MessageField::some(wa::SyncdIndex {
+                blob: Some(generate_index_mac(index_bytes, &keys.index)),
+            }),
+            value: buffa::MessageField::some(wa::SyncdValue {
+                blob: Some(value_blob),
+            }),
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(key_id.to_vec()),
+            }),
         }
     }
 
@@ -237,14 +229,12 @@ mod tests {
         let keys = expand_app_state_keys(&master_key);
         let key_id = b"test_key_id".to_vec();
 
-        let action_data = {
-            let mut proto = wa::SyncActionData::default();
-            proto.value = buffa::MessageField::some({
-                let mut proto = wa::SyncActionValue::default();
-                proto.timestamp = Some(1234567890);
-                proto
-            });
-            proto
+        let action_data = wa::SyncActionData {
+            value: buffa::MessageField::some(wa::SyncActionValue {
+                timestamp: Some(1234567890),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
 
         let record = create_test_record(
@@ -281,14 +271,12 @@ mod tests {
         let keys = expand_app_state_keys(&master_key);
         let key_id = b"test_key_id".to_vec();
 
-        let action_data = {
-            let mut proto = wa::SyncActionData::default();
-            proto.value = buffa::MessageField::some({
-                let mut proto = wa::SyncActionValue::default();
-                proto.timestamp = Some(1234567890);
-                proto
-            });
-            proto
+        let action_data = wa::SyncActionData {
+            value: buffa::MessageField::some(wa::SyncActionValue {
+                timestamp: Some(1234567890),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
 
         let record = create_test_record(
@@ -315,14 +303,12 @@ mod tests {
         let keys = expand_app_state_keys(&master_key);
         let key_id = b"test_key_id".to_vec();
 
-        let action_data = {
-            let mut proto = wa::SyncActionData::default();
-            proto.value = buffa::MessageField::some({
-                let mut proto = wa::SyncActionValue::default();
-                proto.timestamp = Some(1234567890);
-                proto
-            });
-            proto
+        let action_data = wa::SyncActionData {
+            value: buffa::MessageField::some(wa::SyncActionValue {
+                timestamp: Some(1234567890),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         let mut record = create_test_record(
             wa::syncd_mutation::SyncdOperation::SET,
@@ -332,10 +318,8 @@ mod tests {
         );
         // Tamper the stored index MAC: with no index field the old code skipped the
         // check entirely and accepted this; WA Web (and now we) reject it.
-        record.index = buffa::MessageField::some({
-            let mut proto = wa::SyncdIndex::default();
-            proto.blob = Some(vec![0xFF; 32]);
-            proto
+        record.index = buffa::MessageField::some(wa::SyncdIndex {
+            blob: Some(vec![0xFF; 32]),
         });
 
         let err = decode_record(
@@ -362,15 +346,13 @@ mod tests {
     }
 
     fn valid_action_data() -> wa::SyncActionData {
-        {
-            let mut proto = wa::SyncActionData::default();
-            proto.index = Some(br#"["mute","1555550100@s.whatsapp.net"]"#.to_vec());
-            proto.value = buffa::MessageField::some({
-                let mut proto = wa::SyncActionValue::default();
-                proto.timestamp = Some(1234567890);
-                proto
-            });
-            proto
+        wa::SyncActionData {
+            index: Some(br#"["mute","1555550100@s.whatsapp.net"]"#.to_vec()),
+            value: buffa::MessageField::some(wa::SyncActionValue {
+                timestamp: Some(1234567890),
+                ..Default::default()
+            }),
+            ..Default::default()
         }
     }
 
@@ -394,24 +376,16 @@ mod tests {
         let mut value_blob = value_with_iv;
         value_blob.extend_from_slice(&value_mac);
 
-        {
-            let mut proto = wa::SyncdRecord::default();
-            proto.index = buffa::MessageField::some({
-                let mut proto = wa::SyncdIndex::default();
-                proto.blob = Some(generate_index_mac(index_bytes, &keys.index));
-                proto
-            });
-            proto.value = buffa::MessageField::some({
-                let mut proto = wa::SyncdValue::default();
-                proto.blob = Some(value_blob);
-                proto
-            });
-            proto.key_id = buffa::MessageField::some({
-                let mut proto = wa::KeyId::default();
-                proto.id = Some(key_id.to_vec());
-                proto
-            });
-            proto
+        wa::SyncdRecord {
+            index: buffa::MessageField::some(wa::SyncdIndex {
+                blob: Some(generate_index_mac(index_bytes, &keys.index)),
+            }),
+            value: buffa::MessageField::some(wa::SyncdValue {
+                blob: Some(value_blob),
+            }),
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(key_id.to_vec()),
+            }),
         }
     }
 
@@ -423,11 +397,7 @@ mod tests {
             .and_then(|v| v.blob.clone())
             .expect("fixture record has a value blob");
         f(&mut blob);
-        record.value = buffa::MessageField::some({
-            let mut proto = wa::SyncdValue::default();
-            proto.blob = Some(blob);
-            proto
-        });
+        record.value = buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) });
     }
 
     fn decode(record: &wa::SyncdRecord, validate_macs: bool) -> Result<Mutation, AppStateError> {
@@ -451,11 +421,7 @@ mod tests {
             &key_id,
             &valid_action_data(),
         );
-        record.value = buffa::MessageField::some({
-            let mut proto = wa::SyncdValue::default();
-            proto.blob = None;
-            proto
-        });
+        record.value = buffa::MessageField::some(wa::SyncdValue { blob: None });
 
         assert!(matches!(
             decode(&record, true).unwrap_err(),
@@ -577,11 +543,7 @@ mod tests {
         );
         // Skipping MAC validation must not turn a MAC-less record into an
         // empty persisted MAC.
-        record.index = buffa::MessageField::some({
-            let mut proto = wa::SyncdIndex::default();
-            proto.blob = None;
-            proto
-        });
+        record.index = buffa::MessageField::some(wa::SyncdIndex { blob: None });
 
         assert!(matches!(
             decode(&record, false).unwrap_err(),
@@ -606,15 +568,13 @@ mod tests {
     #[test]
     fn decode_record_tolerates_non_json_index() {
         let (keys, key_id) = test_keys();
-        let action_data = {
-            let mut proto = wa::SyncActionData::default();
-            proto.index = Some(b"not-json".to_vec());
-            proto.value = buffa::MessageField::some({
-                let mut proto = wa::SyncActionValue::default();
-                proto.timestamp = Some(1);
-                proto
-            });
-            proto
+        let action_data = wa::SyncActionData {
+            index: Some(b"not-json".to_vec()),
+            value: buffa::MessageField::some(wa::SyncActionValue {
+                timestamp: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         let record = create_test_record(
             wa::syncd_mutation::SyncdOperation::SET,
@@ -636,46 +596,33 @@ mod tests {
         let key_id_3 = vec![7, 8, 9];
         let key_id_4 = vec![10, 11, 12];
 
-        let snapshot = {
-            let mut proto = wa::SyncdSnapshot::default();
-            proto.key_id = buffa::MessageField::some({
-                let mut proto = wa::KeyId::default();
-                proto.id = Some(key_id_1.clone());
-                proto
-            });
-            proto.records = vec![{
-                let mut proto = wa::SyncdRecord::default();
-                proto.key_id = buffa::MessageField::some({
-                    let mut proto = wa::KeyId::default();
-                    proto.id = Some(key_id_2.clone());
-                    proto
-                });
-                proto
-            }];
-            proto
+        let snapshot = wa::SyncdSnapshot {
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(key_id_1.clone()),
+            }),
+            records: vec![wa::SyncdRecord {
+                key_id: buffa::MessageField::some(wa::KeyId {
+                    id: Some(key_id_2.clone()),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
         };
 
-        let patches = vec![{
-            let mut proto = wa::SyncdPatch::default();
-            proto.key_id = buffa::MessageField::some({
-                let mut proto = wa::KeyId::default();
-                proto.id = Some(key_id_3.clone());
-                proto
-            });
-            proto.mutations = vec![{
-                let mut proto = wa::SyncdMutation::default();
-                proto.record = buffa::MessageField::some({
-                    let mut proto = wa::SyncdRecord::default();
-                    proto.key_id = buffa::MessageField::some({
-                        let mut proto = wa::KeyId::default();
-                        proto.id = Some(key_id_4.clone());
-                        proto
-                    });
-                    proto
-                });
-                proto
-            }];
-            proto
+        let patches = vec![wa::SyncdPatch {
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(key_id_3.clone()),
+            }),
+            mutations: vec![wa::SyncdMutation {
+                record: buffa::MessageField::some(wa::SyncdRecord {
+                    key_id: buffa::MessageField::some(wa::KeyId {
+                        id: Some(key_id_4.clone()),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
         }];
 
         let key_ids = collect_key_ids_from_patch_list(Some(&snapshot), &patches);
@@ -691,33 +638,24 @@ mod tests {
     fn test_collect_key_ids_deduplicates() {
         let key_id = vec![1, 2, 3];
 
-        let snapshot = {
-            let mut proto = wa::SyncdSnapshot::default();
-            proto.key_id = buffa::MessageField::some({
-                let mut proto = wa::KeyId::default();
-                proto.id = Some(key_id.clone());
-                proto
-            });
-            proto.records = vec![{
-                let mut proto = wa::SyncdRecord::default();
-                proto.key_id = buffa::MessageField::some({
-                    let mut proto = wa::KeyId::default();
-                    proto.id = Some(key_id.clone());
-                    proto
-                });
-                proto
-            }];
-            proto
+        let snapshot = wa::SyncdSnapshot {
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            records: vec![wa::SyncdRecord {
+                key_id: buffa::MessageField::some(wa::KeyId {
+                    id: Some(key_id.clone()),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
         };
 
-        let patches = vec![{
-            let mut proto = wa::SyncdPatch::default();
-            proto.key_id = buffa::MessageField::some({
-                let mut proto = wa::KeyId::default();
-                proto.id = Some(key_id.clone());
-                proto
-            });
-            proto
+        let patches = vec![wa::SyncdPatch {
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            ..Default::default()
         }];
 
         let key_ids = collect_key_ids_from_patch_list(Some(&snapshot), &patches);

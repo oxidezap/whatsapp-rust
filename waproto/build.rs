@@ -18,17 +18,13 @@
 //! Fields this crate persists but upstream does not declare go in
 //! [`LOCAL_FIELDS`], never in the `.proto`.
 
-#[path = "build_support/emission.rs"]
-mod emission;
-#[path = "build_support/names.rs"]
-mod names;
-#[path = "build_support/signal_storage.rs"]
-mod signal_storage;
-
 use buffa::Message as _;
 use buffa_descriptor::generated::descriptor::{
     DescriptorProto, FieldDescriptorProto, FileDescriptorSet, field_descriptor_proto,
 };
+
+#[path = "build/pin_clone.rs"]
+mod pin_clone;
 
 /// A field this crate persists that the upstream proto does not declare.
 struct LocalField {
@@ -37,6 +33,7 @@ struct LocalField {
     name: &'static str,
     number: i32,
     kind: field_descriptor_proto::Type,
+    type_name: Option<&'static str>,
 }
 
 /// Local additions to the upstream schema, spliced into the descriptor at
@@ -46,18 +43,29 @@ struct LocalField {
 /// numbers fails the build instead of silently reinterpreting records already
 /// written.
 ///
-/// Numbers stay far above what upstream uses — it appends low ones without
-/// notice, the way `kyberPreKeyId = 4` and `kyberCiphertext = 5` arrived on
-/// `SessionStructure.PendingPreKey`.
-const LOCAL_FIELDS: &[LocalField] = &[LocalField {
-    // Deriving the stored cipher/mac/iv from this seed is one-way, so a
-    // skipped message key that kept only the derived material could never be
-    // projected back into a seed-based external format.
-    message: "SessionStructure.Chain.MessageKey",
-    name: "seed",
-    number: 100,
-    kind: field_descriptor_proto::Type::TYPE_BYTES,
-}];
+/// New local fields use high numbers. Retained upstream fields keep their
+/// original wire numbers; either kind must stop on a future collision.
+const LOCAL_FIELDS: &[LocalField] = &[
+    LocalField {
+        // Deriving the stored cipher/mac/iv from this seed is one-way, so a
+        // skipped message key that kept only the derived material could never be
+        // projected back into a seed-based external format.
+        message: "SessionStructure.Chain.MessageKey",
+        name: "seed",
+        number: 100,
+        kind: field_descriptor_proto::Type::TYPE_BYTES,
+        type_name: None,
+    },
+    LocalField {
+        // Public field from whatspec 1a441f0. Its absence in the next Web
+        // capture does not make already stored or received payloads obsolete.
+        message: "Message",
+        name: "newsletterAdminProfileMessageV2",
+        number: 117,
+        kind: field_descriptor_proto::Type::TYPE_MESSAGE,
+        type_name: Some(".whatsapp.Message.FutureProofMessage"),
+    },
+];
 
 fn main() -> std::io::Result<()> {
     // Rerun on desc change (new codegen) and proto change (so the staleness
@@ -66,9 +74,7 @@ fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=src/whatsapp.desc.sha256");
     println!("cargo:rerun-if-changed=src/whatsapp.proto");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=build_support");
-    println!("cargo:rerun-if-changed=api.snapshot");
-    println!("cargo:rerun-if-changed=signal-storage.snapshot");
+    println!("cargo:rerun-if-changed=build/pin_clone.rs");
 
     ensure_proto_descriptor_hash()?;
 
@@ -79,17 +85,7 @@ fn main() -> std::io::Result<()> {
     #[allow(clippy::disallowed_methods)]
     let mut fds = FileDescriptorSet::decode_from_slice(&std::fs::read("src/whatsapp.desc")?)
         .map_err(std::io::Error::other)?;
-    names::apply(
-        &mut fds,
-        names::TYPES,
-        names::FIELDS,
-        names::ENUM_VALUES,
-        names::ONEOFS,
-    )?;
-    // Local persisted fields target the frozen names, so an upstream rename
-    // cannot detach a persistence extension from its message.
     apply_local_fields(&mut fds)?;
-    signal_storage::check(&names::wire_api(&fds))?;
 
     // Emit the wire-tag consts (field numbers) for hand-written partial decoders.
     generate_tags(&fds, &out_path.join("tags.rs"))?;
@@ -237,22 +233,21 @@ fn main() -> std::io::Result<()> {
             ".whatsapp.SenderKeyStateStructure.SenderSigningKey.private",
             "#[serde(skip)]",
         )
-        // Keep unknown wire data through decode/edit/encode and persisted
-        // protobuf state. The compatibility emitter hides its storage from
-        // derived serde, preserving the bridge's JSON shape.
-        .preserve_unknown_fields(true)
-        .generate_with_setters(true)
+        // We control both encoder and decoder — no need to preserve unknown
+        // fields. Disabling removes __buffa_unknown_fields from every struct,
+        // eliminating allocation/drop overhead in nested types like
+        // SessionStructure (chains × message keys).
+        .preserve_unknown_fields(false)
         // Generate view types for zero-copy decoding.
         .generate_views(true)
         .out_dir(&out_path)
         .compile()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    let mut api = emission::finish(&out_path, "whatsapp")?;
-    api.extend(names::wire_api(&fds));
-    let snapshot = api.iter().cloned().collect::<Vec<_>>().join("\n") + "\n";
-    std::fs::write(out_path.join("api.snapshot"), snapshot)?;
-    emission::check_api(include_str!("api.snapshot"), &api)?;
+    let generated = out_path.join("whatsapp.rs");
+    let source = std::fs::read_to_string(&generated)?;
+    let source = pin_clone::generate(&source).map_err(std::io::Error::other)?;
+    std::fs::write(generated, source)?;
 
     Ok(())
 }
@@ -305,6 +300,7 @@ fn apply_local_fields(fds: &mut FileDescriptorSet) -> std::io::Result<()> {
             number: Some(local.number),
             label: Some(field_descriptor_proto::Label::LABEL_OPTIONAL),
             r#type: Some(local.kind),
+            type_name: local.type_name.map(str::to_owned),
             json_name: Some(local.name.to_owned()),
             ..Default::default()
         });

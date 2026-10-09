@@ -12,15 +12,13 @@ fn main() {
 
 #[divan::bench(args = [false, true])]
 fn image_metadata(bencher: divan::Bencher, view_once: bool) {
-    let message = {
-        let mut proto = wa::Message::default();
-        proto.image_message = Some({
-            let mut proto = wa::message::ImageMessage::default();
-            proto.view_once = Some(view_once);
-            proto
+    let message = wa::Message {
+        image_message: Some(wa::message::ImageMessage {
+            view_once: Some(view_once),
+            ..Default::default()
         })
-        .into();
-        proto
+        .into(),
+        ..Default::default()
     };
     bencher.bench(|| message_meta_from_message(std::hint::black_box(&message)));
 }
@@ -34,10 +32,9 @@ fn allocation_control() -> Box<[u8]> {
 
 #[divan::bench]
 fn ordinary_text_metadata(bencher: divan::Bencher) {
-    let message = {
-        let mut proto = wa::Message::default();
-        proto.conversation = Some("synthetic".into());
-        proto
+    let message = wa::Message {
+        conversation: Some("synthetic".into()),
+        ..Default::default()
     };
     bencher.bench(|| message_meta_from_message(std::hint::black_box(&message)));
 }

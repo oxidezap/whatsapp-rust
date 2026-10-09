@@ -728,19 +728,15 @@ pub async fn create_sender_key_distribution_message_for_group(
 /// Sent via the standard E2EE fanout, not an IQ. Empty `label` clears.
 /// `ts_secs` is unix seconds, matching WA Web's `unixTime()`.
 pub fn build_member_label_message(label: String, ts_secs: i64) -> wa::Message {
-    {
-        let mut proto_ = wa::Message::default();
-        proto_.protocol_message = buffa::MessageField::some({
-            let mut proto_ = wa::message::ProtocolMessage::default();
-            proto_.r#type = Some(wa::message::protocol_message::Type::GroupMemberLabelChange);
-            proto_.member_label = buffa::MessageField::some({
-                let mut proto = wa::MemberLabel::default();
-                proto.label = Some(label);
-                proto.label_timestamp = Some(ts_secs);
-                proto
-            });
-            proto_
-        });
-        proto_
+    wa::Message {
+        protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::GroupMemberLabelChange),
+            member_label: buffa::MessageField::some(wa::MemberLabel {
+                label: Some(label),
+                label_timestamp: Some(ts_secs),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
     }
 }

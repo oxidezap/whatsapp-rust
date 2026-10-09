@@ -12,7 +12,6 @@ use subtle::ConstantTimeEq;
 
 use crate::core::curve::KeyType;
 use crate::protocol::counter_lease::CounterLease;
-use crate::protocol::local_field::{future_record_fields, unknown_fields_retained};
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
 use crate::protocol::ratchet::{ChainKey, RootKey};
 use crate::protocol::record_components::{
@@ -106,15 +105,7 @@ impl SkippedKey {
             && pb.cipher_key.is_none()
             && pb.mac_key.is_none()
             && pb.iv.is_none()
-            && pb == {
-                let mut seed_only = session_structure::chain::MessageKey::default();
-                seed_only.index = pb.index;
-                seed_only.seed = pb.seed.clone();
-                seed_only
-            }
         {
-            // Compact only when every field is represented. Unknown wire data
-            // and future generated fields must keep the original protobuf.
             return Self::Seed { index, seed };
         }
         Self::Legacy(Box::new(pb))
@@ -164,14 +155,12 @@ impl SkippedKey {
                 Self::Seed { index, .. } => {
                     let seed = seeds.slice(next_seed..next_seed + 32);
                     next_seed += 32;
-                    {
-                        let mut proto = session_structure::chain::MessageKey::default();
-                        proto.cipher_key = None;
-                        proto.mac_key = None;
-                        proto.iv = None;
-                        proto.index = Some(*index);
-                        proto.seed = Some(seed);
-                        proto
+                    session_structure::chain::MessageKey {
+                        cipher_key: None,
+                        mac_key: None,
+                        iv: None,
+                        index: Some(*index),
+                        seed: Some(seed),
                     }
                 }
                 Self::Legacy(pb) => (**pb).clone(),
@@ -189,7 +178,6 @@ impl SkippedKey {
                     + bytes_field_retained(&pb.mac_key)
                     + bytes_field_retained(&pb.iv)
                     + bytes_field_retained(&pb.seed)
-                    + unknown_fields_retained(&pb.__buffa_unknown_fields)
             }
         }
     }
@@ -377,18 +365,17 @@ impl SessionState {
         alice_base_key: &PublicKey,
     ) -> Self {
         Self {
-            session: {
-                let mut proto = SessionStructure::default();
-                proto.session_version = Some(version as u32);
-                proto.local_identity_public = Some(our_identity.public_key().serialize().to_vec());
-                proto.remote_identity_public = Some(their_identity.serialize().to_vec());
-                proto.root_key = Some(root_key.key().to_vec());
-                proto.previous_counter = Some(0);
-                proto.receiver_chains = vec![];
-                proto.remote_registration_id = Some(0);
-                proto.local_registration_id = Some(0);
-                proto.alice_base_key = Some(alice_base_key.serialize().to_vec());
-                proto
+            session: SessionStructure {
+                session_version: Some(version as u32),
+                local_identity_public: Some(our_identity.public_key().serialize().to_vec()),
+                remote_identity_public: Some(their_identity.serialize().to_vec()),
+                root_key: Some(root_key.key().to_vec()),
+                previous_counter: Some(0),
+                receiver_chains: vec![],
+                remote_registration_id: Some(0),
+                local_registration_id: Some(0),
+                alice_base_key: Some(alice_base_key.serialize().to_vec()),
+                ..Default::default()
             },
             skipped: Vec::new(),
         }
@@ -611,20 +598,16 @@ impl SessionState {
 
     pub fn add_receiver_chain(&mut self, sender: &PublicKey, chain_key: &ChainKey) {
         use bytes::Bytes;
-        let chain_key = {
-            let mut proto = session_structure::chain::ChainKey::default();
-            proto.index = Some(chain_key.index());
-            proto.key = Some(Bytes::copy_from_slice(chain_key.key()));
-            proto
+        let chain_key = session_structure::chain::ChainKey {
+            index: Some(chain_key.index()),
+            key: Some(Bytes::copy_from_slice(chain_key.key())),
         };
 
-        let chain = {
-            let mut proto = session_structure::Chain::default();
-            proto.sender_ratchet_key = Some(sender.serialize().to_vec());
-            proto.sender_ratchet_key_private = Some(vec![]);
-            proto.chain_key = MessageField::some(chain_key);
-            proto.message_keys = vec![];
-            proto
+        let chain = session_structure::Chain {
+            sender_ratchet_key: Some(sender.serialize().to_vec()),
+            sender_ratchet_key_private: Some(vec![]),
+            chain_key: MessageField::some(chain_key),
+            message_keys: vec![],
         };
 
         self.session.receiver_chains.push(chain);
@@ -653,20 +636,16 @@ impl SessionState {
 
     pub fn set_sender_chain(&mut self, sender: &KeyPair, next_chain_key: &ChainKey) {
         use bytes::Bytes;
-        let chain_key = {
-            let mut proto = session_structure::chain::ChainKey::default();
-            proto.index = Some(next_chain_key.index());
-            proto.key = Some(Bytes::copy_from_slice(next_chain_key.key()));
-            proto
+        let chain_key = session_structure::chain::ChainKey {
+            index: Some(next_chain_key.index()),
+            key: Some(Bytes::copy_from_slice(next_chain_key.key())),
         };
 
-        let new_chain = {
-            let mut proto = session_structure::Chain::default();
-            proto.sender_ratchet_key = Some(sender.public_key.serialize().to_vec());
-            proto.sender_ratchet_key_private = Some(sender.private_key.serialize().to_vec());
-            proto.chain_key = MessageField::some(chain_key);
-            proto.message_keys = vec![];
-            proto
+        let new_chain = session_structure::Chain {
+            sender_ratchet_key: Some(sender.public_key.serialize().to_vec()),
+            sender_ratchet_key_private: Some(sender.private_key.serialize().to_vec()),
+            chain_key: MessageField::some(chain_key),
+            message_keys: vec![],
         };
 
         self.session.sender_chain = MessageField::some(new_chain);
@@ -723,11 +702,9 @@ impl SessionState {
                 write_chain_key(&mut existing.key, next_chain_key.key());
             }
             None => {
-                chain.chain_key = MessageField::some({
-                    let mut proto = session_structure::chain::ChainKey::default();
-                    proto.index = Some(next_chain_key.index());
-                    proto.key = Some(Bytes::copy_from_slice(next_chain_key.key()));
-                    proto
+                chain.chain_key = MessageField::some(session_structure::chain::ChainKey {
+                    index: Some(next_chain_key.index()),
+                    key: Some(Bytes::copy_from_slice(next_chain_key.key())),
                 });
             }
         }
@@ -867,11 +844,9 @@ impl SessionState {
                 write_chain_key(&mut existing.key, chain_key.key());
             }
             None => {
-                *target = MessageField::some({
-                    let mut proto = session_structure::chain::ChainKey::default();
-                    proto.index = Some(chain_key.index());
-                    proto.key = Some(Bytes::copy_from_slice(chain_key.key()));
-                    proto
+                *target = MessageField::some(session_structure::chain::ChainKey {
+                    index: Some(chain_key.index()),
+                    key: Some(Bytes::copy_from_slice(chain_key.key())),
                 });
             }
         }
@@ -886,15 +861,13 @@ impl SessionState {
         base_key: &PublicKey,
     ) {
         let signed_ec_pre_key_id: u32 = signed_ec_pre_key_id.into();
-        let pending = {
-            let mut proto = session_structure::PendingPreKey::default();
-            proto.pre_key_id = pre_key_id.map(PreKeyId::into);
-            proto.signed_pre_key_id = Some(signed_ec_pre_key_id as i32);
-            proto.base_key = Some(base_key.serialize().to_vec()); // Post-quantum (Kyber) prekeys are not implemented; classic X3DH only.
-
-            proto.kyber_pre_key_id = None;
-            proto.kyber_ciphertext = None;
-            proto
+        let pending = session_structure::PendingPreKey {
+            pre_key_id: pre_key_id.map(PreKeyId::into),
+            signed_pre_key_id: Some(signed_ec_pre_key_id as i32),
+            base_key: Some(base_key.serialize().to_vec()),
+            // Post-quantum (Kyber) prekeys are not implemented; classic X3DH only.
+            kyber_pre_key_id: None,
+            kyber_ciphertext: None,
         };
         self.session.pending_pre_key = MessageField::some(pending);
     }
@@ -920,8 +893,24 @@ impl SessionState {
     }
 
     pub fn clear_unacknowledged_pre_key_message(&mut self) {
-        // Acknowledge the known pre-key exchange without discarding unrelated
-        // session fields, including extensions from a newer persisted schema.
+        // Explicitly destructuring the SessionStructure in case there are new
+        // pending fields that need to be cleared.
+        let SessionStructure {
+            session_version: _session_version,
+            local_identity_public: _local_identity_public,
+            remote_identity_public: _remote_identity_public,
+            root_key: _root_key,
+            previous_counter: _previous_counter,
+            sender_chain: _sender_chain,
+            receiver_chains: _receiver_chains,
+            pending_pre_key: _pending_pre_key,
+            remote_registration_id: _remote_registration_id,
+            local_registration_id: _local_registration_id,
+            alice_base_key: _alice_base_key,
+            needs_refresh: _needs_refresh,
+            pending_key_exchange: _pending_key_exchange,
+        } = &self.session;
+
         self.session.pending_pre_key = MessageField::none();
     }
 
@@ -980,7 +969,6 @@ const RESERVED_SENDER_CHAIN_INDEX_FIELD: u32 =
 
 #[derive(Clone)]
 pub struct SessionRecord {
-    future: buffa::UnknownFields,
     current_session: Option<SessionState>,
     previous_sessions: Arc<Vec<ArchivedSession>>,
     /// Durability lease over sender-chain counters, or the consumer's
@@ -1014,12 +1002,10 @@ fn vec_field_retained(field: &Option<Vec<u8>>) -> usize {
 /// what hangs off it. Counting `size_of::<Chain>()` here as well is how a
 /// report starts growing faster than the memory it describes.
 fn chain_pointed_bytes(chain: &session_structure::Chain) -> usize {
-    unknown_fields_retained(&chain.__buffa_unknown_fields)
-        + vec_field_retained(&chain.sender_ratchet_key)
+    vec_field_retained(&chain.sender_ratchet_key)
         + vec_field_retained(&chain.sender_ratchet_key_private)
         + chain.chain_key.as_option().map_or(0, |key| {
             size_of::<session_structure::chain::ChainKey>() + bytes_field_retained(&key.key)
-                + unknown_fields_retained(&key.__buffa_unknown_fields)
         })
         // The skipped-key backlog: capacity, not length, because the `Vec`
         // keeps its allocation when keys are consumed or pruned.
@@ -1032,7 +1018,6 @@ fn chain_pointed_bytes(chain: &session_structure::Chain) -> usize {
                     + bytes_field_retained(&key.mac_key)
                     + bytes_field_retained(&key.iv)
                     + bytes_field_retained(&key.seed)
-                    + unknown_fields_retained(&key.__buffa_unknown_fields)
             })
             .sum::<usize>()
 }
@@ -1040,8 +1025,7 @@ fn chain_pointed_bytes(chain: &session_structure::Chain) -> usize {
 /// Heap bytes one session state points at, excluding the `SessionStructure`
 /// itself.
 fn session_pointed_bytes(session: &SessionStructure) -> usize {
-    unknown_fields_retained(&session.__buffa_unknown_fields)
-        + vec_field_retained(&session.local_identity_public)
+    vec_field_retained(&session.local_identity_public)
         + vec_field_retained(&session.remote_identity_public)
         + vec_field_retained(&session.root_key)
         + vec_field_retained(&session.alice_base_key)
@@ -1067,13 +1051,11 @@ fn session_pointed_bytes(session: &SessionStructure) -> usize {
                 + vec_field_retained(&pending.local_ratchet_key_private)
                 + vec_field_retained(&pending.local_identity_key)
                 + vec_field_retained(&pending.local_identity_key_private)
-                + unknown_fields_retained(&pending.__buffa_unknown_fields)
         })
         + session.pending_pre_key.as_option().map_or(0, |pending| {
             size_of::<session_structure::PendingPreKey>()
                 + vec_field_retained(&pending.base_key)
                 + vec_field_retained(&pending.kyber_ciphertext)
-                + unknown_fields_retained(&pending.__buffa_unknown_fields)
         })
 }
 
@@ -1188,7 +1170,6 @@ impl SessionRecord {
         Self {
             current_session: None,
             previous_sessions: Arc::new(Vec::new()),
-            future: buffa::UnknownFields::new(),
             lease: CounterLease::default(),
         }
     }
@@ -1197,7 +1178,6 @@ impl SessionRecord {
         Self {
             current_session: Some(state),
             previous_sessions: Arc::new(Vec::new()),
-            future: buffa::UnknownFields::new(),
             lease: CounterLease::default(),
         }
     }
@@ -1225,7 +1205,6 @@ impl SessionRecord {
         Ok(Self {
             current_session,
             previous_sessions: Arc::new(previous_sessions),
-            future: buffa::UnknownFields::new(),
             lease: CounterLease::default(),
         })
     }
@@ -1423,11 +1402,6 @@ impl SessionRecord {
                 .map_err(|_| InvalidSessionError("failed to decode current session protobuf"))?
                 .map(Into::into),
             previous_sessions: Arc::new(previous_sessions),
-            future: future_record_fields(
-                view.__buffa_unknown_fields
-                    .to_owned()
-                    .map_err(|_| InvalidSessionError("failed to decode future record fields"))?,
-            ),
             lease: CounterLease::from_persisted_ceiling(local_fields.reservation),
         };
 
@@ -1705,9 +1679,7 @@ impl SessionRecord {
             .unwrap_or(0);
 
         buf.clear();
-        buf.reserve(
-            current_len + previous_len + reserved_len + incarnation_len + self.future.encoded_len(),
-        );
+        buf.reserve(current_len + previous_len + reserved_len + incarnation_len);
 
         if let Some(session) = current.as_deref()
             && let Some(msg_len) = current_msg_len
@@ -1727,7 +1699,6 @@ impl SessionRecord {
         if let Some(incarnation) = incarnation {
             crate::protocol::local_field::encode_store_incarnation(buf, incarnation);
         }
-        self.future.write_to(buf);
     }
 
     /// Retained in-memory bytes of the current plus archived states.
@@ -1759,7 +1730,7 @@ impl SessionRecord {
                 .iter()
                 .map(|archived| archived.as_bytes().len())
                 .sum::<usize>();
-        size_of::<Self>() + current + previous + unknown_fields_retained(&self.future)
+        size_of::<Self>() + current + previous
     }
 
     pub fn remote_registration_id(&self) -> Result<u32, SignalProtocolError> {
@@ -1849,11 +1820,10 @@ mod tests {
             ),
             (Some(key), None, Err("invalid local identity key")),
         ] {
-            let state = SessionState::from_session_structure({
-                let mut proto = SessionStructure::default();
-                proto.remote_identity_public = remote;
-                proto.local_identity_public = local;
-                proto
+            let state = SessionState::from_session_structure(SessionStructure {
+                remote_identity_public: remote,
+                local_identity_public: local,
+                ..Default::default()
             });
             assert_eq!(state.session_with_self().map_err(|err| err.0), expected,);
         }
@@ -1871,10 +1841,9 @@ mod tests {
             Some(oversized),
         ] {
             let expected = previous.clone();
-            let mut state = SessionState::from_session_structure({
-                let mut proto = SessionStructure::default();
-                proto.root_key = previous;
-                proto
+            let mut state = SessionState::from_session_structure(SessionStructure {
+                root_key: previous,
+                ..Default::default()
             });
             let ptr = state
                 .session
@@ -2229,82 +2198,29 @@ mod tests {
     }
 
     fn make_cache_shape_chain(seed: u8, message_key_count: usize) -> session_structure::Chain {
-        let chain_key = {
-            let mut proto = session_structure::chain::ChainKey::default();
-            proto.index = Some(seed as u32);
-            proto.key = Some(vec![seed; 32].into());
-            proto
+        let chain_key = session_structure::chain::ChainKey {
+            index: Some(seed as u32),
+            key: Some(vec![seed; 32].into()),
         };
         let message_keys = (0..message_key_count)
             .map(|idx| {
                 let idx = idx as u8;
-                {
-                    let mut proto = session_structure::chain::MessageKey::default();
-                    proto.index = Some(idx as u32);
-                    proto.cipher_key = Some(vec![seed.wrapping_add(idx); 32].into());
-                    proto.mac_key = Some(vec![seed.wrapping_add(idx).wrapping_add(1); 32].into());
-                    proto.iv = Some(vec![seed.wrapping_add(idx).wrapping_add(2); 16].into());
-                    proto.seed = Some(vec![seed.wrapping_add(idx).wrapping_add(3); 32].into());
-                    proto
+                session_structure::chain::MessageKey {
+                    index: Some(idx as u32),
+                    cipher_key: Some(vec![seed.wrapping_add(idx); 32].into()),
+                    mac_key: Some(vec![seed.wrapping_add(idx).wrapping_add(1); 32].into()),
+                    iv: Some(vec![seed.wrapping_add(idx).wrapping_add(2); 16].into()),
+                    seed: Some(vec![seed.wrapping_add(idx).wrapping_add(3); 32].into()),
                 }
             })
             .collect();
 
-        {
-            let mut proto = session_structure::Chain::default();
-            proto.sender_ratchet_key = Some(vec![seed; 33]);
-            proto.sender_ratchet_key_private = Some(vec![seed.wrapping_add(1); 32]);
-            proto.chain_key = MessageField::some(chain_key);
-            proto.message_keys = message_keys;
-            proto
+        session_structure::Chain {
+            sender_ratchet_key: Some(vec![seed; 33]),
+            sender_ratchet_key_private: Some(vec![seed.wrapping_add(1); 32]),
+            chain_key: MessageField::some(chain_key),
+            message_keys,
         }
-    }
-
-    #[test]
-    fn future_session_storage_is_preserved_and_counted() {
-        let future = buffa::UnknownField {
-            number: 200,
-            data: buffa::UnknownFieldData::LengthDelimited(vec![0x77; 8192]),
-        };
-        let mut key = session_structure::chain::MessageKey::default();
-        key.index = Some(7);
-        key.seed = Some(bytes::Bytes::from_static(&[0x42; 32]));
-        key.__buffa_unknown_fields.push(future.clone());
-        let mut chain = session_structure::Chain::default();
-        chain.message_keys.push(key);
-        chain.__buffa_unknown_fields.push(future.clone());
-        let mut session = SessionStructure::default();
-        session.receiver_chains.push(chain);
-        session.__buffa_unknown_fields.push(future.clone());
-        let mut record = SessionRecord::new(SessionState::from_session_structure(session));
-        record.future.push(future);
-        let wire = record.serialize().unwrap();
-        let loaded = SessionRecord::deserialize(&wire).unwrap();
-        assert_eq!(loaded.serialize().unwrap(), wire);
-        assert!(loaded.estimated_size() >= 4 * 8192);
-    }
-
-    #[test]
-    fn skipped_seed_preserves_future_fields_through_session_state() {
-        let mut seed_only = session_structure::chain::MessageKey::default();
-        seed_only.index = Some(7);
-        seed_only.seed = Some(bytes::Bytes::from_static(&[0x42; 32]));
-        assert!(matches!(
-            SkippedKey::from_pb(seed_only.clone()),
-            SkippedKey::Seed { .. }
-        ));
-        let mut wire = seed_only.encode_to_vec();
-        wire.extend_from_slice(&[0xa8, 0x06, 9]); // future field 101
-        let key = session_structure::chain::MessageKey::decode_from_slice(&wire).unwrap();
-        let mut chain = session_structure::Chain::default();
-        chain.message_keys.push(key);
-        let mut session = SessionStructure::default();
-        session.receiver_chains.push(chain);
-        let restored = SessionStructure::from(SessionState::from_session_structure(session));
-        assert_eq!(
-            restored.receiver_chains[0].message_keys[0].encode_to_vec(),
-            wire
-        );
     }
 
     /// Every walker charges only what hangs off a slot, and the owner charges
@@ -2315,13 +2231,11 @@ mod tests {
     fn a_chain_is_charged_once_not_once_per_walker() {
         let empty = make_cache_shape_session(1, 0, 0);
         let mut with_one = empty.clone();
-        with_one.receiver_chains = vec![{
-            let mut proto = session_structure::Chain::default();
-            proto.sender_ratchet_key = None;
-            proto.sender_ratchet_key_private = None;
-            proto.chain_key = MessageField::none();
-            proto.message_keys = Vec::new();
-            proto
+        with_one.receiver_chains = vec![session_structure::Chain {
+            sender_ratchet_key: None,
+            sender_ratchet_key_private: None,
+            chain_key: MessageField::none(),
+            message_keys: Vec::new(),
         }];
 
         let delta = session_pointed_bytes(&with_one) - session_pointed_bytes(&empty);
@@ -2348,28 +2262,22 @@ mod tests {
             .map(|i| {
                 let mut session = make_cache_shape_session(i.wrapping_mul(7).wrapping_add(3), 0, 0);
                 session.receiver_chains = (0..3)
-                    .map(|c| {
-                        let mut proto = session_structure::Chain::default();
-                        proto.sender_ratchet_key = Some(vec![c as u8; 33]);
-                        proto.sender_ratchet_key_private = Some(vec![c as u8; 32]);
-                        proto.chain_key = MessageField::some({
-                            let mut proto = session_structure::chain::ChainKey::default();
-                            proto.index = Some(c);
-                            proto.key = Some(vec![c as u8; 32].into());
-                            proto
-                        });
-                        proto.message_keys = (0..40)
-                            .map(|k| {
-                                let mut proto = session_structure::chain::MessageKey::default();
-                                proto.index = Some(k);
-                                proto.cipher_key = None;
-                                proto.mac_key = None;
-                                proto.iv = None;
-                                proto.seed = Some(vec![k as u8; 32].into());
-                                proto
+                    .map(|c| session_structure::Chain {
+                        sender_ratchet_key: Some(vec![c as u8; 33]),
+                        sender_ratchet_key_private: Some(vec![c as u8; 32]),
+                        chain_key: MessageField::some(session_structure::chain::ChainKey {
+                            index: Some(c),
+                            key: Some(vec![c as u8; 32].into()),
+                        }),
+                        message_keys: (0..40)
+                            .map(|k| session_structure::chain::MessageKey {
+                                index: Some(k),
+                                cipher_key: None,
+                                mac_key: None,
+                                iv: None,
+                                seed: Some(vec![k as u8; 32].into()),
                             })
-                            .collect();
-                        proto
+                            .collect(),
                     })
                     .collect();
                 session
@@ -2380,7 +2288,6 @@ mod tests {
                 make_cache_shape_session(1, 1, 2),
             )),
             previous_sessions: Arc::new(archived.iter().map(ArchivedSession::encode).collect()),
-            future: buffa::UnknownFields::new(),
             lease: CounterLease::default(),
         };
 
@@ -2429,28 +2336,22 @@ mod tests {
         const KEYS: usize = 500;
 
         let message_keys: Vec<session_structure::chain::MessageKey> = (0..KEYS)
-            .map(|index| {
-                let mut proto = session_structure::chain::MessageKey::default();
-                proto.index = Some(index as u32);
-                proto.cipher_key = None;
-                proto.mac_key = None;
-                proto.iv = None;
-                proto.seed = Some(vec![7u8; 32].into());
-                proto
+            .map(|index| session_structure::chain::MessageKey {
+                index: Some(index as u32),
+                cipher_key: None,
+                mac_key: None,
+                iv: None,
+                seed: Some(vec![7u8; 32].into()),
             })
             .collect();
-        let chain = {
-            let mut proto = session_structure::Chain::default();
-            proto.sender_ratchet_key = Some(vec![1u8; 33]);
-            proto.sender_ratchet_key_private = Some(vec![2u8; 32]);
-            proto.chain_key = MessageField::some({
-                let mut proto = session_structure::chain::ChainKey::default();
-                proto.index = Some(0);
-                proto.key = Some(vec![3u8; 32].into());
-                proto
-            });
-            proto.message_keys = message_keys;
-            proto
+        let chain = session_structure::Chain {
+            sender_ratchet_key: Some(vec![1u8; 33]),
+            sender_ratchet_key_private: Some(vec![2u8; 32]),
+            chain_key: MessageField::some(session_structure::chain::ChainKey {
+                index: Some(0),
+                key: Some(vec![3u8; 32].into()),
+            }),
+            message_keys,
         };
         let mut session = make_cache_shape_session(1, 0, 0);
         session.receiver_chains = vec![chain];
@@ -2463,7 +2364,6 @@ mod tests {
         let record = SessionRecord {
             current_session: Some(state),
             previous_sessions: Arc::new(Vec::new()),
-            future: buffa::UnknownFields::new(),
             lease: CounterLease::default(),
         };
 
@@ -2494,7 +2394,6 @@ mod tests {
                     skipped: Vec::new(),
                 }),
                 previous_sessions: Arc::new(Vec::new()),
-                future: buffa::UnknownFields::new(),
                 lease: CounterLease::default(),
             }
             .serialize()
@@ -2512,23 +2411,20 @@ mod tests {
             .map(|idx| make_cache_shape_chain(seed.wrapping_add(idx as u8 + 1), idx + 1))
             .collect();
 
-        {
-            let mut proto = SessionStructure::default();
-            proto.session_version = Some(3);
-            proto.local_identity_public = Some(vec![seed; 33]);
-            proto.remote_identity_public = Some(vec![seed.wrapping_add(1); 33]);
-            proto.root_key = Some(vec![seed.wrapping_add(2); 32]);
-            proto.previous_counter = Some(seed as u32);
-            proto.sender_chain =
-                MessageField::some(make_cache_shape_chain(seed, message_key_count));
-            proto.receiver_chains = receiver_chains;
-            proto.pending_key_exchange = MessageField::none();
-            proto.pending_pre_key = MessageField::none();
-            proto.remote_registration_id = Some(10_000 + seed as u32);
-            proto.local_registration_id = Some(20_000 + seed as u32);
-            proto.needs_refresh = Some(seed.is_multiple_of(2));
-            proto.alice_base_key = Some(vec![seed.wrapping_add(3); 33]);
-            proto
+        SessionStructure {
+            session_version: Some(3),
+            local_identity_public: Some(vec![seed; 33]),
+            remote_identity_public: Some(vec![seed.wrapping_add(1); 33]),
+            root_key: Some(vec![seed.wrapping_add(2); 32]),
+            previous_counter: Some(seed as u32),
+            sender_chain: MessageField::some(make_cache_shape_chain(seed, message_key_count)),
+            receiver_chains,
+            pending_key_exchange: MessageField::none(),
+            pending_pre_key: MessageField::none(),
+            remote_registration_id: Some(10_000 + seed as u32),
+            local_registration_id: Some(20_000 + seed as u32),
+            needs_refresh: Some(seed.is_multiple_of(2)),
+            alice_base_key: Some(vec![seed.wrapping_add(3); 33]),
         }
     }
 
@@ -2936,16 +2832,15 @@ mod tests {
     #[test]
     fn test_session_record_manual_encoding_matches_generated_record_structure() {
         let record = create_record_with_previous_sessions(4);
-        let expected = {
-            let mut proto_ = waproto::whatsapp::RecordStructure::default();
-            proto_.current_session =
-                MessageField::some(record.current_session.as_ref().unwrap().session.clone());
-            proto_.previous_sessions = record
+        let expected = waproto::whatsapp::RecordStructure {
+            current_session: MessageField::some(
+                record.current_session.as_ref().unwrap().session.clone(),
+            ),
+            previous_sessions: record
                 .previous_sessions
                 .iter()
                 .map(|archived| archived.decode().expect("archived state decodes"))
-                .collect();
-            proto_
+                .collect(),
         }
         .encode_to_vec();
 
@@ -2972,14 +2867,11 @@ mod tests {
                     .map(ArchivedSession::encode)
                     .collect(),
             ),
-            future: buffa::UnknownFields::new(),
             lease: CounterLease::default(),
         };
-        let expected = {
-            let mut proto_ = waproto::whatsapp::RecordStructure::default();
-            proto_.current_session = MessageField::some(current);
-            proto_.previous_sessions = previous_sessions;
-            proto_
+        let expected = waproto::whatsapp::RecordStructure {
+            current_session: MessageField::some(current),
+            previous_sessions,
         }
         .encode_to_vec();
 
@@ -3024,14 +2916,11 @@ mod tests {
                     .map(ArchivedSession::encode)
                     .collect(),
             ),
-            future: buffa::UnknownFields::new(),
             lease: CounterLease::default(),
         };
-        let expected = {
-            let mut proto_ = waproto::whatsapp::RecordStructure::default();
-            proto_.current_session = MessageField::some(current);
-            proto_.previous_sessions = previous_sessions;
-            proto_
+        let expected = waproto::whatsapp::RecordStructure {
+            current_session: MessageField::some(current),
+            previous_sessions,
         }
         .encode_to_vec();
 

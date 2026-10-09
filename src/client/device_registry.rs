@@ -2554,22 +2554,18 @@ mod tests {
         valid_indexes: Vec<u32>,
     ) -> Vec<u8> {
         use buffa::Message;
-        let details = {
-            let mut proto_ = waproto::whatsapp::ADVKeyIndexList::default();
-            proto_.raw_id = Some(raw_id);
-            proto_.timestamp = Some(100);
-            proto_.current_index = Some(current_index);
-            proto_.valid_indexes = valid_indexes;
-            proto_.account_type = None;
-            proto_
+        let details = waproto::whatsapp::ADVKeyIndexList {
+            raw_id: Some(raw_id),
+            timestamp: Some(100),
+            current_index: Some(current_index),
+            valid_indexes,
+            account_type: None,
         }
         .encode_to_vec();
-        {
-            let mut proto_ = waproto::whatsapp::ADVSignedKeyIndexList::default();
-            proto_.details = Some(details);
-            proto_.account_signature = None;
-            proto_.account_signature_key = None;
-            proto_
+        waproto::whatsapp::ADVSignedKeyIndexList {
+            details: Some(details),
+            account_signature: None,
+            account_signature_key: None,
         }
         .encode_to_vec()
     }

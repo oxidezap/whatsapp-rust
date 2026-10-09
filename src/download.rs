@@ -2527,13 +2527,12 @@ mod tests {
                         MediaType::Image,
                     )
                     .unwrap();
-                    let mut message = {
-                        let mut proto_ = waproto::whatsapp::message::ImageMessage::default();
-                        proto_.media_key = Some(enc.media_key.to_vec());
-                        proto_.file_enc_sha256 = Some(enc.file_enc_sha256.to_vec());
-                        proto_.file_sha256 = Some(enc.file_sha256.to_vec());
-                        proto_.static_url = Some("https://cdn.example.com/p1-fixture".to_owned());
-                        proto_
+                    let mut message = waproto::whatsapp::message::ImageMessage {
+                        media_key: Some(enc.media_key.to_vec()),
+                        file_enc_sha256: Some(enc.file_enc_sha256.to_vec()),
+                        file_sha256: Some(enc.file_sha256.to_vec()),
+                        static_url: Some("https://cdn.example.com/p1-fixture".to_owned()),
+                        ..Default::default()
                     };
                     if corrupt_encrypted_hash {
                         message.file_enc_sha256.as_mut().unwrap()[0] ^= 1;
@@ -3017,14 +3016,13 @@ mod tests {
             crate::test_utils::create_test_client_with_name("invalid_metadata_no_iq").await;
         for static_url in [None, Some("https://cdn.example/static".to_owned())] {
             for encrypted_hash in [false, true] {
-                let mut message = {
-                    let mut proto = wa::message::ImageMessage::default();
-                    proto.direct_path = Some("/file".into());
-                    proto.static_url = static_url.clone();
-                    proto.media_key = Some(vec![1; 32]);
-                    proto.file_sha256 = Some(vec![2; 32]);
-                    proto.file_enc_sha256 = Some(vec![3; 32]);
-                    proto
+                let mut message = wa::message::ImageMessage {
+                    direct_path: Some("/file".into()),
+                    static_url: static_url.clone(),
+                    media_key: Some(vec![1; 32]),
+                    file_sha256: Some(vec![2; 32]),
+                    file_enc_sha256: Some(vec![3; 32]),
+                    ..Default::default()
                 };
                 let expected = if encrypted_hash {
                     message.file_enc_sha256 = Some(vec![3; 31]);
@@ -3045,11 +3043,10 @@ mod tests {
         }
         // Missing optional hashes and a non-32-byte raw transport key remain
         // valid for the static-URL path; the owned container has stricter keys.
-        let optional = {
-            let mut proto = wa::message::ImageMessage::default();
-            proto.static_url = Some("https://cdn.example/static?signature=unchanged#part".into());
-            proto.media_key = Some(vec![1; 16]);
-            proto
+        let optional = wa::message::ImageMessage {
+            static_url: Some("https://cdn.example/static?signature=unchanged#part".into()),
+            media_key: Some(vec![1; 16]),
+            ..Default::default()
         };
         let requests = client.prepare_requests(&optional, false).await.unwrap();
         assert_eq!(requests[0].url, optional.static_url.as_deref().unwrap());
@@ -3062,12 +3059,11 @@ mod tests {
     async fn static_url_download_asks_for_no_media_conn() {
         let client = crate::test_utils::create_test_client_with_name("static_url_no_iq").await;
 
-        let with_static_url = {
-            let mut proto = wa::message::ImageMessage::default();
-            proto.static_url = Some("https://static.cdn.example.com/media/abc123".to_string());
-            proto.direct_path = Some("/v/t62.7118-24/unused".to_string());
-            proto.file_sha256 = Some(vec![7u8; 32]);
-            proto
+        let with_static_url = wa::message::ImageMessage {
+            static_url: Some("https://static.cdn.example.com/media/abc123".to_string()),
+            direct_path: Some("/v/t62.7118-24/unused".to_string()),
+            file_sha256: Some(vec![7u8; 32]),
+            ..Default::default()
         };
         let requests = client
             .prepare_requests(&with_static_url, false)
@@ -3081,11 +3077,10 @@ mod tests {
 
         // The same client still asks the server for hosts when there is no
         // static URL, which is what makes the assertion above meaningful.
-        let without_static_url = {
-            let mut proto = wa::message::ImageMessage::default();
-            proto.direct_path = Some("/v/t62.7118-24/needs-hosts".to_string());
-            proto.file_sha256 = Some(vec![7u8; 32]);
-            proto
+        let without_static_url = wa::message::ImageMessage {
+            direct_path: Some("/v/t62.7118-24/needs-hosts".to_string()),
+            file_sha256: Some(vec![7u8; 32]),
+            ..Default::default()
         };
         let err = client
             .prepare_requests(&without_static_url, false)
@@ -3104,14 +3099,13 @@ mod tests {
     async fn client_params_and_messages_share_routes_and_outputs() {
         let original = b"one canonical route";
         let (params, encrypted) = encrypted_params(original);
-        let message = {
-            let mut proto = wa::message::ImageMessage::default();
-            proto.direct_path = Some(params.direct_path.clone());
-            proto.media_key = params.media_key.clone();
-            proto.file_sha256 = Some(params.file_sha256.clone());
-            proto.file_enc_sha256 = params.file_enc_sha256.clone();
-            proto.file_length = Some(params.file_length);
-            proto
+        let message = wa::message::ImageMessage {
+            direct_path: Some(params.direct_path.clone()),
+            media_key: params.media_key.clone(),
+            file_sha256: Some(params.file_sha256.clone()),
+            file_enc_sha256: params.file_enc_sha256.clone(),
+            file_length: Some(params.file_length),
+            ..Default::default()
         };
         for streaming in [false, true] {
             let http = if streaming {
@@ -3150,11 +3144,10 @@ mod tests {
 
     #[tokio::test]
     async fn client_static_rejection_is_final_without_invalidating_a_session() {
-        let message = {
-            let mut proto = wa::message::ImageMessage::default();
-            proto.static_url = Some("https://cdn.example.com/static".into());
-            proto.file_sha256 = Some(vec![0; 32]);
-            proto
+        let message = wa::message::ImageMessage {
+            static_url: Some("https://cdn.example.com/static".into()),
+            file_sha256: Some(vec![0; 32]),
+            ..Default::default()
         };
         for streaming in [false, true] {
             let http = if streaming {

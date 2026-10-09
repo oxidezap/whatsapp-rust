@@ -95,12 +95,10 @@ impl ShortcakeUtils {
         device_type: wa::device_props::PlatformType,
         ref_str: &str,
     ) -> Vec<u8> {
-        waproto::codec::companion_ephemeral_identity_to_vec(&{
-            let mut proto = wa::CompanionEphemeralIdentity::default();
-            proto.public_key = Some(public_key.to_vec());
-            proto.device_type = Some(device_type);
-            proto.r#ref = Some(ref_str.to_string());
-            proto
+        waproto::codec::companion_ephemeral_identity_to_vec(&wa::CompanionEphemeralIdentity {
+            public_key: Some(public_key.to_vec()),
+            device_type: Some(device_type),
+            r#ref: Some(ref_str.to_string()),
         })
     }
 
@@ -121,15 +119,11 @@ impl ShortcakeUtils {
         companion_ephemeral_identity: &[u8],
         commitment_hash: &[u8; 32],
     ) -> Vec<u8> {
-        waproto::codec::prologue_payload_to_vec(&{
-            let mut proto = wa::ProloguePayload::default();
-            proto.companion_ephemeral_identity = Some(companion_ephemeral_identity.to_vec());
-            proto.commitment = buffa::MessageField::some({
-                let mut proto = wa::CompanionCommitment::default();
-                proto.hash = Some(commitment_hash.to_vec());
-                proto
-            });
-            proto
+        waproto::codec::prologue_payload_to_vec(&wa::ProloguePayload {
+            companion_ephemeral_identity: Some(companion_ephemeral_identity.to_vec()),
+            commitment: buffa::MessageField::some(wa::CompanionCommitment {
+                hash: Some(commitment_hash.to_vec()),
+            }),
         })
     }
 
@@ -228,12 +222,10 @@ impl ShortcakeUtils {
         companion_identity_key: &[u8; 32],
         adv_secret: &[u8; 32],
     ) -> Vec<u8> {
-        waproto::codec::pairing_request_to_vec(&{
-            let mut proto = wa::PairingRequest::default();
-            proto.companion_public_key = Some(companion_public_key.to_vec());
-            proto.companion_identity_key = Some(companion_identity_key.to_vec());
-            proto.adv_secret = Some(adv_secret.to_vec());
-            proto
+        waproto::codec::pairing_request_to_vec(&wa::PairingRequest {
+            companion_public_key: Some(companion_public_key.to_vec()),
+            companion_identity_key: Some(companion_identity_key.to_vec()),
+            adv_secret: Some(adv_secret.to_vec()),
         })
     }
 
@@ -256,11 +248,9 @@ impl ShortcakeUtils {
 
     /// Encode the `EncryptedPairingRequest` protobuf sent in the final IQ.
     pub fn build_encrypted_pairing_request(enc: &EncryptedPairing) -> Vec<u8> {
-        waproto::codec::encrypted_pairing_request_to_vec(&{
-            let mut proto = wa::EncryptedPairingRequest::default();
-            proto.encrypted_payload = Some(enc.encrypted_payload.clone());
-            proto.iv = Some(enc.iv.to_vec());
-            proto
+        waproto::codec::encrypted_pairing_request_to_vec(&wa::EncryptedPairingRequest {
+            encrypted_payload: Some(enc.encrypted_payload.clone()),
+            iv: Some(enc.iv.to_vec()),
         })
     }
 
@@ -369,11 +359,9 @@ mod tests {
 
     #[test]
     fn parse_primary_ephemeral_identity_roundtrip_and_length_validation() {
-        let proto = {
-            let mut proto = wa::PrimaryEphemeralIdentity::default();
-            proto.public_key = Some(vec![0xAB; 32]);
-            proto.nonce = Some(vec![0xCD; 32]);
-            proto
+        let proto = wa::PrimaryEphemeralIdentity {
+            public_key: Some(vec![0xAB; 32]),
+            nonce: Some(vec![0xCD; 32]),
         }
         .encode_to_vec();
         let parsed = ShortcakeUtils::parse_primary_ephemeral_identity(&proto).unwrap();
@@ -381,11 +369,9 @@ mod tests {
         assert_eq!(parsed.nonce, [0xCD; 32]);
 
         // wrong-length pubkey is rejected with a Length error
-        let bad_pk = {
-            let mut proto = wa::PrimaryEphemeralIdentity::default();
-            proto.public_key = Some(vec![0xAB; 31]);
-            proto.nonce = Some(vec![0xCD; 32]);
-            proto
+        let bad_pk = wa::PrimaryEphemeralIdentity {
+            public_key: Some(vec![0xAB; 31]),
+            nonce: Some(vec![0xCD; 32]),
         }
         .encode_to_vec();
         assert!(matches!(
@@ -397,11 +383,9 @@ mod tests {
         ));
 
         // wrong-length nonce is rejected
-        let bad_nonce = {
-            let mut proto = wa::PrimaryEphemeralIdentity::default();
-            proto.public_key = Some(vec![0xAB; 32]);
-            proto.nonce = Some(vec![0xCD; 1]);
-            proto
+        let bad_nonce = wa::PrimaryEphemeralIdentity {
+            public_key: Some(vec![0xAB; 32]),
+            nonce: Some(vec![0xCD; 1]),
         }
         .encode_to_vec();
         assert!(matches!(
@@ -560,11 +544,9 @@ mod tests {
         let primary_kp = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
         let primary_pub: [u8; 32] = primary_kp.public_key.public_key_bytes().try_into().unwrap();
         let primary_nonce = [0x33u8; 32];
-        let primary_wire = {
-            let mut proto = wa::PrimaryEphemeralIdentity::default();
-            proto.public_key = Some(primary_pub.to_vec());
-            proto.nonce = Some(primary_nonce.to_vec());
-            proto
+        let primary_wire = wa::PrimaryEphemeralIdentity {
+            public_key: Some(primary_pub.to_vec()),
+            nonce: Some(primary_nonce.to_vec()),
         }
         .encode_to_vec();
         let parsed = ShortcakeUtils::parse_primary_ephemeral_identity(&primary_wire).unwrap();

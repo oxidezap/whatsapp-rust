@@ -66,36 +66,3 @@ pub(crate) fn encode_store_incarnation(bytes: &mut Vec<u8>, incarnation: &[u8; 1
     encode_varint(STORE_INCARNATION_LEN as u64, bytes);
     bytes.extend_from_slice(incarnation);
 }
-
-/// Keep future record data without replaying an old local lease/incarnation.
-pub(crate) fn future_record_fields(
-    fields: impl Into<buffa::UnknownFields>,
-) -> buffa::UnknownFields {
-    let fields: buffa::UnknownFields = fields.into();
-    let mut future = buffa::UnknownFields::new();
-    for field in fields {
-        if field.number != COUNTER_RESERVATION_FIELD && field.number != STORE_INCARNATION_FIELD {
-            future.push(field);
-        }
-    }
-    future
-}
-
-/// Estimate decoder-grown unknown storage, including recursively owned payloads.
-/// buffa exposes live entries but not Vec capacity; round slots up to the
-/// decoder's geometric allocation bound. Payload Vec capacities are exact.
-pub(crate) fn unknown_fields_retained(fields: &buffa::UnknownFields) -> usize {
-    if fields.is_empty() {
-        return 0;
-    }
-    let slots = fields.len().next_power_of_two().max(4);
-    slots * size_of::<buffa::UnknownField>()
-        + fields
-            .iter()
-            .map(|field| match &field.data {
-                buffa::UnknownFieldData::LengthDelimited(bytes) => bytes.capacity(),
-                buffa::UnknownFieldData::Group(fields) => unknown_fields_retained(fields),
-                _ => 0,
-            })
-            .sum::<usize>()
-}

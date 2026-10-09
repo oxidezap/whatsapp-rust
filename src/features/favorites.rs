@@ -87,23 +87,19 @@ mod tests {
         Mutation {
             index: vec!["favorites".into()],
             operation: wa::syncd_mutation::SyncdOperation::Set,
-            action_value: Some({
-                let mut proto = wa::SyncActionValue::default();
-                proto.favorites_action = buffa::MessageField::some({
-                    let mut proto = wa::sync_action_value::FavoritesAction::default();
-                    proto.favorites = ids
-                        .iter()
-                        .map(|id| {
-                            let mut proto =
-                                wa::sync_action_value::favorites_action::Favorite::default();
-                            proto.id = Some((*id).into());
-                            proto
-                        })
-                        .collect();
-                    proto
-                });
-                proto.timestamp = Some(1_700_000_000_000);
-                proto
+            action_value: Some(wa::SyncActionValue {
+                favorites_action: buffa::MessageField::some(
+                    wa::sync_action_value::FavoritesAction {
+                        favorites: ids
+                            .iter()
+                            .map(|id| wa::sync_action_value::favorites_action::Favorite {
+                                id: Some((*id).into()),
+                            })
+                            .collect(),
+                    },
+                ),
+                timestamp: Some(1_700_000_000_000),
+                ..Default::default()
             }),
         }
     }

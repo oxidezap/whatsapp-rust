@@ -90,18 +90,16 @@ mod tests {
     fn build_test_key_index_bytes(device_ids: &[u16]) -> Vec<u8> {
         use buffa::Message;
         let valid_indexes: Vec<u32> = device_ids.iter().map(|&id| id as u32).collect();
-        let key_index = {
-            let mut proto_ = waproto::whatsapp::ADVKeyIndexList::default();
-            proto_.raw_id = Some(1);
-            proto_.timestamp = Some(1000);
-            proto_.current_index = Some(valid_indexes.iter().copied().max().unwrap_or(0));
-            proto_.valid_indexes = valid_indexes;
-            proto_
+        let key_index = waproto::whatsapp::ADVKeyIndexList {
+            raw_id: Some(1),
+            timestamp: Some(1000),
+            current_index: Some(valid_indexes.iter().copied().max().unwrap_or(0)),
+            valid_indexes,
+            ..Default::default()
         };
-        let signed = {
-            let mut proto_ = waproto::whatsapp::ADVSignedKeyIndexList::default();
-            proto_.details = Some(key_index.encode_to_vec());
-            proto_
+        let signed = waproto::whatsapp::ADVSignedKeyIndexList {
+            details: Some(key_index.encode_to_vec()),
+            ..Default::default()
         };
         signed.encode_to_vec()
     }

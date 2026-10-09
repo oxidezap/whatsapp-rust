@@ -62,16 +62,13 @@ fn setup_patch(n: usize) -> PatchFixture {
     let mut mutations = Vec::with_capacity(n);
     for i in 0..n {
         let index = format!("[\"star\",\"5511{i:09}@s.whatsapp.net\"]");
-        let value = {
-            let mut proto = wa::SyncActionValue::default();
-            proto.timestamp = Some(1_700_000_000 + i as i64);
-            proto.star_action = {
-                let mut proto = wa::sync_action_value::StarAction::default();
-                proto.starred = Some(i % 2 == 0);
-                proto
+        let value = wa::SyncActionValue {
+            timestamp: Some(1_700_000_000 + i as i64),
+            star_action: wa::sync_action_value::StarAction {
+                starred: Some(i % 2 == 0),
             }
-            .into();
-            proto
+            .into(),
+            ..Default::default()
         };
         let iv = [i as u8; 16];
         let (mutation, _value_mac) = encode_record(
@@ -102,23 +99,15 @@ fn setup_patch(n: usize) -> PatchFixture {
     let snapshot_mac = probe.generate_snapshot_mac("regular", &keys.snapshot_mac);
     state.version = 0;
 
-    let mut patch = {
-        let mut proto = wa::SyncdPatch::default();
-        proto.version = {
-            let mut proto = wa::SyncdVersion::default();
-            proto.version = Some(1);
-            proto
+    let mut patch = wa::SyncdPatch {
+        version: wa::SyncdVersion { version: Some(1) }.into(),
+        mutations,
+        key_id: wa::KeyId {
+            id: Some(key_id.clone()),
         }
-        .into();
-        proto.mutations = mutations;
-        proto.key_id = {
-            let mut proto = wa::KeyId::default();
-            proto.id = Some(key_id.clone());
-            proto
-        }
-        .into();
-        proto.snapshot_mac = Some(snapshot_mac);
-        proto
+        .into(),
+        snapshot_mac: Some(snapshot_mac),
+        ..Default::default()
     };
     patch.patch_mac = Some(wacore_appstate::hash::generate_patch_mac(
         &patch,
@@ -176,33 +165,28 @@ fn setup_record(
         "star" => (
             "[\"star\",\"5511000000000@s.whatsapp.net\",\"3EB0123456789ABCDEF01234\",\"1\",\"0\"]"
                 .to_string(),
-            {
-                let mut proto = wa::SyncActionValue::default();
-                proto.timestamp = Some(1_700_000_000);
-                proto.star_action = {
-                    let mut proto = wa::sync_action_value::StarAction::default();
-                    proto.starred = Some(true);
-                    proto
+            wa::SyncActionValue {
+                timestamp: Some(1_700_000_000),
+                star_action: wa::sync_action_value::StarAction {
+                    starred: Some(true),
                 }
-                .into();
-                proto
+                .into(),
+                ..Default::default()
             },
         ),
         // A contact mutation: longer index plus a name-carrying value, the
         // larger-payload end of the AES/HMAC cost.
         "contact" => (
             "[\"contact\",\"5511999998888@s.whatsapp.net\"]".to_string(),
-            {
-                let mut proto = wa::SyncActionValue::default();
-                proto.timestamp = Some(1_700_000_000);
-                proto.contact_action = {
-                    let mut proto = wa::sync_action_value::ContactAction::default();
-                    proto.full_name = Some("Benchmark Contact Full Name".to_string());
-                    proto.first_name = Some("Benchmark".to_string());
-                    proto
+            wa::SyncActionValue {
+                timestamp: Some(1_700_000_000),
+                contact_action: wa::sync_action_value::ContactAction {
+                    full_name: Some("Benchmark Contact Full Name".to_string()),
+                    first_name: Some("Benchmark".to_string()),
+                    ..Default::default()
                 }
-                .into();
-                proto
+                .into(),
+                ..Default::default()
             },
         ),
         other => unreachable!("unknown shape {other}"),
@@ -256,19 +240,12 @@ fn bench_update_hash_from_records(bencher: divan::Bencher, shape: (usize, bool))
                     index_mac[..4].copy_from_slice(&idx.to_le_bytes());
                     let mut blob = vec![0u8; 16];
                     blob.extend_from_slice(&[(i % 251) as u8; 32]);
-                    {
-                        let mut proto = wa::SyncdRecord::default();
-                        proto.index = buffa::MessageField::some({
-                            let mut proto = wa::SyncdIndex::default();
-                            proto.blob = Some(index_mac.to_vec());
-                            proto
-                        });
-                        proto.value = buffa::MessageField::some({
-                            let mut proto = wa::SyncdValue::default();
-                            proto.blob = Some(blob);
-                            proto
-                        });
-                        proto
+                    wa::SyncdRecord {
+                        index: buffa::MessageField::some(wa::SyncdIndex {
+                            blob: Some(index_mac.to_vec()),
+                        }),
+                        value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) }),
+                        ..Default::default()
                     }
                 })
                 .collect::<Vec<_>>()

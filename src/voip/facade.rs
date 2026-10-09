@@ -1688,14 +1688,12 @@ async fn fanout_group_epoch_for_generation(
     ensure_group_rekey_generation(client, &update.call_id, generation)?;
 
     let raw_epoch = Zeroizing::new(rand::random::<[u8; 32]>().to_vec());
-    let mut message = {
-        let mut proto = wa::Message::default();
-        proto.call = buffa::MessageField::some({
-            let mut proto = wa::message::Call::default();
-            proto.call_key = Some(raw_epoch.to_vec());
-            proto
-        });
-        proto
+    let mut message = wa::Message {
+        call: buffa::MessageField::some(wa::message::Call {
+            call_key: Some(raw_epoch.to_vec()),
+            ..Default::default()
+        }),
+        ..Default::default()
     };
     let padded = Zeroizing::new(MessageUtils::encode_and_pad(&message));
     if let Some(call) = message.call.as_option_mut()
@@ -1890,14 +1888,12 @@ async fn place_call(
     // The callKey we generate is what the engine and SFrame key from; the peer learns it by
     // decrypting the per-device <enc> we send below.
     let call_key = rand::random::<[u8; 32]>();
-    let padded = MessageUtils::encode_and_pad(&{
-        let mut proto = wa::Message::default();
-        proto.call = buffa::MessageField::some({
-            let mut proto = wa::message::Call::default();
-            proto.call_key = Some(call_key.to_vec());
-            proto
-        });
-        proto
+    let padded = MessageUtils::encode_and_pad(&wa::Message {
+        call: buffa::MessageField::some(wa::message::Call {
+            call_key: Some(call_key.to_vec()),
+            ..Default::default()
+        }),
+        ..Default::default()
     });
 
     // Encrypt the callKey for each peer device, reusing the message send path's per-device encrypt
@@ -8673,14 +8669,14 @@ mod tests {
         )))
         .await;
         // Set the ADV account so a pkmsg offer attaches a <device-identity> (as the send path does).
-        pm.process_command(crate::store::commands::DeviceCommand::SetAccount(Some({
-            let mut proto = wa::ADVSignedDeviceIdentity::default();
-            proto.details = Some(vec![0u8; 32]);
-            proto.account_signature_key = Some(vec![0u8; 32]);
-            proto.account_signature = Some(vec![0u8; 64]);
-            proto.device_signature = Some(vec![0u8; 64]);
-            proto
-        })))
+        pm.process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
+            wa::ADVSignedDeviceIdentity {
+                details: Some(vec![0u8; 32]),
+                account_signature_key: Some(vec![0u8; 32]),
+                account_signature: Some(vec![0u8; 64]),
+                device_signature: Some(vec![0u8; 64]),
+            },
+        )))
         .await;
         let transport = Arc::new(crate::transport::mock::MockTransportFactory::new());
         let (client, _rx) = Client::builder()
@@ -10781,14 +10777,14 @@ mod tests {
             Jid::new("111111111111111", Server::Lid),
         )))
         .await;
-        pm.process_command(crate::store::commands::DeviceCommand::SetAccount(Some({
-            let mut proto = wa::ADVSignedDeviceIdentity::default();
-            proto.details = Some(vec![0u8; 32]);
-            proto.account_signature_key = Some(vec![0u8; 32]);
-            proto.account_signature = Some(vec![0u8; 64]);
-            proto.device_signature = Some(vec![0u8; 64]);
-            proto
-        })))
+        pm.process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
+            wa::ADVSignedDeviceIdentity {
+                details: Some(vec![0u8; 32]),
+                account_signature_key: Some(vec![0u8; 32]),
+                account_signature: Some(vec![0u8; 64]),
+                device_signature: Some(vec![0u8; 64]),
+            },
+        )))
         .await;
         let transport = Arc::new(crate::transport::mock::MockTransportFactory::new());
         let (client, _rx) = Client::builder()
@@ -12792,14 +12788,14 @@ mod control_only_tests {
             Jid::new("111111111111111", Server::Lid),
         )))
         .await;
-        pm.process_command(crate::store::commands::DeviceCommand::SetAccount(Some({
-            let mut proto = wa::ADVSignedDeviceIdentity::default();
-            proto.details = Some(vec![0u8; 32]);
-            proto.account_signature_key = Some(vec![0u8; 32]);
-            proto.account_signature = Some(vec![0u8; 64]);
-            proto.device_signature = Some(vec![0u8; 64]);
-            proto
-        })))
+        pm.process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
+            wa::ADVSignedDeviceIdentity {
+                details: Some(vec![0u8; 32]),
+                account_signature_key: Some(vec![0u8; 32]),
+                account_signature: Some(vec![0u8; 64]),
+                device_signature: Some(vec![0u8; 64]),
+            },
+        )))
         .await;
         let peer = Jid::new("333333333333333", Server::Lid).with_device(0);
         crate::test_utils::seed_peer_session(&client, &peer).await;

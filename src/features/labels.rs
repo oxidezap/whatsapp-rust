@@ -6,6 +6,8 @@
 //! - `label_jid`     (index `["label_jid", labelId, chatJid]`) -> `LabelAssociationAction`
 //! - `label_message` (index `["label_message", labelId, chatJid, messageId, fromMe, participant]`)
 //!   -> `LabelAssociationAction`
+//! - `label_sublist` (index `["label_sublist", predefinedId, chatJid]`)
+//!   -> `LabelSublistUpdate` (inbound only; Set upserts, Remove deletes)
 //!
 //! Collection, action version, and index shape come from the generated
 //! `schemas::{LABEL_EDIT, LABEL_JID}` registry, except `label_message`, which
@@ -19,7 +21,8 @@ use crate::features::chat_actions::AppStateError;
 use log::debug;
 use wacore::appstate::{schemas, schemas_unlisted};
 use wacore::types::events::{
-    Event, LabelAssociationUpdate, LabelEditUpdate, MessageLabelAssociationUpdate,
+    Event, LabelAssociationUpdate, LabelEditUpdate, LabelSublistChange, LabelSublistUpdate,
+    MessageLabelAssociationUpdate,
 };
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
@@ -32,6 +35,12 @@ pub(crate) fn dispatch_label_mutation_outcome(
     m: &mut Mutation,
     event_full_sync: bool,
 ) -> AppStateDispatchOutcome {
+    if m.index
+        .first()
+        .is_some_and(|kind| kind == schemas::LABEL_SUBLIST.name)
+    {
+        return dispatch_sublist_mutation(event_bus, m, event_full_sync);
+    }
     if m.operation != wa::syncd_mutation::SyncdOperation::Set || m.index.is_empty() {
         return AppStateDispatchOutcome::Unclaimed;
     }
@@ -128,7 +137,55 @@ pub(crate) fn dispatch_label_mutation_outcome(
     }
 }
 
-/// Both association actions carry the chat JID at index position 2. Returns
+fn dispatch_sublist_mutation(
+    event_bus: &wacore::types::events::CoreEventBus,
+    m: &Mutation,
+    event_full_sync: bool,
+) -> AppStateDispatchOutcome {
+    // WAWebLabelSublistSync keys an upsert/removal by predefinedId + chatJid.
+    // Use the signed integer namespace of LabelEditAction.predefinedId, not
+    // ListType or an allowlist of the currently known predefined IDs.
+    let Some(predefined_id) = m.index.get(1).and_then(|id| id.parse::<i32>().ok()) else {
+        return AppStateDispatchOutcome::Skipped("bad-predefined-id");
+    };
+    let Some(chat_jid) = parse_association_chat_jid("label_sublist", &m.index) else {
+        return AppStateDispatchOutcome::Skipped("bad-chat-jid");
+    };
+    let change = if m.operation == wa::syncd_mutation::SyncdOperation::Remove {
+        // Remove's builder carries an empty action value. Never require a
+        // subListId here or mistake Set(subListId=0) for this operation.
+        LabelSublistChange::Remove
+    } else if m.operation == wa::syncd_mutation::SyncdOperation::Set {
+        let Some(sub_list_id) = m
+            .action_value
+            .as_ref()
+            .and_then(|value| value.label_sublist_action.as_option())
+            .and_then(|action| action.sub_list_id)
+        else {
+            return AppStateDispatchOutcome::Malformed("LabelSublistUpdate");
+        };
+        LabelSublistChange::Upsert { sub_list_id }
+    } else {
+        return AppStateDispatchOutcome::Unclaimed;
+    };
+    let action_timestamp = m
+        .action_value
+        .as_ref()
+        .and_then(|value| value.timestamp)
+        .and_then(wacore::time::from_millis);
+    event_bus.dispatch(Event::LabelSublistUpdate(
+        LabelSublistUpdate::builder()
+            .predefined_id(predefined_id)
+            .chat_jid(chat_jid)
+            .change(change)
+            .maybe_action_timestamp(action_timestamp)
+            .from_full_sync(event_full_sync)
+            .build(),
+    ));
+    AppStateDispatchOutcome::Event("LabelSublistUpdate")
+}
+
+/// Association and sublist actions carry the chat JID at index position 2. Returns
 /// `None` (with a warning) when it is missing or unparseable, so the caller can
 /// claim the mutation without emitting a half-formed event.
 fn parse_association_chat_jid(kind: &str, index: &[String]) -> Option<Jid> {
@@ -187,17 +244,15 @@ impl<'a> Labels<'a> {
             fingerprint_id(label_id),
             name.len()
         );
-        let value = {
-            let mut proto = wa::SyncActionValue::default();
-            proto.label_edit_action = buffa::MessageField::some({
-                let mut proto = wa::sync_action_value::LabelEditAction::default();
-                proto.name = Some(name.to_string());
-                proto.color = Some(color);
-                proto.deleted = Some(false);
-                proto
-            });
-            proto.timestamp = Some(wacore::time::now_millis());
-            proto
+        let value = wa::SyncActionValue {
+            label_edit_action: buffa::MessageField::some(wa::sync_action_value::LabelEditAction {
+                name: Some(name.to_string()),
+                color: Some(color),
+                deleted: Some(false),
+                ..Default::default()
+            }),
+            timestamp: Some(wacore::time::now_millis()),
+            ..Default::default()
         };
         self.client
             .send_app_state_action(&schemas::LABEL_EDIT, &[label_id], &value)
@@ -213,15 +268,13 @@ impl<'a> Labels<'a> {
             ));
         }
         debug!("Deleting label {}", fingerprint_id(label_id));
-        let value = {
-            let mut proto = wa::SyncActionValue::default();
-            proto.label_edit_action = buffa::MessageField::some({
-                let mut proto = wa::sync_action_value::LabelEditAction::default();
-                proto.deleted = Some(true);
-                proto
-            });
-            proto.timestamp = Some(wacore::time::now_millis());
-            proto
+        let value = wa::SyncActionValue {
+            label_edit_action: buffa::MessageField::some(wa::sync_action_value::LabelEditAction {
+                deleted: Some(true),
+                ..Default::default()
+            }),
+            timestamp: Some(wacore::time::now_millis()),
+            ..Default::default()
         };
         self.client
             .send_app_state_action(&schemas::LABEL_EDIT, &[label_id], &value)
@@ -345,15 +398,15 @@ impl<'a> Labels<'a> {
 }
 
 fn association_value(labeled: bool) -> wa::SyncActionValue {
-    {
-        let mut proto = wa::SyncActionValue::default();
-        proto.label_association_action = buffa::MessageField::some({
-            let mut proto = wa::sync_action_value::LabelAssociationAction::default();
-            proto.labeled = Some(labeled);
-            proto
-        });
-        proto.timestamp = Some(wacore::time::now_millis());
-        proto
+    wa::SyncActionValue {
+        label_association_action: buffa::MessageField::some(
+            wa::sync_action_value::LabelAssociationAction {
+                labeled: Some(labeled),
+                ..Default::default()
+            },
+        ),
+        timestamp: Some(wacore::time::now_millis()),
+        ..Default::default()
     }
 }
 
@@ -399,6 +452,177 @@ mod tests {
         let outcome = dispatch_label_mutation_outcome(&bus, &mut m.clone(), false);
         let events = rec.events.lock().unwrap().clone();
         (outcome, events)
+    }
+
+    fn sublist_mutation(sub_list_id: Option<i32>) -> Mutation {
+        // WAWebLabelSublistSync, verified WA 2.3000.1045368834:
+        // regular/version 1, [label_sublist, predefinedId, chatJid].
+        // predefinedId 11 is the lead parent, not ListType::AiResponding.
+        let mut value = wa::SyncActionValue::default();
+        value
+            .label_sublist_action
+            .get_or_insert_default()
+            .sub_list_id = sub_list_id;
+        set_mutation(
+            vec!["label_sublist", "11", "12025550111@s.whatsapp.net"],
+            value,
+        )
+    }
+
+    #[test]
+    fn label_sublist_preserves_ids_timestamps_and_sync_provenance() {
+        for sub_list_id in [i32::MIN, 0, 2, i32::MAX] {
+            for raw_timestamp in [
+                None,
+                Some(0),
+                Some(1_700_000_000_123),
+                Some(i64::MIN),
+                Some(i64::MAX),
+            ] {
+                for full_sync in [false, true] {
+                    let mut mutation = sublist_mutation(Some(sub_list_id));
+                    mutation.index[1] = "2147483647".into();
+                    mutation.index[2] = "120363000000000042@lid".into();
+                    mutation.action_value.as_mut().unwrap().timestamp = raw_timestamp;
+                    let bus = CoreEventBus::new();
+                    let recorder = Arc::new(Recorder::default());
+                    let _subscription = bus.subscribe_handler(recorder.clone());
+                    for operation in [
+                        wa::syncd_mutation::SyncdOperation::Set,
+                        wa::syncd_mutation::SyncdOperation::Remove,
+                    ] {
+                        mutation.operation = operation;
+                        assert_eq!(
+                            dispatch_label_mutation_outcome(&bus, &mut mutation, full_sync),
+                            AppStateDispatchOutcome::Event("LabelSublistUpdate")
+                        );
+                    }
+                    let events = recorder.events.lock().unwrap();
+                    assert_eq!(events.len(), 2);
+                    for (index, event) in events.iter().enumerate() {
+                        let Event::LabelSublistUpdate(update) = &**event else {
+                            panic!("wrong event: {event:?}")
+                        };
+                        assert_eq!(update.predefined_id, i32::MAX);
+                        assert_eq!(update.chat_jid.to_string(), "120363000000000042@lid");
+                        assert_eq!(
+                            update.action_timestamp,
+                            raw_timestamp.and_then(wacore::time::from_millis)
+                        );
+                        assert_eq!(update.from_full_sync, full_sync);
+                        assert_eq!(
+                            update.change,
+                            if index == 0 {
+                                LabelSublistChange::Upsert { sub_list_id }
+                            } else {
+                                LabelSublistChange::Remove
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn label_sublist_set_requires_a_value_but_remove_does_not() {
+        let mut absent = sublist_mutation(None);
+        let mut no_action = absent.clone();
+        no_action.action_value = Some(wa::SyncActionValue::default());
+        let mut no_value = absent.clone();
+        no_value.action_value = None;
+        for mutation in [&mut absent, &mut no_action, &mut no_value] {
+            let (outcome, events) = run(mutation);
+            assert_eq!(
+                outcome,
+                AppStateDispatchOutcome::Malformed("LabelSublistUpdate")
+            );
+            assert!(events.is_empty());
+            mutation.operation = wa::syncd_mutation::SyncdOperation::Remove;
+            let (outcome, events) = run(mutation);
+            assert_eq!(
+                outcome,
+                AppStateDispatchOutcome::Event("LabelSublistUpdate")
+            );
+            let Event::LabelSublistUpdate(update) = &*events[0] else {
+                panic!("wrong event")
+            };
+            assert_eq!(update.change, LabelSublistChange::Remove);
+            assert_eq!(update.action_timestamp, None);
+        }
+    }
+
+    #[test]
+    fn label_sublist_rejects_unusable_keys_without_partial_events() {
+        for index in [
+            vec!["label_sublist"],
+            vec!["label_sublist", ""],
+            vec!["label_sublist", "NaN", "12025550111@s.whatsapp.net"],
+            vec!["label_sublist", "2147483648", "12025550111@s.whatsapp.net"],
+            vec!["label_sublist", "1.5", "12025550111@s.whatsapp.net"],
+            vec!["label_sublist", "11"],
+            vec!["label_sublist", "11", ""],
+            vec!["label_sublist", "11", "not a jid"],
+        ] {
+            for operation in [
+                wa::syncd_mutation::SyncdOperation::Set,
+                wa::syncd_mutation::SyncdOperation::Remove,
+            ] {
+                let mut mutation = sublist_mutation(Some(2));
+                mutation.index = index.iter().map(|s| (*s).into()).collect();
+                mutation.operation = operation;
+                let (outcome, events) = run(&mutation);
+                assert!(
+                    matches!(outcome, AppStateDispatchOutcome::Skipped(_)),
+                    "{index:?}"
+                );
+                assert!(events.is_empty(), "{index:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn label_sublist_replay_replaces_then_removes_without_label_assignment() {
+        let mut state = std::collections::HashMap::new();
+        for sub_list_id in [Some(1), Some(1), Some(0), Some(-1), None, None] {
+            let mut mutation = sublist_mutation(sub_list_id);
+            // As with existing label handlers, future index suffixes do not
+            // erase the fields this version understands.
+            mutation.index.push("future-extension".into());
+            if sub_list_id.is_none() {
+                mutation.operation = wa::syncd_mutation::SyncdOperation::Remove;
+                mutation.action_value = None;
+            }
+            let (_, events) = run(&mutation);
+            assert_eq!(events.len(), 1);
+            let Event::LabelSublistUpdate(update) = &*events[0] else {
+                panic!("must not fabricate a parent-label event")
+            };
+            let key = (update.predefined_id, update.chat_jid.clone());
+            match update.change {
+                LabelSublistChange::Upsert { sub_list_id } => {
+                    state.insert(key.clone(), sub_list_id);
+                }
+                LabelSublistChange::Remove => {
+                    state.remove(&key);
+                }
+                _ => panic!("unexpected future sublist change"),
+            }
+            assert_eq!(state.get(&key).copied(), sub_list_id);
+        }
+        for kind in [
+            "label_jid",
+            "label_edit",
+            "label_message",
+            "label_reordering",
+        ] {
+            let mut mutation = sublist_mutation(Some(2));
+            mutation.index[0] = kind.into();
+            mutation.operation = wa::syncd_mutation::SyncdOperation::Remove;
+            let (outcome, events) = run(&mutation);
+            assert_eq!(outcome, AppStateDispatchOutcome::Unclaimed);
+            assert!(events.is_empty());
+        }
     }
 
     #[test]
@@ -489,18 +713,21 @@ mod tests {
 
     #[test]
     fn label_edit_dispatches_update() {
-        let m = set_mutation(vec!["label_edit", "5"], {
-            let mut proto = wa::SyncActionValue::default();
-            proto.label_edit_action = buffa::MessageField::some({
-                let mut proto = wa::sync_action_value::LabelEditAction::default();
-                proto.name = Some("Work".into());
-                proto.color = Some(2);
-                proto.deleted = Some(false);
-                proto
-            });
-            proto.timestamp = Some(1000);
-            proto
-        });
+        let m = set_mutation(
+            vec!["label_edit", "5"],
+            wa::SyncActionValue {
+                label_edit_action: buffa::MessageField::some(
+                    wa::sync_action_value::LabelEditAction {
+                        name: Some("Work".into()),
+                        color: Some(2),
+                        deleted: Some(false),
+                        ..Default::default()
+                    },
+                ),
+                timestamp: Some(1000),
+                ..Default::default()
+            },
+        );
         let (outcome, events) = run(&m);
         assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert_eq!(events.len(), 1);
@@ -517,16 +744,19 @@ mod tests {
 
     #[test]
     fn label_jid_dispatches_association() {
-        let m = set_mutation(vec!["label_jid", "5", "12025550111@s.whatsapp.net"], {
-            let mut proto = wa::SyncActionValue::default();
-            proto.label_association_action = buffa::MessageField::some({
-                let mut proto = wa::sync_action_value::LabelAssociationAction::default();
-                proto.labeled = Some(true);
-                proto
-            });
-            proto.timestamp = Some(1000);
-            proto
-        });
+        let m = set_mutation(
+            vec!["label_jid", "5", "12025550111@s.whatsapp.net"],
+            wa::SyncActionValue {
+                label_association_action: buffa::MessageField::some(
+                    wa::sync_action_value::LabelAssociationAction {
+                        labeled: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                timestamp: Some(1000),
+                ..Default::default()
+            },
+        );
         let (outcome, events) = run(&m);
         assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert_eq!(events.len(), 1);
@@ -718,15 +948,18 @@ mod tests {
                 "0",
             ],
         ] {
-            let m = set_mutation(index.clone(), {
-                let mut proto = wa::SyncActionValue::default();
-                proto.label_association_action = buffa::MessageField::some({
-                    let mut proto = wa::sync_action_value::LabelAssociationAction::default();
-                    proto.labeled = Some(true);
-                    proto
-                });
-                proto
-            });
+            let m = set_mutation(
+                index.clone(),
+                wa::SyncActionValue {
+                    label_association_action: buffa::MessageField::some(
+                        wa::sync_action_value::LabelAssociationAction {
+                            labeled: Some(true),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                },
+            );
             let (outcome, events) = run(&m);
             assert!(
                 outcome != AppStateDispatchOutcome::Unclaimed,
@@ -751,15 +984,18 @@ mod tests {
     #[test]
     fn label_jid_with_malformed_chat_is_claimed_but_not_dispatched() {
         // Claimed (a non-`Unclaimed` outcome) so it isn't re-tried, but no event is emitted.
-        let m = set_mutation(vec!["label_jid", "5", "not a jid"], {
-            let mut proto = wa::SyncActionValue::default();
-            proto.label_association_action = buffa::MessageField::some({
-                let mut proto = wa::sync_action_value::LabelAssociationAction::default();
-                proto.labeled = Some(true);
-                proto
-            });
-            proto
-        });
+        let m = set_mutation(
+            vec!["label_jid", "5", "not a jid"],
+            wa::SyncActionValue {
+                label_association_action: buffa::MessageField::some(
+                    wa::sync_action_value::LabelAssociationAction {
+                        labeled: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            },
+        );
         let (outcome, events) = run(&m);
         assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert!(events.is_empty());

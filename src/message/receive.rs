@@ -220,6 +220,14 @@ impl Client {
             info.is_offline,
         )
         .await;
+        if info.source.is_self_fanout() {
+            self.cache_lid_pn_from_message(
+                &info.source.chat,
+                info.source.recipient_alt.as_ref(),
+                info.is_offline,
+            )
+            .await;
+        }
         let sender_encryption_jid = self.resolve_encryption_jid(&info.source.sender).await;
 
         let unavailable_node = nr.get_optional_child("unavailable");
@@ -1949,10 +1957,8 @@ impl Client {
         // `WAWebHandleHistorySyncNotification` gates on `isMePrimaryNonLid`.
         if let Some(history_sync) = history_sync_taken {
             if info.source.is_from_me {
-                // This uncommon notification's future carries the detached
-                // history metadata. Keep it out of every ordinary chat lane,
-                // as with the PDO recovery future above.
-                Box::pin(self.handle_history_sync(info.id.to_string(), history_sync)).await;
+                self.handle_history_sync(info.id.to_string(), history_sync)
+                    .await;
             } else {
                 warn!(
                     "[msg:{}] Dropping history_sync_notification from non-self sender {}",

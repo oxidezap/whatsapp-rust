@@ -174,6 +174,9 @@ pub struct MessageSource {
     pub addressing_mode: Option<AddressingMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_alt: Option<Jid>,
+    /// Explicit alternate identity of the recipient, not of `sender`.
+    /// Self-synced LID DMs populate this from a valid `peer_recipient_pn`
+    /// without changing `chat`. An omitted PN is not inferred from the cache.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recipient_alt: Option<Jid>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -467,9 +470,9 @@ pub struct MessageInfo {
     /// struct.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_name_serial: Option<i64>,
-    /// Envelope `peer_recipient_pn` attr. Present on companion-device
-    /// self-synced DM stanzas to identify the peer's PN (so the receipt
-    /// goes to the right routing target).
+    /// Raw parsed envelope `peer_recipient_pn`. For a valid self-synced LID
+    /// DM, `source.recipient_alt` associates this PN with the explicit peer.
+    /// This field alone does not establish an identity pair or change routing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_recipient_pn: Option<Jid>,
     /// Broadcast-contact-list recipients from `<participants><to jid>` on an
@@ -869,10 +872,9 @@ mod tests {
     fn test_decrypt_fail_hide_logic_for_edits() {
         // Exercise the real rule; both revoke kinds are excluded (WA Web never
         // hides REVOKE and the server drops revokes carrying the attribute).
-        let plain = {
-            let mut proto_ = waproto::whatsapp::Message::default();
-            proto_.conversation = Some("hi".into());
-            proto_
+        let plain = waproto::whatsapp::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
         };
         let hide =
             |e: EditAttribute| crate::send::should_hide_decrypt_fail_for_send(Some(&e), &plain);
@@ -888,19 +890,16 @@ mod tests {
 
     #[test]
     fn infer_from_message_admin_revoke() {
-        let msg = {
-            let mut proto_ = waproto::whatsapp::Message::default();
-            proto_.protocol_message = MessageField::some({
-                let mut proto_ = waproto::whatsapp::message::ProtocolMessage::default();
-                proto_.key = MessageField::some({
-                    let mut proto_ = waproto::whatsapp::MessageKey::default();
-                    proto_.from_me = Some(false);
-                    proto_
-                });
-                proto_.r#type = Some(waproto::whatsapp::message::protocol_message::Type::REVOKE);
-                proto_
-            });
-            proto_
+        let msg = waproto::whatsapp::Message {
+            protocol_message: MessageField::some(waproto::whatsapp::message::ProtocolMessage {
+                key: MessageField::some(waproto::whatsapp::MessageKey {
+                    from_me: Some(false),
+                    ..Default::default()
+                }),
+                r#type: Some(waproto::whatsapp::message::protocol_message::Type::REVOKE),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         assert_eq!(
             EditAttribute::infer_from_message(&msg),
@@ -910,19 +909,16 @@ mod tests {
 
     #[test]
     fn infer_from_message_sender_revoke() {
-        let msg = {
-            let mut proto_ = waproto::whatsapp::Message::default();
-            proto_.protocol_message = MessageField::some({
-                let mut proto_ = waproto::whatsapp::message::ProtocolMessage::default();
-                proto_.key = MessageField::some({
-                    let mut proto_ = waproto::whatsapp::MessageKey::default();
-                    proto_.from_me = Some(true);
-                    proto_
-                });
-                proto_.r#type = Some(waproto::whatsapp::message::protocol_message::Type::REVOKE);
-                proto_
-            });
-            proto_
+        let msg = waproto::whatsapp::Message {
+            protocol_message: MessageField::some(waproto::whatsapp::message::ProtocolMessage {
+                key: MessageField::some(waproto::whatsapp::MessageKey {
+                    from_me: Some(true),
+                    ..Default::default()
+                }),
+                r#type: Some(waproto::whatsapp::message::protocol_message::Type::REVOKE),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         assert_eq!(
             EditAttribute::infer_from_message(&msg),
@@ -932,14 +928,11 @@ mod tests {
 
     #[test]
     fn infer_from_message_top_level_edit() {
-        let msg = {
-            let mut proto_ = waproto::whatsapp::Message::default();
-            proto_.edited_message = MessageField::some({
-                let mut proto_ = waproto::whatsapp::message::FutureProofMessage::default();
-                proto_.message = MessageField::some(waproto::whatsapp::Message::default());
-                proto_
-            });
-            proto_
+        let msg = waproto::whatsapp::Message {
+            edited_message: MessageField::some(waproto::whatsapp::message::FutureProofMessage {
+                message: MessageField::some(waproto::whatsapp::Message::default()),
+            }),
+            ..Default::default()
         };
         assert_eq!(
             EditAttribute::infer_from_message(&msg),
@@ -949,14 +942,12 @@ mod tests {
 
     #[test]
     fn infer_from_message_legacy_edit() {
-        let msg = {
-            let mut proto_ = waproto::whatsapp::Message::default();
-            proto_.protocol_message = MessageField::some({
-                let mut proto_ = waproto::whatsapp::message::ProtocolMessage::default();
-                proto_.edited_message = MessageField::some(waproto::whatsapp::Message::default());
-                proto_
-            });
-            proto_
+        let msg = waproto::whatsapp::Message {
+            protocol_message: MessageField::some(waproto::whatsapp::message::ProtocolMessage {
+                edited_message: MessageField::some(waproto::whatsapp::Message::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         assert_eq!(
             EditAttribute::infer_from_message(&msg),
@@ -966,21 +957,17 @@ mod tests {
 
     #[test]
     fn infer_from_message_message_edit_sender() {
-        let msg = {
-            let mut proto_ = waproto::whatsapp::Message::default();
-            proto_.protocol_message = MessageField::some({
-                let mut proto_ = waproto::whatsapp::message::ProtocolMessage::default();
-                proto_.key = MessageField::some({
-                    let mut proto_ = waproto::whatsapp::MessageKey::default();
-                    proto_.from_me = Some(true);
-                    proto_
-                });
-                proto_.r#type =
-                    Some(waproto::whatsapp::message::protocol_message::Type::MESSAGE_EDIT);
-                proto_.edited_message = MessageField::some(waproto::whatsapp::Message::default());
-                proto_
-            });
-            proto_
+        let msg = waproto::whatsapp::Message {
+            protocol_message: MessageField::some(waproto::whatsapp::message::ProtocolMessage {
+                key: MessageField::some(waproto::whatsapp::MessageKey {
+                    from_me: Some(true),
+                    ..Default::default()
+                }),
+                r#type: Some(waproto::whatsapp::message::protocol_message::Type::MESSAGE_EDIT),
+                edited_message: MessageField::some(waproto::whatsapp::Message::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         assert_eq!(
             EditAttribute::infer_from_message(&msg),
@@ -990,38 +977,31 @@ mod tests {
 
     #[test]
     fn infer_from_message_plain_returns_none() {
-        let msg = {
-            let mut proto_ = waproto::whatsapp::Message::default();
-            proto_.conversation = Some("plain".into());
-            proto_
+        let msg = waproto::whatsapp::Message {
+            conversation: Some("plain".into()),
+            ..Default::default()
         };
         assert_eq!(EditAttribute::infer_from_message(&msg), None);
     }
 
     #[test]
     fn infer_from_message_unwraps_neutral_wrappers() {
-        let inner_revoke = {
-            let mut proto_ = waproto::whatsapp::Message::default();
-            proto_.protocol_message = MessageField::some({
-                let mut proto_ = waproto::whatsapp::message::ProtocolMessage::default();
-                proto_.key = MessageField::some({
-                    let mut proto_ = waproto::whatsapp::MessageKey::default();
-                    proto_.from_me = Some(false);
-                    proto_
-                });
-                proto_.r#type = Some(waproto::whatsapp::message::protocol_message::Type::REVOKE);
-                proto_
-            });
-            proto_
+        let inner_revoke = waproto::whatsapp::Message {
+            protocol_message: MessageField::some(waproto::whatsapp::message::ProtocolMessage {
+                key: MessageField::some(waproto::whatsapp::MessageKey {
+                    from_me: Some(false),
+                    ..Default::default()
+                }),
+                r#type: Some(waproto::whatsapp::message::protocol_message::Type::REVOKE),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
-        let wrapped = {
-            let mut proto_ = waproto::whatsapp::Message::default();
-            proto_.ephemeral_message = MessageField::some({
-                let mut proto_ = waproto::whatsapp::message::FutureProofMessage::default();
-                proto_.message = MessageField::some(inner_revoke);
-                proto_
-            });
-            proto_
+        let wrapped = waproto::whatsapp::Message {
+            ephemeral_message: MessageField::some(waproto::whatsapp::message::FutureProofMessage {
+                message: MessageField::some(inner_revoke),
+            }),
+            ..Default::default()
         };
         assert_eq!(
             EditAttribute::infer_from_message(&wrapped),
@@ -1029,29 +1009,28 @@ mod tests {
         );
 
         // Same for pin wrapped in view_once and device_sent (double nesting).
-        let inner_pin = {
-            let mut proto_ = waproto::whatsapp::Message::default();
-            proto_.pin_in_chat_message =
-                MessageField::some(waproto::whatsapp::message::PinInChatMessage::default());
-            proto_
+        let inner_pin = waproto::whatsapp::Message {
+            pin_in_chat_message: MessageField::some(
+                waproto::whatsapp::message::PinInChatMessage::default(),
+            ),
+            ..Default::default()
         };
-        let wrapped_pin = {
-            let mut proto_ = waproto::whatsapp::Message::default();
-            proto_.device_sent_message = MessageField::some({
-                let mut proto_ = waproto::whatsapp::message::DeviceSentMessage::default();
-                proto_.destination_jid = Some(String::new());
-                proto_.message = MessageField::some({
-                    let mut proto_ = waproto::whatsapp::Message::default();
-                    proto_.view_once_message = MessageField::some({
-                        let mut proto_ = waproto::whatsapp::message::FutureProofMessage::default();
-                        proto_.message = MessageField::some(inner_pin);
-                        proto_
-                    });
-                    proto_
-                });
-                proto_
-            });
-            proto_
+        let wrapped_pin = waproto::whatsapp::Message {
+            device_sent_message: MessageField::some(
+                waproto::whatsapp::message::DeviceSentMessage {
+                    destination_jid: Some(String::new()),
+                    message: MessageField::some(waproto::whatsapp::Message {
+                        view_once_message: MessageField::some(
+                            waproto::whatsapp::message::FutureProofMessage {
+                                message: MessageField::some(inner_pin),
+                            },
+                        ),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
         };
         assert_eq!(
             EditAttribute::infer_from_message(&wrapped_pin),

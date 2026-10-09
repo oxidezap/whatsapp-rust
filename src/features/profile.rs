@@ -180,15 +180,12 @@ impl<'a> Profile<'a> {
         use wacore::appstate::schemas;
         use waproto::whatsapp as wa;
 
-        let value = {
-            let mut proto = wa::SyncActionValue::default();
-            proto.push_name_setting = buffa::MessageField::some({
-                let mut proto = wa::sync_action_value::PushNameSetting::default();
-                proto.name = Some(name.to_string());
-                proto
-            });
-            proto.timestamp = Some(wacore::time::now_millis());
-            proto
+        let value = wa::SyncActionValue {
+            push_name_setting: buffa::MessageField::some(wa::sync_action_value::PushNameSetting {
+                name: Some(name.to_string()),
+            }),
+            timestamp: Some(wacore::time::now_millis()),
+            ..Default::default()
         };
         // setting_pushName's index has no args (collection/version come from the schema).
         self.client

@@ -1285,13 +1285,11 @@ mod tests {
     fn generated_signal_wire(counter: u32, previous_counter: u32, ciphertext: &[u8]) -> Vec<u8> {
         let sender_identity = IdentityKey::new(public_key_from_seed(TEST_SENDER_IDENTITY_SEED));
         let receiver_identity = IdentityKey::new(public_key_from_seed(TEST_RECEIVER_IDENTITY_SEED));
-        let proto = {
-            let mut proto_ = waproto::whatsapp::SignalMessage::default();
-            proto_.ratchet_key = Some(public_key_from_seed(TEST_RATCHET_SEED).serialize().to_vec());
-            proto_.counter = Some(counter);
-            proto_.previous_counter = Some(previous_counter);
-            proto_.ciphertext = Some(ciphertext.to_vec());
-            proto_
+        let proto = waproto::whatsapp::SignalMessage {
+            ratchet_key: Some(public_key_from_seed(TEST_RATCHET_SEED).serialize().to_vec()),
+            counter: Some(counter),
+            previous_counter: Some(previous_counter),
+            ciphertext: Some(ciphertext.to_vec()),
         };
         let mut wire =
             Vec::with_capacity(1 + proto.encoded_len() as usize + SignalMessage::MAC_LENGTH);
@@ -1313,25 +1311,23 @@ mod tests {
         signed_pre_key_id: SignedPreKeyId,
         nested_message: &[u8],
     ) -> Vec<u8> {
-        let proto = {
-            let mut proto_ = waproto::whatsapp::PreKeySignalMessage::default();
-            proto_.registration_id = Some(registration_id);
-            proto_.pre_key_id = pre_key_id.map(Into::into);
-            proto_.signed_pre_key_id = Some(signed_pre_key_id.into());
-            proto_.base_key = Some(
+        let proto = waproto::whatsapp::PreKeySignalMessage {
+            registration_id: Some(registration_id),
+            pre_key_id: pre_key_id.map(Into::into),
+            signed_pre_key_id: Some(signed_pre_key_id.into()),
+            base_key: Some(
                 public_key_from_seed(TEST_BASE_KEY_SEED)
                     .serialize()
                     .to_vec(),
-            );
-            proto_.identity_key = Some(
+            ),
+            identity_key: Some(
                 public_key_from_seed(TEST_SENDER_IDENTITY_SEED)
                     .serialize()
                     .to_vec(),
-            );
-            proto_.message = Some(nested_message.to_vec());
-            proto_.kyber_pre_key_id = None;
-            proto_.kyber_ciphertext = None;
-            proto_
+            ),
+            message: Some(nested_message.to_vec()),
+            kyber_pre_key_id: None,
+            kyber_ciphertext: None,
         };
         let mut wire = Vec::with_capacity(1 + proto.encoded_len() as usize);
         wire.push(encode_version_byte(
@@ -1535,12 +1531,10 @@ mod tests {
     }
 
     fn generated_sender_key_wire(chain_id: u32, iteration: u32, ciphertext: &[u8]) -> Vec<u8> {
-        let proto = {
-            let mut proto_ = waproto::whatsapp::SenderKeyMessage::default();
-            proto_.id = Some(chain_id);
-            proto_.iteration = Some(iteration);
-            proto_.ciphertext = Some(ciphertext.to_vec());
-            proto_
+        let proto = waproto::whatsapp::SenderKeyMessage {
+            id: Some(chain_id),
+            iteration: Some(iteration),
+            ciphertext: Some(ciphertext.to_vec()),
         };
         let mut wire = Vec::with_capacity(1 + proto.encoded_len() as usize);
         wire.push(encode_version_byte(
@@ -1645,13 +1639,11 @@ mod tests {
                 )
                 .expect("test SenderKeyDistributionMessage");
 
-                let proto = {
-                    let mut proto_ = waproto::whatsapp::SenderKeyDistributionMessage::default();
-                    proto_.id = Some(chain_id);
-                    proto_.iteration = Some(iteration);
-                    proto_.chain_key = Some(chain_key.to_vec());
-                    proto_.signing_key = Some(signing_key.serialize().to_vec());
-                    proto_
+                let proto = waproto::whatsapp::SenderKeyDistributionMessage {
+                    id: Some(chain_id),
+                    iteration: Some(iteration),
+                    chain_key: Some(chain_key.to_vec()),
+                    signing_key: Some(signing_key.serialize().to_vec()),
                 };
                 let mut generated = Vec::with_capacity(1 + proto.encoded_len() as usize);
                 generated.push(encode_version_byte(

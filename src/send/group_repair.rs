@@ -387,12 +387,13 @@ impl Client {
         if !sent.identity.has_history(self) {
             return Ok(());
         }
-        let context = sent.message_secret.map(|secret| {
-            let mut proto_ = waproto::whatsapp::MessageContextInfo::default();
-            proto_.message_secret = Some(secret.to_vec());
-            proto_.reporting_token_version = Some(wacore::reporting_token::REPORTING_TOKEN_VERSION);
-            proto_
-        });
+        let context = sent
+            .message_secret
+            .map(|secret| waproto::whatsapp::MessageContextInfo {
+                message_secret: Some(secret.to_vec()),
+                reporting_token_version: Some(wacore::reporting_token::REPORTING_TOKEN_VERSION),
+                ..Default::default()
+            });
         let plaintexts = if message.message_context_info.is_unset() {
             wacore::messages::MessageUtils::dm_plaintexts_from_encoded(
                 &bytes,

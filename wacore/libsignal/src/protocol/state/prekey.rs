@@ -61,12 +61,10 @@ impl PreKeyRecord {
         let public_key = key.public_key.public_key_bytes().to_vec();
         let private_key = key.private_key.serialize().to_vec();
         Self {
-            pre_key: {
-                let mut proto = PreKeyRecordStructure::default();
-                proto.id = Some(id.into());
-                proto.public_key = Some(public_key);
-                proto.private_key = Some(private_key);
-                proto
+            pre_key: PreKeyRecordStructure {
+                id: Some(id.into()),
+                public_key: Some(public_key),
+                private_key: Some(private_key),
             },
         }
     }
@@ -125,9 +123,5 @@ impl PreKeyRecord {
 
     pub fn serialize(&self) -> Result<Vec<u8>> {
         Ok(waproto::codec::pre_key_record_to_vec(&self.pre_key))
-    }
-
-    pub(crate) fn as_storage(&self) -> &PreKeyRecordStructure {
-        &self.pre_key
     }
 }

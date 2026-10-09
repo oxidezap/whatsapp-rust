@@ -46,11 +46,10 @@ pub fn encrypt_reaction_with_secret(
         message_secret.len()
     );
     // WA Web encodes only { text, senderTimestampMs }; the key is envelope-side.
-    let inner = {
-        let mut proto = ReactionMessage::default();
-        proto.text = Some(text.to_string());
-        proto.sender_timestamp_ms = Some(sender_timestamp_ms);
-        proto
+    let inner = ReactionMessage {
+        text: Some(text.to_string()),
+        sender_timestamp_ms: Some(sender_timestamp_ms),
+        ..Default::default()
     };
     let plaintext = waproto::codec::reaction_message_to_vec(&inner);
     encrypt_addon(

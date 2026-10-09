@@ -38,7 +38,6 @@ pub fn account_prefix(device_type: Option<ADVEncryptionType>) -> &'static [u8; 2
     match device_type {
         Some(ADVEncryptionType::HOSTED) => &[6, 5],
         None | Some(ADVEncryptionType::E2EE | ADVEncryptionType::NON_E2EE) => &[6, 0],
-        Some(other) => panic!("unsupported encryption type in synthetic identity: {other:?}"),
     }
 }
 
@@ -70,12 +69,10 @@ pub fn signed_identity(
             .expect("synthetic device signature")
             .to_vec()
     });
-    {
-        let mut proto = wa::ADVSignedDeviceIdentity::default();
-        proto.details = Some(details.to_vec());
-        proto.account_signature_key = include_account_key.then(|| account_key.to_vec());
-        proto.account_signature = Some(account_signature.to_vec());
-        proto.device_signature = device_signature;
-        proto
+    wa::ADVSignedDeviceIdentity {
+        details: Some(details.to_vec()),
+        account_signature_key: include_account_key.then(|| account_key.to_vec()),
+        account_signature: Some(account_signature.to_vec()),
+        device_signature,
     }
 }

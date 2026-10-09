@@ -16,7 +16,59 @@ const HEADER: &str = "\
 #![allow(clippy::all)]
 
 use serde::{Deserialize, Serialize};
+
+// Historical contracts retained at their public paths; see the sibling's provenance.
+pub use super::mex_operations_unlisted::{
+    create_labyrinth_backup, debug_labyrinth_inbox_snapshot, debug_labyrinth_range,
+    eb_message_metadata_query, rotate_labyrinth_epoch, team_link_create_invitation,
+    team_link_list_invitations, team_link_remove_invitation, upload_labyrinth_messages,
+};
 ";
+
+pub fn preserve_compatibility(ir: &mut MexIr) -> anyhow::Result<()> {
+    for name in [
+        "CreateLabyrinthBackup",
+        "DebugLabyrinthInboxSnapshot",
+        "DebugLabyrinthRange",
+        "EBMessageMetadataQuery",
+        "RotateLabyrinthEpoch",
+        "TeamLinkCreateInvitation",
+        "TeamLinkListInvitations",
+        "TeamLinkRemoveInvitation",
+        "UploadLabyrinthMessages",
+    ] {
+        anyhow::ensure!(
+            !ir.operations.contains_key(name),
+            "upstream reclaimed {name}; reconcile mex_operations_unlisted before regenerating"
+        );
+    }
+    if let Some(op) = ir.operations.get_mut("ContactManagerCustomerProfiles") {
+        // WAWebContactManagerCustomerProfilesQuery, bundle 36dc1290c51b0250,
+        // bytes 254574..257662 in set 05609307e68b: candidateLids is passed
+        // through with [] as the nullish fallback, not converted to a string.
+        // Keep the previous array API instead of propagating the IR's fallback
+        // inference. A new document must be reviewed against its own source.
+        anyhow::ensure!(
+            op.doc_id == "27796221486653417",
+            "review ContactManagerCustomerProfiles before changing its retained input shape"
+        );
+        let Some(TypeNode::Object(input)) = op.variables_shape.get_mut("input") else {
+            anyhow::bail!("ContactManagerCustomerProfiles input is no longer an object");
+        };
+        let Some(candidate) = input.get_mut("candidate_lids") else {
+            anyhow::bail!("ContactManagerCustomerProfiles lost candidate_lids");
+        };
+        match candidate {
+            TypeNode::Leaf(kind) if kind == "string" => {
+                *candidate = TypeNode::Array(vec![TypeNode::Leaf("string".into())]);
+            }
+            TypeNode::Array(elements) if matches!(elements.as_slice(), [TypeNode::Leaf(kind)] if kind == "string") =>
+                {}
+            _ => anyhow::bail!("review ContactManagerCustomerProfiles candidate_lids type"),
+        }
+    }
+    Ok(())
+}
 
 /// Doc comment on every generated `Variables`.
 ///
@@ -245,6 +297,35 @@ fn scalar_rust(tag: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_operation_reappearance_requires_reconciliation() {
+        let mut ir = ir("CreateLabyrinthBackup", op(&[], &[]));
+        assert!(
+            preserve_compatibility(&mut ir)
+                .unwrap_err()
+                .to_string()
+                .contains("reconcile")
+        );
+    }
+
+    #[test]
+    fn candidate_array_override_is_bound_to_the_reviewed_document() {
+        let mut operation = op(
+            &[("input", obj(&[("candidate_lids", leaf("string"))]))],
+            &[],
+        );
+        operation.doc_id = "27796221486653417".into();
+        let mut ir = ir("ContactManagerCustomerProfiles", operation);
+        preserve_compatibility(&mut ir).unwrap();
+        assert!(generate(&ir).contains("pub candidate_lids: Option<Vec<String>>"));
+        preserve_compatibility(&mut ir).unwrap();
+        ir.operations
+            .get_mut("ContactManagerCustomerProfiles")
+            .unwrap()
+            .doc_id = "new".into();
+        assert!(preserve_compatibility(&mut ir).is_err());
+    }
     use crate::ir::{MexOperation, MexOperationKind};
 
     fn leaf(t: &str) -> TypeNode {

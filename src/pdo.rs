@@ -153,9 +153,12 @@ impl PdoRequestMemo {
         self.info.id == key.id
             && (same_chat(&source.chat)
                 || (!source.is_group
-                    && !source.is_from_me
-                    && (same_chat(&source.sender)
-                        || source.sender_alt.as_ref().is_some_and(same_chat))))
+                    && if source.is_from_me {
+                        source.recipient_alt.as_ref().is_some_and(same_chat)
+                    } else {
+                        same_chat(&source.sender)
+                            || source.sender_alt.as_ref().is_some_and(same_chat)
+                    }))
             && self.matches_source(from_me, participant)
     }
 }
@@ -293,12 +296,15 @@ impl Client {
             None
         };
 
-        // Cache key must use PN JID because the phone's response always contains
-        // PN JIDs in WebMessageInfo.key. For LID-migrated DMs, info.source.chat
-        // can be LID while sender_alt holds the PN — prefer the PN form.
-        let cache_chat = if !info.source.is_group && info.source.chat.is_lid() {
-            info.source
-                .sender_alt
+        // Prefer the peer's explicit PN when a LID DM response crosses namespaces.
+        // In self-sync, sender_alt identifies us; only recipient_alt names the peer.
+        let cache_chat = if !info.source.is_group && info.source.chat.server.is_lid_family() {
+            let peer_alt = if info.source.is_from_me {
+                &info.source.recipient_alt
+            } else {
+                &info.source.sender_alt
+            };
+            peer_alt
                 .as_ref()
                 .map(|jid| jid.to_non_ad())
                 .unwrap_or_else(|| info.source.chat.clone())
@@ -517,41 +523,36 @@ impl Client {
 
         let memo = owner;
 
-        let message_key = {
-            let mut proto = wa::MessageKey::default();
-            proto.remote_jid = Some(resolved_jid.to_string());
-            proto.from_me = Some(info.source.is_from_me);
-            proto.id = Some(info.id.to_string());
-            proto.participant = participant.map(|p| p.to_string());
-            proto
+        let message_key = wa::MessageKey {
+            remote_jid: Some(resolved_jid.to_string()),
+            from_me: Some(info.source.is_from_me),
+            id: Some(info.id.to_string()),
+            participant: participant.map(|p| p.to_string()),
         };
 
         // Build the PDO request message
-        let pdo_request = {
-            let mut proto = wa::message::PeerDataOperationRequestMessage::default();
-            proto.peer_data_operation_request_type =
-                Some(wa::message::PeerDataOperationRequestType::PLACEHOLDER_MESSAGE_RESEND);
-            proto.placeholder_message_resend_request = vec![{
-                let mut proto = wa::message::peer_data_operation_request_message::PlaceholderMessageResendRequest::default();
-                proto.message_key = buffa::MessageField::some(message_key);
-                proto
-            }];
-            proto
+        let pdo_request = wa::message::PeerDataOperationRequestMessage {
+            peer_data_operation_request_type: Some(
+                wa::message::PeerDataOperationRequestType::PLACEHOLDER_MESSAGE_RESEND,
+            ),
+            placeholder_message_resend_request: vec![
+                wa::message::peer_data_operation_request_message::PlaceholderMessageResendRequest {
+                    message_key: buffa::MessageField::some(message_key),
+                },
+            ],
+            ..Default::default()
         };
 
         // Wrap it in a protocol message
-        let protocol_message = {
-            let mut proto_ = wa::message::ProtocolMessage::default();
-            proto_.r#type =
-                Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE);
-            proto_.peer_data_operation_request_message = buffa::MessageField::some(pdo_request);
-            proto_
+        let protocol_message = wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE),
+            peer_data_operation_request_message: buffa::MessageField::some(pdo_request),
+            ..Default::default()
         };
 
-        let msg = {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some(protocol_message);
-            proto_
+        let msg = wa::Message {
+            protocol_message: buffa::MessageField::some(protocol_message),
+            ..Default::default()
         };
 
         info!(
@@ -648,34 +649,32 @@ impl Client {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let peer_target = self_peer_target(&device_snapshot)?;
 
-        let pdo_request = {
-            let mut proto = wa::message::PeerDataOperationRequestMessage::default();
-            proto.peer_data_operation_request_type =
-                Some(wa::message::PeerDataOperationRequestType::HISTORY_SYNC_ON_DEMAND);
-            proto.history_sync_on_demand_request = buffa::MessageField::some({
-                let mut proto = wa::message::peer_data_operation_request_message::HistorySyncOnDemandRequest::default();
-                proto.chat_jid = Some(chat_jid.to_string());
-                proto.oldest_msg_id = Some(oldest_msg_id.to_string());
-                proto.oldest_msg_from_me = Some(oldest_msg_from_me);
-                proto.oldest_msg_timestamp_ms = Some(oldest_msg_timestamp_ms);
-                proto.on_demand_msg_count = Some(count);
-                proto
-            });
-            proto
+        let pdo_request = wa::message::PeerDataOperationRequestMessage {
+            peer_data_operation_request_type: Some(
+                wa::message::PeerDataOperationRequestType::HISTORY_SYNC_ON_DEMAND,
+            ),
+            history_sync_on_demand_request: buffa::MessageField::some(
+                wa::message::peer_data_operation_request_message::HistorySyncOnDemandRequest {
+                    chat_jid: Some(chat_jid.to_string()),
+                    oldest_msg_id: Some(oldest_msg_id.to_string()),
+                    oldest_msg_from_me: Some(oldest_msg_from_me),
+                    oldest_msg_timestamp_ms: Some(oldest_msg_timestamp_ms),
+                    on_demand_msg_count: Some(count),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
         };
 
-        let protocol_message = {
-            let mut proto_ = wa::message::ProtocolMessage::default();
-            proto_.r#type =
-                Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE);
-            proto_.peer_data_operation_request_message = buffa::MessageField::some(pdo_request);
-            proto_
+        let protocol_message = wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE),
+            peer_data_operation_request_message: buffa::MessageField::some(pdo_request),
+            ..Default::default()
         };
 
-        let msg = {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some(protocol_message);
-            proto_
+        let msg = wa::Message {
+            protocol_message: buffa::MessageField::some(protocol_message),
+            ..Default::default()
         };
 
         info!(
@@ -754,32 +753,28 @@ impl Client {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let peer_target = self_peer_target(&device_snapshot)?;
 
-        let pdo_request = {
-            let mut proto = wa::message::PeerDataOperationRequestMessage::default();
-            proto.peer_data_operation_request_type = Some(
+        let pdo_request = wa::message::PeerDataOperationRequestMessage {
+            peer_data_operation_request_type: Some(
                 wa::message::PeerDataOperationRequestType::COMPANION_SYNCD_SNAPSHOT_FATAL_RECOVERY,
-            );
-            proto.syncd_collection_fatal_recovery_request = buffa::MessageField::some({
-                let mut proto = wa::message::peer_data_operation_request_message::SyncDCollectionFatalRecoveryRequest::default();
-                proto.collection_name = Some(collection.to_string());
-                proto.timestamp = Some(wacore::time::now_secs() as i64);
-                proto
-            });
-            proto
+            ),
+            syncd_collection_fatal_recovery_request: buffa::MessageField::some(
+                wa::message::peer_data_operation_request_message::SyncDCollectionFatalRecoveryRequest {
+                    collection_name: Some(collection.to_string()),
+                    timestamp: Some(wacore::time::now_secs() as i64),
+                },
+            ),
+            ..Default::default()
         };
 
-        let protocol_message = {
-            let mut proto_ = wa::message::ProtocolMessage::default();
-            proto_.r#type =
-                Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE);
-            proto_.peer_data_operation_request_message = buffa::MessageField::some(pdo_request);
-            proto_
+        let protocol_message = wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE),
+            peer_data_operation_request_message: buffa::MessageField::some(pdo_request),
+            ..Default::default()
         };
 
-        let msg = {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some(protocol_message);
-            proto_
+        let msg = wa::Message {
+            protocol_message: buffa::MessageField::some(protocol_message),
+            ..Default::default()
         };
 
         info!(
@@ -1244,7 +1239,7 @@ impl Client {
             .pdo_pending_requests
             .remove_if(&cache_key, &matches_pending)
             .await;
-        let alias_key = if !cache_key.chat.is_group() {
+        let mut alias_key = if !cache_key.chat.is_group() {
             self.swap_pn_lid_namespace(&cache_key.chat)
                 .await
                 .map(|alias| ChatMessageId::new(alias, msg_id.into()))
@@ -1258,6 +1253,53 @@ impl Client {
                 .pdo_pending_requests
                 .remove_if(alias_key, &matches_pending)
                 .await;
+        }
+        if pending.is_none()
+            && (cache_key.chat.server.is_lid_family() || cache_key.chat.server.is_pn_family())
+        {
+            // Explicit envelope aliases may be hosted, absent from the mapping
+            // cache, or conflict with its retained mapping. On a miss, correlate
+            // against pending metadata instead of inferring another identity.
+            // This scan is bounded by the pending-cache capacity (default 200).
+            let explicit_key = self
+                .pdo_pending_requests
+                .fold_entries(
+                    None,
+                    |known: Option<(ChatMessageId, u64)>, key, (_, memo)| {
+                        if matches!(
+                            memo.outcome.load(std::sync::atomic::Ordering::Acquire),
+                            PDO_WRITING | PDO_SENT
+                        ) && memo.matches_target(
+                            &cache_key,
+                            response_from_me,
+                            response_participant.as_deref(),
+                        ) && known
+                            .as_ref()
+                            .is_none_or(|(_, generation)| *generation < memo.generation)
+                        {
+                            Some((key.clone(), memo.generation))
+                        } else {
+                            known
+                        }
+                    },
+                )
+                .await;
+            if let Some((key, _)) = explicit_key {
+                pending = self
+                    .pdo_pending_requests
+                    .remove_if(&key, &|entry| {
+                        matches_pending(entry)
+                            && entry.1.matches_target(
+                                &cache_key,
+                                response_from_me,
+                                response_participant.as_deref(),
+                            )
+                    })
+                    .await;
+                // Keep the candidate even for a stale request ID so the
+                // generation check below can reject it without consuming it.
+                alias_key = Some(key);
+            }
         }
         let authority = pending.as_ref().map(|(_, memo)| memo.clone());
         let pending = pending.map(|(entry, _)| entry);
@@ -1690,17 +1732,14 @@ mod tests {
         participant: Option<&str>,
     ) -> waproto::whatsapp::WebMessageInfo {
         use waproto::whatsapp as wa;
-        {
-            let mut proto = wa::WebMessageInfo::default();
-            proto.key = buffa::MessageField::some({
-                let mut proto = wa::MessageKey::default();
-                proto.remote_jid = Some(remote_jid.into());
-                proto.from_me = Some(from_me);
-                proto.id = Some(id.into());
-                proto.participant = participant.map(|p| p.into());
-                proto
-            });
-            proto
+        wa::WebMessageInfo {
+            key: buffa::MessageField::some(wa::MessageKey {
+                remote_jid: Some(remote_jid.into()),
+                from_me: Some(from_me),
+                id: Some(id.into()),
+                participant: participant.map(|p| p.into()),
+            }),
+            ..Default::default()
         }
     }
 
@@ -1713,15 +1752,12 @@ mod tests {
     {
         use buffa::Message as _;
         let mut web_msg = make_web_msg(remote_jid, from_me, id, participant);
-        web_msg.message = buffa::MessageField::some({
-            let mut proto_ = waproto::whatsapp::Message::default();
-            proto_.conversation = Some("recovered by the phone".to_owned());
-            proto_
+        web_msg.message = buffa::MessageField::some(waproto::whatsapp::Message {
+            conversation: Some("recovered by the phone".to_owned()),
+            ..Default::default()
         });
-        {
-            let mut proto_ = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse::default();
-            proto_.web_message_info_bytes = Some(web_msg.encode_to_vec());
-            proto_
+        waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
         }
     }
 
@@ -2089,27 +2125,21 @@ mod tests {
             )
             .await;
 
-        let web_msg = {
-            let mut proto_ = waproto::whatsapp::WebMessageInfo::default();
-            proto_.key = buffa::MessageField::some({
-                let mut proto_ = waproto::whatsapp::MessageKey::default();
-                proto_.remote_jid = Some(chat.to_owned());
-                proto_.from_me = Some(false);
-                proto_.id = Some(msg_id.into());
-                proto_.participant = Some("111222333444555@lid".to_owned());
-                proto_
-            });
-            proto_.message = buffa::MessageField::some({
-                let mut proto_ = waproto::whatsapp::Message::default();
-                proto_.conversation = Some("recovered by the phone".to_owned());
-                proto_
-            });
-            proto_
+        let web_msg = waproto::whatsapp::WebMessageInfo {
+            key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
+                remote_jid: Some(chat.to_owned()),
+                from_me: Some(false),
+                id: Some(msg_id.into()),
+                participant: Some("111222333444555@lid".to_owned()),
+            }),
+            message: buffa::MessageField::some(waproto::whatsapp::Message {
+                conversation: Some("recovered by the phone".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
-        let response = {
-            let mut proto_ = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse::default();
-            proto_.web_message_info_bytes = Some(web_msg.encode_to_vec());
-            proto_
+        let response = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
         };
 
         client
@@ -2179,28 +2209,22 @@ mod tests {
             )
             .await;
 
-        let web_msg = {
-            let mut proto_ = waproto::whatsapp::WebMessageInfo::default();
-            proto_.key = buffa::MessageField::some({
-                let mut proto_ = waproto::whatsapp::MessageKey::default();
-                proto_.remote_jid = Some(chat.to_owned());
-                proto_.from_me = Some(false);
-                proto_.id = Some(msg_id.into()); // The phone answers in PN.
-
-                proto_.participant = Some("15550001234@s.whatsapp.net".to_owned());
-                proto_
-            });
-            proto_.message = buffa::MessageField::some({
-                let mut proto_ = waproto::whatsapp::Message::default();
-                proto_.conversation = Some("recovered by the phone".to_owned());
-                proto_
-            });
-            proto_
+        let web_msg = waproto::whatsapp::WebMessageInfo {
+            key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
+                remote_jid: Some(chat.to_owned()),
+                from_me: Some(false),
+                id: Some(msg_id.into()),
+                // The phone answers in PN.
+                participant: Some("15550001234@s.whatsapp.net".to_owned()),
+            }),
+            message: buffa::MessageField::some(waproto::whatsapp::Message {
+                conversation: Some("recovered by the phone".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
-        let response = {
-            let mut proto_ = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse::default();
-            proto_.web_message_info_bytes = Some(web_msg.encode_to_vec());
-            proto_
+        let response = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
         };
 
         client
@@ -2455,59 +2479,73 @@ mod tests {
         );
     }
 
-    /// Without a mapping, a namespace mismatch still takes the existing
-    /// reconstruction path instead of guessing an alias.
+    /// An explicit envelope alias is sufficient evidence even with a cold
+    /// mapping cache. Without either, reconstruct instead of guessing a pair.
     #[tokio::test]
-    async fn pdo_alias_miss_without_mapping_reconstructs_response() {
+    async fn pdo_alias_miss_uses_only_explicit_pending_identity() {
         use wacore::types::events::ChannelEventHandler;
         use wacore::types::message::ChatMessageId;
 
-        let client = setup_reconstruct_client().await;
-        let pn = "5511999998888@s.whatsapp.net";
-        let lid = "236395184570386@lid";
-        let msg_id = "PDO_DM_NO_MAPPING";
-        client
-            .pdo_pending_requests
-            .insert(
-                ChatMessageId::new(pn.parse().unwrap(), msg_id.into()),
-                super::test_pending(
-                    super::PendingPdoRequest {
-                        message_info: make_dm_pending_info(
-                            pn,
-                            lid,
-                            msg_id,
-                            wacore::types::message::AddressingMode::Pn,
-                        ),
-                        requested_at: wacore::time::Instant::now(),
-                    },
-                    "req-no-mapping",
-                    false,
-                ),
-            )
-            .await;
-
-        let (handler, rx) = ChannelEventHandler::new();
-        client.core.event_bus.subscribe_handler(handler).detach();
-        let response = make_placeholder_response(lid, false, msg_id, None);
-        client
-            .handle_placeholder_resend_response(&response, "req-no-mapping")
-            .await;
-
-        assert!(
+        for explicit_alias in [true, false] {
+            let client = setup_reconstruct_client().await;
+            let pn = "12025550101@s.whatsapp.net";
+            let lid = "777000000000101@lid";
+            let msg_id = "PDO_DM_NO_MAPPING";
+            let mut info =
+                make_dm_pending_info(pn, lid, msg_id, wacore::types::message::AddressingMode::Pn);
+            if !explicit_alias {
+                std::sync::Arc::make_mut(&mut info).source.sender_alt = None;
+            }
+            let key = ChatMessageId::new(pn.parse().unwrap(), msg_id.into());
             client
                 .pdo_pending_requests
-                .get(&ChatMessageId::new(pn.parse().unwrap(), msg_id.into()))
-                .await
-                .is_some()
-        );
-        let mut infos = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            infos.extend(event.messages().map(|message| message.info.clone()));
+                .insert(
+                    key.clone(),
+                    super::test_pending(
+                        super::PendingPdoRequest {
+                            message_info: info.clone(),
+                            requested_at: wacore::time::Instant::now(),
+                        },
+                        "req-no-mapping",
+                        false,
+                    ),
+                )
+                .await;
+            let (handler, rx) = ChannelEventHandler::new();
+            client.core.event_bus.subscribe_handler(handler).detach();
+            let response = make_placeholder_response(lid, false, msg_id, None);
+            client
+                .handle_placeholder_resend_response(&response, "req-no-mapping")
+                .await;
+
+            assert_eq!(
+                client.pdo_pending_requests.get(&key).await.is_none(),
+                explicit_alias
+            );
+            let mut infos = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                infos.extend(event.messages().map(|message| message.info.clone()));
+            }
+            assert_eq!(infos.len(), 1);
+            if explicit_alias {
+                assert_eq!(infos[0].source.chat, info.source.chat);
+                assert_eq!(infos[0].source.sender, info.source.sender);
+                assert_eq!(infos[0].source.sender_alt, info.source.sender_alt);
+                assert_eq!(infos[0].push_name, info.push_name);
+            } else {
+                assert_eq!(infos[0].source.chat.to_string(), lid);
+                assert_eq!(infos[0].source.sender.to_string(), lid);
+                assert!(infos[0].source.sender_alt.is_none());
+                assert_eq!(infos[0].push_name, "");
+            }
+            assert!(
+                client
+                    .lid_pn_cache
+                    .get_phone_number("777000000000101")
+                    .await
+                    .is_none()
+            );
         }
-        assert_eq!(infos.len(), 1);
-        assert_eq!(infos[0].source.chat.to_string(), lid);
-        assert_eq!(infos[0].source.sender.to_string(), lid);
-        assert_eq!(infos[0].push_name, "");
     }
 
     /// Two directions of one DM can share an id, and both their responses omit
@@ -2554,27 +2592,21 @@ mod tests {
             .await;
 
         // The response answers the incoming one, and omits the participant too.
-        let web_msg = {
-            let mut proto_ = waproto::whatsapp::WebMessageInfo::default();
-            proto_.key = buffa::MessageField::some({
-                let mut proto_ = waproto::whatsapp::MessageKey::default();
-                proto_.remote_jid = Some(peer.to_owned());
-                proto_.from_me = Some(false);
-                proto_.id = Some(msg_id.into());
-                proto_.participant = None;
-                proto_
-            });
-            proto_.message = buffa::MessageField::some({
-                let mut proto_ = waproto::whatsapp::Message::default();
-                proto_.conversation = Some("recovered by the phone".to_owned());
-                proto_
-            });
-            proto_
+        let web_msg = waproto::whatsapp::WebMessageInfo {
+            key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
+                remote_jid: Some(peer.to_owned()),
+                from_me: Some(false),
+                id: Some(msg_id.into()),
+                participant: None,
+            }),
+            message: buffa::MessageField::some(waproto::whatsapp::Message {
+                conversation: Some("recovered by the phone".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
-        let response = {
-            let mut proto_ = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse::default();
-            proto_.web_message_info_bytes = Some(web_msg.encode_to_vec());
-            proto_
+        let response = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
         };
 
         client
@@ -2644,6 +2676,197 @@ mod tests {
                 "MANUAL_PDO_SYNTHETIC",
             );
             (client, transport, info)
+        }
+
+        #[tokio::test]
+        async fn outgoing_lid_pdo_uses_recipient_alias_and_preserves_metadata() {
+            use wacore::types::events::ChannelEventHandler;
+            use wacore::types::message::{AddressingMode, MessageSource};
+            for explicit_alias in [true, false] {
+                let (client, transport, _) = manual_retry_client().await;
+                let peer_lid: Jid = "777000000000101@lid".parse().unwrap();
+                let peer_pn: Jid = "12025550101@s.whatsapp.net".parse().unwrap();
+                let own_pn: Jid = "12025550100@s.whatsapp.net".parse().unwrap();
+                let info = Arc::new(MessageInfo {
+                    id: "OUTGOING_ALIAS_PDO".into(),
+                    push_name: "original self-sync metadata".into(),
+                    source: MessageSource {
+                        chat: peer_lid.clone(),
+                        sender: "777000000000100@lid".parse().unwrap(),
+                        sender_alt: Some(own_pn.clone()),
+                        recipient_alt: explicit_alias.then_some(peer_pn.clone()),
+                        is_from_me: true,
+                        addressing_mode: Some(AddressingMode::Lid),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+                let request_id = client
+                    .retry_pdo_placeholder_resend_request(&info)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let response_chat = if explicit_alias { peer_pn } else { peer_lid };
+                let key = ChatMessageId::new(response_chat.clone(), info.id.clone());
+                assert!(client.pdo_pending_requests.get(&key).await.is_some());
+                assert!(
+                    client
+                        .pdo_pending_requests
+                        .get(&ChatMessageId::new(own_pn, info.id.clone()))
+                        .await
+                        .is_none()
+                );
+                let (handler, rx) = ChannelEventHandler::new();
+                client.core.event_bus.subscribe_handler(handler).detach();
+                let response =
+                    make_placeholder_response(&response_chat.to_string(), true, &info.id, None);
+                client
+                    .handle_placeholder_resend_response(&response, "STALE_REQUEST")
+                    .await;
+                assert!(client.pdo_pending_requests.get(&key).await.is_some());
+                assert!(rx.try_recv().is_err(), "stale response must not publish");
+                client
+                    .handle_placeholder_resend_response(&response, &request_id)
+                    .await;
+                assert!(client.pdo_pending_requests.get(&key).await.is_none());
+                let mut delivered = 0;
+                while let Ok(event) = rx.try_recv() {
+                    for message in event.messages() {
+                        assert_eq!(message.info.push_name, info.push_name);
+                        assert_eq!(message.info.source.chat, info.source.chat);
+                        assert_eq!(message.info.source.sender, info.source.sender);
+                        assert_eq!(message.info.source.recipient_alt, info.source.recipient_alt);
+                        assert_eq!(
+                            message.info.unavailable_request_id.as_deref(),
+                            Some(request_id.as_str())
+                        );
+                        delivered += 1;
+                    }
+                }
+                assert_eq!(delivered, 1);
+                client
+                    .handle_placeholder_resend_response(&response, "STALE_REQUEST")
+                    .await;
+                assert!(
+                    rx.try_recv().is_err(),
+                    "completed owner still rejects stale aliases"
+                );
+                crate::test_utils::decode_sent_iq(&transport, 0).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn pdo_explicit_aliases_preserve_metadata_across_reply_namespaces() {
+            use wacore::types::events::ChannelEventHandler;
+            use wacore::types::message::{AddressingMode, MessageSource, SenderMessageId};
+            for (lid_server, pn_server, conflicting_cache) in [
+                ("hosted.lid", "hosted", false),
+                ("hosted.lid", "hosted", true),
+                ("lid", "s.whatsapp.net", false),
+                ("lid", "s.whatsapp.net", true),
+            ] {
+                for (explicit_alias, reply_with_pn) in [(true, true), (true, false), (false, false)]
+                {
+                    let (client, transport, _) = manual_retry_client().await;
+                    let peer_lid: Jid = format!("777000000000101@{lid_server}").parse().unwrap();
+                    let peer_pn: Jid = format!("12025550101@{pn_server}").parse().unwrap();
+                    let own_pn: Jid = "12025550100@s.whatsapp.net".parse().unwrap();
+                    if conflicting_cache {
+                        client
+                            .lid_pn_cache
+                            .add(&wacore::types::lid_pn::LidPnEntry {
+                                lid: peer_lid.user.to_string().into(),
+                                phone_number: "12025550109".into(),
+                                created_at: 0,
+                                learning_source: wacore::types::lid_pn::LearningSource::Usync,
+                            })
+                            .await;
+                    }
+                    let info = Arc::new(MessageInfo {
+                        id: "EXPLICIT_ALIAS_PDO".into(),
+                        push_name: "original self-sync metadata".into(),
+                        source: MessageSource {
+                            chat: peer_lid.clone(),
+                            sender: "777000000000100@lid".parse().unwrap(),
+                            sender_alt: Some(own_pn.clone()),
+                            recipient_alt: explicit_alias.then_some(peer_pn.clone()),
+                            is_from_me: true,
+                            addressing_mode: Some(AddressingMode::Lid),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    });
+                    client
+                        .send_pdo_placeholder_resend_request(&info)
+                        .await
+                        .unwrap();
+                    let request_id = client
+                        .pdo_requested
+                        .get(&SenderMessageId::new(
+                            info.source.chat.clone(),
+                            info.id.clone(),
+                            info.source.sender.clone(),
+                        ))
+                        .await
+                        .unwrap()
+                        .request_id
+                        .clone();
+                    let pending_chat = if explicit_alias {
+                        peer_pn.clone()
+                    } else {
+                        peer_lid.clone()
+                    };
+                    let response_chat = if reply_with_pn { peer_pn } else { peer_lid };
+                    let key = ChatMessageId::new(pending_chat, info.id.clone());
+                    assert!(client.pdo_pending_requests.get(&key).await.is_some());
+                    assert!(
+                        client
+                            .pdo_pending_requests
+                            .get(&ChatMessageId::new(own_pn, info.id.clone()))
+                            .await
+                            .is_none()
+                    );
+                    let (handler, rx) = ChannelEventHandler::new();
+                    client.core.event_bus.subscribe_handler(handler).detach();
+                    let response =
+                        make_placeholder_response(&response_chat.to_string(), true, &info.id, None);
+                    client
+                        .handle_placeholder_resend_response(&response, "STALE_REQUEST")
+                        .await;
+                    assert!(client.pdo_pending_requests.get(&key).await.is_some());
+                    assert!(rx.try_recv().is_err(), "stale response must not publish");
+                    client
+                        .handle_placeholder_resend_response(&response, &request_id)
+                        .await;
+                    assert!(client.pdo_pending_requests.get(&key).await.is_none());
+                    let mut delivered = 0;
+                    while let Ok(event) = rx.try_recv() {
+                        for message in event.messages() {
+                            assert_eq!(message.info.push_name, info.push_name);
+                            assert_eq!(message.info.source.chat, info.source.chat);
+                            assert_eq!(message.info.source.sender, info.source.sender);
+                            assert_eq!(
+                                message.info.source.recipient_alt,
+                                info.source.recipient_alt
+                            );
+                            assert_eq!(
+                                message.info.unavailable_request_id.as_deref(),
+                                Some(request_id.as_str())
+                            );
+                            delivered += 1;
+                        }
+                    }
+                    assert_eq!(delivered, 1);
+                    assert_eq!(
+                        client
+                            .lid_pn_cache
+                            .get_phone_number(&info.source.chat.user)
+                            .await,
+                        conflicting_cache.then(|| "12025550109".to_owned())
+                    );
+                    crate::test_utils::decode_sent_iq(&transport, 0).await;
+                }
+            }
         }
 
         #[tokio::test]
@@ -3815,22 +4038,17 @@ mod tests {
             )
             .await;
 
-        let web_msg = {
-            let mut proto_ = waproto::whatsapp::WebMessageInfo::default();
-            proto_.key = buffa::MessageField::some({
-                let mut proto_ = waproto::whatsapp::MessageKey::default();
-                proto_.remote_jid = Some(chat.to_owned());
-                proto_.from_me = Some(false);
-                proto_.id = Some(msg_id.into());
-                proto_.participant = None;
-                proto_
-            });
-            proto_
+        let web_msg = waproto::whatsapp::WebMessageInfo {
+            key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
+                remote_jid: Some(chat.to_owned()),
+                from_me: Some(false),
+                id: Some(msg_id.into()),
+                participant: None,
+            }),
+            ..Default::default()
         };
-        let response = {
-            let mut proto_ = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse::default();
-            proto_.web_message_info_bytes = Some(web_msg.encode_to_vec());
-            proto_
+        let response = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
         };
 
         client

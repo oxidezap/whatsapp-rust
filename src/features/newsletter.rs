@@ -962,7 +962,7 @@ impl<'a> Newsletter<'a> {
     /// [`NewsletterMessage`] / the id returned when it was sent), NOT its
     /// `server_id` (edit/revoke key on the message id, unlike reactions which use
     /// `server_id`). `new_content` is the replacement body (e.g.
-    /// `wa::Message::default().with_conversation("text")`).
+    /// `wa::Message { conversation: Some(..), .. }`).
     pub async fn edit_message_raw(
         &self,
         jid: &Jid,

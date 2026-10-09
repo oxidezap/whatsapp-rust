@@ -2934,25 +2934,19 @@ impl Client {
         let peers = self.app_state_key_request_peers().await?;
         let key_ids: Vec<wa::message::AppStateSyncKeyId> = raw_key_ids
             .iter()
-            .map(|k| {
-                let mut proto = wa::message::AppStateSyncKeyId::default();
-                proto.key_id = Some(k.to_vec());
-                proto
+            .map(|k| wa::message::AppStateSyncKeyId {
+                key_id: Some(k.to_vec()),
             })
             .collect();
-        let msg = {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some({
-                let mut proto_ = wa::message::ProtocolMessage::default();
-                proto_.r#type = Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest);
-                proto_.app_state_sync_key_request = buffa::MessageField::some({
-                    let mut proto = wa::message::AppStateSyncKeyRequest::default();
-                    proto.key_ids = key_ids;
-                    proto
-                });
-                proto_
-            });
-            proto_
+        let msg = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest),
+                app_state_sync_key_request: buffa::MessageField::some(
+                    wa::message::AppStateSyncKeyRequest { key_ids },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
 
         let requests = futures::stream::FuturesUnordered::new();
@@ -4280,7 +4274,6 @@ fn log_mutation_dispatched(
     let op = match m.operation {
         wa::syncd_mutation::SyncdOperation::SET => "SET",
         wa::syncd_mutation::SyncdOperation::REMOVE => "REMOVE",
-        _ => "UNKNOWN",
     };
     let command = m.index.first().map(String::as_str).unwrap_or("");
     // `cursor=` names the page end cursor explicitly: the page concatenates
@@ -4523,6 +4516,17 @@ impl Client {
             return report("chat_actions", m, chat_outcome, effect_detail);
         }
 
+        // Labels have their own index shape. Sublist deletion is a Remove,
+        // so this handler must also run before the Set-only gate.
+        let outcome = crate::features::labels::dispatch_label_mutation_outcome(
+            &self.core.event_bus,
+            m,
+            event_full_sync,
+        );
+        if outcome != AppStateDispatchOutcome::Unclaimed {
+            return report("labels", m, outcome, effect_detail);
+        }
+
         // All remaining mutations only care about Set operations
         if m.operation != wa::syncd_mutation::SyncdOperation::Set {
             return report("none", m, AppStateDispatchOutcome::Unclaimed, effect_detail);
@@ -4572,17 +4576,6 @@ impl Client {
         );
         if outcome != AppStateDispatchOutcome::Unclaimed {
             return report("call_log", m, outcome, effect_detail);
-        }
-
-        // Label mutations have their own index shape (labelId, not a chat JID at
-        // index[1]), so they are dispatched separately from chat actions.
-        let outcome = crate::features::labels::dispatch_label_mutation_outcome(
-            &self.core.event_bus,
-            m,
-            event_full_sync,
-        );
-        if outcome != AppStateDispatchOutcome::Unclaimed {
-            return report("labels", m, outcome, effect_detail);
         }
 
         // Quick replies and account-level syncd settings key on their own index
@@ -4786,9 +4779,7 @@ mod tests {
             let fp = fingerprint_id(id);
             assert!(fp.starts_with("id#"), "{id} fingerprints, got {fp}");
             assert_eq!(fp.len(), 3 + 16);
-            // A random hex digest can contain a short hex id such as "abc"
-            // by coincidence; that is not evidence that the input leaked.
-            assert!(fp[3..].bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert!(!fp.contains(id));
         }
         // Stable within the process; distinct inputs diverge (including the
         // old head/tail-collision pair, which a prefix scheme conflated).
@@ -4797,7 +4788,7 @@ mod tests {
             fingerprint_id("ABCD1111WXYZ"),
             fingerprint_id("ABCD2222WXYZ")
         );
-        // These complete identifiers cannot occur in the hex projection.
+        // No byte of the input survives, whatever its length or charset.
         for id in ["MSGID123", "3EB0284A7C9112345678", "a\u{1F600}bcdefghij"] {
             let fp = fingerprint_id(id);
             assert!(!fp.contains(id));
@@ -5158,30 +5149,34 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::SET,
             action_value: Some(value),
         };
-        let archived = scalar(&["archive", "120363000000000042@g.us"], {
-            let mut proto = wa::SyncActionValue::default();
-            proto.archive_chat_action = buffa::MessageField::some({
-                let mut proto = wa::sync_action_value::ArchiveChatAction::default();
-                proto.archived = Some(true);
-                proto
-            });
-            proto
-        });
+        let archived = scalar(
+            &["archive", "120363000000000042@g.us"],
+            wa::SyncActionValue {
+                archive_chat_action: buffa::MessageField::some(
+                    wa::sync_action_value::ArchiveChatAction {
+                        archived: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            },
+        );
         assert_eq!(
             mutation_effect_detail(&archived),
             Some(MutationEffectDetail::Bool("archived", true))
         );
 
-        let muted = scalar(&["mute", "5511999990042@s.whatsapp.net"], {
-            let mut proto = wa::SyncActionValue::default();
-            proto.mute_action = buffa::MessageField::some({
-                let mut proto = wa::sync_action_value::MuteAction::default();
-                proto.muted = Some(true);
-                proto.mute_end_timestamp = Some(1_789_834_000_000);
-                proto
-            });
-            proto
-        });
+        let muted = scalar(
+            &["mute", "5511999990042@s.whatsapp.net"],
+            wa::SyncActionValue {
+                mute_action: buffa::MessageField::some(wa::sync_action_value::MuteAction {
+                    muted: Some(true),
+                    mute_end_timestamp: Some(1_789_834_000_000),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
         assert_eq!(
             mutation_effect_detail(&muted),
             Some(MutationEffectDetail::BoolUntil(
@@ -5204,16 +5199,17 @@ mod tests {
 
         // Contact carries names: the detail is None, so the log line shows the
         // redacted target and the event name but no PII.
-        let contact = scalar(&["contact", "5511999990042@s.whatsapp.net"], {
-            let mut proto = wa::SyncActionValue::default();
-            proto.contact_action = buffa::MessageField::some({
-                let mut proto = wa::sync_action_value::ContactAction::default();
-                proto.full_name = Some("Alex Doe".to_string());
-                proto.first_name = Some("Alex".to_string());
-                proto
-            });
-            proto
-        });
+        let contact = scalar(
+            &["contact", "5511999990042@s.whatsapp.net"],
+            wa::SyncActionValue {
+                contact_action: buffa::MessageField::some(wa::sync_action_value::ContactAction {
+                    full_name: Some("Alex Doe".to_string()),
+                    first_name: Some("Alex".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
         assert_eq!(mutation_effect_detail(&contact), None);
         assert_eq!(
             mutation_target(&contact),
@@ -5249,17 +5245,17 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::SET,
             action_value: Some(value),
         };
-        let delete_chat = || {
-            let mut proto = wa::SyncActionValue::default();
-            proto.delete_chat_action =
-                buffa::MessageField::some(wa::sync_action_value::DeleteChatAction::default());
-            proto
+        let delete_chat = || wa::SyncActionValue {
+            delete_chat_action: buffa::MessageField::some(
+                wa::sync_action_value::DeleteChatAction::default(),
+            ),
+            ..Default::default()
         };
-        let clear_chat = || {
-            let mut proto = wa::SyncActionValue::default();
-            proto.clear_chat_action =
-                buffa::MessageField::some(wa::sync_action_value::ClearChatAction::default());
-            proto
+        let clear_chat = || wa::SyncActionValue {
+            clear_chat_action: buffa::MessageField::some(
+                wa::sync_action_value::ClearChatAction::default(),
+            ),
+            ..Default::default()
         };
         assert_eq!(
             mutation_effect_detail(&scalar(
@@ -5315,22 +5311,18 @@ mod tests {
         let favorites = |ids: &[&str]| Mutation {
             index: vec!["favorites".to_string()],
             operation: wa::syncd_mutation::SyncdOperation::SET,
-            action_value: Some({
-                let mut proto = wa::SyncActionValue::default();
-                proto.favorites_action = buffa::MessageField::some({
-                    let mut proto = wa::sync_action_value::FavoritesAction::default();
-                    proto.favorites = ids
-                        .iter()
-                        .map(|id| {
-                            let mut proto =
-                                wa::sync_action_value::favorites_action::Favorite::default();
-                            proto.id = Some((*id).to_string());
-                            proto
-                        })
-                        .collect();
-                    proto
-                });
-                proto
+            action_value: Some(wa::SyncActionValue {
+                favorites_action: buffa::MessageField::some(
+                    wa::sync_action_value::FavoritesAction {
+                        favorites: ids
+                            .iter()
+                            .map(|id| wa::sync_action_value::favorites_action::Favorite {
+                                id: Some((*id).to_string()),
+                            })
+                            .collect(),
+                    },
+                ),
+                ..Default::default()
             }),
         };
         let detail = mutation_effect_detail(&favorites(&[
@@ -5360,14 +5352,14 @@ mod tests {
                 "0".to_string(),
             ],
             operation: wa::syncd_mutation::SyncdOperation::SET,
-            action_value: Some({
-                let mut proto = wa::SyncActionValue::default();
-                proto.delete_message_for_me_action = buffa::MessageField::some({
-                    let mut proto = wa::sync_action_value::DeleteMessageForMeAction::default();
-                    proto.delete_media = delete_media;
-                    proto
-                });
-                proto
+            action_value: Some(wa::SyncActionValue {
+                delete_message_for_me_action: buffa::MessageField::some(
+                    wa::sync_action_value::DeleteMessageForMeAction {
+                        delete_media,
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
             }),
         };
         assert_eq!(
@@ -8789,6 +8781,71 @@ mod critical_bootstrap_tests {
     }
 
     #[tokio::test]
+    async fn label_sublist_set_and_remove_reach_the_event_bus() {
+        use std::sync::{Arc, Mutex};
+        use wacore::types::events::{Event, EventHandler, EventInterest};
+
+        struct Recorder(Mutex<Vec<Arc<Event>>>);
+        impl EventHandler for Recorder {
+            fn handle_event(&self, event: Arc<Event>) {
+                self.0.lock().unwrap().push(event);
+            }
+            fn interest(&self) -> EventInterest {
+                EventInterest::ALL
+            }
+        }
+
+        let client = crate::test_utils::create_test_client().await;
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        let _subscription = client.core.event_bus.subscribe_handler(recorder.clone());
+        for operation in [
+            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::Remove,
+        ] {
+            let mut value = wa::SyncActionValue::default().with_timestamp(0);
+            if operation == wa::syncd_mutation::SyncdOperation::Set {
+                value
+                    .label_sublist_action
+                    .get_or_insert_default()
+                    .sub_list_id = Some(2);
+            }
+            let mut mutation = crate::appstate_sync::Mutation {
+                index: vec![
+                    "label_sublist".into(),
+                    "11".into(),
+                    "12025550111@s.whatsapp.net".into(),
+                ],
+                operation,
+                action_value: Some(value),
+            };
+            // Recovery may log a snapshot at TRACE without claiming full-sync
+            // event provenance. The label handler must use event_full_sync.
+            let outcome = client
+                .dispatch_app_state_mutation_inner(&mut mutation, false, true, None)
+                .await;
+            assert_eq!(
+                outcome,
+                AppStateDispatchOutcome::Event("LabelSublistUpdate")
+            );
+        }
+        let events = recorder.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        let set = serde_json::to_value(&*events[0]).unwrap();
+        let remove = serde_json::to_value(&*events[1]).unwrap();
+        assert_eq!(
+            set["LabelSublistUpdate"]["change"],
+            serde_json::json!({"Upsert": {"sub_list_id": 2}})
+        );
+        assert_eq!(remove["LabelSublistUpdate"]["change"], "Remove");
+        for event in [set, remove] {
+            let update = &event["LabelSublistUpdate"];
+            assert_eq!(update["predefined_id"], 11);
+            assert_eq!(update["action_timestamp"], "1970-01-01T00:00:00Z");
+            assert_eq!(update["from_full_sync"], false);
+        }
+    }
+
+    #[tokio::test]
     async fn status_privacy_sync_persists_and_emits_full_action() {
         use std::sync::{Arc, Mutex};
         use wa::sync_action_value::status_privacy_action::{
@@ -8814,32 +8871,28 @@ mod critical_bootstrap_tests {
             .subscribe_handler(Arc::clone(&recorder) as _);
         assert!(client.status().audience().is_none());
 
-        let action = {
-            let mut proto = wa::sync_action_value::StatusPrivacyAction::default();
-            proto.mode = Some(Mode::CUSTOM_LIST.into());
-            proto.user_jid = vec!["120363000000000042@lid".into()];
-            proto.custom_lists = vec![{
-                let mut proto = CustomList::default();
-                proto.list_id = Some("friends".into());
-                proto.name = Some("Friends".into());
-                proto.user_jid = vec!["120363000000000043@lid".into()];
-                proto.is_selected = Some(true);
-                proto
-            }];
-            proto.modes = vec![Mode::CLOSE_FRIENDS.into(), Mode::CUSTOM_LIST.into()];
-            proto.share_to_fb = Some(false);
-            proto.share_to_ig = Some(true);
-            proto
+        let action = wa::sync_action_value::StatusPrivacyAction {
+            mode: Some(Mode::CUSTOM_LIST.into()),
+            user_jid: vec!["120363000000000042@lid".into()],
+            custom_lists: vec![CustomList {
+                list_id: Some("friends".into()),
+                name: Some("Friends".into()),
+                user_jid: vec!["120363000000000043@lid".into()],
+                is_selected: Some(true),
+                ..Default::default()
+            }],
+            modes: vec![Mode::CLOSE_FRIENDS.into(), Mode::CUSTOM_LIST.into()],
+            share_to_fb: Some(false),
+            share_to_ig: Some(true),
         };
         let make_mutation =
             |action: wa::sync_action_value::StatusPrivacyAction| crate::appstate_sync::Mutation {
                 index: vec!["status_privacy".into()],
                 operation: wa::syncd_mutation::SyncdOperation::Set,
-                action_value: Some({
-                    let mut proto = wa::SyncActionValue::default();
-                    proto.status_privacy = buffa::MessageField::some(action);
-                    proto.timestamp = Some(1_700_000_000_000);
-                    proto
+                action_value: Some(wa::SyncActionValue {
+                    status_privacy: buffa::MessageField::some(action),
+                    timestamp: Some(1_700_000_000_000),
+                    ..Default::default()
                 }),
             };
         let mut mutation = make_mutation(action.clone());
@@ -8915,10 +8968,9 @@ mod critical_bootstrap_tests {
             }
         }
 
-        let mut missing_mode = make_mutation({
-            let mut proto = wa::sync_action_value::StatusPrivacyAction::default();
-            proto.mode = None;
-            proto
+        let mut missing_mode = make_mutation(wa::sync_action_value::StatusPrivacyAction {
+            mode: None,
+            ..Default::default()
         });
         assert_eq!(
             client
@@ -8969,15 +9021,15 @@ mod critical_bootstrap_tests {
         let mut m = crate::appstate_sync::Mutation {
             index: vec!["archive".to_string(), "120363000000000042@g.us".to_string()],
             operation: wa::syncd_mutation::SyncdOperation::SET,
-            action_value: Some({
-                let mut proto = wa::SyncActionValue::default();
-                proto.archive_chat_action = buffa::MessageField::some({
-                    let mut proto = wa::sync_action_value::ArchiveChatAction::default();
-                    proto.archived = Some(true);
-                    proto
-                });
-                proto.timestamp = Some(1_700_000_000_000);
-                proto
+            action_value: Some(wa::SyncActionValue {
+                archive_chat_action: buffa::MessageField::some(
+                    wa::sync_action_value::ArchiveChatAction {
+                        archived: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                timestamp: Some(1_700_000_000_000),
+                ..Default::default()
             }),
         };
         let outcome = client

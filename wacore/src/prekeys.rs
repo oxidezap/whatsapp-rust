@@ -477,12 +477,10 @@ mod tests {
     fn extract_prekey_public_key_matches_full_decode_validation() {
         use buffa::Message;
         let public_key = vec![0x05u8; 33];
-        let record = {
-            let mut proto_ = waproto::whatsapp::PreKeyRecordStructure::default();
-            proto_.id = Some(1);
-            proto_.public_key = Some(public_key.clone());
-            proto_.private_key = Some(vec![0x09u8; 32]);
-            proto_
+        let record = waproto::whatsapp::PreKeyRecordStructure {
+            id: Some(1),
+            public_key: Some(public_key.clone()),
+            private_key: Some(vec![0x09u8; 32]),
         }
         .encode_to_vec();
 
@@ -738,11 +736,10 @@ mod tests {
             )
             .unwrap();
             for device_type in test_util::ENCRYPTION_TYPES {
-                let details = {
-                    let mut proto = wa::ADVDeviceIdentity::default();
-                    proto.key_index = Some(0);
-                    proto.device_type = device_type;
-                    proto
+                let details = wa::ADVDeviceIdentity {
+                    key_index: Some(0),
+                    device_type,
+                    ..Default::default()
                 }
                 .encode_to_vec();
                 let acct_prefix = test_util::account_prefix(device_type);
@@ -849,13 +846,11 @@ mod tests {
             )
             .unwrap()
             .to_vec();
-        {
-            let mut proto_ = waproto::whatsapp::ADVSignedDeviceIdentity::default();
-            proto_.details = Some(details.to_vec());
-            proto_.account_signature_key = None;
-            proto_.account_signature = Some(account_sig);
-            proto_.device_signature = Some(device_sig);
-            proto_
+        waproto::whatsapp::ADVSignedDeviceIdentity {
+            details: Some(details.to_vec()),
+            account_signature_key: None,
+            account_signature: Some(account_sig),
+            device_signature: Some(device_sig),
         }
         .encode_to_vec()
     }

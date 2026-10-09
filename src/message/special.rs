@@ -174,13 +174,13 @@ impl Client {
             };
             let key_data = if let Some(stored) = key_store.get_sync_key(key_id).await? {
                 match waproto::codec::app_state_sync_key_fingerprint_decode(&stored.fingerprint) {
-                    Ok(fingerprint) => buffa::MessageField::some({
-                        let mut proto = wa::message::AppStateSyncKeyData::default();
-                        proto.key_data = Some(stored.key_data);
-                        proto.fingerprint = buffa::MessageField::some(fingerprint);
-                        proto.timestamp = Some(stored.timestamp);
-                        proto
-                    }),
+                    Ok(fingerprint) => {
+                        buffa::MessageField::some(wa::message::AppStateSyncKeyData {
+                            key_data: Some(stored.key_data),
+                            fingerprint: buffa::MessageField::some(fingerprint),
+                            timestamp: Some(stored.timestamp),
+                        })
+                    }
                     Err(error) => {
                         warn!(target: "Client/AppState", "Stored app-state key fingerprint is invalid; returning orphan: {error}");
                         buffa::MessageField::default()
@@ -189,19 +189,13 @@ impl Client {
             } else {
                 buffa::MessageField::default()
             };
-            keys.push({
-                let mut proto = wa::message::AppStateSyncKey::default();
-                proto.key_id = buffa::MessageField::some(requested.clone());
-                proto.key_data = key_data;
-                proto
+            keys.push(wa::message::AppStateSyncKey {
+                key_id: buffa::MessageField::some(requested.clone()),
+                key_data,
             });
         }
 
-        Ok({
-            let mut proto = wa::message::AppStateSyncKeyShare::default();
-            proto.keys = keys;
-            proto
-        })
+        Ok(wa::message::AppStateSyncKeyShare { keys })
     }
 
     pub(crate) fn schedule_app_state_sync_key_share(
@@ -295,13 +289,20 @@ impl Client {
                         }
                         None => match client.build_app_state_sync_key_share(&request).await {
                             Ok(share) => {
-                                let prepared = { let mut proto_ = wa::Message::default(); proto_.protocol_message = buffa::MessageField::some(
-                                        { let mut proto_ = wa::message::ProtocolMessage::default(); proto_.r#type = Some(
+                                let prepared = wa::Message {
+                                    protocol_message: buffa::MessageField::some(
+                                        wa::message::ProtocolMessage {
+                                            r#type: Some(
                                                 wa::message::protocol_message::Type::AppStateSyncKeyShare,
-                                            ); proto_.app_state_sync_key_share = buffa::MessageField::some(
+                                            ),
+                                            app_state_sync_key_share: buffa::MessageField::some(
                                                 share,
-                                            ); proto_ },
-                                    ); proto_ };
+                                            ),
+                                            ..Default::default()
+                                        },
+                                    ),
+                                    ..Default::default()
+                                };
                                 let result = client
                                     .send_app_state_sync_key_share_once(
                                         &requester,

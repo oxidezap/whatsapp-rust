@@ -104,12 +104,10 @@ mod tests {
     #[test]
     fn event_response_roundtrip() {
         let secret = [0x55u8; 32];
-        let resp = {
-            let mut proto = EventResponseMessage::default();
-            proto.response = Some(EventResponseType::Going);
-            proto.timestamp_ms = Some(1_700_000_000_000);
-            proto.extra_guest_count = Some(2);
-            proto
+        let resp = EventResponseMessage {
+            response: Some(EventResponseType::Going),
+            timestamp_ms: Some(1_700_000_000_000),
+            extra_guest_count: Some(2),
         };
         let (enc, iv) = encrypt_event_response_with_secret(
             &resp,
@@ -151,12 +149,10 @@ mod tests {
         // A different responder JID derives a different key + AAD, so decryption
         // must fail rather than silently mis-decrypt.
         let secret = [0x55u8; 32];
-        let resp = {
-            let mut proto = EventResponseMessage::default();
-            proto.response = Some(EventResponseType::Maybe);
-            proto.timestamp_ms = None;
-            proto.extra_guest_count = None;
-            proto
+        let resp = EventResponseMessage {
+            response: Some(EventResponseType::Maybe),
+            timestamp_ms: None,
+            extra_guest_count: None,
         };
         let (enc, iv) = encrypt_event_response_with_secret(
             &resp,

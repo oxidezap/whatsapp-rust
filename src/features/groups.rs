@@ -209,28 +209,25 @@ fn group_history_bundle_message(
     upload: &crate::upload::UploadResponse,
     metadata: &wa::message::MessageHistoryMetadata,
 ) -> wa::Message {
-    {
-        let mut proto_ = wa::Message::default();
-        proto_.message_history_bundle = buffa::MessageField::some({
-            let mut proto_ = wa::message::MessageHistoryBundle::default();
-            proto_.mimetype = Some("application/protobuf".into());
-            proto_.file_sha256 = Some(upload.file_sha256.to_vec());
-            proto_.media_key = Some(upload.media_key.to_vec());
-            proto_.file_enc_sha256 = Some(upload.file_enc_sha256.to_vec());
-            proto_.direct_path = Some(upload.direct_path.clone());
-            proto_.media_key_timestamp = Some(upload.media_key_timestamp);
-            proto_.message_history_metadata = buffa::MessageField::some(metadata.clone());
-            proto_
-        });
-        proto_
+    wa::Message {
+        message_history_bundle: buffa::MessageField::some(wa::message::MessageHistoryBundle {
+            mimetype: Some("application/protobuf".into()),
+            file_sha256: Some(upload.file_sha256.to_vec()),
+            media_key: Some(upload.media_key.to_vec()),
+            file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+            direct_path: Some(upload.direct_path.clone()),
+            media_key_timestamp: Some(upload.media_key_timestamp),
+            message_history_metadata: buffa::MessageField::some(metadata.clone()),
+            ..Default::default()
+        }),
+        ..Default::default()
     }
 }
 
 fn compress_group_history(messages: Vec<wa::WebMessageInfo>) -> Result<Vec<u8>, std::io::Error> {
-    let history = {
-        let mut proto = wa::GroupHistory::default();
-        proto.messages = messages;
-        proto
+    let history = wa::GroupHistory {
+        messages,
+        ..Default::default()
     };
     let encoded = waproto::codec::group_history_to_vec(&history);
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -2112,15 +2109,14 @@ impl<'a> Groups<'a> {
             })
             .map(|member| member.jid.to_non_ad().to_string())
             .collect();
-        let history_metadata = {
-            let mut proto = wa::message::MessageHistoryMetadata::default();
-            proto.history_receivers = history_receivers.iter().map(ToString::to_string).collect();
-            proto.oldest_message_timestamp_in_window =
-                Some(now.saturating_sub(limits.time_window_seconds) as i64);
-            proto.message_count = Some(selected.messages.len() as i64);
-            proto.non_history_receivers = non_history_receivers;
-            proto.oldest_message_timestamp_in_bundle = Some(selected.oldest_timestamp as i64);
-            proto
+        let history_metadata = wa::message::MessageHistoryMetadata {
+            history_receivers: history_receivers.iter().map(ToString::to_string).collect(),
+            oldest_message_timestamp_in_window: Some(
+                now.saturating_sub(limits.time_window_seconds) as i64,
+            ),
+            message_count: Some(selected.messages.len() as i64),
+            non_history_receivers,
+            oldest_message_timestamp_in_bundle: Some(selected.oldest_timestamp as i64),
         };
 
         let messages = selected.messages;
@@ -2139,15 +2135,12 @@ impl<'a> Groups<'a> {
                 }));
             }
         };
-        let notice_message = Arc::new({
-            let mut proto = wa::Message::default();
-            proto.message_history_notice = buffa::MessageField::some({
-                let mut proto = wa::message::MessageHistoryNotice::default();
-                proto.message_history_metadata =
-                    buffa::MessageField::some(history_metadata.clone());
-                proto
-            });
-            proto
+        let notice_message = Arc::new(wa::Message {
+            message_history_notice: buffa::MessageField::some(wa::message::MessageHistoryNotice {
+                message_history_metadata: buffa::MessageField::some(history_metadata.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
         });
         let bundle_message_id = self
             .client
@@ -3350,12 +3343,11 @@ mod tests {
             media_key_timestamp: 1000,
             streaming_sidecar: None,
         };
-        let metadata = {
-            let mut proto = wa::message::MessageHistoryMetadata::default();
-            proto.history_receivers = vec!["10001@s.whatsapp.net".into()];
-            proto.message_count = Some(1);
-            proto.oldest_message_timestamp_in_window = Some(900);
-            proto
+        let metadata = wa::message::MessageHistoryMetadata {
+            history_receivers: vec!["10001@s.whatsapp.net".into()],
+            message_count: Some(1),
+            oldest_message_timestamp_in_window: Some(900),
+            ..Default::default()
         };
         let message = group_history_bundle_message(&upload, &metadata);
         let bundle = message.message_history_bundle.as_option().expect("bundle");
@@ -3387,24 +3379,21 @@ mod tests {
         use std::io::Read as _;
         use waproto::whatsapp as wa;
 
-        let source = {
-            let mut proto = wa::WebMessageInfo::default();
-            proto.key = buffa::MessageField::some({
-                let mut proto = wa::MessageKey::default();
-                proto.remote_jid = Some("120363000000000001@g.us".into());
-                proto.id = Some("SYNTHETIC-HISTORY-ID".into());
-                proto
-            });
-            proto.message = buffa::MessageField::some({
-                let mut proto = wa::Message::default();
-                proto.conversation = Some("synthetic history payload".into());
-                proto
-            });
-            proto.message_timestamp = Some(1_700_000_000);
-            proto.status = Some(wa::web_message_info::Status::SERVER_ACK);
-            proto.starred = Some(true);
-            proto.message_add_ons = vec![wa::MessageAddOn::default()];
-            proto
+        let source = wa::WebMessageInfo {
+            key: buffa::MessageField::some(wa::MessageKey {
+                remote_jid: Some("120363000000000001@g.us".into()),
+                id: Some("SYNTHETIC-HISTORY-ID".into()),
+                ..Default::default()
+            }),
+            message: buffa::MessageField::some(wa::Message {
+                conversation: Some("synthetic history payload".into()),
+                ..Default::default()
+            }),
+            message_timestamp: Some(1_700_000_000),
+            status: Some(wa::web_message_info::Status::SERVER_ACK),
+            starred: Some(true),
+            message_add_ons: vec![wa::MessageAddOn::default()],
+            ..Default::default()
         };
         let group: Jid = "120363000000000001@g.us".parse().unwrap();
         let selected = select_group_history_messages(

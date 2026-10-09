@@ -1339,16 +1339,13 @@ impl AppStateProcessor {
         let snapshot_mac = state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
 
         // Build the patch — matching whatsmeow: no Version or DeviceIndex fields
-        let mut patch = {
-            let mut proto = wa::SyncdPatch::default();
-            proto.snapshot_mac = Some(snapshot_mac);
-            proto.key_id = buffa::MessageField::some({
-                let mut proto = wa::KeyId::default();
-                proto.id = Some(key_id.clone());
-                proto
-            });
-            proto.mutations = mutations;
-            proto
+        let mut patch = wa::SyncdPatch {
+            snapshot_mac: Some(snapshot_mac),
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            mutations,
+            ..Default::default()
         };
 
         // Generate and set patch MAC
@@ -1442,10 +1439,9 @@ mod external_blob_tests {
     fn external_snapshot_download_failure_propagates() {
         // A referenced blob that fails to download must error, not be swallowed
         // (which would apply an empty patch and advance the version).
-        let mut pl = pl_with_snapshot_ref(Some({
-            let mut proto = wa::ExternalBlobReference::default();
-            proto.direct_path = Some("/blob".into());
-            proto
+        let mut pl = pl_with_snapshot_ref(Some(wa::ExternalBlobReference {
+            direct_path: Some("/blob".into()),
+            ..Default::default()
         }));
         let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
             Err(anyhow!("simulated failure"))
@@ -1457,10 +1453,9 @@ mod external_blob_tests {
     fn external_snapshot_decode_failure_propagates() {
         // Download succeeds but the bytes aren't a valid SyncdSnapshot: the decode
         // error must propagate too, not just download errors.
-        let mut pl = pl_with_snapshot_ref(Some({
-            let mut proto = wa::ExternalBlobReference::default();
-            proto.direct_path = Some("/blob".into());
-            proto
+        let mut pl = pl_with_snapshot_ref(Some(wa::ExternalBlobReference {
+            direct_path: Some("/blob".into()),
+            ..Default::default()
         }));
         let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
             Ok(bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF]))
@@ -1474,14 +1469,12 @@ mod external_blob_tests {
         let mut pl = PatchList {
             name: WAPatchName::Regular,
             has_more_patches: false,
-            patches: vec![{
-                let mut proto = wa::SyncdPatch::default();
-                proto.external_mutations = buffa::MessageField::some({
-                    let mut proto = wa::ExternalBlobReference::default();
-                    proto.direct_path = Some("/mutations".into());
-                    proto
-                });
-                proto
+            patches: vec![wa::SyncdPatch {
+                external_mutations: buffa::MessageField::some(wa::ExternalBlobReference {
+                    direct_path: Some("/mutations".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
             }],
             snapshot: None,
             snapshot_ref: None,
@@ -1500,14 +1493,12 @@ mod external_blob_tests {
         let mut pl = PatchList {
             name: WAPatchName::Regular,
             has_more_patches: false,
-            patches: vec![{
-                let mut proto = wa::SyncdPatch::default();
-                proto.external_mutations = buffa::MessageField::some({
-                    let mut proto = wa::ExternalBlobReference::default();
-                    proto.direct_path = Some("/mutations".into());
-                    proto
-                });
-                proto
+            patches: vec![wa::SyncdPatch {
+                external_mutations: buffa::MessageField::some(wa::ExternalBlobReference {
+                    direct_path: Some("/mutations".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
             }],
             snapshot: None,
             snapshot_ref: None,
@@ -1539,18 +1530,14 @@ mod dedup_tests {
     use super::*;
 
     fn mutation(index_mac: &[u8]) -> wa::SyncdMutation {
-        {
-            let mut proto = wa::SyncdMutation::default();
-            proto.record = buffa::MessageField::some({
-                let mut proto = wa::SyncdRecord::default();
-                proto.index = buffa::MessageField::some({
-                    let mut proto = wa::SyncdIndex::default();
-                    proto.blob = Some(index_mac.to_vec());
-                    proto
-                });
-                proto
-            });
-            proto
+        wa::SyncdMutation {
+            record: buffa::MessageField::some(wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
+                    blob: Some(index_mac.to_vec()),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
         }
     }
 

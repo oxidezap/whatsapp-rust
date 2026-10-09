@@ -557,22 +557,20 @@ async fn session_migration_finishes_before_offer_event_dispatch() {
     let client = create_test_client().await;
     let pn_addr = Jid::pn_device(PN.to_string(), 0).to_protocol_address();
     let lid_addr = Jid::lid_device(LID.to_string(), 0).to_protocol_address();
-    let state = SessionState::from_session_structure({
-        let mut proto = SessionStructure::default();
-        proto.session_version = Some(3);
-        proto.local_identity_public = None;
-        proto.remote_identity_public = None;
-        proto.root_key = None;
-        proto.previous_counter = Some(0);
-        proto.sender_chain = buffa::MessageField::none();
-        proto.receiver_chains = vec![];
-        proto.pending_pre_key = buffa::MessageField::none();
-        proto.remote_registration_id = Some(123);
-        proto.local_registration_id = Some(0);
-        proto.alice_base_key = Some(vec![]);
-        proto.needs_refresh = None;
-        proto.pending_key_exchange = buffa::MessageField::none();
-        proto
+    let state = SessionState::from_session_structure(SessionStructure {
+        session_version: Some(3),
+        local_identity_public: None,
+        remote_identity_public: None,
+        root_key: None,
+        previous_counter: Some(0),
+        sender_chain: buffa::MessageField::none(),
+        receiver_chains: vec![],
+        pending_pre_key: buffa::MessageField::none(),
+        remote_registration_id: Some(123),
+        local_registration_id: Some(0),
+        alice_base_key: Some(vec![]),
+        needs_refresh: None,
+        pending_key_exchange: buffa::MessageField::none(),
     });
     client
         .signal_cache

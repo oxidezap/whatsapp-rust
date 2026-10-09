@@ -3,10 +3,8 @@
 //! These types keep codec-generated structures private while providing a
 //! stable representation for record handoff. Conversion validates fixed-width
 //! key material and emits public keys in their canonical serialized form. The
-//! explicit field mappings are intentional: `waproto/signal-storage.snapshot`
-//! rejects descriptor changes during code generation until these projections
-//! and their preservation tests are updated together. Public generated types
-//! are non-exhaustive, so struct literals can no longer enforce that tripwire.
+//! explicit field mappings are intentional: a generated schema change must
+//! fail to compile here instead of silently dropping protocol state.
 
 use std::fmt;
 
@@ -326,15 +324,13 @@ impl SessionMessageKeyComponents {
                 cipher_key,
                 mac_key,
                 iv,
-            } => {
-                let mut proto = session_structure::chain::MessageKey::default();
-                proto.index = Some(self.index);
-                proto.cipher_key = Some(Bytes::copy_from_slice(&cipher_key));
-                proto.mac_key = Some(Bytes::copy_from_slice(&mac_key));
-                proto.iv = Some(Bytes::copy_from_slice(&iv));
-                proto.seed = None;
-                proto
-            }
+            } => session_structure::chain::MessageKey {
+                index: Some(self.index),
+                cipher_key: Some(Bytes::copy_from_slice(&cipher_key)),
+                mac_key: Some(Bytes::copy_from_slice(&mac_key)),
+                iv: Some(Bytes::copy_from_slice(&iv)),
+                seed: None,
+            },
         }
     }
 
@@ -380,12 +376,10 @@ impl SessionMessageKeyComponents {
 
 impl SessionChainKeyComponents {
     fn into_structure(self) -> Result<session_structure::chain::ChainKey> {
-        Ok({
-            let mut proto = session_structure::chain::ChainKey::default();
-            proto.index = self.index;
-            proto.key = optional_exact_bytes(self.key, SYMMETRIC_KEY_BYTES, "session chain key")?
-                .map(Bytes::from);
-            proto
+        Ok(session_structure::chain::ChainKey {
+            index: self.index,
+            key: optional_exact_bytes(self.key, SYMMETRIC_KEY_BYTES, "session chain key")?
+                .map(Bytes::from),
         })
     }
 
@@ -401,18 +395,16 @@ impl SessionChainKeyComponents {
     }
 
     fn into_required_structure(self) -> Result<session_structure::chain::ChainKey> {
-        Ok({
-            let mut proto = session_structure::chain::ChainKey::default();
-            proto.index = Some(
+        Ok(session_structure::chain::ChainKey {
+            index: Some(
                 self.index
                     .ok_or_else(|| invalid("sender chain-key index", "present"))?,
-            );
-            proto.key = Some(Bytes::from(required_exact_bytes(
+            ),
+            key: Some(Bytes::from(required_exact_bytes(
                 self.key,
                 SYMMETRIC_KEY_BYTES,
                 "sender chain key",
-            )?));
-            proto
+            )?)),
         })
     }
 
@@ -434,28 +426,26 @@ impl SessionChainKeyComponents {
 
 impl SessionChainComponents {
     fn into_sender_structure(self) -> Result<session_structure::Chain> {
-        Ok({
-            let mut proto = session_structure::Chain::default();
-            proto.sender_ratchet_key = Some(required_public_key(
+        Ok(session_structure::Chain {
+            sender_ratchet_key: Some(required_public_key(
                 self.sender_ratchet_key,
                 "sender ratchet public key",
-            )?);
-            proto.sender_ratchet_key_private = Some(required_exact_bytes(
+            )?),
+            sender_ratchet_key_private: Some(required_exact_bytes(
                 self.sender_ratchet_key_private,
                 PRIVATE_KEY_BYTES,
                 "sender ratchet private key",
-            )?);
-            proto.chain_key = MessageField::some(
+            )?),
+            chain_key: MessageField::some(
                 self.chain_key
                     .ok_or_else(|| invalid("sender chain key", "present"))?
                     .into_required_structure()?,
-            );
-            proto.message_keys = self
+            ),
+            message_keys: self
                 .message_keys
                 .into_iter()
                 .map(SessionMessageKeyComponents::into_structure)
-                .collect();
-            proto
+                .collect(),
         })
     }
 
@@ -467,22 +457,22 @@ impl SessionChainComponents {
             ));
         }
 
-        Ok({
-            let mut proto = session_structure::Chain::default();
-            proto.sender_ratchet_key =
-                optional_public_key(self.sender_ratchet_key, "receiver ratchet public key")?;
-            proto.sender_ratchet_key_private = None;
-            proto.chain_key = self
+        Ok(session_structure::Chain {
+            sender_ratchet_key: optional_public_key(
+                self.sender_ratchet_key,
+                "receiver ratchet public key",
+            )?,
+            sender_ratchet_key_private: None,
+            chain_key: self
                 .chain_key
                 .map(SessionChainKeyComponents::into_structure)
                 .transpose()?
-                .into();
-            proto.message_keys = self
+                .into(),
+            message_keys: self
                 .message_keys
                 .into_iter()
                 .map(SessionMessageKeyComponents::into_structure)
-                .collect();
-            proto
+                .collect(),
         })
     }
 
@@ -537,31 +527,32 @@ impl SessionChainComponents {
 
 impl PendingKeyExchangeComponents {
     fn into_structure(self) -> Result<session_structure::PendingKeyExchange> {
-        Ok({
-            let mut proto = session_structure::PendingKeyExchange::default();
-            proto.sequence = self.sequence;
-            proto.local_base_key =
-                optional_public_key(self.local_base_key, "local base public key")?;
-            proto.local_base_key_private = optional_exact_bytes(
+        Ok(session_structure::PendingKeyExchange {
+            sequence: self.sequence,
+            local_base_key: optional_public_key(self.local_base_key, "local base public key")?,
+            local_base_key_private: optional_exact_bytes(
                 self.local_base_key_private,
                 PRIVATE_KEY_BYTES,
                 "local base private key",
-            )?;
-            proto.local_ratchet_key =
-                optional_public_key(self.local_ratchet_key, "local ratchet public key")?;
-            proto.local_ratchet_key_private = optional_exact_bytes(
+            )?,
+            local_ratchet_key: optional_public_key(
+                self.local_ratchet_key,
+                "local ratchet public key",
+            )?,
+            local_ratchet_key_private: optional_exact_bytes(
                 self.local_ratchet_key_private,
                 PRIVATE_KEY_BYTES,
                 "local ratchet private key",
-            )?;
-            proto.local_identity_key =
-                optional_public_key(self.local_identity_key, "local identity public key")?;
-            proto.local_identity_key_private = optional_exact_bytes(
+            )?,
+            local_identity_key: optional_public_key(
+                self.local_identity_key,
+                "local identity public key",
+            )?,
+            local_identity_key_private: optional_exact_bytes(
                 self.local_identity_key_private,
                 PRIVATE_KEY_BYTES,
                 "local identity private key",
-            )?;
-            proto
+            )?,
         })
     }
 
@@ -598,14 +589,12 @@ impl PendingKeyExchangeComponents {
 
 impl PendingPreKeyComponents {
     fn into_structure(self) -> Result<session_structure::PendingPreKey> {
-        Ok({
-            let mut proto = session_structure::PendingPreKey::default();
-            proto.pre_key_id = self.pre_key_id;
-            proto.signed_pre_key_id = self.signed_pre_key_id;
-            proto.base_key = optional_public_key(self.base_key, "pending pre-key base key")?;
-            proto.kyber_pre_key_id = self.kyber_pre_key_id;
-            proto.kyber_ciphertext = self.kyber_ciphertext;
-            proto
+        Ok(session_structure::PendingPreKey {
+            pre_key_id: self.pre_key_id,
+            signed_pre_key_id: self.signed_pre_key_id,
+            base_key: optional_public_key(self.base_key, "pending pre-key base key")?,
+            kyber_pre_key_id: self.kyber_pre_key_id,
+            kyber_ciphertext: self.kyber_ciphertext,
         })
     }
 
@@ -623,42 +612,42 @@ impl PendingPreKeyComponents {
 pub(crate) fn session_structure_from_components(
     value: SessionComponents,
 ) -> Result<SessionStructure> {
-    Ok({
-        let mut proto = SessionStructure::default();
-        proto.session_version = value.session_version;
-        proto.local_identity_public =
-            optional_public_key(value.local_identity_public, "local identity public key")?;
-        proto.remote_identity_public =
-            optional_public_key(value.remote_identity_public, "remote identity public key")?;
-        proto.root_key =
-            optional_exact_bytes(value.root_key, SYMMETRIC_KEY_BYTES, "session root key")?;
-        proto.previous_counter = value.previous_counter;
-        proto.sender_chain = value
+    Ok(SessionStructure {
+        session_version: value.session_version,
+        local_identity_public: optional_public_key(
+            value.local_identity_public,
+            "local identity public key",
+        )?,
+        remote_identity_public: optional_public_key(
+            value.remote_identity_public,
+            "remote identity public key",
+        )?,
+        root_key: optional_exact_bytes(value.root_key, SYMMETRIC_KEY_BYTES, "session root key")?,
+        previous_counter: value.previous_counter,
+        sender_chain: value
             .sender_chain
             .map(SessionChainComponents::into_sender_structure)
             .transpose()?
-            .into();
-        proto.receiver_chains = value
+            .into(),
+        receiver_chains: value
             .receiver_chains
             .into_iter()
             .map(SessionChainComponents::into_receiver_structure)
-            .collect::<Result<_>>()?;
-        proto.pending_key_exchange = value
+            .collect::<Result<_>>()?,
+        pending_key_exchange: value
             .pending_key_exchange
             .map(PendingKeyExchangeComponents::into_structure)
             .transpose()?
-            .into();
-        proto.pending_pre_key = value
+            .into(),
+        pending_pre_key: value
             .pending_pre_key
             .map(PendingPreKeyComponents::into_structure)
             .transpose()?
-            .into();
-        proto.remote_registration_id = value.remote_registration_id;
-        proto.local_registration_id = value.local_registration_id;
-        proto.needs_refresh = value.needs_refresh;
-        proto.alice_base_key =
-            optional_public_key(value.alice_base_key, "session base public key")?;
-        proto
+            .into(),
+        remote_registration_id: value.remote_registration_id,
+        local_registration_id: value.local_registration_id,
+        needs_refresh: value.needs_refresh,
+        alice_base_key: optional_public_key(value.alice_base_key, "session base public key")?,
     })
 }
 
@@ -719,38 +708,30 @@ pub(crate) fn sender_state_structure_from_components(
         PRIVATE_KEY_BYTES,
         "sender signing private key",
     )?;
-    Ok({
-        let mut proto = SenderKeyStateStructure::default();
-        proto.sender_key_id = Some(value.key_id);
-        proto.sender_chain_key = MessageField::some({
-            let mut proto = sender_key_state_structure::SenderChainKey::default();
-            proto.iteration = Some(value.chain_key.iteration);
-            proto.seed = Some(Bytes::from(chain_seed));
-            proto
-        });
-        proto.sender_signing_key = MessageField::some({
-            let mut proto = sender_key_state_structure::SenderSigningKey::default();
-            proto.public = Some(Bytes::from(signing_public));
-            proto.private = signing_private.map(Bytes::from);
-            proto
-        });
-        proto.sender_message_keys = value
+    Ok(SenderKeyStateStructure {
+        sender_key_id: Some(value.key_id),
+        sender_chain_key: MessageField::some(sender_key_state_structure::SenderChainKey {
+            iteration: Some(value.chain_key.iteration),
+            seed: Some(Bytes::from(chain_seed)),
+        }),
+        sender_signing_key: MessageField::some(sender_key_state_structure::SenderSigningKey {
+            public: Some(Bytes::from(signing_public)),
+            private: signing_private.map(Bytes::from),
+        }),
+        sender_message_keys: value
             .message_keys
             .into_iter()
             .map(|key| {
-                Ok({
-                    let mut proto = sender_key_state_structure::SenderMessageKey::default();
-                    proto.iteration = Some(key.iteration);
-                    proto.seed = Some(Bytes::from(exact_bytes(
+                Ok(sender_key_state_structure::SenderMessageKey {
+                    iteration: Some(key.iteration),
+                    seed: Some(Bytes::from(exact_bytes(
                         key.seed,
                         SYMMETRIC_KEY_BYTES,
                         "sender message-key seed",
-                    )?));
-                    proto
+                    )?)),
                 })
             })
-            .collect::<Result<_>>()?;
-        proto
+            .collect::<Result<_>>()?,
     })
 }
 
@@ -1114,14 +1095,12 @@ mod tests {
         index: u32,
     ) -> session_structure::chain::MessageKey {
         let derived = MessageKeys::derive_keys(&seed, None, index);
-        {
-            let mut proto = session_structure::chain::MessageKey::default();
-            proto.index = Some(index);
-            proto.cipher_key = Some(Bytes::copy_from_slice(derived.cipher_key()));
-            proto.mac_key = Some(Bytes::copy_from_slice(derived.mac_key()));
-            proto.iv = Some(Bytes::copy_from_slice(derived.iv()));
-            proto.seed = Some(Bytes::copy_from_slice(&seed));
-            proto
+        session_structure::chain::MessageKey {
+            index: Some(index),
+            cipher_key: Some(Bytes::copy_from_slice(derived.cipher_key())),
+            mac_key: Some(Bytes::copy_from_slice(derived.mac_key())),
+            iv: Some(Bytes::copy_from_slice(derived.iv())),
+            seed: Some(Bytes::copy_from_slice(&seed)),
         }
     }
 

@@ -1,20 +1,5 @@
 //! Auto-generated protobuf definitions for the WhatsApp wire format.
 //!
-//! Generated messages, views, enums and oneofs are extensible. Construct owned
-//! messages with `Default` and public field assignments, or the generated
-//! `with_*` setters where available. Match enums/oneofs with a fallback and
-//! destructure messages with `..` so future protocol additions remain compatible.
-//!
-//! ```
-//! use waproto::whatsapp::Message;
-//! let mut message = Message::default();
-//! message.conversation = Some("hello".into());
-//! let same = Message::default().with_conversation("hello");
-//! assert_eq!(message, same);
-//! ```
-//! Unknown protobuf fields survive wire decode/encode; they are deliberately
-//! omitted from the derived-serde bridge representation.
-//!
 //! The Rust source (`whatsapp.rs`) is produced by `build.rs` from the
 //! pre-compiled descriptor set `whatsapp.desc`, and written to `OUT_DIR` —
 //! not tracked in git. To regenerate the descriptor after editing

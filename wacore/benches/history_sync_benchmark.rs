@@ -84,93 +84,77 @@ fn build_message_body(seed: u64, variant: usize) -> wa::Message {
     match variant {
         // Plain text, no secret: the cheapest record, and the one that must
         // still be walked to be rejected.
-        0 => {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some(pseudo_text(seed, 130));
-            proto
-        }
+        0 => wa::Message {
+            conversation: Some(pseudo_text(seed, 130)),
+            ..Default::default()
+        },
         // Extended text with context info.
-        1 => {
-            let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
-                let mut proto = wa::message::ExtendedTextMessage::default();
-                proto.text = Some(pseudo_text(seed, 64));
-                proto.context_info = buffa::MessageField::some({
-                    let mut proto = wa::ContextInfo::default();
-                    proto.is_forwarded = Some(false);
-                    proto.forwarding_score = Some(0);
-                    proto.stanza_id = Some(format!("QUOTE{seed:012X}"));
-                    proto
-                });
-                proto
-            });
-            proto.message_context_info = buffa::MessageField::some({
-                let mut proto = wa::MessageContextInfo::default();
-                proto.message_secret = Some(vec![(seed & 0xff) as u8; 32]);
-                proto
-            });
-            proto
-        }
+        1 => wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some(pseudo_text(seed, 64)),
+                context_info: buffa::MessageField::some(wa::ContextInfo {
+                    is_forwarded: Some(false),
+                    forwarding_score: Some(0),
+                    stanza_id: Some(format!("QUOTE{seed:012X}")),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![(seed & 0xff) as u8; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         // Poll: classified as `is_poll_or_event`, so it survives a bot-only
         // retention policy differently from the text arms.
-        2 => {
-            let mut proto = wa::Message::default();
-            proto.poll_creation_message = buffa::MessageField::some({
-                let mut proto = wa::message::PollCreationMessage::default();
-                proto.name = Some(pseudo_text(seed, 24));
-                proto.selectable_options_count = Some(1);
-                proto
-            });
-            proto.message_context_info = buffa::MessageField::some({
-                let mut proto = wa::MessageContextInfo::default();
-                proto.message_secret = Some(vec![(seed & 0xff) as u8; 32]);
-                proto
-            });
-            proto
-        }
+        2 => wa::Message {
+            poll_creation_message: buffa::MessageField::some(wa::message::PollCreationMessage {
+                name: Some(pseudo_text(seed, 24)),
+                selectable_options_count: Some(1),
+                ..Default::default()
+            }),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![(seed & 0xff) as u8; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         // Bot invocation: `botMetadata` presence is the flag the classifier
         // reads, and the one class every retention policy keeps.
-        3 => {
-            let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
-                let mut proto = wa::message::ExtendedTextMessage::default();
-                proto.text = Some(pseudo_text(seed, 48));
-                proto
-            });
-            proto.message_context_info = buffa::MessageField::some({
-                let mut proto = wa::MessageContextInfo::default();
-                proto.message_secret = Some(vec![(seed & 0xff) as u8; 32]);
-                proto.bot_metadata = buffa::MessageField::some({
-                    let mut proto = wa::BotMetadata::default();
-                    proto.persona_id = Some("persona".to_string());
-                    proto
-                });
-                proto
-            });
-            proto
-        }
+        3 => wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some(pseudo_text(seed, 48)),
+                ..Default::default()
+            }),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![(seed & 0xff) as u8; 32]),
+                bot_metadata: buffa::MessageField::some(wa::BotMetadata {
+                    persona_id: Some("persona".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         // Forwarded: extraction skips its secret entirely, so it measures the
         // walk that proves the message is forwarded.
-        _ => {
-            let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
-                let mut proto = wa::message::ExtendedTextMessage::default();
-                proto.text = Some(pseudo_text(seed, 90));
-                proto.context_info = buffa::MessageField::some({
-                    let mut proto = wa::ContextInfo::default();
-                    proto.is_forwarded = Some(true);
-                    proto.forwarding_score = Some(3);
-                    proto
-                });
-                proto
-            });
-            proto.message_context_info = buffa::MessageField::some({
-                let mut proto = wa::MessageContextInfo::default();
-                proto.message_secret = Some(vec![(seed & 0xff) as u8; 32]);
-                proto
-            });
-            proto
-        }
+        _ => wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some(pseudo_text(seed, 90)),
+                context_info: buffa::MessageField::some(wa::ContextInfo {
+                    is_forwarded: Some(true),
+                    forwarding_score: Some(3),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![(seed & 0xff) as u8; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
     }
 }
 
@@ -182,24 +166,21 @@ fn build_history_msg(
     index: usize,
 ) -> wa::HistorySyncMsg {
     let seed = (convo * 4099 + index * 31) as u64;
-    {
-        let mut proto = wa::HistorySyncMsg::default();
-        proto.message = buffa::MessageField::some({
-            let mut proto = wa::WebMessageInfo::default();
-            proto.key = buffa::MessageField::some({
-                let mut proto = wa::MessageKey::default();
-                proto.remote_jid = Some(chat.to_string());
-                proto.from_me = Some(from_me);
-                proto.id = Some(format!("MSGID{convo:04}{index:04}ABCDEF"));
-                proto.participant = participant.map(str::to_string);
-                proto
-            });
-            proto.message = buffa::MessageField::some(build_message_body(seed, index % 5));
-            proto.message_timestamp =
-                Some(1_700_000_000 + (convo * MESSAGES_PER_CONVERSATION + index) as u64);
-            proto
-        });
-        proto
+    wa::HistorySyncMsg {
+        message: buffa::MessageField::some(wa::WebMessageInfo {
+            key: buffa::MessageField::some(wa::MessageKey {
+                remote_jid: Some(chat.to_string()),
+                from_me: Some(from_me),
+                id: Some(format!("MSGID{convo:04}{index:04}ABCDEF")),
+                participant: participant.map(str::to_string),
+            }),
+            message: buffa::MessageField::some(build_message_body(seed, index % 5)),
+            message_timestamp: Some(
+                1_700_000_000 + (convo * MESSAGES_PER_CONVERSATION + index) as u64,
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
     }
 }
 
@@ -222,19 +203,18 @@ fn build_dm_conversation(index: usize, msgs_per_convo: usize) -> wa::Conversatio
     // Three DMs in four carry a token; one in two also carries the sender
     // bucket, which is how the wire mixes them.
     let has_token = index % 4 != 3;
-    {
-        let mut proto = wa::Conversation::default();
-        proto.id = chat;
-        proto.messages = messages;
-        proto.pn_jid = pn_meta;
-        proto.lid_jid = lid_meta;
-        proto.tc_token = has_token.then(|| vec![(index % 251) as u8; 32]);
-        proto.tc_token_timestamp = has_token.then_some(1_700_000_000 + index as u64);
-        proto.tc_token_sender_timestamp =
-            (has_token && index.is_multiple_of(2)).then_some(1_700_000_500 + index as u64);
-        proto.conversation_timestamp = Some(1_700_100_000 + index as u64);
-        proto.unread_count = Some((index % 7) as u32);
-        proto
+    wa::Conversation {
+        id: chat,
+        messages,
+        pn_jid: pn_meta,
+        lid_jid: lid_meta,
+        tc_token: has_token.then(|| vec![(index % 251) as u8; 32]),
+        tc_token_timestamp: has_token.then_some(1_700_000_000 + index as u64),
+        tc_token_sender_timestamp: (has_token && index.is_multiple_of(2))
+            .then_some(1_700_000_500 + index as u64),
+        conversation_timestamp: Some(1_700_100_000 + index as u64),
+        unread_count: Some((index % 7) as u32),
+        ..Default::default()
     }
 }
 
@@ -266,27 +246,25 @@ fn build_group_conversation(index: usize, msgs_per_convo: usize) -> wa::Conversa
         })
         .collect();
 
-    {
-        let mut proto = wa::Conversation::default();
-        proto.id = chat;
-        proto.messages = messages;
-        proto.participant = roster
+    wa::Conversation {
+        id: chat,
+        messages,
+        participant: roster
             .iter()
             .enumerate()
-            .map(|(p, jid)| {
-                let mut proto = wa::GroupParticipant::default();
-                proto.user_jid = jid.clone();
-                proto.rank = Some(if p == 0 {
+            .map(|(p, jid)| wa::GroupParticipant {
+                user_jid: jid.clone(),
+                rank: Some(if p == 0 {
                     wa::group_participant::Rank::SUPERADMIN
                 } else {
                     wa::group_participant::Rank::REGULAR
-                });
-                proto
+                }),
+                ..Default::default()
             })
-            .collect();
-        proto.name = Some(format!("Group {index}"));
-        proto.conversation_timestamp = Some(1_700_200_000 + index as u64);
-        proto
+            .collect(),
+        name: Some(format!("Group {index}")),
+        conversation_timestamp: Some(1_700_200_000 + index as u64),
+        ..Default::default()
     }
 }
 
@@ -305,20 +283,17 @@ fn build_realistic_history_sync(
     }
 
     let phone_number_to_lid_mappings = (0..bulk_mappings)
-        .map(|i| {
-            let mut proto = wa::PhoneNumberToLIDMapping::default();
-            proto.pn_jid = Some(pn_jid(i));
-            proto.lid_jid = Some(lid_jid(i));
-            proto
+        .map(|i| wa::PhoneNumberToLIDMapping {
+            pn_jid: Some(pn_jid(i)),
+            lid_jid: Some(lid_jid(i)),
         })
         .collect();
 
-    let hs = {
-        let mut proto = wa::HistorySync::default();
-        proto.sync_type = wa::history_sync::HistorySyncType::InitialBootstrap;
-        proto.conversations = conversations;
-        proto.phone_number_to_lid_mappings = phone_number_to_lid_mappings;
-        proto
+    let hs = wa::HistorySync {
+        sync_type: wa::history_sync::HistorySyncType::InitialBootstrap,
+        conversations,
+        phone_number_to_lid_mappings,
+        ..Default::default()
     };
     let proto = hs.encode_to_vec();
     let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
