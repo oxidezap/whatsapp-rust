@@ -14,16 +14,13 @@ struct LocalBlock {
     /// Spliced in after this top-level message's closing brace, so the block
     /// lands beside the message it belongs to instead of at the end of the file.
     after_message: &'static str,
-    /// Type names the block declares. Upstream declaring one of these means the
-    /// block is obsolete and must be deleted, not duplicated.
-    declares: &'static [&'static str],
     text: &'static str,
 }
 
-const LOCAL_BLOCKS: &[LocalBlock] = &[LocalBlock {
-    after_message: "LIDMigrationMappingSyncMessage",
-    declares: &["LIDMigrationMapping", "LIDMigrationMappingSyncPayload"],
-    text: "\
+const LOCAL_BLOCKS: &[LocalBlock] = &[
+    LocalBlock {
+        after_message: "LIDMigrationMappingSyncMessage",
+        text: "\
 // Retained locally: WA dropped these from the public JS bundle, but the wire
 // still carries them as the protobuf-encoded `encodedMappingPayload` above.
 message LIDMigrationMapping {
@@ -37,15 +34,25 @@ message LIDMigrationMappingSyncPayload {
   optional uint64 chatDbMigrationTimestamp = 2;
 }
 ",
-}];
+    },
+    LocalBlock {
+        after_message: "WebNotificationsInfo",
+        // A locked capture is a sample of client code, not an authority to delete API.
+        text: include_str!("retained.proto"),
+    },
+];
 
 pub fn generate(upstream: &str) -> Result<String> {
     let mut out = upstream.to_string();
     for block in LOCAL_BLOCKS {
-        for name in block.declares {
-            if declares_message(upstream, name) {
+        for name in block.text.lines().filter_map(declaration_name) {
+            if upstream
+                .lines()
+                .filter_map(declaration_name)
+                .any(|upstream| upstream == name)
+            {
                 bail!(
-                    "upstream now declares `message {name}`; drop the local block anchored at \
+                    "upstream now declares `{name}`; drop the local block anchored at \
                      `{}` in the proto emitter instead of shadowing it",
                     block.after_message
                 );
@@ -54,9 +61,8 @@ pub fn generate(upstream: &str) -> Result<String> {
         let at = end_of_message(&out, block.after_message).ok_or_else(|| {
             anyhow::anyhow!(
                 "anchor `message {}` is gone from the upstream proto; re-anchor the local block \
-                 declaring {:?}",
+                 declaring retained types",
                 block.after_message,
-                block.declares
             )
         })?;
         out.insert_str(at, &format!("\n{}", block.text));
@@ -64,11 +70,11 @@ pub fn generate(upstream: &str) -> Result<String> {
     Ok(out)
 }
 
-/// Whether the file declares a top-level `message <name>`.
-fn declares_message(proto: &str, name: &str) -> bool {
-    proto
-        .lines()
-        .any(|l| l == format!("message {name} {{") || l == format!("message {name} {{}}"))
+fn declaration_name(line: &str) -> Option<&str> {
+    line.strip_prefix("message ")
+        .or_else(|| line.strip_prefix("enum "))?
+        .split_whitespace()
+        .next()
 }
 
 /// Byte offset just past the closing brace line of a top-level message.
@@ -104,10 +110,13 @@ message LIDMigrationMappingSyncMessage {
   optional bytes encodedMappingPayload = 1;
 }
 
-message LabyrinthWaCommand {
+message NextMessage {
   oneof commandInput {
     CreateBackupInput createBackupInput = 1;
   }
+}
+
+message WebNotificationsInfo {
 }
 ";
 
@@ -120,9 +129,7 @@ message LabyrinthWaCommand {
         let local = out
             .find("message LIDMigrationMapping {")
             .expect("local block");
-        let next = out
-            .find("message LabyrinthWaCommand")
-            .expect("next message");
+        let next = out.find("message NextMessage").expect("next message");
         assert!(anchor < local && local < next, "{out}");
         assert!(out.contains("message LIDMigrationMappingSyncPayload {"));
         // The upstream text is otherwise untouched.
@@ -134,6 +141,17 @@ message LabyrinthWaCommand {
     fn a_lost_anchor_fails_instead_of_dropping_the_block() {
         let err = generate("syntax = \"proto2\";\npackage whatsapp;\n").expect_err("must fail");
         assert!(err.to_string().contains("re-anchor"), "{err}");
+    }
+
+    #[test]
+    fn retained_messages_and_enums_cannot_be_silently_reclaimed() {
+        for declaration in [
+            "message LabyrinthWaCommand {}",
+            "enum FUTURE_PROOF_BEHAVIOR {}",
+        ] {
+            let err = generate(&format!("{UPSTREAM}\n{declaration}\n")).expect_err("collision");
+            assert!(err.to_string().contains("drop the local block"), "{err}");
+        }
     }
 
     #[test]
@@ -152,6 +170,8 @@ message LIDMigrationMappingSyncMessage {
     optional bytes a = 1;
   }
   optional bytes encodedMappingPayload = 1;
+}
+message WebNotificationsInfo {
 }
 ";
         let out = generate(upstream).expect("proto");

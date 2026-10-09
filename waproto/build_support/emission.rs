@@ -236,14 +236,18 @@ fn share_message_impls(items: &mut Vec<syn::Item>, scope: &str) {
             .iter()
             .map(|field| field.ident.as_ref().expect("named protobuf field"))
             .collect();
-        implementations.push(syn::parse_quote! {
-            impl ::core::clone::Clone for #name {
-                #[inline(never)]
-                fn clone(&self) -> Self {
-                    Self { #(#fields: ::core::clone::Clone::clone(&self.#fields)),* }
+        // The root Message clone is pinned once by build/pin_clone.rs before
+        // this pass. That transformer rejects missing or duplicate derives.
+        if !share_default {
+            implementations.push(syn::parse_quote! {
+                impl ::core::clone::Clone for #name {
+                    #[inline(never)]
+                    fn clone(&self) -> Self {
+                        Self { #(#fields: ::core::clone::Clone::clone(&self.#fields)),* }
+                    }
                 }
-            }
-        });
+            });
+        }
         // Keep generator-provided protobuf defaults intact. Only a derived
         // Default is equivalent to applying Rust Default to every field.
         if derived_default {

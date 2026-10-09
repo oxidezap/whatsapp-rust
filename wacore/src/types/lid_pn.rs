@@ -18,7 +18,8 @@ use std::sync::Arc;
 /// The source is load-bearing, not just provenance: it selects the write
 /// policy applied when the pair reaches the cache — see `lid_pn_write_policy`
 /// in the `whatsapp-rust` client, which mirrors WhatsApp Web's
-/// `createLidPnMappings` `switch (learningSource)`. Directed sources overwrite
+/// `createLidPnMappings` `switch (learningSource)`. Peer-message sources only
+/// seed unseen LIDs, without re-querying conflicts. Latest-LID sources overwrite
 /// on any change; observational bulk sources (`Other` and friends, WA Web
 /// `"other"`) only seed new LIDs and re-resolve conflicts via a live query;
 /// known-stale sources are stamped `created_at = 0` so they never outrank a
@@ -32,7 +33,8 @@ pub enum LearningSource {
     /// Mapping learned from incoming message with sender_lid attribute (sender is PN)
     #[wire = "peer_pn_message"]
     PeerPnMessage,
-    /// Mapping learned from incoming message with sender_pn attribute (sender is LID)
+    /// Mapping learned from `sender_pn` on a LID message or
+    /// `peer_recipient_pn` on a self-synced LID DM. Only seeds unseen LIDs.
     #[wire = "peer_lid_message"]
     PeerLidMessage,
     /// Mapping learned when looking up recipient's latest LID
