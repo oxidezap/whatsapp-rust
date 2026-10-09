@@ -534,9 +534,7 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                 item.items.push(syn::parse_quote! {
                     fn merge_group(&mut self, buf: &mut impl ::buffa::bytes::Buf, ctx: ::buffa::DecodeContext<'_>, field_number: u32) -> ::core::result::Result<(), ::buffa::DecodeError> {
                         let ctx = ctx.descend()?;
-                        if self.__buffa_unknown_fields.active() {
-                            #runtime::reconcile_owned(&mut #runtime::Adapter(self), ctx)?;
-                        }
+                        let mut first = true;
                         loop {
                             if !buf.has_remaining() {
                                 return Err(::buffa::DecodeError::UnexpectedEof);
@@ -549,6 +547,10 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                                     Err(::buffa::DecodeError::InvalidEndGroup(tag.field_number()))
                                 };
                             }
+                            if first && self.__buffa_unknown_fields.active() {
+                                #runtime::reconcile_owned(&mut #runtime::Adapter(self), ctx)?;
+                            }
+                            first = false;
                             self.__wire_merge_field(tag, buf, ctx, false)?;
                         }
                     }
