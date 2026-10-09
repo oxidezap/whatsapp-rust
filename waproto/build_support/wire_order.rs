@@ -209,8 +209,25 @@ struct State {
 }
 
 /// Internal storage; raw unknown-field mutation deliberately drops the journal.
-#[derive(Clone, Default, PartialEq, Hash)]
+#[derive(Clone, Default)]
 pub struct Storage(Option<Box<State>>);
+
+impl PartialEq for Storage {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+            && self.0.as_ref().and_then(|state| state.order.as_ref())
+                == other.0.as_ref().and_then(|state| state.order.as_ref())
+    }
+}
+impl ::core::hash::Hash for Storage {
+    fn hash<H: ::core::hash::Hasher>(&self, state: &mut H) {
+        ::core::hash::Hash::hash(&**self, state);
+        ::core::hash::Hash::hash(
+            &self.0.as_ref().and_then(|state| state.order.as_ref()),
+            state,
+        );
+    }
+}
 
 impl ::core::fmt::Debug for Storage {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
