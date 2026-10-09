@@ -2,7 +2,7 @@ name: CodSpeed
 
 on:
   push:
-    branches: [main, qualify/projection-const-v45-codec-oct09]
+    branches: [main, qualify/projection-const-v45b-codec-oct09]
     paths-ignore: ["**.md", "docs/**"]
   pull_request:
     branches: [main]
@@ -32,7 +32,7 @@ env:
 
 jobs:
   benchmarks:
-    if: github.ref != 'refs/heads/qualify/projection-const-v45-codec-oct09'
+    if: github.ref != 'refs/heads/qualify/projection-const-v45b-codec-oct09'
     name: Run CodSpeed benchmarks (${{ matrix.shard.name }})
     runs-on: ubuntu-24.04
     # The slowest shard finishes in ~13min. The cap exists because the CodSpeed
@@ -174,7 +174,7 @@ jobs:
     # `credentials.password` rejects the empty string while the job template is
     # being prepared, so the job fails before any step runs and a step-level
     # `if:` cannot save it — the guard has to sit here. Same condition as e2e.yml.
-    if: ${{ github.ref != 'refs/heads/qualify/projection-const-v45-codec-oct09' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ github.ref != 'refs/heads/qualify/projection-const-v45b-codec-oct09' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-24.04
     # These benches drive the real client (connect/reconnect handshakes) under
     # Valgrind, so they are slow; cap the job so a stuck run can't hang CI
@@ -291,7 +291,7 @@ jobs:
 
   a02-cpu-pair:
     # Isolate batch decoding against v38 with the same occurrence semantics.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/qualify/projection-const-v45-codec-oct09' && github.event.before == '0000000000000000000000000000000000000000' && github.run_attempt == 1
+    if: github.event_name == 'push' && github.ref == 'refs/heads/qualify/projection-const-v45b-codec-oct09' && github.event.before == '0000000000000000000000000000000000000000' && github.run_attempt == 1
     name: Paired CPU (${{ matrix.pr }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -300,7 +300,7 @@ jobs:
       matrix:
         include:
           - pr: projection-const-v45
-            head: 250c6fdc
+            head: 250c6fdc2fd96409842321782b42d097d1b52f67
     env:
       A02_PAIR_HEAD_SHA: ${{ matrix.head }}
       CODSPEED_SKIP_UPLOAD: "true"
