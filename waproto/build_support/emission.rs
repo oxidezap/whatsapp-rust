@@ -376,6 +376,14 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
                     api.insert(format!("variant {public_scope}::{name}::{}", tokens(&v)));
                 }
             }
+            // Adapters into the hidden journal runtime are crate-private,
+            // just like the runtime module excluded above.
+            syn::Item::Impl(i)
+                if i.trait_.as_ref().is_some_and(|(_, path, _)| {
+                    path.segments
+                        .iter()
+                        .any(|segment| segment.ident == "__wire_order")
+                }) => {}
             syn::Item::Impl(i) if i.trait_.is_some() => {
                 let (_, path, _) = i.trait_.as_ref().expect("trait implementation");
                 let owner = format!(
