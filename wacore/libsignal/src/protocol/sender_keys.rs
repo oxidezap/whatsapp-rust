@@ -15,7 +15,8 @@ use crate::protocol::counter_lease::CounterLease;
 use crate::protocol::crypto::hmac_sha256;
 use crate::protocol::record_components::{
     SenderKeyRecordComponents, SenderKeyStateComponents, SenderMessageKeyComponents,
-    sender_state_components_from_structure, validate_sender_state_components,
+    sender_components_from_compact_header, sender_state_components_from_structure,
+    validate_sender_state_components,
 };
 #[cfg(test)]
 use crate::protocol::stores::SenderKeyRecordStructure;
@@ -232,6 +233,7 @@ impl SenderChainKey {
         hmac_sha256(&self.chain_key, &label)
     }
 
+    #[cfg(test)]
     pub(crate) fn as_protobuf(&self) -> sender_key_state_structure::SenderChainKey {
         use bytes::Bytes;
         {
@@ -708,19 +710,12 @@ impl SenderKeyState {
         if let Some(state) = self.preserved_protobuf() {
             return sender_state_components_from_structure(state);
         }
-        let header = {
-            let mut proto_ = SenderKeyStateStructure::default();
-            proto_.sender_key_id = self.sender_key_id;
-            proto_.sender_chain_key = self
-                .sender_chain
-                .as_ref()
-                .map_or_else(MessageField::none, |chain| {
-                    MessageField::some(chain.as_protobuf())
-                });
-            proto_.sender_signing_key = self.sender_signing_key;
-            proto_
-        };
-        let mut components = sender_state_components_from_structure(header)?;
+        let mut signing = self.sender_signing_key;
+        let mut components = sender_components_from_compact_header(
+            self.sender_key_id,
+            self.sender_chain,
+            signing.take(),
+        )?;
         // Compact keys already carry a validated u32 and a 32-byte seed.
         // Export their final Vec directly instead of constructing, slicing,
         // validating and discarding a protobuf for each shared backlog entry.
@@ -1470,6 +1465,52 @@ mod tests {
     // module itself no longer encodes anything.
     use crate::protocol::KeyPair;
     use buffa::Message;
+
+    #[test]
+    fn compact_component_export_preserves_header_validation() {
+        use bytes::Bytes;
+        let fixture = record_with_state(7, 0x42)
+            .states
+            .pop_front()
+            .expect("fixture state")
+            .as_protobuf();
+        for id in [None, Some(0), Some(u32::MAX)] {
+            for chain_present in [false, true] {
+                for signing_present in [false, true] {
+                    for public_len in [0, 31, 32, 33] {
+                        for private_len in [None, Some(0), Some(32)] {
+                            let mut proto = fixture.clone();
+                            proto.sender_key_id = id;
+                            if !chain_present {
+                                proto.sender_chain_key = MessageField::none();
+                            }
+                            if !signing_present {
+                                proto.sender_signing_key = MessageField::none();
+                            } else {
+                                let signing = proto
+                                    .sender_signing_key
+                                    .as_option_mut()
+                                    .expect("fixture signing key");
+                                signing.public = if public_len == 0 {
+                                    None
+                                } else {
+                                    Some(Bytes::from(vec![5; public_len]))
+                                };
+                                signing.private =
+                                    private_len.map(|length| Bytes::from(vec![0x31; length]));
+                            }
+                            let state = SenderKeyState::from_protobuf(proto);
+                            let expected =
+                                sender_state_components_from_structure(state.as_protobuf())
+                                    .map_err(|error| error.to_string());
+                            let actual = state.into_components().map_err(|error| error.to_string());
+                            assert_eq!(actual, expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn direct_components_match_generated_projection_for_shared_backlogs() {

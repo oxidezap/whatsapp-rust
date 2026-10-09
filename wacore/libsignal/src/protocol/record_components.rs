@@ -17,7 +17,6 @@ use crate::core::curve::PublicKey;
 use crate::protocol::error::{Result, SignalProtocolError};
 use crate::protocol::ratchet::MessageKeyGenerator;
 use crate::protocol::ratchet::keys::MessageKeys;
-#[cfg(test)]
 use crate::protocol::stores::sender_key_state_structure;
 use crate::protocol::stores::{SenderKeyStateStructure, SessionStructure, session_structure};
 
@@ -842,6 +841,39 @@ pub(crate) fn sender_state_components_from_structure(
                 })
             })
             .collect::<Result<_>>()?,
+    })
+}
+
+pub(crate) fn sender_components_from_compact_header(
+    key_id: Option<u32>,
+    chain: Option<crate::protocol::sender_keys::SenderChainKey>,
+    signing: Option<sender_key_state_structure::SenderSigningKey>,
+) -> Result<SenderKeyStateComponents> {
+    let chain = chain.ok_or_else(|| invalid("sender chain key", "present"))?;
+    let signing = signing.ok_or_else(|| invalid("sender signing key", "present"))?;
+    Ok(SenderKeyStateComponents {
+        key_id: key_id.ok_or_else(|| invalid("sender key id", "present"))?,
+        // The compact chain already guarantees the scalar's presence and a
+        // 32-byte seed. Allocate only the final public component buffer.
+        chain_key: SenderChainKeyComponents {
+            iteration: chain.iteration(),
+            seed: chain.seed().to_vec(),
+        },
+        signing_key: SenderSigningKeyComponents {
+            public: normalize_public_key(
+                signing
+                    .public
+                    .ok_or_else(|| invalid("sender signing public key", "present"))?
+                    .to_vec(),
+                "sender signing public key",
+            )?,
+            private: optional_exact_bytes(
+                signing.private.map(|value| value.to_vec()),
+                PRIVATE_KEY_BYTES,
+                "sender signing private key",
+            )?,
+        },
+        message_keys: Vec::new(),
     })
 }
 
