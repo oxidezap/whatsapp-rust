@@ -15,6 +15,24 @@ fn main() {
     divan::main();
 }
 
+/// Track clone ownership and allocation cost separately from encode/decode.
+/// Unknown records are synthetic and include an owned payload inside a group.
+#[divan::bench(args = ["empty", "text", "future_field", "future_group"])]
+fn bench_protobuf_clone(bencher: divan::Bencher, shape: &str) {
+    use buffa::Message as _;
+    let message = match shape {
+        "empty" => wa::Message::default(),
+        "text" => text_message(),
+        "future_field" => wa::Message::decode_from_slice(&[0xc2, 0x3e, 4, 11, 22, 33, 44]).unwrap(),
+        "future_group" => {
+            wa::Message::decode_from_slice(&[0xc3, 0x3e, 0x0a, 4, 11, 22, 33, 44, 0xc4, 0x3e])
+                .unwrap()
+        }
+        _ => unreachable!(),
+    };
+    bencher.bench(|| black_box(black_box(&message).clone()));
+}
+
 fn setup_device_list(users: usize, devices_per_user: u16) -> Vec<Jid> {
     let mut out = Vec::with_capacity(users * devices_per_user as usize);
     for u in 0..users {
