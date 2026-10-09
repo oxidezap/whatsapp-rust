@@ -110,6 +110,15 @@ impl IntoIterator for Storage {
     }
 }
 impl Storage {
+    /// Heap header owned by this wrapper, excluding the record buffer and payloads.
+    #[inline]
+    pub fn allocated_header_bytes(&self) -> usize {
+        if self.0.is_some() {
+            ::core::mem::size_of::<::buffa::UnknownFields>()
+        } else {
+            0
+        }
+    }
     #[cold]
     #[inline(never)]
     pub(super) fn merge_unknown(
