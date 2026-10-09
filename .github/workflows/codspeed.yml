@@ -2,7 +2,7 @@ name: CodSpeed
 
 on:
   push:
-    branches: [main, qualify/child-default-v38-cpu-oct09]
+    branches: [main, qualify/proto-v39-cpu-oct09]
     paths-ignore: ["**.md", "docs/**"]
   pull_request:
     branches: [main]
@@ -32,7 +32,7 @@ env:
 
 jobs:
   benchmarks:
-    if: github.ref != 'refs/heads/qualify/child-default-v38-cpu-oct09'
+    if: github.ref != 'refs/heads/qualify/proto-v39-cpu-oct09'
     name: Run CodSpeed benchmarks (${{ matrix.shard.name }})
     runs-on: ubuntu-24.04
     # The slowest shard finishes in ~13min. The cap exists because the CodSpeed
@@ -174,7 +174,7 @@ jobs:
     # `credentials.password` rejects the empty string while the job template is
     # being prepared, so the job fails before any step runs and a step-level
     # `if:` cannot save it — the guard has to sit here. Same condition as e2e.yml.
-    if: ${{ github.ref != 'refs/heads/qualify/child-default-v38-cpu-oct09' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ github.ref != 'refs/heads/qualify/proto-v39-cpu-oct09' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-24.04
     # These benches drive the real client (connect/reconnect handshakes) under
     # Valgrind, so they are slow; cap the job so a stuck run can't hang CI
@@ -290,8 +290,8 @@ jobs:
           run: cargo codspeed run -p bench-integration
 
   a02-cpu-pair:
-    # Each candidate shares one host with its fixed main baseline.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/qualify/child-default-v38-cpu-oct09' && github.event.before == '0000000000000000000000000000000000000000' && github.run_attempt == 1
+    # Isolate codec changes against v34, which has the same retention semantics.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/qualify/proto-v39-cpu-oct09' && github.event.before == '0000000000000000000000000000000000000000' && github.run_attempt == 1
     name: Paired CPU (${{ matrix.pr }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -299,12 +299,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - pr: 1676
-            head: 4292d3d2c4eb1bbc5b5220e376fc90a4e8083e2e
-          - pr: 1694
-            head: 67645e946a8c3c5c367f55ecfdf8df4e0f299b87
-          - pr: 1679
-            head: 1e275bfea58cee2f866a72f923e127f3180dde4c
+          - pr: proto-v38
+            head: 0a6fe624721bf4280889fa12226fc9681a5d4194
+          - pr: proto-v39
+            head: 2145e52aa3755eaf252a01d0106c3d5192ec3014
     env:
       A02_PAIR_HEAD_SHA: ${{ matrix.head }}
       CODSPEED_SKIP_UPLOAD: "true"
@@ -313,7 +311,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 2d87ae79df3a93b3c42adf742ee305824c2255a5
+          ref: 2b5a20abce32cf39d40baa2b73595a638b53fc5a
           path: _a02_pair/base
           persist-credentials: false
       - uses: actions/checkout@v7
@@ -354,16 +352,12 @@ jobs:
       - name: Build fixed baseline benchmarks
         working-directory: _a02_pair/base
         run: |
-          cargo codspeed build --locked -m simulation -p wacore --features voip-mlow,bench-internals --bench appstate_sync_benchmark --bench sender_key_derivation_benchmark
-          cargo codspeed build --locked -m simulation -p wacore-libsignal --bench libsignal_benchmark
-          cargo codspeed build --locked -m simulation -p whatsapp-rust --features bench-harness --bench client_receive
+          cargo codspeed build --locked -m simulation -p wacore --features voip-mlow,bench-internals --bench message_utils_benchmark
           git diff --exit-code
       - name: Build fixed candidate benchmarks
         working-directory: _a02_pair/head
         run: |
-          cargo codspeed build --locked -m simulation -p wacore --features voip-mlow,bench-internals --bench appstate_sync_benchmark --bench sender_key_derivation_benchmark
-          cargo codspeed build --locked -m simulation -p wacore-libsignal --bench libsignal_benchmark
-          cargo codspeed build --locked -m simulation -p whatsapp-rust --features bench-harness --bench client_receive
+          cargo codspeed build --locked -m simulation -p wacore --features voip-mlow,bench-internals --bench message_utils_benchmark
           git diff --exit-code
       - name: Measure base once without upload
         uses: CodSpeedHQ/action@c4fd08a3a159bd0cc208da1e0edf32b8c47d75e5 # v5
@@ -378,12 +372,7 @@ jobs:
           run: |
             set -e
             "$GITHUB_WORKSPACE/_a02_tools/target/debug/whatsapp-xtask" ci codspeed-pair capture --side base
-            cargo codspeed run -p wacore --bench appstate_sync_benchmark bench_collect_unique_index_macs
-            cargo codspeed run -p wacore --bench sender_key_derivation_benchmark store_round_trip_rebuilt
-            cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark bench_sender_key_
-            cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark bench_session_
-            cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark bench_reject_prekey_as_signal
-            cargo codspeed run -p whatsapp-rust --bench client_receive plaintext_ownership_controls
+            cargo codspeed run -p wacore --bench message_utils_benchmark bench_oneof_
       - name: Measure head once without upload
         uses: CodSpeedHQ/action@c4fd08a3a159bd0cc208da1e0edf32b8c47d75e5 # v5
         env:
@@ -397,12 +386,7 @@ jobs:
           run: |
             set -e
             "$GITHUB_WORKSPACE/_a02_tools/target/debug/whatsapp-xtask" ci codspeed-pair capture --side head
-            cargo codspeed run -p wacore --bench appstate_sync_benchmark bench_collect_unique_index_macs
-            cargo codspeed run -p wacore --bench sender_key_derivation_benchmark store_round_trip_rebuilt
-            cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark bench_sender_key_
-            cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark bench_session_
-            cargo codspeed run -p wacore-libsignal --bench libsignal_benchmark bench_reject_prekey_as_signal
-            cargo codspeed run -p whatsapp-rust --bench client_receive plaintext_ownership_controls
+            cargo codspeed run -p wacore --bench message_utils_benchmark bench_oneof_
       - name: Validate captured benchmark sets and runtime contracts
         run: _a02_tools/target/debug/whatsapp-xtask ci codspeed-pair validate
       - name: Print validated instruction counters
