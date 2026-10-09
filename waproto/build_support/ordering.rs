@@ -266,14 +266,15 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     if f.sig.ident == "compute_size" {
                         f.block = syn::parse_quote!({
                             if self.__buffa_unknown_fields.active() {
-                                return ::buffa::saturate_size(self.__buffa_unknown_fields.compose(&self.__wire_known(), Self::__wire_group).len() as u64);
+                                let bytes = self.__buffa_unknown_fields.compose(&self.__wire_known(), Self::__wire_group);
+                                return #runtime::cache_output(&bytes, #compute_cache);
                             }
                             self.__wire_compute(#compute_cache, true)
                         });
                     } else if f.sig.ident == "write_to" {
                         f.block = syn::parse_quote!({
                             if self.__buffa_unknown_fields.active() {
-                                #write_buf.put_slice(&self.__buffa_unknown_fields.compose(&self.__wire_known(), Self::__wire_group));
+                                #runtime::write_cached(#write_cache, #write_buf);
                             } else {
                                 self.__wire_write(#write_cache, #write_buf, true);
                             }

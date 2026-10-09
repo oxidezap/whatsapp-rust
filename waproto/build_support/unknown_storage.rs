@@ -10,9 +10,32 @@ impl ::core::fmt::Debug for Storage {
     }
 }
 impl PartialEq for Storage {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
-        **self == **other
+        if self.0.is_none() && other.0.is_none() {
+            return true;
+        }
+        equal_nonempty(self, other)
     }
+}
+#[cold]
+#[inline(never)]
+fn equal_nonempty(left: &Storage, right: &Storage) -> bool {
+    **left == **right
+}
+
+impl Drop for Storage {
+    #[inline]
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            drop_nonempty(&mut self.0);
+        }
+    }
+}
+#[cold]
+#[inline(never)]
+fn drop_nonempty(fields: &mut Option<Box<::buffa::UnknownFields>>) {
+    *fields = None;
 }
 impl ::core::hash::Hash for Storage {
     fn hash<H: ::core::hash::Hasher>(&self, state: &mut H) {
@@ -58,8 +81,8 @@ impl From<::buffa::UnknownFields> for Storage {
     }
 }
 impl From<Storage> for ::buffa::UnknownFields {
-    fn from(value: Storage) -> Self {
-        value.0.map_or_else(Self::new, |fields| *fields)
+    fn from(mut value: Storage) -> Self {
+        value.0.take().map_or_else(Self::new, |fields| *fields)
     }
 }
 impl PartialEq<::buffa::UnknownFields> for Storage {
