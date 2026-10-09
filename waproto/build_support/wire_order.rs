@@ -70,18 +70,32 @@ pub(crate) fn begin_owned(
 
 #[cold]
 #[inline(never)]
+pub(crate) fn reconcile_owned(
+    codec: &mut dyn OwnedCodec,
+    ctx: DecodeContext<'_>,
+) -> Result<(), DecodeError> {
+    let known = codec.known(ctx)?;
+    let map = codec.groups();
+    codec.storage().reconcile(&known, map, ctx)
+}
+
+#[cold]
+#[inline(never)]
 pub(crate) fn merge_owned_known(
     codec: &mut dyn OwnedCodec,
     tag: ::buffa::encoding::Tag,
     buf: &mut dyn Buf,
     ctx: DecodeContext<'_>,
+    check_current: bool,
 ) -> Result<(), DecodeError> {
     let map = codec.groups();
     let group = map(tag.field_number());
     let previous = codec.storage().len();
     debug_assert_ne!(group, 0);
-    let known = codec.known(ctx)?;
-    codec.storage().reconcile(&known, map, ctx)?;
+    if check_current {
+        let known = codec.known(ctx)?;
+        codec.storage().reconcile(&known, map, ctx)?;
+    }
     let mut input = buf;
     let mut captured = Capture::new(&mut input, tag, ctx)?;
     ::buffa::encoding::skip_field_depth(tag, &mut captured, ctx.depth())?;
@@ -103,14 +117,15 @@ pub(crate) fn finish_owned_unknown(
     codec: &mut dyn OwnedCodec,
     previous: usize,
     ctx: DecodeContext<'_>,
+    check_current: bool,
 ) -> Result<(), DecodeError> {
     if codec.storage().len() != previous {
         let map = codec.groups();
-        let known = codec.known(ctx)?;
-        codec.storage().reconcile(&known, map, ctx)?;
-        codec
-            .storage()
-            .finish(0, None, &known, map, previous, ctx)?;
+        if check_current {
+            let known = codec.known(ctx)?;
+            codec.storage().reconcile(&known, map, ctx)?;
+        }
+        codec.storage().finish(0, None, &[], map, previous, ctx)?;
     }
     Ok(())
 }
@@ -141,25 +156,41 @@ pub(crate) fn begin_view<'a>(
 
 #[cold]
 #[inline(never)]
+pub(crate) fn reconcile_view<'a>(
+    codec: &mut dyn ViewCodec<'a>,
+    ctx: DecodeContext<'_>,
+) -> Result<(), DecodeError> {
+    let known = codec.known(ctx)?;
+    let map = codec.groups();
+    codec.storage().reconcile(&known, map, ctx)
+}
+
+#[cold]
+#[inline(never)]
 pub(crate) fn merge_view<'a>(
     codec: &mut dyn ViewCodec<'a>,
     tag: ::buffa::encoding::Tag,
     cur: &'a [u8],
     before: &'a [u8],
     ctx: DecodeContext<'_>,
+    check_current: bool,
 ) -> Result<&'a [u8], DecodeError> {
     let map = codec.groups();
     let group = map(tag.field_number());
     let previous = codec.storage().len();
-    if group != 0 {
+    if group != 0 && check_current {
         let known = codec.known(ctx)?;
         codec.storage().reconcile(&known, map, ctx)?;
     }
     let rest = codec.merge(tag, cur, before, ctx)?;
     let count = codec.storage().len();
     if group != 0 || count != previous {
-        let known = codec.known(ctx)?;
-        if group == 0 {
+        let known = if group != 0 || check_current {
+            codec.known(ctx)?
+        } else {
+            Vec::new()
+        };
+        if group == 0 && check_current {
             codec.storage().reconcile(&known, map, ctx)?;
         }
         codec.storage().finish(

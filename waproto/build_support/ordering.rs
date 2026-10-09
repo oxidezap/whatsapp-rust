@@ -433,6 +433,7 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     use ::buffa::{Message as _, MessageView as _};
                 ),
             );
+            let mut retained_merge = None;
             for member in &mut item.items {
                 let syn::ImplItem::Fn(f) = member else {
                     continue;
@@ -449,7 +450,7 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                                 }
                                 return Ok(rest);
                             }
-                            #runtime::merge_view(&mut #runtime::Adapter(self), tag, cur, before_tag, ctx)
+                            #runtime::merge_view(&mut #runtime::Adapter(self), tag, cur, before_tag, ctx, check_current)
                         })
                     } else {
                         syn::parse_quote!({
@@ -461,13 +462,27 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                                 return Ok(());
                             }
                             if Self::__wire_group(tag.field_number()) != 0 {
-                                #runtime::merge_owned_known(&mut #runtime::Adapter(self), tag, buf, ctx)
+                                #runtime::merge_owned_known(&mut #runtime::Adapter(self), tag, buf, ctx, check_current)
                             } else {
                                 let previous = self.__buffa_unknown_fields.len();
                                 self.__wire_merge(tag, buf, ctx)?;
-                                #runtime::finish_owned_unknown(&mut #runtime::Adapter(self), previous, ctx)
+                                #runtime::finish_owned_unknown(&mut #runtime::Adapter(self), previous, ctx, check_current)
                             }
                         })
+                    };
+                    let mut retained = f.clone();
+                    retained.sig.ident = format_ident!("__wire_merge_field");
+                    retained
+                        .sig
+                        .inputs
+                        .push(syn::parse_quote!(check_current: bool));
+                    retained_merge = Some(retained);
+                    f.block = if view {
+                        syn::parse_quote!({
+                            self.__wire_merge_field(tag, cur, before_tag, ctx, true)
+                        })
+                    } else {
+                        syn::parse_quote!({ self.__wire_merge_field(tag, buf, ctx, true) })
                     };
                 } else if view && f.sig.ident == "to_owned_from_source" {
                     let body = f.block.clone();
@@ -482,9 +497,69 @@ fn transform(items: &mut Vec<syn::Item>, view: bool, depth: usize) {
                     });
                 }
             }
+            // One exclusive borrow covers the whole loop: public fields cannot
+            // change between its iterations. Reconcile edits at the first
+            // field, then reuse the baseline maintained by each known merge.
+            // Direct single-field calls still check on every invocation.
+            item.items.push(if view {
+                syn::parse_quote! {
+                    fn merge_into_view(&mut self, buf: &'a [u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<(), ::buffa::DecodeError> {
+                        let mut cur = buf;
+                        if !cur.is_empty() && self.__buffa_unknown_fields.active() {
+                            #runtime::reconcile_view(&mut #runtime::Adapter(self), ctx)?;
+                        }
+                        while !cur.is_empty() {
+                            let before_tag = cur;
+                            let tag = ::buffa::encoding::Tag::decode(&mut cur)?;
+                            cur = self.__wire_merge_field(tag, cur, before_tag, ctx, false)?;
+                        }
+                        Ok(())
+                    }
+                }
+            } else {
+                syn::parse_quote! {
+                    fn merge_to_limit(&mut self, buf: &mut impl ::buffa::bytes::Buf, ctx: ::buffa::DecodeContext<'_>, limit: usize) -> ::core::result::Result<(), ::buffa::DecodeError> {
+                        if buf.remaining() > limit && self.__buffa_unknown_fields.active() {
+                            #runtime::reconcile_owned(&mut #runtime::Adapter(self), ctx)?;
+                        }
+                        while buf.remaining() > limit {
+                            let tag = ::buffa::encoding::Tag::decode(buf)?;
+                            self.__wire_merge_field(tag, buf, ctx, false)?;
+                        }
+                        Ok(())
+                    }
+                }
+            });
+            if !view {
+                item.items.push(syn::parse_quote! {
+                    fn merge_group(&mut self, buf: &mut impl ::buffa::bytes::Buf, ctx: ::buffa::DecodeContext<'_>, field_number: u32) -> ::core::result::Result<(), ::buffa::DecodeError> {
+                        let ctx = ctx.descend()?;
+                        let mut first = true;
+                        loop {
+                            if !buf.has_remaining() {
+                                return Err(::buffa::DecodeError::UnexpectedEof);
+                            }
+                            let tag = ::buffa::encoding::Tag::decode(buf)?;
+                            if tag.wire_type() == ::buffa::encoding::WireType::EndGroup {
+                                return if tag.field_number() == field_number {
+                                    Ok(())
+                                } else {
+                                    Err(::buffa::DecodeError::InvalidEndGroup(tag.field_number()))
+                                };
+                            }
+                            if first && self.__buffa_unknown_fields.active() {
+                                #runtime::reconcile_owned(&mut #runtime::Adapter(self), ctx)?;
+                            }
+                            first = false;
+                            self.__wire_merge_field(tag, buf, ctx, false)?;
+                        }
+                    }
+                });
+            }
             helpers.push(syn::parse_quote! {
                 impl #impl_generics #ty #where_clause {
                     #merge
+                    #retained_merge
                     #[inline]
                     fn __wire_group(tag: u32) -> u32 {
                         match tag { #(#cases)* _ => 0 }
