@@ -269,7 +269,7 @@ fn main() -> std::io::Result<()> {
     let source = pin_clone::generate(&source).map_err(std::io::Error::other)?;
     std::fs::write(generated, source)?;
 
-    let mut api = emission::finish(&out_path, "whatsapp")?;
+    let mut api = emission::finish(&out_path, "whatsapp", &fds)?;
     api.extend(names::wire_api(&fds));
     let snapshot = api.iter().cloned().collect::<Vec<_>>().join("\n") + "\n";
     std::fs::write(out_path.join("api.snapshot"), snapshot)?;

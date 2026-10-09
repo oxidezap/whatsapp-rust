@@ -9,6 +9,23 @@ use ::core::mem::ManuallyDrop;
 type GroupMap = fn(u32) -> u32;
 type Projection = Vec<(u32, Vec<u8>)>;
 
+// A field decoder can mutate its receiver before journal insertion. Prepay
+// insertion as well as finalization so an exhausted caller budget cannot erase
+// a completed known occurrence behind an earlier future value.
+fn reserve_record(group: u32, raw: &[u8], view: bool, ctx: DecodeContext<'_>) -> Result<usize, DecodeError> {
+    let mut charge = event_charge(1).saturating_add(if view { raw.len() } else { 0 });
+    if group & (1 << 31) != 0 {
+        // Packed input is split into individual values before this entrypoint.
+        // A synthetic view record has no tag in `raw`; allow its five bytes,
+        // plus a canonical tag and ten-byte signed enum in the projection.
+        charge = charge.saturating_add(if view { 5 } else { 0 })
+            .saturating_add(::core::mem::size_of::<(u32, Vec<u8>)>())
+            .saturating_add(15);
+    }
+    ctx.register_element_memory(charge)?;
+    Ok(charge)
+}
+
 // Enum-only owners need no per-type copy of protobuf sizing and writing code.
 // The stack projection retains field presence, including present zero values.
 #[cold]
@@ -48,6 +65,7 @@ pub(crate) struct Adapter<'a, T>(pub(crate) &'a mut T);
 pub(crate) trait OwnedCodec {
     fn storage(&mut self) -> &mut Storage;
     fn groups(&self) -> GroupMap;
+    fn growth(&self, tag: u32) -> usize;
     fn known(&self, ctx: DecodeContext<'_>) -> Result<Vec<u8>, DecodeError>;
     fn merge_slice(
         &mut self,
@@ -113,16 +131,21 @@ pub(crate) fn merge_owned_known(
     let raw = captured.finish()?;
     let mut payload = raw.as_slice();
     ::buffa::encoding::Tag::decode(&mut payload)?;
+    let record_credit = ::core::cell::Cell::new(if !check_current {
+        reserve_record(group, &raw, false, ctx)?
+    } else { 0 });
     if !check_current {
-        codec.storage().reserve_baseline(group, raw.len(), ctx)?;
+        let encoded_bound = raw.len().saturating_mul(codec.growth(tag.field_number()));
+        codec.storage().reserve_baseline(group, encoded_bound, ctx)?;
     }
     // Generated decoders receive their existing slice specialization. Erasing
     // their input buffer would instantiate a second recursive codec tree.
     codec.merge_slice(tag, &mut payload, ctx)?;
+    let finish_ctx = if check_current { ctx } else { ctx.with_element_memory(&record_credit) };
     let known = if check_current && group & (1 << 31) == 0 { Some(codec.known(ctx)?) } else { None };
     codec
         .storage()
-        .finish(group, Some(raw), known.as_deref(), map, previous, ctx)
+        .finish(group, Some(raw), known.as_deref(), map, previous, finish_ctx)
 }
 
 #[cold]
@@ -147,6 +170,7 @@ pub(crate) fn finish_owned_unknown(
 pub(crate) trait ViewCodec<'a> {
     fn storage(&mut self) -> &mut ViewStorage<'a>;
     fn groups(&self) -> GroupMap;
+    fn growth(&self, tag: u32) -> usize;
     fn known(&self, ctx: DecodeContext<'_>) -> Result<Vec<u8>, DecodeError>;
     fn merge(
         &mut self,
@@ -207,12 +231,19 @@ pub(crate) fn merge_view<'a>(
         let known = codec.known(ctx)?;
         codec.storage().reconcile(&known, map, ctx)?;
     }
-    if group != 0 && !check_current {
+    let record_credit = ::core::cell::Cell::new(if group != 0 && !check_current {
         let mut after = cur;
         ::buffa::encoding::skip_field_depth(tag, &mut after, ctx.depth())?;
-        codec.storage().reserve_baseline(group, before.len() - after.len(), ctx)?;
-    }
+        let raw = &before[..before.len() - after.len()];
+        let record_len = raw.len().saturating_add(if group & (1 << 31) != 0 {
+            ::buffa::encoding::varint_len(u64::from(tag.field_number()) << 3)
+        } else { 0 });
+        let encoded_bound = record_len.saturating_mul(codec.growth(tag.field_number()));
+        codec.storage().reserve_baseline(group, encoded_bound, ctx)?;
+        reserve_record(group, raw, true, ctx)?
+    } else { 0 });
     let rest = codec.merge(tag, cur, before, ctx)?;
+    let finish_ctx = if group != 0 && !check_current { ctx.with_element_memory(&record_credit) } else { ctx };
     let count = codec.storage().len();
     if group != 0 || count != previous {
         let known = if check_current && group & (1 << 31) == 0 {
@@ -226,7 +257,7 @@ pub(crate) fn merge_view<'a>(
         let raw = if group & (1 << 31) != 0 {
             let mut raw = Vec::new();
             let len = ::buffa::encoding::varint_len(u64::from(tag.field_number()) << 3) + cur.len() - rest.len();
-            ctx.register_element_memory(len)?;
+            finish_ctx.register_element_memory(len)?;
             raw.reserve_exact(len);
             tag.encode(&mut raw);
             raw.extend_from_slice(&cur[..cur.len() - rest.len()]);
@@ -240,7 +271,7 @@ pub(crate) fn merge_view<'a>(
             known.as_deref(),
             map,
             previous,
-            ctx,
+            finish_ctx,
         )?;
     }
     Ok(rest)
@@ -388,13 +419,13 @@ fn value(values: &Projection, group: u32) -> &[u8] {
 }
 
 impl<'a> Order<'a> {
-    fn reserve_baseline(&mut self, group: u32, raw_len: usize, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+    fn reserve_baseline(&mut self, group: u32, encoded_bound: usize, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
         if group & (1 << 31) != 0 && !self.baseline_pending {
             return Ok(());
         }
         // Reserve before mutation: completed occurrences must remain encodable
         // even if a later decode exhausts the caller's budget. A canonical
-        // int32 can grow from five wire bytes to ten; two copies cover the
+        // field's schema bounds packed and signed-integer growth; two copies cover the
         // temporary encoding and the final projection. Existing values are
         // charged once per batch, not once per fragment.
         let header = ::core::mem::size_of::<(u32, Vec<u8>)>() + ::core::mem::size_of::<Event<'_>>();
@@ -405,7 +436,7 @@ impl<'a> Order<'a> {
         } else { 0 };
         let new_group = !self.baseline.iter().any(|(id, _)| *id == group)
             && !self.events.iter().any(|event| matches!(event, Event::Known(id, _) if *id == group));
-        let charge = initial.saturating_add(raw_len.saturating_mul(4))
+        let charge = initial.saturating_add(encoded_bound.saturating_mul(2))
             .saturating_add(if new_group { header } else { 0 });
         ctx.register_element_memory(charge)?;
         self.completion_credit = self.completion_credit.saturating_add(charge);

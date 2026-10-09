@@ -12,6 +12,9 @@ use syn::visit_mut::{self, VisitMut};
 #[path = "ordering.rs"]
 mod ordering;
 
+#[path = "wire_growth.rs"]
+mod wire_growth;
+
 struct Extensible {
     serde: bool,
 }
@@ -297,8 +300,13 @@ fn share_message_impls(items: &mut Vec<syn::Item>, scope: &str) {
     items.extend(implementations);
 }
 
-pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
+pub fn finish(
+    out: &Path,
+    package: &str,
+    fds: &buffa_descriptor::generated::descriptor::FileDescriptorSet,
+) -> io::Result<BTreeSet<String>> {
     let mut api = BTreeSet::new();
+    let growth = wire_growth::bounds(fds, package);
     for (suffix, serde) in [
         ("", true),
         (".__oneof", false),
@@ -313,7 +321,7 @@ pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
         if serde {
             share_codecs(&mut file.items);
             ColdStorage { depth: 0 }.visit_file_mut(&mut file);
-            ordering::apply(&mut file, false);
+            ordering::apply(&mut file, false, &growth);
             let body = syn::parse_file(include_str!("unknown_storage.rs")).expect("storage syntax");
             let body = body.items;
             file.items
@@ -325,7 +333,7 @@ pub fn finish(out: &Path, package: &str) -> io::Result<BTreeSet<String>> {
         }
 
         if suffix == ".__view" {
-            ordering::apply(&mut file, true);
+            ordering::apply(&mut file, true, &growth);
         }
 
         if serde {

@@ -129,6 +129,55 @@ fn protocol_type_setter_keeps_same_value_replacement_after_future_type() {
 }
 
 #[test]
+fn image_header_accepts_packed_scan_lengths_within_decode_budget() {
+    use waproto::buffa::{DecodeOptions, ViewEncode};
+    // Future field, imageMessage, then 512 packed values of unpacked scanLengths.
+    let mut wire = vec![0xc0, 0x3e, 7, 0x22, 0x84, 4, 0xb2, 1, 0x80, 4];
+    wire.extend(std::iter::repeat_n(0, 512));
+    let options = DecodeOptions::new().with_element_memory_limit(128 * 1024);
+    let owned = options
+        .decode_from_slice::<wa::message::interactive_message::Header>(&wire)
+        .unwrap();
+    let view = options
+        .decode_view::<wa::message::interactive_message::HeaderView<'_>>(&wire)
+        .unwrap();
+    assert_eq!(owned.encode_to_vec(), wire);
+    assert_eq!(view.encode_to_vec(), wire);
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), wire);
+}
+
+#[test]
+fn failed_protocol_event_reservation_keeps_completed_later_type() {
+    use waproto::buffa::{DecodeContext, ViewEncode};
+    let first = [0xc0, 0x3e, 7];
+    let later = [0x10, 0, 0x10, 99, 0x10, 3];
+    let expected = [&first[..], &later[..]].concat();
+    for allowance in 0..600 {
+        let unknown = core::cell::Cell::new(usize::MAX);
+        let budget = core::cell::Cell::new(allowance);
+        let mut owned = wa::message::ProtocolMessage::decode_from_slice(&first).unwrap();
+        let _ = owned.merge_to_limit(
+            &mut &later[..],
+            DecodeContext::new(100, &unknown).with_element_memory(&budget),
+            0,
+        );
+        if owned.r#type == Some(wa::message::protocol_message::Type::EPHEMERAL_SETTING) {
+            assert_eq!(owned.encode_to_vec(), expected, "owned budget {allowance}");
+        }
+        let budget = core::cell::Cell::new(allowance);
+        let mut view = wa::message::ProtocolMessageView::decode_view(&first).unwrap();
+        let _ = view.merge_into_view(
+            &later,
+            DecodeContext::new(100, &unknown).with_element_memory(&budget),
+        );
+        if view.r#type == Some(wa::message::protocol_message::Type::EPHEMERAL_SETTING) {
+            assert_eq!(view.encode_to_vec(), expected, "view budget {allowance}");
+            assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
+        }
+    }
+}
+
+#[test]
 fn failed_protocol_batch_keeps_future_type_after_revoke() {
     use waproto::buffa::{DecodeContext, ViewEncode};
     let first = [0xc0, 0x3e, 7];

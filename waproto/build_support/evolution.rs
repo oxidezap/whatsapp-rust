@@ -65,6 +65,9 @@ fn schema(new: bool) -> FileDescriptorSet {
     let mut values = field("values", 3, Type::TYPE_UINT32);
     values.label = Some(Label::LABEL_REPEATED);
     record.nested_type[0].field.push(values);
+    let mut wide_values = field("wide_values", 32, Type::TYPE_UINT32);
+    wide_values.label = Some(Label::LABEL_REPEATED);
+    record.nested_type[0].field.push(wide_values);
     let mut back = field("next", 8, Type::TYPE_MESSAGE);
     back.type_name = Some(format!(".contract.{message}"));
     record.field.push(back);
@@ -117,9 +120,11 @@ fn schema(new: bool) -> FileDescriptorSet {
         packed: Some(true),
         ..Default::default()
     });
+    let mut state = field("state", 3, Type::TYPE_ENUM);
+    state.type_name = Some(format!(".contract.{message}.{mode}"));
     let repeated_record = DescriptorProto {
         name: Some("RepeatedRecord".into()),
-        field: vec![modes, packed_modes],
+        field: vec![modes, packed_modes, state],
         ..Default::default()
     };
     FileDescriptorSet {
@@ -241,7 +246,7 @@ fn emit(
         .out_dir(out)
         .compile()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let mut api = emission::finish(out, "contract")?;
+    let mut api = emission::finish(out, "contract", fds)?;
     api.extend(names::wire_api(fds));
     Ok(api)
 }
