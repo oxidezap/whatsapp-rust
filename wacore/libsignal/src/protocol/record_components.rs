@@ -1461,6 +1461,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // Generated codec is the differential reference.
     fn compact_sender_import_matches_protobuf_reference() {
         use crate::protocol::stores::SenderKeyRecordStructure;
         use buffa::Message as _;
@@ -1534,8 +1535,8 @@ mod tests {
             let actual = SenderKeyRecord::from_components(SenderKeyRecordComponents {
                 states: vec![state],
             })
-            .err()
-            .expect("invalid compact components")
+            .map(|_| ())
+            .expect_err("invalid compact components")
             .to_string();
             assert_eq!(actual, expected, "fault mask {faults}");
         }
