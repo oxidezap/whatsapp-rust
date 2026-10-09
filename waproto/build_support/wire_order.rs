@@ -81,6 +81,15 @@ pub(crate) fn reconcile_owned(
 
 #[cold]
 #[inline(never)]
+pub(crate) fn complete_owned_batch(codec: &mut dyn OwnedCodec, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+    if !codec.storage().needs_baseline() { return Ok(()); }
+    let known = codec.known(ctx)?;
+    let map = codec.groups();
+    codec.storage().complete_batch(&known, map, ctx)
+}
+
+#[cold]
+#[inline(never)]
 pub(crate) fn merge_owned_known(
     codec: &mut dyn OwnedCodec,
     tag: ::buffa::encoding::Tag,
@@ -105,10 +114,10 @@ pub(crate) fn merge_owned_known(
     // Generated decoders receive their existing slice specialization. Erasing
     // their input buffer would instantiate a second recursive codec tree.
     codec.merge_slice(tag, &mut payload, ctx)?;
-    let known = if group & (1 << 31) == 0 { codec.known(ctx)? } else { Vec::new() };
+    let known = if check_current && group & (1 << 31) == 0 { Some(codec.known(ctx)?) } else { None };
     codec
         .storage()
-        .finish(group, Some(raw), &known, map, previous, ctx)
+        .finish(group, Some(raw), known.as_deref(), map, previous, ctx)
 }
 
 #[cold]
@@ -125,7 +134,7 @@ pub(crate) fn finish_owned_unknown(
             let known = codec.known(ctx)?;
             codec.storage().reconcile(&known, map, ctx)?;
         }
-        codec.storage().finish(0, None, &[], map, previous, ctx)?;
+        codec.storage().finish(0, None, None, map, previous, ctx)?;
     }
     Ok(())
 }
@@ -167,6 +176,15 @@ pub(crate) fn reconcile_view<'a>(
 
 #[cold]
 #[inline(never)]
+pub(crate) fn complete_view_batch<'a>(codec: &mut dyn ViewCodec<'a>, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+    if !codec.storage().needs_baseline() { return Ok(()); }
+    let known = codec.known(ctx)?;
+    let map = codec.groups();
+    codec.storage().complete_batch(&known, map, ctx)
+}
+
+#[cold]
+#[inline(never)]
 pub(crate) fn merge_view<'a>(
     codec: &mut dyn ViewCodec<'a>,
     tag: ::buffa::encoding::Tag,
@@ -185,13 +203,13 @@ pub(crate) fn merge_view<'a>(
     let rest = codec.merge(tag, cur, before, ctx)?;
     let count = codec.storage().len();
     if group != 0 || count != previous {
-        let known = if (group != 0 && group & (1 << 31) == 0) || (group == 0 && check_current) {
-            codec.known(ctx)?
+        let known = if check_current && group & (1 << 31) == 0 {
+            Some(codec.known(ctx)?)
         } else {
-            Vec::new()
+            None
         };
         if group == 0 && check_current {
-            codec.storage().reconcile(&known, map, ctx)?;
+            codec.storage().reconcile(known.as_deref().unwrap_or_default(), map, ctx)?;
         }
         let raw = if group & (1 << 31) != 0 {
             let mut raw = Vec::new();
@@ -207,7 +225,7 @@ pub(crate) fn merge_view<'a>(
         codec.storage().finish(
             group,
             raw,
-            &known,
+            known.as_deref(),
             map,
             previous,
             ctx,
@@ -268,6 +286,7 @@ struct Order<'a> {
     baseline: Projection,
     forced: Vec<u32>,
     unknown_count: usize,
+    baseline_pending: bool,
 }
 
 fn records(mut bytes: &[u8]) -> impl Iterator<Item = (u32, &[u8])> {
@@ -403,6 +422,7 @@ impl<'a> Order<'a> {
             baseline,
             forced: Vec::new(),
             unknown_count: count,
+            baseline_pending: false,
         }
     }
 
@@ -438,6 +458,7 @@ impl<'a> Order<'a> {
             }
         }
         self.baseline = current;
+        self.baseline_pending = false;
         self.forced.clear();
         Ok(())
     }
@@ -505,6 +526,7 @@ impl<'a> Order<'a> {
             baseline: self.baseline.clone(),
             forced: self.forced.clone(),
             unknown_count: self.unknown_count,
+            baseline_pending: self.baseline_pending,
         }
     }
 }
@@ -700,7 +722,7 @@ impl Storage {
         &mut self,
         group: u32,
         raw: Option<Vec<u8>>,
-        known: &[u8],
+        known: Option<&[u8]>,
         map: GroupMap,
         previous: usize,
         ctx: DecodeContext<'_>,
@@ -709,19 +731,34 @@ impl Storage {
         let order = state.order.as_mut().expect("started occurrence journal");
         if group != 0 && previous == state.fields.len() {
             ctx.register_element_memory(
-                projection_charge(known, map, 1).saturating_add(event_charge(1)),
+                known.map_or(0, |known| projection_charge(known, map, 1)).saturating_add(event_charge(1)),
             )?;
             let raw = raw.expect("captured known occurrence");
             if group & (1 << 31) != 0 {
                 order.append_repeated(group, &raw, ctx)?;
-            } else {
+            } else if let Some(known) = known {
                 order.baseline = projection(known, map);
+            } else {
+                order.baseline_pending = true;
             }
             order.events.push(Event::Known(group, Cow::Owned(raw)));
         }
         ctx.register_element_memory(event_charge(state.fields.len() - order.unknown_count))?;
         order.append_unknown(state.fields.len());
         Ok(())
+    }
+    #[cold]
+    #[inline(never)]
+    pub fn complete_batch(&mut self, known: &[u8], map: GroupMap, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+        if let Some(order) = self.0.as_mut().and_then(|state| state.order.as_mut()) {
+            ctx.register_element_memory(projection_charge(known, map, 1))?;
+            order.baseline = projection(known, map);
+            order.baseline_pending = false;
+        }
+        Ok(())
+    }
+    pub fn needs_baseline(&self) -> bool {
+        self.0.as_ref().and_then(|state| state.order.as_ref()).is_some_and(|order| order.baseline_pending)
     }
     #[cold]
     #[inline(never)]
@@ -909,7 +946,7 @@ impl<'a> ViewStorage<'a> {
         &mut self,
         group: u32,
         raw: Cow<'a, [u8]>,
-        known: &[u8],
+        known: Option<&[u8]>,
         map: GroupMap,
         previous: usize,
         ctx: DecodeContext<'_>,
@@ -921,20 +958,35 @@ impl<'a> ViewStorage<'a> {
             // repeated-enum records were already charged when materialized.
             let owned_copy = if matches!(&raw, Cow::Borrowed(_)) { raw.len() } else { 0 };
             ctx.register_element_memory(
-                projection_charge(known, map, 1)
+                known.map_or(0, |known| projection_charge(known, map, 1))
                     .saturating_add(owned_copy)
                     .saturating_add(event_charge(1)),
             )?;
             if group & (1 << 31) != 0 {
                 order.append_repeated(group, &raw, ctx)?;
-            } else {
+            } else if let Some(known) = known {
                 order.baseline = projection(known, map);
+            } else {
+                order.baseline_pending = true;
             }
             order.events.push(Event::Known(group, raw));
         }
         ctx.register_element_memory(event_charge(state.count - order.unknown_count))?;
         order.append_unknown(state.count);
         Ok(())
+    }
+    #[cold]
+    #[inline(never)]
+    pub fn complete_batch(&mut self, known: &[u8], map: GroupMap, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+        if let Some(order) = self.0.as_mut().and_then(|state| state.order.as_mut()) {
+            ctx.register_element_memory(projection_charge(known, map, 1))?;
+            order.baseline = projection(known, map);
+            order.baseline_pending = false;
+        }
+        Ok(())
+    }
+    pub fn needs_baseline(&self) -> bool {
+        self.0.as_ref().and_then(|state| state.order.as_ref()).is_some_and(|order| order.baseline_pending)
     }
     #[cold]
     #[inline(never)]

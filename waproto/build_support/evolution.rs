@@ -62,6 +62,9 @@ fn schema(new: bool) -> FileDescriptorSet {
         ],
         ..Default::default()
     });
+    let mut values = field("values", 3, Type::TYPE_UINT32);
+    values.label = Some(Label::LABEL_REPEATED);
+    record.nested_type[0].field.push(values);
     let mut back = field("next", 8, Type::TYPE_MESSAGE);
     back.type_name = Some(format!(".contract.{message}"));
     record.field.push(back);
