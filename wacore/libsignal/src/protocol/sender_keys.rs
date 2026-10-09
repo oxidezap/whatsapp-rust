@@ -1253,10 +1253,10 @@ impl SenderKeyRecord {
             .unwrap_or(0);
         let single = (self.states.len() == 1)
             .then(|| &self.states[0])
-            .filter(|state| state.future.is_none());
+            .filter(|state| state.future.is_none() && state.message_keys.is_empty());
         let mut buf = if let Some(state) = single {
-            // The usual record owns one state. Avoid history bookkeeping and
-            // template lookup while retaining the same per-state encoder.
+            // The usual in-order record owns one state without a backlog.
+            // Avoid history bookkeeping and template lookup for this case.
             let len = state.encoded_len();
             let mut buf = Vec::with_capacity(
                 record_encoding::nested_len(len)
