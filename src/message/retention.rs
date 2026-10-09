@@ -312,16 +312,15 @@ impl InboundRetention {
             stanza.state = State::Batched;
         }
     }
+    #[inline]
     pub(crate) fn commit(self: &Arc<Self>, items: &[InboundMessage]) -> Option<RetentionCommit> {
         if !self.active.load(Ordering::Acquire) {
-            return Some(RetentionCommit {
-                retention: Arc::clone(self),
-                keys: Vec::new(),
-                id: 0,
-                complete: false,
-                _admissions: Vec::new(),
-            });
+            return Some(RetentionCommit(None));
         }
+        self.commit_active(items)
+    }
+
+    fn commit_active(self: &Arc<Self>, items: &[InboundMessage]) -> Option<RetentionCommit> {
         let mut stanzas = lock(&self.stanzas);
         let mut keys = Vec::new();
         for item in items {
@@ -346,13 +345,13 @@ impl InboundRetention {
             .iter()
             .flat_map(|key| stanzas[key].admissions.iter().cloned())
             .collect();
-        Some(RetentionCommit {
+        Some(RetentionCommit(Some(ActiveRetentionCommit {
             retention: Arc::clone(self),
             keys,
             id,
             complete: false,
             _admissions: admissions,
-        })
+        })))
     }
     #[cfg(test)]
     fn retry_one(self: &Arc<Self>, info: &MessageInfo) -> Option<RetryAttempt> {
@@ -438,14 +437,56 @@ impl Drop for RetryAttempt {
     }
 }
 
-pub(crate) struct RetentionCommit {
+// An inactive acquisition owns no stanza, admission or ticket. Keep it as an
+// empty marker instead of retaining an Arc and locking the map on completion.
+pub(crate) struct RetentionCommit(Option<ActiveRetentionCommit>);
+
+impl RetentionCommit {
+    #[inline]
+    fn owns_stanza(&self, key: &Key, stanza: &Stanza) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|commit| commit.owns_stanza(key, stanza))
+    }
+    #[inline]
+    pub(crate) fn owns(&self, info: &MessageInfo) -> bool {
+        self.0.as_ref().is_some_and(|commit| commit.owns(info))
+    }
+    #[inline]
+    pub(crate) fn canonical_items(&self, items: Arc<[InboundMessage]>) -> Arc<[InboundMessage]> {
+        match &self.0 {
+            Some(commit) => commit.canonical_items(items),
+            None => items,
+        }
+    }
+    #[inline]
+    pub(crate) fn pending_keys(&self) -> Vec<(String, String, String)> {
+        self.0
+            .as_ref()
+            .map_or_else(Vec::new, ActiveRetentionCommit::pending_keys)
+    }
+    #[inline]
+    pub(crate) fn durable(&self) {
+        if let Some(commit) = &self.0 {
+            commit.durable();
+        }
+    }
+    #[inline]
+    pub(crate) fn complete(&mut self) {
+        if let Some(commit) = &mut self.0 {
+            commit.complete();
+        }
+    }
+}
+
+struct ActiveRetentionCommit {
     retention: Arc<InboundRetention>,
     keys: Vec<Key>,
     id: u64,
     complete: bool,
     _admissions: Vec<Arc<InboundAdmission>>,
 }
-impl RetentionCommit {
+impl ActiveRetentionCommit {
     fn owns_stanza(&self, key: &Key, stanza: &Stanza) -> bool {
         stanza.state == State::Committing(self.id) && self.keys.contains(key)
     }
@@ -518,7 +559,7 @@ impl RetentionCommit {
         }
     }
 }
-impl Drop for RetentionCommit {
+impl Drop for ActiveRetentionCommit {
     fn drop(&mut self) {
         if self.complete || self.keys.is_empty() {
             return;
@@ -645,6 +686,32 @@ mod tests {
             .message(Arc::new(message))
             .info(Arc::new(info))
             .build()
+    }
+    #[tokio::test]
+    async fn inactive_commit_does_not_own_or_settle_a_later_stanza() {
+        let retention = Arc::new(InboundRetention::default());
+        let items: Arc<[InboundMessage]> = Arc::from([item("later-active", "first")]);
+        let mut inactive = retention.commit(&items).unwrap();
+        assert_eq!(Arc::strong_count(&retention), 1);
+        assert!(Arc::ptr_eq(
+            &inactive.canonical_items(Arc::clone(&items)),
+            &items
+        ));
+        assert!(inactive.pending_keys().is_empty());
+        assert!(!inactive.owns(&items[0].info));
+
+        assert!(retention.begin(&items[0].info, retention.admit(123)).await);
+        assert!(retention.stage(&items, false).is_some());
+        let (sealed, _) = retention.seal(&items[0].info, false);
+        inactive.durable();
+        inactive.complete();
+        drop(inactive);
+        assert_eq!(retention.stats(), (1, 123));
+        assert!(retention.replay_items(&items[0].info).is_some());
+        let mut active = retention.commit(&sealed).unwrap();
+        active.complete();
+        drop(active);
+        assert_eq!(retention.stats(), (0, 0));
     }
     #[test]
     fn retention_identity_preserves_direct_devices_and_pn_lid_namespaces() {
