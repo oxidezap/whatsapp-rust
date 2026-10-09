@@ -511,6 +511,54 @@ fn occurrence_metadata_obeys_the_existing_decode_memory_budget() {
 }
 
 #[test]
+fn consecutive_future_fields_reuse_the_unchanged_oneof_projection() {
+    use evolution_fixture::{DecodeContext, DecodeOptions, v1};
+    let mut message = v1::Record::default();
+    message.choice = Some(v1::record::Choice::Text("x".repeat(16 * 1024)));
+    let mut wire = message.encode_to_vec();
+    for _ in 0..20 {
+        wire.extend_from_slice(&[0x20, 7]);
+    }
+    let options = DecodeOptions::new().with_element_memory_limit(128 * 1024);
+    let owned = options.decode_from_slice::<v1::Record>(&wire).unwrap();
+    assert_eq!(owned.encode_to_vec(), wire);
+    let view = options.decode_view::<v1::RecordView<'_>>(&wire).unwrap();
+    assert_eq!(view.encode_to_vec(), wire);
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), wire);
+    let mut group_wire = wire.clone();
+    group_wire.extend_from_slice(&[0x9c, 0x06]); // EndGroup, field 99.
+    let unknown_limit = core::cell::Cell::new(1024 * 1024);
+    let memory_limit = core::cell::Cell::new(128 * 1024);
+    let ctx = DecodeContext::new(100, &unknown_limit).with_element_memory(&memory_limit);
+    let mut group = v1::Record::default();
+    group
+        .merge_group(&mut group_wire.as_slice(), ctx, 99)
+        .unwrap();
+    assert_eq!(group.encode_to_vec(), wire);
+}
+
+#[test]
+fn decode_batches_reconcile_edits_before_unrelated_fields() {
+    use evolution_fixture::{DecodeContext, v1, v2};
+    let received = [0x1a, 1, b'a', 0x2a, 1, b'b'];
+    // The first field changes an unrelated string; the last is a new future
+    // alternative that must win over the edit made between decode calls.
+    let appended = [0x0a, 1, b'n', 0x20, 7, 0x2a, 1, b'c'];
+    let mut owned = v1::Record::decode_from_slice(&received).unwrap();
+    owned.choice = Some(v1::record::Choice::Text("edited".into()));
+    owned.merge_from_slice(&appended).unwrap();
+    let restored = v2::Record::decode_from_slice(&owned.encode_to_vec()).unwrap();
+    assert_eq!(restored.choice, Some(v2::record::Choice::Bytes(vec![b'c'])));
+    let mut view = v1::RecordView::decode_view(&received).unwrap();
+    view.choice = Some(v1::record::ChoiceView::Text("edited"));
+    let unknown_limit = core::cell::Cell::new(1024 * 1024);
+    view.merge_into_view(&appended, DecodeContext::new(100, &unknown_limit))
+        .unwrap();
+    let restored = v2::Record::decode_from_slice(&view.encode_to_vec()).unwrap();
+    assert_eq!(restored.choice, Some(v2::record::Choice::Bytes(vec![b'c'])));
+}
+
+#[test]
 fn removing_raw_unknowns_discards_the_journal_without_changing_empty_equality() {
     use evolution_fixture::v1;
     use std::hash::{Hash, Hasher};
