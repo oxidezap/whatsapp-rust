@@ -68,6 +68,30 @@ impl VisitMut for ColdStorage {
     }
     fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
         visit_mut::visit_expr_mut(self, expr);
+        if let syn::Expr::Call(call) = expr
+            && let syn::Expr::Path(path) = &*call.func
+            && path
+                .path
+                .segments
+                .iter()
+                .map(|part| part.ident.to_string())
+                .eq(["buffa", "Message", "merge_length_delimited"])
+            && call.args.len() == 3
+            && let syn::Expr::MethodCall(field) = &call.args[0]
+            && field.method == "get_or_insert_default"
+            && field.args.is_empty()
+        {
+            let receiver = &field.receiver;
+            let buf = &call.args[1];
+            let ctx = &call.args[2];
+            let helper: syn::Path = syn::parse_str(&format!(
+                "{}__unknown_storage::merge_message",
+                "super::".repeat(self.depth),
+            ))
+            .expect("internal nested-message helper path");
+            *expr = syn::parse_quote!(#helper(&mut #receiver, #buf, #ctx));
+            return;
+        }
         let syn::Expr::MethodCall(call) = expr else {
             return;
         };
@@ -253,9 +277,16 @@ fn share_message_impls(items: &mut Vec<syn::Item>, scope: &str) {
         // Keep generator-provided protobuf defaults intact. Only a derived
         // Default is equivalent to applying Rust Default to every field.
         if derived_default {
+            // The root decoder benefits from folding initialization into its
+            // final output slot; keep outlining defaults of nested owners.
+            let inline: syn::Attribute = if pin_root_clone {
+                syn::parse_quote!(#[inline])
+            } else {
+                syn::parse_quote!(#[inline(never)])
+            };
             implementations.push(syn::parse_quote! {
                 impl ::core::default::Default for #name {
-                    #[inline(never)]
+                    #inline
                     fn default() -> Self {
                         Self { #(#fields: ::core::default::Default::default()),* }
                     }
