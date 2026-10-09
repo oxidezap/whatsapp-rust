@@ -1360,11 +1360,15 @@ mod tests {
             wire.len() - SignalMessage::MAC_LENGTH..wire.len() - SignalMessage::MAC_LENGTH,
             [0x28, 0x81, 0],
         );
-        let borrowed = SignalMessage::try_from(wire.as_slice()).unwrap();
-        let shared = SignalMessage::try_from(Bytes::from(wire.clone())).unwrap();
+        let borrowed = SignalMessage::try_from(wire.as_slice()).expect("borrowed future envelope");
+        let shared =
+            SignalMessage::try_from(Bytes::from(wire.clone())).expect("shared future envelope");
         assert_eq!(borrowed.serialized(), wire);
         assert_eq!(shared.serialized(), wire);
-        assert_eq!(borrowed.body().unwrap(), original.body().unwrap());
+        assert_eq!(
+            borrowed.body().expect("borrowed body"),
+            original.body().expect("original body")
+        );
         assert_eq!(shared.counter(), 7);
     }
 
