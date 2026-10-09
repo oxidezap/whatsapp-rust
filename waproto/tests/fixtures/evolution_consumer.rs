@@ -1,6 +1,70 @@
 use evolution_fixture::{Message, MessageView, ViewEncode};
 
 #[test]
+fn every_budget_boundary_keeps_materialized_future_enum_last() {
+    use evolution_fixture::{v1, v2, DecodeContext};
+    let first = [0xc0, 0x3e, 7];
+    let later = [0x10, 0, 0x10, 1];
+    for allowance in 0..400 {
+        let unknown = core::cell::Cell::new(usize::MAX);
+        let budget = core::cell::Cell::new(allowance);
+        let mut owned = v1::EnumRecord::decode_from_slice(&first).unwrap();
+        let _ = owned.merge_to_limit(&mut &later[..], DecodeContext::new(100, &unknown).with_element_memory(&budget), 0);
+        if owned.__buffa_unknown_fields.len() == 2 {
+            assert_eq!(v2::EnumRecord::decode_from_slice(&owned.encode_to_vec()).unwrap().mode, Some(v2::record::Mode::NEW), "owned budget {allowance}");
+        }
+        let budget = core::cell::Cell::new(allowance);
+        let mut view = v1::EnumRecordView::decode_view(&first).unwrap();
+        let _ = view.merge_into_view(&later, DecodeContext::new(100, &unknown).with_element_memory(&budget));
+        if view.__buffa_unknown_fields.len() == 2 {
+            for bytes in [view.encode_to_vec(), view.to_owned_message().unwrap().encode_to_vec()] {
+                assert_eq!(v2::EnumRecord::decode_from_slice(&bytes).unwrap().mode, Some(v2::record::Mode::NEW), "view budget {allowance}");
+            }
+        }
+    }
+}
+
+#[test]
+fn failed_final_baseline_budget_keeps_owned_enum_winner() {
+    use evolution_fixture::{v1, v2, DecodeContext};
+    let first = [0xc0, 0x3e, 7];
+    let later = [0x10, 0, 0x10, 1];
+    let mut measured = v1::EnumRecord::decode_from_slice(&first).unwrap();
+    let unknown = core::cell::Cell::new(usize::MAX);
+    let budget = core::cell::Cell::new(1024);
+    measured.merge_to_limit(&mut &later[..], DecodeContext::new(100, &unknown).with_element_memory(&budget), 0).unwrap();
+    let used = 1024 - budget.get();
+    let mut retained = v1::EnumRecord::decode_from_slice(&first).unwrap();
+    let budget = core::cell::Cell::new(used - 1);
+    assert!(retained.merge_to_limit(&mut &later[..], DecodeContext::new(100, &unknown).with_element_memory(&budget), 0).is_err());
+    let restored = v2::EnumRecord::decode_from_slice(&retained.encode_to_vec()).unwrap();
+    assert_eq!(restored.mode, Some(v2::record::Mode::NEW));
+    retained.merge_from_slice(&[0x10, 2]).unwrap();
+    assert_eq!(v2::EnumRecord::decode_from_slice(&retained.encode_to_vec()).unwrap().mode, Some(v2::record::Mode::OTHER));
+}
+
+#[test]
+fn failed_final_baseline_budget_keeps_view_enum_winner() {
+    use evolution_fixture::{v1, v2, DecodeContext};
+    let first = [0xc0, 0x3e, 7];
+    let later = [0x10, 0, 0x10, 1];
+    let mut measured = v1::EnumRecordView::decode_view(&first).unwrap();
+    let unknown = core::cell::Cell::new(usize::MAX);
+    let budget = core::cell::Cell::new(1024);
+    measured.merge_into_view(&later, DecodeContext::new(100, &unknown).with_element_memory(&budget)).unwrap();
+    let used = 1024 - budget.get();
+    let mut retained = v1::EnumRecordView::decode_view(&first).unwrap();
+    let budget = core::cell::Cell::new(used - 1);
+    assert!(retained.merge_into_view(&later, DecodeContext::new(100, &unknown).with_element_memory(&budget)).is_err());
+    let restored = v2::EnumRecord::decode_from_slice(&retained.encode_to_vec()).unwrap();
+    assert_eq!(restored.mode, Some(v2::record::Mode::NEW));
+    let owned = retained.to_owned_message().unwrap();
+    assert_eq!(v2::EnumRecord::decode_from_slice(&owned.encode_to_vec()).unwrap().mode, Some(v2::record::Mode::NEW));
+    retained.merge_into_view(&[0x10, 2], DecodeContext::new(100, &unknown)).unwrap();
+    assert_eq!(v2::EnumRecord::decode_from_slice(&retained.encode_to_vec()).unwrap().mode, Some(v2::record::Mode::OTHER));
+}
+
+#[test]
 fn fragmented_oneof_baseline_is_built_once_per_batch() {
     use evolution_fixture::{v1, DecodeOptions};
     let mut wire = vec![0xc0, 0x3e, 7];
