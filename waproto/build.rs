@@ -30,6 +30,9 @@ use buffa_descriptor::generated::descriptor::{
     DescriptorProto, FieldDescriptorProto, FileDescriptorSet, field_descriptor_proto,
 };
 
+#[path = "build/pin_clone.rs"]
+mod pin_clone;
+
 /// A field this crate persists that the upstream proto does not declare.
 struct LocalField {
     /// Message path inside the `whatsapp` package, e.g. `Outer.Inner`.
@@ -37,6 +40,7 @@ struct LocalField {
     name: &'static str,
     number: i32,
     kind: field_descriptor_proto::Type,
+    type_name: Option<&'static str>,
 }
 
 /// Local additions to the upstream schema, spliced into the descriptor at
@@ -46,18 +50,29 @@ struct LocalField {
 /// numbers fails the build instead of silently reinterpreting records already
 /// written.
 ///
-/// Numbers stay far above what upstream uses — it appends low ones without
-/// notice, the way `kyberPreKeyId = 4` and `kyberCiphertext = 5` arrived on
-/// `SessionStructure.PendingPreKey`.
-const LOCAL_FIELDS: &[LocalField] = &[LocalField {
-    // Deriving the stored cipher/mac/iv from this seed is one-way, so a
-    // skipped message key that kept only the derived material could never be
-    // projected back into a seed-based external format.
-    message: "SessionStructure.Chain.MessageKey",
-    name: "seed",
-    number: 100,
-    kind: field_descriptor_proto::Type::TYPE_BYTES,
-}];
+/// New local fields use high numbers. Retained upstream fields keep their
+/// original wire numbers; either kind must stop on a future collision.
+const LOCAL_FIELDS: &[LocalField] = &[
+    LocalField {
+        // Deriving the stored cipher/mac/iv from this seed is one-way, so a
+        // skipped message key that kept only the derived material could never be
+        // projected back into a seed-based external format.
+        message: "SessionStructure.Chain.MessageKey",
+        name: "seed",
+        number: 100,
+        kind: field_descriptor_proto::Type::TYPE_BYTES,
+        type_name: None,
+    },
+    LocalField {
+        // Public field from whatspec 1a441f0. Its absence in the next Web
+        // capture does not make already stored or received payloads obsolete.
+        message: "Message",
+        name: "newsletterAdminProfileMessageV2",
+        number: 117,
+        kind: field_descriptor_proto::Type::TYPE_MESSAGE,
+        type_name: Some(".whatsapp.Message.FutureProofMessage"),
+    },
+];
 
 fn main() -> std::io::Result<()> {
     // Rerun on desc change (new codegen) and proto change (so the staleness
@@ -67,6 +82,7 @@ fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=src/whatsapp.proto");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_support");
+    println!("cargo:rerun-if-changed=build/pin_clone.rs");
     println!("cargo:rerun-if-changed=api.snapshot");
     println!("cargo:rerun-if-changed=signal-storage.snapshot");
 
@@ -248,6 +264,11 @@ fn main() -> std::io::Result<()> {
         .compile()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+    let generated = out_path.join("whatsapp.rs");
+    let source = std::fs::read_to_string(&generated)?;
+    let source = pin_clone::generate(&source).map_err(std::io::Error::other)?;
+    std::fs::write(generated, source)?;
+
     let mut api = emission::finish(&out_path, "whatsapp")?;
     api.extend(names::wire_api(&fds));
     let snapshot = api.iter().cloned().collect::<Vec<_>>().join("\n") + "\n";
@@ -305,6 +326,7 @@ fn apply_local_fields(fds: &mut FileDescriptorSet) -> std::io::Result<()> {
             number: Some(local.number),
             label: Some(field_descriptor_proto::Label::LABEL_OPTIONAL),
             r#type: Some(local.kind),
+            type_name: local.type_name.map(str::to_owned),
             json_name: Some(local.name.to_owned()),
             ..Default::default()
         });

@@ -1,5 +1,7 @@
 //! External public-API contracts. Each profile compiles separately without defaults.
 
+pub mod whatspec_compat;
+
 #[cfg(feature = "core")]
 pub mod derive_contract;
 

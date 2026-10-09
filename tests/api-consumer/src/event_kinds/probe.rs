@@ -43,6 +43,7 @@ fn disposition(kind: EventKind) -> Option<bool> {
         | DeleteMessageForMeUpdate
         | LabelEditUpdate
         | LabelAssociationUpdate
+        | LabelSublistUpdate
         | HistorySync
         | OfflineSyncPreview
         | OfflineSyncCompleted

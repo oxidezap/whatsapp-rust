@@ -59,10 +59,11 @@ fn lid_pn_write_policy(source: LearningSource, lid_unseen: bool, exact: bool) ->
         // Device-list usync: authoritative for a new LID and for correcting a
         // known LID whose phone drifted.
         LearningSource::Usync => (lid_unseen || lid_known_mismatch, false),
+        // A peer-device message may carry an old association. WA Web seeds
+        // only unseen LIDs for these sources, without querying on conflicts.
+        LearningSource::PeerPnMessage | LearningSource::PeerLidMessage => (lid_unseen, false),
         // Directed sources: overwrite on any difference from what's cached.
-        LearningSource::PeerPnMessage
-        | LearningSource::PeerLidMessage
-        | LearningSource::RecipientLatestLid
+        LearningSource::RecipientLatestLid
         | LearningSource::MigrationSyncLatest
         | LearningSource::MigrationSyncOld
         | LearningSource::BlocklistActive
@@ -1415,8 +1416,6 @@ mod tests {
         // observational sources refuse and request a live re-resolve.
         let directed = [
             LearningSource::Usync,
-            LearningSource::PeerPnMessage,
-            LearningSource::PeerLidMessage,
             LearningSource::RecipientLatestLid,
             LearningSource::MigrationSyncLatest,
             LearningSource::MigrationSyncOld,
@@ -1429,6 +1428,12 @@ mod tests {
                 (true, false),
                 "a directed source overwrites a conflicting known LID ({src:?})"
             );
+        }
+        for src in [
+            LearningSource::PeerPnMessage,
+            LearningSource::PeerLidMessage,
+        ] {
+            assert_eq!(lid_pn_write_policy(src, false, false), (false, false));
         }
         for src in [
             LearningSource::Other,
@@ -1531,8 +1536,7 @@ mod tests {
         );
     }
 
-    /// A directed source (`PeerPnMessage`) does overwrite a conflicting known
-    /// LID — the WA Web `!y` branch.
+    /// A latest-LID source can replace an existing mapping.
     #[tokio::test]
     async fn test_record_directed_overwrites_conflicting_known_lid() {
         let client = create_test_client().await;
@@ -1549,7 +1553,7 @@ mod tests {
             .unwrap();
 
         let outcome = client
-            .record_lid_pn_in_memory(lid_new, phone, LearningSource::PeerPnMessage)
+            .record_lid_pn_in_memory(lid_new, phone, LearningSource::RecipientLatestLid)
             .await;
 
         assert!(matches!(
@@ -1564,6 +1568,48 @@ mod tests {
             Some(lid_new),
             "a directed source must overwrite a conflicting known LID"
         );
+    }
+
+    #[tokio::test]
+    async fn peer_message_mapping_preserves_known_lid_conflicts() {
+        for source in [
+            LearningSource::PeerPnMessage,
+            LearningSource::PeerLidMessage,
+        ] {
+            let client = create_test_client().await;
+            let lid = "100000000000071";
+            let pn = "15550000071";
+            client
+                .add_lid_pn_mapping(lid, pn, LearningSource::Usync)
+                .await
+                .unwrap();
+            let outcome = client
+                .record_lid_pn_in_memory(lid, "15550000072", source)
+                .await;
+            assert!(matches!(outcome, RecordOutcome::Skipped));
+            assert_eq!(
+                client.lid_pn_cache.get_phone_number(lid).await.as_deref(),
+                Some(pn)
+            );
+            assert!(
+                client
+                    .lid_pn_cache
+                    .get_current_lid("15550000072")
+                    .await
+                    .is_none()
+            );
+            assert_eq!(
+                client
+                    .persistence_manager
+                    .backend()
+                    .get_lid_mapping(lid)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .phone_number,
+                pn
+            );
+        }
     }
 
     /// Even an observational source seeds a *brand-new* LID for an existing
