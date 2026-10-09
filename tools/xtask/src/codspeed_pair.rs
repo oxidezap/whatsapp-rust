@@ -60,6 +60,8 @@ pub enum Task {
     Validate,
     /// Validate an existing pair and print its captured counters, without rerunning it.
     Summarize,
+    /// Attribute an existing pair to exclusive function instruction counts.
+    FunctionCosts,
     /// Print existing size artifact metadata and attribution without building.
     InspectSize {
         directory: PathBuf,
@@ -301,6 +303,95 @@ fn validate(root: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+fn function_costs(text: &str) -> Result<BTreeMap<String, BTreeMap<String, u64>>> {
+    let mut symbols = BTreeMap::new();
+    let mut result = BTreeMap::new();
+    for part in text.split("part:").skip(1) {
+        let Some(name) = part
+            .lines()
+            .find_map(|line| line.strip_prefix("desc: Trigger: Client Request: "))
+        else {
+            continue;
+        };
+        if !name.contains("bench_oneof_") || !name.contains("_decode[") {
+            continue;
+        }
+        let positions = part
+            .lines()
+            .find_map(|line| line.strip_prefix("positions: "))
+            .context("positions")?
+            .split_whitespace()
+            .count();
+        let events: Vec<_> = part
+            .lines()
+            .find_map(|line| line.strip_prefix("events: "))
+            .context("events")?
+            .split_whitespace()
+            .collect();
+        let ir = events
+            .iter()
+            .position(|event| *event == "Ir")
+            .context("Ir column")?;
+        let mut current = None;
+        let mut call_cost = false;
+        let mut costs: BTreeMap<String, u64> = BTreeMap::new();
+        for line in part.lines() {
+            if let Some(value) = line
+                .strip_prefix("fn=")
+                .or_else(|| line.strip_prefix("cfn="))
+                && let Some(rest) = value.strip_prefix('(')
+                && let Some((id, name)) = rest.split_once(')')
+                && !name.trim().is_empty()
+            {
+                symbols.insert(id.to_owned(), name.trim().to_owned());
+            }
+            if let Some(value) = line.strip_prefix("fn=") {
+                let name = if let Some(rest) = value.strip_prefix('(') {
+                    let (id, _) = rest.split_once(')').context("symbol reference")?;
+                    symbols.get(id).context("unresolved function")?.clone()
+                } else {
+                    value.to_owned()
+                };
+                current = Some(name);
+                call_cost = false;
+            } else if line.starts_with("calls=") {
+                call_cost = true;
+            } else if line
+                .starts_with(|ch: char| ch.is_ascii_digit() || matches!(ch, '*' | '+' | '-'))
+            {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                if fields.len() <= positions {
+                    continue;
+                }
+                let count: u64 = fields.get(positions + ir).unwrap_or(&"0").parse()?;
+                if call_cost {
+                    call_cost = false;
+                    continue;
+                }
+                *costs
+                    .entry(current.as_ref().context("cost without function")?.clone())
+                    .or_default() += count;
+            }
+        }
+        let totals: Vec<_> = part
+            .lines()
+            .find_map(|line| line.strip_prefix("totals:"))
+            .context("totals")?
+            .split_whitespace()
+            .collect();
+        let total: u64 = totals.get(ir).context("total Ir")?.parse()?;
+        ensure!(
+            costs.values().sum::<u64>() == total,
+            "exclusive costs differ from captured total for {name}"
+        );
+        ensure!(
+            result.insert(name.to_owned(), costs).is_none(),
+            "duplicate benchmark"
+        );
+    }
+    Ok(result)
+}
 pub fn run(task: Task) -> Result<()> {
     let workspace = env_path("GITHUB_WORKSPACE")?.canonicalize()?;
     let profiles = workspace.join("_a02_profiles");
@@ -399,6 +490,28 @@ pub fn run(task: Task) -> Result<()> {
                 );
             }
         }
+        Task::FunctionCosts => {
+            validate(&profiles)?;
+            for side in ["base", "head"] {
+                let directory = profile(&profiles.join(side))?;
+                for entry in std::fs::read_dir(directory)? {
+                    let path = entry?.path();
+                    if !path.file_name().is_some_and(|name| {
+                        let name = name.to_string_lossy();
+                        name.starts_with(|c: char| c.is_ascii_digit()) && name.ends_with(".out")
+                    }) {
+                        continue;
+                    }
+                    let costs = function_costs(&std::fs::read_to_string(path)?)?;
+                    if !costs.is_empty() {
+                        println!(
+                            "{}",
+                            serde_json::json!({"side": side, "exclusive_function_instructions": costs})
+                        );
+                    }
+                }
+            }
+        }
         Task::InspectSize { directory } => {
             for name in [
                 "size-meta.json",
@@ -423,6 +536,15 @@ pub fn run(task: Task) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn function_costs_exclude_call_edges_and_verify_the_total() {
+        let profile = "part: 1\ndesc: Trigger: Client Request: bench_oneof_owned_decode[known]\npositions: line\nevents: Ir Dr\nfn=(1) parent\n10 4 2\ncfn=(2) child\ncalls=1 0\n* 7 3\n+1 2 1\nfn=(2)\n20 7 3\ntotals: 13 6\n";
+        let parsed = function_costs(profile).unwrap();
+        let costs = &parsed["bench_oneof_owned_decode[known]"];
+        assert_eq!(costs["parent"], 6);
+        assert_eq!(costs["child"], 7);
+        assert!(function_costs(&profile.replace("totals: 13", "totals: 14")).is_err());
+    }
     #[cfg(unix)]
     #[test]
     fn version_accepts_only_the_pinned_display_version_failure() {
