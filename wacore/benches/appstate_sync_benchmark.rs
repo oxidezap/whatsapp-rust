@@ -72,3 +72,36 @@ fn bench_collect_unique_index_macs_duplicates(bencher: divan::Bencher, n: usize)
         .with_inputs(|| setup_duplicate_mutations(n))
         .bench_refs(|mutations| black_box(collect_unique_index_macs(black_box(mutations))));
 }
+
+fn setup_random_mutations(n: usize) -> Vec<wa::SyncdMutation> {
+    let mut mutations = setup_mutations(n);
+    for (index, mutation) in mutations.iter_mut().enumerate() {
+        let mut state = (index as u64).wrapping_add(0x9e3779b97f4a7c15);
+        for word in mutation
+            .record
+            .as_option_mut()
+            .expect("fixture record")
+            .index
+            .as_option_mut()
+            .expect("fixture index")
+            .blob
+            .as_mut()
+            .expect("fixture MAC")
+            .chunks_exact_mut(8)
+        {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            word.copy_from_slice(&state.wrapping_mul(0x2545f4914f6cdd1d).to_le_bytes());
+        }
+    }
+    mutations
+}
+
+/// Uniformly spread synthetic MACs exercise sorting beyond ordered counters.
+#[divan::bench(args = [10, 1000])]
+fn bench_collect_unique_index_macs_random(bencher: divan::Bencher, n: usize) {
+    bencher
+        .with_inputs(|| setup_random_mutations(n))
+        .bench_refs(|mutations| black_box(collect_unique_index_macs(black_box(mutations))));
+}

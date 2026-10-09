@@ -188,7 +188,17 @@ pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<IndexMa
     macs.push(first);
     macs.push(second);
     macs.extend(indices);
-    macs.sort_unstable();
+    // Only adjacency of equal MACs matters. Compare native words so sorting
+    // does not need bytewise lexicographic ordering of these opaque values.
+    macs.sort_unstable_by(|left, right| {
+        for (left, right) in left.as_chunks::<8>().0.iter().zip(right.as_chunks::<8>().0) {
+            let order = u64::from_ne_bytes(*left).cmp(&u64::from_ne_bytes(*right));
+            if order != std::cmp::Ordering::Equal {
+                return order;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
     macs.dedup();
     macs
 }
@@ -1638,6 +1648,21 @@ mod dedup_tests {
             assert_eq!(got, expected(if distinct { 3 } else { 1 }));
         }
         assert!(collect_unique_index_macs(&vec![wa::SyncdMutation::default(); 1000]).is_empty());
+    }
+
+    #[test]
+    fn large_dedup_distinguishes_every_mac_byte() {
+        for byte in 0..32 {
+            let first = [0; 32];
+            let mut second = first;
+            second[byte] = 1;
+            let mutations: Vec<_> = (0..1000)
+                .map(|i| mutation(if i % 2 == 0 { &first } else { &second }))
+                .collect();
+            let mut actual = collect_unique_index_macs(&mutations);
+            actual.sort_unstable();
+            assert_eq!(actual, vec![first, second], "distinct byte {byte}");
+        }
     }
 }
 
