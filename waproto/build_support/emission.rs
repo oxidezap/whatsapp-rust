@@ -378,9 +378,12 @@ fn share_message_impls(items: &mut Vec<syn::Item>, scope: &str) {
         // Keep generator-provided protobuf defaults intact. Only a derived
         // Default is equivalent to applying Rust Default to every field.
         if derived_default {
-            // The root decoder benefits from folding initialization into its
-            // final output slot; keep outlining defaults of nested owners.
-            let inline: syn::Attribute = if pin_root_clone {
+            // These hot decoders benefit from initializing the final slot
+            // directly instead of returning a large temporary owner. Other
+            // nested defaults stay shared to bound generated code size.
+            let inline_leaf_default = (scope.is_empty() && name == "ContextInfo")
+                || (scope == "::message" && name == "ImageMessage");
+            let inline: syn::Attribute = if pin_root_clone || inline_leaf_default {
                 syn::parse_quote!(#[inline])
             } else {
                 syn::parse_quote!(#[inline(never)])
