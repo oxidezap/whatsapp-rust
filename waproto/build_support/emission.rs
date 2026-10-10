@@ -135,6 +135,87 @@ impl VisitMut for ColdStorage {
     }
 }
 
+// A runtime field number lets large generated writers share the scalar codec
+// instead of expanding tag and value encoding at every call site.
+#[derive(Default)]
+struct SharedScalarWriters {
+    depth: usize,
+    helpers: BTreeSet<String>,
+}
+
+impl VisitMut for SharedScalarWriters {
+    fn visit_item_mod_mut(&mut self, item: &mut syn::ItemMod) {
+        self.depth += 1;
+        visit_mut::visit_item_mod_mut(self, item);
+        self.depth -= 1;
+    }
+
+    fn visit_expr_call_mut(&mut self, call: &mut syn::ExprCall) {
+        visit_mut::visit_expr_call_mut(self, call);
+        let syn::Expr::Path(path) = &mut *call.func else {
+            return;
+        };
+        let parts: Vec<_> = path
+            .path
+            .segments
+            .iter()
+            .map(|p| p.ident.to_string())
+            .collect();
+        if parts.len() != 3 || parts[0] != "buffa" || parts[1] != "types" {
+            return;
+        }
+        let name = &parts[2];
+        if scalar_writer_type(name).is_none() {
+            return;
+        }
+        self.helpers.insert(name.clone());
+        path.path = syn::parse_str(&format!(
+            "{}__scalar_writers::{name}",
+            "super::".repeat(self.depth)
+        ))
+        .expect("internal scalar writer path");
+    }
+}
+
+fn scalar_writer_type(name: &str) -> Option<&'static str> {
+    match name {
+        "put_int32_field" | "put_sint32_field" | "put_sfixed32_field" => Some("i32"),
+        "put_int64_field" | "put_sint64_field" | "put_sfixed64_field" => Some("i64"),
+        "put_uint32_field" | "put_fixed32_field" => Some("u32"),
+        "put_uint64_field" | "put_fixed64_field" => Some("u64"),
+        "put_bool_field" => Some("bool"),
+        "put_float_field" => Some("f32"),
+        "put_double_field" => Some("f64"),
+        "put_string_field" => Some("&str"),
+        _ => None,
+    }
+}
+
+fn share_scalar_writers(file: &mut syn::File) {
+    let mut writer = SharedScalarWriters::default();
+    writer.visit_file_mut(file);
+    let helpers: Vec<syn::ItemFn> = writer
+        .helpers
+        .iter()
+        .map(|name| {
+            let name: syn::Ident = syn::parse_str(name).expect("scalar writer name");
+            let ty: syn::Type =
+                syn::parse_str(scalar_writer_type(&name.to_string()).expect("selected writer"))
+                    .expect("scalar writer type");
+            syn::parse_quote! {
+                #[inline(never)]
+                pub(super) fn #name<S: ::buffa::EncodeSink>(number: u32, value: #ty, sink: &mut S) {
+                    ::buffa::types::#name(number, value, sink);
+                }
+            }
+        })
+        .collect();
+    if !helpers.is_empty() {
+        file.items
+            .push(syn::parse_quote!(mod __scalar_writers { #(#helpers)* }));
+    }
+}
+
 fn protect(attrs: &mut Vec<syn::Attribute>) {
     if !attrs.iter().any(|a| a.path().is_ident("non_exhaustive")) {
         attrs.push(syn::parse_quote!(#[non_exhaustive]));
@@ -355,6 +436,7 @@ pub fn finish(
 
         if serde {
             share_message_impls(&mut file.items, "");
+            share_scalar_writers(&mut file);
         }
         let implementation = match suffix {
             ".__oneof" => "::__buffa::oneof",
