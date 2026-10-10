@@ -687,6 +687,39 @@ fn transform(
                     });
                 }
             }
+            // Known-only batches call the static decoder directly. Keeping
+            // its activation check here avoids a cold wrapper call per field,
+            // without inlining the recursive decoder into either route.
+            // Repeated enums retain their packed-occurrence splitting wrapper.
+            let batch_merge = if groups.values().any(|group| group & (1 << 31) != 0) {
+                if view {
+                    quote!(cur = self.__wire_merge_field(tag, cur, before_tag, ctx, false)?;)
+                } else {
+                    quote!(self.__wire_merge_field(tag, buf, ctx, false)?;)
+                }
+            } else if view {
+                quote! {
+                    if !self.__buffa_unknown_fields.active() {
+                        cur = self.__wire_merge(tag, cur, before_tag, ctx)?;
+                        if !self.__buffa_unknown_fields.is_empty() {
+                            #runtime::begin_view(&mut #runtime::Adapter(self), ctx)?;
+                        }
+                    } else {
+                        cur = self.__wire_merge_field(tag, cur, before_tag, ctx, false)?;
+                    }
+                }
+            } else {
+                quote! {
+                    if !self.__buffa_unknown_fields.active() {
+                        self.__wire_merge(tag, buf, ctx)?;
+                        if !self.__buffa_unknown_fields.is_empty() {
+                            #runtime::begin_owned(&mut #runtime::Adapter(self), ctx)?;
+                        }
+                    } else {
+                        self.__wire_merge_field(tag, buf, ctx, false)?;
+                    }
+                }
+            };
             // One exclusive borrow covers the whole loop: public fields cannot
             // change between its iterations. Reconcile edits at the first
             // field, then rebuild the baseline once when the batch ends.
@@ -709,7 +742,7 @@ fn transform(
                             while !cur.is_empty() {
                                 let before_tag = cur;
                                 let tag = ::buffa::encoding::Tag::decode(&mut cur)?;
-                                cur = self.__wire_merge_field(tag, cur, before_tag, ctx, false)?;
+                                #batch_merge
                             }
                             Ok(())
                         })();
@@ -730,7 +763,7 @@ fn transform(
                         let result = (|| {
                             while buf.remaining() > limit {
                                 let tag = ::buffa::encoding::Tag::decode(buf)?;
-                                self.__wire_merge_field(tag, buf, ctx, false)?;
+                                #batch_merge
                             }
                             Ok(())
                         })();
