@@ -909,7 +909,7 @@ fn transform(
                 }
             });
         }
-        if !view && item.trait_.is_none() {
+        if item.trait_.is_none() {
             for member in &mut item.items {
                 let syn::ImplItem::Fn(method) = member else {
                     continue;

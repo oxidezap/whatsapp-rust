@@ -428,7 +428,7 @@ pub fn finish(
                     syn::parse_file(include_str!("wire_snapshot.rs")).expect("snapshot syntax");
                 snapshot.items.extend(body.items);
                 let body = snapshot.items;
-                file.items.push(syn::parse_quote!(#[doc(hidden)] pub(crate) mod __wire_snapshot { use self as semantic; #(#body)* }));
+                file.items.push(syn::parse_quote!(#[doc(hidden)] pub(crate) mod __wire_snapshot { use super::__wire_snapshot as semantic; #(#body)* }));
                 let source = prettyplease::unparse(&visitors);
                 let target = out.join("semantic_header_visitors.rs");
                 if !std::fs::read_to_string(&target).is_ok_and(|old| old == source) {
@@ -487,21 +487,39 @@ pub fn finish(
 fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
     let tokens = |value: &dyn ToTokens| normalize(&value.to_token_stream().to_string(), scope);
     let public_scope = canonical(scope.split("::").map(str::to_owned).collect(), false);
+    let availability = |attrs: &[syn::Attribute]| {
+        let attrs: Vec<_> = attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr"))
+            .collect();
+        if attrs.is_empty() {
+            String::new()
+        } else {
+            let attrs = quote::quote!(#(#attrs)*);
+            format!(" availability={}", tokens(&attrs))
+        }
+    };
     for item in items {
         match item {
             syn::Item::Mod(m) if !m.ident.to_string().starts_with("__") => {
                 // Keep owned/view source scopes distinct: their canonical
                 // public paths overlap, but either module can lose visibility.
-                api.insert(format!("module {scope}::{} {}", m.ident, tokens(&m.vis)));
+                api.insert(format!(
+                    "module {scope}::{} {}{}",
+                    m.ident,
+                    tokens(&m.vis),
+                    availability(&m.attrs)
+                ));
                 if let Some((_, items)) = &m.content {
                     inventory(items, &format!("{scope}::{}", m.ident), api);
                 }
             }
             syn::Item::Struct(s) if matches!(s.vis, syn::Visibility::Public(_)) => {
                 api.insert(format!(
-                    "struct {public_scope}::{} {}",
+                    "struct {public_scope}::{} {}{}",
                     s.ident,
-                    tokens(&s.generics)
+                    tokens(&s.generics),
+                    availability(&s.attrs)
                 ));
                 contract_attributes(&s.attrs, &format!("{public_scope}::{}", s.ident), api);
                 for f in &s.fields {
@@ -517,10 +535,11 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
                             api,
                         );
                         api.insert(format!(
-                            "field {public_scope}::{}::{} {}",
+                            "field {public_scope}::{}::{} {}{}",
                             s.ident,
                             tokens(&f.ident),
-                            tokens(&f.ty)
+                            tokens(&f.ty),
+                            availability(&f.attrs)
                         ));
                     }
                 }
@@ -532,8 +551,9 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
                     e.ident.to_string()
                 };
                 api.insert(format!(
-                    "enum {public_scope}::{name} {}",
-                    tokens(&e.generics)
+                    "enum {public_scope}::{name} {}{}",
+                    tokens(&e.generics),
+                    availability(&e.attrs)
                 ));
                 contract_attributes(&e.attrs, &format!("{public_scope}::{name}"), api);
                 for v in &e.variants {
@@ -555,24 +575,33 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
             syn::Item::Impl(i) if i.trait_.is_some() => {
                 let (_, path, _) = i.trait_.as_ref().expect("trait implementation");
                 let owner = format!(
-                    "impl {public_scope}::{} {} for {} {}",
+                    "impl {public_scope}::{} {} for {} {}{}",
                     tokens(&i.generics),
                     tokens(path),
                     tokens(&i.self_ty),
-                    tokens(&i.generics.where_clause)
+                    tokens(&i.generics.where_clause),
+                    availability(&i.attrs)
                 );
                 api.insert(owner.clone());
                 for item in &i.items {
                     match item {
                         syn::ImplItem::Type(associated) => {
+                            let conditional = availability(&associated.attrs);
                             let mut associated = associated.clone();
                             associated.attrs.clear();
-                            api.insert(format!("associated {owner} {}", tokens(&associated)));
+                            api.insert(format!(
+                                "associated {owner} {}{conditional}",
+                                tokens(&associated)
+                            ));
                         }
                         syn::ImplItem::Const(associated) => {
+                            let conditional = availability(&associated.attrs);
                             let mut associated = associated.clone();
                             associated.attrs.clear();
-                            api.insert(format!("associated {owner} {}", tokens(&associated)));
+                            api.insert(format!(
+                                "associated {owner} {}{conditional}",
+                                tokens(&associated)
+                            ));
                         }
                         _ => {}
                     }
@@ -583,18 +612,22 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
                     match item {
                         syn::ImplItem::Fn(f) if matches!(f.vis, syn::Visibility::Public(_)) => {
                             api.insert(format!(
-                                "method {public_scope}::{} {}",
+                                "method {public_scope}::{} {}{}{}",
                                 tokens(&i.self_ty),
-                                tokens(&f.sig)
+                                tokens(&f.sig),
+                                availability(&i.attrs),
+                                availability(&f.attrs)
                             ));
                         }
                         syn::ImplItem::Const(c) if matches!(c.vis, syn::Visibility::Public(_)) => {
                             api.insert(format!(
-                                "const {public_scope}::{}::{} {} = {}",
+                                "const {public_scope}::{}::{} {} = {}{}{}",
                                 tokens(&i.self_ty),
                                 c.ident,
                                 tokens(&c.ty),
-                                tokens(&c.expr)
+                                tokens(&c.expr),
+                                availability(&i.attrs),
+                                availability(&c.attrs)
                             ));
                         }
                         _ => {}
@@ -602,22 +635,28 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
                 }
             }
             syn::Item::Use(u) if matches!(u.vis, syn::Visibility::Public(_)) => {
-                api.insert(format!("use {public_scope} {}", tokens(&u.tree)));
+                api.insert(format!(
+                    "use {public_scope} {}{}",
+                    tokens(&u.tree),
+                    availability(&u.attrs)
+                ));
             }
             syn::Item::Const(c) if matches!(c.vis, syn::Visibility::Public(_)) => {
                 api.insert(format!(
-                    "const {public_scope}::{} {} = {}",
+                    "const {public_scope}::{} {} = {}{}",
                     c.ident,
                     tokens(&c.ty),
-                    tokens(&c.expr)
+                    tokens(&c.expr),
+                    availability(&c.attrs)
                 ));
             }
             syn::Item::Type(t) if matches!(t.vis, syn::Visibility::Public(_)) => {
                 api.insert(format!(
-                    "alias {public_scope}::{} {} = {}",
+                    "alias {public_scope}::{} {} = {}{}",
                     t.ident,
                     tokens(&t.generics),
-                    tokens(&t.ty)
+                    tokens(&t.ty),
+                    availability(&t.attrs)
                 ));
             }
             _ => {}
@@ -626,11 +665,11 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
 }
 
 fn is_contract_attribute(attr: &syn::Attribute) -> bool {
-    let text = attr.to_token_stream().to_string();
     attr.path().is_ident("derive")
         || attr.path().is_ident("repr")
         || attr.path().is_ident("serde")
-        || (attr.path().is_ident("cfg_attr") && (text.contains("derive") || text.contains("serde")))
+        || attr.path().is_ident("cfg")
+        || attr.path().is_ident("cfg_attr")
 }
 
 fn contract_attributes(attrs: &[syn::Attribute], owner: &str, api: &mut BTreeSet<String>) {
@@ -718,6 +757,58 @@ pub fn check_api(expected: &str, actual: &BTreeSet<String>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conditional_availability_cannot_change_existing_declarations() {
+        let collect = |source: &str| {
+            let file = syn::parse_file(source).unwrap();
+            let mut api = BTreeSet::new();
+            inventory(&file.items, "whatsapp", &mut api);
+            api
+        };
+        for source in [
+            "ATTR pub struct Record { pub value: u32 }",
+            "pub struct Record { ATTR pub value: u32 }",
+            "ATTR pub enum Kind { Value }",
+            "pub enum Kind { ATTR Value }",
+            "pub struct Record; impl Record { ATTR pub fn value(&self) {} }",
+            "pub struct Record; ATTR impl Record { pub fn value(&self) {} }",
+            "ATTR pub mod nested { pub struct Record; }",
+            "mod internal { pub struct Record; } ATTR pub use internal::Record;",
+            "ATTR pub type Alias = u32;",
+            "ATTR pub const VALUE: u32 = 1;",
+            "pub struct Record; impl Record { ATTR pub const VALUE: u32 = 1; }",
+            "pub struct Record; trait Contract { type Value; } impl Contract for Record { ATTR type Value = u32; }",
+            "pub struct Record; trait Contract { const VALUE: u32; } impl Contract for Record { ATTR const VALUE: u32 = 1; }",
+        ] {
+            let bare = source.replace("ATTR", "");
+            let baseline = collect(&bare).into_iter().collect::<Vec<_>>().join("\n");
+            for attr in [
+                "#[cfg(feature = \"new\")]",
+                "#[cfg(target_arch = \"wasm32\")]",
+                "#[cfg_attr(feature = \"new\", cfg(target_arch = \"wasm32\"))]",
+            ] {
+                let conditional = source.replace("ATTR", attr);
+                check_api(&baseline, &collect(&conditional))
+                    .expect_err("adding a condition removes an existing API");
+                let frozen = collect(&conditional)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                check_api(&frozen, &collect(&bare))
+                    .expect_err("removing a condition changes availability");
+                check_api(
+                    &frozen,
+                    &collect(
+                        &conditional
+                            .replace("new", "changed")
+                            .replace("wasm32", "aarch64"),
+                    ),
+                )
+                .expect_err("changing a condition changes availability");
+            }
+        }
+    }
 
     #[test]
     fn variant_serialization_attributes_are_part_of_the_frozen_api() {

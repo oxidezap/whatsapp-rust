@@ -126,6 +126,15 @@ fn protocol_type_setter_keeps_same_value_replacement_after_future_type() {
         .unwrap()
         .with_type(wa::message::protocol_message::Type::REVOKE);
     assert_eq!(message.encode_to_vec(), [0x10, 99, 0x10, 0]);
+    use waproto::buffa::ViewEncode;
+    let view = wa::message::ProtocolMessageView::decode_view(&wire)
+        .unwrap()
+        .with_type(wa::message::protocol_message::Type::REVOKE);
+    assert_eq!(view.encode_to_vec(), [0x10, 99, 0x10, 0]);
+    assert_eq!(
+        view.to_owned_message().unwrap().encode_to_vec(),
+        [0x10, 99, 0x10, 0]
+    );
 }
 
 #[test]
@@ -446,4 +455,36 @@ fn recovery_replays_nested_unknowns_without_recharging_the_caller_allowance() {
     assert_eq!(owned.encode_to_vec(), expected);
     assert_eq!(view.encode_to_vec(), expected);
     assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
+}
+
+#[test]
+fn failed_public_view_unknown_insert_keeps_occurrence_order() {
+    use waproto::buffa::{DecodeContext, ViewEncode};
+    // The later known value wins; dropping its journal would move the retained
+    // future value after it and change the value seen by a newer reader.
+    let wire = [0x10, 99, 0x10, 0];
+    for insertion in 0..4 {
+        let mut view = wa::message::ProtocolMessageView::decode_view(&wire).unwrap();
+        let unknown = core::cell::Cell::new(0);
+        let budget = core::cell::Cell::new(0);
+        let ctx = DecodeContext::new(100, &unknown).with_element_memory(&budget);
+        let result = match insertion {
+            0 => view.__buffa_unknown_fields.push_record(&[0x80], 2, ctx),
+            1 => view
+                .__buffa_unknown_fields
+                .push_record(&[0xc0, 0x3e, 7], 3, ctx),
+            2 => view.__buffa_unknown_fields.push_varint(1000, 7, ctx),
+            _ => {
+                let unrestricted = core::cell::Cell::new(usize::MAX);
+                view.__buffa_unknown_fields.push_record(
+                    &[0x80],
+                    1,
+                    DecodeContext::new(100, &unrestricted),
+                )
+            }
+        };
+        assert!(result.is_err());
+        assert_eq!(view.encode_to_vec(), wire);
+        assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), wire);
+    }
 }

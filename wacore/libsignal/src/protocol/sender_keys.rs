@@ -1384,7 +1384,8 @@ impl SenderKeyRecord {
                 .map(|s| {
                     s.future.as_ref().map_or(0, |state| future_state_pointed_bytes(state))
                         + signing_key_pointed_bytes(&s.sender_signing_key)
-                        // The `Arc` owns a `Vec` header plus its buffer.
+                        // The `Arc` owns its counters, a `Vec` header and its buffer.
+                        + 2 * size_of::<usize>()
                         + size_of::<Vec<StoredMessageKey>>()
                         + s.message_keys.capacity() * size_of::<StoredMessageKey>()
                 })
@@ -2381,6 +2382,19 @@ mod tests {
             original.remove_sender_message_key(7).is_some(),
             "the cache's copy must keep its key after the loaded copy removed it"
         );
+    }
+
+    #[test]
+    fn memory_ledger_counts_backlog_arc_even_when_empty() {
+        let record = record_with_state(42, 0x55);
+        let state = &record.states[0];
+        let expected = size_of::<SenderKeyRecord>()
+            + record.states.capacity() * size_of::<SenderKeyState>()
+            + signing_key_pointed_bytes(&state.sender_signing_key)
+            + 2 * size_of::<usize>()
+            + size_of::<Vec<StoredMessageKey>>()
+            + state.message_keys.capacity() * size_of::<StoredMessageKey>();
+        assert_eq!(record.estimated_size(), expected);
     }
 
     /// Test SenderKeyRecord basic operations

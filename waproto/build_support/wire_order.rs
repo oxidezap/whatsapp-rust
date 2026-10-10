@@ -1040,10 +1040,11 @@ impl<'a> ViewStorage<'a> {
         len: usize,
         ctx: DecodeContext<'_>,
     ) -> Result<(), DecodeError> {
+        self.push_decoded_record(tail, len, ctx)?;
         if let Some(state) = &mut self.0 {
             state.order = None;
         }
-        self.push_decoded_record(tail, len, ctx)
+        Ok(())
     }
     pub(super) fn push_decoded_record(
         &mut self,
@@ -1065,10 +1066,11 @@ impl<'a> ViewStorage<'a> {
         value: u64,
         ctx: DecodeContext<'_>,
     ) -> Result<(), DecodeError> {
+        self.push_decoded_varint(field, value, ctx)?;
         if let Some(state) = &mut self.0 {
             state.order = None;
         }
-        self.push_decoded_varint(field, value, ctx)
+        Ok(())
     }
     pub(super) fn push_decoded_varint(
         &mut self,
