@@ -694,6 +694,38 @@ fn transform(
             // its growing repeated fields quadratically. Retain raw events
             // throughout the batch, including before an eventual decode error.
             // Direct single-field calls still check on every invocation.
+            // Packed closed enums need the retained dispatcher even before
+            // activation; other owners can decode the known prefix directly.
+            let known_prefix = if groups.values().any(|group| group & (1 << 31) != 0) {
+                quote!()
+            } else if view {
+                quote! {
+                    if !self.__buffa_unknown_fields.active() {
+                        while !cur.is_empty() {
+                            let before_tag = cur;
+                            let tag = ::buffa::encoding::Tag::decode(&mut cur)?;
+                            cur = self.__wire_merge(tag, cur, before_tag, ctx)?;
+                            if !self.__buffa_unknown_fields.is_empty() {
+                                #runtime::begin_view(&mut #runtime::Adapter(self), ctx)?;
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                quote! {
+                    if !self.__buffa_unknown_fields.active() {
+                        while buf.remaining() > limit {
+                            let tag = ::buffa::encoding::Tag::decode(buf)?;
+                            self.__wire_merge(tag, buf, ctx)?;
+                            if !self.__buffa_unknown_fields.is_empty() {
+                                #runtime::begin_owned(&mut #runtime::Adapter(self), ctx)?;
+                                break;
+                            }
+                        }
+                    }
+                }
+            };
             item.items.push(if view {
                 syn::parse_quote! {
                     fn merge_into_view(&mut self, buf: &'a [u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<(), ::buffa::DecodeError> {
@@ -703,6 +735,7 @@ fn transform(
                             #runtime::reconcile_view(&mut #runtime::Adapter(self), ctx)?;
                         }
                         let result = (|| {
+                            #known_prefix
                             while !cur.is_empty() {
                                 let before_tag = cur;
                                 let tag = ::buffa::encoding::Tag::decode(&mut cur)?;
@@ -724,6 +757,7 @@ fn transform(
                             #runtime::reconcile_owned(&mut #runtime::Adapter(self), ctx)?;
                         }
                         let result = (|| {
+                            #known_prefix
                             while buf.remaining() > limit {
                                 let tag = ::buffa::encoding::Tag::decode(buf)?;
                                 self.__wire_merge_field(tag, buf, ctx, false)?;
