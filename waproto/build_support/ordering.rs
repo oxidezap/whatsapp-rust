@@ -836,9 +836,9 @@ fn transform(
                 syn::parse_quote! {
                     impl #impl_generics #runtime::ViewCodec<'a> for #runtime::Adapter<'_, #ty> #where_clause {
                         fn storage(&mut self) -> &mut #runtime::ViewStorage<'a> { &mut self.0.__buffa_unknown_fields }
-                        fn groups(&self) -> fn(u32) -> u32 { <#ty>::__wire_group }
-                        fn growth(&self, tag: u32) -> usize { <#ty>::__wire_growth(tag) }
-                        fn replay(&self) -> #runtime::Replay { <#ty>::__wire_expected }
+                        fn policy(&self) -> #runtime::Policy {
+                            #runtime::Policy { groups: <#ty>::__wire_group, growth: <#ty>::__wire_growth, replay: <#ty>::__wire_expected }
+                        }
                         fn known(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> { self.0.__wire_known_for_decode(ctx) }
                         fn merge(&mut self, tag: ::buffa::encoding::Tag, cur: &'a [u8], before: &'a [u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> { self.0.__wire_merge(tag, cur, before, ctx) }
                     }
@@ -847,9 +847,9 @@ fn transform(
                 syn::parse_quote! {
                     impl #impl_generics #runtime::OwnedCodec for #runtime::Adapter<'_, #ty> #where_clause {
                         fn storage(&mut self) -> &mut #runtime::Storage { &mut self.0.__buffa_unknown_fields }
-                        fn groups(&self) -> fn(u32) -> u32 { <#ty>::__wire_group }
-                        fn growth(&self, tag: u32) -> usize { <#ty>::__wire_growth(tag) }
-                        fn replay(&self) -> #runtime::Replay { <#ty>::__wire_expected }
+                        fn policy(&self) -> #runtime::Policy {
+                            #runtime::Policy { groups: <#ty>::__wire_group, growth: <#ty>::__wire_growth, replay: <#ty>::__wire_expected }
+                        }
                         fn known(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> { self.0.__wire_known_for_decode(ctx) }
                         fn merge_slice(&mut self, tag: ::buffa::encoding::Tag, buf: &mut &[u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<(), ::buffa::DecodeError> { self.0.__wire_merge(tag, buf, ctx) }
                     }

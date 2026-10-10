@@ -10,6 +10,14 @@ type GroupMap = fn(u32) -> u32;
 type Projection = Vec<(u32, Vec<u8>)>;
 pub(crate) type Replay = fn(&[u8], Option<DecodeContext<'_>>) -> Result<Vec<u8>, DecodeError>;
 
+// These immutable callbacks are fetched together on the cold journal path.
+// One adapter method avoids three per-owner vtable slots and return thunks.
+pub(crate) struct Policy {
+    pub(crate) groups: GroupMap,
+    pub(crate) growth: fn(u32) -> usize,
+    pub(crate) replay: Replay,
+}
+
 // A field decoder can mutate its receiver before journal insertion. Prepay
 // insertion as well as finalization so an exhausted caller budget cannot erase
 // a completed known occurrence behind an earlier future value.
@@ -86,9 +94,7 @@ pub(crate) struct Adapter<'a, T>(pub(crate) &'a mut T);
 
 pub(crate) trait OwnedCodec {
     fn storage(&mut self) -> &mut Storage;
-    fn groups(&self) -> GroupMap;
-    fn growth(&self, tag: u32) -> usize;
-    fn replay(&self) -> Replay;
+    fn policy(&self) -> Policy;
     fn known(&self, ctx: DecodeContext<'_>) -> Result<Vec<u8>, DecodeError>;
     fn merge_slice(
         &mut self,
@@ -105,7 +111,8 @@ pub(crate) fn begin_owned(
     ctx: DecodeContext<'_>,
 ) -> Result<(), DecodeError> {
     let known = codec.known(ctx)?;
-    let map = codec.groups();
+    let policy = codec.policy();
+    let map = policy.groups;
     codec.storage().begin(&known, map, ctx)
 }
 
@@ -116,8 +123,9 @@ pub(crate) fn reconcile_owned(
     ctx: DecodeContext<'_>,
 ) -> Result<(), DecodeError> {
     let known = codec.known(ctx)?;
-    let map = codec.groups();
-    let replay = codec.replay();
+    let policy = codec.policy();
+    let map = policy.groups;
+    let replay = policy.replay;
     codec.storage().reconcile(&known, map, replay, ctx)
 }
 
@@ -128,7 +136,8 @@ pub(crate) fn complete_owned_batch(codec: &mut dyn OwnedCodec, ctx: DecodeContex
     if !codec.storage().needs_baseline() { return Ok(()); }
     let ctx = ctx.with_element_memory(&reserved);
     let known = codec.known(ctx)?;
-    let map = codec.groups();
+    let policy = codec.policy();
+    let map = policy.groups;
     codec.storage().complete_batch(known, map, ctx)
 }
 
@@ -141,13 +150,14 @@ pub(crate) fn merge_owned_known(
     ctx: DecodeContext<'_>,
     check_current: bool,
 ) -> Result<(), DecodeError> {
-    let map = codec.groups();
+    let policy = codec.policy();
+    let map = policy.groups;
     let group = map(tag.field_number());
     let previous = codec.storage().len();
     debug_assert_ne!(group, 0);
     if check_current {
         let known = codec.known(ctx)?;
-        let replay = codec.replay();
+        let replay = policy.replay;
         codec.storage().reconcile(&known, map, replay, ctx)?;
     }
     let mut input = buf;
@@ -160,7 +170,7 @@ pub(crate) fn merge_owned_known(
         reserve_record(group, &raw, false, ctx)?
     } else { 0 });
     if !check_current {
-        let encoded_bound = raw.len().saturating_mul(codec.growth(tag.field_number()));
+        let encoded_bound = raw.len().saturating_mul((policy.growth)(tag.field_number()));
         codec.storage().reserve_baseline(group, encoded_bound, ctx)?;
     }
     // Generated decoders receive their existing slice specialization. Erasing
@@ -182,11 +192,12 @@ pub(crate) fn finish_owned_unknown(
     check_current: bool,
 ) -> Result<(), DecodeError> {
     if codec.storage().len() != previous {
-        let map = codec.groups();
+        let policy = codec.policy();
+        let map = policy.groups;
         if check_current {
             let known = codec.known(ctx)?;
-            let replay = codec.replay();
-        codec.storage().reconcile(&known, map, replay, ctx)?;
+            let replay = policy.replay;
+            codec.storage().reconcile(&known, map, replay, ctx)?;
         }
         codec.storage().finish(0, None, None, map, previous, ctx)?;
     }
@@ -195,9 +206,7 @@ pub(crate) fn finish_owned_unknown(
 
 pub(crate) trait ViewCodec<'a> {
     fn storage(&mut self) -> &mut ViewStorage<'a>;
-    fn groups(&self) -> GroupMap;
-    fn growth(&self, tag: u32) -> usize;
-    fn replay(&self) -> Replay;
+    fn policy(&self) -> Policy;
     fn known(&self, ctx: DecodeContext<'_>) -> Result<Vec<u8>, DecodeError>;
     fn merge(
         &mut self,
@@ -215,7 +224,8 @@ pub(crate) fn begin_view<'a>(
     ctx: DecodeContext<'_>,
 ) -> Result<(), DecodeError> {
     let known = codec.known(ctx)?;
-    let map = codec.groups();
+    let policy = codec.policy();
+    let map = policy.groups;
     codec.storage().begin(&known, map, ctx)
 }
 
@@ -226,8 +236,9 @@ pub(crate) fn reconcile_view<'a>(
     ctx: DecodeContext<'_>,
 ) -> Result<(), DecodeError> {
     let known = codec.known(ctx)?;
-    let map = codec.groups();
-    let replay = codec.replay();
+    let policy = codec.policy();
+    let map = policy.groups;
+    let replay = policy.replay;
     codec.storage().reconcile(&known, map, replay, ctx)
 }
 
@@ -238,7 +249,8 @@ pub(crate) fn complete_view_batch<'a>(codec: &mut dyn ViewCodec<'a>, ctx: Decode
     if !codec.storage().needs_baseline() { return Ok(()); }
     let ctx = ctx.with_element_memory(&reserved);
     let known = codec.known(ctx)?;
-    let map = codec.groups();
+    let policy = codec.policy();
+    let map = policy.groups;
     codec.storage().complete_batch(known, map, ctx)
 }
 
@@ -252,12 +264,13 @@ pub(crate) fn merge_view<'a>(
     ctx: DecodeContext<'_>,
     check_current: bool,
 ) -> Result<&'a [u8], DecodeError> {
-    let map = codec.groups();
+    let policy = codec.policy();
+    let map = policy.groups;
     let group = map(tag.field_number());
     let previous = codec.storage().len();
     if group != 0 && check_current {
         let known = codec.known(ctx)?;
-        let replay = codec.replay();
+        let replay = policy.replay;
         codec.storage().reconcile(&known, map, replay, ctx)?;
     }
     let record_credit = ::core::cell::Cell::new(if group != 0 && !check_current {
@@ -267,7 +280,7 @@ pub(crate) fn merge_view<'a>(
         let record_len = raw.len().saturating_add(if group & (1 << 31) != 0 {
             ::buffa::encoding::varint_len(u64::from(tag.field_number()) << 3)
         } else { 0 });
-        let encoded_bound = record_len.saturating_mul(codec.growth(tag.field_number()));
+        let encoded_bound = record_len.saturating_mul((policy.growth)(tag.field_number()));
         codec.storage().reserve_baseline(group, encoded_bound, ctx)?;
         reserve_record(group, raw, true, ctx)?
     } else { 0 });
@@ -281,7 +294,7 @@ pub(crate) fn merge_view<'a>(
             None
         };
         if group == 0 && check_current {
-            let replay = codec.replay();
+            let replay = policy.replay;
             codec.storage().reconcile(known.as_deref().unwrap_or_default(), map, replay, ctx)?;
         }
         let raw = if group & (1 << 31) != 0 {
