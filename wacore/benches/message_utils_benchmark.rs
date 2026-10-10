@@ -104,6 +104,204 @@ fn bench_oneof_view_decode(bencher: divan::Bencher, shape: &str) {
     });
 }
 
+fn oneof_records(mut wire: &[u8]) -> Vec<&[u8]> {
+    let mut records = Vec::new();
+    while !wire.is_empty() {
+        let before = wire;
+        let tag = buffa::encoding::Tag::decode(&mut wire).expect("valid fixture tag");
+        buffa::encoding::skip_field_depth(tag, &mut wire, 100).expect("valid fixture record");
+        records.push(&before[..before.len() - wire.len()]);
+    }
+    records
+}
+
+fn verify_oneof_diagnostic(encoded: &[u8], operation: &str) {
+    use buffa::Message as _;
+    use wa::message::interactive_message::header::Media;
+    let decoded = wa::message::interactive_message::Header::decode_from_slice(encoded)
+        .expect("valid diagnostic output");
+    let Some(Media::ImageMessage(image)) = decoded.media.as_ref() else {
+        unreachable!("image fixture")
+    };
+    let caption = match operation {
+        "edit" => "Synthetic edited caption",
+        "retry" => "c",
+        _ => "Synthetic image caption",
+    };
+    assert_eq!(image.caption.as_deref(), Some(caption));
+    assert_eq!(image.jpeg_thumbnail.as_deref(), Some([0x5a; 64].as_slice()));
+    assert_eq!(
+        image
+            .context_info
+            .as_option()
+            .unwrap()
+            .quoted_message
+            .as_option()
+            .unwrap()
+            .conversation
+            .as_deref(),
+        Some("Synthetic quoted text"),
+    );
+}
+
+// Keep these end-to-end diagnostics alongside the existing encode/decode gates:
+// postponing journal work must be judged at the point callers use the result.
+#[divan::bench(args = [
+    "future_first/untouched", "future_last/untouched",
+    "future_first/edit", "future_last/edit",
+    "future_first/retry", "future_last/retry",
+    "future_first/clone", "future_last/clone",
+    "future_first/repeat_encode", "future_last/repeat_encode",
+    "future_first/fragmented", "future_last/fragmented",
+])]
+fn bench_oneof_owned_decode_encode(bencher: divan::Bencher, scenario: &str) {
+    use buffa::Message as _;
+    use wa::message::interactive_message::header::Media;
+    let (shape, operation) = scenario.split_once('/').unwrap();
+    let wire = oneof_wire(shape);
+    let records = oneof_records(&wire);
+    // The nested merge accepts caption c before the incomplete varint fails.
+    let failed = [0x22, 5, 0x1a, 1, b'c', 0xc0, 0x3e];
+    let retry = [0x22, 0];
+    let roundtrip = || {
+        let mut message = wa::message::interactive_message::Header::decode_from_slice(black_box(
+            if operation == "fragmented" {
+                &[]
+            } else {
+                &wire
+            },
+        ))
+        .expect("valid synthetic oneof fixture");
+        match operation {
+            "untouched" => {}
+            "clone" => return message.clone().encode_to_vec(),
+            "repeat_encode" => {
+                black_box(message.encode_to_vec());
+            }
+            "fragmented" => {
+                for record in &records {
+                    message
+                        .merge_from_slice(black_box(record))
+                        .expect("valid fragment");
+                }
+            }
+            "edit" => {
+                let Some(Media::ImageMessage(image)) = message.media.as_mut() else {
+                    unreachable!("image fixture")
+                };
+                image.caption = Some("Synthetic edited caption".into());
+            }
+            "retry" => {
+                assert!(message.merge_from_slice(black_box(&failed)).is_err());
+                message
+                    .merge_from_slice(black_box(&retry))
+                    .expect("valid retry");
+                let Some(Media::ImageMessage(image)) = message.media.as_ref() else {
+                    unreachable!("image fixture")
+                };
+                assert_eq!(image.caption.as_deref(), Some("c"));
+            }
+            _ => unreachable!("declared diagnostic operation"),
+        }
+        message.encode_to_vec()
+    };
+    let expected = roundtrip();
+    verify_oneof_diagnostic(&expected, operation);
+    if matches!(
+        operation,
+        "untouched" | "clone" | "repeat_encode" | "fragmented"
+    ) {
+        let canonical = wa::message::interactive_message::Header::decode_from_slice(&wire)
+            .expect("valid synthetic oneof fixture")
+            .encode_to_vec();
+        assert_eq!(expected, canonical);
+    }
+    bencher.bench(|| black_box(roundtrip()));
+}
+
+#[divan::bench(args = [
+    "future_first/untouched", "future_last/untouched",
+    "future_first/edit", "future_last/edit",
+    "future_first/retry", "future_last/retry",
+    "future_first/clone", "future_last/clone",
+    "future_first/repeat_encode", "future_last/repeat_encode",
+    "future_first/fragmented", "future_last/fragmented",
+])]
+/// The clone arm measures view-to-owned conversion, owned clone, then encode.
+fn bench_oneof_view_decode_encode(bencher: divan::Bencher, scenario: &str) {
+    use buffa::{DecodeContext, Message as _, MessageView as _, ViewEncode as _};
+    use wa::__buffa::view::oneof::message::interactive_message::header::Media;
+    let (shape, operation) = scenario.split_once('/').unwrap();
+    let wire = oneof_wire(shape);
+    let records = oneof_records(&wire);
+    let failed = [0x22, 5, 0x1a, 1, b'c', 0xc0, 0x3e];
+    let retry = [0x22, 0];
+    let roundtrip = || {
+        let mut message = wa::message::interactive_message::HeaderView::decode_view(black_box(
+            if operation == "fragmented" {
+                &[]
+            } else {
+                &wire
+            },
+        ))
+        .expect("valid synthetic oneof fixture");
+        match operation {
+            "untouched" => {}
+            "clone" => {
+                return message
+                    .to_owned_message()
+                    .expect("valid owned conversion")
+                    .clone()
+                    .encode_to_vec();
+            }
+            "repeat_encode" => {
+                black_box(message.encode_to_vec());
+            }
+            "fragmented" => {
+                let unknown = core::cell::Cell::new(usize::MAX);
+                let ctx = DecodeContext::new(100, &unknown);
+                for record in &records {
+                    message
+                        .merge_into_view(black_box(record), ctx)
+                        .expect("valid fragment");
+                }
+            }
+            "edit" => {
+                let Some(Media::ImageMessage(image)) = message.media.as_mut() else {
+                    unreachable!("image fixture")
+                };
+                image.caption = Some("Synthetic edited caption");
+            }
+            "retry" => {
+                let unknown = core::cell::Cell::new(usize::MAX);
+                let ctx = DecodeContext::new(100, &unknown);
+                assert!(message.merge_into_view(black_box(&failed), ctx).is_err());
+                message
+                    .merge_into_view(black_box(&retry), ctx)
+                    .expect("valid retry");
+                let Some(Media::ImageMessage(image)) = message.media.as_ref() else {
+                    unreachable!("image fixture")
+                };
+                assert_eq!(image.caption, Some("c"));
+            }
+            _ => unreachable!("declared diagnostic operation"),
+        }
+        message.encode_to_vec()
+    };
+    let expected = roundtrip();
+    verify_oneof_diagnostic(&expected, operation);
+    if matches!(
+        operation,
+        "untouched" | "clone" | "repeat_encode" | "fragmented"
+    ) {
+        let canonical = wa::message::interactive_message::Header::decode_from_slice(&wire)
+            .expect("valid synthetic oneof fixture")
+            .encode_to_vec();
+        assert_eq!(expected, canonical);
+    }
+    bencher.bench(|| black_box(roundtrip()));
+}
+
 fn setup_device_list(users: usize, devices_per_user: u16) -> Vec<Jid> {
     let mut out = Vec::with_capacity(users * devices_per_user as usize);
     for u in 0..users {
