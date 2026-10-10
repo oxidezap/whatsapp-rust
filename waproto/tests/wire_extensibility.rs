@@ -147,6 +147,75 @@ fn image_header_accepts_packed_scan_lengths_within_decode_budget() {
 }
 
 #[test]
+fn failed_nested_oneof_merge_keeps_valid_partial_edits() {
+    use wa::message::interactive_message::{Header, HeaderView, header::Media};
+    use waproto::buffa::{DecodeContext, ViewEncode, encoding::Tag};
+
+    fn caption(header: &Header) -> Option<&str> {
+        match header.media.as_ref() {
+            Some(Media::ImageMessage(image)) => image.caption.as_deref(),
+            _ => None,
+        }
+    }
+
+    // Future field, then image caption "a". A second image accepts caption
+    // "c" before failing on an unknown varint field with no payload.
+    let first = [0xc0, 0x3e, 7, 0x22, 3, 0x1a, 1, b'a'];
+    let failed = [0x22, 5, 0x1a, 1, b'c', 0xc0, 0x3e];
+    let completed = [0x22, 3, 0x1a, 1, b'b'];
+    let batch = [completed.as_slice(), failed.as_slice()].concat();
+    let expected = [0xc0, 0x3e, 7, 0x22, 3, 0x1a, 1, b'c'];
+    let unknown = core::cell::Cell::new(usize::MAX);
+    let ctx = DecodeContext::new(100, &unknown);
+
+    let mut owned = Header::decode_from_slice(&first).unwrap();
+    let mut payload = &failed[..];
+    let tag = Tag::decode(&mut payload).unwrap();
+    assert!(owned.merge_field(tag, &mut payload, ctx).is_err());
+    assert_eq!(caption(&owned), Some("c"));
+    assert_eq!(owned.encode_to_vec(), expected, "direct owned merge");
+
+    let mut view = HeaderView::decode_view(&first).unwrap();
+    assert!(
+        view.merge_view_field(tag, &failed[1..], &failed, ctx)
+            .is_err()
+    );
+    assert_eq!(caption(&view.to_owned_message().unwrap()), Some("c"));
+    assert_eq!(view.encode_to_vec(), expected, "direct view merge");
+
+    let mut owned = Header::decode_from_slice(&first).unwrap();
+    assert!(owned.merge_to_limit(&mut &batch[..], ctx, 0).is_err());
+    assert_eq!(caption(&owned), Some("c"));
+    assert_eq!(owned.encode_to_vec(), expected, "batched owned merge");
+
+    let mut view = HeaderView::decode_view(&first).unwrap();
+    assert!(view.merge_into_view(&batch, ctx).is_err());
+    assert_eq!(caption(&view.to_owned_message().unwrap()), Some("c"));
+    assert_eq!(view.encode_to_vec(), expected, "batched view merge");
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
+}
+
+#[test]
+fn failed_nested_oneof_without_mutation_keeps_future_order() {
+    use wa::message::interactive_message::{Header, HeaderView};
+    use waproto::buffa::{DecodeContext, ViewEncode};
+    let first = [0xc0, 0x3e, 7, 0x22, 3, 0x1a, 1, b'a'];
+    let completed = [0x22, 3, 0x1a, 1, b'b', 0xc8, 0x3e, 8];
+    let failed = [0x22, 2, 0xc0, 0x3e];
+    let batch = [completed.as_slice(), failed.as_slice()].concat();
+    let expected = [first.as_slice(), completed.as_slice()].concat();
+    let unknown = core::cell::Cell::new(usize::MAX);
+    let ctx = DecodeContext::new(100, &unknown);
+    let mut owned = Header::decode_from_slice(&first).unwrap();
+    assert!(owned.merge_to_limit(&mut &batch[..], ctx, 0).is_err());
+    assert_eq!(owned.encode_to_vec(), expected);
+    let mut view = HeaderView::decode_view(&first).unwrap();
+    assert!(view.merge_into_view(&batch, ctx).is_err());
+    assert_eq!(view.encode_to_vec(), expected);
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
+}
+
+#[test]
 fn failed_protocol_event_reservation_keeps_completed_later_type() {
     use waproto::buffa::{DecodeContext, ViewEncode};
     let first = [0xc0, 0x3e, 7];
@@ -252,4 +321,23 @@ fn retained_lid_mapping_keeps_wire_identity() {
         wa::LIDMigrationMappingSyncPayload::decode_from_slice(&wire).unwrap(),
         payload
     );
+}
+
+#[test]
+fn failed_enum_batch_keeps_unreceived_nonoptional_default() {
+    use waproto::buffa::{DecodeContext, ViewEncode};
+    // FilterClause exposes a nonoptional enum with default AND = 1.
+    // Journal activation must seed it even when the field was not received.
+    let first = [0xc0, 0x3e, 7];
+    let later = [0x08, 2, 0x80];
+    let expected = [0x08, 1, 0xc0, 0x3e, 7, 0x08, 2];
+    let unknown = core::cell::Cell::new(usize::MAX);
+    let ctx = DecodeContext::new(100, &unknown);
+    let mut owned = wa::qp::FilterClause::decode_from_slice(&first).unwrap();
+    assert!(owned.merge_to_limit(&mut &later[..], ctx, 0).is_err());
+    assert_eq!(owned.encode_to_vec(), expected);
+    let mut view = wa::qp::FilterClauseView::decode_view(&first).unwrap();
+    assert!(view.merge_into_view(&later, ctx).is_err());
+    assert_eq!(view.encode_to_vec(), expected);
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
 }

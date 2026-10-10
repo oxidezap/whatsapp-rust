@@ -114,7 +114,39 @@ impl VisitMut for PushViewDecoded {
 }
 
 pub fn apply(file: &mut syn::File, view: bool, growth: &super::wire_growth::Bounds) {
+    fn collect(items: &[syn::Item], scope: &str, view: bool, types: &mut Vec<syn::Type>) {
+        for item in items {
+            match item {
+                syn::Item::Mod(module) => {
+                    if let Some((_, children)) = &module.content {
+                        collect(children, &format!("{scope}{}::", module.ident), view, types);
+                    }
+                }
+                syn::Item::Impl(item)
+                    if trait_name(item).as_deref()
+                        == Some(if view { "MessageView" } else { "Message" }) =>
+                {
+                    let name = type_name(item).expect("generated message");
+                    let lifetime = if view { "<'static>" } else { "" };
+                    types.push(
+                        syn::parse_str(&format!("{scope}{name}{lifetime}"))
+                            .expect("generated replay bound"),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut types = Vec::new();
+    collect(&file.items, "", view, &mut types);
     transform(&mut file.items, view, 0, "", growth);
+    file.items.push(syn::parse_quote! {
+        const __WIRE_REPLAY_NODE_SIZE: usize = {
+            let mut maximum = 1usize;
+            #(if maximum < ::core::mem::size_of::<#types>() { maximum = ::core::mem::size_of::<#types>(); })*
+            maximum
+        };
+    });
 }
 
 fn transform(
@@ -208,6 +240,11 @@ fn transform(
     let prefix = "super::".repeat(depth + if view { 2 } else { 0 });
     let runtime: syn::Path =
         syn::parse_str(&format!("{prefix}__wire_order")).expect("runtime path");
+    let replay_bound: syn::Path = syn::parse_str(&format!(
+        "{}__WIRE_REPLAY_NODE_SIZE",
+        "super::".repeat(depth)
+    ))
+    .expect("replay bound path");
     let mut helpers = Vec::new();
     let mut enum_values = BTreeMap::new();
     for item in items.iter() {
@@ -425,7 +462,7 @@ fn transform(
                             let original = statement.clone();
                             *statement = if is_compute {
                                 syn::parse_quote!(if __wire_active {
-                                    let bytes = self.__buffa_unknown_fields.compose(&self.__wire_known(), Self::__wire_group);
+                                    let bytes = self.__buffa_unknown_fields.compose(&self.__wire_known(), Self::__wire_group, Self::__wire_expected);
                                     size += #runtime::cache_output(&bytes, #compute_cache) as u64;
                                 } else { #original })
                             } else {
@@ -681,7 +718,7 @@ fn transform(
                         if self.__buffa_unknown_fields.active() {
                             let view_known = self.__wire_known();
                             let owned_known = owned.__wire_known();
-                            owned.__buffa_unknown_fields.rebase(&view_known, &owned_known, Self::__wire_group);
+                            owned.__buffa_unknown_fields.rebase(&view_known, &owned_known, Self::__wire_group, Self::__wire_expected);
                         }
                         Ok(owned)
                     });
@@ -713,7 +750,7 @@ fn transform(
                             }
                             Ok(())
                         })();
-                        let completed = if self.__buffa_unknown_fields.active() {
+                        let completed = if result.is_ok() && self.__buffa_unknown_fields.active() {
                             #runtime::complete_view_batch(&mut #runtime::Adapter(self), ctx)
                         } else { Ok(()) };
                         result.and(completed)
@@ -734,7 +771,7 @@ fn transform(
                             }
                             Ok(())
                         })();
-                        let completed = if self.__buffa_unknown_fields.active() {
+                        let completed = if result.is_ok() && self.__buffa_unknown_fields.active() {
                             #runtime::complete_owned_batch(&mut #runtime::Adapter(self), ctx)
                         } else { Ok(()) };
                         result.and(completed)
@@ -764,15 +801,71 @@ fn transform(
                             first = false;
                             self.__wire_merge_field(tag, buf, ctx, false)?;
                         } })();
-                        let completed = if !first && self.__buffa_unknown_fields.active() {
+                        let completed = if result.is_ok() && !first && self.__buffa_unknown_fields.active() {
                             #runtime::complete_owned_batch(&mut #runtime::Adapter(self), ctx)
                         } else { Ok(()) };
                         result.and(completed)
                     }
                 });
             }
+            let replay_owner = format_ident!("{name}");
+            let replay_merge = if view {
+                quote! {
+                    while !cur.is_empty() {
+                        let before = cur;
+                        let tag = ::buffa::encoding::Tag::decode(&mut cur)?;
+                        cur = expected.__wire_merge(tag, cur, before, replay_ctx)?;
+                    }
+                }
+            } else {
+                quote! {
+                    while !cur.is_empty() {
+                        let tag = ::buffa::encoding::Tag::decode(&mut cur)?;
+                        expected.__wire_merge(tag, &mut cur, replay_ctx)?;
+                    }
+                }
+            };
+            let replay_body = if let Some(values) = enum_values.get(&name) {
+                let tags = values.iter().map(|value| {
+                    let tuple: syn::ExprTuple =
+                        syn::parse2(value.clone()).expect("enum projection tuple");
+                    tuple.elems[0].clone()
+                });
+                quote!({ #runtime::enum_replay(raw, &[#(#tags),*], ctx) })
+            } else {
+                quote!({
+                    if let Some(ctx) = ctx {
+                        // Generated codecs charge repeated entries and journals.
+                        // Reserve the remaining singular payloads, boxed nodes
+                        // and packed scalars before constructing the replay owner.
+                        let charge = raw.len().max(1)
+                            .saturating_mul(#replay_bound.saturating_mul(4).saturating_add(64));
+                        ctx.register_element_memory(charge)?;
+                    }
+                    // Replay only completed records. Give them fresh depth and
+                    // unknown allowances, but transfer the caller's remaining
+                    // memory cap and debit it on both success and failure.
+                    let remaining = ctx.and_then(|ctx| ctx.remaining_element_memory()).unwrap_or(usize::MAX);
+                    let budget = ::core::cell::Cell::new(remaining);
+                    let unknown = ::core::cell::Cell::new(usize::MAX);
+                    let replay_ctx = ::buffa::DecodeContext::new(u32::MAX, &unknown).with_element_memory(&budget);
+                    let result = (|| {
+                        let mut expected = #replay_owner::default();
+                        let mut cur = raw;
+                        #replay_merge
+                        expected.__wire_snapshot(Some(replay_ctx))
+                    })();
+                    if let Some(ctx) = ctx {
+                        ctx.register_element_memory(remaining.saturating_sub(budget.get()))?;
+                    }
+                    result
+                })
+            };
             helpers.push(syn::parse_quote! {
                 impl #impl_generics #ty #where_clause {
+                    #[cold]
+                    #[inline(never)]
+                    fn __wire_expected(raw: &[u8], ctx: ::core::option::Option<::buffa::DecodeContext<'_>>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> #replay_body
                     #merge
                     #retained_merge
                     #repeated_merge
@@ -788,6 +881,7 @@ fn transform(
                         fn storage(&mut self) -> &mut #runtime::ViewStorage<'a> { &mut self.0.__buffa_unknown_fields }
                         fn groups(&self) -> fn(u32) -> u32 { <#ty>::__wire_group }
                         fn growth(&self, tag: u32) -> usize { <#ty>::__wire_growth(tag) }
+                        fn replay(&self) -> #runtime::Replay { <#ty>::__wire_expected }
                         fn known(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> { self.0.__wire_known_for_decode(ctx) }
                         fn merge(&mut self, tag: ::buffa::encoding::Tag, cur: &'a [u8], before: &'a [u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> { self.0.__wire_merge(tag, cur, before, ctx) }
                     }
@@ -798,6 +892,7 @@ fn transform(
                         fn storage(&mut self) -> &mut #runtime::Storage { &mut self.0.__buffa_unknown_fields }
                         fn groups(&self) -> fn(u32) -> u32 { <#ty>::__wire_group }
                         fn growth(&self, tag: u32) -> usize { <#ty>::__wire_growth(tag) }
+                        fn replay(&self) -> #runtime::Replay { <#ty>::__wire_expected }
                         fn known(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> { self.0.__wire_known_for_decode(ctx) }
                         fn merge_slice(&mut self, tag: ::buffa::encoding::Tag, buf: &mut &[u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<(), ::buffa::DecodeError> { self.0.__wire_merge(tag, buf, ctx) }
                     }

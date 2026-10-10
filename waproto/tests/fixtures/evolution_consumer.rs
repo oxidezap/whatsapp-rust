@@ -191,6 +191,43 @@ fn failed_fragment_batch_preserves_completed_occurrences() {
 }
 
 #[test]
+fn partial_nested_failure_keeps_edits_and_retries_without_losing_history() {
+    use evolution_fixture::{v1, DecodeContext};
+    let first = [0xc0, 0x3e, 7, 0x3a, 2, 0x08, 1];
+    let later = [0x3a, 2, 0x10, 2, 0x3a, 4, 0x08, 3, 0xc0, 0x3e];
+    let expected = [0xc0, 0x3e, 7, 0x3a, 4, 0x08, 3, 0x10, 2];
+    let retry = [0x3a, 2, 0x08, 4];
+    let unknown = core::cell::Cell::new(usize::MAX);
+    let ctx = DecodeContext::new(100, &unknown);
+    let mut owned = v1::Record::decode_from_slice(&first).unwrap();
+    assert!(owned.merge_to_limit(&mut &later[..], ctx, 0).is_err());
+    assert_eq!(owned.encode_to_vec(), expected);
+    let budget = core::cell::Cell::new(0);
+    assert!(owned.merge_to_limit(&mut &retry[..], ctx.with_element_memory(&budget), 0).is_err());
+    assert_eq!(owned.encode_to_vec(), expected);
+    let budget = core::cell::Cell::new(128 * 1024);
+    owned.merge_to_limit(&mut &retry[..], ctx.with_element_memory(&budget), 0).unwrap();
+    let restored = v1::Record::decode_from_slice(&owned.encode_to_vec()).unwrap();
+    let Some(v1::record::Choice::Detail(child)) = restored.choice else { panic!("detail") };
+    assert_eq!(child.left, Some(4));
+    assert_eq!(child.right, Some(2));
+
+    let mut view = v1::RecordView::decode_view(&first).unwrap();
+    assert!(view.merge_into_view(&later, ctx).is_err());
+    assert_eq!(view.encode_to_vec(), expected);
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
+    let budget = core::cell::Cell::new(0);
+    assert!(view.merge_into_view(&retry, ctx.with_element_memory(&budget)).is_err());
+    assert_eq!(view.encode_to_vec(), expected);
+    let budget = core::cell::Cell::new(128 * 1024);
+    view.merge_into_view(&retry, ctx.with_element_memory(&budget)).unwrap();
+    let restored = view.to_owned_message().unwrap();
+    let Some(v1::record::Choice::Detail(child)) = restored.choice else { panic!("detail") };
+    assert_eq!(child.left, Some(4));
+    assert_eq!(child.right, Some(2));
+}
+
+#[test]
 fn enum_only_projection_preserves_each_winner_across_owners() {
     use evolution_fixture::{v1, v2};
     for (wire, expected) in [

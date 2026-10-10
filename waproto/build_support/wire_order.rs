@@ -8,6 +8,7 @@ use ::core::mem::ManuallyDrop;
 
 type GroupMap = fn(u32) -> u32;
 type Projection = Vec<(u32, Vec<u8>)>;
+pub(crate) type Replay = fn(&[u8], Option<DecodeContext<'_>>) -> Result<Vec<u8>, DecodeError>;
 
 // A field decoder can mutate its receiver before journal insertion. Prepay
 // insertion as well as finalization so an exhausted caller budget cannot erase
@@ -55,6 +56,27 @@ pub(crate) fn enum_snapshot(
     Ok(bytes)
 }
 
+// Every occurrence in this replay was already accepted as a declared enum.
+// Keep the last value per field, including present zero and signed values,
+// without constructing an owner and retaining its unrelated codec tree.
+// begin seeds nonoptional defaults as known records, so they are present here
+// even when the corresponding field was absent from the received message.
+#[cold]
+#[inline(never)]
+pub(crate) fn enum_replay(raw: &[u8], fields: &[u32], ctx: Option<DecodeContext<'_>>) -> Result<Vec<u8>, DecodeError> {
+    if let Some(ctx) = ctx {
+        ctx.register_element_memory(fields.len().saturating_mul(::core::mem::size_of::<(u32, Option<i32>)>()))?;
+    }
+    let values: Vec<_> = fields.iter().map(|&field| {
+        let value = records(raw).filter(|(tag, _)| *tag == field).last().map(|(_, mut bytes)| {
+            ::buffa::encoding::Tag::decode(&mut bytes).expect("completed enum tag");
+            ::buffa::encoding::decode_varint(&mut bytes).expect("completed enum value") as i32
+        });
+        (field, value)
+    }).collect();
+    enum_snapshot(&values, ctx)
+}
+
 // The occurrence algorithm is shared through an erased adapter only after a
 // future field activates the journal. Known-only decoding keeps its generated
 // static codec; hundreds of message types need not repeat this cold algorithm.
@@ -66,6 +88,7 @@ pub(crate) trait OwnedCodec {
     fn storage(&mut self) -> &mut Storage;
     fn groups(&self) -> GroupMap;
     fn growth(&self, tag: u32) -> usize;
+    fn replay(&self) -> Replay;
     fn known(&self, ctx: DecodeContext<'_>) -> Result<Vec<u8>, DecodeError>;
     fn merge_slice(
         &mut self,
@@ -94,7 +117,8 @@ pub(crate) fn reconcile_owned(
 ) -> Result<(), DecodeError> {
     let known = codec.known(ctx)?;
     let map = codec.groups();
-    codec.storage().reconcile(&known, map, ctx)
+    let replay = codec.replay();
+    codec.storage().reconcile(&known, map, replay, ctx)
 }
 
 #[cold]
@@ -123,7 +147,8 @@ pub(crate) fn merge_owned_known(
     debug_assert_ne!(group, 0);
     if check_current {
         let known = codec.known(ctx)?;
-        codec.storage().reconcile(&known, map, ctx)?;
+        let replay = codec.replay();
+        codec.storage().reconcile(&known, map, replay, ctx)?;
     }
     let mut input = buf;
     let mut captured = Capture::new(&mut input, tag, ctx)?;
@@ -160,7 +185,8 @@ pub(crate) fn finish_owned_unknown(
         let map = codec.groups();
         if check_current {
             let known = codec.known(ctx)?;
-            codec.storage().reconcile(&known, map, ctx)?;
+            let replay = codec.replay();
+        codec.storage().reconcile(&known, map, replay, ctx)?;
         }
         codec.storage().finish(0, None, None, map, previous, ctx)?;
     }
@@ -171,6 +197,7 @@ pub(crate) trait ViewCodec<'a> {
     fn storage(&mut self) -> &mut ViewStorage<'a>;
     fn groups(&self) -> GroupMap;
     fn growth(&self, tag: u32) -> usize;
+    fn replay(&self) -> Replay;
     fn known(&self, ctx: DecodeContext<'_>) -> Result<Vec<u8>, DecodeError>;
     fn merge(
         &mut self,
@@ -200,7 +227,8 @@ pub(crate) fn reconcile_view<'a>(
 ) -> Result<(), DecodeError> {
     let known = codec.known(ctx)?;
     let map = codec.groups();
-    codec.storage().reconcile(&known, map, ctx)
+    let replay = codec.replay();
+    codec.storage().reconcile(&known, map, replay, ctx)
 }
 
 #[cold]
@@ -229,7 +257,8 @@ pub(crate) fn merge_view<'a>(
     let previous = codec.storage().len();
     if group != 0 && check_current {
         let known = codec.known(ctx)?;
-        codec.storage().reconcile(&known, map, ctx)?;
+        let replay = codec.replay();
+        codec.storage().reconcile(&known, map, replay, ctx)?;
     }
     let record_credit = ::core::cell::Cell::new(if group != 0 && !check_current {
         let mut after = cur;
@@ -252,7 +281,8 @@ pub(crate) fn merge_view<'a>(
             None
         };
         if group == 0 && check_current {
-            codec.storage().reconcile(known.as_deref().unwrap_or_default(), map, ctx)?;
+            let replay = codec.replay();
+            codec.storage().reconcile(known.as_deref().unwrap_or_default(), map, replay, ctx)?;
         }
         let raw = if group & (1 << 31) != 0 {
             let mut raw = Vec::new();
@@ -436,6 +466,32 @@ fn value(values: &Projection, group: u32) -> &[u8] {
 }
 
 impl<'a> Order<'a> {
+    // A failed nested decoder can mutate after the last completed record.
+    // Reconstruct the expected pre-failure value from completed occurrences;
+    // snapshotting the receiver would bless that unrecorded partial mutation.
+    fn expected(&self, map: GroupMap, replay: Replay, ctx: Option<DecodeContext<'_>>) -> Result<Projection, DecodeError> {
+        let len = self.events.iter().fold(0usize, |len, event| match event {
+            Event::Known(_, bytes) => len.saturating_add(bytes.len()),
+            Event::Unknown(_) => len,
+        });
+        if let Some(ctx) = ctx { ctx.register_element_memory(len)?; }
+        let mut raw = Vec::with_capacity(len);
+        for event in &self.events {
+            if let Event::Known(_, bytes) = event { raw.extend_from_slice(bytes); }
+        }
+        let known = replay(&raw, ctx)?;
+        if let Some(ctx) = ctx { ctx.register_element_memory(projection_charge(&known, map, 1))?; }
+        Ok(owned_projection(known, map))
+    }
+    fn materialize(&mut self, map: GroupMap, replay: Replay, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+        if self.baseline_pending {
+            let expected = self.expected(map, replay, Some(ctx))?;
+            self.baseline = expected;
+            self.baseline_pending = false;
+        }
+        Ok(())
+    }
+
     fn reserve_baseline(&mut self, group: u32, encoded_bound: usize, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
         if group & (1 << 31) != 0 && !self.baseline_pending {
             return Ok(());
@@ -460,6 +516,9 @@ impl<'a> Order<'a> {
         Ok(())
     }
     fn unchanged(&self, known: &[u8], map: GroupMap) -> bool {
+        self.unchanged_against(&self.baseline, known, map)
+    }
+    fn unchanged_against(&self, baseline: &Projection, known: &[u8], map: GroupMap) -> bool {
         if !self.forced.is_empty() {
             return false;
         }
@@ -467,21 +526,21 @@ impl<'a> Order<'a> {
         for (tag, raw) in records(known) {
             let group = map(tag);
             if group != 0 {
-                if group & (1 << 31) != 0 { return self.unchanged_repeated(known, map); }
+                if group & (1 << 31) != 0 { return self.unchanged_repeated(baseline, known, map); }
                 count += 1;
-                if value(&self.baseline, group) != raw {
-                    return self.unchanged_repeated(known, map);
+                if value(baseline, group) != raw {
+                    return self.unchanged_repeated(baseline, known, map);
                 }
             }
         }
-        count == self.baseline.len()
+        count == baseline.len()
     }
     #[cold]
-    fn unchanged_repeated(&self, known: &[u8], map: GroupMap) -> bool {
-        if records(known).any(|(tag, _)| map(tag) != 0 && !self.baseline.iter().any(|(group, _)| *group == map(tag))) {
+    fn unchanged_repeated(&self, baseline: &Projection, known: &[u8], map: GroupMap) -> bool {
+        if records(known).any(|(tag, _)| map(tag) != 0 && !baseline.iter().any(|(group, _)| *group == map(tag))) {
             return false;
         }
-        self.baseline.iter().all(|(group, baseline)| {
+        baseline.iter().all(|(group, baseline)| {
             let mut offset = 0;
             for (_, raw) in records(known).filter(|(tag, _)| map(*tag) == *group) {
                 let mut equal = true;
@@ -512,9 +571,12 @@ impl<'a> Order<'a> {
     }
 
     fn changed(&self, current: &Projection) -> Vec<u32> {
+        self.changed_against(&self.baseline, current)
+    }
+    fn changed_against(&self, baseline: &Projection, current: &Projection) -> Vec<u32> {
         let mut ids = self.forced.clone();
-        for (group, _) in self.baseline.iter().chain(current.iter()) {
-            if !ids.contains(group) && value(&self.baseline, *group) != value(current, *group) {
+        for (group, _) in baseline.iter().chain(current.iter()) {
+            if !ids.contains(group) && value(baseline, *group) != value(current, *group) {
                 ids.push(*group);
             }
         }
@@ -525,8 +587,10 @@ impl<'a> Order<'a> {
         &mut self,
         known: &[u8],
         map: GroupMap,
+        replay: Replay,
         ctx: DecodeContext<'_>,
     ) -> Result<(), DecodeError> {
+        self.materialize(map, replay, ctx)?;
         if self.unchanged(known, map) {
             return Ok(());
         }
@@ -566,12 +630,14 @@ impl<'a> Order<'a> {
         Ok(())
     }
 
-    fn write(&self, known: &[u8], unknown: &[u8], map: GroupMap) -> Vec<u8> {
-        let (current, changed) = if self.unchanged(known, map) {
+    fn write(&self, known: &[u8], unknown: &[u8], map: GroupMap, replay: Replay) -> Vec<u8> {
+        let expected = self.baseline_pending.then(|| self.expected(map, replay, None).expect("completed occurrence replay"));
+        let baseline = expected.as_ref().unwrap_or(&self.baseline);
+        let (current, changed) = if self.unchanged_against(baseline, known, map) {
             (Vec::new(), Vec::new())
         } else {
             let current = projection(known, map);
-            let changed = self.changed(&current);
+            let changed = self.changed_against(baseline, &current);
             (current, changed)
         };
         let mut unknown = records(unknown);
@@ -800,6 +866,7 @@ impl Storage {
         &mut self,
         known: &[u8],
         map: GroupMap,
+        replay: Replay,
         ctx: DecodeContext<'_>,
     ) -> Result<(), DecodeError> {
         if let Some(state) = self.0.as_mut()
@@ -807,7 +874,7 @@ impl Storage {
         {
             ctx.register_element_memory(event_charge(state.fields.len() - order.unknown_count))?;
             order.append_unknown(state.fields.len());
-            order.reconcile(known, map, ctx)?;
+            order.reconcile(known, map, replay, ctx)?;
         }
         Ok(())
     }
@@ -863,7 +930,7 @@ impl Storage {
     }
     #[cold]
     #[inline(never)]
-    pub fn compose(&self, known: &[u8], map: GroupMap) -> Vec<u8> {
+    pub fn compose(&self, known: &[u8], map: GroupMap, replay: Replay) -> Vec<u8> {
         let state = self.0.as_ref().expect("active occurrence journal");
         let mut unknown = Vec::new();
         state.fields.write_to(&mut unknown);
@@ -871,7 +938,7 @@ impl Storage {
             .order
             .as_ref()
             .expect("active occurrence journal")
-            .write(known, &unknown, map)
+            .write(known, &unknown, map, replay)
     }
     pub fn force(&mut self, group: u32) {
         if let Some(order) = self.0.as_mut().and_then(|state| state.order.as_mut())
@@ -885,10 +952,14 @@ impl Storage {
     }
     /// Rebase only representation differences during view conversion; retain
     /// forced or value-observable edits instead of blessing them as received.
-    pub fn rebase(&mut self, view_known: &[u8], owned_known: &[u8], map: GroupMap) {
+    pub fn rebase(&mut self, view_known: &[u8], owned_known: &[u8], map: GroupMap, replay: Replay) {
         if let Some(order) = self.0.as_mut().and_then(|state| state.order.as_mut()) {
+            if order.baseline_pending {
+                order.baseline = order.expected(map, replay, None).expect("completed view occurrence replay");
+            }
             order.forced = order.changed(&projection(view_known, map));
             order.baseline = projection(owned_known, map);
+            order.baseline_pending = false;
         }
     }
 }
@@ -1034,6 +1105,7 @@ impl<'a> ViewStorage<'a> {
         &mut self,
         known: &[u8],
         map: GroupMap,
+        replay: Replay,
         ctx: DecodeContext<'_>,
     ) -> Result<(), DecodeError> {
         if let Some(state) = self.0.as_mut()
@@ -1041,7 +1113,7 @@ impl<'a> ViewStorage<'a> {
         {
             ctx.register_element_memory(event_charge(state.count - order.unknown_count))?;
             order.append_unknown(state.count);
-            order.reconcile(known, map, ctx)?;
+            order.reconcile(known, map, replay, ctx)?;
         }
         Ok(())
     }
@@ -1101,7 +1173,7 @@ impl<'a> ViewStorage<'a> {
     }
     #[cold]
     #[inline(never)]
-    pub fn compose(&self, known: &[u8], map: GroupMap) -> Vec<u8> {
+    pub fn compose(&self, known: &[u8], map: GroupMap, replay: Replay) -> Vec<u8> {
         let state = self.0.as_ref().expect("active occurrence journal");
         let mut unknown = Vec::new();
         state.fields.write_to(&mut unknown);
@@ -1109,7 +1181,7 @@ impl<'a> ViewStorage<'a> {
             .order
             .as_ref()
             .expect("active occurrence journal")
-            .write(known, &unknown, map)
+            .write(known, &unknown, map, replay)
     }
 }
 
