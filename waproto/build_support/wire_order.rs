@@ -104,6 +104,34 @@ pub(crate) trait OwnedCodec {
     ) -> Result<(), DecodeError>;
 }
 
+// Only the active continuation uses an erased owner. Keep the ordinary
+// decoder static and preserve the existing buffer specialization.
+pub(crate) trait OwnedBatch<B: Buf> {
+    fn merge_batch_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut B,
+        ctx: DecodeContext<'_>,
+    ) -> Result<(), DecodeError>;
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn continue_owned_batch<B: Buf>(
+    codec: &mut dyn OwnedBatch<B>,
+    buf: &mut B,
+    ctx: DecodeContext<'_>,
+    limit: usize,
+) -> Result<(), DecodeError> {
+    // Reconciliation belongs to the entrypoint. Repeating it after activation
+    // would debit a caller's budget again in the middle of the same batch.
+    while buf.remaining() > limit {
+        let tag = ::buffa::encoding::Tag::decode(buf)?;
+        codec.merge_batch_field(tag, buf, ctx)?;
+    }
+    Ok(())
+}
+
 #[cold]
 #[inline(never)]
 pub(crate) fn begin_owned(

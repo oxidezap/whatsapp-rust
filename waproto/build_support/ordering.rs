@@ -710,15 +710,22 @@ fn transform(
                 }
             } else {
                 quote! {
-                    if !self.__buffa_unknown_fields.active() {
-                        self.__wire_merge(tag, buf, ctx)?;
-                        if !self.__buffa_unknown_fields.is_empty() {
-                            #runtime::begin_owned(&mut #runtime::Adapter(self), ctx)?;
-                        }
-                    } else {
-                        self.__wire_merge_field(tag, buf, ctx, false)?;
+                    self.__wire_merge(tag, buf, ctx)?;
+                    if !self.__buffa_unknown_fields.is_empty() {
+                        #runtime::begin_owned(&mut #runtime::Adapter(self), ctx)?;
                     }
                 }
+            };
+            let active_owned_continuation = if !view
+                && !groups.values().any(|group| group & (1 << 31) != 0)
+            {
+                quote! {
+                    if self.__buffa_unknown_fields.active() {
+                        return #runtime::continue_owned_batch(&mut #runtime::Adapter(self), buf, ctx, limit);
+                    }
+                }
+            } else {
+                quote!()
             };
             // One exclusive borrow covers the whole loop: public fields cannot
             // change between its iterations. Reconcile edits at the first
@@ -762,6 +769,7 @@ fn transform(
                         }
                         let result = (|| {
                             while buf.remaining() > limit {
+                                #active_owned_continuation
                                 let tag = ::buffa::encoding::Tag::decode(buf)?;
                                 #batch_merge
                             }
@@ -865,6 +873,20 @@ fn transform(
                     }
                 }
             });
+            if !view && !groups.values().any(|group| group & (1 << 31) != 0) {
+                let mut batch_generics = item.generics.clone();
+                batch_generics
+                    .params
+                    .push(syn::parse_quote!(__WireBuf: ::buffa::bytes::Buf));
+                let (batch_impl_generics, _, batch_where_clause) = batch_generics.split_for_impl();
+                helpers.push(syn::parse_quote! {
+                    impl #batch_impl_generics #runtime::OwnedBatch<__WireBuf> for #runtime::Adapter<'_, #ty> #batch_where_clause {
+                        fn merge_batch_field(&mut self, tag: ::buffa::encoding::Tag, buf: &mut __WireBuf, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<(), ::buffa::DecodeError> {
+                            self.0.__wire_merge_field(tag, buf, ctx, false)
+                        }
+                    }
+                });
+            }
             helpers.push(if view {
                 syn::parse_quote! {
                     impl #impl_generics #runtime::ViewCodec<'a> for #runtime::Adapter<'_, #ty> #where_clause {
