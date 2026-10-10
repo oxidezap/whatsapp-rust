@@ -475,6 +475,15 @@ fn transform(
                 && name == if view { "HeaderView" } else { "Header" }
             {
                 quote!({
+                    // The descriptor/AST support guard rejects additional
+                    // tracked fields before an absent media projection can
+                    // skip the shared visitor's sizing and writing passes.
+                    if self.media.is_none()
+                        && <Self as crate::whatsapp::__wire_snapshot::Visitor>::supported(self)
+                    {
+                        if let Some(ctx) = ctx { ctx.register_element_memory(0)?; }
+                        return Ok(::buffa::alloc::vec::Vec::new());
+                    }
                     if let Some(bytes) = crate::whatsapp::__wire_snapshot::snapshot(self, ctx)? {
                         return Ok(bytes);
                     }

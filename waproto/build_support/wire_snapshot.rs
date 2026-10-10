@@ -211,6 +211,35 @@ mod tests {
     }
 
     #[test]
+    fn empty_projection_keeps_presence_and_exact_debits_for_owned_and_view() {
+        use crate::whatsapp::__wire_order::{Adapter, OwnedCodec, ViewCodec};
+        // Ordinary fields and root unknowns are outside the retained media
+        // projection. Empty present alternatives still pay for their tags.
+        for media in [&[][..], &[0x22, 0], &[0x32, 0], &[0x3a, 0]] {
+            let mut wire = vec![0x0a, 1, b't', 0xb8, 0x0c, 1];
+            wire.extend_from_slice(media);
+            let mut header = Header::decode_from_slice(&wire).unwrap();
+            let mut view = HeaderView::decode_view(&wire).unwrap();
+            let unknown = ::core::cell::Cell::new(0);
+            let allowance = ::core::cell::Cell::new(media.len());
+            let ctx = DecodeContext::new(0, &unknown).with_element_memory(&allowance);
+            assert_eq!(OwnedCodec::known(&Adapter(&mut header), ctx).unwrap(), media);
+            assert_eq!(allowance.get(), 0);
+            allowance.set(media.len());
+            assert_eq!(ViewCodec::known(&Adapter(&mut view), ctx).unwrap(), media);
+            assert_eq!(allowance.get(), 0);
+            if !media.is_empty() {
+                allowance.set(media.len() - 1);
+                assert!(OwnedCodec::known(&Adapter(&mut header), ctx).is_err());
+                assert_eq!(allowance.get(), media.len() - 1);
+                assert!(ViewCodec::known(&Adapter(&mut view), ctx).is_err());
+                assert_eq!(allowance.get(), media.len() - 1);
+            }
+            assert_eq!(unknown.get(), 0);
+        }
+    }
+
+    #[test]
     fn snapshot_unsupported_child_falls_back_without_budget_debit() {
         let mut header = nested(1, true);
         let Some(Media::ImageMessage(image)) = &mut header.media else { panic!("image"); };
