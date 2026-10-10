@@ -756,8 +756,19 @@ fn transform(
             // its growing repeated fields quadratically. Retain raw events
             // throughout the batch, including before an eventual decode error.
             // Direct single-field calls still check on every invocation.
-            // Keep each batch loop shared by decode entry points and nested
-            // merge adapters rather than expanding it into every caller.
+            // Keep batch loops shared except for the hot nested-message chain,
+            // where callers can fold the small control loop. Recursive field
+            // codecs stay outlined to contain generated code size.
+            let batch_attribute = if matches!(
+                (scope, name.as_str()),
+                ("message::interactive_message::", "Header")
+                    | ("message::", "ImageMessage")
+                    | ("", "ContextInfo")
+            ) {
+                quote!(#[inline])
+            } else {
+                quote!(#[inline(never)])
+            };
             item.items.push(if view {
                 syn::parse_quote! {
                     #[inline(never)]
@@ -783,7 +794,7 @@ fn transform(
                 }
             } else {
                 syn::parse_quote! {
-                    #[inline(never)]
+                    #batch_attribute
                     fn merge_to_limit(&mut self, buf: &mut impl ::buffa::bytes::Buf, ctx: ::buffa::DecodeContext<'_>, limit: usize) -> ::core::result::Result<(), ::buffa::DecodeError> {
                         if buf.remaining() <= limit { return Ok(()); }
                         if buf.remaining() > limit && self.__buffa_unknown_fields.active() {
