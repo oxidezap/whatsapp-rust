@@ -11,6 +11,40 @@ pub(crate) trait Visitor {
     fn field(&self, number: u32, index: usize) -> Option<ValueRef<'_>>;
 }
 
+// Only completed Known occurrences reach this predicate: the decoder has
+// already validated strings. Prove the guarded singular-field projection is
+// exactly the original writer's encoding, without visiting the receiver.
+pub(crate) fn canonical(raw: &[u8]) -> bool {
+    !raw.is_empty() && canonical_fields(0, raw)
+}
+
+fn canonical_fields(schema: usize, mut input: &[u8]) -> bool {
+    if input.len() > ::buffa::MAX_MESSAGE_BYTES as usize { return false; }
+    let mut previous = 0;
+    let mut count = 0;
+    while !input.is_empty() {
+        let start = input.len();
+        let Ok(tag) = ::buffa::encoding::decode_varint(&mut input) else { return false; };
+        if tag & 7 != 2 || start - input.len() != ::buffa::encoding::varint_len(tag) { return false; }
+        let Ok(number) = u32::try_from(tag >> 3) else { return false; };
+        if number <= previous { return false; }
+        let Some(field) = SCHEMA[schema].iter().find(|field| field.number == number) else { return false; };
+        let start = input.len();
+        let Ok(length) = ::buffa::encoding::decode_varint(&mut input) else { return false; };
+        if start - input.len() != ::buffa::encoding::varint_len(length) { return false; }
+        let Ok(length) = usize::try_from(length) else { return false; };
+        let Some(bytes) = input.get(..length) else { return false; };
+        if let Kind::Message(child) = field.kind
+            && !canonical_fields(usize::from(child), bytes) { return false; }
+        input = &input[length..];
+        previous = number;
+        count += 1;
+    }
+    // Header's supported fields are alternatives of one oneof. Descendants
+    // contain ordinary singular fields and can represent an empty message.
+    schema != 0 || count == 1
+}
+
 fn sizes(schema: usize, current: &dyn Visitor, plan: &mut [usize; 4]) -> Option<usize> {
     if !current.supported() { return None; }
     let mut total = 0usize;
@@ -91,16 +125,68 @@ mod tests {
                 let expected = header.encode_to_vec();
                 let view = HeaderView::decode_view(&expected).unwrap();
                 assert_eq!(snapshot(&header, None).unwrap().unwrap(), expected);
+                assert!(canonical(&expected));
                 assert_eq!(snapshot(&view, None).unwrap().unwrap(), expected);
             }
             let header = Header { media: Some(Media::JpegThumbnail(vec![42; length])), ..Default::default() };
             let expected = header.encode_to_vec();
             let view = HeaderView::decode_view(&expected).unwrap();
             assert_eq!(snapshot(&header, None).unwrap().unwrap(), expected);
+            assert!(canonical(&expected));
             assert_eq!(snapshot(&view, None).unwrap().unwrap(), expected);
         }
         assert_eq!(snapshot(&Header::default(), None).unwrap(), Some(Vec::new()));
         assert_eq!(snapshot(&HeaderView::decode_view(&[]).unwrap(), None).unwrap(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn canonical_projection_rejects_noncanonical_and_unsupported_occurrences() {
+        for raw in [
+            &[0xa2, 0x00, 0][..], // Overlong Header tag.
+            &[0x22, 0x80, 0][..], // Overlong empty image length.
+            &[0x22, 0, 0x32, 0][..], // Two media alternatives.
+            &[0x22, 4, 0x1a, 0, 0x1a, 0][..], // Duplicate caption.
+            &[0x22, 5, 0x82, 1, 0, 0x1a, 0][..], // Reordered image fields.
+            &[0x22, 2, 0x0a, 0][..], // Unsupported image URL.
+            &[0x22, 3, 0xb8, 0x0c, 1][..], // Future nested field.
+            &[0x22, 2, 0x1a][..], // Truncated image.
+            &[][..],
+        ] {
+            assert!(!canonical(raw), "unexpected canonical projection: {raw:?}");
+        }
+        assert!(canonical(&[0x22, 0])); // Present empty image.
+        assert!(canonical(&[0x22, 3, 0x8a, 1, 0])); // Present empty context.
+    }
+
+    #[test]
+    fn canonical_completion_keeps_public_edits_and_failed_batch_retry() {
+        let future = [0xc2, 0x3e, 4, 11, 22, 33, 44];
+        let known = nested(1, true).encode_to_vec();
+        let mut wire = future.to_vec();
+        wire.extend_from_slice(&known);
+        let mut header = Header::decode_from_slice(&wire).unwrap();
+        assert_eq!(header.encode_to_vec(), wire);
+        let mut edited = header.clone();
+        let Some(Media::ImageMessage(image)) = &mut edited.media else { panic!("image"); };
+        image.caption = Some("edited".into());
+        let mut reference = edited.clone();
+        reference.__buffa_unknown_fields.clear();
+        let mut expected = future.to_vec();
+        expected.extend(reference.encode_to_vec());
+        assert_eq!(edited.encode_to_vec(), expected);
+        assert_eq!(header.encode_to_vec(), wire);
+
+        header.media = None;
+        header.merge_from_slice(&known).unwrap();
+        assert_eq!(header.encode_to_vec(), wire);
+        let mut pending = Header::decode_from_slice(&future).unwrap();
+        let mut failed = known.clone();
+        failed.push(0x80);
+        assert!(pending.merge_from_slice(&failed).is_err());
+        assert_eq!(pending.encode_to_vec(), wire);
+        pending.merge_from_slice(&[0x22, 0]).unwrap();
+        wire.extend_from_slice(&[0x22, 0]);
+        assert_eq!(pending.encode_to_vec(), wire);
     }
 
     #[test]

@@ -16,7 +16,10 @@ pub(crate) struct Policy {
     pub(crate) groups: GroupMap,
     pub(crate) growth: fn(u32) -> usize,
     pub(crate) replay: Replay,
+    pub(crate) canonical: fn(&[u8]) -> bool,
 }
+
+pub(crate) fn no_canonical_projection(_: &[u8]) -> bool { false }
 
 // A field decoder can mutate its receiver before journal insertion. Prepay
 // insertion as well as finalization so an exhausted caller budget cannot erase
@@ -135,10 +138,12 @@ pub(crate) fn complete_owned_batch(codec: &mut dyn OwnedCodec, ctx: DecodeContex
     let reserved = ::core::cell::Cell::new(codec.storage().take_completion_credit());
     if !codec.storage().needs_baseline() { return Ok(()); }
     let ctx = ctx.with_element_memory(&reserved);
-    let known = codec.known(ctx)?;
     let policy = codec.policy();
-    let map = policy.groups;
-    codec.storage().complete_batch(known, map, ctx)
+    let known = match codec.storage().completed_canonical(policy.canonical, ctx)? {
+        Some(known) => known,
+        None => codec.known(ctx)?,
+    };
+    codec.storage().complete_batch(known, policy.groups, ctx)
 }
 
 #[cold]
@@ -248,10 +253,12 @@ pub(crate) fn complete_view_batch<'a>(codec: &mut dyn ViewCodec<'a>, ctx: Decode
     let reserved = ::core::cell::Cell::new(codec.storage().take_completion_credit());
     if !codec.storage().needs_baseline() { return Ok(()); }
     let ctx = ctx.with_element_memory(&reserved);
-    let known = codec.known(ctx)?;
     let policy = codec.policy();
-    let map = policy.groups;
-    codec.storage().complete_batch(known, map, ctx)
+    let known = match codec.storage().completed_canonical(policy.canonical, ctx)? {
+        Some(known) => known,
+        None => codec.known(ctx)?,
+    };
+    codec.storage().complete_batch(known, policy.groups, ctx)
 }
 
 #[cold]
@@ -479,6 +486,24 @@ fn value(values: &Projection, group: u32) -> &[u8] {
 }
 
 impl<'a> Order<'a> {
+    fn completed_canonical(&self, validate: fn(&[u8]) -> bool, ctx: DecodeContext<'_>) -> Result<Option<Vec<u8>>, DecodeError> {
+        if !self.baseline_pending || !self.baseline.is_empty() || !self.forced.is_empty() {
+            return Ok(None);
+        }
+        let mut known = self.events.iter().filter_map(|event| match event {
+            Event::Known(_, raw) => Some(raw.as_ref()),
+            Event::Unknown(_) => None,
+        });
+        let Some(raw) = known.next() else { return Ok(None); };
+        if known.next().is_some() || !validate(raw) { return Ok(None); }
+        // The successful batch held an exclusive receiver borrow. A single
+        // canonical occurrence starting from an empty projection is its exact
+        // final snapshot. Retain a concrete baseline for later public edits,
+        // with the same pre-allocation debit as the original snapshot path.
+        ctx.register_element_memory(raw.len())?;
+        Ok(Some(raw.to_vec()))
+    }
+
     // A failed nested decoder can mutate after the last completed record.
     // Reconstruct the expected pre-failure value from completed occurrences;
     // snapshotting the receiver would bless that unrecorded partial mutation.
@@ -932,6 +957,12 @@ impl Storage {
         }
         Ok(())
     }
+    fn completed_canonical(&self, validate: fn(&[u8]) -> bool, ctx: DecodeContext<'_>) -> Result<Option<Vec<u8>>, DecodeError> {
+        match self.0.as_ref().and_then(|state| state.order.as_ref()) {
+            Some(order) => order.completed_canonical(validate, ctx),
+            None => Ok(None),
+        }
+    }
     pub fn needs_baseline(&self) -> bool {
         self.0.as_ref().and_then(|state| state.order.as_ref()).is_some_and(|order| order.baseline_pending)
     }
@@ -1177,6 +1208,12 @@ impl<'a> ViewStorage<'a> {
         }
         Ok(())
     }
+    fn completed_canonical(&self, validate: fn(&[u8]) -> bool, ctx: DecodeContext<'_>) -> Result<Option<Vec<u8>>, DecodeError> {
+        match self.0.as_ref().and_then(|state| state.order.as_ref()) {
+            Some(order) => order.completed_canonical(validate, ctx),
+            None => Ok(None),
+        }
+    }
     pub fn needs_baseline(&self) -> bool {
         self.0.as_ref().and_then(|state| state.order.as_ref()).is_some_and(|order| order.baseline_pending)
     }
@@ -1255,5 +1292,43 @@ impl Buf for Capture<'_, '_> {
             self.inner.advance(len);
             count -= len;
         }
+    }
+}
+
+#[cfg(test)]
+mod canonical_completion_tests {
+    use super::*;
+
+    fn canonical_empty_image(raw: &[u8]) -> bool { raw == [0x22, 0] }
+
+    #[test]
+    fn completion_preserves_allocation_debit_and_requires_a_fresh_single_occurrence() {
+        let raw = [0x22, 0];
+        let order = Order {
+            events: ::buffa::alloc::vec![Event::Unknown(0), Event::Known(1, Cow::Borrowed(&raw))],
+            baseline_pending: true,
+            ..Default::default()
+        };
+        let unknown = ::core::cell::Cell::new(0);
+        for extra in [0, 1] {
+            let allowance = ::core::cell::Cell::new(raw.len() + extra);
+            let ctx = DecodeContext::new(0, &unknown).with_element_memory(&allowance);
+            assert_eq!(order.completed_canonical(canonical_empty_image, ctx).unwrap(), Some(raw.to_vec()));
+            assert_eq!(allowance.get(), extra);
+        }
+        let allowance = ::core::cell::Cell::new(raw.len() - 1);
+        let ctx = DecodeContext::new(0, &unknown).with_element_memory(&allowance);
+        assert!(matches!(order.completed_canonical(canonical_empty_image, ctx), Err(DecodeError::ElementMemoryLimitExceeded)));
+        assert_eq!(allowance.get(), raw.len() - 1);
+        let mut previous = order.clone();
+        previous.baseline.push((1, raw.to_vec()));
+        assert_eq!(previous.completed_canonical(canonical_empty_image, ctx).unwrap(), None);
+        previous = order.clone();
+        previous.events.push(Event::Known(1, Cow::Borrowed(&raw)));
+        assert_eq!(previous.completed_canonical(canonical_empty_image, ctx).unwrap(), None);
+        previous = order;
+        previous.forced.push(1);
+        assert_eq!(previous.completed_canonical(canonical_empty_image, ctx).unwrap(), None);
+        assert_eq!(unknown.get(), 0);
     }
 }
