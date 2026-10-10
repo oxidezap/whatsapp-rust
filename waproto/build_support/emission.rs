@@ -182,7 +182,7 @@ fn scalar_writer_type(name: &str) -> Option<&'static str> {
         "put_int32_field" | "put_sint32_field" | "put_sfixed32_field" => Some("i32"),
         "put_int64_field" | "put_sint64_field" | "put_sfixed64_field" => Some("i64"),
         "put_uint32_field" | "put_fixed32_field" => Some("u32"),
-        "put_uint64_field" | "put_fixed64_field" => Some("u64"),
+        "put_uint64_field" | "put_fixed64_field" | "put_len_delimited_header" => Some("u64"),
         "put_bool_field" => Some("bool"),
         "put_float_field" => Some("f32"),
         "put_double_field" => Some("f64"),
