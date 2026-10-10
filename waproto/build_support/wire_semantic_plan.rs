@@ -386,6 +386,43 @@ pub fn emit(messages: &[Message; 4], syntax: &syn::File) -> syn::File {
     syn::parse2(quote! {
         const SCHEMA: semantic::Schema = &[#(#schemas),*];
         #(#implementations)*
+        #[derive(Debug, PartialEq, Eq)]
+        struct ProjectionSize { encoded: usize, payload: usize }
+        // Canonical lengths for the bounded closure require neither an encoder
+        // nor a snapshot allocation. Admission must compare representations
+        // against the original reserves before choosing a backend.
+        fn projection_size(schema: u16, current: &dyn semantic::Visitor) -> Result<ProjectionSize, ::buffa::DecodeError> {
+            if !current.supported() { return Err(::buffa::DecodeError::InvalidWireType(3)); }
+            let mut result = ProjectionSize { encoded: 0, payload: 0 };
+            for field in SCHEMA[usize::from(schema)] {
+                let Some(value) = current.field(field.number, 0) else { continue; };
+                let (len, payload) = match (field.kind, value) {
+                    (semantic::Kind::Bytes, semantic::ValueRef::Bytes(bytes)) => (bytes.len(), bytes.len()),
+                    (semantic::Kind::Message(child), semantic::ValueRef::Child(value)) => {
+                        let nested = projection_size(child, value)?;
+                        (nested.encoded, nested.payload)
+                    }
+                    _ => return Err(::buffa::DecodeError::InvalidWireType(2)),
+                };
+                let header = ::buffa::encoding::varint_len((u64::from(field.number) << 3) | 2)
+                    + ::buffa::encoding::varint_len(len as u64);
+                result.encoded = result.encoded.checked_add(header).and_then(|size| size.checked_add(len)).ok_or(::buffa::DecodeError::MessageTooLarge)?;
+                result.payload = result.payload.checked_add(payload).ok_or(::buffa::DecodeError::MessageTooLarge)?;
+            }
+            Ok(result)
+        }
+        // Entry and event headers are identical in these two representations.
+        // The original activation pays one temporary encoding and two retained
+        // copies. The flat alternative needs a prefix, metadata and a prepaid
+        // canonical baseline for migration; all must fit that same envelope.
+        // The prefix must canonicalize in place, with its metadata space
+        // covering every wire header, rather than allocating another copy.
+        fn flat_activation_fits(size: &ProjectionSize, metadata: usize) -> bool {
+            if size.encoded.checked_sub(size.payload).is_none_or(|headers| headers > metadata) { return false; }
+            let legacy = size.encoded.checked_mul(3);
+            let flat = metadata.checked_mul(2).and_then(|cost| cost.checked_add(size.payload)).and_then(|cost| cost.checked_add(size.encoded));
+            match (legacy, flat) { (Some(legacy), Some(flat)) => flat <= legacy, _ => false }
+        }
         // Probe a captured known projection record before the typed decoder
         // mutates its owner. Rejection allocates nothing and debits no budget.
         fn can_stage_known(record: &[u8], ctx: ::buffa::DecodeContext<'_>) -> Result<bool, ::buffa::DecodeError> {

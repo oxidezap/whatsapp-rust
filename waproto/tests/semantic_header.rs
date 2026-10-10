@@ -1,4 +1,6 @@
 #![allow(clippy::disallowed_methods)]
+#[path = "../build_support/semantic_flat.rs"]
+mod flat;
 #[path = "fixtures/semantic_projection.rs"]
 pub mod semantic;
 use buffa::Message as _;
@@ -28,6 +30,9 @@ fn actual_header_projection_visits_nested_messages_without_encoding() {
     assert!(projection.matches(&header));
     header.title = None;
     assert_eq!(projection.encode(), header.encode_to_vec());
+    let size = projection_size(0, &header).unwrap();
+    assert_eq!(size.encoded, header.encode_to_vec().len());
+    assert!(flat_activation_fits(&size, 40));
 }
 #[test]
 fn actual_descendant_enum_unknown_and_recursion_select_fallback() {
@@ -134,4 +139,109 @@ fn a_supported_record_with_invalid_utf8_cannot_commit_its_staged_projection() {
         panic!("image");
     };
     assert_eq!(image.caption.as_deref(), Some(""));
+}
+
+#[test]
+fn activation_cost_probe_keeps_small_shapes_on_the_original_backend_without_debits() {
+    use wa::message::interactive_message::Header;
+    let unknown = std::cell::Cell::new(0);
+    let budget = std::cell::Cell::new(0);
+    let ctx = buffa::DecodeContext::new(100, &unknown).with_element_memory(&budget);
+    for wire in [
+        &[][..],
+        &[0x22, 0],
+        &[0x32, 0],
+        &[0x22, 5, 0x8a, 1, 2, 0x1a, 0],
+    ] {
+        let header = Header::decode_from_slice(wire).unwrap();
+        let size = projection_size(0, &header).unwrap();
+        assert_eq!(size.encoded, header.encode_to_vec().len());
+        assert!(!flat_activation_fits(&size, 40));
+        assert!(flat::Prefix::freeze(&header, ctx).is_err());
+    }
+    assert!(!flat_activation_fits(
+        &ProjectionSize {
+            encoded: usize::MAX,
+            payload: 0
+        },
+        40
+    ));
+    assert_eq!(unknown.get(), 0);
+    assert_eq!(budget.get(), 0);
+}
+
+#[test]
+fn frozen_prefix_canonicalizes_in_place_across_presence_and_length_boundaries() {
+    use wa::message::interactive_message::{Header, header::Media};
+    let unknown = std::cell::Cell::new(usize::MAX);
+    let ctx = buffa::DecodeContext::new(100, &unknown);
+    for len in [0, 1, 127, 128, 255, 16_383, 16_384] {
+        let mut quote = wa::Message::default();
+        quote.conversation = Some("q".repeat(len));
+        let mut context = wa::ContextInfo::default();
+        context.quoted_message = quote.into();
+        let mut image = wa::message::ImageMessage::default();
+        image.caption = Some("c".repeat(len));
+        image.jpeg_thumbnail = Some(vec![42; len]);
+        image.context_info = context.into();
+        let mut header = Header::default();
+        header.media = Some(Media::ImageMessage(Box::new(image)));
+        let prefix = flat::Prefix::freeze(&header, ctx).unwrap();
+        let address = prefix.allocation_address();
+        let capacity = prefix.capacity();
+        let wire = prefix.into_wire().unwrap();
+        assert_eq!(wire.as_ptr() as usize, address);
+        assert_eq!(wire.capacity(), capacity);
+        assert_eq!(wire, header.encode_to_vec());
+    }
+    for wire in [
+        &[][..],
+        &[0x22, 0],
+        &[0x32, 0],
+        &[0x22, 5, 0x8a, 1, 2, 0x1a, 0],
+    ] {
+        let header = Header::decode_from_slice(wire).unwrap();
+        assert_eq!(
+            flat::Prefix::freeze(&header, ctx)
+                .unwrap()
+                .into_wire()
+                .unwrap(),
+            wire
+        );
+    }
+}
+
+#[test]
+fn snapshotting_existing_fields_does_not_spend_the_incoming_recursion_allowance() {
+    use wa::message::interactive_message::Header;
+    let wire = [0x22, 8, 0x8a, 1, 5, 0x1a, 3, 0x0a, 1, b'q'];
+    let mut header = Header::decode_from_slice(&wire).unwrap();
+    let unknown = std::cell::Cell::new(100);
+    let ctx = buffa::DecodeContext::new(0, &unknown);
+    let future = [0xc2, 0x3e, 1, b'x'];
+    header.merge(&mut future.as_slice(), ctx).unwrap();
+    let prefix = flat::Prefix::freeze(&header, ctx).unwrap();
+    assert_eq!(prefix.into_wire().unwrap(), wire);
+    assert_eq!(projection_size(0, &header).unwrap().encoded, wire.len());
+}
+
+#[test]
+fn prefix_preparation_reserves_before_copying_and_conversion_needs_no_further_budget() {
+    use wa::message::interactive_message::Header;
+    let header = Header::decode_from_slice(&[0x32, 1, b'x']).unwrap();
+    let unknown = std::cell::Cell::new(0);
+    let short = std::cell::Cell::new(flat::METADATA);
+    let ctx = buffa::DecodeContext::new(0, &unknown).with_element_memory(&short);
+    assert!(matches!(
+        flat::Prefix::freeze(&header, ctx),
+        Err(buffa::DecodeError::ElementMemoryLimitExceeded)
+    ));
+    assert_eq!(short.get(), flat::METADATA);
+    let exact = std::cell::Cell::new(flat::METADATA + 1);
+    let ctx = ctx.with_element_memory(&exact);
+    let prefix = flat::Prefix::freeze(&header, ctx).unwrap();
+    assert_eq!(exact.get(), 0);
+    assert_eq!(prefix.into_wire().unwrap(), header.encode_to_vec());
+    assert_eq!(exact.get(), 0);
+    assert_eq!(unknown.get(), 0);
 }
