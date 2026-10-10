@@ -363,6 +363,32 @@ fn transform(
                     *statement = call;
                 }
             }
+            let mut shared_write = BTreeMap::new();
+            for statement in &mut write.block.stmts {
+                let probe = fields(statement);
+                if probe.choice
+                    && probe.fields.len() == 1
+                    && let Some(field) = probe.fields.first()
+                    && groups.contains_key(field)
+                {
+                    let method = format_ident!("__wire_write_{}", field.trim_start_matches("r#"));
+                    let original = statement.clone();
+                    helpers.push(syn::parse_quote! {
+                        impl #impl_generics #ty #where_clause {
+                            #[inline(never)]
+                            fn #method(&self, #write_cache: &mut ::buffa::SizeCache, #write_buf: &mut impl ::buffa::EncodeSink) {
+                                #[allow(unused_imports)]
+                                use ::buffa::{Message as _, MessageView as _, ViewEncode as _, Enumeration as _};
+                                #original
+                            }
+                        }
+                    });
+                    let call: syn::Stmt =
+                        syn::parse_quote!(self.#method(#write_cache, #write_buf););
+                    shared_write.insert(field.clone(), call.clone());
+                    *statement = call;
+                }
+            }
             for member in &mut item.items {
                 if let syn::ImplItem::Fn(f) = member {
                     let is_compute = f.sig.ident == "compute_size";
@@ -375,11 +401,13 @@ fn transform(
                     for statement in &mut f.block.stmts {
                         let probe = fields(statement);
                         if probe.fields.iter().any(|field| groups.contains_key(field)) {
-                            if is_compute
-                                && let Some(call) = probe
-                                    .fields
-                                    .iter()
-                                    .find_map(|field| shared_compute.get(field))
+                            let shared = if is_compute {
+                                &shared_compute
+                            } else {
+                                &shared_write
+                            };
+                            if let Some(call) =
+                                probe.fields.iter().find_map(|field| shared.get(field))
                             {
                                 *statement = syn::parse_quote!(if !__wire_active { #call });
                             } else if let syn::Stmt::Expr(syn::Expr::If(conditional), _) = statement
