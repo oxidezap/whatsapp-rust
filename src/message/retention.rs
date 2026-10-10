@@ -74,6 +74,9 @@ pub(super) fn merge_parts(items: &mut Vec<InboundMessage>, fresh: Vec<InboundMes
         *items = fresh;
         return;
     }
+    if fresh.is_empty() {
+        return;
+    }
     let mut prior = HashMap::<DispatchFingerprint, usize>::new();
     let mut scratch = Vec::new();
     for item in items.iter() {
