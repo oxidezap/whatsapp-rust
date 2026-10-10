@@ -237,6 +237,7 @@ mod tests {
 
     #[test]
     fn strict_typed_host_call_does_not_reacquire_the_guest_turn() {
+        let (_local, _cross_process) = crate::test_common::threaded_guard();
         use wasm_encoder::{
             CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
             ImportSection, Instruction, Module, TypeSection,
@@ -302,6 +303,7 @@ mod tests {
 
     #[test]
     fn clock_import_yields_to_a_waiting_thread() {
+        let (_local, _cross_process) = crate::test_common::threaded_guard();
         use std::sync::Arc;
         use wasm_encoder::{
             BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function,
