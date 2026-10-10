@@ -343,6 +343,21 @@ pub fn wire_api(fds: &FileDescriptorSet) -> std::collections::BTreeSet<String> {
                     "wire {path}.{} number={:?} type={:?} label={:?} target={:?} default={:?} oneof={oneof:?}",
                     field.name.as_deref().unwrap_or_default(), field.number, field.r#type, field.label, field.type_name, field.default_value,
                 ));
+                if field.label != Some(Label::LABEL_REPEATED) {
+                    let resolved =
+                        features::resolve_child(&message_features, features::field_features(field));
+                    let presence = if field.label == Some(Label::LABEL_REQUIRED) {
+                        features::FieldPresence::LegacyRequired
+                    } else if field.proto3_optional == Some(true) {
+                        features::FieldPresence::Explicit
+                    } else {
+                        resolved.field_presence
+                    };
+                    out.insert(format!(
+                        "field-presence {path}.{}={presence:?}",
+                        field.name.as_deref().unwrap_or_default(),
+                    ));
+                }
                 if matches!(field.r#type, Some(Type::TYPE_MESSAGE | Type::TYPE_GROUP)) {
                     let map_field = message.nested_type.iter().any(|nested| {
                         nested.options.as_option().and_then(|o| o.map_entry) == Some(true)
@@ -513,6 +528,71 @@ mod tests {
             ..Default::default()
         });
         fds
+    }
+
+    #[test]
+    fn field_presence_inventory_resolves_inheritance_and_overrides() {
+        use buffa_descriptor::generated::descriptor::feature_set::FieldPresence;
+
+        let entry = "field-presence .contract.Record.values=Explicit";
+        let mut fds = message_fixture("editions");
+        assert!(wire_api(&fds).contains(entry));
+        let expected = wire_api(&fds).into_iter().collect::<Vec<_>>().join("\n");
+        fds.file[0].options = buffa::MessageField::some(FileOptions {
+            features: buffa::MessageField::some(FeatureSet {
+                field_presence: Some(FieldPresence::LEGACY_REQUIRED),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(wire_api(&fds).contains("field-presence .contract.Record.values=LegacyRequired"));
+        super::super::emission::check_api(&expected, &wire_api(&fds)).expect_err(
+            "inherited required presence changes validation without changing the Rust field type",
+        );
+        fds.file[0].message_type[0].options = buffa::MessageField::some(MessageOptions {
+            features: buffa::MessageField::some(FeatureSet {
+                field_presence: Some(FieldPresence::EXPLICIT),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        super::super::emission::check_api(&expected, &wire_api(&fds))
+            .expect("message override restores equivalent effective presence");
+        fds.file[0].message_type[0].field[0]
+            .options
+            .as_option_mut()
+            .unwrap()
+            .features = buffa::MessageField::some(FeatureSet {
+            field_presence: Some(FieldPresence::LEGACY_REQUIRED),
+            ..Default::default()
+        });
+        super::super::emission::check_api(&expected, &wire_api(&fds))
+            .expect_err("field override takes precedence over message and file");
+        fds.file[0].message_type[0].field[0]
+            .options
+            .as_option_mut()
+            .unwrap()
+            .features = buffa::MessageField::default();
+        let mut record = fds.file[0].message_type.remove(0);
+        let parent_options = std::mem::take(&mut record.options);
+        fds.file[0].message_type.push(DescriptorProto {
+            name: Some("Parent".into()),
+            options: parent_options,
+            nested_type: vec![record],
+            ..Default::default()
+        });
+        assert!(wire_api(&fds).contains("field-presence .contract.Parent.Record.values=Explicit"));
+
+        let mut required = message_fixture("proto2");
+        required.file[0].message_type[0].field[0].label = Some(Label::LABEL_REQUIRED);
+        assert!(
+            wire_api(&required).contains("field-presence .contract.Record.values=LegacyRequired")
+        );
+        let mut optional = fixture("proto3", None);
+        optional.file[0].message_type[0].field[0].label = Some(Label::LABEL_OPTIONAL);
+        assert!(wire_api(&optional).contains("field-presence .contract.Record.values=Implicit"));
+        optional.file[0].message_type[0].field[0].proto3_optional = Some(true);
+        assert!(wire_api(&optional).contains(entry));
     }
 
     #[test]
