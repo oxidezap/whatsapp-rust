@@ -471,9 +471,8 @@ fn transform(
                 )
             };
             let projection = if header_snapshot
-                && !view
                 && scope == "message::interactive_message::"
-                && name == "Header"
+                && name == if view { "HeaderView" } else { "Header" }
             {
                 quote!({
                     if let Some(bytes) = crate::whatsapp::__wire_snapshot::snapshot(self, ctx)? {

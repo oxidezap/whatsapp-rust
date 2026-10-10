@@ -313,3 +313,59 @@ fn snapshot_schema_preserves_codec_order_when_descriptors_are_reordered() {
             .all(|item| matches!(item, syn::Item::Const(_) | syn::Item::Impl(_)))
     );
 }
+
+#[test]
+fn view_snapshot_rejects_a_future_lazy_container_before_field_access() {
+    let source = std::fs::read_to_string(concat!(env!("OUT_DIR"), "/whatsapp.__view.rs")).unwrap();
+    let mut syntax = syn::parse_file(&source).unwrap();
+    let original = semantic_plan::emit_view_snapshot(&semantic_plan::plan(&descriptors()), &syntax);
+    assert_eq!(original.items.len(), 4);
+    let context = syntax
+        .items
+        .iter_mut()
+        .find_map(|item| match item {
+            syn::Item::Struct(owner) if owner.ident == "ContextInfoView" => Some(owner),
+            _ => None,
+        })
+        .unwrap();
+    let quoted = context
+        .fields
+        .iter_mut()
+        .find(|field| {
+            field
+                .ident
+                .as_ref()
+                .is_some_and(|name| name == "quoted_message")
+        })
+        .unwrap();
+    quoted.ty = syn::parse_quote!(::buffa::LazyMessageFieldView<MessageView<'a>>);
+    let changed = semantic_plan::emit_view_snapshot(&semantic_plan::plan(&descriptors()), &syntax);
+    let context = changed
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Impl(owner)
+                if quote::quote!(#owner)
+                    .to_string()
+                    .contains("ContextInfoView") =>
+            {
+                Some(owner)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let supported = context
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::ImplItem::Fn(method) if method.sig.ident == "supported" => Some(&method.block),
+            _ => None,
+        })
+        .unwrap();
+    assert!(quote::quote!(#supported).to_string().contains("false"));
+    assert!(
+        !quote::quote!(#context)
+            .to_string()
+            .contains("quoted_message . as_option")
+    );
+}

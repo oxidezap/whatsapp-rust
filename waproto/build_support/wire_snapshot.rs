@@ -63,9 +63,9 @@ pub(crate) fn snapshot(current: &dyn Visitor, ctx: Option<DecodeContext<'_>>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ::buffa::Message as _;
+    use ::buffa::{Message as _, MessageView as _};
     use crate::whatsapp as wa;
-    use wa::message::interactive_message::{Header, header::Media};
+    use wa::message::interactive_message::{Header, HeaderView, header::Media};
     use ::buffa::alloc::{vec, string::String};
 
     fn nested(length: usize, present: bool) -> Header {
@@ -88,29 +88,39 @@ mod tests {
         for length in [0, 1, 127, 128, 255, 16_383, 16_384] {
             for present in [false, true] {
                 let header = nested(length, present);
-                assert_eq!(snapshot(&header, None).unwrap().unwrap(), header.encode_to_vec());
+                let expected = header.encode_to_vec();
+                let view = HeaderView::decode_view(&expected).unwrap();
+                assert_eq!(snapshot(&header, None).unwrap().unwrap(), expected);
+                assert_eq!(snapshot(&view, None).unwrap().unwrap(), expected);
             }
             let header = Header { media: Some(Media::JpegThumbnail(vec![42; length])), ..Default::default() };
-            assert_eq!(snapshot(&header, None).unwrap().unwrap(), header.encode_to_vec());
+            let expected = header.encode_to_vec();
+            let view = HeaderView::decode_view(&expected).unwrap();
+            assert_eq!(snapshot(&header, None).unwrap().unwrap(), expected);
+            assert_eq!(snapshot(&view, None).unwrap().unwrap(), expected);
         }
         assert_eq!(snapshot(&Header::default(), None).unwrap(), Some(Vec::new()));
+        assert_eq!(snapshot(&HeaderView::decode_view(&[]).unwrap(), None).unwrap(), Some(Vec::new()));
     }
 
     #[test]
     fn snapshot_preserves_exact_wire_allocation_debit_without_incoming_depth() {
         let header = nested(128, true);
         let expected = header.encode_to_vec();
+        let view = HeaderView::decode_view(&expected).unwrap();
         let unknown = ::core::cell::Cell::new(0);
-        for extra in [0, 1] {
-            let allowance = ::core::cell::Cell::new(expected.len() + extra);
+        for current in [&header as &dyn Visitor, &view as &dyn Visitor] {
+            for extra in [0, 1] {
+                let allowance = ::core::cell::Cell::new(expected.len() + extra);
+                let ctx = DecodeContext::new(0, &unknown).with_element_memory(&allowance);
+                assert_eq!(snapshot(current, Some(ctx)).unwrap().unwrap(), expected);
+                assert_eq!(allowance.get(), extra);
+            }
+            let allowance = ::core::cell::Cell::new(expected.len() - 1);
             let ctx = DecodeContext::new(0, &unknown).with_element_memory(&allowance);
-            assert_eq!(snapshot(&header, Some(ctx)).unwrap().unwrap(), expected);
-            assert_eq!(allowance.get(), extra);
+            assert!(matches!(snapshot(current, Some(ctx)), Err(DecodeError::ElementMemoryLimitExceeded)));
+            assert_eq!(allowance.get(), expected.len() - 1);
         }
-        let allowance = ::core::cell::Cell::new(expected.len() - 1);
-        let ctx = DecodeContext::new(0, &unknown).with_element_memory(&allowance);
-        assert!(matches!(snapshot(&header, Some(ctx)), Err(DecodeError::ElementMemoryLimitExceeded)));
-        assert_eq!(allowance.get(), expected.len() - 1);
         assert_eq!(unknown.get(), 0);
     }
 
@@ -123,6 +133,9 @@ mod tests {
         let unknown = ::core::cell::Cell::new(0);
         let ctx = DecodeContext::new(0, &unknown).with_element_memory(&allowance);
         assert!(snapshot(&header, Some(ctx)).unwrap().is_none());
+        let encoded = header.encode_to_vec();
+        let view = HeaderView::decode_view(&encoded).unwrap();
+        assert!(snapshot(&view, Some(ctx)).unwrap().is_none());
         assert_eq!(allowance.get(), 0);
         assert_eq!(unknown.get(), 0);
     }
@@ -136,11 +149,17 @@ mod tests {
         let mut reference = header.clone();
         reference.__buffa_unknown_fields.clear();
         reference.title = None;
+        let mut view = HeaderView::decode_view(&wire).unwrap();
+        view.title = Some("outside selected projection");
         assert_eq!(snapshot(&header, None).unwrap().unwrap(), reference.encode_to_vec());
+        assert_eq!(snapshot(&view, None).unwrap().unwrap(), reference.encode_to_vec());
         for child in [&[0xb8, 0x0c, 1][..], &[0xf8, 1, 99][..]] {
             let image = wa::message::ImageMessage::decode_from_slice(child).unwrap();
             let header = Header { media: Some(Media::ImageMessage(Box::new(image))), ..Default::default() };
             assert!(snapshot(&header, None).unwrap().is_none());
+            let encoded = header.encode_to_vec();
+            let view = HeaderView::decode_view(&encoded).unwrap();
+            assert!(snapshot(&view, None).unwrap().is_none());
         }
     }
 }

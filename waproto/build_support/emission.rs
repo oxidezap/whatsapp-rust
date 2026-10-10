@@ -446,7 +446,14 @@ pub fn finish(
         }
 
         if suffix == ".__view" {
-            ordering::apply(&mut file, true, &growth, false);
+            ordering::apply(&mut file, true, &growth, package == "whatsapp");
+            if package == "whatsapp" {
+                let visitors =
+                    wire_semantic_plan::emit_view_snapshot(&wire_semantic_plan::plan(fds), &file);
+                let implementations = visitors.items;
+                file.items
+                    .push(syn::parse_quote!(mod __snapshot_visitors { #(#implementations)* }));
+            }
         }
 
         if serde {

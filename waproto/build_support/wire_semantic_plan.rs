@@ -149,6 +149,10 @@ pub fn plan(fds: &FileDescriptorSet) -> [Message; 4] {
 // This output is compiled by the real-type qualification fixture first. It
 // does not become a decode backend merely because its visitors compile.
 pub fn emit(messages: &[Message; 4], syntax: &syn::File) -> syn::File {
+    emit_owners(messages, syntax, false)
+}
+
+fn emit_owners(messages: &[Message; 4], syntax: &syn::File, view: bool) -> syn::File {
     fn collect<'a>(
         items: &'a [syn::Item],
         scope: &str,
@@ -187,10 +191,25 @@ pub fn emit(messages: &[Message; 4], syntax: &syn::File) -> syn::File {
     let mut schemas = Vec::new();
     let mut probes = Vec::new();
     for (index, message) in messages.iter().enumerate() {
-        let name = rust_name(&message.name);
+        let base_name = rust_name(&message.name);
+        let name = if view {
+            format!("{base_name}View")
+        } else {
+            base_name
+        };
         let owner = owners[&name];
+        let namespace = if view { "__buffa::view::" } else { "" };
+        let lifetime = if view { "<'_>" } else { "" };
         let path: syn::Path =
-            syn::parse_str(&format!("::waproto::whatsapp::{name}")).expect("owner path");
+            syn::parse_str(&format!("::waproto::whatsapp::{namespace}{name}{lifetime}"))
+                .expect("owner path");
+        let oneof_namespace = if view { "__buffa::view::oneof::" } else { "" };
+        let owner_name = owner.ident.to_string();
+        let owner_name = if view {
+            owner_name.strip_suffix("View").expect("view name")
+        } else {
+            &owner_name
+        };
         let parent = name.rsplit_once("::").map_or("", |(parent, _)| parent);
         let mut guards = Vec::new();
         let mut cases = Vec::new();
@@ -261,10 +280,10 @@ pub fn emit(messages: &[Message; 4], syntax: &syn::File) -> syn::File {
                             .to_upper_camel_case()
                     );
                     let enum_path: syn::Path = syn::parse_str(&format!(
-                        "::waproto::whatsapp::{}{}{}::{oneof}",
+                        "::waproto::whatsapp::{oneof_namespace}{}{}{}::{oneof}",
                         parent,
                         if parent.is_empty() { "" } else { "::" },
-                        owner.ident.to_string().to_snake_case()
+                        owner_name.to_snake_case()
                     ))
                     .expect("oneof path");
                     let alternatives: Vec<_> = same_group
@@ -287,15 +306,39 @@ pub fn emit(messages: &[Message; 4], syntax: &syn::File) -> syn::File {
                     let last = &ty.path.segments.last().expect("member type").ident;
                     guards.push(if last == "Option" {
                         quote!(self.#access.is_none())
-                    } else if last == "MessageField" {
+                    } else if last == "MessageField" || (view && last == "MessageFieldView") {
                         quote!(self.#access.is_unset())
-                    } else if last == "Vec" || last == "HashMap" || last == "BTreeMap" {
+                    } else if last == "Vec"
+                        || last == "HashMap"
+                        || last == "BTreeMap"
+                        || (view && last == "RepeatedView")
+                    {
                         quote!(self.#access.is_empty())
                     } else {
                         quote!(false)
                     });
                 }
                 continue;
+            }
+            // Borrowing an eager view is allocation-free. A future lazy or
+            // custom container must fall back before accessing its contents.
+            if view {
+                let eager = if let syn::Type::Path(ty) = &ast.ty {
+                    ty.path.segments.last().is_some_and(|part| {
+                        part.ident
+                            == if field.oneof.is_some() || field.mode == FieldMode::Bytes {
+                                "Option"
+                            } else {
+                                "MessageFieldView"
+                            }
+                    })
+                } else {
+                    false
+                };
+                if !eager {
+                    guards.push(quote!(false));
+                    continue;
+                }
             }
             let value = if field.oneof.is_some() {
                 let oneof = format_ident!(
@@ -307,10 +350,10 @@ pub fn emit(messages: &[Message; 4], syntax: &syn::File) -> syn::File {
                         .to_upper_camel_case()
                 );
                 let enum_path: syn::Path = syn::parse_str(&format!(
-                    "::waproto::whatsapp::{}{}{}::{oneof}",
+                    "::waproto::whatsapp::{oneof_namespace}{}{}{}::{oneof}",
                     parent,
                     if parent.is_empty() { "" } else { "::" },
-                    owner.ident.to_string().to_snake_case()
+                    owner_name.to_snake_case()
                 ))
                 .expect("oneof path");
                 let variant = format_ident!("{}", field.name.to_upper_camel_case());
@@ -319,6 +362,7 @@ pub fn emit(messages: &[Message; 4], syntax: &syn::File) -> syn::File {
                         quote!(semantic::ValueRef::Child(value.as_ref()))
                     }
                     _ if field.string => quote!(semantic::ValueRef::Bytes(value.as_bytes())),
+                    _ if view => quote!(semantic::ValueRef::Bytes(value)),
                     _ => quote!(semantic::ValueRef::Bytes(value.as_ref())),
                 };
                 quote!(match self.#access.as_ref() { Some(#enum_path::#variant(value)) => Some(#value), _ => None })
@@ -327,6 +371,10 @@ pub fn emit(messages: &[Message; 4], syntax: &syn::File) -> syn::File {
                     FieldMode::Message(_) => {
                         quote!(self.#access.as_option().map(|value| semantic::ValueRef::Child(value)))
                     }
+                    _ if field.string && view => {
+                        quote!(self.#access.map(|value| semantic::ValueRef::Bytes(value.as_bytes())))
+                    }
+                    _ if view => quote!(self.#access.map(semantic::ValueRef::Bytes)),
                     _ if field.string => {
                         quote!(self.#access.as_deref().map(|value| semantic::ValueRef::Bytes(value.as_bytes())))
                     }
@@ -479,4 +527,15 @@ pub fn emit_snapshot(messages: &[Message; 4], syntax: &syn::File) -> syn::File {
     syn::visit_mut::VisitMut::visit_file_mut(&mut Snapshot, &mut file);
     let source = prettyplease::unparse(&file).replace("::waproto::whatsapp::", "crate::whatsapp::");
     syn::parse_file(&source).expect("snapshot visitor syntax")
+}
+
+// Views share the owned schema and snapshot runtime, but guard their actual
+// container types so later lazy codegen cannot allocate during support checks.
+pub fn emit_view_snapshot(messages: &[Message; 4], syntax: &syn::File) -> syn::File {
+    let mut file = emit_owners(messages, syntax, true);
+    file.items.retain(|item| matches!(item, syn::Item::Impl(_)));
+    let source = prettyplease::unparse(&file)
+        .replace("::waproto::whatsapp::", "crate::whatsapp::")
+        .replace("semantic::", "crate::whatsapp::__wire_snapshot::");
+    syn::parse_file(&source).expect("view snapshot visitor syntax")
 }
