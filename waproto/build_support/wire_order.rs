@@ -105,7 +105,7 @@ pub(crate) fn complete_owned_batch(codec: &mut dyn OwnedCodec, ctx: DecodeContex
     let ctx = ctx.with_element_memory(&reserved);
     let known = codec.known(ctx)?;
     let map = codec.groups();
-    codec.storage().complete_batch(&known, map, ctx)
+    codec.storage().complete_batch(known, map, ctx)
 }
 
 #[cold]
@@ -211,7 +211,7 @@ pub(crate) fn complete_view_batch<'a>(codec: &mut dyn ViewCodec<'a>, ctx: Decode
     let ctx = ctx.with_element_memory(&reserved);
     let known = codec.known(ctx)?;
     let map = codec.groups();
-    codec.storage().complete_batch(&known, map, ctx)
+    codec.storage().complete_batch(known, map, ctx)
 }
 
 #[cold]
@@ -360,6 +360,23 @@ fn projection(known: &[u8], map: GroupMap) -> Projection {
         canonical_record(group, raw, |bytes| result[index].1.extend_from_slice(bytes));
     }
     result
+}
+
+fn owned_projection(known: Vec<u8>, map: GroupMap) -> Projection {
+    let singular_group = {
+        let mut fields = records(&known);
+        fields.next().and_then(|(tag, _)| {
+            let group = map(tag);
+            (group != 0 && group & (1 << 31) == 0 && fields.next().is_none())
+                .then_some(group)
+        })
+    };
+    if let Some(group) = singular_group {
+        // A single singular record is already canonical. Keep the completed
+        // snapshot allocation instead of copying its entire nested payload.
+        return ::buffa::alloc::vec![(group, known)];
+    }
+    projection(&known, map)
 }
 
 // A repeated enum baseline uses canonical unpacked records regardless of its
@@ -827,10 +844,10 @@ impl Storage {
     }
     #[cold]
     #[inline(never)]
-    pub fn complete_batch(&mut self, known: &[u8], map: GroupMap, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+    pub fn complete_batch(&mut self, known: Vec<u8>, map: GroupMap, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
         if let Some(order) = self.0.as_mut().and_then(|state| state.order.as_mut()) {
-            ctx.register_element_memory(projection_charge(known, map, 1))?;
-            order.baseline = projection(known, map);
+            ctx.register_element_memory(projection_charge(&known, map, 1))?;
+            order.baseline = owned_projection(known, map);
             order.baseline_pending = false;
         }
         Ok(())
@@ -1065,10 +1082,10 @@ impl<'a> ViewStorage<'a> {
     }
     #[cold]
     #[inline(never)]
-    pub fn complete_batch(&mut self, known: &[u8], map: GroupMap, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+    pub fn complete_batch(&mut self, known: Vec<u8>, map: GroupMap, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
         if let Some(order) = self.0.as_mut().and_then(|state| state.order.as_mut()) {
-            ctx.register_element_memory(projection_charge(known, map, 1))?;
-            order.baseline = projection(known, map);
+            ctx.register_element_memory(projection_charge(&known, map, 1))?;
+            order.baseline = owned_projection(known, map);
             order.baseline_pending = false;
         }
         Ok(())
