@@ -694,8 +694,11 @@ fn transform(
             // its growing repeated fields quadratically. Retain raw events
             // throughout the batch, including before an eventual decode error.
             // Direct single-field calls still check on every invocation.
+            // Keep each batch loop shared by decode entry points and nested
+            // merge adapters rather than expanding it into every caller.
             item.items.push(if view {
                 syn::parse_quote! {
+                    #[inline(never)]
                     fn merge_into_view(&mut self, buf: &'a [u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<(), ::buffa::DecodeError> {
                         let mut cur = buf;
                         if cur.is_empty() { return Ok(()); }
@@ -718,6 +721,7 @@ fn transform(
                 }
             } else {
                 syn::parse_quote! {
+                    #[inline(never)]
                     fn merge_to_limit(&mut self, buf: &mut impl ::buffa::bytes::Buf, ctx: ::buffa::DecodeContext<'_>, limit: usize) -> ::core::result::Result<(), ::buffa::DecodeError> {
                         if buf.remaining() <= limit { return Ok(()); }
                         if buf.remaining() > limit && self.__buffa_unknown_fields.active() {
