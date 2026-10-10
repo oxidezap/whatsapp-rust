@@ -116,7 +116,7 @@ pub(crate) fn begin_owned(
     let known = codec.known(ctx)?;
     let policy = codec.policy();
     let map = policy.groups;
-    codec.storage().begin(&known, map, ctx)
+    codec.storage().begin_snapshot(known, map, ctx)
 }
 
 #[cold]
@@ -226,7 +226,7 @@ pub(crate) fn begin_view<'a>(
     let known = codec.known(ctx)?;
     let policy = codec.policy();
     let map = policy.groups;
-    codec.storage().begin(&known, map, ctx)
+    codec.storage().begin_snapshot(known, map, ctx)
 }
 
 #[cold]
@@ -485,16 +485,29 @@ fn projection(known: &[u8], map: GroupMap) -> Projection {
     result
 }
 
-fn owned_projection(known: Vec<u8>, map: GroupMap) -> Projection {
-    let singular_group = {
-        let mut fields = records(&known);
-        fields.next().and_then(|(tag, _)| {
-            let group = map(tag);
-            (group != 0 && group & (1 << 31) == 0 && fields.next().is_none())
-                .then_some(group)
-        })
+// A completed snapshot is already encoded by the current writer. One singular
+// record is its whole projection, even when descendants retain unknown data.
+fn snapshot_group(known: &[u8], map: GroupMap) -> Option<u32> {
+    let mut fields = records(known);
+    fields.next().and_then(|(tag, _)| {
+        let group = map(tag);
+        (group != 0 && group & (1 << 31) == 0 && fields.next().is_none()).then_some(group)
+    })
+}
+
+fn begin_charge(known: &[u8], map: GroupMap, count: usize) -> usize {
+    let projection = if snapshot_group(known, map).is_some() {
+        known.len().saturating_mul(2).saturating_add(
+            ::core::mem::size_of::<(u32, Vec<u8>)>() + ::core::mem::size_of::<Event<'_>>(),
+        )
+    } else {
+        projection_charge(known, map, 2)
     };
-    if let Some(group) = singular_group {
+    projection.saturating_add(event_charge(count))
+}
+
+fn owned_projection(known: Vec<u8>, map: GroupMap) -> Projection {
+    if let Some(group) = snapshot_group(&known, map) {
         // A single singular record is already canonical. Keep the completed
         // snapshot allocation instead of copying its entire nested payload.
         return ::buffa::alloc::vec![(group, known)];
@@ -671,6 +684,23 @@ impl<'a> Order<'a> {
             offset == baseline.len()
         })
     }
+    fn begin_snapshot(known: Vec<u8>, map: GroupMap, count: usize) -> Self {
+        let Some(group) = snapshot_group(&known, map) else { return Self::begin(&known, map, count); };
+        // The snapshot allocation becomes the immutable event. The original
+        // two-copy projection debit still prepays promotion before mutation.
+        let mut events = Vec::new();
+        events.push(Event::Known(group, Cow::Owned(known)));
+        events.extend((0..count).map(Event::Unknown));
+        Self {
+            events,
+            baseline: Baseline::Event(0),
+            forced: Vec::new(),
+            unknown_count: count,
+            baseline_pending: false,
+            completion_credit: 0,
+        }
+    }
+
     fn begin(known: &[u8], map: GroupMap, count: usize) -> Self {
         let baseline = projection(known, map);
         let mut events = Vec::new();
@@ -981,6 +1011,14 @@ impl Storage {
     }
     #[cold]
     #[inline(never)]
+    fn begin_snapshot(&mut self, known: Vec<u8>, map: GroupMap, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+        ctx.register_element_memory(begin_charge(&known, map, self.len()))?;
+        let state = self.0.get_or_insert_with(Box::default);
+        state.order = Some(Order::begin_snapshot(known, map, state.fields.len()));
+        Ok(())
+    }
+    #[cold]
+    #[inline(never)]
     pub fn reconcile(
         &mut self,
         known: &[u8],
@@ -1228,6 +1266,14 @@ impl<'a> ViewStorage<'a> {
     }
     #[cold]
     #[inline(never)]
+    fn begin_snapshot(&mut self, known: Vec<u8>, map: GroupMap, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+        ctx.register_element_memory(begin_charge(&known, map, self.len()))?;
+        let state = self.0.get_or_insert_with(Box::default);
+        state.order = Some(Order::begin_snapshot(known, map, state.count));
+        Ok(())
+    }
+    #[cold]
+    #[inline(never)]
     pub fn reconcile(
         &mut self,
         known: &[u8],
@@ -1439,6 +1485,68 @@ mod canonical_completion_tests {
         let mut state = std::collections::hash_map::DefaultHasher::new();
         order.hash(&mut state);
         state.finish()
+    }
+
+    #[test]
+    fn snapshot_begin_reuses_the_allocation_and_keeps_logical_order_after_edits() {
+        let raw = ::buffa::alloc::vec![0x22, 0];
+        let pointer = raw.as_ptr();
+        let mut legacy = Order::begin(&raw, image_group, 1);
+        let mut retained = Order::begin_snapshot(raw, image_group, 1);
+        assert!(matches!(retained.baseline, Baseline::Event(0)));
+        assert_eq!(retained.baseline.view(&retained.events).value(1).as_ptr(), pointer);
+        assert!(retained == legacy);
+        assert_eq!(hash(&retained), hash(&legacy));
+        let unknown = [0xc2, 0x3e, 0];
+        assert_eq!(retained.write(&[0x22, 0], &unknown, image_group, replay), [0x22, 0, 0xc2, 0x3e, 0]);
+        let allowance = ::core::cell::Cell::new(0);
+        let ctx = DecodeContext::new(0, &allowance);
+        for known in [&[0x22, 2, 0x1a, 0][..], &[][..]] {
+            retained.reconcile(known, image_group, replay, ctx).unwrap();
+            legacy.reconcile(known, image_group, replay, ctx).unwrap();
+            assert!(retained == legacy);
+            assert_eq!(retained.write(known, &unknown, image_group, replay), legacy.write(known, &unknown, image_group, replay));
+        }
+        for (known, map) in [(&[][..], image_group as GroupMap), (&[0x22, 0, 0x22, 0][..], image_group), (&[0x0a, 0][..], image_group), (&[0x22, 0][..], (|_| 1 << 31 | 1) as GroupMap)] {
+            let retained = Order::begin_snapshot(known.to_vec(), map, 1);
+            let legacy = Order::begin(known, map, 1);
+            assert!(matches!(retained.baseline, Baseline::Projection(_)));
+            assert!(retained == legacy);
+        }
+    }
+
+    #[test]
+    fn snapshot_begin_preserves_the_original_debit_and_failure_state_for_owned_and_view() {
+        let raw = [0x22, 0];
+        let charge = projection_charge(&raw, image_group, 2);
+        let unknown = ::core::cell::Cell::new(0);
+        for extra in [0, 1] {
+            let mut owned = Storage::default();
+            let allowance = ::core::cell::Cell::new(charge + extra);
+            owned.begin_snapshot(raw.to_vec(), image_group, DecodeContext::new(0, &unknown).with_element_memory(&allowance)).unwrap();
+            assert_eq!(allowance.get(), extra);
+            assert!(matches!(owned.0.as_ref().unwrap().order.as_ref().unwrap().baseline, Baseline::Event(0)));
+            let mut view = ViewStorage::default();
+            let allowance = ::core::cell::Cell::new(charge + extra);
+            view.begin_snapshot(raw.to_vec(), image_group, DecodeContext::new(0, &unknown).with_element_memory(&allowance)).unwrap();
+            assert_eq!(allowance.get(), extra);
+            assert!(matches!(view.0.as_ref().unwrap().order.as_ref().unwrap().baseline, Baseline::Event(0)));
+        }
+        let allowance = ::core::cell::Cell::new(charge - 1);
+        let ctx = DecodeContext::new(0, &unknown).with_element_memory(&allowance);
+        let mut owned = Storage::default();
+        assert!(matches!(owned.begin_snapshot(raw.to_vec(), image_group, ctx), Err(DecodeError::ElementMemoryLimitExceeded)));
+        assert!(owned.0.is_none());
+        assert_eq!(allowance.get(), charge - 1);
+        let mut view = ViewStorage::default();
+        assert!(matches!(view.begin_snapshot(raw.to_vec(), image_group, ctx), Err(DecodeError::ElementMemoryLimitExceeded)));
+        assert!(view.0.is_none());
+        assert_eq!(allowance.get(), charge - 1);
+        for count in [0, 1, 3] {
+            for known in [&raw[..], &[][..], &[0x22, 0, 0x22, 0][..]] {
+                assert_eq!(begin_charge(known, image_group, count), projection_charge(known, image_group, 2).saturating_add(event_charge(count)));
+            }
+        }
     }
 
     #[test]
