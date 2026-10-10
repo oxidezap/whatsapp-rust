@@ -165,7 +165,7 @@ impl VisitMut for SharedScalarWriters {
             return;
         }
         let name = &parts[2];
-        if scalar_writer_type(name).is_none() {
+        if scalar_writer_type(name).is_none() && name != "put_shared_bytes_field" {
             return;
         }
         self.helpers.insert(name.clone());
@@ -199,6 +199,14 @@ fn share_scalar_writers(file: &mut syn::File) {
         .iter()
         .map(|name| {
             let name: syn::Ident = syn::parse_str(name).expect("scalar writer name");
+            if name == "put_shared_bytes_field" {
+                return syn::parse_quote! {
+                    #[inline(never)]
+                    pub(super) fn put_shared_bytes_field<B: ::buffa::types::AsSharedBytes, S: ::buffa::EncodeSink>(number: u32, value: &B, sink: &mut S) {
+                        ::buffa::types::put_shared_bytes_field(number, value, sink);
+                    }
+                };
+            }
             let ty: syn::Type =
                 syn::parse_str(scalar_writer_type(&name.to_string()).expect("selected writer"))
                     .expect("scalar writer type");
@@ -211,8 +219,15 @@ fn share_scalar_writers(file: &mut syn::File) {
         })
         .collect();
     if !helpers.is_empty() {
+        let tests = if writer.helpers.contains("put_shared_bytes_field") {
+            syn::parse_file(include_str!("field_writer_tests.rs"))
+                .expect("field writer tests")
+                .items
+        } else {
+            Vec::new()
+        };
         file.items
-            .push(syn::parse_quote!(mod __scalar_writers { #(#helpers)* }));
+            .push(syn::parse_quote!(mod __scalar_writers { #(#helpers)* #(#tests)* }));
     }
 }
 
