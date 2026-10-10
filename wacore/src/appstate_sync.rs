@@ -166,10 +166,11 @@ pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<IndexMa
     if mutations.len() <= MAC_DEDUP_SCAN_LIMIT {
         let mut out: Vec<IndexMac> = Vec::with_capacity(mutations.len());
         for m in mutations {
-            if let Some(mac) = mutation_index_mac_array(m)
-                && !out.contains(&mac)
+            if let Some(mac) =
+                mutation_index_mac(m).and_then(|bytes| <&IndexMac>::try_from(bytes).ok())
+                && !out.contains(mac)
             {
-                out.push(mac);
+                out.push(*mac);
             }
         }
         return out;
