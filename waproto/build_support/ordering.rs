@@ -113,8 +113,13 @@ impl VisitMut for PushViewDecoded {
     }
 }
 
-pub fn apply(file: &mut syn::File, view: bool, growth: &super::wire_growth::Bounds) {
-    transform(&mut file.items, view, 0, "", growth);
+pub fn apply(
+    file: &mut syn::File,
+    view: bool,
+    growth: &super::wire_growth::Bounds,
+    header_snapshot: bool,
+) {
+    transform(&mut file.items, view, 0, "", growth, header_snapshot);
 }
 
 fn transform(
@@ -123,6 +128,7 @@ fn transform(
     depth: usize,
     scope: &str,
     growth: &super::wire_growth::Bounds,
+    header_snapshot: bool,
 ) {
     for item in items.iter_mut() {
         if let syn::Item::Mod(module) = item
@@ -135,6 +141,7 @@ fn transform(
                 depth + 1,
                 &format!("{scope}{}::", name.trim_start_matches("r#")),
                 growth,
+                header_snapshot,
             );
         }
     }
@@ -462,6 +469,20 @@ fn transform(
                         Ok(bytes)
                     }),
                 )
+            };
+            let projection = if header_snapshot
+                && !view
+                && scope == "message::interactive_message::"
+                && name == "Header"
+            {
+                quote!({
+                    if let Some(bytes) = crate::whatsapp::__wire_snapshot::snapshot(self, ctx)? {
+                        return Ok(bytes);
+                    }
+                    #projection
+                })
+            } else {
+                projection
             };
             let owner = if view {
                 name.strip_suffix("View").expect("view suffix")

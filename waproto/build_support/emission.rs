@@ -323,9 +323,16 @@ pub fn finish(
         if serde {
             share_codecs(&mut file.items);
             ColdStorage { depth: 0 }.visit_file_mut(&mut file);
-            ordering::apply(&mut file, false, &growth);
+            ordering::apply(&mut file, false, &growth, package == "whatsapp");
             if package == "whatsapp" {
                 let visitors = wire_semantic_plan::emit(&wire_semantic_plan::plan(fds), &file);
+                let mut snapshot =
+                    wire_semantic_plan::emit_snapshot(&wire_semantic_plan::plan(fds), &file);
+                let body =
+                    syn::parse_file(include_str!("wire_snapshot.rs")).expect("snapshot syntax");
+                snapshot.items.extend(body.items);
+                let body = snapshot.items;
+                file.items.push(syn::parse_quote!(#[doc(hidden)] pub(crate) mod __wire_snapshot { use self as semantic; #(#body)* }));
                 let source = prettyplease::unparse(&visitors);
                 let target = out.join("semantic_header_visitors.rs");
                 if !std::fs::read_to_string(&target).is_ok_and(|old| old == source) {
@@ -343,7 +350,7 @@ pub fn finish(
         }
 
         if suffix == ".__view" {
-            ordering::apply(&mut file, true, &growth);
+            ordering::apply(&mut file, true, &growth, false);
         }
 
         if serde {

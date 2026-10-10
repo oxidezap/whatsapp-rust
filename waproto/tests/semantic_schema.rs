@@ -279,3 +279,37 @@ fn a_candidate_moved_to_an_independent_oneof_is_not_merged_into_media() {
         FieldMode::Unsupported
     );
 }
+
+#[test]
+fn snapshot_schema_preserves_codec_order_when_descriptors_are_reordered() {
+    let mut fds = descriptors();
+    let source = std::fs::read_to_string(concat!(env!("OUT_DIR"), "/whatsapp.rs")).unwrap();
+    let syntax = syn::parse_file(&source).unwrap();
+    let original = semantic_plan::emit_snapshot(&semantic_plan::plan(&fds), &syntax);
+    for path in [
+        &["Message", "InteractiveMessage", "Header"][..],
+        &["Message", "ImageMessage"][..],
+        &["ContextInfo"][..],
+        &["Message"][..],
+    ] {
+        owner_mut(&mut fds.file[0].message_type, path)
+            .field
+            .reverse();
+    }
+    let reordered = semantic_plan::emit_snapshot(&semantic_plan::plan(&fds), &syntax);
+    let schema = |file: &syn::File| {
+        let item = file
+            .items
+            .iter()
+            .find(|item| matches!(item, syn::Item::Const(value) if value.ident == "SCHEMA"))
+            .unwrap();
+        quote::quote!(#item).to_string()
+    };
+    assert_eq!(schema(&original), schema(&reordered));
+    assert!(
+        original
+            .items
+            .iter()
+            .all(|item| matches!(item, syn::Item::Const(_) | syn::Item::Impl(_)))
+    );
+}

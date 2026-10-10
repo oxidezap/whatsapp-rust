@@ -437,3 +437,46 @@ pub fn emit(messages: &[Message; 4], syntax: &syn::File) -> syn::File {
         }
     }).expect("visitor syntax")
 }
+
+// Reuse the descriptor/AST support decisions without bringing the staged
+// journal prototype into production. The snapshot only borrows current leaves.
+pub fn emit_snapshot(messages: &[Message; 4], syntax: &syn::File) -> syn::File {
+    let mut file = emit(messages, syntax);
+    file.items
+        .retain(|item| matches!(item, syn::Item::Const(_) | syn::Item::Impl(_)));
+    struct Snapshot;
+    impl syn::visit_mut::VisitMut for Snapshot {
+        fn visit_expr_array_mut(&mut self, value: &mut syn::ExprArray) {
+            syn::visit_mut::visit_expr_array_mut(self, value);
+            let numbered: Option<Vec<_>> = value.elems.iter().map(|expr| {
+                let syn::Expr::Struct(field) = expr else { return None; };
+                let number = field.fields.iter().find(|field| matches!(&field.member, syn::Member::Named(name) if name == "number"))?;
+                let syn::Expr::Lit(number) = &number.expr else { return None; };
+                let syn::Lit::Int(number) = &number.lit else { return None; };
+                Some((number.base10_parse::<u32>().ok()?, expr.clone()))
+            }).collect();
+            if let Some(mut numbered) = numbered {
+                // Supported descendants contain only ordinary fields; Header
+                // contains just one oneof. Match buffa's numeric field order.
+                numbered.sort_by_key(|(number, _)| *number);
+                value.elems = numbered.into_iter().map(|(_, expr)| expr).collect();
+            }
+        }
+        fn visit_expr_struct_mut(&mut self, value: &mut syn::ExprStruct) {
+            syn::visit_mut::visit_expr_struct_mut(self, value);
+            if value
+                .path
+                .segments
+                .last()
+                .is_some_and(|part| part.ident == "Field")
+            {
+                value.fields = value.fields.iter().filter(|field| {
+                    matches!(&field.member, syn::Member::Named(name) if name == "number" || name == "kind")
+                }).cloned().collect();
+            }
+        }
+    }
+    syn::visit_mut::VisitMut::visit_file_mut(&mut Snapshot, &mut file);
+    let source = prettyplease::unparse(&file).replace("::waproto::whatsapp::", "crate::whatsapp::");
+    syn::parse_file(&source).expect("snapshot visitor syntax")
+}
