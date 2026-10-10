@@ -417,7 +417,9 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
                 contract_attributes(&e.attrs, &format!("{public_scope}::{name}"), api);
                 for v in &e.variants {
                     let mut v = v.clone();
-                    v.attrs.clear();
+                    // Keep attributes in the existing variant entry so adding
+                    // a rename cannot pass as an additive API declaration.
+                    v.attrs.retain(is_contract_attribute);
                     api.insert(format!("variant {public_scope}::{name}::{}", tokens(&v)));
                 }
             }
@@ -502,15 +504,18 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
     }
 }
 
+fn is_contract_attribute(attr: &syn::Attribute) -> bool {
+    let text = attr.to_token_stream().to_string();
+    attr.path().is_ident("derive")
+        || attr.path().is_ident("repr")
+        || attr.path().is_ident("serde")
+        || (attr.path().is_ident("cfg_attr") && (text.contains("derive") || text.contains("serde")))
+}
+
 fn contract_attributes(attrs: &[syn::Attribute], owner: &str, api: &mut BTreeSet<String>) {
     for attr in attrs {
-        let text = attr.to_token_stream().to_string();
-        if attr.path().is_ident("derive")
-            || attr.path().is_ident("repr")
-            || attr.path().is_ident("serde")
-            || (attr.path().is_ident("cfg_attr")
-                && (text.contains("derive") || text.contains("serde")))
-        {
+        if is_contract_attribute(attr) {
+            let text = attr.to_token_stream().to_string();
             api.insert(format!("attribute {owner} {text}"));
         }
     }
@@ -592,6 +597,46 @@ pub fn check_api(expected: &str, actual: &BTreeSet<String>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variant_serialization_attributes_are_part_of_the_frozen_api() {
+        let collect = |source: &str| {
+            let file = syn::parse_file(source).unwrap();
+            let mut api = BTreeSet::new();
+            inventory(&file.items, "whatsapp", &mut api);
+            api
+        };
+        for variant in ["Value", "Value(String)"] {
+            for attribute in [
+                "#[serde(rename = \"original\")]",
+                "#[cfg_attr(feature = \"serde\", serde(rename = \"original\"))]",
+                "#[serde(skip)]",
+            ] {
+                let source = format!("pub enum Kind {{ {attribute} {variant} }}");
+                let expected = collect(&source).into_iter().collect::<Vec<_>>().join("\n");
+                for changed in [
+                    source.replace("original", "changed"),
+                    format!("pub enum Kind {{ {variant} }}"),
+                ] {
+                    if changed != source {
+                        check_api(&expected, &collect(&changed))
+                            .expect_err("variant serialization is frozen");
+                    }
+                }
+                let bare = format!("pub enum Kind {{ {variant} }}");
+                let expected_bare = collect(&bare).into_iter().collect::<Vec<_>>().join("\n");
+                check_api(&expected_bare, &collect(&source))
+                    .expect_err("adding serialization metadata changes an existing variant");
+                check_api(
+                    &expected,
+                    &collect(&format!(
+                        "pub enum Kind {{ #[doc = \"updated\"] {attribute} {variant}, Added }}"
+                    )),
+                )
+                .expect("documentation and new variants remain additive");
+            }
+        }
+    }
 
     #[test]
     fn trait_constant_values_and_types_are_part_of_the_frozen_api() {
