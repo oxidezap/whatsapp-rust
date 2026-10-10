@@ -45,6 +45,26 @@ fn canonical_fields(schema: usize, mut input: &[u8]) -> bool {
     schema != 0 || count == 1
 }
 
+// Raw completion must check every descendant representation before touching
+// its fields. A parent guard alone cannot reject a future lazy child container.
+#[cold]
+pub(crate) fn supported(current: &dyn Visitor) -> bool {
+    supported_fields(0, current)
+}
+
+fn supported_fields(schema: usize, current: &dyn Visitor) -> bool {
+    if !current.supported() { return false; }
+    for field in SCHEMA[schema] {
+        if let Kind::Message(child) = field.kind
+            && let Some(value) = current.field(field.number, 0)
+        {
+            let ValueRef::Child(value) = value else { return false; };
+            if !supported_fields(usize::from(child), value) { return false; }
+        }
+    }
+    true
+}
+
 fn sizes(schema: usize, current: &dyn Visitor, plan: &mut [usize; 4]) -> Option<usize> {
     if !current.supported() { return None; }
     let mut total = 0usize;
@@ -98,6 +118,22 @@ pub(crate) fn snapshot(current: &dyn Visitor, ctx: Option<DecodeContext<'_>>) ->
 mod tests {
     use super::*;
     use ::buffa::{Message as _, MessageView as _};
+
+    #[test]
+    fn raw_completion_checks_nested_support_before_field_access() {
+        struct Denied;
+        impl Visitor for Denied {
+            fn supported(&self) -> bool { false }
+            fn field(&self, _: u32, _: usize) -> Option<ValueRef<'_>> { panic!("unsupported field access"); }
+        }
+        struct Parent;
+        impl Visitor for Parent {
+            fn supported(&self) -> bool { true }
+            fn field(&self, _: u32, _: usize) -> Option<ValueRef<'_>> { Some(ValueRef::Child(&Denied)) }
+        }
+        assert!(!supported(&Denied));
+        assert!(!supported(&Parent));
+    }
     use crate::whatsapp as wa;
     use wa::message::interactive_message::{Header, HeaderView, header::Media};
     use ::buffa::alloc::{vec, string::String};

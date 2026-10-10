@@ -903,12 +903,31 @@ fn transform(
             } else {
                 quote!(#runtime::no_canonical_projection)
             };
+            // Raw completion is valid for views only after the current eager
+            // representation passes the same support guard as its snapshot.
+            // Other policy requests must not traverse the receiver.
+            let view_canonical = if header_snapshot
+                && scope == "message::interactive_message::"
+                && name == "HeaderView"
+            {
+                quote! {
+                    if _completed_batch
+                        && crate::whatsapp::__wire_snapshot::supported(self.0)
+                    {
+                        crate::whatsapp::__wire_snapshot::canonical
+                    } else {
+                        #runtime::no_canonical_projection
+                    }
+                }
+            } else {
+                quote!(#runtime::no_canonical_projection)
+            };
             helpers.push(if view {
                 syn::parse_quote! {
                     impl #impl_generics #runtime::ViewCodec<'a> for #runtime::Adapter<'_, #ty> #where_clause {
                         fn storage(&mut self) -> &mut #runtime::ViewStorage<'a> { &mut self.0.__buffa_unknown_fields }
-                        fn policy(&self) -> #runtime::Policy {
-                            #runtime::Policy { groups: <#ty>::__wire_group, growth: <#ty>::__wire_growth, replay: <#ty>::__wire_expected, canonical: #canonical }
+                        fn policy(&self, _completed_batch: bool) -> #runtime::Policy {
+                            #runtime::Policy { groups: <#ty>::__wire_group, growth: <#ty>::__wire_growth, replay: <#ty>::__wire_expected, canonical: #view_canonical }
                         }
                         fn known(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> { self.0.__wire_known_for_decode(ctx) }
                         fn merge(&mut self, tag: ::buffa::encoding::Tag, cur: &'a [u8], before: &'a [u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> { self.0.__wire_merge(tag, cur, before, ctx) }

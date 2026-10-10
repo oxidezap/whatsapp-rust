@@ -206,7 +206,7 @@ pub(crate) fn finish_owned_unknown(
 
 pub(crate) trait ViewCodec<'a> {
     fn storage(&mut self) -> &mut ViewStorage<'a>;
-    fn policy(&self) -> Policy;
+    fn policy(&self, completed_batch: bool) -> Policy;
     fn known(&self, ctx: DecodeContext<'_>) -> Result<Vec<u8>, DecodeError>;
     fn merge(
         &mut self,
@@ -224,7 +224,7 @@ pub(crate) fn begin_view<'a>(
     ctx: DecodeContext<'_>,
 ) -> Result<(), DecodeError> {
     let known = codec.known(ctx)?;
-    let policy = codec.policy();
+    let policy = codec.policy(false);
     let map = policy.groups;
     codec.storage().begin_snapshot(known, map, ctx)
 }
@@ -236,7 +236,7 @@ pub(crate) fn reconcile_view<'a>(
     ctx: DecodeContext<'_>,
 ) -> Result<(), DecodeError> {
     let known = codec.known(ctx)?;
-    let policy = codec.policy();
+    let policy = codec.policy(false);
     let map = policy.groups;
     let replay = policy.replay;
     codec.storage().reconcile(&known, map, replay, ctx)
@@ -248,7 +248,7 @@ pub(crate) fn complete_view_batch<'a>(codec: &mut dyn ViewCodec<'a>, ctx: Decode
     let reserved = ::core::cell::Cell::new(codec.storage().take_completion_credit());
     if !codec.storage().needs_baseline() { return Ok(()); }
     let ctx = ctx.with_element_memory(&reserved);
-    let policy = codec.policy();
+    let policy = codec.policy(true);
     if codec.storage().complete_canonical(policy.canonical, policy.groups, ctx)? { return Ok(()); }
     let known = codec.known(ctx)?;
     codec.storage().complete_batch(known, policy.groups, ctx)
@@ -264,7 +264,7 @@ pub(crate) fn merge_view<'a>(
     ctx: DecodeContext<'_>,
     check_current: bool,
 ) -> Result<&'a [u8], DecodeError> {
-    let policy = codec.policy();
+    let policy = codec.policy(false);
     let map = policy.groups;
     let group = map(tag.field_number());
     let previous = codec.storage().len();
@@ -1512,6 +1512,34 @@ mod canonical_completion_tests {
             let legacy = Order::begin(known, map, 1);
             assert!(matches!(retained.baseline, Baseline::Projection(_)));
             assert!(retained == legacy);
+        }
+    }
+
+    #[test]
+    fn view_completion_reuses_only_a_supported_completed_occurrence() {
+        use ::buffa::{Message as _, MessageView as _, ViewEncode as _};
+        use crate::whatsapp::message::interactive_message::HeaderView;
+        let wire = [0xc2, 0x3e, 0, 0x22, 0];
+        let mut view = HeaderView::decode_view(&wire).unwrap();
+        let order = view.__buffa_unknown_fields.0.as_ref().unwrap().order.as_ref().unwrap();
+        assert!(matches!(order.baseline, Baseline::Event(1)));
+        let Event::Known(_, Cow::Borrowed(raw)) = &order.events[1] else { panic!("borrowed accepted occurrence"); };
+        assert_eq!(raw.as_ptr(), wire[3..].as_ptr());
+        assert_eq!(view.encode_to_vec(), wire);
+        assert_eq!(view.clone().encode_to_vec(), wire);
+        assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), wire);
+        let adapter = Adapter(&mut view);
+        assert!(!(adapter.policy(false).canonical)(&wire[3..]));
+        assert!((adapter.policy(true).canonical)(&wire[3..]));
+        view.media = None;
+        assert_eq!(view.encode_to_vec(), wire[..3]);
+
+        // Nonminimal lengths and unsupported nested scalar fields retain the
+        // original snapshot path rather than accepting raw bytes as canonical.
+        for wire in [&[0xc2, 0x3e, 0, 0x22, 0x80, 0][..], &[0xc2, 0x3e, 0, 0x22, 2, 0x30, 1][..]] {
+            let view = HeaderView::decode_view(wire).unwrap();
+            assert!(matches!(view.__buffa_unknown_fields.0.as_ref().unwrap().order.as_ref().unwrap().baseline, Baseline::Projection(_)));
+            assert_eq!(view.encode_to_vec(), view.to_owned_message().unwrap().encode_to_vec());
         }
     }
 
