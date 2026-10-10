@@ -165,10 +165,7 @@ pub(crate) fn merge_owned_known(
         let replay = policy.replay;
         codec.storage().reconcile(&known, map, replay, ctx)?;
     }
-    let mut input = buf;
-    let mut captured = Capture::new(&mut input, tag, ctx)?;
-    ::buffa::encoding::skip_field_depth(tag, &mut captured, ctx.depth())?;
-    let raw = captured.finish()?;
+    let raw = capture_known_field(buf, tag, ctx)?;
     let mut payload = raw.as_slice();
     ::buffa::encoding::Tag::decode(&mut payload)?;
     let record_credit = ::core::cell::Cell::new(if !check_current {
@@ -1237,6 +1234,38 @@ impl<'a> ViewStorage<'a> {
     }
 }
 
+// A contiguous completed field needs one allocation. Pay the initial tag
+// before probing, just as incremental capture rejects a too-small allowance
+// before reading input. Fragmented, malformed and quota-limited payloads keep
+// the original cursor and partial debit through the incremental fallback.
+#[cold]
+#[inline(never)]
+fn capture_known_field(
+    buf: &mut dyn Buf,
+    tag: ::buffa::encoding::Tag,
+    ctx: DecodeContext<'_>,
+) -> Result<Vec<u8>, DecodeError> {
+    ctx.register_element_memory(5)?;
+    let input = buf.chunk();
+    let mut remaining = input;
+    if ::buffa::encoding::skip_field_depth(tag, &mut remaining, ctx.depth()).is_ok() {
+        let consumed = input.len() - remaining.len();
+        if let Some(charge) = consumed.checked_add(5)
+            && ctx.register_element_memory(consumed).is_ok()
+        {
+            let mut raw = Vec::with_capacity(charge);
+            tag.encode(&mut raw);
+            raw.extend_from_slice(&input[..consumed]);
+            buf.advance(consumed);
+            return Ok(raw);
+        }
+    }
+    let mut input = buf;
+    let mut captured = Capture::with_prepaid_tag(&mut input, tag, ctx);
+    ::buffa::encoding::skip_field_depth(tag, &mut captured, ctx.depth())?;
+    captured.finish()
+}
+
 /// Records only fields read after a message's first unknown occurrence.
 pub struct Capture<'a, 'c> {
     inner: &'a mut dyn Buf,
@@ -1251,14 +1280,16 @@ impl<'a, 'c> Capture<'a, 'c> {
         ctx: DecodeContext<'c>,
     ) -> Result<Self, DecodeError> {
         ctx.register_element_memory(5)?;
+        Ok(Self::with_prepaid_tag(inner, tag, ctx))
+    }
+    fn with_prepaid_tag(
+        inner: &'a mut impl Buf,
+        tag: ::buffa::encoding::Tag,
+        ctx: DecodeContext<'c>,
+    ) -> Self {
         let mut bytes = Vec::new();
         tag.encode(&mut bytes);
-        Ok(Self {
-            inner,
-            bytes,
-            ctx,
-            exhausted: false,
-        })
+        Self { inner, bytes, ctx, exhausted: false }
     }
     pub fn finish(self) -> Result<Vec<u8>, DecodeError> {
         if self.exhausted {
@@ -1330,5 +1361,100 @@ mod canonical_completion_tests {
         previous.forced.push(1);
         assert_eq!(previous.completed_canonical(canonical_empty_image, ctx).unwrap(), None);
         assert_eq!(unknown.get(), 0);
+    }
+}
+
+#[cfg(test)]
+mod contiguous_capture_tests {
+    use super::*;
+    use ::buffa::encoding::{Tag, WireType};
+
+    fn original(buf: &mut dyn Buf, tag: Tag, ctx: DecodeContext<'_>) -> Result<Vec<u8>, DecodeError> {
+        let mut input = buf;
+        let mut captured = Capture::new(&mut input, tag, ctx)?;
+        ::buffa::encoding::skip_field_depth(tag, &mut captured, ctx.depth())?;
+        captured.finish()
+    }
+
+    #[test]
+    fn insufficient_tag_allowance_rejects_before_reading_input() {
+        struct Counted<'a> { bytes: &'a [u8], chunks: &'a ::core::cell::Cell<usize> }
+        impl Buf for Counted<'_> {
+            fn remaining(&self) -> usize { self.bytes.len() }
+            fn chunk(&self) -> &[u8] {
+                self.chunks.set(self.chunks.get() + 1);
+                self.bytes
+            }
+            fn advance(&mut self, count: usize) { self.bytes.advance(count); }
+        }
+        let payload = [0x08, 1, 0x1c];
+        for quota in 0..5 {
+            let chunks = ::core::cell::Cell::new(0);
+            let allowance = ::core::cell::Cell::new(quota);
+            let unknown = ::core::cell::Cell::new(0);
+            let mut input = Counted { bytes: &payload, chunks: &chunks };
+            let ctx = DecodeContext::new(100, &unknown).with_element_memory(&allowance);
+            assert!(matches!(capture_known_field(&mut input, Tag::new(3, WireType::StartGroup), ctx), Err(DecodeError::ElementMemoryLimitExceeded)));
+            assert_eq!(chunks.get(), 0);
+            assert_eq!(input.bytes, payload);
+            assert_eq!(allowance.get(), quota);
+            assert_eq!(unknown.get(), 0);
+        }
+    }
+
+    #[test]
+    fn contiguous_capture_matches_incremental_bytes_debits_and_errors() {
+        for (wire, payload) in [
+            (WireType::Varint, &[1, 7][..]),
+            (WireType::Varint, &[0x81, 0, 7][..]),
+            (WireType::Varint, &[0x80][..]),
+            (WireType::Fixed32, &[1, 2, 3, 4, 7][..]),
+            (WireType::Fixed32, &[1, 2][..]),
+            (WireType::Fixed64, &[1, 2, 3, 4, 5, 6, 7, 8, 9][..]),
+            (WireType::LengthDelimited, &[3, 11, 22, 33, 7][..]),
+            (WireType::LengthDelimited, &[0x83, 0, 11, 22, 33, 7][..]),
+            (WireType::LengthDelimited, &[3, 11][..]),
+            (WireType::StartGroup, &[0x08, 1, 0x1c, 7][..]),
+            (WireType::StartGroup, &[0x08, 1, 0x24, 7][..]),
+        ] {
+            let tag = Tag::new(3, wire);
+            for depth in [0, 1, 100] {
+                for quota in 0..=payload.len() + 7 {
+                    let a = ::core::cell::Cell::new(quota);
+                    let b = ::core::cell::Cell::new(quota);
+                    let unknown = ::core::cell::Cell::new(0);
+                    let mut before = payload;
+                    let mut after = payload;
+                    let expected = original(&mut before, tag, DecodeContext::new(depth, &unknown).with_element_memory(&a));
+                    let actual = capture_known_field(&mut after, tag, DecodeContext::new(depth, &unknown).with_element_memory(&b));
+                    assert_eq!(format!("{actual:?}"), format!("{expected:?}"), "wire={wire:?} depth={depth} quota={quota}");
+                    assert_eq!(after, before);
+                    assert_eq!(b.get(), a.get());
+                    assert_eq!(unknown.get(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contiguous_capture_matches_records_crossing_buffer_chunks() {
+        let payload = [3, 11, 22, 33, 7];
+        let tag = Tag::new(3, WireType::LengthDelimited);
+        for split in 0..=payload.len() {
+            for quota in 0..=12 {
+                let a = ::core::cell::Cell::new(quota);
+                let b = ::core::cell::Cell::new(quota);
+                let unknown = ::core::cell::Cell::new(0);
+                let mut before = (&payload[..split]).chain(&payload[split..]);
+                let mut after = (&payload[..split]).chain(&payload[split..]);
+                let expected = original(&mut before, tag, DecodeContext::new(100, &unknown).with_element_memory(&a));
+                let actual = capture_known_field(&mut after, tag, DecodeContext::new(100, &unknown).with_element_memory(&b));
+                assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+                assert_eq!(after.remaining(), before.remaining());
+                assert_eq!(after.copy_to_bytes(after.remaining()), before.copy_to_bytes(before.remaining()));
+                assert_eq!(b.get(), a.get());
+                assert_eq!(unknown.get(), 0);
+            }
+        }
     }
 }
