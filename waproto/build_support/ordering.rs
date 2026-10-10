@@ -333,6 +333,36 @@ fn transform(
             let compute_cache = argument(&compute, 1);
             let write_cache = argument(&write, 1);
             let write_buf = argument(&write, 2);
+            let mut shared_compute = BTreeMap::new();
+            for statement in &mut compute.block.stmts {
+                let probe = fields(statement);
+                if probe.choice
+                    && probe.fields.len() == 1
+                    && let Some(field) = probe.fields.first()
+                    && groups.contains_key(field)
+                {
+                    // Share each oneof's sizing match with the ordinary codec.
+                    // A helper per field preserves traversal-cache order when
+                    // other message fields occur between selected groups.
+                    let method = format_ident!("__wire_compute_{}", field.trim_start_matches("r#"));
+                    let original = statement.clone();
+                    helpers.push(syn::parse_quote! {
+                        impl #impl_generics #ty #where_clause {
+                            #[inline(never)]
+                            fn #method(&self, #compute_cache: &mut ::buffa::SizeCache) -> u64 {
+                                #[allow(unused_imports)]
+                                use ::buffa::{Message as _, MessageView as _, ViewEncode as _, Enumeration as _};
+                                let mut size = 0u64;
+                                #original
+                                size
+                            }
+                        }
+                    });
+                    let call: syn::Stmt = syn::parse_quote!(size += self.#method(#compute_cache););
+                    shared_compute.insert(field.clone(), call.clone());
+                    *statement = call;
+                }
+            }
             for member in &mut item.items {
                 if let syn::ImplItem::Fn(f) = member {
                     let is_compute = f.sig.ident == "compute_size";
@@ -345,7 +375,14 @@ fn transform(
                     for statement in &mut f.block.stmts {
                         let probe = fields(statement);
                         if probe.fields.iter().any(|field| groups.contains_key(field)) {
-                            if let syn::Stmt::Expr(syn::Expr::If(conditional), _) = statement
+                            if is_compute
+                                && let Some(call) = probe
+                                    .fields
+                                    .iter()
+                                    .find_map(|field| shared_compute.get(field))
+                            {
+                                *statement = syn::parse_quote!(if !__wire_active { #call });
+                            } else if let syn::Stmt::Expr(syn::Expr::If(conditional), _) = statement
                                 && conditional.else_branch.is_none()
                             {
                                 let condition = &conditional.cond;
