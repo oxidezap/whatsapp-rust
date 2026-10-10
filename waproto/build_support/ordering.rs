@@ -114,39 +114,7 @@ impl VisitMut for PushViewDecoded {
 }
 
 pub fn apply(file: &mut syn::File, view: bool, growth: &super::wire_growth::Bounds) {
-    fn collect(items: &[syn::Item], scope: &str, view: bool, types: &mut Vec<syn::Type>) {
-        for item in items {
-            match item {
-                syn::Item::Mod(module) => {
-                    if let Some((_, children)) = &module.content {
-                        collect(children, &format!("{scope}{}::", module.ident), view, types);
-                    }
-                }
-                syn::Item::Impl(item)
-                    if trait_name(item).as_deref()
-                        == Some(if view { "MessageView" } else { "Message" }) =>
-                {
-                    let name = type_name(item).expect("generated message");
-                    let lifetime = if view { "<'static>" } else { "" };
-                    types.push(
-                        syn::parse_str(&format!("{scope}{name}{lifetime}"))
-                            .expect("generated replay bound"),
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut types = Vec::new();
-    collect(&file.items, "", view, &mut types);
     transform(&mut file.items, view, 0, "", growth);
-    file.items.push(syn::parse_quote! {
-        const __WIRE_REPLAY_NODE_SIZE: usize = {
-            let mut maximum = 1usize;
-            #(if maximum < ::core::mem::size_of::<#types>() { maximum = ::core::mem::size_of::<#types>(); })*
-            maximum
-        };
-    });
 }
 
 fn transform(
@@ -240,11 +208,6 @@ fn transform(
     let prefix = "super::".repeat(depth + if view { 2 } else { 0 });
     let runtime: syn::Path =
         syn::parse_str(&format!("{prefix}__wire_order")).expect("runtime path");
-    let replay_bound: syn::Path = syn::parse_str(&format!(
-        "{}__WIRE_REPLAY_NODE_SIZE",
-        "super::".repeat(depth)
-    ))
-    .expect("replay bound path");
     let mut helpers = Vec::new();
     let mut enum_values = BTreeMap::new();
     for item in items.iter() {
@@ -834,21 +797,15 @@ fn transform(
                 quote!({ #runtime::enum_replay(raw, &[#(#tags),*], ctx) })
             } else {
                 quote!({
-                    if let Some(ctx) = ctx {
-                        // Generated codecs charge repeated entries and journals.
-                        // Reserve the remaining singular payloads, boxed nodes
-                        // and packed scalars before constructing the replay owner.
-                        let charge = raw.len().max(1)
-                            .saturating_mul(#replay_bound.saturating_mul(4).saturating_add(64));
-                        ctx.register_element_memory(charge)?;
-                    }
-                    // Replay only completed records. Give them fresh depth and
-                    // unknown allowances, but transfer the caller's remaining
-                    // memory cap and debit it on both success and failure.
+                    // Completed input already passed the caller's depth and
+                    // unknown limits. Replay transfers its remaining element
+                    // budget; the codecs charge repeated entries and journals.
+                    // Also debit one slot per replayed unknown from this cell,
+                    // bounding temporary unknown metadata without charging
+                    // singular payloads or packed scalars excluded by buffa.
                     let remaining = ctx.and_then(|ctx| ctx.remaining_element_memory()).unwrap_or(usize::MAX);
                     let budget = ::core::cell::Cell::new(remaining);
-                    let unknown = ::core::cell::Cell::new(usize::MAX);
-                    let replay_ctx = ::buffa::DecodeContext::new(u32::MAX, &unknown).with_element_memory(&budget);
+                    let replay_ctx = ::buffa::DecodeContext::new(u32::MAX, &budget).with_element_memory(&budget);
                     let result = (|| {
                         let mut expected = #replay_owner::default();
                         let mut cur = raw;

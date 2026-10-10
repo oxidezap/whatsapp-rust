@@ -966,3 +966,31 @@ fn nested_future_records_reuse_prepared_output_across_encoding_passes() {
         cache.clear();
     }
 }
+
+#[test]
+fn repeated_groups_keep_equality_and_hash_across_merge_batches() {
+    use evolution_fixture::{v1, DecodeContext};
+    use std::hash::{Hash, Hasher};
+    let first = [8, 1, 8, 0, 16, 0];
+    let later = [24, 0, 8, 0, 16, 0];
+    let mut wire = first.to_vec();
+    wire.extend_from_slice(&later);
+    let batch = v1::RepeatedRecord::decode_from_slice(&wire).unwrap();
+    let mut direct = v1::RepeatedRecord::decode_from_slice(&first).unwrap();
+    for field in later.chunks_exact(2) { direct.merge_from_slice(field).unwrap(); }
+    assert_eq!(batch.encode_to_vec(), direct.encode_to_vec());
+    assert_eq!(batch, direct);
+    let hash = |value: &v1::RepeatedRecord| {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        value.__buffa_unknown_fields.hash(&mut hash);
+        hash.finish()
+    };
+    assert_eq!(hash(&batch), hash(&direct));
+    let unknown = core::cell::Cell::new(usize::MAX);
+    let ctx = DecodeContext::new(100, &unknown);
+    let view_batch = v1::RepeatedRecordView::decode_view(&wire).unwrap();
+    let mut view_direct = v1::RepeatedRecordView::decode_view(&first).unwrap();
+    for field in later.chunks_exact(2) { view_direct.merge_into_view(field, ctx).unwrap(); }
+    assert_eq!(view_batch.encode_to_vec(), view_direct.encode_to_vec());
+    assert_eq!(view_batch.to_owned_message().unwrap(), view_direct.to_owned_message().unwrap());
+}

@@ -341,3 +341,109 @@ fn failed_enum_batch_keeps_unreceived_nonoptional_default() {
     assert_eq!(view.encode_to_vec(), expected);
     assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
 }
+
+#[test]
+fn retry_after_failed_fragmented_batch_fits_linear_memory_budget() {
+    use waproto::buffa::{DecodeContext, ViewEncode};
+    let first = [0xc0, 0x3e, 7];
+    let mut batch = Vec::new();
+    for _ in 0..512 {
+        batch.extend_from_slice(&[0x32, 2, 0x0a, 0]);
+    }
+    batch.push(0x80);
+    let retry = [0x32, 0];
+    let mut expected = first.to_vec();
+    expected.extend_from_slice(&batch[..batch.len() - 1]);
+    let unknown = core::cell::Cell::new(usize::MAX);
+    let mut owned = wa::message::InteractiveMessage::decode_from_slice(&first).unwrap();
+    let mut view = wa::message::InteractiveMessageView::decode_view(&first).unwrap();
+    assert!(owned.merge_from_slice(&batch).is_err());
+    assert!(
+        view.merge_into_view(&batch, DecodeContext::new(100, &unknown))
+            .is_err()
+    );
+    assert_eq!(owned.encode_to_vec(), expected);
+    assert_eq!(view.encode_to_vec(), expected);
+    for allowance in [0, 4096] {
+        let budget = core::cell::Cell::new(allowance);
+        let ctx = DecodeContext::new(100, &unknown).with_element_memory(&budget);
+        assert!(owned.merge(&mut &retry[..], ctx).is_err());
+        if allowance != 0 {
+            assert!(
+                budget.get() < 256,
+                "failed replay debits decoded elements, not only input buffers"
+            );
+        }
+        assert_eq!(owned.encode_to_vec(), expected);
+        let budget = core::cell::Cell::new(allowance);
+        let ctx = DecodeContext::new(100, &unknown).with_element_memory(&budget);
+        assert!(view.merge_into_view(&retry, ctx).is_err());
+        if allowance != 0 {
+            assert!(
+                budget.get() < 256,
+                "failed view replay debits decoded elements, not only input buffers"
+            );
+        }
+        assert_eq!(view.encode_to_vec(), expected);
+        assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
+    }
+    let budget = core::cell::Cell::new(128 * 1024);
+    let ctx = DecodeContext::new(100, &unknown).with_element_memory(&budget);
+    let mut bytes = &retry[..];
+    owned
+        .merge(&mut bytes, ctx)
+        .expect("owned retry fits the element budget");
+    let budget = core::cell::Cell::new(128 * 1024);
+    let ctx = DecodeContext::new(100, &unknown).with_element_memory(&budget);
+    view.merge_into_view(&retry, ctx)
+        .expect("view retry fits the element budget");
+    expected.extend_from_slice(&retry);
+    assert_eq!(owned.encode_to_vec(), expected);
+    assert_eq!(view.encode_to_vec(), expected);
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
+}
+
+#[test]
+fn recovery_replays_nested_unknowns_without_recharging_the_caller_allowance() {
+    use wa::message::interactive_message::{Header, HeaderView};
+    use waproto::buffa::{DecodeContext, ViewEncode};
+    let first = [0xc0, 0x3e, 7, 0x22, 6, 0x1a, 1, b'a', 0xc0, 0x3e, 9];
+    let completed = [0x22, 6, 0x1a, 1, b'b', 0xc0, 0x3e, 8];
+    let failed = [0x22, 1, 0x80];
+    let batch = [completed.as_slice(), failed.as_slice()].concat();
+    let retry = [0x22, 0];
+    let expected = [first.as_slice(), completed.as_slice(), retry.as_slice()].concat();
+    let mut owned = Header::decode_from_slice(&first).unwrap();
+    let mut view = HeaderView::decode_view(&first).unwrap();
+    let unknown = core::cell::Cell::new(1);
+    assert!(
+        owned
+            .merge(&mut &batch[..], DecodeContext::new(100, &unknown))
+            .is_err()
+    );
+    assert_eq!(unknown.get(), 0);
+    let unknown = core::cell::Cell::new(1);
+    assert!(
+        view.merge_into_view(&batch, DecodeContext::new(100, &unknown))
+            .is_err()
+    );
+    assert_eq!(unknown.get(), 0);
+    let budget = core::cell::Cell::new(128 * 1024);
+    owned
+        .merge(
+            &mut &retry[..],
+            DecodeContext::new(100, &unknown).with_element_memory(&budget),
+        )
+        .unwrap();
+    assert_eq!(unknown.get(), 0);
+    let budget = core::cell::Cell::new(128 * 1024);
+    view.merge_into_view(
+        &retry,
+        DecodeContext::new(100, &unknown).with_element_memory(&budget),
+    )
+    .unwrap();
+    assert_eq!(unknown.get(), 0);
+    assert_eq!(owned.encode_to_vec(), expected);
+    assert_eq!(view.encode_to_vec(), expected);
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
+}
