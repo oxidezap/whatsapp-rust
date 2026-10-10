@@ -658,6 +658,13 @@ fn transform(
                         .sig
                         .inputs
                         .push(syn::parse_quote!(check_current: bool));
+                    if !groups.values().any(|group| group & (1 << 31) != 0) {
+                        // Inline only the journal dispatch, not its recursive codec.
+                        retained
+                            .attrs
+                            .retain(|attr| !attr.path().is_ident("inline"));
+                        retained.attrs.push(syn::parse_quote!(#[inline]));
+                    }
                     if groups.values().any(|group| group & (1 << 31) != 0) {
                         let mut element = retained.clone();
                         element.block.stmts.remove(0);
@@ -672,6 +679,8 @@ fn transform(
                     } else {
                         syn::parse_quote!({ self.__wire_merge_field(tag, buf, ctx, true) })
                     };
+                    f.attrs.retain(|attr| !attr.path().is_ident("inline"));
+                    f.attrs.push(syn::parse_quote!(#[inline]));
                 } else if view && f.sig.ident == "to_owned_from_source" {
                     let body = f.block.clone();
                     f.block = syn::parse_quote!({
