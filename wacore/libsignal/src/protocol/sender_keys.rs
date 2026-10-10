@@ -874,7 +874,7 @@ impl SenderKeyState {
 
 #[derive(Clone)]
 pub struct SenderKeyRecord {
-    future: buffa::UnknownFields,
+    future: waproto::whatsapp::__unknown_storage::Storage,
     states: VecDeque<SenderKeyState>,
     /// Durability lease over sender-chain iterations, mirroring
     /// `SessionRecord`'s for DM, or the consumer's declaration that it needs
@@ -977,7 +977,7 @@ impl SenderKeyRecord {
             // allocation per sender learned — 255 of them on joining a large
             // group — that the first `group_decrypt` clone dropped anyway.
             states: VecDeque::new(),
-            future: buffa::UnknownFields::new(),
+            future: Default::default(),
             lease: CounterLease::default(),
         }
     }
@@ -998,7 +998,7 @@ impl SenderKeyRecord {
 
         Ok(Self {
             states,
-            future: buffa::UnknownFields::new(),
+            future: Default::default(),
             lease: CounterLease::default(),
         })
     }
@@ -1118,7 +1118,7 @@ impl SenderKeyRecord {
 
         Ok(Self {
             states,
-            future: future_record_fields(skr.__buffa_unknown_fields),
+            future: future_record_fields(skr.__buffa_unknown_fields).into(),
             lease: CounterLease::from_persisted_ceiling(reserved_iteration),
         })
     }
@@ -1246,7 +1246,7 @@ impl SenderKeyRecord {
         {
             let mut proto = SenderKeyRecordStructure::default();
             proto.sender_key_states = states;
-            proto.__buffa_unknown_fields = self.future.clone().into();
+            proto.__buffa_unknown_fields = self.future.clone();
             proto
         }
     }
@@ -2626,6 +2626,9 @@ mod tests {
             wire
         );
         assert!(loaded.estimated_size() >= 5 * 8192);
+        let cloned = loaded.clone();
+        assert_eq!(cloned.serialize().expect("cloned future record"), wire);
+        assert_eq!(cloned.estimated_size(), loaded.estimated_size());
         assert!(!format!("{loaded:?}").contains("LengthDelimited"));
         loaded.reserve_iterations(0);
         let stored = loaded
