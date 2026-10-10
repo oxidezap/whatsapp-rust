@@ -1119,14 +1119,69 @@ fn failed_occurrence_does_not_bless_the_typed_receivers_partial_edit() {
     assert_eq!(evolved.choice, expected.choice);
 }
 // The prototype receiver below handles the fixture's text/detail oneof and
-// future field5 only. Production codecs and other schema fields are untouched.
+// future field5 directly; unsupported shapes migrate to the original codec.
+// Production codecs are untouched.
 #[derive(Clone)]
 enum ReplayEvent { Prefix(std::sync::Arc<Arena>), Known(std::ops::Range<usize>), Future(Vec<u8>) }
 #[derive(Clone)]
-struct ProjectedRecord { current: v1::Record, baseline: Arena, events: Vec<ReplayEvent>, active: bool }
+struct ProjectedRecord { current: v1::Record, baseline: Arena, events: Vec<ReplayEvent>, active: bool, eager: bool }
 impl ProjectedRecord {
-    fn new() -> Self { Self { current: v1::Record::default(), baseline: Arena::new(SCHEMA), events: Vec::new(), active: false } }
+    fn new() -> Self { Self { current: v1::Record::default(), baseline: Arena::new(SCHEMA), events: Vec::new(), active: false, eager: false } }
+    fn supports_current(&self) -> bool {
+        RecordVisitor::new(&self.current).supported()
+            && self.current.name.is_none() && self.current.child.is_unset()
+            && self.current.__buffa_unknown_fields.is_empty()
+            && match self.current.choice.as_ref() {
+                Some(v1::record::Choice::Detail(child)) => !child.__buffa_unknown_fields.iter().any(|field| matches!(field.data, evolution_fixture::UnknownFieldData::Group(_))),
+                _ => true,
+            }
+    }
+    fn migrate(&mut self, ctx: evolution_fixture::DecodeContext<'_>) -> Result<(), evolution_fixture::DecodeError> {
+        let bound = if self.active {
+            self.events.iter().fold(0usize, |total, event| total.saturating_add(match event {
+                ReplayEvent::Prefix(prefix) => prefix.encoding_bound(),
+                ReplayEvent::Known(raw) => raw.len(),
+                ReplayEvent::Future(raw) => raw.len(),
+            }))
+        } else { self.baseline.encoding_bound() };
+        ctx.register_element_memory(bound)?;
+        let mut wire = Vec::with_capacity(bound);
+        if self.active {
+            for event in &self.events {
+                match event {
+                    ReplayEvent::Prefix(prefix) => wire.extend(prefix.encode()),
+                    ReplayEvent::Known(raw) => wire.extend_from_slice(self.baseline.record(raw)),
+                    ReplayEvent::Future(raw) => wire.extend_from_slice(raw),
+                }
+            }
+        } else { wire.extend(self.baseline.encode()); }
+        // Accepted unknowns do not debit the caller again. Replay still pays
+        // unknown metadata from its local element balance, including on error.
+        let remaining = ctx.remaining_element_memory().unwrap_or(usize::MAX);
+        let budget = std::cell::Cell::new(remaining);
+        let replay_ctx = evolution_fixture::DecodeContext::new(u32::MAX, &budget).with_element_memory(&budget);
+        let mut prepared = v1::Record::default();
+        let result = prepared.merge(&mut wire.as_slice(), replay_ctx);
+        ctx.register_element_memory(remaining.saturating_sub(budget.get()))?;
+        result?;
+        // Publish only after fallible preparation. Move public fields rather
+        // than cloning them or blessing a partial receiver as the baseline.
+        prepared.name = std::mem::take(&mut self.current.name);
+        prepared.mode = std::mem::take(&mut self.current.mode);
+        prepared.choice = std::mem::take(&mut self.current.choice);
+        prepared.child = std::mem::take(&mut self.current.child);
+        prepared.next = std::mem::take(&mut self.current.next);
+        self.current = prepared;
+        self.events.clear();
+        self.baseline = Arena::new(SCHEMA);
+        self.active = false;
+        self.eager = true;
+        Ok(())
+    }
     fn reconcile(&mut self, ctx: evolution_fixture::DecodeContext<'_>) -> Result<(), evolution_fixture::DecodeError> {
+        if self.eager { return Ok(()); }
+        if !self.supports_current() { return self.migrate(ctx); }
+        if !self.active { return Ok(()); }
         if self.baseline.matches(&RecordVisitor::new(&self.current)) { return Ok(()); }
         if let Some(edit) = self.baseline.scalar_edit(&RecordVisitor::new(&self.current)) {
             let prefix = if self.active {
@@ -1175,6 +1230,14 @@ impl ProjectedRecord {
         Ok(())
     }
     fn merge_record_inner(&mut self, record: &[u8], ctx: evolution_fixture::DecodeContext<'_>) -> Result<(), evolution_fixture::DecodeError> {
+        if self.eager { return self.current.merge(&mut &record[..], ctx); }
+        let tag = evolution_fixture::encoding::Tag::decode(&mut &record[..])?;
+        if !matches!(tag.field_number(), 3 | 5 | 7)
+            || (tag.field_number() == 5 && record.first() != Some(&0x2a))
+            || tag.wire_type() != evolution_fixture::encoding::WireType::LengthDelimited {
+            self.migrate(ctx)?;
+            return self.current.merge(&mut &record[..], ctx);
+        }
         if record.first() == Some(&0x2a) {
             let mut bytes = &record[1..];
             evolution_fixture::types::borrow_bytes(&mut bytes)?;
@@ -1182,17 +1245,25 @@ impl ProjectedRecord {
             ctx.register_element_memory(size_of::<ReplayEvent>().saturating_add(record.len()))?;
             ctx.register_unknown_field()?;
             if !self.active {
-                if !self.baseline.is_empty() {
+                let baseline = Arena::from_visitor(SCHEMA, &RecordVisitor::new(&self.current), ctx)?;
+                if !baseline.is_empty() {
                     ctx.register_element_memory(size_of::<ReplayEvent>().saturating_add(size_of::<Arena>()).saturating_add(2 * size_of::<usize>()))?;
-                    let prefix = self.baseline.clone_with_context(ctx)?;
+                    let prefix = baseline.clone_with_context(ctx)?;
                     self.events.push(ReplayEvent::Prefix(std::sync::Arc::new(prefix)));
                 }
+                self.baseline = baseline;
                 self.active = true;
             }
             self.events.push(ReplayEvent::Future(record.to_vec()));
             return Ok(());
         }
+        if !self.active { return self.current.merge(&mut &record[..], ctx); }
         let staged = self.baseline.stage(record, ctx);
+        if matches!(&staged, Err(evolution_fixture::DecodeError::InvalidWireType(3))) {
+            drop(staged);
+            self.migrate(ctx)?;
+            return self.current.merge(&mut &record[..], ctx);
+        }
         let staged = match staged {
             Ok(staged) => staged,
             Err(evolution_fixture::DecodeError::ElementMemoryLimitExceeded) => return Err(evolution_fixture::DecodeError::ElementMemoryLimitExceeded),
@@ -1210,6 +1281,7 @@ impl ProjectedRecord {
         Ok(())
     }
     fn encode(&self) -> Vec<u8> {
+        if self.eager { return self.current.encode_to_vec(); }
         if !self.active { return self.current.encode_to_vec(); }
         let unchanged = self.baseline.matches(&RecordVisitor::new(&self.current));
         let mut bytes = Vec::new();
@@ -1224,6 +1296,105 @@ impl ProjectedRecord {
         if !unchanged { bytes.extend(self.current.encode_to_vec()); }
         bytes
     }
+}
+#[test]
+fn prototype_known_only_decode_needs_no_semantic_bookkeeping_budget() {
+    let unknown = std::cell::Cell::new(100);
+    let budget = std::cell::Cell::new(0);
+    let ctx = evolution_fixture::DecodeContext::new(100, &unknown);
+    let mut prototype = ProjectedRecord::new();
+    prototype.merge_records(&[&[0x3a, 2, 8, 1], &[0x3a, 2, 16, 2]], ctx.with_element_memory(&budget)).unwrap();
+    assert!(prototype.baseline.is_empty());
+    assert!(!prototype.active && !prototype.eager);
+    assert!(prototype.merge_record(&[0x3a, 4, 8, 3, 0xc0, 0x3e], ctx.with_element_memory(&budget)).is_err());
+    assert!(prototype.merge_record(&[0x2a, 1, b'b'], ctx.with_element_memory(&budget)).is_err());
+    assert!(prototype.baseline.is_empty());
+    assert!(!prototype.active);
+    prototype.merge_record(&[0x2a, 1, b'b'], ctx).unwrap();
+    prototype.merge_record(&[0x3a, 0], ctx).unwrap();
+    let mut original = v1::Record::default();
+    original.merge_from_slice(&[0x3a, 4, 8, 3, 16, 2]).unwrap();
+    original.merge_from_slice(&[0x2a, 1, b'b', 0x3a, 0]).unwrap();
+    assert_eq!(v2::Record::decode_from_slice(&prototype.encode()).unwrap(), v2::Record::decode_from_slice(&original.encode_to_vec()).unwrap());
+}
+#[test]
+fn prototype_migration_delegates_received_unsupported_fields_to_original_codec() {
+    for unsupported in [&[0x10, 0][..], &[0x10, 1], &[0x42, 0], &[0xaa, 0, 1, b'z'], &[0x3a, 4, 0x2b, 8, 1, 0x2c]] {
+        let unknown = std::cell::Cell::new(100);
+        let ctx = evolution_fixture::DecodeContext::new(100, &unknown);
+        let records: &[&[u8]] = &[&[0x3a, 2, 8, 1], &[0x2a, 1, b'b'], &[0x3a, 2, 16, 2]];
+        let mut prototype = ProjectedRecord::new();
+        let mut original = v1::Record::default();
+        for record in records {
+            prototype.merge_record(record, ctx).unwrap();
+            original.merge_from_slice(record).unwrap();
+        }
+        prototype.merge_record(unsupported, ctx).unwrap();
+        original.merge_from_slice(unsupported).unwrap();
+        assert!(prototype.eager);
+        prototype.merge_record(&[0x3a, 0], ctx).unwrap();
+        original.merge_from_slice(&[0x3a, 0]).unwrap();
+        assert_eq!(v2::Record::decode_from_slice(&prototype.encode()).unwrap(), v2::Record::decode_from_slice(&original.encode_to_vec()).unwrap());
+    }
+}
+#[test]
+fn prototype_migration_preserves_unsupported_public_edits() {
+    for next in [false, true] {
+        let unknown = std::cell::Cell::new(100);
+        let ctx = evolution_fixture::DecodeContext::new(100, &unknown);
+        let wire = [0x3a, 2, 8, 1, 0x2a, 1, b'b'];
+        let mut prototype = ProjectedRecord::new();
+        prototype.merge_records(&[&wire[..4], &wire[4..]], ctx).unwrap();
+        let mut original = v1::Record::decode_from_slice(&wire).unwrap();
+        if next {
+            prototype.current.next = Some(v1::Record::default()).into();
+            original.next = Some(v1::Record::default()).into();
+        } else {
+            prototype.current.mode = Some(v1::record::Mode::READY);
+            original.mode = Some(v1::record::Mode::READY);
+        }
+        prototype.merge_record(&[0x3a, 0], ctx).unwrap();
+        original.merge_from_slice(&[0x3a, 0]).unwrap();
+        assert!(prototype.eager);
+        assert_eq!(v2::Record::decode_from_slice(&prototype.encode()).unwrap(), v2::Record::decode_from_slice(&original.encode_to_vec()).unwrap());
+    }
+}
+#[test]
+fn prototype_migration_failures_preserve_partial_receiver_and_allow_retry() {
+    let mut rejected = 0;
+    let mut admitted = 0;
+    for quota in 0..1024 {
+        let unknown = std::cell::Cell::new(100);
+        let ctx = evolution_fixture::DecodeContext::new(100, &unknown);
+        let records: &[&[u8]] = &[&[0x3a, 2, 8, 1], &[0x2a, 1, b'b'], &[0x3a, 2, 16, 2]];
+        let mut prototype = ProjectedRecord::new();
+        let mut original = v1::Record::default();
+        for record in records {
+            prototype.merge_record(record, ctx).unwrap();
+            original.merge_from_slice(record).unwrap();
+        }
+        let malformed = [0x3a, 4, 8, 3, 0xc0, 0x3e];
+        assert!(prototype.merge_record(&malformed, ctx).is_err());
+        assert!(original.merge_from_slice(&malformed).is_err());
+        let before = prototype.encode();
+        // Replayed unknowns use the element balance, not this allowance.
+        unknown.set(0);
+        let budget = std::cell::Cell::new(quota);
+        match prototype.migrate(ctx.with_element_memory(&budget)) {
+            Ok(()) => { admitted += 1; assert!(prototype.eager); }
+            Err(_) => {
+                rejected += 1;
+                assert!(!prototype.eager);
+                assert_eq!(prototype.encode(), before);
+                prototype.migrate(ctx).unwrap();
+            }
+        }
+        assert_eq!(unknown.get(), 0);
+        prototype.merge_record(&[0x10, 0], ctx).unwrap();
+        original.merge_from_slice(&[0x10, 0]).unwrap();
+        assert_eq!(v2::Record::decode_from_slice(&prototype.encode()).unwrap(), v2::Record::decode_from_slice(&original.encode_to_vec()).unwrap());
+    }
+    assert!(rejected > 0 && admitted > 0);
 }
 #[test]
 fn prototype_receiver_matches_owned_codec_and_future_reader_with_no_decode_encoding() {

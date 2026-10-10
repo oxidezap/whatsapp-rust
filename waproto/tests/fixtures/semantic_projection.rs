@@ -197,6 +197,7 @@ impl Arena {
                     let start = offset + input_len - input.len() - bytes.len();
                     Value::Bytes(start..start + bytes.len())
                 }
+                (_, WireType::StartGroup) => return Err(DecodeError::InvalidWireType(3)),
                 (_, WireType::Fixed32) if input.remaining() >= 4 => {
                     Value::Fixed32(input.get_u32_le())
                 }
@@ -605,6 +606,13 @@ impl Arena {
                 }
             }
         }
+    }
+    // Migration is an explicit encoding operation. Reserve a linear upper
+    // bound before allocating its output; dead records only make it larger.
+    pub fn encoding_bound(&self) -> usize {
+        self.nodes.iter().fold(self.bytes.len(), |total, node| {
+            total.saturating_add(node.entries.len().saturating_mul(25))
+        })
     }
     pub fn encode(&self) -> Vec<u8> {
         #[cfg(test)]

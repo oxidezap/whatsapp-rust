@@ -365,6 +365,7 @@ fn projection_compaction_preserves_payloads_and_remaps_live_children() {
         baseline.accept(record, context(&unknown)).unwrap();
     }
     let before = baseline.encode();
+    assert!(baseline.encoding_bound() >= before.len());
     baseline.compact_projection();
     assert_eq!(baseline.encode(), before);
     baseline
