@@ -98,6 +98,40 @@ pub(crate) trait OwnedCodec {
     ) -> Result<(), DecodeError>;
 }
 
+// Keep the buffer specialization, while sharing the tag loop across owners.
+// Erasing Buf here would instantiate another recursive decoder tree; inheriting
+// OwnedCodec would duplicate all its vtable slots for every buffer type.
+pub(crate) trait OwnedBatch<B: Buf> {
+    fn base(&mut self) -> &mut dyn OwnedCodec;
+    fn merge_batch_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut B,
+        ctx: DecodeContext<'_>,
+    ) -> Result<(), DecodeError>;
+}
+
+#[inline(never)]
+pub(crate) fn merge_owned_batch<B: Buf>(
+    codec: &mut dyn OwnedBatch<B>,
+    buf: &mut B,
+    ctx: DecodeContext<'_>,
+    limit: usize,
+) -> Result<(), DecodeError> {
+    if buf.remaining() <= limit { return Ok(()); }
+    {
+        let base = codec.base();
+        if base.storage().active() { reconcile_owned(base, ctx)?; }
+    }
+    while buf.remaining() > limit {
+        let tag = ::buffa::encoding::Tag::decode(buf)?;
+        codec.merge_batch_field(tag, buf, ctx)?;
+    }
+    let base = codec.base();
+    if base.storage().active() { complete_owned_batch(base, ctx)?; }
+    Ok(())
+}
+
 #[cold]
 #[inline(never)]
 pub(crate) fn begin_owned(

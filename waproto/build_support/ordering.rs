@@ -723,21 +723,7 @@ fn transform(
                 syn::parse_quote! {
                     #[inline(never)]
                     fn merge_to_limit(&mut self, buf: &mut impl ::buffa::bytes::Buf, ctx: ::buffa::DecodeContext<'_>, limit: usize) -> ::core::result::Result<(), ::buffa::DecodeError> {
-                        if buf.remaining() <= limit { return Ok(()); }
-                        if buf.remaining() > limit && self.__buffa_unknown_fields.active() {
-                            #runtime::reconcile_owned(&mut #runtime::Adapter(self), ctx)?;
-                        }
-                        let result = (|| {
-                            while buf.remaining() > limit {
-                                let tag = ::buffa::encoding::Tag::decode(buf)?;
-                                self.__wire_merge_field(tag, buf, ctx, false)?;
-                            }
-                            Ok(())
-                        })();
-                        let completed = if result.is_ok() && self.__buffa_unknown_fields.active() {
-                            #runtime::complete_owned_batch(&mut #runtime::Adapter(self), ctx)
-                        } else { Ok(()) };
-                        result.and(completed)
+                        #runtime::merge_owned_batch(&mut #runtime::Adapter(self), buf, ctx, limit)
                     }
                 }
             });
@@ -832,6 +818,21 @@ fn transform(
                     }
                 }
             });
+            if !view {
+                let mut batch_generics = item.generics.clone();
+                batch_generics
+                    .params
+                    .push(syn::parse_quote!(__WireBuf: ::buffa::bytes::Buf));
+                let (batch_impl_generics, _, batch_where_clause) = batch_generics.split_for_impl();
+                helpers.push(syn::parse_quote! {
+                    impl #batch_impl_generics #runtime::OwnedBatch<__WireBuf> for #runtime::Adapter<'_, #ty> #batch_where_clause {
+                        fn base(&mut self) -> &mut dyn #runtime::OwnedCodec { self }
+                        fn merge_batch_field(&mut self, tag: ::buffa::encoding::Tag, buf: &mut __WireBuf, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<(), ::buffa::DecodeError> {
+                            self.0.__wire_merge_field(tag, buf, ctx, false)
+                        }
+                    }
+                });
+            }
             helpers.push(if view {
                 syn::parse_quote! {
                     impl #impl_generics #runtime::ViewCodec<'a> for #runtime::Adapter<'_, #ty> #where_clause {
