@@ -1149,12 +1149,12 @@ impl ProjectedRecord {
         if self.active {
             for event in &self.events {
                 match event {
-                    ReplayEvent::Prefix(prefix) => wire.extend(prefix.encode()),
+                    ReplayEvent::Prefix(prefix) => prefix.encode_into(&mut wire),
                     ReplayEvent::Known(raw) => wire.extend_from_slice(self.baseline.record(raw)),
                     ReplayEvent::Future(raw) => wire.extend_from_slice(raw),
                 }
             }
-        } else { wire.extend(self.baseline.encode()); }
+        } else { self.baseline.encode_into(&mut wire); }
         // Accepted unknowns do not debit the caller again. Replay still pays
         // unknown metadata from its local element balance, including on error.
         let remaining = ctx.remaining_element_memory().unwrap_or(usize::MAX);
@@ -1164,6 +1164,7 @@ impl ProjectedRecord {
         let result = prepared.merge(&mut wire.as_slice(), replay_ctx);
         ctx.register_element_memory(remaining.saturating_sub(budget.get()))?;
         result?;
+        ctx.register_element_memory(self.current.__buffa_unknown_fields.len().saturating_mul(size_of::<evolution_fixture::UnknownField>()))?;
         // Publish only after fallible preparation. Move public fields rather
         // than cloning them or blessing a partial receiver as the baseline.
         prepared.name = std::mem::take(&mut self.current.name);
@@ -1171,6 +1172,9 @@ impl ProjectedRecord {
         prepared.choice = std::mem::take(&mut self.current.choice);
         prepared.child = std::mem::take(&mut self.current.child);
         prepared.next = std::mem::take(&mut self.current.next);
+        for field in std::mem::take(&mut self.current.__buffa_unknown_fields) {
+            prepared.__buffa_unknown_fields.push(field);
+        }
         self.current = prepared;
         self.events.clear();
         self.baseline = Arena::new(SCHEMA);
@@ -1280,7 +1284,17 @@ impl ProjectedRecord {
         if self.active { self.events.push(ReplayEvent::Known(raw)); }
         Ok(())
     }
+    fn raw_unknowns_mut(&mut self, ctx: evolution_fixture::DecodeContext<'_>) -> Result<&mut evolution_fixture::UnknownFields, evolution_fixture::DecodeError> {
+        if !self.eager { self.migrate(ctx)?; }
+        Ok(&mut self.current.__buffa_unknown_fields)
+    }
     fn encode(&self) -> Vec<u8> {
+        if !self.eager && !self.supports_current() {
+            let mut migrated = self.clone();
+            let unlimited = std::cell::Cell::new(usize::MAX);
+            migrated.migrate(evolution_fixture::DecodeContext::new(u32::MAX, &unlimited)).expect("unbudgeted fixture migration");
+            return migrated.current.encode_to_vec();
+        }
         if self.eager { return self.current.encode_to_vec(); }
         if !self.active { return self.current.encode_to_vec(); }
         let unchanged = self.baseline.matches(&RecordVisitor::new(&self.current));
@@ -1588,6 +1602,37 @@ fn prototype_receiver_retains_partial_edits_and_retries() {
     prototype.merge_record(&empty, ctx).unwrap();
     oracle.merge_from_slice(&empty).unwrap();
     assert_eq!(prototype.encode(), oracle.encode_to_vec());
+}
+
+#[test]
+fn prototype_root_unknown_edits_survive_migration_and_clear() {
+    let unknown = std::cell::Cell::new(100);
+    let ctx = evolution_fixture::DecodeContext::new(100, &unknown);
+    let wire = [0x3a, 2, 8, 1, 0x2a, 1, b'b', 0x3a, 2, 16, 2];
+    let mut prototype = ProjectedRecord::new();
+    prototype.merge_records(&[&wire[..4], &wire[4..7], &wire[7..]], ctx).unwrap();
+    let mut original = v1::Record::decode_from_slice(&wire).unwrap();
+    let added = evolution_fixture::UnknownField { number: 99, data: evolution_fixture::UnknownFieldData::Varint(17) };
+    original.__buffa_unknown_fields.push(added.clone());
+    prototype.current.__buffa_unknown_fields.push(added);
+    assert_eq!(prototype.encode(), original.encode_to_vec());
+    let before = prototype.encode();
+    let zero = std::cell::Cell::new(0);
+    assert!(prototype.migrate(ctx.with_element_memory(&zero)).is_err());
+    assert_eq!(prototype.encode(), before);
+    assert!(!prototype.eager);
+    prototype.migrate(ctx).unwrap();
+    assert_eq!(prototype.encode(), original.encode_to_vec());
+    original.__buffa_unknown_fields.clear();
+    prototype.raw_unknowns_mut(ctx).unwrap().clear();
+    assert_eq!(prototype.encode(), original.encode_to_vec());
+
+    let mut prototype = ProjectedRecord::new();
+    prototype.merge_records(&[&wire[..4], &wire[4..7], &wire[7..]], ctx).unwrap();
+    let mut original = v1::Record::decode_from_slice(&wire).unwrap();
+    prototype.raw_unknowns_mut(ctx).unwrap().clear();
+    original.__buffa_unknown_fields.clear();
+    assert_eq!(prototype.encode(), original.encode_to_vec());
 }
 
 }

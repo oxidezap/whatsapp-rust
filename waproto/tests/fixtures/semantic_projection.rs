@@ -615,13 +615,54 @@ impl Arena {
         })
     }
     pub fn encode(&self) -> Vec<u8> {
+        let mut output = Vec::with_capacity(self.encoded_len());
+        self.encode_into(&mut output);
+        output
+    }
+    // Migration already reserved its entire destination. Writing children
+    // directly keeps that reservation sufficient, without temporary buffers.
+    pub fn encode_into(&self, output: &mut Vec<u8>) {
         #[cfg(test)]
         self.encode_calls.set(self.encode_calls.get() + 1);
-        let mut output = Vec::new();
         if !self.nodes.is_empty() {
-            self.write(0, 0, &mut output);
+            self.write(0, 0, output);
         }
-        output
+    }
+    fn encoded_len(&self) -> usize {
+        if self.nodes.is_empty() {
+            0
+        } else {
+            self.node_len(0, 0)
+        }
+    }
+    fn node_len(&self, node: usize, schema: usize) -> usize {
+        self.nodes[node]
+            .entries
+            .iter()
+            .map(|entry| {
+                let tag = buffa::encoding::varint_len(u64::from(entry.number) << 3);
+                let value = match &entry.value {
+                    Value::Varint(value) => buffa::encoding::varint_len(*value),
+                    Value::Bytes(range) => {
+                        buffa::encoding::varint_len(range.len() as u64) + range.len()
+                    }
+                    Value::Child(child) => {
+                        let field = self.schema[schema]
+                            .iter()
+                            .find(|field| field.number == entry.number)
+                            .expect("child descriptor");
+                        let Kind::Message(child_schema) = field.kind else {
+                            unreachable!("child descriptor")
+                        };
+                        let len = self.node_len(*child, usize::from(child_schema));
+                        buffa::encoding::varint_len(len as u64) + len
+                    }
+                    Value::Fixed32(_) => 4,
+                    Value::Fixed64(_) => 8,
+                };
+                tag + value
+            })
+            .sum()
     }
     #[cfg(test)]
     pub fn encode_calls(&self) -> usize {
@@ -661,10 +702,9 @@ impl Arena {
                 let Kind::Message(schema) = kind else {
                     unreachable!("child descriptor")
                 };
-                let mut bytes = Vec::new();
-                self.write(*child, usize::from(schema), &mut bytes);
-                varint(bytes.len() as u64, out);
-                out.extend(bytes);
+                let len = self.node_len(*child, usize::from(schema));
+                varint(len as u64, out);
+                self.write(*child, usize::from(schema), out);
             }
             Value::Fixed32(value) => out.extend(value.to_le_bytes()),
             Value::Fixed64(value) => out.extend(value.to_le_bytes()),

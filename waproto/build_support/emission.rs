@@ -14,6 +14,8 @@ mod ordering;
 
 #[path = "wire_growth.rs"]
 mod wire_growth;
+#[path = "wire_semantic_plan.rs"]
+mod wire_semantic_plan;
 
 struct Extensible {
     serde: bool,
@@ -322,6 +324,14 @@ pub fn finish(
             share_codecs(&mut file.items);
             ColdStorage { depth: 0 }.visit_file_mut(&mut file);
             ordering::apply(&mut file, false, &growth);
+            if package == "whatsapp" {
+                let visitors = wire_semantic_plan::emit(&wire_semantic_plan::plan(fds), &file);
+                let source = prettyplease::unparse(&visitors);
+                let target = out.join("semantic_header_visitors.rs");
+                if !std::fs::read_to_string(&target).is_ok_and(|old| old == source) {
+                    std::fs::write(target, source)?;
+                }
+            }
             let body = syn::parse_file(include_str!("unknown_storage.rs")).expect("storage syntax");
             let body = body.items;
             file.items

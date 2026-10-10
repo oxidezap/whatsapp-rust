@@ -366,6 +366,12 @@ fn projection_compaction_preserves_payloads_and_remaps_live_children() {
     }
     let before = baseline.encode();
     assert!(baseline.encoding_bound() >= before.len());
+    let mut reserved = Vec::with_capacity(baseline.encoding_bound() + 3);
+    reserved.extend_from_slice(b"pre");
+    let capacity = reserved.capacity();
+    baseline.encode_into(&mut reserved);
+    assert_eq!(&reserved[3..], before);
+    assert_eq!(reserved.capacity(), capacity);
     baseline.compact_projection();
     assert_eq!(baseline.encode(), before);
     baseline
