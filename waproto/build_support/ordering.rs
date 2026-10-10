@@ -749,6 +749,14 @@ fn transform(
             // Direct single-field calls still check on every invocation.
             // Keep each batch loop shared by decode entry points and nested
             // merge adapters rather than expanding it into every caller.
+            // ContextInfo's batch has one caller in the demo: the shared
+            // nested-message adapter. Inline only its control loop into that
+            // adapter; the recursive field decoder remains outlined.
+            let owned_batch_inline: syn::Attribute = if name == "ContextInfo" {
+                syn::parse_quote!(#[inline])
+            } else {
+                syn::parse_quote!(#[inline(never)])
+            };
             item.items.push(if view {
                 syn::parse_quote! {
                     #[inline(never)]
@@ -774,7 +782,7 @@ fn transform(
                 }
             } else {
                 syn::parse_quote! {
-                    #[inline(never)]
+                    #owned_batch_inline
                     fn merge_to_limit(&mut self, buf: &mut impl ::buffa::bytes::Buf, ctx: ::buffa::DecodeContext<'_>, limit: usize) -> ::core::result::Result<(), ::buffa::DecodeError> {
                         if buf.remaining() <= limit { return Ok(()); }
                         if buf.remaining() > limit && self.__buffa_unknown_fields.active() {
