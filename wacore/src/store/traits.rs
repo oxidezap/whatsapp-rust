@@ -1173,11 +1173,13 @@ pub trait ProtocolStore: Send + Sync {
     /// Oversized or non-BLOB rows are errors, distinct from absence. Empty bytes
     /// are a present row; envelope validation belongs to the decoder. The length
     /// check and read must observe the same row. This optional contract has no
-    /// fallback to the unbounded getter.
+    /// fallback to the unbounded getter. The supplied lease must cover the
+    /// maximum returned payload before this operation starts.
     async fn read_pending_inbound_bounded(
         &self,
         _key: PendingInboundKey<'_>,
         _max_bytes: usize,
+        _lease: PendingInboundLease,
     ) -> Result<Option<PendingInboundRecord>> {
         Err(unsupported_pending_inbound())
     }
@@ -1187,6 +1189,7 @@ pub trait ProtocolStore: Send + Sync {
     /// and reject oversized existing or replacement payloads before copying. An
     /// already installed identical replacement is an idempotent success only
     /// because each new envelope carries its unique operation identifier.
+    /// The owned payload and its lease stay alive through all detached workers.
     ///
     /// The caller must retain exclusive ownership until detached workers and
     /// retries finish, including after cancellation. Revision checks alone do
@@ -1195,7 +1198,7 @@ pub trait ProtocolStore: Send + Sync {
         &self,
         _key: PendingInboundKey<'_>,
         _expected: PendingInboundRevision,
-        _replacement: &[u8],
+        _replacement: PendingInboundPayload,
         _max_bytes: usize,
     ) -> Result<PendingInboundMutation> {
         Err(unsupported_pending_inbound())
@@ -1211,6 +1214,7 @@ pub trait ProtocolStore: Send + Sync {
         _key: PendingInboundKey<'_>,
         _expected: PendingInboundRevision,
         _max_bytes: usize,
+        _lease: PendingInboundLease,
     ) -> Result<PendingInboundMutation> {
         Err(unsupported_pending_inbound())
     }
@@ -1275,17 +1279,69 @@ impl PendingInboundRevision {
     }
 }
 
+/// Opaque ownership retained by every detached pending-row worker and result.
+/// The caller supplies its identity lock and byte-budget reservation together.
+/// Cloning this token must not reacquire the lock or release its reservation.
+/// Backends must capture a clone in every retry factory and detached worker.
+#[derive(Clone)]
+pub struct PendingInboundLease {
+    _keepalive: Arc<dyn crate::sync_marker::MaybeSendSync>,
+}
+
+impl PendingInboundLease {
+    pub fn new(owner: Arc<dyn crate::sync_marker::MaybeSendSync>) -> Self {
+        Self { _keepalive: owner }
+    }
+}
+
+impl std::fmt::Debug for PendingInboundLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingInboundLease")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Immutable replacement bytes and the ownership that accounts for them.
+/// The caller reserves before allocating; the lease must also cover bounded
+/// prior-row scratch. SQLite's internal copies need separate peak accounting.
+#[derive(Debug)]
+pub struct PendingInboundPayload {
+    bytes: Bytes,
+    // Fields drop in declaration order: bytes must die before their charge.
+    lease: PendingInboundLease,
+}
+
+impl PendingInboundPayload {
+    pub fn new(bytes: Bytes, lease: PendingInboundLease) -> Self {
+        Self { bytes, lease }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn lease(&self) -> PendingInboundLease {
+        self.lease.clone()
+    }
+}
+
 /// One bounded pending row, with its revision computed from the original bytes.
+/// Keep this wrapper, or a clone of its lease, while decoded data remains live.
 #[derive(Debug)]
 pub struct PendingInboundRecord {
     bytes: Vec<u8>,
     revision: PendingInboundRevision,
+    lease: PendingInboundLease,
 }
 
 impl PendingInboundRecord {
-    pub fn new(bytes: Vec<u8>) -> Self {
+    pub fn new(bytes: Vec<u8>, lease: PendingInboundLease) -> Self {
         let revision = PendingInboundRevision::for_bytes(&bytes);
-        Self { bytes, revision }
+        Self {
+            bytes,
+            revision,
+            lease,
+        }
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -1296,8 +1352,8 @@ impl PendingInboundRecord {
         self.revision
     }
 
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+    pub fn lease(&self) -> PendingInboundLease {
+        self.lease.clone()
     }
 }
 

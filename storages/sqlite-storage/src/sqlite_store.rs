@@ -3259,6 +3259,7 @@ fn read_pending_inbound_bounded_row(
     sender: &str,
     id: &str,
     max_bytes: usize,
+    lease: PendingInboundLease,
 ) -> QueryResult<Result<Option<PendingInboundRecord>>> {
     // CASE keeps oversized blobs out of the Diesel value buffer. Both length
     // and payload come from one row snapshot, never separate racing queries.
@@ -3284,7 +3285,7 @@ fn read_pending_inbound_bounded_row(
             "pending inbound payload is not a BLOB".to_owned(),
         )),
         Some(row) => match row.payload {
-            Some(bytes) => Ok(Some(PendingInboundRecord::new(bytes))),
+            Some(bytes) => Ok(Some(PendingInboundRecord::new(bytes, lease))),
             None => Err(StoreError::Validation(format!(
                 "pending inbound payload length {:?} exceeds limit {max_bytes}",
                 row.byte_len,
@@ -4360,6 +4361,7 @@ impl ProtocolStore for SqliteStore {
         &self,
         key: PendingInboundKey<'_>,
         max_bytes: usize,
+        lease: PendingInboundLease,
     ) -> Result<Option<PendingInboundRecord>> {
         let (chat, sender, id) = (
             key.chat.to_owned(),
@@ -4368,9 +4370,18 @@ impl ProtocolStore for SqliteStore {
         );
         let device_id = self.device_id;
         self.with_read_retry("read_pending_inbound_bounded", || {
+            let lease = lease.clone();
             let (chat, sender, id) = (chat.clone(), sender.clone(), id.clone());
             Box::new(move |conn| {
-                read_pending_inbound_bounded_row(conn, device_id, &chat, &sender, &id, max_bytes)
+                read_pending_inbound_bounded_row(
+                    conn,
+                    device_id,
+                    &chat,
+                    &sender,
+                    &id,
+                    max_bytes,
+                    lease.clone(),
+                )
             })
         })
         .await?
@@ -4380,17 +4391,17 @@ impl ProtocolStore for SqliteStore {
         &self,
         key: PendingInboundKey<'_>,
         expected: PendingInboundRevision,
-        replacement: &[u8],
+        replacement: PendingInboundPayload,
         max_bytes: usize,
     ) -> Result<PendingInboundMutation> {
-        if replacement.len() > max_bytes {
+        if replacement.bytes().len() > max_bytes {
             return Err(StoreError::Validation(format!(
                 "pending inbound replacement length {} exceeds limit {max_bytes}",
-                replacement.len(),
+                replacement.bytes().len(),
             )));
         }
-        let replacement_revision = PendingInboundRevision::for_bytes(replacement);
-        let replacement = Arc::new(replacement.to_vec());
+        let replacement_revision = PendingInboundRevision::for_bytes(replacement.bytes());
+        let replacement = Arc::new(replacement);
         let (chat, sender, id) = (
             key.chat.to_owned(),
             key.sender.to_owned(),
@@ -4403,7 +4414,13 @@ impl ProtocolStore for SqliteStore {
             Box::new(move |conn| {
                 conn.immediate_transaction(|conn| {
                     let current = match read_pending_inbound_bounded_row(
-                        conn, device_id, &chat, &sender, &id, max_bytes,
+                        conn,
+                        device_id,
+                        &chat,
+                        &sender,
+                        &id,
+                        max_bytes,
+                        replacement.lease(),
                     )? {
                         Ok(current) => current,
                         Err(error) => return Ok(Err(error)),
@@ -4418,7 +4435,14 @@ impl ProtocolStore for SqliteStore {
                     if revision != expected {
                         return Ok(Ok(PendingInboundMutation::Conflict));
                     }
-                    insert_pending_inbound_row(conn, device_id, &chat, &sender, &id, &replacement)?;
+                    insert_pending_inbound_row(
+                        conn,
+                        device_id,
+                        &chat,
+                        &sender,
+                        &id,
+                        replacement.bytes(),
+                    )?;
                     Ok(Ok(PendingInboundMutation::Applied))
                 })
             })
@@ -4431,6 +4455,7 @@ impl ProtocolStore for SqliteStore {
         key: PendingInboundKey<'_>,
         expected: PendingInboundRevision,
         max_bytes: usize,
+        lease: PendingInboundLease,
     ) -> Result<PendingInboundMutation> {
         let (chat, sender, id) = (
             key.chat.to_owned(),
@@ -4439,11 +4464,18 @@ impl ProtocolStore for SqliteStore {
         );
         let device_id = self.device_id;
         self.with_retry("delete_pending_inbound_if", || {
+            let lease = lease.clone();
             let (chat, sender, id) = (chat.clone(), sender.clone(), id.clone());
             Box::new(move |conn| {
                 conn.immediate_transaction(|conn| {
                     let current = match read_pending_inbound_bounded_row(
-                        conn, device_id, &chat, &sender, &id, max_bytes,
+                        conn,
+                        device_id,
+                        &chat,
+                        &sender,
+                        &id,
+                        max_bytes,
+                        lease.clone(),
                     )? {
                         Ok(current) => current,
                         Err(error) => return Ok(Err(error)),
@@ -4990,6 +5022,155 @@ mod tests {
             .expect("Failed to create test store")
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    struct PendingTestOwner {
+        _lock: tokio::sync::OwnedMutexGuard<()>,
+        charged: Arc<std::sync::atomic::AtomicUsize>,
+        amount: usize,
+        released: std::sync::mpsc::Sender<()>,
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    impl Drop for PendingTestOwner {
+        fn drop(&mut self) {
+            self.charged
+                .fetch_sub(self.amount, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.released.send(());
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn pending_owned_read_result_keeps_budget_and_identity_lock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = create_test_store().await;
+        let key = PendingInboundKey {
+            chat: "test-chat",
+            sender: "test-sender",
+            id: "owned-read",
+        };
+        store
+            .store_pending_inbound(key.chat, key.sender, key.id, b"raw")
+            .await
+            .unwrap();
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let charged = Arc::new(AtomicUsize::new(16));
+        let (released, completion) = std::sync::mpsc::channel();
+        let lease = PendingInboundLease::new(Arc::new(PendingTestOwner {
+            _lock: lock.clone().lock_owned().await,
+            charged: charged.clone(),
+            amount: 16,
+            released,
+        }));
+        let record = store
+            .read_pending_inbound_bounded(key, 16, lease)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.bytes(), b"raw");
+        assert!(
+            lock.try_lock().is_err(),
+            "the returned bytes still own their identity"
+        );
+        assert_eq!(charged.load(Ordering::SeqCst), 16);
+        drop(record);
+        completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(lock.try_lock().is_ok());
+        assert_eq!(charged.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn pending_owned_cancelled_cas_keeps_worker_budget_and_excludes_successor() {
+        use std::future::{Future, poll_fn};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Poll;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let store = create_test_store().await;
+            let key = PendingInboundKey {
+                chat: "test-chat",
+                sender: "test-sender",
+                id: "cancelled-cas",
+            };
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            let charged = Arc::new(AtomicUsize::new(32));
+            let (released, completion) = std::sync::mpsc::channel();
+            let owner = Arc::new(PendingTestOwner {
+                _lock: lock.clone().lock_owned().await,
+                charged: charged.clone(),
+                amount: 32,
+                released,
+            });
+            let weak = Arc::downgrade(&owner);
+            let request = PendingInboundPayload::new(
+                Bytes::from_static(b"raw"),
+                PendingInboundLease::new(owner),
+            );
+            // One blocking slot makes the actual CAS worker queue deterministic.
+            // No production hook or timing sleep changes the storage path.
+            let (started, entered) = std::sync::mpsc::channel();
+            let (unpark, parked) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                parked.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut operation = Box::pin(store.replace_pending_inbound_if(
+                key,
+                PendingInboundRevision::missing(),
+                request,
+                16,
+            ));
+            assert!(poll_fn(|cx| Poll::Ready(operation.as_mut().poll(cx).is_pending())).await);
+            drop(operation);
+            assert!(
+                weak.upgrade().is_some(),
+                "cancelled caller must not release the queued worker"
+            );
+            assert!(
+                lock.try_lock().is_err(),
+                "a successor cannot enter before worker terminal"
+            );
+            assert_eq!(charged.load(Ordering::SeqCst), 32);
+            unpark.send(()).unwrap();
+            completion.recv_timeout(Duration::from_secs(5)).unwrap();
+            blocker.await.unwrap();
+            assert!(weak.upgrade().is_none());
+            assert_eq!(charged.load(Ordering::SeqCst), 0);
+            let successor = lock.clone().lock_owned().await;
+            let record = store
+                .read_pending_inbound_bounded(key, 16, pending_test_lease())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.bytes(), b"raw");
+            assert_eq!(
+                store
+                    .delete_pending_inbound_if(key, record.revision(), 16, pending_test_lease())
+                    .await
+                    .unwrap(),
+                PendingInboundMutation::Applied
+            );
+            drop(successor);
+            assert!(
+                store
+                    .read_pending_inbound_bounded(key, 16, pending_test_lease())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    fn pending_test_lease() -> PendingInboundLease {
+        PendingInboundLease::new(Arc::new(()))
+    }
+
     #[tokio::test]
     async fn pending_bounded_empty_is_present_and_delete_requires_revision() {
         let store = create_test_store().await;
@@ -5000,14 +5181,19 @@ mod tests {
         };
         assert!(
             store
-                .read_pending_inbound_bounded(key, 0)
+                .read_pending_inbound_bounded(key, 0, pending_test_lease())
                 .await
                 .unwrap()
                 .is_none()
         );
         assert_eq!(
             store
-                .delete_pending_inbound_if(key, PendingInboundRevision::missing(), 0)
+                .delete_pending_inbound_if(
+                    key,
+                    PendingInboundRevision::missing(),
+                    0,
+                    pending_test_lease()
+                )
                 .await
                 .unwrap(),
             PendingInboundMutation::Applied
@@ -5017,7 +5203,7 @@ mod tests {
             .await
             .unwrap();
         let row = store
-            .read_pending_inbound_bounded(key, 0)
+            .read_pending_inbound_bounded(key, 0, pending_test_lease())
             .await
             .unwrap()
             .unwrap();
@@ -5025,21 +5211,26 @@ mod tests {
         assert_ne!(row.revision(), PendingInboundRevision::missing());
         assert_eq!(
             store
-                .delete_pending_inbound_if(key, PendingInboundRevision::missing(), 0)
+                .delete_pending_inbound_if(
+                    key,
+                    PendingInboundRevision::missing(),
+                    0,
+                    pending_test_lease()
+                )
                 .await
                 .unwrap(),
             PendingInboundMutation::Conflict
         );
         assert_eq!(
             store
-                .delete_pending_inbound_if(key, row.revision(), 0)
+                .delete_pending_inbound_if(key, row.revision(), 0, pending_test_lease())
                 .await
                 .unwrap(),
             PendingInboundMutation::Applied
         );
         assert_eq!(
             store
-                .delete_pending_inbound_if(key, row.revision(), 0)
+                .delete_pending_inbound_if(key, row.revision(), 0, pending_test_lease())
                 .await
                 .unwrap(),
             PendingInboundMutation::Conflict
@@ -5069,20 +5260,28 @@ mod tests {
             .await
             .unwrap();
         let original = store
-            .read_pending_inbound_bounded(key, 16)
+            .read_pending_inbound_bounded(key, 16, pending_test_lease())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(original.bytes(), compact);
         assert_eq!(
             store
-                .replace_pending_inbound_if(key, original.revision(), &extended, 16)
+                .replace_pending_inbound_if(
+                    key,
+                    original.revision(),
+                    PendingInboundPayload::new(
+                        Bytes::copy_from_slice(&extended),
+                        pending_test_lease()
+                    ),
+                    16
+                )
                 .await
                 .unwrap(),
             PendingInboundMutation::Applied
         );
         let successor = store
-            .read_pending_inbound_bounded(key, 16)
+            .read_pending_inbound_bounded(key, 16, pending_test_lease())
             .await
             .unwrap()
             .unwrap();
@@ -5090,21 +5289,37 @@ mod tests {
         assert_ne!(successor.revision(), original.revision());
         assert_eq!(
             store
-                .replace_pending_inbound_if(key, original.revision(), b"stale", 16)
+                .replace_pending_inbound_if(
+                    key,
+                    original.revision(),
+                    PendingInboundPayload::new(
+                        Bytes::copy_from_slice(b"stale"),
+                        pending_test_lease()
+                    ),
+                    16
+                )
                 .await
                 .unwrap(),
             PendingInboundMutation::Conflict
         );
         assert_eq!(
             store
-                .delete_pending_inbound_if(key, original.revision(), 16)
+                .delete_pending_inbound_if(key, original.revision(), 16, pending_test_lease())
                 .await
                 .unwrap(),
             PendingInboundMutation::Conflict
         );
         assert_eq!(
             store
-                .replace_pending_inbound_if(key, original.revision(), &extended, 16)
+                .replace_pending_inbound_if(
+                    key,
+                    original.revision(),
+                    PendingInboundPayload::new(
+                        Bytes::copy_from_slice(&extended),
+                        pending_test_lease()
+                    ),
+                    16
+                )
                 .await
                 .unwrap(),
             PendingInboundMutation::Applied
@@ -5133,22 +5348,43 @@ mod tests {
             .await
             .unwrap();
         let revision = PendingInboundRevision::for_bytes(&payload);
-        assert!(store.read_pending_inbound_bounded(key, 16).await.is_err());
         assert!(
             store
-                .replace_pending_inbound_if(key, revision, b"new", 16)
+                .read_pending_inbound_bounded(key, 16, pending_test_lease())
                 .await
                 .is_err()
         );
         assert!(
             store
-                .delete_pending_inbound_if(key, revision, 16)
+                .replace_pending_inbound_if(
+                    key,
+                    revision,
+                    PendingInboundPayload::new(
+                        Bytes::copy_from_slice(b"new"),
+                        pending_test_lease()
+                    ),
+                    16
+                )
                 .await
                 .is_err()
         );
         assert!(
             store
-                .replace_pending_inbound_if(key, revision, &payload, 16)
+                .delete_pending_inbound_if(key, revision, 16, pending_test_lease())
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .replace_pending_inbound_if(
+                    key,
+                    revision,
+                    PendingInboundPayload::new(
+                        Bytes::copy_from_slice(&payload),
+                        pending_test_lease()
+                    ),
+                    16
+                )
                 .await
                 .is_err()
         );
@@ -5165,16 +5401,29 @@ mod tests {
                 .execute(conn).map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         }).await.unwrap();
-        assert!(store.read_pending_inbound_bounded(key, 16).await.is_err());
         assert!(
             store
-                .replace_pending_inbound_if(key, revision, b"new", 16)
+                .read_pending_inbound_bounded(key, 16, pending_test_lease())
                 .await
                 .is_err()
         );
         assert!(
             store
-                .delete_pending_inbound_if(key, revision, 16)
+                .replace_pending_inbound_if(
+                    key,
+                    revision,
+                    PendingInboundPayload::new(
+                        Bytes::copy_from_slice(b"new"),
+                        pending_test_lease()
+                    ),
+                    16
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .delete_pending_inbound_if(key, revision, 16, pending_test_lease())
                 .await
                 .is_err()
         );
