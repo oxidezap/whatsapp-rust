@@ -15,28 +15,10 @@ fn main() {
     divan::main();
 }
 
-/// Track clone ownership and allocation cost separately from encode/decode.
-/// Unknown records are synthetic and include an owned payload inside a group.
-#[divan::bench(args = ["empty", "text", "future_field", "future_group"])]
-fn bench_protobuf_clone(bencher: divan::Bencher, shape: &str) {
-    use buffa::Message as _;
-    let message = match shape {
-        "empty" => wa::Message::default(),
-        "text" => text_message(),
-        "future_field" => wa::Message::decode_from_slice(&[0xc2, 0x3e, 4, 11, 22, 33, 44])
-            .expect("synthetic future-field clone fixture decodes"),
-        "future_group" => {
-            wa::Message::decode_from_slice(&[0xc3, 0x3e, 0x0a, 4, 11, 22, 33, 44, 0xc4, 0x3e])
-                .expect("synthetic future-group clone fixture decodes")
-        }
-        _ => unreachable!(),
-    };
-    bencher.bench(|| black_box(black_box(&message).clone()));
-}
-
 // The nested image and quoted message exercise traversal-cache entries. The
 // synthetic future field appears on either side of a known oneof alternative,
-// to measure both decode positions. Encode measures the known fixture.
+// to measure both decode positions. Encode measures the known fixture because
+// the current generated owned and borrowed codecs discard unknown fields.
 #[allow(clippy::field_reassign_with_default)] // Also works with non-exhaustive generated messages.
 fn oneof_wire(shape: &str) -> Vec<u8> {
     use buffa::Message as _;
@@ -141,20 +123,17 @@ fn bench_participant_list_hash_8(bencher: divan::Bencher) {
 }
 
 fn text_message() -> wa::Message {
-    {
-        let mut proto = wa::Message::default();
-        proto.extended_text_message = buffa::MessageField::some({
-            let mut proto = wa::message::ExtendedTextMessage::default();
-            proto.text = Some("Benchmark message with a realistic amount of text content.".into());
-            proto.context_info = buffa::MessageField::some({
-                let mut proto = wa::ContextInfo::default();
-                proto.stanza_id = Some("3EB0F4E1D2C3B4A59687".into());
-                proto.participant = Some("5511999990000@s.whatsapp.net".into());
-                proto
-            });
-            proto
-        });
-        proto
+    wa::Message {
+        extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+            text: Some("Benchmark message with a realistic amount of text content.".into()),
+            context_info: buffa::MessageField::some(wa::ContextInfo {
+                stanza_id: Some("3EB0F4E1D2C3B4A59687".into()),
+                participant: Some("5511999990000@s.whatsapp.net".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
     }
 }
 
@@ -187,30 +166,27 @@ fn bench_unpad_message_ref(bencher: divan::Bencher) {
 fn dm_shape(shape: &str) -> wa::Message {
     match shape {
         "text_reply" => text_message(),
-        "media_refs" => {
-            let mut proto = wa::Message::default();
-            proto.image_message = buffa::MessageField::some({
-                let mut proto = wa::message::ImageMessage::default();
-                proto.url = Some("https://mmg.whatsapp.net/v/t62.7118-24/abc123".into());
-                proto.direct_path = Some("/v/t62.7118-24/abc123".into());
-                proto.mimetype = Some("image/jpeg".into());
-                proto.caption = Some("Benchmark media caption".into());
-                proto.media_key = Some(vec![0xA5; 32]);
-                proto.file_sha256 = Some(vec![0x11; 32]);
-                proto.file_enc_sha256 = Some(vec![0x22; 32]);
-                proto.file_length = Some(184_320);
-                proto.height = Some(1280);
-                proto.width = Some(960);
-                proto.jpeg_thumbnail = Some(vec![0x7F; 6 * 1024]);
-                proto
-            });
-            proto
-        }
-        "large_text" => {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("Lorem ipsum dolor sit amet 0123456789 ".repeat(108));
-            proto
-        }
+        "media_refs" => wa::Message {
+            image_message: buffa::MessageField::some(wa::message::ImageMessage {
+                url: Some("https://mmg.whatsapp.net/v/t62.7118-24/abc123".into()),
+                direct_path: Some("/v/t62.7118-24/abc123".into()),
+                mimetype: Some("image/jpeg".into()),
+                caption: Some("Benchmark media caption".into()),
+                media_key: Some(vec![0xA5; 32]),
+                file_sha256: Some(vec![0x11; 32]),
+                file_enc_sha256: Some(vec![0x22; 32]),
+                file_length: Some(184_320),
+                height: Some(1280),
+                width: Some(960),
+                jpeg_thumbnail: Some(vec![0x7F; 6 * 1024]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        "large_text" => wa::Message {
+            conversation: Some("Lorem ipsum dolor sit amet 0123456789 ".repeat(108)),
+            ..Default::default()
+        },
         other => unreachable!("unknown shape {other}"),
     }
 }
@@ -219,17 +195,16 @@ fn recv_shape(shape: &str) -> wa::Message {
     match shape {
         // The first group message from a sender carries the SKDM inline
         // alongside the content.
-        "group_skdm_text" => {
-            let mut proto = wa::Message::default();
-            proto.sender_key_distribution_message = buffa::MessageField::some({
-                let mut proto = wa::message::SenderKeyDistributionMessage::default();
-                proto.group_id = Some("120363000000000001@g.us".into());
-                proto.axolotl_sender_key_distribution_message = Some(vec![0x33; 350]);
-                proto
-            });
-            proto.conversation = Some("Benchmark group message with realistic text.".into());
-            proto
-        }
+        "group_skdm_text" => wa::Message {
+            sender_key_distribution_message: buffa::MessageField::some(
+                wa::message::SenderKeyDistributionMessage {
+                    group_id: Some("120363000000000001@g.us".into()),
+                    axolotl_sender_key_distribution_message: Some(vec![0x33; 350]),
+                },
+            ),
+            conversation: Some("Benchmark group message with realistic text.".into()),
+            ..Default::default()
+        },
         other => dm_shape(other),
     }
 }

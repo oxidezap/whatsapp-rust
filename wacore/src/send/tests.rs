@@ -99,20 +99,18 @@ mod peer_message_options {
     fn pdo_message_raw(
         request_type: Option<wa::message::PeerDataOperationRequestType>,
     ) -> wa::Message {
-        {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some({
-                let mut proto_ = wa::message::ProtocolMessage::default();
-                proto_.r#type =
-                    Some(wa::message::protocol_message::Type::PeerDataOperationRequestMessage);
-                proto_.peer_data_operation_request_message = buffa::MessageField::some({
-                    let mut proto = wa::message::PeerDataOperationRequestMessage::default();
-                    proto.peer_data_operation_request_type = request_type;
-                    proto
-                });
-                proto_
-            });
-            proto_
+        wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::PeerDataOperationRequestMessage),
+                peer_data_operation_request_message: buffa::MessageField::some(
+                    wa::message::PeerDataOperationRequestMessage {
+                        peer_data_operation_request_type: request_type,
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
         }
     }
 
@@ -179,19 +177,17 @@ mod peer_message_options {
 
     #[test]
     fn non_pdo_and_unknown_pdo_keep_peer_defaults() {
-        let app_state_key_request = {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some({
-                let mut proto_ = wa::message::ProtocolMessage::default();
-                proto_.r#type = Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest);
-                proto_.app_state_sync_key_request = buffa::MessageField::some({
-                    let mut proto = wa::message::AppStateSyncKeyRequest::default();
-                    proto.key_ids = Vec::new();
-                    proto
-                });
-                proto_
-            });
-            proto_
+        let app_state_key_request = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest),
+                app_state_sync_key_request: buffa::MessageField::some(
+                    wa::message::AppStateSyncKeyRequest {
+                        key_ids: Vec::new(),
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
 
         for msg in [app_state_key_request, pdo_message_raw(None)] {
@@ -207,38 +203,33 @@ mod status_carries_privacy_meta {
 
     #[test]
     fn true_for_text_post() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
-                let mut proto = wa::message::ExtendedTextMessage::default();
-                proto.text = Some("hi".into());
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("hi".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         assert!(status_carries_privacy_meta(&msg));
     }
 
     #[test]
     fn true_for_image_post() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.image_message = buffa::MessageField::some(wa::message::ImageMessage::default());
-            proto
+        let msg = wa::Message {
+            image_message: buffa::MessageField::some(wa::message::ImageMessage::default()),
+            ..Default::default()
         };
         assert!(status_carries_privacy_meta(&msg));
     }
 
     #[test]
     fn false_for_reaction() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.reaction_message = buffa::MessageField::some({
-                let mut proto = wa::message::ReactionMessage::default();
-                proto.text = Some("💚".into());
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
+                text: Some("💚".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         assert!(
             !status_carries_privacy_meta(&msg),
@@ -248,24 +239,21 @@ mod status_carries_privacy_meta {
 
     #[test]
     fn false_for_enc_reaction() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.enc_reaction_message = buffa::MessageField::some(Default::default());
-            proto
+        let msg = wa::Message {
+            enc_reaction_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert!(!status_carries_privacy_meta(&msg));
     }
 
     #[test]
     fn false_for_revoke() {
-        let msg = {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some({
-                let mut proto_ = wa::message::ProtocolMessage::default();
-                proto_.r#type = Some(wa::message::protocol_message::Type::Revoke);
-                proto_
-            });
-            proto_
+        let msg = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::Revoke),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         assert!(!status_carries_privacy_meta(&msg));
     }
@@ -274,57 +262,47 @@ mod status_carries_privacy_meta {
     fn true_for_non_revoke_protocol_message() {
         // Other ProtocolMessage types (e.g., EphemeralSettings) aren't
         // reactions and aren't revokes — treat as posts for now.
-        let msg = {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some({
-                let mut proto_ = wa::message::ProtocolMessage::default();
-                proto_.r#type = Some(wa::message::protocol_message::Type::EphemeralSetting);
-                proto_
-            });
-            proto_
+        let msg = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::EphemeralSetting),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         assert!(status_carries_privacy_meta(&msg));
     }
 
     #[test]
     fn false_for_reaction_inside_ephemeral_wrapper() {
-        let inner = {
-            let mut proto = wa::Message::default();
-            proto.reaction_message = buffa::MessageField::some(Default::default());
-            proto
+        let inner = wa::Message {
+            reaction_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.ephemeral_message = buffa::MessageField::some({
-                let mut proto = wa::message::FutureProofMessage::default();
-                proto.message = buffa::MessageField::some(inner);
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            ephemeral_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                message: buffa::MessageField::some(inner),
+            }),
+            ..Default::default()
         };
         assert!(!status_carries_privacy_meta(&msg));
     }
 
     #[test]
     fn false_for_revoke_inside_device_sent_wrapper() {
-        let inner = {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some({
-                let mut proto_ = wa::message::ProtocolMessage::default();
-                proto_.r#type = Some(wa::message::protocol_message::Type::Revoke);
-                proto_
-            });
-            proto_
+        let inner = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::Revoke),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.device_sent_message = buffa::MessageField::some({
-                let mut proto = wa::message::DeviceSentMessage::default();
-                proto.destination_jid = Some(String::new());
-                proto.message = buffa::MessageField::some(inner);
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
+                destination_jid: Some(String::new()),
+                message: buffa::MessageField::some(inner),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         assert!(!status_carries_privacy_meta(&msg));
     }
@@ -335,19 +313,16 @@ mod status_revoke_target_id {
 
     #[test]
     fn returns_embedded_target_for_revoke() {
-        let msg = {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some({
-                let mut proto_ = wa::message::ProtocolMessage::default();
-                proto_.r#type = Some(wa::message::protocol_message::Type::Revoke);
-                proto_.key = buffa::MessageField::some({
-                    let mut proto = wa::MessageKey::default();
-                    proto.id = Some("target-id".into());
-                    proto
-                });
-                proto_
-            });
-            proto_
+        let msg = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::Revoke),
+                key: buffa::MessageField::some(wa::MessageKey {
+                    id: Some("target-id".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
 
         assert_eq!(status_revoke_target_id(&msg), Some("target-id"));
@@ -355,28 +330,23 @@ mod status_revoke_target_id {
 
     #[test]
     fn ignores_other_or_incomplete_protocol_messages() {
-        let non_revoke = {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some({
-                let mut proto_ = wa::message::ProtocolMessage::default();
-                proto_.r#type = Some(wa::message::protocol_message::Type::EphemeralSetting);
-                proto_.key = buffa::MessageField::some({
-                    let mut proto = wa::MessageKey::default();
-                    proto.id = Some("not-a-revoke".into());
-                    proto
-                });
-                proto_
-            });
-            proto_
+        let non_revoke = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::EphemeralSetting),
+                key: buffa::MessageField::some(wa::MessageKey {
+                    id: Some("not-a-revoke".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
-        let incomplete_revoke = {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some({
-                let mut proto_ = wa::message::ProtocolMessage::default();
-                proto_.r#type = Some(wa::message::protocol_message::Type::Revoke);
-                proto_
-            });
-            proto_
+        let incomplete_revoke = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::Revoke),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
 
         assert_eq!(status_revoke_target_id(&non_revoke), None);
@@ -1289,177 +1259,144 @@ mod metadata {
     pub(super) fn message(case: &serde_json::Value) -> wa::Message {
         let flag = case["flag"].as_bool();
         let mut msg = match case["kind"].as_str().unwrap() {
-            "image" => {
-                let mut proto = wa::Message::default();
-                proto.image_message = Some({
-                    let mut proto = wa::message::ImageMessage::default();
-                    proto.view_once = flag;
-                    proto
+            "image" => wa::Message {
+                image_message: Some(wa::message::ImageMessage {
+                    view_once: flag,
+                    ..Default::default()
                 })
-                .into();
-                proto
-            }
-            "video" => {
-                let mut proto = wa::Message::default();
-                proto.video_message = Some({
-                    let mut proto = wa::message::VideoMessage::default();
-                    proto.view_once = flag;
-                    proto
+                .into(),
+                ..Default::default()
+            },
+            "video" => wa::Message {
+                video_message: Some(wa::message::VideoMessage {
+                    view_once: flag,
+                    ..Default::default()
                 })
-                .into();
-                proto
-            }
-            "audio" => {
-                let mut proto = wa::Message::default();
-                proto.audio_message = Some({
-                    let mut proto = wa::message::AudioMessage::default();
-                    proto.view_once = flag;
-                    proto.ptt = Some(true);
-                    proto
+                .into(),
+                ..Default::default()
+            },
+            "audio" => wa::Message {
+                audio_message: Some(wa::message::AudioMessage {
+                    view_once: flag,
+                    ptt: Some(true),
+                    ..Default::default()
                 })
-                .into();
-                proto
-            }
-            "ptv" => {
-                let mut proto = wa::Message::default();
-                proto.ptv_message = Some({
-                    let mut proto = wa::message::VideoMessage::default();
-                    proto.view_once = flag;
-                    proto
+                .into(),
+                ..Default::default()
+            },
+            "ptv" => wa::Message {
+                ptv_message: Some(wa::message::VideoMessage {
+                    view_once: flag,
+                    ..Default::default()
                 })
-                .into();
-                proto
-            }
-            "text" => {
-                let mut proto = wa::Message::default();
-                proto.conversation = Some("synthetic".into());
-                proto
-            }
-            "extended_text" => {
-                let mut proto = wa::Message::default();
-                proto.extended_text_message = Some({
-                    let mut proto = wa::message::ExtendedTextMessage::default();
-                    proto.view_once = flag;
-                    proto
+                .into(),
+                ..Default::default()
+            },
+            "text" => wa::Message {
+                conversation: Some("synthetic".into()),
+                ..Default::default()
+            },
+            "extended_text" => wa::Message {
+                extended_text_message: Some(wa::message::ExtendedTextMessage {
+                    view_once: flag,
+                    ..Default::default()
                 })
-                .into();
-                proto
-            }
-            "buttons" => {
-                let mut proto = wa::Message::default();
-                proto.buttons_message = Some(Default::default()).into();
-                proto
-            }
-            "interactive" => {
-                let mut proto = wa::Message::default();
-                proto.interactive_message = Some({
-                    let mut proto = wa::message::InteractiveMessage::default();
-                    proto.header = Some({
-                        let mut proto = wa::message::interactive_message::Header::default();
-                        proto.media = Some(
+                .into(),
+                ..Default::default()
+            },
+            "buttons" => wa::Message {
+                buttons_message: Some(Default::default()).into(),
+                ..Default::default()
+            },
+            "interactive" => wa::Message {
+                interactive_message: Some(wa::message::InteractiveMessage {
+                    header: Some(wa::message::interactive_message::Header {
+                        media: Some(
                             wa::message::interactive_message::header::Media::ImageMessage(
-                                {
-                                    let mut proto = wa::message::ImageMessage::default();
-                                    proto.view_once = Some(true);
-                                    proto
+                                wa::message::ImageMessage {
+                                    view_once: Some(true),
+                                    ..Default::default()
                                 }
                                 .into(),
                             ),
-                        );
-                        proto
+                        ),
+                        ..Default::default()
                     })
-                    .into();
-                    proto
+                    .into(),
+                    ..Default::default()
                 })
-                .into();
-                proto
-            }
-            "quoted" => {
-                let mut proto = wa::Message::default();
-                proto.image_message = Some({
-                    let mut proto = wa::message::ImageMessage::default();
-                    proto.context_info = Some({
-                        let mut proto = wa::ContextInfo::default();
-                        proto.quoted_message = Some({
-                            let mut proto = wa::Message::default();
-                            proto.view_once_message = Some({
-                                let mut proto = wa::message::FutureProofMessage::default();
-                                proto.message = Some({
-                                    let mut proto = wa::Message::default();
-                                    proto.image_message = Some(Default::default()).into();
-                                    proto
+                .into(),
+                ..Default::default()
+            },
+            "quoted" => wa::Message {
+                image_message: Some(wa::message::ImageMessage {
+                    context_info: Some(wa::ContextInfo {
+                        quoted_message: Some(wa::Message {
+                            view_once_message: Some(wa::message::FutureProofMessage {
+                                message: Some(wa::Message {
+                                    image_message: Some(Default::default()).into(),
+                                    ..Default::default()
                                 })
-                                .into();
-                                proto
+                                .into(),
                             })
-                            .into();
-                            proto
+                            .into(),
+                            ..Default::default()
                         })
-                        .into();
-                        proto
+                        .into(),
+                        ..Default::default()
                     })
-                    .into();
-                    proto
+                    .into(),
+                    ..Default::default()
                 })
-                .into();
-                proto
-            }
-            "poll_v1" => {
-                let mut proto = wa::Message::default();
-                proto.poll_creation_message = Some(Default::default()).into();
-                proto
-            }
-            "poll_v2" => {
-                let mut proto = wa::Message::default();
-                proto.poll_creation_message_v2 = Some(Default::default()).into();
-                proto
-            }
-            "poll_v3" => {
-                let mut proto = wa::Message::default();
-                proto.poll_creation_message_v3 = Some(Default::default()).into();
-                proto
-            }
-            "poll_vote" => {
-                let mut proto = wa::Message::default();
-                proto.poll_update_message = Some({
-                    let mut proto = wa::message::PollUpdateMessage::default();
-                    proto.vote = Some(Default::default()).into();
-                    proto
+                .into(),
+                ..Default::default()
+            },
+            "poll_v1" => wa::Message {
+                poll_creation_message: Some(Default::default()).into(),
+                ..Default::default()
+            },
+            "poll_v2" => wa::Message {
+                poll_creation_message_v2: Some(Default::default()).into(),
+                ..Default::default()
+            },
+            "poll_v3" => wa::Message {
+                poll_creation_message_v3: Some(Default::default()).into(),
+                ..Default::default()
+            },
+            "poll_vote" => wa::Message {
+                poll_update_message: Some(wa::message::PollUpdateMessage {
+                    vote: Some(Default::default()).into(),
+                    ..Default::default()
                 })
-                .into();
-                proto
-            }
-            "poll_empty_vote" => {
-                let mut proto = wa::Message::default();
-                proto.poll_update_message = Some(Default::default()).into();
-                proto
-            }
-            "poll_snapshot" => {
-                let mut proto = wa::Message::default();
-                proto.poll_result_snapshot_message = Some(Default::default()).into();
-                proto
-            }
-            "event" => {
-                let mut proto = wa::Message::default();
-                proto.event_message = Some(Default::default()).into();
-                proto
-            }
-            "event_response" => {
-                let mut proto = wa::Message::default();
-                proto.enc_event_response_message = Some(Default::default()).into();
-                proto
-            }
-            "event_edit" => {
-                let mut proto = wa::Message::default();
-                proto.secret_encrypted_message = Some({
-                    let mut proto = wa::message::SecretEncryptedMessage::default();
-                    proto.secret_enc_type =
-                        Some(wa::message::secret_encrypted_message::SecretEncType::EventEdit);
-                    proto
+                .into(),
+                ..Default::default()
+            },
+            "poll_empty_vote" => wa::Message {
+                poll_update_message: Some(Default::default()).into(),
+                ..Default::default()
+            },
+            "poll_snapshot" => wa::Message {
+                poll_result_snapshot_message: Some(Default::default()).into(),
+                ..Default::default()
+            },
+            "event" => wa::Message {
+                event_message: Some(Default::default()).into(),
+                ..Default::default()
+            },
+            "event_response" => wa::Message {
+                enc_event_response_message: Some(Default::default()).into(),
+                ..Default::default()
+            },
+            "event_edit" => wa::Message {
+                secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+                    secret_enc_type: Some(
+                        wa::message::secret_encrypted_message::SecretEncType::EventEdit,
+                    ),
+                    ..Default::default()
                 })
-                .into();
-                proto
-            }
+                .into(),
+                ..Default::default()
+            },
             "member_label" => build_member_label_message(
                 if flag == Some(true) {
                     "synthetic".into()
@@ -1474,45 +1411,37 @@ mod metadata {
         for wrapper in case["wrappers"].as_array().unwrap().iter().rev() {
             let inner = (case["kind"] != "empty").then_some(msg);
             msg = if wrapper == "dsm" {
-                {
-                    let mut proto = wa::Message::default();
-                    proto.device_sent_message = Some({
-                        let mut proto = wa::message::DeviceSentMessage::default();
-                        proto.message = inner.into();
-                        proto.destination_jid = Some("15550000002@s.whatsapp.net".into());
-                        proto
+                wa::Message {
+                    device_sent_message: Some(wa::message::DeviceSentMessage {
+                        message: inner.into(),
+                        destination_jid: Some("15550000002@s.whatsapp.net".into()),
+                        ..Default::default()
                     })
-                    .into();
-                    proto
+                    .into(),
+                    ..Default::default()
                 }
             } else {
-                let fp = Some({
-                    let mut proto = wa::message::FutureProofMessage::default();
-                    proto.message = inner.into();
-                    proto
+                let fp = Some(wa::message::FutureProofMessage {
+                    message: inner.into(),
                 })
                 .into();
                 match wrapper.as_str().unwrap() {
-                    "ephemeral" => {
-                        let mut proto = wa::Message::default();
-                        proto.ephemeral_message = fp;
-                        proto
-                    }
-                    "v1" => {
-                        let mut proto = wa::Message::default();
-                        proto.view_once_message = fp;
-                        proto
-                    }
-                    "v2" => {
-                        let mut proto = wa::Message::default();
-                        proto.view_once_message_v2 = fp;
-                        proto
-                    }
-                    "v2ext" => {
-                        let mut proto = wa::Message::default();
-                        proto.view_once_message_v2_extension = fp;
-                        proto
-                    }
+                    "ephemeral" => wa::Message {
+                        ephemeral_message: fp,
+                        ..Default::default()
+                    },
+                    "v1" => wa::Message {
+                        view_once_message: fp,
+                        ..Default::default()
+                    },
+                    "v2" => wa::Message {
+                        view_once_message_v2: fp,
+                        ..Default::default()
+                    },
+                    "v2ext" => wa::Message {
+                        view_once_message_v2_extension: fp,
+                        ..Default::default()
+                    },
                     other => panic!("unknown fixture wrapper {other}"),
                 }
             };
@@ -1547,41 +1476,34 @@ mod metadata {
     #[test]
     fn metadata_traversal_is_bounded_without_changing_general_view_once_detection() {
         use crate::proto_helpers::MessageExt;
-        let text = {
-            let mut proto = wa::Message::default();
-            proto.extended_text_message = Some({
-                let mut proto = wa::message::ExtendedTextMessage::default();
-                proto.view_once = Some(true);
-                proto
+        let text = wa::Message {
+            extended_text_message: Some(wa::message::ExtendedTextMessage {
+                view_once: Some(true),
+                ..Default::default()
             })
-            .into();
-            proto
+            .into(),
+            ..Default::default()
         };
         assert!(
             text.is_view_once(),
             "the general predicate's contract is unchanged"
         );
         assert!(message_meta_from_message(&text).is_none());
-        let mut nested = {
-            let mut proto = wa::Message::default();
-            proto.image_message = Some({
-                let mut proto = wa::message::ImageMessage::default();
-                proto.view_once = Some(true);
-                proto
+        let mut nested = wa::Message {
+            image_message: Some(wa::message::ImageMessage {
+                view_once: Some(true),
+                ..Default::default()
             })
-            .into();
-            proto
+            .into(),
+            ..Default::default()
         };
         for _ in 0..buffa::RECURSION_LIMIT {
-            nested = {
-                let mut proto = wa::Message::default();
-                proto.ephemeral_message = Some({
-                    let mut proto = wa::message::FutureProofMessage::default();
-                    proto.message = Some(nested).into();
-                    proto
+            nested = wa::Message {
+                ephemeral_message: Some(wa::message::FutureProofMessage {
+                    message: Some(nested).into(),
                 })
-                .into();
-                proto
+                .into(),
+                ..Default::default()
             };
         }
         assert!(message_meta_from_message(&nested).is_none());
@@ -1718,20 +1640,16 @@ mod group_retry {
                     ss.store_session(&address, session).await.unwrap();
                 }
                 let account = pkmsg_account_proto();
-                let message = {
-                    let mut proto = wa::Message::default();
-                    proto.view_once_message = Some({
-                        let mut proto = wa::message::FutureProofMessage::default();
-                        proto.message = Some({
-                            let mut proto = wa::Message::default();
-                            proto.image_message = Some(wa::message::ImageMessage::default()).into();
-                            proto
+                let message = wa::Message {
+                    view_once_message: Some(wa::message::FutureProofMessage {
+                        message: Some(wa::Message {
+                            image_message: Some(wa::message::ImageMessage::default()).into(),
+                            ..Default::default()
                         })
-                        .into();
-                        proto
+                        .into(),
                     })
-                    .into();
-                    proto
+                    .into(),
+                    ..Default::default()
                 };
                 let bytes = waproto::codec::message_to_vec(&message);
                 let to: Jid = match route {
@@ -2117,10 +2035,9 @@ mod group_retry {
     async fn dm_retry_pkmsg_with_account_has_device_identity() {
         let (mut ss, mut is, jid) = setup_session().await;
         let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
-        let acc = {
-            let mut proto = wa::ADVSignedDeviceIdentity::default();
-            proto.details = Some(b"t".to_vec());
-            proto
+        let acc = wa::ADVSignedDeviceIdentity {
+            details: Some(b"t".to_vec()),
+            ..Default::default()
         };
 
         let n = prepare_pairwise_retry_stanza(
@@ -2157,10 +2074,9 @@ mod group_retry {
         let (mut ss, mut is, jid) = setup_session().await;
         let group: Jid = "120363098765432100@g.us".parse().unwrap();
         let p: Jid = jid.to_string().parse().unwrap();
-        let acc = {
-            let mut proto = wa::ADVSignedDeviceIdentity::default();
-            proto.details = Some(b"t".to_vec());
-            proto
+        let acc = wa::ADVSignedDeviceIdentity {
+            details: Some(b"t".to_vec()),
+            ..Default::default()
         };
         let n = prepare_pairwise_retry_stanza(
             &mut ss,
@@ -2537,13 +2453,11 @@ mod group_retry {
     fn pkmsg_account_proto() -> wa::ADVSignedDeviceIdentity {
         // Opaque placeholder bytes — the assertions only check that
         // the element carries non-empty content.
-        {
-            let mut proto = wa::ADVSignedDeviceIdentity::default();
-            proto.details = Some(vec![0u8; 32]);
-            proto.account_signature_key = Some(vec![0u8; 32]);
-            proto.account_signature = Some(vec![0u8; 64]);
-            proto.device_signature = Some(vec![0u8; 64]);
-            proto
+        wa::ADVSignedDeviceIdentity {
+            details: Some(vec![0u8; 32]),
+            account_signature_key: Some(vec![0u8; 32]),
+            account_signature: Some(vec![0u8; 64]),
+            device_signature: Some(vec![0u8; 64]),
         }
     }
 
@@ -2922,82 +2836,71 @@ mod decrypt_fail {
 
     #[test]
     fn regular_message() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("hi".into());
-            proto
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
         };
         assert!(!should_hide_decrypt_fail(&msg));
     }
 
     #[test]
     fn reaction() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.reaction_message = buffa::MessageField::some(Default::default());
-            proto
+        let msg = wa::Message {
+            reaction_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
     }
 
     #[test]
     fn pin() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.pin_in_chat_message = buffa::MessageField::some(Default::default());
-            proto
+        let msg = wa::Message {
+            pin_in_chat_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
     }
 
     #[test]
     fn poll_vote() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.poll_update_message = buffa::MessageField::some({
-                let mut proto = wa::message::PollUpdateMessage::default();
-                proto.vote = buffa::MessageField::some(Default::default());
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            poll_update_message: buffa::MessageField::some(wa::message::PollUpdateMessage {
+                vote: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
     }
 
     #[test]
     fn poll_update_without_vote() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.poll_update_message = buffa::MessageField::some(Default::default());
-            proto
+        let msg = wa::Message {
+            poll_update_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert!(!should_hide_decrypt_fail(&msg));
     }
 
     #[test]
     fn reaction_inside_ephemeral_wrapper() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.ephemeral_message = buffa::MessageField::some({
-                let mut proto = wa::message::FutureProofMessage::default();
-                proto.message = buffa::MessageField::some({
-                    let mut proto = wa::Message::default();
-                    proto.reaction_message = buffa::MessageField::some(Default::default());
-                    proto
-                });
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            ephemeral_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                message: buffa::MessageField::some(wa::Message {
+                    reaction_message: buffa::MessageField::some(Default::default()),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
     }
 
     #[test]
     fn conditional_reveal() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conditional_reveal_message = buffa::MessageField::some(Default::default());
-            proto
+        let msg = wa::Message {
+            conditional_reveal_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
     }
@@ -3005,14 +2908,14 @@ mod decrypt_fail {
     #[test]
     fn poll_add_option_edit() {
         use wa::message::secret_encrypted_message::SecretEncType;
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.secret_encrypted_message = buffa::MessageField::some({
-                let mut proto = wa::message::SecretEncryptedMessage::default();
-                proto.secret_enc_type = Some(SecretEncType::PollAddOption);
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            secret_encrypted_message: buffa::MessageField::some(
+                wa::message::SecretEncryptedMessage {
+                    secret_enc_type: Some(SecretEncType::PollAddOption),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
     }
@@ -3023,10 +2926,9 @@ mod decrypt_fail_for_send {
     use crate::types::message::EditAttribute;
 
     fn plain() -> wa::Message {
-        {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("hi".into());
-            proto
+        wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
         }
     }
 
@@ -3057,10 +2959,9 @@ mod decrypt_fail_for_send {
     #[test]
     fn revoke_does_not_block_content_based_hide() {
         // A reaction still hides on its own merits even under a revoke edit.
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.reaction_message = buffa::MessageField::some(Default::default());
-            proto
+        let msg = wa::Message {
+            reaction_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert!(should_hide_decrypt_fail_for_send(
             Some(&EditAttribute::SenderRevoke),
@@ -3074,14 +2975,14 @@ mod stanza_type {
     use wa::message::secret_encrypted_message::SecretEncType;
 
     fn secret(enc: SecretEncType) -> wa::Message {
-        {
-            let mut proto = wa::Message::default();
-            proto.secret_encrypted_message = buffa::MessageField::some({
-                let mut proto = wa::message::SecretEncryptedMessage::default();
-                proto.secret_enc_type = Some(enc);
-                proto
-            });
-            proto
+        wa::Message {
+            secret_encrypted_message: buffa::MessageField::some(
+                wa::message::SecretEncryptedMessage {
+                    secret_enc_type: Some(enc),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
         }
     }
 
@@ -3103,10 +3004,9 @@ mod stanza_type {
 
     #[test]
     fn album_is_text() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.album_message = buffa::MessageField::some(Default::default());
-            proto
+        let msg = wa::Message {
+            album_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&msg), stanza::MSG_TYPE_TEXT);
     }
@@ -3115,43 +3015,37 @@ mod stanza_type {
     // FutureProofMessage wrappers (via getUnwrappedProtobufMessage) and then
     // classifies the inner message.
     fn fpm(inner: wa::Message) -> wa::message::FutureProofMessage {
-        {
-            let mut proto = wa::message::FutureProofMessage::default();
-            proto.message = buffa::MessageField::some(inner);
-            proto
+        wa::message::FutureProofMessage {
+            message: buffa::MessageField::some(inner),
         }
     }
     fn text_inner() -> wa::Message {
-        {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("hi".to_string());
-            proto
+        wa::Message {
+            conversation: Some("hi".to_string()),
+            ..Default::default()
         }
     }
     fn image_inner() -> wa::Message {
-        {
-            let mut proto = wa::Message::default();
-            proto.image_message = buffa::MessageField::some(Default::default());
-            proto
+        wa::Message {
+            image_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         }
     }
 
     #[test]
     fn group_status_v2_classifies_by_inner() {
-        let txt = {
-            let mut proto = wa::Message::default();
-            proto.group_status_message_v2 = buffa::MessageField::some(fpm(text_inner()));
-            proto
+        let txt = wa::Message {
+            group_status_message_v2: buffa::MessageField::some(fpm(text_inner())),
+            ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&txt), stanza::MSG_TYPE_TEXT);
 
         // Regression guard: forcing this wrapper to "text" dropped the
         // mediatype and silently dropped the stanza. WA Web unwraps it and
         // sends type="media" mediatype="image".
-        let img = {
-            let mut proto = wa::Message::default();
-            proto.group_status_message_v2 = buffa::MessageField::some(fpm(image_inner()));
-            proto
+        let img = wa::Message {
+            group_status_message_v2: buffa::MessageField::some(fpm(image_inner())),
+            ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&img), stanza::MSG_TYPE_MEDIA);
         assert_eq!(media_type_from_message(&img), Some("image"));
@@ -3162,10 +3056,9 @@ mod stanza_type {
         // An empty wrapper is not one of WA Web's four re-checked wrappers
         // (ephemeral/groupMentioned/botInvoke/deviceSent), so it falls through
         // to the media default in both WA Web and here.
-        let m = {
-            let mut proto = wa::Message::default();
-            proto.group_status_message_v2 = buffa::MessageField::some(Default::default());
-            proto
+        let m = wa::Message {
+            group_status_message_v2: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_MEDIA);
     }
@@ -3174,32 +3067,25 @@ mod stanza_type {
     fn payment_family_is_text() {
         // Payment family classifies as text; the media default would be dropped.
         let cases = [
-            {
-                let mut proto = wa::Message::default();
-                proto.request_payment_message = buffa::MessageField::some(Default::default());
-                proto
+            wa::Message {
+                request_payment_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
             },
-            {
-                let mut proto = wa::Message::default();
-                proto.send_payment_message = buffa::MessageField::some(Default::default());
-                proto
+            wa::Message {
+                send_payment_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
             },
-            {
-                let mut proto = wa::Message::default();
-                proto.decline_payment_request_message =
-                    buffa::MessageField::some(Default::default());
-                proto
+            wa::Message {
+                decline_payment_request_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
             },
-            {
-                let mut proto = wa::Message::default();
-                proto.cancel_payment_request_message =
-                    buffa::MessageField::some(Default::default());
-                proto
+            wa::Message {
+                cancel_payment_request_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
             },
-            {
-                let mut proto = wa::Message::default();
-                proto.payment_invite_message = buffa::MessageField::some(Default::default());
-                proto
+            wa::Message {
+                payment_invite_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
             },
         ];
         for m in cases {
@@ -3210,10 +3096,9 @@ mod stanza_type {
 
     #[test]
     fn rich_response_is_text() {
-        let m = {
-            let mut proto = wa::Message::default();
-            proto.rich_response_message = buffa::MessageField::some(Default::default());
-            proto
+        let m = wa::Message {
+            rich_response_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert_eq!(media_type_from_message(&m), None);
         assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_TEXT);
@@ -3221,65 +3106,56 @@ mod stanza_type {
 
     #[test]
     fn bot_forwarded_classifies_by_inner() {
-        let rich = {
-            let mut proto = wa::Message::default();
-            proto.bot_forwarded_message = buffa::MessageField::some(fpm({
-                let mut proto = wa::Message::default();
-                proto.rich_response_message = buffa::MessageField::some(Default::default());
-                proto
-            }));
-            proto
+        let rich = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(fpm(wa::Message {
+                rich_response_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            })),
+            ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&rich), stanza::MSG_TYPE_TEXT);
         assert_eq!(media_type_from_message(&rich), None);
 
-        let img = {
-            let mut proto = wa::Message::default();
-            proto.bot_forwarded_message = buffa::MessageField::some(fpm({
-                let mut proto = wa::Message::default();
-                proto.image_message = buffa::MessageField::some(Default::default());
-                proto
-            }));
-            proto
+        let img = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(fpm(wa::Message {
+                image_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            })),
+            ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&img), stanza::MSG_TYPE_MEDIA);
         assert_eq!(media_type_from_message(&img), Some("image"));
 
-        let vazio = {
-            let mut proto = wa::Message::default();
-            proto.bot_forwarded_message = buffa::MessageField::some(Default::default());
-            proto
+        let vazio = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&vazio), stanza::MSG_TYPE_TEXT);
     }
 
     #[test]
     fn lottie_behind_bot_forwarded_stays_sticker() {
-        let m = {
-            let mut proto = wa::Message::default();
-            proto.bot_forwarded_message = buffa::MessageField::some(fpm({
-                let mut proto = wa::Message::default();
-                proto.lottie_sticker_message = buffa::MessageField::some(Default::default());
-                proto
-            }));
-            proto
+        let m = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(fpm(wa::Message {
+                lottie_sticker_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            })),
+            ..Default::default()
         };
         assert_eq!(media_type_from_message(&m), Some("sticker"));
     }
 
     #[test]
     fn backfilled_wrappers_classify_by_inner() {
-        let spoiler = {
-            let mut proto = wa::Message::default();
-            proto.spoiler_message = buffa::MessageField::some(fpm(text_inner()));
-            proto
+        let spoiler = wa::Message {
+            spoiler_message: buffa::MessageField::some(fpm(text_inner())),
+            ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&spoiler), stanza::MSG_TYPE_TEXT);
 
-        let status_mention = {
-            let mut proto = wa::Message::default();
-            proto.status_mention_message = buffa::MessageField::some(fpm(image_inner()));
-            proto
+        let status_mention = wa::Message {
+            status_mention_message: buffa::MessageField::some(fpm(image_inner())),
+            ..Default::default()
         };
         assert_eq!(
             stanza_type_from_message(&status_mention),
@@ -3287,17 +3163,15 @@ mod stanza_type {
         );
         assert_eq!(media_type_from_message(&status_mention), Some("image"));
 
-        let question = {
-            let mut proto = wa::Message::default();
-            proto.question_message = buffa::MessageField::some(fpm(text_inner()));
-            proto
+        let question = wa::Message {
+            question_message: buffa::MessageField::some(fpm(text_inner())),
+            ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&question), stanza::MSG_TYPE_TEXT);
 
-        let group_status_v1 = {
-            let mut proto = wa::Message::default();
-            proto.group_status_message = buffa::MessageField::some(fpm(text_inner()));
-            proto
+        let group_status_v1 = wa::Message {
+            group_status_message: buffa::MessageField::some(fpm(text_inner())),
+            ..Default::default()
         };
         assert_eq!(
             stanza_type_from_message(&group_status_v1),
@@ -3308,15 +3182,13 @@ mod stanza_type {
     #[test]
     fn nested_wrappers_reach_innermost() {
         // ephemeral { viewOnceV2 { image } } -> media + mediatype.
-        let inner = {
-            let mut proto = wa::Message::default();
-            proto.view_once_message_v2 = buffa::MessageField::some(fpm(image_inner()));
-            proto
+        let inner = wa::Message {
+            view_once_message_v2: buffa::MessageField::some(fpm(image_inner())),
+            ..Default::default()
         };
-        let m = {
-            let mut proto = wa::Message::default();
-            proto.ephemeral_message = buffa::MessageField::some(fpm(inner));
-            proto
+        let m = wa::Message {
+            ephemeral_message: buffa::MessageField::some(fpm(inner)),
+            ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_MEDIA);
         assert_eq!(media_type_from_message(&m), Some("image"));
@@ -3324,24 +3196,21 @@ mod stanza_type {
 
     #[test]
     fn preserved_classifier_branches() {
-        let r = {
-            let mut proto = wa::Message::default();
-            proto.reaction_message = buffa::MessageField::some(Default::default());
-            proto
+        let r = wa::Message {
+            reaction_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&r), stanza::MSG_TYPE_REACTION);
 
-        let ev = {
-            let mut proto = wa::Message::default();
-            proto.event_message = buffa::MessageField::some(Default::default());
-            proto
+        let ev = wa::Message {
+            event_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&ev), stanza::MSG_TYPE_EVENT);
 
-        let poll = {
-            let mut proto = wa::Message::default();
-            proto.poll_creation_message_v3 = buffa::MessageField::some(Default::default());
-            proto
+        let poll = wa::Message {
+            poll_creation_message_v3: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&poll), stanza::MSG_TYPE_POLL);
 
@@ -3354,21 +3223,18 @@ mod stanza_type {
             stanza::MSG_TYPE_MEDIA
         );
 
-        let proto = {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some(Default::default());
-            proto_
+        let proto = wa::Message {
+            protocol_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&proto), stanza::MSG_TYPE_TEXT);
 
-        let url = {
-            let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
-                let mut proto = wa::message::ExtendedTextMessage::default();
-                proto.matched_text = Some("https://example.com".to_string());
-                proto
-            });
-            proto
+        let url = wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                matched_text: Some("https://example.com".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&url), stanza::MSG_TYPE_MEDIA);
     }
@@ -3377,62 +3243,55 @@ mod stanza_type {
     fn interactive_and_list_types_get_their_mediatype() {
         // WA Web's mediaTypeFromProtobuf maps these to concrete mediatypes;
         // omitting the attribute makes the server drop the type="media" stanza.
-        let list = {
-            let mut proto = wa::Message::default();
-            proto.list_message = buffa::MessageField::some(Default::default());
-            proto
+        let list = wa::Message {
+            list_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&list), stanza::MSG_TYPE_MEDIA);
         assert_eq!(media_type_from_message(&list), Some("list"));
 
-        let list_response = {
-            let mut proto = wa::Message::default();
-            proto.list_response_message = buffa::MessageField::some(Default::default());
-            proto
+        let list_response = wa::Message {
+            list_response_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert_eq!(
             media_type_from_message(&list_response),
             Some("list_response")
         );
 
-        let buttons_response = {
-            let mut proto = wa::Message::default();
-            proto.buttons_response_message = buffa::MessageField::some(Default::default());
-            proto
+        let buttons_response = wa::Message {
+            buttons_response_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert_eq!(
             media_type_from_message(&buttons_response),
             Some("buttons_response")
         );
 
-        let order = {
-            let mut proto = wa::Message::default();
-            proto.order_message = buffa::MessageField::some(Default::default());
-            proto
+        let order = wa::Message {
+            order_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert_eq!(media_type_from_message(&order), Some("order"));
 
-        let product = {
-            let mut proto = wa::Message::default();
-            proto.product_message = buffa::MessageField::some(Default::default());
-            proto
+        let product = wa::Message {
+            product_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert_eq!(media_type_from_message(&product), Some("product"));
 
-        let interactive_response = {
-            let mut proto = wa::Message::default();
-            proto.interactive_response_message = buffa::MessageField::some(Default::default());
-            proto
+        let interactive_response = wa::Message {
+            interactive_response_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert_eq!(
             media_type_from_message(&interactive_response),
             Some("native_flow_response")
         );
 
-        let history_bundle = {
-            let mut proto = wa::Message::default();
-            proto.message_history_bundle = buffa::MessageField::some(Default::default());
-            proto
+        let history_bundle = wa::Message {
+            message_history_bundle: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert_eq!(
             media_type_from_message(&history_bundle),
@@ -3445,24 +3304,21 @@ mod stanza_type {
         // WA Web maps buttonsMessage to EncMediaType.Button, but its string
         // mapper has no Button case (returns null/DROP_ATTR), so the attribute
         // is omitted. Adding a "buttons" mediatype would diverge from WA Web.
-        let buttons = {
-            let mut proto = wa::Message::default();
-            proto.buttons_message = buffa::MessageField::some(Default::default());
-            proto
+        let buttons = wa::Message {
+            buttons_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
         };
         assert_eq!(media_type_from_message(&buttons), None);
     }
 
     #[test]
     fn ephemeral_wrapped_list_reaches_list_mediatype() {
-        let m = {
-            let mut proto = wa::Message::default();
-            proto.ephemeral_message = buffa::MessageField::some(fpm({
-                let mut proto = wa::Message::default();
-                proto.list_message = buffa::MessageField::some(Default::default());
-                proto
-            }));
-            proto
+        let m = wa::Message {
+            ephemeral_message: buffa::MessageField::some(fpm(wa::Message {
+                list_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            })),
+            ..Default::default()
         };
         assert_eq!(media_type_from_message(&m), Some("list"));
     }
@@ -3472,10 +3328,9 @@ mod stanza_type {
         // WA Web's mediaTypeFromProtobuf treats a top-level lottieStickerMessage
         // as a terminal "sticker" and does NOT recurse into it, unlike the
         // stanza-type path which unwraps it.
-        let lottie = {
-            let mut proto = wa::Message::default();
-            proto.lottie_sticker_message = buffa::MessageField::some(fpm(image_inner()));
-            proto
+        let lottie = wa::Message {
+            lottie_sticker_message: buffa::MessageField::some(fpm(image_inner())),
+            ..Default::default()
         };
         assert_eq!(media_type_from_message(&lottie), Some("sticker"));
     }
@@ -4093,10 +3948,9 @@ mod mark_full_distribution_list {
             signed_prekey_store: &signed_prekeys,
         };
         let group = GroupRoutingInfo::new(Vec::new(), AddressingMode::Lid);
-        let message = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("status retry".into());
-            proto
+        let message = wa::Message {
+            conversation: Some("status retry".into()),
+            ..Default::default()
         };
         let account = wa::ADVSignedDeviceIdentity::default();
         let extension = NodeBuilder::new("custom-extension")
@@ -4203,10 +4057,9 @@ mod mark_full_distribution_list {
             signed_prekey_store: &signed_prekeys,
         };
         let group = GroupRoutingInfo::new(Vec::new(), AddressingMode::Lid);
-        let message = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("status retry".into());
-            proto
+        let message = wa::Message {
+            conversation: Some("status retry".into()),
+            ..Default::default()
         };
 
         let result = prepare_group_stanza(
@@ -4288,10 +4141,9 @@ mod mark_full_distribution_list {
             vec![own_jid.to_non_ad(), a.to_non_ad(), b.to_non_ad()],
             AddressingMode::Pn,
         );
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("hi".into());
-            proto
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
         };
 
         let prepared = prepare_group_stanza(
@@ -4386,10 +4238,9 @@ mod mark_full_distribution_list {
             vec![own_jid.to_non_ad(), a.to_non_ad(), b_primary.to_non_ad()],
             AddressingMode::Pn,
         );
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("hi".into());
-            proto
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
         };
 
         let prepared = prepare_group_stanza(
@@ -4470,10 +4321,9 @@ mod mark_full_distribution_list {
             vec![own_jid.to_non_ad(), a.to_non_ad(), b.to_non_ad()],
             AddressingMode::Pn,
         );
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("hi".into());
-            proto
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
         };
 
         let prepared = prepare_group_stanza(
@@ -4580,10 +4430,9 @@ mod mark_full_distribution_list {
         }
 
         // Token-bearing message → secret minted + <reporting> node carrying a token.
-        let text = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("hi".into());
-            proto
+        let text = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
         };
         let (node, has_secret) = prepare(
             &group,
@@ -4605,14 +4454,12 @@ mod mark_full_distribution_list {
         );
 
         // Excluded type (reaction) → no secret, no <reporting> node.
-        let reaction = {
-            let mut proto = wa::Message::default();
-            proto.reaction_message = buffa::MessageField::some({
-                let mut proto = wa::message::ReactionMessage::default();
-                proto.text = Some("👍".into());
-                proto
-            });
-            proto
+        let reaction = wa::Message {
+            reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
+                text: Some("👍".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         let (node, has_secret) = prepare(
             &group,
@@ -4677,10 +4524,9 @@ mod mark_full_distribution_list {
 
         let group_info =
             GroupRoutingInfo::new(vec![own_jid.to_non_ad(), b.to_non_ad()], AddressingMode::Pn);
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("hi".into());
-            proto
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
         };
 
         let prepared = prepare_group_stanza(
@@ -4776,10 +4622,9 @@ mod mark_full_distribution_list {
             vec![own_jid.to_non_ad(), good.to_non_ad(), bad.to_non_ad()],
             AddressingMode::Pn,
         );
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("hi".into());
-            proto
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
         };
 
         let prepared = prepare_group_stanza(
@@ -4858,10 +4703,9 @@ mod mark_full_distribution_list {
             vec![own_jid.to_non_ad(), good.to_non_ad(), bad.to_non_ad()],
             AddressingMode::Pn,
         );
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("hi".into());
-            proto
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
         };
 
         prepare_group_stanza(
@@ -4935,10 +4779,9 @@ mod mark_full_distribution_list {
             vec![own_jid.to_non_ad(), first.to_non_ad(), second.to_non_ad()],
             AddressingMode::Pn,
         );
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("hi".into());
-            proto
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
         };
 
         let prepared = prepare_group_stanza(
@@ -5274,10 +5117,9 @@ mod mark_full_distribution_list {
             let mut resolved_devices = participants;
             resolved_devices.extend(own_companions.iter().cloned());
             let resolved = ResolvedGroupDevices::new(resolved_devices);
-            let msg = {
-                let mut proto = wa::Message::default();
-                proto.conversation = Some("steady state".into());
-                proto
+            let msg = wa::Message {
+                conversation: Some("steady state".into()),
+                ..Default::default()
             };
 
             prepare_group_stanza(
@@ -6227,10 +6069,9 @@ mod local_identity_change_on_send {
             let resolver = MockSendContextResolver::new();
             let devices = ResolvedDmDevices::new(all, &own_jid, None);
             let to = recipient_a.to_non_ad();
-            let message = {
-                let mut proto = wa::Message::default();
-                proto.conversation = Some("hi".into());
-                proto
+            let message = wa::Message {
+                conversation: Some("hi".into()),
+                ..Default::default()
             };
 
             let prepared = prepare_dm_stanza(
@@ -6312,10 +6153,9 @@ mod local_identity_change_on_send {
                 .fold(MockSendContextResolver::new(), |resolver, device| {
                     resolver.with_missing_bundle(device.clone())
                 });
-            let message = {
-                let mut proto = wa::Message::default();
-                proto.conversation = Some("hi".into());
-                proto
+            let message = wa::Message {
+                conversation: Some("hi".into()),
+                ..Default::default()
             };
 
             prepare_dm_stanza(
@@ -7203,10 +7043,9 @@ mod warm_group_send_encoding_scale {
         // tests claim is warm — measuring the cold path under a warm name, and
         // leaving a regression that recomputed it per send undetectable.
         resolved.phash(&own).expect("phash must warm in setup");
-        let message = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("same text regardless of group size".into());
-            proto
+        let message = wa::Message {
+            conversation: Some("same text regardless of group size".into()),
+            ..Default::default()
         };
         let account = wa::ADVSignedDeviceIdentity::default();
 

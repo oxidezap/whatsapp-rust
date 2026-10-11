@@ -1157,10 +1157,9 @@ mod tests {
 
     fn item(id: &str) -> InboundMessage {
         InboundMessage::builder()
-            .message(Arc::new({
-                let mut proto = wa::Message::default();
-                proto.conversation = Some(format!("text {id}"));
-                proto
+            .message(Arc::new(wa::Message {
+                conversation: Some(format!("text {id}")),
+                ..Default::default()
             }))
             .info(Arc::new(MessageInfo {
                 id: id.into(),
@@ -1186,10 +1185,9 @@ mod tests {
         let mut capacity = None;
         for id in ["ARENA_1", "ARENA_2"] {
             let mut incoming = item(id);
-            incoming.message = Arc::new({
-                let mut proto = wa::Message::default();
-                proto.conversation = Some("x".repeat(16 * 1024));
-                proto
+            incoming.message = Arc::new(wa::Message {
+                conversation: Some("x".repeat(16 * 1024)),
+                ..Default::default()
             });
             client.commit_or_batch_inbound(incoming, false).await;
             assert!(

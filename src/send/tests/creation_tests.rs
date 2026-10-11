@@ -561,14 +561,12 @@ async fn malformed_raw_inputs_fail_before_wire_and_debug_has_negative_controls()
         message_id: crate::MessageId::new("SECRET-CONTROL").unwrap(),
         to: peer.clone(),
         recipient_fanout: None,
-        message: Arc::new({
-            let mut proto = wa::Message::default();
-            proto.message_context_info = buffa::MessageField::some({
-                let mut proto = wa::MessageContextInfo::default();
-                proto.message_secret = Some(vec![177; 32]);
-                proto
-            });
-            proto
+        message: Arc::new(wa::Message {
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![177; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
         }),
     };
     assert!(format!("{raw:?}").contains("177"));

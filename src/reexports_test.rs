@@ -15,25 +15,23 @@ use whatsapp_rust::waproto::whatsapp as wa;
 #[test]
 fn message_literals_build_from_reexports_only() {
     // Explicit MessageField path, as a consumer would write it.
-    let explicit = {
-        let mut proto = wa::Message::default();
-        proto.extended_text_message = whatsapp_rust::buffa::MessageField::some({
-            let mut proto = wa::message::ExtendedTextMessage::default();
-            proto.text = Some("hi".into());
-            proto
-        });
-        proto
+    let explicit = wa::Message {
+        extended_text_message: whatsapp_rust::buffa::MessageField::some(
+            wa::message::ExtendedTextMessage {
+                text: Some("hi".into()),
+                ..Default::default()
+            },
+        ),
+        ..Default::default()
     };
     // The From<T> route: no MessageField naming at all.
-    let via_into = {
-        let mut proto = wa::Message::default();
-        proto.extended_text_message = {
-            let mut proto = wa::message::ExtendedTextMessage::default();
-            proto.text = Some("hi".into());
-            proto
+    let via_into = wa::Message {
+        extended_text_message: wa::message::ExtendedTextMessage {
+            text: Some("hi".into()),
+            ..Default::default()
         }
-        .into();
-        proto
+        .into(),
+        ..Default::default()
     };
     assert_eq!(explicit, via_into);
 

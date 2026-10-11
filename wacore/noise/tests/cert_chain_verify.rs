@@ -19,43 +19,33 @@ fn build_zero_signed_chain(server_static_pub: &[u8; 32]) -> Vec<u8> {
 }
 
 fn build_chain_with_issuer_serial(server_static_pub: &[u8; 32], issuer_serial: u32) -> Vec<u8> {
-    let intermediate_details = {
-        let mut proto = noise_certificate::Details::default();
-        proto.serial = Some(1);
-        proto.issuer_serial = Some(issuer_serial);
-        proto.key = Some(vec![0xCC; 32]);
-        proto.not_before = Some(1_700_000_000);
-        proto.not_after = Some(1_900_000_000);
-        proto
+    let intermediate_details = noise_certificate::Details {
+        serial: Some(1),
+        issuer_serial: Some(issuer_serial),
+        key: Some(vec![0xCC; 32]),
+        not_before: Some(1_700_000_000),
+        not_after: Some(1_900_000_000),
     };
     let intermediate_details_bytes = intermediate_details.encode_to_vec();
 
-    let leaf_details = {
-        let mut proto = noise_certificate::Details::default();
-        proto.serial = Some(2);
-        proto.issuer_serial = Some(1);
-        proto.key = Some(server_static_pub.to_vec());
-        proto.not_before = Some(1_700_000_500);
-        proto.not_after = Some(1_899_999_500);
-        proto
+    let leaf_details = noise_certificate::Details {
+        serial: Some(2),
+        issuer_serial: Some(1),
+        key: Some(server_static_pub.to_vec()),
+        not_before: Some(1_700_000_500),
+        not_after: Some(1_899_999_500),
     };
     let leaf_details_bytes = leaf_details.encode_to_vec();
 
-    let chain = {
-        let mut proto = wa::CertChain::default();
-        proto.leaf = buffa::MessageField::some({
-            let mut proto = wa::cert_chain::NoiseCertificate::default();
-            proto.details = Some(leaf_details_bytes);
-            proto.signature = Some(vec![0u8; 64]);
-            proto
-        });
-        proto.intermediate = buffa::MessageField::some({
-            let mut proto = wa::cert_chain::NoiseCertificate::default();
-            proto.details = Some(intermediate_details_bytes);
-            proto.signature = Some(vec![0u8; 64]);
-            proto
-        });
-        proto
+    let chain = wa::CertChain {
+        leaf: buffa::MessageField::some(wa::cert_chain::NoiseCertificate {
+            details: Some(leaf_details_bytes),
+            signature: Some(vec![0u8; 64]),
+        }),
+        intermediate: buffa::MessageField::some(wa::cert_chain::NoiseCertificate {
+            details: Some(intermediate_details_bytes),
+            signature: Some(vec![0u8; 64]),
+        }),
     };
     chain.encode_to_vec()
 }

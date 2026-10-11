@@ -3338,11 +3338,10 @@ mod tests {
     fn make_compressed_history_sync(conversations: Vec<wa::Conversation>) -> (Bytes, usize) {
         use flate2::{Compression, write::ZlibEncoder};
         use std::io::Write;
-        let hs = {
-            let mut proto = wa::HistorySync::default();
-            proto.sync_type = wa::history_sync::HistorySyncType::InitialBootstrap;
-            proto.conversations = conversations;
-            proto
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap,
+            conversations,
+            ..Default::default()
         };
         let raw = hs.encode_to_vec();
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -3357,10 +3356,9 @@ mod tests {
 
     #[test]
     fn lazy_history_sync_get_decodes() {
-        let lazy = lazy_from(vec![{
-            let mut proto = wa::Conversation::default();
-            proto.id = "chat@s.whatsapp.net".into();
-            proto
+        let lazy = lazy_from(vec![wa::Conversation {
+            id: "chat@s.whatsapp.net".into(),
+            ..Default::default()
         }]);
 
         let hs = lazy.get().expect("should decode");
@@ -3370,10 +3368,9 @@ mod tests {
 
     #[test]
     fn lazy_history_sync_caches_decode() {
-        let lazy = lazy_from(vec![{
-            let mut proto = wa::Conversation::default();
-            proto.id = "test@g.us".into();
-            proto
+        let lazy = lazy_from(vec![wa::Conversation {
+            id: "test@g.us".into(),
+            ..Default::default()
         }]);
 
         let first = lazy.get().expect("first decode");
@@ -3412,10 +3409,9 @@ mod tests {
 
     #[test]
     fn lazy_history_sync_decompress_yields_raw_proto() {
-        let lazy = lazy_from(vec![{
-            let mut proto = wa::Conversation::default();
-            proto.id = "raw@s.whatsapp.net".into();
-            proto
+        let lazy = lazy_from(vec![wa::Conversation {
+            id: "raw@s.whatsapp.net".into(),
+            ..Default::default()
         }]);
 
         // Consumer can partial-decode from the inflated bytes.
@@ -3430,10 +3426,9 @@ mod tests {
 
     #[test]
     fn lazy_history_sync_everything_keeps_working_after_get() {
-        let lazy = lazy_from(vec![{
-            let mut proto = wa::Conversation::default();
-            proto.id = "kept@s.whatsapp.net".into();
-            proto
+        let lazy = lazy_from(vec![wa::Conversation {
+            id: "kept@s.whatsapp.net".into(),
+            ..Default::default()
         }]);
 
         assert_eq!(
@@ -3456,15 +3451,13 @@ mod tests {
     #[test]
     fn lazy_history_sync_stream_iterates_conversations() {
         let lazy = lazy_from(vec![
-            {
-                let mut proto = wa::Conversation::default();
-                proto.id = "first@s.whatsapp.net".into();
-                proto
+            wa::Conversation {
+                id: "first@s.whatsapp.net".into(),
+                ..Default::default()
             },
-            {
-                let mut proto = wa::Conversation::default();
-                proto.id = "second@s.whatsapp.net".into();
-                proto
+            wa::Conversation {
+                id: "second@s.whatsapp.net".into(),
+                ..Default::default()
             },
         ]);
 
@@ -3488,10 +3481,9 @@ mod tests {
 
     #[test]
     fn lazy_history_sync_clone_is_cheap_and_redecodes() {
-        let lazy = lazy_from(vec![{
-            let mut proto = wa::Conversation::default();
-            proto.id = "cloned@s.whatsapp.net".into();
-            proto
+        let lazy = lazy_from(vec![wa::Conversation {
+            id: "cloned@s.whatsapp.net".into(),
+            ..Default::default()
         }]);
 
         // Decode on the original; the clone shares the compressed buffer (no
@@ -3534,10 +3526,9 @@ mod tests {
     fn lazy_history_sync_undersized_cap_fails_loud() {
         // A decompressed_size below the real inflated size trips the inflate
         // cap instead of silently over-allocating past the producer's count.
-        let (compressed, raw_len) = make_compressed_history_sync(vec![{
-            let mut proto = wa::Conversation::default();
-            proto.id = "capped@s.whatsapp.net".into();
-            proto
+        let (compressed, raw_len) = make_compressed_history_sync(vec![wa::Conversation {
+            id: "capped@s.whatsapp.net".into(),
+            ..Default::default()
         }]);
         let lazy = LazyHistorySync::new(compressed, raw_len - 1, 0, None, None);
         assert!(lazy.decompress().is_err());
@@ -3546,26 +3537,21 @@ mod tests {
 
     #[test]
     fn lazy_history_sync_preserves_messages() {
-        let conv = {
-            let mut proto = wa::Conversation::default();
-            proto.id = "chat@s.whatsapp.net".into();
-            proto.messages = vec![{
-                let mut proto = wa::HistorySyncMsg::default();
-                proto.message = {
-                    let mut proto = wa::WebMessageInfo::default();
-                    proto.key = {
-                        let mut proto = wa::MessageKey::default();
-                        proto.id = Some("msg-0".to_string());
-                        proto
+        let conv = wa::Conversation {
+            id: "chat@s.whatsapp.net".into(),
+            messages: vec![wa::HistorySyncMsg {
+                message: wa::WebMessageInfo {
+                    key: wa::MessageKey {
+                        id: Some("msg-0".to_string()),
+                        ..Default::default()
                     }
-                    .into();
-                    proto
+                    .into(),
+                    ..Default::default()
                 }
-                .into();
-                proto.msg_order_id = Some(0);
-                proto
-            }];
-            proto
+                .into(),
+                msg_order_id: Some(0),
+            }],
+            ..Default::default()
         };
         let lazy = lazy_from(vec![conv]);
 

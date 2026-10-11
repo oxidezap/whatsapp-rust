@@ -72,14 +72,12 @@ impl<'a> Comments<'a> {
     ) -> Result<SendResult, SendError> {
         let chat = &chat.into();
         // WA Web encryptExtendedTextComment: the body is an extendedTextMessage.
-        let body = {
-            let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
-                let mut proto = wa::message::ExtendedTextMessage::default();
-                proto.text = Some(text.to_string());
-                proto
-            });
-            proto
+        let body = wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some(text.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         self.send_message_raw(chat, parent_key, body).await
     }
@@ -125,21 +123,17 @@ impl<'a> Comments<'a> {
         // Fresh secret so the comment can itself receive encrypted add-ons.
         let comment_secret = super::creation::generate_message_secret().into_bytes();
 
-        let message = {
-            let mut proto = wa::Message::default();
-            proto.enc_comment_message = buffa::MessageField::some({
-                let mut proto = wa::message::EncCommentMessage::default();
-                proto.target_message_key = buffa::MessageField::some(parent_key);
-                proto.enc_payload = Some(enc_payload);
-                proto.enc_iv = Some(iv.to_vec());
-                proto
-            });
-            proto.message_context_info = buffa::MessageField::some({
-                let mut proto = wa::MessageContextInfo::default();
-                proto.message_secret = Some(comment_secret.to_vec());
-                proto
-            });
-            proto
+        let message = wa::Message {
+            enc_comment_message: buffa::MessageField::some(wa::message::EncCommentMessage {
+                target_message_key: buffa::MessageField::some(parent_key),
+                enc_payload: Some(enc_payload),
+                enc_iv: Some(iv.to_vec()),
+            }),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(comment_secret.to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         let result = client.send_message(chat, message).await?;
 

@@ -149,17 +149,15 @@ pub fn extract_envelope(msg: &wa::Message) -> Option<EncryptedEdit<'_>> {
 pub fn rewrap_as_legacy_edit(inner: wa::Message) -> Option<wa::Message> {
     let pm = inner.protocol_message.into_option()?;
     let edited = pm.edited_message.into_option()?;
-    Some({
-        let mut proto_ = wa::Message::default();
-        proto_.protocol_message = MessageField::some({
-            let mut proto_ = wa::message::ProtocolMessage::default();
-            proto_.key = pm.key;
-            proto_.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
-            proto_.edited_message = MessageField::some(edited);
-            proto_.timestamp_ms = pm.timestamp_ms;
-            proto_
-        });
-        proto_
+    Some(wa::Message {
+        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+            key: pm.key,
+            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+            edited_message: MessageField::some(edited),
+            timestamp_ms: pm.timestamp_ms,
+            ..Default::default()
+        }),
+        ..Default::default()
     })
 }
 
@@ -279,7 +277,6 @@ impl SecretEncKind {
             T::POLL_EDIT => Some(Self::PollEdit),
             T::POLL_ADD_OPTION => Some(Self::PollAddOption),
             T::MESSAGE_SCHEDULE | T::UNKNOWN => None,
-            _ => None,
         }
     }
 
@@ -450,10 +447,9 @@ pub fn decrypt_secret_encrypted(
                 &orig,
                 &sender,
             )?;
-            Ok({
-                let mut proto = wa::Message::default();
-                proto.reaction_message = MessageField::some(reaction);
-                proto
+            Ok(wa::Message {
+                reaction_message: MessageField::some(reaction),
+                ..Default::default()
             })
         }
         SecretEncKind::EncComment => wacore::comment::decrypt_comment_with_secret(
@@ -588,28 +584,23 @@ mod tests {
     use wacore::message_edit::encrypt_message_edit;
 
     fn inner(text: &str) -> wa::Message {
-        {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = MessageField::some({
-                let mut proto_ = wa::message::ProtocolMessage::default();
-                proto_.key = MessageField::some({
-                    let mut proto = wa::MessageKey::default();
-                    proto.remote_jid = Some("123@s.whatsapp.net".to_string());
-                    proto.from_me = Some(false);
-                    proto.id = Some("AC1".to_string());
-                    proto.participant = None;
-                    proto
-                });
-                proto_.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
-                proto_.edited_message = MessageField::some({
-                    let mut proto = wa::Message::default();
-                    proto.conversation = Some(text.to_string());
-                    proto
-                });
-                proto_.timestamp_ms = Some(1_700_000_000_000);
-                proto_
-            });
-            proto_
+        wa::Message {
+            protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                key: MessageField::some(wa::MessageKey {
+                    remote_jid: Some("123@s.whatsapp.net".to_string()),
+                    from_me: Some(false),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+                edited_message: MessageField::some(wa::Message {
+                    conversation: Some(text.to_string()),
+                    ..Default::default()
+                }),
+                timestamp_ms: Some(1_700_000_000_000),
+                ..Default::default()
+            }),
+            ..Default::default()
         }
     }
 
@@ -638,25 +629,20 @@ mod tests {
 
     #[test]
     fn extract_envelope_recognises_message_edit() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.secret_encrypted_message = MessageField::some({
-                let mut proto = wa::message::SecretEncryptedMessage::default();
-                proto.target_message_key = MessageField::some({
-                    let mut proto = wa::MessageKey::default();
-                    proto.remote_jid = Some("g@g.us".to_string());
-                    proto.from_me = Some(false);
-                    proto.id = Some("AC1".to_string());
-                    proto.participant = Some("5511999@s.whatsapp.net".to_string());
-                    proto
-                });
-                proto.enc_payload = Some(vec![0u8; 32]);
-                proto.enc_iv = Some(vec![0u8; 12]);
-                proto.secret_enc_type = Some(SecretEncType::MESSAGE_EDIT);
-                proto.remote_key_id = None;
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: MessageField::some(wa::MessageKey {
+                    remote_jid: Some("g@g.us".to_string()),
+                    from_me: Some(false),
+                    id: Some("AC1".to_string()),
+                    participant: Some("5511999@s.whatsapp.net".to_string()),
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(SecretEncType::MESSAGE_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
         };
         let env = extract_envelope(&msg).expect("recognised");
         assert_eq!(env.target_id(), Some("AC1"));
@@ -670,25 +656,20 @@ mod tests {
 
     #[test]
     fn original_sender_jid_uses_my_jid_for_self_sent_edits() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.secret_encrypted_message = MessageField::some({
-                let mut proto = wa::message::SecretEncryptedMessage::default();
-                proto.target_message_key = MessageField::some({
-                    let mut proto = wa::MessageKey::default();
-                    proto.remote_jid = Some("5510000@s.whatsapp.net".to_string());
-                    proto.from_me = Some(true);
-                    proto.id = Some("AC1".to_string());
-                    proto.participant = None;
-                    proto
-                });
-                proto.enc_payload = Some(vec![0u8; 32]);
-                proto.enc_iv = Some(vec![0u8; 12]);
-                proto.secret_enc_type = Some(SecretEncType::MESSAGE_EDIT);
-                proto.remote_key_id = None;
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: MessageField::some(wa::MessageKey {
+                    remote_jid: Some("5510000@s.whatsapp.net".to_string()),
+                    from_me: Some(true),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(SecretEncType::MESSAGE_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
         };
         let env = extract_envelope(&msg).expect("recognised");
         let my_jid = "5511999:13@s.whatsapp.net".parse::<Jid>().unwrap();
@@ -701,25 +682,20 @@ mod tests {
 
     #[test]
     fn original_sender_jid_reports_an_unparseable_participant() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.secret_encrypted_message = MessageField::some({
-                let mut proto = wa::message::SecretEncryptedMessage::default();
-                proto.target_message_key = MessageField::some({
-                    let mut proto = wa::MessageKey::default();
-                    proto.remote_jid = Some("g@g.us".to_string());
-                    proto.from_me = Some(false);
-                    proto.id = Some("AC1".to_string());
-                    proto.participant = Some("not a jid".to_string());
-                    proto
-                });
-                proto.enc_payload = Some(vec![0u8; 32]);
-                proto.enc_iv = Some(vec![0u8; 12]);
-                proto.secret_enc_type = Some(SecretEncType::MESSAGE_EDIT);
-                proto.remote_key_id = None;
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: MessageField::some(wa::MessageKey {
+                    remote_jid: Some("g@g.us".to_string()),
+                    from_me: Some(false),
+                    id: Some("AC1".to_string()),
+                    participant: Some("not a jid".to_string()),
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(SecretEncType::MESSAGE_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
         };
         let env = extract_envelope(&msg).expect("recognised");
         let my_jid = "5511999@s.whatsapp.net".parse::<Jid>().unwrap();
@@ -738,25 +714,20 @@ mod tests {
 
     #[test]
     fn original_sender_jid_reports_a_target_key_without_any_sender() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.secret_encrypted_message = MessageField::some({
-                let mut proto = wa::message::SecretEncryptedMessage::default();
-                proto.target_message_key = MessageField::some({
-                    let mut proto = wa::MessageKey::default();
-                    proto.remote_jid = None;
-                    proto.from_me = Some(false);
-                    proto.id = Some("AC1".to_string());
-                    proto.participant = None;
-                    proto
-                });
-                proto.enc_payload = Some(vec![0u8; 32]);
-                proto.enc_iv = Some(vec![0u8; 12]);
-                proto.secret_enc_type = Some(SecretEncType::MESSAGE_EDIT);
-                proto.remote_key_id = None;
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: MessageField::some(wa::MessageKey {
+                    remote_jid: None,
+                    from_me: Some(false),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(SecretEncType::MESSAGE_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
         };
         let env = extract_envelope(&msg).expect("recognised");
         let my_jid = "5511999@s.whatsapp.net".parse::<Jid>().unwrap();
@@ -768,25 +739,20 @@ mod tests {
 
     #[test]
     fn original_sender_jid_reports_an_unparseable_remote_jid() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.secret_encrypted_message = MessageField::some({
-                let mut proto = wa::message::SecretEncryptedMessage::default();
-                proto.target_message_key = MessageField::some({
-                    let mut proto = wa::MessageKey::default();
-                    proto.remote_jid = Some("not a jid".to_string());
-                    proto.from_me = Some(false);
-                    proto.id = Some("AC1".to_string());
-                    proto.participant = None;
-                    proto
-                });
-                proto.enc_payload = Some(vec![0u8; 32]);
-                proto.enc_iv = Some(vec![0u8; 12]);
-                proto.secret_enc_type = Some(SecretEncType::MESSAGE_EDIT);
-                proto.remote_key_id = None;
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: MessageField::some(wa::MessageKey {
+                    remote_jid: Some("not a jid".to_string()),
+                    from_me: Some(false),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(SecretEncType::MESSAGE_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
         };
         let env = extract_envelope(&msg).expect("recognised");
         let my_jid = "5511999@s.whatsapp.net".parse::<Jid>().unwrap();
@@ -809,25 +775,20 @@ mod tests {
         // edit frame: an actual incoming peer edit writes the target key in the
         // editor's frame (from_me=true), so the receive path uses the envelope
         // sender via `original_sender_for_dispatch`, not this resolver.
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.secret_encrypted_message = MessageField::some({
-                let mut proto = wa::message::SecretEncryptedMessage::default();
-                proto.target_message_key = MessageField::some({
-                    let mut proto = wa::MessageKey::default();
-                    proto.remote_jid = Some("5510000@s.whatsapp.net".to_string());
-                    proto.from_me = Some(false);
-                    proto.id = Some("AC1".to_string());
-                    proto.participant = None;
-                    proto
-                });
-                proto.enc_payload = Some(vec![0u8; 32]);
-                proto.enc_iv = Some(vec![0u8; 12]);
-                proto.secret_enc_type = Some(SecretEncType::MESSAGE_EDIT);
-                proto.remote_key_id = None;
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: MessageField::some(wa::MessageKey {
+                    remote_jid: Some("5510000@s.whatsapp.net".to_string()),
+                    from_me: Some(false),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(SecretEncType::MESSAGE_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
         };
         let env = extract_envelope(&msg).expect("recognised");
         let my_jid = "5511999@s.whatsapp.net".parse::<Jid>().unwrap();
@@ -841,25 +802,20 @@ mod tests {
     fn encrypted_edit_dispatch_resolver_uses_envelope_frame() {
         // The MESSAGE_EDIT-specific consumer API resolves from the envelope
         // frame, ignoring the editor-framed target key (here from_me=true).
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.secret_encrypted_message = MessageField::some({
-                let mut proto = wa::message::SecretEncryptedMessage::default();
-                proto.target_message_key = MessageField::some({
-                    let mut proto = wa::MessageKey::default();
-                    proto.remote_jid = Some("100000000000001@lid".to_string());
-                    proto.from_me = Some(true);
-                    proto.id = Some("AC1".to_string());
-                    proto.participant = None;
-                    proto
-                });
-                proto.enc_payload = Some(vec![0u8; 32]);
-                proto.enc_iv = Some(vec![0u8; 12]);
-                proto.secret_enc_type = Some(SecretEncType::MESSAGE_EDIT);
-                proto.remote_key_id = None;
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: MessageField::some(wa::MessageKey {
+                    remote_jid: Some("100000000000001@lid".to_string()),
+                    from_me: Some(true),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(SecretEncType::MESSAGE_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
         };
         let env = extract_envelope(&msg).expect("recognised");
         let my_jid = "100000000000001:3@lid".parse::<Jid>().unwrap();
@@ -886,26 +842,20 @@ mod tests {
         // sender to *us*, so the parent messageSecret lookup misses. The editor
         // is always the author (you can only edit your own message), so the
         // sender must come from the envelope frame.
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.secret_encrypted_message = MessageField::some({
-                let mut proto = wa::message::SecretEncryptedMessage::default();
-                proto.target_message_key = MessageField::some({
-                    let mut proto = wa::MessageKey::default();
-                    proto.remote_jid = Some("100000000000001@lid".to_string()); // our LID (editor's frame)
-
-                    proto.from_me = Some(true);
-                    proto.id = Some("AC1".to_string());
-                    proto.participant = None;
-                    proto
-                });
-                proto.enc_payload = Some(vec![0u8; 32]);
-                proto.enc_iv = Some(vec![0u8; 12]);
-                proto.secret_enc_type = Some(SecretEncType::MESSAGE_EDIT);
-                proto.remote_key_id = None;
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: MessageField::some(wa::MessageKey {
+                    remote_jid: Some("100000000000001@lid".to_string()), // our LID (editor's frame)
+                    from_me: Some(true),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(SecretEncType::MESSAGE_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
         };
         let env = extract_secret_encrypted(&msg).expect("recognised");
         let my_jid = "100000000000001@lid".parse::<Jid>().unwrap();
@@ -923,25 +873,20 @@ mod tests {
     fn message_edit_original_sender_uses_my_jid_for_self_synced_edit() {
         // Our own edit, synced from another linked device: the envelope IS from
         // me, so the original sender is us — device suffix stripped.
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.secret_encrypted_message = MessageField::some({
-                let mut proto = wa::message::SecretEncryptedMessage::default();
-                proto.target_message_key = MessageField::some({
-                    let mut proto = wa::MessageKey::default();
-                    proto.remote_jid = Some("200000000000002@lid".to_string());
-                    proto.from_me = Some(true);
-                    proto.id = Some("AC1".to_string());
-                    proto.participant = None;
-                    proto
-                });
-                proto.enc_payload = Some(vec![0u8; 32]);
-                proto.enc_iv = Some(vec![0u8; 12]);
-                proto.secret_enc_type = Some(SecretEncType::MESSAGE_EDIT);
-                proto.remote_key_id = None;
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: MessageField::some(wa::MessageKey {
+                    remote_jid: Some("200000000000002@lid".to_string()),
+                    from_me: Some(true),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(SecretEncType::MESSAGE_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
         };
         let env = extract_secret_encrypted(&msg).expect("recognised");
         let my_jid = "100000000000001:3@lid".parse::<Jid>().unwrap();
@@ -959,25 +904,20 @@ mod tests {
         // Regression guard: poll/event modifications can be authored by someone
         // other than the target's author (e.g. a peer votes on our poll), so the
         // target key stays authoritative for non-edit kinds.
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.secret_encrypted_message = MessageField::some({
-                let mut proto = wa::message::SecretEncryptedMessage::default();
-                proto.target_message_key = MessageField::some({
-                    let mut proto = wa::MessageKey::default();
-                    proto.remote_jid = Some("g@g.us".to_string());
-                    proto.from_me = Some(false);
-                    proto.id = Some("AC1".to_string());
-                    proto.participant = Some("creator@s.whatsapp.net".to_string());
-                    proto
-                });
-                proto.enc_payload = Some(vec![0u8; 32]);
-                proto.enc_iv = Some(vec![0u8; 12]);
-                proto.secret_enc_type = Some(SecretEncType::POLL_EDIT);
-                proto.remote_key_id = None;
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: MessageField::some(wa::MessageKey {
+                    remote_jid: Some("g@g.us".to_string()),
+                    from_me: Some(false),
+                    id: Some("AC1".to_string()),
+                    participant: Some("creator@s.whatsapp.net".to_string()),
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(SecretEncType::POLL_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
         };
         let env = extract_secret_encrypted(&msg).expect("recognised");
         let my_jid = "999@s.whatsapp.net".parse::<Jid>().unwrap();
@@ -994,36 +934,30 @@ mod tests {
 
     #[test]
     fn extract_envelope_rejects_non_edit_secret_enc_type() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.secret_encrypted_message = MessageField::some({
-                let mut proto = wa::message::SecretEncryptedMessage::default();
-                proto.target_message_key = MessageField::some(wa::MessageKey::default());
-                proto.enc_payload = Some(vec![0u8; 32]);
-                proto.enc_iv = Some(vec![0u8; 12]);
-                proto.secret_enc_type = Some(SecretEncType::EVENT_EDIT);
-                proto.remote_key_id = None;
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: MessageField::some(wa::MessageKey::default()),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(SecretEncType::EVENT_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
         };
         assert!(extract_envelope(&msg).is_none());
     }
 
     #[test]
     fn extract_envelope_rejects_invalid_iv_size() {
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.secret_encrypted_message = MessageField::some({
-                let mut proto = wa::message::SecretEncryptedMessage::default();
-                proto.target_message_key = MessageField::some(wa::MessageKey::default());
-                proto.enc_payload = Some(vec![0u8; 32]);
-                proto.enc_iv = Some(vec![0u8; 11]);
-                proto.secret_enc_type = Some(SecretEncType::MESSAGE_EDIT);
-                proto.remote_key_id = None;
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: MessageField::some(wa::MessageKey::default()),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 11]),
+                secret_enc_type: Some(SecretEncType::MESSAGE_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
         };
         assert!(extract_envelope(&msg).is_none());
     }
@@ -1082,10 +1016,9 @@ mod tests {
 
     #[test]
     fn rewrap_returns_none_when_inner_missing_edit() {
-        let m = {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = MessageField::some(wa::message::ProtocolMessage::default());
-            proto_
+        let m = wa::Message {
+            protocol_message: MessageField::some(wa::message::ProtocolMessage::default()),
+            ..Default::default()
         };
         assert!(rewrap_as_legacy_edit(m).is_none());
     }
@@ -1093,25 +1026,20 @@ mod tests {
     use wa::message::secret_encrypted_message::SecretEncType;
 
     fn secret_msg(enc_type: SecretEncType, payload: Vec<u8>, iv: Vec<u8>) -> wa::Message {
-        {
-            let mut proto = wa::Message::default();
-            proto.secret_encrypted_message = MessageField::some({
-                let mut proto = wa::message::SecretEncryptedMessage::default();
-                proto.target_message_key = MessageField::some({
-                    let mut proto = wa::MessageKey::default();
-                    proto.remote_jid = Some("5510000@s.whatsapp.net".to_string());
-                    proto.from_me = Some(false);
-                    proto.id = Some("PARENT1".to_string());
-                    proto.participant = None;
-                    proto
-                });
-                proto.enc_payload = Some(payload);
-                proto.enc_iv = Some(iv);
-                proto.secret_enc_type = Some(enc_type);
-                proto.remote_key_id = None;
-                proto
-            });
-            proto
+        wa::Message {
+            secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: MessageField::some(wa::MessageKey {
+                    remote_jid: Some("5510000@s.whatsapp.net".to_string()),
+                    from_me: Some(false),
+                    id: Some("PARENT1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(payload),
+                enc_iv: Some(iv),
+                secret_enc_type: Some(enc_type),
+                remote_key_id: None,
+            }),
+            ..Default::default()
         }
     }
 
@@ -1160,10 +1088,9 @@ mod tests {
         let creator: Jid = "5510000@s.whatsapp.net".parse().unwrap();
         let actor: Jid = "5511111@s.whatsapp.net".parse().unwrap();
 
-        let payload = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("poll edited".to_string());
-            proto
+        let payload = wa::Message {
+            conversation: Some("poll edited".to_string()),
+            ..Default::default()
         }
         .encode_to_vec();
         let (enc, iv) = encrypt_addon(
@@ -1214,40 +1141,33 @@ mod enc_addon_tests {
     use super::*;
 
     fn key(id: &str) -> wa::MessageKey {
-        {
-            let mut proto = wa::MessageKey::default();
-            proto.id = Some(id.to_string());
-            proto
+        wa::MessageKey {
+            id: Some(id.to_string()),
+            ..Default::default()
         }
     }
 
     #[test]
     fn extract_recognises_enc_reaction_and_comment_envelopes() {
-        let reaction = {
-            let mut proto = wa::Message::default();
-            proto.enc_reaction_message = MessageField::some({
-                let mut proto = wa::message::EncReactionMessage::default();
-                proto.target_message_key = MessageField::some(key("PARENT1"));
-                proto.enc_payload = Some(vec![0; 32]);
-                proto.enc_iv = Some(vec![0; 12]);
-                proto
-            });
-            proto
+        let reaction = wa::Message {
+            enc_reaction_message: MessageField::some(wa::message::EncReactionMessage {
+                target_message_key: MessageField::some(key("PARENT1")),
+                enc_payload: Some(vec![0; 32]),
+                enc_iv: Some(vec![0; 12]),
+            }),
+            ..Default::default()
         };
         let env = extract_secret_encrypted(&reaction).expect("reaction recognised");
         assert_eq!(env.kind, SecretEncKind::EncReaction);
         assert_eq!(env.target_id(), Some("PARENT1"));
 
-        let comment = {
-            let mut proto = wa::Message::default();
-            proto.enc_comment_message = MessageField::some({
-                let mut proto = wa::message::EncCommentMessage::default();
-                proto.target_message_key = MessageField::some(key("PARENT2"));
-                proto.enc_payload = Some(vec![0; 32]);
-                proto.enc_iv = Some(vec![0; 12]);
-                proto
-            });
-            proto
+        let comment = wa::Message {
+            enc_comment_message: MessageField::some(wa::message::EncCommentMessage {
+                target_message_key: MessageField::some(key("PARENT2")),
+                enc_payload: Some(vec![0; 32]),
+                enc_iv: Some(vec![0; 12]),
+            }),
+            ..Default::default()
         };
         let env = extract_secret_encrypted(&comment).expect("comment recognised");
         assert_eq!(env.kind, SecretEncKind::EncComment);
@@ -1256,29 +1176,23 @@ mod enc_addon_tests {
 
     #[test]
     fn extract_rejects_malformed_enc_reaction_envelope() {
-        let bad_iv = {
-            let mut proto = wa::Message::default();
-            proto.enc_reaction_message = MessageField::some({
-                let mut proto = wa::message::EncReactionMessage::default();
-                proto.target_message_key = MessageField::some(key("PARENT1"));
-                proto.enc_payload = Some(vec![0; 32]);
-                proto.enc_iv = Some(vec![0; 8]);
-                proto
-            });
-            proto
+        let bad_iv = wa::Message {
+            enc_reaction_message: MessageField::some(wa::message::EncReactionMessage {
+                target_message_key: MessageField::some(key("PARENT1")),
+                enc_payload: Some(vec![0; 32]),
+                enc_iv: Some(vec![0; 8]),
+            }),
+            ..Default::default()
         };
         assert!(extract_secret_encrypted(&bad_iv).is_none());
 
-        let no_key = {
-            let mut proto = wa::Message::default();
-            proto.enc_reaction_message = MessageField::some({
-                let mut proto = wa::message::EncReactionMessage::default();
-                proto.target_message_key = MessageField::none();
-                proto.enc_payload = Some(vec![0; 32]);
-                proto.enc_iv = Some(vec![0; 12]);
-                proto
-            });
-            proto
+        let no_key = wa::Message {
+            enc_reaction_message: MessageField::some(wa::message::EncReactionMessage {
+                target_message_key: MessageField::none(),
+                enc_payload: Some(vec![0; 32]),
+                enc_iv: Some(vec![0; 12]),
+            }),
+            ..Default::default()
         };
         assert!(extract_secret_encrypted(&no_key).is_none());
     }
@@ -1370,14 +1284,12 @@ mod enc_addon_tests {
         let secret = [0x22u8; 32];
         let author: Jid = "5511000000001@s.whatsapp.net".parse().unwrap();
         let commenter: Jid = "5511000000002@s.whatsapp.net".parse().unwrap();
-        let body = {
-            let mut proto = wa::Message::default();
-            proto.extended_text_message = MessageField::some({
-                let mut proto = wa::message::ExtendedTextMessage::default();
-                proto.text = Some("hi".to_string());
-                proto
-            });
-            proto
+        let body = wa::Message {
+            extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("hi".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         let (enc, iv) = wacore::comment::encrypt_comment_with_secret(
             &body,

@@ -97,13 +97,11 @@ impl CallFixture {
             DeviceCommand::SetId(Some(Jid::new("15550002222", Server::Pn).with_device(1))),
             DeviceCommand::SetLid(Some(own.clone())),
             DeviceCommand::SetPushName("Synthetic call fixture".into()),
-            DeviceCommand::SetAccount(Some({
-                let mut proto = wa::ADVSignedDeviceIdentity::default();
-                proto.details = Some(vec![0; 32]);
-                proto.account_signature_key = Some(vec![0; 32]);
-                proto.account_signature = Some(vec![0; 64]);
-                proto.device_signature = Some(vec![0; 64]);
-                proto
+            DeviceCommand::SetAccount(Some(wa::ADVSignedDeviceIdentity {
+                details: Some(vec![0; 32]),
+                account_signature_key: Some(vec![0; 32]),
+                account_signature: Some(vec![0; 64]),
+                device_signature: Some(vec![0; 64]),
             })),
         ] {
             pm.process_command(command).await;
@@ -377,16 +375,14 @@ impl Wire {
                 let payload = noise.encrypt(&wacore_noise::test_util::build_cert_chain_bytes(
                     &identity_pub,
                 ))?;
-                let response = waproto::codec::handshake_message_to_vec(&{
-                    let mut proto = wa::HandshakeMessage::default();
-                    proto.server_hello = buffa::MessageField::some({
-                        let mut proto = wa::handshake_message::ServerHello::default();
-                        proto.ephemeral = Some(ephemeral_pub.to_vec());
-                        proto.r#static = Some(encrypted_static);
-                        proto.payload = Some(payload);
-                        proto
-                    });
-                    proto
+                let response = waproto::codec::handshake_message_to_vec(&wa::HandshakeMessage {
+                    server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
+                        ephemeral: Some(ephemeral_pub.to_vec()),
+                        r#static: Some(encrypted_static),
+                        payload: Some(payload),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
                 });
                 *state = State::Finish {
                     noise: Box::new(noise),

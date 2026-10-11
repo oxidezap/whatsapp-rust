@@ -527,9 +527,6 @@ fn startup_is_reliable_and_never_forces_a_turn() {
 
     let _serial = threaded_guard();
     for round in 1..=ROUNDS {
-        if std::env::var_os("WA_ORACLE_TURN_DIAGNOSTICS").is_some() {
-            eprintln!("oracle-startup-round begin={round}");
-        }
         let Some(runtime) = engine(ThreadPolicy::Spawn) else {
             eprintln!("skipping: no capture (set WA_WASM_DIR)");
             return;
@@ -555,9 +552,6 @@ fn startup_is_reliable_and_never_forces_a_turn() {
         // why a live worker sometimes has to be forced, and why zero used to
         // mean "the workers were already dead".
         let forced = runtime.forced_turns();
-        if std::env::var_os("WA_ORACLE_TURN_DIAGNOSTICS").is_some() {
-            eprintln!("oracle-startup-round end={round} forced={forced}");
-        }
         assert!(
             forced <= 8,
             "round {round}: forced turns should stay bounded, saw {forced}"

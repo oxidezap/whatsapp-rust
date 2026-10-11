@@ -97,10 +97,9 @@ fn borrowed_public_inbound_reference_preserves_arc_and_origin() {
         .message(body.clone())
         .info(info.clone())
         .ephemeral_expiration(86400)
-        .comment_target(Box::new({
-            let mut proto = wa::MessageKey::default();
-            proto.id = Some("PARENT_POST".into());
-            proto
+        .comment_target(Box::new(wa::MessageKey {
+            id: Some("PARENT_POST".into()),
+            ..Default::default()
         }))
         .build();
     let reference = inbound.message_ref().unwrap();

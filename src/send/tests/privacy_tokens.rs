@@ -106,13 +106,11 @@ async fn assert_dm_operations(legacy: Option<bool>, nct: bool, migrated: bool) {
             1 => client
                 .send_reaction_raw(
                     pn.clone(),
-                    {
-                        let mut proto = wa::MessageKey::default();
-                        proto.remote_jid = Some(pn.to_string());
-                        proto.from_me = Some(false);
-                        proto.id = Some("ORIGINAL".into());
-                        proto.participant = None;
-                        proto
+                    wa::MessageKey {
+                        remote_jid: Some(pn.to_string()),
+                        from_me: Some(false),
+                        id: Some("ORIGINAL".into()),
+                        participant: None,
                     },
                     "👍",
                 )
@@ -456,23 +454,22 @@ async fn group_newsletter_and_status_addon_keep_token_exclusions() {
     assert_tokens(owned.get(), None, None);
 
     client
-        .send_message(Jid::status_broadcast(), {
-            let mut proto = wa::Message::default();
-            proto.reaction_message = buffa::MessageField::some({
-                let mut proto = wa::message::ReactionMessage::default();
-                proto.key = buffa::MessageField::some({
-                    let mut proto = wa::MessageKey::default();
-                    proto.remote_jid = Some(Jid::status_broadcast().to_string());
-                    proto.from_me = Some(false);
-                    proto.id = Some("STATUSPOST".into());
-                    proto.participant = Some(pn.to_string());
-                    proto
-                });
-                proto.text = Some("👍".into());
-                proto
-            });
-            proto
-        })
+        .send_message(
+            Jid::status_broadcast(),
+            wa::Message {
+                reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
+                    key: buffa::MessageField::some(wa::MessageKey {
+                        remote_jid: Some(Jid::status_broadcast().to_string()),
+                        from_me: Some(false),
+                        id: Some("STATUSPOST".into()),
+                        participant: Some(pn.to_string()),
+                    }),
+                    text: Some("👍".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     let owned = crate::test_utils::decode_sent_iq(&transport, 1).await;

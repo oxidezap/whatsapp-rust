@@ -6637,12 +6637,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let action = {
-            let mut proto_ = waproto::whatsapp::sync_action_value::StatusPrivacyAction::default();
-            proto_.mode = Some(buffa::EnumValue::Unknown(99));
-            proto_.user_jid = vec!["120363000000000042@lid".into()];
-            proto_.modes = vec![buffa::EnumValue::Unknown(100)];
-            proto_
+        let action = waproto::whatsapp::sync_action_value::StatusPrivacyAction {
+            mode: Some(buffa::EnumValue::Unknown(99)),
+            user_jid: vec!["120363000000000042@lid".into()],
+            modes: vec![buffa::EnumValue::Unknown(100)],
+            ..Default::default()
         };
         apply_command_to_device(&mut device, DeviceCommand::SetStatusPrivacy(action.clone()));
         store

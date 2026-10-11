@@ -42,7 +42,6 @@ x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 [dev-dependencies]
 divan = { workspace = true }
 futures = { workspace = true, features = ["executor"] }
-serde_json = { workspace = true }
 
 [[bench]]
 name = "libsignal_benchmark"

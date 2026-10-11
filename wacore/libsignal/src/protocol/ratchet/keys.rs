@@ -85,15 +85,13 @@ impl MessageKeyGenerator {
         match self {
             // Zero-cost pass-through: return original protobuf unchanged
             Self::Serialized(pb) => pb,
-            Self::Seed((seed, counter)) => {
-                let mut proto = session_structure::chain::MessageKey::default();
-                proto.cipher_key = None;
-                proto.mac_key = None;
-                proto.iv = None;
-                proto.index = Some(counter);
-                proto.seed = Some(bytes::Bytes::copy_from_slice(&seed));
-                proto
-            }
+            Self::Seed((seed, counter)) => session_structure::chain::MessageKey {
+                cipher_key: None,
+                mac_key: None,
+                iv: None,
+                index: Some(counter),
+                seed: Some(bytes::Bytes::copy_from_slice(&seed)),
+            },
         }
     }
 
@@ -485,14 +483,12 @@ mod tests {
     fn legacy_pb(seed: &[u8; 32], counter: u32) -> session_structure::chain::MessageKey {
         use bytes::Bytes;
         let keys = MessageKeys::derive_keys(seed, None, counter);
-        {
-            let mut proto = session_structure::chain::MessageKey::default();
-            proto.cipher_key = Some(Bytes::copy_from_slice(keys.cipher_key()));
-            proto.mac_key = Some(Bytes::copy_from_slice(keys.mac_key()));
-            proto.iv = Some(Bytes::copy_from_slice(keys.iv()));
-            proto.index = Some(counter);
-            proto.seed = Some(Bytes::copy_from_slice(seed));
-            proto
+        session_structure::chain::MessageKey {
+            cipher_key: Some(Bytes::copy_from_slice(keys.cipher_key())),
+            mac_key: Some(Bytes::copy_from_slice(keys.mac_key())),
+            iv: Some(Bytes::copy_from_slice(keys.iv())),
+            index: Some(counter),
+            seed: Some(Bytes::copy_from_slice(seed)),
         }
     }
 

@@ -106,62 +106,6 @@ struct ParsedSignalMessage {
     ciphertext_range: Range<usize>,
 }
 
-#[derive(Default)]
-struct SignalFields<'a> {
-    ratchet_key: Option<&'a [u8]>,
-    counter: Option<u32>,
-    ciphertext: Option<&'a [u8]>,
-}
-
-impl<'a> SignalFields<'a> {
-    #[inline]
-    fn decode(mut cur: &'a [u8]) -> std::result::Result<Self, buffa::DecodeError> {
-        use buffa::encoding::{Tag, WireType, check_wire_type};
-        use waproto::tags::signal_message as tags;
-
-        let input = cur;
-        let mut fields = Self::default();
-        while !cur.is_empty() {
-            let tag = Tag::decode(&mut cur)?;
-            match tag.field_number() {
-                tags::RATCHET_KEY => {
-                    check_wire_type(tag, WireType::LengthDelimited)?;
-                    fields.ratchet_key = Some(buffa::types::borrow_bytes(&mut cur)?);
-                }
-                tags::COUNTER => {
-                    check_wire_type(tag, WireType::Varint)?;
-                    fields.counter = Some(buffa::types::decode_uint32(&mut cur)?);
-                }
-                tags::PREVIOUS_COUNTER => {
-                    check_wire_type(tag, WireType::Varint)?;
-                    buffa::types::decode_uint32(&mut cur)?;
-                }
-                tags::CIPHERTEXT => {
-                    check_wire_type(tag, WireType::LengthDelimited)?;
-                    fields.ciphertext = Some(buffa::types::borrow_bytes(&mut cur)?);
-                }
-                _ => {
-                    // Keep the generated decoder's unknown/group budgets and
-                    // validation when the envelope actually has future data.
-                    return Self::decode_future(input);
-                }
-            }
-        }
-        Ok(fields)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn decode_future(input: &'a [u8]) -> std::result::Result<Self, buffa::DecodeError> {
-        let view = waproto::whatsapp::SignalMessageView::decode_view(input)?;
-        Ok(Self {
-            ratchet_key: view.ratchet_key,
-            counter: view.counter,
-            ciphertext: view.ciphertext,
-        })
-    }
-}
-
 /// Expand validation into each ownership adapter so parse errors are lowered
 /// directly into its final `Result`. A function returning an intermediate
 /// parsed value prevents that optimization on current LLVM and adds work to
@@ -430,15 +374,16 @@ impl SignalMessage {
     }
 
     #[inline]
-    fn decode_view_from(serialized: &[u8]) -> Result<SignalFields<'_>> {
+    fn decode_view_from(serialized: &[u8]) -> Result<waproto::whatsapp::SignalMessageView<'_>> {
         let proto_bytes = &serialized[1..serialized.len() - Self::MAC_LENGTH];
-        // SignalStorage retains the entire authenticated wire buffer. A second
-        // unknown-field owner adds allocations and drop work without retaining
-        // additional data, especially on rejected envelope probes.
-        SignalFields::decode(proto_bytes).map_err(|_| SignalProtocolError::InvalidProtobufEncoding)
+        waproto::whatsapp::SignalMessageView::decode_view(proto_bytes)
+            .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)
     }
 
-    fn ciphertext_range_from(serialized: &[u8], view: &SignalFields<'_>) -> Result<Range<usize>> {
+    fn ciphertext_range_from(
+        serialized: &[u8],
+        view: &waproto::whatsapp::SignalMessageView<'_>,
+    ) -> Result<Range<usize>> {
         let ciphertext = view
             .ciphertext
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
@@ -1305,73 +1250,6 @@ impl TryFrom<&[u8]> for DecryptionErrorMessage {
 mod tests {
     use super::*;
 
-    #[test]
-    fn signal_projection_matches_generated_validation_and_last_wins() {
-        let mut cases = vec![
-            vec![],
-            vec![0x0a, 1, 7, 0x10, 1, 0x18, 2, 0x22, 2, 3, 4],
-            vec![0x22, 0, 0x10, 1, 0x0a, 0, 0x10, 9, 0x22, 1, 5],
-            vec![0x10, 0xff, 0xff, 0xff, 0xff, 0x1f],
-        ];
-        for wire in cases.clone() {
-            for unknown in [
-                vec![0x28, 0x80, 1],
-                vec![0x32, 2, 1, 2],
-                vec![0x3b, 0x08, 1, 0x3c],
-                vec![0x3b, 0x3c],
-                vec![0x3b, 0x44],
-            ] {
-                let mut before = unknown.clone();
-                before.extend_from_slice(&wire);
-                cases.push(before);
-                let mut after = wire.clone();
-                after.extend_from_slice(&unknown);
-                cases.push(after);
-            }
-        }
-        for number in 1..=4 {
-            for wire_type in 0..=7 {
-                cases.push(vec![(number << 3) | wire_type, 0]);
-            }
-        }
-        for wire in cases {
-            for end in 0..=wire.len() {
-                let input = &wire[..end];
-                let actual = SignalFields::decode(input);
-                let generated = waproto::whatsapp::SignalMessageView::decode_view(input);
-                match (actual, generated) {
-                    (Ok(actual), Ok(expected)) => {
-                        assert_eq!(actual.ratchet_key, expected.ratchet_key);
-                        assert_eq!(actual.counter, expected.counter);
-                        assert_eq!(actual.ciphertext, expected.ciphertext);
-                    }
-                    (Err(actual), Err(expected)) => assert_eq!(actual, expected),
-                    _ => panic!("projection validation differs for {input:?}"),
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn signal_projection_keeps_original_unknown_wire_in_both_owners() {
-        let original = test_signal_message(7, 2, b"synthetic ciphertext");
-        let mut wire = original.serialized().to_vec();
-        wire.splice(
-            wire.len() - SignalMessage::MAC_LENGTH..wire.len() - SignalMessage::MAC_LENGTH,
-            [0x28, 0x81, 0],
-        );
-        let borrowed = SignalMessage::try_from(wire.as_slice()).expect("borrowed future envelope");
-        let shared =
-            SignalMessage::try_from(Bytes::from(wire.clone())).expect("shared future envelope");
-        assert_eq!(borrowed.serialized(), wire);
-        assert_eq!(shared.serialized(), wire);
-        assert_eq!(
-            borrowed.body().expect("borrowed body"),
-            original.body().expect("original body")
-        );
-        assert_eq!(shared.counter(), 7);
-    }
-
     const TEST_MESSAGE_VERSION: u8 = CIPHERTEXT_MESSAGE_CURRENT_VERSION;
     const TEST_MAC_KEY: [u8; 32] = [0xA5; 32];
     const TEST_RATCHET_SEED: u8 = 0x11;
@@ -1407,13 +1285,11 @@ mod tests {
     fn generated_signal_wire(counter: u32, previous_counter: u32, ciphertext: &[u8]) -> Vec<u8> {
         let sender_identity = IdentityKey::new(public_key_from_seed(TEST_SENDER_IDENTITY_SEED));
         let receiver_identity = IdentityKey::new(public_key_from_seed(TEST_RECEIVER_IDENTITY_SEED));
-        let proto = {
-            let mut proto_ = waproto::whatsapp::SignalMessage::default();
-            proto_.ratchet_key = Some(public_key_from_seed(TEST_RATCHET_SEED).serialize().to_vec());
-            proto_.counter = Some(counter);
-            proto_.previous_counter = Some(previous_counter);
-            proto_.ciphertext = Some(ciphertext.to_vec());
-            proto_
+        let proto = waproto::whatsapp::SignalMessage {
+            ratchet_key: Some(public_key_from_seed(TEST_RATCHET_SEED).serialize().to_vec()),
+            counter: Some(counter),
+            previous_counter: Some(previous_counter),
+            ciphertext: Some(ciphertext.to_vec()),
         };
         let mut wire =
             Vec::with_capacity(1 + proto.encoded_len() as usize + SignalMessage::MAC_LENGTH);
@@ -1435,25 +1311,23 @@ mod tests {
         signed_pre_key_id: SignedPreKeyId,
         nested_message: &[u8],
     ) -> Vec<u8> {
-        let proto = {
-            let mut proto_ = waproto::whatsapp::PreKeySignalMessage::default();
-            proto_.registration_id = Some(registration_id);
-            proto_.pre_key_id = pre_key_id.map(Into::into);
-            proto_.signed_pre_key_id = Some(signed_pre_key_id.into());
-            proto_.base_key = Some(
+        let proto = waproto::whatsapp::PreKeySignalMessage {
+            registration_id: Some(registration_id),
+            pre_key_id: pre_key_id.map(Into::into),
+            signed_pre_key_id: Some(signed_pre_key_id.into()),
+            base_key: Some(
                 public_key_from_seed(TEST_BASE_KEY_SEED)
                     .serialize()
                     .to_vec(),
-            );
-            proto_.identity_key = Some(
+            ),
+            identity_key: Some(
                 public_key_from_seed(TEST_SENDER_IDENTITY_SEED)
                     .serialize()
                     .to_vec(),
-            );
-            proto_.message = Some(nested_message.to_vec());
-            proto_.kyber_pre_key_id = None;
-            proto_.kyber_ciphertext = None;
-            proto_
+            ),
+            message: Some(nested_message.to_vec()),
+            kyber_pre_key_id: None,
+            kyber_ciphertext: None,
         };
         let mut wire = Vec::with_capacity(1 + proto.encoded_len() as usize);
         wire.push(encode_version_byte(
@@ -1657,12 +1531,10 @@ mod tests {
     }
 
     fn generated_sender_key_wire(chain_id: u32, iteration: u32, ciphertext: &[u8]) -> Vec<u8> {
-        let proto = {
-            let mut proto_ = waproto::whatsapp::SenderKeyMessage::default();
-            proto_.id = Some(chain_id);
-            proto_.iteration = Some(iteration);
-            proto_.ciphertext = Some(ciphertext.to_vec());
-            proto_
+        let proto = waproto::whatsapp::SenderKeyMessage {
+            id: Some(chain_id),
+            iteration: Some(iteration),
+            ciphertext: Some(ciphertext.to_vec()),
         };
         let mut wire = Vec::with_capacity(1 + proto.encoded_len() as usize);
         wire.push(encode_version_byte(
@@ -1767,13 +1639,11 @@ mod tests {
                 )
                 .expect("test SenderKeyDistributionMessage");
 
-                let proto = {
-                    let mut proto_ = waproto::whatsapp::SenderKeyDistributionMessage::default();
-                    proto_.id = Some(chain_id);
-                    proto_.iteration = Some(iteration);
-                    proto_.chain_key = Some(chain_key.to_vec());
-                    proto_.signing_key = Some(signing_key.serialize().to_vec());
-                    proto_
+                let proto = waproto::whatsapp::SenderKeyDistributionMessage {
+                    id: Some(chain_id),
+                    iteration: Some(iteration),
+                    chain_key: Some(chain_key.to_vec()),
+                    signing_key: Some(signing_key.serialize().to_vec()),
                 };
                 let mut generated = Vec::with_capacity(1 + proto.encoded_len() as usize);
                 generated.push(encode_version_byte(

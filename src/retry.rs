@@ -68,10 +68,9 @@ fn group_history_retry_audience_requires_opt_in_and_membership() {
     let other: Jid = "10002@s.whatsapp.net".parse().unwrap();
     let own: Jid = "10003:1@s.whatsapp.net".parse().unwrap();
     let peer: Jid = "10003:2@s.whatsapp.net".parse().unwrap();
-    let metadata = {
-        let mut proto = wa::message::MessageHistoryMetadata::default();
-        proto.history_receivers = vec![opted.to_string()];
-        proto
+    let metadata = wa::message::MessageHistoryMetadata {
+        history_receivers: vec![opted.to_string()],
+        ..Default::default()
     };
     let mut group = wacore::client::context::GroupRoutingInfo::new(
         vec![opted.clone(), other.clone(), own.to_non_ad()],
@@ -2203,14 +2202,14 @@ mod tests {
             .await;
         client
             .persistence_manager
-            .process_command(DeviceCommand::SetAccount(Some({
-                let mut proto = wa::ADVSignedDeviceIdentity::default();
-                proto.details = Some(vec![0; 32]);
-                proto.account_signature_key = Some(vec![0; 32]);
-                proto.account_signature = Some(vec![0; 64]);
-                proto.device_signature = Some(vec![0; 64]);
-                proto
-            })))
+            .process_command(DeviceCommand::SetAccount(Some(
+                wa::ADVSignedDeviceIdentity {
+                    details: Some(vec![0; 32]),
+                    account_signature_key: Some(vec![0; 32]),
+                    account_signature: Some(vec![0; 64]),
+                    device_signature: Some(vec![0; 64]),
+                },
+            )))
             .await;
         let (prekey_id, prekey) = receiver.get_or_gen_single_pre_key().await.unwrap();
         let snapshot = receiver.persistence_manager.get_device_snapshot();
@@ -2237,16 +2236,14 @@ mod tests {
         .await
         .unwrap();
         drop(adapter);
-        let image = {
-            let mut proto = wa::Message::default();
-            proto.image_message = Some({
-                let mut proto = wa::message::ImageMessage::default();
-                proto.view_once = Some(true);
-                proto.caption = Some("synthetic view-once retry".into());
-                proto
+        let image = wa::Message {
+            image_message: Some(wa::message::ImageMessage {
+                view_once: Some(true),
+                caption: Some("synthetic view-once retry".into()),
+                ..Default::default()
             })
-            .into();
-            proto
+            .into(),
+            ..Default::default()
         };
 
         // The public API supplies canonical bytes; the receipt path has only the
@@ -2367,51 +2364,42 @@ mod tests {
             .await;
         client
             .persistence_manager
-            .process_command(DeviceCommand::SetAccount(Some({
-                let mut proto = wa::ADVSignedDeviceIdentity::default();
-                proto.details = Some(vec![0; 32]);
-                proto.account_signature_key = Some(vec![0; 32]);
-                proto.account_signature = Some(vec![0; 64]);
-                proto.device_signature = Some(vec![0; 64]);
-                proto
-            })))
+            .process_command(DeviceCommand::SetAccount(Some(
+                wa::ADVSignedDeviceIdentity {
+                    details: Some(vec![0; 32]),
+                    account_signature_key: Some(vec![0; 32]),
+                    account_signature: Some(vec![0; 64]),
+                    device_signature: Some(vec![0; 64]),
+                },
+            )))
             .await;
         crate::test_utils::seed_peer_session(&client, &requester).await;
-        let message = {
-            let mut proto = wa::Message::default();
-            proto.device_sent_message = Some({
-                let mut proto = wa::message::DeviceSentMessage::default();
-                proto.destination_jid = Some(chat.to_string());
-                proto.message = Some({
-                    let mut proto = wa::Message::default();
-                    proto.ephemeral_message = Some({
-                        let mut proto = wa::message::FutureProofMessage::default();
-                        proto.message = Some({
-                            let mut proto = wa::Message::default();
-                            proto.view_once_message_v2 = Some({
-                                let mut proto = wa::message::FutureProofMessage::default();
-                                proto.message = Some({
-                                    let mut proto = wa::Message::default();
-                                    proto.video_message = Some(Default::default()).into();
-                                    proto
+        let message = wa::Message {
+            device_sent_message: Some(wa::message::DeviceSentMessage {
+                destination_jid: Some(chat.to_string()),
+                message: Some(wa::Message {
+                    ephemeral_message: Some(wa::message::FutureProofMessage {
+                        message: Some(wa::Message {
+                            view_once_message_v2: Some(wa::message::FutureProofMessage {
+                                message: Some(wa::Message {
+                                    video_message: Some(Default::default()).into(),
+                                    ..Default::default()
                                 })
-                                .into();
-                                proto
+                                .into(),
                             })
-                            .into();
-                            proto
+                            .into(),
+                            ..Default::default()
                         })
-                        .into();
-                        proto
+                        .into(),
                     })
-                    .into();
-                    proto
+                    .into(),
+                    ..Default::default()
                 })
-                .into();
-                proto
+                .into(),
+                ..Default::default()
             })
-            .into();
-            proto
+            .into(),
+            ..Default::default()
         };
         let id = "SELF_DSM_META";
         let waiter =
@@ -2490,10 +2478,9 @@ mod tests {
             .parse()
             .expect("test JID should be valid");
         let msg_id = "ABC123".to_string();
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("hello".into());
-            proto
+        let msg = wa::Message {
+            conversation: Some("hello".into()),
+            ..Default::default()
         };
 
         // Insert via the new async API
@@ -2548,10 +2535,9 @@ mod tests {
             .parse()
             .expect("test JID should be valid");
         let msg_id = "DBONLY1".to_string();
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("db-only".into());
-            proto
+        let msg = wa::Message {
+            conversation: Some("db-only".into()),
+            ..Default::default()
         };
 
         client.add_recent_message(&chat, &msg_id, &msg, None).await;
@@ -2595,10 +2581,9 @@ mod tests {
 
         let chat: Jid = "120363021033254949@g.us".parse().unwrap();
         let msg_id = "PEEK1".to_string();
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("hi".into());
-            proto
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
         };
         client.add_recent_message(&chat, &msg_id, &msg, None).await;
 
@@ -3095,22 +3080,20 @@ mod tests {
         use wacore::libsignal::protocol::{SessionRecord, SessionState};
         use waproto::whatsapp::SessionStructure;
 
-        let state = SessionState::from_session_structure({
-            let mut proto = SessionStructure::default();
-            proto.session_version = Some(3);
-            proto.local_identity_public = None;
-            proto.remote_identity_public = None;
-            proto.root_key = None;
-            proto.previous_counter = Some(0);
-            proto.sender_chain = buffa::MessageField::default();
-            proto.receiver_chains = vec![];
-            proto.pending_pre_key = buffa::MessageField::default();
-            proto.remote_registration_id = Some(remote_regid);
-            proto.local_registration_id = Some(0);
-            proto.alice_base_key = Some(base_key);
-            proto.needs_refresh = None;
-            proto.pending_key_exchange = buffa::MessageField::default();
-            proto
+        let state = SessionState::from_session_structure(SessionStructure {
+            session_version: Some(3),
+            local_identity_public: None,
+            remote_identity_public: None,
+            root_key: None,
+            previous_counter: Some(0),
+            sender_chain: buffa::MessageField::default(),
+            receiver_chains: vec![],
+            pending_pre_key: buffa::MessageField::default(),
+            remote_registration_id: Some(remote_regid),
+            local_registration_id: Some(0),
+            alice_base_key: Some(base_key),
+            needs_refresh: None,
+            pending_key_exchange: buffa::MessageField::default(),
         });
         SessionRecord::new(state)
             .serialize()
@@ -3564,10 +3547,9 @@ mod tests {
             .add_recent_message(
                 &group,
                 msg_id,
-                &{
-                    let mut proto = wa::Message::default();
-                    proto.conversation = Some("hi".into());
-                    proto
+                &wa::Message {
+                    conversation: Some("hi".into()),
+                    ..Default::default()
                 },
                 None,
             )
@@ -3738,10 +3720,9 @@ mod tests {
     }
 
     fn hello() -> wa::Message {
-        {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("hi".into());
-            proto
+        wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
         }
     }
 
@@ -3751,18 +3732,16 @@ mod tests {
             (None, false),
             (Some(hello()), false),
             (
-                Some({
-                    let mut proto = wa::Message::default();
-                    proto.message_history_bundle = Some(Default::default()).into();
-                    proto
+                Some(wa::Message {
+                    message_history_bundle: Some(Default::default()).into(),
+                    ..Default::default()
                 }),
                 true,
             ),
             (
-                Some({
-                    let mut proto = wa::Message::default();
-                    proto.message_history_notice = Some(Default::default()).into();
-                    proto
+                Some(wa::Message {
+                    message_history_notice: Some(Default::default()).into(),
+                    ..Default::default()
                 }),
                 false,
             ),
@@ -4696,10 +4675,9 @@ mod tests {
             .add_recent_message(
                 &group,
                 msg_id,
-                &{
-                    let mut proto = wa::Message::default();
-                    proto.conversation = Some("hi".into());
-                    proto
+                &wa::Message {
+                    conversation: Some("hi".into()),
+                    ..Default::default()
                 },
                 None,
             )
@@ -4845,11 +4823,10 @@ mod tests {
             .unwrap();
         for (jid, hosted_device) in test_util::device_cases() {
             for device_type in test_util::ENCRYPTION_TYPES {
-                let details = {
-                    let mut proto = wa::ADVDeviceIdentity::default();
-                    proto.key_index = Some(0);
-                    proto.device_type = device_type;
-                    proto
+                let details = wa::ADVDeviceIdentity {
+                    key_index: Some(0),
+                    device_type,
+                    ..Default::default()
                 }
                 .encode_to_vec();
                 let acct_prefix = test_util::account_prefix(device_type);
@@ -5299,10 +5276,9 @@ mod tests {
         let chat = Jid::pn("12025550103");
         let requester = chat.with_device(7);
         crate::test_utils::seed_peer_session(&client, &requester).await;
-        let message = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("retry me".into());
-            proto
+        let message = wa::Message {
+            conversation: Some("retry me".into()),
+            ..Default::default()
         };
         let message_id = "PUBLIC-RETRY-CACHE-1";
 
@@ -5652,14 +5628,12 @@ mod tests {
             .expect("test client should build")
             .into_parts();
 
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
-                let mut proto = wa::message::ExtendedTextMessage::default();
-                proto.text = Some("status text".to_string());
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("status text".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
 
         for (chat, msg_id) in [
@@ -5724,10 +5698,9 @@ mod tests {
 
         let bare_jid: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
         let msg_id = "RETRY_MSG_001";
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("test dm".into());
-            proto
+        let msg = wa::Message {
+            conversation: Some("test dm".into()),
+            ..Default::default()
         };
 
         // Store under bare JID (how send_message stores it)
@@ -5785,10 +5758,9 @@ mod tests {
         let pn_jid: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
         let lid_jid: Jid = "236395184570386@lid".parse().unwrap();
         let msg_id = "RETRY_ALT_001";
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("alternate key test".into());
-            proto
+        let msg = wa::Message {
+            conversation: Some("alternate key test".into()),
+            ..Default::default()
         };
 
         // Store under PN (no LID mapping existed at send time)
@@ -5909,10 +5881,9 @@ mod tests {
         let pn_jid: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
         let lid_jid: Jid = "236395184570386@lid".parse().unwrap();
         let msg_id = "RETRY_ALT_PN";
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("pn input alternate".into());
-            proto
+        let msg = wa::Message {
+            conversation: Some("pn input alternate".into()),
+            ..Default::default()
         };
 
         // Store under PN (no mapping at send time)
@@ -5974,10 +5945,9 @@ mod tests {
 
         let lid_jid: Jid = "236395184570386@lid".parse().unwrap();
         let msg_id = "RETRY_NO_ALT";
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("no alternate".into());
-            proto
+        let msg = wa::Message {
+            conversation: Some("no alternate".into()),
+            ..Default::default()
         };
 
         // Store under LID, no PN mapping exists

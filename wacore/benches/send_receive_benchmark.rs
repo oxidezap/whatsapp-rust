@@ -469,10 +469,9 @@ impl SendContextResolver for MockResolver {
 // ---------------------------------------------------------------------------
 
 fn text_msg() -> wa::Message {
-    {
-        let mut proto = wa::Message::default();
-        proto.conversation = Some("Hello, this is a benchmark message.".to_string());
-        proto
+    wa::Message {
+        conversation: Some("Hello, this is a benchmark message.".to_string()),
+        ..Default::default()
     }
 }
 
@@ -594,13 +593,11 @@ fn decrypt_group(
 /// Only the bytes matter here — it is serialised into the stanza, never
 /// validated by the sender.
 fn bench_account() -> wa::ADVSignedDeviceIdentity {
-    {
-        let mut proto = wa::ADVSignedDeviceIdentity::default();
-        proto.details = Some(vec![0xAD; 32]);
-        proto.account_signature_key = Some(vec![0xAC; 32]);
-        proto.account_signature = Some(vec![0x51; 64]);
-        proto.device_signature = Some(vec![0xD5; 64]);
-        proto
+    wa::ADVSignedDeviceIdentity {
+        details: Some(vec![0xAD; 32]),
+        account_signature_key: Some(vec![0xAC; 32]),
+        account_signature: Some(vec![0x51; 64]),
+        device_signature: Some(vec![0xD5; 64]),
     }
 }
 
@@ -983,15 +980,13 @@ fn bench_pairwise_retry(bencher: divan::Bencher, view_once: bool) {
     bencher
         .with_inputs(|| {
             let mut data = setup_dm_send();
-            data.msg = {
-                let mut proto = wa::Message::default();
-                proto.image_message = Some({
-                    let mut proto = wa::message::ImageMessage::default();
-                    proto.view_once = Some(view_once);
-                    proto
+            data.msg = wa::Message {
+                image_message: Some(wa::message::ImageMessage {
+                    view_once: Some(view_once),
+                    ..Default::default()
                 })
-                .into();
-                proto
+                .into(),
+                ..Default::default()
             };
             data
         })

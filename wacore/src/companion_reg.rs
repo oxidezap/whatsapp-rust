@@ -115,7 +115,6 @@ pub const fn companion_web_client_type_for_platform(
         | P::WAIL
         | P::WASS
         | P::BUSINESS_BACK_OFFICE => C::OtherWebClient,
-        _ => C::OtherWebClient,
     }
 }
 
@@ -362,10 +361,9 @@ mod tests {
 
     #[test]
     fn for_props_reads_platform_type() {
-        let props = {
-            let mut proto = wa::DeviceProps::default();
-            proto.platform_type = Some(wa::device_props::PlatformType::CHROME);
-            proto
+        let props = wa::DeviceProps {
+            platform_type: Some(wa::device_props::PlatformType::CHROME),
+            ..Default::default()
         };
         assert_eq!(
             companion_web_client_type_for_props(&props),

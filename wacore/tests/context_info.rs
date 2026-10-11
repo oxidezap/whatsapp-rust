@@ -4,19 +4,17 @@ use wacore::proto_helpers::MessageExt;
 use waproto::whatsapp as wa;
 
 fn context() -> wa::ContextInfo {
-    {
-        let mut proto = wa::ContextInfo::default();
-        proto.stanza_id = Some("quoted-message".into());
-        proto.is_forwarded = Some(true);
-        proto.forwarding_score = Some(2);
-        proto.mentioned_jid = vec!["assistant@bot".into()];
-        proto.expiration = Some(3600);
-        proto.quoted_message = buffa::MessageField::some({
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("quoted text".repeat(1024));
-            proto
-        });
-        proto
+    wa::ContextInfo {
+        stanza_id: Some("quoted-message".into()),
+        is_forwarded: Some(true),
+        forwarding_score: Some(2),
+        mentioned_jid: vec!["assistant@bot".into()],
+        expiration: Some(3600),
+        quoted_message: buffa::MessageField::some(wa::Message {
+            conversation: Some("quoted text".repeat(1024)),
+            ..Default::default()
+        }),
+        ..Default::default()
     }
 }
 
@@ -195,22 +193,17 @@ fn context_is_borrowed_from_location_and_nested_wrappers() {
         .unwrap();
     assert!(std::ptr::eq(message.context_info().unwrap(), expected));
     let expected_quote = expected.quoted_message.as_option().unwrap() as *const wa::Message;
-    let wrapped = {
-        let mut proto = wa::Message::default();
-        proto.device_sent_message = buffa::MessageField::some({
-            let mut proto = wa::message::DeviceSentMessage::default();
-            proto.message = buffa::MessageField::some({
-                let mut proto = wa::Message::default();
-                proto.ephemeral_message = buffa::MessageField::some({
-                    let mut proto = wa::message::FutureProofMessage::default();
-                    proto.message = buffa::MessageField::some(message);
-                    proto
-                });
-                proto
-            });
-            proto
-        });
-        proto
+    let wrapped = wa::Message {
+        device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
+            message: buffa::MessageField::some(wa::Message {
+                ephemeral_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                    message: buffa::MessageField::some(message),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
     };
     let base_context = wrapped
         .get_base_message()
@@ -363,22 +356,17 @@ fn context_uses_existing_base_wrapper_order() {
         .poll_creation_message_v5
         .get_or_insert_default()
         .context_info = buffa::MessageField::some(context());
-    let message = {
-        let mut proto = wa::Message::default();
-        proto.ephemeral_message = buffa::MessageField::some({
-            let mut proto = wa::message::FutureProofMessage::default();
-            proto.message = buffa::MessageField::some({
-                let mut proto = wa::Message::default();
-                proto.device_sent_message = buffa::MessageField::some({
-                    let mut proto = wa::message::DeviceSentMessage::default();
-                    proto.message = buffa::MessageField::some(inner);
-                    proto
-                });
-                proto
-            });
-            proto
-        });
-        proto
+    let message = wa::Message {
+        ephemeral_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+            message: buffa::MessageField::some(wa::Message {
+                device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
+                    message: buffa::MessageField::some(inner),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }),
+        ..Default::default()
     };
     assert!(message.get_base_message().device_sent_message.is_set());
     assert!(message.context_info().is_none());

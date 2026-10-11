@@ -19,29 +19,19 @@ fn setup_mutations(n: usize) -> Vec<wa::SyncdMutation> {
         .map(|i| {
             let mut index_mac = vec![0u8; 32];
             index_mac[..8].copy_from_slice(&i.to_le_bytes());
-            {
-                let mut proto = wa::SyncdMutation::default();
-                proto.operation = Some(wa::syncd_mutation::SyncdOperation::Set.into());
-                proto.record = buffa::MessageField::some({
-                    let mut proto = wa::SyncdRecord::default();
-                    proto.index = buffa::MessageField::some({
-                        let mut proto = wa::SyncdIndex::default();
-                        proto.blob = Some(index_mac);
-                        proto
-                    });
-                    proto.value = buffa::MessageField::some({
-                        let mut proto = wa::SyncdValue::default();
-                        proto.blob = Some(vec![0x5A; 48]);
-                        proto
-                    });
-                    proto.key_id = buffa::MessageField::some({
-                        let mut proto = wa::KeyId::default();
-                        proto.id = Some(b"AAAA".to_vec());
-                        proto
-                    });
-                    proto
-                });
-                proto
+            wa::SyncdMutation {
+                operation: Some(wa::syncd_mutation::SyncdOperation::Set.into()),
+                record: buffa::MessageField::some(wa::SyncdRecord {
+                    index: buffa::MessageField::some(wa::SyncdIndex {
+                        blob: Some(index_mac),
+                    }),
+                    value: buffa::MessageField::some(wa::SyncdValue {
+                        blob: Some(vec![0x5A; 48]),
+                    }),
+                    key_id: buffa::MessageField::some(wa::KeyId {
+                        id: Some(b"AAAA".to_vec()),
+                    }),
+                }),
             }
         })
         .collect()
@@ -70,38 +60,5 @@ fn setup_duplicate_mutations(n: usize) -> Vec<wa::SyncdMutation> {
 fn bench_collect_unique_index_macs_duplicates(bencher: divan::Bencher, n: usize) {
     bencher
         .with_inputs(|| setup_duplicate_mutations(n))
-        .bench_refs(|mutations| black_box(collect_unique_index_macs(black_box(mutations))));
-}
-
-fn setup_random_mutations(n: usize) -> Vec<wa::SyncdMutation> {
-    let mut mutations = setup_mutations(n);
-    for (index, mutation) in mutations.iter_mut().enumerate() {
-        let mut state = (index as u64).wrapping_add(0x9e3779b97f4a7c15);
-        for word in mutation
-            .record
-            .as_option_mut()
-            .expect("fixture record")
-            .index
-            .as_option_mut()
-            .expect("fixture index")
-            .blob
-            .as_mut()
-            .expect("fixture MAC")
-            .chunks_exact_mut(8)
-        {
-            state ^= state >> 12;
-            state ^= state << 25;
-            state ^= state >> 27;
-            word.copy_from_slice(&state.wrapping_mul(0x2545f4914f6cdd1d).to_le_bytes());
-        }
-    }
-    mutations
-}
-
-/// Uniformly spread synthetic MACs exercise sorting beyond ordered counters.
-#[divan::bench(args = [10, 1000])]
-fn bench_collect_unique_index_macs_random(bencher: divan::Bencher, n: usize) {
-    bencher
-        .with_inputs(|| setup_random_mutations(n))
         .bench_refs(|mutations| black_box(collect_unique_index_macs(black_box(mutations))));
 }

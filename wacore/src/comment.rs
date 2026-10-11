@@ -84,14 +84,12 @@ mod tests {
     const COMMENTER: &str = "222222222222222@lid";
 
     fn body(text: &str) -> wa::Message {
-        {
-            let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
-                let mut proto = wa::message::ExtendedTextMessage::default();
-                proto.text = Some(text.to_string());
-                proto
-            });
-            proto
+        wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some(text.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
         }
     }
 

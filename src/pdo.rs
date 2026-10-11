@@ -523,41 +523,36 @@ impl Client {
 
         let memo = owner;
 
-        let message_key = {
-            let mut proto = wa::MessageKey::default();
-            proto.remote_jid = Some(resolved_jid.to_string());
-            proto.from_me = Some(info.source.is_from_me);
-            proto.id = Some(info.id.to_string());
-            proto.participant = participant.map(|p| p.to_string());
-            proto
+        let message_key = wa::MessageKey {
+            remote_jid: Some(resolved_jid.to_string()),
+            from_me: Some(info.source.is_from_me),
+            id: Some(info.id.to_string()),
+            participant: participant.map(|p| p.to_string()),
         };
 
         // Build the PDO request message
-        let pdo_request = {
-            let mut proto = wa::message::PeerDataOperationRequestMessage::default();
-            proto.peer_data_operation_request_type =
-                Some(wa::message::PeerDataOperationRequestType::PLACEHOLDER_MESSAGE_RESEND);
-            proto.placeholder_message_resend_request = vec![{
-                let mut proto = wa::message::peer_data_operation_request_message::PlaceholderMessageResendRequest::default();
-                proto.message_key = buffa::MessageField::some(message_key);
-                proto
-            }];
-            proto
+        let pdo_request = wa::message::PeerDataOperationRequestMessage {
+            peer_data_operation_request_type: Some(
+                wa::message::PeerDataOperationRequestType::PLACEHOLDER_MESSAGE_RESEND,
+            ),
+            placeholder_message_resend_request: vec![
+                wa::message::peer_data_operation_request_message::PlaceholderMessageResendRequest {
+                    message_key: buffa::MessageField::some(message_key),
+                },
+            ],
+            ..Default::default()
         };
 
         // Wrap it in a protocol message
-        let protocol_message = {
-            let mut proto_ = wa::message::ProtocolMessage::default();
-            proto_.r#type =
-                Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE);
-            proto_.peer_data_operation_request_message = buffa::MessageField::some(pdo_request);
-            proto_
+        let protocol_message = wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE),
+            peer_data_operation_request_message: buffa::MessageField::some(pdo_request),
+            ..Default::default()
         };
 
-        let msg = {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some(protocol_message);
-            proto_
+        let msg = wa::Message {
+            protocol_message: buffa::MessageField::some(protocol_message),
+            ..Default::default()
         };
 
         info!(
@@ -654,34 +649,32 @@ impl Client {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let peer_target = self_peer_target(&device_snapshot)?;
 
-        let pdo_request = {
-            let mut proto = wa::message::PeerDataOperationRequestMessage::default();
-            proto.peer_data_operation_request_type =
-                Some(wa::message::PeerDataOperationRequestType::HISTORY_SYNC_ON_DEMAND);
-            proto.history_sync_on_demand_request = buffa::MessageField::some({
-                let mut proto = wa::message::peer_data_operation_request_message::HistorySyncOnDemandRequest::default();
-                proto.chat_jid = Some(chat_jid.to_string());
-                proto.oldest_msg_id = Some(oldest_msg_id.to_string());
-                proto.oldest_msg_from_me = Some(oldest_msg_from_me);
-                proto.oldest_msg_timestamp_ms = Some(oldest_msg_timestamp_ms);
-                proto.on_demand_msg_count = Some(count);
-                proto
-            });
-            proto
+        let pdo_request = wa::message::PeerDataOperationRequestMessage {
+            peer_data_operation_request_type: Some(
+                wa::message::PeerDataOperationRequestType::HISTORY_SYNC_ON_DEMAND,
+            ),
+            history_sync_on_demand_request: buffa::MessageField::some(
+                wa::message::peer_data_operation_request_message::HistorySyncOnDemandRequest {
+                    chat_jid: Some(chat_jid.to_string()),
+                    oldest_msg_id: Some(oldest_msg_id.to_string()),
+                    oldest_msg_from_me: Some(oldest_msg_from_me),
+                    oldest_msg_timestamp_ms: Some(oldest_msg_timestamp_ms),
+                    on_demand_msg_count: Some(count),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
         };
 
-        let protocol_message = {
-            let mut proto_ = wa::message::ProtocolMessage::default();
-            proto_.r#type =
-                Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE);
-            proto_.peer_data_operation_request_message = buffa::MessageField::some(pdo_request);
-            proto_
+        let protocol_message = wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE),
+            peer_data_operation_request_message: buffa::MessageField::some(pdo_request),
+            ..Default::default()
         };
 
-        let msg = {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some(protocol_message);
-            proto_
+        let msg = wa::Message {
+            protocol_message: buffa::MessageField::some(protocol_message),
+            ..Default::default()
         };
 
         info!(
@@ -760,32 +753,28 @@ impl Client {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let peer_target = self_peer_target(&device_snapshot)?;
 
-        let pdo_request = {
-            let mut proto = wa::message::PeerDataOperationRequestMessage::default();
-            proto.peer_data_operation_request_type = Some(
+        let pdo_request = wa::message::PeerDataOperationRequestMessage {
+            peer_data_operation_request_type: Some(
                 wa::message::PeerDataOperationRequestType::COMPANION_SYNCD_SNAPSHOT_FATAL_RECOVERY,
-            );
-            proto.syncd_collection_fatal_recovery_request = buffa::MessageField::some({
-                let mut proto = wa::message::peer_data_operation_request_message::SyncDCollectionFatalRecoveryRequest::default();
-                proto.collection_name = Some(collection.to_string());
-                proto.timestamp = Some(wacore::time::now_secs() as i64);
-                proto
-            });
-            proto
+            ),
+            syncd_collection_fatal_recovery_request: buffa::MessageField::some(
+                wa::message::peer_data_operation_request_message::SyncDCollectionFatalRecoveryRequest {
+                    collection_name: Some(collection.to_string()),
+                    timestamp: Some(wacore::time::now_secs() as i64),
+                },
+            ),
+            ..Default::default()
         };
 
-        let protocol_message = {
-            let mut proto_ = wa::message::ProtocolMessage::default();
-            proto_.r#type =
-                Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE);
-            proto_.peer_data_operation_request_message = buffa::MessageField::some(pdo_request);
-            proto_
+        let protocol_message = wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE),
+            peer_data_operation_request_message: buffa::MessageField::some(pdo_request),
+            ..Default::default()
         };
 
-        let msg = {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some(protocol_message);
-            proto_
+        let msg = wa::Message {
+            protocol_message: buffa::MessageField::some(protocol_message),
+            ..Default::default()
         };
 
         info!(
@@ -1743,17 +1732,14 @@ mod tests {
         participant: Option<&str>,
     ) -> waproto::whatsapp::WebMessageInfo {
         use waproto::whatsapp as wa;
-        {
-            let mut proto = wa::WebMessageInfo::default();
-            proto.key = buffa::MessageField::some({
-                let mut proto = wa::MessageKey::default();
-                proto.remote_jid = Some(remote_jid.into());
-                proto.from_me = Some(from_me);
-                proto.id = Some(id.into());
-                proto.participant = participant.map(|p| p.into());
-                proto
-            });
-            proto
+        wa::WebMessageInfo {
+            key: buffa::MessageField::some(wa::MessageKey {
+                remote_jid: Some(remote_jid.into()),
+                from_me: Some(from_me),
+                id: Some(id.into()),
+                participant: participant.map(|p| p.into()),
+            }),
+            ..Default::default()
         }
     }
 
@@ -1766,15 +1752,12 @@ mod tests {
     {
         use buffa::Message as _;
         let mut web_msg = make_web_msg(remote_jid, from_me, id, participant);
-        web_msg.message = buffa::MessageField::some({
-            let mut proto_ = waproto::whatsapp::Message::default();
-            proto_.conversation = Some("recovered by the phone".to_owned());
-            proto_
+        web_msg.message = buffa::MessageField::some(waproto::whatsapp::Message {
+            conversation: Some("recovered by the phone".to_owned()),
+            ..Default::default()
         });
-        {
-            let mut proto_ = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse::default();
-            proto_.web_message_info_bytes = Some(web_msg.encode_to_vec());
-            proto_
+        waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
         }
     }
 
@@ -2142,27 +2125,21 @@ mod tests {
             )
             .await;
 
-        let web_msg = {
-            let mut proto_ = waproto::whatsapp::WebMessageInfo::default();
-            proto_.key = buffa::MessageField::some({
-                let mut proto_ = waproto::whatsapp::MessageKey::default();
-                proto_.remote_jid = Some(chat.to_owned());
-                proto_.from_me = Some(false);
-                proto_.id = Some(msg_id.into());
-                proto_.participant = Some("111222333444555@lid".to_owned());
-                proto_
-            });
-            proto_.message = buffa::MessageField::some({
-                let mut proto_ = waproto::whatsapp::Message::default();
-                proto_.conversation = Some("recovered by the phone".to_owned());
-                proto_
-            });
-            proto_
+        let web_msg = waproto::whatsapp::WebMessageInfo {
+            key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
+                remote_jid: Some(chat.to_owned()),
+                from_me: Some(false),
+                id: Some(msg_id.into()),
+                participant: Some("111222333444555@lid".to_owned()),
+            }),
+            message: buffa::MessageField::some(waproto::whatsapp::Message {
+                conversation: Some("recovered by the phone".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
-        let response = {
-            let mut proto_ = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse::default();
-            proto_.web_message_info_bytes = Some(web_msg.encode_to_vec());
-            proto_
+        let response = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
         };
 
         client
@@ -2232,28 +2209,22 @@ mod tests {
             )
             .await;
 
-        let web_msg = {
-            let mut proto_ = waproto::whatsapp::WebMessageInfo::default();
-            proto_.key = buffa::MessageField::some({
-                let mut proto_ = waproto::whatsapp::MessageKey::default();
-                proto_.remote_jid = Some(chat.to_owned());
-                proto_.from_me = Some(false);
-                proto_.id = Some(msg_id.into()); // The phone answers in PN.
-
-                proto_.participant = Some("15550001234@s.whatsapp.net".to_owned());
-                proto_
-            });
-            proto_.message = buffa::MessageField::some({
-                let mut proto_ = waproto::whatsapp::Message::default();
-                proto_.conversation = Some("recovered by the phone".to_owned());
-                proto_
-            });
-            proto_
+        let web_msg = waproto::whatsapp::WebMessageInfo {
+            key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
+                remote_jid: Some(chat.to_owned()),
+                from_me: Some(false),
+                id: Some(msg_id.into()),
+                // The phone answers in PN.
+                participant: Some("15550001234@s.whatsapp.net".to_owned()),
+            }),
+            message: buffa::MessageField::some(waproto::whatsapp::Message {
+                conversation: Some("recovered by the phone".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
-        let response = {
-            let mut proto_ = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse::default();
-            proto_.web_message_info_bytes = Some(web_msg.encode_to_vec());
-            proto_
+        let response = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
         };
 
         client
@@ -2621,27 +2592,21 @@ mod tests {
             .await;
 
         // The response answers the incoming one, and omits the participant too.
-        let web_msg = {
-            let mut proto_ = waproto::whatsapp::WebMessageInfo::default();
-            proto_.key = buffa::MessageField::some({
-                let mut proto_ = waproto::whatsapp::MessageKey::default();
-                proto_.remote_jid = Some(peer.to_owned());
-                proto_.from_me = Some(false);
-                proto_.id = Some(msg_id.into());
-                proto_.participant = None;
-                proto_
-            });
-            proto_.message = buffa::MessageField::some({
-                let mut proto_ = waproto::whatsapp::Message::default();
-                proto_.conversation = Some("recovered by the phone".to_owned());
-                proto_
-            });
-            proto_
+        let web_msg = waproto::whatsapp::WebMessageInfo {
+            key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
+                remote_jid: Some(peer.to_owned()),
+                from_me: Some(false),
+                id: Some(msg_id.into()),
+                participant: None,
+            }),
+            message: buffa::MessageField::some(waproto::whatsapp::Message {
+                conversation: Some("recovered by the phone".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
-        let response = {
-            let mut proto_ = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse::default();
-            proto_.web_message_info_bytes = Some(web_msg.encode_to_vec());
-            proto_
+        let response = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
         };
 
         client
@@ -4073,22 +4038,17 @@ mod tests {
             )
             .await;
 
-        let web_msg = {
-            let mut proto_ = waproto::whatsapp::WebMessageInfo::default();
-            proto_.key = buffa::MessageField::some({
-                let mut proto_ = waproto::whatsapp::MessageKey::default();
-                proto_.remote_jid = Some(chat.to_owned());
-                proto_.from_me = Some(false);
-                proto_.id = Some(msg_id.into());
-                proto_.participant = None;
-                proto_
-            });
-            proto_
+        let web_msg = waproto::whatsapp::WebMessageInfo {
+            key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
+                remote_jid: Some(chat.to_owned()),
+                from_me: Some(false),
+                id: Some(msg_id.into()),
+                participant: None,
+            }),
+            ..Default::default()
         };
-        let response = {
-            let mut proto_ = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse::default();
-            proto_.web_message_info_bytes = Some(web_msg.encode_to_vec());
-            proto_
+        let response = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
         };
 
         client

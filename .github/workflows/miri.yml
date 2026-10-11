@@ -40,7 +40,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Cover wacore-binary's load-bearing `unsafe`: the
+          # wacore-binary owns the workspace's only load-bearing `unsafe`: the
           # `Yokeable`/`StableDeref` impls behind `OwnedNodeRef` (two lifetime
           # transmutes over borrowed decode output) and the `set_len` over
           # inflate's uninitialized spare capacity in `zlib_pool`. Both are
@@ -54,11 +54,6 @@ jobs:
           - name: wacore-binary
             cache-key: binary
             args: -p wacore-binary --lib
-          # The generated unknown-field owner uses ManuallyDrop to share
-          # destruction. Cover transfers, clones and empty retained capacity.
-          - name: waproto (unknown ownership)
-            cache-key: proto-unknown-ownership
-            args: -p waproto --test unknown_storage
           # No `unsafe` of its own, but it drives wacore-binary's zero-copy
           # decode over real Noise frames and pulls the crypto stack
           # (aes/sha2/curve25519), whose unsafe backends this exercises.

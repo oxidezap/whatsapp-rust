@@ -842,41 +842,30 @@ mod racing_tests {
 
     #[tokio::test]
     async fn double_failure_returns_the_last_error() {
-        struct ControlledFailure(async_channel::Receiver<&'static str>);
+        // WA Web rejects with the failure that completes the set.
+        let (primary, _) = scripted(Some(20), Some("boom-primary"));
+        let (secondary, _) = scripted(Some(5), Some("boom-secondary"));
+        let err = race(primary, secondary)
+            .create_transport()
+            .await
+            .err()
+            .expect("both dials fail");
+        assert!(
+            err.to_string().contains("boom-primary"),
+            "the last failure wins, got: {err}"
+        );
 
-        #[async_trait::async_trait]
-        impl TransportFactory for ControlledFailure {
-            async fn create_transport(&self) -> TransportDial {
-                Err(anyhow::anyhow!(
-                    self.0.recv().await.expect("release failure")
-                ))
-            }
-        }
-
-        for primary_first in [true, false] {
-            let (primary_tx, primary_rx) = async_channel::bounded(1);
-            let (secondary_tx, secondary_rx) = async_channel::bounded(1);
-            let factory = RacingTransportFactory::new(
-                Arc::new(ControlledFailure(primary_rx)),
-                Arc::new(ControlledFailure(secondary_rx)),
-                test_runtime(),
-            );
-            let mut dial = factory.create_transport();
-            assert!(futures::poll!(&mut dial).is_pending());
-
-            let (first, last, last_error) = if primary_first {
-                (primary_tx, secondary_tx, "boom-secondary")
-            } else {
-                (secondary_tx, primary_tx, "boom-primary")
-            };
-            // Observe the first failure before releasing the second. Wall-clock
-            // delays can both expire while a loaded executor is descheduled.
-            first.send("first failure").await.expect("release first");
-            assert!(futures::poll!(&mut dial).is_pending());
-            last.send(last_error).await.expect("release last");
-            let err = dial.await.err().expect("both dials fail");
-            assert_eq!(err.to_string(), last_error, "the last failure wins");
-        }
+        let (primary, _) = scripted(Some(5), Some("boom-primary"));
+        let (secondary, _) = scripted(Some(20), Some("boom-secondary"));
+        let err = race(primary, secondary)
+            .create_transport()
+            .await
+            .err()
+            .expect("both dials fail");
+        assert!(
+            err.to_string().contains("boom-secondary"),
+            "the last failure wins, got: {err}"
+        );
     }
 
     #[tokio::test]

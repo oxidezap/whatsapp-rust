@@ -1,7 +1,6 @@
 //! Rust repository automation: `cargo xt`.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 mod ci;
-mod codspeed_pair;
 mod compatibility;
 mod consumers;
 mod package_consumers;

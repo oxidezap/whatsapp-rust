@@ -224,21 +224,17 @@ impl Client {
         pin_type: wa::message::pin_in_chat_message::Type,
         duration_secs: u32,
     ) -> Result<SendResult, SendError> {
-        let message = {
-            let mut proto = wa::Message::default();
-            proto.pin_in_chat_message = buffa::MessageField::some({
-                let mut proto = wa::message::PinInChatMessage::default();
-                proto.key = buffa::MessageField::some(key);
-                proto.r#type = Some(pin_type);
-                proto.sender_timestamp_ms = Some(wacore::time::now_millis());
-                proto
-            });
-            proto.message_context_info = buffa::MessageField::some({
-                let mut proto = wa::MessageContextInfo::default();
-                proto.message_add_on_duration_in_secs = Some(duration_secs);
-                proto
-            });
-            proto
+        let message = wa::Message {
+            pin_in_chat_message: buffa::MessageField::some(wa::message::PinInChatMessage {
+                key: buffa::MessageField::some(key),
+                r#type: Some(pin_type),
+                sender_timestamp_ms: Some(wacore::time::now_millis()),
+            }),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                message_add_on_duration_in_secs: Some(duration_secs),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
 
         self.send_built_message(chat, message, EditAttribute::PinInChat, None)

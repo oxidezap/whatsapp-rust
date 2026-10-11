@@ -58,20 +58,18 @@ impl<'a> Events<'a> {
             ));
         }
 
-        let mut message = {
-            let mut proto = wa::Message::default();
-            proto.event_message = buffa::MessageField::some(build_event_message(params));
-            proto
+        let mut message = wa::Message {
+            event_message: buffa::MessageField::some(build_event_message(params)),
+            ..Default::default()
         };
 
         // Events carry a per-message secret (like polls); responders derive their
         // RSVP encryption key from it. WA Web rejects an event without one
         // (Events/ValidationError MISSING_MESSAGE_SECRET).
         let message_secret = super::creation::generate_message_secret();
-        message.message_context_info = buffa::MessageField::some({
-            let mut proto = wa::MessageContextInfo::default();
-            proto.message_secret = Some(message_secret.as_bytes().to_vec());
-            proto
+        message.message_context_info = buffa::MessageField::some(wa::MessageContextInfo {
+            message_secret: Some(message_secret.as_bytes().to_vec()),
+            ..Default::default()
         });
 
         let (result, creator) = self.client.send_creation_message(to, message).await?;
@@ -98,12 +96,10 @@ impl<'a> Events<'a> {
         let responder_str = responder.to_string();
         let creator_str = event_creator_jid.to_non_ad_string();
 
-        let response_msg = {
-            let mut proto = wa::message::EventResponseMessage::default();
-            proto.response = Some(response);
-            proto.timestamp_ms = Some(wacore::time::now_millis());
-            proto.extra_guest_count = extra_guest_count;
-            proto
+        let response_msg = wa::message::EventResponseMessage {
+            response: Some(response),
+            timestamp_ms: Some(wacore::time::now_millis()),
+            extra_guest_count,
         };
 
         let (enc_payload, iv) = event::encrypt_event_response_with_secret(
@@ -115,29 +111,24 @@ impl<'a> Events<'a> {
         )?;
 
         let from_me = target.message().from_me();
-        let enc = {
-            let mut proto = wa::message::EncEventResponseMessage::default();
-            proto.event_creation_message_key = buffa::MessageField::some({
-                let mut proto = wa::MessageKey::default();
-                proto.remote_jid = Some(chat_jid.to_string());
-                proto.from_me = Some(from_me);
-                proto.id = Some(event_msg_id.to_string());
-                proto.participant = if chat_jid.is_group() {
+        let enc = wa::message::EncEventResponseMessage {
+            event_creation_message_key: buffa::MessageField::some(wa::MessageKey {
+                remote_jid: Some(chat_jid.to_string()),
+                from_me: Some(from_me),
+                id: Some(event_msg_id.to_string()),
+                participant: if chat_jid.is_group() {
                     Some(event_creator_jid.to_string())
                 } else {
                     None
-                };
-                proto
-            });
-            proto.enc_payload = Some(enc_payload);
-            proto.enc_iv = Some(iv.to_vec());
-            proto
+                },
+            }),
+            enc_payload: Some(enc_payload),
+            enc_iv: Some(iv.to_vec()),
         };
 
-        let message = {
-            let mut proto = wa::Message::default();
-            proto.enc_event_response_message = buffa::MessageField::some(enc);
-            proto
+        let message = wa::Message {
+            enc_event_response_message: buffa::MessageField::some(enc),
+            ..Default::default()
         };
 
         self.client.send_message(chat_jid, message).await
@@ -198,17 +189,16 @@ impl Client {
 /// Build an `EventMessage` from the public params. Mirrors WA Web's
 /// `GenerateEventCreationMessageProto` field set.
 fn build_event_message(params: EventCreationParams) -> wa::message::EventMessage {
-    {
-        let mut proto = wa::message::EventMessage::default();
-        proto.name = Some(params.name);
-        proto.description = params.description;
-        proto.start_time = params.start_time;
-        proto.end_time = params.end_time;
-        proto.join_link = params.join_link;
-        proto.location = params.location.into();
-        proto.is_schedule_call = params.is_scheduled_call;
-        proto.extra_guests_allowed = params.extra_guests_allowed;
-        proto
+    wa::message::EventMessage {
+        name: Some(params.name),
+        description: params.description,
+        start_time: params.start_time,
+        end_time: params.end_time,
+        join_link: params.join_link,
+        location: params.location.into(),
+        is_schedule_call: params.is_scheduled_call,
+        extra_guests_allowed: params.extra_guests_allowed,
+        ..Default::default()
     }
 }
 

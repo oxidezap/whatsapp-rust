@@ -158,10 +158,9 @@ pub fn mock_context(client: Arc<Client>) -> MessageContext {
         .message(Arc::new(proto::Message::text("comment")))
         .info(mock_info())
         .ephemeral_expiration(86400)
-        .comment_target(Box::new({
-            let mut proto_ = proto::MessageKey::default();
-            proto_.id = Some("PARENT".into());
-            proto_
+        .comment_target(Box::new(proto::MessageKey {
+            id: Some("PARENT".into()),
+            ..Default::default()
         }))
         .build()
 }

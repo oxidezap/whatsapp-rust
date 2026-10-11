@@ -164,16 +164,14 @@ async fn xx_serve_hello_only(
         .unwrap();
     let encrypted_payload = noise.encrypt(&server.cert_chain_bytes).unwrap();
 
-    let server_hello = {
-        let mut proto = wa::HandshakeMessage::default();
-        proto.server_hello = buffa::MessageField::some({
-            let mut proto = wa::handshake_message::ServerHello::default();
-            proto.ephemeral = Some(server_eph_pub.to_vec());
-            proto.r#static = Some(encrypted_static);
-            proto.payload = Some(encrypted_payload);
-            proto
-        });
-        proto
+    let server_hello = wa::HandshakeMessage {
+        server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
+            ephemeral: Some(server_eph_pub.to_vec()),
+            r#static: Some(encrypted_static),
+            payload: Some(encrypted_payload),
+            ..Default::default()
+        }),
+        ..Default::default()
     };
     let sh_bytes = server_hello.encode_to_vec();
     let framed = wacore::framing::encode_frame(&sh_bytes, None).unwrap();
@@ -215,16 +213,14 @@ async fn xx_serve_full(
         .unwrap();
     let encrypted_payload = noise.encrypt(&server.cert_chain_bytes).unwrap();
 
-    let server_hello = {
-        let mut proto = wa::HandshakeMessage::default();
-        proto.server_hello = buffa::MessageField::some({
-            let mut proto = wa::handshake_message::ServerHello::default();
-            proto.ephemeral = Some(server_eph_pub.to_vec());
-            proto.r#static = Some(encrypted_static);
-            proto.payload = Some(encrypted_payload);
-            proto
-        });
-        proto
+    let server_hello = wa::HandshakeMessage {
+        server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
+            ephemeral: Some(server_eph_pub.to_vec()),
+            r#static: Some(encrypted_static),
+            payload: Some(encrypted_payload),
+            ..Default::default()
+        }),
+        ..Default::default()
     };
     let sh_bytes = server_hello.encode_to_vec();
     let framed = wacore::framing::encode_frame(&sh_bytes, None).unwrap();
@@ -282,16 +278,14 @@ async fn ik_serve_accept(
         .unwrap();
     let encrypted_cert = noise.encrypt(&server.cert_chain_bytes).unwrap();
 
-    let server_hello = {
-        let mut proto = wa::HandshakeMessage::default();
-        proto.server_hello = buffa::MessageField::some({
-            let mut proto = wa::handshake_message::ServerHello::default();
-            proto.ephemeral = Some(server_eph_pub.to_vec());
-            proto.r#static = None;
-            proto.payload = Some(encrypted_cert);
-            proto
-        });
-        proto
+    let server_hello = wa::HandshakeMessage {
+        server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
+            ephemeral: Some(server_eph_pub.to_vec()),
+            r#static: None,
+            payload: Some(encrypted_cert),
+            ..Default::default()
+        }),
+        ..Default::default()
     };
     let sh_bytes = server_hello.encode_to_vec();
     let framed = wacore::framing::encode_frame(&sh_bytes, None).unwrap();
@@ -678,16 +672,14 @@ async fn ik_serve_fallback_with_corrupt_payloads(
     let server_eph = KeyPair::generate(&mut rand::rng());
     let server_eph_pub: [u8; 32] = server_eph.public_key.public_key_bytes().try_into().unwrap();
 
-    let server_hello = {
-        let mut proto = wa::HandshakeMessage::default();
-        proto.server_hello = buffa::MessageField::some({
-            let mut proto = wa::handshake_message::ServerHello::default();
-            proto.ephemeral = Some(server_eph_pub.to_vec());
-            proto.r#static = Some(vec![0xCC; 32 + 16]);
-            proto.payload = Some(vec![0xDE; 64]);
-            proto
-        });
-        proto
+    let server_hello = wa::HandshakeMessage {
+        server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
+            ephemeral: Some(server_eph_pub.to_vec()),
+            r#static: Some(vec![0xCC; 32 + 16]),
+            payload: Some(vec![0xDE; 64]),
+            ..Default::default()
+        }),
+        ..Default::default()
     };
     let sh_bytes = server_hello.encode_to_vec();
     let framed = wacore::framing::encode_frame(&sh_bytes, None).unwrap();
@@ -994,16 +986,14 @@ async fn ik_serve_force_fallback(
         .unwrap();
     let encrypted_cert = noise.encrypt(&server.cert_chain_bytes).unwrap();
 
-    let server_hello = {
-        let mut proto = wa::HandshakeMessage::default();
-        proto.server_hello = buffa::MessageField::some({
-            let mut proto = wa::handshake_message::ServerHello::default();
-            proto.ephemeral = Some(server_eph_pub.to_vec());
-            proto.r#static = Some(encrypted_static);
-            proto.payload = Some(encrypted_cert);
-            proto
-        });
-        proto
+    let server_hello = wa::HandshakeMessage {
+        server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
+            ephemeral: Some(server_eph_pub.to_vec()),
+            r#static: Some(encrypted_static),
+            payload: Some(encrypted_cert),
+            ..Default::default()
+        }),
+        ..Default::default()
     };
     let sh_bytes = server_hello.encode_to_vec();
     let framed = wacore::framing::encode_frame(&sh_bytes, None).unwrap();
@@ -1135,17 +1125,15 @@ async fn ik_with_stale_cache_invalidates_and_increments_counter() {
     // decrypt of the cert (Core handshake error → invalidation runs).
     let bogus_server_eph = KeyPair::generate(&mut rand::rng()).public_key;
     let bogus_server_eph_bytes: [u8; 32] = bogus_server_eph.public_key_bytes().try_into().unwrap();
-    let server_hello = {
-        let mut proto = wa::HandshakeMessage::default();
-        proto.server_hello = buffa::MessageField::some({
-            let mut proto = wa::handshake_message::ServerHello::default();
-            proto.ephemeral = Some(bogus_server_eph_bytes.to_vec());
-            proto.r#static = None; // `payload` here is just garbage — AEAD MAC check will fail.
-
-            proto.payload = Some(vec![0xAB; 64]);
-            proto
-        });
-        proto
+    let server_hello = wa::HandshakeMessage {
+        server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
+            ephemeral: Some(bogus_server_eph_bytes.to_vec()),
+            r#static: None,
+            // `payload` here is just garbage — AEAD MAC check will fail.
+            payload: Some(vec![0xAB; 64]),
+            ..Default::default()
+        }),
+        ..Default::default()
     };
     let sh_bytes = server_hello.encode_to_vec();
     let framed = wacore::framing::encode_frame(&sh_bytes, None).unwrap();

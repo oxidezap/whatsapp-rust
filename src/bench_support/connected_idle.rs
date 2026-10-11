@@ -189,13 +189,11 @@ impl Session {
                 Jid::new("100000000000001", Server::Lid).with_device(1),
             )),
             DeviceCommand::SetPushName("Synthetic idle fixture".into()),
-            DeviceCommand::SetAccount(Some({
-                let mut proto = wa::ADVSignedDeviceIdentity::default();
-                proto.details = Some(vec![0; 32]);
-                proto.account_signature_key = Some(vec![0; 32]);
-                proto.account_signature = Some(vec![0; 64]);
-                proto.device_signature = Some(vec![0; 64]);
-                proto
+            DeviceCommand::SetAccount(Some(wa::ADVSignedDeviceIdentity {
+                details: Some(vec![0; 32]),
+                account_signature_key: Some(vec![0; 32]),
+                account_signature: Some(vec![0; 64]),
+                device_signature: Some(vec![0; 64]),
             })),
         ] {
             pm.process_command(command).await;
@@ -283,10 +281,9 @@ impl Session {
             keys.push(key);
         }
         let text = "x".repeat(TEXT_BYTES);
-        let plaintext = wacore::messages::MessageUtils::encode_and_pad(&{
-            let mut proto = wa::Message::default();
-            proto.conversation = Some(text.clone());
-            proto
+        let plaintext = wacore::messages::MessageUtils::encode_and_pad(&wa::Message {
+            conversation: Some(text.clone()),
+            ..Default::default()
         });
         let mut stanzas = Vec::with_capacity(MESSAGES);
         for i in 0..MESSAGES {
@@ -315,46 +312,38 @@ impl Session {
         drop(adapter);
         peer.flush_signal_cache().await?;
         self.client.flush_pending_signal_state().await?;
-        let history = {
-            let mut proto = wa::HistorySync::default();
-            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
-            proto.conversations = groups
+        let history = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            conversations: groups
                 .iter()
                 .enumerate()
-                .map(|(lane, group)| {
-                    let mut proto = wa::Conversation::default();
-                    proto.id = group.to_string();
-                    proto.messages = (lane..HISTORY_MESSAGES)
+                .map(|(lane, group)| wa::Conversation {
+                    id: group.to_string(),
+                    messages: (lane..HISTORY_MESSAGES)
                         .step_by(LANES)
-                        .map(|i| {
-                            let mut proto = wa::HistorySyncMsg::default();
-                            proto.message = buffa::MessageField::some({
-                                let mut proto = wa::WebMessageInfo::default();
-                                proto.key = buffa::MessageField::some({
-                                    let mut proto = wa::MessageKey::default();
-                                    proto.remote_jid = Some(group.to_string());
-                                    proto.from_me = Some(false);
-                                    proto.id = Some(format!("HISTORY-{i}"));
-                                    proto.participant = Some(peer_jid.to_string());
-                                    proto
-                                });
-                                proto.message = buffa::MessageField::some({
-                                    let mut proto = wa::Message::default();
-                                    proto.conversation = Some(text.clone());
-                                    proto
-                                });
-                                proto.message_secret = Some(vec![0x44; 32]);
-                                proto.message_timestamp = Some(wacore::time::now_secs() as u64);
-                                proto
-                            });
-                            proto.msg_order_id = Some(i as u64);
-                            proto
+                        .map(|i| wa::HistorySyncMsg {
+                            message: buffa::MessageField::some(wa::WebMessageInfo {
+                                key: buffa::MessageField::some(wa::MessageKey {
+                                    remote_jid: Some(group.to_string()),
+                                    from_me: Some(false),
+                                    id: Some(format!("HISTORY-{i}")),
+                                    participant: Some(peer_jid.to_string()),
+                                }),
+                                message: buffa::MessageField::some(wa::Message {
+                                    conversation: Some(text.clone()),
+                                    ..Default::default()
+                                }),
+                                message_secret: Some(vec![0x44; 32]),
+                                message_timestamp: Some(wacore::time::now_secs() as u64),
+                                ..Default::default()
+                            }),
+                            msg_order_id: Some(i as u64),
                         })
-                        .collect();
-                    proto
+                        .collect(),
+                    ..Default::default()
                 })
-                .collect();
-            proto
+                .collect(),
+            ..Default::default()
         };
         let mut encoder =
             flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
@@ -362,12 +351,11 @@ impl Session {
         let compressed = encoder.finish()?;
         Ok(Activity {
             stanzas,
-            history: {
-                let mut proto = wa::message::HistorySyncNotification::default();
-                proto.file_length = Some(compressed.len() as u64);
-                proto.sync_type = Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP);
-                proto.initial_hist_bootstrap_inline_payload = Some(compressed);
-                proto
+            history: wa::message::HistorySyncNotification {
+                file_length: Some(compressed.len() as u64),
+                sync_type: Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP),
+                initial_hist_bootstrap_inline_payload: Some(compressed),
+                ..Default::default()
             },
         })
     }
@@ -639,16 +627,14 @@ impl Wire {
                 let payload = noise.encrypt(&wacore_noise::test_util::build_cert_chain_bytes(
                     &identity_pub,
                 ))?;
-                let response = waproto::codec::handshake_message_to_vec(&{
-                    let mut proto = wa::HandshakeMessage::default();
-                    proto.server_hello = buffa::MessageField::some({
-                        let mut proto = wa::handshake_message::ServerHello::default();
-                        proto.ephemeral = Some(ephemeral_pub.to_vec());
-                        proto.r#static = Some(encrypted_static);
-                        proto.payload = Some(payload);
-                        proto
-                    });
-                    proto
+                let response = waproto::codec::handshake_message_to_vec(&wa::HandshakeMessage {
+                    server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
+                        ephemeral: Some(ephemeral_pub.to_vec()),
+                        r#static: Some(encrypted_static),
+                        payload: Some(payload),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
                 });
                 *state = State::Finish {
                     noise: Box::new(noise),

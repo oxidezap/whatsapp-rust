@@ -608,10 +608,9 @@ mod tests {
         ];
         let state = dummy_device_state();
         for (pt, expected_wire) in cases {
-            let props = {
-                let mut proto = wa::DeviceProps::default();
-                proto.platform_type = Some(pt);
-                proto
+            let props = wa::DeviceProps {
+                platform_type: Some(pt),
+                ..Default::default()
             };
             let ct = companion_web_client_type_for_props(&props);
             let qr = PairUtils::make_qr_data(&state, "ref", ct);
@@ -679,15 +678,18 @@ mod tests {
         } else {
             ADVEncryptionType::E2EE
         };
-        build_pair_success_payload_with_types(state, adv_secret_for_hmac, Some(account_type), {
-            let mut proto = wa::ADVDeviceIdentity::default();
-            proto.raw_id = Some(1);
-            proto.timestamp = Some(0);
-            proto.key_index = key_index;
-            proto.account_type = Some(account_type);
-            proto.device_type = Some(account_type);
-            proto
-        })
+        build_pair_success_payload_with_types(
+            state,
+            adv_secret_for_hmac,
+            Some(account_type),
+            wa::ADVDeviceIdentity {
+                raw_id: Some(1),
+                timestamp: Some(0),
+                key_index,
+                account_type: Some(account_type),
+                device_type: Some(account_type),
+            },
+        )
     }
 
     fn build_pair_success_payload_with_types(
@@ -726,12 +728,10 @@ mod tests {
             mac.update(&[6, 5]);
         }
         mac.update(&signed);
-        {
-            let mut proto = wa::ADVSignedDeviceIdentityHMAC::default();
-            proto.details = Some(signed);
-            proto.hmac = Some(mac.finalize().into_bytes().to_vec());
-            proto.account_type = account_type;
-            proto
+        wa::ADVSignedDeviceIdentityHMAC {
+            details: Some(signed),
+            hmac: Some(mac.finalize().into_bytes().to_vec()),
+            account_type,
         }
         .encode_to_vec()
     }
@@ -748,12 +748,11 @@ mod tests {
                         &state,
                         &state.adv_secret_key,
                         outer,
-                        {
-                            let mut proto = wa::ADVDeviceIdentity::default();
-                            proto.key_index = Some(42);
-                            proto.account_type = account_type;
-                            proto.device_type = device_type;
-                            proto
+                        wa::ADVDeviceIdentity {
+                            key_index: Some(42),
+                            account_type,
+                            device_type,
+                            ..Default::default()
                         },
                     );
                     let (result, index) = PairUtils::do_pair_crypto(&state, &payload)
@@ -816,11 +815,10 @@ mod tests {
     fn pairing_preserves_signed_details_when_signature_buffers_spill() {
         let state = dummy_device_state();
         let account = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
-        let mut details = {
-            let mut proto = wa::ADVDeviceIdentity::default();
-            proto.key_index = Some(0);
-            proto.device_type = Some(ADVEncryptionType::HOSTED);
-            proto
+        let mut details = wa::ADVDeviceIdentity {
+            key_index: Some(0),
+            device_type: Some(ADVEncryptionType::HOSTED),
+            ..Default::default()
         }
         .encode_to_vec();
         // Unknown field 100 with a 512-byte payload forces both signature buffers to spill.
@@ -963,11 +961,10 @@ mod tests {
         let account = KeyPair::generate(&mut rng);
         for outer in [ADVEncryptionType::E2EE, ADVEncryptionType::HOSTED] {
             for device_type in [ADVEncryptionType::E2EE, ADVEncryptionType::HOSTED] {
-                let details = {
-                    let mut proto = wa::ADVDeviceIdentity::default();
-                    proto.key_index = Some(0);
-                    proto.device_type = Some(device_type);
-                    proto
+                let details = wa::ADVDeviceIdentity {
+                    key_index: Some(0),
+                    device_type: Some(device_type),
+                    ..Default::default()
                 }
                 .encode_to_vec();
                 let wrong_prefix: &[u8; 2] = if device_type == ADVEncryptionType::HOSTED {
@@ -1120,10 +1117,9 @@ mod tests {
                     .build(),
                 NodeBuilder::new("client-props")
                     .bytes(
-                        {
-                            let mut proto = wa::ClientPairingProps::default();
-                            proto.is_chat_db_lid_migrated = Some(true);
-                            proto
+                        wa::ClientPairingProps {
+                            is_chat_db_lid_migrated: Some(true),
+                            ..Default::default()
                         }
                         .encode_to_vec(),
                     )
@@ -1141,10 +1137,9 @@ mod tests {
         let pair_success = NodeBuilder::new("pair-success")
             .children([NodeBuilder::new("client-props")
                 .bytes(
-                    {
-                        let mut proto = wa::ClientPairingProps::default();
-                        proto.is_chat_db_lid_migrated = Some(false);
-                        proto
+                    wa::ClientPairingProps {
+                        is_chat_db_lid_migrated: Some(false),
+                        ..Default::default()
                     }
                     .encode_to_vec(),
                 )

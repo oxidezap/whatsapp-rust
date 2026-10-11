@@ -244,17 +244,15 @@ impl<'a> Labels<'a> {
             fingerprint_id(label_id),
             name.len()
         );
-        let value = {
-            let mut proto = wa::SyncActionValue::default();
-            proto.label_edit_action = buffa::MessageField::some({
-                let mut proto = wa::sync_action_value::LabelEditAction::default();
-                proto.name = Some(name.to_string());
-                proto.color = Some(color);
-                proto.deleted = Some(false);
-                proto
-            });
-            proto.timestamp = Some(wacore::time::now_millis());
-            proto
+        let value = wa::SyncActionValue {
+            label_edit_action: buffa::MessageField::some(wa::sync_action_value::LabelEditAction {
+                name: Some(name.to_string()),
+                color: Some(color),
+                deleted: Some(false),
+                ..Default::default()
+            }),
+            timestamp: Some(wacore::time::now_millis()),
+            ..Default::default()
         };
         self.client
             .send_app_state_action(&schemas::LABEL_EDIT, &[label_id], &value)
@@ -270,15 +268,13 @@ impl<'a> Labels<'a> {
             ));
         }
         debug!("Deleting label {}", fingerprint_id(label_id));
-        let value = {
-            let mut proto = wa::SyncActionValue::default();
-            proto.label_edit_action = buffa::MessageField::some({
-                let mut proto = wa::sync_action_value::LabelEditAction::default();
-                proto.deleted = Some(true);
-                proto
-            });
-            proto.timestamp = Some(wacore::time::now_millis());
-            proto
+        let value = wa::SyncActionValue {
+            label_edit_action: buffa::MessageField::some(wa::sync_action_value::LabelEditAction {
+                deleted: Some(true),
+                ..Default::default()
+            }),
+            timestamp: Some(wacore::time::now_millis()),
+            ..Default::default()
         };
         self.client
             .send_app_state_action(&schemas::LABEL_EDIT, &[label_id], &value)
@@ -402,15 +398,15 @@ impl<'a> Labels<'a> {
 }
 
 fn association_value(labeled: bool) -> wa::SyncActionValue {
-    {
-        let mut proto = wa::SyncActionValue::default();
-        proto.label_association_action = buffa::MessageField::some({
-            let mut proto = wa::sync_action_value::LabelAssociationAction::default();
-            proto.labeled = Some(labeled);
-            proto
-        });
-        proto.timestamp = Some(wacore::time::now_millis());
-        proto
+    wa::SyncActionValue {
+        label_association_action: buffa::MessageField::some(
+            wa::sync_action_value::LabelAssociationAction {
+                labeled: Some(labeled),
+                ..Default::default()
+            },
+        ),
+        timestamp: Some(wacore::time::now_millis()),
+        ..Default::default()
     }
 }
 
@@ -717,18 +713,21 @@ mod tests {
 
     #[test]
     fn label_edit_dispatches_update() {
-        let m = set_mutation(vec!["label_edit", "5"], {
-            let mut proto = wa::SyncActionValue::default();
-            proto.label_edit_action = buffa::MessageField::some({
-                let mut proto = wa::sync_action_value::LabelEditAction::default();
-                proto.name = Some("Work".into());
-                proto.color = Some(2);
-                proto.deleted = Some(false);
-                proto
-            });
-            proto.timestamp = Some(1000);
-            proto
-        });
+        let m = set_mutation(
+            vec!["label_edit", "5"],
+            wa::SyncActionValue {
+                label_edit_action: buffa::MessageField::some(
+                    wa::sync_action_value::LabelEditAction {
+                        name: Some("Work".into()),
+                        color: Some(2),
+                        deleted: Some(false),
+                        ..Default::default()
+                    },
+                ),
+                timestamp: Some(1000),
+                ..Default::default()
+            },
+        );
         let (outcome, events) = run(&m);
         assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert_eq!(events.len(), 1);
@@ -745,16 +744,19 @@ mod tests {
 
     #[test]
     fn label_jid_dispatches_association() {
-        let m = set_mutation(vec!["label_jid", "5", "12025550111@s.whatsapp.net"], {
-            let mut proto = wa::SyncActionValue::default();
-            proto.label_association_action = buffa::MessageField::some({
-                let mut proto = wa::sync_action_value::LabelAssociationAction::default();
-                proto.labeled = Some(true);
-                proto
-            });
-            proto.timestamp = Some(1000);
-            proto
-        });
+        let m = set_mutation(
+            vec!["label_jid", "5", "12025550111@s.whatsapp.net"],
+            wa::SyncActionValue {
+                label_association_action: buffa::MessageField::some(
+                    wa::sync_action_value::LabelAssociationAction {
+                        labeled: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                timestamp: Some(1000),
+                ..Default::default()
+            },
+        );
         let (outcome, events) = run(&m);
         assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert_eq!(events.len(), 1);
@@ -946,15 +948,18 @@ mod tests {
                 "0",
             ],
         ] {
-            let m = set_mutation(index.clone(), {
-                let mut proto = wa::SyncActionValue::default();
-                proto.label_association_action = buffa::MessageField::some({
-                    let mut proto = wa::sync_action_value::LabelAssociationAction::default();
-                    proto.labeled = Some(true);
-                    proto
-                });
-                proto
-            });
+            let m = set_mutation(
+                index.clone(),
+                wa::SyncActionValue {
+                    label_association_action: buffa::MessageField::some(
+                        wa::sync_action_value::LabelAssociationAction {
+                            labeled: Some(true),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                },
+            );
             let (outcome, events) = run(&m);
             assert!(
                 outcome != AppStateDispatchOutcome::Unclaimed,
@@ -979,15 +984,18 @@ mod tests {
     #[test]
     fn label_jid_with_malformed_chat_is_claimed_but_not_dispatched() {
         // Claimed (a non-`Unclaimed` outcome) so it isn't re-tried, but no event is emitted.
-        let m = set_mutation(vec!["label_jid", "5", "not a jid"], {
-            let mut proto = wa::SyncActionValue::default();
-            proto.label_association_action = buffa::MessageField::some({
-                let mut proto = wa::sync_action_value::LabelAssociationAction::default();
-                proto.labeled = Some(true);
-                proto
-            });
-            proto
-        });
+        let m = set_mutation(
+            vec!["label_jid", "5", "not a jid"],
+            wa::SyncActionValue {
+                label_association_action: buffa::MessageField::some(
+                    wa::sync_action_value::LabelAssociationAction {
+                        labeled: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            },
+        );
         let (outcome, events) = run(&m);
         assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert!(events.is_empty());

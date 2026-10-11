@@ -7,8 +7,8 @@
 use anyhow::Result;
 use wasmtime::error::Context as _;
 use wasmtime::{
-    CallHook, Caller, Config, Engine, Extern, ExternType, Func, FuncType, Global, Linker, Memory,
-    Module, Ref, SharedMemory, Store, Table, Val, ValType,
+    Caller, Config, Engine, Extern, ExternType, Func, FuncType, Global, Linker, Memory, Module,
+    Ref, SharedMemory, Store, Table, Val, ValType,
 };
 
 use crate::state::{HostState, sync_memory};
@@ -71,8 +71,9 @@ where
         + 'static,
 {
     Func::new(store, ty, move |mut caller, params, results| {
-        // Wrapped host calls let spawned workers observe cancellation.
-        // Scheduling also covers typed imports through the store call hook.
+        // Every host call is both a cancellation point and a yield point. A
+        // guest worker loop reaches one constantly — it polls the clock — which
+        // is what makes them the right place for each.
         let thread = caller.data().thread_id;
         if thread != 0 && caller.data().shared.is_shutting_down() {
             return Err(wasmtime::Error::msg("host is shutting down"));
@@ -96,6 +97,7 @@ where
             }
         }
 
+        caller.data().shared.scheduler.yield_point(thread);
         // Also checks the memory watch; see `sync_memory`.
         sync_memory(&mut caller);
         handler(&mut caller, params, results)
@@ -153,13 +155,6 @@ pub fn install_memory_watch(store: &mut Store<HostState>) {
             }
             if strict {
                 context.data().shared.scheduler.release(thread);
-            }
-            if !strict && matches!(hook, CallHook::CallingHost) {
-                // Typed imports such as emscripten_get_now bypass host_func.
-                // They must still let a waiting guest thread take its turn.
-                // Strict turns stay released throughout host execution and
-                // are acquired only on return to wasm, above.
-                context.data().shared.scheduler.yield_point(thread);
             }
         }
         Ok(())

@@ -377,10 +377,8 @@ mod tests {
             voter,
         )
         .unwrap();
-        let vote_message = {
-            let mut proto_ = waproto::whatsapp::message::PollVoteMessage::default();
-            proto_.selected_options = hashes;
-            proto_
+        let vote_message = waproto::whatsapp::message::PollVoteMessage {
+            selected_options: hashes,
         };
         assert_eq!(plaintext, vote_message.encode_to_vec());
     }
@@ -414,10 +412,8 @@ mod tests {
             compute_option_hash("Yes").to_vec(),
             compute_option_hash("No").to_vec(),
         ];
-        let vote_msg = {
-            let mut proto_ = waproto::whatsapp::message::PollVoteMessage::default();
-            proto_.selected_options = hashes.clone();
-            proto_
+        let vote_msg = waproto::whatsapp::message::PollVoteMessage {
+            selected_options: hashes.clone(),
         };
 
         assert_eq!(encode_selected_options(&hashes), vote_msg.encode_to_vec());

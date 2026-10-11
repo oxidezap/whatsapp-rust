@@ -523,10 +523,9 @@ mod tests {
         use buffa::Message as ProtoMessage;
 
         // Create a simple text message
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("hello".to_string());
-            proto
+        let msg = wa::Message {
+            conversation: Some("hello".to_string()),
+            ..Default::default()
         };
         let plaintext = msg.encode_to_vec();
         let padded = crate::messages::MessageUtils::pad_message_v2(plaintext);
@@ -543,16 +542,15 @@ mod tests {
     fn test_process_decrypted_plaintext_with_skdm() {
         use buffa::Message as ProtoMessage;
 
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.conversation = Some("hello".to_string());
-            proto.sender_key_distribution_message = buffa::MessageField::some({
-                let mut proto = wa::message::SenderKeyDistributionMessage::default();
-                proto.group_id = Some("group@g.us".to_string());
-                proto.axolotl_sender_key_distribution_message = Some(vec![1, 2, 3]);
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            conversation: Some("hello".to_string()),
+            sender_key_distribution_message: buffa::MessageField::some(
+                wa::message::SenderKeyDistributionMessage {
+                    group_id: Some("group@g.us".to_string()),
+                    axolotl_sender_key_distribution_message: Some(vec![1, 2, 3]),
+                },
+            ),
+            ..Default::default()
         };
         let plaintext = msg.encode_to_vec();
         let padded = crate::messages::MessageUtils::pad_message_v2(plaintext);
@@ -566,15 +564,14 @@ mod tests {
     fn test_process_decrypted_plaintext_skdm_only() {
         use buffa::Message as ProtoMessage;
 
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.sender_key_distribution_message = buffa::MessageField::some({
-                let mut proto = wa::message::SenderKeyDistributionMessage::default();
-                proto.group_id = Some("group@g.us".to_string());
-                proto.axolotl_sender_key_distribution_message = Some(vec![1, 2, 3]);
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            sender_key_distribution_message: buffa::MessageField::some(
+                wa::message::SenderKeyDistributionMessage {
+                    group_id: Some("group@g.us".to_string()),
+                    axolotl_sender_key_distribution_message: Some(vec![1, 2, 3]),
+                },
+            ),
+            ..Default::default()
         };
         let plaintext = msg.encode_to_vec();
         let padded = crate::messages::MessageUtils::pad_message_v2(plaintext);
@@ -588,18 +585,15 @@ mod tests {
     fn test_process_decrypted_plaintext_invalid_dsm() {
         use buffa::Message as ProtoMessage;
 
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.device_sent_message = buffa::MessageField::some({
-                let mut proto = wa::message::DeviceSentMessage::default();
-                proto.message = buffa::MessageField::some({
-                    let mut proto = wa::Message::default();
-                    proto.conversation = Some("inner".to_string());
-                    proto
-                });
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
+                message: buffa::MessageField::some(wa::Message {
+                    conversation: Some("inner".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         let plaintext = msg.encode_to_vec();
         let padded = crate::messages::MessageUtils::pad_message_v2(plaintext);
@@ -615,18 +609,15 @@ mod tests {
     fn test_process_decrypted_plaintext_valid_dsm() {
         use buffa::Message as ProtoMessage;
 
-        let msg = {
-            let mut proto = wa::Message::default();
-            proto.device_sent_message = buffa::MessageField::some({
-                let mut proto = wa::message::DeviceSentMessage::default();
-                proto.message = buffa::MessageField::some({
-                    let mut proto = wa::Message::default();
-                    proto.conversation = Some("self-sent".to_string());
-                    proto
-                });
-                proto
-            });
-            proto
+        let msg = wa::Message {
+            device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
+                message: buffa::MessageField::some(wa::Message {
+                    conversation: Some("self-sent".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
         let plaintext = msg.encode_to_vec();
         let padded = crate::messages::MessageUtils::pad_message_v2(plaintext);

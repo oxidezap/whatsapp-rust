@@ -213,121 +213,113 @@ impl AudioOptions {
 
 /// Build an image message from an upload result.
 pub fn image_message(upload: UploadResponse, opts: ImageOptions) -> wa::Message {
-    {
-        let mut proto = wa::Message::default();
-        proto.image_message = buffa::MessageField::some({
-            let mut proto = wa::message::ImageMessage::default();
-            proto.url = Some(upload.url);
-            proto.direct_path = Some(upload.direct_path);
-            proto.media_key = Some(upload.media_key.to_vec());
-            proto.file_sha256 = Some(upload.file_sha256.to_vec());
-            proto.file_enc_sha256 = Some(upload.file_enc_sha256.to_vec());
-            proto.file_length = Some(upload.file_length);
-            proto.media_key_timestamp = Some(upload.media_key_timestamp);
-            proto.mimetype = Some(opts.mimetype.unwrap_or_else(|| "image/jpeg".to_string()));
-            proto.caption = opts.caption;
-            proto.jpeg_thumbnail = opts.jpeg_thumbnail;
-            proto.context_info = opts
+    wa::Message {
+        image_message: buffa::MessageField::some(wa::message::ImageMessage {
+            url: Some(upload.url),
+            direct_path: Some(upload.direct_path),
+            media_key: Some(upload.media_key.to_vec()),
+            file_sha256: Some(upload.file_sha256.to_vec()),
+            file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+            file_length: Some(upload.file_length),
+            media_key_timestamp: Some(upload.media_key_timestamp),
+            mimetype: Some(opts.mimetype.unwrap_or_else(|| "image/jpeg".to_string())),
+            caption: opts.caption,
+            jpeg_thumbnail: opts.jpeg_thumbnail,
+            context_info: opts
                 .context_info
                 .map(|ci| buffa::MessageField::some(*ci))
-                .unwrap_or_default();
-            proto
-        });
-        proto
+                .unwrap_or_default(),
+            ..Default::default()
+        }),
+        ..Default::default()
     }
 }
 
 /// Build a video message from an upload result. Carries the streaming sidecar
 /// (progressive-playback HMAC table) from the upload when present.
 pub fn video_message(upload: UploadResponse, opts: VideoOptions) -> wa::Message {
-    {
-        let mut proto = wa::Message::default();
-        proto.video_message = buffa::MessageField::some({
-            let mut proto = wa::message::VideoMessage::default();
-            proto.url = Some(upload.url);
-            proto.direct_path = Some(upload.direct_path);
-            proto.media_key = Some(upload.media_key.to_vec());
-            proto.file_sha256 = Some(upload.file_sha256.to_vec());
-            proto.file_enc_sha256 = Some(upload.file_enc_sha256.to_vec());
-            proto.file_length = Some(upload.file_length);
-            proto.media_key_timestamp = Some(upload.media_key_timestamp);
-            proto.streaming_sidecar = upload.streaming_sidecar;
-            proto.mimetype = Some(opts.mimetype.unwrap_or_else(|| "video/mp4".to_string()));
-            proto.caption = opts.caption;
-            proto.jpeg_thumbnail = opts.jpeg_thumbnail;
-            proto.seconds = opts.duration_seconds;
-            proto.gif_playback = opts.gif_playback;
-            proto.context_info = opts
+    wa::Message {
+        video_message: buffa::MessageField::some(wa::message::VideoMessage {
+            url: Some(upload.url),
+            direct_path: Some(upload.direct_path),
+            media_key: Some(upload.media_key.to_vec()),
+            file_sha256: Some(upload.file_sha256.to_vec()),
+            file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+            file_length: Some(upload.file_length),
+            media_key_timestamp: Some(upload.media_key_timestamp),
+            streaming_sidecar: upload.streaming_sidecar,
+            mimetype: Some(opts.mimetype.unwrap_or_else(|| "video/mp4".to_string())),
+            caption: opts.caption,
+            jpeg_thumbnail: opts.jpeg_thumbnail,
+            seconds: opts.duration_seconds,
+            gif_playback: opts.gif_playback,
+            context_info: opts
                 .context_info
                 .map(|ci| buffa::MessageField::some(*ci))
-                .unwrap_or_default();
-            proto
-        });
-        proto
+                .unwrap_or_default(),
+            ..Default::default()
+        }),
+        ..Default::default()
     }
 }
 
 /// Build a document message from an upload result.
 pub fn document_message(upload: UploadResponse, opts: DocumentOptions) -> wa::Message {
-    {
-        let mut proto = wa::Message::default();
-        proto.document_message = buffa::MessageField::some({
-            let mut proto = wa::message::DocumentMessage::default();
-            proto.url = Some(upload.url);
-            proto.direct_path = Some(upload.direct_path);
-            proto.media_key = Some(upload.media_key.to_vec());
-            proto.file_sha256 = Some(upload.file_sha256.to_vec());
-            proto.file_enc_sha256 = Some(upload.file_enc_sha256.to_vec());
-            proto.file_length = Some(upload.file_length);
-            proto.media_key_timestamp = Some(upload.media_key_timestamp);
-            proto.mimetype = Some(
+    wa::Message {
+        document_message: buffa::MessageField::some(wa::message::DocumentMessage {
+            url: Some(upload.url),
+            direct_path: Some(upload.direct_path),
+            media_key: Some(upload.media_key.to_vec()),
+            file_sha256: Some(upload.file_sha256.to_vec()),
+            file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+            file_length: Some(upload.file_length),
+            media_key_timestamp: Some(upload.media_key_timestamp),
+            mimetype: Some(
                 opts.mimetype
                     .unwrap_or_else(|| "application/octet-stream".to_string()),
-            );
-            proto.file_name = opts.file_name;
-            proto.title = opts.title;
-            proto.caption = opts.caption;
-            proto.page_count = opts.page_count;
-            proto.jpeg_thumbnail = opts.jpeg_thumbnail;
-            proto.context_info = opts
+            ),
+            file_name: opts.file_name,
+            title: opts.title,
+            caption: opts.caption,
+            page_count: opts.page_count,
+            jpeg_thumbnail: opts.jpeg_thumbnail,
+            context_info: opts
                 .context_info
                 .map(|ci| buffa::MessageField::some(*ci))
-                .unwrap_or_default();
-            proto
-        });
-        proto
+                .unwrap_or_default(),
+            ..Default::default()
+        }),
+        ..Default::default()
     }
 }
 
 /// Build an audio / voice-note message from an upload result. Carries the
 /// streaming sidecar from the upload when present.
 pub fn audio_message(upload: UploadResponse, opts: AudioOptions) -> wa::Message {
-    {
-        let mut proto = wa::Message::default();
-        proto.audio_message = buffa::MessageField::some({
-            let mut proto = wa::message::AudioMessage::default();
-            proto.url = Some(upload.url);
-            proto.direct_path = Some(upload.direct_path);
-            proto.media_key = Some(upload.media_key.to_vec());
-            proto.file_sha256 = Some(upload.file_sha256.to_vec());
-            proto.file_enc_sha256 = Some(upload.file_enc_sha256.to_vec());
-            proto.file_length = Some(upload.file_length);
-            proto.media_key_timestamp = Some(upload.media_key_timestamp);
-            proto.streaming_sidecar = upload.streaming_sidecar;
-            proto.mimetype = Some(
+    wa::Message {
+        audio_message: buffa::MessageField::some(wa::message::AudioMessage {
+            url: Some(upload.url),
+            direct_path: Some(upload.direct_path),
+            media_key: Some(upload.media_key.to_vec()),
+            file_sha256: Some(upload.file_sha256.to_vec()),
+            file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+            file_length: Some(upload.file_length),
+            media_key_timestamp: Some(upload.media_key_timestamp),
+            streaming_sidecar: upload.streaming_sidecar,
+            mimetype: Some(
                 opts.mimetype
                     .unwrap_or_else(|| "audio/ogg; codecs=opus".to_string()),
-            );
-            proto.seconds = opts.duration_seconds;
-            proto.ptt = opts.ptt;
-            proto.waveform = opts.waveform;
-            proto.context_info = opts
+            ),
+            seconds: opts.duration_seconds,
+            ptt: opts.ptt,
+            waveform: opts.waveform,
+            context_info: opts
                 .context_info
                 .map(|ci| buffa::MessageField::some(*ci))
-                .unwrap_or_default();
-            proto
-        });
-        proto
+                .unwrap_or_default(),
+            ..Default::default()
+        }),
+        ..Default::default()
     }
 }
 
