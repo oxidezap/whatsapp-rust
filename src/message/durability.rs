@@ -322,6 +322,15 @@ mod tests {
     }
 
     #[test]
+    fn pending_records_differing_only_in_future_fields_do_not_alias() {
+        let original = [10, 1, b'b', 0xc0, 0x3e, 7];
+        let different = [10, 1, b'b', 0xc0, 0x3e, 8];
+        assert!(extend_pending_record(&original, &different).is_err());
+        assert!(extend_pending_record(&different, &original).is_err());
+        assert!(extend_pending_record(&original, &original).unwrap().is_none());
+    }
+
+    #[test]
     fn pending_extension_uses_replay_carrier_equivalence_and_keeps_bytes() {
         let original = [10, 1, b'b', 0xc0, 0x3e, 7];
         let with_carrier = [&original[..], &[0x12, 0]].concat();

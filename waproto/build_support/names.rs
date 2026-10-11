@@ -323,6 +323,23 @@ fn walk_enums(
 /// required message field from an optional one using the same MessageField.
 /// Freeze those encoding/presence choices alongside the emitted API.
 pub fn wire_api(fds: &FileDescriptorSet) -> std::collections::BTreeSet<String> {
+    fn enum_defaults(
+        items: &[EnumDescriptorProto],
+        scope: &str,
+        out: &mut std::collections::BTreeSet<String>,
+    ) {
+        for enumeration in items {
+            // Rust Default and an implicit proto2 default follow declaration
+            // order, which the unordered public-variant inventory cannot freeze.
+            let default = enumeration.value.first();
+            out.insert(format!(
+                "enum-default {scope}.{} name={:?} number={:?}",
+                enumeration.name.as_deref().unwrap_or_default(),
+                default.and_then(|value| value.name.as_deref()),
+                default.and_then(|value| value.number),
+            ));
+        }
+    }
     fn messages(
         items: &[DescriptorProto],
         scope: &str,
@@ -332,6 +349,7 @@ pub fn wire_api(fds: &FileDescriptorSet) -> std::collections::BTreeSet<String> {
         use buffa_descriptor::generated::descriptor::field_descriptor_proto::{Label, Type};
         for message in items {
             let path = format!("{scope}.{}", message.name.as_deref().unwrap_or_default());
+            enum_defaults(&message.enum_type, &path, out);
             let message_features =
                 features::resolve_child(parent_features, features::message_features(message));
             for field in &message.field {
@@ -343,6 +361,21 @@ pub fn wire_api(fds: &FileDescriptorSet) -> std::collections::BTreeSet<String> {
                     "wire {path}.{} number={:?} type={:?} label={:?} target={:?} default={:?} oneof={oneof:?}",
                     field.name.as_deref().unwrap_or_default(), field.number, field.r#type, field.label, field.type_name, field.default_value,
                 ));
+                if field.label != Some(Label::LABEL_REPEATED) {
+                    let resolved =
+                        features::resolve_child(&message_features, features::field_features(field));
+                    let presence = if field.label == Some(Label::LABEL_REQUIRED) {
+                        features::FieldPresence::LegacyRequired
+                    } else if field.proto3_optional == Some(true) {
+                        features::FieldPresence::Explicit
+                    } else {
+                        resolved.field_presence
+                    };
+                    out.insert(format!(
+                        "field-presence {path}.{}={presence:?}",
+                        field.name.as_deref().unwrap_or_default(),
+                    ));
+                }
                 if matches!(field.r#type, Some(Type::TYPE_MESSAGE | Type::TYPE_GROUP)) {
                     let map_field = message.nested_type.iter().any(|nested| {
                         nested.options.as_option().and_then(|o| o.map_entry) == Some(true)
@@ -407,9 +440,11 @@ pub fn wire_api(fds: &FileDescriptorSet) -> std::collections::BTreeSet<String> {
     }
     let mut out = std::collections::BTreeSet::new();
     for file in &fds.file {
+        let scope = format!(".{}", file.package.as_deref().unwrap_or_default());
+        enum_defaults(&file.enum_type, &scope, &mut out);
         messages(
             &file.message_type,
-            &format!(".{}", file.package.as_deref().unwrap_or_default()),
+            &scope,
             &features::for_file(file),
             &mut out,
         );
@@ -513,6 +548,118 @@ mod tests {
             ..Default::default()
         });
         fds
+    }
+
+    #[test]
+    fn enum_default_inventory_rejects_reordering_the_first_value() {
+        use buffa_descriptor::generated::descriptor::EnumValueDescriptorProto;
+        let mut fds = message_fixture("proto2");
+        let field = &mut fds.file[0].message_type[0].field[0];
+        field.r#type = Some(Type::TYPE_ENUM);
+        field.type_name = Some(".contract.Mode".into());
+        fds.file[0].enum_type.push(EnumDescriptorProto {
+            name: Some("Mode".into()),
+            value: ["FIRST", "SECOND", "THIRD"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| EnumValueDescriptorProto {
+                    name: Some(name.into()),
+                    number: Some(index as i32 + 1),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        });
+        let expected = wire_api(&fds).into_iter().collect::<Vec<_>>().join("\n");
+        let mut reordered = fds.clone();
+        reordered.file[0].enum_type[0].value.swap(0, 1);
+        super::super::emission::check_api(&expected, &wire_api(&reordered)).expect_err(
+            "reordering the implicit default changes missing fields and Enum::default()",
+        );
+        fds.file[0].enum_type[0].value.swap(1, 2);
+        super::super::emission::check_api(&expected, &wire_api(&fds))
+            .expect("non-default value order leaves the effective default unchanged");
+        fds.file[0].enum_type[0]
+            .value
+            .push(EnumValueDescriptorProto {
+                name: Some("FUTURE".into()),
+                number: Some(99),
+                ..Default::default()
+            });
+        super::super::emission::check_api(&expected, &wire_api(&fds))
+            .expect("adding a trailing value remains compatible");
+        let enumeration = fds.file[0].enum_type.remove(0);
+        fds.file[0].message_type[0].field[0].type_name = Some(".contract.Record.Mode".into());
+        fds.file[0].message_type[0].enum_type.push(enumeration);
+        assert!(
+            wire_api(&fds)
+                .contains("enum-default .contract.Record.Mode name=Some(\"FIRST\") number=Some(1)")
+        );
+    }
+
+    #[test]
+    fn field_presence_inventory_resolves_inheritance_and_overrides() {
+        use buffa_descriptor::generated::descriptor::feature_set::FieldPresence;
+
+        let entry = "field-presence .contract.Record.values=Explicit";
+        let mut fds = message_fixture("editions");
+        assert!(wire_api(&fds).contains(entry));
+        let expected = wire_api(&fds).into_iter().collect::<Vec<_>>().join("\n");
+        fds.file[0].options = buffa::MessageField::some(FileOptions {
+            features: buffa::MessageField::some(FeatureSet {
+                field_presence: Some(FieldPresence::LEGACY_REQUIRED),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(wire_api(&fds).contains("field-presence .contract.Record.values=LegacyRequired"));
+        super::super::emission::check_api(&expected, &wire_api(&fds)).expect_err(
+            "inherited required presence changes validation without changing the Rust field type",
+        );
+        fds.file[0].message_type[0].options = buffa::MessageField::some(MessageOptions {
+            features: buffa::MessageField::some(FeatureSet {
+                field_presence: Some(FieldPresence::EXPLICIT),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        super::super::emission::check_api(&expected, &wire_api(&fds))
+            .expect("message override restores equivalent effective presence");
+        fds.file[0].message_type[0].field[0]
+            .options
+            .as_option_mut()
+            .unwrap()
+            .features = buffa::MessageField::some(FeatureSet {
+            field_presence: Some(FieldPresence::LEGACY_REQUIRED),
+            ..Default::default()
+        });
+        super::super::emission::check_api(&expected, &wire_api(&fds))
+            .expect_err("field override takes precedence over message and file");
+        fds.file[0].message_type[0].field[0]
+            .options
+            .as_option_mut()
+            .unwrap()
+            .features = buffa::MessageField::default();
+        let mut record = fds.file[0].message_type.remove(0);
+        let parent_options = std::mem::take(&mut record.options);
+        fds.file[0].message_type.push(DescriptorProto {
+            name: Some("Parent".into()),
+            options: parent_options,
+            nested_type: vec![record],
+            ..Default::default()
+        });
+        assert!(wire_api(&fds).contains("field-presence .contract.Parent.Record.values=Explicit"));
+
+        let mut required = message_fixture("proto2");
+        required.file[0].message_type[0].field[0].label = Some(Label::LABEL_REQUIRED);
+        assert!(
+            wire_api(&required).contains("field-presence .contract.Record.values=LegacyRequired")
+        );
+        let mut optional = fixture("proto3", None);
+        optional.file[0].message_type[0].field[0].label = Some(Label::LABEL_OPTIONAL);
+        assert!(wire_api(&optional).contains("field-presence .contract.Record.values=Implicit"));
+        optional.file[0].message_type[0].field[0].proto3_optional = Some(true);
+        assert!(wire_api(&optional).contains(entry));
     }
 
     #[test]

@@ -1063,7 +1063,7 @@ const RESERVED_SENDER_CHAIN_INDEX_FIELD: u32 =
 
 #[derive(Clone)]
 pub struct SessionRecord {
-    future: buffa::UnknownFields,
+    future: waproto::whatsapp::__unknown_storage::Storage,
     current_session: Option<SessionState>,
     previous_sessions: Arc<Vec<ArchivedSession>>,
     /// Durability lease over sender-chain counters, or the consumer's
@@ -1271,7 +1271,7 @@ impl SessionRecord {
         Self {
             current_session: None,
             previous_sessions: Arc::new(Vec::new()),
-            future: buffa::UnknownFields::new(),
+            future: Default::default(),
             lease: CounterLease::default(),
         }
     }
@@ -1280,7 +1280,7 @@ impl SessionRecord {
         Self {
             current_session: Some(state),
             previous_sessions: Arc::new(Vec::new()),
-            future: buffa::UnknownFields::new(),
+            future: Default::default(),
             lease: CounterLease::default(),
         }
     }
@@ -1308,7 +1308,7 @@ impl SessionRecord {
         Ok(Self {
             current_session,
             previous_sessions: Arc::new(previous_sessions),
-            future: buffa::UnknownFields::new(),
+            future: Default::default(),
             lease: CounterLease::default(),
         })
     }
@@ -1510,7 +1510,8 @@ impl SessionRecord {
                 view.__buffa_unknown_fields
                     .to_owned()
                     .map_err(|_| InvalidSessionError("failed to decode future record fields"))?,
-            ),
+            )
+            .into(),
             lease: CounterLease::from_persisted_ceiling(local_fields.reservation),
         };
 
@@ -2549,7 +2550,7 @@ mod tests {
                 make_cache_shape_session(1, 1, 2),
             )),
             previous_sessions: Arc::new(archived.iter().map(ArchivedSession::encode).collect()),
-            future: buffa::UnknownFields::new(),
+            future: Default::default(),
             lease: CounterLease::default(),
         };
 
@@ -2632,7 +2633,7 @@ mod tests {
         let record = SessionRecord {
             current_session: Some(state),
             previous_sessions: Arc::new(Vec::new()),
-            future: buffa::UnknownFields::new(),
+            future: Default::default(),
             lease: CounterLease::default(),
         };
 
@@ -2663,7 +2664,7 @@ mod tests {
                     skipped: Vec::new(),
                 }),
                 previous_sessions: Arc::new(Vec::new()),
-                future: buffa::UnknownFields::new(),
+                future: Default::default(),
                 lease: CounterLease::default(),
             }
             .serialize()
@@ -3141,7 +3142,7 @@ mod tests {
                     .map(ArchivedSession::encode)
                     .collect(),
             ),
-            future: buffa::UnknownFields::new(),
+            future: Default::default(),
             lease: CounterLease::default(),
         };
         let expected = {
@@ -3193,7 +3194,7 @@ mod tests {
                     .map(ArchivedSession::encode)
                     .collect(),
             ),
-            future: buffa::UnknownFields::new(),
+            future: Default::default(),
             lease: CounterLease::default(),
         };
         let expected = {

@@ -113,8 +113,13 @@ impl VisitMut for PushViewDecoded {
     }
 }
 
-pub fn apply(file: &mut syn::File, view: bool, growth: &super::wire_growth::Bounds) {
-    transform(&mut file.items, view, 0, "", growth);
+pub fn apply(
+    file: &mut syn::File,
+    view: bool,
+    growth: &super::wire_growth::Bounds,
+    header_snapshot: bool,
+) {
+    transform(&mut file.items, view, 0, "", growth, header_snapshot);
 }
 
 fn transform(
@@ -123,6 +128,7 @@ fn transform(
     depth: usize,
     scope: &str,
     growth: &super::wire_growth::Bounds,
+    header_snapshot: bool,
 ) {
     for item in items.iter_mut() {
         if let syn::Item::Mod(module) = item
@@ -135,6 +141,7 @@ fn transform(
                 depth + 1,
                 &format!("{scope}{}::", name.trim_start_matches("r#")),
                 growth,
+                header_snapshot,
             );
         }
     }
@@ -333,6 +340,62 @@ fn transform(
             let compute_cache = argument(&compute, 1);
             let write_cache = argument(&write, 1);
             let write_buf = argument(&write, 2);
+            let mut shared_compute = BTreeMap::new();
+            for statement in &mut compute.block.stmts {
+                let probe = fields(statement);
+                if probe.choice
+                    && probe.fields.len() == 1
+                    && let Some(field) = probe.fields.first()
+                    && groups.contains_key(field)
+                {
+                    // Share each oneof's sizing match with the ordinary codec.
+                    // A helper per field preserves traversal-cache order when
+                    // other message fields occur between selected groups.
+                    let method = format_ident!("__wire_compute_{}", field.trim_start_matches("r#"));
+                    let original = statement.clone();
+                    helpers.push(syn::parse_quote! {
+                        impl #impl_generics #ty #where_clause {
+                            #[inline(never)]
+                            fn #method(&self, #compute_cache: &mut ::buffa::SizeCache) -> u64 {
+                                #[allow(unused_imports)]
+                                use ::buffa::{Message as _, MessageView as _, ViewEncode as _, Enumeration as _};
+                                let mut size = 0u64;
+                                #original
+                                size
+                            }
+                        }
+                    });
+                    let call: syn::Stmt = syn::parse_quote!(size += self.#method(#compute_cache););
+                    shared_compute.insert(field.clone(), call.clone());
+                    *statement = call;
+                }
+            }
+            let mut shared_write = BTreeMap::new();
+            for statement in &mut write.block.stmts {
+                let probe = fields(statement);
+                if probe.choice
+                    && probe.fields.len() == 1
+                    && let Some(field) = probe.fields.first()
+                    && groups.contains_key(field)
+                {
+                    let method = format_ident!("__wire_write_{}", field.trim_start_matches("r#"));
+                    let original = statement.clone();
+                    helpers.push(syn::parse_quote! {
+                        impl #impl_generics #ty #where_clause {
+                            #[inline(never)]
+                            fn #method(&self, #write_cache: &mut ::buffa::SizeCache, #write_buf: &mut impl ::buffa::EncodeSink) {
+                                #[allow(unused_imports)]
+                                use ::buffa::{Message as _, MessageView as _, ViewEncode as _, Enumeration as _};
+                                #original
+                            }
+                        }
+                    });
+                    let call: syn::Stmt =
+                        syn::parse_quote!(self.#method(#write_cache, #write_buf););
+                    shared_write.insert(field.clone(), call.clone());
+                    *statement = call;
+                }
+            }
             for member in &mut item.items {
                 if let syn::ImplItem::Fn(f) = member {
                     let is_compute = f.sig.ident == "compute_size";
@@ -345,7 +408,16 @@ fn transform(
                     for statement in &mut f.block.stmts {
                         let probe = fields(statement);
                         if probe.fields.iter().any(|field| groups.contains_key(field)) {
-                            if let syn::Stmt::Expr(syn::Expr::If(conditional), _) = statement
+                            let shared = if is_compute {
+                                &shared_compute
+                            } else {
+                                &shared_write
+                            };
+                            if let Some(call) =
+                                probe.fields.iter().find_map(|field| shared.get(field))
+                            {
+                                *statement = syn::parse_quote!(if !__wire_active { #call });
+                            } else if let syn::Stmt::Expr(syn::Expr::If(conditional), _) = statement
                                 && conditional.else_branch.is_none()
                             {
                                 let condition = &conditional.cond;
@@ -360,7 +432,7 @@ fn transform(
                             let original = statement.clone();
                             *statement = if is_compute {
                                 syn::parse_quote!(if __wire_active {
-                                    let bytes = self.__buffa_unknown_fields.compose(&self.__wire_known(), Self::__wire_group);
+                                    let bytes = self.__buffa_unknown_fields.compose(&self.__wire_known(), Self::__wire_group, Self::__wire_expected);
                                     size += #runtime::cache_output(&bytes, #compute_cache) as u64;
                                 } else { #original })
                             } else {
@@ -397,6 +469,28 @@ fn transform(
                         Ok(bytes)
                     }),
                 )
+            };
+            let projection = if header_snapshot
+                && scope == "message::interactive_message::"
+                && name == if view { "HeaderView" } else { "Header" }
+            {
+                quote!({
+                    // The descriptor/AST support guard rejects additional
+                    // tracked fields before an absent media projection can
+                    // skip the shared visitor's sizing and writing passes.
+                    if self.media.is_none()
+                        && <Self as crate::whatsapp::__wire_snapshot::Visitor>::supported(self)
+                    {
+                        if let Some(ctx) = ctx { ctx.register_element_memory(0)?; }
+                        return Ok(::buffa::alloc::vec::Vec::new());
+                    }
+                    if let Some(bytes) = crate::whatsapp::__wire_snapshot::snapshot(self, ctx)? {
+                        return Ok(bytes);
+                    }
+                    #projection
+                })
+            } else {
+                projection
             };
             let owner = if view {
                 name.strip_suffix("View").expect("view suffix")
@@ -607,6 +701,8 @@ fn transform(
                     } else {
                         syn::parse_quote!({ self.__wire_merge_field(tag, buf, ctx, true) })
                     };
+                    f.attrs.retain(|attr| !attr.path().is_ident("inline"));
+                    f.attrs.push(syn::parse_quote!(#[inline]));
                 } else if view && f.sig.ident == "to_owned_from_source" {
                     let body = f.block.clone();
                     f.block = syn::parse_quote!({
@@ -614,12 +710,45 @@ fn transform(
                         if self.__buffa_unknown_fields.active() {
                             let view_known = self.__wire_known();
                             let owned_known = owned.__wire_known();
-                            owned.__buffa_unknown_fields.rebase(&view_known, &owned_known, Self::__wire_group);
+                            owned.__buffa_unknown_fields.rebase(&view_known, &owned_known, Self::__wire_group, Self::__wire_expected);
                         }
                         Ok(owned)
                     });
                 }
             }
+            // Known-only batches call the static decoder directly. Keeping
+            // its activation check here avoids a cold wrapper call per field,
+            // without inlining the recursive decoder into either route.
+            // Repeated enums retain their packed-occurrence splitting wrapper.
+            let batch_merge = if groups.values().any(|group| group & (1 << 31) != 0) {
+                if view {
+                    quote!(cur = self.__wire_merge_field(tag, cur, before_tag, ctx, false)?;)
+                } else {
+                    quote!(self.__wire_merge_field(tag, buf, ctx, false)?;)
+                }
+            } else if view {
+                quote! {
+                    if !self.__buffa_unknown_fields.active() {
+                        cur = self.__wire_merge(tag, cur, before_tag, ctx)?;
+                        if !self.__buffa_unknown_fields.is_empty() {
+                            #runtime::begin_view(&mut #runtime::Adapter(self), ctx)?;
+                        }
+                    } else {
+                        cur = self.__wire_merge_field(tag, cur, before_tag, ctx, false)?;
+                    }
+                }
+            } else {
+                quote! {
+                    if !self.__buffa_unknown_fields.active() {
+                        self.__wire_merge(tag, buf, ctx)?;
+                        if !self.__buffa_unknown_fields.is_empty() {
+                            #runtime::begin_owned(&mut #runtime::Adapter(self), ctx)?;
+                        }
+                    } else {
+                        self.__wire_merge_field(tag, buf, ctx, false)?;
+                    }
+                }
+            };
             // One exclusive borrow covers the whole loop: public fields cannot
             // change between its iterations. Reconcile edits at the first
             // field, then rebuild the baseline once when the batch ends.
@@ -627,8 +756,11 @@ fn transform(
             // its growing repeated fields quadratically. Retain raw events
             // throughout the batch, including before an eventual decode error.
             // Direct single-field calls still check on every invocation.
+            // Keep each batch loop shared by decode entry points and nested
+            // merge adapters rather than expanding it into every caller.
             item.items.push(if view {
                 syn::parse_quote! {
+                    #[inline(never)]
                     fn merge_into_view(&mut self, buf: &'a [u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<(), ::buffa::DecodeError> {
                         let mut cur = buf;
                         if cur.is_empty() { return Ok(()); }
@@ -639,11 +771,11 @@ fn transform(
                             while !cur.is_empty() {
                                 let before_tag = cur;
                                 let tag = ::buffa::encoding::Tag::decode(&mut cur)?;
-                                cur = self.__wire_merge_field(tag, cur, before_tag, ctx, false)?;
+                                #batch_merge
                             }
                             Ok(())
                         })();
-                        let completed = if self.__buffa_unknown_fields.active() {
+                        let completed = if result.is_ok() && self.__buffa_unknown_fields.active() {
                             #runtime::complete_view_batch(&mut #runtime::Adapter(self), ctx)
                         } else { Ok(()) };
                         result.and(completed)
@@ -651,6 +783,7 @@ fn transform(
                 }
             } else {
                 syn::parse_quote! {
+                    #[inline(never)]
                     fn merge_to_limit(&mut self, buf: &mut impl ::buffa::bytes::Buf, ctx: ::buffa::DecodeContext<'_>, limit: usize) -> ::core::result::Result<(), ::buffa::DecodeError> {
                         if buf.remaining() <= limit { return Ok(()); }
                         if buf.remaining() > limit && self.__buffa_unknown_fields.active() {
@@ -659,11 +792,11 @@ fn transform(
                         let result = (|| {
                             while buf.remaining() > limit {
                                 let tag = ::buffa::encoding::Tag::decode(buf)?;
-                                self.__wire_merge_field(tag, buf, ctx, false)?;
+                                #batch_merge
                             }
                             Ok(())
                         })();
-                        let completed = if self.__buffa_unknown_fields.active() {
+                        let completed = if result.is_ok() && self.__buffa_unknown_fields.active() {
                             #runtime::complete_owned_batch(&mut #runtime::Adapter(self), ctx)
                         } else { Ok(()) };
                         result.and(completed)
@@ -693,15 +826,65 @@ fn transform(
                             first = false;
                             self.__wire_merge_field(tag, buf, ctx, false)?;
                         } })();
-                        let completed = if !first && self.__buffa_unknown_fields.active() {
+                        let completed = if result.is_ok() && !first && self.__buffa_unknown_fields.active() {
                             #runtime::complete_owned_batch(&mut #runtime::Adapter(self), ctx)
                         } else { Ok(()) };
                         result.and(completed)
                     }
                 });
             }
+            let replay_owner = format_ident!("{name}");
+            let replay_merge = if view {
+                quote! {
+                    while !cur.is_empty() {
+                        let before = cur;
+                        let tag = ::buffa::encoding::Tag::decode(&mut cur)?;
+                        cur = expected.__wire_merge(tag, cur, before, replay_ctx)?;
+                    }
+                }
+            } else {
+                quote! {
+                    while !cur.is_empty() {
+                        let tag = ::buffa::encoding::Tag::decode(&mut cur)?;
+                        expected.__wire_merge(tag, &mut cur, replay_ctx)?;
+                    }
+                }
+            };
+            let replay_body = if let Some(values) = enum_values.get(&name) {
+                let tags = values.iter().map(|value| {
+                    let tuple: syn::ExprTuple =
+                        syn::parse2(value.clone()).expect("enum projection tuple");
+                    tuple.elems[0].clone()
+                });
+                quote!({ #runtime::enum_replay(raw, &[#(#tags),*], ctx) })
+            } else {
+                quote!({
+                    // Completed input already passed the caller's depth and
+                    // unknown limits. Replay transfers its remaining element
+                    // budget; the codecs charge repeated entries and journals.
+                    // Also debit one slot per replayed unknown from this cell,
+                    // bounding temporary unknown metadata without charging
+                    // singular payloads or packed scalars excluded by buffa.
+                    let remaining = ctx.and_then(|ctx| ctx.remaining_element_memory()).unwrap_or(usize::MAX);
+                    let budget = ::core::cell::Cell::new(remaining);
+                    let replay_ctx = ::buffa::DecodeContext::new(u32::MAX, &budget).with_element_memory(&budget);
+                    let result = (|| {
+                        let mut expected = #replay_owner::default();
+                        let mut cur = raw;
+                        #replay_merge
+                        expected.__wire_snapshot(Some(replay_ctx))
+                    })();
+                    if let Some(ctx) = ctx {
+                        ctx.register_element_memory(remaining.saturating_sub(budget.get()))?;
+                    }
+                    result
+                })
+            };
             helpers.push(syn::parse_quote! {
                 impl #impl_generics #ty #where_clause {
+                    #[cold]
+                    #[inline(never)]
+                    fn __wire_expected(raw: &[u8], ctx: ::core::option::Option<::buffa::DecodeContext<'_>>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> #replay_body
                     #merge
                     #retained_merge
                     #repeated_merge
@@ -711,12 +894,41 @@ fn transform(
                     }
                 }
             });
+            let canonical = if !view
+                && header_snapshot
+                && scope == "message::interactive_message::"
+                && name == "Header"
+            {
+                quote!(crate::whatsapp::__wire_snapshot::canonical)
+            } else {
+                quote!(#runtime::no_canonical_projection)
+            };
+            // Raw completion is valid for views only after the current eager
+            // representation passes the same support guard as its snapshot.
+            // Other policy requests must not traverse the receiver.
+            let view_canonical = if header_snapshot
+                && scope == "message::interactive_message::"
+                && name == "HeaderView"
+            {
+                quote! {
+                    if _completed_batch
+                        && crate::whatsapp::__wire_snapshot::supported(self.0)
+                    {
+                        crate::whatsapp::__wire_snapshot::canonical
+                    } else {
+                        #runtime::no_canonical_projection
+                    }
+                }
+            } else {
+                quote!(#runtime::no_canonical_projection)
+            };
             helpers.push(if view {
                 syn::parse_quote! {
                     impl #impl_generics #runtime::ViewCodec<'a> for #runtime::Adapter<'_, #ty> #where_clause {
                         fn storage(&mut self) -> &mut #runtime::ViewStorage<'a> { &mut self.0.__buffa_unknown_fields }
-                        fn groups(&self) -> fn(u32) -> u32 { <#ty>::__wire_group }
-                        fn growth(&self, tag: u32) -> usize { <#ty>::__wire_growth(tag) }
+                        fn policy(&self, _completed_batch: bool) -> #runtime::Policy {
+                            #runtime::Policy { groups: <#ty>::__wire_group, growth: <#ty>::__wire_growth, replay: <#ty>::__wire_expected, canonical: #view_canonical }
+                        }
                         fn known(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> { self.0.__wire_known_for_decode(ctx) }
                         fn merge(&mut self, tag: ::buffa::encoding::Tag, cur: &'a [u8], before: &'a [u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> { self.0.__wire_merge(tag, cur, before, ctx) }
                     }
@@ -725,15 +937,16 @@ fn transform(
                 syn::parse_quote! {
                     impl #impl_generics #runtime::OwnedCodec for #runtime::Adapter<'_, #ty> #where_clause {
                         fn storage(&mut self) -> &mut #runtime::Storage { &mut self.0.__buffa_unknown_fields }
-                        fn groups(&self) -> fn(u32) -> u32 { <#ty>::__wire_group }
-                        fn growth(&self, tag: u32) -> usize { <#ty>::__wire_growth(tag) }
+                        fn policy(&self) -> #runtime::Policy {
+                            #runtime::Policy { groups: <#ty>::__wire_group, growth: <#ty>::__wire_growth, replay: <#ty>::__wire_expected, canonical: #canonical }
+                        }
                         fn known(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> { self.0.__wire_known_for_decode(ctx) }
                         fn merge_slice(&mut self, tag: ::buffa::encoding::Tag, buf: &mut &[u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<(), ::buffa::DecodeError> { self.0.__wire_merge(tag, buf, ctx) }
                     }
                 }
             });
         }
-        if !view && item.trait_.is_none() {
+        if item.trait_.is_none() {
             for member in &mut item.items {
                 let syn::ImplItem::Fn(method) = member else {
                     continue;

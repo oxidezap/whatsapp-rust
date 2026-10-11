@@ -106,3 +106,39 @@ fn shared_message_clones_keep_unknown_wire_after_original_is_dropped() {
         Some("synthetic clone fixture")
     );
 }
+
+#[test]
+fn borrowed_journal_clones_drop_independently_and_keep_owned_baselines() {
+    use waproto::buffa::{MessageView, ViewEncode};
+    use waproto::whatsapp::__wire_order::ViewStorage;
+    use waproto::whatsapp::message::interactive_message::{Header, HeaderView, header::Media};
+
+    assert_eq!(size_of::<ViewStorage<'_>>(), size_of::<usize>());
+    assert_eq!(align_of::<ViewStorage<'_>>(), align_of::<usize>());
+    drop(ViewStorage::default().clone());
+    let mut header = Header::default();
+    header.media = Some(Media::ImageMessage(Box::new(
+        waproto::whatsapp::message::ImageMessage::default()
+            .with_caption("synthetic borrowed journal")
+            .with_jpeg_thumbnail(vec![0x55; 32]),
+    )));
+    let known = header.encode_to_vec();
+    let mut unknown = Vec::new();
+    future().write_to(&mut unknown);
+    for wire in [
+        [unknown.as_slice(), known.as_slice()].concat(),
+        [known.as_slice(), unknown.as_slice()].concat(),
+    ] {
+        let view = HeaderView::decode_view(&wire).unwrap();
+        let expected = view.encode_to_vec();
+        let first = view.clone();
+        drop(view);
+        let owned = first.to_owned_message().unwrap();
+        let second = first.clone();
+        drop(first);
+        assert_eq!(second.encode_to_vec(), expected);
+        assert_eq!(owned.encode_to_vec(), expected);
+        drop(second);
+        assert_eq!(owned.encode_to_vec(), expected);
+    }
+}

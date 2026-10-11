@@ -8,6 +8,18 @@ use ::core::mem::ManuallyDrop;
 
 type GroupMap = fn(u32) -> u32;
 type Projection = Vec<(u32, Vec<u8>)>;
+pub(crate) type Replay = fn(&[u8], Option<DecodeContext<'_>>) -> Result<Vec<u8>, DecodeError>;
+
+// These immutable callbacks are fetched together on the cold journal path.
+// One adapter method avoids three per-owner vtable slots and return thunks.
+pub(crate) struct Policy {
+    pub(crate) groups: GroupMap,
+    pub(crate) growth: fn(u32) -> usize,
+    pub(crate) replay: Replay,
+    pub(crate) canonical: fn(&[u8]) -> bool,
+}
+
+pub(crate) fn no_canonical_projection(_: &[u8]) -> bool { false }
 
 // A field decoder can mutate its receiver before journal insertion. Prepay
 // insertion as well as finalization so an exhausted caller budget cannot erase
@@ -55,6 +67,27 @@ pub(crate) fn enum_snapshot(
     Ok(bytes)
 }
 
+// Every occurrence in this replay was already accepted as a declared enum.
+// Keep the last value per field, including present zero and signed values,
+// without constructing an owner and retaining its unrelated codec tree.
+// begin seeds nonoptional defaults as known records, so they are present here
+// even when the corresponding field was absent from the received message.
+#[cold]
+#[inline(never)]
+pub(crate) fn enum_replay(raw: &[u8], fields: &[u32], ctx: Option<DecodeContext<'_>>) -> Result<Vec<u8>, DecodeError> {
+    if let Some(ctx) = ctx {
+        ctx.register_element_memory(fields.len().saturating_mul(::core::mem::size_of::<(u32, Option<i32>)>()))?;
+    }
+    let values: Vec<_> = fields.iter().map(|&field| {
+        let value = records(raw).filter(|(tag, _)| *tag == field).last().map(|(_, mut bytes)| {
+            ::buffa::encoding::Tag::decode(&mut bytes).expect("completed enum tag");
+            ::buffa::encoding::decode_varint(&mut bytes).expect("completed enum value") as i32
+        });
+        (field, value)
+    }).collect();
+    enum_snapshot(&values, ctx)
+}
+
 // The occurrence algorithm is shared through an erased adapter only after a
 // future field activates the journal. Known-only decoding keeps its generated
 // static codec; hundreds of message types need not repeat this cold algorithm.
@@ -64,8 +97,7 @@ pub(crate) struct Adapter<'a, T>(pub(crate) &'a mut T);
 
 pub(crate) trait OwnedCodec {
     fn storage(&mut self) -> &mut Storage;
-    fn groups(&self) -> GroupMap;
-    fn growth(&self, tag: u32) -> usize;
+    fn policy(&self) -> Policy;
     fn known(&self, ctx: DecodeContext<'_>) -> Result<Vec<u8>, DecodeError>;
     fn merge_slice(
         &mut self,
@@ -82,8 +114,9 @@ pub(crate) fn begin_owned(
     ctx: DecodeContext<'_>,
 ) -> Result<(), DecodeError> {
     let known = codec.known(ctx)?;
-    let map = codec.groups();
-    codec.storage().begin(&known, map, ctx)
+    let policy = codec.policy();
+    let map = policy.groups;
+    codec.storage().begin_snapshot(known, map, ctx)
 }
 
 #[cold]
@@ -93,8 +126,10 @@ pub(crate) fn reconcile_owned(
     ctx: DecodeContext<'_>,
 ) -> Result<(), DecodeError> {
     let known = codec.known(ctx)?;
-    let map = codec.groups();
-    codec.storage().reconcile(&known, map, ctx)
+    let policy = codec.policy();
+    let map = policy.groups;
+    let replay = policy.replay;
+    codec.storage().reconcile(&known, map, replay, ctx)
 }
 
 #[cold]
@@ -103,9 +138,10 @@ pub(crate) fn complete_owned_batch(codec: &mut dyn OwnedCodec, ctx: DecodeContex
     let reserved = ::core::cell::Cell::new(codec.storage().take_completion_credit());
     if !codec.storage().needs_baseline() { return Ok(()); }
     let ctx = ctx.with_element_memory(&reserved);
+    let policy = codec.policy();
+    if codec.storage().complete_canonical(policy.canonical, policy.groups, ctx)? { return Ok(()); }
     let known = codec.known(ctx)?;
-    let map = codec.groups();
-    codec.storage().complete_batch(&known, map, ctx)
+    codec.storage().complete_batch(known, policy.groups, ctx)
 }
 
 #[cold]
@@ -117,25 +153,24 @@ pub(crate) fn merge_owned_known(
     ctx: DecodeContext<'_>,
     check_current: bool,
 ) -> Result<(), DecodeError> {
-    let map = codec.groups();
+    let policy = codec.policy();
+    let map = policy.groups;
     let group = map(tag.field_number());
     let previous = codec.storage().len();
     debug_assert_ne!(group, 0);
     if check_current {
         let known = codec.known(ctx)?;
-        codec.storage().reconcile(&known, map, ctx)?;
+        let replay = policy.replay;
+        codec.storage().reconcile(&known, map, replay, ctx)?;
     }
-    let mut input = buf;
-    let mut captured = Capture::new(&mut input, tag, ctx)?;
-    ::buffa::encoding::skip_field_depth(tag, &mut captured, ctx.depth())?;
-    let raw = captured.finish()?;
+    let raw = capture_known_field(buf, tag, ctx)?;
     let mut payload = raw.as_slice();
     ::buffa::encoding::Tag::decode(&mut payload)?;
     let record_credit = ::core::cell::Cell::new(if !check_current {
         reserve_record(group, &raw, false, ctx)?
     } else { 0 });
     if !check_current {
-        let encoded_bound = raw.len().saturating_mul(codec.growth(tag.field_number()));
+        let encoded_bound = raw.len().saturating_mul((policy.growth)(tag.field_number()));
         codec.storage().reserve_baseline(group, encoded_bound, ctx)?;
     }
     // Generated decoders receive their existing slice specialization. Erasing
@@ -157,10 +192,12 @@ pub(crate) fn finish_owned_unknown(
     check_current: bool,
 ) -> Result<(), DecodeError> {
     if codec.storage().len() != previous {
-        let map = codec.groups();
+        let policy = codec.policy();
+        let map = policy.groups;
         if check_current {
             let known = codec.known(ctx)?;
-            codec.storage().reconcile(&known, map, ctx)?;
+            let replay = policy.replay;
+            codec.storage().reconcile(&known, map, replay, ctx)?;
         }
         codec.storage().finish(0, None, None, map, previous, ctx)?;
     }
@@ -169,8 +206,7 @@ pub(crate) fn finish_owned_unknown(
 
 pub(crate) trait ViewCodec<'a> {
     fn storage(&mut self) -> &mut ViewStorage<'a>;
-    fn groups(&self) -> GroupMap;
-    fn growth(&self, tag: u32) -> usize;
+    fn policy(&self, completed_batch: bool) -> Policy;
     fn known(&self, ctx: DecodeContext<'_>) -> Result<Vec<u8>, DecodeError>;
     fn merge(
         &mut self,
@@ -188,8 +224,9 @@ pub(crate) fn begin_view<'a>(
     ctx: DecodeContext<'_>,
 ) -> Result<(), DecodeError> {
     let known = codec.known(ctx)?;
-    let map = codec.groups();
-    codec.storage().begin(&known, map, ctx)
+    let policy = codec.policy(false);
+    let map = policy.groups;
+    codec.storage().begin_snapshot(known, map, ctx)
 }
 
 #[cold]
@@ -199,8 +236,10 @@ pub(crate) fn reconcile_view<'a>(
     ctx: DecodeContext<'_>,
 ) -> Result<(), DecodeError> {
     let known = codec.known(ctx)?;
-    let map = codec.groups();
-    codec.storage().reconcile(&known, map, ctx)
+    let policy = codec.policy(false);
+    let map = policy.groups;
+    let replay = policy.replay;
+    codec.storage().reconcile(&known, map, replay, ctx)
 }
 
 #[cold]
@@ -209,9 +248,10 @@ pub(crate) fn complete_view_batch<'a>(codec: &mut dyn ViewCodec<'a>, ctx: Decode
     let reserved = ::core::cell::Cell::new(codec.storage().take_completion_credit());
     if !codec.storage().needs_baseline() { return Ok(()); }
     let ctx = ctx.with_element_memory(&reserved);
+    let policy = codec.policy(true);
+    if codec.storage().complete_canonical(policy.canonical, policy.groups, ctx)? { return Ok(()); }
     let known = codec.known(ctx)?;
-    let map = codec.groups();
-    codec.storage().complete_batch(&known, map, ctx)
+    codec.storage().complete_batch(known, policy.groups, ctx)
 }
 
 #[cold]
@@ -224,12 +264,14 @@ pub(crate) fn merge_view<'a>(
     ctx: DecodeContext<'_>,
     check_current: bool,
 ) -> Result<&'a [u8], DecodeError> {
-    let map = codec.groups();
+    let policy = codec.policy(false);
+    let map = policy.groups;
     let group = map(tag.field_number());
     let previous = codec.storage().len();
     if group != 0 && check_current {
         let known = codec.known(ctx)?;
-        codec.storage().reconcile(&known, map, ctx)?;
+        let replay = policy.replay;
+        codec.storage().reconcile(&known, map, replay, ctx)?;
     }
     let record_credit = ::core::cell::Cell::new(if group != 0 && !check_current {
         let mut after = cur;
@@ -238,7 +280,7 @@ pub(crate) fn merge_view<'a>(
         let record_len = raw.len().saturating_add(if group & (1 << 31) != 0 {
             ::buffa::encoding::varint_len(u64::from(tag.field_number()) << 3)
         } else { 0 });
-        let encoded_bound = record_len.saturating_mul(codec.growth(tag.field_number()));
+        let encoded_bound = record_len.saturating_mul((policy.growth)(tag.field_number()));
         codec.storage().reserve_baseline(group, encoded_bound, ctx)?;
         reserve_record(group, raw, true, ctx)?
     } else { 0 });
@@ -252,7 +294,8 @@ pub(crate) fn merge_view<'a>(
             None
         };
         if group == 0 && check_current {
-            codec.storage().reconcile(known.as_deref().unwrap_or_default(), map, ctx)?;
+            let replay = policy.replay;
+            codec.storage().reconcile(known.as_deref().unwrap_or_default(), map, replay, ctx)?;
         }
         let raw = if group & (1 << 31) != 0 {
             let mut raw = Vec::new();
@@ -323,14 +366,94 @@ enum Event<'a> {
     Unknown(usize),
 }
 
-#[derive(Clone, Default, PartialEq, Hash)]
+#[derive(Clone)]
+enum Baseline {
+    Projection(Projection),
+    Event(usize),
+}
+
+impl Default for Baseline {
+    fn default() -> Self { Self::Projection(Vec::new()) }
+}
+
+#[derive(Clone, Copy)]
+enum ProjectionRef<'a> {
+    Groups(&'a Projection),
+    Single(u32, &'a [u8]),
+}
+
+impl<'a> ProjectionRef<'a> {
+    fn iter(self) -> impl Iterator<Item = (u32, &'a [u8])> + Clone {
+        let (groups, single): (&[(u32, Vec<u8>)], _) = match self {
+            Self::Groups(groups) => (groups, None),
+            Self::Single(group, bytes) => (&[], Some((group, bytes))),
+        };
+        groups.iter().map(|(group, bytes)| (*group, bytes.as_slice())).chain(single)
+    }
+    fn len(self) -> usize {
+        match self { Self::Groups(groups) => groups.len(), Self::Single(_, _) => 1 }
+    }
+    fn value(self, group: u32) -> &'a [u8] {
+        self.iter().find(|(id, _)| *id == group).map_or(&[], |(_, bytes)| bytes)
+    }
+}
+
+impl Baseline {
+    fn view<'a>(&'a self, events: &'a [Event<'_>]) -> ProjectionRef<'a> {
+        match self {
+            Self::Projection(groups) => ProjectionRef::Groups(groups),
+            Self::Event(index) => match &events[*index] {
+                Event::Known(group, bytes) => ProjectionRef::Single(*group, bytes),
+                Event::Unknown(_) => unreachable!("canonical baseline references a known event"),
+            },
+        }
+    }
+    fn promote(&mut self, events: &[Event<'_>]) -> &mut Projection {
+        if let Self::Event(index) = self {
+            let Event::Known(group, bytes) = &events[*index] else {
+                unreachable!("canonical baseline references a known event");
+            };
+            // Completion prepaid this projection's payload and metadata. Event
+            // indices survive appends and clones; promote before editing groups.
+            *self = Self::Projection(::buffa::alloc::vec![(*group, bytes.to_vec())]);
+        }
+        let Self::Projection(groups) = self else { unreachable!("promoted baseline"); };
+        groups
+    }
+}
+
+#[derive(Clone, Default)]
 struct Order<'a> {
     events: Vec<Event<'a>>,
-    baseline: Projection,
+    baseline: Baseline,
     forced: Vec<u32>,
     unknown_count: usize,
     baseline_pending: bool,
     completion_credit: usize,
+}
+
+impl PartialEq for Order<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.events == other.events
+            && self.baseline.view(&self.events).iter().eq(other.baseline.view(&other.events).iter())
+            && self.forced == other.forced
+            && self.unknown_count == other.unknown_count
+            && self.baseline_pending == other.baseline_pending
+            && self.completion_credit == other.completion_credit
+    }
+}
+
+impl ::core::hash::Hash for Order<'_> {
+    fn hash<H: ::core::hash::Hasher>(&self, state: &mut H) {
+        self.events.hash(state);
+        let baseline = self.baseline.view(&self.events);
+        baseline.len().hash(state);
+        for (group, bytes) in baseline.iter() { group.hash(state); bytes.hash(state); }
+        self.forced.hash(state);
+        self.unknown_count.hash(state);
+        self.baseline_pending.hash(state);
+        self.completion_credit.hash(state);
+    }
 }
 
 fn records(mut bytes: &[u8]) -> impl Iterator<Item = (u32, &[u8])> {
@@ -360,6 +483,36 @@ fn projection(known: &[u8], map: GroupMap) -> Projection {
         canonical_record(group, raw, |bytes| result[index].1.extend_from_slice(bytes));
     }
     result
+}
+
+// A completed snapshot is already encoded by the current writer. One singular
+// record is its whole projection, even when descendants retain unknown data.
+fn snapshot_group(known: &[u8], map: GroupMap) -> Option<u32> {
+    let mut fields = records(known);
+    fields.next().and_then(|(tag, _)| {
+        let group = map(tag);
+        (group != 0 && group & (1 << 31) == 0 && fields.next().is_none()).then_some(group)
+    })
+}
+
+fn begin_charge(known: &[u8], map: GroupMap, count: usize) -> usize {
+    let projection = if snapshot_group(known, map).is_some() {
+        known.len().saturating_mul(2).saturating_add(
+            ::core::mem::size_of::<(u32, Vec<u8>)>() + ::core::mem::size_of::<Event<'_>>(),
+        )
+    } else {
+        projection_charge(known, map, 2)
+    };
+    projection.saturating_add(event_charge(count))
+}
+
+fn owned_projection(known: Vec<u8>, map: GroupMap) -> Projection {
+    if let Some(group) = snapshot_group(&known, map) {
+        // A single singular record is already canonical. Keep the completed
+        // snapshot allocation instead of copying its entire nested payload.
+        return ::buffa::alloc::vec![(group, known)];
+    }
+    projection(&known, map)
 }
 
 // A repeated enum baseline uses canonical unpacked records regardless of its
@@ -419,6 +572,57 @@ fn value(values: &Projection, group: u32) -> &[u8] {
 }
 
 impl<'a> Order<'a> {
+    fn complete_canonical(&mut self, validate: fn(&[u8]) -> bool, map: GroupMap, ctx: DecodeContext<'_>) -> Result<bool, DecodeError> {
+        if !self.baseline_pending || self.baseline.view(&self.events).len() != 0 || !self.forced.is_empty() {
+            return Ok(false);
+        }
+        let mut known = self.events.iter().enumerate().filter_map(|(index, event)| match event {
+            Event::Known(group, raw) => Some((index, *group, raw.as_ref())),
+            Event::Unknown(_) => None,
+        });
+        let Some((index, group, raw)) = known.next() else { return Ok(false); };
+        if known.next().is_some() || group == 0 || group & (1 << 31) != 0 || !validate(raw) { return Ok(false); }
+        let mut fields = records(raw);
+        if !fields.next().is_some_and(|(tag, _)| map(tag) == group) || fields.next().is_some() { return Ok(false); }
+        // The successful batch held an exclusive receiver borrow. A single
+        // canonical occurrence starting from an empty projection is its exact
+        // final snapshot. Reference its immutable event by index while paying
+        // the original snapshot and projection debit, including promotion.
+        ctx.register_element_memory(raw.len())?;
+        // The single singular record needs no group-discovery allocation.
+        let metadata = ::core::mem::size_of::<(u32, Vec<u8>)>() + ::core::mem::size_of::<Event<'_>>();
+        ctx.register_element_memory(raw.len().saturating_add(metadata))?;
+        self.baseline = Baseline::Event(index);
+        self.baseline_pending = false;
+        Ok(true)
+    }
+
+    // A failed nested decoder can mutate after the last completed record.
+    // Reconstruct the expected pre-failure value from completed occurrences;
+    // snapshotting the receiver would bless that unrecorded partial mutation.
+    fn expected(&self, map: GroupMap, replay: Replay, ctx: Option<DecodeContext<'_>>) -> Result<Projection, DecodeError> {
+        let len = self.events.iter().fold(0usize, |len, event| match event {
+            Event::Known(_, bytes) => len.saturating_add(bytes.len()),
+            Event::Unknown(_) => len,
+        });
+        if let Some(ctx) = ctx { ctx.register_element_memory(len)?; }
+        let mut raw = Vec::with_capacity(len);
+        for event in &self.events {
+            if let Event::Known(_, bytes) = event { raw.extend_from_slice(bytes); }
+        }
+        let known = replay(&raw, ctx)?;
+        if let Some(ctx) = ctx { ctx.register_element_memory(projection_charge(&known, map, 1))?; }
+        Ok(owned_projection(known, map))
+    }
+    fn materialize(&mut self, map: GroupMap, replay: Replay, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+        if self.baseline_pending {
+            let expected = self.expected(map, replay, Some(ctx))?;
+            self.baseline = Baseline::Projection(expected);
+            self.baseline_pending = false;
+        }
+        Ok(())
+    }
+
     fn reserve_baseline(&mut self, group: u32, encoded_bound: usize, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
         if group & (1 << 31) != 0 && !self.baseline_pending {
             return Ok(());
@@ -430,11 +634,11 @@ impl<'a> Order<'a> {
         // charged once per batch, not once per fragment.
         let header = ::core::mem::size_of::<(u32, Vec<u8>)>() + ::core::mem::size_of::<Event<'_>>();
         let initial = if self.completion_credit == 0 {
-            self.baseline.iter().fold(0usize, |total, (_, bytes)| {
+            self.baseline.view(&self.events).iter().fold(0usize, |total, (_, bytes)| {
                 total.saturating_add(bytes.len().saturating_add(20).saturating_mul(2)).saturating_add(header)
             })
         } else { 0 };
-        let new_group = !self.baseline.iter().any(|(id, _)| *id == group)
+        let new_group = !self.baseline.view(&self.events).iter().any(|(id, _)| id == group)
             && !self.events.iter().any(|event| matches!(event, Event::Known(id, _) if *id == group));
         let charge = initial.saturating_add(encoded_bound.saturating_mul(2))
             .saturating_add(if new_group { header } else { 0 });
@@ -443,6 +647,9 @@ impl<'a> Order<'a> {
         Ok(())
     }
     fn unchanged(&self, known: &[u8], map: GroupMap) -> bool {
+        self.unchanged_against(self.baseline.view(&self.events), known, map)
+    }
+    fn unchanged_against(&self, baseline: ProjectionRef<'_>, known: &[u8], map: GroupMap) -> bool {
         if !self.forced.is_empty() {
             return false;
         }
@@ -450,25 +657,25 @@ impl<'a> Order<'a> {
         for (tag, raw) in records(known) {
             let group = map(tag);
             if group != 0 {
-                if group & (1 << 31) != 0 { return self.unchanged_repeated(known, map); }
+                if group & (1 << 31) != 0 { return self.unchanged_repeated(baseline, known, map); }
                 count += 1;
-                if value(&self.baseline, group) != raw {
-                    return self.unchanged_repeated(known, map);
+                if baseline.value(group) != raw {
+                    return self.unchanged_repeated(baseline, known, map);
                 }
             }
         }
-        count == self.baseline.len()
+        count == baseline.len()
     }
     #[cold]
-    fn unchanged_repeated(&self, known: &[u8], map: GroupMap) -> bool {
-        if records(known).any(|(tag, _)| map(tag) != 0 && !self.baseline.iter().any(|(group, _)| *group == map(tag))) {
+    fn unchanged_repeated(&self, baseline: ProjectionRef<'_>, known: &[u8], map: GroupMap) -> bool {
+        if records(known).any(|(tag, _)| map(tag) != 0 && !baseline.iter().any(|(group, _)| group == map(tag))) {
             return false;
         }
-        self.baseline.iter().all(|(group, baseline)| {
+        baseline.iter().all(|(group, baseline)| {
             let mut offset = 0;
-            for (_, raw) in records(known).filter(|(tag, _)| map(*tag) == *group) {
+            for (_, raw) in records(known).filter(|(tag, _)| map(*tag) == group) {
                 let mut equal = true;
-                canonical_record(*group, raw, |bytes| {
+                canonical_record(group, raw, |bytes| {
                     equal &= baseline.get(offset..offset + bytes.len()) == Some(bytes);
                     offset += bytes.len();
                 });
@@ -477,6 +684,23 @@ impl<'a> Order<'a> {
             offset == baseline.len()
         })
     }
+    fn begin_snapshot(known: Vec<u8>, map: GroupMap, count: usize) -> Self {
+        let Some(group) = snapshot_group(&known, map) else { return Self::begin(&known, map, count); };
+        // The snapshot allocation becomes the immutable event. The original
+        // two-copy projection debit still prepays promotion before mutation.
+        let mut events = Vec::new();
+        events.push(Event::Known(group, Cow::Owned(known)));
+        events.extend((0..count).map(Event::Unknown));
+        Self {
+            events,
+            baseline: Baseline::Event(0),
+            forced: Vec::new(),
+            unknown_count: count,
+            baseline_pending: false,
+            completion_credit: 0,
+        }
+    }
+
     fn begin(known: &[u8], map: GroupMap, count: usize) -> Self {
         let baseline = projection(known, map);
         let mut events = Vec::new();
@@ -486,7 +710,7 @@ impl<'a> Order<'a> {
         events.extend((0..count).map(Event::Unknown));
         Self {
             events,
-            baseline,
+            baseline: Baseline::Projection(baseline),
             forced: Vec::new(),
             unknown_count: count,
             baseline_pending: false,
@@ -495,10 +719,13 @@ impl<'a> Order<'a> {
     }
 
     fn changed(&self, current: &Projection) -> Vec<u32> {
+        self.changed_against(self.baseline.view(&self.events), current)
+    }
+    fn changed_against(&self, baseline: ProjectionRef<'_>, current: &Projection) -> Vec<u32> {
         let mut ids = self.forced.clone();
-        for (group, _) in self.baseline.iter().chain(current.iter()) {
-            if !ids.contains(group) && value(&self.baseline, *group) != value(current, *group) {
-                ids.push(*group);
+        for (group, _) in baseline.iter().chain(current.iter().map(|(group, bytes)| (*group, bytes.as_slice()))) {
+            if !ids.contains(&group) && baseline.value(group) != value(current, group) {
+                ids.push(group);
             }
         }
         ids
@@ -508,8 +735,10 @@ impl<'a> Order<'a> {
         &mut self,
         known: &[u8],
         map: GroupMap,
+        replay: Replay,
         ctx: DecodeContext<'_>,
     ) -> Result<(), DecodeError> {
+        self.materialize(map, replay, ctx)?;
         if self.unchanged(known, map) {
             return Ok(());
         }
@@ -525,7 +754,7 @@ impl<'a> Order<'a> {
                     .push(Event::Known(group, Cow::Owned(bytes.to_vec())));
             }
         }
-        self.baseline = current;
+        self.baseline = Baseline::Projection(current);
         self.baseline_pending = false;
         self.forced.clear();
         Ok(())
@@ -538,23 +767,26 @@ impl<'a> Order<'a> {
     }
 
     fn append_repeated(&mut self, group: u32, raw: &[u8], ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
-        let index = self.baseline.iter().position(|(id, _)| *id == group);
+        let index = self.baseline.view(&self.events).iter().position(|(id, _)| id == group);
         let header = if index.is_none() { ::core::mem::size_of::<(u32, Vec<u8>)>() } else { 0 };
         ctx.register_element_memory(header.saturating_add(canonical_len(group, raw)))?;
+        let baseline = self.baseline.promote(&self.events);
         let index = index.unwrap_or_else(|| {
-            self.baseline.push((group, Vec::new()));
-            self.baseline.len() - 1
+            baseline.push((group, Vec::new()));
+            baseline.len() - 1
         });
-        canonical_record(group, raw, |bytes| self.baseline[index].1.extend_from_slice(bytes));
+        canonical_record(group, raw, |bytes| baseline[index].1.extend_from_slice(bytes));
         Ok(())
     }
 
-    fn write(&self, known: &[u8], unknown: &[u8], map: GroupMap) -> Vec<u8> {
-        let (current, changed) = if self.unchanged(known, map) {
+    fn write(&self, known: &[u8], unknown: &[u8], map: GroupMap, replay: Replay) -> Vec<u8> {
+        let expected = self.baseline_pending.then(|| self.expected(map, replay, None).expect("completed occurrence replay"));
+        let baseline = expected.as_ref().map_or_else(|| self.baseline.view(&self.events), ProjectionRef::Groups);
+        let (current, changed) = if self.unchanged_against(baseline, known, map) {
             (Vec::new(), Vec::new())
         } else {
             let current = projection(known, map);
-            let changed = self.changed(&current);
+            let changed = self.changed_against(baseline, &current);
             (current, changed)
         };
         let mut unknown = records(unknown);
@@ -779,10 +1011,19 @@ impl Storage {
     }
     #[cold]
     #[inline(never)]
+    fn begin_snapshot(&mut self, known: Vec<u8>, map: GroupMap, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+        ctx.register_element_memory(begin_charge(&known, map, self.len()))?;
+        let state = self.0.get_or_insert_with(Box::default);
+        state.order = Some(Order::begin_snapshot(known, map, state.fields.len()));
+        Ok(())
+    }
+    #[cold]
+    #[inline(never)]
     pub fn reconcile(
         &mut self,
         known: &[u8],
         map: GroupMap,
+        replay: Replay,
         ctx: DecodeContext<'_>,
     ) -> Result<(), DecodeError> {
         if let Some(state) = self.0.as_mut()
@@ -790,7 +1031,7 @@ impl Storage {
         {
             ctx.register_element_memory(event_charge(state.fields.len() - order.unknown_count))?;
             order.append_unknown(state.fields.len());
-            order.reconcile(known, map, ctx)?;
+            order.reconcile(known, map, replay, ctx)?;
         }
         Ok(())
     }
@@ -815,7 +1056,7 @@ impl Storage {
             if group & (1 << 31) != 0 {
                 order.append_repeated(group, &raw, ctx)?;
             } else if let Some(known) = known {
-                order.baseline = projection(known, map);
+                order.baseline = Baseline::Projection(projection(known, map));
             } else {
                 order.baseline_pending = true;
             }
@@ -827,13 +1068,19 @@ impl Storage {
     }
     #[cold]
     #[inline(never)]
-    pub fn complete_batch(&mut self, known: &[u8], map: GroupMap, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+    pub fn complete_batch(&mut self, known: Vec<u8>, map: GroupMap, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
         if let Some(order) = self.0.as_mut().and_then(|state| state.order.as_mut()) {
-            ctx.register_element_memory(projection_charge(known, map, 1))?;
-            order.baseline = projection(known, map);
+            ctx.register_element_memory(projection_charge(&known, map, 1))?;
+            order.baseline = Baseline::Projection(owned_projection(known, map));
             order.baseline_pending = false;
         }
         Ok(())
+    }
+    fn complete_canonical(&mut self, validate: fn(&[u8]) -> bool, map: GroupMap, ctx: DecodeContext<'_>) -> Result<bool, DecodeError> {
+        match self.0.as_mut().and_then(|state| state.order.as_mut()) {
+            Some(order) => order.complete_canonical(validate, map, ctx),
+            None => Ok(false),
+        }
     }
     pub fn needs_baseline(&self) -> bool {
         self.0.as_ref().and_then(|state| state.order.as_ref()).is_some_and(|order| order.baseline_pending)
@@ -846,7 +1093,7 @@ impl Storage {
     }
     #[cold]
     #[inline(never)]
-    pub fn compose(&self, known: &[u8], map: GroupMap) -> Vec<u8> {
+    pub fn compose(&self, known: &[u8], map: GroupMap, replay: Replay) -> Vec<u8> {
         let state = self.0.as_ref().expect("active occurrence journal");
         let mut unknown = Vec::new();
         state.fields.write_to(&mut unknown);
@@ -854,7 +1101,7 @@ impl Storage {
             .order
             .as_ref()
             .expect("active occurrence journal")
-            .write(known, &unknown, map)
+            .write(known, &unknown, map, replay)
     }
     pub fn force(&mut self, group: u32) {
         if let Some(order) = self.0.as_mut().and_then(|state| state.order.as_mut())
@@ -868,10 +1115,14 @@ impl Storage {
     }
     /// Rebase only representation differences during view conversion; retain
     /// forced or value-observable edits instead of blessing them as received.
-    pub fn rebase(&mut self, view_known: &[u8], owned_known: &[u8], map: GroupMap) {
+    pub fn rebase(&mut self, view_known: &[u8], owned_known: &[u8], map: GroupMap, replay: Replay) {
         if let Some(order) = self.0.as_mut().and_then(|state| state.order.as_mut()) {
+            if order.baseline_pending {
+                order.baseline = Baseline::Projection(order.expected(map, replay, None).expect("completed view occurrence replay"));
+            }
             order.forced = order.changed(&projection(view_known, map));
-            order.baseline = projection(owned_known, map);
+            order.baseline = Baseline::Projection(projection(owned_known, map));
+            order.baseline_pending = false;
         }
     }
 }
@@ -939,10 +1190,11 @@ impl<'a> ViewStorage<'a> {
         len: usize,
         ctx: DecodeContext<'_>,
     ) -> Result<(), DecodeError> {
+        self.push_decoded_record(tail, len, ctx)?;
         if let Some(state) = &mut self.0 {
             state.order = None;
         }
-        self.push_decoded_record(tail, len, ctx)
+        Ok(())
     }
     pub(super) fn push_decoded_record(
         &mut self,
@@ -964,10 +1216,11 @@ impl<'a> ViewStorage<'a> {
         value: u64,
         ctx: DecodeContext<'_>,
     ) -> Result<(), DecodeError> {
+        self.push_decoded_varint(field, value, ctx)?;
         if let Some(state) = &mut self.0 {
             state.order = None;
         }
-        self.push_decoded_varint(field, value, ctx)
+        Ok(())
     }
     pub(super) fn push_decoded_varint(
         &mut self,
@@ -1013,10 +1266,19 @@ impl<'a> ViewStorage<'a> {
     }
     #[cold]
     #[inline(never)]
+    fn begin_snapshot(&mut self, known: Vec<u8>, map: GroupMap, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+        ctx.register_element_memory(begin_charge(&known, map, self.len()))?;
+        let state = self.0.get_or_insert_with(Box::default);
+        state.order = Some(Order::begin_snapshot(known, map, state.count));
+        Ok(())
+    }
+    #[cold]
+    #[inline(never)]
     pub fn reconcile(
         &mut self,
         known: &[u8],
         map: GroupMap,
+        replay: Replay,
         ctx: DecodeContext<'_>,
     ) -> Result<(), DecodeError> {
         if let Some(state) = self.0.as_mut()
@@ -1024,7 +1286,7 @@ impl<'a> ViewStorage<'a> {
         {
             ctx.register_element_memory(event_charge(state.count - order.unknown_count))?;
             order.append_unknown(state.count);
-            order.reconcile(known, map, ctx)?;
+            order.reconcile(known, map, replay, ctx)?;
         }
         Ok(())
     }
@@ -1053,7 +1315,7 @@ impl<'a> ViewStorage<'a> {
             if group & (1 << 31) != 0 {
                 order.append_repeated(group, &raw, ctx)?;
             } else if let Some(known) = known {
-                order.baseline = projection(known, map);
+                order.baseline = Baseline::Projection(projection(known, map));
             } else {
                 order.baseline_pending = true;
             }
@@ -1065,13 +1327,19 @@ impl<'a> ViewStorage<'a> {
     }
     #[cold]
     #[inline(never)]
-    pub fn complete_batch(&mut self, known: &[u8], map: GroupMap, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
+    pub fn complete_batch(&mut self, known: Vec<u8>, map: GroupMap, ctx: DecodeContext<'_>) -> Result<(), DecodeError> {
         if let Some(order) = self.0.as_mut().and_then(|state| state.order.as_mut()) {
-            ctx.register_element_memory(projection_charge(known, map, 1))?;
-            order.baseline = projection(known, map);
+            ctx.register_element_memory(projection_charge(&known, map, 1))?;
+            order.baseline = Baseline::Projection(owned_projection(known, map));
             order.baseline_pending = false;
         }
         Ok(())
+    }
+    fn complete_canonical(&mut self, validate: fn(&[u8]) -> bool, map: GroupMap, ctx: DecodeContext<'_>) -> Result<bool, DecodeError> {
+        match self.0.as_mut().and_then(|state| state.order.as_mut()) {
+            Some(order) => order.complete_canonical(validate, map, ctx),
+            None => Ok(false),
+        }
     }
     pub fn needs_baseline(&self) -> bool {
         self.0.as_ref().and_then(|state| state.order.as_ref()).is_some_and(|order| order.baseline_pending)
@@ -1084,7 +1352,7 @@ impl<'a> ViewStorage<'a> {
     }
     #[cold]
     #[inline(never)]
-    pub fn compose(&self, known: &[u8], map: GroupMap) -> Vec<u8> {
+    pub fn compose(&self, known: &[u8], map: GroupMap, replay: Replay) -> Vec<u8> {
         let state = self.0.as_ref().expect("active occurrence journal");
         let mut unknown = Vec::new();
         state.fields.write_to(&mut unknown);
@@ -1092,8 +1360,40 @@ impl<'a> ViewStorage<'a> {
             .order
             .as_ref()
             .expect("active occurrence journal")
-            .write(known, &unknown, map)
+            .write(known, &unknown, map, replay)
     }
+}
+
+// A contiguous completed field needs one allocation. Pay the initial tag
+// before probing, just as incremental capture rejects a too-small allowance
+// before reading input. Fragmented, malformed and quota-limited payloads keep
+// the original cursor and partial debit through the incremental fallback.
+#[cold]
+#[inline(never)]
+fn capture_known_field(
+    buf: &mut dyn Buf,
+    tag: ::buffa::encoding::Tag,
+    ctx: DecodeContext<'_>,
+) -> Result<Vec<u8>, DecodeError> {
+    ctx.register_element_memory(5)?;
+    let input = buf.chunk();
+    let mut remaining = input;
+    if ::buffa::encoding::skip_field_depth(tag, &mut remaining, ctx.depth()).is_ok() {
+        let consumed = input.len() - remaining.len();
+        if let Some(charge) = consumed.checked_add(5)
+            && ctx.register_element_memory(consumed).is_ok()
+        {
+            let mut raw = Vec::with_capacity(charge);
+            tag.encode(&mut raw);
+            raw.extend_from_slice(&input[..consumed]);
+            buf.advance(consumed);
+            return Ok(raw);
+        }
+    }
+    let mut input = buf;
+    let mut captured = Capture::with_prepaid_tag(&mut input, tag, ctx);
+    ::buffa::encoding::skip_field_depth(tag, &mut captured, ctx.depth())?;
+    captured.finish()
 }
 
 /// Records only fields read after a message's first unknown occurrence.
@@ -1110,14 +1410,16 @@ impl<'a, 'c> Capture<'a, 'c> {
         ctx: DecodeContext<'c>,
     ) -> Result<Self, DecodeError> {
         ctx.register_element_memory(5)?;
+        Ok(Self::with_prepaid_tag(inner, tag, ctx))
+    }
+    fn with_prepaid_tag(
+        inner: &'a mut impl Buf,
+        tag: ::buffa::encoding::Tag,
+        ctx: DecodeContext<'c>,
+    ) -> Self {
         let mut bytes = Vec::new();
         tag.encode(&mut bytes);
-        Ok(Self {
-            inner,
-            bytes,
-            ctx,
-            exhausted: false,
-        })
+        Self { inner, bytes, ctx, exhausted: false }
     }
     pub fn finish(self) -> Result<Vec<u8>, DecodeError> {
         if self.exhausted {
@@ -1150,6 +1452,353 @@ impl Buf for Capture<'_, '_> {
             }
             self.inner.advance(len);
             count -= len;
+        }
+    }
+}
+
+#[cfg(test)]
+mod canonical_completion_tests {
+    use super::*;
+    use ::core::hash::{Hash as _, Hasher as _};
+
+    fn canonical_empty_image(raw: &[u8]) -> bool { raw == [0x22, 0] }
+    fn image_group(tag: u32) -> u32 { if tag == 4 { 1 } else { 0 } }
+    fn replay(raw: &[u8], _: Option<DecodeContext<'_>>) -> Result<Vec<u8>, DecodeError> {
+        Ok(raw.to_vec())
+    }
+    fn fresh(raw: Cow<'_, [u8]>, future_first: bool) -> Order<'_> {
+        let known = Event::Known(1, raw);
+        let unknown = Event::Unknown(0);
+        Order {
+            events: if future_first { ::buffa::alloc::vec![unknown, known] } else { ::buffa::alloc::vec![known, unknown] },
+            unknown_count: 1,
+            baseline_pending: true,
+            ..Default::default()
+        }
+    }
+    fn complete(order: &mut Order<'_>) {
+        let unknown = ::core::cell::Cell::new(0);
+        let ctx = DecodeContext::new(0, &unknown);
+        assert!(order.complete_canonical(canonical_empty_image, image_group, ctx).unwrap());
+    }
+    fn hash(order: &Order<'_>) -> u64 {
+        let mut state = std::collections::hash_map::DefaultHasher::new();
+        order.hash(&mut state);
+        state.finish()
+    }
+
+    #[test]
+    fn snapshot_begin_reuses_the_allocation_and_keeps_logical_order_after_edits() {
+        let raw = ::buffa::alloc::vec![0x22, 0];
+        let pointer = raw.as_ptr();
+        let mut legacy = Order::begin(&raw, image_group, 1);
+        let mut retained = Order::begin_snapshot(raw, image_group, 1);
+        assert!(matches!(retained.baseline, Baseline::Event(0)));
+        assert_eq!(retained.baseline.view(&retained.events).value(1).as_ptr(), pointer);
+        assert!(retained == legacy);
+        assert_eq!(hash(&retained), hash(&legacy));
+        let unknown = [0xc2, 0x3e, 0];
+        assert_eq!(retained.write(&[0x22, 0], &unknown, image_group, replay), [0x22, 0, 0xc2, 0x3e, 0]);
+        let allowance = ::core::cell::Cell::new(0);
+        let ctx = DecodeContext::new(0, &allowance);
+        for known in [&[0x22, 2, 0x1a, 0][..], &[][..]] {
+            retained.reconcile(known, image_group, replay, ctx).unwrap();
+            legacy.reconcile(known, image_group, replay, ctx).unwrap();
+            assert!(retained == legacy);
+            assert_eq!(retained.write(known, &unknown, image_group, replay), legacy.write(known, &unknown, image_group, replay));
+        }
+        for (known, map) in [(&[][..], image_group as GroupMap), (&[0x22, 0, 0x22, 0][..], image_group), (&[0x0a, 0][..], image_group), (&[0x22, 0][..], (|_| 1 << 31 | 1) as GroupMap)] {
+            let retained = Order::begin_snapshot(known.to_vec(), map, 1);
+            let legacy = Order::begin(known, map, 1);
+            assert!(matches!(retained.baseline, Baseline::Projection(_)));
+            assert!(retained == legacy);
+        }
+    }
+
+    #[test]
+    fn view_completion_reuses_only_a_supported_completed_occurrence() {
+        use ::buffa::{Message as _, MessageView as _, ViewEncode as _};
+        use crate::whatsapp::message::interactive_message::HeaderView;
+        let wire = [0xc2, 0x3e, 0, 0x22, 0];
+        let mut view = HeaderView::decode_view(&wire).unwrap();
+        let order = view.__buffa_unknown_fields.0.as_ref().unwrap().order.as_ref().unwrap();
+        assert!(matches!(order.baseline, Baseline::Event(1)));
+        let Event::Known(_, Cow::Borrowed(raw)) = &order.events[1] else { panic!("borrowed accepted occurrence"); };
+        assert_eq!(raw.as_ptr(), wire[3..].as_ptr());
+        assert_eq!(view.encode_to_vec(), wire);
+        assert_eq!(view.clone().encode_to_vec(), wire);
+        assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), wire);
+        let adapter = Adapter(&mut view);
+        assert!(!(adapter.policy(false).canonical)(&wire[3..]));
+        assert!((adapter.policy(true).canonical)(&wire[3..]));
+        view.media = None;
+        assert_eq!(view.encode_to_vec(), wire[..3]);
+
+        // Nonminimal lengths and unsupported nested scalar fields retain the
+        // original snapshot path rather than accepting raw bytes as canonical.
+        for wire in [&[0xc2, 0x3e, 0, 0x22, 0x80, 0][..], &[0xc2, 0x3e, 0, 0x22, 2, 0x30, 1][..]] {
+            let view = HeaderView::decode_view(wire).unwrap();
+            assert!(matches!(view.__buffa_unknown_fields.0.as_ref().unwrap().order.as_ref().unwrap().baseline, Baseline::Projection(_)));
+            assert_eq!(view.encode_to_vec(), view.to_owned_message().unwrap().encode_to_vec());
+        }
+    }
+
+    #[test]
+    fn snapshot_begin_preserves_the_original_debit_and_failure_state_for_owned_and_view() {
+        let raw = [0x22, 0];
+        let charge = projection_charge(&raw, image_group, 2);
+        let unknown = ::core::cell::Cell::new(0);
+        for extra in [0, 1] {
+            let mut owned = Storage::default();
+            let allowance = ::core::cell::Cell::new(charge + extra);
+            owned.begin_snapshot(raw.to_vec(), image_group, DecodeContext::new(0, &unknown).with_element_memory(&allowance)).unwrap();
+            assert_eq!(allowance.get(), extra);
+            assert!(matches!(owned.0.as_ref().unwrap().order.as_ref().unwrap().baseline, Baseline::Event(0)));
+            let mut view = ViewStorage::default();
+            let allowance = ::core::cell::Cell::new(charge + extra);
+            view.begin_snapshot(raw.to_vec(), image_group, DecodeContext::new(0, &unknown).with_element_memory(&allowance)).unwrap();
+            assert_eq!(allowance.get(), extra);
+            assert!(matches!(view.0.as_ref().unwrap().order.as_ref().unwrap().baseline, Baseline::Event(0)));
+        }
+        let allowance = ::core::cell::Cell::new(charge - 1);
+        let ctx = DecodeContext::new(0, &unknown).with_element_memory(&allowance);
+        let mut owned = Storage::default();
+        assert!(matches!(owned.begin_snapshot(raw.to_vec(), image_group, ctx), Err(DecodeError::ElementMemoryLimitExceeded)));
+        assert!(owned.0.is_none());
+        assert_eq!(allowance.get(), charge - 1);
+        let mut view = ViewStorage::default();
+        assert!(matches!(view.begin_snapshot(raw.to_vec(), image_group, ctx), Err(DecodeError::ElementMemoryLimitExceeded)));
+        assert!(view.0.is_none());
+        assert_eq!(allowance.get(), charge - 1);
+        for count in [0, 1, 3] {
+            for known in [&raw[..], &[][..], &[0x22, 0, 0x22, 0][..]] {
+                assert_eq!(begin_charge(known, image_group, count), projection_charge(known, image_group, 2).saturating_add(event_charge(count)));
+            }
+        }
+    }
+
+    #[test]
+    fn completion_preserves_both_allocation_debits_and_requires_a_fresh_single_occurrence() {
+        let raw = [0x22, 0];
+        let order = fresh(Cow::Borrowed(&raw), true);
+        let charge = raw.len() + projection_charge(&raw, image_group, 1);
+        let unknown = ::core::cell::Cell::new(0);
+        for extra in [0, 1] {
+            let mut candidate = order.clone();
+            let allowance = ::core::cell::Cell::new(charge + extra);
+            let ctx = DecodeContext::new(0, &unknown).with_element_memory(&allowance);
+            assert!(candidate.complete_canonical(canonical_empty_image, image_group, ctx).unwrap());
+            assert!(matches!(candidate.baseline, Baseline::Event(1)));
+            assert!(!candidate.baseline_pending);
+            assert_eq!(allowance.get(), extra);
+        }
+        for (available, remaining) in [(raw.len() - 1, raw.len() - 1), (charge - 1, charge - raw.len() - 1)] {
+            let mut candidate = order.clone();
+            let allowance = ::core::cell::Cell::new(available);
+            let ctx = DecodeContext::new(0, &unknown).with_element_memory(&allowance);
+            assert!(matches!(candidate.complete_canonical(canonical_empty_image, image_group, ctx), Err(DecodeError::ElementMemoryLimitExceeded)));
+            assert_eq!(allowance.get(), remaining);
+            assert!(candidate == order);
+        }
+        let ctx = DecodeContext::new(0, &unknown);
+        let mut previous = order.clone();
+        previous.baseline = Baseline::Projection(::buffa::alloc::vec![(1, raw.to_vec())]);
+        assert!(!previous.complete_canonical(canonical_empty_image, image_group, ctx).unwrap());
+        previous = order.clone();
+        previous.events.push(Event::Known(1, Cow::Borrowed(&raw)));
+        assert!(!previous.complete_canonical(canonical_empty_image, image_group, ctx).unwrap());
+        previous = order.clone();
+        previous.forced.push(1);
+        assert!(!previous.complete_canonical(canonical_empty_image, image_group, ctx).unwrap());
+        previous = order.clone();
+        assert!(!previous.complete_canonical(canonical_empty_image, |_| 0, ctx).unwrap());
+        previous = order;
+        previous.events[1] = Event::Known(1 << 31 | 1, Cow::Borrowed(&raw));
+        assert!(!previous.complete_canonical(canonical_empty_image, image_group, ctx).unwrap());
+        assert_eq!(unknown.get(), 0);
+    }
+
+    #[test]
+    fn canonical_completion_reuses_owned_and_borrowed_events_with_logical_equality_and_hash() {
+        assert_eq!(::core::mem::size_of::<Baseline>(), ::core::mem::size_of::<Projection>());
+        let raw = [0x22, 0];
+        for raw in [Cow::Borrowed(raw.as_slice()), Cow::Owned(raw.to_vec())] {
+            let pointer = raw.as_ptr();
+            let mut order = fresh(raw, true);
+            complete(&mut order);
+            assert_eq!(order.baseline.view(&order.events).value(1).as_ptr(), pointer);
+            let mut materialized = order.clone();
+            materialized.baseline.promote(&materialized.events);
+            assert!(order == materialized);
+            assert_eq!(hash(&order), hash(&materialized));
+            assert!(order == order.clone());
+            assert_eq!(hash(&order), hash(&order.owned()));
+        }
+    }
+
+    #[test]
+    fn indexed_baseline_survives_appends_and_view_to_owned_without_borrowing_the_source() {
+        let mut owned = {
+            let raw = [0x22, 0];
+            let mut view = fresh(Cow::Borrowed(&raw), false);
+            complete(&mut view);
+            view.owned()
+        };
+        let baseline = owned.baseline.view(&owned.events).value(1).as_ptr();
+        owned.append_unknown(128);
+        assert_eq!(owned.baseline.view(&owned.events).value(1), [0x22, 0]);
+        assert_eq!(owned.baseline.view(&owned.events).value(1).as_ptr(), baseline);
+        assert!(owned.unchanged(&[0x22, 0], image_group));
+    }
+
+    #[test]
+    fn indexed_baseline_preserves_untouched_order_removal_and_explicit_replacement() {
+        let raw = [0x22, 0];
+        let future = [0xc2, 0x3e, 1, 9];
+        for first in [false, true] {
+            let mut order = fresh(Cow::Borrowed(&raw), first);
+            complete(&mut order);
+            let expected = if first { [future.as_slice(), raw.as_slice()].concat() } else { [raw.as_slice(), future.as_slice()].concat() };
+            assert_eq!(order.write(&raw, &future, image_group, replay), expected);
+            assert_eq!(order.write(&[], &future, image_group, replay), future);
+            order.forced.push(1);
+            assert_eq!(order.write(&raw, &future, image_group, replay), [future.as_slice(), raw.as_slice()].concat());
+        }
+    }
+
+    #[test]
+    fn reconcile_checks_budget_before_removing_the_indexed_event() {
+        let raw = [0x22, 0];
+        let changed = [0x22, 3, 0x1a, 1, b'x'];
+        let future = [0xc2, 0x3e, 1, 9];
+        let mut order = fresh(Cow::Borrowed(&raw), false);
+        complete(&mut order);
+        let before = order.clone();
+        let unknown = ::core::cell::Cell::new(0);
+        let charge = projection_charge(&changed, image_group, 2);
+        let allowance = ::core::cell::Cell::new(charge - 1);
+        let ctx = DecodeContext::new(0, &unknown).with_element_memory(&allowance);
+        assert!(matches!(order.reconcile(&changed, image_group, replay, ctx), Err(DecodeError::ElementMemoryLimitExceeded)));
+        assert!(order == before);
+        assert_eq!(allowance.get(), charge - 1);
+        allowance.set(charge);
+        order.reconcile(&changed, image_group, replay, ctx).unwrap();
+        assert_eq!(allowance.get(), 0);
+        assert!(matches!(order.baseline, Baseline::Projection(_)));
+        assert!(order.unchanged(&changed, image_group));
+        assert_eq!(order.write(&changed, &future, image_group, replay), [future.as_slice(), changed.as_slice()].concat());
+    }
+
+    #[test]
+    fn repeated_append_promotes_the_prepaid_baseline_before_mutating_groups() {
+        let raw = [0x22, 0];
+        let mut order = fresh(Cow::Borrowed(&raw), true);
+        complete(&mut order);
+        let repeated = [0x28, 1];
+        let group = 1 << 31 | 2;
+        let charge = ::core::mem::size_of::<(u32, Vec<u8>)>() + canonical_len(group, &repeated);
+        let allowance = ::core::cell::Cell::new(charge);
+        let unknown = ::core::cell::Cell::new(0);
+        let ctx = DecodeContext::new(0, &unknown).with_element_memory(&allowance);
+        order.append_repeated(group, &repeated, ctx).unwrap();
+        assert_eq!(allowance.get(), 0);
+        let baseline = order.baseline.view(&order.events);
+        assert_eq!(baseline.value(1), raw);
+        assert_eq!(baseline.value(group), repeated);
+    }
+}
+
+#[cfg(test)]
+mod contiguous_capture_tests {
+    use super::*;
+    use ::buffa::encoding::{Tag, WireType};
+
+    fn original(buf: &mut dyn Buf, tag: Tag, ctx: DecodeContext<'_>) -> Result<Vec<u8>, DecodeError> {
+        let mut input = buf;
+        let mut captured = Capture::new(&mut input, tag, ctx)?;
+        ::buffa::encoding::skip_field_depth(tag, &mut captured, ctx.depth())?;
+        captured.finish()
+    }
+
+    #[test]
+    fn insufficient_tag_allowance_rejects_before_reading_input() {
+        struct Counted<'a> { bytes: &'a [u8], chunks: &'a ::core::cell::Cell<usize> }
+        impl Buf for Counted<'_> {
+            fn remaining(&self) -> usize { self.bytes.len() }
+            fn chunk(&self) -> &[u8] {
+                self.chunks.set(self.chunks.get() + 1);
+                self.bytes
+            }
+            fn advance(&mut self, count: usize) { self.bytes.advance(count); }
+        }
+        let payload = [0x08, 1, 0x1c];
+        for quota in 0..5 {
+            let chunks = ::core::cell::Cell::new(0);
+            let allowance = ::core::cell::Cell::new(quota);
+            let unknown = ::core::cell::Cell::new(0);
+            let mut input = Counted { bytes: &payload, chunks: &chunks };
+            let ctx = DecodeContext::new(100, &unknown).with_element_memory(&allowance);
+            assert!(matches!(capture_known_field(&mut input, Tag::new(3, WireType::StartGroup), ctx), Err(DecodeError::ElementMemoryLimitExceeded)));
+            assert_eq!(chunks.get(), 0);
+            assert_eq!(input.bytes, payload);
+            assert_eq!(allowance.get(), quota);
+            assert_eq!(unknown.get(), 0);
+        }
+    }
+
+    #[test]
+    fn contiguous_capture_matches_incremental_bytes_debits_and_errors() {
+        for (wire, payload) in [
+            (WireType::Varint, &[1, 7][..]),
+            (WireType::Varint, &[0x81, 0, 7][..]),
+            (WireType::Varint, &[0x80][..]),
+            (WireType::Fixed32, &[1, 2, 3, 4, 7][..]),
+            (WireType::Fixed32, &[1, 2][..]),
+            (WireType::Fixed64, &[1, 2, 3, 4, 5, 6, 7, 8, 9][..]),
+            (WireType::LengthDelimited, &[3, 11, 22, 33, 7][..]),
+            (WireType::LengthDelimited, &[0x83, 0, 11, 22, 33, 7][..]),
+            (WireType::LengthDelimited, &[3, 11][..]),
+            (WireType::StartGroup, &[0x08, 1, 0x1c, 7][..]),
+            (WireType::StartGroup, &[0x08, 1, 0x24, 7][..]),
+        ] {
+            let tag = Tag::new(3, wire);
+            for depth in [0, 1, 100] {
+                for quota in 0..=payload.len() + 7 {
+                    let a = ::core::cell::Cell::new(quota);
+                    let b = ::core::cell::Cell::new(quota);
+                    let unknown = ::core::cell::Cell::new(0);
+                    let mut before = payload;
+                    let mut after = payload;
+                    let expected = original(&mut before, tag, DecodeContext::new(depth, &unknown).with_element_memory(&a));
+                    let actual = capture_known_field(&mut after, tag, DecodeContext::new(depth, &unknown).with_element_memory(&b));
+                    assert_eq!(format!("{actual:?}"), format!("{expected:?}"), "wire={wire:?} depth={depth} quota={quota}");
+                    assert_eq!(after, before);
+                    assert_eq!(b.get(), a.get());
+                    assert_eq!(unknown.get(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contiguous_capture_matches_records_crossing_buffer_chunks() {
+        let payload = [3, 11, 22, 33, 7];
+        let tag = Tag::new(3, WireType::LengthDelimited);
+        for split in 0..=payload.len() {
+            for quota in 0..=12 {
+                let a = ::core::cell::Cell::new(quota);
+                let b = ::core::cell::Cell::new(quota);
+                let unknown = ::core::cell::Cell::new(0);
+                let mut before = (&payload[..split]).chain(&payload[split..]);
+                let mut after = (&payload[..split]).chain(&payload[split..]);
+                let expected = original(&mut before, tag, DecodeContext::new(100, &unknown).with_element_memory(&a));
+                let actual = capture_known_field(&mut after, tag, DecodeContext::new(100, &unknown).with_element_memory(&b));
+                assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+                assert_eq!(after.remaining(), before.remaining());
+                assert_eq!(after.copy_to_bytes(after.remaining()), before.copy_to_bytes(before.remaining()));
+                assert_eq!(b.get(), a.get());
+                assert_eq!(unknown.get(), 0);
+            }
         }
     }
 }

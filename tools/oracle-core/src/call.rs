@@ -203,12 +203,6 @@ fn decode_integer(wire: IntegerType, value: Option<&Val>) -> Result<Value> {
 impl Runtime {
     /// Calls a registered embind free function by name.
     pub fn call_embind(&mut self, name: &str, args: &[Value]) -> Result<Value> {
-        let shared = std::sync::Arc::clone(self.shared());
-        let _phase = match name {
-            "initVoipStack" => shared.scheduler.diagnostic_phase("initVoipStack"),
-            "initLogRingBuffer" => shared.scheduler.diagnostic_phase("initLogRingBuffer"),
-            _ => None,
-        };
         let function = self
             .embind_function(name)
             .ok_or_else(|| anyhow!("no embind function `{name}`"))?;

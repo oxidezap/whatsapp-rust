@@ -31,11 +31,6 @@ pub enum Task {
         #[arg(long)]
         toolchain: String,
     },
-    /// Validate the fixed, upload-disabled A02 benchmark comparison.
-    CodspeedPair {
-        #[command(subcommand)]
-        task: super::codspeed_pair::Task,
-    },
     /// Registered standalone API hosts and drift detection.
     Consumers {
         #[command(subcommand)]
@@ -212,7 +207,6 @@ fn timed_report(
 
 pub fn run(root: &Path, task: Task) -> Result<u8> {
     match task {
-        Task::CodspeedPair { task } => super::codspeed_pair::run(task)?,
         Task::Consumers { task } => return super::consumers::run(root, task),
         Task::CompatibilityControls { lane, toolchain } => {
             super::compatibility::controls(root, lane, &toolchain)?;

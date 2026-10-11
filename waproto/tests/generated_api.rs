@@ -146,6 +146,14 @@ edition = "2024"
 buffa = {{ version = {:?}, default-features = {}, features = {} }}
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
+[features]
+semantic-bench = []
+[dev-dependencies]
+divan = {{ package = "codspeed-divan-compat", version = "5.0.1" }}
+[[bench]]
+name = "semantic_projection"
+harness = false
+required-features = ["semantic-bench"]
 "#,
         runtime["req"].as_str().unwrap(),
         runtime["uses_default_features"],
@@ -163,6 +171,12 @@ pub mod v2 {{ include!({:?}); }}
         generated.join("v1/contract.mod.rs"),
         generated.join("v2/contract.mod.rs")
     );
+    let source = source + "pub mod semantic_projection;\n";
+    std::fs::write(
+        scratch.0.join("src/semantic_projection.rs"),
+        include_str!("fixtures/semantic_projection.rs"),
+    )
+    .unwrap();
     std::fs::write(scratch.0.join("src/lib.rs"), source).unwrap();
     std::fs::write(
         scratch.0.join("tests/consumer.rs"),
@@ -171,15 +185,28 @@ pub mod v2 {{ include!({:?}); }}
     .unwrap();
     let target = root.join("../target/generated-api-consumer");
     let run = |args: &[&str]| {
-        Command::new(env!("CARGO"))
-            .args(args)
+        let separator = args
+            .iter()
+            .position(|arg| *arg == "--")
+            .unwrap_or(args.len());
+        let mut command = Command::new(env!("CARGO"));
+        command
+            .args(&args[..separator])
             .arg("--manifest-path")
             .arg(scratch.0.join("Cargo.toml"))
             .arg("--target-dir")
-            .arg(&target)
-            .output()
-            .expect("run external Cargo consumer")
+            .arg(&target);
+        if separator < args.len() {
+            command.arg("--").args(&args[separator + 1..]);
+        }
+        command.output().expect("run external Cargo consumer")
     };
+    std::fs::create_dir_all(scratch.0.join("benches")).unwrap();
+    std::fs::write(
+        scratch.0.join("benches/semantic_projection.rs"),
+        include_str!("fixtures/semantic_projection_bench.rs"),
+    )
+    .unwrap();
     let output = run(&["test", "--test", "consumer"]);
     assert!(
         output.status.success(),
@@ -188,6 +215,51 @@ pub mod v2 {{ include!({:?}); }}
         String::from_utf8_lossy(&output.stderr)
     );
 
+    if std::env::var_os("WAPROTO_SEMANTIC_MIRI").is_some() {
+        let semantic_only =
+            std::env::var("WAPROTO_SEMANTIC_MIRI").is_ok_and(|value| value == "semantic");
+        let output = if semantic_only {
+            run(&[
+                "miri",
+                "test",
+                "--test",
+                "consumer",
+                "--",
+                "semantic_projection_differential",
+                "--test-threads=4",
+            ])
+        } else {
+            run(&["miri", "test", "--test", "consumer"])
+        };
+        assert!(
+            output.status.success(),
+            "fixture Miri failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        println!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if std::env::var_os("WAPROTO_SEMANTIC_BENCH").is_some() {
+        let output = run(&[
+            "bench",
+            "--bench",
+            "semantic_projection",
+            "--features",
+            "semantic-bench",
+            "--no-run",
+        ]);
+        assert!(
+            output.status.success(),
+            "fixture benchmark build failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        println!("{}", String::from_utf8_lossy(&output.stderr));
+    }
     std::fs::write(
         scratch.0.join("tests/consumer.rs"),
         r#"

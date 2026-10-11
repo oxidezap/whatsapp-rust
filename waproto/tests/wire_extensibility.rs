@@ -126,6 +126,15 @@ fn protocol_type_setter_keeps_same_value_replacement_after_future_type() {
         .unwrap()
         .with_type(wa::message::protocol_message::Type::REVOKE);
     assert_eq!(message.encode_to_vec(), [0x10, 99, 0x10, 0]);
+    use waproto::buffa::ViewEncode;
+    let view = wa::message::ProtocolMessageView::decode_view(&wire)
+        .unwrap()
+        .with_type(wa::message::protocol_message::Type::REVOKE);
+    assert_eq!(view.encode_to_vec(), [0x10, 99, 0x10, 0]);
+    assert_eq!(
+        view.to_owned_message().unwrap().encode_to_vec(),
+        [0x10, 99, 0x10, 0]
+    );
 }
 
 #[test]
@@ -144,6 +153,75 @@ fn image_header_accepts_packed_scan_lengths_within_decode_budget() {
     assert_eq!(owned.encode_to_vec(), wire);
     assert_eq!(view.encode_to_vec(), wire);
     assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), wire);
+}
+
+#[test]
+fn failed_nested_oneof_merge_keeps_valid_partial_edits() {
+    use wa::message::interactive_message::{Header, HeaderView, header::Media};
+    use waproto::buffa::{DecodeContext, ViewEncode, encoding::Tag};
+
+    fn caption(header: &Header) -> Option<&str> {
+        match header.media.as_ref() {
+            Some(Media::ImageMessage(image)) => image.caption.as_deref(),
+            _ => None,
+        }
+    }
+
+    // Future field, then image caption "a". A second image accepts caption
+    // "c" before failing on an unknown varint field with no payload.
+    let first = [0xc0, 0x3e, 7, 0x22, 3, 0x1a, 1, b'a'];
+    let failed = [0x22, 5, 0x1a, 1, b'c', 0xc0, 0x3e];
+    let completed = [0x22, 3, 0x1a, 1, b'b'];
+    let batch = [completed.as_slice(), failed.as_slice()].concat();
+    let expected = [0xc0, 0x3e, 7, 0x22, 3, 0x1a, 1, b'c'];
+    let unknown = core::cell::Cell::new(usize::MAX);
+    let ctx = DecodeContext::new(100, &unknown);
+
+    let mut owned = Header::decode_from_slice(&first).unwrap();
+    let mut payload = &failed[..];
+    let tag = Tag::decode(&mut payload).unwrap();
+    assert!(owned.merge_field(tag, &mut payload, ctx).is_err());
+    assert_eq!(caption(&owned), Some("c"));
+    assert_eq!(owned.encode_to_vec(), expected, "direct owned merge");
+
+    let mut view = HeaderView::decode_view(&first).unwrap();
+    assert!(
+        view.merge_view_field(tag, &failed[1..], &failed, ctx)
+            .is_err()
+    );
+    assert_eq!(caption(&view.to_owned_message().unwrap()), Some("c"));
+    assert_eq!(view.encode_to_vec(), expected, "direct view merge");
+
+    let mut owned = Header::decode_from_slice(&first).unwrap();
+    assert!(owned.merge_to_limit(&mut &batch[..], ctx, 0).is_err());
+    assert_eq!(caption(&owned), Some("c"));
+    assert_eq!(owned.encode_to_vec(), expected, "batched owned merge");
+
+    let mut view = HeaderView::decode_view(&first).unwrap();
+    assert!(view.merge_into_view(&batch, ctx).is_err());
+    assert_eq!(caption(&view.to_owned_message().unwrap()), Some("c"));
+    assert_eq!(view.encode_to_vec(), expected, "batched view merge");
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
+}
+
+#[test]
+fn failed_nested_oneof_without_mutation_keeps_future_order() {
+    use wa::message::interactive_message::{Header, HeaderView};
+    use waproto::buffa::{DecodeContext, ViewEncode};
+    let first = [0xc0, 0x3e, 7, 0x22, 3, 0x1a, 1, b'a'];
+    let completed = [0x22, 3, 0x1a, 1, b'b', 0xc8, 0x3e, 8];
+    let failed = [0x22, 2, 0xc0, 0x3e];
+    let batch = [completed.as_slice(), failed.as_slice()].concat();
+    let expected = [first.as_slice(), completed.as_slice()].concat();
+    let unknown = core::cell::Cell::new(usize::MAX);
+    let ctx = DecodeContext::new(100, &unknown);
+    let mut owned = Header::decode_from_slice(&first).unwrap();
+    assert!(owned.merge_to_limit(&mut &batch[..], ctx, 0).is_err());
+    assert_eq!(owned.encode_to_vec(), expected);
+    let mut view = HeaderView::decode_view(&first).unwrap();
+    assert!(view.merge_into_view(&batch, ctx).is_err());
+    assert_eq!(view.encode_to_vec(), expected);
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
 }
 
 #[test]
@@ -252,4 +330,161 @@ fn retained_lid_mapping_keeps_wire_identity() {
         wa::LIDMigrationMappingSyncPayload::decode_from_slice(&wire).unwrap(),
         payload
     );
+}
+
+#[test]
+fn failed_enum_batch_keeps_unreceived_nonoptional_default() {
+    use waproto::buffa::{DecodeContext, ViewEncode};
+    // FilterClause exposes a nonoptional enum with default AND = 1.
+    // Journal activation must seed it even when the field was not received.
+    let first = [0xc0, 0x3e, 7];
+    let later = [0x08, 2, 0x80];
+    let expected = [0x08, 1, 0xc0, 0x3e, 7, 0x08, 2];
+    let unknown = core::cell::Cell::new(usize::MAX);
+    let ctx = DecodeContext::new(100, &unknown);
+    let mut owned = wa::qp::FilterClause::decode_from_slice(&first).unwrap();
+    assert!(owned.merge_to_limit(&mut &later[..], ctx, 0).is_err());
+    assert_eq!(owned.encode_to_vec(), expected);
+    let mut view = wa::qp::FilterClauseView::decode_view(&first).unwrap();
+    assert!(view.merge_into_view(&later, ctx).is_err());
+    assert_eq!(view.encode_to_vec(), expected);
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
+}
+
+#[test]
+fn retry_after_failed_fragmented_batch_fits_linear_memory_budget() {
+    use waproto::buffa::{DecodeContext, ViewEncode};
+    let first = [0xc0, 0x3e, 7];
+    let mut batch = Vec::new();
+    for _ in 0..512 {
+        batch.extend_from_slice(&[0x32, 2, 0x0a, 0]);
+    }
+    batch.push(0x80);
+    let retry = [0x32, 0];
+    let mut expected = first.to_vec();
+    expected.extend_from_slice(&batch[..batch.len() - 1]);
+    let unknown = core::cell::Cell::new(usize::MAX);
+    let mut owned = wa::message::InteractiveMessage::decode_from_slice(&first).unwrap();
+    let mut view = wa::message::InteractiveMessageView::decode_view(&first).unwrap();
+    assert!(owned.merge_from_slice(&batch).is_err());
+    assert!(
+        view.merge_into_view(&batch, DecodeContext::new(100, &unknown))
+            .is_err()
+    );
+    assert_eq!(owned.encode_to_vec(), expected);
+    assert_eq!(view.encode_to_vec(), expected);
+    for allowance in [0, 4096] {
+        let budget = core::cell::Cell::new(allowance);
+        let ctx = DecodeContext::new(100, &unknown).with_element_memory(&budget);
+        assert!(owned.merge(&mut &retry[..], ctx).is_err());
+        if allowance != 0 {
+            assert!(
+                budget.get() < 256,
+                "failed replay debits decoded elements, not only input buffers"
+            );
+        }
+        assert_eq!(owned.encode_to_vec(), expected);
+        let budget = core::cell::Cell::new(allowance);
+        let ctx = DecodeContext::new(100, &unknown).with_element_memory(&budget);
+        assert!(view.merge_into_view(&retry, ctx).is_err());
+        if allowance != 0 {
+            assert!(
+                budget.get() < 256,
+                "failed view replay debits decoded elements, not only input buffers"
+            );
+        }
+        assert_eq!(view.encode_to_vec(), expected);
+        assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
+    }
+    let budget = core::cell::Cell::new(128 * 1024);
+    let ctx = DecodeContext::new(100, &unknown).with_element_memory(&budget);
+    let mut bytes = &retry[..];
+    owned
+        .merge(&mut bytes, ctx)
+        .expect("owned retry fits the element budget");
+    let budget = core::cell::Cell::new(128 * 1024);
+    let ctx = DecodeContext::new(100, &unknown).with_element_memory(&budget);
+    view.merge_into_view(&retry, ctx)
+        .expect("view retry fits the element budget");
+    expected.extend_from_slice(&retry);
+    assert_eq!(owned.encode_to_vec(), expected);
+    assert_eq!(view.encode_to_vec(), expected);
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
+}
+
+#[test]
+fn recovery_replays_nested_unknowns_without_recharging_the_caller_allowance() {
+    use wa::message::interactive_message::{Header, HeaderView};
+    use waproto::buffa::{DecodeContext, ViewEncode};
+    let first = [0xc0, 0x3e, 7, 0x22, 6, 0x1a, 1, b'a', 0xc0, 0x3e, 9];
+    let completed = [0x22, 6, 0x1a, 1, b'b', 0xc0, 0x3e, 8];
+    let failed = [0x22, 1, 0x80];
+    let batch = [completed.as_slice(), failed.as_slice()].concat();
+    let retry = [0x22, 0];
+    let expected = [first.as_slice(), completed.as_slice(), retry.as_slice()].concat();
+    let mut owned = Header::decode_from_slice(&first).unwrap();
+    let mut view = HeaderView::decode_view(&first).unwrap();
+    let unknown = core::cell::Cell::new(1);
+    assert!(
+        owned
+            .merge(&mut &batch[..], DecodeContext::new(100, &unknown))
+            .is_err()
+    );
+    assert_eq!(unknown.get(), 0);
+    let unknown = core::cell::Cell::new(1);
+    assert!(
+        view.merge_into_view(&batch, DecodeContext::new(100, &unknown))
+            .is_err()
+    );
+    assert_eq!(unknown.get(), 0);
+    let budget = core::cell::Cell::new(128 * 1024);
+    owned
+        .merge(
+            &mut &retry[..],
+            DecodeContext::new(100, &unknown).with_element_memory(&budget),
+        )
+        .unwrap();
+    assert_eq!(unknown.get(), 0);
+    let budget = core::cell::Cell::new(128 * 1024);
+    view.merge_into_view(
+        &retry,
+        DecodeContext::new(100, &unknown).with_element_memory(&budget),
+    )
+    .unwrap();
+    assert_eq!(unknown.get(), 0);
+    assert_eq!(owned.encode_to_vec(), expected);
+    assert_eq!(view.encode_to_vec(), expected);
+    assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), expected);
+}
+
+#[test]
+fn failed_public_view_unknown_insert_keeps_occurrence_order() {
+    use waproto::buffa::{DecodeContext, ViewEncode};
+    // The later known value wins; dropping its journal would move the retained
+    // future value after it and change the value seen by a newer reader.
+    let wire = [0x10, 99, 0x10, 0];
+    for insertion in 0..4 {
+        let mut view = wa::message::ProtocolMessageView::decode_view(&wire).unwrap();
+        let unknown = core::cell::Cell::new(0);
+        let budget = core::cell::Cell::new(0);
+        let ctx = DecodeContext::new(100, &unknown).with_element_memory(&budget);
+        let result = match insertion {
+            0 => view.__buffa_unknown_fields.push_record(&[0x80], 2, ctx),
+            1 => view
+                .__buffa_unknown_fields
+                .push_record(&[0xc0, 0x3e, 7], 3, ctx),
+            2 => view.__buffa_unknown_fields.push_varint(1000, 7, ctx),
+            _ => {
+                let unrestricted = core::cell::Cell::new(usize::MAX);
+                view.__buffa_unknown_fields.push_record(
+                    &[0x80],
+                    1,
+                    DecodeContext::new(100, &unrestricted),
+                )
+            }
+        };
+        assert!(result.is_err());
+        assert_eq!(view.encode_to_vec(), wire);
+        assert_eq!(view.to_owned_message().unwrap().encode_to_vec(), wire);
+    }
 }

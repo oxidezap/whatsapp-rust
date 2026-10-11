@@ -14,6 +14,8 @@ mod ordering;
 
 #[path = "wire_growth.rs"]
 mod wire_growth;
+#[path = "wire_semantic_plan.rs"]
+mod wire_semantic_plan;
 
 struct Extensible {
     serde: bool,
@@ -130,6 +132,102 @@ impl VisitMut for ColdStorage {
         let receiver = &call.receiver;
         let args = &decode.args;
         *expr = syn::parse_quote!(#receiver.merge_unknown(#args)?);
+    }
+}
+
+// A runtime field number lets large generated writers share the scalar codec
+// instead of expanding tag and value encoding at every call site.
+#[derive(Default)]
+struct SharedScalarWriters {
+    depth: usize,
+    helpers: BTreeSet<String>,
+}
+
+impl VisitMut for SharedScalarWriters {
+    fn visit_item_mod_mut(&mut self, item: &mut syn::ItemMod) {
+        self.depth += 1;
+        visit_mut::visit_item_mod_mut(self, item);
+        self.depth -= 1;
+    }
+
+    fn visit_expr_call_mut(&mut self, call: &mut syn::ExprCall) {
+        visit_mut::visit_expr_call_mut(self, call);
+        let syn::Expr::Path(path) = &mut *call.func else {
+            return;
+        };
+        let parts: Vec<_> = path
+            .path
+            .segments
+            .iter()
+            .map(|p| p.ident.to_string())
+            .collect();
+        if parts.len() != 3 || parts[0] != "buffa" || parts[1] != "types" {
+            return;
+        }
+        let name = &parts[2];
+        if scalar_writer_type(name).is_none() && name != "put_shared_bytes_field" {
+            return;
+        }
+        self.helpers.insert(name.clone());
+        path.path = syn::parse_str(&format!(
+            "{}__scalar_writers::{name}",
+            "super::".repeat(self.depth)
+        ))
+        .expect("internal scalar writer path");
+    }
+}
+
+fn scalar_writer_type(name: &str) -> Option<&'static str> {
+    match name {
+        "put_int32_field" | "put_sint32_field" | "put_sfixed32_field" => Some("i32"),
+        "put_int64_field" | "put_sint64_field" | "put_sfixed64_field" => Some("i64"),
+        "put_uint32_field" | "put_fixed32_field" => Some("u32"),
+        "put_uint64_field" | "put_fixed64_field" | "put_len_delimited_header" => Some("u64"),
+        "put_bool_field" => Some("bool"),
+        "put_float_field" => Some("f32"),
+        "put_double_field" => Some("f64"),
+        "put_string_field" => Some("&str"),
+        _ => None,
+    }
+}
+
+fn share_scalar_writers(file: &mut syn::File) {
+    let mut writer = SharedScalarWriters::default();
+    writer.visit_file_mut(file);
+    let helpers: Vec<syn::ItemFn> = writer
+        .helpers
+        .iter()
+        .map(|name| {
+            let name: syn::Ident = syn::parse_str(name).expect("scalar writer name");
+            if name == "put_shared_bytes_field" {
+                return syn::parse_quote! {
+                    #[inline(never)]
+                    pub(super) fn put_shared_bytes_field<B: ::buffa::types::AsSharedBytes, S: ::buffa::EncodeSink>(number: u32, value: &B, sink: &mut S) {
+                        ::buffa::types::put_shared_bytes_field(number, value, sink);
+                    }
+                };
+            }
+            let ty: syn::Type =
+                syn::parse_str(scalar_writer_type(&name.to_string()).expect("selected writer"))
+                    .expect("scalar writer type");
+            syn::parse_quote! {
+                #[inline(never)]
+                pub(super) fn #name<S: ::buffa::EncodeSink>(number: u32, value: #ty, sink: &mut S) {
+                    ::buffa::types::#name(number, value, sink);
+                }
+            }
+        })
+        .collect();
+    if !helpers.is_empty() {
+        let tests = if writer.helpers.contains("put_shared_bytes_field") {
+            syn::parse_file(include_str!("field_writer_tests.rs"))
+                .expect("field writer tests")
+                .items
+        } else {
+            Vec::new()
+        };
+        file.items
+            .push(syn::parse_quote!(mod __scalar_writers { #(#helpers)* #(#tests)* }));
     }
 }
 
@@ -321,7 +419,22 @@ pub fn finish(
         if serde {
             share_codecs(&mut file.items);
             ColdStorage { depth: 0 }.visit_file_mut(&mut file);
-            ordering::apply(&mut file, false, &growth);
+            ordering::apply(&mut file, false, &growth, package == "whatsapp");
+            if package == "whatsapp" {
+                let visitors = wire_semantic_plan::emit(&wire_semantic_plan::plan(fds), &file);
+                let mut snapshot =
+                    wire_semantic_plan::emit_snapshot(&wire_semantic_plan::plan(fds), &file);
+                let body =
+                    syn::parse_file(include_str!("wire_snapshot.rs")).expect("snapshot syntax");
+                snapshot.items.extend(body.items);
+                let body = snapshot.items;
+                file.items.push(syn::parse_quote!(#[doc(hidden)] pub(crate) mod __wire_snapshot { use super::__wire_snapshot as semantic; #(#body)* }));
+                let source = prettyplease::unparse(&visitors);
+                let target = out.join("semantic_header_visitors.rs");
+                if !std::fs::read_to_string(&target).is_ok_and(|old| old == source) {
+                    std::fs::write(target, source)?;
+                }
+            }
             let body = syn::parse_file(include_str!("unknown_storage.rs")).expect("storage syntax");
             let body = body.items;
             file.items
@@ -333,11 +446,19 @@ pub fn finish(
         }
 
         if suffix == ".__view" {
-            ordering::apply(&mut file, true, &growth);
+            ordering::apply(&mut file, true, &growth, package == "whatsapp");
+            if package == "whatsapp" {
+                let visitors =
+                    wire_semantic_plan::emit_view_snapshot(&wire_semantic_plan::plan(fds), &file);
+                let implementations = visitors.items;
+                file.items
+                    .push(syn::parse_quote!(mod __snapshot_visitors { #(#implementations)* }));
+            }
         }
 
         if serde {
             share_message_impls(&mut file.items, "");
+            share_scalar_writers(&mut file);
         }
         let implementation = match suffix {
             ".__oneof" => "::__buffa::oneof",
@@ -366,21 +487,39 @@ pub fn finish(
 fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
     let tokens = |value: &dyn ToTokens| normalize(&value.to_token_stream().to_string(), scope);
     let public_scope = canonical(scope.split("::").map(str::to_owned).collect(), false);
+    let availability = |attrs: &[syn::Attribute]| {
+        let attrs: Vec<_> = attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr"))
+            .collect();
+        if attrs.is_empty() {
+            String::new()
+        } else {
+            let attrs = quote::quote!(#(#attrs)*);
+            format!(" availability={}", tokens(&attrs))
+        }
+    };
     for item in items {
         match item {
             syn::Item::Mod(m) if !m.ident.to_string().starts_with("__") => {
                 // Keep owned/view source scopes distinct: their canonical
                 // public paths overlap, but either module can lose visibility.
-                api.insert(format!("module {scope}::{} {}", m.ident, tokens(&m.vis)));
+                api.insert(format!(
+                    "module {scope}::{} {}{}",
+                    m.ident,
+                    tokens(&m.vis),
+                    availability(&m.attrs)
+                ));
                 if let Some((_, items)) = &m.content {
                     inventory(items, &format!("{scope}::{}", m.ident), api);
                 }
             }
             syn::Item::Struct(s) if matches!(s.vis, syn::Visibility::Public(_)) => {
                 api.insert(format!(
-                    "struct {public_scope}::{} {}",
+                    "struct {public_scope}::{} {}{}",
                     s.ident,
-                    tokens(&s.generics)
+                    tokens(&s.generics),
+                    availability(&s.attrs)
                 ));
                 contract_attributes(&s.attrs, &format!("{public_scope}::{}", s.ident), api);
                 for f in &s.fields {
@@ -396,10 +535,11 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
                             api,
                         );
                         api.insert(format!(
-                            "field {public_scope}::{}::{} {}",
+                            "field {public_scope}::{}::{} {}{}",
                             s.ident,
                             tokens(&f.ident),
-                            tokens(&f.ty)
+                            tokens(&f.ty),
+                            availability(&f.attrs)
                         ));
                     }
                 }
@@ -411,13 +551,16 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
                     e.ident.to_string()
                 };
                 api.insert(format!(
-                    "enum {public_scope}::{name} {}",
-                    tokens(&e.generics)
+                    "enum {public_scope}::{name} {}{}",
+                    tokens(&e.generics),
+                    availability(&e.attrs)
                 ));
                 contract_attributes(&e.attrs, &format!("{public_scope}::{name}"), api);
                 for v in &e.variants {
                     let mut v = v.clone();
-                    v.attrs.clear();
+                    // Keep attributes in the existing variant entry so adding
+                    // a rename cannot pass as an additive API declaration.
+                    v.attrs.retain(is_contract_attribute);
                     api.insert(format!("variant {public_scope}::{name}::{}", tokens(&v)));
                 }
             }
@@ -432,24 +575,33 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
             syn::Item::Impl(i) if i.trait_.is_some() => {
                 let (_, path, _) = i.trait_.as_ref().expect("trait implementation");
                 let owner = format!(
-                    "impl {public_scope}::{} {} for {} {}",
+                    "impl {public_scope}::{} {} for {} {}{}",
                     tokens(&i.generics),
                     tokens(path),
                     tokens(&i.self_ty),
-                    tokens(&i.generics.where_clause)
+                    tokens(&i.generics.where_clause),
+                    availability(&i.attrs)
                 );
                 api.insert(owner.clone());
                 for item in &i.items {
                     match item {
                         syn::ImplItem::Type(associated) => {
+                            let conditional = availability(&associated.attrs);
                             let mut associated = associated.clone();
                             associated.attrs.clear();
-                            api.insert(format!("associated {owner} {}", tokens(&associated)));
+                            api.insert(format!(
+                                "associated {owner} {}{conditional}",
+                                tokens(&associated)
+                            ));
                         }
                         syn::ImplItem::Const(associated) => {
+                            let conditional = availability(&associated.attrs);
                             let mut associated = associated.clone();
                             associated.attrs.clear();
-                            api.insert(format!("associated {owner} {}", tokens(&associated)));
+                            api.insert(format!(
+                                "associated {owner} {}{conditional}",
+                                tokens(&associated)
+                            ));
                         }
                         _ => {}
                     }
@@ -460,18 +612,22 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
                     match item {
                         syn::ImplItem::Fn(f) if matches!(f.vis, syn::Visibility::Public(_)) => {
                             api.insert(format!(
-                                "method {public_scope}::{} {}",
+                                "method {public_scope}::{} {}{}{}",
                                 tokens(&i.self_ty),
-                                tokens(&f.sig)
+                                tokens(&f.sig),
+                                availability(&i.attrs),
+                                availability(&f.attrs)
                             ));
                         }
                         syn::ImplItem::Const(c) if matches!(c.vis, syn::Visibility::Public(_)) => {
                             api.insert(format!(
-                                "const {public_scope}::{}::{} {} = {}",
+                                "const {public_scope}::{}::{} {} = {}{}{}",
                                 tokens(&i.self_ty),
                                 c.ident,
                                 tokens(&c.ty),
-                                tokens(&c.expr)
+                                tokens(&c.expr),
+                                availability(&i.attrs),
+                                availability(&c.attrs)
                             ));
                         }
                         _ => {}
@@ -479,22 +635,28 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
                 }
             }
             syn::Item::Use(u) if matches!(u.vis, syn::Visibility::Public(_)) => {
-                api.insert(format!("use {public_scope} {}", tokens(&u.tree)));
+                api.insert(format!(
+                    "use {public_scope} {}{}",
+                    tokens(&u.tree),
+                    availability(&u.attrs)
+                ));
             }
             syn::Item::Const(c) if matches!(c.vis, syn::Visibility::Public(_)) => {
                 api.insert(format!(
-                    "const {public_scope}::{} {} = {}",
+                    "const {public_scope}::{} {} = {}{}",
                     c.ident,
                     tokens(&c.ty),
-                    tokens(&c.expr)
+                    tokens(&c.expr),
+                    availability(&c.attrs)
                 ));
             }
             syn::Item::Type(t) if matches!(t.vis, syn::Visibility::Public(_)) => {
                 api.insert(format!(
-                    "alias {public_scope}::{} {} = {}",
+                    "alias {public_scope}::{} {} = {}{}",
                     t.ident,
                     tokens(&t.generics),
-                    tokens(&t.ty)
+                    tokens(&t.ty),
+                    availability(&t.attrs)
                 ));
             }
             _ => {}
@@ -502,15 +664,18 @@ fn inventory(items: &[syn::Item], scope: &str, api: &mut BTreeSet<String>) {
     }
 }
 
+fn is_contract_attribute(attr: &syn::Attribute) -> bool {
+    attr.path().is_ident("derive")
+        || attr.path().is_ident("repr")
+        || attr.path().is_ident("serde")
+        || attr.path().is_ident("cfg")
+        || attr.path().is_ident("cfg_attr")
+}
+
 fn contract_attributes(attrs: &[syn::Attribute], owner: &str, api: &mut BTreeSet<String>) {
     for attr in attrs {
-        let text = attr.to_token_stream().to_string();
-        if attr.path().is_ident("derive")
-            || attr.path().is_ident("repr")
-            || attr.path().is_ident("serde")
-            || (attr.path().is_ident("cfg_attr")
-                && (text.contains("derive") || text.contains("serde")))
-        {
+        if is_contract_attribute(attr) {
+            let text = attr.to_token_stream().to_string();
             api.insert(format!("attribute {owner} {text}"));
         }
     }
@@ -592,6 +757,98 @@ pub fn check_api(expected: &str, actual: &BTreeSet<String>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conditional_availability_cannot_change_existing_declarations() {
+        let collect = |source: &str| {
+            let file = syn::parse_file(source).unwrap();
+            let mut api = BTreeSet::new();
+            inventory(&file.items, "whatsapp", &mut api);
+            api
+        };
+        for source in [
+            "ATTR pub struct Record { pub value: u32 }",
+            "pub struct Record { ATTR pub value: u32 }",
+            "ATTR pub enum Kind { Value }",
+            "pub enum Kind { ATTR Value }",
+            "pub struct Record; impl Record { ATTR pub fn value(&self) {} }",
+            "pub struct Record; ATTR impl Record { pub fn value(&self) {} }",
+            "ATTR pub mod nested { pub struct Record; }",
+            "mod internal { pub struct Record; } ATTR pub use internal::Record;",
+            "ATTR pub type Alias = u32;",
+            "ATTR pub const VALUE: u32 = 1;",
+            "pub struct Record; impl Record { ATTR pub const VALUE: u32 = 1; }",
+            "pub struct Record; trait Contract { type Value; } impl Contract for Record { ATTR type Value = u32; }",
+            "pub struct Record; trait Contract { const VALUE: u32; } impl Contract for Record { ATTR const VALUE: u32 = 1; }",
+        ] {
+            let bare = source.replace("ATTR", "");
+            let baseline = collect(&bare).into_iter().collect::<Vec<_>>().join("\n");
+            for attr in [
+                "#[cfg(feature = \"new\")]",
+                "#[cfg(target_arch = \"wasm32\")]",
+                "#[cfg_attr(feature = \"new\", cfg(target_arch = \"wasm32\"))]",
+            ] {
+                let conditional = source.replace("ATTR", attr);
+                check_api(&baseline, &collect(&conditional))
+                    .expect_err("adding a condition removes an existing API");
+                let frozen = collect(&conditional)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                check_api(&frozen, &collect(&bare))
+                    .expect_err("removing a condition changes availability");
+                check_api(
+                    &frozen,
+                    &collect(
+                        &conditional
+                            .replace("new", "changed")
+                            .replace("wasm32", "aarch64"),
+                    ),
+                )
+                .expect_err("changing a condition changes availability");
+            }
+        }
+    }
+
+    #[test]
+    fn variant_serialization_attributes_are_part_of_the_frozen_api() {
+        let collect = |source: &str| {
+            let file = syn::parse_file(source).unwrap();
+            let mut api = BTreeSet::new();
+            inventory(&file.items, "whatsapp", &mut api);
+            api
+        };
+        for variant in ["Value", "Value(String)"] {
+            for attribute in [
+                "#[serde(rename = \"original\")]",
+                "#[cfg_attr(feature = \"serde\", serde(rename = \"original\"))]",
+                "#[serde(skip)]",
+            ] {
+                let source = format!("pub enum Kind {{ {attribute} {variant} }}");
+                let expected = collect(&source).into_iter().collect::<Vec<_>>().join("\n");
+                for changed in [
+                    source.replace("original", "changed"),
+                    format!("pub enum Kind {{ {variant} }}"),
+                ] {
+                    if changed != source {
+                        check_api(&expected, &collect(&changed))
+                            .expect_err("variant serialization is frozen");
+                    }
+                }
+                let bare = format!("pub enum Kind {{ {variant} }}");
+                let expected_bare = collect(&bare).into_iter().collect::<Vec<_>>().join("\n");
+                check_api(&expected_bare, &collect(&source))
+                    .expect_err("adding serialization metadata changes an existing variant");
+                check_api(
+                    &expected,
+                    &collect(&format!(
+                        "pub enum Kind {{ #[doc = \"updated\"] {attribute} {variant}, Added }}"
+                    )),
+                )
+                .expect("documentation and new variants remain additive");
+            }
+        }
+    }
 
     #[test]
     fn trait_constant_values_and_types_are_part_of_the_frozen_api() {
