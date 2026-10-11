@@ -354,11 +354,74 @@ fn normalize(input: &str, scope: &str) -> String {
     output.join(" ")
 }
 
+fn serialization_attribute(text: &str) -> bool {
+    fn has_serde(meta: &syn::Meta) -> bool {
+        if meta.path().is_ident("serde") {
+            return true;
+        }
+        if let syn::Meta::List(list) = meta
+            && list.path.is_ident("cfg_attr")
+            && let Ok(nested) = list.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            )
+        {
+            return nested.iter().any(has_serde);
+        }
+        false
+    }
+    syn::parse::Parser::parse_str(syn::Attribute::parse_outer, text)
+        .is_ok_and(|attrs| attrs.iter().any(|attr| has_serde(&attr.meta)))
+}
+
 pub fn check_api(expected: &str, actual: &BTreeSet<String>) -> io::Result<()> {
     let missing: Vec<_> = expected
         .lines()
         .filter(|l| !l.is_empty() && !l.starts_with('#') && !actual.contains(*l))
         .collect();
+    // Attribute entries are separate so existing snapshots stay readable.
+    // A new attribute on a retained field can change serialization, even
+    // though adding an entirely new field and its attributes is compatible.
+    let retained_fields: BTreeSet<_> = expected
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("field ")?
+                .split_once(' ')
+                .map(|(owner, _)| owner)
+        })
+        .collect();
+    let retained_types: BTreeSet<_> = expected
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("struct ")
+                .or_else(|| line.strip_prefix("enum "))?
+                .split_once(' ')
+                .map(|(owner, _)| owner)
+        })
+        .collect();
+    let expected_entries: BTreeSet<_> = expected.lines().collect();
+    let added_attributes: Vec<_> = actual
+        .iter()
+        .filter(|line| {
+            line.strip_prefix("attribute ")
+                .and_then(|entry| entry.split_once(' '))
+                .is_some_and(|(owner, attribute)| {
+                    retained_fields.contains(owner)
+                        || (retained_types.contains(owner) && serialization_attribute(attribute))
+                })
+                && !expected_entries.contains(line.as_str())
+        })
+        .collect();
+    if !added_attributes.is_empty() {
+        return Err(io::Error::other(format!(
+            "generated protobuf API changed: contract attributes added to retained declarations:\n{}",
+            added_attributes
+                .into_iter()
+                .take(20)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        )));
+    }
     if missing.is_empty() {
         return Ok(());
     }
@@ -444,6 +507,89 @@ mod tests {
                 )
                 .expect_err("changing a condition changes availability");
             }
+        }
+    }
+
+    #[test]
+    fn field_serialization_attributes_are_part_of_the_frozen_api() {
+        let collect = |source: &str| {
+            let file = syn::parse_file(source).unwrap();
+            let mut api = BTreeSet::new();
+            inventory(&file.items, "whatsapp", &mut api);
+            api
+        };
+        for declaration in ["Message", "MessageView<'a>"] {
+            let bare = format!("pub struct {declaration} {{ pub conversation: String }}");
+            let baseline = collect(&bare).into_iter().collect::<Vec<_>>().join("\n");
+            for attribute in [
+                "#[serde(rename = \"original\")]",
+                "#[cfg_attr(feature = \"serde\", serde(rename = \"original\"))]",
+                "#[serde(skip)]",
+            ] {
+                let source =
+                    bare.replace("pub conversation", &format!("{attribute} pub conversation"));
+                check_api(&baseline, &collect(&source))
+                    .expect_err("adding metadata can rename or omit a retained field");
+                let frozen = collect(&source).into_iter().collect::<Vec<_>>().join("\n");
+                check_api(&frozen, &collect(&bare)).expect_err("removing metadata changes JSON");
+                if source.contains("original") {
+                    check_api(&frozen, &collect(&source.replace("original", "changed")))
+                        .expect_err("changing serialization metadata changes JSON");
+                }
+                let additive = source.replace(
+                    "pub conversation: String",
+                    "pub conversation: String, #[serde(rename = \"added\")] pub added: String",
+                );
+                check_api(&frozen, &collect(&additive)).expect("new fields remain additive");
+                check_api(
+                    &frozen,
+                    &collect(
+                        &source
+                            .replace("pub conversation", "#[doc = \"updated\"] pub conversation"),
+                    ),
+                )
+                .expect("documentation remains additive");
+            }
+        }
+    }
+
+    #[test]
+    fn type_serialization_attributes_cannot_bypass_field_guards() {
+        let collect = |source: &str| {
+            let file = syn::parse_file(source).unwrap();
+            let mut api = BTreeSet::new();
+            inventory(&file.items, "whatsapp", &mut api);
+            api
+        };
+        for declaration in [
+            "pub struct Message { pub conversation: String }",
+            "pub struct MessageView<'a> { pub conversation: String }",
+            "pub enum Kind { Value }",
+        ] {
+            let baseline = collect(declaration)
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join("\n");
+            for attribute in [
+                "#[serde(rename_all = \"camelCase\")]",
+                "#[cfg_attr(feature = \"serde\", serde(rename_all = \"camelCase\"))]",
+                "#[cfg_attr(feature = \"serde\", cfg_attr(feature = \"json\", serde(rename_all = \"camelCase\")))]",
+            ] {
+                check_api(&baseline, &collect(&format!("{attribute} {declaration}")))
+                    .expect_err("type metadata can change retained field and variant names");
+                check_api(
+                    &baseline,
+                    &collect(&format!(
+                        "{declaration} {attribute} pub struct Added {{ pub value: String }}"
+                    )),
+                )
+                .expect("metadata on new declarations is additive");
+            }
+            check_api(
+                &baseline,
+                &collect(&format!("#[derive(Clone)] {declaration}")),
+            )
+            .expect("new non-serialization derives remain additive");
         }
     }
 
