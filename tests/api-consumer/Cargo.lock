@@ -1936,6 +1936,7 @@ dependencies = [
  "bytes",
  "heck",
  "prettyplease 0.3.0",
+ "quote",
  "serde",
  "sha2",
  "syn 3.0.6",

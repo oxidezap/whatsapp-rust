@@ -20,23 +20,36 @@ fn make_mutation(
     index_mac: Vec<u8>,
     value_blob: Option<Vec<u8>>,
 ) -> wa::SyncdMutation {
-    wa::SyncdMutation {
-        operation: Some(op.into()),
-        record: wa::SyncdRecord {
-            index: wa::SyncdIndex {
-                blob: Some(index_mac),
+    {
+        let mut proto = wa::SyncdMutation::default();
+        proto.operation = Some(op.into());
+        proto.record = {
+            let mut proto = wa::SyncdRecord::default();
+            proto.index = {
+                let mut proto = wa::SyncdIndex::default();
+                proto.blob = Some(index_mac);
+                proto
             }
-            .into(),
-            value: match value_blob {
-                Some(b) => wa::SyncdValue { blob: Some(b) }.into(),
+            .into();
+            proto.value = match value_blob {
+                Some(b) => {
+                    let mut proto = wa::SyncdValue::default();
+                    proto.blob = Some(b);
+                    proto
+                }
+                .into(),
                 None => Default::default(),
-            },
-            key_id: wa::KeyId {
-                id: Some(key_id.to_vec()),
+            };
+            proto.key_id = {
+                let mut proto = wa::KeyId::default();
+                proto.id = Some(key_id.to_vec());
+                proto
             }
-            .into(),
+            .into();
+            proto
         }
-        .into(),
+        .into();
+        proto
     }
 }
 
@@ -218,8 +231,10 @@ fn test_external_mutations_decode_from_syncd_mutations() {
     );
 
     // Encode as SyncdMutations (what external_mutations downloads return)
-    let syncd_mutations = wa::SyncdMutations {
-        mutations: vec![mutation1, mutation2],
+    let syncd_mutations = {
+        let mut proto = wa::SyncdMutations::default();
+        proto.mutations = vec![mutation1, mutation2];
+        proto
     };
 
     let encoded = syncd_mutations.encode_to_vec();
@@ -255,14 +270,23 @@ fn test_validate_patch_macs_reports_divergence_regardless_of_has_missing_remove(
     };
 
     // Create a patch with a snapshot_mac that won't match our state
-    let patch = wa::SyncdPatch {
-        version: wa::SyncdVersion { version: Some(2) }.into(),
-        snapshot_mac: Some(vec![0u8; 32]), // This won't match our computed MAC
-        key_id: wa::KeyId {
-            id: Some(key_id.to_vec()),
+    let patch = {
+        let mut proto = wa::SyncdPatch::default();
+        proto.version = {
+            let mut proto = wa::SyncdVersion::default();
+            proto.version = Some(2);
+            proto
         }
-        .into(),
-        ..Default::default()
+        .into();
+        proto.snapshot_mac = Some(vec![0u8; 32]); // This won't match our computed MAC
+
+        proto.key_id = {
+            let mut proto = wa::KeyId::default();
+            proto.id = Some(key_id.to_vec());
+            proto
+        }
+        .into();
+        proto
     };
 
     for has_missing_remove in [false, true] {

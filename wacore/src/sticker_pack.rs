@@ -182,14 +182,15 @@ pub fn create_sticker_pack_zip(
         }
 
         let is_animated = webp::is_animated(input.data);
-        proto_stickers.push(wa::message::sticker_pack_message::Sticker {
-            file_name: Some(file_name),
-            is_animated: Some(is_animated),
-            emojis: input.emojis.clone(),
-            accessibility_label: input.accessibility_label.clone(),
-            is_lottie: Some(false),
-            mimetype: Some("image/webp".to_string()),
-            ..Default::default()
+        proto_stickers.push({
+            let mut proto = wa::message::sticker_pack_message::Sticker::default();
+            proto.file_name = Some(file_name);
+            proto.is_animated = Some(is_animated);
+            proto.emojis = input.emojis.clone();
+            proto.accessibility_label = input.accessibility_label.clone();
+            proto.is_lottie = Some(false);
+            proto.mimetype = Some("image/webp".to_string());
+            proto
         });
     }
 
@@ -220,29 +221,31 @@ pub fn build_sticker_pack_message(
         bail!("thumbnail must be uploaded with the same media_key as the zip");
     }
 
-    let pack_msg = wa::message::StickerPackMessage {
-        sticker_pack_id: Some(metadata.pack_id),
-        name: Some(metadata.name),
-        publisher: Some(metadata.publisher),
-        stickers: zip_result.stickers.clone(),
-        file_length: Some(zip_upload.file_length),
-        file_sha256: Some(zip_upload.file_sha256.to_vec()),
-        file_enc_sha256: Some(zip_upload.file_enc_sha256.to_vec()),
-        media_key: Some(zip_upload.media_key.to_vec()),
-        direct_path: Some(zip_upload.direct_path.clone()),
-        caption: metadata.caption,
-        pack_description: metadata.description,
-        thumbnail_sha256: Some(thumb_upload.file_sha256.to_vec()),
-        thumbnail_enc_sha256: Some(thumb_upload.file_enc_sha256.to_vec()),
-        thumbnail_direct_path: Some(thumb_upload.direct_path.clone()),
-        sticker_pack_size: Some(zip_result.zip_bytes.len() as u64),
-        tray_icon_file_name: Some(zip_result.tray_icon_file_name.clone()),
-        ..Default::default()
+    let pack_msg = {
+        let mut proto = wa::message::StickerPackMessage::default();
+        proto.sticker_pack_id = Some(metadata.pack_id);
+        proto.name = Some(metadata.name);
+        proto.publisher = Some(metadata.publisher);
+        proto.stickers = zip_result.stickers.clone();
+        proto.file_length = Some(zip_upload.file_length);
+        proto.file_sha256 = Some(zip_upload.file_sha256.to_vec());
+        proto.file_enc_sha256 = Some(zip_upload.file_enc_sha256.to_vec());
+        proto.media_key = Some(zip_upload.media_key.to_vec());
+        proto.direct_path = Some(zip_upload.direct_path.clone());
+        proto.caption = metadata.caption;
+        proto.pack_description = metadata.description;
+        proto.thumbnail_sha256 = Some(thumb_upload.file_sha256.to_vec());
+        proto.thumbnail_enc_sha256 = Some(thumb_upload.file_enc_sha256.to_vec());
+        proto.thumbnail_direct_path = Some(thumb_upload.direct_path.clone());
+        proto.sticker_pack_size = Some(zip_result.zip_bytes.len() as u64);
+        proto.tray_icon_file_name = Some(zip_result.tray_icon_file_name.clone());
+        proto
     };
 
-    Ok(wa::Message {
-        sticker_pack_message: buffa::MessageField::some(pack_msg),
-        ..Default::default()
+    Ok({
+        let mut proto = wa::Message::default();
+        proto.sticker_pack_message = buffa::MessageField::some(pack_msg);
+        proto
     })
 }
 

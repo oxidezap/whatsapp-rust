@@ -57,16 +57,20 @@ pub fn message_range<'a>(
     last_system_message_timestamp: Option<i64>,
     messages: impl IntoIterator<Item = (MessageRef<'a>, i64)>,
 ) -> SyncActionMessageRange {
-    SyncActionMessageRange {
-        last_message_timestamp: Some(last_message_timestamp),
-        last_system_message_timestamp,
-        messages: messages
+    {
+        let mut proto_ = SyncActionMessageRange::default();
+        proto_.last_message_timestamp = Some(last_message_timestamp);
+        proto_.last_system_message_timestamp = last_system_message_timestamp;
+        proto_.messages = messages
             .into_iter()
-            .map(|(reference, ts)| wa::sync_action_value::SyncActionMessage {
-                key: buffa::MessageField::some(reference.to_raw_key()),
-                timestamp: Some(ts),
+            .map(|(reference, ts)| {
+                let mut proto = wa::sync_action_value::SyncActionMessage::default();
+                proto.key = buffa::MessageField::some(reference.to_raw_key());
+                proto.timestamp = Some(ts);
+                proto
             })
-            .collect(),
+            .collect();
+        proto_
     }
 }
 
@@ -593,15 +597,16 @@ impl<'a> ChatActions<'a> {
             redact_jid(jid),
             if read { "read" } else { "unread" }
         );
-        let value = wa::SyncActionValue {
-            mark_chat_as_read_action: buffa::MessageField::some(
-                wa::sync_action_value::MarkChatAsReadAction {
-                    read: Some(read),
-                    message_range: message_range.into(),
-                },
-            ),
-            timestamp: Some(wacore::time::now_millis()),
-            ..Default::default()
+        let value = {
+            let mut proto = wa::SyncActionValue::default();
+            proto.mark_chat_as_read_action = buffa::MessageField::some({
+                let mut proto = wa::sync_action_value::MarkChatAsReadAction::default();
+                proto.read = Some(read);
+                proto.message_range = message_range.into();
+                proto
+            });
+            proto.timestamp = Some(wacore::time::now_millis());
+            proto
         };
         let jid = jid.to_string();
         self.client
@@ -617,14 +622,15 @@ impl<'a> ChatActions<'a> {
     ) -> Result<(), AppStateError> {
         debug!("Deleting chat {}", redact_jid(jid));
         let delete_media_str = if delete_media { "1" } else { "0" };
-        let value = wa::SyncActionValue {
-            delete_chat_action: buffa::MessageField::some(
-                wa::sync_action_value::DeleteChatAction {
-                    message_range: message_range.into(),
-                },
-            ),
-            timestamp: Some(wacore::time::now_millis()),
-            ..Default::default()
+        let value = {
+            let mut proto = wa::SyncActionValue::default();
+            proto.delete_chat_action = buffa::MessageField::some({
+                let mut proto = wa::sync_action_value::DeleteChatAction::default();
+                proto.message_range = message_range.into();
+                proto
+            });
+            proto.timestamp = Some(wacore::time::now_millis());
+            proto
         };
         let jid = jid.to_string();
         self.client
@@ -651,12 +657,15 @@ impl<'a> ChatActions<'a> {
         // WA Web's $ClearChatSync$p_3 encodes both flags as "1"/"0".
         let delete_starred_str = if delete_starred { "1" } else { "0" };
         let delete_media_str = if delete_media { "1" } else { "0" };
-        let value = wa::SyncActionValue {
-            clear_chat_action: buffa::MessageField::some(wa::sync_action_value::ClearChatAction {
-                message_range: message_range.into(),
-            }),
-            timestamp: Some(wacore::time::now_millis()),
-            ..Default::default()
+        let value = {
+            let mut proto = wa::SyncActionValue::default();
+            proto.clear_chat_action = buffa::MessageField::some({
+                let mut proto = wa::sync_action_value::ClearChatAction::default();
+                proto.message_range = message_range.into();
+                proto
+            });
+            proto.timestamp = Some(wacore::time::now_millis());
+            proto
         };
         let jid = jid.to_string();
         self.client
@@ -672,12 +681,15 @@ impl<'a> ChatActions<'a> {
     /// (WA Web's userStatusMute). `muted = true` hides their status.
     pub async fn set_user_status_mute(&self, jid: &Jid, muted: bool) -> Result<(), AppStateError> {
         debug!("Setting userStatusMute for {} -> {muted}", redact_jid(jid));
-        let value = wa::SyncActionValue {
-            user_status_mute_action: buffa::MessageField::some(
-                wa::sync_action_value::UserStatusMuteAction { muted: Some(muted) },
-            ),
-            timestamp: Some(wacore::time::now_millis()),
-            ..Default::default()
+        let value = {
+            let mut proto = wa::SyncActionValue::default();
+            proto.user_status_mute_action = buffa::MessageField::some({
+                let mut proto = wa::sync_action_value::UserStatusMuteAction::default();
+                proto.muted = Some(muted);
+                proto
+            });
+            proto.timestamp = Some(wacore::time::now_millis());
+            proto
         };
         let jid = jid.to_string();
         self.client
@@ -693,15 +705,16 @@ impl<'a> ChatActions<'a> {
         message_timestamp: Option<i64>,
     ) -> Result<(), AppStateError> {
         let (chat, participant) = message_key_owned(target);
-        let value = wa::SyncActionValue {
-            delete_message_for_me_action: buffa::MessageField::some(
-                wa::sync_action_value::DeleteMessageForMeAction {
-                    delete_media: Some(delete_media),
-                    message_timestamp,
-                },
-            ),
-            timestamp: Some(wacore::time::now_millis()),
-            ..Default::default()
+        let value = {
+            let mut proto = wa::SyncActionValue::default();
+            proto.delete_message_for_me_action = buffa::MessageField::some({
+                let mut proto = wa::sync_action_value::DeleteMessageForMeAction::default();
+                proto.delete_media = Some(delete_media);
+                proto.message_timestamp = message_timestamp;
+                proto
+            });
+            proto.timestamp = Some(wacore::time::now_millis());
+            proto
         };
         self.client
             .send_app_state_action(
@@ -740,15 +753,17 @@ impl<'a> ChatActions<'a> {
             ));
         }
         debug!("Saving contact {}", redact_jid(jid));
-        let value = wa::SyncActionValue {
-            contact_action: buffa::MessageField::some(wa::sync_action_value::ContactAction {
-                full_name,
-                first_name,
-                save_on_primary_addressbook: Some(save_on_primary_addressbook),
-                ..Default::default()
-            }),
-            timestamp: Some(wacore::time::now_millis()),
-            ..Default::default()
+        let value = {
+            let mut proto = wa::SyncActionValue::default();
+            proto.contact_action = buffa::MessageField::some({
+                let mut proto = wa::sync_action_value::ContactAction::default();
+                proto.full_name = full_name;
+                proto.first_name = first_name;
+                proto.save_on_primary_addressbook = Some(save_on_primary_addressbook);
+                proto
+            });
+            proto.timestamp = Some(wacore::time::now_millis());
+            proto
         };
         let jid_str = jid.to_string();
         self.client
@@ -777,12 +792,12 @@ impl<'a> ChatActions<'a> {
             ));
         }
         debug!("Removing contact {}", redact_jid(jid));
-        let value = wa::SyncActionValue {
-            contact_action: buffa::MessageField::some(
-                wa::sync_action_value::ContactAction::default(),
-            ),
-            timestamp: Some(wacore::time::now_millis()),
-            ..Default::default()
+        let value = {
+            let mut proto = wa::SyncActionValue::default();
+            proto.contact_action =
+                buffa::MessageField::some(wa::sync_action_value::ContactAction::default());
+            proto.timestamp = Some(wacore::time::now_millis());
+            proto
         };
         let jid_str = jid.to_string();
         self.client
@@ -796,15 +811,16 @@ impl<'a> ChatActions<'a> {
         archived: bool,
         message_range: Option<SyncActionMessageRange>,
     ) -> Result<(), AppStateError> {
-        let value = wa::SyncActionValue {
-            archive_chat_action: buffa::MessageField::some(
-                wa::sync_action_value::ArchiveChatAction {
-                    archived: Some(archived),
-                    message_range: message_range.into(),
-                },
-            ),
-            timestamp: Some(wacore::time::now_millis()),
-            ..Default::default()
+        let value = {
+            let mut proto = wa::SyncActionValue::default();
+            proto.archive_chat_action = buffa::MessageField::some({
+                let mut proto = wa::sync_action_value::ArchiveChatAction::default();
+                proto.archived = Some(archived);
+                proto.message_range = message_range.into();
+                proto
+            });
+            proto.timestamp = Some(wacore::time::now_millis());
+            proto
         };
         let jid = jid.to_string();
         self.client
@@ -813,12 +829,15 @@ impl<'a> ChatActions<'a> {
     }
 
     async fn send_pin_mutation(&self, jid: &Jid, pinned: bool) -> Result<(), AppStateError> {
-        let value = wa::SyncActionValue {
-            pin_action: buffa::MessageField::some(wa::sync_action_value::PinAction {
-                pinned: Some(pinned),
-            }),
-            timestamp: Some(wacore::time::now_millis()),
-            ..Default::default()
+        let value = {
+            let mut proto = wa::SyncActionValue::default();
+            proto.pin_action = buffa::MessageField::some({
+                let mut proto = wa::sync_action_value::PinAction::default();
+                proto.pinned = Some(pinned);
+                proto
+            });
+            proto.timestamp = Some(wacore::time::now_millis());
+            proto
         };
         let jid = jid.to_string();
         self.client
@@ -838,14 +857,16 @@ impl<'a> ChatActions<'a> {
         } else {
             Some(0)
         };
-        let value = wa::SyncActionValue {
-            mute_action: buffa::MessageField::some(wa::sync_action_value::MuteAction {
-                muted: Some(muted),
-                mute_end_timestamp: mute_end,
-                ..Default::default()
-            }),
-            timestamp: Some(wacore::time::now_millis()),
-            ..Default::default()
+        let value = {
+            let mut proto = wa::SyncActionValue::default();
+            proto.mute_action = buffa::MessageField::some({
+                let mut proto = wa::sync_action_value::MuteAction::default();
+                proto.muted = Some(muted);
+                proto.mute_end_timestamp = mute_end;
+                proto
+            });
+            proto.timestamp = Some(wacore::time::now_millis());
+            proto
         };
         let jid = jid.to_string();
         self.client
@@ -854,12 +875,15 @@ impl<'a> ChatActions<'a> {
     }
 
     async fn send_lock_mutation(&self, jid: &Jid, locked: bool) -> Result<(), AppStateError> {
-        let value = wa::SyncActionValue {
-            lock_chat_action: buffa::MessageField::some(wa::sync_action_value::LockChatAction {
-                locked: Some(locked),
-            }),
-            timestamp: Some(wacore::time::now_millis()),
-            ..Default::default()
+        let value = {
+            let mut proto = wa::SyncActionValue::default();
+            proto.lock_chat_action = buffa::MessageField::some({
+                let mut proto = wa::sync_action_value::LockChatAction::default();
+                proto.locked = Some(locked);
+                proto
+            });
+            proto.timestamp = Some(wacore::time::now_millis());
+            proto
         };
         let jid = jid.to_string();
         self.client
@@ -873,12 +897,15 @@ impl<'a> ChatActions<'a> {
         starred: bool,
     ) -> Result<(), AppStateError> {
         let (chat, participant) = message_key_owned(target);
-        let value = wa::SyncActionValue {
-            star_action: buffa::MessageField::some(wa::sync_action_value::StarAction {
-                starred: Some(starred),
-            }),
-            timestamp: Some(wacore::time::now_millis()),
-            ..Default::default()
+        let value = {
+            let mut proto = wa::SyncActionValue::default();
+            proto.star_action = buffa::MessageField::some({
+                let mut proto = wa::sync_action_value::StarAction::default();
+                proto.starred = Some(starred);
+                proto
+            });
+            proto.timestamp = Some(wacore::time::now_millis());
+            proto
         };
         self.client
             .send_app_state_action(
@@ -953,11 +980,9 @@ impl Client {
     /// # async fn ex(client: &whatsapp_rust::Client) -> anyhow::Result<()> {
     /// use whatsapp_rust::schemas;
     /// use whatsapp_rust::waproto::whatsapp as wa;
-    /// let value = wa::SyncActionValue {
-    ///     clear_chat_action: Some(Default::default()).into(),
-    ///     timestamp: Some(1_700_000_000_000), // a real epoch-ms timestamp
-    ///     ..Default::default()
-    /// };
+    /// let mut value = wa::SyncActionValue::default();
+    /// value.clear_chat_action = Some(Default::default()).into();
+    /// value.timestamp = Some(1_700_000_000_000); // epoch-ms timestamp
     /// // Args are the non-literal index parts in `schema.index_parts` order;
     /// // CLEAR_CHAT is [chatJid, deleteStarred, deleteMedia].
     /// client
@@ -1163,15 +1188,14 @@ mod registry_tests {
         assert_eq!(range.messages.len(), cases.len());
         for (i, message) in range.messages.iter().enumerate() {
             assert_eq!(message.timestamp, Some(timestamps[i]));
-            assert_eq!(
-                message.key.as_option().unwrap(),
-                &wa::MessageKey {
-                    remote_jid: Some(cases[i].0.into()),
-                    id: Some(format!("range-{i}")),
-                    from_me: Some(cases[i].2),
-                    participant: cases[i].3.map(str::to_owned),
-                }
-            );
+            assert_eq!(message.key.as_option().unwrap(), &{
+                let mut proto = wa::MessageKey::default();
+                proto.remote_jid = Some(cases[i].0.into());
+                proto.id = Some(format!("range-{i}"));
+                proto.from_me = Some(cases[i].2);
+                proto.participant = cases[i].3.map(str::to_owned);
+                proto
+            });
         }
     }
 
@@ -1495,12 +1519,14 @@ mod registry_tests {
         let m = Mutation {
             index: vec!["contact".into(), "12025550111@s.whatsapp.net".into()],
             operation: wa::syncd_mutation::SyncdOperation::SET,
-            action_value: Some(wa::SyncActionValue {
-                contact_action: buffa::MessageField::some(wa::sync_action_value::ContactAction {
-                    full_name: Some("Alex Doe".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
+            action_value: Some({
+                let mut proto = wa::SyncActionValue::default();
+                proto.contact_action = buffa::MessageField::some({
+                    let mut proto = wa::sync_action_value::ContactAction::default();
+                    proto.full_name = Some("Alex Doe".into());
+                    proto
+                });
+                proto
             }),
         };
         let (outcome, events) = dispatch_outcome_into_recorder(&m);
@@ -1567,13 +1593,14 @@ mod registry_tests {
             let m = Mutation {
                 index: vec!["lock".into(), "12025550111@s.whatsapp.net".into()],
                 operation: wa::syncd_mutation::SyncdOperation::SET,
-                action_value: Some(wa::SyncActionValue {
-                    lock_chat_action: buffa::MessageField::some(
-                        wa::sync_action_value::LockChatAction {
-                            locked: Some(locked),
-                        },
-                    ),
-                    ..Default::default()
+                action_value: Some({
+                    let mut proto = wa::SyncActionValue::default();
+                    proto.lock_chat_action = buffa::MessageField::some({
+                        let mut proto = wa::sync_action_value::LockChatAction::default();
+                        proto.locked = Some(locked);
+                        proto
+                    });
+                    proto
                 }),
             };
             let (outcome, events) = dispatch_outcome_into_recorder(&m);
@@ -1622,120 +1649,97 @@ mod registry_tests {
         let set = |index: &[&str], value: wa::SyncActionValue| Mutation {
             index: index.iter().map(|s| s.to_string()).collect(),
             operation: wa::syncd_mutation::SyncdOperation::SET,
-            action_value: Some(wa::SyncActionValue { timestamp, ..value }),
+            action_value: Some({
+                let mut proto = value;
+                proto.timestamp = timestamp;
+                proto
+            }),
         };
         let range = || buffa::MessageField::some(message_range(1_700_000_000_000, None, vec![]));
         let message_key = ["120363000000000042@g.us", "MSGID", "0", CHAT];
         vec![
-            set(
-                &["mute", CHAT],
-                wa::SyncActionValue {
-                    mute_action: buffa::MessageField::some(sav::MuteAction::default()),
-                    ..Default::default()
-                },
-            ),
-            set(
-                &["pin_v1", CHAT],
-                wa::SyncActionValue {
-                    pin_action: buffa::MessageField::some(sav::PinAction::default()),
-                    ..Default::default()
-                },
-            ),
-            set(
-                &["pin", CHAT],
-                wa::SyncActionValue {
-                    pin_action: buffa::MessageField::some(sav::PinAction::default()),
-                    ..Default::default()
-                },
-            ),
-            set(
-                &["archive", CHAT],
-                wa::SyncActionValue {
-                    archive_chat_action: buffa::MessageField::some(
-                        sav::ArchiveChatAction::default(),
-                    ),
-                    ..Default::default()
-                },
-            ),
-            set(
-                &[&["star"][..], &message_key].concat(),
-                wa::SyncActionValue {
-                    star_action: buffa::MessageField::some(sav::StarAction::default()),
-                    ..Default::default()
-                },
-            ),
-            set(
-                &["contact", CHAT],
-                wa::SyncActionValue {
-                    contact_action: buffa::MessageField::some(sav::ContactAction::default()),
-                    ..Default::default()
-                },
-            ),
+            set(&["mute", CHAT], {
+                let mut proto = wa::SyncActionValue::default();
+                proto.mute_action = buffa::MessageField::some(sav::MuteAction::default());
+                proto
+            }),
+            set(&["pin_v1", CHAT], {
+                let mut proto = wa::SyncActionValue::default();
+                proto.pin_action = buffa::MessageField::some(sav::PinAction::default());
+                proto
+            }),
+            set(&["pin", CHAT], {
+                let mut proto = wa::SyncActionValue::default();
+                proto.pin_action = buffa::MessageField::some(sav::PinAction::default());
+                proto
+            }),
+            set(&["archive", CHAT], {
+                let mut proto = wa::SyncActionValue::default();
+                proto.archive_chat_action =
+                    buffa::MessageField::some(sav::ArchiveChatAction::default());
+                proto
+            }),
+            set(&[&["star"][..], &message_key].concat(), {
+                let mut proto = wa::SyncActionValue::default();
+                proto.star_action = buffa::MessageField::some(sav::StarAction::default());
+                proto
+            }),
+            set(&["contact", CHAT], {
+                let mut proto = wa::SyncActionValue::default();
+                proto.contact_action = buffa::MessageField::some(sav::ContactAction::default());
+                proto
+            }),
             Mutation {
                 operation: wa::syncd_mutation::SyncdOperation::REMOVE,
                 ..set(&["contact", CHAT], wa::SyncActionValue::default())
             },
-            set(
-                &["markChatAsRead", CHAT],
-                wa::SyncActionValue {
-                    mark_chat_as_read_action: buffa::MessageField::some(
-                        sav::MarkChatAsReadAction::default(),
-                    ),
-                    ..Default::default()
-                },
-            ),
-            set(
-                &["mark_chat_as_read", CHAT],
-                wa::SyncActionValue {
-                    mark_chat_as_read_action: buffa::MessageField::some(
-                        sav::MarkChatAsReadAction::default(),
-                    ),
-                    ..Default::default()
-                },
-            ),
-            set(
-                &["deleteChat", CHAT, "1"],
-                wa::SyncActionValue {
-                    delete_chat_action: buffa::MessageField::some(sav::DeleteChatAction {
-                        message_range: range(),
-                    }),
-                    ..Default::default()
-                },
-            ),
-            set(
-                &["clearChat", CHAT, "0", "1"],
-                wa::SyncActionValue {
-                    clear_chat_action: buffa::MessageField::some(sav::ClearChatAction {
-                        message_range: range(),
-                    }),
-                    ..Default::default()
-                },
-            ),
-            set(
-                &["lock", CHAT],
-                wa::SyncActionValue {
-                    lock_chat_action: buffa::MessageField::some(sav::LockChatAction::default()),
-                    ..Default::default()
-                },
-            ),
-            set(
-                &["userStatusMute", CHAT],
-                wa::SyncActionValue {
-                    user_status_mute_action: buffa::MessageField::some(
-                        sav::UserStatusMuteAction::default(),
-                    ),
-                    ..Default::default()
-                },
-            ),
-            set(
-                &[&["deleteMessageForMe"][..], &message_key].concat(),
-                wa::SyncActionValue {
-                    delete_message_for_me_action: buffa::MessageField::some(
-                        sav::DeleteMessageForMeAction::default(),
-                    ),
-                    ..Default::default()
-                },
-            ),
+            set(&["markChatAsRead", CHAT], {
+                let mut proto = wa::SyncActionValue::default();
+                proto.mark_chat_as_read_action =
+                    buffa::MessageField::some(sav::MarkChatAsReadAction::default());
+                proto
+            }),
+            set(&["mark_chat_as_read", CHAT], {
+                let mut proto = wa::SyncActionValue::default();
+                proto.mark_chat_as_read_action =
+                    buffa::MessageField::some(sav::MarkChatAsReadAction::default());
+                proto
+            }),
+            set(&["deleteChat", CHAT, "1"], {
+                let mut proto = wa::SyncActionValue::default();
+                proto.delete_chat_action = buffa::MessageField::some({
+                    let mut proto = sav::DeleteChatAction::default();
+                    proto.message_range = range();
+                    proto
+                });
+                proto
+            }),
+            set(&["clearChat", CHAT, "0", "1"], {
+                let mut proto = wa::SyncActionValue::default();
+                proto.clear_chat_action = buffa::MessageField::some({
+                    let mut proto = sav::ClearChatAction::default();
+                    proto.message_range = range();
+                    proto
+                });
+                proto
+            }),
+            set(&["lock", CHAT], {
+                let mut proto = wa::SyncActionValue::default();
+                proto.lock_chat_action = buffa::MessageField::some(sav::LockChatAction::default());
+                proto
+            }),
+            set(&["userStatusMute", CHAT], {
+                let mut proto = wa::SyncActionValue::default();
+                proto.user_status_mute_action =
+                    buffa::MessageField::some(sav::UserStatusMuteAction::default());
+                proto
+            }),
+            set(&[&["deleteMessageForMe"][..], &message_key].concat(), {
+                let mut proto = wa::SyncActionValue::default();
+                proto.delete_message_for_me_action =
+                    buffa::MessageField::some(sav::DeleteMessageForMeAction::default());
+                proto
+            }),
         ]
     }
 
@@ -1853,9 +1857,10 @@ mod registry_tests {
         let m = Mutation {
             index: vec!["archive".to_string(), "120363000000000042@g.us".to_string()],
             operation: wa::syncd_mutation::SyncdOperation::SET,
-            action_value: Some(wa::SyncActionValue {
-                timestamp: Some(1_700_000_000_000),
-                ..Default::default()
+            action_value: Some({
+                let mut proto = wa::SyncActionValue::default();
+                proto.timestamp = Some(1_700_000_000_000);
+                proto
             }),
         };
         let (outcome, events) = dispatch_outcome_into_recorder(&m);
@@ -1876,9 +1881,10 @@ mod registry_tests {
                 "120363000000000042@g.us".to_string(),
             ],
             operation: wa::syncd_mutation::SyncdOperation::SET,
-            action_value: Some(wa::SyncActionValue {
-                timestamp: Some(1_700_000_000_000),
-                ..Default::default()
+            action_value: Some({
+                let mut proto = wa::SyncActionValue::default();
+                proto.timestamp = Some(1_700_000_000_000);
+                proto
             }),
         };
         let (outcome, events) = dispatch_outcome_into_recorder(&m);

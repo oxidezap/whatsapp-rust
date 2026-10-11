@@ -55,3 +55,6 @@ pub mod community;
 
 #[cfg(feature = "sdk")]
 pub mod status;
+
+#[cfg(feature = "sdk")]
+pub mod protobuf_contract;

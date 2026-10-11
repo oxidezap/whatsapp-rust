@@ -283,15 +283,17 @@ impl<'a> MessageRef<'a> {
             || self.chat.is_status_broadcast()
             || self.chat.is_broadcast_list()
             || self.source.is_some_and(|s| s.is_group);
-        wa::MessageKey {
-            remote_jid: Some(self.chat.to_string()),
-            id: Some(self.id.to_string()),
-            from_me: Some(self.from_me),
-            participant: if needs_sender {
+        {
+            let mut proto = wa::MessageKey::default();
+            proto.remote_jid = Some(self.chat.to_string());
+            proto.id = Some(self.id.to_string());
+            proto.from_me = Some(self.from_me);
+            proto.participant = if needs_sender {
                 self.sender.map(ToString::to_string)
             } else {
                 None
-            },
+            };
+            proto
         }
     }
 

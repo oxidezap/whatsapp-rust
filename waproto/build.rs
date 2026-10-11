@@ -18,6 +18,13 @@
 //! Fields this crate persists but upstream does not declare go in
 //! [`LOCAL_FIELDS`], never in the `.proto`.
 
+#[path = "build_support/emission.rs"]
+mod emission;
+#[path = "build_support/names.rs"]
+mod names;
+#[path = "build_support/signal_storage.rs"]
+mod signal_storage;
+
 use buffa::Message as _;
 use buffa_descriptor::generated::descriptor::{
     DescriptorProto, FieldDescriptorProto, FileDescriptorSet, field_descriptor_proto,
@@ -76,6 +83,10 @@ fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build/pin_clone.rs");
 
+    println!("cargo:rerun-if-changed=build_support");
+    println!("cargo:rerun-if-changed=api.snapshot");
+    println!("cargo:rerun-if-changed=signal-storage.snapshot");
+
     ensure_proto_descriptor_hash()?;
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR must be set by cargo");
@@ -85,7 +96,15 @@ fn main() -> std::io::Result<()> {
     #[allow(clippy::disallowed_methods)]
     let mut fds = FileDescriptorSet::decode_from_slice(&std::fs::read("src/whatsapp.desc")?)
         .map_err(std::io::Error::other)?;
+    names::apply(
+        &mut fds,
+        names::TYPES,
+        names::FIELDS,
+        names::ENUM_VALUES,
+        names::ONEOFS,
+    )?;
     apply_local_fields(&mut fds)?;
+    signal_storage::check(&names::wire_api(&fds))?;
 
     // Emit the wire-tag consts (field numbers) for hand-written partial decoders.
     generate_tags(&fds, &out_path.join("tags.rs"))?;
@@ -238,6 +257,7 @@ fn main() -> std::io::Result<()> {
         // eliminating allocation/drop overhead in nested types like
         // SessionStructure (chains × message keys).
         .preserve_unknown_fields(false)
+        .generate_with_setters(true)
         // Generate view types for zero-copy decoding.
         .generate_views(true)
         .out_dir(&out_path)
@@ -248,6 +268,12 @@ fn main() -> std::io::Result<()> {
     let source = std::fs::read_to_string(&generated)?;
     let source = pin_clone::generate(&source).map_err(std::io::Error::other)?;
     std::fs::write(generated, source)?;
+
+    let mut api = emission::finish(&out_path, "whatsapp", &fds)?;
+    api.extend(names::wire_api(&fds));
+    let snapshot = api.iter().cloned().collect::<Vec<_>>().join("\n") + "\n";
+    std::fs::write(out_path.join("api.snapshot"), snapshot)?;
+    emission::check_api(include_str!("api.snapshot"), &api)?;
 
     Ok(())
 }

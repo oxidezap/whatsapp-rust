@@ -5361,6 +5361,7 @@ dependencies = [
  "bytes",
  "heck",
  "prettyplease 0.3.0",
+ "quote",
  "serde",
  "serde_json",
  "serde_repr",

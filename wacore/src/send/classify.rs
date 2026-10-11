@@ -533,22 +533,26 @@ mod history_wrapper_tests {
         inner: wa::Message,
         wrap: fn(wa::message::FutureProofMessage) -> wa::Message,
     ) -> wa::Message {
-        wrap(wa::message::FutureProofMessage {
-            message: buffa::MessageField::some(inner),
+        wrap({
+            let mut proto = wa::message::FutureProofMessage::default();
+            proto.message = buffa::MessageField::some(inner);
+            proto
         })
     }
 
     fn history_bundle() -> wa::Message {
-        wa::Message {
-            message_history_bundle: buffa::MessageField::some(Default::default()),
-            ..Default::default()
+        {
+            let mut proto = wa::Message::default();
+            proto.message_history_bundle = buffa::MessageField::some(Default::default());
+            proto
         }
     }
 
     fn history_notice() -> wa::Message {
-        wa::Message {
-            message_history_notice: buffa::MessageField::some(Default::default()),
-            ..Default::default()
+        {
+            let mut proto = wa::Message::default();
+            proto.message_history_notice = buffa::MessageField::some(Default::default());
+            proto
         }
     }
 
@@ -565,186 +569,218 @@ mod history_wrapper_tests {
     fn every_wrapper_routes_history_detection() {
         let wrappers: &[WrapperCase] = &[
             ("ephemeral_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    ephemeral_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.ephemeral_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("view_once_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    view_once_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.view_once_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("view_once_message_v2", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    view_once_message_v2: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.view_once_message_v2 = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("view_once_message_v2_extension", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    view_once_message_v2_extension: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.view_once_message_v2_extension = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("document_with_caption_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    document_with_caption_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.document_with_caption_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("group_mentioned_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    group_mentioned_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.group_mentioned_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("bot_invoke_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    bot_invoke_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.bot_invoke_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("associated_child_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    associated_child_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.associated_child_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("poll_creation_option_image_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    poll_creation_option_image_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.poll_creation_option_image_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("event_cover_image", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    event_cover_image: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.event_cover_image = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("group_status_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    group_status_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.group_status_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("group_status_message_v2", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    group_status_message_v2: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.group_status_message_v2 = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("group_status_mention_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    group_status_mention_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.group_status_mention_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("status_add_yours", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    status_add_yours: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.status_add_yours = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("status_mention_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    status_mention_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.status_mention_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("question_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    question_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.question_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("question_reply_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    question_reply_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.question_reply_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("spoiler_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    spoiler_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.spoiler_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("lottie_sticker_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    lottie_sticker_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.lottie_sticker_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("limit_sharing_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    limit_sharing_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.limit_sharing_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("newsletter_admin_profile_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    newsletter_admin_profile_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.newsletter_admin_profile_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("newsletter_admin_profile_message_v2", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    newsletter_admin_profile_message_v2: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.newsletter_admin_profile_message_v2 = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("poll_creation_message_v4", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    poll_creation_message_v4: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.poll_creation_message_v4 = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("bot_forwarded_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    bot_forwarded_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.bot_forwarded_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("edited_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    edited_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.edited_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("bot_task_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    bot_task_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.bot_task_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("newsletter_admin_profile_status_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    newsletter_admin_profile_status_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.newsletter_admin_profile_status_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
             ("bot_platform_registration_success_message", |m| {
-                fp_wrapped(m, |w| wa::Message {
-                    bot_platform_registration_success_message: buffa::MessageField::some(w),
-                    ..Default::default()
+                fp_wrapped(m, |w| {
+                    let mut proto = wa::Message::default();
+                    proto.bot_platform_registration_success_message = buffa::MessageField::some(w);
+                    proto
                 })
             }),
-            ("device_sent_message", |m| wa::Message {
-                device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
-                    message: buffa::MessageField::some(m),
-                    ..Default::default()
-                }),
-                ..Default::default()
+            ("device_sent_message", |m| {
+                let mut proto = wa::Message::default();
+                proto.device_sent_message = buffa::MessageField::some({
+                    let mut proto = wa::message::DeviceSentMessage::default();
+                    proto.message = buffa::MessageField::some(m);
+                    proto
+                });
+                proto
             }),
-            ("comment_message", |m| wa::Message {
-                comment_message: buffa::MessageField::some(wa::message::CommentMessage {
-                    message: buffa::MessageField::some(m),
-                    ..Default::default()
-                }),
-                ..Default::default()
+            ("comment_message", |m| {
+                let mut proto = wa::Message::default();
+                proto.comment_message = buffa::MessageField::some({
+                    let mut proto = wa::message::CommentMessage::default();
+                    proto.message = buffa::MessageField::some(m);
+                    proto
+                });
+                proto
             }),
         ];
         assert_eq!(wrappers.len(), 30, "one row per traversed wrapper");
@@ -760,9 +796,10 @@ mod history_wrapper_tests {
                 );
             }
         }
-        assert!(!contains_group_history_payload(&wa::Message {
-            conversation: Some("plain".into()),
-            ..Default::default()
+        assert!(!contains_group_history_payload(&{
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("plain".into());
+            proto
         }));
     }
 }

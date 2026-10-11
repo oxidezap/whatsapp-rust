@@ -717,24 +717,30 @@ fn build_secret_message_edit(
         &ctx,
     )?;
 
-    Ok(wa::Message {
-        secret_encrypted_message: buffa::MessageField::some(wa::message::SecretEncryptedMessage {
-            target_message_key: buffa::MessageField::some(wa::MessageKey {
-                remote_jid: Some(to.to_string()),
-                from_me: Some(true),
-                id: Some(original_id.to_string()),
-                participant,
-            }),
-            enc_payload: Some(enc_payload),
-            enc_iv: Some(iv.to_vec()),
-            secret_enc_type: Some(secret_enc_type),
-            remote_key_id: None,
-        }),
-        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
-            message_secret: Some(message_secret.to_vec()),
-            ..Default::default()
-        }),
-        ..Default::default()
+    Ok({
+        let mut proto = wa::Message::default();
+        proto.secret_encrypted_message = buffa::MessageField::some({
+            let mut proto = wa::message::SecretEncryptedMessage::default();
+            proto.target_message_key = buffa::MessageField::some({
+                let mut proto = wa::MessageKey::default();
+                proto.remote_jid = Some(to.to_string());
+                proto.from_me = Some(true);
+                proto.id = Some(original_id.to_string());
+                proto.participant = participant;
+                proto
+            });
+            proto.enc_payload = Some(enc_payload);
+            proto.enc_iv = Some(iv.to_vec());
+            proto.secret_enc_type = Some(secret_enc_type);
+            proto.remote_key_id = None;
+            proto
+        });
+        proto.message_context_info = buffa::MessageField::some({
+            let mut proto = wa::MessageContextInfo::default();
+            proto.message_secret = Some(message_secret.to_vec());
+            proto
+        });
+        proto
     })
 }
 
@@ -855,9 +861,10 @@ mod secret_message_edit_tests {
         let secret = [0x33u8; 32];
         let to: Jid = "5511777777777@s.whatsapp.net".parse().unwrap();
         let self_str = "5511999999999@s.whatsapp.net";
-        let new_content = wa::Message {
-            conversation: Some("edited!".into()),
-            ..Default::default()
+        let new_content = {
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("edited!".into());
+            proto
         };
 
         let envelope = build_secret_message_edit(
@@ -911,19 +918,13 @@ mod secret_message_edit_tests {
         let secret = [0x33u8; 32];
         let to: Jid = "5511777777777@s.whatsapp.net".parse().unwrap();
         let self_str = "5511999999999@s.whatsapp.net";
-        let envelope = build_secret_message_edit(
-            &to,
-            "ORIGID",
-            None,
-            self_str,
-            self_str,
-            &secret,
-            wa::Message {
-                conversation: Some("edited!".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let envelope =
+            build_secret_message_edit(&to, "ORIGID", None, self_str, self_str, &secret, {
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("edited!".into());
+                proto
+            })
+            .unwrap();
         let sem = envelope.secret_encrypted_message.as_option().unwrap();
         let ctx = wacore::message_edit::MessageEditContext {
             original_msg_id: "ORIGID",

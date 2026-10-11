@@ -363,18 +363,20 @@ mod tests {
     fn decode_roundtrip() {
         use buffa::Message;
 
-        let key_index = waproto::whatsapp::ADVKeyIndexList {
-            raw_id: Some(42),
-            timestamp: Some(1000),
-            current_index: Some(5),
-            valid_indexes: vec![3, 5, 7],
-            ..Default::default()
+        let key_index = {
+            let mut proto_ = waproto::whatsapp::ADVKeyIndexList::default();
+            proto_.raw_id = Some(42);
+            proto_.timestamp = Some(1000);
+            proto_.current_index = Some(5);
+            proto_.valid_indexes = vec![3, 5, 7];
+            proto_
         };
         let details = key_index.encode_to_vec();
 
-        let signed = waproto::whatsapp::ADVSignedKeyIndexList {
-            details: Some(details),
-            ..Default::default()
+        let signed = {
+            let mut proto_ = waproto::whatsapp::ADVSignedKeyIndexList::default();
+            proto_.details = Some(details);
+            proto_
         };
         let bytes = signed.encode_to_vec();
 
@@ -484,11 +486,12 @@ mod tests {
         let addresses = device_cases();
         for account_type in types {
             for device_type in types {
-                let details = waproto::whatsapp::ADVDeviceIdentity {
-                    key_index: Some(0),
-                    account_type,
-                    device_type,
-                    ..Default::default()
+                let details = {
+                    let mut proto_ = waproto::whatsapp::ADVDeviceIdentity::default();
+                    proto_.key_index = Some(0);
+                    proto_.account_type = account_type;
+                    proto_.device_type = device_type;
+                    proto_
                 }
                 .encode_to_vec();
                 let account_prefix = test_util::account_prefix(device_type);
@@ -537,11 +540,12 @@ mod tests {
         let jid = Jid::pn_device(TEST_PN, 1);
         for account_len in [0, 63, 64, 65] {
             for device_len in [0, 63, 64, 65] {
-                let signed = waproto::whatsapp::ADVSignedDeviceIdentity {
-                    details: Some(vec![0x18, 0]),
-                    account_signature: Some(vec![0; account_len]),
-                    device_signature: Some(vec![0; device_len]),
-                    ..Default::default()
+                let signed = {
+                    let mut proto_ = waproto::whatsapp::ADVSignedDeviceIdentity::default();
+                    proto_.details = Some(vec![0x18, 0]);
+                    proto_.account_signature = Some(vec![0; account_len]);
+                    proto_.device_signature = Some(vec![0; device_len]);
+                    proto_
                 };
                 let expected = if account_len == 64 && device_len == 64 {
                     AdvValidation::NoAccountKey
@@ -694,11 +698,13 @@ mod tests {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account = KeyPair::generate(&mut rng);
         let device = KeyPair::generate(&mut rng);
-        let no_dev_sig = waproto::whatsapp::ADVSignedDeviceIdentity {
-            details: Some(b"\x18\x01".to_vec()),
-            account_signature_key: Some(account.public_key.public_key_bytes().to_vec()),
-            account_signature: Some(vec![0u8; 64]),
-            device_signature: None,
+        let no_dev_sig = {
+            let mut proto_ = waproto::whatsapp::ADVSignedDeviceIdentity::default();
+            proto_.details = Some(b"\x18\x01".to_vec());
+            proto_.account_signature_key = Some(account.public_key.public_key_bytes().to_vec());
+            proto_.account_signature = Some(vec![0u8; 64]);
+            proto_.device_signature = None;
+            proto_
         }
         .encode_to_vec();
         assert_eq!(

@@ -12,12 +12,14 @@ use waproto::whatsapp as wa;
 
 #[test]
 fn regression_a1_revoked_reaction_returns_sender_revoke() {
-    let msg = wa::Message {
-        reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
-            text: Some(String::new()),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let msg = {
+        let mut proto = wa::Message::default();
+        proto.reaction_message = buffa::MessageField::some({
+            let mut proto = wa::message::ReactionMessage::default();
+            proto.text = Some(String::new());
+            proto
+        });
+        proto
     };
     assert_eq!(
         EditAttribute::infer_from_message(&msg),
@@ -27,16 +29,19 @@ fn regression_a1_revoked_reaction_returns_sender_revoke() {
 
 #[test]
 fn regression_a1_keep_in_chat_undo_returns_sender_revoke() {
-    let msg = wa::Message {
-        keep_in_chat_message: buffa::MessageField::some(wa::message::KeepInChatMessage {
-            key: buffa::MessageField::some(wa::MessageKey {
-                from_me: Some(true),
-                ..Default::default()
-            }),
-            keep_type: Some(wa::KeepType::UNDO_KEEP_FOR_ALL),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let msg = {
+        let mut proto = wa::Message::default();
+        proto.keep_in_chat_message = buffa::MessageField::some({
+            let mut proto = wa::message::KeepInChatMessage::default();
+            proto.key = buffa::MessageField::some({
+                let mut proto = wa::MessageKey::default();
+                proto.from_me = Some(true);
+                proto
+            });
+            proto.keep_type = Some(wa::KeepType::UNDO_KEEP_FOR_ALL);
+            proto
+        });
+        proto
     };
     assert_eq!(
         EditAttribute::infer_from_message(&msg),
@@ -46,14 +51,15 @@ fn regression_a1_keep_in_chat_undo_returns_sender_revoke() {
 
 #[test]
 fn regression_a1_secret_encrypted_message_edit_returns_message_edit() {
-    let msg = wa::Message {
-        secret_encrypted_message: buffa::MessageField::some(wa::message::SecretEncryptedMessage {
-            secret_enc_type: Some(
-                wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT,
-            ),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let msg = {
+        let mut proto = wa::Message::default();
+        proto.secret_encrypted_message = buffa::MessageField::some({
+            let mut proto = wa::message::SecretEncryptedMessage::default();
+            proto.secret_enc_type =
+                Some(wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT);
+            proto
+        });
+        proto
     };
     assert_eq!(
         EditAttribute::infer_from_message(&msg),
@@ -63,12 +69,15 @@ fn regression_a1_secret_encrypted_message_edit_returns_message_edit() {
 
 #[test]
 fn regression_a1_secret_encrypted_event_edit_returns_message_edit() {
-    let msg = wa::Message {
-        secret_encrypted_message: buffa::MessageField::some(wa::message::SecretEncryptedMessage {
-            secret_enc_type: Some(wa::message::secret_encrypted_message::SecretEncType::EVENT_EDIT),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let msg = {
+        let mut proto = wa::Message::default();
+        proto.secret_encrypted_message = buffa::MessageField::some({
+            let mut proto = wa::message::SecretEncryptedMessage::default();
+            proto.secret_enc_type =
+                Some(wa::message::secret_encrypted_message::SecretEncType::EVENT_EDIT);
+            proto
+        });
+        proto
     };
     assert_eq!(
         EditAttribute::infer_from_message(&msg),

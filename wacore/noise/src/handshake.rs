@@ -137,12 +137,14 @@ enum ChainAcceptance {
 impl HandshakeUtils {
     /// Creates a ClientHello message with the given ephemeral key only (XX).
     pub fn build_client_hello(ephemeral_key: &[u8]) -> HandshakeMessage {
-        HandshakeMessage {
-            client_hello: buffa::MessageField::some(wa::handshake_message::ClientHello {
-                ephemeral: Some(ephemeral_key.to_vec()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        {
+            let mut proto = HandshakeMessage::default();
+            proto.client_hello = buffa::MessageField::some({
+                let mut proto = wa::handshake_message::ClientHello::default();
+                proto.ephemeral = Some(ephemeral_key.to_vec());
+                proto
+            });
+            proto
         }
     }
 
@@ -153,14 +155,16 @@ impl HandshakeUtils {
         encrypted_static: Vec<u8>,
         encrypted_payload: Vec<u8>,
     ) -> HandshakeMessage {
-        HandshakeMessage {
-            client_hello: buffa::MessageField::some(wa::handshake_message::ClientHello {
-                ephemeral: Some(ephemeral_key.to_vec()),
-                r#static: Some(encrypted_static),
-                payload: Some(encrypted_payload),
-                ..Default::default()
-            }),
-            ..Default::default()
+        {
+            let mut proto = HandshakeMessage::default();
+            proto.client_hello = buffa::MessageField::some({
+                let mut proto = wa::handshake_message::ClientHello::default();
+                proto.ephemeral = Some(ephemeral_key.to_vec());
+                proto.r#static = Some(encrypted_static);
+                proto.payload = Some(encrypted_payload);
+                proto
+            });
+            proto
         }
     }
 
@@ -330,13 +334,15 @@ impl HandshakeUtils {
         encrypted_pubkey: Vec<u8>,
         encrypted_payload: Vec<u8>,
     ) -> HandshakeMessage {
-        HandshakeMessage {
-            client_finish: buffa::MessageField::some(wa::handshake_message::ClientFinish {
-                r#static: Some(encrypted_pubkey),
-                payload: Some(encrypted_payload),
-                ..Default::default()
-            }),
-            ..Default::default()
+        {
+            let mut proto = HandshakeMessage::default();
+            proto.client_finish = buffa::MessageField::some({
+                let mut proto = wa::handshake_message::ClientFinish::default();
+                proto.r#static = Some(encrypted_pubkey);
+                proto.payload = Some(encrypted_payload);
+                proto
+            });
+            proto
         }
     }
 }
@@ -905,14 +911,16 @@ mod tests {
             .encrypt(&responder.cert_chain_bytes)
             .expect("enc cert");
 
-        let server_hello = HandshakeMessage {
-            server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
-                ephemeral: Some(server_eph_pub.to_vec()),
-                r#static: Some(encrypted_static),
-                payload: Some(encrypted_payload),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let server_hello = {
+            let mut proto = HandshakeMessage::default();
+            proto.server_hello = buffa::MessageField::some({
+                let mut proto = wa::handshake_message::ServerHello::default();
+                proto.ephemeral = Some(server_eph_pub.to_vec());
+                proto.r#static = Some(encrypted_static);
+                proto.payload = Some(encrypted_payload);
+                proto
+            });
+            proto
         };
         let bytes = server_hello.encode_to_vec();
         (bytes, noise, server_eph, client_eph_pub)
@@ -996,14 +1004,16 @@ mod tests {
             .unwrap();
         let encrypted_cert = noise.encrypt(&responder.cert_chain_bytes).unwrap();
 
-        let server_hello = HandshakeMessage {
-            server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
-                ephemeral: Some(server_eph_pub.to_vec()),
-                r#static: None,
-                payload: Some(encrypted_cert),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let server_hello = {
+            let mut proto = HandshakeMessage::default();
+            proto.server_hello = buffa::MessageField::some({
+                let mut proto = wa::handshake_message::ServerHello::default();
+                proto.ephemeral = Some(server_eph_pub.to_vec());
+                proto.r#static = None;
+                proto.payload = Some(encrypted_cert);
+                proto
+            });
+            proto
         };
         server_hello.encode_to_vec()
     }
@@ -1048,14 +1058,16 @@ mod tests {
 
         let encrypted_cert = noise.encrypt(&responder.cert_chain_bytes).unwrap();
 
-        let server_hello = HandshakeMessage {
-            server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
-                ephemeral: Some(server_eph_pub.to_vec()),
-                r#static: Some(encrypted_static),
-                payload: Some(encrypted_cert),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let server_hello = {
+            let mut proto = HandshakeMessage::default();
+            proto.server_hello = buffa::MessageField::some({
+                let mut proto = wa::handshake_message::ServerHello::default();
+                proto.ephemeral = Some(server_eph_pub.to_vec());
+                proto.r#static = Some(encrypted_static);
+                proto.payload = Some(encrypted_cert);
+                proto
+            });
+            proto
         };
         let bytes = server_hello.encode_to_vec();
         (bytes, noise, server_eph)

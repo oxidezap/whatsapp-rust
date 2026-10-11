@@ -602,9 +602,10 @@ mod tests {
         let device = client.persistence_manager.get_device_snapshot();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account = KeyPair::generate(&mut rng);
-        let details = wa::ADVDeviceIdentity {
-            key_index: Some(1),
-            ..Default::default()
+        let details = {
+            let mut proto_value = wa::ADVDeviceIdentity::default();
+            proto_value.key_index = Some(1);
+            proto_value
         }
         .encode_to_vec();
         let signature = account
@@ -619,19 +620,21 @@ mod tests {
                 &mut rng,
             )
             .unwrap();
-        let identity =
-            waproto::codec::adv_signed_device_identity_to_vec(&wa::ADVSignedDeviceIdentity {
-                details: Some(details),
-                account_signature_key: Some(account.public_key.public_key_bytes().to_vec()),
-                account_signature: Some(signature.to_vec()),
-                ..Default::default()
-            });
+        let identity = waproto::codec::adv_signed_device_identity_to_vec(&{
+            let mut proto_value = wa::ADVSignedDeviceIdentity::default();
+            proto_value.details = Some(details);
+            proto_value.account_signature_key =
+                Some(account.public_key.public_key_bytes().to_vec());
+            proto_value.account_signature = Some(signature.to_vec());
+            proto_value
+        });
         let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&device.adv_secret_key).unwrap();
         mac.update(&identity);
-        let payload = wa::ADVSignedDeviceIdentityHMAC {
-            details: Some(identity),
-            hmac: Some(mac.finalize().into_bytes().to_vec()),
-            ..Default::default()
+        let payload = {
+            let mut proto_value = wa::ADVSignedDeviceIdentityHMAC::default();
+            proto_value.details = Some(identity);
+            proto_value.hmac = Some(mac.finalize().into_bytes().to_vec());
+            proto_value
         }
         .encode_to_vec();
         NodeBuilder::new("iq")

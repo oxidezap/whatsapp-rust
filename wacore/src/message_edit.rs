@@ -183,23 +183,28 @@ mod tests {
     use waproto::whatsapp as wa;
 
     fn make_inner_edit(new_text: &str) -> wa::Message {
-        wa::Message {
-            protocol_message: MessageField::some(wa::message::ProtocolMessage {
-                key: MessageField::some(wa::MessageKey {
-                    remote_jid: Some("g@g.us".to_string()),
-                    from_me: Some(true),
-                    id: Some("AC1234567890ABCDEF".to_string()),
-                    participant: None,
-                }),
-                r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
-                edited_message: MessageField::some(wa::Message {
-                    conversation: Some(new_text.to_string()),
-                    ..Default::default()
-                }),
-                timestamp_ms: Some(1_700_000_000_000),
-                ..Default::default()
-            }),
-            ..Default::default()
+        {
+            let mut proto_ = wa::Message::default();
+            proto_.protocol_message = MessageField::some({
+                let mut proto_ = wa::message::ProtocolMessage::default();
+                proto_.key = MessageField::some({
+                    let mut proto = wa::MessageKey::default();
+                    proto.remote_jid = Some("g@g.us".to_string());
+                    proto.from_me = Some(true);
+                    proto.id = Some("AC1234567890ABCDEF".to_string());
+                    proto.participant = None;
+                    proto
+                });
+                proto_.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
+                proto_.edited_message = MessageField::some({
+                    let mut proto = wa::Message::default();
+                    proto.conversation = Some(new_text.to_string());
+                    proto
+                });
+                proto_.timestamp_ms = Some(1_700_000_000_000);
+                proto_
+            });
+            proto_
         }
     }
 
@@ -298,9 +303,10 @@ mod tests {
             original_sender_jid: "creator@s.whatsapp.net",
             editor_jid: "editor@s.whatsapp.net",
         };
-        let inner = wa::Message {
-            conversation: Some("poll edited".to_string()),
-            ..Default::default()
+        let inner = {
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("poll edited".to_string());
+            proto
         };
         let (enc, iv) = encrypt_addon(
             &inner.encode_to_vec(),

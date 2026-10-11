@@ -314,25 +314,19 @@ pub(crate) fn can_current_user_share_history(
     is_admin || is_super_admin || mode == Some(MemberShareHistoryMode::AllMemberShare)
 }
 
-fn is_shareable_history_text(content: &waproto::whatsapp::Message) -> bool {
-    use waproto::whatsapp::{Message, MessageContextInfo};
-
-    macro_rules! remaining_fields_are_empty {
-        ($value:expr, $ty:ident, [$($allowed:ident),*], [$($field:ident => $empty:ident),* $(,)?]) => {{
-            let $ty { $($allowed: _,)* $($field,)* } = $value;
+// Keep runtime checks borrowed; waproto's generated_api test checks these lists
+// against the current generated fields hidden by `..`.
+macro_rules! history_field_whitelist {
+    ($predicate:ident, $ty:ident, [$($allowed:ident),*], [$($field:ident => $empty:ident),* $(,)?]) => {
+        fn $predicate(value: &waproto::whatsapp::$ty) -> bool {
+            let waproto::whatsapp::$ty { $($allowed: _,)* $($field,)* .. } = value;
             $($field.$empty())&&*
-        }};
-    }
+        }
+    };
+}
 
-    content
-        .conversation
-        .as_deref()
-        .is_some_and(|text| !text.is_empty())
-        && remaining_fields_are_empty!(
-            content,
-            Message,
-            [conversation, message_context_info],
-            [
+history_field_whitelist!(
+    history_message_fields_are_empty, Message, [conversation, message_context_info], [
                 sender_key_distribution_message => is_unset,
                 image_message => is_unset,
                 contact_message => is_unset,
@@ -446,16 +440,10 @@ fn is_shareable_history_text(content: &waproto::whatsapp::Message) -> bool {
                 acp2_setting_message => is_unset,
                 audio_sticker_message => is_unset,
             ]
-        )
-        && content
-            .message_context_info
-            .as_option()
-            .is_none_or(|context| {
-                remaining_fields_are_empty!(
-                    context,
-                    MessageContextInfo,
-                    [message_secret, reporting_token_version],
-                    [
+);
+
+history_field_whitelist!(
+    history_context_fields_are_empty, MessageContextInfo, [message_secret, reporting_token_version], [
                         device_list_metadata => is_unset,
                         device_list_metadata_version => is_none,
                         padding_bytes => is_none,
@@ -476,8 +464,18 @@ fn is_shareable_history_text(content: &waproto::whatsapp::Message) -> bool {
                         tee_context_anchor_message_id => is_none,
                         acp2_setting => is_unset,
                     ]
-                )
-            })
+);
+
+fn is_shareable_history_text(content: &waproto::whatsapp::Message) -> bool {
+    content
+        .conversation
+        .as_deref()
+        .is_some_and(|text| !text.is_empty())
+        && history_message_fields_are_empty(content)
+        && content
+            .message_context_info
+            .as_option()
+            .is_none_or(history_context_fields_are_empty)
 }
 
 pub(crate) struct SelectedGroupHistory {
@@ -581,24 +579,27 @@ pub(crate) fn select_group_history_messages(
                 .as_option()
                 .and_then(|context| {
                     context.message_secret.clone().map(|message_secret| {
-                        buffa::MessageField::some(waproto::whatsapp::MessageContextInfo {
-                            message_secret: Some(message_secret),
-                            ..Default::default()
+                        buffa::MessageField::some({
+                            let mut proto_ = waproto::whatsapp::MessageContextInfo::default();
+                            proto_.message_secret = Some(message_secret);
+                            proto_
                         })
                     })
                 })
                 .unwrap_or_default();
-            Some(waproto::whatsapp::WebMessageInfo {
-                key: source.key.clone(),
-                message: buffa::MessageField::some(waproto::whatsapp::Message {
-                    conversation: content.conversation.clone(),
-                    message_context_info: context,
-                    ..Default::default()
-                }),
-                message_timestamp: Some(timestamp),
-                status: source.status,
-                participant: source.participant.clone(),
-                ..Default::default()
+            Some({
+                let mut proto_ = waproto::whatsapp::WebMessageInfo::default();
+                proto_.key = source.key.clone();
+                proto_.message = buffa::MessageField::some({
+                    let mut proto_ = waproto::whatsapp::Message::default();
+                    proto_.conversation = content.conversation.clone();
+                    proto_.message_context_info = context;
+                    proto_
+                });
+                proto_.message_timestamp = Some(timestamp);
+                proto_.status = source.status;
+                proto_.participant = source.participant.clone();
+                proto_
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -717,16 +718,18 @@ fn group_int(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use wacore::store::ab_props::AbPropsCache;
     use wacore_binary::CompactString;
 
     #[test]
     fn group_history_retry_checks_current_count_and_window() {
-        let metadata = waproto::whatsapp::message::MessageHistoryMetadata {
-            message_count: Some(100),
-            oldest_message_timestamp_in_bundle: Some(800),
-            ..Default::default()
+        let metadata = {
+            let mut proto_ = waproto::whatsapp::message::MessageHistoryMetadata::default();
+            proto_.message_count = Some(100);
+            proto_.oldest_message_timestamp_in_bundle = Some(800);
+            proto_
         };
         let limits = GroupHistoryLimits {
             max_messages: 100,
@@ -787,12 +790,14 @@ mod tests {
 
         let group = wacore_binary::Jid::new("120363000000000001", wacore_binary::Server::Group);
         let receiver = wacore_binary::Jid::pn("111111111111");
-        let bundle_message = Arc::new(wa::Message {
-            message_history_bundle: buffa::MessageField::some(wa::message::MessageHistoryBundle {
-                media_key: Some(b"SYNTHETIC-MEDIA-KEY".to_vec()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let bundle_message = Arc::new({
+            let mut proto = wa::Message::default();
+            proto.message_history_bundle = buffa::MessageField::some({
+                let mut proto = wa::message::MessageHistoryBundle::default();
+                proto.media_key = Some(b"SYNTHETIC-MEDIA-KEY".to_vec());
+                proto
+            });
+            proto
         });
         let token = GroupHistoryRetryToken::bundle(
             &group,
@@ -816,20 +821,19 @@ mod tests {
             &group,
             std::slice::from_ref(&receiver),
             b"synthetic-compressed-history".to_vec(),
-            Arc::new(wa::Message {
-                message_history_notice: buffa::MessageField::some(
-                    wa::message::MessageHistoryNotice {
-                        message_history_metadata: buffa::MessageField::some(
-                            wa::message::MessageHistoryMetadata {
-                                message_count: Some(1),
-                                oldest_message_timestamp_in_bundle: Some(900),
-                                ..Default::default()
-                            },
-                        ),
-                        ..Default::default()
-                    },
-                ),
-                ..Default::default()
+            Arc::new({
+                let mut proto = wa::Message::default();
+                proto.message_history_notice = buffa::MessageField::some({
+                    let mut proto = wa::message::MessageHistoryNotice::default();
+                    proto.message_history_metadata = buffa::MessageField::some({
+                        let mut proto = wa::message::MessageHistoryMetadata::default();
+                        proto.message_count = Some(1);
+                        proto.oldest_message_timestamp_in_bundle = Some(900);
+                        proto
+                    });
+                    proto
+                });
+                proto
             }),
             "SYNTHETIC-BUNDLE-ID".into(),
             "SYNTHETIC-NOTICE-ID".into(),
@@ -862,18 +866,19 @@ mod tests {
     fn retransmitted_bundle_must_fit_current_count_and_time_window() {
         use waproto::whatsapp as wa;
 
-        let make_bundle = |count: Option<i64>, oldest: Option<i64>| wa::Message {
-            message_history_bundle: buffa::MessageField::some(wa::message::MessageHistoryBundle {
-                message_history_metadata: buffa::MessageField::some(
-                    wa::message::MessageHistoryMetadata {
-                        message_count: count,
-                        oldest_message_timestamp_in_bundle: oldest,
-                        ..Default::default()
-                    },
-                ),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let make_bundle = |count: Option<i64>, oldest: Option<i64>| {
+            let mut proto = wa::Message::default();
+            proto.message_history_bundle = buffa::MessageField::some({
+                let mut proto = wa::message::MessageHistoryBundle::default();
+                proto.message_history_metadata = buffa::MessageField::some({
+                    let mut proto = wa::message::MessageHistoryMetadata::default();
+                    proto.message_count = count;
+                    proto.oldest_message_timestamp_in_bundle = oldest;
+                    proto
+                });
+                proto
+            });
+            proto
         };
         let limits = GroupHistoryLimits {
             max_messages: 2,
@@ -926,29 +931,33 @@ mod tests {
         let group = wacore_binary::Jid::new("120363000000000001", wacore_binary::Server::Group);
         let other_group =
             wacore_binary::Jid::new("120363000000000002", wacore_binary::Server::Group);
-        let make_message = |id: &str, remote: &wacore_binary::Jid, timestamp| wa::WebMessageInfo {
-            key: buffa::MessageField::some(wa::MessageKey {
-                remote_jid: Some(remote.to_string()),
-                id: Some(id.into()),
-                ..Default::default()
-            }),
-            message: buffa::MessageField::some(wa::Message {
-                conversation: Some("synthetic test message".into()),
-                ..Default::default()
-            }),
-            message_timestamp: Some(timestamp),
-            status: Some(wa::web_message_info::Status::SERVER_ACK),
-            ..Default::default()
+        let make_message = |id: &str, remote: &wacore_binary::Jid, timestamp| {
+            let mut proto = wa::WebMessageInfo::default();
+            proto.key = buffa::MessageField::some({
+                let mut proto = wa::MessageKey::default();
+                proto.remote_jid = Some(remote.to_string());
+                proto.id = Some(id.into());
+                proto
+            });
+            proto.message = buffa::MessageField::some({
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("synthetic test message".into());
+                proto
+            });
+            proto.message_timestamp = Some(timestamp);
+            proto.status = Some(wa::web_message_info::Status::SERVER_ACK);
+            proto
         };
         let mut private = make_message("latest", &group, 950);
         private
             .message
             .as_option_mut()
             .unwrap()
-            .message_context_info = buffa::MessageField::some(wa::MessageContextInfo {
-            message_secret: Some(b"synthetic-secret".to_vec()),
-            reporting_token_version: Some(1),
-            ..Default::default()
+            .message_context_info = buffa::MessageField::some({
+            let mut proto = wa::MessageContextInfo::default();
+            proto.message_secret = Some(b"synthetic-secret".to_vec());
+            proto.reporting_token_version = Some(1);
+            proto
         });
         private.starred = Some(true);
         private.labels = vec!["private-label".into()];
@@ -1020,19 +1029,22 @@ mod tests {
         use waproto::whatsapp as wa;
 
         let group = wacore_binary::Jid::new("120363000000000001", wacore_binary::Server::Group);
-        let make_message = |id: &str, timestamp| wa::WebMessageInfo {
-            key: buffa::MessageField::some(wa::MessageKey {
-                remote_jid: Some(group.to_string()),
-                id: Some(id.into()),
-                ..Default::default()
-            }),
-            message: buffa::MessageField::some(wa::Message {
-                conversation: Some("synthetic text".into()),
-                ..Default::default()
-            }),
-            message_timestamp: Some(timestamp),
-            status: Some(wa::web_message_info::Status::SERVER_ACK),
-            ..Default::default()
+        let make_message = |id: &str, timestamp| {
+            let mut proto = wa::WebMessageInfo::default();
+            proto.key = buffa::MessageField::some({
+                let mut proto = wa::MessageKey::default();
+                proto.remote_jid = Some(group.to_string());
+                proto.id = Some(id.into());
+                proto
+            });
+            proto.message = buffa::MessageField::some({
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("synthetic text".into());
+                proto
+            });
+            proto.message_timestamp = Some(timestamp);
+            proto.status = Some(wa::web_message_info::Status::SERVER_ACK);
+            proto
         };
         // More unique eligible IDs than the limit: only the newest two
         // survive, and a duplicate of an evicted ID is admitted as new
@@ -1072,42 +1084,46 @@ mod tests {
     fn history_text_admission_checks_borrowed_payload_and_context() {
         use waproto::whatsapp as wa;
 
-        let mut content = wa::Message {
-            conversation: Some("synthetic text".into()),
-            ..Default::default()
+        let mut content = {
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("synthetic text".into());
+            proto
         };
         assert!(is_shareable_history_text(&content));
-        for context in [
-            wa::MessageContextInfo::default(),
-            wa::MessageContextInfo {
-                message_secret: Some(vec![7; 32]),
-                reporting_token_version: Some(1),
-                ..Default::default()
-            },
-        ] {
+        for context in [wa::MessageContextInfo::default(), {
+            let mut proto = wa::MessageContextInfo::default();
+            proto.message_secret = Some(vec![7; 32]);
+            proto.reporting_token_version = Some(1);
+            proto
+        }] {
             content.message_context_info = buffa::MessageField::some(context);
             assert!(is_shareable_history_text(&content));
         }
         for context in [
-            wa::MessageContextInfo {
-                padding_bytes: Some(Vec::new()),
-                ..Default::default()
+            {
+                let mut proto = wa::MessageContextInfo::default();
+                proto.padding_bytes = Some(Vec::new());
+                proto
             },
-            wa::MessageContextInfo {
-                support_payload: Some("private".into()),
-                ..Default::default()
+            {
+                let mut proto = wa::MessageContextInfo::default();
+                proto.support_payload = Some("private".into());
+                proto
             },
-            wa::MessageContextInfo {
-                limit_sharing: buffa::MessageField::some(Default::default()),
-                ..Default::default()
+            {
+                let mut proto = wa::MessageContextInfo::default();
+                proto.limit_sharing = buffa::MessageField::some(Default::default());
+                proto
             },
-            wa::MessageContextInfo {
-                tee_context_anchor_message_id: Some(String::new()),
-                ..Default::default()
+            {
+                let mut proto = wa::MessageContextInfo::default();
+                proto.tee_context_anchor_message_id = Some(String::new());
+                proto
             },
-            wa::MessageContextInfo {
-                acp2_setting: buffa::MessageField::some(Default::default()),
-                ..Default::default()
+            {
+                let mut proto = wa::MessageContextInfo::default();
+                proto.acp2_setting = buffa::MessageField::some(Default::default());
+                proto
             },
         ] {
             content.message_context_info = buffa::MessageField::some(context);
@@ -1116,11 +1132,14 @@ mod tests {
         content.message_context_info = buffa::MessageField::none();
         content.ephemeral_message = buffa::MessageField::some(Default::default());
         assert!(!is_shareable_history_text(&content));
-        content.ephemeral_message = buffa::MessageField::some(wa::message::FutureProofMessage {
-            message: buffa::MessageField::some(wa::Message {
-                conversation: Some("private nested text".repeat(4096)),
-                ..Default::default()
-            }),
+        content.ephemeral_message = buffa::MessageField::some({
+            let mut proto = wa::message::FutureProofMessage::default();
+            proto.message = buffa::MessageField::some({
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("private nested text".repeat(4096));
+                proto
+            });
+            proto
         });
         assert!(!is_shareable_history_text(&content));
         content.ephemeral_message = buffa::MessageField::none();
@@ -1143,19 +1162,22 @@ mod tests {
         use waproto::whatsapp as wa;
 
         let group = wacore_binary::Jid::new("120363000000000001", wacore_binary::Server::Group);
-        let make_message = |id: &str, timestamp| wa::WebMessageInfo {
-            key: buffa::MessageField::some(wa::MessageKey {
-                remote_jid: Some(group.to_string()),
-                id: Some(id.into()),
-                ..Default::default()
-            }),
-            message: buffa::MessageField::some(wa::Message {
-                conversation: Some(id.into()),
-                ..Default::default()
-            }),
-            message_timestamp: Some(timestamp),
-            status: Some(wa::web_message_info::Status::SERVER_ACK),
-            ..Default::default()
+        let make_message = |id: &str, timestamp| {
+            let mut proto = wa::WebMessageInfo::default();
+            proto.key = buffa::MessageField::some({
+                let mut proto = wa::MessageKey::default();
+                proto.remote_jid = Some(group.to_string());
+                proto.id = Some(id.into());
+                proto
+            });
+            proto.message = buffa::MessageField::some({
+                let mut proto = wa::Message::default();
+                proto.conversation = Some(id.into());
+                proto
+            });
+            proto.message_timestamp = Some(timestamp);
+            proto.status = Some(wa::web_message_info::Status::SERVER_ACK);
+            proto
         };
         let archive = [
             make_message("duplicate", 799),
@@ -1195,29 +1217,34 @@ mod tests {
     fn selection_refuses_nested_bundles_unsent_messages_and_expired_content() {
         use waproto::whatsapp as wa;
         let group = wacore_binary::Jid::new("120363000000000001", wacore_binary::Server::Group);
-        let make_message = |id: &str| wa::WebMessageInfo {
-            key: buffa::MessageField::some(wa::MessageKey {
-                remote_jid: Some(group.to_string()),
-                id: Some(id.into()),
-                from_me: Some(true),
-                ..Default::default()
-            }),
-            message: buffa::MessageField::some(wa::Message {
-                conversation: Some("synthetic text".into()),
-                ..Default::default()
-            }),
-            message_timestamp: Some(950),
-            status: Some(wa::web_message_info::Status::SERVER_ACK),
-            ..Default::default()
+        let make_message = |id: &str| {
+            let mut proto = wa::WebMessageInfo::default();
+            proto.key = buffa::MessageField::some({
+                let mut proto = wa::MessageKey::default();
+                proto.remote_jid = Some(group.to_string());
+                proto.id = Some(id.into());
+                proto.from_me = Some(true);
+                proto
+            });
+            proto.message = buffa::MessageField::some({
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("synthetic text".into());
+                proto
+            });
+            proto.message_timestamp = Some(950);
+            proto.status = Some(wa::web_message_info::Status::SERVER_ACK);
+            proto
         };
         let mut nested = make_message("nested");
-        nested.message = buffa::MessageField::some(wa::Message {
-            conversation: Some("synthetic text".into()),
-            message_history_bundle: buffa::MessageField::some(wa::message::MessageHistoryBundle {
-                media_key: Some(b"SYNTHETIC-OTHER-KEY".to_vec()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        nested.message = buffa::MessageField::some({
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("synthetic text".into());
+            proto.message_history_bundle = buffa::MessageField::some({
+                let mut proto = wa::message::MessageHistoryBundle::default();
+                proto.media_key = Some(b"SYNTHETIC-OTHER-KEY".to_vec());
+                proto
+            });
+            proto
         });
         let mut pending = make_message("pending");
         pending.status = Some(wa::web_message_info::Status::PENDING);

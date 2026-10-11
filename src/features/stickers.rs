@@ -127,22 +127,24 @@ mod tests {
         favorite: bool,
     ) -> wa::SyncActionValue {
         sticker.is_favorite = Some(favorite);
-        wa::SyncActionValue {
-            sticker_action: buffa::MessageField::some(sticker),
-            timestamp: Some(1_700_000_000_000),
-            ..Default::default()
+        {
+            let mut proto = wa::SyncActionValue::default();
+            proto.sticker_action = buffa::MessageField::some(sticker);
+            proto.timestamp = Some(1_700_000_000_000);
+            proto
         }
     }
 
     fn sticker() -> wa::sync_action_value::StickerAction {
-        wa::sync_action_value::StickerAction {
-            direct_path: Some("/v/t62.15575-24/sticker.enc".into()),
-            media_key: Some(vec![7; 32]),
-            file_enc_sha256: Some(vec![9; 32]),
-            mimetype: Some("image/webp".into()),
-            width: Some(512),
-            height: Some(512),
-            ..Default::default()
+        {
+            let mut proto = wa::sync_action_value::StickerAction::default();
+            proto.direct_path = Some("/v/t62.15575-24/sticker.enc".into());
+            proto.media_key = Some(vec![7; 32]);
+            proto.file_enc_sha256 = Some(vec![9; 32]);
+            proto.mimetype = Some("image/webp".into());
+            proto.width = Some(512);
+            proto.height = Some(512);
+            proto
         }
     }
 
@@ -166,9 +168,10 @@ mod tests {
                 index: vec!["favoriteSticker".into(), FILEHASH.into()],
                 operation: wa::syncd_mutation::SyncdOperation::Set,
                 action_value: Some(favorite_value(
-                    wa::sync_action_value::StickerAction {
-                        device_id_hint: Some(3),
-                        ..sticker()
+                    {
+                        let mut proto = sticker();
+                        proto.device_id_hint = Some(3);
+                        proto
                     },
                     favorite,
                 )),
@@ -201,9 +204,10 @@ mod tests {
         // WA Web counts a stickerAction missing isFavorite as a malformed
         // action value: it cannot tell which way the mutation goes.
         for action_value in [
-            Some(wa::SyncActionValue {
-                sticker_action: buffa::MessageField::some(sticker()),
-                ..Default::default()
+            Some({
+                let mut proto = wa::SyncActionValue::default();
+                proto.sticker_action = buffa::MessageField::some(sticker());
+                proto
             }),
             Some(wa::SyncActionValue::default()),
             None,
@@ -227,14 +231,15 @@ mod tests {
         let m = Mutation {
             index: vec!["removeRecentSticker".into(), FILEHASH.into()],
             operation: wa::syncd_mutation::SyncdOperation::Set,
-            action_value: Some(wa::SyncActionValue {
-                remove_recent_sticker_action: buffa::MessageField::some(
-                    wa::sync_action_value::RemoveRecentStickerAction {
-                        last_sticker_sent_ts: Some(1_700_000_000_000),
-                    },
-                ),
-                timestamp: Some(1_700_000_000_500),
-                ..Default::default()
+            action_value: Some({
+                let mut proto = wa::SyncActionValue::default();
+                proto.remove_recent_sticker_action = buffa::MessageField::some({
+                    let mut proto = wa::sync_action_value::RemoveRecentStickerAction::default();
+                    proto.last_sticker_sent_ts = Some(1_700_000_000_000);
+                    proto
+                });
+                proto.timestamp = Some(1_700_000_000_500);
+                proto
             }),
         };
         let (outcome, events) = run(&m);

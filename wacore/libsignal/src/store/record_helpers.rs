@@ -26,10 +26,12 @@ use waproto::whatsapp as wa;
 pub fn encode_pre_key_record_to(id: u32, key_pair: &KeyPair, out: &mut Vec<u8>) {
     use buffa::ViewEncode as _;
 
-    let view = wa::PreKeyRecordStructureView {
-        id: Some(id),
-        public_key: Some(key_pair.public_key.public_key_bytes()),
-        private_key: Some(key_pair.private_key.serialize()),
+    let view = {
+        let mut proto = wa::PreKeyRecordStructureView::default();
+        proto.id = Some(id);
+        proto.public_key = Some(key_pair.public_key.public_key_bytes());
+        proto.private_key = Some(key_pair.private_key.serialize());
+        proto
     };
 
     // `ViewEncode::encode` computes the size but leaves capacity management to
@@ -46,10 +48,12 @@ pub fn encode_pre_key_record_to(id: u32, key_pair: &KeyPair, out: &mut Vec<u8>) 
 }
 
 pub fn new_pre_key_record(id: u32, key_pair: &KeyPair) -> wa::PreKeyRecordStructure {
-    wa::PreKeyRecordStructure {
-        id: Some(id),
-        public_key: Some(key_pair.public_key.public_key_bytes().to_vec()),
-        private_key: Some(key_pair.private_key.serialize().to_vec()),
+    {
+        let mut proto = wa::PreKeyRecordStructure::default();
+        proto.id = Some(id);
+        proto.public_key = Some(key_pair.public_key.public_key_bytes().to_vec());
+        proto.private_key = Some(key_pair.private_key.serialize().to_vec());
+        proto
     }
 }
 
@@ -59,17 +63,19 @@ pub fn new_signed_pre_key_record(
     signature: [u8; 64],
     timestamp: chrono::DateTime<Utc>,
 ) -> wa::SignedPreKeyRecordStructure {
-    wa::SignedPreKeyRecordStructure {
-        id: Some(id),
-        public_key: Some(key_pair.public_key.public_key_bytes().to_vec()),
-        private_key: Some(key_pair.private_key.serialize().to_vec()),
-        signature: Some(signature.to_vec()),
-        timestamp: Some(
+    {
+        let mut proto = wa::SignedPreKeyRecordStructure::default();
+        proto.id = Some(id);
+        proto.public_key = Some(key_pair.public_key.public_key_bytes().to_vec());
+        proto.private_key = Some(key_pair.private_key.serialize().to_vec());
+        proto.signature = Some(signature.to_vec());
+        proto.timestamp = Some(
             timestamp
                 .timestamp()
                 .try_into()
                 .expect("Timestamp conversion failed"),
-        ),
+        );
+        proto
     }
 }
 
@@ -306,10 +312,12 @@ mod tests {
         let tagged = key_pair.public_key.serialize().to_vec();
         assert_eq!(tagged.len(), PublicKey::SERIALIZED_KEY_LEN);
 
-        let legacy_prekey = wa::PreKeyRecordStructure {
-            id: Some(3),
-            public_key: Some(tagged.clone()),
-            private_key: Some(key_pair.private_key.serialize().to_vec()),
+        let legacy_prekey = {
+            let mut proto = wa::PreKeyRecordStructure::default();
+            proto.id = Some(3);
+            proto.public_key = Some(tagged.clone());
+            proto.private_key = Some(key_pair.private_key.serialize().to_vec());
+            proto
         };
         let record = PreKeyRecord::deserialize(&legacy_prekey.clone().encode_to_vec())?;
         assert_eq!(
@@ -334,12 +342,14 @@ mod tests {
             Some(key_pair.public_key.public_key_bytes())
         );
 
-        let legacy_signed = wa::SignedPreKeyRecordStructure {
-            id: Some(4),
-            public_key: Some(tagged),
-            private_key: Some(key_pair.private_key.serialize().to_vec()),
-            signature: Some(vec![0u8; 64]),
-            timestamp: Some(0),
+        let legacy_signed = {
+            let mut proto = wa::SignedPreKeyRecordStructure::default();
+            proto.id = Some(4);
+            proto.public_key = Some(tagged);
+            proto.private_key = Some(key_pair.private_key.serialize().to_vec());
+            proto.signature = Some(vec![0u8; 64]);
+            proto.timestamp = Some(0);
+            proto
         };
         let signed = <SignedPreKeyRecord as GenericSignedPreKey>::deserialize(
             &waproto::codec::signed_pre_key_record_to_vec(&legacy_signed),

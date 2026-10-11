@@ -444,9 +444,10 @@ async fn sent_message_backend_workers_keep_their_lease_after_client_drop() {
         let weak = Arc::downgrade(&client);
         let release = client.store_release();
         let chat = crate::Jid::pn("15550000001");
-        let message = waproto::whatsapp::Message {
-            conversation: Some("synthetic".into()),
-            ..Default::default()
+        let message = {
+            let mut proto_ = waproto::whatsapp::Message::default();
+            proto_.conversation = Some("synthetic".into());
+            proto_
         };
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
