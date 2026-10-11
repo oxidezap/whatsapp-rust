@@ -327,7 +327,11 @@ mod tests {
         let different = [10, 1, b'b', 0xc0, 0x3e, 8];
         assert!(extend_pending_record(&original, &different).is_err());
         assert!(extend_pending_record(&different, &original).is_err());
-        assert!(extend_pending_record(&original, &original).unwrap().is_none());
+        assert!(
+            extend_pending_record(&original, &original)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
