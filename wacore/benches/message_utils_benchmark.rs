@@ -23,10 +23,11 @@ fn bench_protobuf_clone(bencher: divan::Bencher, shape: &str) {
     let message = match shape {
         "empty" => wa::Message::default(),
         "text" => text_message(),
-        "future_field" => wa::Message::decode_from_slice(&[0xc2, 0x3e, 4, 11, 22, 33, 44]).unwrap(),
+        "future_field" => wa::Message::decode_from_slice(&[0xc2, 0x3e, 4, 11, 22, 33, 44])
+            .expect("valid synthetic future-field clone fixture"),
         "future_group" => {
             wa::Message::decode_from_slice(&[0xc3, 0x3e, 0x0a, 4, 11, 22, 33, 44, 0xc4, 0x3e])
-                .unwrap()
+                .expect("valid synthetic future-group clone fixture")
         }
         _ => unreachable!(),
     };
@@ -134,10 +135,10 @@ fn verify_oneof_diagnostic(encoded: &[u8], operation: &str) {
         image
             .context_info
             .as_option()
-            .unwrap()
+            .expect("synthetic image has context info")
             .quoted_message
             .as_option()
-            .unwrap()
+            .expect("synthetic context has quoted message")
             .conversation
             .as_deref(),
         Some("Synthetic quoted text"),
@@ -157,7 +158,9 @@ fn verify_oneof_diagnostic(encoded: &[u8], operation: &str) {
 fn bench_oneof_owned_decode_encode(bencher: divan::Bencher, scenario: &str) {
     use buffa::Message as _;
     use wa::message::interactive_message::header::Media;
-    let (shape, operation) = scenario.split_once('/').unwrap();
+    let (shape, operation) = scenario
+        .split_once('/')
+        .expect("synthetic scenario contains shape/operation");
     let wire = oneof_wire(shape);
     let records = oneof_records(&wire);
     // The nested merge accepts caption c before the incomplete varint fails.
@@ -231,7 +234,9 @@ fn bench_oneof_owned_decode_encode(bencher: divan::Bencher, scenario: &str) {
 fn bench_oneof_view_decode_encode(bencher: divan::Bencher, scenario: &str) {
     use buffa::{DecodeContext, Message as _, MessageView as _, ViewEncode as _};
     use wa::__buffa::view::oneof::message::interactive_message::header::Media;
-    let (shape, operation) = scenario.split_once('/').unwrap();
+    let (shape, operation) = scenario
+        .split_once('/')
+        .expect("synthetic scenario contains shape/operation");
     let wire = oneof_wire(shape);
     let records = oneof_records(&wire);
     let failed = [0x22, 5, 0x1a, 1, b'c', 0xc0, 0x3e];
