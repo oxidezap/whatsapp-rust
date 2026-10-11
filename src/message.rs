@@ -723,6 +723,7 @@ pub(crate) mod commit_batch;
 mod dispatch;
 mod durability;
 mod msg_secret;
+mod raw_pending;
 mod receive;
 mod retry;
 mod special;

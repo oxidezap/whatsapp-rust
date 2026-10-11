@@ -494,11 +494,11 @@ impl Client {
     /// outbound `messageSecret` we persisted at send time and runs the
     /// dual-HKDF + AES-GCM open from [`wacore::bot_message`]. Failures
     /// (missing secret, GCM tag fail, malformed proto) nack with code 495.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.msmsg", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
-    pub(crate) async fn handle_msmsg_payload(
+    pub(super) async fn handle_msmsg_payload_in_scope(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
         payload: EncPayload,
+        producer: raw_pending::StanzaOrigin,
     ) {
         use wacore::bot_message::{BotMessageContext, decrypt_bot_message};
         use wacore::protocol::nack::NackReason;
@@ -839,7 +839,24 @@ impl Client {
             info.id,
             info.source.sender.observe()
         );
-        self.dispatch_parsed_message(msg, info, false).await;
+        let index = match u32::try_from(enc_index) {
+            Ok(index) => index,
+            Err(_) => return,
+        };
+        self.dispatch_shared_message_with_carrier(
+            Arc::new(msg),
+            info,
+            false,
+            None,
+            self.inbound_durability_hook()
+                .is_some()
+                .then_some((Some(index), plaintext)),
+            Some(raw_pending::DeliveryOrigin {
+                stanza: producer,
+                position: enc_index,
+            }),
+        )
+        .await;
     }
 
     /// Resolve `target_sender` for a msmsg stanza: echo from `<meta>` when

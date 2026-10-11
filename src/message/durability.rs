@@ -39,42 +39,59 @@ impl Client {
     /// failed returns `false`, because nothing reached a consumer.
     pub(crate) async fn ack_or_replay_to_hook(self: &Arc<Self>, info: &Arc<MessageInfo>) -> bool {
         if self.inbound_durability_hook().is_some() {
-            let backend = self.persistence_manager.backend();
-            let chat = info.source.chat.to_string();
-            let sender = info.source.sender.to_string();
-            match backend.get_pending_inbound(&chat, &sender, &info.id).await {
-                Ok(Some(bytes)) => match waproto::codec::message_decode(&bytes) {
-                    Ok(msg) => {
-                        // Only a replay that will actually reach the consumer
-                        // counts as one. `Deferred` still does, later, when its
-                        // batch commits; `Failed` dispatched nothing, so the
-                        // caller must count that resend as a suppression or the
-                        // message reaches no one and nothing records it.
-                        return !matches!(
-                            self.commit_or_batch_inbound(
-                                InboundMessage::builder()
-                                    .message(Arc::new(msg))
-                                    .info(Arc::clone(info))
-                                    .build(),
-                                false,
-                            )
-                            .await,
+            match self.read_pending_for_replay(info).await {
+                Ok(Some(record)) => {
+                    // Decode before releasing the read owner, then release it
+                    // before the batch's conditional write takes that owner.
+                    let decoded = raw_pending::PendingJournal::decode(
+                        bytes::Bytes::copy_from_slice(record.bytes()),
+                    );
+                    drop(record);
+                    let replay = match decoded.and_then(|journal| {
+                        journal
+                            .occurrences
+                            .into_iter()
+                            .enumerate()
+                            .map(|(position, entry)| {
+                                let message = waproto::codec::message_decode(&entry.projection)?;
+                                Ok(raw_pending::PendingDelivery {
+                                    item: InboundMessage::builder()
+                                        .message(Arc::new(message))
+                                        .info(Arc::clone(info))
+                                        .build(),
+
+                                    carrier: Some((entry.index, entry.original)),
+                                    // A legacy row has no producer ownership. Inventing one
+                                    // on replay would leave its predecessor uncovered.
+                                    origin: entry.producer.map(|stanza| {
+                                        raw_pending::DeliveryOrigin { stanza, position }
+                                    }),
+                                })
+                            })
+                            .collect::<anyhow::Result<Vec<_>>>()
+                    }) {
+                        Ok(replay) => replay,
+                        Err(error) => {
+                            log::error!(
+                                "[msg:{}] invalid pending journal; preserving row and suppressing ACK: {error:?}",
+                                info.id
+                            );
+                            return false;
+                        }
+                    };
+                    if !self.inbound_commit_batch.is_active() {
+                        return self.replay_pending_batch(replay.into()).await;
+                    }
+                    for item in replay {
+                        if matches!(
+                            self.commit_or_batch_pending(item, false).await,
                             InboundCommitState::Failed
-                        );
+                        ) {
+                            return false;
+                        }
                     }
-                    Err(e) => {
-                        // Corrupt row (our own serialization): it can never be
-                        // replayed, so drop it and ack to unstick the queue.
-                        log::error!(
-                            "[msg:{}] failed to decode buffered inbound message; acking to unstick queue: {e:?}",
-                            info.id
-                        );
-                        let _ = backend
-                            .delete_pending_inbound(&chat, &sender, &info.id)
-                            .await;
-                        self.ack_received_message(info);
-                    }
-                },
+                    return true;
+                }
                 // Genuine duplicate (never buffered, or already committed): ack it.
                 Ok(None) => self.ack_received_message(info),
                 // Fail closed: a transient read error must not ack a message whose
@@ -277,6 +294,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn replay_malformed_row_keeps_original_bytes_and_does_not_deliver() {
+        let client = create_test_client_with_failing_http("durability_malformed").await;
+        let hook = counting_hook(true);
+        let _ = client.inbound_durability_hook.set(hook.clone());
+        let info = test_info("MSG_MALFORMED");
+        let backend = client.persistence_manager.backend();
+        let chat = info.source.chat.to_string();
+        let sender = info.source.sender.to_string();
+        // Zero is not a valid protobuf tag. It also discriminates a private
+        // envelope; unsupported versions must never be deleted as corruption.
+        let original = b"\0WRPI\xfforiginal";
+        backend
+            .store_pending_inbound(&chat, &sender, &info.id, original)
+            .await
+            .expect("fixture row");
+        let (handler, rx) = wacore::types::events::ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+        assert!(!client.ack_or_replay_to_hook(&info).await);
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 0);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            backend
+                .get_pending_inbound(&chat, &sender, &info.id)
+                .await
+                .expect("read row")
+                .as_deref(),
+            Some(original.as_slice())
+        );
+    }
+
     // A genuine duplicate (no buffered copy) just acks without invoking the hook.
     #[tokio::test]
     async fn replay_without_buffer_just_acks() {
@@ -289,6 +337,254 @@ mod tests {
             hook.calls.load(Ordering::SeqCst),
             0,
             "no buffered copy means the hook must not run"
+        );
+    }
+
+    // These exercise the existing receive entry point, not a decode/re-encode
+    // oracle. The original synthetic unknown field is also a noncanonical
+    // varint and precedes the known fields, so normalized storage cannot pass.
+    async fn raw_origin_fixture(name: &str, message: wa::Message, from_me: bool) {
+        let client = create_test_client_with_failing_http(name).await;
+        let hook = counting_hook(false);
+        client
+            .inbound_durability_hook
+            .set(hook.clone())
+            .ok()
+            .unwrap();
+        let mut info = (*test_info("RAW_ORIGIN")).clone();
+        info.source.is_from_me = from_me;
+        let info = Arc::new(info);
+        let mut raw = vec![0xa0, 0x1f, 0x81, 0x00]; // field500 varint1, exact bytes
+        raw.extend(waproto::codec::message_to_vec(&message));
+        assert!(waproto::codec::message_decode(&raw).is_ok());
+        client
+            .handle_decrypted_plaintext(
+                "msg",
+                wacore::messages::MessageUtils::pad_message_v2(raw.clone()),
+                2,
+                0,
+                Default::default(),
+                &info,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hook.calls.load(Ordering::SeqCst),
+            1,
+            "the hook failed after receive normalization"
+        );
+        let stored = client
+            .persistence_manager
+            .backend()
+            .get_pending_inbound(
+                &info.source.chat.to_string(),
+                &info.source.sender.to_string(),
+                &info.id,
+            )
+            .await
+            .unwrap()
+            .expect("failed hook must leave a durable record");
+        assert!(
+            stored.windows(raw.len()).any(|bytes| bytes == raw),
+            "pending replay must retain original unknown fields, order and noncanonical bytes before normalization"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_pending_dsm_preserves_original_noncanonical_carrier() {
+        let mut message = wa::Message::default();
+        let mut inner = wa::Message::default();
+        inner.conversation = Some("synthetic DSM delivery".into());
+        let mut dsm = wa::message::DeviceSentMessage::default();
+        dsm.message = buffa::MessageField::some(inner);
+        message.device_sent_message = buffa::MessageField::some(dsm);
+        raw_origin_fixture("raw_dsm", message, true).await;
+    }
+
+    #[tokio::test]
+    async fn raw_pending_history_preserves_detached_original_carrier() {
+        let mut message = wa::Message::default();
+        message.conversation = Some("synthetic accompanying delivery".into());
+        let mut protocol = wa::message::ProtocolMessage::default();
+        protocol.r#type = Some(wa::message::protocol_message::Type::HISTORY_SYNC_NOTIFICATION);
+        let mut history = wa::message::HistorySyncNotification::default();
+        history.initial_hist_bootstrap_inline_payload = Some(vec![7; 128]);
+        protocol.history_sync_notification = buffa::MessageField::some(history);
+        message.protocol_message = buffa::MessageField::some(protocol);
+        // A peer history notification is detached but rejected by the self-only
+        // gate, so this fixture cannot download or acknowledge real history.
+        raw_origin_fixture("raw_history", message, false).await;
+    }
+
+    struct OrderedReplayHook {
+        succeed: AtomicBool,
+        attempted: std::sync::Mutex<Vec<String>>,
+        observed: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for OrderedReplayHook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            batch: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            self.attempted
+                .lock()
+                .unwrap()
+                .extend(batch.iter().map(|item| {
+                    item.message
+                        .conversation
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_owned()
+                }));
+            if !self.succeed.load(Ordering::SeqCst) {
+                return Err(anyhow::anyhow!("synthetic consumer unavailable"));
+            }
+            self.observed
+                .lock()
+                .unwrap()
+                .extend(batch.iter().map(|item| {
+                    item.message
+                        .conversation
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_owned()
+                }));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_pending_failed_replay_does_not_report_consumer_delivery() {
+        let client = create_test_client_with_failing_http("raw_replay_failed").await;
+        let hook = counting_hook(false);
+        client
+            .inbound_durability_hook
+            .set(hook.clone())
+            .ok()
+            .unwrap();
+        client
+            .commit_or_batch_inbound(test_item("RAW_REPLAY_FAILED"), false)
+            .await;
+        assert!(
+            !client
+                .ack_or_replay_to_hook(&test_info("RAW_REPLAY_FAILED"))
+                .await
+        );
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 2);
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "RAW_REPLAY_FAILED")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_pending_subset_cannot_clear_uncommitted_occurrence_group() {
+        let client = create_test_client_with_failing_http("raw_subset").await;
+        let hook = counting_hook(false);
+        client
+            .inbound_durability_hook
+            .set(hook.clone())
+            .ok()
+            .unwrap();
+        let info = test_info("RAW_SUBSET");
+        for (index, text) in ["A", "B"].into_iter().enumerate() {
+            let mut message = wa::Message::default();
+            message.conversation = Some(text.into());
+            if index == 1 {
+                hook.succeed.store(true, Ordering::SeqCst);
+            }
+            client
+                .handle_decrypted_plaintext(
+                    "msg",
+                    wacore::messages::MessageUtils::encode_and_pad(&message),
+                    2,
+                    index,
+                    Default::default(),
+                    &info,
+                )
+                .await
+                .unwrap();
+        }
+        assert!(client.delivery_receipt_queue.get().is_none());
+        assert!(
+            client.transport_ack_queue.get().is_none(),
+            "a successful subset hook must not acknowledge the retained group"
+        );
+        let backend = client.persistence_manager.backend();
+        let bytes = backend
+            .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "RAW_SUBSET")
+            .await
+            .unwrap()
+            .expect("subset commit cannot delete predecessor");
+        let journal = raw_pending::PendingJournal::decode(bytes.into()).unwrap();
+        assert_eq!(journal.occurrences.len(), 2);
+        assert!(client.ack_or_replay_to_hook(&info).await);
+        assert!(
+            client.delivery_receipt_queue.get().is_some()
+                || client.transport_ack_queue.get().is_some(),
+            "only the complete replay may schedule the stanza acknowledgement"
+        );
+        assert!(
+            backend
+                .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "RAW_SUBSET")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_pending_replay_preserves_equal_occurrences_and_later_part() {
+        let client = create_test_client_with_failing_http("raw_occurrences").await;
+        let hook = Arc::new(OrderedReplayHook {
+            succeed: AtomicBool::new(false),
+            attempted: std::sync::Mutex::new(Vec::new()),
+            observed: std::sync::Mutex::new(Vec::new()),
+        });
+        client
+            .inbound_durability_hook
+            .set(hook.clone())
+            .ok()
+            .unwrap();
+        let info = test_info("RAW_MULTIPART");
+        let origin = raw_pending::StanzaOrigin::new();
+        for (index, text) in ["A", "A", "B"].into_iter().enumerate() {
+            let mut message = wa::Message::default();
+            message.conversation = Some(text.into());
+            client
+                .handle_decrypted_plaintext_in_scope(
+                    "msg",
+                    wacore::messages::MessageUtils::encode_and_pad(&message),
+                    2,
+                    receive::PlaintextSlot {
+                        index,
+                        annotations: Default::default(),
+                        producer: origin,
+                    },
+                    &info,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            *hook.attempted.lock().unwrap(),
+            ["A", "A", "B"],
+            "all three original occurrences reached the failing hook"
+        );
+        hook.succeed.store(true, Ordering::SeqCst);
+        assert!(client.ack_or_replay_to_hook(&info).await);
+        assert_eq!(
+            *hook.observed.lock().unwrap(),
+            ["A", "A", "B"],
+            "one pending row must preserve the whole occurrence group, not only its last normalized payload"
         );
     }
 }

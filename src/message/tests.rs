@@ -20062,6 +20062,43 @@ async fn suppressed_resend_replays_to_a_durability_hook() {
             .await;
     }
 
+    let pending = client
+        .persistence_manager
+        .backend()
+        .get_pending_inbound(&group.to_string(), &alice.jid.to_string(), id)
+        .await
+        .unwrap();
+    if let Some(pending) = &pending {
+        let journal = raw_pending::PendingJournal::decode(pending.clone().into()).unwrap();
+        println!(
+            "pending retry diagnostic: calls={}, entries={}, positions={:?}, producers={:?}, equal_projection={}",
+            hook.calls.load(Ordering::SeqCst),
+            journal.occurrences.len(),
+            journal
+                .occurrences
+                .iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>(),
+            journal
+                .occurrences
+                .iter()
+                .map(|entry| entry.producer.is_some())
+                .collect::<Vec<_>>(),
+            journal
+                .occurrences
+                .windows(2)
+                .all(|pair| pair[0].projection == pair[1].projection)
+        );
+    }
+    assert_eq!(
+        hook.calls.load(Ordering::SeqCst),
+        2,
+        "both attempts must reach the durability hook"
+    );
+    assert!(
+        pending.is_none(),
+        "a successful equivalent retry must clear the retained physical row"
+    );
     crate::test_utils::poll_until("the replayed commit's receipt", || {
         delivery_receipts_for(&transport.sent(), id) == 1
     })

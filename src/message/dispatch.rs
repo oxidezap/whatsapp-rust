@@ -261,6 +261,57 @@ impl Client {
         track_commit: bool,
         pre_decrypted: Option<Arc<wa::Message>>,
     ) -> InboundCommitState {
+        self.dispatch_shared_message_with_carrier(
+            msg,
+            info,
+            track_commit,
+            pre_decrypted,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn dispatch_shared_message_with_carrier(
+        self: &Arc<Self>,
+        msg: Arc<wa::Message>,
+        info: &Arc<MessageInfo>,
+        track_commit: bool,
+        pre_decrypted: Option<Arc<wa::Message>>,
+        carrier: Option<(Option<u32>, bytes::Bytes)>,
+        origin: Option<raw_pending::DeliveryOrigin>,
+    ) -> InboundCommitState {
+        let item = self
+            .prepare_shared_inbound_message(msg, info, pre_decrypted)
+            .await;
+        // Newsletters were already transport-acked before the processing permit.
+        if info.source.chat.is_newsletter() {
+            self.core.event_bus.dispatch(Event::Messages(
+                wacore::types::events::MessageBatch::builder()
+                    .messages(Arc::from([item]))
+                    .origin(wacore::types::events::BatchOrigin::Live)
+                    .build(),
+            ));
+            return InboundCommitState::Durable;
+        }
+        self.commit_or_batch_pending(
+            raw_pending::PendingDelivery {
+                item,
+                carrier,
+                origin,
+            },
+            track_commit,
+        )
+        .await
+    }
+
+    /// Prepare the consumer projection before entering the existing commit path.
+    pub(crate) async fn prepare_shared_inbound_message(
+        self: &Arc<Self>,
+        msg: Arc<wa::Message>,
+        info: &Arc<MessageInfo>,
+        pre_decrypted: Option<Arc<wa::Message>>,
+    ) -> wacore::types::events::InboundMessage {
         use wacore::proto_helpers::MessageExt;
         wacore::telemetry::recv("decrypted");
         self.stats.record_message_received();
@@ -289,42 +340,12 @@ impl Client {
         };
         let dispatch_msg = decrypted.unwrap_or(msg);
 
-        // Newsletters never enter the commit pipeline: the plaintext stanza
-        // was already transport-acked at enqueue and the server never
-        // redelivers it, so a hook failure (or a batcher reset) would lose
-        // the message for good instead of trading on redelivery. They also
-        // reach here without the processing permit, so enqueueing could
-        // straddle the drain→live transition.
-        if info.source.chat.is_newsletter() {
-            self.core.event_bus.dispatch(Event::Messages(
-                wacore::types::events::MessageBatch::builder()
-                    .messages(Arc::from([wacore::types::events::InboundMessage::builder(
-                    )
-                    .message(dispatch_msg)
-                    .info(Arc::clone(info))
-                    .maybe_ephemeral_expiration(ephemeral_expiration)
-                    .maybe_comment_target(comment_target)
-                    .build()]))
-                    .origin(wacore::types::events::BatchOrigin::Live)
-                    .build(),
-            ));
-            return InboundCommitState::Durable;
-        }
-
-        // Live traffic commits (and acks) as a batch of one; during the
-        // offline drain the message joins the accumulating commit batch and
-        // the event/ack fire only after its batch commits. Either way the
-        // hook (when registered) gates everything observable.
-        self.commit_or_batch_inbound(
-            wacore::types::events::InboundMessage::builder()
-                .message(dispatch_msg)
-                .info(Arc::clone(info))
-                .maybe_ephemeral_expiration(ephemeral_expiration)
-                .maybe_comment_target(comment_target)
-                .build(),
-            track_commit,
-        )
-        .await
+        wacore::types::events::InboundMessage::builder()
+            .message(dispatch_msg)
+            .info(Arc::clone(info))
+            .maybe_ephemeral_expiration(ephemeral_expiration)
+            .maybe_comment_target(comment_target)
+            .build()
     }
 
     /// Acknowledge a received message so the server drops it from the offline

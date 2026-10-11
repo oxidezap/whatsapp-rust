@@ -113,6 +113,12 @@ async fn decrypt_session_message(
     }
 }
 
+pub(super) struct PlaintextSlot<'a> {
+    pub index: usize,
+    pub annotations: EncNodeAnnotations<'a>,
+    pub producer: raw_pending::StanzaOrigin,
+}
+
 impl Client {
     /// Test and bench convenience: scope to the current generation. Production
     /// inbound traffic always goes through the chat-lane worker, which passes
@@ -489,6 +495,7 @@ impl Client {
             decrypt_fail_mode,
         } = msg;
 
+        let stanza_origin = raw_pending::StanzaOrigin::new();
         if max_sender_retry_count > 0 {
             let cache_key = self
                 .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
@@ -554,11 +561,12 @@ impl Client {
 
         let session_outcome = if !is_group_sender && !session_payloads_empty {
             self.clone()
-                .process_session_enc_batch(
+                .process_session_enc_batch_with_origin(
                     session_payloads,
                     &info,
                     &sender_encryption_jid,
                     decrypt_fail_mode,
+                    stanza_origin,
                 )
                 .await
         } else {
@@ -609,6 +617,7 @@ impl Client {
                         &info,
                         &sender_encryption_jid,
                         decrypt_fail_mode,
+                        stanza_origin,
                     )
                     .await
                 {
@@ -734,7 +743,8 @@ impl Client {
         // with the session/group decrypt batches under the same global
         // permit + per-chat enqueue lock acquired upstream.
         for payload in bot_payloads {
-            self.handle_msmsg_payload(&info, payload).await;
+            self.handle_msmsg_payload_in_scope(&info, payload, stanza_origin)
+                .await;
         }
 
         // Live: coalesce the receive-side flush. A lost advance re-derives
@@ -749,12 +759,31 @@ impl Client {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.session_decrypt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %sender_encryption_jid.observe(), msg_id = %info.id)))]
+    #[cfg(any(test, feature = "bench-harness"))]
     pub(crate) async fn process_session_enc_batch(
         self: Arc<Self>,
         payloads: Vec<EncPayload>,
         info: &Arc<MessageInfo>,
         sender_encryption_jid: &Jid,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
+    ) -> SessionBatchOutcome {
+        self.process_session_enc_batch_with_origin(
+            payloads,
+            info,
+            sender_encryption_jid,
+            decrypt_fail_mode,
+            raw_pending::StanzaOrigin::new(),
+        )
+        .await
+    }
+
+    async fn process_session_enc_batch_with_origin(
+        self: Arc<Self>,
+        payloads: Vec<EncPayload>,
+        info: &Arc<MessageInfo>,
+        sender_encryption_jid: &Jid,
+        decrypt_fail_mode: crate::types::events::DecryptFailMode,
+        stanza_origin: raw_pending::StanzaOrigin,
     ) -> SessionBatchOutcome {
         if payloads.is_empty() {
             return SessionBatchOutcome::default();
@@ -1453,14 +1482,17 @@ impl Client {
         } in deferred
         {
             match self
-                .handle_decrypted_plaintext(
+                .handle_decrypted_plaintext_in_scope(
                     enc_type,
                     plaintext,
                     padding_version,
-                    enc_index,
-                    EncNodeAnnotations {
-                        state: state.as_deref(),
-                        session_type: session_type.as_deref(),
+                    PlaintextSlot {
+                        index: enc_index,
+                        annotations: EncNodeAnnotations {
+                            state: state.as_deref(),
+                            session_type: session_type.as_deref(),
+                        },
+                        producer: stanza_origin,
                     },
                     info,
                 )
@@ -1504,6 +1536,7 @@ impl Client {
         info: &Arc<MessageInfo>,
         _sender_encryption_jid: &Jid,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
+        stanza_origin: raw_pending::StanzaOrigin,
     ) -> Result<(), DecryptionError> {
         if payloads.is_empty() {
             return Ok(());
@@ -1567,12 +1600,15 @@ impl Client {
                     }
 
                     if let Err(e) = self
-                        .handle_decrypted_plaintext(
+                        .handle_decrypted_plaintext_in_scope(
                             "skmsg",
                             padded_plaintext,
                             padding_version,
-                            enc_index,
-                            payload.annotations(),
+                            PlaintextSlot {
+                                index: enc_index,
+                                annotations: payload.annotations(),
+                                producer: stanza_origin,
+                            },
                             info,
                         )
                         .await
@@ -1773,6 +1809,7 @@ impl Client {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.handle_plaintext", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, enc_type = %enc_type), err(Debug)))]
+    #[cfg(any(test, feature = "bench-harness"))]
     pub(crate) async fn handle_decrypted_plaintext(
         self: &Arc<Self>,
         enc_type: &'static str,
@@ -1782,6 +1819,33 @@ impl Client {
         annotations: EncNodeAnnotations<'_>,
         info: &Arc<MessageInfo>,
     ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
+        self.handle_decrypted_plaintext_in_scope(
+            enc_type,
+            padded_plaintext,
+            padding_version,
+            PlaintextSlot {
+                index: enc_index,
+                annotations,
+                producer: raw_pending::StanzaOrigin::new(),
+            },
+            info,
+        )
+        .await
+    }
+
+    pub(super) async fn handle_decrypted_plaintext_in_scope(
+        self: &Arc<Self>,
+        enc_type: &'static str,
+        padded_plaintext: Vec<u8>,
+        padding_version: u8,
+        slot: PlaintextSlot<'_>,
+        info: &Arc<MessageInfo>,
+    ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
+        let PlaintextSlot {
+            index: enc_index,
+            annotations,
+            producer: stanza_origin,
+        } = slot;
         let source = wacore::messages::unpad_plaintext(padded_plaintext, padding_version)?;
 
         // Emitted before decoding, so a payload this build cannot decode still
@@ -1800,6 +1864,13 @@ impl Client {
             ));
         }
 
+        // Retain the exact unpadded carrier before detached-history decode,
+        // DSM unwrapping or consumer projection construction can discard it.
+        let carrier = self
+            .inbound_durability_hook()
+            .is_some()
+            .then(|| u32::try_from(enc_index).map(|index| (Some(index), source.clone())))
+            .transpose()?;
         let (original_msg, history_sync_taken) =
             wacore::messages::decode_unpadded_detached_history_sync(source)?;
         log::debug!(
@@ -2032,11 +2103,16 @@ impl Client {
             // that allocation for SKDM carriers and suppressed resends; dispatch
             // still carries the event's final handle rather than a Message.
             let commit_state = self
-                .dispatch_shared_message_with_decrypted(
+                .dispatch_shared_message_with_carrier(
                     Arc::new(msg),
                     info,
                     app_state_key_share_job.is_some(),
                     pre_decrypted,
+                    carrier,
+                    Some(raw_pending::DeliveryOrigin {
+                        stanza: stanza_origin,
+                        position: enc_index,
+                    }),
                 )
                 .await;
             if let Some((requester, request)) = app_state_key_share_job {
