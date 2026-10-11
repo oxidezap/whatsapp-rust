@@ -948,9 +948,8 @@ pub trait ProtocolStore: Send + Sync {
     /// Delete base keys recorded before `cutoff_timestamp` (unix seconds).
     /// Returns the count deleted.
     ///
-    /// A benign `Ok(0)` default rather than an `unsupported` error, for the same
-    /// reason as [`delete_expired_pending_inbound`](Self::delete_expired_pending_inbound):
-    /// the keepalive sweep calls it unconditionally for every backend.
+    /// A benign `Ok(0)` default: the keepalive sweep calls this optional
+    /// cleanup operation unconditionally for every backend.
     async fn delete_expired_base_keys(&self, _cutoff_timestamp: i64) -> Result<u32> {
         Ok(0)
     }
@@ -1125,17 +1124,15 @@ pub trait ProtocolStore: Send + Sync {
 
     // --- Pending Inbound Buffer (inbound durability hook) ---
     //
-    // Backs the at-least-once inbound durability hook: a decrypted message is
-    // buffered here (keyed by its stanza id) before the Signal ratchet is
-    // flushed, so a crash or failed commit before the hook acks replays the
-    // message on redelivery instead of dropping it. The defaults are non-breaking
-    // for backends that do not implement the hook, but fail CLOSED rather than
-    // no-op: an unsupported backend used with a hook surfaces an error (and the
-    // message stays unacked) instead of silently degrading to at-most-once.
+    // Backs the consumer commit barrier. Unsupported implementations fail
+    // closed, rather than silently accepting a write without retaining bytes.
+    // Storage success and receipt suppression alone do not guarantee redelivery.
 
-    /// Persist a decrypted inbound message awaiting a durability-hook commit.
+    /// Persist the SDK's opaque pending-inbound record, awaiting consumer commit.
+    /// Preserve its bytes exactly; one identity can contain several payload parts.
     /// Scoped by `(chat, sender, id)` because stanza ids are only unique within
-    /// a `(chat, sender)`.
+    /// a `(chat, sender)`. The SDK reader accepts legacy single-message records
+    /// and versioned multipart records; backends must not decode/re-encode them.
     async fn store_pending_inbound(
         &self,
         _chat: &str,
@@ -1156,15 +1153,32 @@ pub trait ProtocolStore: Send + Sync {
         Err(unsupported_pending_inbound())
     }
 
+    /// Read every pending row for `(chat, id)` in this backend's device scope.
+    /// Return each original sender key and its opaque bytes without changing
+    /// either. The SDK, not the backend, decides which participants identify
+    /// the same message; rows from other senders must remain available.
+    ///
+    /// Required by the durability hook to recover legacy device-qualified group
+    /// participants after restart. Returning an incomplete set can lose pending
+    /// payloads. Unsupported implementations must return an error, not an empty
+    /// set; the builder probes this operation before enabling the hook.
+    async fn get_pending_inbound_for_message(
+        &self,
+        _chat: &str,
+        _id: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        Err(unsupported_pending_inbound())
+    }
+
     /// Remove a buffered inbound message once its durability hook has committed.
     async fn delete_pending_inbound(&self, _chat: &str, _sender: &str, _id: &str) -> Result<()> {
         Err(unsupported_pending_inbound())
     }
 
-    /// Delete buffered inbound messages older than cutoff (unix seconds). Returns
-    /// count deleted. Unlike the other defaults this is a benign `Ok(0)`: the
-    /// keepalive sweep calls it unconditionally for every backend, so it must not
-    /// error when the buffer is unsupported.
+    /// Explicitly discard pending records older than cutoff (unix seconds),
+    /// returning the count deleted. The SDK does not call this automatically:
+    /// elapsed time cannot prove consumer commit. Callers own the data-loss
+    /// policy for this operation. Unsupported cleanup remains a benign `Ok(0)`.
     async fn delete_expired_pending_inbound(&self, _cutoff_timestamp: i64) -> Result<u32> {
         Ok(0)
     }

@@ -55,6 +55,7 @@ impl PendingInboundBatch {
 }
 
 pub(crate) struct InboundCommitBatcher {
+    pub(crate) retention: Arc<retention::InboundRetention>,
     state: std::sync::Mutex<BatchState>,
     #[cfg(test)]
     pub(crate) publication_reached: std::sync::atomic::AtomicBool,
@@ -97,6 +98,7 @@ impl Default for InboundCommitBatcher {
     fn default() -> Self {
         Self {
             state: std::sync::Mutex::new(BatchState::default()),
+            retention: Arc::default(),
             #[cfg(test)]
             publication_reached: std::sync::atomic::AtomicBool::new(false),
             active: std::sync::atomic::AtomicBool::new(true),
@@ -117,6 +119,18 @@ impl InboundCommitBatcher {
             Ok(guard) => guard,
             Err(poison) => poison.into_inner(),
         }
+    }
+
+    pub(crate) fn remove_retained_identity(&self, info: &MessageInfo) {
+        let mut state = self.lock();
+        state
+            .entries
+            .retain(|item| retention::key(&item.info) != retention::key(info));
+        state.bytes = state
+            .entries
+            .iter()
+            .map(|item| waproto::codec::message_encoded_len(&item.message))
+            .sum();
     }
 
     /// Take the accumulated batch, invalidating any armed timer.
@@ -222,7 +236,21 @@ impl InboundCommitBatcher {
     /// caller must drop the Signal cache with them (their cache-only ratchet
     /// advances have no rows; flushing them later would make each redelivery
     /// an ackable duplicate).
+    #[cfg(test)]
     pub(crate) fn reset(&self) -> bool {
+        self.reset_for_reconnect(false)
+    }
+
+    /// Re-arm the connection's drain. Durability mode preserves entries and
+    /// Client-owned reservations; the legacy no-hook mode drops its batch.
+    pub(crate) fn reset_for_reconnect(&self, preserve: bool) -> bool {
+        if preserve {
+            self.epoch.fetch_add(1, Ordering::AcqRel);
+            self.lock().timer_armed = false;
+            self.pending_live.store(false, Ordering::Release);
+            self.active.store(true, Ordering::Release);
+            return false;
+        }
         let dropped = self.take().mark_dropped();
         if !dropped.is_empty() {
             log::debug!(
@@ -267,11 +295,17 @@ struct ReinsertGuard<'a> {
     batcher: &'a InboundCommitBatcher,
     items: Option<Arc<[InboundMessage]>>,
     commit_ticket: Option<InboundCommitTicket>,
+    // Fields drop after our Drop implementation: restore the batch before
+    // waking a producer that was waiting for this identity's commit.
+    retained: Option<retention::RetentionCommit>,
 }
 
 impl ReinsertGuard<'_> {
     fn mark_durable(&mut self) {
         self.items = None;
+        if let Some(retained) = &self.retained {
+            retained.durable();
+        }
         if let Some(ticket) = self.commit_ticket.take() {
             ticket.mark_durable();
         }
@@ -288,6 +322,13 @@ impl Drop for ReinsertGuard<'_> {
         // Nothing newer can normally exist (the permit serializes drain
         // flushes), but keep arrival order if it ever does.
         restored.append(&mut state.entries);
+        let before_filter = restored.len();
+        // A newer producer already retains these parts, or has completed
+        // them. An old snapshot must not outlive that ownership and later
+        // delete a new delivery's pending row through an ownerless commit.
+        self.batcher
+            .retention
+            .restore_batched(&mut restored, self.retained.as_ref());
         state.bytes = restored
             .iter()
             .map(|i| waproto::codec::message_encoded_len(&i.message))
@@ -297,6 +338,19 @@ impl Drop for ReinsertGuard<'_> {
         // flushes cover the gap regardless.
         state.timer_armed = false;
         state.entries = restored;
+        if state.entries.len() != before_filter {
+            // A batch ticket covers all its entries. A partial restoration
+            // cannot acknowledge the entries now owned by another producer.
+            for ticket in [state.commit_ticket.take(), self.commit_ticket.take()]
+                .into_iter()
+                .flatten()
+            {
+                ticket.mark_dropped();
+            }
+        }
+        if state.entries.is_empty() {
+            return;
+        }
         if let Some(ticket) = self.commit_ticket.take() {
             if state.commit_ticket.is_some() {
                 ticket.mark_dropped();
@@ -343,12 +397,28 @@ impl Client {
         item: InboundMessage,
         track_commit: bool,
     ) -> InboundCommitState {
+        self.commit_or_batch_inbound_items(Arc::from([item]), track_commit)
+            .await
+    }
+
+    pub(crate) async fn commit_or_batch_inbound_items(
+        self: &Arc<Self>,
+        items: Arc<[InboundMessage]>,
+        track_commit: bool,
+    ) -> InboundCommitState {
+        if let Some(state) = self
+            .inbound_commit_batch
+            .retention
+            .stage(&items, track_commit)
+        {
+            return state;
+        }
         if !self.inbound_commit_batch.is_active() {
             // Arc::from([item]) builds the event/hook slice in one allocation;
             // a Vec would add an alloc+dealloc per live message (measured
             // ~18ns and 2x the allocations of this step).
             return if self
-                .commit_inbound_batch(Arc::from([item]), BatchOrigin::Live, None)
+                .commit_inbound_batch(items, BatchOrigin::Live, None)
                 .await
             {
                 InboundCommitState::Durable
@@ -356,7 +426,14 @@ impl Client {
                 InboundCommitState::Failed
             };
         }
-        let (timer_epoch, ticket) = self.enqueue_inbound_commit(item, track_commit);
+        self.inbound_commit_batch.retention.batched(&items, None);
+        let mut timer_epoch = None;
+        let mut ticket = None;
+        for item in items.iter().cloned() {
+            let (epoch, item_ticket) = self.enqueue_inbound_commit(item, track_commit);
+            timer_epoch = timer_epoch.or(epoch);
+            ticket = ticket.or(item_ticket);
+        }
         if let Some(epoch) = timer_epoch {
             // Weak: a sleeper must not keep the whole Client graph alive for
             // up to 3s after the app drops its handle.
@@ -569,13 +646,19 @@ impl Client {
     /// persisted its rowless advances; the reset then dropped the entry and
     /// its redelivery was acked as a duplicate.
     ///
-    /// On timeout (stalled permit holder / hung hook) the cache is cleared
-    /// WITHOUT flushing: everything dirty then belongs to uncommitted
-    /// entries, and dropping both sides keeps redelivery consistent.
+    /// With a durability hook, a timeout preserves both the retained plaintext
+    /// and the Signal cache. Without one, the legacy timeout path clears dirty
+    /// cache state rather than persisting unbuffered advances.
     pub(crate) async fn teardown_inbound_commits_bounded(
         self: &Arc<Self>,
         limit: std::time::Duration,
     ) -> DrainOutcome {
+        if self.inbound_durability_hook().is_some() {
+            // A socket reset cannot roll back Signal state shared with outgoing
+            // sends or discard plaintext admitted by another live worker. Keep
+            // both across this bounded attempt; recovery owns the retained data.
+            return self.flush_inbound_commits_bounded(limit).await;
+        }
         let settle = async {
             let _permit = self.acquire_message_processing_permit().await;
             let batch = self.inbound_commit_batch.take();
@@ -753,7 +836,11 @@ impl Client {
     /// them, losing content with nothing left to redeliver it. Comparing the
     /// message keeps them and costs a structural compare only where identities
     /// actually collide, which is the rare case this whole function exists for.
-    fn dedup_batch_by_message(&self, items: Arc<[InboundMessage]>) -> Arc<[InboundMessage]> {
+    fn dedup_batch_with_retention(
+        &self,
+        items: Arc<[InboundMessage]>,
+        retained: Option<&retention::RetentionCommit>,
+    ) -> Arc<[InboundMessage]> {
         if items.len() < 2 {
             return items;
         }
@@ -784,7 +871,11 @@ impl Client {
             buf
         }
         type Seen = std::collections::HashMap<DispatchKey, Vec<Kept>>;
-        fn keep(seen: &mut Seen, item: &InboundMessage) -> bool {
+        fn keep(
+            seen: &mut Seen,
+            item: &InboundMessage,
+            retained: Option<&retention::RetentionCommit>,
+        ) -> bool {
             let kept = seen.entry(Client::dispatch_key(&item.info)).or_default();
             if kept.len() >= MAX_COMPARED_PER_ID {
                 return true;
@@ -801,7 +892,11 @@ impl Client {
                 // separate stanzas always allocate separate infos, so this
                 // never exempts a genuine resend, while a part whose info was
                 // copied on write falls through to the content compare.
-                if Arc::ptr_eq(&k.info, &item.info) {
+                if Arc::ptr_eq(&k.info, &item.info)
+                    || retained.is_some_and(|r| {
+                        r.owns(&item.info) && retention::key(&k.info) == retention::key(&item.info)
+                    })
+                {
                     continue;
                 }
                 if Arc::ptr_eq(&k.message, &item.message) {
@@ -831,13 +926,13 @@ impl Client {
             true
         }
         let mut seen = Seen::with_capacity(items.len());
-        if items.iter().all(|item| keep(&mut seen, item)) {
+        if items.iter().all(|item| keep(&mut seen, item, retained)) {
             return items;
         }
         seen.clear();
         let kept: Arc<[InboundMessage]> = items
             .iter()
-            .filter(|item| keep(&mut seen, item))
+            .filter(|item| keep(&mut seen, item, retained))
             .cloned()
             .collect();
         // Counted like any other suppression: what this drops never reaches a
@@ -857,8 +952,9 @@ impl Client {
     /// misbehaving synchronous handler cannot suppress them — the contract the
     /// pre-batch at-most-once path had. A crash between ack and event trades
     /// exactly like that old path: the consumer's durable copy is the hook
-    /// commit, not the event. On any commit failure everything stays unacked
-    /// and the server redelivers the whole batch.
+    /// commit, not the event. Commit failures suppress receipts; resident
+    /// durability-mode entries remain available to retry without another
+    /// incoming delivery. Receipt suppression is not a server replay guarantee.
     ///
     /// Drain commits also flush the Signal cache (bulk signal-store commit per
     /// snapshot, WA Web ordering); live commits leave it to the per-stanza
@@ -890,16 +986,29 @@ impl Client {
         // acked from `arrived`; only what the hook and the consumer see is
         // reduced to one copy.
         let arrived = Arc::clone(&items);
-        let items = if self.dispatch_gate_enabled() {
-            self.dedup_batch_by_message(items)
-        } else {
-            items
-        };
+        // Own every physical arrival before payload deduplication. Dropped
+        // payloads still hold admission leases and need their commit settled.
         let mut reinsert = ReinsertGuard {
             batcher: &self.inbound_commit_batch,
             items: is_drain.then(|| Arc::clone(&items)),
             commit_ticket,
+            retained: None,
         };
+        let items = if self.inbound_commit_batch.retention.is_active() {
+            reinsert.retained = self.inbound_commit_batch.retention.commit_active(&items);
+            let Some(retained) = &reinsert.retained else {
+                return false;
+            };
+            retained.canonical_items(items)
+        } else {
+            items
+        };
+        let items = if self.dispatch_gate_enabled() {
+            self.dedup_batch_with_retention(items, reinsert.retained.as_ref())
+        } else {
+            items
+        };
+        reinsert.items = is_drain.then(|| Arc::clone(&items));
         #[cfg(test)]
         if self
             .inbound_commit_batch
@@ -970,22 +1079,87 @@ impl Client {
                         );
                     }
                 }
-                let rows: Vec<PendingInboundRow<'_>> = items
+                // A stanza can carry several distinct payloads under one key.
+                // Keep their order and multiplicity in one opaque record rather
+                // than letting the backend's replace-into retain only the tail.
+                let mut groups: Vec<Vec<usize>> = Vec::new();
+                let mut indexes = std::collections::HashMap::new();
+                for (i, (item, (chat, sender))) in items.iter().zip(&keys).enumerate() {
+                    let index =
+                        *indexes
+                            .entry((chat, sender, &item.info.id))
+                            .or_insert_with(|| {
+                                groups.push(Vec::new());
+                                groups.len() - 1
+                            });
+                    groups[index].push(i);
+                }
+                let records: Vec<Option<Vec<u8>>> = groups
                     .iter()
-                    .zip(&keys)
-                    .zip(&ranges)
-                    .map(|((item, (chat, sender)), range)| PendingInboundRow {
-                        chat,
-                        sender,
-                        id: &item.info.id,
-                        message: &arena[range.clone()],
+                    .map(|group| {
+                        (group.len() > 1).then(|| {
+                            let parts: Vec<&[u8]> =
+                                group.iter().map(|&i| &arena[ranges[i].clone()]).collect();
+                            durability::encode_pending_parts(&parts)
+                        })
+                    })
+                    .collect();
+                let rows: Vec<PendingInboundRow<'_>> = groups
+                    .iter()
+                    .zip(&records)
+                    .map(|(group, record)| {
+                        let i = group[0];
+                        PendingInboundRow {
+                            chat: &keys[i].0,
+                            sender: &keys[i].1,
+                            id: &items[i].info.id,
+                            message: record.as_deref().unwrap_or(&arena[ranges[i].clone()]),
+                        }
                     })
                     .collect();
 
                 // Fail closed: without a durable buffered copy, do not run the
                 // hook and do not ack — the entries return to the batcher (via
                 // the guard) and the server redelivers once storage recovers.
-                if let Err(e) = backend.store_pending_inbound_batch(&rows).await {
+                let mut updates = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    match backend
+                        .get_pending_inbound(row.chat, row.sender, row.id)
+                        .await
+                    {
+                        Ok(None) => updates.push((true, None)),
+                        Ok(Some(existing)) => {
+                            match durability::extend_pending_record(&existing, row.message) {
+                                Ok(Some(extended)) => updates.push((true, Some(extended))),
+                                Ok(None) => updates.push((false, None)),
+                                Err(error) => {
+                                    log::error!(
+                                        "Pending inbound record is corrupt or conflicts with retained parts; preserving both copies and withholding receipt: {error:?}"
+                                    );
+                                    return false;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "Cannot check pending inbound record; withholding receipt: {error:?}"
+                            );
+                            return false;
+                        }
+                    }
+                }
+                let missing: Vec<_> = rows
+                    .into_iter()
+                    .zip(&updates)
+                    .filter(|(_, (write, _))| *write)
+                    .map(|(row, (_, bytes))| PendingInboundRow {
+                        message: bytes.as_deref().unwrap_or(row.message),
+                        ..row
+                    })
+                    .collect();
+                if !missing.is_empty()
+                    && let Err(e) = backend.store_pending_inbound_batch(&missing).await
+                {
                     log::error!(
                         "Failed to buffer inbound batch of {}; suppressing acks for redelivery: {e:?}",
                         items.len()
@@ -993,18 +1167,15 @@ impl Client {
                     return false;
                 }
             }
-            // A failed flush reports not-durable so buffered receipts are held
-            // back. The guard is still armed: the rows are in place and
-            // re-storing them is idempotent (replace-into), so the restored
-            // entries make the batch retryable THIS session — the retry
-            // re-runs the full commit (rows → flush → hook → acks → event)
-            // instead of parking the messages until a reconnect replay.
+            // A failed flush holds buffered receipts back and restores the
+            // batch. A retry reuses compatible stored rows and repeats the
+            // flush, hook, receipt and event pipeline.
             if is_drain && !self.drain_signal_flush_reporting().await {
                 return false;
             }
-            // Rows durable and Signal flushed: from here on a cancelled
-            // future must not restore the entries — redelivery replays from
-            // the rows.
+            // The batch queue can release these entries once the durable
+            // point is reached. The separate retention guard still keeps
+            // plaintext for local retry if the hook fails or is cancelled.
             reinsert.mark_durable();
 
             if let Err(e) = hook.on_messages(self.clone(), &items).await {
@@ -1016,43 +1187,27 @@ impl Client {
             }
             hook_committed = true;
 
-            // Cleared for every stanza that arrived, not just the ones kept: a
-            // pending row is keyed on the sender exactly as that delivery spelled
-            // it, while the collapse folds spellings together. Deleting only the
-            // kept spelling would leave a row that a later resend replays as an
-            // already committed message. Deleting a row that is not there is a
-            // no-op, so the superset is free.
-            let arrived_keys: Vec<(String, String)>;
-            let delete_keys: Vec<PendingInboundKey<'_>> = if arrived.len() == items.len() {
-                items
-                    .iter()
-                    .zip(&keys)
-                    .map(|(item, (chat, sender))| PendingInboundKey {
-                        chat,
-                        sender,
-                        id: &item.info.id,
-                    })
-                    .collect()
-            } else {
-                arrived_keys = arrived
-                    .iter()
-                    .map(|m| {
-                        (
-                            m.info.source.chat.to_string(),
-                            m.info.source.sender.to_string(),
-                        )
-                    })
-                    .collect();
-                arrived
-                    .iter()
-                    .zip(&arrived_keys)
-                    .map(|(item, (chat, sender))| PendingInboundKey {
-                        chat,
-                        sender,
-                        id: &item.info.id,
-                    })
-                    .collect()
-            };
+            // Remove only keys loaded for this commit plus rows this batch
+            // wrote. Never delete by normalized participant: a row we did not
+            // read might contain another uncommitted payload.
+            let mut settled_keys = reinsert
+                .retained
+                .as_ref()
+                .map(retention::RetentionCommit::pending_keys)
+                .unwrap_or_default();
+            settled_keys.extend(arrived.iter().chain(items.iter()).map(|item| {
+                (
+                    item.info.source.chat.to_string(),
+                    item.info.source.sender.to_string(),
+                    item.info.id.to_string(),
+                )
+            }));
+            settled_keys.sort_unstable();
+            settled_keys.dedup();
+            let delete_keys: Vec<_> = settled_keys
+                .iter()
+                .map(|(chat, sender, id)| PendingInboundKey { chat, sender, id })
+                .collect();
             if let Err(e) = backend.delete_pending_inbound_batch(&delete_keys).await {
                 // Leftover rows replay as duplicates; the idempotent hook
                 // re-commits and the replay path clears them.
@@ -1070,6 +1225,9 @@ impl Client {
         }
 
         reinsert.mark_durable();
+        if let Some(retained) = &mut reinsert.retained {
+            retained.complete();
+        }
         #[cfg(test)]
         self.inbound_commit_batch
             .publication_reached
@@ -1107,8 +1265,19 @@ impl Client {
         }
         let items = retained.map(Arc::from).unwrap_or(items);
         // Schedule receipts before synchronous consumer code can block or panic.
-        for item in arrived.iter() {
-            self.ack_received_message(&item.info);
+        if arrived.len() == 1 {
+            self.ack_received_message(&arrived[0].info);
+        } else {
+            let mut receipted = std::collections::HashSet::new();
+            for item in arrived.iter() {
+                if receipted.insert((
+                    &item.info.source.chat,
+                    &item.info.source.sender,
+                    &item.info.id,
+                )) {
+                    self.ack_received_message(&item.info);
+                }
+            }
         }
         if is_drain {
             self.flush_offline_receipts();
@@ -1138,6 +1307,77 @@ mod tests {
 
     struct RecordingHook {
         batches: Mutex<Vec<Vec<String>>>,
+    }
+
+    #[tokio::test]
+    async fn refused_old_snapshot_is_not_restored_after_successor_completes() {
+        let batcher = InboundCommitBatcher::default();
+        let retained = &batcher.retention;
+        let first = item("restored-owner");
+        retained.begin(&first.info, retained.admit(100)).await;
+        retained.stage(std::slice::from_ref(&first), false).unwrap();
+        let (old_items, _) = retained.seal(&first.info, true);
+        retained.begin(&first.info, retained.admit(200)).await;
+        assert!(retained.commit_active(&old_items).is_none());
+        let ticket = InboundCommitTicket::new();
+        let old = ReinsertGuard {
+            batcher: &batcher,
+            items: Some(Arc::clone(&old_items)),
+            commit_ticket: Some(ticket.clone()),
+            retained: None,
+        };
+        let (new_items, _) = retained.seal(&first.info, false);
+        let mut successor = retained.commit_active(&new_items).unwrap();
+        successor.complete();
+        drop(successor);
+        drop(old);
+        assert!(batcher.lock().entries.is_empty());
+        assert_eq!(batcher.lock().bytes, 0);
+        assert_eq!(ticket.state(), InboundCommitTicketState::Dropped);
+        assert!(retained.commit_active(&old_items).is_none());
+
+        retained.begin(&first.info, retained.admit(300)).await;
+        retained.stage(std::slice::from_ref(&first), false).unwrap();
+        let (next, _) = retained.seal(&first.info, false);
+        let owner = retained.commit_active(&next).unwrap();
+        drop(ReinsertGuard {
+            batcher: &batcher,
+            items: Some(old_items),
+            commit_ticket: None,
+            retained: None,
+        });
+        assert!(batcher.lock().entries.is_empty());
+        assert!(owner.owns(&first.info));
+    }
+
+    #[tokio::test]
+    async fn refused_snapshot_keeps_the_new_producer_and_unrelated_batch() {
+        let batcher = InboundCommitBatcher::default();
+        let retained = &batcher.retention;
+        let first = item("old-producer");
+        let other = item("other-producer");
+        for item in [&first, &other] {
+            retained.begin(&item.info, retained.admit(100)).await;
+            retained.stage(std::slice::from_ref(item), false).unwrap();
+            retained.seal(&item.info, true);
+        }
+        retained.begin(&first.info, retained.admit(200)).await;
+        let ticket = InboundCommitTicket::new();
+        drop(ReinsertGuard {
+            batcher: &batcher,
+            items: Some(Arc::from([first.clone(), other.clone()])),
+            commit_ticket: Some(ticket.clone()),
+            retained: None,
+        });
+        assert!(retained.is_collecting(&first.info));
+        assert_eq!(ticket.state(), InboundCommitTicketState::Dropped);
+        let state = batcher.lock();
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].info.id, other.info.id);
+        assert_eq!(
+            state.bytes,
+            waproto::codec::message_encoded_len(&other.message)
+        );
     }
 
     #[async_trait::async_trait]
@@ -1772,3 +2012,7 @@ mod tests {
         guards.len()
     }
 }
+
+#[cfg(test)]
+#[path = "tests/a09_restore.rs"]
+mod restore_tests;

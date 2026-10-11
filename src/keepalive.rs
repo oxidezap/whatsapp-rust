@@ -495,43 +495,23 @@ impl Client {
     /// the store without ever holding a connection still reaps what expired
     /// while it was closed.
     pub(crate) async fn run_retention_cleanup(&self, sent_msg_ttl: u64) {
-        self.run_retention_cleanup_scope(sent_msg_ttl, true).await;
+        self.run_retention_cleanup_scope(sent_msg_ttl).await;
     }
 
-    /// The startup subset of the retention sweep: everything except the
-    /// pending-inbound buffer.
-    ///
-    /// Those rows are the only recoverable plaintext for a decrypted message
-    /// whose inbound durability hook has not committed. The server can
-    /// redeliver one after a restart, and [`Client::ack_or_replay_to_hook`]
-    /// uses the buffered copy to re-run the hook; if the row is gone first, the
-    /// redelivery looks like a genuine duplicate and is acked without the hook,
-    /// losing the message. The buffer is therefore swept only on the keepalive
-    /// tick, by which point the connection has been up long enough for the
-    /// offline redelivery to have replayed what it can. Secrets, sent messages
-    /// and base keys have no such replay dependency and are safe pre-connection.
+    /// Run retention before connecting. Pending inbound records are excluded
+    /// from both startup and periodic cleanup: elapsed time cannot establish
+    /// that their consumer committed them.
     pub(crate) async fn run_startup_retention_cleanup(&self) {
         let sent_msg_ttl = self.cache_config.sent_message_ttl_secs;
-        self.run_retention_cleanup_scope(sent_msg_ttl, false).await;
+        self.run_retention_cleanup_scope(sent_msg_ttl).await;
     }
 
-    /// Shared body: `sweep_pending_inbound` decides whether the durability
-    /// buffer is pruned. See [`Self::run_startup_retention_cleanup`] for why
-    /// the startup caller passes `false`.
-    async fn run_retention_cleanup_scope(&self, sent_msg_ttl: u64, sweep_pending_inbound: bool) {
+    async fn run_retention_cleanup_scope(&self, sent_msg_ttl: u64) {
         let now = wacore::time::now_secs();
         let cutoff_for = |ttl: u64| now.saturating_sub(i64::try_from(ttl).unwrap_or(i64::MAX));
 
         let backend = self.persistence_manager.backend();
         let sent_cutoff = (sent_msg_ttl > 0).then(|| cutoff_for(sent_msg_ttl));
-        // Pending inbound buffer retention (inbound durability hook): a row a
-        // permanently-failing hook never commits would otherwise linger once the
-        // server stops redelivering it. Run unconditionally (not gated on the hook
-        // being set now) so rows buffered by a hook in a previous run are still
-        // swept after it is disabled. Backends without the buffer return 0 from
-        // the default impl, so this is a cheap no-op there.
-        const PENDING_INBOUND_TTL_SECS: u64 = 7 * 24 * 60 * 60;
-        let pending_cutoff = cutoff_for(PENDING_INBOUND_TTL_SECS);
         // A base key is recorded when a peer's retry #2 arrives and is read back
         // only by a retry #3 for the same message. One retry conversation is the
         // whole lifetime of the row: past that window it answers a question
@@ -547,12 +527,6 @@ impl Client {
             && let Err(e) = backend.delete_expired_sent_messages(cutoff).await
         {
             client_log!(self, warn, target: "Client/Keepalive", "Sent message cleanup error: {e}");
-        }
-
-        if sweep_pending_inbound
-            && let Err(e) = backend.delete_expired_pending_inbound(pending_cutoff).await
-        {
-            client_log!(self, warn, target: "Client/Keepalive", "Pending inbound cleanup error: {e}");
         }
 
         if let Err(e) = backend.delete_expired_base_keys(base_key_cutoff).await {
