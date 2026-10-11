@@ -185,3 +185,102 @@ fn history_whitelist_covers_current_generated_fields() {
         );
     }
 }
+
+// Keep AST dependency in this build-tool test crate; pairing runtime needs none.
+fn explicit_platform_variants(source: &str) -> std::collections::BTreeSet<String> {
+    fn collect(pattern: &syn::Pat, names: &mut std::collections::BTreeSet<String>) {
+        match pattern {
+            syn::Pat::Path(path) => {
+                assert_eq!(path.path.segments.len(), 2);
+                assert_eq!(path.path.segments[0].ident, "P");
+                names.insert(path.path.segments[1].ident.to_string());
+            }
+            syn::Pat::Or(pattern) => {
+                for case in &pattern.cases {
+                    collect(case, names);
+                }
+            }
+            syn::Pat::Guard(_) => panic!("conditional arms do not cover a platform"),
+            syn::Pat::Wild(_) => {}
+            _ => panic!("unsupported platform mapping pattern"),
+        }
+    }
+    let file = syn::parse_file(source).expect("pairing source parses");
+    let function = file
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(function)
+                if function.sig.ident == "companion_web_client_type_for_platform" =>
+            {
+                Some(function)
+            }
+            _ => None,
+        })
+        .expect("platform mapping exists");
+    let mapping = function
+        .block
+        .stmts
+        .iter()
+        .find_map(|statement| match statement {
+            syn::Stmt::Expr(syn::Expr::Match(mapping), _) => Some(mapping),
+            _ => None,
+        })
+        .expect("platform mapping retains explicit match");
+    assert!(
+        mapping
+            .arms
+            .iter()
+            .any(|arm| matches!(arm.pat, syn::Pat::Wild(_))),
+        "non-exhaustive enum requires the wildcard arm"
+    );
+    let mut names = std::collections::BTreeSet::new();
+    for arm in &mapping.arms {
+        collect(&arm.pat, &mut names);
+    }
+    names
+}
+
+#[test]
+fn platform_mapping_covers_every_generated_variant() {
+    use buffa::Enumeration;
+    use waproto::whatsapp::device_props::PlatformType;
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../wacore/src/companion_reg.rs");
+    let source = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "workspace-only platform mapping gate NOT_EXECUTED: wacore source is outside the waproto package"
+            );
+            return;
+        }
+        Err(error) => panic!("read platform mapping source: {error}"),
+    };
+    let known: std::collections::BTreeSet<String> = PlatformType::values()
+        .iter()
+        .map(|platform| platform.proto_name().to_owned())
+        .collect();
+    assert!(!known.is_empty());
+    let explicit = explicit_platform_variants(&source);
+    assert_eq!(
+        explicit, known,
+        "every current platform needs a deliberate mapping"
+    );
+
+    // A wildcard still handles these values, so result-only tests cannot detect
+    // a forgotten arm. Inspect the arms against generated metadata instead.
+    let removed = source.replace("P::CHROME => C::Chrome,", "");
+    assert_ne!(removed, source);
+    let missing = explicit_platform_variants(&removed);
+    assert!(!missing.contains("CHROME"));
+    assert_ne!(missing, known);
+    let conditional = source.replace("P::CHROME => C::Chrome,", "P::CHROME if true => C::Chrome,");
+    assert_ne!(conditional, source);
+    assert!(std::panic::catch_unwind(|| explicit_platform_variants(&conditional)).is_err());
+    let mut future = known;
+    future.insert("FUTURE_BROWSER".to_owned());
+    assert_ne!(
+        explicit, future,
+        "an additive enum variant must require a mapping decision"
+    );
+}
