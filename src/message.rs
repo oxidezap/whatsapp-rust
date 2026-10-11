@@ -537,15 +537,23 @@ enum InboundCommitTicketState {
 }
 
 #[derive(Clone)]
-pub(crate) struct InboundCommitTicket(Arc<AtomicU8>);
+pub(crate) struct InboundCommitTicket(Arc<InboundCommitTicketInner>);
+
+struct InboundCommitTicketInner {
+    state: AtomicU8,
+    resolved: event_listener::Event,
+}
 
 impl InboundCommitTicket {
     fn new() -> Self {
-        Self(Arc::new(AtomicU8::new(INBOUND_COMMIT_PENDING)))
+        Self(Arc::new(InboundCommitTicketInner {
+            state: AtomicU8::new(INBOUND_COMMIT_PENDING),
+            resolved: event_listener::Event::new(),
+        }))
     }
 
     fn state(&self) -> InboundCommitTicketState {
-        match self.0.load(Ordering::Acquire) {
+        match self.0.state.load(Ordering::Acquire) {
             INBOUND_COMMIT_DURABLE => InboundCommitTicketState::Durable,
             INBOUND_COMMIT_DROPPED => InboundCommitTicketState::Dropped,
             _ => InboundCommitTicketState::Pending,
@@ -553,12 +561,19 @@ impl InboundCommitTicket {
     }
 
     fn resolve(&self, state: u8) {
-        let _ = self.0.compare_exchange(
-            INBOUND_COMMIT_PENDING,
-            state,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        if self
+            .0
+            .state
+            .compare_exchange(
+                INBOUND_COMMIT_PENDING,
+                state,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.0.resolved.notify(usize::MAX);
+        }
     }
 
     fn mark_durable(&self) {

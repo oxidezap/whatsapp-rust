@@ -301,8 +301,12 @@ struct ReinsertGuard<'a> {
 }
 
 impl ReinsertGuard<'_> {
-    fn mark_durable(&mut self) {
+    fn mark_buffered(&mut self) {
         self.items = None;
+    }
+
+    fn mark_durable(&mut self) {
+        self.mark_buffered();
         if let Some(retained) = &self.retained {
             retained.durable();
         }
@@ -1082,16 +1086,17 @@ impl Client {
                 // A stanza can carry several distinct payloads under one key.
                 // Keep their order and multiplicity in one opaque record rather
                 // than letting the backend's replace-into retain only the tail.
+                // Sender spellings of one retained stanza must not split its
+                // canonical sequence; raw keys remain available for cleanup.
                 let mut groups: Vec<Vec<usize>> = Vec::new();
                 let mut indexes = std::collections::HashMap::new();
-                for (i, (item, (chat, sender))) in items.iter().zip(&keys).enumerate() {
-                    let index =
-                        *indexes
-                            .entry((chat, sender, &item.info.id))
-                            .or_insert_with(|| {
-                                groups.push(Vec::new());
-                                groups.len() - 1
-                            });
+                for (i, item) in items.iter().enumerate() {
+                    let index = *indexes
+                        .entry(retention::key(&item.info))
+                        .or_insert_with(|| {
+                            groups.push(Vec::new());
+                            groups.len() - 1
+                        });
                     groups[index].push(i);
                 }
                 let records: Vec<Option<Vec<u8>>> = groups
@@ -1175,8 +1180,9 @@ impl Client {
             }
             // The batch queue can release these entries once the durable
             // point is reached. The separate retention guard still keeps
-            // plaintext for local retry if the hook fails or is cancelled.
-            reinsert.mark_durable();
+            // plaintext and its pending ticket for local retry if the hook fails
+            // or is cancelled. Only the consumer commit permits a key-share reply.
+            reinsert.mark_buffered();
 
             if let Err(e) = hook.on_messages(self.clone(), &items).await {
                 log::warn!(

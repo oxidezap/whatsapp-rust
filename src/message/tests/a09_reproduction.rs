@@ -2,7 +2,7 @@
 use super::*;
 use diesel::{Connection, RunQueryDsl, SqliteConnection};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use wacore::types::events::{ChannelEventHandler, InboundMessage};
+use wacore::types::events::{BatchOrigin, ChannelEventHandler, InboundMessage};
 
 #[derive(Default)]
 struct Hook {
@@ -1393,4 +1393,195 @@ async fn restart_contained_alias_exact_tail_uses_complete_recorded_sequence() {
 #[tokio::test]
 async fn restart_contained_alias_preserves_repeated_parts_and_all_keys() {
     restart_contained_alias(&["A", "A", "B"], &["A", "B"], true).await;
+}
+
+async fn retained_key_share_waits_for_consumer(cancel: bool) {
+    let f = Fixture::new("KEY_SHARE_CONSUMER_COMMIT", false).await;
+    f.receive().await;
+    let mut info = f.info.clone();
+    info.id = "KEY_SHARE_TICKET".into();
+    let info = Arc::new(info);
+    let mut request = wa::message::AppStateSyncKeyRequest::default();
+    let mut key_id = wa::message::AppStateSyncKeyId::default();
+    key_id.key_id = Some(vec![4, 3, 2, 1]);
+    request.key_ids.push(key_id);
+    let mut protocol = wa::message::ProtocolMessage::default();
+    protocol.r#type = Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest);
+    protocol.app_state_sync_key_request = buffa::MessageField::some(request.clone());
+    let mut message = wa::Message::default();
+    message.protocol_message = buffa::MessageField::some(protocol);
+    let items: Arc<[InboundMessage]> = Arc::from([InboundMessage::builder()
+        .info(info.clone())
+        .message(Arc::new(message))
+        .build()]);
+    let retention = &f.client.inbound_commit_batch.retention;
+    retention.begin(&info, retention.admit(100)).await;
+    let Some(InboundCommitState::Deferred(Some(ticket))) = retention.stage(&items, true) else {
+        panic!("key request must have a tracked commit")
+    };
+    let (items, _) = retention.seal(&info, false);
+    f.hook.pause_first.store(true, Ordering::SeqCst);
+    f.hook.fail.store(!cancel, Ordering::SeqCst);
+    let task = tokio::spawn({
+        let client = f.client.clone();
+        let items = items.clone();
+        async move {
+            client
+                .commit_inbound_batch(items, BatchOrigin::Live, None)
+                .await
+        }
+    });
+    f.hook.entered.notified().await;
+    assert_eq!(ticket.state(), InboundCommitTicketState::Pending);
+    let sent_before = f.transport.sent_count();
+    f.client.schedule_app_state_sync_key_share(
+        info.source.sender.clone(),
+        request,
+        Some(ticket.clone()),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert!(!has_message_to_after(
+        &f.transport.sent(),
+        sent_before,
+        &info.source.sender.to_string()
+    ));
+    if cancel {
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    } else {
+        f.hook.release.notify_one();
+        assert!(task.await.unwrap());
+    }
+    assert_eq!(ticket.state(), InboundCommitTicketState::Pending);
+    assert!(!has_message_to_after(
+        &f.transport.sent(),
+        sent_before,
+        &info.source.sender.to_string()
+    ));
+    f.hook.fail.store(false, Ordering::SeqCst);
+    assert!(
+        f.client
+            .commit_inbound_batch(items, BatchOrigin::Live, None)
+            .await
+    );
+    assert_eq!(ticket.state(), InboundCommitTicketState::Durable);
+    // A live consumer commit must wake the job without an offline-sync event.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !has_message_to_after(
+            &f.transport.sent(),
+            sent_before,
+            &info.source.sender.to_string(),
+        ) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("successful live hook must release the deferred key share");
+}
+
+#[tokio::test]
+async fn retained_key_share_waits_after_hook_failure_and_wakes_on_retry() {
+    retained_key_share_waits_for_consumer(false).await;
+}
+
+#[tokio::test]
+async fn retained_key_share_waits_after_hook_cancellation_and_wakes_on_retry() {
+    retained_key_share_waits_for_consumer(true).await;
+}
+
+async fn restart_merged_alias_sequence(first_device: bool, repeated: bool) {
+    let mut f = Fixture::new("RESTART_MERGED_ALIAS_SEQUENCE", false).await;
+    let group: Jid = "120363000000000030@g.us".parse().unwrap();
+    let mut peer = joined_group_sender(&f.client, "100000000000030:75@lid", &group).await;
+    let bare = peer.jid.to_non_ad();
+    let (first, second) = if first_device {
+        (peer.jid.clone(), bare)
+    } else {
+        (bare, peer.jid.clone())
+    };
+    let original = p1_group_parts(
+        &mut peer,
+        &group,
+        &f.info.id,
+        if repeated { &["A", "A"] } else { &["A"] },
+    )
+    .await;
+    f.stanza = with_participant(&original, &first);
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    f.hook.fail.store(true, Ordering::SeqCst);
+    f.receive().await;
+    let appended = p1_group_parts(&mut peer, &group, &f.info.id, &["B"]).await;
+    f.stanza = with_participant(&appended, &second);
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    f.receive().await;
+    assert_eq!(f.receipts(), 0);
+    f.restart().await;
+    f.hook.fail.store(false, Ordering::SeqCst);
+    f.receive().await;
+    let expected = if repeated {
+        vec!["A", "A", "B"]
+    } else {
+        vec!["A", "B"]
+    };
+    assert_eq!(
+        f.published(),
+        expected,
+        "restart must preserve canonical arrival order and multiplicity across sender spellings"
+    );
+    assert_eq!(f.receipts(), 1);
+    for sender in [&first, &second] {
+        assert!(
+            f.client
+                .persistence_manager
+                .backend()
+                .get_pending_inbound(&group.to_string(), &sender.to_string(), &f.info.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "settle each original sender key"
+        );
+    }
+}
+
+#[tokio::test]
+async fn restart_merged_device_to_bare_preserves_part_order() {
+    restart_merged_alias_sequence(true, false).await;
+}
+
+#[tokio::test]
+async fn restart_merged_bare_to_device_preserves_repeated_parts() {
+    restart_merged_alias_sequence(false, true).await;
+}
+
+#[tokio::test]
+async fn recovered_middle_part_uses_retry_order_including_repeated_occurrences() {
+    for repeated in [false, true] {
+        let mut f = Fixture::new("RECOVERED_MIDDLE_PART", false).await;
+        let group: Jid = "120363000000000031@g.us".parse().unwrap();
+        let mut peer = joined_group_sender(&f.client, "100000000000031:75@lid", &group).await;
+        let retained = if repeated {
+            vec!["A", "A", "C"]
+        } else {
+            vec!["A", "C"]
+        };
+        let recovered = if repeated {
+            vec!["A", "B", "A", "C"]
+        } else {
+            vec!["A", "B", "C"]
+        };
+        f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, &retained).await;
+        f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+        f.hook.fail.store(true, Ordering::SeqCst);
+        f.receive().await;
+        assert_eq!(f.receipts(), 0);
+        f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, &recovered).await;
+        f.hook.fail.store(false, Ordering::SeqCst);
+        f.receive().await;
+        assert_eq!(
+            f.published(),
+            recovered,
+            "a recovered middle occurrence must precede its retained successor"
+        );
+        assert_eq!(f.receipts(), 1);
+    }
 }

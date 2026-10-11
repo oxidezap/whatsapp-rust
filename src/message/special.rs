@@ -228,6 +228,9 @@ impl Client {
                             return;
                         };
                         let listener = client.offline_sync_notifier.listen();
+                        let ticket_listener = commit_ticket
+                            .as_ref()
+                            .map(|ticket| ticket.0.resolved.listen());
                         let commit_ready = match commit_ticket
                             .as_ref()
                             .map(InboundCommitTicket::state)
@@ -252,6 +255,13 @@ impl Client {
                                     != generation
                             });
                         drop(client);
+                        // A live hook commit does not finish offline sync. Listen
+                        // before checking state so its own resolution cannot be lost.
+                        let listener = if commit_ready {
+                            listener
+                        } else {
+                            ticket_listener.expect("pending commit has a ticket listener")
+                        };
 
                         if ready {
                             reconnect_after = None;

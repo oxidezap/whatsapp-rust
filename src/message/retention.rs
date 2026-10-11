@@ -74,26 +74,56 @@ pub(super) fn merge_parts(items: &mut Vec<InboundMessage>, fresh: Vec<InboundMes
         *items = fresh;
         return;
     }
-    let mut prior = HashMap::<DispatchFingerprint, usize>::new();
+    // Retained occurrences anchor the retry sequence. Appending a newly
+    // recovered B after retained A,C would durably publish A,C,B instead of A,B,C.
+    let mut prior = HashMap::<DispatchFingerprint, (smallvec::SmallVec<[usize; 1]>, usize)>::new();
     let mut scratch = Vec::new();
-    for item in items.iter() {
-        *prior
+    for (index, item) in items.iter().enumerate() {
+        prior
             .entry(MessageDispatch::fingerprint_into(
                 &item.message,
                 &mut scratch,
             ))
-            .or_default() += 1;
+            .or_default()
+            .0
+            .push(index);
     }
+    let mut merged = Vec::with_capacity(items.len().max(fresh.len()));
+    let mut old = std::mem::take(items).into_iter();
+    let mut next_old = 0;
+    let mut additions = Vec::new();
+    let mut anchored = false;
     for item in fresh {
         let fingerprint = MessageDispatch::fingerprint_into(&item.message, &mut scratch);
-        if let Some(count) = prior.get_mut(&fingerprint)
-            && *count != 0
-        {
-            *count -= 1;
+        let position = prior
+            .get_mut(&fingerprint)
+            .and_then(|(positions, consumed)| {
+                let position = positions.get(*consumed).copied();
+                *consumed += 1;
+                position
+            });
+        if let Some(position) = position {
+            if position < next_old {
+                continue;
+            }
+            merged.extend(old.by_ref().take(position - next_old));
+            merged.append(&mut additions);
+            merged.push(old.next().expect("retained occurrence position exists"));
+            next_old = position + 1;
+            anchored = true;
         } else {
-            items.push(item);
+            additions.push(item);
         }
     }
+    if anchored {
+        merged.append(&mut additions);
+        merged.extend(old);
+    } else {
+        // Disjoint deliveries add new parts after the already-retained sequence.
+        merged.extend(old);
+        merged.append(&mut additions);
+    }
+    *items = merged;
 }
 impl Stanza {
     fn reconcile(&mut self) {
