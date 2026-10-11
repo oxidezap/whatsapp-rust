@@ -11,8 +11,33 @@ use crate::types::durability_hook::InboundDurabilityHook;
 use wacore::types::events::InboundMessage;
 
 // Zero is not a protobuf field tag, so the envelope cannot alias an existing
-// serialized Message. Single-message rows keep their original representation.
+// serialized Message. Legacy single-message and v1 rows remain readable.
 const PARTS_HEADER: &[u8] = b"\0WAPI\x01";
+const SOURCED_PARTS_HEADER: &[u8] = b"\0WAPI\x02";
+
+#[derive(Clone, Copy)]
+struct PendingPart<'a> {
+    bytes: &'a [u8],
+    source: Option<retention::PayloadSource>,
+}
+
+pub(super) fn encode_pending_sourced_parts(
+    parts: &[(&[u8], Option<retention::PayloadSource>)],
+) -> Vec<u8> {
+    if parts.iter().all(|(_, source)| source.is_none()) {
+        return encode_pending_parts(&parts.iter().map(|(bytes, _)| *bytes).collect::<Vec<_>>());
+    }
+    let mut record = SOURCED_PARTS_HEADER.to_vec();
+    for &(bytes, source) in parts {
+        record.push(u8::from(source.is_some()));
+        if let Some(source) = source {
+            record.extend_from_slice(&source);
+        }
+        record.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        record.extend_from_slice(bytes);
+    }
+    record
+}
 
 pub(super) fn encode_pending_parts(parts: &[&[u8]]) -> Vec<u8> {
     let mut record = Vec::new();
@@ -26,15 +51,40 @@ pub(super) fn encode_pending_parts(parts: &[&[u8]]) -> Vec<u8> {
     record
 }
 
-fn pending_parts(bytes: &[u8]) -> anyhow::Result<Vec<&[u8]>> {
+fn pending_records(bytes: &[u8]) -> anyhow::Result<Vec<PendingPart<'_>>> {
     if bytes.first() != Some(&0) {
-        return Ok(vec![bytes]);
+        return Ok(vec![PendingPart {
+            bytes,
+            source: None,
+        }]);
     }
+    let sourced = bytes.starts_with(SOURCED_PARTS_HEADER);
     let mut remaining = bytes
-        .strip_prefix(PARTS_HEADER)
+        .strip_prefix(if sourced {
+            SOURCED_PARTS_HEADER
+        } else {
+            PARTS_HEADER
+        })
         .ok_or_else(|| anyhow::anyhow!("unknown pending-inbound record header"))?;
     let mut parts = Vec::new();
     while !remaining.is_empty() {
+        let source = if sourced {
+            let (&flag, rest) = remaining.split_first().expect("nonempty record remainder");
+            remaining = rest;
+            match flag {
+                0 => None,
+                1 => {
+                    anyhow::ensure!(remaining.len() >= 32, "truncated pending-inbound source");
+                    let mut source = [0; 32];
+                    source.copy_from_slice(&remaining[..32]);
+                    remaining = &remaining[32..];
+                    Some(source)
+                }
+                _ => anyhow::bail!("invalid pending-inbound source flag"),
+            }
+        } else {
+            None
+        };
         anyhow::ensure!(remaining.len() >= 8, "truncated pending-inbound length");
         let mut length = [0; 8];
         length.copy_from_slice(&remaining[..8]);
@@ -44,16 +94,26 @@ fn pending_parts(bytes: &[u8]) -> anyhow::Result<Vec<&[u8]>> {
             length <= remaining.len(),
             "truncated pending-inbound payload"
         );
-        parts.push(&remaining[..length]);
+        parts.push(PendingPart {
+            bytes: &remaining[..length],
+            source,
+        });
         remaining = &remaining[length..];
     }
     anyhow::ensure!(!parts.is_empty(), "empty pending-inbound record");
     Ok(parts)
 }
-pub(super) fn decode_pending_parts(bytes: &[u8]) -> anyhow::Result<Vec<wa::Message>> {
-    pending_parts(bytes)?
+#[cfg(test)]
+fn pending_parts(bytes: &[u8]) -> anyhow::Result<Vec<&[u8]>> {
+    Ok(pending_records(bytes)?
         .into_iter()
-        .map(|part| waproto::codec::message_decode(part).map_err(Into::into))
+        .map(|part| part.bytes)
+        .collect())
+}
+pub(super) fn decode_pending_parts(bytes: &[u8]) -> anyhow::Result<Vec<wa::Message>> {
+    pending_records(bytes)?
+        .into_iter()
+        .map(|part| waproto::codec::message_decode(part.bytes).map_err(Into::into))
         .collect()
 }
 
@@ -61,7 +121,7 @@ pub(super) fn extend_pending_record(
     existing: &[u8],
     proposed: &[u8],
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    let original_parts = pending_parts(existing)?;
+    let original_parts = pending_records(existing)?;
     let mut scratch = Vec::new();
     // Replay selection already treats SKDM as a carrier, not a new user
     // payload. Extension must use that same occurrence identity while keeping
@@ -70,18 +130,21 @@ pub(super) fn extend_pending_record(
         .iter()
         .map(|message| MessageDispatch::fingerprint_into(message, &mut scratch))
         .collect();
-    let proposed_parts = pending_parts(proposed)?;
+    let proposed_parts = pending_records(proposed)?;
     let mut next = 0;
     let mut merged = Vec::with_capacity(proposed_parts.len());
     for part in proposed_parts {
         let matches = if let Some(expected) = existing_fingerprints.get(next) {
-            let message = waproto::codec::message_decode(part)?;
+            let message = waproto::codec::message_decode(part.bytes)?;
             *expected == MessageDispatch::fingerprint_into(&message, &mut scratch)
         } else {
             false
         };
         if matches {
-            merged.push(original_parts[next]);
+            merged.push(PendingPart {
+                bytes: original_parts[next].bytes,
+                source: original_parts[next].source.or(part.source),
+            });
             next += 1;
         } else {
             merged.push(part);
@@ -91,12 +154,22 @@ pub(super) fn extend_pending_record(
         next == original_parts.len(),
         "pending identity conflicts with retained payloads"
     );
-    if merged.len() == original_parts.len() {
+    if merged.len() == original_parts.len()
+        && merged
+            .iter()
+            .zip(&original_parts)
+            .all(|(a, b)| a.source == b.source)
+    {
         return Ok(None);
     }
     // Every existing part stays byte-for-byte intact; only additional parts
     // extend the row. No parallel DTO or table migration is involved.
-    Ok(Some(encode_pending_parts(&merged)))
+    Ok(Some(encode_pending_sourced_parts(
+        &merged
+            .iter()
+            .map(|part| (part.bytes, part.source))
+            .collect::<Vec<_>>(),
+    )))
 }
 
 fn is_subsequence(sequence: &[DispatchFingerprint], candidate: &[DispatchFingerprint]) -> bool {
@@ -112,6 +185,7 @@ fn is_subsequence(sequence: &[DispatchFingerprint], candidate: &[DispatchFingerp
 pub(super) struct PendingReplay {
     pub(super) items: Vec<InboundMessage>,
     pub(super) keys: Vec<(String, String, String)>,
+    pub(super) sources: std::collections::HashMap<usize, retention::PayloadSource>,
 }
 
 // Keep the string comparisons out of the stable sort's generated inner loops.
@@ -153,25 +227,30 @@ impl Client {
                         .parse::<Jid>()
                         .is_ok_and(|stored| stored.to_non_ad() == info.source.sender.to_non_ad())
         });
-        // Prefer the exact spelling when recorded sequences are equivalent.
+        // Prefer exact spelling when equivalent rows have equal source coverage.
         rows.sort_by(|a, b| compare_pending_senders(&a.0, &b.0, &sender));
         let mut replay = PendingReplay {
             items: Vec::new(),
             keys: Vec::new(),
+            sources: std::collections::HashMap::new(),
         };
         let mut sequences = Vec::new();
         let mut candidates = Vec::new();
         let mut scratch = Vec::new();
         for (stored_sender, bytes) in rows {
-            let items: Vec<_> = decode_pending_parts(&bytes)?
-                .into_iter()
-                .map(|message| {
-                    InboundMessage::builder()
-                        .message(Arc::new(message))
-                        .info(Arc::clone(info))
-                        .build()
-                })
-                .collect();
+            let mut items = Vec::new();
+            for part in pending_records(&bytes)? {
+                let item = InboundMessage::builder()
+                    .message(Arc::new(waproto::codec::message_decode(part.bytes)?))
+                    .info(Arc::clone(info))
+                    .build();
+                if let Some(source) = part.source {
+                    replay
+                        .sources
+                        .insert(Arc::as_ptr(&item.message) as usize, source);
+                }
+                items.push(item);
+            }
             sequences.push(
                 items
                     .iter()
@@ -183,14 +262,29 @@ impl Client {
                 .keys
                 .push((chat.clone(), stored_sender, info.id.to_string()));
         }
-        // Prefer an already-recorded sequence containing every row. An exact
+        // Prefer a complete sequence with source metadata for partial retries. An exact
         // alias can be only a suffix: [B] must not make stored [A,B] become [B,A].
         // Compare occurrences so [A,A,B] still contains two copies of A.
-        if let Some(complete) = sequences.iter().position(|candidate| {
-            sequences
-                .iter()
-                .all(|sequence| is_subsequence(sequence, candidate))
-        }) {
+        if let Some(complete) = (0..sequences.len())
+            .filter(|&index| {
+                sequences
+                    .iter()
+                    .all(|sequence| is_subsequence(sequence, &sequences[index]))
+            })
+            .max_by_key(|&index| {
+                (
+                    candidates[index]
+                        .iter()
+                        .filter(|item| {
+                            replay
+                                .sources
+                                .contains_key(&(Arc::as_ptr(&item.message) as usize))
+                        })
+                        .count(),
+                    std::cmp::Reverse(index),
+                )
+            })
+        {
             replay.items = candidates.swap_remove(complete);
         } else {
             for items in candidates {
@@ -208,6 +302,12 @@ impl Client {
                 "conflicting pending-inbound part order across sender keys"
             );
         }
+        let live: std::collections::HashSet<_> = replay
+            .items
+            .iter()
+            .map(|item| Arc::as_ptr(&item.message) as usize)
+            .collect();
+        replay.sources.retain(|key, _| live.contains(key));
         Ok(replay)
     }
 
@@ -319,6 +419,46 @@ mod tests {
         let mut oversized = PARTS_HEADER.to_vec();
         oversized.extend_from_slice(&u64::MAX.to_be_bytes());
         assert!(decode_pending_parts(&oversized).is_err());
+    }
+
+    #[test]
+    fn sourced_pending_records_preserve_bytes_and_metadata_on_extension() {
+        let first = [10, 1, b'a', 0xc0, 0x3e, 7];
+        let second = [10, 1, b'b'];
+        let third = [10, 1, b'c'];
+        let original =
+            encode_pending_sourced_parts(&[(&first, Some([1; 32])), (&third, Some([3; 32]))]);
+        let proposed = encode_pending_sourced_parts(&[
+            (&first, Some([9; 32])),
+            (&second, Some([2; 32])),
+            (&third, Some([8; 32])),
+        ]);
+        let extended = extend_pending_record(&original, &proposed)
+            .unwrap()
+            .unwrap();
+        let parts = pending_records(&extended).unwrap();
+        assert_eq!(
+            parts.iter().map(|p| p.bytes).collect::<Vec<_>>(),
+            [&first[..], &second[..], &third[..]]
+        );
+        assert_eq!(
+            parts.iter().map(|p| p.source).collect::<Vec<_>>(),
+            [Some([1; 32]), Some([2; 32]), Some([3; 32])]
+        );
+        assert!(
+            extend_pending_record(&extended, &extended)
+                .unwrap()
+                .is_none()
+        );
+        for length in 0..33 {
+            let mut invalid = SOURCED_PARTS_HEADER.to_vec();
+            invalid.push(1);
+            invalid.extend_from_slice(&[0; 32][..length.min(32)]);
+            assert!(pending_records(&invalid).is_err());
+        }
+        let mut invalid = SOURCED_PARTS_HEADER.to_vec();
+        invalid.push(2);
+        assert!(pending_records(&invalid).is_err());
     }
 
     #[test]

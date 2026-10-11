@@ -1102,11 +1102,17 @@ impl Client {
                 let records: Vec<Option<Vec<u8>>> = groups
                     .iter()
                     .map(|group| {
-                        (group.len() > 1).then(|| {
-                            let parts: Vec<&[u8]> =
-                                group.iter().map(|&i| &arena[ranges[i].clone()]).collect();
-                            durability::encode_pending_parts(&parts)
-                        })
+                        let parts: Vec<_> = group
+                            .iter()
+                            .map(|&i| {
+                                (
+                                    &arena[ranges[i].clone()],
+                                    self.inbound_commit_batch.retention.source(&items[i]),
+                                )
+                            })
+                            .collect();
+                        (group.len() > 1 || parts.iter().any(|(_, source)| source.is_some()))
+                            .then(|| durability::encode_pending_sourced_parts(&parts))
                     })
                     .collect();
                 let rows: Vec<PendingInboundRow<'_>> = groups

@@ -10,6 +10,12 @@ const MAX_STANZAS: usize = 400;
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 type Key = (String, String, String);
+// Ciphertext identities let a retry's undecrypted duplicates anchor new parts.
+// Plaintext fingerprints alone cannot position B when only B decrypts after A,C.
+pub(super) type PayloadSource = [u8; 32];
+fn part_key(item: &InboundMessage) -> usize {
+    Arc::as_ptr(&item.message) as usize
+}
 pub(super) fn key(info: &MessageInfo) -> Key {
     (
         info.source.chat.to_string(),
@@ -60,6 +66,9 @@ struct Stanza {
     // Parts produced by this delivery, distinct from retained/replayed parts.
     fresh: Vec<InboundMessage>,
     pending_keys: Vec<Key>,
+    sources: HashMap<usize, PayloadSource>,
+    delivery: Vec<(usize, PayloadSource)>,
+    current_source: Option<PayloadSource>,
     state: State,
     receipt: bool,
     ticket: Option<InboundCommitTicket>,
@@ -76,7 +85,8 @@ pub(super) fn merge_parts(items: &mut Vec<InboundMessage>, fresh: Vec<InboundMes
     }
     // Retained occurrences anchor the retry sequence. Appending a newly
     // recovered B after retained A,C would durably publish A,C,B instead of A,B,C.
-    let mut prior = HashMap::<DispatchFingerprint, (smallvec::SmallVec<[usize; 1]>, usize)>::new();
+    let mut prior =
+        HashMap::<DispatchFingerprint, (smallvec::SmallVec<[usize; 1]>, usize, usize)>::new();
     let mut scratch = Vec::new();
     for (index, item) in items.iter().enumerate() {
         prior
@@ -95,13 +105,28 @@ pub(super) fn merge_parts(items: &mut Vec<InboundMessage>, fresh: Vec<InboundMes
     let mut anchored = false;
     for item in fresh {
         let fingerprint = MessageDispatch::fingerprint_into(&item.message, &mut scratch);
-        let position = prior
-            .get_mut(&fingerprint)
-            .and_then(|(positions, consumed)| {
-                let position = positions.get(*consumed).copied();
+        let position = if let Some((positions, consumed, seen)) = prior.get_mut(&fingerprint) {
+            *seen += 1;
+            // An earlier occurrence may already have been emitted before
+            // another anchor. Match the next occurrence in sequence order.
+            while positions
+                .get(*consumed)
+                .is_some_and(|position| *position < next_old)
+            {
                 *consumed += 1;
-                position
-            });
+            }
+            let position = positions.get(*consumed).copied();
+            if position.is_some() {
+                *consumed += 1;
+            } else if *seen <= positions.len() {
+                // Do not invent copies to reconcile contradictory orders.
+                // Pending-row selection verifies that every sequence survives.
+                continue;
+            }
+            position
+        } else {
+            None
+        };
         if let Some(position) = position {
             if position < next_old {
                 continue;
@@ -128,6 +153,30 @@ pub(super) fn merge_parts(items: &mut Vec<InboundMessage>, fresh: Vec<InboundMes
 impl Stanza {
     fn reconcile(&mut self) {
         merge_parts(&mut self.items, std::mem::take(&mut self.fresh));
+        let mut positions = HashMap::<PayloadSource, std::collections::VecDeque<usize>>::new();
+        for &(index, source) in &self.delivery {
+            positions.entry(source).or_default().push_back(index);
+        }
+        // Rearrange only parts present in this ciphertext sequence. Disjoint
+        // deliveries remain appended, and re-encrypted retries use the
+        // plaintext occurrence anchors above rather than guessed enc ordinals.
+        let mut slots = Vec::new();
+        let mut ordered = Vec::new();
+        for (slot, item) in self.items.iter().enumerate() {
+            if let Some(source) = self.sources.get(&part_key(item))
+                && let Some(index) = positions.get_mut(source).and_then(|p| p.pop_front())
+            {
+                slots.push(slot);
+                ordered.push((index, item.clone()));
+            }
+        }
+        ordered.sort_by_key(|(index, _)| *index);
+        for (slot, (_, item)) in slots.into_iter().zip(ordered) {
+            self.items[slot] = item;
+        }
+        let live: std::collections::HashSet<_> = self.items.iter().map(part_key).collect();
+        self.sources.retain(|key, _| live.contains(key));
+        self.current_source = None;
     }
 }
 #[derive(Default)]
@@ -208,6 +257,8 @@ impl InboundRetention {
             // prior parts while a re-encrypted resend is examined for new parts.
             stanza.id = id;
             stanza.state = State::Collecting;
+            stanza.delivery.clear();
+            stanza.current_source = None;
             stanza.admissions.extend(admission.take().map(Arc::new));
             return Ok(false);
         }
@@ -218,6 +269,9 @@ impl InboundRetention {
                 items: Vec::new(),
                 fresh: Vec::new(),
                 pending_keys: Vec::new(),
+                sources: HashMap::new(),
+                delivery: Vec::new(),
+                current_source: None,
                 state: State::Collecting,
                 receipt: false,
                 ticket: None,
@@ -226,6 +280,44 @@ impl InboundRetention {
             },
         );
         Ok(true)
+    }
+    pub(super) fn set_delivery<'a>(
+        &self,
+        info: &MessageInfo,
+        payloads: impl Iterator<Item = &'a EncPayload>,
+    ) {
+        use sha2::{Digest, Sha256};
+        let mut delivery: Vec<_> = payloads
+            .map(|payload| {
+                let mut digest = Sha256::new();
+                digest.update(payload.enc_type.as_wire_str().as_bytes());
+                digest.update([payload.padding_version]);
+                digest.update(&payload.ciphertext);
+                (payload.enc_index, digest.finalize().into())
+            })
+            .collect();
+        delivery.sort_by_key(|(index, _)| *index);
+        // Hash before taking the shared mutex: independent live chat lanes
+        // must not hold each other behind the size of a ciphertext frame.
+        let mut stanzas = lock(&self.stanzas);
+        if let Some(stanza) = stanzas.get_mut(&key(info)) {
+            stanza.delivery = delivery;
+        }
+    }
+    pub(super) fn select_source(&self, info: &MessageInfo, enc_index: usize) {
+        let mut stanzas = lock(&self.stanzas);
+        if let Some(stanza) = stanzas.get_mut(&key(info)) {
+            stanza.current_source = stanza
+                .delivery
+                .binary_search_by_key(&enc_index, |(i, _)| *i)
+                .ok()
+                .map(|position| stanza.delivery[position].1);
+        }
+    }
+    pub(super) fn source(&self, item: &InboundMessage) -> Option<PayloadSource> {
+        lock(&self.stanzas)
+            .get(&key(&item.info))
+            .and_then(|stanza| stanza.sources.get(&part_key(item)).copied())
     }
     pub(crate) fn stage(
         &self,
@@ -240,6 +332,11 @@ impl InboundRetention {
         let stanza = stanzas.get_mut(&key(&first.info))?;
         if stanza.state != State::Collecting {
             return None;
+        }
+        if let Some(source) = stanza.current_source {
+            for item in items {
+                stanza.sources.insert(part_key(item), source);
+            }
         }
         stanza.fresh.extend_from_slice(items);
         let ticket = track.then(|| {
@@ -297,6 +394,7 @@ impl InboundRetention {
         let mut stanzas = lock(&self.stanzas);
         if let Some(stanza) = stanzas.get_mut(&key(&first.info)) {
             merge_parts(&mut stanza.items, replay.items);
+            stanza.sources.extend(replay.sources);
             stanza.pending_keys.extend(replay.keys);
             stanza.pending_keys.sort_unstable();
             stanza.pending_keys.dedup();

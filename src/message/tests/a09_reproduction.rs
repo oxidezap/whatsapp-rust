@@ -1585,3 +1585,184 @@ async fn recovered_middle_part_uses_retry_order_including_repeated_occurrences()
         assert_eq!(f.receipts(), 1);
     }
 }
+
+async fn partially_recovered_ciphertext_order(restart: bool, repeated: bool) {
+    let mut f = Fixture::new("PARTIAL_CIPHERTEXT_ORDER", false).await;
+    let group: Jid = "120363000000000032@g.us".parse().unwrap();
+    let mut peer = joined_group_sender(&f.client, "100000000000032:75@lid", &group).await;
+    let bodies = if repeated {
+        vec!["A", "B", "A", "C"]
+    } else {
+        vec!["A", "B", "C"]
+    };
+    let original = p1_group_parts(&mut peer, &group, &f.info.id, &bodies).await;
+    // Corrupt only B on the first delivery. A and C advance the sender-key
+    // ratchet, retaining B's skipped key. On the unchanged retry, A and C
+    // are cryptographic duplicates and only the restored B decrypts.
+    let encs: Vec<_> = original
+        .get()
+        .children()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(index, enc)| {
+            NodeBuilder::new("enc")
+                .attr("type", "skmsg")
+                .attr("v", "2")
+                .bytes(if index == 1 {
+                    vec![0]
+                } else {
+                    enc.content_bytes().unwrap().to_vec()
+                })
+                .build()
+        })
+        .collect();
+    f.stanza = node_to_arc(
+        NodeBuilder::new("message")
+            .attr("from", &group)
+            .attr("participant", &peer.jid)
+            .attr("id", &f.info.id)
+            .attr("type", "text")
+            .attr("addressing_mode", "lid")
+            .attr("t", wacore::time::now_secs().to_string())
+            .children(encs)
+            .build(),
+    );
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    f.hook.fail.store(true, Ordering::SeqCst);
+    f.receive().await;
+    assert_eq!(f.receipts(), 0);
+    let retained = durability::decode_pending_parts(&f.pending().await.unwrap()).unwrap();
+    assert_eq!(
+        retained
+            .iter()
+            .map(|m| m.conversation.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        if repeated {
+            vec!["A", "A", "C"]
+        } else {
+            vec!["A", "C"]
+        }
+    );
+    if restart && repeated {
+        // An exact bare alias may hold the same sequence in legacy format.
+        // Prefer the compatible device row's ciphertext metadata, then clear both.
+        let wires: Vec<_> = retained
+            .iter()
+            .map(|message| {
+                let mut bytes = Vec::new();
+                waproto::codec::message_encode_into(message, &mut bytes);
+                bytes
+            })
+            .collect();
+        let legacy =
+            durability::encode_pending_parts(&wires.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        f.client
+            .persistence_manager
+            .backend()
+            .store_pending_inbound(
+                &group.to_string(),
+                &peer.jid.to_non_ad().to_string(),
+                &f.info.id,
+                &legacy,
+            )
+            .await
+            .unwrap();
+    }
+    if restart {
+        f.restart().await;
+    }
+    f.stanza = if repeated {
+        with_participant(&original, &peer.jid.to_non_ad())
+    } else {
+        original
+    };
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    f.hook.fail.store(false, Ordering::SeqCst);
+    f.receive().await;
+    assert_eq!(
+        f.published(),
+        bodies,
+        "only B decrypts; ciphertext duplicates must anchor its wire position"
+    );
+    assert_eq!(f.receipts(), 1);
+    assert!(f.pending().await.is_none());
+    assert!(
+        f.client
+            .persistence_manager
+            .backend()
+            .get_pending_inbound(&group.to_string(), &peer.jid.to_string(), &f.info.id,)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(f.client.inbound_commit_batch.retention.stats(), (0, 0));
+}
+
+#[tokio::test]
+async fn partial_ciphertext_retry_preserves_middle_part_order() {
+    partially_recovered_ciphertext_order(false, false).await;
+}
+#[tokio::test]
+async fn partial_ciphertext_retry_after_restart_preserves_middle_part_order() {
+    partially_recovered_ciphertext_order(true, false).await;
+}
+#[tokio::test]
+async fn partial_ciphertext_retry_after_restart_preserves_repeated_occurrences() {
+    partially_recovered_ciphertext_order(true, true).await;
+}
+
+#[tokio::test]
+async fn restart_overlapping_repeated_alias_sequences_preserves_both_orders() {
+    let mut f = Fixture::new("OVERLAPPING_REPEATED_ALIASES", false).await;
+    let group: Jid = "120363000000000033@g.us".parse().unwrap();
+    let mut peer = joined_group_sender(&f.client, "100000000000033:75@lid", &group).await;
+    let bodies = ["A", "B", "A", "B"];
+    f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, &bodies).await;
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    f.hook.fail.store(true, Ordering::SeqCst);
+    f.receive().await;
+    let messages = durability::decode_pending_parts(&f.pending().await.unwrap()).unwrap();
+    let wires: Vec<_> = messages
+        .iter()
+        .map(|message| {
+            let mut bytes = Vec::new();
+            waproto::codec::message_encode_into(message, &mut bytes);
+            bytes
+        })
+        .collect();
+    let backend = f.client.persistence_manager.backend();
+    for (sender, range) in [
+        (peer.jid.to_string(), 0..3),
+        (peer.jid.to_non_ad().to_string(), 1..4),
+    ] {
+        let bytes = durability::encode_pending_parts(
+            &wires[range].iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        );
+        backend
+            .store_pending_inbound(&group.to_string(), &sender, &f.info.id, &bytes)
+            .await
+            .unwrap();
+    }
+    f.restart().await;
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    f.hook.fail.store(false, Ordering::SeqCst);
+    f.receive().await;
+    assert_eq!(
+        f.published(),
+        bodies,
+        "A,B,A and B,A,B have the compatible canonical order A,B,A,B"
+    );
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), bodies.len());
+    assert_eq!(f.receipts(), 1);
+    for sender in [peer.jid.to_string(), peer.jid.to_non_ad().to_string()] {
+        assert!(
+            backend
+                .get_pending_inbound(&group.to_string(), &sender, &f.info.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_eq!(f.client.inbound_commit_batch.retention.stats(), (0, 0));
+}

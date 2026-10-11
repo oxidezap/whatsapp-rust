@@ -633,6 +633,16 @@ impl Client {
             }
         }
 
+        if self.inbound_durability_hook().is_some() {
+            self.inbound_commit_batch.retention.set_delivery(
+                &info,
+                session_payloads
+                    .iter()
+                    .chain(&group_payloads)
+                    .chain(&bot_payloads),
+            );
+        }
+
         // The guard restores partial plaintext on cancellation or an early
         // return; sealing transfers recovery ownership to the commit path.
         log::debug!(
@@ -2151,6 +2161,11 @@ impl Client {
             // Only messages entering dispatch need an outer message Arc. Avoid
             // that allocation for SKDM carriers and suppressed resends; dispatch
             // still carries the event's final handle rather than a Message.
+            if self.inbound_durability_hook().is_some() {
+                self.inbound_commit_batch
+                    .retention
+                    .select_source(info, enc_index);
+            }
             let commit_state = self
                 .dispatch_shared_message_with_decrypted(
                     Arc::new(msg),
