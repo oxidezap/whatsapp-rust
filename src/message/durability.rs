@@ -307,7 +307,7 @@ pub(super) fn extend_pending_record(
     )))
 }
 
-fn is_subsequence(sequence: &[DispatchFingerprint], candidate: &[DispatchFingerprint]) -> bool {
+fn is_subsequence<T: PartialEq>(sequence: &[T], candidate: &[T]) -> bool {
     let mut remaining = sequence;
     for fingerprint in candidate {
         if remaining.first() == Some(fingerprint) {
@@ -411,9 +411,10 @@ impl Client {
         };
         let mut sequences = Vec::new();
         let mut candidates = Vec::new();
+        let mut raw_candidates = Vec::new();
         let mut scratch = Vec::new();
-        for (stored_sender, bytes) in rows {
-            if let Some(deferred) = deferred_parts(&bytes)? {
+        for (stored_sender, bytes) in &rows {
+            if let Some(deferred) = deferred_parts(bytes)? {
                 for group in deferred.waiting {
                     let mut waiting = Vec::new();
                     for part in plain_pending_records(group)? {
@@ -432,7 +433,9 @@ impl Client {
                 }
             }
             let mut items = Vec::new();
-            for part in pending_records(&bytes)? {
+            let mut raw_parts = Vec::new();
+            for part in pending_records(bytes)? {
+                raw_parts.push(part.bytes);
                 let item = InboundMessage::builder()
                     .message(Arc::new(waproto::codec::message_decode(part.bytes)?))
                     .info(Arc::clone(info))
@@ -451,9 +454,10 @@ impl Client {
                     .collect::<Vec<_>>(),
             );
             candidates.push(items);
+            raw_candidates.push(raw_parts);
             replay
                 .keys
-                .push((chat.clone(), stored_sender, info.id.to_string()));
+                .push((chat.clone(), stored_sender.clone(), info.id.to_string()));
         }
         // Prefer a complete sequence with source metadata for partial retries. An exact
         // alias can be only a suffix: [B] must not make stored [A,B] become [B,A].
@@ -497,6 +501,18 @@ impl Client {
                     &candidates[complete],
                     &replay.sources,
                 ) else {
+                    // A legacy alias needs no occurrence assignment when its
+                    // original wire chunks are already covered by the canonical.
+                    // Decode/encode can normalize known fields, so compare the
+                    // borrowed stored bytes rather than reconstructed messages.
+                    if candidates[index].iter().all(|item| {
+                        !replay
+                            .sources
+                            .contains_key(&(Arc::as_ptr(&item.message) as usize))
+                    }) && is_subsequence(&raw_candidates[index], &raw_candidates[complete])
+                    {
+                        continue;
+                    }
                     // Ambiguous or disjoint source positions cannot discard
                     // the row's bytes or ciphertext identities.
                     let legacy_disjoint = candidates[index].iter().all(|item| {
@@ -1160,6 +1176,77 @@ mod tests {
             }
         }
         assert_eq!(replay.keys.len(), 2);
+    }
+
+    async fn repeated_legacy_partial_alias(alias: &[u8], covered: bool) {
+        let client = create_test_client_with_failing_http("repeated_legacy_partial_alias").await;
+        let mut info = (*test_info("REPEATED_LEGACY_PARTIAL_ALIAS")).clone();
+        info.source.is_group = true;
+        let info = Arc::new(info);
+        let a = [10, 1, b'A'];
+        let b = [10, 1, b'B'];
+        let canonical = encode_pending_parts(&[&a, &a, &b]);
+        let partial = encode_pending_parts(&[alias]);
+        let backend = client.persistence_manager.backend();
+        for (sender, bytes) in [
+            ("200@s.whatsapp.net", canonical.as_slice()),
+            ("200:1@s.whatsapp.net", partial.as_slice()),
+        ] {
+            backend
+                .store_pending_inbound("100@g.us", sender, &info.id, bytes)
+                .await
+                .unwrap();
+        }
+        let replay = client.load_pending_inbound(&info).await.unwrap();
+        assert_eq!(replay.items.len(), 3);
+        assert_eq!(
+            replay
+                .items
+                .iter()
+                .map(|item| item.message.conversation.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("A"), Some("A"), Some("B")]
+        );
+        assert_eq!(replay.keys.len(), 2);
+        assert!(replay.sources.is_empty());
+        assert_eq!(replay.waiting.is_empty(), covered);
+        let hook = counting_hook(true);
+        assert!(client.inbound_durability_hook.set(hook.clone()).is_ok());
+        assert_eq!(client.ack_or_replay_to_hook(&info).await, covered);
+        assert_eq!(hook.calls.load(Ordering::SeqCst), usize::from(covered));
+        assert_eq!(
+            hook.messages.load(Ordering::SeqCst),
+            if covered { 3 } else { 0 }
+        );
+        for (sender, original) in [
+            ("200@s.whatsapp.net", canonical.as_slice()),
+            ("200:1@s.whatsapp.net", partial.as_slice()),
+        ] {
+            let stored = backend
+                .get_pending_inbound("100@g.us", sender, &info.id)
+                .await
+                .unwrap();
+            if covered {
+                assert!(stored.is_none());
+            } else {
+                assert_eq!(stored.as_deref(), Some(original));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_legacy_partial_alias_replays_exact_raw_coverage() {
+        repeated_legacy_partial_alias(&[10, 1, b'A'], true).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_legacy_partial_alias_preserves_distinct_carrier() {
+        repeated_legacy_partial_alias(&[10, 1, b'A', 18, 0], false).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_legacy_partial_alias_preserves_normalized_known_fields() {
+        repeated_legacy_partial_alias(&[10, 1, b'A', 10, 1, b'A'], false).await;
     }
 
     async fn overlapping_legacy_additions(reverse: bool) {
