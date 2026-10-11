@@ -80,6 +80,8 @@ struct Stanza {
     items: Vec<InboundMessage>,
     // Parts produced by this delivery, distinct from retained/replayed parts.
     fresh: Vec<InboundMessage>,
+    // End offsets preserve each waiting delivery's multiplicity and order.
+    fresh_boundaries: Vec<usize>,
     pending_keys: Vec<Key>,
     sources: HashMap<usize, PayloadSources>,
     delivery: Vec<(usize, PayloadSource)>,
@@ -166,8 +168,51 @@ pub(super) fn merge_parts(items: &mut Vec<InboundMessage>, fresh: Vec<InboundMes
     }
     *items = merged;
 }
+fn order_sourced_parts(
+    items: &mut [InboundMessage],
+    source_map: &HashMap<usize, PayloadSources>,
+    delivery: &[(usize, PayloadSource)],
+) {
+    let mut positions = HashMap::<PayloadSource, std::collections::VecDeque<usize>>::new();
+    for &(index, source) in delivery {
+        positions.entry(source).or_default().push_back(index);
+    }
+    // Rearrange only parts present in this ciphertext sequence. Disjoint
+    // deliveries remain appended. Cross-generation overlap requires the
+    // complete sequence above rather than guessed plaintext aliases.
+    let mut slots = Vec::new();
+    let mut ordered = Vec::new();
+    for (slot, item) in items.iter().enumerate() {
+        if let Some(sources) = source_map.get(&part_key(item))
+            && let Some(index) = sources
+                .iter()
+                .filter_map(|source| positions.get(source).and_then(|p| p.front().copied()))
+                .min()
+        {
+            for source in sources {
+                if let Some(queue) = positions.get_mut(source)
+                    && queue.front() == Some(&index)
+                {
+                    queue.pop_front();
+                }
+            }
+            slots.push(slot);
+            ordered.push((index, item.clone()));
+        }
+    }
+    ordered.sort_by_key(|(index, _)| *index);
+    for (slot, (_, item)) in slots.into_iter().zip(ordered) {
+        items[slot] = item;
+    }
+}
 impl Stanza {
     fn reconcile(&mut self) -> bool {
+        let fresh_start = self.fresh_boundaries.last().copied().unwrap_or_default();
+        order_sourced_parts(
+            &mut self.fresh[fresh_start..],
+            &self.sources,
+            &self.delivery,
+        );
         let current_position = |item: &InboundMessage| {
             self.sources.get(&part_key(item)).and_then(|sources| {
                 self.delivery
@@ -207,10 +252,17 @@ impl Stanza {
         let needs_order =
             unsourced || (unproven && (overlap || self.fresh.len() < self.delivery.len()));
         let mut identities = std::collections::HashSet::new();
-        let ambiguous = self
-            .delivery
-            .iter()
-            .any(|(_, source)| !identities.insert(*source));
+        let mut repeated_sources = std::collections::HashSet::new();
+        for (_, source) in &self.delivery {
+            if !identities.insert(*source) {
+                repeated_sources.insert(*source);
+            }
+        }
+        let mut retained_positions = std::collections::HashSet::new();
+        let ambiguous = !repeated_sources.is_empty()
+            || self.items.iter().any(|item| {
+                current_position(item).is_some_and(|index| !retained_positions.insert(index))
+            });
         if self.ordering_blocked
             || ((needs_order || ambiguous) && !self.fresh.is_empty() && !self.delivery.is_empty())
         {
@@ -236,13 +288,7 @@ impl Stanza {
             for item in &self.items {
                 if let Some(sources) = self.sources.get(&part_key(item))
                     && let Some(position) = remaining.iter().position(|(_, source)| {
-                        sources.contains(source)
-                            && self
-                                .delivery
-                                .iter()
-                                .filter(|(_, candidate)| candidate == source)
-                                .count()
-                                == 1
+                        sources.contains(source) && !repeated_sources.contains(source)
                     })
                 {
                     let (index, _) = remaining.remove(position);
@@ -260,6 +306,29 @@ impl Stanza {
                 .iter()
                 .map(|item| MessageDispatch::fingerprint_into(&item.message, &mut scratch))
                 .collect();
+            // A later complete frame must also cover every successfully
+            // decrypted waiting sequence. Check deliveries separately so a
+            // repeated retry does not manufacture additional occurrences.
+            let mut start = 0;
+            for end in self
+                .fresh_boundaries
+                .iter()
+                .copied()
+                .chain(std::iter::once(self.fresh.len()))
+            {
+                let mut next = 0;
+                for item in &self.fresh[start..end] {
+                    let fingerprint =
+                        MessageDispatch::fingerprint_into(&item.message, &mut scratch);
+                    let Some(offset) = fingerprints[next..].iter().position(|f| *f == fingerprint)
+                    else {
+                        self.ordering_blocked = true;
+                        return false;
+                    };
+                    next += offset + 1;
+                }
+                start = end;
+            }
             let mut replacements = Vec::new();
             let mut next = 0;
             for item in &self.items {
@@ -285,6 +354,7 @@ impl Stanza {
             }
             self.items = candidate;
             self.fresh.clear();
+            self.fresh_boundaries.clear();
             self.ordering_blocked = false;
         } else if !self.items.is_empty()
             && !self.fresh.is_empty()
@@ -307,40 +377,12 @@ impl Stanza {
             }
             self.items = ordered.into_values().collect();
             self.fresh.clear();
+            self.fresh_boundaries.clear();
         }
 
         merge_parts(&mut self.items, std::mem::take(&mut self.fresh));
-        let mut positions = HashMap::<PayloadSource, std::collections::VecDeque<usize>>::new();
-        for &(index, source) in &self.delivery {
-            positions.entry(source).or_default().push_back(index);
-        }
-        // Rearrange only parts present in this ciphertext sequence. Disjoint
-        // deliveries remain appended. Cross-generation overlap requires the
-        // complete sequence above rather than guessed plaintext aliases.
-        let mut slots = Vec::new();
-        let mut ordered = Vec::new();
-        for (slot, item) in self.items.iter().enumerate() {
-            if let Some(sources) = self.sources.get(&part_key(item))
-                && let Some(index) = sources
-                    .iter()
-                    .filter_map(|source| positions.get(source).and_then(|p| p.front().copied()))
-                    .min()
-            {
-                for source in sources {
-                    if let Some(queue) = positions.get_mut(source)
-                        && queue.front() == Some(&index)
-                    {
-                        queue.pop_front();
-                    }
-                }
-                slots.push(slot);
-                ordered.push((index, item.clone()));
-            }
-        }
-        ordered.sort_by_key(|(index, _)| *index);
-        for (slot, (_, item)) in slots.into_iter().zip(ordered) {
-            self.items[slot] = item;
-        }
+        self.fresh_boundaries.clear();
+        order_sourced_parts(&mut self.items, &self.sources, &self.delivery);
         let live: std::collections::HashSet<_> = self.items.iter().map(part_key).collect();
         self.sources.retain(|key, _| live.contains(key));
         self.current_source = None;
@@ -425,6 +467,9 @@ impl InboundRetention {
             // prior parts while a re-encrypted resend is examined for new parts.
             stanza.id = id;
             stanza.state = State::Collecting;
+            if stanza.fresh.len() > stanza.fresh_boundaries.last().copied().unwrap_or_default() {
+                stanza.fresh_boundaries.push(stanza.fresh.len());
+            }
             stanza.delivery.clear();
             stanza.current_source = None;
             stanza.admissions.extend(admission.take().map(Arc::new));
@@ -436,6 +481,7 @@ impl InboundRetention {
                 id,
                 items: Vec::new(),
                 fresh: Vec::new(),
+                fresh_boundaries: Vec::new(),
                 pending_keys: Vec::new(),
                 sources: HashMap::new(),
                 delivery: Vec::new(),
@@ -1047,6 +1093,152 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn complete_retry_preserves_unknown_fields_in_waiting_fresh_parts() {
+        fn marked(id: &str, marker: u8) -> InboundMessage {
+            let message = waproto::codec::message_decode(&[10, 1, b'B', 192, 62, marker]).unwrap();
+            InboundMessage::builder()
+                .message(Arc::new(message))
+                .info(Arc::new(MessageInfo {
+                    id: id.into(),
+                    ..Default::default()
+                }))
+                .build()
+        }
+        async fn frame(
+            retention: &Arc<InboundRetention>,
+            info: &MessageInfo,
+            delivery: &[(usize, PayloadSource)],
+            parts: &[(PayloadSource, InboundMessage)],
+        ) -> Arc<[InboundMessage]> {
+            retention.begin(info, None).await;
+            lock(&retention.stanzas)
+                .get_mut(&key(info))
+                .unwrap()
+                .delivery = delivery.to_vec();
+            for (source, item) in parts {
+                lock(&retention.stanzas)
+                    .get_mut(&key(info))
+                    .unwrap()
+                    .current_source = Some(*source);
+                retention.stage(std::slice::from_ref(item), false);
+            }
+            retention.seal(info, false).0
+        }
+        let retention = Arc::new(InboundRetention::default());
+        let first = item("waiting-fresh-unknown", "A");
+        let old = marked("waiting-fresh-unknown", 7);
+        let new = marked("waiting-fresh-unknown", 8);
+        assert_eq!(
+            frame(
+                &retention,
+                &first.info,
+                &[(0, [1; 32])],
+                &[([1; 32], first.clone())]
+            )
+            .await
+            .len(),
+            1
+        );
+        assert!(
+            frame(
+                &retention,
+                &first.info,
+                &[(0, [2; 32]), (1, [3; 32])],
+                &[([3; 32], old.clone())]
+            )
+            .await
+            .is_empty()
+        );
+        assert!(
+            frame(
+                &retention,
+                &first.info,
+                &[(0, [4; 32]), (1, [5; 32])],
+                &[
+                    ([4; 32], item("waiting-fresh-unknown", "A")),
+                    ([5; 32], new.clone())
+                ]
+            )
+            .await
+            .is_empty(),
+            "new unknown fields cannot replace an admitted waiting payload"
+        );
+        let items = frame(
+            &retention,
+            &first.info,
+            &[(0, [6; 32]), (1, [7; 32]), (2, [8; 32])],
+            &[
+                ([6; 32], item("waiting-fresh-unknown", "A")),
+                ([7; 32], old.clone()),
+                ([8; 32], new.clone()),
+            ],
+        )
+        .await;
+        assert_eq!(items.len(), 3);
+        assert!(Arc::ptr_eq(&items[0].message, &first.message));
+        for (got, expected) in items[1..].iter().zip([old, new]) {
+            let mut got_bytes = Vec::new();
+            let mut expected_bytes = Vec::new();
+            waproto::codec::message_encode_into(&got.message, &mut got_bytes);
+            waproto::codec::message_encode_into(&expected.message, &mut expected_bytes);
+            assert_eq!(got_bytes, expected_bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_source_histories_do_not_collapse_retained_occurrences() {
+        let retention = Arc::new(InboundRetention::default());
+        let first = item("source-history-collision", "A");
+        let second = item("source-history-collision", "A");
+        retention.begin(&first.info, None).await;
+        retention.stage(&[first.clone(), second.clone()], false);
+        retention.seal(&first.info, false);
+        retention.begin(&first.info, None).await;
+        {
+            let mut stanzas = lock(&retention.stanzas);
+            let stanza = stanzas.get_mut(&key(&first.info)).unwrap();
+            stanza.delivery = vec![(0, [1; 32]), (1, [2; 32])];
+            stanza
+                .sources
+                .insert(part_key(&first), smallvec::smallvec![[1; 32], [3; 32]]);
+            stanza
+                .sources
+                .insert(part_key(&second), smallvec::smallvec![[1; 32], [4; 32]]);
+            stanza.current_source = Some([2; 32]);
+        }
+        retention.stage(&[item("source-history-collision", "B")], false);
+        let (items, _) = retention.seal(&first.info, false);
+        assert!(
+            items.is_empty(),
+            "one wire occurrence cannot replace two retained copies"
+        );
+        assert!(retention.awaiting_order(&first.info));
+        {
+            let stanzas = lock(&retention.stanzas);
+            let stanza = stanzas.get(&key(&first.info)).unwrap();
+            assert_eq!(stanza.items.len(), 2);
+            assert!(Arc::ptr_eq(&stanza.items[0].message, &first.message));
+            assert!(Arc::ptr_eq(&stanza.items[1].message, &second.message));
+        }
+        retention.begin(&first.info, None).await;
+        {
+            let mut stanzas = lock(&retention.stanzas);
+            let stanza = stanzas.get_mut(&key(&first.info)).unwrap();
+            stanza.delivery = vec![(0, [3; 32]), (1, [4; 32]), (2, [5; 32])];
+        }
+        for (source, body) in [([3; 32], "A"), ([4; 32], "A"), ([5; 32], "B")] {
+            lock(&retention.stanzas)
+                .get_mut(&key(&first.info))
+                .unwrap()
+                .current_source = Some(source);
+            retention.stage(&[item("source-history-collision", body)], false);
+        }
+        let (items, _) = retention.seal(&first.info, false);
+        assert_eq!(items.len(), 3);
+        assert!(Arc::ptr_eq(&items[0].message, &first.message));
+        assert!(Arc::ptr_eq(&items[1].message, &second.message));
+    }
     #[tokio::test]
     async fn identical_ciphertext_retries_keep_repeated_occurrences() {
         let retention = Arc::new(InboundRetention::default());
