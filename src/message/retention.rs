@@ -679,6 +679,16 @@ impl InboundRetention {
             && stanza.id == id
             && stanza.state == State::AwaitingOrder
         {
+            // Storage keeps the sender spelling of each write, while the
+            // resident group key normalizes devices. Cleanup needs both.
+            let stored_key = (
+                info.source.chat.to_string(),
+                info.source.sender.to_string(),
+                info.id.to_string(),
+            );
+            if !stanza.pending_keys.contains(&stored_key) {
+                stanza.pending_keys.push(stored_key);
+            }
             stanza.persisted_fresh = fresh_len;
         }
     }
@@ -1223,6 +1233,14 @@ impl Client {
                                         );
                                         return;
                                     }
+                                    // PDO may wait for offline delivery or acquire
+                                    // Signal permits itself. Neither incoming guard
+                                    // can stay owned across that recovery request.
+                                    drop(_permit);
+                                    drop(_chat);
+                                    if !attempt.is_current() || !client.is_socket_connected() {
+                                        return;
+                                    }
                                     let cache_key = client
                                         .make_retry_cache_key(
                                             &attempt.info.source.chat,
@@ -1238,6 +1256,9 @@ impl Client {
                                         .await
                                         .is_some_and(|(count, _)| count >= MAX_DECRYPT_RETRIES)
                                     {
+                                        return;
+                                    }
+                                    if !attempt.is_current() || !client.is_socket_connected() {
                                         return;
                                     }
                                     if let Err(error) = client
@@ -1361,6 +1382,64 @@ mod tests {
         assert!(retention.awaiting_order(&first.info));
         assert!(retention.commit(std::slice::from_ref(&first)).is_none());
         client.set_connected_for_test(false);
+    }
+
+    #[tokio::test]
+    async fn awaiting_order_pdo_wait_does_not_own_incoming_permit_or_chat_gate() {
+        let client =
+            crate::test_utils::create_test_client_with_failing_http("order_pdo_permit").await;
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetId(Some(
+                "15550000001:0@s.whatsapp.net".parse().unwrap(),
+            )))
+            .await;
+        client
+            .offline_sync_completed
+            .store(false, Ordering::Relaxed);
+        *client.message_processing_semaphore.lock().unwrap() =
+            Arc::new(async_lock::Semaphore::new(1));
+        let mut first = item("order-pdo-permit", "A");
+        let info = Arc::make_mut(&mut first.info);
+        info.timestamp = wacore::time::now_utc();
+        info.source.chat = "15550000002@s.whatsapp.net".parse().unwrap();
+        info.source.sender = info.source.chat.clone();
+        let retention = &client.inbound_commit_batch.retention;
+        retention.begin(&first.info, None).await;
+        retention.stage(std::slice::from_ref(&first), false);
+        {
+            let mut stanzas = lock(&retention.stanzas);
+            let stanza = stanzas.get_mut(&key(&first.info)).unwrap();
+            stanza.state = State::AwaitingOrder;
+            stanza.ordering_blocked = true;
+        }
+        client.set_connected_for_test(true);
+        client.start_inbound_recovery();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(7),
+            crate::test_utils::wait_for_notifier_listeners(&client.offline_sync_notifier, 1),
+        )
+        .await
+        .unwrap();
+        let permit = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.acquire_message_processing_permit(),
+        )
+        .await
+        .expect("PDO waiting on drain must not hold its incoming permit");
+        let chat = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            retention.chat_gate(&first.info).lock_arc(),
+        )
+        .await
+        .expect("PDO must not hold the incoming chat gate");
+        assert!(retention.awaiting_order(&first.info));
+        assert!(retention.commit(std::slice::from_ref(&first)).is_none());
+        drop(chat);
+        drop(permit);
+        client.set_connected_for_test(false);
+        client.offline_sync_completed.store(true, Ordering::Relaxed);
+        client.offline_sync_notifier.notify(usize::MAX);
     }
 
     #[tokio::test]

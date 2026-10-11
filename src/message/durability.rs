@@ -239,16 +239,15 @@ pub(super) fn extend_pending_record(
     proposed: &[u8],
 ) -> anyhow::Result<Option<Vec<u8>>> {
     if let Some(deferred) = deferred_parts(existing)? {
-        let mut merged = if deferred.canonical.is_empty() {
-            proposed.to_vec()
-        } else {
-            extend_pending_record(deferred.canonical, proposed)?
-                .unwrap_or_else(|| deferred.canonical.to_vec())
-        };
-        for waiting in deferred.waiting {
-            if let Some(extended) = extend_pending_record(waiting, &merged)? {
-                merged = extended;
-            }
+        let mut merged = proposed.to_vec();
+        // Older stored chunks own their bytes. Merge waiting coverage and
+        // histories newest-first, then restore the canonical row last.
+        for waiting in deferred.waiting.into_iter().rev() {
+            merged = extend_pending_record(waiting, &merged)?.unwrap_or_else(|| waiting.to_vec());
+        }
+        if !deferred.canonical.is_empty() {
+            merged = extend_pending_record(deferred.canonical, &merged)?
+                .unwrap_or_else(|| deferred.canonical.to_vec());
         }
         return Ok(Some(merged));
     }
@@ -654,6 +653,42 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deferred_waiting_only_chunk_keeps_original_bytes() {
+        let a = [10, 1, b'A'];
+        let b = [10, 1, b'B', 192, 62, 7];
+        let with_carrier = [&b[..], &[0x12, 0]].concat();
+        let c = [10, 1, b'C'];
+        let waiting = encode_pending_parts(&[&with_carrier]);
+        let deferred = append_deferred_parts(None, &[], &[waiting]).unwrap();
+        let complete = extend_pending_record(&deferred, &encode_pending_parts(&[&a, &b, &c]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pending_parts(&complete).unwrap(),
+            [&a[..], &with_carrier[..], &c[..]]
+        );
+    }
+
+    #[test]
+    fn deferred_waiting_carrier_cannot_replace_canonical_chunk() {
+        let a = [10, 1, b'A'];
+        let b = [10, 1, b'B', 192, 62, 7];
+        let with_carrier = [&b[..], &[0x12, 0]].concat();
+        let c = [10, 1, b'C'];
+        let canonical = encode_pending_source_sets(&[(&b, smallvec::smallvec![[1; 32]])]);
+        let waiting = encode_pending_source_sets(&[(&with_carrier, smallvec::smallvec![[2; 32]])]);
+        let deferred = append_deferred_parts(None, &canonical, &[waiting]).unwrap();
+        let complete = extend_pending_record(&deferred, &encode_pending_parts(&[&a, &b, &c]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending_parts(&complete).unwrap(), [&a[..], &b[..], &c[..]]);
+        assert_eq!(
+            pending_records(&complete).unwrap()[1].sources.as_slice(),
+            &[[1; 32], [2; 32]]
+        );
+    }
+
     #[test]
     fn deferred_completion_keeps_unknown_chunks_and_rejects_missing_parts() {
         let a = [10, 1, b'A'];

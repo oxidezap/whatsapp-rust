@@ -1979,6 +1979,7 @@ async fn legacy_partial_ciphertext_order(
     carrier: bool,
     restart_ambiguous: bool,
     recover_store_failure: bool,
+    complete_bare_alias: bool,
 ) {
     let mut f = Fixture::new("PARTIAL_CIPHERTEXT_ORDER", false).await;
     let group: Jid = "120363000000000032@g.us".parse().unwrap();
@@ -2063,6 +2064,11 @@ async fn legacy_partial_ciphertext_order(
     }
     f.restart().await;
     f.stanza = original;
+    let deferred_sender: Jid = if complete_bare_alias {
+        "100000000000032:76@lid".parse().unwrap()
+    } else {
+        peer.jid.clone()
+    };
     f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
     f.hook.fail.store(false, Ordering::SeqCst);
     if recover_store_failure {
@@ -2129,31 +2135,47 @@ async fn legacy_partial_ciphertext_order(
             );
             assert_eq!(f.receipts(), 0);
         }
-        let mut replay = f
-            .client
-            .load_pending_inbound(&Arc::new(f.info.clone()))
-            .await
-            .unwrap()
-            .items;
-        f.client
-            .inbound_commit_batch
-            .retention
-            .batched(&replay, None);
-        assert!(
+        if complete_bare_alias {
+            // Keep the original resident sender metadata, then write another
+            // waiting delivery under a new device spelling without restarting.
+            f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, &["B"]).await;
+            f.stanza = with_participant(&f.stanza, &deferred_sender);
+            f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+            f.receive().await;
+            assert!(f.published().is_empty());
+            assert_eq!(f.receipts(), 0);
+            assert!(
+                durability::deferred_parts(&f.pending().await.unwrap())
+                    .unwrap()
+                    .is_some()
+            );
+        } else {
+            let mut replay = f
+                .client
+                .load_pending_inbound(&Arc::new(f.info.clone()))
+                .await
+                .unwrap()
+                .items;
             f.client
                 .inbound_commit_batch
                 .retention
-                .commit_active(&replay)
-                .is_none()
-        );
-        f.client
-            .inbound_commit_batch
-            .retention
-            .restore_batched(&mut replay, None);
-        assert!(
-            replay.is_empty(),
-            "stale batch recovery must not commit ambiguous parts"
-        );
+                .batched(&replay, None);
+            assert!(
+                f.client
+                    .inbound_commit_batch
+                    .retention
+                    .commit_active(&replay)
+                    .is_none()
+            );
+            f.client
+                .inbound_commit_batch
+                .retention
+                .restore_batched(&mut replay, None);
+            assert!(
+                replay.is_empty(),
+                "stale batch recovery must not commit ambiguous parts"
+            );
+        }
         let carrier_enc = if carrier {
             let (bundle, own) = bobs_prekey_bundle(&f.client).await;
             peer.install_bob_session(&own.to_protocol_address(), &bundle)
@@ -2202,6 +2224,9 @@ async fn legacy_partial_ciphertext_order(
             );
         }
 
+        if complete_bare_alias {
+            f.stanza = with_participant(&f.stanza, &peer.jid.to_non_ad());
+        }
         f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
         f.receive().await;
     }
@@ -2210,7 +2235,19 @@ async fn legacy_partial_ciphertext_order(
         bodies,
         "only B decrypts; ciphertext duplicates must anchor its wire position"
     );
-    assert_eq!(f.receipts(), 1);
+    if complete_bare_alias {
+        assert!(
+            f.client
+                .persistence_manager
+                .backend()
+                .get_pending_inbound(&group.to_string(), &deferred_sender.to_string(), &f.info.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the newly written deferred alias must be removed too"
+        );
+    }
+    assert_eq!(f.receipts(), if complete_bare_alias { 2 } else { 1 });
     assert!(f.pending().await.is_none());
     assert!(
         f.client
@@ -2226,11 +2263,11 @@ async fn legacy_partial_ciphertext_order(
 
 #[tokio::test]
 async fn legacy_partial_retry_preserves_middle_occurrence() {
-    legacy_partial_ciphertext_order(false, true, false, false, false).await;
+    legacy_partial_ciphertext_order(false, true, false, false, false, false).await;
 }
 #[tokio::test]
 async fn legacy_partial_retry_preserves_leading_repeat() {
-    legacy_partial_ciphertext_order(true, true, false, false, false).await;
+    legacy_partial_ciphertext_order(true, true, false, false, false, false).await;
 }
 
 #[tokio::test]
@@ -2293,12 +2330,12 @@ async fn mixed_bot_and_signal_parts_keep_wire_order() {
 
 #[tokio::test]
 async fn sourced_partial_retry_preserves_leading_repeat() {
-    legacy_partial_ciphertext_order(true, false, false, false, false).await;
+    legacy_partial_ciphertext_order(true, false, false, false, false, false).await;
 }
 
 #[tokio::test]
 async fn legacy_partial_retry_accepts_complete_resend_with_skdm_carrier() {
-    legacy_partial_ciphertext_order(false, true, true, false, false).await;
+    legacy_partial_ciphertext_order(false, true, true, false, false, false).await;
 }
 #[tokio::test]
 async fn compatible_alias_rows_combine_ciphertext_histories() {
@@ -2464,10 +2501,15 @@ async fn identical_bot_ciphertexts_keep_repeated_occurrences_after_retry() {
 
 #[tokio::test]
 async fn ambiguous_legacy_partial_survives_signal_flush_and_restart() {
-    legacy_partial_ciphertext_order(false, true, false, true, false).await;
+    legacy_partial_ciphertext_order(false, true, false, true, false, false).await;
 }
 
 #[tokio::test]
 async fn ambiguous_pending_store_failure_recovers_without_another_delivery() {
-    legacy_partial_ciphertext_order(false, true, false, false, true).await;
+    legacy_partial_ciphertext_order(false, true, false, false, true, false).await;
+}
+
+#[tokio::test]
+async fn deferred_device_alias_is_removed_after_bare_sender_completion() {
+    legacy_partial_ciphertext_order(false, true, false, false, false, true).await;
 }
