@@ -231,19 +231,22 @@ impl Client {
 /// `disappearingModeTrigger: Unknown`).
 fn build_ephemeral_setting_message(duration: u32, now_secs: i64) -> waproto::whatsapp::Message {
     use waproto::whatsapp as wa;
-    wa::Message {
-        protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
-            r#type: Some(wa::message::protocol_message::Type::EphemeralSetting),
-            ephemeral_expiration: Some(duration),
-            ephemeral_setting_timestamp: Some(now_secs),
-            disappearing_mode: buffa::MessageField::some(wa::DisappearingMode {
-                initiator: Some(wa::disappearing_mode::Initiator::ChangedInChat),
-                trigger: Some(wa::disappearing_mode::Trigger::Unknown),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
+    {
+        let mut proto_ = wa::Message::default();
+        proto_.protocol_message = buffa::MessageField::some({
+            let mut proto_ = wa::message::ProtocolMessage::default();
+            proto_.r#type = Some(wa::message::protocol_message::Type::EphemeralSetting);
+            proto_.ephemeral_expiration = Some(duration);
+            proto_.ephemeral_setting_timestamp = Some(now_secs);
+            proto_.disappearing_mode = buffa::MessageField::some({
+                let mut proto = wa::DisappearingMode::default();
+                proto.initiator = Some(wa::disappearing_mode::Initiator::ChangedInChat);
+                proto.trigger = Some(wa::disappearing_mode::Trigger::Unknown);
+                proto
+            });
+            proto_
+        });
+        proto_
     }
 }
 

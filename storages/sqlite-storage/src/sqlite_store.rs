@@ -4288,6 +4288,32 @@ impl ProtocolStore for SqliteStore {
         .await
     }
 
+    async fn get_pending_inbound_for_message(
+        &self,
+        chat: &str,
+        id: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let chat = chat.to_owned();
+        let id = id.to_owned();
+        let device_id = self.device_id;
+        self.with_read_retry("get_pending_inbound_for_message", || {
+            let chat = chat.clone();
+            let id = id.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                pending_inbound_messages::table
+                    .select((
+                        pending_inbound_messages::sender,
+                        pending_inbound_messages::message,
+                    ))
+                    .filter(pending_inbound_messages::chat.eq(&chat))
+                    .filter(pending_inbound_messages::id.eq(&id))
+                    .filter(pending_inbound_messages::device_id.eq(device_id))
+                    .load(conn)
+            })
+        })
+        .await
+    }
+
     async fn delete_pending_inbound(&self, chat: &str, sender: &str, id: &str) -> Result<()> {
         let chat = chat.to_string();
         let sender = sender.to_string();
@@ -4830,6 +4856,58 @@ mod tests {
         SqliteStore::open(&db_name)
             .await
             .expect("Failed to create test store")
+    }
+
+    #[tokio::test]
+    async fn pending_message_lookup_preserves_opaque_rows_and_device_scope() {
+        let database = create_test_store().await;
+        let (first_id, store) = database.create_sibling_device_impl().await.unwrap();
+        let (second_id, other) = store.create_sibling_device_impl().await.unwrap();
+        assert_ne!(first_id, second_id);
+        for sender in ["100:75@lid", "100@lid", "100@s.whatsapp.net"] {
+            store
+                .store_pending_inbound("group", sender, "id", &[0, 255, 7])
+                .await
+                .unwrap();
+        }
+        store
+            .store_pending_inbound("other-chat", "100@lid", "id", b"other chat")
+            .await
+            .unwrap();
+        store
+            .store_pending_inbound("group", "100@lid", "other-id", b"other id")
+            .await
+            .unwrap();
+        other
+            .store_pending_inbound("group", "100@lid", "id", b"other device")
+            .await
+            .unwrap();
+        let mut rows = store
+            .get_pending_inbound_for_message("group", "id")
+            .await
+            .unwrap();
+        rows.sort();
+        assert_eq!(
+            rows,
+            ["100:75@lid", "100@lid", "100@s.whatsapp.net"]
+                .map(|sender| (sender.to_owned(), vec![0, 255, 7]))
+        );
+        for (sender, bytes) in rows {
+            assert_eq!(
+                store
+                    .get_pending_inbound("group", &sender, "id")
+                    .await
+                    .unwrap(),
+                Some(bytes)
+            );
+        }
+        assert_eq!(
+            other
+                .get_pending_inbound_for_message("group", "id")
+                .await
+                .unwrap(),
+            [("100@lid".to_owned(), b"other device".to_vec())]
+        );
     }
 
     #[tokio::test]
@@ -6637,11 +6715,12 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let action = waproto::whatsapp::sync_action_value::StatusPrivacyAction {
-            mode: Some(buffa::EnumValue::Unknown(99)),
-            user_jid: vec!["120363000000000042@lid".into()],
-            modes: vec![buffa::EnumValue::Unknown(100)],
-            ..Default::default()
+        let action = {
+            let mut proto_ = waproto::whatsapp::sync_action_value::StatusPrivacyAction::default();
+            proto_.mode = Some(buffa::EnumValue::Unknown(99));
+            proto_.user_jid = vec!["120363000000000042@lid".into()];
+            proto_.modes = vec![buffa::EnumValue::Unknown(100)];
+            proto_
         };
         apply_command_to_device(&mut device, DeviceCommand::SetStatusPrivacy(action.clone()));
         store
@@ -8358,6 +8437,10 @@ mod read_routing_tests {
             "get_sent_message",
             "retries SQLITE_BUSY on the write queue: a read error skips the repair, \
              so retain the consuming lookup's retry behavior without deleting the row",
+        ),
+        (
+            "get_pending_inbound_for_message",
+            "must order with pending writes and retry SQLITE_BUSY: a stale miss could acknowledge an uncommitted alias",
         ),
         (
             "get_pending_inbound",

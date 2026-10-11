@@ -146,9 +146,10 @@ fn plaintext_ownership_controls(bencher: divan::Bencher, case: &str) {
         })
     };
     let seed = make_info("PLAINTEXT_SEED".into());
-    let mut message = wa::Message {
-        conversation: Some("control".into()),
-        ..Default::default()
+    let mut message = {
+        let mut proto = wa::Message::default();
+        proto.conversation = Some("control".into());
+        proto
     };
     harness.plaintext_burst(vec![(
         wacore::messages::MessageUtils::encode_and_pad(&message),

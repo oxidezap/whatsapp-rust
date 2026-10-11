@@ -100,9 +100,10 @@ fn info(id: String) -> Arc<MessageInfo> {
 
 fn plaintext_control(case: &str, repetition: usize) {
     let harness = ReceiveHarness::new();
-    let text = wa::Message {
-        conversation: Some("control".into()),
-        ..Default::default()
+    let text = {
+        let mut proto = wa::Message::default();
+        proto.conversation = Some("control".into());
+        proto
     };
     let seed = info(format!("SEED-{case}-{repetition}"));
     // Warm receipt/dispatch infrastructure outside every control's profiler.

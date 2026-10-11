@@ -661,16 +661,18 @@ mod tests {
     use wacore::types::jid::JidExt;
 
     fn signed_key_index_bytes(valid_indexes: Vec<u32>, current_index: u32) -> Vec<u8> {
-        let key_index = waproto::whatsapp::ADVKeyIndexList {
-            raw_id: Some(1),
-            timestamp: Some(1_700_000_000),
-            current_index: Some(current_index),
-            valid_indexes,
-            ..Default::default()
+        let key_index = {
+            let mut proto_ = waproto::whatsapp::ADVKeyIndexList::default();
+            proto_.raw_id = Some(1);
+            proto_.timestamp = Some(1_700_000_000);
+            proto_.current_index = Some(current_index);
+            proto_.valid_indexes = valid_indexes;
+            proto_
         };
-        let signed = waproto::whatsapp::ADVSignedKeyIndexList {
-            details: Some(waproto::codec::adv_key_index_list_to_vec(&key_index)),
-            ..Default::default()
+        let signed = {
+            let mut proto_ = waproto::whatsapp::ADVSignedKeyIndexList::default();
+            proto_.details = Some(waproto::codec::adv_key_index_list_to_vec(&key_index));
+            proto_
         };
         waproto::codec::adv_signed_key_index_list_to_vec(&signed)
     }

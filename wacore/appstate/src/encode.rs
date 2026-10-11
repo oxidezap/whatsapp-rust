@@ -53,21 +53,31 @@ pub fn encode_record(
     };
 
     // 5. Build the record
-    let record = wa::SyncdRecord {
-        index: buffa::MessageField::some(wa::SyncdIndex {
-            blob: Some(index_mac),
-        }),
-        value: buffa::MessageField::some(wa::SyncdValue {
-            blob: Some(value_blob),
-        }),
-        key_id: buffa::MessageField::some(wa::KeyId {
-            id: Some(key_id.to_vec()),
-        }),
+    let record = {
+        let mut proto = wa::SyncdRecord::default();
+        proto.index = buffa::MessageField::some({
+            let mut proto = wa::SyncdIndex::default();
+            proto.blob = Some(index_mac);
+            proto
+        });
+        proto.value = buffa::MessageField::some({
+            let mut proto = wa::SyncdValue::default();
+            proto.blob = Some(value_blob);
+            proto
+        });
+        proto.key_id = buffa::MessageField::some({
+            let mut proto = wa::KeyId::default();
+            proto.id = Some(key_id.to_vec());
+            proto
+        });
+        proto
     };
 
-    let mutation = wa::SyncdMutation {
-        operation: Some(operation.into()),
-        record: buffa::MessageField::some(record),
+    let mutation = {
+        let mut proto = wa::SyncdMutation::default();
+        proto.operation = Some(operation.into());
+        proto.record = buffa::MessageField::some(record);
+        proto
     };
 
     (mutation, value_mac)
@@ -87,12 +97,15 @@ mod tests {
         let iv = [0u8; 16];
 
         let index = b"[\"setting_pushName\"]";
-        let value = wa::SyncActionValue {
-            push_name_setting: buffa::MessageField::some(wa::sync_action_value::PushNameSetting {
-                name: Some("Test User".to_string()),
-            }),
-            timestamp: Some(1234567890),
-            ..Default::default()
+        let value = {
+            let mut proto = wa::SyncActionValue::default();
+            proto.push_name_setting = buffa::MessageField::some({
+                let mut proto = wa::sync_action_value::PushNameSetting::default();
+                proto.name = Some("Test User".to_string());
+                proto
+            });
+            proto.timestamp = Some(1234567890);
+            proto
         };
 
         let (mutation, _value_mac) = encode_record(
@@ -146,18 +159,17 @@ mod tests {
 
         let index = b"[\"contact\",\"5511999998888@s.whatsapp.net\"]";
         let cases = [
-            (
-                1,
-                wa::SyncActionValue {
-                    timestamp: Some(1_700_000_000),
-                    contact_action: wa::sync_action_value::ContactAction {
-                        full_name: Some("Contact Full Name".to_string()),
-                        ..Default::default()
-                    }
-                    .into(),
-                    ..Default::default()
-                },
-            ),
+            (1, {
+                let mut proto = wa::SyncActionValue::default();
+                proto.timestamp = Some(1_700_000_000);
+                proto.contact_action = {
+                    let mut proto = wa::sync_action_value::ContactAction::default();
+                    proto.full_name = Some("Contact Full Name".to_string());
+                    proto
+                }
+                .into();
+                proto
+            }),
             // Empty value and a multi-byte version: the degenerate shapes the
             // exact-size arithmetic is most likely to get wrong.
             (0, wa::SyncActionValue::default()),
@@ -166,11 +178,13 @@ mod tests {
         ];
 
         for (version, value) in cases {
-            let expected = wa::SyncActionData {
-                index: Some(index.to_vec()),
-                value: buffa::MessageField::some(value.clone()),
-                padding: Some(vec![]),
-                version: Some(version),
+            let expected = {
+                let mut proto = wa::SyncActionData::default();
+                proto.index = Some(index.to_vec());
+                proto.value = buffa::MessageField::some(value.clone());
+                proto.padding = Some(vec![]);
+                proto.version = Some(version);
+                proto
             }
             .encode_to_vec();
             let got = waproto::codec::sync_action_data_to_vec(index, &value, version);

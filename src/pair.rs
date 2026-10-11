@@ -602,11 +602,9 @@ mod tests {
         let device = client.persistence_manager.get_device_snapshot();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account = KeyPair::generate(&mut rng);
-        let details = wa::ADVDeviceIdentity {
-            key_index: Some(1),
-            ..Default::default()
-        }
-        .encode_to_vec();
+        let mut details = wa::ADVDeviceIdentity::default();
+        details.key_index = Some(1);
+        let details = details.encode_to_vec();
         let signature = account
             .private_key
             .calculate_signature(
@@ -619,21 +617,17 @@ mod tests {
                 &mut rng,
             )
             .unwrap();
-        let identity =
-            waproto::codec::adv_signed_device_identity_to_vec(&wa::ADVSignedDeviceIdentity {
-                details: Some(details),
-                account_signature_key: Some(account.public_key.public_key_bytes().to_vec()),
-                account_signature: Some(signature.to_vec()),
-                ..Default::default()
-            });
+        let mut identity = wa::ADVSignedDeviceIdentity::default();
+        identity.details = Some(details);
+        identity.account_signature_key = Some(account.public_key.public_key_bytes().to_vec());
+        identity.account_signature = Some(signature.to_vec());
+        let identity = waproto::codec::adv_signed_device_identity_to_vec(&identity);
         let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&device.adv_secret_key).unwrap();
         mac.update(&identity);
-        let payload = wa::ADVSignedDeviceIdentityHMAC {
-            details: Some(identity),
-            hmac: Some(mac.finalize().into_bytes().to_vec()),
-            ..Default::default()
-        }
-        .encode_to_vec();
+        let mut payload = wa::ADVSignedDeviceIdentityHMAC::default();
+        payload.details = Some(identity);
+        payload.hmac = Some(mac.finalize().into_bytes().to_vec());
+        let payload = payload.encode_to_vec();
         NodeBuilder::new("iq")
             .attrs([
                 ("from", "s.whatsapp.net"),

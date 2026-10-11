@@ -839,6 +839,11 @@ impl Client {
             info.id,
             info.source.sender.observe()
         );
+        if self.inbound_durability_hook().is_some() {
+            self.inbound_commit_batch
+                .retention
+                .select_source(info, enc_index);
+        }
         self.dispatch_parsed_message(msg, info, false).await;
     }
 

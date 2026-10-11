@@ -832,19 +832,44 @@ async fn probe_durability_backend(
     let map_err =
         |error: StoreError| ClientBuilderError::UnsupportedDurabilityBackend(error.to_string());
 
-    backend
-        .store_pending_inbound(PROBE_JID, PROBE_JID, &probe_id, PROBE_PAYLOAD)
-        .await
-        .map_err(map_err)?;
-    let stored = backend
-        .get_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
-        .await
-        .map_err(map_err)?;
-    backend
+    const OTHER_SENDER: &str = "0:1@s.whatsapp.net";
+    let round_trip = async {
+        backend
+            .store_pending_inbound(PROBE_JID, PROBE_JID, &probe_id, PROBE_PAYLOAD)
+            .await?;
+        backend
+            .store_pending_inbound(PROBE_JID, OTHER_SENDER, &probe_id, PROBE_PAYLOAD)
+            .await?;
+        let stored = backend
+            .get_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
+            .await?;
+        let candidates = backend
+            .get_pending_inbound_for_message(PROBE_JID, &probe_id)
+            .await?;
+        Ok::<_, StoreError>((stored, candidates))
+    }
+    .await;
+    // Clean both uniquely named probe rows even after a partial write/read failure.
+    let first_delete = backend
         .delete_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
-        .await
-        .map_err(map_err)?;
-
+        .await;
+    let second_delete = backend
+        .delete_pending_inbound(PROBE_JID, OTHER_SENDER, &probe_id)
+        .await;
+    let (stored, mut candidates) = round_trip.map_err(map_err)?;
+    first_delete.map_err(map_err)?;
+    second_delete.map_err(map_err)?;
+    candidates.sort();
+    let mut expected = vec![
+        (PROBE_JID.to_owned(), PROBE_PAYLOAD.to_vec()),
+        (OTHER_SENDER.to_owned(), PROBE_PAYLOAD.to_vec()),
+    ];
+    expected.sort();
+    if candidates != expected {
+        return Err(ClientBuilderError::UnsupportedDurabilityBackend(
+            "pending-inbound participant lookup did not round-trip every sender key".to_owned(),
+        ));
+    }
     if stored.as_deref() != Some(PROBE_PAYLOAD) {
         return Err(ClientBuilderError::UnsupportedDurabilityBackend(
             "pending-inbound buffer did not round-trip".to_string(),

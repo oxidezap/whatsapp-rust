@@ -1935,10 +1935,11 @@ dependencies = [
  "buffa-descriptor",
  "bytes",
  "heck",
- "prettyplease 0.3.0",
+ "prettyplease 0.2.37",
+ "quote",
  "serde",
  "sha2",
- "syn 3.0.6",
+ "syn 2.0.119",
 ]
 
 [[package]]

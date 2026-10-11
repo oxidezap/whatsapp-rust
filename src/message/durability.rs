@@ -1,19 +1,373 @@
-//! Inbound durability hook: opt-in at-least-once delivery by gating the
-//! transport ack on a consumer-provided durable commit. See
+//! Inbound durability hook: pending-record replay and the consumer commit barrier.
+//! See
 //! [`crate::types::durability_hook::InboundDurabilityHook`] for the contract.
 //!
 //! The first-receipt path lives in [`super::commit_batch`]: messages commit
 //! per batch (buffer → hook → ack). This module keeps the redelivery replay,
-//! which is inherently per-message: each replayed stanza resolves against its
-//! own buffered copy.
+//! where each replayed stanza resolves all of its stored payload parts.
 
 use super::*;
 use crate::types::durability_hook::InboundDurabilityHook;
 use wacore::types::events::InboundMessage;
 
+// Zero is not a protobuf field tag, so the envelope cannot alias an existing
+// serialized Message. Legacy single-message and v1 rows remain readable.
+const PARTS_HEADER: &[u8] = b"\0WAPI\x01";
+const SOURCED_PARTS_HEADER: &[u8] = b"\0WAPI\x02";
+const SOURCE_SETS_HEADER: &[u8] = b"\0WAPI\x03";
+
+#[derive(Clone)]
+struct PendingPart<'a> {
+    bytes: &'a [u8],
+    sources: retention::PayloadSources,
+}
+
+#[cfg(test)]
+fn encode_pending_sourced_parts(parts: &[(&[u8], Option<retention::PayloadSource>)]) -> Vec<u8> {
+    encode_pending_source_sets(
+        &parts
+            .iter()
+            .map(|(bytes, source)| (*bytes, source.iter().copied().collect()))
+            .collect::<Vec<_>>(),
+    )
+}
+pub(super) fn encode_pending_source_sets(parts: &[(&[u8], retention::PayloadSources)]) -> Vec<u8> {
+    if parts.iter().all(|(_, sources)| sources.is_empty()) {
+        return encode_pending_parts(&parts.iter().map(|(bytes, _)| *bytes).collect::<Vec<_>>());
+    }
+    let sets = parts.iter().any(|(_, sources)| sources.len() > 1);
+    let mut record = if sets {
+        SOURCE_SETS_HEADER
+    } else {
+        SOURCED_PARTS_HEADER
+    }
+    .to_vec();
+    for (bytes, sources) in parts {
+        if sets {
+            record.extend_from_slice(&(sources.len() as u64).to_be_bytes());
+        } else {
+            record.push(u8::from(!sources.is_empty()));
+        }
+        for source in sources {
+            record.extend_from_slice(source);
+        }
+        record.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        record.extend_from_slice(bytes);
+    }
+    record
+}
+
+pub(super) fn encode_pending_parts(parts: &[&[u8]]) -> Vec<u8> {
+    let mut record = Vec::new();
+    record.extend_from_slice(PARTS_HEADER);
+    for part in parts {
+        // A slice cannot exceed u64 on supported targets. Lengths are decoded
+        // against the remaining input before any payload allocation.
+        record.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        record.extend_from_slice(part);
+    }
+    record
+}
+
+fn pending_records(bytes: &[u8]) -> anyhow::Result<Vec<PendingPart<'_>>> {
+    if bytes.first() != Some(&0) {
+        return Ok(vec![PendingPart {
+            bytes,
+            sources: Default::default(),
+        }]);
+    }
+    let sets = bytes.starts_with(SOURCE_SETS_HEADER);
+    let sourced = sets || bytes.starts_with(SOURCED_PARTS_HEADER);
+    let mut remaining = bytes
+        .strip_prefix(if sets {
+            SOURCE_SETS_HEADER
+        } else if sourced {
+            SOURCED_PARTS_HEADER
+        } else {
+            PARTS_HEADER
+        })
+        .ok_or_else(|| anyhow::anyhow!("unknown pending-inbound record header"))?;
+    let mut parts = Vec::new();
+    while !remaining.is_empty() {
+        let count = if sets {
+            anyhow::ensure!(remaining.len() >= 8, "truncated source count");
+            let count = usize::try_from(u64::from_be_bytes(remaining[..8].try_into()?))?;
+            remaining = &remaining[8..];
+            anyhow::ensure!(count <= remaining.len() / 32, "truncated source identities");
+            count
+        } else if sourced {
+            let (&flag, rest) = remaining.split_first().expect("nonempty record remainder");
+            remaining = rest;
+            anyhow::ensure!(flag <= 1, "invalid pending-inbound source flag");
+            usize::from(flag)
+        } else {
+            0
+        };
+        anyhow::ensure!(
+            count <= remaining.len() / 32,
+            "truncated pending-inbound source"
+        );
+        anyhow::ensure!(
+            count <= retention::MAX_SOURCE_IDENTITIES,
+            "source history limit exceeded"
+        );
+        let mut sources = retention::PayloadSources::new();
+        for _ in 0..count {
+            sources.push(remaining[..32].try_into()?);
+            remaining = &remaining[32..];
+        }
+        anyhow::ensure!(remaining.len() >= 8, "truncated pending-inbound length");
+        let mut length = [0; 8];
+        length.copy_from_slice(&remaining[..8]);
+        remaining = &remaining[8..];
+        let length = usize::try_from(u64::from_be_bytes(length))?;
+        anyhow::ensure!(
+            length <= remaining.len(),
+            "truncated pending-inbound payload"
+        );
+        parts.push(PendingPart {
+            bytes: &remaining[..length],
+            sources,
+        });
+        remaining = &remaining[length..];
+    }
+    anyhow::ensure!(!parts.is_empty(), "empty pending-inbound record");
+    Ok(parts)
+}
+#[cfg(test)]
+pub(super) fn pending_parts(bytes: &[u8]) -> anyhow::Result<Vec<&[u8]>> {
+    Ok(pending_records(bytes)?
+        .into_iter()
+        .map(|part| part.bytes)
+        .collect())
+}
+pub(super) fn decode_pending_parts(bytes: &[u8]) -> anyhow::Result<Vec<wa::Message>> {
+    pending_records(bytes)?
+        .into_iter()
+        .map(|part| waproto::codec::message_decode(part.bytes).map_err(Into::into))
+        .collect()
+}
+
+pub(super) fn extend_pending_record(
+    existing: &[u8],
+    proposed: &[u8],
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let original_parts = pending_records(existing)?;
+    let mut scratch = Vec::new();
+    // Replay selection already treats SKDM as a carrier, not a new user
+    // payload. Extension must use that same occurrence identity while keeping
+    // each original row's bytes, including its carrier and unknown fields.
+    let existing_fingerprints: Vec<_> = decode_pending_parts(existing)?
+        .iter()
+        .map(|message| MessageDispatch::fingerprint_into(message, &mut scratch))
+        .collect();
+    let proposed_parts = pending_records(proposed)?;
+    let mut next = 0;
+    let mut merged = Vec::with_capacity(proposed_parts.len());
+    for part in proposed_parts {
+        let matches = if let Some(expected) = existing_fingerprints.get(next) {
+            let message = waproto::codec::message_decode(part.bytes)?;
+            *expected == MessageDispatch::fingerprint_into(&message, &mut scratch)
+        } else {
+            false
+        };
+        if matches {
+            merged.push(PendingPart {
+                bytes: original_parts[next].bytes,
+                sources: {
+                    let mut sources = original_parts[next].sources.clone();
+                    retention::remember_sources(&mut sources, &part.sources);
+                    sources
+                },
+            });
+            next += 1;
+        } else {
+            merged.push(part);
+        }
+    }
+    anyhow::ensure!(
+        next == original_parts.len(),
+        "pending identity conflicts with retained payloads"
+    );
+    if merged.len() == original_parts.len()
+        && merged
+            .iter()
+            .zip(&original_parts)
+            .all(|(a, b)| a.sources == b.sources)
+    {
+        return Ok(None);
+    }
+    // Existing payload bytes stay intact. New parts or ciphertext identities
+    // extend only this opaque envelope; no table migration is involved.
+    Ok(Some(encode_pending_source_sets(
+        &merged
+            .into_iter()
+            .map(|part| (part.bytes, part.sources))
+            .collect::<Vec<_>>(),
+    )))
+}
+
+fn is_subsequence(sequence: &[DispatchFingerprint], candidate: &[DispatchFingerprint]) -> bool {
+    let mut remaining = sequence;
+    for fingerprint in candidate {
+        if remaining.first() == Some(fingerprint) {
+            remaining = &remaining[1..];
+        }
+    }
+    remaining.is_empty()
+}
+
+pub(super) struct PendingReplay {
+    pub(super) items: Vec<InboundMessage>,
+    pub(super) keys: Vec<(String, String, String)>,
+    pub(super) sources: std::collections::HashMap<usize, retention::PayloadSources>,
+}
+
+// Keep the string comparisons out of the stable sort's generated inner loops.
+#[inline(never)]
+fn compare_pending_senders(a: &str, b: &str, preferred: &str) -> std::cmp::Ordering {
+    (a != preferred, a).cmp(&(b != preferred, b))
+}
+
 impl Client {
+    /// Load all matching original keys before decrypting another delivery.
+    /// Other namespaces/participants are filtered before decoding; their rows
+    /// cannot block or be removed by this consumer's successful commit.
+    pub(super) async fn load_pending_inbound(
+        &self,
+        info: &Arc<MessageInfo>,
+    ) -> anyhow::Result<PendingReplay> {
+        let backend = self.persistence_manager.backend();
+        let chat = info.source.chat.to_string();
+        let sender = info.source.sender.to_string();
+        let group = info.source.chat.is_group()
+            || info.source.chat.is_broadcast_list()
+            || info.source.chat.is_status_broadcast();
+        let mut rows = if group {
+            backend
+                .get_pending_inbound_for_message(&chat, &info.id)
+                .await?
+        } else {
+            backend
+                .get_pending_inbound(&chat, &sender, &info.id)
+                .await?
+                .map(|bytes| (sender.clone(), bytes))
+                .into_iter()
+                .collect()
+        };
+        rows.retain(|(stored_sender, _)| {
+            stored_sender == &sender
+                || group
+                    && stored_sender
+                        .parse::<Jid>()
+                        .is_ok_and(|stored| stored.to_non_ad() == info.source.sender.to_non_ad())
+        });
+        // Prefer exact spelling when equivalent rows have equal source coverage.
+        rows.sort_by(|a, b| compare_pending_senders(&a.0, &b.0, &sender));
+        let mut replay = PendingReplay {
+            items: Vec::new(),
+            keys: Vec::new(),
+            sources: std::collections::HashMap::new(),
+        };
+        let mut sequences = Vec::new();
+        let mut candidates = Vec::new();
+        let mut scratch = Vec::new();
+        for (stored_sender, bytes) in rows {
+            let mut items = Vec::new();
+            for part in pending_records(&bytes)? {
+                let item = InboundMessage::builder()
+                    .message(Arc::new(waproto::codec::message_decode(part.bytes)?))
+                    .info(Arc::clone(info))
+                    .build();
+                if !part.sources.is_empty() {
+                    replay
+                        .sources
+                        .insert(Arc::as_ptr(&item.message) as usize, part.sources);
+                }
+                items.push(item);
+            }
+            sequences.push(
+                items
+                    .iter()
+                    .map(|item| MessageDispatch::fingerprint_into(&item.message, &mut scratch))
+                    .collect::<Vec<_>>(),
+            );
+            candidates.push(items);
+            replay
+                .keys
+                .push((chat.clone(), stored_sender, info.id.to_string()));
+        }
+        // Prefer a complete sequence with source metadata for partial retries. An exact
+        // alias can be only a suffix: [B] must not make stored [A,B] become [B,A].
+        // Compare occurrences so [A,A,B] still contains two copies of A.
+        if let Some(complete) = (0..sequences.len())
+            .filter(|&index| {
+                sequences
+                    .iter()
+                    .all(|sequence| is_subsequence(sequence, &sequences[index]))
+            })
+            .max_by_key(|&index| {
+                (
+                    candidates[index]
+                        .iter()
+                        .filter(|item| {
+                            replay
+                                .sources
+                                .contains_key(&(Arc::as_ptr(&item.message) as usize))
+                        })
+                        .count(),
+                    std::cmp::Reverse(index),
+                )
+            })
+        {
+            // Equally complete aliases may carry identities from different
+            // encrypted retries. Their occurrence sequences align exactly.
+            for index in 0..candidates.len() {
+                if index == complete || sequences[index] != sequences[complete] {
+                    continue;
+                }
+                for (old, selected) in candidates[index].iter().zip(&candidates[complete]) {
+                    if let Some(incoming) = replay
+                        .sources
+                        .get(&(Arc::as_ptr(&old.message) as usize))
+                        .cloned()
+                    {
+                        let sources = replay
+                            .sources
+                            .entry(Arc::as_ptr(&selected.message) as usize)
+                            .or_default();
+                        retention::remember_sources(sources, &incoming);
+                    }
+                }
+            }
+            replay.items = candidates.swap_remove(complete);
+        } else {
+            for items in candidates {
+                retention::merge_parts(&mut replay.items, items);
+            }
+            let canonical: Vec<_> = replay
+                .items
+                .iter()
+                .map(|item| MessageDispatch::fingerprint_into(&item.message, &mut scratch))
+                .collect();
+            anyhow::ensure!(
+                sequences
+                    .iter()
+                    .all(|sequence| is_subsequence(sequence, &canonical)),
+                "conflicting pending-inbound part order across sender keys"
+            );
+        }
+        let live: std::collections::HashSet<_> = replay
+            .items
+            .iter()
+            .map(|item| Arc::as_ptr(&item.message) as usize)
+            .collect();
+        replay.sources.retain(|key, _| live.contains(key));
+        Ok(replay)
+    }
+
     /// The registered inbound durability hook, if any. `None` (default) keeps
-    /// the at-most-once ack path with zero overhead.
+    /// the existing at-most-once acknowledgement path.
     pub(crate) fn inbound_durability_hook(&self) -> Option<Arc<dyn InboundDurabilityHook>> {
         self.inbound_durability_hook.get().cloned()
     }
@@ -23,11 +377,11 @@ impl Client {
     /// acking. The replay routes through the commit batcher: during a drain it
     /// joins the accumulating batch, so its hook commit, ack and event keep
     /// arrival order with the fresh stanzas around it; live it commits
-    /// immediately as a batch of one. Either way the batch commit rewrites and
-    /// then clears its pending row, and consumers observe the message there.
+    /// immediately with all stored parts. A successful batch commit clears its
+    /// pending row, and consumers observe the message there.
     /// Usually its original batch never dispatched (the hook failed then); if
     /// it did (post-commit row cleanup failed AND the ack was lost), event
-    /// consumers see it twice — the documented at-least-once shape of
+    /// consumers can see it twice, so commits must tolerate duplicate
     /// `Event::Messages` with a hook registered. A plain ack is sent only for
     /// a genuine duplicate (no buffered copy). A read failure fails closed
     /// (no ack) so a transient storage error cannot drop a message that still
@@ -39,50 +393,45 @@ impl Client {
     /// failed returns `false`, because nothing reached a consumer.
     pub(crate) async fn ack_or_replay_to_hook(self: &Arc<Self>, info: &Arc<MessageInfo>) -> bool {
         if self.inbound_durability_hook().is_some() {
-            let backend = self.persistence_manager.backend();
-            let chat = info.source.chat.to_string();
-            let sender = info.source.sender.to_string();
-            match backend.get_pending_inbound(&chat, &sender, &info.id).await {
-                Ok(Some(bytes)) => match waproto::codec::message_decode(&bytes) {
-                    Ok(msg) => {
-                        // Only a replay that will actually reach the consumer
-                        // counts as one. `Deferred` still does, later, when its
-                        // batch commits; `Failed` dispatched nothing, so the
-                        // caller must count that resend as a suppression or the
-                        // message reaches no one and nothing records it.
-                        return !matches!(
-                            self.commit_or_batch_inbound(
-                                InboundMessage::builder()
-                                    .message(Arc::new(msg))
-                                    .info(Arc::clone(info))
-                                    .build(),
-                                false,
-                            )
-                            .await,
-                            InboundCommitState::Failed
-                        );
+            if self.inbound_commit_batch.retention.has_plaintext(info) {
+                if let Some(items) = self.inbound_commit_batch.retention.replay_items(info) {
+                    return !matches!(
+                        self.commit_or_batch_inbound_items(items, false).await,
+                        InboundCommitState::Failed
+                    );
+                }
+                // Its complete in-memory stanza will commit at the end of this
+                // receive, even when a storage failure left no pending row.
+                return false;
+            }
+            match self.load_pending_inbound(info).await {
+                Ok(replay) if !replay.items.is_empty() => {
+                    if self.inbound_commit_batch.retention.is_collecting(info) {
+                        self.inbound_commit_batch.retention.seed_replay(replay);
+                        return false; // The outer producer seals every part together.
                     }
-                    Err(e) => {
-                        // Corrupt row (our own serialization): it can never be
-                        // replayed, so drop it and ack to unstick the queue.
-                        log::error!(
-                            "[msg:{}] failed to decode buffered inbound message; acking to unstick queue: {e:?}",
-                            info.id
-                        );
-                        let _ = backend
-                            .delete_pending_inbound(&chat, &sender, &info.id)
-                            .await;
+                    self.inbound_commit_batch.retention.begin(info, None).await;
+                    let _collection = self.inbound_commit_batch.retention.collection_guard(info);
+                    self.inbound_commit_batch.retention.seed_replay(replay);
+                    let (items, _) = self
+                        .inbound_commit_batch
+                        .retention
+                        .seal(info, self.inbound_commit_batch.is_active());
+                    return !matches!(
+                        self.commit_or_batch_inbound_items(items, false).await,
+                        InboundCommitState::Failed
+                    );
+                }
+                Ok(_) => {
+                    if !self.inbound_commit_batch.retention.has_plaintext(info) {
                         self.ack_received_message(info);
                     }
-                },
-                // Genuine duplicate (never buffered, or already committed): ack it.
-                Ok(None) => self.ack_received_message(info),
-                // Fail closed: a transient read error must not ack a message whose
-                // hook may not have committed. Leave it unacked for the next replay.
-                Err(e) => log::warn!(
-                    "[msg:{}] failed to read pending inbound buffer; suppressing ack for redelivery: {e:?}",
-                    info.id
-                ),
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Pending inbound lookup failed; preserving all records and withholding receipt: {error:?}"
+                    );
+                }
             }
         } else {
             self.ack_received_message(info);
@@ -98,6 +447,227 @@ mod tests {
     use crate::types::message::MessageInfo;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use wacore::types::events::BatchOrigin;
+
+    #[test]
+    fn pending_record_reads_legacy_and_preserves_opaque_parts() {
+        // Framing never interprets protobuf tags or enum values.
+        let unknown = [0xc0, 0x3e, 7];
+        assert_eq!(pending_parts(&unknown).unwrap(), [&unknown[..]]);
+        let opaque = encode_pending_parts(&[&unknown, &[], &unknown]);
+        assert_eq!(
+            pending_parts(&opaque).unwrap(),
+            [&unknown[..], &[], &unknown[..]]
+        );
+        let wire = [10, 1, b'x'];
+        let legacy = decode_pending_parts(&wire).unwrap();
+        let record = encode_pending_parts(&[&wire, &[], &wire]);
+        let decoded = decode_pending_parts(&record).unwrap();
+        assert_eq!(decoded.len(), 3);
+        for message in [&legacy[0], &decoded[0], &decoded[2]] {
+            let mut encoded = Vec::new();
+            waproto::codec::message_encode_into(message, &mut encoded);
+            assert_eq!(encoded, wire);
+        }
+        assert!(decode_pending_parts(PARTS_HEADER).is_err());
+        assert!(decode_pending_parts(b"\0WAPI\x02").is_err());
+        assert!(decode_pending_parts(&record[..record.len() - 1]).is_err());
+        let mut oversized = PARTS_HEADER.to_vec();
+        oversized.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(decode_pending_parts(&oversized).is_err());
+    }
+
+    #[test]
+    fn sourced_pending_records_preserve_bytes_and_metadata_on_extension() {
+        let first = [10, 1, b'a', 0xc0, 0x3e, 7];
+        let second = [10, 1, b'b'];
+        let third = [10, 1, b'c'];
+        let original =
+            encode_pending_sourced_parts(&[(&first, Some([1; 32])), (&third, Some([3; 32]))]);
+        let proposed = encode_pending_sourced_parts(&[
+            (&first, Some([9; 32])),
+            (&second, Some([2; 32])),
+            (&third, Some([8; 32])),
+        ]);
+        let extended = extend_pending_record(&original, &proposed)
+            .unwrap()
+            .unwrap();
+        let parts = pending_records(&extended).unwrap();
+        assert_eq!(
+            parts.iter().map(|p| p.bytes).collect::<Vec<_>>(),
+            [&first[..], &second[..], &third[..]]
+        );
+        assert_eq!(
+            parts
+                .iter()
+                .map(|p| p.sources.first().copied())
+                .collect::<Vec<_>>(),
+            [Some([1; 32]), Some([2; 32]), Some([3; 32])]
+        );
+        assert!(
+            extend_pending_record(&extended, &extended)
+                .unwrap()
+                .is_none()
+        );
+        for length in 0..33 {
+            let mut invalid = SOURCED_PARTS_HEADER.to_vec();
+            invalid.push(1);
+            invalid.extend_from_slice(&[0; 32][..length.min(32)]);
+            assert!(pending_records(&invalid).is_err());
+        }
+        let mut invalid = SOURCED_PARTS_HEADER.to_vec();
+        invalid.push(2);
+        assert!(pending_records(&invalid).is_err());
+    }
+
+    #[test]
+    fn pending_source_history_preserves_both_ciphertext_generations() {
+        let bytes = [10, 1, b'a', 0xc0, 0x3e, 7];
+        let existing = encode_pending_sourced_parts(&[(&bytes, Some([1; 32]))]);
+        let proposed = encode_pending_sourced_parts(&[(&bytes, Some([2; 32]))]);
+        let extended = extend_pending_record(&existing, &proposed)
+            .unwrap()
+            .unwrap();
+        assert!(extended.starts_with(SOURCE_SETS_HEADER));
+        let parts = pending_records(&extended).unwrap();
+        assert_eq!(parts[0].bytes, bytes);
+        assert_eq!(parts[0].sources.as_slice(), &[[1; 32], [2; 32]]);
+        assert!(
+            extend_pending_record(&extended, &proposed)
+                .unwrap()
+                .is_none()
+        );
+        let mut malformed = SOURCE_SETS_HEADER.to_vec();
+        malformed.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(pending_records(&malformed).is_err());
+    }
+
+    #[test]
+    fn saturated_source_history_keeps_original_bytes_without_growth() {
+        let bytes = [10, 1, b'a', 0xc0, 0x3e, 7];
+        let sources: retention::PayloadSources = (0..retention::MAX_SOURCE_IDENTITIES)
+            .map(|index| {
+                let mut source = [0; 32];
+                source[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                source
+            })
+            .collect();
+        let existing = encode_pending_source_sets(&[(&bytes, sources.clone())]);
+        let proposed = encode_pending_sourced_parts(&[(&bytes, Some([255; 32]))]);
+        assert!(
+            extend_pending_record(&existing, &proposed)
+                .unwrap()
+                .is_none()
+        );
+        let parts = pending_records(&existing).unwrap();
+        assert_eq!(parts[0].bytes, bytes);
+        assert_eq!(parts[0].sources, sources);
+        let mut oversized = SOURCE_SETS_HEADER.to_vec();
+        oversized.extend_from_slice(&((retention::MAX_SOURCE_IDENTITIES + 1) as u64).to_be_bytes());
+        oversized.extend(vec![0; (retention::MAX_SOURCE_IDENTITIES + 1) * 32]);
+        oversized.extend_from_slice(&0u64.to_be_bytes());
+        assert!(
+            pending_records(&oversized)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("source history limit")
+        );
+    }
+
+    #[test]
+    fn pending_records_differing_only_in_future_fields_do_not_alias() {
+        let original = [10, 1, b'b', 0xc0, 0x3e, 7];
+        let different = [10, 1, b'b', 0xc0, 0x3e, 8];
+        assert!(extend_pending_record(&original, &different).is_err());
+        assert!(extend_pending_record(&different, &original).is_err());
+        assert!(
+            extend_pending_record(&original, &original)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pending_extension_uses_replay_carrier_equivalence_and_keeps_bytes() {
+        let original = [10, 1, b'b', 0xc0, 0x3e, 7];
+        let with_carrier = [&original[..], &[0x12, 0]].concat();
+        let first = [10, 1, b'a'];
+        let proposed = encode_pending_parts(&[&first, &with_carrier]);
+        let extended = extend_pending_record(&original, &proposed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pending_parts(&extended).unwrap(),
+            [&first[..], &original[..]]
+        );
+        assert!(
+            extend_pending_record(&original, &with_carrier)
+                .unwrap()
+                .is_none()
+        );
+        let duplicate = encode_pending_parts(&[&original, &original]);
+        assert!(extend_pending_record(&duplicate, &proposed).is_err());
+        assert!(extend_pending_record(&original, &first).is_err());
+    }
+
+    #[tokio::test]
+    async fn restarted_alias_replay_with_carrier_difference_reaches_hook() {
+        let client = create_test_client_with_failing_http("durability_carrier_alias").await;
+        let mut info = (*test_info("CARRIER_ALIAS")).clone();
+        info.source.is_group = true;
+        let info = Arc::new(info);
+        let backend = client.persistence_manager.backend();
+        let original = [10, 1, b'b', 0xc0, 0x3e, 7];
+        let with_carrier = [&original[..], &[0x12, 0]].concat();
+        let combined = encode_pending_parts(&[&[10, 1, b'a'], &with_carrier]);
+        for (sender, bytes) in [
+            ("200@s.whatsapp.net", &original[..]),
+            ("200:1@s.whatsapp.net", &combined[..]),
+        ] {
+            backend
+                .store_pending_inbound("100@g.us", sender, &info.id, bytes)
+                .await
+                .unwrap();
+        }
+        let hook = counting_hook(true);
+        assert!(client.inbound_durability_hook.set(hook.clone()).is_ok());
+        assert!(client.ack_or_replay_to_hook(&info).await);
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hook.messages.load(Ordering::SeqCst), 2);
+        for sender in ["200@s.whatsapp.net", "200:1@s.whatsapp.net"] {
+            assert!(
+                backend
+                    .get_pending_inbound("100@g.us", sender, &info.id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn extending_a_pending_record_keeps_legacy_bytes_and_part_multiplicity() {
+        let original = [10, 1, b'x', 0xc0, 0x3e, 7];
+        let mut canonical = Vec::new();
+        waproto::codec::message_encode_into(
+            &decode_pending_parts(&original).unwrap()[0],
+            &mut canonical,
+        );
+        let proposed = encode_pending_parts(&[&canonical, &[10, 1, b'y'], &[10, 1, b'y']]);
+        let extended = extend_pending_record(&original, &proposed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pending_parts(&extended).unwrap(),
+            [&original[..], &[10, 1, b'y'], &[10, 1, b'y']]
+        );
+        assert!(extend_pending_record(&original, &[10, 1, b'y']).is_err());
+        assert!(
+            extend_pending_record(&original, &canonical)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     struct CountingHook {
         calls: AtomicUsize,
@@ -145,9 +715,10 @@ mod tests {
 
     fn test_item(id: &str) -> InboundMessage {
         InboundMessage::builder()
-            .message(Arc::new(wa::Message {
-                conversation: Some("hello".to_string()),
-                ..Default::default()
+            .message(Arc::new({
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("hello".to_string());
+                proto
             }))
             .info(test_info(id))
             .build()
@@ -200,9 +771,10 @@ mod tests {
         client
             .commit_inbound_batch(
                 Arc::from([InboundMessage::builder()
-                    .message(Arc::new(wa::Message {
-                        conversation: Some("hello".to_string()),
-                        ..Default::default()
+                    .message(Arc::new({
+                        let mut proto = wa::Message::default();
+                        proto.conversation = Some("hello".to_string());
+                        proto
                     }))
                     .info(Arc::clone(&info))
                     .build()]),
@@ -272,6 +844,66 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a successful replay must clear the buffered copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_replay_preserves_distinct_parts_with_the_same_identity() {
+        let client = create_test_client_with_failing_http("durability_parts").await;
+        let hook = counting_hook(false);
+        let _ = client.inbound_durability_hook.set(hook.clone());
+        let first = test_item("MULTIPART");
+        let info = Arc::clone(&first.info);
+        let mut message = wa::Message::default();
+        message.conversation = Some("second distinct part".to_owned());
+        let second = InboundMessage::builder()
+            .message(Arc::new(message))
+            .info(Arc::clone(&info))
+            .build();
+        assert!(
+            client
+                .commit_inbound_batch(Arc::from([first, second]), BatchOrigin::OfflineDrain, None,)
+                .await
+        );
+        assert_eq!(hook.messages.swap(0, Ordering::SeqCst), 2);
+        hook.succeed.store(true, Ordering::SeqCst);
+        assert!(client.ack_or_replay_to_hook(&info).await);
+        assert_eq!(
+            hook.messages.load(Ordering::SeqCst),
+            2,
+            "replay must retain every distinct part of one message identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_replay_preserves_original_legacy_wire_bytes() {
+        let client = create_test_client_with_failing_http("durability_legacy_wire").await;
+        let _ = client.inbound_durability_hook.set(counting_hook(false));
+        let info = test_info("LEGACY_WIRE");
+        // A known conversation and an opaque unknown field in an existing row.
+        let original = [10, 1, b'x', 0xc0, 0x3e, 7];
+        let backend = client.persistence_manager.backend();
+        backend
+            .store_pending_inbound(
+                &info.source.chat.to_string(),
+                &info.source.sender.to_string(),
+                &info.id,
+                &original,
+            )
+            .await
+            .unwrap();
+        client.ack_or_replay_to_hook(&info).await;
+        assert_eq!(
+            backend
+                .get_pending_inbound(
+                    &info.source.chat.to_string(),
+                    &info.source.sender.to_string(),
+                    &info.id
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+            original
         );
     }
 

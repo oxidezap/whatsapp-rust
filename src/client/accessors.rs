@@ -483,6 +483,8 @@ impl Client {
         let (commit_batch_entries, commit_batch_bytes) = self.inbound_commit_batch.pending_stats();
         let inbound_commit_batch =
             CollectionStats::new(commit_batch_entries as u64, commit_batch_bytes as u64);
+        let (retained_count, retained_bytes) = self.inbound_commit_batch.retention.stats();
+        let inbound_retention = CollectionStats::new(retained_count as u64, retained_bytes as u64);
         let msg_secret_buffer = self.msg_secret_buffer.pending_len();
         let pending_device_sync = self.pending_device_sync.len();
         let pending_group_device_resync = self.pending_group_device_resync.len();
@@ -593,6 +595,7 @@ impl Client {
             history_sync_tasks_peak: history_sync_activity.tasks_peak as u64,
             history_sync_payload_bytes_peak: history_sync_activity.payload_bytes_peak as u64,
             inbound_commit_batch,
+            inbound_retention,
             offline_receipt_buffer,
             msg_secret_buffer,
             pending_device_sync,

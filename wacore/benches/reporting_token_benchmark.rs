@@ -15,24 +15,28 @@ fn main() {
 }
 
 fn create_simple_message() -> wa::Message {
-    wa::Message {
-        conversation: Some("Hello, World!".to_string()),
-        ..Default::default()
+    {
+        let mut proto = wa::Message::default();
+        proto.conversation = Some("Hello, World!".to_string());
+        proto
     }
 }
 
 fn create_extended_message() -> wa::Message {
-    wa::Message {
-        extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
-            text: Some("Test message with context info".to_string()),
-            context_info: buffa::MessageField::some(wa::ContextInfo {
-                is_forwarded: Some(true),
-                forwarding_score: Some(5),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
+    {
+        let mut proto = wa::Message::default();
+        proto.extended_text_message = buffa::MessageField::some({
+            let mut proto = wa::message::ExtendedTextMessage::default();
+            proto.text = Some("Test message with context info".to_string());
+            proto.context_info = buffa::MessageField::some({
+                let mut proto = wa::ContextInfo::default();
+                proto.is_forwarded = Some(true);
+                proto.forwarding_score = Some(5);
+                proto
+            });
+            proto
+        });
+        proto
     }
 }
 

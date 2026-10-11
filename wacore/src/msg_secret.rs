@@ -533,18 +533,21 @@ mod tests {
         // Chat is a bot.
         assert!(is_bot_context(true, &wa::Message::default()));
         // bot_metadata on a non-bot (e.g. group) chat is still a bot context.
-        let prompt = wa::Message {
-            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
-                bot_metadata: buffa::MessageField::some(wa::BotMetadata::default()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let prompt = {
+            let mut proto = wa::Message::default();
+            proto.message_context_info = buffa::MessageField::some({
+                let mut proto = wa::MessageContextInfo::default();
+                proto.bot_metadata = buffa::MessageField::some(wa::BotMetadata::default());
+                proto
+            });
+            proto
         };
         assert!(is_bot_context(false, &prompt));
         // A plain message in a non-bot chat is not a bot context.
-        let plain = wa::Message {
-            conversation: Some("hi".into()),
-            ..Default::default()
+        let plain = {
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("hi".into());
+            proto
         };
         assert!(!is_bot_context(false, &plain));
     }

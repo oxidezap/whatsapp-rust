@@ -4,29 +4,45 @@ use std::sync::Arc;
 pub use wacore::types::events::InboundMessage;
 use waproto::whatsapp as wa;
 
-/// Hook invoked for every decrypted inbound user message before it is
-/// acknowledged to the server, turning the consumer from at-most-once into
-/// at-least-once delivery.
+/// Consumer commit barrier for supported decrypted inbound messages.
 ///
-/// The transport ack tells the server to drop the message from its offline
-/// queue. By default the SDK acks as soon as a message is decrypted, so a crash
-/// (or a failed DB write) before the consumer persists the message loses it for
-/// good. When a hook is registered, the ack is deferred until the hook returns
-/// `Ok`: the decrypted messages are buffered durably first, the hook runs, and
-/// only on success are their acks sent and the buffer cleared. On `Err` (or a
-/// crash) the messages stay unacked and the server redelivers them on the next
-/// connect, where the hook runs again from the buffered copies.
+/// For ordinary encrypted 1:1 and group messages, the SDK collects every
+/// dispatched payload of a stanza, stores a pending copy, awaits this hook,
+/// and attempts its delivery receipt only after `Ok(())`. The message event
+/// follows the receipt attempt. During an offline drain, pending writes and
+/// Signal persistence are batched before the hook. Live Signal writes remain
+/// coalesced independently; this is not a transaction spanning Signal and the
+/// consumer's store.
 ///
-/// This is at-least-once, not exactly-once: a crash after the consumer commits
-/// but before the ack lands replays the message, so the hook MUST be idempotent.
-/// A failed batch is redelivered whole, so a partially-applied batch commit
-/// must also be safe to re-run. Deduplicate by the message source AND id —
-/// `(info.source.chat, info.source.sender, info.id)` — not `info.id` alone:
-/// stanza ids are only unique within a `(chat, sender)`, so two chats can
-/// reuse the same id.
+/// Buffer-write and hook failures retain the admitted plaintext in this Client
+/// across connection resets. Resident failures are retried while the client is
+/// running. A duplicate cannot bypass a resident copy just because its pending
+/// database row is absent. Corrupt or conflicting pending records are preserved
+/// and withhold receipts until repaired; uncommitted rows never expire
+/// automatically. Multipart records use a versioned envelope; the reader also
+/// accepts legacy single-message records, but older SDKs cannot read the new
+/// multipart format. Existing rows from a previous process are replayed when a
+/// corresponding inbound delivery reaches the replay path, not scanned at startup.
+/// Group replay reads all original sender keys for that chat/id and filters the
+/// established device-less participant identity without merging PN and LID.
+/// If one recorded payload sequence contains all matching rows, replay reuses
+/// that sequence and its repeated parts. Corrupt or conflicting matching rows
+/// fail closed. Partial retries whose ciphertexts cannot prove the retained
+/// occurrence order withhold commit until a complete sequence proves it.
+/// Fresh parts waiting for that proof remain in this Client; after a restart,
+/// another fully decoded delivery may be needed. Receipt suppression does not
+/// guarantee that the server provides one.
+/// Only rows read for the
+/// successful commit (and rows it wrote) are removed; unrelated participants,
+/// chats, message ids and backend devices are preserved.
+///
+/// Receipt suppression does not guarantee another server delivery. If the
+/// process stops or the Client is dropped before a pending copy is persisted,
+/// memory retention cannot provide crash durability. A consumer must make its
+/// own commit durable before returning `Ok(())`.
 ///
 /// The builder checks the backend's individual `ProtocolStore` pending-inbound
-/// store/read/delete operations and rejects unsupported backends with
+/// store/read/delete and participant lookup operations, rejecting unsupported backends with
 /// [`ClientBuilderError::UnsupportedDurabilityBackend`](crate::ClientBuilderError::UnsupportedDurabilityBackend).
 /// Custom batched overrides must preserve those operations' semantics; the
 /// construction probe does not certify an arbitrary batch implementation.
@@ -34,41 +50,54 @@ use waproto::whatsapp as wa;
 /// History capture is configured independently through [`HistorySyncCaptureHook`].
 /// Registering this hook alone does not change history receipt ordering.
 ///
-/// The hook is awaited inside the receive pipeline, so a slow hook backpressures
-/// inbound processing (the same trade-off as whatsmeow's synchronous ack). Do
-/// not perform blocking client operations for a sender present in the batch
-/// (e.g. a synchronous reply) — that can deadlock against the per-sender Signal
-/// lock held while a 1:1 message is processed; persist and return, and spawn
-/// any reply.
+/// Retries can repeat a successful consumer commit whose receipt or cleanup
+/// failed, and batch boundaries can change. Make commits idempotent by source
+/// and id — `(info.source.chat, info.source.sender, info.id)` — while preserving
+/// the ordered payloads and their multiplicity: one stanza can contain several
+/// equal parts with the same id. For group/broadcast authors, device-qualified
+/// and device-less spellings identify the same message, as in the event dispatch
+/// gate; PN and LID remain separate namespaces. Original metadata and stored
+/// keys are preserved. A partial batch commit must be safe to retry.
 ///
-/// Scope and known limitations:
-/// - Covers end-to-end encrypted messages (1:1 and group). Newsletter / broadcast
-///   channel messages are not encrypted and are acked on their own path, so the
-///   hook does not gate them (they dispatch event-only). The same applies to PDO
-///   placeholder recoveries (`info.unavailable_request_id` is set): their ack runs
-///   on the PDO path, so the hook never sees them.
-/// - If the durable buffer write itself fails (e.g. disk full, after retries),
-///   the acks are suppressed, but if the process does not crash the Signal
-///   ratchet still advances and those messages degrade to at-most-once on their
-///   next redelivery (they can no longer be decrypted, and there is no buffered
-///   copy to replay). The guarantee holds whenever the buffer write succeeds.
-/// - On a redelivery replay the `info` is re-parsed from the stanza, so a few
-///   fields derived during the first dispatch (the ephemeral timer, encrypted
-///   comment threading) may be absent. The `message` body is always the original.
+/// Admission counts queued, processing and retained stanzas together: at most
+/// 400 stanzas and a 4 MiB budget of original decoded-frame lengths. One larger
+/// supported frame can occupy an otherwise empty budget. These are SDK limits,
+/// not exact decoded-heap measurements. Exhaustion ends the connection without
+/// decrypting or acknowledging the rejected stanza; the read loop never waits
+/// for a hook to release capacity. Each connection retains the existing 64-slot
+/// live limit and per-chat receive serialization. Retries may follow newer
+/// deliveries, and an entered hook can outlive its connection. Persistent storage
+/// capacity across process restarts is the backend/operator's responsibility;
+/// the store interface does not scan pending rows at startup or impose a quota.
+///
+/// The builder probes pending-inbound store, exact read, participant-candidate
+/// read and delete operations. Custom backends must implement
+/// [`ProtocolStore::get_pending_inbound_for_message`](crate::store::traits::ProtocolStore::get_pending_inbound_for_message)
+/// in addition to the existing buffer methods. Unsupported backends are rejected with
+/// [`ClientBuilderError::UnsupportedDurabilityBackend`](crate::ClientBuilderError::UnsupportedDurabilityBackend).
+/// Custom batch overrides must preserve their semantics. History capture is
+/// configured independently through [`HistorySyncCaptureHook`]; this hook alone
+/// does not change history receipt ordering.
+///
+/// A slow hook occupies a processing slot. Do not wait for inbound work from the
+/// same chat inside the hook. Persist and return, then schedule dependent work.
+/// Shutdown stops scheduling recovery retries but does not abort or join an
+/// already-entered hook. Use [`Client::shutdown_signal`] if the hook needs to
+/// observe shutdown, and make partial writes safe against cancellation.
+///
+/// Scope: newsletter/channel messages and PDO placeholder recoveries use their
+/// existing separate paths and are not gated by this hook. On replay from a
+/// persisted row, stanza metadata is re-parsed; derived fields such as ephemeral
+/// timers or encrypted-comment threading may be absent. The stored message
+/// payloads are reused without a parallel metadata schema.
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait InboundDurabilityHook: wacore::sync_marker::MaybeSendSync {
-    /// Durably commit the whole batch, all-or-nothing, in slice order (e.g. one
-    /// multi-row INSERT transaction). Return `Ok(())` only after the commit is
-    /// durable; the SDK then acks every message in the batch. Return `Err` to
-    /// suppress all their acks and have the server redeliver them.
-    ///
-    /// Live messages arrive as batches of one. During the offline drain the
-    /// SDK accumulates and commits per batch (WA Web's MessageProcessorCache
-    /// granularity), so one round-trip covers the lot.
-    /// [`Event::Messages`](wacore::types::events::Event::Messages) then
-    /// carries the exact same items: what this method committed is what event
-    /// consumers observe.
+    /// Commit the whole batch durably before returning `Ok(())`. An error
+    /// suppresses its receipts and leaves the pending copies available to retry.
+    /// Live calls contain all dispatched parts of one stanza; offline calls can
+    /// contain several stanzas. Successful commits feed the same items to
+    /// [`Event::Messages`](wacore::types::events::Event::Messages).
     async fn on_messages(&self, client: Arc<Client>, batch: &[InboundMessage]) -> Result<()>;
 }
 

@@ -113,6 +113,7 @@ macro_rules! forward_domains {
                 fn delete_expired_sent_messages<'s>(this: &'s Self, cutoff_timestamp: i64) -> Result<u32>;
                 fn store_pending_inbound<'s, 'a, 'b, 'c, 'd>(this: &'s Self, chat: &'a str, sender: &'b str, id: &'c str, message: &'d [u8]) -> Result<()>;
                 fn get_pending_inbound<'s, 'a, 'b, 'c>(this: &'s Self, chat: &'a str, sender: &'b str, id: &'c str) -> Result<Option<Vec<u8>>>;
+                fn get_pending_inbound_for_message<'s, 'a, 'b>(this: &'s Self, chat: &'a str, id: &'b str) -> Result<Vec<(String, Vec<u8>)>>;
                 fn delete_pending_inbound<'s, 'a, 'b, 'c>(this: &'s Self, chat: &'a str, sender: &'b str, id: &'c str) -> Result<()>;
                 fn delete_expired_pending_inbound<'s>(this: &'s Self, cutoff_timestamp: i64) -> Result<u32>;
                 fn store_pending_inbound_batch<'s, 'a, 'b>(this: &'s Self, rows: &'a [PendingInboundRow<'b>]) -> Result<()>;

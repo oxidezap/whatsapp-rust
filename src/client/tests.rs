@@ -17,10 +17,11 @@ async fn replacing_status_privacy_releases_the_assembled_copy() {
             .await
             .expect("persistence manager"),
     );
-    let first = wa::sync_action_value::StatusPrivacyAction {
-        mode: Some(buffa::EnumValue::Unknown(99)),
-        user_jid: vec!["120363000000000042@lid".into()],
-        ..Default::default()
+    let first = {
+        let mut proto = wa::sync_action_value::StatusPrivacyAction::default();
+        proto.mode = Some(buffa::EnumValue::Unknown(99));
+        proto.user_jid = vec!["120363000000000042@lid".into()];
+        proto
     };
     persistence_manager
         .persist_status_privacy(&first)
@@ -43,9 +44,10 @@ async fn replacing_status_privacy_releases_the_assembled_copy() {
         .expect("test client should build")
         .into_parts();
 
-    let second = wa::sync_action_value::StatusPrivacyAction {
-        mode: Some(buffa::EnumValue::Unknown(100)),
-        ..Default::default()
+    let second = {
+        let mut proto = wa::sync_action_value::StatusPrivacyAction::default();
+        proto.mode = Some(buffa::EnumValue::Unknown(100));
+        proto
     };
     persistence_manager
         .persist_status_privacy(&second)
@@ -3793,14 +3795,11 @@ fn client_size_pins_runtime_cache_config_saving() {
     if cfg!(feature = "plugins") {
         expected += size_of::<Option<Arc<()>>>();
     }
-    #[cfg(feature = "bench-harness")]
-    {
-        // Only the benchmark carries this one-pointer attachment (4368 ->
-        // 4376 B on x86_64 defaults). The fixed base and production budgets
-        // stay unchanged, just as for the other feature-sized attachments.
-        expected += size_of::<Arc<bench_startup::StartupTasks>>();
-    }
+    // Benchmarks and tests track startup tasks; production builds without
+    // the benchmark feature do not carry this attachment.
+    expected += size_of::<Arc<bench_startup::StartupTasks>>();
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::HistorySyncCaptureHook>>>();
+    expected += size_of::<Arc<crate::message::retention::InboundRetention>>();
     assert_eq!(
         size_of::<Client>(),
         expected,
@@ -5762,16 +5761,15 @@ async fn startup_maintenance_leaves_the_pending_inbound_buffer_alone() {
         "the startup pass must preserve a buffered message awaiting redelivery"
     );
 
-    // The control: the full sweep does prune it, so the assertion above is
-    // about the scope, not about a row that could never be deleted.
+    // The periodic sweep must preserve the same uncommitted record.
     client.run_retention_cleanup(7200).await;
     assert!(
         store
             .get_pending_inbound(chat, chat, "STARTUP_PENDING")
             .await
             .expect("lookup")
-            .is_none(),
-        "the keepalive sweep must still prune an expired pending-inbound row"
+            .is_some(),
+        "the keepalive sweep must not expire an uncommitted pending-inbound row"
     );
 }
 

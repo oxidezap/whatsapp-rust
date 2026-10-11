@@ -222,14 +222,16 @@ async fn xx_serve_full(
         .unwrap();
     let encrypted_payload = noise.encrypt(&server.cert_chain_bytes).unwrap();
 
-    let server_hello = wa::HandshakeMessage {
-        server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
-            ephemeral: Some(server_eph_pub.to_vec()),
-            r#static: Some(encrypted_static),
-            payload: Some(encrypted_payload),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let server_hello = {
+        let mut proto = wa::HandshakeMessage::default();
+        proto.server_hello = buffa::MessageField::some({
+            let mut proto = wa::handshake_message::ServerHello::default();
+            proto.ephemeral = Some(server_eph_pub.to_vec());
+            proto.r#static = Some(encrypted_static);
+            proto.payload = Some(encrypted_payload);
+            proto
+        });
+        proto
     };
     let framed = wacore::framing::encode_frame(&server_hello.encode_to_vec(), None).unwrap();
     events_tx

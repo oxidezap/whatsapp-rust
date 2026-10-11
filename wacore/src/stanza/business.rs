@@ -431,14 +431,16 @@ mod tests {
     fn verified_name_decodes_certificate_content_bytes() {
         // usync's <verified_name> has no name/serial attrs; the name lives inside
         // the certificate protobuf carried as content bytes.
-        let details = waproto::whatsapp::verified_name_certificate::Details {
-            verified_name: Some("Acme Inc".to_string()),
-            serial: Some(42),
-            ..Default::default()
+        let details = {
+            let mut proto_ = waproto::whatsapp::verified_name_certificate::Details::default();
+            proto_.verified_name = Some("Acme Inc".to_string());
+            proto_.serial = Some(42);
+            proto_
         };
-        let cert = waproto::whatsapp::VerifiedNameCertificate {
-            details: Some(details.encode_to_vec()),
-            ..Default::default()
+        let cert = {
+            let mut proto_ = waproto::whatsapp::VerifiedNameCertificate::default();
+            proto_.details = Some(details.encode_to_vec());
+            proto_
         };
         let node = NodeBuilder::new("verified_name")
             .bytes(cert.encode_to_vec())

@@ -53,13 +53,11 @@ async fn test_prekey_collision_regression() -> anyhow::Result<()> {
         let text = format!("online-{i}");
         sender
             .client
-            .send_message(
-                recipient_jid.clone(),
-                wa::Message {
-                    conversation: Some(text.clone()),
-                    ..Default::default()
-                },
-            )
+            .send_message(recipient_jid.clone(), {
+                let mut proto = wa::Message::default();
+                proto.conversation = Some(text.clone());
+                proto
+            })
             .await?;
         recipient
             .wait_for_event(30, |e| {
@@ -116,13 +114,11 @@ async fn test_prekey_collision_regression() -> anyhow::Result<()> {
         let text = format!("offline-{i}");
         send_handles.push(tokio::spawn(async move {
             client
-                .send_message(
-                    jid,
-                    wa::Message {
-                        conversation: Some(text),
-                        ..Default::default()
-                    },
-                )
+                .send_message(jid, {
+                    let mut proto = wa::Message::default();
+                    proto.conversation = Some(text);
+                    proto
+                })
                 .await
         }));
     }

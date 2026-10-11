@@ -111,14 +111,16 @@ impl<'a> AppStateSettings<'a> {
     /// explicitly asked to send.
     pub async fn set_link_previews_disabled(&self, disabled: bool) -> Result<(), AppStateError> {
         debug!("Setting disableLinkPreviews -> {disabled}");
-        let value = wa::SyncActionValue {
-            privacy_setting_disable_link_previews_action: buffa::MessageField::some(
-                wa::sync_action_value::PrivacySettingDisableLinkPreviewsAction {
-                    is_previews_disabled: Some(disabled),
-                },
-            ),
-            timestamp: Some(wacore::time::now_millis()),
-            ..Default::default()
+        let value = {
+            let mut proto = wa::SyncActionValue::default();
+            proto.privacy_setting_disable_link_previews_action = buffa::MessageField::some({
+                let mut proto =
+                    wa::sync_action_value::PrivacySettingDisableLinkPreviewsAction::default();
+                proto.is_previews_disabled = Some(disabled);
+                proto
+            });
+            proto.timestamp = Some(wacore::time::now_millis());
+            proto
         };
         self.client
             .send_app_state_action(&schemas::DISABLE_LINK_PREVIEWS, &[], &value)
@@ -233,14 +235,16 @@ mod tests {
     #[test]
     fn inbound_set_dispatches_the_flag() {
         for disabled in [true, false] {
-            let m = set_mutation(wa::SyncActionValue {
-                privacy_setting_disable_link_previews_action: buffa::MessageField::some(
-                    wa::sync_action_value::PrivacySettingDisableLinkPreviewsAction {
-                        is_previews_disabled: Some(disabled),
-                    },
-                ),
-                timestamp: Some(1000),
-                ..Default::default()
+            let m = set_mutation({
+                let mut proto = wa::SyncActionValue::default();
+                proto.privacy_setting_disable_link_previews_action = buffa::MessageField::some({
+                    let mut proto =
+                        wa::sync_action_value::PrivacySettingDisableLinkPreviewsAction::default();
+                    proto.is_previews_disabled = Some(disabled);
+                    proto
+                });
+                proto.timestamp = Some(1000);
+                proto
             });
             let (outcome, events) = run(&m);
             assert!(outcome != AppStateDispatchOutcome::Unclaimed);
@@ -259,13 +263,15 @@ mod tests {
     fn absent_flag_is_claimed_but_not_dispatched() {
         // WA Web logs it as a malformed action value and applies nothing; an
         // event with a made-up default would be worse than none.
-        let m = set_mutation(wa::SyncActionValue {
-            privacy_setting_disable_link_previews_action: buffa::MessageField::some(
-                wa::sync_action_value::PrivacySettingDisableLinkPreviewsAction {
-                    is_previews_disabled: None,
-                },
-            ),
-            ..Default::default()
+        let m = set_mutation({
+            let mut proto = wa::SyncActionValue::default();
+            proto.privacy_setting_disable_link_previews_action = buffa::MessageField::some({
+                let mut proto =
+                    wa::sync_action_value::PrivacySettingDisableLinkPreviewsAction::default();
+                proto.is_previews_disabled = None;
+                proto
+            });
+            proto
         });
         let (outcome, events) = run(&m);
         assert!(outcome != AppStateDispatchOutcome::Unclaimed);
@@ -276,12 +282,15 @@ mod tests {
         Mutation {
             index: vec!["setting_unarchiveChats".into()],
             operation: wa::syncd_mutation::SyncdOperation::Set,
-            action_value: Some(wa::SyncActionValue {
-                unarchive_chats_setting: buffa::MessageField::some(
-                    wa::sync_action_value::UnarchiveChatsSetting { unarchive_chats },
-                ),
-                timestamp: Some(1000),
-                ..Default::default()
+            action_value: Some({
+                let mut proto = wa::SyncActionValue::default();
+                proto.unarchive_chats_setting = buffa::MessageField::some({
+                    let mut proto = wa::sync_action_value::UnarchiveChatsSetting::default();
+                    proto.unarchive_chats = unarchive_chats;
+                    proto
+                });
+                proto.timestamp = Some(1000);
+                proto
             }),
         }
     }

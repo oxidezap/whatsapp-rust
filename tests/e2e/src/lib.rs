@@ -658,9 +658,10 @@ pub async fn scan_sessions(
 
 /// Build a simple text message.
 pub fn text_msg(text: &str) -> wa::Message {
-    wa::Message {
-        conversation: Some(text.to_string()),
-        ..Default::default()
+    {
+        let mut proto = wa::Message::default();
+        proto.conversation = Some(text.to_string());
+        proto
     }
 }
 

@@ -175,9 +175,30 @@ pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<IndexMa
         return out;
     }
 
+    let mut indices = mutations.iter().filter_map(mutation_index_mac_array);
+    let Some(first) = indices.next() else {
+        return Vec::new();
+    };
+    // A run of one index needs one output slot, regardless of patch width.
+    // Defer the wide allocation until a second distinct index requires sort.
+    let Some(second) = indices.find(|mac| *mac != first) else {
+        return vec![first];
+    };
     let mut macs: Vec<IndexMac> = Vec::with_capacity(mutations.len());
-    macs.extend(mutations.iter().filter_map(mutation_index_mac_array));
-    macs.sort_unstable();
+    macs.push(first);
+    macs.push(second);
+    macs.extend(indices);
+    // Only adjacency of equal MACs matters. Compare native words so sorting
+    // does not need bytewise lexicographic ordering of these opaque values.
+    macs.sort_unstable_by(|left, right| {
+        for (left, right) in left.as_chunks::<8>().0.iter().zip(right.as_chunks::<8>().0) {
+            let order = u64::from_ne_bytes(*left).cmp(&u64::from_ne_bytes(*right));
+            if order != std::cmp::Ordering::Equal {
+                return order;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
     macs.dedup();
     macs
 }
@@ -1339,13 +1360,16 @@ impl AppStateProcessor {
         let snapshot_mac = state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
 
         // Build the patch — matching whatsmeow: no Version or DeviceIndex fields
-        let mut patch = wa::SyncdPatch {
-            snapshot_mac: Some(snapshot_mac),
-            key_id: buffa::MessageField::some(wa::KeyId {
-                id: Some(key_id.clone()),
-            }),
-            mutations,
-            ..Default::default()
+        let mut patch = {
+            let mut proto = wa::SyncdPatch::default();
+            proto.snapshot_mac = Some(snapshot_mac);
+            proto.key_id = buffa::MessageField::some({
+                let mut proto = wa::KeyId::default();
+                proto.id = Some(key_id.clone());
+                proto
+            });
+            proto.mutations = mutations;
+            proto
         };
 
         // Generate and set patch MAC
@@ -1439,9 +1463,10 @@ mod external_blob_tests {
     fn external_snapshot_download_failure_propagates() {
         // A referenced blob that fails to download must error, not be swallowed
         // (which would apply an empty patch and advance the version).
-        let mut pl = pl_with_snapshot_ref(Some(wa::ExternalBlobReference {
-            direct_path: Some("/blob".into()),
-            ..Default::default()
+        let mut pl = pl_with_snapshot_ref(Some({
+            let mut proto = wa::ExternalBlobReference::default();
+            proto.direct_path = Some("/blob".into());
+            proto
         }));
         let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
             Err(anyhow!("simulated failure"))
@@ -1453,9 +1478,10 @@ mod external_blob_tests {
     fn external_snapshot_decode_failure_propagates() {
         // Download succeeds but the bytes aren't a valid SyncdSnapshot: the decode
         // error must propagate too, not just download errors.
-        let mut pl = pl_with_snapshot_ref(Some(wa::ExternalBlobReference {
-            direct_path: Some("/blob".into()),
-            ..Default::default()
+        let mut pl = pl_with_snapshot_ref(Some({
+            let mut proto = wa::ExternalBlobReference::default();
+            proto.direct_path = Some("/blob".into());
+            proto
         }));
         let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
             Ok(bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF]))
@@ -1469,12 +1495,14 @@ mod external_blob_tests {
         let mut pl = PatchList {
             name: WAPatchName::Regular,
             has_more_patches: false,
-            patches: vec![wa::SyncdPatch {
-                external_mutations: buffa::MessageField::some(wa::ExternalBlobReference {
-                    direct_path: Some("/mutations".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
+            patches: vec![{
+                let mut proto = wa::SyncdPatch::default();
+                proto.external_mutations = buffa::MessageField::some({
+                    let mut proto = wa::ExternalBlobReference::default();
+                    proto.direct_path = Some("/mutations".into());
+                    proto
+                });
+                proto
             }],
             snapshot: None,
             snapshot_ref: None,
@@ -1493,12 +1521,14 @@ mod external_blob_tests {
         let mut pl = PatchList {
             name: WAPatchName::Regular,
             has_more_patches: false,
-            patches: vec![wa::SyncdPatch {
-                external_mutations: buffa::MessageField::some(wa::ExternalBlobReference {
-                    direct_path: Some("/mutations".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
+            patches: vec![{
+                let mut proto = wa::SyncdPatch::default();
+                proto.external_mutations = buffa::MessageField::some({
+                    let mut proto = wa::ExternalBlobReference::default();
+                    proto.direct_path = Some("/mutations".into());
+                    proto
+                });
+                proto
             }],
             snapshot: None,
             snapshot_ref: None,
@@ -1530,14 +1560,18 @@ mod dedup_tests {
     use super::*;
 
     fn mutation(index_mac: &[u8]) -> wa::SyncdMutation {
-        wa::SyncdMutation {
-            record: buffa::MessageField::some(wa::SyncdRecord {
-                index: buffa::MessageField::some(wa::SyncdIndex {
-                    blob: Some(index_mac.to_vec()),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
+        {
+            let mut proto = wa::SyncdMutation::default();
+            proto.record = buffa::MessageField::some({
+                let mut proto = wa::SyncdRecord::default();
+                proto.index = buffa::MessageField::some({
+                    let mut proto = wa::SyncdIndex::default();
+                    proto.blob = Some(index_mac.to_vec());
+                    proto
+                });
+                proto
+            });
+            proto
         }
     }
 
@@ -1595,6 +1629,40 @@ mod dedup_tests {
                 *b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             ]
         );
+    }
+
+    #[test]
+    fn large_repeated_prefix_preserves_later_indices_and_skips_invalid_ones() {
+        for distinct in [false, true] {
+            let mut mutations = build(1000, 1);
+            mutations[0] = wa::SyncdMutation::default();
+            mutations[100] = mutation(&[1; 31]);
+            mutations[500] = mutation(&[1; 33]);
+            if distinct {
+                mutations[998] = mutation(&mac_bytes(1));
+                mutations.push(mutation(&mac_bytes(0)));
+                mutations.push(mutation(&mac_bytes(2)));
+            }
+            let mut got = collect_unique_index_macs(&mutations);
+            got.sort_unstable();
+            assert_eq!(got, expected(if distinct { 3 } else { 1 }));
+        }
+        assert!(collect_unique_index_macs(&vec![wa::SyncdMutation::default(); 1000]).is_empty());
+    }
+
+    #[test]
+    fn large_dedup_distinguishes_every_mac_byte() {
+        for byte in 0..32 {
+            let first = [0; 32];
+            let mut second = first;
+            second[byte] = 1;
+            let mutations: Vec<_> = (0..1000)
+                .map(|i| mutation(if i % 2 == 0 { &first } else { &second }))
+                .collect();
+            let mut actual = collect_unique_index_macs(&mutations);
+            actual.sort_unstable();
+            assert_eq!(actual, vec![first, second], "distinct byte {byte}");
+        }
     }
 }
 

@@ -204,21 +204,24 @@ fn analyze_growth(label: &str, snapshots: &[Snapshot]) {
 }
 
 fn make_text_msg(text: &str) -> wa::Message {
-    wa::Message {
-        conversation: Some(text.to_string()),
-        ..Default::default()
+    {
+        let mut proto = wa::Message::default();
+        proto.conversation = Some(text.to_string());
+        proto
     }
 }
 
 /// Build a larger message (~2KB) with extended text to stress the recent_messages cache.
 fn make_large_msg(round: usize) -> wa::Message {
     let body = format!("large-msg-r{round}-{}", "X".repeat(2000));
-    wa::Message {
-        extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
-            text: Some(body),
-            ..Default::default()
-        }),
-        ..Default::default()
+    {
+        let mut proto = wa::Message::default();
+        proto.extended_text_message = buffa::MessageField::some({
+            let mut proto = wa::message::ExtendedTextMessage::default();
+            proto.text = Some(body);
+            proto
+        });
+        proto
     }
 }
 

@@ -199,12 +199,14 @@ async fn handle_text_ping(ctx: &MessageContext) {
         duration, sent.message_id
     );
 
-    let edit = wa::Message {
-        extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
-            text: Some(format!("{PONG_TEXT}\n`{duration}`")),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let edit = {
+        let mut proto = wa::Message::default();
+        proto.extended_text_message = MessageField::some({
+            let mut proto = wa::message::ExtendedTextMessage::default();
+            proto.text = Some(format!("{PONG_TEXT}\n`{duration}`"));
+            proto
+        });
+        proto
     };
     if let Err(e) = ctx.edit_message(sent.message_id.clone(), edit).await {
         error!("Failed to edit message {}: {}", sent.message_id, e);
@@ -261,23 +263,27 @@ fn build_media_pong(message: &wa::Message) -> Option<wa::Message> {
     if let Some(img) = base.image_message.as_option()
         && img.caption.as_deref() == Some(PING_TRIGGER)
     {
-        return Some(wa::Message {
-            image_message: MessageField::some(wa::message::ImageMessage {
-                caption: Some(PONG_TEXT.to_string()),
-                ..img.clone()
-            }),
-            ..Default::default()
+        return Some({
+            let mut proto = wa::Message::default();
+            proto.image_message = MessageField::some({
+                let mut proto = img.clone();
+                proto.caption = Some(PONG_TEXT.to_string());
+                proto
+            });
+            proto
         });
     }
     if let Some(vid) = base.video_message.as_option()
         && vid.caption.as_deref() == Some(PING_TRIGGER)
     {
-        return Some(wa::Message {
-            video_message: MessageField::some(wa::message::VideoMessage {
-                caption: Some(PONG_TEXT.to_string()),
-                ..vid.clone()
-            }),
-            ..Default::default()
+        return Some({
+            let mut proto = wa::Message::default();
+            proto.video_message = MessageField::some({
+                let mut proto = vid.clone();
+                proto.caption = Some(PONG_TEXT.to_string());
+                proto
+            });
+            proto
         });
     }
     None

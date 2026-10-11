@@ -134,33 +134,37 @@ fn build_base_client_payload(
     // WA Web (`Client/Payload.js`) never sets `UserAgent.phoneId`; a previous
     // audit auto-generated a UUID per build, which the server flagged as a
     // rotating device fingerprint and silently invalidated the session.
-    wa::ClientPayload {
-        user_agent: buffa::MessageField::some(wa::client_payload::UserAgent {
-            platform: Some(profile.user_agent_platform),
-            release_channel: Some(wa::client_payload::user_agent::ReleaseChannel::RELEASE),
-            app_version: buffa::MessageField::some(app_version),
-            mcc: Some("000".to_string()),
-            mnc: Some("000".to_string()),
-            os_version: Some(profile.os_version.clone()),
-            manufacturer: Some(profile.manufacturer.clone()),
-            device: Some(profile.device.clone()),
-            os_build_number: Some(profile.os_version.clone()),
-            locale_language_iso6391: Some(profile.locale_language.clone()),
-            locale_country_iso31661_alpha2: Some(profile.locale_country.clone()),
-            phone_id: profile.phone_id.clone(),
-            ..Default::default()
-        }),
-        web_info: if profile.include_web_info {
-            buffa::MessageField::some(wa::client_payload::WebInfo {
-                web_sub_platform: Some(wa::client_payload::web_info::WebSubPlatform::WEB_BROWSER),
-                ..Default::default()
+    {
+        let mut proto = wa::ClientPayload::default();
+        proto.user_agent = buffa::MessageField::some({
+            let mut proto = wa::client_payload::UserAgent::default();
+            proto.platform = Some(profile.user_agent_platform);
+            proto.release_channel = Some(wa::client_payload::user_agent::ReleaseChannel::RELEASE);
+            proto.app_version = buffa::MessageField::some(app_version);
+            proto.mcc = Some("000".to_string());
+            proto.mnc = Some("000".to_string());
+            proto.os_version = Some(profile.os_version.clone());
+            proto.manufacturer = Some(profile.manufacturer.clone());
+            proto.device = Some(profile.device.clone());
+            proto.os_build_number = Some(profile.os_version.clone());
+            proto.locale_language_iso6391 = Some(profile.locale_language.clone());
+            proto.locale_country_iso31661_alpha2 = Some(profile.locale_country.clone());
+            proto.phone_id = profile.phone_id.clone();
+            proto
+        });
+        proto.web_info = if profile.include_web_info {
+            buffa::MessageField::some({
+                let mut proto = wa::client_payload::WebInfo::default();
+                proto.web_sub_platform =
+                    Some(wa::client_payload::web_info::WebSubPlatform::WEB_BROWSER);
+                proto
             })
         } else {
             buffa::MessageField::default()
-        },
-        connect_type: Some(wa::client_payload::ConnectType::WIFI_UNKNOWN),
-        connect_reason: Some(wa::client_payload::ConnectReason::USER_ACTIVATED),
-        ..Default::default()
+        };
+        proto.connect_type = Some(wa::client_payload::ConnectType::WIFI_UNKNOWN);
+        proto.connect_reason = Some(wa::client_payload::ConnectReason::USER_ACTIVATED);
+        proto
     }
 }
 
@@ -206,20 +210,18 @@ impl DevicePropsOverride {
     /// DevicePropsOverride::new()
     ///     .with_platform_type(PlatformType::UWP)
     ///     .with_require_full_sync(true)
-    ///     .with_history_sync_config(wa::device_props::HistorySyncConfig {
-    ///         full_sync_days_limit: Some(365),
-    ///         on_demand_ready: Some(true),
-    ///         complete_on_demand_ready: Some(true),
-    ///         ..default_history_sync_config()
-    ///     })
+    ///     .with_history_sync_config(default_history_sync_config()
+    ///         .with_full_sync_days_limit(365)
+    ///         .with_on_demand_ready(true)
+    ///         .with_complete_on_demand_ready(true))
     /// ```
     pub fn with_require_full_sync(mut self, require_full_sync: bool) -> Self {
         self.require_full_sync = Some(require_full_sync);
         self
     }
 
-    /// Replaces the entire `HistorySyncConfig`. Spread [`default_history_sync_config`]
-    /// into the literal to patch only specific fields while keeping sane defaults.
+    /// Replaces the entire `HistorySyncConfig`. Start with [`default_history_sync_config`]
+    /// and assign fields or use setters to retain the other defaults.
     pub fn with_history_sync_config(
         mut self,
         history_sync_config: wa::device_props::HistorySyncConfig,
@@ -253,20 +255,21 @@ impl DevicePropsOverride {
 /// server which history payload variants the client can ingest, and the
 /// library either handles them or treats them as opaque (no harm).
 pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
-    wa::device_props::HistorySyncConfig {
-        inline_initial_payload_in_e2_ee_msg: Some(true),
-        support_bot_user_agent_chat_history: Some(true),
-        support_cag_reactions_and_polls: Some(true),
-        support_recent_sync_chunk_message_count_tuning: Some(true),
-        support_hosted_group_msg: Some(true),
-        support_biz_hosted_msg: Some(true),
-        support_fbid_bot_chat_history: Some(true),
-        support_message_association: Some(true),
-        support_call_log_history: Some(true),
-        support_group_history: Some(true),
-        support_manus_history: Some(true),
-        support_hatch_history: Some(true),
-        ..Default::default()
+    {
+        let mut proto = wa::device_props::HistorySyncConfig::default();
+        proto.inline_initial_payload_in_e2_ee_msg = Some(true);
+        proto.support_bot_user_agent_chat_history = Some(true);
+        proto.support_cag_reactions_and_polls = Some(true);
+        proto.support_recent_sync_chunk_message_count_tuning = Some(true);
+        proto.support_hosted_group_msg = Some(true);
+        proto.support_biz_hosted_msg = Some(true);
+        proto.support_fbid_bot_chat_history = Some(true);
+        proto.support_message_association = Some(true);
+        proto.support_call_log_history = Some(true);
+        proto.support_group_history = Some(true);
+        proto.support_manus_history = Some(true);
+        proto.support_hatch_history = Some(true);
+        proto
     }
 }
 
@@ -297,17 +300,20 @@ pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
 /// [`DevicePropsOverride`]. Pairing a real identity with the sync row that
 /// belongs to it is the embedder's call; the table is what makes the pairs
 /// legible.
-pub static DEVICE_PROPS: LazyLock<wa::DeviceProps> = LazyLock::new(|| wa::DeviceProps {
-    os: Some("rust".to_string()),
-    version: buffa::MessageField::some(wa::device_props::AppVersion {
-        primary: Some(0),
-        secondary: Some(1),
-        tertiary: Some(0),
-        ..Default::default()
-    }),
-    platform_type: Some(wa::device_props::PlatformType::UNKNOWN),
-    require_full_sync: Some(false),
-    history_sync_config: buffa::MessageField::some(default_history_sync_config()),
+pub static DEVICE_PROPS: LazyLock<wa::DeviceProps> = LazyLock::new(|| {
+    let mut proto = wa::DeviceProps::default();
+    proto.os = Some("rust".to_string());
+    proto.version = buffa::MessageField::some({
+        let mut proto = wa::device_props::AppVersion::default();
+        proto.primary = Some(0);
+        proto.secondary = Some(1);
+        proto.tertiary = Some(0);
+        proto
+    });
+    proto.platform_type = Some(wa::device_props::PlatformType::UNKNOWN);
+    proto.require_full_sync = Some(false);
+    proto.history_sync_config = buffa::MessageField::some(default_history_sync_config());
+    proto
 });
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -633,11 +639,12 @@ impl Device {
 
     /// Returns the default device props version
     pub fn default_device_props_version() -> wa::device_props::AppVersion {
-        wa::device_props::AppVersion {
-            primary: Some(0),
-            secondary: Some(1),
-            tertiary: Some(0),
-            ..Default::default()
+        {
+            let mut proto = wa::device_props::AppVersion::default();
+            proto.primary = Some(0);
+            proto.secondary = Some(1);
+            proto.tertiary = Some(0);
+            proto
         }
     }
 
@@ -678,11 +685,12 @@ impl Device {
     }
 
     fn get_login_payload(&self, jid: &Jid) -> wa::ClientPayload {
-        let app_version = wa::client_payload::user_agent::AppVersion {
-            primary: Some(self.app_version_primary),
-            secondary: Some(self.app_version_secondary),
-            tertiary: Some(self.app_version_tertiary),
-            ..Default::default()
+        let app_version = {
+            let mut proto = wa::client_payload::user_agent::AppVersion::default();
+            proto.primary = Some(self.app_version_primary);
+            proto.secondary = Some(self.app_version_secondary);
+            proto.tertiary = Some(self.app_version_tertiary);
+            proto
         };
         let mut payload = build_base_client_payload(app_version, &self.client_profile);
         payload.username = jid.user.parse::<u64>().ok();
@@ -699,11 +707,12 @@ impl Device {
     }
 
     fn get_registration_payload(&self) -> wa::ClientPayload {
-        let app_version = wa::client_payload::user_agent::AppVersion {
-            primary: Some(self.app_version_primary),
-            secondary: Some(self.app_version_secondary),
-            tertiary: Some(self.app_version_tertiary),
-            ..Default::default()
+        let app_version = {
+            let mut proto = wa::client_payload::user_agent::AppVersion::default();
+            proto.primary = Some(self.app_version_primary);
+            proto.secondary = Some(self.app_version_secondary);
+            proto.tertiary = Some(self.app_version_tertiary);
+            proto
         };
         let mut payload = build_base_client_payload(app_version, &self.client_profile);
 
@@ -718,15 +727,17 @@ impl Device {
         );
         let build_hash = crate::crypto::md5_digest(version_str.as_bytes());
 
-        let reg_data = wa::client_payload::DevicePairingRegistrationData {
-            e_regid: Some(self.registration_id.to_be_bytes().to_vec()),
-            e_keytype: Some(vec![5]),
-            e_ident: Some(self.identity_key.public_key.public_key_bytes().to_vec()),
-            e_skey_id: Some(self.signed_pre_key_id.to_be_bytes()[1..].to_vec()),
-            e_skey_val: Some(self.signed_pre_key.public_key.public_key_bytes().to_vec()),
-            e_skey_sig: Some(self.signed_pre_key_signature.to_vec()),
-            build_hash: Some(build_hash.to_vec()),
-            device_props: Some(device_props_bytes),
+        let reg_data = {
+            let mut proto = wa::client_payload::DevicePairingRegistrationData::default();
+            proto.e_regid = Some(self.registration_id.to_be_bytes().to_vec());
+            proto.e_keytype = Some(vec![5]);
+            proto.e_ident = Some(self.identity_key.public_key.public_key_bytes().to_vec());
+            proto.e_skey_id = Some(self.signed_pre_key_id.to_be_bytes()[1..].to_vec());
+            proto.e_skey_val = Some(self.signed_pre_key.public_key.public_key_bytes().to_vec());
+            proto.e_skey_sig = Some(self.signed_pre_key_signature.to_vec());
+            proto.build_hash = Some(build_hash.to_vec());
+            proto.device_props = Some(device_props_bytes);
+            proto
         };
 
         payload.device_pairing_data = buffa::MessageField::some(reg_data);
@@ -833,11 +844,13 @@ mod tests {
     #[test]
     fn test_device_serde_preserves_account() {
         let mut device = Device::new();
-        device.account = Some(Arc::new(wa::ADVSignedDeviceIdentity {
-            details: Some(b"test-details".to_vec()),
-            account_signature_key: Some(vec![1; 32]),
-            account_signature: Some(vec![2; 64]),
-            device_signature: Some(vec![3; 64]),
+        device.account = Some(Arc::new({
+            let mut proto = wa::ADVSignedDeviceIdentity::default();
+            proto.details = Some(b"test-details".to_vec());
+            proto.account_signature_key = Some(vec![1; 32]);
+            proto.account_signature = Some(vec![2; 64]);
+            proto.device_signature = Some(vec![3; 64]);
+            proto
         }));
 
         let json = serde_json::to_string(&device).expect("serialize should succeed");
@@ -928,11 +941,12 @@ mod tests {
             DevicePropsOverride::new()
                 .with_platform_type(wa::device_props::PlatformType::UWP)
                 .with_require_full_sync(true)
-                .with_history_sync_config(wa::device_props::HistorySyncConfig {
-                    full_sync_days_limit: Some(365),
-                    on_demand_ready: Some(true),
-                    complete_on_demand_ready: Some(true),
-                    ..default_history_sync_config()
+                .with_history_sync_config({
+                    let mut proto = default_history_sync_config();
+                    proto.full_sync_days_limit = Some(365);
+                    proto.on_demand_ready = Some(true);
+                    proto.complete_on_demand_ready = Some(true);
+                    proto
                 }),
         );
 
@@ -963,18 +977,17 @@ mod tests {
         );
     }
 
-    /// `HistorySyncConfig` override is delivered whole — users patch by
-    /// spreading [`default_history_sync_config`] into the literal.
+    /// A `HistorySyncConfig` override retains the defaults of fields the caller
+    /// did not change.
     #[test]
     fn history_sync_config_override_reaches_registration_payload() {
         let mut device = Device::new();
-        device.set_device_props(DevicePropsOverride::new().with_history_sync_config(
-            wa::device_props::HistorySyncConfig {
-                full_sync_days_limit: Some(365),
-                support_group_history: Some(true),
-                ..default_history_sync_config()
-            },
-        ));
+        device.set_device_props(DevicePropsOverride::new().with_history_sync_config({
+            let mut proto = default_history_sync_config();
+            proto.full_sync_days_limit = Some(365);
+            proto.support_group_history = Some(true);
+            proto
+        }));
 
         let payload = device.get_client_payload();
         let bytes = payload

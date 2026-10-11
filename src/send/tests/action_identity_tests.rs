@@ -145,15 +145,14 @@ async fn typed_cag_reactions_and_comments_keep_parent_author_and_comment_secret(
                 // exercise the buffered-first reader, not transient map occupancy.
                 let (comment_author, readable) = fixture
                     .client
-                    .resolve_outgoing_addon_parent(
-                        &fixture.group,
-                        &wa::MessageKey {
-                            remote_jid: Some(fixture.group.to_string()),
-                            id: Some(result.message_id.to_string()),
-                            participant: Some(modifier.clone()),
-                            from_me: Some(true),
-                        },
-                    )
+                    .resolve_outgoing_addon_parent(&fixture.group, &{
+                        let mut proto = wa::MessageKey::default();
+                        proto.remote_jid = Some(fixture.group.to_string());
+                        proto.id = Some(result.message_id.to_string());
+                        proto.participant = Some(modifier.clone());
+                        proto.from_me = Some(true);
+                        proto
+                    })
                     .await
                     .unwrap();
                 assert_eq!(comment_author.to_non_ad_string(), modifier);
