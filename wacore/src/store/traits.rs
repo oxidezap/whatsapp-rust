@@ -1169,6 +1169,52 @@ pub trait ProtocolStore: Send + Sync {
         Ok(0)
     }
 
+    /// Read a pending row without allocating its payload above `max_bytes`.
+    /// Oversized or non-BLOB rows are errors, distinct from absence. Empty bytes
+    /// are a present row; envelope validation belongs to the decoder. The length
+    /// check and read must observe the same row. This optional contract has no
+    /// fallback to the unbounded getter.
+    async fn read_pending_inbound_bounded(
+        &self,
+        _key: PendingInboundKey<'_>,
+        _max_bytes: usize,
+    ) -> Result<Option<PendingInboundRecord>> {
+        Err(unsupported_pending_inbound())
+    }
+
+    /// Replace only the exact revision observed by the owner. Absence is an
+    /// explicit expected revision. Backends must compare and write atomically,
+    /// and reject oversized existing or replacement payloads before copying. An
+    /// already installed identical replacement is an idempotent success only
+    /// because each new envelope carries its unique operation identifier.
+    ///
+    /// The caller must retain exclusive ownership until detached workers and
+    /// retries finish, including after cancellation. Revision checks alone do
+    /// not prevent an absent-row ABA after a successor creates and deletes it.
+    async fn replace_pending_inbound_if(
+        &self,
+        _key: PendingInboundKey<'_>,
+        _expected: PendingInboundRevision,
+        _replacement: &[u8],
+        _max_bytes: usize,
+    ) -> Result<PendingInboundMutation> {
+        Err(unsupported_pending_inbound())
+    }
+
+    /// Delete only the exact stored bytes observed by the current owner, in one
+    /// atomic operation. Missing expected and stored revisions are a no-op
+    /// success; a present expected revision against absence is a conflict.
+    /// The same worker-terminal ownership rule as conditional
+    /// replacement applies. A conflicting revision must remain untouched.
+    async fn delete_pending_inbound_if(
+        &self,
+        _key: PendingInboundKey<'_>,
+        _expected: PendingInboundRevision,
+        _max_bytes: usize,
+    ) -> Result<PendingInboundMutation> {
+        Err(unsupported_pending_inbound())
+    }
+
     /// Batched [`store_pending_inbound`](Self::store_pending_inbound): the
     /// offline drain buffers one commit-batch of messages per call, so backends
     /// should override this with a single transaction (the bundled SqliteStore
@@ -1209,6 +1255,58 @@ pub struct PendingInboundKey<'a> {
     pub chat: &'a str,
     pub sender: &'a str,
     pub id: &'a str,
+}
+
+/// Revision of the exact stored bytes, including legacy encodings. New raw
+/// envelopes must include a distinct operation identifier so successive writes
+/// with equal plaintext still have different revisions. No decode or re-encode
+/// participates in this identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingInboundRevision(Option<[u8; 32]>);
+
+impl PendingInboundRevision {
+    pub const fn missing() -> Self {
+        Self(None)
+    }
+
+    pub fn for_bytes(bytes: &[u8]) -> Self {
+        use sha2::Digest;
+        Self(Some(sha2::Sha256::digest(bytes).into()))
+    }
+}
+
+/// One bounded pending row, with its revision computed from the original bytes.
+#[derive(Debug)]
+pub struct PendingInboundRecord {
+    bytes: Vec<u8>,
+    revision: PendingInboundRevision,
+}
+
+impl PendingInboundRecord {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        let revision = PendingInboundRevision::for_bytes(&bytes);
+        Self { bytes, revision }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub const fn revision(&self) -> PendingInboundRevision {
+        self.revision
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// Result of an atomic conditional pending-row mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PendingInboundMutation {
+    Applied,
+    Conflict,
 }
 
 /// Device data persistence operations.
