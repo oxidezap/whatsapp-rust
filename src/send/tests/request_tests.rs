@@ -441,22 +441,22 @@ async fn default_request_text_reply_quote_and_forward_preserve_their_preparation
     let (client, transport) = crate::test_utils::create_iq_test_client().await;
     let chat: Jid = "120363000000000001@newsletter".parse().unwrap();
     let sender = Jid::pn("15550000001");
-    let source = wa::Message::text_with_context(
-        "source",
-        wa::ContextInfo {
-            stanza_id: Some("OLD_QUOTE".into()),
-            quoted_message: buffa::MessageField::some(wa::Message::text("old quote")),
-            forwarding_score: Some(2),
-            is_forwarded: Some(true),
-            ..Default::default()
-        },
-    );
-    let source = wa::Message {
-        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
-            message_secret: Some(vec![177; 32]),
-            ..Default::default()
-        }),
-        ..source
+    let source = wa::Message::text_with_context("source", {
+        let mut proto = wa::ContextInfo::default();
+        proto.stanza_id = Some("OLD_QUOTE".into());
+        proto.quoted_message = buffa::MessageField::some(wa::Message::text("old quote"));
+        proto.forwarding_score = Some(2);
+        proto.is_forwarded = Some(true);
+        proto
+    });
+    let source = {
+        let mut proto_ = source;
+        proto_.message_context_info = buffa::MessageField::some({
+            let mut proto = wa::MessageContextInfo::default();
+            proto.message_secret = Some(vec![177; 32]);
+            proto
+        });
+        proto_
     };
     let info = crate::types::message::MessageInfo {
         id: "SOURCE".into(),
@@ -494,14 +494,12 @@ async fn default_request_text_reply_quote_and_forward_preserve_their_preparation
     assert!(context.quoted_message.is_unset());
     assert!(context.stanza_id.is_none());
     assert!(forward.message.message_context_info.is_unset());
-    let first = wa::Message::text_with_context(
-        "first",
-        wa::ContextInfo {
-            forwarding_score: Some(2),
-            is_forwarded: Some(false),
-            ..Default::default()
-        },
-    );
+    let first = wa::Message::text_with_context("first", {
+        let mut proto = wa::ContextInfo::default();
+        proto.forwarding_score = Some(2);
+        proto.is_forwarded = Some(false);
+        proto
+    });
     let first_forward = client.forward_message(&chat, &first).await.unwrap();
     assert_eq!(
         first_forward

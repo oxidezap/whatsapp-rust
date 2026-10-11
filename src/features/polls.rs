@@ -107,14 +107,16 @@ impl<'a> Polls<'a> {
 
         // WA Web: v3 for single-select, v1 for multi-select (GeneratePollCreationMessageProto.js:39-41)
         let mut message = if selectable_count == 1 {
-            wa::Message {
-                poll_creation_message_v3: buffa::MessageField::some(poll_msg),
-                ..Default::default()
+            {
+                let mut proto = wa::Message::default();
+                proto.poll_creation_message_v3 = buffa::MessageField::some(poll_msg);
+                proto
             }
         } else {
-            wa::Message {
-                poll_creation_message: buffa::MessageField::some(poll_msg),
-                ..Default::default()
+            {
+                let mut proto = wa::Message::default();
+                proto.poll_creation_message = buffa::MessageField::some(poll_msg);
+                proto
             }
         };
 
@@ -122,9 +124,10 @@ impl<'a> Polls<'a> {
         // (SendPollCreationMsgAction.js:158). Voters need this to derive their encryption key.
         let message_secret = super::creation::generate_message_secret();
 
-        message.message_context_info = buffa::MessageField::some(wa::MessageContextInfo {
-            message_secret: Some(message_secret.as_bytes().to_vec()),
-            ..Default::default()
+        message.message_context_info = buffa::MessageField::some({
+            let mut proto = wa::MessageContextInfo::default();
+            proto.message_secret = Some(message_secret.as_bytes().to_vec());
+            proto
         });
 
         let (result, creator) = self.client.send_creation_message(to, message).await?;
@@ -166,12 +169,14 @@ impl<'a> Polls<'a> {
 
         let from_me = target.message().from_me();
 
-        let poll_update = wa::message::PollUpdateMessage {
-            poll_creation_message_key: buffa::MessageField::some(wa::MessageKey {
-                remote_jid: Some(chat_jid.to_string()),
-                from_me: Some(from_me),
-                id: Some(poll_msg_id.to_string()),
-                participant: if chat_jid.is_group() {
+        let poll_update = {
+            let mut proto = wa::message::PollUpdateMessage::default();
+            proto.poll_creation_message_key = buffa::MessageField::some({
+                let mut proto = wa::MessageKey::default();
+                proto.remote_jid = Some(chat_jid.to_string());
+                proto.from_me = Some(from_me);
+                proto.id = Some(poll_msg_id.to_string());
+                proto.participant = if chat_jid.is_group() {
                     // Addressing belongs to the message reference; the exact
                     // captured creator above remains the crypto namespace.
                     Some(
@@ -183,21 +188,26 @@ impl<'a> Polls<'a> {
                     )
                 } else {
                     None
-                },
-            }),
-            vote: buffa::MessageField::some(wa::message::PollEncValue {
-                enc_payload: Some(enc_payload),
-                enc_iv: Some(iv.to_vec()),
-            }),
-            // WA Web's GeneratePollVoteMessageProto never sets metadata; a Some(empty)
+                };
+                proto
+            });
+            proto.vote = buffa::MessageField::some({
+                let mut proto = wa::message::PollEncValue::default();
+                proto.enc_payload = Some(enc_payload);
+                proto.enc_iv = Some(iv.to_vec());
+                proto
+            }); // WA Web's GeneratePollVoteMessageProto never sets metadata; a Some(empty)
             // submessage emits a stray `1A 00` (tag 3) on the wire. Omit it.
-            metadata: buffa::MessageField::none(),
-            sender_timestamp_ms: Some(wacore::time::now_millis()),
+
+            proto.metadata = buffa::MessageField::none();
+            proto.sender_timestamp_ms = Some(wacore::time::now_millis());
+            proto
         };
 
-        let message = wa::Message {
-            poll_update_message: buffa::MessageField::some(poll_update),
-            ..Default::default()
+        let message = {
+            let mut proto = wa::Message::default();
+            proto.poll_update_message = buffa::MessageField::some(poll_update);
+            proto
         };
 
         Ok(self.client.send_message(chat_jid, message).await?)
@@ -516,11 +526,13 @@ fn build_poll_creation_message(
                     options.len()
                 ))
             })?;
-            let answer = wa::message::poll_creation_message::Option {
-                option_name: Some(correct.clone()),
-                // optionHash is the lowercase hex of SHA-256(name), matching WA Web's
+            let answer = {
+                let mut proto_ = wa::message::poll_creation_message::Option::default();
+                proto_.option_name = Some(correct.clone()); // optionHash is the lowercase hex of SHA-256(name), matching WA Web's
                 // createOptionHashHexFromString (the proto field is a string, not bytes).
-                option_hash: Some(hex::encode(poll::compute_option_hash(correct))),
+
+                proto_.option_hash = Some(hex::encode(poll::compute_option_hash(correct)));
+                proto_
             };
             (
                 Some(wa::message::PollType::QUIZ),
@@ -532,25 +544,28 @@ fn build_poll_creation_message(
 
     let poll_options: Vec<wa::message::poll_creation_message::Option> = options
         .iter()
-        .map(|name| wa::message::poll_creation_message::Option {
-            option_name: Some(name.clone()),
-            option_hash: None,
+        .map(|name| {
+            let mut proto = wa::message::poll_creation_message::Option::default();
+            proto.option_name = Some(name.clone());
+            proto.option_hash = None;
+            proto
         })
         .collect();
 
-    Ok(wa::message::PollCreationMessage {
-        enc_key: None,
-        name: Some(name.to_string()),
-        options: poll_options,
-        selectable_options_count: Some(selectable_count),
-        context_info: buffa::MessageField::none(),
-        // WA Web's GeneratePollCreationMessageProto always sets pollContentType
+    Ok({
+        let mut proto = wa::message::PollCreationMessage::default();
+        proto.enc_key = None;
+        proto.name = Some(name.to_string());
+        proto.options = poll_options;
+        proto.selectable_options_count = Some(selectable_count);
+        proto.context_info = buffa::MessageField::none(); // WA Web's GeneratePollCreationMessageProto always sets pollContentType
         // (TEXT=1 for a normal poll); omitting it drops a field the real client
         // always emits.
-        poll_content_type: Some(wa::message::PollContentType::TEXT),
-        poll_type,
-        correct_answer,
-        ..Default::default()
+
+        proto.poll_content_type = Some(wa::message::PollContentType::TEXT);
+        proto.poll_type = poll_type;
+        proto.correct_answer = correct_answer;
+        proto
     })
 }
 

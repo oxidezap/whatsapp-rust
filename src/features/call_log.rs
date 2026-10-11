@@ -199,12 +199,15 @@ mod tests {
         Mutation {
             operation: wa::syncd_mutation::SyncdOperation::Set,
             index: index.iter().map(|part| (*part).to_string()).collect(),
-            action_value: Some(wa::SyncActionValue {
-                timestamp: Some(1_700_000_000_000),
-                call_log_action: buffa::MessageField::some(wa::sync_action_value::CallLogAction {
-                    call_log_record: record.into(),
-                }),
-                ..Default::default()
+            action_value: Some({
+                let mut proto = wa::SyncActionValue::default();
+                proto.timestamp = Some(1_700_000_000_000);
+                proto.call_log_action = buffa::MessageField::some({
+                    let mut proto = wa::sync_action_value::CallLogAction::default();
+                    proto.call_log_record = record.into();
+                    proto
+                });
+                proto
             }),
         }
     }
@@ -219,12 +222,13 @@ mod tests {
 
     #[test]
     fn dispatches_call_log_record() {
-        let record = wa::CallLogRecord {
-            call_id: Some("call-42".into()),
-            duration: Some(91),
-            is_incoming: Some(false),
-            is_video: Some(true),
-            ..Default::default()
+        let record = {
+            let mut proto = wa::CallLogRecord::default();
+            proto.call_id = Some("call-42".into());
+            proto.duration = Some(91);
+            proto.is_incoming = Some(false);
+            proto.is_video = Some(true);
+            proto
         };
         let (outcome, events) = dispatch(&call_log_mutation(&full_index(), Some(record)), true);
 
@@ -268,9 +272,10 @@ mod tests {
     #[test]
     fn a_call_this_account_placed_is_from_me() {
         for creator in [OWN_PN, OWN_LID] {
-            let record = wa::CallLogRecord {
-                is_incoming: Some(false),
-                ..Default::default()
+            let record = {
+                let mut proto = wa::CallLogRecord::default();
+                proto.is_incoming = Some(false);
+                proto
             };
             let index = ["call_log", creator, "call-7", "0"];
             let (_, events) = dispatch(&call_log_mutation(&index, Some(record)), false);
@@ -293,9 +298,10 @@ mod tests {
     #[test]
     fn a_call_the_peer_placed_is_not_from_me() {
         for (index_part, record_is_incoming) in [("0", Some(false)), ("1", Some(true))] {
-            let record = wa::CallLogRecord {
-                is_incoming: record_is_incoming,
-                ..Default::default()
+            let record = {
+                let mut proto = wa::CallLogRecord::default();
+                proto.is_incoming = record_is_incoming;
+                proto
             };
             let index = ["call_log", PEER, "call-7", index_part];
             let (_, events) = dispatch(&call_log_mutation(&index, Some(record)), false);

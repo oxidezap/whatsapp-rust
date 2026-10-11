@@ -1081,15 +1081,17 @@ fn push_message_field_sized(
 /// [`unwrap_device_sent`].
 pub fn wrap_device_sent(mut message: wa::Message, destination_jid: String) -> wa::Message {
     let context = std::mem::take(&mut message.message_context_info);
-    wa::Message {
-        message_context_info: context,
-        device_sent_message: wa::message::DeviceSentMessage {
-            destination_jid: Some(destination_jid),
-            message: message.into(),
-            ..Default::default()
+    {
+        let mut proto = wa::Message::default();
+        proto.message_context_info = context;
+        proto.device_sent_message = {
+            let mut proto = wa::message::DeviceSentMessage::default();
+            proto.destination_jid = Some(destination_jid);
+            proto.message = message.into();
+            proto
         }
-        .into(),
-        ..Default::default()
+        .into();
+        proto
     }
 }
 
@@ -1151,19 +1153,20 @@ pub fn is_sender_key_distribution_only(msg: &mut wa::Message) -> bool {
     // Slow path: temporarily take out the carrier fields and compare the rest to
     // default to catch all current and future fields, then restore them. This
     // avoids deep-cloning the whole Message just to clear three fields.
-    let skdm = msg.sender_key_distribution_message.take();
-    let fast = msg.fast_ratchet_key_sender_key_distribution_message.take();
-    let ctx = msg.message_context_info.take();
+    // Keep the MessageField boxes: taking their inner values would free each
+    // box and allocate it again when the carrier fields are restored.
+    let skdm = std::mem::take(&mut msg.sender_key_distribution_message);
+    let fast = std::mem::take(&mut msg.fast_ratchet_key_sender_key_distribution_message);
+    let ctx = std::mem::take(&mut msg.message_context_info);
 
     // proto fields only encode when non-default, so encoded length 0 means all
     // remaining fields are at default — i.e. the message has no user content.
     let mut cache = buffa::SizeCache::new();
     let only = waproto::codec::message_compute_size(msg, &mut cache) == 0;
 
-    msg.sender_key_distribution_message = skdm.map(buffa::MessageField::some).unwrap_or_default();
-    msg.fast_ratchet_key_sender_key_distribution_message =
-        fast.map(buffa::MessageField::some).unwrap_or_default();
-    msg.message_context_info = ctx.map(buffa::MessageField::some).unwrap_or_default();
+    msg.sender_key_distribution_message = skdm;
+    msg.fast_ratchet_key_sender_key_distribution_message = fast;
+    msg.message_context_info = ctx;
 
     only
 }
@@ -1650,38 +1653,45 @@ mod plaintext_view_tests {
     }
 
     fn skdm(bytes: &[u8]) -> wa::message::SenderKeyDistributionMessage {
-        wa::message::SenderKeyDistributionMessage {
-            group_id: Some("120000000000000000@g.us".to_string()),
-            axolotl_sender_key_distribution_message: Some(bytes.to_vec()),
+        {
+            let mut proto = wa::message::SenderKeyDistributionMessage::default();
+            proto.group_id = Some("120000000000000000@g.us".to_string());
+            proto.axolotl_sender_key_distribution_message = Some(bytes.to_vec());
+            proto
         }
     }
 
     fn history_notification(payload: Vec<u8>) -> wa::message::HistorySyncNotification {
-        wa::message::HistorySyncNotification {
-            file_length: Some(payload.len() as u64),
-            sync_type: Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP),
-            initial_hist_bootstrap_inline_payload: Some(payload),
-            progress: Some(73),
-            ..Default::default()
+        {
+            let mut proto = wa::message::HistorySyncNotification::default();
+            proto.file_length = Some(payload.len() as u64);
+            proto.sync_type = Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP);
+            proto.initial_hist_bootstrap_inline_payload = Some(payload);
+            proto.progress = Some(73);
+            proto
         }
     }
 
     fn message_with_history(payload: Vec<u8>, text: &str) -> wa::Message {
-        wa::Message {
-            conversation: Some(text.to_owned()),
-            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
-                history_sync_notification: buffa::MessageField::some(history_notification(payload)),
-                ..Default::default()
-            }),
-            ..Default::default()
+        {
+            let mut proto_ = wa::Message::default();
+            proto_.conversation = Some(text.to_owned());
+            proto_.protocol_message = buffa::MessageField::some({
+                let mut proto = wa::message::ProtocolMessage::default();
+                proto.history_sync_notification =
+                    buffa::MessageField::some(history_notification(payload));
+                proto
+            });
+            proto_
         }
     }
 
     #[test]
     fn decode_plaintext_view_borrows_message_fields() {
-        let msg = wa::Message {
-            conversation: Some("hello".to_string()),
-            ..Default::default()
+        let msg = {
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("hello".to_string());
+            proto
         };
         let padded = padded(&msg);
 
@@ -1692,9 +1702,10 @@ mod plaintext_view_tests {
 
     #[test]
     fn decode_plaintext_owned_view_keeps_unpadded_bytes() {
-        let msg = wa::Message {
-            conversation: Some("hello".to_string()),
-            ..Default::default()
+        let msg = {
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("hello".to_string());
+            proto
         };
         let padded = padded(&msg);
         let padded_len = padded.len();
@@ -1742,12 +1753,11 @@ mod plaintext_view_tests {
         let inner_payload = vec![0x11; 64];
         let inner = message_with_history(inner_payload.clone(), "inner");
         let mut wrapped = wrap_device_sent(inner, "1@s.whatsapp.net".into());
-        wrapped.protocol_message = buffa::MessageField::some(wa::message::ProtocolMessage {
-            history_sync_notification: buffa::MessageField::some(history_notification(vec![
-                0x22;
-                32
-            ])),
-            ..Default::default()
+        wrapped.protocol_message = buffa::MessageField::some({
+            let mut proto = wa::message::ProtocolMessage::default();
+            proto.history_sync_notification =
+                buffa::MessageField::some(history_notification(vec![0x22; 32]));
+            proto
         });
 
         let (decoded, detached) = decode_plaintext_detached_history_sync(padded(&wrapped), 2)
@@ -1767,9 +1777,10 @@ mod plaintext_view_tests {
 
     #[test]
     fn sender_key_distribution_only_plaintext_returns_borrowed_axolotl() {
-        let msg = wa::Message {
-            sender_key_distribution_message: buffa::MessageField::some(skdm(&[1, 2, 3])),
-            ..Default::default()
+        let msg = {
+            let mut proto = wa::Message::default();
+            proto.sender_key_distribution_message = buffa::MessageField::some(skdm(&[1, 2, 3]));
+            proto
         };
         let padded = padded(&msg);
 
@@ -1785,10 +1796,11 @@ mod plaintext_view_tests {
 
     #[test]
     fn sender_key_distribution_only_plaintext_rejects_user_content() {
-        let msg = wa::Message {
-            conversation: Some("hello".to_string()),
-            sender_key_distribution_message: buffa::MessageField::some(skdm(&[1, 2, 3])),
-            ..Default::default()
+        let msg = {
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("hello".to_string());
+            proto.sender_key_distribution_message = buffa::MessageField::some(skdm(&[1, 2, 3]));
+            proto
         };
         let padded = padded(&msg);
 
@@ -1800,11 +1812,11 @@ mod plaintext_view_tests {
 
     #[test]
     fn sender_key_distribution_only_plaintext_allows_fast_ratchet_only() {
-        let msg = wa::Message {
-            fast_ratchet_key_sender_key_distribution_message: buffa::MessageField::some(skdm(&[
-                4, 5, 6,
-            ])),
-            ..Default::default()
+        let msg = {
+            let mut proto = wa::Message::default();
+            proto.fast_ratchet_key_sender_key_distribution_message =
+                buffa::MessageField::some(skdm(&[4, 5, 6]));
+            proto
         };
         let padded = padded(&msg);
 
@@ -2032,15 +2044,17 @@ mod parse_message_info_tests {
     #[allow(clippy::disallowed_methods)]
     fn envelope_verified_name_cert_is_decoded() {
         use buffa::Message;
-        let details = wa::verified_name_certificate::Details {
-            verified_name: Some("Fictitious Biz Ltd".into()),
-            issuer: Some("smb:wa".into()),
-            serial: Some(12345),
-            ..Default::default()
+        let details = {
+            let mut proto = wa::verified_name_certificate::Details::default();
+            proto.verified_name = Some("Fictitious Biz Ltd".into());
+            proto.issuer = Some("smb:wa".into());
+            proto.serial = Some(12345);
+            proto
         };
-        let cert = wa::VerifiedNameCertificate {
-            details: Some(details.encode_to_vec()),
-            ..Default::default()
+        let cert = {
+            let mut proto = wa::VerifiedNameCertificate::default();
+            proto.details = Some(details.encode_to_vec());
+            proto
         };
         let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
         let node = NodeBuilder::new("message")
@@ -2611,9 +2625,10 @@ mod device_sent_tests {
         use wacore_binary::jid::Jid;
 
         let jid: Jid = "5511987650001:5@s.whatsapp.net".parse().expect("parse");
-        let message = wa::Message {
-            conversation: Some("destination check".to_string()),
-            ..Default::default()
+        let message = {
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("destination check".to_string());
+            proto
         };
         let content = waproto::codec::message_to_vec(&message);
 
@@ -2641,9 +2656,10 @@ mod device_sent_tests {
         use std::rc::Rc;
         use std::sync::Arc;
 
-        let message = wa::Message {
-            conversation: Some("wrapper check".to_string()),
-            ..Default::default()
+        let message = {
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("wrapper check".to_string());
+            proto
         };
         let content = waproto::codec::message_to_vec(&message);
         let dest = "5511987650001:5@s.whatsapp.net";
@@ -2725,14 +2741,16 @@ mod device_sent_tests {
     use super::*;
 
     fn msg_with_secret(secret: &[u8]) -> wa::Message {
-        wa::Message {
-            conversation: Some("hi".into()),
-            message_context_info: wa::MessageContextInfo {
-                message_secret: Some(secret.to_vec()),
-                ..Default::default()
+        {
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("hi".into());
+            proto.message_context_info = {
+                let mut proto = wa::MessageContextInfo::default();
+                proto.message_secret = Some(secret.to_vec());
+                proto
             }
-            .into(),
-            ..Default::default()
+            .into();
+            proto
         }
     }
 
@@ -2764,9 +2782,10 @@ mod device_sent_tests {
 
     #[test]
     fn wrap_without_context_leaves_outer_empty() {
-        let inner = wa::Message {
-            conversation: Some("hi".into()),
-            ..Default::default()
+        let inner = {
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("hi".into());
+            proto
         };
         let wrapped = wrap_device_sent(inner, "1@s.whatsapp.net".into());
 
@@ -2784,13 +2803,15 @@ mod device_sent_tests {
 
     #[test]
     fn wrap_then_unwrap_preserves_non_secret_context_fields() {
-        let inner = wa::Message {
-            message_context_info: wa::MessageContextInfo {
-                message_add_on_duration_in_secs: Some(604800),
-                ..Default::default()
+        let inner = {
+            let mut proto = wa::Message::default();
+            proto.message_context_info = {
+                let mut proto = wa::MessageContextInfo::default();
+                proto.message_add_on_duration_in_secs = Some(604800);
+                proto
             }
-            .into(),
-            ..Default::default()
+            .into();
+            proto
         };
         let unwrapped = unwrap_device_sent(wrap_device_sent(inner, "1@s.whatsapp.net".into()));
         assert_eq!(
@@ -2857,17 +2878,19 @@ mod device_sent_tests {
 
         // plain conversation text
         assert_splice_matches(
-            wa::Message {
-                conversation: Some("ping".into()),
-                ..Default::default()
+            {
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("ping".into());
+                proto
             },
             dest,
         );
         // unicode + long text (multi-byte content, larger than one varint length)
         assert_splice_matches(
-            wa::Message {
-                conversation: Some("héllo 🚀 ".repeat(500)),
-                ..Default::default()
+            {
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("héllo 🚀 ".repeat(500));
+                proto
             },
             dest,
         );
@@ -2875,38 +2898,44 @@ mod device_sent_tests {
         assert_splice_matches(msg_with_secret(&[42u8; 32]), dest);
         // extended text + nested context_info (forwarded) AND top-level mci
         assert_splice_matches(
-            wa::Message {
-                extended_text_message: wa::message::ExtendedTextMessage {
-                    text: Some("quoted".into()),
-                    context_info: wa::ContextInfo {
-                        is_forwarded: Some(true),
-                        ..Default::default()
+            {
+                let mut proto = wa::Message::default();
+                proto.extended_text_message = {
+                    let mut proto = wa::message::ExtendedTextMessage::default();
+                    proto.text = Some("quoted".into());
+                    proto.context_info = {
+                        let mut proto = wa::ContextInfo::default();
+                        proto.is_forwarded = Some(true);
+                        proto
                     }
-                    .into(),
-                    ..Default::default()
+                    .into();
+                    proto
                 }
-                .into(),
-                message_context_info: wa::MessageContextInfo {
-                    message_secret: Some(vec![1, 2, 3, 4]),
-                    ..Default::default()
+                .into();
+                proto.message_context_info = {
+                    let mut proto = wa::MessageContextInfo::default();
+                    proto.message_secret = Some(vec![1, 2, 3, 4]);
+                    proto
                 }
-                .into(),
-                ..Default::default()
+                .into();
+                proto
             },
             dest,
         );
         // media message (refs/keys), no mci
         assert_splice_matches(
-            wa::Message {
-                image_message: wa::message::ImageMessage {
-                    url: Some("https://mmg.example/abc".into()),
-                    media_key: Some(vec![9u8; 32]),
-                    file_sha256: Some(vec![8u8; 32]),
-                    mimetype: Some("image/jpeg".into()),
-                    ..Default::default()
+            {
+                let mut proto = wa::Message::default();
+                proto.image_message = {
+                    let mut proto = wa::message::ImageMessage::default();
+                    proto.url = Some("https://mmg.example/abc".into());
+                    proto.media_key = Some(vec![9u8; 32]);
+                    proto.file_sha256 = Some(vec![8u8; 32]);
+                    proto.mimetype = Some("image/jpeg".into());
+                    proto
                 }
-                .into(),
-                ..Default::default()
+                .into();
+                proto
             },
             dest,
         );
@@ -2914,21 +2943,24 @@ mod device_sent_tests {
         assert_splice_matches(wa::Message::default(), dest);
         // mci-only (no content body)
         assert_splice_matches(
-            wa::Message {
-                message_context_info: wa::MessageContextInfo {
-                    message_secret: Some(vec![7u8; 32]),
-                    ..Default::default()
+            {
+                let mut proto = wa::Message::default();
+                proto.message_context_info = {
+                    let mut proto = wa::MessageContextInfo::default();
+                    proto.message_secret = Some(vec![7u8; 32]);
+                    proto
                 }
-                .into(),
-                ..Default::default()
+                .into();
+                proto
             },
             dest,
         );
         // empty destination_jid (degenerate but must still match)
         assert_splice_matches(
-            wa::Message {
-                conversation: Some("x".into()),
-                ..Default::default()
+            {
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("x".into());
+                proto
             },
             "",
         );
@@ -2946,9 +2978,10 @@ mod device_sent_tests {
                 .field_number()
         }
 
-        let outer_dsm = wa::Message {
-            device_sent_message: wa::message::DeviceSentMessage::default().into(),
-            ..Default::default()
+        let outer_dsm = {
+            let mut proto = wa::Message::default();
+            proto.device_sent_message = wa::message::DeviceSentMessage::default().into();
+            proto
         };
         assert_eq!(
             first_field_number(&outer_dsm.encode_to_vec()),
@@ -2956,9 +2989,10 @@ mod device_sent_tests {
             "Message.device_sent_message tag drifted from the .proto"
         );
 
-        let outer_mci = wa::Message {
-            message_context_info: wa::MessageContextInfo::default().into(),
-            ..Default::default()
+        let outer_mci = {
+            let mut proto = wa::Message::default();
+            proto.message_context_info = wa::MessageContextInfo::default().into();
+            proto
         };
         assert_eq!(
             first_field_number(&outer_mci.encode_to_vec()),
@@ -2966,9 +3000,10 @@ mod device_sent_tests {
             "Message.message_context_info tag drifted from the .proto"
         );
 
-        let dsm_dest = wa::message::DeviceSentMessage {
-            destination_jid: Some("x".into()),
-            ..Default::default()
+        let dsm_dest = {
+            let mut proto = wa::message::DeviceSentMessage::default();
+            proto.destination_jid = Some("x".into());
+            proto
         };
         assert_eq!(
             first_field_number(&dsm_dest.encode_to_vec()),
@@ -2976,9 +3011,10 @@ mod device_sent_tests {
             "DeviceSentMessage.destination_jid tag drifted from the .proto"
         );
 
-        let dsm_msg = wa::message::DeviceSentMessage {
-            message: wa::Message::default().into(),
-            ..Default::default()
+        let dsm_msg = {
+            let mut proto = wa::message::DeviceSentMessage::default();
+            proto.message = wa::Message::default().into();
+            proto
         };
         assert_eq!(
             first_field_number(&dsm_msg.encode_to_vec()),
@@ -3003,14 +3039,15 @@ mod device_sent_tests {
         ] {
             let jid = wacore_binary::jid::Jid::from_str(group).expect("valid group jid");
 
-            let reference = wa::Message {
-                sender_key_distribution_message: buffa::MessageField::some(
-                    wa::message::SenderKeyDistributionMessage {
-                        group_id: Some(jid.to_string()),
-                        axolotl_sender_key_distribution_message: Some(axolotl.clone()),
-                    },
-                ),
-                ..Default::default()
+            let reference = {
+                let mut proto = wa::Message::default();
+                proto.sender_key_distribution_message = buffa::MessageField::some({
+                    let mut proto = wa::message::SenderKeyDistributionMessage::default();
+                    proto.group_id = Some(jid.to_string());
+                    proto.axolotl_sender_key_distribution_message = Some(axolotl.clone());
+                    proto
+                });
+                proto
             };
 
             let framed = MessageUtils::encode_and_pad_skdm_wrapper(&jid, &axolotl);
@@ -3044,10 +3081,11 @@ mod device_sent_tests {
                 .field_number()
         }
 
-        let outer = wa::Message {
-            sender_key_distribution_message: wa::message::SenderKeyDistributionMessage::default()
-                .into(),
-            ..Default::default()
+        let outer = {
+            let mut proto = wa::Message::default();
+            proto.sender_key_distribution_message =
+                wa::message::SenderKeyDistributionMessage::default().into();
+            proto
         };
         assert_eq!(
             first_field_number(&outer.encode_to_vec()),
@@ -3055,9 +3093,10 @@ mod device_sent_tests {
             "Message.sender_key_distribution_message tag drifted from the .proto"
         );
 
-        let group = wa::message::SenderKeyDistributionMessage {
-            group_id: Some("x".into()),
-            ..Default::default()
+        let group = {
+            let mut proto = wa::message::SenderKeyDistributionMessage::default();
+            proto.group_id = Some("x".into());
+            proto
         };
         assert_eq!(
             first_field_number(&group.encode_to_vec()),
@@ -3065,9 +3104,10 @@ mod device_sent_tests {
             "SenderKeyDistributionMessage.group_id tag drifted from the .proto"
         );
 
-        let axolotl = wa::message::SenderKeyDistributionMessage {
-            axolotl_sender_key_distribution_message: Some(vec![1]),
-            ..Default::default()
+        let axolotl = {
+            let mut proto = wa::message::SenderKeyDistributionMessage::default();
+            proto.axolotl_sender_key_distribution_message = Some(vec![1]);
+            proto
         };
         assert_eq!(
             first_field_number(&axolotl.encode_to_vec()),
@@ -3081,21 +3121,24 @@ mod device_sent_tests {
     /// must survive the merge while message_secret is overwritten (rare, clone).
     fn context_test_shapes() -> Vec<wa::Message> {
         vec![
-            wa::Message {
-                conversation: Some("ping".into()),
-                ..Default::default()
+            {
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("ping".into());
+                proto
             },
-            wa::Message {
-                conversation: Some("poll".into()),
-                message_context_info: wa::MessageContextInfo {
-                    // preserved by the merge
-                    message_add_on_duration_in_secs: Some(604800),
-                    // overwritten by the reporting context
-                    message_secret: Some(vec![1u8; 32]),
-                    ..Default::default()
+            {
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("poll".into());
+                proto.message_context_info = {
+                    let mut proto = wa::MessageContextInfo::default(); // preserved by the merge
+
+                    proto.message_add_on_duration_in_secs = Some(604800); // overwritten by the reporting context
+
+                    proto.message_secret = Some(vec![1u8; 32]);
+                    proto
                 }
-                .into(),
-                ..Default::default()
+                .into();
+                proto
             },
         ]
     }
@@ -3103,10 +3146,11 @@ mod device_sent_tests {
     /// The reporting context the send path injects (message_secret +
     /// reporting_token_version), matching `prepare_message_with_context`.
     fn reporting_context(secret: &[u8; 32]) -> wa::MessageContextInfo {
-        wa::MessageContextInfo {
-            message_secret: Some(secret.to_vec()),
-            reporting_token_version: Some(crate::reporting_token::REPORTING_TOKEN_VERSION),
-            ..Default::default()
+        {
+            let mut proto = wa::MessageContextInfo::default();
+            proto.message_secret = Some(secret.to_vec());
+            proto.reporting_token_version = Some(crate::reporting_token::REPORTING_TOKEN_VERSION);
+            proto
         }
     }
 
@@ -3160,18 +3204,21 @@ mod device_sent_tests {
         let reporting_ctx = reporting_context(&[0x5Au8; 32]);
 
         let shapes = [
-            wa::Message {
-                conversation: Some("ping".into()),
-                ..Default::default()
+            {
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("ping".into());
+                proto
             },
-            wa::Message {
-                image_message: wa::message::ImageMessage {
-                    url: Some("https://mmg.example/abc".into()),
-                    media_key: Some(vec![9u8; 32]),
-                    ..Default::default()
+            {
+                let mut proto = wa::Message::default();
+                proto.image_message = {
+                    let mut proto = wa::message::ImageMessage::default();
+                    proto.url = Some("https://mmg.example/abc".into());
+                    proto.media_key = Some(vec![9u8; 32]);
+                    proto
                 }
-                .into(),
-                ..Default::default()
+                .into();
+                proto
             },
         ];
 
@@ -3206,22 +3253,26 @@ mod device_sent_tests {
         let unpad = |b: &[u8]| MessageUtils::unpad_message_ref(b, 2).unwrap().to_vec();
 
         let shapes = [
-            wa::Message {
-                conversation: Some("ping".into()),
-                ..Default::default()
+            {
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("ping".into());
+                proto
             },
-            wa::Message {
-                conversation: Some("héllo 🚀 ".repeat(500)),
-                ..Default::default()
+            {
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("héllo 🚀 ".repeat(500));
+                proto
             },
-            wa::Message {
-                image_message: wa::message::ImageMessage {
-                    url: Some("https://mmg.example/abc".into()),
-                    media_key: Some(vec![9u8; 32]),
-                    ..Default::default()
+            {
+                let mut proto = wa::Message::default();
+                proto.image_message = {
+                    let mut proto = wa::message::ImageMessage::default();
+                    proto.url = Some("https://mmg.example/abc".into());
+                    proto.media_key = Some(vec![9u8; 32]);
+                    proto
                 }
-                .into(),
-                ..Default::default()
+                .into();
+                proto
             },
         ];
 
@@ -3274,9 +3325,10 @@ mod device_sent_tests {
             assert_eq!(got, ref_decoded, "group encode-with-context mismatch");
         }
 
-        let plain = wa::Message {
-            conversation: Some("x".into()),
-            ..Default::default()
+        let plain = {
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("x".into());
+            proto
         };
         assert_eq!(
             decode_padded(&MessageUtils::encode_and_pad_with_context(&plain, None)),

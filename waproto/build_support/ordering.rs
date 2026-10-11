@@ -1,0 +1,970 @@
+//! Add a cold wire-occurrence journal only to generated enum/oneof owners.
+
+use quote::{format_ident, quote};
+use std::collections::{BTreeMap, BTreeSet};
+use syn::visit_mut::{self, VisitMut};
+
+#[derive(Default)]
+struct Probe {
+    fields: BTreeSet<String>,
+    enumeration: bool,
+    choice: bool,
+    enum_number: Option<u32>,
+}
+impl VisitMut for Probe {
+    fn visit_expr_field_mut(&mut self, expr: &mut syn::ExprField) {
+        if let syn::Expr::Path(base) = &*expr.base
+            && (base.path.is_ident("self") || base.path.is_ident("view"))
+            && let syn::Member::Named(name) = &expr.member
+        {
+            self.fields.insert(name.to_string());
+        }
+        visit_mut::visit_expr_field_mut(self, expr);
+    }
+    fn visit_expr_method_call_mut(&mut self, expr: &mut syn::ExprMethodCall) {
+        self.enumeration |= expr.method == "to_i32";
+        visit_mut::visit_expr_method_call_mut(self, expr);
+    }
+    fn visit_expr_match_mut(&mut self, expr: &mut syn::ExprMatch) {
+        self.choice = true;
+        visit_mut::visit_expr_match_mut(self, expr);
+    }
+    fn visit_expr_call_mut(&mut self, expr: &mut syn::ExprCall) {
+        if let syn::Expr::Path(path) = &*expr.func
+            && path
+                .path
+                .segments
+                .last()
+                .is_some_and(|part| part.ident == "put_int32_field")
+            && let Some(syn::Expr::Lit(literal)) = expr.args.first()
+            && let syn::Lit::Int(number) = &literal.lit
+        {
+            self.enum_number = Some(number.base10_parse().expect("generated field number"));
+        }
+        visit_mut::visit_expr_call_mut(self, expr);
+    }
+}
+
+fn fields(statement: &syn::Stmt) -> Probe {
+    let mut result = Probe::default();
+    result.visit_stmt_mut(&mut statement.clone());
+    result
+}
+
+fn type_name(item: &syn::ItemImpl) -> Option<String> {
+    let syn::Type::Path(path) = &*item.self_ty else {
+        return None;
+    };
+    path.path.segments.last().map(|p| p.ident.to_string())
+}
+fn trait_name(item: &syn::ItemImpl) -> Option<String> {
+    item.trait_
+        .as_ref()?
+        .1
+        .segments
+        .last()
+        .map(|p| p.ident.to_string())
+}
+fn method(item: &syn::ItemImpl, name: &str) -> Option<syn::ImplItemFn> {
+    item.items.iter().find_map(|m| match m {
+        syn::ImplItem::Fn(f) if f.sig.ident == name => Some(f.clone()),
+        _ => None,
+    })
+}
+fn argument(method: &syn::ImplItemFn, index: usize) -> syn::Ident {
+    let syn::FnArg::Typed(arg) = &method.sig.inputs[index] else {
+        panic!("generated typed argument")
+    };
+    let syn::Pat::Ident(name) = &*arg.pat else {
+        panic!("generated identifier argument")
+    };
+    name.ident.clone()
+}
+
+struct PushDecoded;
+impl VisitMut for PushDecoded {
+    fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
+        visit_mut::visit_expr_mut(self, expr);
+        if let syn::Expr::MethodCall(call) = expr
+            && call.method == "push"
+            && let syn::Expr::Field(field) = &*call.receiver
+            && matches!(&field.member, syn::Member::Named(name) if name == "__buffa_unknown_fields")
+        {
+            let receiver = &call.receiver;
+            let args = &call.args;
+            *expr = syn::parse_quote!(#receiver.push_decoded(#args, ctx)?);
+        }
+    }
+}
+
+struct PushViewDecoded;
+impl VisitMut for PushViewDecoded {
+    fn visit_expr_method_call_mut(&mut self, call: &mut syn::ExprMethodCall) {
+        visit_mut::visit_expr_method_call_mut(self, call);
+        if let syn::Expr::Field(field) = &*call.receiver
+            && matches!(&field.member, syn::Member::Named(name) if name == "__buffa_unknown_fields")
+        {
+            if call.method == "push_record" {
+                call.method = format_ident!("push_decoded_record");
+            } else if call.method == "push_varint" {
+                call.method = format_ident!("push_decoded_varint");
+            }
+        }
+    }
+}
+
+pub fn apply(
+    file: &mut syn::File,
+    view: bool,
+    growth: &super::wire_growth::Bounds,
+    header_snapshot: bool,
+) {
+    transform(&mut file.items, view, 0, "", growth, header_snapshot);
+}
+
+fn transform(
+    items: &mut Vec<syn::Item>,
+    view: bool,
+    depth: usize,
+    scope: &str,
+    growth: &super::wire_growth::Bounds,
+    header_snapshot: bool,
+) {
+    for item in items.iter_mut() {
+        if let syn::Item::Mod(module) = item
+            && let Some((_, children)) = &mut module.content
+        {
+            let name = module.ident.to_string();
+            transform(
+                children,
+                view,
+                depth + 1,
+                &format!("{scope}{}::", name.trim_start_matches("r#")),
+                growth,
+                header_snapshot,
+            );
+        }
+    }
+    let mut selected: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
+    let mut enum_fields = BTreeMap::new();
+    for item in items.iter() {
+        let syn::Item::Impl(item) = item else {
+            continue;
+        };
+        if trait_name(item).as_deref() != Some(if view { "ViewEncode" } else { "Message" }) {
+            continue;
+        }
+        let Some(write) = method(item, "write_to") else {
+            continue;
+        };
+        let owner_name = type_name(item).expect("generated type");
+        let repeated_fields: BTreeSet<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                syn::Item::Struct(owner) if owner.ident == owner_name => Some(owner),
+                _ => None,
+            })
+            .flat_map(|owner| owner.fields.iter())
+            .filter_map(|field| {
+                let syn::Type::Path(path) = &field.ty else {
+                    return None;
+                };
+                path.path
+                    .segments
+                    .last()
+                    .filter(|part| part.ident == "Vec" || part.ident == "RepeatedView")?;
+                field.ident.as_ref().map(ToString::to_string)
+            })
+            .collect();
+        let mut groups = BTreeMap::new();
+        let mut numbers = BTreeMap::new();
+        for statement in &write.block.stmts {
+            let probe = fields(statement);
+            let repeated = probe
+                .fields
+                .iter()
+                .any(|field| repeated_fields.contains(field));
+            if (probe.enumeration || probe.choice) && probe.fields.len() == 1 {
+                let name = probe
+                    .fields
+                    .iter()
+                    .next()
+                    .expect("one projected field")
+                    .clone();
+                if !repeated
+                    && !probe.choice
+                    && let Some(number) = probe.enum_number
+                {
+                    numbers.insert(name.clone(), number);
+                }
+                let group = groups.len() as u32 + 1;
+                groups.insert(name, group | if repeated { 1 << 31 } else { 0 });
+            }
+        }
+        if !groups.is_empty() {
+            let name = type_name(item).expect("generated type");
+            if numbers.len() == groups.len() {
+                enum_fields.insert(name.clone(), numbers);
+            }
+            selected.insert(name, groups);
+        }
+    }
+    if selected.is_empty() {
+        return;
+    }
+    let prefix = "super::".repeat(depth + if view { 2 } else { 0 });
+    let runtime: syn::Path =
+        syn::parse_str(&format!("{prefix}__wire_order")).expect("runtime path");
+    let mut helpers = Vec::new();
+    let mut enum_values = BTreeMap::new();
+    for item in items.iter() {
+        let syn::Item::Struct(owner) = item else {
+            continue;
+        };
+        let Some(groups) = selected.get(&owner.ident.to_string()) else {
+            continue;
+        };
+        let name = &owner.ident;
+        if let Some(numbers) = enum_fields.get(&name.to_string()) {
+            let values: Vec<_> = owner.fields.iter().filter_map(|field| {
+                let field_name = field.ident.as_ref()?;
+                let number = numbers.get(&field_name.to_string())?;
+                let optional = matches!(&field.ty, syn::Type::Path(path) if path.path.segments.last().is_some_and(|part| part.ident == "Option"));
+                let value = if optional {
+                    quote!(self.#field_name.as_ref().map(|value| value.to_i32()))
+                } else {
+                    quote!(Some(self.#field_name.to_i32()))
+                };
+                Some(quote!((#number, #value)))
+            }).collect();
+            enum_values.insert(name.to_string(), values);
+        }
+        let (impl_generics, ty_generics, where_clause) = owner.generics.split_for_impl();
+        for field in &owner.fields {
+            let Some(field_name) = &field.ident else {
+                continue;
+            };
+            let Some(group) = groups.get(&field_name.to_string()) else {
+                continue;
+            };
+            let setter = format_ident!("with_{}", field_name);
+            let exists = items.iter().any(|item| matches!(item, syn::Item::Impl(item)
+                if item.trait_.is_none() && type_name(item).as_deref() == Some(name.to_string().as_str())
+                    && method(item, &setter.to_string()).is_some()));
+            if exists {
+                continue;
+            }
+            let mut value_ty = &field.ty;
+            let mut optional = false;
+            if let syn::Type::Path(path) = &field.ty
+                && let Some(segment) = path.path.segments.last()
+                && segment.ident == "Option"
+                && let syn::PathArguments::AngleBracketed(args) = &segment.arguments
+                && let Some(syn::GenericArgument::Type(ty)) = args.args.first()
+            {
+                value_ty = ty;
+                optional = true;
+            }
+            let assign = if optional {
+                quote!(Some(value.into()))
+            } else {
+                quote!(value.into())
+            };
+            helpers.push(syn::parse_quote! {
+                impl #impl_generics #name #ty_generics #where_clause {
+                    /// Explicitly replace this known value, including when it
+                    /// equals the received projection of a future-bearing field.
+                    #[must_use = "with_* setters return self; assign or chain the result"]
+                    pub fn #setter(mut self, value: impl Into<#value_ty>) -> Self {
+                        self.#field_name = #assign;
+                        self.__buffa_unknown_fields.force(#group);
+                        self
+                    }
+                }
+            });
+        }
+    }
+    for item in items.iter_mut() {
+        if let syn::Item::Struct(item) = item
+            && selected.contains_key(&item.ident.to_string())
+        {
+            for field in &mut item.fields {
+                if field
+                    .ident
+                    .as_ref()
+                    .is_some_and(|id| id == "__buffa_unknown_fields")
+                {
+                    field.ty = if view {
+                        syn::parse_quote!(#runtime::ViewStorage<'a>)
+                    } else {
+                        syn::parse_quote!(#runtime::Storage)
+                    };
+                }
+            }
+        }
+        let syn::Item::Impl(item) = item else {
+            continue;
+        };
+        let Some(name) = type_name(item) else {
+            continue;
+        };
+        let Some(groups) = selected.get(&name) else {
+            continue;
+        };
+        let ty = item.self_ty.clone();
+        let (impl_generics, _, where_clause) = item.generics.split_for_impl();
+        let trait_id = trait_name(item);
+        if trait_id.as_deref() == Some(if view { "ViewEncode" } else { "Message" }) {
+            let mut compute = method(item, "compute_size").expect("generated size method");
+            let mut write = method(item, "write_to").expect("generated write method");
+            compute.sig.ident = format_ident!("__wire_compute");
+            write.sig.ident = format_ident!("__wire_write");
+            for helper in [&mut compute, &mut write] {
+                // Only selected fields participate in mutation detection. The
+                // remaining fields keep their original generated codec and
+                // traversal-cache entries, avoiding a second whole-message
+                // encoder and copies of unrelated payloads during decoding.
+                helper.block.stmts.retain(|statement| {
+                    let probe = fields(statement);
+                    probe.fields.is_empty()
+                        || probe.fields.iter().any(|field| groups.contains_key(field))
+                });
+                helper.block.stmts.insert(
+                    0,
+                    syn::parse_quote!(
+                        #[allow(unused_imports)]
+                        use ::buffa::{Message as _, MessageView as _, ViewEncode as _};
+                    ),
+                );
+            }
+            let compute_cache = argument(&compute, 1);
+            let write_cache = argument(&write, 1);
+            let write_buf = argument(&write, 2);
+            let mut shared_compute = BTreeMap::new();
+            for statement in &mut compute.block.stmts {
+                let probe = fields(statement);
+                if probe.choice
+                    && probe.fields.len() == 1
+                    && let Some(field) = probe.fields.first()
+                    && groups.contains_key(field)
+                {
+                    // Share each oneof's sizing match with the ordinary codec.
+                    // A helper per field preserves traversal-cache order when
+                    // other message fields occur between selected groups.
+                    let method = format_ident!("__wire_compute_{}", field.trim_start_matches("r#"));
+                    let original = statement.clone();
+                    helpers.push(syn::parse_quote! {
+                        impl #impl_generics #ty #where_clause {
+                            #[inline(never)]
+                            fn #method(&self, #compute_cache: &mut ::buffa::SizeCache) -> u64 {
+                                #[allow(unused_imports)]
+                                use ::buffa::{Message as _, MessageView as _, ViewEncode as _, Enumeration as _};
+                                let mut size = 0u64;
+                                #original
+                                size
+                            }
+                        }
+                    });
+                    let call: syn::Stmt = syn::parse_quote!(size += self.#method(#compute_cache););
+                    shared_compute.insert(field.clone(), call.clone());
+                    *statement = call;
+                }
+            }
+            let mut shared_write = BTreeMap::new();
+            for statement in &mut write.block.stmts {
+                let probe = fields(statement);
+                if probe.choice
+                    && probe.fields.len() == 1
+                    && let Some(field) = probe.fields.first()
+                    && groups.contains_key(field)
+                {
+                    let method = format_ident!("__wire_write_{}", field.trim_start_matches("r#"));
+                    let original = statement.clone();
+                    helpers.push(syn::parse_quote! {
+                        impl #impl_generics #ty #where_clause {
+                            #[inline(never)]
+                            fn #method(&self, #write_cache: &mut ::buffa::SizeCache, #write_buf: &mut impl ::buffa::EncodeSink) {
+                                #[allow(unused_imports)]
+                                use ::buffa::{Message as _, MessageView as _, ViewEncode as _, Enumeration as _};
+                                #original
+                            }
+                        }
+                    });
+                    let call: syn::Stmt =
+                        syn::parse_quote!(self.#method(#write_cache, #write_buf););
+                    shared_write.insert(field.clone(), call.clone());
+                    *statement = call;
+                }
+            }
+            for member in &mut item.items {
+                if let syn::ImplItem::Fn(f) = member {
+                    let is_compute = f.sig.ident == "compute_size";
+                    if !is_compute && f.sig.ident != "write_to" {
+                        continue;
+                    }
+                    f.attrs.retain(|attr| !attr.path().is_ident("inline"));
+                    f.attrs.push(syn::parse_quote!(#[inline(never)]));
+                    let mut unknown = false;
+                    for statement in &mut f.block.stmts {
+                        let probe = fields(statement);
+                        if probe.fields.iter().any(|field| groups.contains_key(field)) {
+                            let shared = if is_compute {
+                                &shared_compute
+                            } else {
+                                &shared_write
+                            };
+                            if let Some(call) =
+                                probe.fields.iter().find_map(|field| shared.get(field))
+                            {
+                                *statement = syn::parse_quote!(if !__wire_active { #call });
+                            } else if let syn::Stmt::Expr(syn::Expr::If(conditional), _) = statement
+                                && conditional.else_branch.is_none()
+                            {
+                                let condition = &conditional.cond;
+                                *conditional.cond = syn::parse_quote!(!__wire_active && #condition);
+                            } else {
+                                let original = statement.clone();
+                                *statement = syn::parse_quote!(if !__wire_active { #original });
+                            }
+                        } else if probe.fields.contains("__buffa_unknown_fields") {
+                            assert!(!unknown, "one generated unknown-field statement");
+                            unknown = true;
+                            let original = statement.clone();
+                            *statement = if is_compute {
+                                syn::parse_quote!(if __wire_active {
+                                    let bytes = self.__buffa_unknown_fields.compose(&self.__wire_known(), Self::__wire_group, Self::__wire_expected);
+                                    size += #runtime::cache_output(&bytes, #compute_cache) as u64;
+                                } else { #original })
+                            } else {
+                                syn::parse_quote!(if __wire_active {
+                                    #runtime::write_cached(#write_cache, #write_buf);
+                                } else { #original })
+                            };
+                        }
+                    }
+                    assert!(unknown, "generated codec retains unknown fields");
+                    f.block.stmts.insert(0, syn::parse_quote!(let __wire_active = self.__buffa_unknown_fields.active();));
+                }
+            }
+            let (codecs, projection) = if let Some(values) = enum_values.get(&name) {
+                (
+                    quote!(),
+                    quote!({
+                        #[allow(unused_imports)]
+                        use ::buffa::Enumeration as _;
+                        #runtime::enum_snapshot(&[#(#values),*], ctx)
+                    }),
+                )
+            } else {
+                (
+                    quote!(#compute #write),
+                    quote!({
+                        let mut cache = ::buffa::SizeCache::new();
+                        let size = self.__wire_compute(&mut cache);
+                        if let Some(ctx) = ctx {
+                            ctx.register_element_memory(size as usize)?;
+                        }
+                        let mut bytes = ::buffa::alloc::vec::Vec::with_capacity(size as usize);
+                        self.__wire_write(&mut cache, &mut bytes);
+                        Ok(bytes)
+                    }),
+                )
+            };
+            let projection = if header_snapshot
+                && scope == "message::interactive_message::"
+                && name == if view { "HeaderView" } else { "Header" }
+            {
+                quote!({
+                    // The descriptor/AST support guard rejects additional
+                    // tracked fields before an absent media projection can
+                    // skip the shared visitor's sizing and writing passes.
+                    if self.media.is_none()
+                        && <Self as crate::whatsapp::__wire_snapshot::Visitor>::supported(self)
+                    {
+                        if let Some(ctx) = ctx { ctx.register_element_memory(0)?; }
+                        return Ok(::buffa::alloc::vec::Vec::new());
+                    }
+                    if let Some(bytes) = crate::whatsapp::__wire_snapshot::snapshot(self, ctx)? {
+                        return Ok(bytes);
+                    }
+                    #projection
+                })
+            } else {
+                projection
+            };
+            let owner = if view {
+                name.strip_suffix("View").expect("view suffix")
+            } else {
+                &name
+            };
+            let field_growth = growth
+                .get(&format!("{scope}{owner}"))
+                .expect("generated owner descriptor");
+            let growth_cases = field_growth
+                .iter()
+                .filter(|(_, ratio)| **ratio != 2)
+                .map(|(tag, ratio)| quote!(#tag => #ratio,));
+            helpers.push(syn::parse_quote! {
+                impl #impl_generics #ty #where_clause {
+                    #codecs
+                    fn __wire_growth(tag: u32) -> usize {
+                        match tag { #(#growth_cases)* _ => 2 }
+                    }
+                    #[cold]
+                    pub(crate) fn __wire_known(&self) -> ::buffa::alloc::vec::Vec<u8> {
+                        self.__wire_snapshot(None).expect("unbudgeted wire projection")
+                    }
+                    #[cold]
+                    fn __wire_known_for_decode(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> {
+                        self.__wire_snapshot(Some(ctx))
+                    }
+                    #[cold]
+                    #[inline(never)]
+                    fn __wire_snapshot(&self, ctx: ::core::option::Option<::buffa::DecodeContext<'_>>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> #projection
+                }
+            });
+        }
+        if trait_id.as_deref() == Some(if view { "MessageView" } else { "Message" }) {
+            let merge_name = if view {
+                "merge_view_field"
+            } else {
+                "merge_field"
+            };
+            let mut merge = method(item, merge_name).expect("generated merge method");
+            let mut cases = Vec::new();
+            for statement in &merge.block.stmts {
+                if let syn::Stmt::Expr(syn::Expr::Match(m), _) = statement {
+                    for arm in &m.arms {
+                        let mut probe = Probe::default();
+                        // View code aliases self to `view`; examine the emitted
+                        // field accesses structurally with that alias normalized.
+                        let mut body = (*arm.body).clone();
+                        struct Alias;
+                        impl VisitMut for Alias {
+                            fn visit_expr_path_mut(&mut self, path: &mut syn::ExprPath) {
+                                if path.path.is_ident("view") {
+                                    path.path = syn::parse_quote!(self);
+                                }
+                            }
+                        }
+                        Alias.visit_expr_mut(&mut body);
+                        probe.visit_expr_mut(&mut body);
+                        if let Some(group) = probe.fields.iter().find_map(|field| groups.get(field))
+                        {
+                            let pattern = &arm.pat;
+                            cases.push(quote!(#pattern => #group,));
+                        }
+                    }
+                }
+            }
+            if !view {
+                PushDecoded.visit_impl_item_fn_mut(&mut merge);
+            } else {
+                PushViewDecoded.visit_impl_item_fn_mut(&mut merge);
+                for statement in &mut merge.block.stmts {
+                    if let syn::Stmt::Expr(syn::Expr::Match(m), _) = statement {
+                        for arm in &mut m.arms {
+                            struct RepeatedUnknown;
+                            impl VisitMut for RepeatedUnknown {
+                                fn visit_expr_method_call_mut(
+                                    &mut self,
+                                    call: &mut syn::ExprMethodCall,
+                                ) {
+                                    visit_mut::visit_expr_method_call_mut(self, call);
+                                    if call.method == "push_decoded_record" {
+                                        call.method = format_ident!("push_decoded_varint");
+                                        call.args = syn::parse_quote!(
+                                            tag.field_number(),
+                                            __raw as u64,
+                                            ctx
+                                        );
+                                    }
+                                }
+                            }
+                            let mut probe = Probe::default();
+                            probe.visit_expr_mut(&mut arm.body.clone());
+                            if probe.fields.iter().any(|field| {
+                                groups
+                                    .get(field)
+                                    .is_some_and(|group| group & (1 << 31) != 0)
+                            }) {
+                                RepeatedUnknown.visit_expr_mut(&mut arm.body);
+                            }
+                        }
+                    }
+                }
+            }
+            merge.sig.ident = format_ident!("__wire_merge");
+            // Both the ordinary decoder and the retained-occurrence adapter
+            // call this codec. Inlining small codecs into both routes repeats
+            // their nested decode trees, despite the outer dispatch being cold.
+            merge.attrs.retain(|attr| !attr.path().is_ident("inline"));
+            merge.attrs.push(syn::parse_quote!(#[inline(never)]));
+            merge.block.stmts.insert(
+                0,
+                syn::parse_quote!(
+                    #[allow(unused_imports)]
+                    use ::buffa::{Message as _, MessageView as _};
+                ),
+            );
+            let mut retained_merge = None;
+            let mut repeated_merge = None;
+            for member in &mut item.items {
+                let syn::ImplItem::Fn(f) = member else {
+                    continue;
+                };
+                if f.sig.ident == merge_name {
+                    f.attrs.retain(|attr| !attr.path().is_ident("inline"));
+                    f.attrs.push(syn::parse_quote!(#[inline(never)]));
+                    f.block = if view {
+                        syn::parse_quote!({
+                            if !self.__buffa_unknown_fields.active() {
+                                let rest = self.__wire_merge(tag, cur, before_tag, ctx)?;
+                                if !self.__buffa_unknown_fields.is_empty() {
+                                    #runtime::begin_view(&mut #runtime::Adapter(self), ctx)?;
+                                }
+                                return Ok(rest);
+                            }
+                            #runtime::merge_view(&mut #runtime::Adapter(self), tag, cur, before_tag, ctx, check_current)
+                        })
+                    } else {
+                        syn::parse_quote!({
+                            if !self.__buffa_unknown_fields.active() {
+                                self.__wire_merge(tag, buf, ctx)?;
+                                if !self.__buffa_unknown_fields.is_empty() {
+                                    #runtime::begin_owned(&mut #runtime::Adapter(self), ctx)?;
+                                }
+                                return Ok(());
+                            }
+                            if Self::__wire_group(tag.field_number()) != 0 {
+                                #runtime::merge_owned_known(&mut #runtime::Adapter(self), tag, buf, ctx, check_current)
+                            } else {
+                                let previous = self.__buffa_unknown_fields.len();
+                                self.__wire_merge(tag, buf, ctx)?;
+                                #runtime::finish_owned_unknown(&mut #runtime::Adapter(self), previous, ctx, check_current)
+                            }
+                        })
+                    };
+                    let mut retained = f.clone();
+                    let split: syn::Stmt = if view {
+                        syn::parse_quote! {
+                            if Self::__wire_group(tag.field_number()) & (1 << 31) != 0 && tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
+                                if check_current && self.__buffa_unknown_fields.active() {
+                                    #runtime::reconcile_view(&mut #runtime::Adapter(self), ctx)?;
+                                }
+                                let mut rest = cur;
+                                let mut packed = ::buffa::types::borrow_bytes(&mut rest)?;
+                                let element_tag = ::buffa::encoding::Tag::new(tag.field_number(), ::buffa::encoding::WireType::Varint);
+                                while !packed.is_empty() {
+                                    packed = self.__wire_merge_element(element_tag, packed, packed, ctx, false)?;
+                                }
+                                return Ok(rest);
+                            }
+                        }
+                    } else {
+                        syn::parse_quote! {
+                            if Self::__wire_group(tag.field_number()) & (1 << 31) != 0 && tag.wire_type() == ::buffa::encoding::WireType::LengthDelimited {
+                                if check_current && self.__buffa_unknown_fields.active() {
+                                    #runtime::reconcile_owned(&mut #runtime::Adapter(self), ctx)?;
+                                }
+                                let len = ::buffa::encoding::decode_varint(buf)?;
+                                let len = usize::try_from(len).map_err(|_| ::buffa::DecodeError::MessageTooLarge)?;
+                                if ::buffa::bytes::Buf::remaining(buf) < len { return Err(::buffa::DecodeError::UnexpectedEof); }
+                                let mut packed = ::buffa::bytes::Buf::take(&mut *buf, len);
+                                let element_tag = ::buffa::encoding::Tag::new(tag.field_number(), ::buffa::encoding::WireType::Varint);
+                                while ::buffa::bytes::Buf::has_remaining(&packed) {
+                                    self.__wire_merge_element(element_tag, &mut packed, ctx, false)?;
+                                }
+                                return Ok(());
+                            }
+                        }
+                    };
+                    if groups.values().any(|group| group & (1 << 31) != 0) {
+                        retained.block.stmts.insert(0, split);
+                    }
+                    retained.sig.ident = format_ident!("__wire_merge_field");
+                    retained
+                        .sig
+                        .inputs
+                        .push(syn::parse_quote!(check_current: bool));
+                    if groups.values().any(|group| group & (1 << 31) != 0) {
+                        let mut element = retained.clone();
+                        element.block.stmts.remove(0);
+                        element.sig.ident = format_ident!("__wire_merge_element");
+                        repeated_merge = Some(element);
+                    }
+                    retained_merge = Some(retained);
+                    f.block = if view {
+                        syn::parse_quote!({
+                            self.__wire_merge_field(tag, cur, before_tag, ctx, true)
+                        })
+                    } else {
+                        syn::parse_quote!({ self.__wire_merge_field(tag, buf, ctx, true) })
+                    };
+                    f.attrs.retain(|attr| !attr.path().is_ident("inline"));
+                    f.attrs.push(syn::parse_quote!(#[inline]));
+                } else if view && f.sig.ident == "to_owned_from_source" {
+                    let body = f.block.clone();
+                    f.block = syn::parse_quote!({
+                        let mut owned = (|| -> ::core::result::Result<Self::Owned, ::buffa::DecodeError> #body)()?;
+                        if self.__buffa_unknown_fields.active() {
+                            let view_known = self.__wire_known();
+                            let owned_known = owned.__wire_known();
+                            owned.__buffa_unknown_fields.rebase(&view_known, &owned_known, Self::__wire_group, Self::__wire_expected);
+                        }
+                        Ok(owned)
+                    });
+                }
+            }
+            // Known-only batches call the static decoder directly. Keeping
+            // its activation check here avoids a cold wrapper call per field,
+            // without inlining the recursive decoder into either route.
+            // Repeated enums retain their packed-occurrence splitting wrapper.
+            let batch_merge = if groups.values().any(|group| group & (1 << 31) != 0) {
+                if view {
+                    quote!(cur = self.__wire_merge_field(tag, cur, before_tag, ctx, false)?;)
+                } else {
+                    quote!(self.__wire_merge_field(tag, buf, ctx, false)?;)
+                }
+            } else if view {
+                quote! {
+                    if !self.__buffa_unknown_fields.active() {
+                        cur = self.__wire_merge(tag, cur, before_tag, ctx)?;
+                        if !self.__buffa_unknown_fields.is_empty() {
+                            #runtime::begin_view(&mut #runtime::Adapter(self), ctx)?;
+                        }
+                    } else {
+                        cur = self.__wire_merge_field(tag, cur, before_tag, ctx, false)?;
+                    }
+                }
+            } else {
+                quote! {
+                    if !self.__buffa_unknown_fields.active() {
+                        self.__wire_merge(tag, buf, ctx)?;
+                        if !self.__buffa_unknown_fields.is_empty() {
+                            #runtime::begin_owned(&mut #runtime::Adapter(self), ctx)?;
+                        }
+                    } else {
+                        self.__wire_merge_field(tag, buf, ctx, false)?;
+                    }
+                }
+            };
+            // One exclusive borrow covers the whole loop: public fields cannot
+            // change between its iterations. Reconcile edits at the first
+            // field, then rebuild the baseline once when the batch ends.
+            // Rebuilding a message-valued oneof after every fragment copies
+            // its growing repeated fields quadratically. Retain raw events
+            // throughout the batch, including before an eventual decode error.
+            // Direct single-field calls still check on every invocation.
+            // Keep each batch loop shared by decode entry points and nested
+            // merge adapters rather than expanding it into every caller.
+            item.items.push(if view {
+                syn::parse_quote! {
+                    #[inline(never)]
+                    fn merge_into_view(&mut self, buf: &'a [u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<(), ::buffa::DecodeError> {
+                        let mut cur = buf;
+                        if cur.is_empty() { return Ok(()); }
+                        if !cur.is_empty() && self.__buffa_unknown_fields.active() {
+                            #runtime::reconcile_view(&mut #runtime::Adapter(self), ctx)?;
+                        }
+                        let result = (|| {
+                            while !cur.is_empty() {
+                                let before_tag = cur;
+                                let tag = ::buffa::encoding::Tag::decode(&mut cur)?;
+                                #batch_merge
+                            }
+                            Ok(())
+                        })();
+                        let completed = if result.is_ok() && self.__buffa_unknown_fields.active() {
+                            #runtime::complete_view_batch(&mut #runtime::Adapter(self), ctx)
+                        } else { Ok(()) };
+                        result.and(completed)
+                    }
+                }
+            } else {
+                syn::parse_quote! {
+                    #[inline(never)]
+                    fn merge_to_limit(&mut self, buf: &mut impl ::buffa::bytes::Buf, ctx: ::buffa::DecodeContext<'_>, limit: usize) -> ::core::result::Result<(), ::buffa::DecodeError> {
+                        if buf.remaining() <= limit { return Ok(()); }
+                        if buf.remaining() > limit && self.__buffa_unknown_fields.active() {
+                            #runtime::reconcile_owned(&mut #runtime::Adapter(self), ctx)?;
+                        }
+                        let result = (|| {
+                            while buf.remaining() > limit {
+                                let tag = ::buffa::encoding::Tag::decode(buf)?;
+                                #batch_merge
+                            }
+                            Ok(())
+                        })();
+                        let completed = if result.is_ok() && self.__buffa_unknown_fields.active() {
+                            #runtime::complete_owned_batch(&mut #runtime::Adapter(self), ctx)
+                        } else { Ok(()) };
+                        result.and(completed)
+                    }
+                }
+            });
+            if !view {
+                item.items.push(syn::parse_quote! {
+                    fn merge_group(&mut self, buf: &mut impl ::buffa::bytes::Buf, ctx: ::buffa::DecodeContext<'_>, field_number: u32) -> ::core::result::Result<(), ::buffa::DecodeError> {
+                        let ctx = ctx.descend()?;
+                        let mut first = true;
+                        let result = (|| { loop {
+                            if !buf.has_remaining() {
+                                return Err(::buffa::DecodeError::UnexpectedEof);
+                            }
+                            let tag = ::buffa::encoding::Tag::decode(buf)?;
+                            if tag.wire_type() == ::buffa::encoding::WireType::EndGroup {
+                                return if tag.field_number() == field_number {
+                                    Ok(())
+                                } else {
+                                    Err(::buffa::DecodeError::InvalidEndGroup(tag.field_number()))
+                                };
+                            }
+                            if first && self.__buffa_unknown_fields.active() {
+                                #runtime::reconcile_owned(&mut #runtime::Adapter(self), ctx)?;
+                            }
+                            first = false;
+                            self.__wire_merge_field(tag, buf, ctx, false)?;
+                        } })();
+                        let completed = if result.is_ok() && !first && self.__buffa_unknown_fields.active() {
+                            #runtime::complete_owned_batch(&mut #runtime::Adapter(self), ctx)
+                        } else { Ok(()) };
+                        result.and(completed)
+                    }
+                });
+            }
+            let replay_owner = format_ident!("{name}");
+            let replay_merge = if view {
+                quote! {
+                    while !cur.is_empty() {
+                        let before = cur;
+                        let tag = ::buffa::encoding::Tag::decode(&mut cur)?;
+                        cur = expected.__wire_merge(tag, cur, before, replay_ctx)?;
+                    }
+                }
+            } else {
+                quote! {
+                    while !cur.is_empty() {
+                        let tag = ::buffa::encoding::Tag::decode(&mut cur)?;
+                        expected.__wire_merge(tag, &mut cur, replay_ctx)?;
+                    }
+                }
+            };
+            let replay_body = if let Some(values) = enum_values.get(&name) {
+                let tags = values.iter().map(|value| {
+                    let tuple: syn::ExprTuple =
+                        syn::parse2(value.clone()).expect("enum projection tuple");
+                    tuple.elems[0].clone()
+                });
+                quote!({ #runtime::enum_replay(raw, &[#(#tags),*], ctx) })
+            } else {
+                quote!({
+                    // Completed input already passed the caller's depth and
+                    // unknown limits. Replay transfers its remaining element
+                    // budget; the codecs charge repeated entries and journals.
+                    // Also debit one slot per replayed unknown from this cell,
+                    // bounding temporary unknown metadata without charging
+                    // singular payloads or packed scalars excluded by buffa.
+                    let remaining = ctx.and_then(|ctx| ctx.remaining_element_memory()).unwrap_or(usize::MAX);
+                    let budget = ::core::cell::Cell::new(remaining);
+                    let replay_ctx = ::buffa::DecodeContext::new(u32::MAX, &budget).with_element_memory(&budget);
+                    let result = (|| {
+                        let mut expected = #replay_owner::default();
+                        let mut cur = raw;
+                        #replay_merge
+                        expected.__wire_snapshot(Some(replay_ctx))
+                    })();
+                    if let Some(ctx) = ctx {
+                        ctx.register_element_memory(remaining.saturating_sub(budget.get()))?;
+                    }
+                    result
+                })
+            };
+            helpers.push(syn::parse_quote! {
+                impl #impl_generics #ty #where_clause {
+                    #[cold]
+                    #[inline(never)]
+                    fn __wire_expected(raw: &[u8], ctx: ::core::option::Option<::buffa::DecodeContext<'_>>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> #replay_body
+                    #merge
+                    #retained_merge
+                    #repeated_merge
+                    #[inline]
+                    fn __wire_group(tag: u32) -> u32 {
+                        match tag { #(#cases)* _ => 0 }
+                    }
+                }
+            });
+            let canonical = if !view
+                && header_snapshot
+                && scope == "message::interactive_message::"
+                && name == "Header"
+            {
+                quote!(crate::whatsapp::__wire_snapshot::canonical)
+            } else {
+                quote!(#runtime::no_canonical_projection)
+            };
+            // Raw completion is valid for views only after the current eager
+            // representation passes the same support guard as its snapshot.
+            // Other policy requests must not traverse the receiver.
+            let view_canonical = if header_snapshot
+                && scope == "message::interactive_message::"
+                && name == "HeaderView"
+            {
+                quote! {
+                    if _completed_batch
+                        && crate::whatsapp::__wire_snapshot::supported(self.0)
+                    {
+                        crate::whatsapp::__wire_snapshot::canonical
+                    } else {
+                        #runtime::no_canonical_projection
+                    }
+                }
+            } else {
+                quote!(#runtime::no_canonical_projection)
+            };
+            helpers.push(if view {
+                syn::parse_quote! {
+                    impl #impl_generics #runtime::ViewCodec<'a> for #runtime::Adapter<'_, #ty> #where_clause {
+                        fn storage(&mut self) -> &mut #runtime::ViewStorage<'a> { &mut self.0.__buffa_unknown_fields }
+                        fn policy(&self, _completed_batch: bool) -> #runtime::Policy {
+                            #runtime::Policy { groups: <#ty>::__wire_group, growth: <#ty>::__wire_growth, replay: <#ty>::__wire_expected, canonical: #view_canonical }
+                        }
+                        fn known(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> { self.0.__wire_known_for_decode(ctx) }
+                        fn merge(&mut self, tag: ::buffa::encoding::Tag, cur: &'a [u8], before: &'a [u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> { self.0.__wire_merge(tag, cur, before, ctx) }
+                    }
+                }
+            } else {
+                syn::parse_quote! {
+                    impl #impl_generics #runtime::OwnedCodec for #runtime::Adapter<'_, #ty> #where_clause {
+                        fn storage(&mut self) -> &mut #runtime::Storage { &mut self.0.__buffa_unknown_fields }
+                        fn policy(&self) -> #runtime::Policy {
+                            #runtime::Policy { groups: <#ty>::__wire_group, growth: <#ty>::__wire_growth, replay: <#ty>::__wire_expected, canonical: #canonical }
+                        }
+                        fn known(&self, ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<::buffa::alloc::vec::Vec<u8>, ::buffa::DecodeError> { self.0.__wire_known_for_decode(ctx) }
+                        fn merge_slice(&mut self, tag: ::buffa::encoding::Tag, buf: &mut &[u8], ctx: ::buffa::DecodeContext<'_>) -> ::core::result::Result<(), ::buffa::DecodeError> { self.0.__wire_merge(tag, buf, ctx) }
+                    }
+                }
+            });
+        }
+        if item.trait_.is_none() {
+            for member in &mut item.items {
+                let syn::ImplItem::Fn(method) = member else {
+                    continue;
+                };
+                if let Some(field) = method.sig.ident.to_string().strip_prefix("with_")
+                    && let Some((_, group)) = groups
+                        .iter()
+                        .find(|(name, _)| name.trim_start_matches("r#") == field)
+                {
+                    let last = method.block.stmts.pop().expect("setter returns self");
+                    method
+                        .block
+                        .stmts
+                        .push(syn::parse_quote!(self.__buffa_unknown_fields.force(#group);));
+                    method.block.stmts.push(last);
+                }
+            }
+        }
+    }
+    items.extend(helpers);
+}

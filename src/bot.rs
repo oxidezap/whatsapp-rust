@@ -229,11 +229,13 @@ impl MessageContext {
         use wacore_binary::JidExt;
         let needs_participant =
             self.info.source.is_group || self.info.source.chat.is_status_broadcast();
-        wa::MessageKey {
-            remote_jid: Some(self.info.source.chat.to_string()),
-            from_me: Some(self.info.source.is_from_me),
-            id: Some(self.info.id.to_string()),
-            participant: needs_participant.then(|| self.info.source.sender.to_string()),
+        {
+            let mut proto = wa::MessageKey::default();
+            proto.remote_jid = Some(self.info.source.chat.to_string());
+            proto.from_me = Some(self.info.source.is_from_me);
+            proto.id = Some(self.info.id.to_string());
+            proto.participant = needs_participant.then(|| self.info.source.sender.to_string());
+            proto
         }
     }
 
@@ -2093,11 +2095,12 @@ mod tests {
         let http_client = MockHttpClient;
 
         let custom_os = "CustomOS".to_string();
-        let custom_version = wa::device_props::AppVersion {
-            primary: Some(99),
-            secondary: Some(88),
-            tertiary: Some(77),
-            ..Default::default()
+        let custom_version = {
+            let mut proto = wa::device_props::AppVersion::default();
+            proto.primary = Some(99);
+            proto.secondary = Some(88);
+            proto.tertiary = Some(77);
+            proto
         };
 
         let bot = Bot::builder()
@@ -2163,11 +2166,12 @@ mod tests {
         let transport = TokioWebSocketTransportFactory::new();
         let http_client = MockHttpClient;
 
-        let custom_version = wa::device_props::AppVersion {
-            primary: Some(99),
-            secondary: Some(88),
-            tertiary: Some(77),
-            ..Default::default()
+        let custom_version = {
+            let mut proto = wa::device_props::AppVersion::default();
+            proto.primary = Some(99);
+            proto.secondary = Some(88);
+            proto.tertiary = Some(77);
+            proto
         };
 
         let bot = Bot::builder()
@@ -2242,11 +2246,12 @@ mod tests {
         let http_client = MockHttpClient;
 
         let custom_os = "macOS".to_string();
-        let custom_version = wa::device_props::AppVersion {
-            primary: Some(2),
-            secondary: Some(0),
-            tertiary: Some(0),
-            ..Default::default()
+        let custom_version = {
+            let mut proto = wa::device_props::AppVersion::default();
+            proto.primary = Some(2);
+            proto.secondary = Some(0);
+            proto.tertiary = Some(0);
+            proto
         };
         let custom_platform = wa::device_props::PlatformType::SAFARI;
 
@@ -2515,9 +2520,10 @@ mod tests {
             .await
             .expect("Failed to build bot");
 
-        let original = Arc::new(wa::Message {
-            conversation: Some("ping".to_string()),
-            ..Default::default()
+        let original = Arc::new({
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("ping".to_string());
+            proto
         });
         let original_ptr = Arc::as_ptr(&original);
 
@@ -2556,10 +2562,11 @@ mod tests {
         assert!(ctx.comment_target.is_none());
 
         // A newsletter comment: the parent post key rides the same way.
-        let parent = wa::MessageKey {
-            remote_jid: Some("120363000000000001@newsletter".to_string()),
-            id: Some("POSTID01".to_string()),
-            ..Default::default()
+        let parent = {
+            let mut proto = wa::MessageKey::default();
+            proto.remote_jid = Some("120363000000000001@newsletter".to_string());
+            proto.id = Some("POSTID01".to_string());
+            proto
         };
         let comment = wacore::types::events::InboundMessage::builder()
             .message(Arc::new(wa::Message::default()))

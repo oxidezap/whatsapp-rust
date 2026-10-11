@@ -122,13 +122,14 @@ impl<'a> QuickReplies<'a> {
         // WA Web's builders hardcode `associatedLabelIds: []`, and its receiving
         // side never reads the field. A repeated field left at its default
         // encodes to the same bytes, so this is what the official client sends.
-        let value = quick_reply_value(wa::sync_action_value::QuickReplyAction {
-            shortcut: Some(shortcut.to_string()),
-            message: Some(message.to_string()),
-            keywords,
-            count: Some(count),
-            deleted: Some(false),
-            ..Default::default()
+        let value = quick_reply_value({
+            let mut proto = wa::sync_action_value::QuickReplyAction::default();
+            proto.shortcut = Some(shortcut.to_string());
+            proto.message = Some(message.to_string());
+            proto.keywords = keywords;
+            proto.count = Some(count);
+            proto.deleted = Some(false);
+            proto
         });
         self.client
             .send_app_state_action(&schemas::QUICK_REPLY, &[id], &value)
@@ -146,13 +147,14 @@ impl<'a> QuickReplies<'a> {
             ));
         }
         debug!("Deleting quick reply {}", fingerprint_id(id));
-        let value = quick_reply_value(wa::sync_action_value::QuickReplyAction {
-            shortcut: Some(String::new()),
-            message: Some(String::new()),
-            keywords: Vec::new(),
-            count: Some(0),
-            deleted: Some(true),
-            ..Default::default()
+        let value = quick_reply_value({
+            let mut proto = wa::sync_action_value::QuickReplyAction::default();
+            proto.shortcut = Some(String::new());
+            proto.message = Some(String::new());
+            proto.keywords = Vec::new();
+            proto.count = Some(0);
+            proto.deleted = Some(true);
+            proto
         });
         self.client
             .send_app_state_action(&schemas::QUICK_REPLY, &[id], &value)
@@ -161,10 +163,11 @@ impl<'a> QuickReplies<'a> {
 }
 
 fn quick_reply_value(action: wa::sync_action_value::QuickReplyAction) -> wa::SyncActionValue {
-    wa::SyncActionValue {
-        quick_reply_action: buffa::MessageField::some(action),
-        timestamp: Some(wacore::time::now_millis()),
-        ..Default::default()
+    {
+        let mut proto = wa::SyncActionValue::default();
+        proto.quick_reply_action = buffa::MessageField::some(action);
+        proto.timestamp = Some(wacore::time::now_millis());
+        proto
     }
 }
 
@@ -226,13 +229,14 @@ mod tests {
 
     #[test]
     fn set_and_delete_values_match_wa_web() {
-        let set = quick_reply_value(wa::sync_action_value::QuickReplyAction {
-            shortcut: Some("hello".into()),
-            message: Some("Hi there".into()),
-            keywords: vec!["greeting".into()],
-            count: Some(3),
-            deleted: Some(false),
-            ..Default::default()
+        let set = quick_reply_value({
+            let mut proto = wa::sync_action_value::QuickReplyAction::default();
+            proto.shortcut = Some("hello".into());
+            proto.message = Some("Hi there".into());
+            proto.keywords = vec!["greeting".into()];
+            proto.count = Some(3);
+            proto.deleted = Some(false);
+            proto
         });
         let act = set.quick_reply_action.as_option().expect("action is set");
         assert_eq!(act.shortcut.as_deref(), Some("hello"));
@@ -243,13 +247,14 @@ mod tests {
         assert!(set.timestamp.is_some());
 
         // The delete mutation clears the payload and flips `deleted`.
-        let del = quick_reply_value(wa::sync_action_value::QuickReplyAction {
-            shortcut: Some(String::new()),
-            message: Some(String::new()),
-            keywords: Vec::new(),
-            count: Some(0),
-            deleted: Some(true),
-            ..Default::default()
+        let del = quick_reply_value({
+            let mut proto = wa::sync_action_value::QuickReplyAction::default();
+            proto.shortcut = Some(String::new());
+            proto.message = Some(String::new());
+            proto.keywords = Vec::new();
+            proto.count = Some(0);
+            proto.deleted = Some(true);
+            proto
         });
         let act = del.quick_reply_action.as_option().expect("action is set");
         assert_eq!(act.deleted, Some(true));
@@ -348,11 +353,12 @@ mod tests {
         let m = Mutation {
             index: vec!["quick_reply".into(), "1700000000".into()],
             operation: wa::syncd_mutation::SyncdOperation::Set,
-            action_value: Some(quick_reply_value(wa::sync_action_value::QuickReplyAction {
-                shortcut: Some("hello".into()),
-                message: Some("Hi there".into()),
-                deleted: Some(false),
-                ..Default::default()
+            action_value: Some(quick_reply_value({
+                let mut proto = wa::sync_action_value::QuickReplyAction::default();
+                proto.shortcut = Some("hello".into());
+                proto.message = Some("Hi there".into());
+                proto.deleted = Some(false);
+                proto
             })),
         };
         let (outcome, events) = run(&m);
@@ -373,9 +379,10 @@ mod tests {
         let m = Mutation {
             index: vec!["quick_reply".into(), "1700000000".into()],
             operation: wa::syncd_mutation::SyncdOperation::Set,
-            action_value: Some(quick_reply_value(wa::sync_action_value::QuickReplyAction {
-                deleted: Some(true),
-                ..Default::default()
+            action_value: Some(quick_reply_value({
+                let mut proto = wa::sync_action_value::QuickReplyAction::default();
+                proto.deleted = Some(true);
+                proto
             })),
         };
         let (outcome, events) = run(&m);

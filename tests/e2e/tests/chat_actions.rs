@@ -191,9 +191,10 @@ async fn test_star_message() -> anyhow::Result<()> {
     client_a.wait_for_app_state_sync().await?;
 
     // A sends a message to B (we only need the msg_id for starring)
-    let msg = wa::Message {
-        conversation: Some("Star this message!".to_string()),
-        ..Default::default()
+    let msg = {
+        let mut proto = wa::Message::default();
+        proto.conversation = Some("Star this message!".to_string());
+        proto
     };
     let msg_id = client_a
         .client
@@ -234,9 +235,10 @@ async fn test_unstar_message() -> anyhow::Result<()> {
     client_a.wait_for_app_state_sync().await?;
 
     // A sends a message
-    let msg = wa::Message {
-        conversation: Some("Star then unstar".to_string()),
-        ..Default::default()
+    let msg = {
+        let mut proto = wa::Message::default();
+        proto.conversation = Some("Star then unstar".to_string());
+        proto
     };
     let msg_id = client_a
         .client
@@ -387,9 +389,10 @@ async fn test_delete_message_for_me() -> anyhow::Result<()> {
 
     client_a.wait_for_app_state_sync().await?;
 
-    let msg = wa::Message {
-        conversation: Some("Delete me locally".to_string()),
-        ..Default::default()
+    let msg = {
+        let mut proto = wa::Message::default();
+        proto.conversation = Some("Delete me locally".to_string());
+        proto
     };
     let msg_id = client_a
         .client

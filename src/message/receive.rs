@@ -1800,7 +1800,7 @@ impl Client {
             ));
         }
 
-        let (original_msg, history_sync_taken) =
+        let (mut msg, history_sync_taken) =
             wacore::messages::decode_unpadded_detached_history_sync(source)?;
         log::debug!(
             "[msg:{}] Successfully decrypted message from {}: type={} [batch path]",
@@ -1811,7 +1811,7 @@ impl Client {
 
         // Validate DSM presence against sender identity
         // (WAWebHandleMsgError.DeviceSentMessageError)
-        if original_msg.device_sent_message.is_set() && !info.source.is_from_me {
+        if msg.device_sent_message.is_set() && !info.source.is_from_me {
             warn!(
                 "[msg:{}] DeviceSentMessage present but sender {} is not self",
                 info.id,
@@ -1823,7 +1823,7 @@ impl Client {
         // phashV2 of the broadcast recipients in deviceSentMessage.phash.
         // Recompute over our <participants> view and warn on divergence. We log
         // only (no drop) until the participant hash form is confirmed live.
-        if let Some(dsm) = original_msg.device_sent_message.as_option()
+        if let Some(dsm) = msg.device_sent_message.as_option()
             && let Some(expected) = dsm.phash.as_deref()
             && !info.bcl_participants.is_empty()
             && !wacore::messages::MessageUtils::validate_bcl_hash(&info.bcl_participants, expected)
@@ -1839,7 +1839,11 @@ impl Client {
         // the primary device). The actual content (reactions, text, etc.)
         // is nested inside device_sent_message.message and must be
         // extracted before protocol checks or dispatch.
-        let mut msg = wacore::messages::unwrap_device_sent(original_msg);
+        // Keep ordinary messages in their decode slot; only a DSM needs the
+        // consuming unwrap operation and replacement of the root message.
+        if msg.device_sent_message.is_set() {
+            msg = wacore::messages::unwrap_device_sent(msg);
+        }
         let skdm_only = wacore::messages::is_sender_key_distribution_only(&mut msg);
 
         if info.source.chat.is_group()
@@ -1957,8 +1961,10 @@ impl Client {
         // `WAWebHandleHistorySyncNotification` gates on `isMePrimaryNonLid`.
         if let Some(history_sync) = history_sync_taken {
             if info.source.is_from_me {
-                self.handle_history_sync(info.id.to_string(), history_sync)
-                    .await;
+                // This uncommon notification's future carries the detached
+                // history metadata. Keep it out of every ordinary chat lane,
+                // as with the PDO recovery future above.
+                Box::pin(self.handle_history_sync(info.id.to_string(), history_sync)).await;
             } else {
                 warn!(
                     "[msg:{}] Dropping history_sync_notification from non-self sender {}",

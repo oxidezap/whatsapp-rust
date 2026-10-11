@@ -147,9 +147,10 @@ async fn test_cross_collection_mutations() -> anyhow::Result<()> {
     info!("Mute (regular_high) succeeded");
 
     // Star requires a message ID — send a message first
-    let msg = wa::Message {
-        conversation: Some("Cross-collection test".to_string()),
-        ..Default::default()
+    let msg = {
+        let mut proto = wa::Message::default();
+        proto.conversation = Some("Cross-collection test".to_string());
+        proto
     };
     let msg_id = client_a
         .client
@@ -193,9 +194,10 @@ async fn test_star_received_message() -> anyhow::Result<()> {
     client_b.wait_for_app_state_sync().await?;
 
     // A sends a message to B
-    let msg = wa::Message {
-        conversation: Some("Star me from the other side!".to_string()),
-        ..Default::default()
+    let msg = {
+        let mut proto = wa::Message::default();
+        proto.conversation = Some("Star me from the other side!".to_string());
+        proto
     };
     client_a.client.send_message(jid_b.clone(), msg).await?;
     info!("Client A sent message to B");

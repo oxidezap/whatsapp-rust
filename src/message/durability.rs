@@ -145,9 +145,10 @@ mod tests {
 
     fn test_item(id: &str) -> InboundMessage {
         InboundMessage::builder()
-            .message(Arc::new(wa::Message {
-                conversation: Some("hello".to_string()),
-                ..Default::default()
+            .message(Arc::new({
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("hello".to_string());
+                proto
             }))
             .info(test_info(id))
             .build()
@@ -200,9 +201,10 @@ mod tests {
         client
             .commit_inbound_batch(
                 Arc::from([InboundMessage::builder()
-                    .message(Arc::new(wa::Message {
-                        conversation: Some("hello".to_string()),
-                        ..Default::default()
+                    .message(Arc::new({
+                        let mut proto = wa::Message::default();
+                        proto.conversation = Some("hello".to_string());
+                        proto
                     }))
                     .info(Arc::clone(&info))
                     .build()]),

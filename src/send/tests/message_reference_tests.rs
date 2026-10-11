@@ -64,11 +64,13 @@ async fn raw_and_typed_message_transport_match() {
     let (peer, _) = seed_dm_wire_namespace_state(&client).await;
     let target =
         MessageRef::new(&peer, MessageId::new("OWN_ORIGINAL").unwrap(), None, true).unwrap();
-    let raw_key = wa::MessageKey {
-        remote_jid: Some(peer.to_string()),
-        from_me: Some(true),
-        id: Some("OWN_ORIGINAL".into()),
-        participant: None,
+    let raw_key = {
+        let mut proto = wa::MessageKey::default();
+        proto.remote_jid = Some(peer.to_string());
+        proto.from_me = Some(true);
+        proto.id = Some("OWN_ORIGINAL".into());
+        proto.participant = None;
+        proto
     };
     let raw = [
         client
@@ -112,11 +114,13 @@ async fn raw_and_typed_message_transport_match() {
     ];
     let status = info(&Jid::status_broadcast(), &peer, false);
     let status_ref = MessageRef::from_info(&status).unwrap();
-    let status_key = wa::MessageKey {
-        remote_jid: Some(Jid::status_broadcast().to_string()),
-        from_me: Some(false),
-        id: Some("CONTENT_TARGET".into()),
-        participant: Some(peer.to_string()),
+    let status_key = {
+        let mut proto = wa::MessageKey::default();
+        proto.remote_jid = Some(Jid::status_broadcast().to_string());
+        proto.from_me = Some(false);
+        proto.id = Some("CONTENT_TARGET".into());
+        proto.participant = Some(peer.to_string());
+        proto
     };
     let raw_status = client
         .send_reaction_raw(Jid::status_broadcast(), status_key, "👍")
@@ -214,9 +218,10 @@ async fn received_context_and_own_result_references_borrow_metadata() {
     let (client, _) = crate::test_utils::create_iq_test_client().await;
     let chat: Jid = "120363000000000001@g.us".parse().unwrap();
     let sender: Jid = "100000000000001@lid".parse().unwrap();
-    let parent = wa::MessageKey {
-        id: Some("PARENT_POST".into()),
-        ..Default::default()
+    let parent = {
+        let mut proto = wa::MessageKey::default();
+        proto.id = Some("PARENT_POST".into());
+        proto
     };
     let inbound = InboundMessage::builder()
         .message(Arc::new(wa::Message::text("comment")))

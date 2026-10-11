@@ -990,10 +990,11 @@ mod tests {
     }
 
     fn props(os: Option<&str>, pt: Option<wa::device_props::PlatformType>) -> wa::DeviceProps {
-        wa::DeviceProps {
-            os: os.map(|s| s.to_string()),
-            platform_type: pt,
-            ..Default::default()
+        {
+            let mut proto = wa::DeviceProps::default();
+            proto.os = os.map(|s| s.to_string());
+            proto.platform_type = pt;
+            proto
         }
     }
 
@@ -1562,10 +1563,11 @@ mod tests {
 
     #[test]
     fn android_device_props_emit_server_accepted_companion_hello() {
-        let props = wa::DeviceProps {
-            os: Some("Android".into()),
-            platform_type: Some(wa::device_props::PlatformType::ANDROID_PHONE),
-            ..Default::default()
+        let props = {
+            let mut proto = wa::DeviceProps::default();
+            proto.os = Some("Android".into());
+            proto.platform_type = Some(wa::device_props::PlatformType::ANDROID_PHONE);
+            proto
         };
         let (pid, pdisp) = resolve_companion_platform(&PairCodeOptions::default(), &props);
         assert_eq!(pid, CompanionWebClientType::Chrome);
@@ -1585,10 +1587,11 @@ mod tests {
 
     #[test]
     fn explicit_options_override_id_and_display_follows() {
-        let props = wa::DeviceProps {
-            os: Some("Android".into()),
-            platform_type: Some(wa::device_props::PlatformType::ANDROID_PHONE),
-            ..Default::default()
+        let props = {
+            let mut proto = wa::DeviceProps::default();
+            proto.os = Some("Android".into());
+            proto.platform_type = Some(wa::device_props::PlatformType::ANDROID_PHONE);
+            proto
         };
         let opts = PairCodeOptions {
             platform_id: Some(CompanionWebClientType::Chrome),

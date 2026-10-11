@@ -1989,16 +1989,22 @@ mod tests {
         use waproto::whatsapp as wa;
 
         let client: Arc<Client> = create_test_client().await;
-        let payload = wa::LIDMigrationMappingSyncPayload {
-            pn_to_lid_mappings: vec![wa::LIDMigrationMapping {
-                pn: 5511987650001,
-                assigned_lid: 111000011112222,
-                latest_lid: None,
-            }],
-            chat_db_migration_timestamp: None,
+        let payload = {
+            let mut proto = wa::LIDMigrationMappingSyncPayload::default();
+            proto.pn_to_lid_mappings = vec![{
+                let mut proto = wa::LIDMigrationMapping::default();
+                proto.pn = 5511987650001;
+                proto.assigned_lid = 111000011112222;
+                proto.latest_lid = None;
+                proto
+            }];
+            proto.chat_db_migration_timestamp = None;
+            proto
         };
-        let sync = wa::LIDMigrationMappingSyncMessage {
-            encoded_mapping_payload: Some(payload.encode_to_vec()),
+        let sync = {
+            let mut proto = wa::LIDMigrationMappingSyncMessage::default();
+            proto.encoded_mapping_payload = Some(payload.encode_to_vec());
+            proto
         };
 
         // Prop off: mappings are learned but the account stays unmigrated,
@@ -2070,8 +2076,10 @@ mod tests {
 
         // Missing payload: WA Web treats this as malformed; nothing is
         // learned and the account must not flip to migrated.
-        let missing = wa::LIDMigrationMappingSyncMessage {
-            encoded_mapping_payload: None,
+        let missing = {
+            let mut proto = wa::LIDMigrationMappingSyncMessage::default();
+            proto.encoded_mapping_payload = None;
+            proto
         };
         client.handle_lid_migration_mapping_sync(&missing).await;
         assert!(
@@ -2081,8 +2089,10 @@ mod tests {
                 .lid_migrated
         );
 
-        let malformed = wa::LIDMigrationMappingSyncMessage {
-            encoded_mapping_payload: Some(vec![0xFF, 0xFF, 0xFF]),
+        let malformed = {
+            let mut proto = wa::LIDMigrationMappingSyncMessage::default();
+            proto.encoded_mapping_payload = Some(vec![0xFF, 0xFF, 0xFF]);
+            proto
         };
         client.handle_lid_migration_mapping_sync(&malformed).await;
         assert!(
@@ -2099,16 +2109,22 @@ mod tests {
         use waproto::whatsapp as wa;
 
         let client: Arc<Client> = create_test_client().await;
-        let payload = wa::LIDMigrationMappingSyncPayload {
-            pn_to_lid_mappings: vec![wa::LIDMigrationMapping {
-                pn: 5511987650001,
-                assigned_lid: 111000011112222,
-                latest_lid: Some(999000099990000),
-            }],
-            chat_db_migration_timestamp: None,
+        let payload = {
+            let mut proto = wa::LIDMigrationMappingSyncPayload::default();
+            proto.pn_to_lid_mappings = vec![{
+                let mut proto = wa::LIDMigrationMapping::default();
+                proto.pn = 5511987650001;
+                proto.assigned_lid = 111000011112222;
+                proto.latest_lid = Some(999000099990000);
+                proto
+            }];
+            proto.chat_db_migration_timestamp = None;
+            proto
         };
-        let sync = wa::LIDMigrationMappingSyncMessage {
-            encoded_mapping_payload: Some(payload.encode_to_vec()),
+        let sync = {
+            let mut proto = wa::LIDMigrationMappingSyncMessage::default();
+            proto.encoded_mapping_payload = Some(payload.encode_to_vec());
+            proto
         };
 
         client.handle_lid_migration_mapping_sync(&sync).await;
@@ -2536,20 +2552,22 @@ mod tests {
         use wacore::libsignal::protocol::{SessionRecord, SessionState};
         use waproto::whatsapp::SessionStructure;
 
-        let state = SessionState::from_session_structure(SessionStructure {
-            session_version: Some(3),
-            local_identity_public: None,
-            remote_identity_public: None,
-            root_key: None,
-            previous_counter: Some(0),
-            sender_chain: buffa::MessageField::none(),
-            receiver_chains: vec![],
-            pending_pre_key: buffa::MessageField::none(),
-            remote_registration_id: Some(remote_regid),
-            local_registration_id: Some(0),
-            alice_base_key: Some(vec![]),
-            needs_refresh: None,
-            pending_key_exchange: buffa::MessageField::none(),
+        let state = SessionState::from_session_structure({
+            let mut proto = SessionStructure::default();
+            proto.session_version = Some(3);
+            proto.local_identity_public = None;
+            proto.remote_identity_public = None;
+            proto.root_key = None;
+            proto.previous_counter = Some(0);
+            proto.sender_chain = buffa::MessageField::none();
+            proto.receiver_chains = vec![];
+            proto.pending_pre_key = buffa::MessageField::none();
+            proto.remote_registration_id = Some(remote_regid);
+            proto.local_registration_id = Some(0);
+            proto.alice_base_key = Some(vec![]);
+            proto.needs_refresh = None;
+            proto.pending_key_exchange = buffa::MessageField::none();
+            proto
         });
         SessionRecord::new(state)
             .serialize()

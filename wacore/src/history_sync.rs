@@ -2378,30 +2378,36 @@ mod tests {
 
     #[test]
     fn call_records_are_harvested_in_wire_order_without_losing_other_fields() {
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            call_log_records: vec![
-                wa::CallLogRecord {
-                    call_id: Some("placed".into()),
-                    start_time: Some(1_700_000_000),
-                    ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto.call_log_records = vec![
+                {
+                    let mut proto = wa::CallLogRecord::default();
+                    proto.call_id = Some("placed".into());
+                    proto.start_time = Some(1_700_000_000);
+                    proto
                 },
                 wa::CallLogRecord::default(),
-                wa::CallLogRecord {
-                    call_id: Some("received".into()),
-                    ..Default::default()
+                {
+                    let mut proto = wa::CallLogRecord::default();
+                    proto.call_id = Some("received".into());
+                    proto
                 },
-            ],
-            nct_salt: Some(vec![42; 32]),
-            conversations: vec![wa::Conversation {
-                id: "15550000002@s.whatsapp.net".into(),
-                ..Default::default()
-            }],
-            pushnames: vec![wa::Pushname {
-                id: Some("15550000001@s.whatsapp.net".into()),
-                pushname: Some("Synthetic".into()),
-            }],
-            ..Default::default()
+            ];
+            proto.nct_salt = Some(vec![42; 32]);
+            proto.conversations = vec![{
+                let mut proto = wa::Conversation::default();
+                proto.id = "15550000002@s.whatsapp.net".into();
+                proto
+            }];
+            proto.pushnames = vec![{
+                let mut proto = wa::Pushname::default();
+                proto.id = Some("15550000001@s.whatsapp.net".into());
+                proto.pushname = Some("Synthetic".into());
+                proto
+            }];
+            proto
         };
         let result =
             process_history_sync(encode_and_compress(&hs), Some("15550000001"), true).unwrap();
@@ -2428,14 +2434,16 @@ mod tests {
     #[test]
     fn call_record_count_budget_preserves_raw_and_other_harvest() {
         for count in [MAX_CALL_RECORDS, MAX_CALL_RECORDS + 1] {
-            let hs = wa::HistorySync {
-                call_log_records: vec![wa::CallLogRecord::default(); count],
-                nct_salt: Some(vec![42; 32]),
-                conversations: vec![wa::Conversation {
-                    id: "15550000002@s.whatsapp.net".into(),
-                    ..Default::default()
-                }],
-                ..Default::default()
+            let hs = {
+                let mut proto = wa::HistorySync::default();
+                proto.call_log_records = vec![wa::CallLogRecord::default(); count];
+                proto.nct_salt = Some(vec![42; 32]);
+                proto.conversations = vec![{
+                    let mut proto = wa::Conversation::default();
+                    proto.id = "15550000002@s.whatsapp.net".into();
+                    proto
+                }];
+                proto
             };
             let result = process_history_sync(encode_and_compress(&hs), None, true).unwrap();
             assert_eq!(
@@ -2456,9 +2464,10 @@ mod tests {
     fn call_record_wire_byte_budget_is_cumulative_and_checked_before_decode() {
         let sized_record = |bytes: usize| {
             // field11 tag + three-byte string length; no production payload.
-            let record = wa::CallLogRecord {
-                call_id: Some("x".repeat(bytes - 4)),
-                ..Default::default()
+            let record = {
+                let mut proto = wa::CallLogRecord::default();
+                proto.call_id = Some("x".repeat(bytes - 4));
+                proto
             };
             assert_eq!(record.encode_to_vec().len(), bytes);
             record
@@ -2475,10 +2484,11 @@ mod tests {
                 0,
             ),
         ] {
-            let hs = wa::HistorySync {
-                call_log_records: records,
-                nct_salt: Some(vec![42]),
-                ..Default::default()
+            let hs = {
+                let mut proto = wa::HistorySync::default();
+                proto.call_log_records = records;
+                proto.nct_salt = Some(vec![42]);
+                proto
             };
             let result = process_history_sync(encode_and_compress(&hs), None, true).unwrap();
             assert_eq!(result.call_log_records.len(), expected);
@@ -2594,13 +2604,16 @@ mod tests {
     /// without aborting the sync.
     #[test]
     fn test_lid_mappings_extracted_and_invalid_skipped() {
-        let mapping = |pn: &str, lid: &str| wa::PhoneNumberToLIDMapping {
-            pn_jid: Some(pn.to_string()),
-            lid_jid: Some(lid.to_string()),
+        let mapping = |pn: &str, lid: &str| {
+            let mut proto = wa::PhoneNumberToLIDMapping::default();
+            proto.pn_jid = Some(pn.to_string());
+            proto.lid_jid = Some(lid.to_string());
+            proto
         };
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            phone_number_to_lid_mappings: vec![
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto.phone_number_to_lid_mappings = vec![
                 mapping("5511777776666@s.whatsapp.net", "111222333444555@lid"),
                 // Legacy PN namespace, still a phone.
                 mapping("15550001111@c.us", "222333444555666@lid"),
@@ -2613,12 +2626,14 @@ mod tests {
                     "5511777776666@s.whatsapp.net",
                 ),
                 // Incomplete: skipped.
-                wa::PhoneNumberToLIDMapping {
-                    pn_jid: Some("5511000000000@s.whatsapp.net".to_string()),
-                    lid_jid: None,
+                {
+                    let mut proto = wa::PhoneNumberToLIDMapping::default();
+                    proto.pn_jid = Some("5511000000000@s.whatsapp.net".to_string());
+                    proto.lid_jid = None;
+                    proto
                 },
-            ],
-            ..Default::default()
+            ];
+            proto
         };
 
         let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
@@ -2646,21 +2661,24 @@ mod tests {
 
     #[test]
     fn test_lid_mappings_extracted_from_conversations() {
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            conversations: vec![
-                wa::Conversation {
-                    id: "111222333444555@lid".into(),
-                    pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
-                    ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto.conversations = vec![
+                {
+                    let mut proto = wa::Conversation::default();
+                    proto.id = "111222333444555@lid".into();
+                    proto.pn_jid = Some("12025550143@s.whatsapp.net".to_string());
+                    proto
                 },
-                wa::Conversation {
-                    id: "12025550144@s.whatsapp.net".into(),
-                    lid_jid: Some("222333444555666@lid".to_string()),
-                    ..Default::default()
+                {
+                    let mut proto = wa::Conversation::default();
+                    proto.id = "12025550144@s.whatsapp.net".into();
+                    proto.lid_jid = Some("222333444555666@lid".to_string());
+                    proto
                 },
-            ],
-            ..Default::default()
+            ];
+            proto
         };
 
         let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
@@ -2755,14 +2773,16 @@ mod tests {
     /// mapping code already treats as the PN and LID families.
     #[test]
     fn hosted_conversations_yield_mappings() {
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            conversations: vec![wa::Conversation {
-                id: "111222333444555@hosted.lid".into(),
-                pn_jid: Some("12025550143@hosted".to_string()),
-                ..Default::default()
-            }],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto.conversations = vec![{
+                let mut proto = wa::Conversation::default();
+                proto.id = "111222333444555@hosted.lid".into();
+                proto.pn_jid = Some("12025550143@hosted".to_string());
+                proto
+            }];
+            proto
         };
 
         let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
@@ -2780,18 +2800,22 @@ mod tests {
     /// LID whose two sources disagree — whichever order the wire put them in.
     #[test]
     fn bulk_mappings_outrank_conversation_mappings_for_the_same_lid() {
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            conversations: vec![wa::Conversation {
-                id: "111222333444555@lid".into(),
-                pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
-                ..Default::default()
-            }],
-            phone_number_to_lid_mappings: vec![wa::PhoneNumberToLIDMapping {
-                pn_jid: Some("12025550199@s.whatsapp.net".to_string()),
-                lid_jid: Some("111222333444555@lid".to_string()),
-            }],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto.conversations = vec![{
+                let mut proto = wa::Conversation::default();
+                proto.id = "111222333444555@lid".into();
+                proto.pn_jid = Some("12025550143@s.whatsapp.net".to_string());
+                proto
+            }];
+            proto.phone_number_to_lid_mappings = vec![{
+                let mut proto = wa::PhoneNumberToLIDMapping::default();
+                proto.pn_jid = Some("12025550199@s.whatsapp.net".to_string());
+                proto.lid_jid = Some("111222333444555@lid".to_string());
+                proto
+            }];
+            proto
         };
 
         let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
@@ -2809,18 +2833,22 @@ mod tests {
     /// Agreement between the two sources must not produce two pairs.
     #[test]
     fn agreeing_sources_collapse_to_one_mapping() {
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            conversations: vec![wa::Conversation {
-                id: "111222333444555@lid".into(),
-                pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
-                ..Default::default()
-            }],
-            phone_number_to_lid_mappings: vec![wa::PhoneNumberToLIDMapping {
-                pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
-                lid_jid: Some("111222333444555@lid".to_string()),
-            }],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto.conversations = vec![{
+                let mut proto = wa::Conversation::default();
+                proto.id = "111222333444555@lid".into();
+                proto.pn_jid = Some("12025550143@s.whatsapp.net".to_string());
+                proto
+            }];
+            proto.phone_number_to_lid_mappings = vec![{
+                let mut proto = wa::PhoneNumberToLIDMapping::default();
+                proto.pn_jid = Some("12025550143@s.whatsapp.net".to_string());
+                proto.lid_jid = Some("111222333444555@lid".to_string());
+                proto
+            }];
+            proto
         };
 
         let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
@@ -2833,14 +2861,16 @@ mod tests {
     /// carrying only `lidJid` silently loses its pair.
     #[test]
     fn legacy_pn_conversation_ids_yield_mappings() {
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            conversations: vec![wa::Conversation {
-                id: "15550001111@c.us".into(),
-                lid_jid: Some("222333444555666@lid".to_string()),
-                ..Default::default()
-            }],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto.conversations = vec![{
+                let mut proto = wa::Conversation::default();
+                proto.id = "15550001111@c.us".into();
+                proto.lid_jid = Some("222333444555666@lid".to_string());
+                proto
+            }];
+            proto
         };
 
         let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
@@ -2859,18 +2889,22 @@ mod tests {
     /// by wire order, which protobuf does not define.
     #[test]
     fn bulk_mappings_outrank_conversation_mappings_for_the_same_phone() {
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            conversations: vec![wa::Conversation {
-                id: "999888777666555@lid".into(),
-                pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
-                ..Default::default()
-            }],
-            phone_number_to_lid_mappings: vec![wa::PhoneNumberToLIDMapping {
-                pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
-                lid_jid: Some("111222333444555@lid".to_string()),
-            }],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto.conversations = vec![{
+                let mut proto = wa::Conversation::default();
+                proto.id = "999888777666555@lid".into();
+                proto.pn_jid = Some("12025550143@s.whatsapp.net".to_string());
+                proto
+            }];
+            proto.phone_number_to_lid_mappings = vec![{
+                let mut proto = wa::PhoneNumberToLIDMapping::default();
+                proto.pn_jid = Some("12025550143@s.whatsapp.net".to_string());
+                proto.lid_jid = Some("111222333444555@lid".to_string());
+                proto
+            }];
+            proto
         };
 
         let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
@@ -2888,18 +2922,22 @@ mod tests {
     /// Independent pairs must survive the conflict pass untouched.
     #[test]
     fn non_conflicting_mappings_are_all_kept() {
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            conversations: vec![wa::Conversation {
-                id: "222333444555666@lid".into(),
-                pn_jid: Some("12025550144@s.whatsapp.net".to_string()),
-                ..Default::default()
-            }],
-            phone_number_to_lid_mappings: vec![wa::PhoneNumberToLIDMapping {
-                pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
-                lid_jid: Some("111222333444555@lid".to_string()),
-            }],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto.conversations = vec![{
+                let mut proto = wa::Conversation::default();
+                proto.id = "222333444555666@lid".into();
+                proto.pn_jid = Some("12025550144@s.whatsapp.net".to_string());
+                proto
+            }];
+            proto.phone_number_to_lid_mappings = vec![{
+                let mut proto = wa::PhoneNumberToLIDMapping::default();
+                proto.pn_jid = Some("12025550143@s.whatsapp.net".to_string());
+                proto.lid_jid = Some("111222333444555@lid".to_string());
+                proto
+            }];
+            proto
         };
 
         let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
@@ -2944,30 +2982,34 @@ mod tests {
     }
 
     fn wrap_in_history_msg(web_msg: &wa::WebMessageInfo) -> Vec<u8> {
-        wa::HistorySyncMsg {
-            message: buffa::MessageField::some(web_msg.clone()),
-            ..Default::default()
+        {
+            let mut proto = wa::HistorySyncMsg::default();
+            proto.message = buffa::MessageField::some(web_msg.clone());
+            proto
         }
         .encode_to_vec()
     }
 
     fn secret_ctx(secret: &[u8]) -> wa::MessageContextInfo {
-        wa::MessageContextInfo {
-            message_secret: Some(secret.to_vec()),
-            ..Default::default()
+        {
+            let mut proto = wa::MessageContextInfo::default();
+            proto.message_secret = Some(secret.to_vec());
+            proto
         }
     }
 
     fn keyed(id: &str, from_me: bool, message: Option<wa::Message>) -> wa::WebMessageInfo {
-        wa::WebMessageInfo {
-            key: buffa::MessageField::some(wa::MessageKey {
-                from_me: Some(from_me),
-                id: Some(id.to_string()),
-                ..Default::default()
-            }),
-            message: message.map(buffa::MessageField::some).unwrap_or_default(),
-            message_timestamp: Some(1_700_000_777),
-            ..Default::default()
+        {
+            let mut proto = wa::WebMessageInfo::default();
+            proto.key = buffa::MessageField::some({
+                let mut proto = wa::MessageKey::default();
+                proto.from_me = Some(from_me);
+                proto.id = Some(id.to_string());
+                proto
+            });
+            proto.message = message.map(buffa::MessageField::some).unwrap_or_default();
+            proto.message_timestamp = Some(1_700_000_777);
+            proto
         }
     }
 
@@ -2988,10 +3030,7 @@ mod tests {
                     for forwarded in [None, Some(false), Some(true)] {
                         let mut message = wa::Message::default();
                         message.$field.get_or_insert_default().context_info =
-                            buffa::MessageField::some(wa::ContextInfo {
-                                is_forwarded: forwarded,
-                                ..Default::default()
-                            });
+                            buffa::MessageField::some({ let mut context = wa::ContextInfo::default(); context.is_forwarded = forwarded; context });
                         let encoded = message.encode_to_vec();
                         let level = scan_message_level(&encoded).ok().unwrap();
                         assert_eq!(level.forwarded_carriers,
@@ -3011,20 +3050,14 @@ mod tests {
                     // Merge presence/overwrite semantics within each carrier.
                     let mut forwarded = wa::Message::default();
                     forwarded.$field.get_or_insert_default().context_info =
-                        buffa::MessageField::some(wa::ContextInfo {
-                            is_forwarded: Some(true),
-                            ..Default::default()
-                        });
+                        buffa::MessageField::some({ let mut context = wa::ContextInfo::default(); context.is_forwarded = Some(true); context });
                     let mut absent = wa::Message::default();
                     absent.$field.get_or_insert_default();
                     let mut raw = forwarded.encode_to_vec();
                     raw.extend_from_slice(&absent.encode_to_vec());
                     assert_eq!(scan_message_level(&raw).ok().unwrap().forwarded_carriers, 1_u64 << slot);
                     absent.$field.get_or_insert_default().context_info =
-                        buffa::MessageField::some(wa::ContextInfo {
-                            is_forwarded: Some(false),
-                            ..Default::default()
-                        });
+                        buffa::MessageField::some({ let mut context = wa::ContextInfo::default(); context.is_forwarded = Some(false); context });
                     raw.extend_from_slice(&absent.encode_to_vec());
                     assert_eq!(scan_message_level(&raw).ok().unwrap().forwarded_carriers, 0);
                     assert!(!message_context_is_forwarded(&wa::Message::decode_from_slice(&raw).unwrap()));
@@ -3051,11 +3084,11 @@ mod tests {
             .extended_text_message
             .get_or_insert_default()
             .context_info = buffa::MessageField::some(wa::ContextInfo::default());
-        message.music_message.get_or_insert_default().context_info =
-            buffa::MessageField::some(wa::ContextInfo {
-                is_forwarded: Some(true),
-                ..Default::default()
-            });
+        message.music_message.get_or_insert_default().context_info = buffa::MessageField::some({
+            let mut proto = wa::ContextInfo::default();
+            proto.is_forwarded = Some(true);
+            proto
+        });
         assert!(!message.is_forwarded()); // First context is not forwarded.
         assert!(message_context_is_forwarded(&message)); // History inspects all.
         assert_ne!(
@@ -3068,16 +3101,19 @@ mod tests {
 
         // History already unwraps recursively, unlike the public ordered pass.
         for device_first in [true, false] {
-            let device = |inner| wa::Message {
-                device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
-                    message: buffa::MessageField::some(inner),
-                    ..Default::default()
-                }),
-                ..Default::default()
+            let device = |inner| {
+                let mut proto = wa::Message::default();
+                proto.device_sent_message = buffa::MessageField::some({
+                    let mut proto = wa::message::DeviceSentMessage::default();
+                    proto.message = buffa::MessageField::some(inner);
+                    proto
+                });
+                proto
             };
-            let ephemeral = |inner| wa::Message {
-                ephemeral_message: buffa::MessageField::some(fp(inner)),
-                ..Default::default()
+            let ephemeral = |inner| {
+                let mut proto = wa::Message::default();
+                proto.ephemeral_message = buffa::MessageField::some(fp(inner));
+                proto
             };
             let wrapped = if device_first {
                 device(ephemeral(message.clone()))
@@ -3094,8 +3130,10 @@ mod tests {
     }
 
     fn fp(inner: wa::Message) -> wa::message::FutureProofMessage {
-        wa::message::FutureProofMessage {
-            message: buffa::MessageField::some(inner),
+        {
+            let mut proto = wa::message::FutureProofMessage::default();
+            proto.message = buffa::MessageField::some(inner);
+            proto
         }
     }
 
@@ -3115,9 +3153,10 @@ mod tests {
             wrap_in_history_msg(&keyed(
                 "A1",
                 false,
-                Some(wa::Message {
-                    conversation: Some("oi".into()),
-                    ..Default::default()
+                Some({
+                    let mut proto = wa::Message::default();
+                    proto.conversation = Some("oi".into());
+                    proto
                 }),
             )),
         );
@@ -3129,18 +3168,20 @@ mod tests {
             wrap_in_history_msg(&keyed(
                 "A3",
                 false,
-                Some(wa::Message {
-                    message_context_info: buffa::MessageField::some(secret_ctx(&secret)),
-                    ..Default::default()
+                Some({
+                    let mut proto = wa::Message::default();
+                    proto.message_context_info = buffa::MessageField::some(secret_ctx(&secret));
+                    proto
                 }),
             )),
         );
         let mut wm = keyed(
             "A4",
             false,
-            Some(wa::Message {
-                message_context_info: buffa::MessageField::some(secret_ctx(&[0xBB; 32])),
-                ..Default::default()
+            Some({
+                let mut proto = wa::Message::default();
+                proto.message_context_info = buffa::MessageField::some(secret_ctx(&[0xBB; 32]));
+                proto
             }),
         );
         wm.message_secret = Some(secret.clone());
@@ -3151,19 +3192,20 @@ mod tests {
                 wrap_in_history_msg(&keyed(
                     "A5",
                     false,
-                    Some(wa::Message {
-                        extended_text_message: buffa::MessageField::some(
-                            wa::message::ExtendedTextMessage {
-                                text: Some("x".into()),
-                                context_info: buffa::MessageField::some(wa::ContextInfo {
-                                    is_forwarded: Some(fwd),
-                                    ..Default::default()
-                                }),
-                                ..Default::default()
-                            },
-                        ),
-                        message_context_info: buffa::MessageField::some(secret_ctx(&secret)),
-                        ..Default::default()
+                    Some({
+                        let mut proto = wa::Message::default();
+                        proto.extended_text_message = buffa::MessageField::some({
+                            let mut proto = wa::message::ExtendedTextMessage::default();
+                            proto.text = Some("x".into());
+                            proto.context_info = buffa::MessageField::some({
+                                let mut proto = wa::ContextInfo::default();
+                                proto.is_forwarded = Some(fwd);
+                                proto
+                            });
+                            proto
+                        });
+                        proto.message_context_info = buffa::MessageField::some(secret_ctx(&secret));
+                        proto
                     }),
                 )),
             );
@@ -3172,18 +3214,22 @@ mod tests {
             let mut wm = keyed(
                 "A6",
                 false,
-                Some(wa::Message {
-                    ephemeral_message: buffa::MessageField::some(fp(wa::Message {
-                        image_message: buffa::MessageField::some(wa::message::ImageMessage {
-                            context_info: buffa::MessageField::some(wa::ContextInfo {
-                                is_forwarded: Some(true),
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    })),
-                    ..Default::default()
+                Some({
+                    let mut proto = wa::Message::default();
+                    proto.ephemeral_message = buffa::MessageField::some(fp({
+                        let mut proto = wa::Message::default();
+                        proto.image_message = buffa::MessageField::some({
+                            let mut proto = wa::message::ImageMessage::default();
+                            proto.context_info = buffa::MessageField::some({
+                                let mut proto = wa::ContextInfo::default();
+                                proto.is_forwarded = Some(true);
+                                proto
+                            });
+                            proto
+                        });
+                        proto
+                    }));
+                    proto
                 }),
             );
             wm.message_secret = Some(secret.clone());
@@ -3194,18 +3240,19 @@ mod tests {
             wrap_in_history_msg(&keyed(
                 "A7",
                 false,
-                Some(wa::Message {
-                    view_once_message_v2: buffa::MessageField::some(fp(wa::Message {
-                        poll_creation_message: buffa::MessageField::some(
-                            wa::message::PollCreationMessage {
-                                name: Some("poll".into()),
-                                ..Default::default()
-                            },
-                        ),
-                        ..Default::default()
-                    })),
-                    message_context_info: buffa::MessageField::some(secret_ctx(&secret)),
-                    ..Default::default()
+                Some({
+                    let mut proto = wa::Message::default();
+                    proto.view_once_message_v2 = buffa::MessageField::some(fp({
+                        let mut proto = wa::Message::default();
+                        proto.poll_creation_message = buffa::MessageField::some({
+                            let mut proto = wa::message::PollCreationMessage::default();
+                            proto.name = Some("poll".into());
+                            proto
+                        });
+                        proto
+                    }));
+                    proto.message_context_info = buffa::MessageField::some(secret_ctx(&secret));
+                    proto
                 }),
             )),
         );
@@ -3213,26 +3260,28 @@ mod tests {
             let mut wm = keyed(
                 "A8",
                 true,
-                Some(wa::Message {
-                    device_sent_message: buffa::MessageField::some(
-                        wa::message::DeviceSentMessage {
-                            destination_jid: Some("5511777776666@s.whatsapp.net".into()),
-                            message: buffa::MessageField::some(wa::Message {
-                                ephemeral_message: buffa::MessageField::some(fp(wa::Message {
-                                    event_message: buffa::MessageField::some(
-                                        wa::message::EventMessage {
-                                            name: Some("ev".into()),
-                                            ..Default::default()
-                                        },
-                                    ),
-                                    ..Default::default()
-                                })),
-                                ..Default::default()
-                            }),
-                            phash: None,
-                        },
-                    ),
-                    ..Default::default()
+                Some({
+                    let mut proto = wa::Message::default();
+                    proto.device_sent_message = buffa::MessageField::some({
+                        let mut proto = wa::message::DeviceSentMessage::default();
+                        proto.destination_jid = Some("5511777776666@s.whatsapp.net".into());
+                        proto.message = buffa::MessageField::some({
+                            let mut proto = wa::Message::default();
+                            proto.ephemeral_message = buffa::MessageField::some(fp({
+                                let mut proto = wa::Message::default();
+                                proto.event_message = buffa::MessageField::some({
+                                    let mut proto = wa::message::EventMessage::default();
+                                    proto.name = Some("ev".into());
+                                    proto
+                                });
+                                proto
+                            }));
+                            proto
+                        });
+                        proto.phash = None;
+                        proto
+                    });
+                    proto
                 }),
             );
             wm.message_secret = Some(secret.clone());
@@ -3243,13 +3292,15 @@ mod tests {
             wrap_in_history_msg(&keyed(
                 "A9",
                 false,
-                Some(wa::Message {
-                    message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
-                        message_secret: Some(secret.clone()),
-                        bot_metadata: buffa::MessageField::some(wa::BotMetadata::default()),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
+                Some({
+                    let mut proto = wa::Message::default();
+                    proto.message_context_info = buffa::MessageField::some({
+                        let mut proto = wa::MessageContextInfo::default();
+                        proto.message_secret = Some(secret.clone());
+                        proto.bot_metadata = buffa::MessageField::some(wa::BotMetadata::default());
+                        proto
+                    });
+                    proto
                 }),
             )),
         );
@@ -3257,15 +3308,19 @@ mod tests {
             let mut wm = keyed(
                 "A10",
                 false,
-                Some(wa::Message {
-                    ephemeral_message: buffa::MessageField::some(fp(wa::Message {
-                        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
-                            bot_metadata: buffa::MessageField::some(wa::BotMetadata::default()),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    })),
-                    ..Default::default()
+                Some({
+                    let mut proto = wa::Message::default();
+                    proto.ephemeral_message = buffa::MessageField::some(fp({
+                        let mut proto = wa::Message::default();
+                        proto.message_context_info = buffa::MessageField::some({
+                            let mut proto = wa::MessageContextInfo::default();
+                            proto.bot_metadata =
+                                buffa::MessageField::some(wa::BotMetadata::default());
+                            proto
+                        });
+                        proto
+                    }));
+                    proto
                 }),
             );
             wm.message_secret = Some(secret.clone());
@@ -3276,48 +3331,54 @@ mod tests {
             wrap_in_history_msg(&keyed(
                 "A11",
                 false,
-                Some(wa::Message {
-                    edited_message: buffa::MessageField::some(fp(wa::Message {
-                        poll_creation_message_v3: buffa::MessageField::some(
-                            wa::message::PollCreationMessage::default(),
-                        ),
-                        ..Default::default()
-                    })),
-                    message_context_info: buffa::MessageField::some(secret_ctx(&secret)),
-                    ..Default::default()
+                Some({
+                    let mut proto = wa::Message::default();
+                    proto.edited_message = buffa::MessageField::some(fp({
+                        let mut proto = wa::Message::default();
+                        proto.poll_creation_message_v3 =
+                            buffa::MessageField::some(wa::message::PollCreationMessage::default());
+                        proto
+                    }));
+                    proto.message_context_info = buffa::MessageField::some(secret_ctx(&secret));
+                    proto
                 }),
             )),
         );
         add("missing key id, top secret", {
-            let wm = wa::WebMessageInfo {
-                key: buffa::MessageField::some(wa::MessageKey {
-                    from_me: Some(false),
-                    ..Default::default()
-                }),
-                message_secret: Some(secret.clone()),
-                ..Default::default()
+            let wm = {
+                let mut proto = wa::WebMessageInfo::default();
+                proto.key = buffa::MessageField::some({
+                    let mut proto = wa::MessageKey::default();
+                    proto.from_me = Some(false);
+                    proto
+                });
+                proto.message_secret = Some(secret.clone());
+                proto
             };
             wrap_in_history_msg(&wm)
         });
         add("no key at all, top secret", {
-            let wm = wa::WebMessageInfo {
-                message_secret: Some(secret.clone()),
-                ..Default::default()
+            let wm = {
+                let mut proto = wa::WebMessageInfo::default();
+                proto.message_secret = Some(secret.clone());
+                proto
             };
             wrap_in_history_msg(&wm)
         });
         add("participants on key and web msg", {
-            let wm = wa::WebMessageInfo {
-                key: buffa::MessageField::some(wa::MessageKey {
-                    from_me: Some(false),
-                    id: Some("A12".to_string()),
-                    participant: Some("5511888889999@s.whatsapp.net".into()),
-                    ..Default::default()
-                }),
-                participant: Some("5511888887777@s.whatsapp.net".into()),
-                message_secret: Some(secret.clone()),
-                message_timestamp: Some(1_700_000_777),
-                ..Default::default()
+            let wm = {
+                let mut proto = wa::WebMessageInfo::default();
+                proto.key = buffa::MessageField::some({
+                    let mut proto = wa::MessageKey::default();
+                    proto.from_me = Some(false);
+                    proto.id = Some("A12".to_string());
+                    proto.participant = Some("5511888889999@s.whatsapp.net".into());
+                    proto
+                });
+                proto.participant = Some("5511888887777@s.whatsapp.net".into());
+                proto.message_secret = Some(secret.clone());
+                proto.message_timestamp = Some(1_700_000_777);
+                proto
             };
             wrap_in_history_msg(&wm)
         });
@@ -3333,20 +3394,23 @@ mod tests {
         });
 
         // Hand-crafted wire shapes prost's encoder cannot produce.
-        let key_a12 = wa::MessageKey {
-            from_me: Some(false),
-            id: Some("R1".into()),
-            ..Default::default()
+        let key_a12 = {
+            let mut proto = wa::MessageKey::default();
+            proto.from_me = Some(false);
+            proto.id = Some("R1".into());
+            proto
         }
         .encode_to_vec();
-        let msg_plain = wa::Message {
-            conversation: Some("a".into()),
-            ..Default::default()
+        let msg_plain = {
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("a".into());
+            proto
         }
         .encode_to_vec();
-        let msg_secret = wa::Message {
-            message_context_info: buffa::MessageField::some(secret_ctx(&secret)),
-            ..Default::default()
+        let msg_secret = {
+            let mut proto = wa::Message::default();
+            proto.message_context_info = buffa::MessageField::some(secret_ctx(&secret));
+            proto
         }
         .encode_to_vec();
 
@@ -3358,9 +3422,10 @@ mod tests {
         emit(&mut raw, tags::history_sync_msg::MESSAGE, &web);
         add("repeated message field (merge -> fallback)", raw);
 
-        let key_b = wa::MessageKey {
-            participant: Some("5511888889999@s.whatsapp.net".into()),
-            ..Default::default()
+        let key_b = {
+            let mut proto = wa::MessageKey::default();
+            proto.participant = Some("5511888889999@s.whatsapp.net".into());
+            proto
         }
         .encode_to_vec();
         let mut web = Vec::new();
@@ -3443,17 +3508,20 @@ mod tests {
 
         // Repeated occurrences of the same carrier: prost merges their
         // contextInfo fields; the eager overwrite-when-present walk must agree.
-        let etm_fwd = wa::message::ExtendedTextMessage {
-            context_info: buffa::MessageField::some(wa::ContextInfo {
-                is_forwarded: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let etm_fwd = {
+            let mut proto = wa::message::ExtendedTextMessage::default();
+            proto.context_info = buffa::MessageField::some({
+                let mut proto = wa::ContextInfo::default();
+                proto.is_forwarded = Some(true);
+                proto
+            });
+            proto
         }
         .encode_to_vec();
-        let etm_plain = wa::message::ExtendedTextMessage {
-            text: Some("x".into()),
-            ..Default::default()
+        let etm_plain = {
+            let mut proto = wa::message::ExtendedTextMessage::default();
+            proto.text = Some("x".into());
+            proto
         }
         .encode_to_vec();
         for order in [[&etm_fwd, &etm_plain], [&etm_plain, &etm_fwd]] {
@@ -3461,9 +3529,10 @@ mod tests {
             for etm in order {
                 emit(&mut msg, tags::message::EXTENDED_TEXT_MESSAGE, etm);
             }
-            let mci = wa::MessageContextInfo {
-                message_secret: Some(secret.clone()),
-                ..Default::default()
+            let mci = {
+                let mut proto = wa::MessageContextInfo::default();
+                proto.message_secret = Some(secret.clone());
+                proto
             }
             .encode_to_vec();
             emit(&mut msg, tags::message::MESSAGE_CONTEXT_INFO, &mci);
@@ -3487,22 +3556,25 @@ mod tests {
         add("unknown group field (fallback to prost)", raw);
 
         // Repeated ephemeral wrapper occurrences: inner messages merge.
-        let eph_poll = wa::Message {
-            ephemeral_message: buffa::MessageField::some(fp(wa::Message {
-                poll_creation_message: buffa::MessageField::some(
-                    wa::message::PollCreationMessage::default(),
-                ),
-                ..Default::default()
-            })),
-            ..Default::default()
+        let eph_poll = {
+            let mut proto = wa::Message::default();
+            proto.ephemeral_message = buffa::MessageField::some(fp({
+                let mut proto = wa::Message::default();
+                proto.poll_creation_message =
+                    buffa::MessageField::some(wa::message::PollCreationMessage::default());
+                proto
+            }));
+            proto
         }
         .encode_to_vec();
-        let eph_text = wa::Message {
-            ephemeral_message: buffa::MessageField::some(fp(wa::Message {
-                conversation: Some("t".into()),
-                ..Default::default()
-            })),
-            ..Default::default()
+        let eph_text = {
+            let mut proto = wa::Message::default();
+            proto.ephemeral_message = buffa::MessageField::some(fp({
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("t".into());
+                proto
+            }));
+            proto
         }
         .encode_to_vec();
         let mut merged_msg = eph_poll.clone();
@@ -3552,11 +3624,11 @@ mod tests {
         // agree). Built iteratively from raw bytes: encoding a 120-deep owned
         // proto recurses per level and overflows the test stack.
         for depth in [50usize, 120] {
-            let mut msg = wa::Message {
-                poll_creation_message: buffa::MessageField::some(
-                    wa::message::PollCreationMessage::default(),
-                ),
-                ..Default::default()
+            let mut msg = {
+                let mut proto = wa::Message::default();
+                proto.poll_creation_message =
+                    buffa::MessageField::some(wa::message::PollCreationMessage::default());
+                proto
             }
             .encode_to_vec();
             for _ in 0..depth {
@@ -3566,10 +3638,11 @@ mod tests {
                 emit_len_field(&mut outer, tags::message::EPHEMERAL_MESSAGE, &fpm);
                 msg = outer;
             }
-            let key = wa::MessageKey {
-                from_me: Some(false),
-                id: Some("DEEP".into()),
-                ..Default::default()
+            let key = {
+                let mut proto = wa::MessageKey::default();
+                proto.from_me = Some(false);
+                proto.id = Some("DEEP".into());
+                proto
             }
             .encode_to_vec();
             let mut web = Vec::new();
@@ -3621,15 +3694,17 @@ mod tests {
         emit_len_field(&mut conv, tags::conversation::ID, chat.as_bytes());
         let total_msgs = 200usize;
         for i in 0..total_msgs {
-            let wm = wa::WebMessageInfo {
-                key: buffa::MessageField::some(wa::MessageKey {
-                    from_me: Some(false),
-                    id: Some(format!("MSG{i:04}")),
-                    ..Default::default()
-                }),
-                // Varied payload so zlib does not flatten the blob to nothing.
-                message_secret: Some(vec![(i % 251) as u8; 32]),
-                ..Default::default()
+            let wm = {
+                let mut proto = wa::WebMessageInfo::default();
+                proto.key = buffa::MessageField::some({
+                    let mut proto = wa::MessageKey::default();
+                    proto.from_me = Some(false);
+                    proto.id = Some(format!("MSG{i:04}"));
+                    proto
+                }); // Varied payload so zlib does not flatten the blob to nothing.
+
+                proto.message_secret = Some(vec![(i % 251) as u8; 32]);
+                proto
             }
             .encode_to_vec();
             let mut history_msg = Vec::new();
@@ -3678,14 +3753,16 @@ mod tests {
             out.extend_from_slice(v);
         };
 
-        let web_msg = wa::WebMessageInfo {
-            key: buffa::MessageField::some(wa::MessageKey {
-                from_me: Some(false),
-                id: Some("EARLY_MSG".into()),
-                ..Default::default()
-            }),
-            message_secret: Some(vec![0x22u8; 32]),
-            ..Default::default()
+        let web_msg = {
+            let mut proto = wa::WebMessageInfo::default();
+            proto.key = buffa::MessageField::some({
+                let mut proto = wa::MessageKey::default();
+                proto.from_me = Some(false);
+                proto.id = Some("EARLY_MSG".into());
+                proto
+            });
+            proto.message_secret = Some(vec![0x22u8; 32]);
+            proto
         }
         .encode_to_vec();
         let mut history_msg = Vec::new();
@@ -3736,23 +3813,27 @@ mod tests {
     /// by a LATER occurrence of a repeated message field still yields a record.
     #[test]
     fn test_secret_in_second_message_field_occurrence() {
-        let msg_without_secret = wa::Message {
-            conversation: Some("hi".into()),
-            ..Default::default()
+        let msg_without_secret = {
+            let mut proto = wa::Message::default();
+            proto.conversation = Some("hi".into());
+            proto
         }
         .encode_to_vec();
-        let msg_with_secret = wa::Message {
-            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
-                message_secret: Some(vec![0x11u8; 32]),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let msg_with_secret = {
+            let mut proto = wa::Message::default();
+            proto.message_context_info = buffa::MessageField::some({
+                let mut proto = wa::MessageContextInfo::default();
+                proto.message_secret = Some(vec![0x11u8; 32]);
+                proto
+            });
+            proto
         }
         .encode_to_vec();
-        let key = wa::MessageKey {
-            from_me: Some(false),
-            id: Some("DOUBLE_MSG".into()),
-            ..Default::default()
+        let key = {
+            let mut proto = wa::MessageKey::default();
+            proto.from_me = Some(false);
+            proto.id = Some("DOUBLE_MSG".into());
+            proto
         }
         .encode_to_vec();
 
@@ -3787,10 +3868,11 @@ mod tests {
     /// fails the decode), and must not panic the pre-scan.
     #[test]
     fn test_wrong_wire_type_secret_yields_no_record() {
-        let key = wa::MessageKey {
-            from_me: Some(false),
-            id: Some("BAD_WIRE".into()),
-            ..Default::default()
+        let key = {
+            let mut proto = wa::MessageKey::default();
+            proto.from_me = Some(false);
+            proto.id = Some("BAD_WIRE".into());
+            proto
         }
         .encode_to_vec();
 
@@ -3819,26 +3901,31 @@ mod tests {
     #[test]
     fn test_empty_secret_still_yields_record() {
         let chat = "5511777776666@s.whatsapp.net";
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            conversations: vec![wa::Conversation {
-                id: chat.into(),
-                messages: vec![wa::HistorySyncMsg {
-                    message: buffa::MessageField::some(wa::WebMessageInfo {
-                        key: buffa::MessageField::some(wa::MessageKey {
-                            remote_jid: Some(chat.to_string()),
-                            from_me: Some(false),
-                            id: Some("EMPTY_SECRET".to_string()),
-                            ..Default::default()
-                        }),
-                        message_secret: Some(Vec::new()),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto.conversations = vec![{
+                let mut proto = wa::Conversation::default();
+                proto.id = chat.into();
+                proto.messages = vec![{
+                    let mut proto = wa::HistorySyncMsg::default();
+                    proto.message = buffa::MessageField::some({
+                        let mut proto = wa::WebMessageInfo::default();
+                        proto.key = buffa::MessageField::some({
+                            let mut proto = wa::MessageKey::default();
+                            proto.remote_jid = Some(chat.to_string());
+                            proto.from_me = Some(false);
+                            proto.id = Some("EMPTY_SECRET".to_string());
+                            proto
+                        });
+                        proto.message_secret = Some(Vec::new());
+                        proto
+                    });
+                    proto
+                }];
+                proto
+            }];
+            proto
         };
 
         let compressed = encode_and_compress(&hs);
@@ -3850,10 +3937,11 @@ mod tests {
     #[test]
     fn test_nct_salt_extracted_from_history_sync() {
         let salt = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            nct_salt: Some(salt.clone()),
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto.nct_salt = Some(salt.clone());
+            proto
         };
 
         let compressed = encode_and_compress(&hs);
@@ -3864,9 +3952,10 @@ mod tests {
 
     #[test]
     fn test_nct_salt_none_when_absent() {
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto
         };
 
         let compressed = encode_and_compress(&hs);
@@ -3878,14 +3967,17 @@ mod tests {
     #[test]
     fn test_nct_salt_and_pushname_coexist() {
         let salt = vec![0x01, 0x02, 0x03];
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            nct_salt: Some(salt.clone()),
-            pushnames: vec![wa::Pushname {
-                id: Some("15550000000@s.whatsapp.net".into()),
-                pushname: Some("TestUser".into()),
-            }],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto.nct_salt = Some(salt.clone());
+            proto.pushnames = vec![{
+                let mut proto = wa::Pushname::default();
+                proto.id = Some("15550000000@s.whatsapp.net".into());
+                proto.pushname = Some("TestUser".into());
+                proto
+            }];
+            proto
         };
 
         let compressed = encode_and_compress(&hs);
@@ -3909,13 +4001,16 @@ mod tests {
             "15550000000.3@s.whatsapp.net", // legacy dotted device suffix
             "15550000000.3@c.us",
         ] {
-            let hs = wa::HistorySync {
-                sync_type: wa::history_sync::HistorySyncType::PUSH_NAME,
-                pushnames: vec![wa::Pushname {
-                    id: Some(id.into()),
-                    pushname: Some("TestUser".into()),
-                }],
-                ..Default::default()
+            let hs = {
+                let mut proto = wa::HistorySync::default();
+                proto.sync_type = wa::history_sync::HistorySyncType::PUSH_NAME;
+                proto.pushnames = vec![{
+                    let mut proto = wa::Pushname::default();
+                    proto.id = Some(id.into());
+                    proto.pushname = Some("TestUser".into());
+                    proto
+                }];
+                proto
             };
             let result = process_history_sync(encode_and_compress(&hs), Some(own), false).unwrap();
             assert_eq!(
@@ -3928,13 +4023,16 @@ mod tests {
 
     #[test]
     fn another_users_pushname_is_not_taken_as_our_own() {
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::PUSH_NAME,
-            pushnames: vec![wa::Pushname {
-                id: Some("15551111111@s.whatsapp.net".into()),
-                pushname: Some("Someone Else".into()),
-            }],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::PUSH_NAME;
+            proto.pushnames = vec![{
+                let mut proto = wa::Pushname::default();
+                proto.id = Some("15551111111@s.whatsapp.net".into());
+                proto.pushname = Some("Someone Else".into());
+                proto
+            }];
+            proto
         };
         let result =
             process_history_sync(encode_and_compress(&hs), Some("15550000000"), false).unwrap();
@@ -3947,13 +4045,16 @@ mod tests {
     /// real name, and the account announces `-` on every reconnect.
     #[test]
     fn the_absent_pushname_sentinel_is_not_a_name() {
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::PUSH_NAME,
-            pushnames: vec![wa::Pushname {
-                id: Some("15550000000@s.whatsapp.net".into()),
-                pushname: Some("-".into()),
-            }],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::PUSH_NAME;
+            proto.pushnames = vec![{
+                let mut proto = wa::Pushname::default();
+                proto.id = Some("15550000000@s.whatsapp.net".into());
+                proto.pushname = Some("-".into());
+                proto
+            }];
+            proto
         };
         let result =
             process_history_sync(encode_and_compress(&hs), Some("15550000000"), false).unwrap();
@@ -3966,13 +4067,16 @@ mod tests {
     /// A name that merely contains the sentinel is a real name.
     #[test]
     fn a_name_containing_a_dash_is_kept() {
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::PUSH_NAME,
-            pushnames: vec![wa::Pushname {
-                id: Some("15550000000@s.whatsapp.net".into()),
-                pushname: Some("Jean-Luc".into()),
-            }],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::PUSH_NAME;
+            proto.pushnames = vec![{
+                let mut proto = wa::Pushname::default();
+                proto.id = Some("15550000000@s.whatsapp.net".into());
+                proto.pushname = Some("Jean-Luc".into());
+                proto
+            }];
+            proto
         };
         let result =
             process_history_sync(encode_and_compress(&hs), Some("15550000000"), false).unwrap();
@@ -3990,13 +4094,16 @@ mod tests {
             "15550000000@newsletter",
             "15550000000@g.us",
         ] {
-            let hs = wa::HistorySync {
-                sync_type: wa::history_sync::HistorySyncType::PUSH_NAME,
-                pushnames: vec![wa::Pushname {
-                    id: Some(id.into()),
-                    pushname: Some("Not Us".into()),
-                }],
-                ..Default::default()
+            let hs = {
+                let mut proto = wa::HistorySync::default();
+                proto.sync_type = wa::history_sync::HistorySyncType::PUSH_NAME;
+                proto.pushnames = vec![{
+                    let mut proto = wa::Pushname::default();
+                    proto.id = Some(id.into());
+                    proto.pushname = Some("Not Us".into());
+                    proto
+                }];
+                proto
             };
             let result =
                 process_history_sync(encode_and_compress(&hs), Some("15550000000"), false).unwrap();
@@ -4023,49 +4130,59 @@ mod tests {
         let participant = "5511888889999@s.whatsapp.net";
         let top_level_secret = vec![0x44u8; 32];
         let context_secret = vec![0x55u8; 32];
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            conversations: vec![wa::Conversation {
-                id: chat.into(),
-                messages: vec![
-                    wa::HistorySyncMsg {
-                        message: buffa::MessageField::some(wa::WebMessageInfo {
-                            key: buffa::MessageField::some(wa::MessageKey {
-                                remote_jid: Some(chat.to_string()),
-                                from_me: Some(false),
-                                id: Some("HIST_TOP_LEVEL".to_string()),
-                                participant: Some(participant.to_string()),
-                            }),
-                            message_secret: Some(top_level_secret.clone()),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto.conversations = vec![{
+                let mut proto = wa::Conversation::default();
+                proto.id = chat.into();
+                proto.messages = vec![
+                    {
+                        let mut proto = wa::HistorySyncMsg::default();
+                        proto.message = buffa::MessageField::some({
+                            let mut proto = wa::WebMessageInfo::default();
+                            proto.key = buffa::MessageField::some({
+                                let mut proto = wa::MessageKey::default();
+                                proto.remote_jid = Some(chat.to_string());
+                                proto.from_me = Some(false);
+                                proto.id = Some("HIST_TOP_LEVEL".to_string());
+                                proto.participant = Some(participant.to_string());
+                                proto
+                            });
+                            proto.message_secret = Some(top_level_secret.clone());
+                            proto
+                        });
+                        proto
                     },
-                    wa::HistorySyncMsg {
-                        message: buffa::MessageField::some(wa::WebMessageInfo {
-                            key: buffa::MessageField::some(wa::MessageKey {
-                                remote_jid: Some(chat.to_string()),
-                                from_me: Some(true),
-                                id: Some("HIST_CONTEXT".to_string()),
-                                participant: None,
-                            }),
-                            message: buffa::MessageField::some(wa::Message {
-                                message_context_info: buffa::MessageField::some(
-                                    wa::MessageContextInfo {
-                                        message_secret: Some(context_secret.clone()),
-                                        ..Default::default()
-                                    },
-                                ),
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
+                    {
+                        let mut proto = wa::HistorySyncMsg::default();
+                        proto.message = buffa::MessageField::some({
+                            let mut proto = wa::WebMessageInfo::default();
+                            proto.key = buffa::MessageField::some({
+                                let mut proto = wa::MessageKey::default();
+                                proto.remote_jid = Some(chat.to_string());
+                                proto.from_me = Some(true);
+                                proto.id = Some("HIST_CONTEXT".to_string());
+                                proto.participant = None;
+                                proto
+                            });
+                            proto.message = buffa::MessageField::some({
+                                let mut proto = wa::Message::default();
+                                proto.message_context_info = buffa::MessageField::some({
+                                    let mut proto = wa::MessageContextInfo::default();
+                                    proto.message_secret = Some(context_secret.clone());
+                                    proto
+                                });
+                                proto
+                            });
+                            proto
+                        });
+                        proto
                     },
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
+                ];
+                proto
+            }];
+            proto
         };
 
         let compressed = encode_and_compress(&hs);
@@ -4097,25 +4214,29 @@ mod tests {
         dropped.message_secret = Some(vec![0x11; 32]);
         let mut kept = keyed("KEEP", true, None);
         kept.message_secret = Some(vec![0x22; 32]);
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            conversations: vec![wa::Conversation {
-                id: chat.into(),
-                messages: vec![
-                    wa::HistorySyncMsg {
-                        message: buffa::MessageField::some(dropped),
-                        ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto.conversations = vec![{
+                let mut proto = wa::Conversation::default();
+                proto.id = chat.into();
+                proto.messages = vec![
+                    {
+                        let mut proto = wa::HistorySyncMsg::default();
+                        proto.message = buffa::MessageField::some(dropped);
+                        proto
                     },
-                    wa::HistorySyncMsg {
-                        message: buffa::MessageField::some(kept),
-                        ..Default::default()
+                    {
+                        let mut proto = wa::HistorySyncMsg::default();
+                        proto.message = buffa::MessageField::some(kept);
+                        proto
                     },
-                ],
-                tc_token: Some(vec![0x33; 8]),
-                tc_token_timestamp: Some(123),
-                ..Default::default()
-            }],
-            ..Default::default()
+                ];
+                proto.tc_token = Some(vec![0x33; 8]);
+                proto.tc_token_timestamp = Some(123);
+                proto
+            }];
+            proto
         };
 
         let mut visited = Vec::new();
@@ -4146,16 +4267,19 @@ mod tests {
         let chat = "5511777776666@s.whatsapp.net";
         let mut message = keyed("VISIT", false, None);
         message.message_secret = Some(vec![0x44; 32]);
-        let hs = wa::HistorySync {
-            conversations: vec![wa::Conversation {
-                id: chat.into(),
-                messages: vec![wa::HistorySyncMsg {
-                    message: buffa::MessageField::some(message),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.conversations = vec![{
+                let mut proto = wa::Conversation::default();
+                proto.id = chat.into();
+                proto.messages = vec![{
+                    let mut proto = wa::HistorySyncMsg::default();
+                    proto.message = buffa::MessageField::some(message);
+                    proto
+                }];
+                proto
+            }];
+            proto
         };
 
         let mut visited = Vec::new();
@@ -4200,19 +4324,22 @@ mod tests {
             .map(|index| {
                 let mut message = keyed(&format!("VISIT_{index}"), false, None);
                 message.message_secret = Some(vec![0x44; 32]);
-                wa::HistorySyncMsg {
-                    message: buffa::MessageField::some(message),
-                    ..Default::default()
+                {
+                    let mut proto = wa::HistorySyncMsg::default();
+                    proto.message = buffa::MessageField::some(message);
+                    proto
                 }
             })
             .collect();
-        let hs = wa::HistorySync {
-            conversations: vec![wa::Conversation {
-                id: "5511777776666@s.whatsapp.net".into(),
-                messages,
-                ..Default::default()
-            }],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.conversations = vec![{
+                let mut proto = wa::Conversation::default();
+                proto.id = "5511777776666@s.whatsapp.net".into();
+                proto.messages = messages;
+                proto
+            }];
+            proto
         };
         let visits = std::rc::Rc::new(std::cell::Cell::new(0));
         let largest_reserve = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -4278,18 +4405,22 @@ mod tests {
             buf.extend_from_slice(payload);
         }
 
-        let valid_msg = wa::HistorySyncMsg {
-            message: buffa::MessageField::some(wa::WebMessageInfo {
-                key: buffa::MessageField::some(wa::MessageKey {
-                    remote_jid: Some(chat.to_string()),
-                    from_me: Some(false),
-                    id: Some("GOOD_MSG".to_string()),
-                    participant: None,
-                }),
-                message_secret: Some(secret.clone()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let valid_msg = {
+            let mut proto = wa::HistorySyncMsg::default();
+            proto.message = buffa::MessageField::some({
+                let mut proto = wa::WebMessageInfo::default();
+                proto.key = buffa::MessageField::some({
+                    let mut proto = wa::MessageKey::default();
+                    proto.remote_jid = Some(chat.to_string());
+                    proto.from_me = Some(false);
+                    proto.id = Some("GOOD_MSG".to_string());
+                    proto.participant = None;
+                    proto
+                });
+                proto.message_secret = Some(secret.clone());
+                proto
+            });
+            proto
         }
         .encode_to_vec();
 
@@ -4349,44 +4480,49 @@ mod tests {
     #[test]
     fn test_forwarded_message_secrets_skipped_from_history_sync() {
         let chat = "5511000000001@s.whatsapp.net";
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            conversations: vec![wa::Conversation {
-                id: chat.into(),
-                messages: vec![wa::HistorySyncMsg {
-                    message: buffa::MessageField::some(wa::WebMessageInfo {
-                        key: buffa::MessageField::some(wa::MessageKey {
-                            remote_jid: Some(chat.to_string()),
-                            from_me: Some(false),
-                            id: Some("HIST_FORWARDED".to_string()),
-                            ..Default::default()
-                        }),
-                        message: buffa::MessageField::some(wa::Message {
-                            extended_text_message: buffa::MessageField::some(
-                                wa::message::ExtendedTextMessage {
-                                    text: Some("forwarded".into()),
-                                    context_info: buffa::MessageField::some(wa::ContextInfo {
-                                        is_forwarded: Some(true),
-                                        ..Default::default()
-                                    }),
-                                    ..Default::default()
-                                },
-                            ),
-                            message_context_info: buffa::MessageField::some(
-                                wa::MessageContextInfo {
-                                    message_secret: Some(vec![0x66u8; 32]),
-                                    ..Default::default()
-                                },
-                            ),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto.conversations = vec![{
+                let mut proto = wa::Conversation::default();
+                proto.id = chat.into();
+                proto.messages = vec![{
+                    let mut proto = wa::HistorySyncMsg::default();
+                    proto.message = buffa::MessageField::some({
+                        let mut proto = wa::WebMessageInfo::default();
+                        proto.key = buffa::MessageField::some({
+                            let mut proto = wa::MessageKey::default();
+                            proto.remote_jid = Some(chat.to_string());
+                            proto.from_me = Some(false);
+                            proto.id = Some("HIST_FORWARDED".to_string());
+                            proto
+                        });
+                        proto.message = buffa::MessageField::some({
+                            let mut proto = wa::Message::default();
+                            proto.extended_text_message = buffa::MessageField::some({
+                                let mut proto = wa::message::ExtendedTextMessage::default();
+                                proto.text = Some("forwarded".into());
+                                proto.context_info = buffa::MessageField::some({
+                                    let mut proto = wa::ContextInfo::default();
+                                    proto.is_forwarded = Some(true);
+                                    proto
+                                });
+                                proto
+                            });
+                            proto.message_context_info = buffa::MessageField::some({
+                                let mut proto = wa::MessageContextInfo::default();
+                                proto.message_secret = Some(vec![0x66u8; 32]);
+                                proto
+                            });
+                            proto
+                        });
+                        proto
+                    });
+                    proto
+                }];
+                proto
+            }];
+            proto
         };
 
         let compressed = encode_and_compress(&hs);
@@ -4398,64 +4534,69 @@ mod tests {
     #[test]
     fn test_nested_forwarded_message_secrets_skipped_from_history_sync() {
         let chat = "5511000000002@s.whatsapp.net";
-        let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            conversations: vec![wa::Conversation {
-                id: chat.into(),
-                messages: vec![wa::HistorySyncMsg {
-                    message: buffa::MessageField::some(wa::WebMessageInfo {
-                        key: buffa::MessageField::some(wa::MessageKey {
-                            remote_jid: Some(chat.to_string()),
-                            from_me: Some(false),
-                            id: Some("HIST_NESTED_FORWARDED".to_string()),
-                            ..Default::default()
-                        }),
-                        message: buffa::MessageField::some(wa::Message {
-                            view_once_message: buffa::MessageField::some(
-                                wa::message::FutureProofMessage {
-                                    message: buffa::MessageField::some(wa::Message {
-                                        ephemeral_message: buffa::MessageField::some(
-                                            wa::message::FutureProofMessage {
-                                                message: buffa::MessageField::some(wa::Message {
-                                                    extended_text_message:
-                                                        buffa::MessageField::some(
-                                                            wa::message::ExtendedTextMessage {
-                                                                text: Some("nested".into()),
-                                                                context_info:
-                                                                    buffa::MessageField::some(
-                                                                        wa::ContextInfo {
-                                                                            is_forwarded: Some(
-                                                                                true,
-                                                                            ),
-                                                                            ..Default::default()
-                                                                        },
-                                                                    ),
-                                                                ..Default::default()
-                                                            },
-                                                        ),
-                                                    ..Default::default()
-                                                }),
-                                            },
-                                        ),
-                                        ..Default::default()
-                                    }),
-                                },
-                            ),
-                            message_context_info: buffa::MessageField::some(
-                                wa::MessageContextInfo {
-                                    message_secret: Some(vec![0x77u8; 32]),
-                                    ..Default::default()
-                                },
-                            ),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto.conversations = vec![{
+                let mut proto = wa::Conversation::default();
+                proto.id = chat.into();
+                proto.messages = vec![{
+                    let mut proto = wa::HistorySyncMsg::default();
+                    proto.message = buffa::MessageField::some({
+                        let mut proto = wa::WebMessageInfo::default();
+                        proto.key = buffa::MessageField::some({
+                            let mut proto = wa::MessageKey::default();
+                            proto.remote_jid = Some(chat.to_string());
+                            proto.from_me = Some(false);
+                            proto.id = Some("HIST_NESTED_FORWARDED".to_string());
+                            proto
+                        });
+                        proto.message = buffa::MessageField::some({
+                            let mut proto = wa::Message::default();
+                            proto.view_once_message = buffa::MessageField::some({
+                                let mut proto = wa::message::FutureProofMessage::default();
+                                proto.message = buffa::MessageField::some({
+                                    let mut proto = wa::Message::default();
+                                    proto.ephemeral_message = buffa::MessageField::some({
+                                        let mut proto = wa::message::FutureProofMessage::default();
+                                        proto.message = buffa::MessageField::some({
+                                            let mut proto = wa::Message::default();
+                                            proto.extended_text_message =
+                                                buffa::MessageField::some({
+                                                    let mut proto =
+                                                        wa::message::ExtendedTextMessage::default();
+                                                    proto.text = Some("nested".into());
+                                                    proto.context_info =
+                                                        buffa::MessageField::some({
+                                                            let mut proto =
+                                                                wa::ContextInfo::default();
+                                                            proto.is_forwarded = Some(true);
+                                                            proto
+                                                        });
+                                                    proto
+                                                });
+                                            proto
+                                        });
+                                        proto
+                                    });
+                                    proto
+                                });
+                                proto
+                            });
+                            proto.message_context_info = buffa::MessageField::some({
+                                let mut proto = wa::MessageContextInfo::default();
+                                proto.message_secret = Some(vec![0x77u8; 32]);
+                                proto
+                            });
+                            proto
+                        });
+                        proto
+                    });
+                    proto
+                }];
+                proto
+            }];
+            proto
         };
 
         let compressed = encode_and_compress(&hs);
@@ -4559,72 +4700,91 @@ mod tests {
 
         let mut big_msgs = Vec::new();
         for i in 0..1500u32 {
-            big_msgs.push(wa::HistorySyncMsg {
-                message: buffa::MessageField::some(wa::WebMessageInfo {
-                    key: buffa::MessageField::some(wa::MessageKey {
-                        remote_jid: Some(dm.to_string()),
-                        from_me: Some(i % 2 == 0),
-                        id: Some(format!("BIG-{i}")),
-                        participant: Some(participant.to_string()),
-                    }),
-                    message_timestamp: Some(1_700_000_000 + i as u64),
-                    message_secret: Some(vec![(i % 251) as u8; 32]),
-                    ..Default::default()
-                }),
-                msg_order_id: Some(i as u64 + 1),
+            big_msgs.push({
+                let mut proto = wa::HistorySyncMsg::default();
+                proto.message = buffa::MessageField::some({
+                    let mut proto = wa::WebMessageInfo::default();
+                    proto.key = buffa::MessageField::some({
+                        let mut proto = wa::MessageKey::default();
+                        proto.remote_jid = Some(dm.to_string());
+                        proto.from_me = Some(i % 2 == 0);
+                        proto.id = Some(format!("BIG-{i}"));
+                        proto.participant = Some(participant.to_string());
+                        proto
+                    });
+                    proto.message_timestamp = Some(1_700_000_000 + i as u64);
+                    proto.message_secret = Some(vec![(i % 251) as u8; 32]);
+                    proto
+                });
+                proto.msg_order_id = Some(i as u64 + 1);
+                proto
             });
         }
-        let big_conv = wa::Conversation {
-            id: dm.into(),
-            messages: big_msgs,
-            tc_token: Some(vec![0xABu8; 16]),
-            tc_token_timestamp: Some(1_700_000_123),
-            ..Default::default()
+        let big_conv = {
+            let mut proto = wa::Conversation::default();
+            proto.id = dm.into();
+            proto.messages = big_msgs;
+            proto.tc_token = Some(vec![0xABu8; 16]);
+            proto.tc_token_timestamp = Some(1_700_000_123);
+            proto
         };
 
         // Group conversation: a secret message, but its tctoken must be ignored.
-        let group_conv = wa::Conversation {
-            id: group.into(),
-            messages: vec![wa::HistorySyncMsg {
-                message: buffa::MessageField::some(wa::WebMessageInfo {
-                    key: buffa::MessageField::some(wa::MessageKey {
-                        remote_jid: Some(group.to_string()),
-                        from_me: Some(false),
-                        id: Some("GRP-1".to_string()),
-                        participant: Some(participant.to_string()),
-                    }),
-                    message_secret: Some(vec![0x33u8; 32]),
-                    ..Default::default()
-                }),
-                msg_order_id: Some(1),
-            }],
-            tc_token: Some(vec![0xCDu8; 16]),
-            tc_token_timestamp: Some(1_700_000_456),
-            ..Default::default()
+        let group_conv = {
+            let mut proto = wa::Conversation::default();
+            proto.id = group.into();
+            proto.messages = vec![{
+                let mut proto = wa::HistorySyncMsg::default();
+                proto.message = buffa::MessageField::some({
+                    let mut proto = wa::WebMessageInfo::default();
+                    proto.key = buffa::MessageField::some({
+                        let mut proto = wa::MessageKey::default();
+                        proto.remote_jid = Some(group.to_string());
+                        proto.from_me = Some(false);
+                        proto.id = Some("GRP-1".to_string());
+                        proto.participant = Some(participant.to_string());
+                        proto
+                    });
+                    proto.message_secret = Some(vec![0x33u8; 32]);
+                    proto
+                });
+                proto.msg_order_id = Some(1);
+                proto
+            }];
+            proto.tc_token = Some(vec![0xCDu8; 16]);
+            proto.tc_token_timestamp = Some(1_700_000_456);
+            proto
         };
 
-        wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            conversations: vec![big_conv, group_conv],
-            pushnames: vec![wa::Pushname {
-                // JID form, the way the server actually sends it, so the parity
+        {
+            let mut proto = wa::HistorySync::default();
+            proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto.conversations = vec![big_conv, group_conv];
+            proto.pushnames = vec![{
+                let mut proto = wa::Pushname::default(); // JID form, the way the server actually sends it, so the parity
                 // walk exercises the same path production does.
-                id: Some(format!("{own}@s.whatsapp.net")),
-                pushname: Some("Me".into()),
-            }],
-            nct_salt: Some(vec![0x01, 0x02, 0x03, 0x04]),
-            phone_number_to_lid_mappings: vec![
-                wa::PhoneNumberToLIDMapping {
-                    pn_jid: Some("5511777776666@s.whatsapp.net".to_string()),
-                    lid_jid: Some("111222333444555@lid".to_string()),
+
+                proto.id = Some(format!("{own}@s.whatsapp.net"));
+                proto.pushname = Some("Me".into());
+                proto
+            }];
+            proto.nct_salt = Some(vec![0x01, 0x02, 0x03, 0x04]);
+            proto.phone_number_to_lid_mappings = vec![
+                {
+                    let mut proto = wa::PhoneNumberToLIDMapping::default();
+                    proto.pn_jid = Some("5511777776666@s.whatsapp.net".to_string());
+                    proto.lid_jid = Some("111222333444555@lid".to_string());
+                    proto
                 },
                 // Wrong namespace: both walks must skip it identically.
-                wa::PhoneNumberToLIDMapping {
-                    pn_jid: Some("999888777666555@lid".to_string()),
-                    lid_jid: Some("111222333444555@lid".to_string()),
+                {
+                    let mut proto = wa::PhoneNumberToLIDMapping::default();
+                    proto.pn_jid = Some("999888777666555@lid".to_string());
+                    proto.lid_jid = Some("111222333444555@lid".to_string());
+                    proto
                 },
-            ],
-            ..Default::default()
+            ];
+            proto
         }
     }
 
@@ -4713,17 +4873,21 @@ mod tests {
     /// irrelevant.
     #[test]
     fn stream_handles_field_order_shuffled_blobs() {
-        let conv_a = wa::Conversation {
-            id: "5511111111111@s.whatsapp.net".into(),
-            ..Default::default()
+        let conv_a = {
+            let mut proto = wa::Conversation::default();
+            proto.id = "5511111111111@s.whatsapp.net".into();
+            proto
         };
-        let conv_b = wa::Conversation {
-            id: "5511222222222@s.whatsapp.net".into(),
-            ..Default::default()
+        let conv_b = {
+            let mut proto = wa::Conversation::default();
+            proto.id = "5511222222222@s.whatsapp.net".into();
+            proto
         };
-        let pushname = wa::Pushname {
-            id: Some("5511000000000".into()),
-            pushname: Some("Me".into()),
+        let pushname = {
+            let mut proto = wa::Pushname::default();
+            proto.id = Some("5511000000000".into());
+            proto.pushname = Some("Me".into());
+            proto
         };
 
         // pushname, conv A, unknown varint field, nctSalt, conv B.
@@ -4769,18 +4933,22 @@ mod tests {
     #[test]
     fn stream_conversationless_blobs() {
         let cases: Vec<wa::HistorySync> = vec![
-            wa::HistorySync {
-                sync_type: wa::history_sync::HistorySyncType::PUSH_NAME,
-                pushnames: vec![wa::Pushname {
-                    id: Some("5511000000000".into()),
-                    pushname: Some("Me".into()),
-                }],
-                ..Default::default()
+            {
+                let mut proto = wa::HistorySync::default();
+                proto.sync_type = wa::history_sync::HistorySyncType::PUSH_NAME;
+                proto.pushnames = vec![{
+                    let mut proto = wa::Pushname::default();
+                    proto.id = Some("5511000000000".into());
+                    proto.pushname = Some("Me".into());
+                    proto
+                }];
+                proto
             },
-            wa::HistorySync {
-                sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-                nct_salt: Some(vec![1, 2, 3]),
-                ..Default::default()
+            {
+                let mut proto = wa::HistorySync::default();
+                proto.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+                proto.nct_salt = Some(vec![1, 2, 3]);
+                proto
             },
             wa::HistorySync::default(),
         ];
@@ -4798,9 +4966,10 @@ mod tests {
     /// stream continues and the remainder stays intact.
     #[test]
     fn stream_lenient_decode_skips_corrupt_conversation() {
-        let good = wa::Conversation {
-            id: "5511111111111@s.whatsapp.net".into(),
-            ..Default::default()
+        let good = {
+            let mut proto = wa::Conversation::default();
+            proto.id = "5511111111111@s.whatsapp.net".into();
+            proto
         };
         // Field 1 (id) claims 5 bytes but only 1 follows: prost decode fails.
         let corrupt = [0x0A, 0x05, b'x'];
@@ -4919,27 +5088,33 @@ mod tests {
     /// to grow and still come out intact.
     #[test]
     fn stream_window_grows_for_large_conversation() {
-        let big = wa::Conversation {
-            id: "5511111111111@s.whatsapp.net".into(),
-            messages: vec![wa::HistorySyncMsg {
-                message: buffa::MessageField::some(wa::WebMessageInfo {
-                    key: buffa::MessageField::some(wa::MessageKey {
-                        id: Some("BIG".into()),
-                        ..Default::default()
-                    }),
-                    message: buffa::MessageField::some(wa::Message {
-                        conversation: Some("x".repeat(1_000_000)),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }],
-            ..Default::default()
+        let big = {
+            let mut proto = wa::Conversation::default();
+            proto.id = "5511111111111@s.whatsapp.net".into();
+            proto.messages = vec![{
+                let mut proto = wa::HistorySyncMsg::default();
+                proto.message = buffa::MessageField::some({
+                    let mut proto = wa::WebMessageInfo::default();
+                    proto.key = buffa::MessageField::some({
+                        let mut proto = wa::MessageKey::default();
+                        proto.id = Some("BIG".into());
+                        proto
+                    });
+                    proto.message = buffa::MessageField::some({
+                        let mut proto = wa::Message::default();
+                        proto.conversation = Some("x".repeat(1_000_000));
+                        proto
+                    });
+                    proto
+                });
+                proto
+            }];
+            proto
         };
-        let hs = wa::HistorySync {
-            conversations: vec![big.clone()],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.conversations = vec![big.clone()];
+            proto
         };
         let compressed = encode_and_compress(&hs);
 
@@ -4955,28 +5130,34 @@ mod tests {
     fn stream_survives_many_window_refills() {
         let mut conversations = Vec::new();
         for i in 0..50u32 {
-            conversations.push(wa::Conversation {
-                id: format!("55119{i:08}@s.whatsapp.net"),
-                messages: vec![wa::HistorySyncMsg {
-                    message: buffa::MessageField::some(wa::WebMessageInfo {
-                        key: buffa::MessageField::some(wa::MessageKey {
-                            id: Some(format!("M{i}")),
-                            ..Default::default()
-                        }),
-                        message: buffa::MessageField::some(wa::Message {
-                            conversation: Some(format!("{i}").repeat(4_000)),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
-                ..Default::default()
+            conversations.push({
+                let mut proto = wa::Conversation::default();
+                proto.id = format!("55119{i:08}@s.whatsapp.net");
+                proto.messages = vec![{
+                    let mut proto = wa::HistorySyncMsg::default();
+                    proto.message = buffa::MessageField::some({
+                        let mut proto = wa::WebMessageInfo::default();
+                        proto.key = buffa::MessageField::some({
+                            let mut proto = wa::MessageKey::default();
+                            proto.id = Some(format!("M{i}"));
+                            proto
+                        });
+                        proto.message = buffa::MessageField::some({
+                            let mut proto = wa::Message::default();
+                            proto.conversation = Some(format!("{i}").repeat(4_000));
+                            proto
+                        });
+                        proto
+                    });
+                    proto
+                }];
+                proto
             });
         }
-        let hs = wa::HistorySync {
-            conversations: conversations.clone(),
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.conversations = conversations.clone();
+            proto
         };
         let compressed = encode_and_compress(&hs);
 
@@ -4991,22 +5172,27 @@ mod tests {
     /// Inflating past `max_decompressed` must error instead of allocating.
     #[test]
     fn stream_enforces_decompressed_cap() {
-        let hs = wa::HistorySync {
-            conversations: vec![wa::Conversation {
-                id: "5511111111111@s.whatsapp.net".into(),
-                messages: vec![wa::HistorySyncMsg {
-                    message: buffa::MessageField::some(wa::WebMessageInfo {
-                        message: buffa::MessageField::some(wa::Message {
-                            conversation: Some("y".repeat(64 * 1024)),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.conversations = vec![{
+                let mut proto = wa::Conversation::default();
+                proto.id = "5511111111111@s.whatsapp.net".into();
+                proto.messages = vec![{
+                    let mut proto = wa::HistorySyncMsg::default();
+                    proto.message = buffa::MessageField::some({
+                        let mut proto = wa::WebMessageInfo::default();
+                        proto.message = buffa::MessageField::some({
+                            let mut proto = wa::Message::default();
+                            proto.conversation = Some("y".repeat(64 * 1024));
+                            proto
+                        });
+                        proto
+                    });
+                    proto
+                }];
+                proto
+            }];
+            proto
         };
         let compressed = encode_and_compress(&hs);
 
@@ -5021,14 +5207,16 @@ mod tests {
     /// in it is a loud error, while a conversation-free tail succeeds.
     #[test]
     fn stream_remainder_before_exhaustion_is_fail_loud() {
-        let conv = wa::Conversation {
-            id: "5511111111111@s.whatsapp.net".into(),
-            ..Default::default()
+        let conv = {
+            let mut proto = wa::Conversation::default();
+            proto.id = "5511111111111@s.whatsapp.net".into();
+            proto
         };
-        let hs = wa::HistorySync {
-            conversations: vec![conv],
-            nct_salt: Some(vec![9]),
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.conversations = vec![conv];
+            proto.nct_salt = Some(vec![9]);
+            proto
         };
         let compressed = encode_and_compress(&hs);
         let stream = HistorySyncStream::new(&compressed, MAX_DECOMPRESSED);
@@ -5039,9 +5227,10 @@ mod tests {
 
         // Without conversations the early call is fine: the drain only meets
         // remainder fields.
-        let hs = wa::HistorySync {
-            nct_salt: Some(vec![9]),
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.nct_salt = Some(vec![9]);
+            proto
         };
         let compressed = encode_and_compress(&hs);
         let stream = HistorySyncStream::new(&compressed, MAX_DECOMPRESSED);
@@ -5055,13 +5244,15 @@ mod tests {
     /// dispatched event would fail every later get()/decompress().
     #[test]
     fn truncated_zlib_without_terminator_is_rejected() {
-        let conv = wa::Conversation {
-            id: "5511111111111@s.whatsapp.net".into(),
-            ..Default::default()
+        let conv = {
+            let mut proto = wa::Conversation::default();
+            proto.id = "5511111111111@s.whatsapp.net".into();
+            proto
         };
-        let hs = wa::HistorySync {
-            conversations: vec![conv.clone()],
-            ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.conversations = vec![conv.clone()];
+            proto
         };
 
         // Sync-flush makes every written byte inflatable, then drop the
@@ -5100,23 +5291,28 @@ mod tests {
     /// both the public stream and the extraction pass.
     #[test]
     fn stream_and_extractor_survive_mutated_inputs() {
-        let hs = wa::HistorySync {
-            conversations: vec![
-                wa::Conversation {
-                    id: "5511111111111@s.whatsapp.net".into(),
-                    ..Default::default()
+        let hs = {
+            let mut proto = wa::HistorySync::default();
+            proto.conversations = vec![
+                {
+                    let mut proto = wa::Conversation::default();
+                    proto.id = "5511111111111@s.whatsapp.net".into();
+                    proto
                 },
-                wa::Conversation {
-                    id: "5511222222222@s.whatsapp.net".into(),
-                    ..Default::default()
+                {
+                    let mut proto = wa::Conversation::default();
+                    proto.id = "5511222222222@s.whatsapp.net".into();
+                    proto
                 },
-            ],
-            pushnames: vec![wa::Pushname {
-                id: Some("5511000000000".into()),
-                pushname: Some("Me".into()),
-            }],
-            nct_salt: Some(vec![1, 2, 3, 4]),
-            ..Default::default()
+            ];
+            proto.pushnames = vec![{
+                let mut proto = wa::Pushname::default();
+                proto.id = Some("5511000000000".into());
+                proto.pushname = Some("Me".into());
+                proto
+            }];
+            proto.nct_salt = Some(vec![1, 2, 3, 4]);
+            proto
         };
         let compressed = encode_and_compress(&hs);
 

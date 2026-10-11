@@ -251,14 +251,16 @@ async fn serve_noise_handshake(
     let encrypted_static = noise.encrypt(&server_static_pub)?;
     noise.mix_shared_secret(server_static.private_key.serialize(), &client_eph)?;
     let encrypted_payload = noise.encrypt(&cert_chain)?;
-    let server_hello = wa::HandshakeMessage {
-        server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
-            ephemeral: Some(server_eph_pub.to_vec()),
-            r#static: Some(encrypted_static),
-            payload: Some(encrypted_payload),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let server_hello = {
+        let mut proto = wa::HandshakeMessage::default();
+        proto.server_hello = buffa::MessageField::some({
+            let mut proto = wa::handshake_message::ServerHello::default();
+            proto.ephemeral = Some(server_eph_pub.to_vec());
+            proto.r#static = Some(encrypted_static);
+            proto.payload = Some(encrypted_payload);
+            proto
+        });
+        proto
     };
     write_frame(
         stream,
