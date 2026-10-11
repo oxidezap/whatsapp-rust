@@ -1111,8 +1111,8 @@ impl Client {
                                 )
                             })
                             .collect();
-                        (group.len() > 1 || parts.iter().any(|(_, source)| source.is_some()))
-                            .then(|| durability::encode_pending_sourced_parts(&parts))
+                        (group.len() > 1 || parts.iter().any(|(_, source)| !source.is_empty()))
+                            .then(|| durability::encode_pending_source_sets(&parts))
                     })
                     .collect();
                 let rows: Vec<PendingInboundRow<'_>> = groups

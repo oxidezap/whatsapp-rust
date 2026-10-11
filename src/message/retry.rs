@@ -464,6 +464,22 @@ impl Client {
         Ok(outcome)
     }
 
+    // Decrypted but ambiguously ordered retained parts still need their consumer
+    // commit. Request a resend without the ordinary decrypt-failure ACK path.
+    pub(super) fn request_retained_order_retry(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+        decrypt_fail_mode: crate::types::events::DecryptFailMode,
+    ) {
+        let client = Arc::clone(self);
+        let info = Arc::clone(info);
+        self.outbound_flush.spawn(&*self.runtime, async move {
+            client
+                .run_retry_receipt(&info, RetryReason::InvalidMessage, decrypt_fail_mode)
+                .await;
+        });
+    }
+
     /// Awaitable automatic wrapper so retry can be ordered before transport ack.
     ///
     /// Returns whether the caller should send the ack: `false` when we intended

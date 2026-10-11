@@ -846,7 +846,12 @@ impl Client {
             .inbound_commit_batch
             .retention
             .seal(&info, was_draining);
-        if !items.is_empty() {
+        if self.inbound_commit_batch.retention.awaiting_order(&info) {
+            log::warn!(
+                "Retained pending sequence has ambiguous ciphertext occurrence order; withholding consumer commit and requesting a complete resend"
+            );
+            self.request_retained_order_retry(&info, decrypt_fail_mode);
+        } else if !items.is_empty() {
             // Seal after every payload has entered the shared pipeline.
             if was_draining {
                 self.commit_or_batch_inbound_items(items, false).await;
@@ -2103,6 +2108,11 @@ impl Client {
         // These arrive as a separate pkmsg enc node alongside the actual
         // group message (skmsg) and would otherwise surface as "unknown".
         if skdm_only {
+            if self.inbound_durability_hook().is_some() {
+                self.inbound_commit_batch
+                    .retention
+                    .exclude_carrier(info, enc_index);
+            }
             log::debug!(
                 "[msg:{}] Skipping event dispatch for sender key distribution message",
                 info.id

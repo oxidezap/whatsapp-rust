@@ -14,24 +14,42 @@ use wacore::types::events::InboundMessage;
 // serialized Message. Legacy single-message and v1 rows remain readable.
 const PARTS_HEADER: &[u8] = b"\0WAPI\x01";
 const SOURCED_PARTS_HEADER: &[u8] = b"\0WAPI\x02";
+const SOURCE_SETS_HEADER: &[u8] = b"\0WAPI\x03";
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PendingPart<'a> {
     bytes: &'a [u8],
-    source: Option<retention::PayloadSource>,
+    sources: retention::PayloadSources,
 }
 
-pub(super) fn encode_pending_sourced_parts(
-    parts: &[(&[u8], Option<retention::PayloadSource>)],
-) -> Vec<u8> {
-    if parts.iter().all(|(_, source)| source.is_none()) {
+#[cfg(test)]
+fn encode_pending_sourced_parts(parts: &[(&[u8], Option<retention::PayloadSource>)]) -> Vec<u8> {
+    encode_pending_source_sets(
+        &parts
+            .iter()
+            .map(|(bytes, source)| (*bytes, source.iter().copied().collect()))
+            .collect::<Vec<_>>(),
+    )
+}
+pub(super) fn encode_pending_source_sets(parts: &[(&[u8], retention::PayloadSources)]) -> Vec<u8> {
+    if parts.iter().all(|(_, sources)| sources.is_empty()) {
         return encode_pending_parts(&parts.iter().map(|(bytes, _)| *bytes).collect::<Vec<_>>());
     }
-    let mut record = SOURCED_PARTS_HEADER.to_vec();
-    for &(bytes, source) in parts {
-        record.push(u8::from(source.is_some()));
-        if let Some(source) = source {
-            record.extend_from_slice(&source);
+    let sets = parts.iter().any(|(_, sources)| sources.len() > 1);
+    let mut record = if sets {
+        SOURCE_SETS_HEADER
+    } else {
+        SOURCED_PARTS_HEADER
+    }
+    .to_vec();
+    for (bytes, sources) in parts {
+        if sets {
+            record.extend_from_slice(&(sources.len() as u64).to_be_bytes());
+        } else {
+            record.push(u8::from(!sources.is_empty()));
+        }
+        for source in sources {
+            record.extend_from_slice(source);
         }
         record.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
         record.extend_from_slice(bytes);
@@ -55,12 +73,15 @@ fn pending_records(bytes: &[u8]) -> anyhow::Result<Vec<PendingPart<'_>>> {
     if bytes.first() != Some(&0) {
         return Ok(vec![PendingPart {
             bytes,
-            source: None,
+            sources: Default::default(),
         }]);
     }
-    let sourced = bytes.starts_with(SOURCED_PARTS_HEADER);
+    let sets = bytes.starts_with(SOURCE_SETS_HEADER);
+    let sourced = sets || bytes.starts_with(SOURCED_PARTS_HEADER);
     let mut remaining = bytes
-        .strip_prefix(if sourced {
+        .strip_prefix(if sets {
+            SOURCE_SETS_HEADER
+        } else if sourced {
             SOURCED_PARTS_HEADER
         } else {
             PARTS_HEADER
@@ -68,23 +89,33 @@ fn pending_records(bytes: &[u8]) -> anyhow::Result<Vec<PendingPart<'_>>> {
         .ok_or_else(|| anyhow::anyhow!("unknown pending-inbound record header"))?;
     let mut parts = Vec::new();
     while !remaining.is_empty() {
-        let source = if sourced {
+        let count = if sets {
+            anyhow::ensure!(remaining.len() >= 8, "truncated source count");
+            let count = usize::try_from(u64::from_be_bytes(remaining[..8].try_into()?))?;
+            remaining = &remaining[8..];
+            anyhow::ensure!(count <= remaining.len() / 32, "truncated source identities");
+            count
+        } else if sourced {
             let (&flag, rest) = remaining.split_first().expect("nonempty record remainder");
             remaining = rest;
-            match flag {
-                0 => None,
-                1 => {
-                    anyhow::ensure!(remaining.len() >= 32, "truncated pending-inbound source");
-                    let mut source = [0; 32];
-                    source.copy_from_slice(&remaining[..32]);
-                    remaining = &remaining[32..];
-                    Some(source)
-                }
-                _ => anyhow::bail!("invalid pending-inbound source flag"),
-            }
+            anyhow::ensure!(flag <= 1, "invalid pending-inbound source flag");
+            usize::from(flag)
         } else {
-            None
+            0
         };
+        anyhow::ensure!(
+            count <= remaining.len() / 32,
+            "truncated pending-inbound source"
+        );
+        anyhow::ensure!(
+            count <= retention::MAX_SOURCE_IDENTITIES,
+            "source history limit exceeded"
+        );
+        let mut sources = retention::PayloadSources::new();
+        for _ in 0..count {
+            sources.push(remaining[..32].try_into()?);
+            remaining = &remaining[32..];
+        }
         anyhow::ensure!(remaining.len() >= 8, "truncated pending-inbound length");
         let mut length = [0; 8];
         length.copy_from_slice(&remaining[..8]);
@@ -96,7 +127,7 @@ fn pending_records(bytes: &[u8]) -> anyhow::Result<Vec<PendingPart<'_>>> {
         );
         parts.push(PendingPart {
             bytes: &remaining[..length],
-            source,
+            sources,
         });
         remaining = &remaining[length..];
     }
@@ -104,7 +135,7 @@ fn pending_records(bytes: &[u8]) -> anyhow::Result<Vec<PendingPart<'_>>> {
     Ok(parts)
 }
 #[cfg(test)]
-fn pending_parts(bytes: &[u8]) -> anyhow::Result<Vec<&[u8]>> {
+pub(super) fn pending_parts(bytes: &[u8]) -> anyhow::Result<Vec<&[u8]>> {
     Ok(pending_records(bytes)?
         .into_iter()
         .map(|part| part.bytes)
@@ -143,7 +174,11 @@ pub(super) fn extend_pending_record(
         if matches {
             merged.push(PendingPart {
                 bytes: original_parts[next].bytes,
-                source: original_parts[next].source.or(part.source),
+                sources: {
+                    let mut sources = original_parts[next].sources.clone();
+                    retention::remember_sources(&mut sources, &part.sources);
+                    sources
+                },
             });
             next += 1;
         } else {
@@ -158,16 +193,16 @@ pub(super) fn extend_pending_record(
         && merged
             .iter()
             .zip(&original_parts)
-            .all(|(a, b)| a.source == b.source)
+            .all(|(a, b)| a.sources == b.sources)
     {
         return Ok(None);
     }
-    // Every existing part stays byte-for-byte intact; only additional parts
-    // extend the row. No parallel DTO or table migration is involved.
-    Ok(Some(encode_pending_sourced_parts(
+    // Existing payload bytes stay intact. New parts or ciphertext identities
+    // extend only this opaque envelope; no table migration is involved.
+    Ok(Some(encode_pending_source_sets(
         &merged
-            .iter()
-            .map(|part| (part.bytes, part.source))
+            .into_iter()
+            .map(|part| (part.bytes, part.sources))
             .collect::<Vec<_>>(),
     )))
 }
@@ -185,7 +220,7 @@ fn is_subsequence(sequence: &[DispatchFingerprint], candidate: &[DispatchFingerp
 pub(super) struct PendingReplay {
     pub(super) items: Vec<InboundMessage>,
     pub(super) keys: Vec<(String, String, String)>,
-    pub(super) sources: std::collections::HashMap<usize, retention::PayloadSource>,
+    pub(super) sources: std::collections::HashMap<usize, retention::PayloadSources>,
 }
 
 // Keep the string comparisons out of the stable sort's generated inner loops.
@@ -244,10 +279,10 @@ impl Client {
                     .message(Arc::new(waproto::codec::message_decode(part.bytes)?))
                     .info(Arc::clone(info))
                     .build();
-                if let Some(source) = part.source {
+                if !part.sources.is_empty() {
                     replay
                         .sources
-                        .insert(Arc::as_ptr(&item.message) as usize, source);
+                        .insert(Arc::as_ptr(&item.message) as usize, part.sources);
                 }
                 items.push(item);
             }
@@ -285,6 +320,26 @@ impl Client {
                 )
             })
         {
+            // Equally complete aliases may carry identities from different
+            // encrypted retries. Their occurrence sequences align exactly.
+            for index in 0..candidates.len() {
+                if index == complete || sequences[index] != sequences[complete] {
+                    continue;
+                }
+                for (old, selected) in candidates[index].iter().zip(&candidates[complete]) {
+                    if let Some(incoming) = replay
+                        .sources
+                        .get(&(Arc::as_ptr(&old.message) as usize))
+                        .cloned()
+                    {
+                        let sources = replay
+                            .sources
+                            .entry(Arc::as_ptr(&selected.message) as usize)
+                            .or_default();
+                        retention::remember_sources(sources, &incoming);
+                    }
+                }
+            }
             replay.items = candidates.swap_remove(complete);
         } else {
             for items in candidates {
@@ -442,7 +497,10 @@ mod tests {
             [&first[..], &second[..], &third[..]]
         );
         assert_eq!(
-            parts.iter().map(|p| p.source).collect::<Vec<_>>(),
+            parts
+                .iter()
+                .map(|p| p.sources.first().copied())
+                .collect::<Vec<_>>(),
             [Some([1; 32]), Some([2; 32]), Some([3; 32])]
         );
         assert!(
@@ -459,6 +517,61 @@ mod tests {
         let mut invalid = SOURCED_PARTS_HEADER.to_vec();
         invalid.push(2);
         assert!(pending_records(&invalid).is_err());
+    }
+
+    #[test]
+    fn pending_source_history_preserves_both_ciphertext_generations() {
+        let bytes = [10, 1, b'a', 0xc0, 0x3e, 7];
+        let existing = encode_pending_sourced_parts(&[(&bytes, Some([1; 32]))]);
+        let proposed = encode_pending_sourced_parts(&[(&bytes, Some([2; 32]))]);
+        let extended = extend_pending_record(&existing, &proposed)
+            .unwrap()
+            .unwrap();
+        assert!(extended.starts_with(SOURCE_SETS_HEADER));
+        let parts = pending_records(&extended).unwrap();
+        assert_eq!(parts[0].bytes, bytes);
+        assert_eq!(parts[0].sources.as_slice(), &[[1; 32], [2; 32]]);
+        assert!(
+            extend_pending_record(&extended, &proposed)
+                .unwrap()
+                .is_none()
+        );
+        let mut malformed = SOURCE_SETS_HEADER.to_vec();
+        malformed.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(pending_records(&malformed).is_err());
+    }
+
+    #[test]
+    fn saturated_source_history_keeps_original_bytes_without_growth() {
+        let bytes = [10, 1, b'a', 0xc0, 0x3e, 7];
+        let sources: retention::PayloadSources = (0..retention::MAX_SOURCE_IDENTITIES)
+            .map(|index| {
+                let mut source = [0; 32];
+                source[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                source
+            })
+            .collect();
+        let existing = encode_pending_source_sets(&[(&bytes, sources.clone())]);
+        let proposed = encode_pending_sourced_parts(&[(&bytes, Some([255; 32]))]);
+        assert!(
+            extend_pending_record(&existing, &proposed)
+                .unwrap()
+                .is_none()
+        );
+        let parts = pending_records(&existing).unwrap();
+        assert_eq!(parts[0].bytes, bytes);
+        assert_eq!(parts[0].sources, sources);
+        let mut oversized = SOURCE_SETS_HEADER.to_vec();
+        oversized.extend_from_slice(&((retention::MAX_SOURCE_IDENTITIES + 1) as u64).to_be_bytes());
+        oversized.extend(vec![0; (retention::MAX_SOURCE_IDENTITIES + 1) * 32]);
+        oversized.extend_from_slice(&0u64.to_be_bytes());
+        assert!(
+            pending_records(&oversized)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("source history limit")
+        );
     }
 
     #[test]
