@@ -177,26 +177,80 @@ impl Stanza {
                     .min()
             })
         };
-        let unsourced = self.items.iter().any(|item| {
-            self.sources.get(&part_key(item)).is_none_or(|sources| {
-                sources.len() == MAX_SOURCE_IDENTITIES && current_position(item).is_none()
-            })
-        });
-        if self.ordering_blocked
-            || (unsourced && !self.fresh.is_empty() && !self.delivery.is_empty())
-        {
-            // Legacy rows have no ciphertext provenance. A partial retry cannot
-            // prove whether equal plaintext is a missing occurrence or a resend.
-            // Recover only from a complete fresh sequence; otherwise withhold
-            // consumer commit and keep the original row untouched.
-            let mut current: Vec<_> = self
-                .fresh
+        let unproven = self
+            .items
+            .iter()
+            .any(|item| current_position(item).is_none());
+        let unsourced = self
+            .items
+            .iter()
+            .any(|item| !self.sources.contains_key(&part_key(item)));
+        let overlap = if unproven {
+            let mut scratch = Vec::new();
+            let retained: Vec<_> = self
+                .items
                 .iter()
-                .filter_map(|item| current_position(item).map(|index| (index, item.clone())))
+                .map(|item| MessageDispatch::fingerprint_into(&item.message, &mut scratch))
                 .collect();
+            self.fresh.iter().any(|item| {
+                retained.contains(&MessageDispatch::fingerprint_into(
+                    &item.message,
+                    &mut scratch,
+                ))
+            })
+        } else {
+            false
+        };
+        // Fully decoded disjoint deliveries may append another part for this
+        // ID. An incomplete frame or equal plaintext cannot establish an
+        // occurrence's order against unproven retained ciphertexts.
+        let needs_order =
+            unsourced || (unproven && (overlap || self.fresh.len() < self.delivery.len()));
+        let mut identities = std::collections::HashSet::new();
+        let ambiguous = self
+            .delivery
+            .iter()
+            .any(|(_, source)| !identities.insert(*source));
+        if self.ordering_blocked
+            || ((needs_order || ambiguous) && !self.fresh.is_empty() && !self.delivery.is_empty())
+        {
+            // Equal plaintext cannot identify an occurrence across encryption
+            // generations. Identical ciphertext also identifies multiple wire
+            // occurrences. Recover from a complete fresh sequence, preserving
+            // retained bytes, instead of assigning an unproven source alias.
+            let mut remaining = self.delivery.clone();
+            let mut current = Vec::new();
+            for item in &self.fresh {
+                if let Some(sources) = self.sources.get(&part_key(item))
+                    && let Some(position) = remaining
+                        .iter()
+                        .position(|(_, source)| sources.contains(source))
+                {
+                    let (index, _) = remaining.remove(position);
+                    current.push((index, item.clone()));
+                }
+            }
+            // A uniquely identified retained ciphertext may fill a duplicate
+            // ratchet position without freshly decrypting it. Repeated hashes
+            // do not prove which retained occurrence belongs at that position.
+            for item in &self.items {
+                if let Some(sources) = self.sources.get(&part_key(item))
+                    && let Some(position) = remaining.iter().position(|(_, source)| {
+                        sources.contains(source)
+                            && self
+                                .delivery
+                                .iter()
+                                .filter(|(_, candidate)| candidate == source)
+                                .count()
+                                == 1
+                    })
+                {
+                    let (index, _) = remaining.remove(position);
+                    current.push((index, item.clone()));
+                }
+            }
             current.sort_by_key(|(index, _)| *index);
-            current.dedup_by_key(|(index, _)| *index);
-            if current.len() != self.delivery.len() {
+            if !remaining.is_empty() {
                 self.ordering_blocked = true;
                 return false;
             }
@@ -255,41 +309,14 @@ impl Stanza {
             self.fresh.clear();
         }
 
-        // A re-encrypted retry can produce equal plaintext but different wire
-        // identities. Keep each observed identity on its retained occurrence.
-        let mut occurrences =
-            HashMap::<DispatchFingerprint, std::collections::VecDeque<usize>>::new();
-        let mut scratch = Vec::new();
-        for item in &self.items {
-            occurrences
-                .entry(MessageDispatch::fingerprint_into(
-                    &item.message,
-                    &mut scratch,
-                ))
-                .or_default()
-                .push_back(part_key(item));
-        }
-        for item in &self.fresh {
-            if let Some(key) = occurrences
-                .get_mut(&MessageDispatch::fingerprint_into(
-                    &item.message,
-                    &mut scratch,
-                ))
-                .and_then(|keys| keys.pop_front())
-                && let Some(incoming) = self.sources.get(&part_key(item)).cloned()
-            {
-                let retained = self.sources.entry(key).or_default();
-                remember_sources(retained, &incoming);
-            }
-        }
         merge_parts(&mut self.items, std::mem::take(&mut self.fresh));
         let mut positions = HashMap::<PayloadSource, std::collections::VecDeque<usize>>::new();
         for &(index, source) in &self.delivery {
             positions.entry(source).or_default().push_back(index);
         }
         // Rearrange only parts present in this ciphertext sequence. Disjoint
-        // deliveries remain appended, and re-encrypted retries use the
-        // plaintext occurrence anchors above rather than guessed enc ordinals.
+        // deliveries remain appended. Cross-generation overlap requires the
+        // complete sequence above rather than guessed plaintext aliases.
         let mut slots = Vec::new();
         let mut ordered = Vec::new();
         for (slot, item) in self.items.iter().enumerate() {
@@ -1020,6 +1047,37 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn identical_ciphertext_retries_keep_repeated_occurrences() {
+        let retention = Arc::new(InboundRetention::default());
+        let first = item("identical-cipher", "A");
+        let second = item("identical-cipher", "A");
+        retention.begin(&first.info, None).await;
+        {
+            let mut stanzas = lock(&retention.stanzas);
+            let stanza = stanzas.get_mut(&key(&first.info)).unwrap();
+            stanza.delivery = vec![(0, [1; 32]), (1, [1; 32])];
+            stanza.current_source = Some([1; 32]);
+        }
+        retention.stage(&[first.clone(), second.clone()], false);
+        assert_eq!(retention.seal(&first.info, false).0.len(), 2);
+        retention.begin(&first.info, None).await;
+        {
+            let mut stanzas = lock(&retention.stanzas);
+            let stanza = stanzas.get_mut(&key(&first.info)).unwrap();
+            stanza.delivery = vec![(0, [1; 32]), (1, [1; 32])];
+            stanza.current_source = Some([1; 32]);
+        }
+        retention.stage(
+            &[item("identical-cipher", "A"), item("identical-cipher", "A")],
+            false,
+        );
+        let (items, _) = retention.seal(&first.info, false);
+        assert_eq!(items.len(), 2);
+        assert!(Arc::ptr_eq(&items[0].message, &first.message));
+        assert!(Arc::ptr_eq(&items[1].message, &second.message));
+    }
+
     use super::*;
     fn item(id: &str, body: &str) -> InboundMessage {
         let mut message = wa::Message::default();

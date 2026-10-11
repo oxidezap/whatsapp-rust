@@ -27,7 +27,12 @@ use waproto::whatsapp as wa;
 /// established device-less participant identity without merging PN and LID.
 /// If one recorded payload sequence contains all matching rows, replay reuses
 /// that sequence and its repeated parts. Corrupt or conflicting matching rows
-/// fail closed. Only rows read for the
+/// fail closed. Partial retries whose ciphertexts cannot prove the retained
+/// occurrence order withhold commit until a complete sequence proves it.
+/// Fresh parts waiting for that proof remain in this Client; after a restart,
+/// another fully decoded delivery may be needed. Receipt suppression does not
+/// guarantee that the server provides one.
+/// Only rows read for the
 /// successful commit (and rows it wrote) are removed; unrelated participants,
 /// chats, message ids and backend devices are preserved.
 ///
