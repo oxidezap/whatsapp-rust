@@ -267,6 +267,7 @@ pub(super) fn extend_pending_record(
         let matches = if let Some(expected) = existing_fingerprints.get(next) {
             let message = waproto::codec::message_decode(part.bytes)?;
             *expected == MessageDispatch::fingerprint_into(&message, &mut scratch)
+                && retention::sources_compatible(&original_parts[next].sources, &part.sources)
         } else {
             false
         };
@@ -321,22 +322,31 @@ fn is_subsequence(sequence: &[DispatchFingerprint], candidate: &[DispatchFingerp
 fn unique_subsequence_positions(
     sequence: &[DispatchFingerprint],
     candidate: &[DispatchFingerprint],
+    sequence_parts: &[InboundMessage],
+    candidate_parts: &[InboundMessage],
+    sources: &std::collections::HashMap<usize, retention::PayloadSources>,
 ) -> Option<Vec<usize>> {
+    let compatible = |old: usize, new: usize| {
+        sequence[old] == candidate[new]
+            && retention::sources_compatible(
+                sources
+                    .get(&(Arc::as_ptr(&sequence_parts[old].message) as usize))
+                    .map_or(&[], |sources| sources.as_slice()),
+                sources
+                    .get(&(Arc::as_ptr(&candidate_parts[new].message) as usize))
+                    .map_or(&[], |sources| sources.as_slice()),
+            )
+    };
     let mut positions = Vec::with_capacity(sequence.len());
     let mut next = 0;
-    for fingerprint in sequence {
-        let offset = candidate[next..]
-            .iter()
-            .position(|part| part == fingerprint)?;
-        next += offset;
+    for old in 0..sequence.len() {
+        next = (next..candidate.len()).find(|&new| compatible(old, new))?;
         positions.push(next);
         next += 1;
     }
     let mut end = candidate.len();
-    for (fingerprint, earliest) in sequence.iter().zip(&positions).rev() {
-        let latest = candidate[..end]
-            .iter()
-            .rposition(|part| part == fingerprint)?;
+    for (old, earliest) in positions.iter().enumerate().rev() {
+        let latest = (0..end).rfind(|&new| compatible(old, new))?;
         if latest != *earliest {
             return None;
         }
@@ -352,7 +362,7 @@ pub(super) struct PendingReplay {
     pub(super) sources: std::collections::HashMap<usize, retention::PayloadSources>,
 }
 
-// Keep the string comparisons out of the stable sort's generated inner loops.
+// Keep string comparisons out of the sort's generated inner loops.
 #[inline(never)]
 fn compare_pending_senders(a: &str, b: &str, preferred: &str) -> std::cmp::Ordering {
     (a != preferred, a).cmp(&(b != preferred, b))
@@ -392,7 +402,7 @@ impl Client {
                         .is_ok_and(|stored| stored.to_non_ad() == info.source.sender.to_non_ad())
         });
         // Prefer exact spelling when equivalent rows have equal source coverage.
-        rows.sort_by(|a, b| compare_pending_senders(&a.0, &b.0, &sender));
+        rows.sort_unstable_by(|a, b| compare_pending_senders(&a.0, &b.0, &sender));
         let mut replay = PendingReplay {
             items: Vec::new(),
             waiting: Vec::new(),
@@ -450,9 +460,14 @@ impl Client {
         // Compare occurrences so [A,A,B] still contains two copies of A.
         if let Some(complete) = (0..sequences.len())
             .filter(|&index| {
-                sequences
-                    .iter()
-                    .all(|sequence| is_subsequence(sequence, &sequences[index]))
+                sequences.iter().enumerate().all(|(other, sequence)| {
+                    is_subsequence(sequence, &sequences[index])
+                        || (candidates[other].iter().all(|item| {
+                            !replay
+                                .sources
+                                .contains_key(&(Arc::as_ptr(&item.message) as usize))
+                        }) && sequence.iter().all(|part| !sequences[index].contains(part)))
+                })
             })
             .max_by_key(|&index| {
                 (
@@ -470,13 +485,44 @@ impl Client {
         {
             // Partial aliases can also prove ciphertext identities, provided
             // there is exactly one placement for every occurrence.
+            let mut legacy_additions = Vec::new();
             for index in 0..candidates.len() {
                 if index == complete {
                     continue;
                 }
-                let Some(positions) =
-                    unique_subsequence_positions(&sequences[index], &sequences[complete])
-                else {
+                let Some(positions) = unique_subsequence_positions(
+                    &sequences[index],
+                    &sequences[complete],
+                    &candidates[index],
+                    &candidates[complete],
+                    &replay.sources,
+                ) else {
+                    // Ambiguous or disjoint source positions cannot discard
+                    // the row's bytes or ciphertext identities.
+                    let legacy_disjoint = candidates[index].iter().all(|item| {
+                        !replay
+                            .sources
+                            .contains_key(&(Arc::as_ptr(&item.message) as usize))
+                    }) && sequences[index]
+                        .iter()
+                        .all(|part| !sequences[complete].contains(part));
+                    if legacy_disjoint {
+                        let overlaps_addition = candidates[index].iter().any(|item| {
+                            legacy_additions.iter().any(|retained: &InboundMessage| {
+                                MessageDispatch::fingerprint(&item.message)
+                                    == MessageDispatch::fingerprint(&retained.message)
+                            })
+                        });
+                        if overlaps_addition {
+                            // Preserve every overlapping legacy row. No source
+                            // identity proves which bytes own this occurrence.
+                            replay.waiting.push(candidates[index].clone());
+                        } else {
+                            legacy_additions.extend(candidates[index].iter().cloned());
+                        }
+                    } else if !candidates[index].is_empty() {
+                        replay.waiting.push(candidates[index].clone());
+                    }
                     continue;
                 };
                 for (old, position) in candidates[index].iter().zip(positions) {
@@ -495,6 +541,33 @@ impl Client {
                 }
             }
             replay.items = candidates.swap_remove(complete);
+            replay.items.extend(legacy_additions);
+        } else if !replay.sources.is_empty() {
+            // No complete ordered candidate covers these ciphertext histories.
+            // Keep each group intact until a wire frame supplies order proof.
+            for items in candidates {
+                if replay.items.is_empty() {
+                    replay.items = items;
+                } else if !items.is_empty() {
+                    // A disjoint legacy group adds parts without identifying or
+                    // replacing any sourced occurrence. Overlap still needs
+                    // an ordered frame; never use plaintext to alias sources.
+                    let legacy_disjoint = items.iter().all(|item| {
+                        !replay
+                            .sources
+                            .contains_key(&(Arc::as_ptr(&item.message) as usize))
+                            && replay.items.iter().all(|retained| {
+                                MessageDispatch::fingerprint(&item.message)
+                                    != MessageDispatch::fingerprint(&retained.message)
+                            })
+                    });
+                    if legacy_disjoint {
+                        replay.items.extend(items);
+                    } else {
+                        replay.waiting.push(items);
+                    }
+                }
+            }
         } else {
             for items in candidates {
                 retention::merge_parts(&mut replay.items, items);
@@ -616,7 +689,7 @@ impl Client {
                 return false;
             }
             match self.load_pending_inbound(info).await {
-                Ok(replay) if !replay.items.is_empty() => {
+                Ok(replay) if !replay.items.is_empty() || !replay.waiting.is_empty() => {
                     if self.inbound_commit_batch.retention.is_collecting(info) {
                         self.inbound_commit_batch.retention.seed_replay(replay);
                         return false; // The outer producer seals every part together.
@@ -628,6 +701,9 @@ impl Client {
                         .inbound_commit_batch
                         .retention
                         .seal(info, self.inbound_commit_batch.is_active());
+                    if self.inbound_commit_batch.retention.awaiting_order(info) {
+                        return false;
+                    }
                     return !matches!(
                         self.commit_or_batch_inbound_items(items, false).await,
                         InboundCommitState::Failed
@@ -654,6 +730,28 @@ impl Client {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn pending_extension_cannot_merge_disjoint_known_sources() {
+        let raw = [10, 1, b'A', 192, 62, 7];
+        let original = encode_pending_sourced_parts(&[(&raw, Some([1; 32]))]);
+        let proposed = encode_pending_sourced_parts(&[(&raw, Some([2; 32]))]);
+        assert!(
+            extend_pending_record(&original, &proposed).is_err(),
+            "record extension cannot invent an alias between known ciphertexts"
+        );
+        let complete =
+            encode_pending_sourced_parts(&[(&raw, Some([1; 32])), (&raw, Some([2; 32]))]);
+        let result = extend_pending_record(&original, &complete)
+            .unwrap()
+            .unwrap();
+        let parts = pending_records(&result).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].sources.as_slice(), &[[1; 32]]);
+        assert_eq!(parts[1].sources.as_slice(), &[[2; 32]]);
+        assert_eq!(parts[0].bytes, raw);
+        assert_eq!(parts[1].bytes, raw);
+    }
+
+    #[test]
     fn deferred_waiting_only_chunk_keeps_original_bytes() {
         let a = [10, 1, b'A'];
         let b = [10, 1, b'B', 192, 62, 7];
@@ -679,14 +777,22 @@ mod tests {
         let canonical = encode_pending_source_sets(&[(&b, smallvec::smallvec![[1; 32]])]);
         let waiting = encode_pending_source_sets(&[(&with_carrier, smallvec::smallvec![[2; 32]])]);
         let deferred = append_deferred_parts(None, &canonical, &[waiting]).unwrap();
-        let complete = extend_pending_record(&deferred, &encode_pending_parts(&[&a, &b, &c]))
+        let proposed = encode_pending_source_sets(&[
+            (&a, smallvec::smallvec![]),
+            (&b, smallvec::smallvec![[1; 32]]),
+            (&b, smallvec::smallvec![[2; 32]]),
+            (&c, smallvec::smallvec![]),
+        ]);
+        let complete = extend_pending_record(&deferred, &proposed)
             .unwrap()
             .unwrap();
-        assert_eq!(pending_parts(&complete).unwrap(), [&a[..], &b[..], &c[..]]);
         assert_eq!(
-            pending_records(&complete).unwrap()[1].sources.as_slice(),
-            &[[1; 32], [2; 32]]
+            pending_parts(&complete).unwrap(),
+            [&a[..], &b[..], &with_carrier[..], &c[..]]
         );
+        let records = pending_records(&complete).unwrap();
+        assert_eq!(records[1].sources.as_slice(), &[[1; 32]]);
+        assert_eq!(records[2].sources.as_slice(), &[[2; 32]]);
     }
 
     #[test]
@@ -792,9 +898,9 @@ mod tests {
         let original =
             encode_pending_sourced_parts(&[(&first, Some([1; 32])), (&third, Some([3; 32]))]);
         let proposed = encode_pending_sourced_parts(&[
-            (&first, Some([9; 32])),
+            (&first, Some([1; 32])),
             (&second, Some([2; 32])),
-            (&third, Some([8; 32])),
+            (&third, Some([3; 32])),
         ]);
         let extended = extend_pending_record(&original, &proposed)
             .unwrap()
@@ -828,17 +934,19 @@ mod tests {
     }
 
     #[test]
-    fn pending_source_history_preserves_both_ciphertext_generations() {
+    fn overlapping_source_history_preserves_original_bytes() {
         let bytes = [10, 1, b'a', 0xc0, 0x3e, 7];
-        let existing = encode_pending_sourced_parts(&[(&bytes, Some([1; 32]))]);
-        let proposed = encode_pending_sourced_parts(&[(&bytes, Some([2; 32]))]);
+        let existing =
+            encode_pending_source_sets(&[(&bytes, smallvec::smallvec![[1; 32], [2; 32]])]);
+        let proposed =
+            encode_pending_source_sets(&[(&bytes, smallvec::smallvec![[2; 32], [3; 32]])]);
         let extended = extend_pending_record(&existing, &proposed)
             .unwrap()
             .unwrap();
         assert!(extended.starts_with(SOURCE_SETS_HEADER));
         let parts = pending_records(&extended).unwrap();
         assert_eq!(parts[0].bytes, bytes);
-        assert_eq!(parts[0].sources.as_slice(), &[[1; 32], [2; 32]]);
+        assert_eq!(parts[0].sources.as_slice(), &[[1; 32], [2; 32], [3; 32]]);
         assert!(
             extend_pending_record(&extended, &proposed)
                 .unwrap()
@@ -861,11 +969,9 @@ mod tests {
             .collect();
         let existing = encode_pending_source_sets(&[(&bytes, sources.clone())]);
         let proposed = encode_pending_sourced_parts(&[(&bytes, Some([255; 32]))]);
-        assert!(
-            extend_pending_record(&existing, &proposed)
-                .unwrap()
-                .is_none()
-        );
+        assert!(extend_pending_record(&existing, &proposed).is_err());
+        let known = encode_pending_sourced_parts(&[(&bytes, Some([0; 32]))]);
+        assert!(extend_pending_record(&existing, &known).unwrap().is_none());
         let parts = pending_records(&existing).unwrap();
         assert_eq!(parts[0].bytes, bytes);
         assert_eq!(parts[0].sources, sources);
@@ -958,6 +1064,210 @@ mod tests {
         assert_eq!(encoded, a);
         assert_eq!(replay.keys.len(), 2);
     }
+    async fn disjoint_alias_rows(repeated: bool) {
+        let client = create_test_client_with_failing_http("unanchored_alias_rows").await;
+        let mut info = (*test_info("UNANCHORED_ALIAS_ROWS")).clone();
+        info.source.is_group = true;
+        let info = Arc::new(info);
+        let raw = [10, 1, b'a', 0xc0, 0x3e, 7];
+        let backend = client.persistence_manager.backend();
+        for (sender, source) in [
+            ("200@s.whatsapp.net", [1; 32]),
+            ("200:1@s.whatsapp.net", [2; 32]),
+        ] {
+            let row = if repeated && sender == "200@s.whatsapp.net" {
+                encode_pending_sourced_parts(&[(&raw, Some(source)), (&raw, Some([3; 32]))])
+            } else {
+                encode_pending_sourced_parts(&[(&raw, Some(source))])
+            };
+            backend
+                .store_pending_inbound("100@g.us", sender, &info.id, &row)
+                .await
+                .unwrap();
+        }
+        let replay = client.load_pending_inbound(&info).await.unwrap();
+        assert_eq!(replay.items.len(), if repeated { 2 } else { 1 });
+        assert_eq!(
+            replay.waiting.len(),
+            1,
+            "plaintext aliases cannot merge disjoint ciphertext identities"
+        );
+        assert_eq!(replay.waiting[0].len(), 1);
+        for (part, source) in [
+            (&replay.items[0], [1; 32]),
+            (&replay.waiting[0][0], [2; 32]),
+        ] {
+            assert_eq!(
+                replay.sources[&(Arc::as_ptr(&part.message) as usize)].as_slice(),
+                &[source]
+            );
+            let mut encoded = Vec::new();
+            waproto::codec::message_encode_into(&part.message, &mut encoded);
+            assert_eq!(encoded, raw);
+        }
+        assert_eq!(replay.keys.len(), 2);
+        let hook = counting_hook(true);
+        assert!(client.inbound_durability_hook.set(hook.clone()).is_ok());
+        assert!(!client.ack_or_replay_to_hook(&info).await);
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 0);
+        for sender in ["200@s.whatsapp.net", "200:1@s.whatsapp.net"] {
+            assert!(
+                backend
+                    .get_pending_inbound("100@g.us", sender, &info.id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disjoint_legacy_alias_preserves_raw_parts_without_source_assignment() {
+        let client = create_test_client_with_failing_http("disjoint_legacy_alias").await;
+        let mut info = (*test_info("DISJOINT_LEGACY_ALIAS")).clone();
+        info.source.is_group = true;
+        let info = Arc::new(info);
+        let a = [10, 1, b'A', 0xc0, 0x3e, 7];
+        let c = [10, 1, b'C', 0xc0, 0x3e, 9];
+        let canonical = encode_pending_sourced_parts(&[(&a, Some([1; 32]))]);
+        let legacy = encode_pending_parts(&[&c, &c]);
+        let backend = client.persistence_manager.backend();
+        for (sender, bytes) in [
+            ("200@s.whatsapp.net", canonical.as_slice()),
+            ("200:1@s.whatsapp.net", legacy.as_slice()),
+        ] {
+            backend
+                .store_pending_inbound("100@g.us", sender, &info.id, bytes)
+                .await
+                .unwrap();
+        }
+        let replay = client.load_pending_inbound(&info).await.unwrap();
+        assert!(replay.waiting.is_empty());
+        assert_eq!(replay.items.len(), 3);
+        for (index, expected) in [a.as_slice(), c.as_slice(), c.as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let item = &replay.items[index];
+            let mut raw = Vec::new();
+            waproto::codec::message_encode_into(&item.message, &mut raw);
+            assert_eq!(raw, expected);
+            let source = replay.sources.get(&(Arc::as_ptr(&item.message) as usize));
+            if index == 0 {
+                assert_eq!(source.unwrap().as_slice(), &[[1; 32]]);
+            } else {
+                assert!(source.is_none());
+            }
+        }
+        assert_eq!(replay.keys.len(), 2);
+    }
+
+    async fn overlapping_legacy_additions(reverse: bool) {
+        let client = create_test_client_with_failing_http("overlapping_legacy_additions").await;
+        let mut info = (*test_info("OVERLAPPING_LEGACY_ADDITIONS")).clone();
+        info.source.is_group = true;
+        let info = Arc::new(info);
+        let a = [10, 1, b'A'];
+        let c = [10, 1, b'C'];
+        let d = [10, 1, b'D'];
+        let canonical = encode_pending_sourced_parts(&[(&a, Some([1; 32]))]);
+        let first = if reverse {
+            encode_pending_parts(&[&c, &d])
+        } else {
+            encode_pending_parts(&[&c])
+        };
+        let second = if reverse {
+            encode_pending_parts(&[&d, &c])
+        } else {
+            first.clone()
+        };
+        let backend = client.persistence_manager.backend();
+        for (sender, bytes) in [
+            ("200@s.whatsapp.net", canonical.as_slice()),
+            ("200:1@s.whatsapp.net", first.as_slice()),
+            ("200:2@s.whatsapp.net", second.as_slice()),
+        ] {
+            backend
+                .store_pending_inbound("100@g.us", sender, &info.id, bytes)
+                .await
+                .unwrap();
+        }
+        let replay = client.load_pending_inbound(&info).await.unwrap();
+        assert_eq!(replay.items.len(), if reverse { 3 } else { 2 });
+        assert_eq!(replay.waiting.len(), 1);
+        assert_eq!(replay.waiting[0].len(), if reverse { 2 } else { 1 });
+        assert_eq!(replay.keys.len(), 3);
+        let hook = counting_hook(true);
+        assert!(client.inbound_durability_hook.set(hook.clone()).is_ok());
+        assert!(!client.ack_or_replay_to_hook(&info).await);
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 0);
+        for sender in [
+            "200@s.whatsapp.net",
+            "200:1@s.whatsapp.net",
+            "200:2@s.whatsapp.net",
+        ] {
+            assert!(
+                backend
+                    .get_pending_inbound("100@g.us", sender, &info.id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn identical_legacy_additions_do_not_manufacture_occurrences() {
+        overlapping_legacy_additions(false).await;
+    }
+    #[tokio::test]
+    async fn conflicting_legacy_additions_cannot_commit() {
+        overlapping_legacy_additions(true).await;
+    }
+
+    #[tokio::test]
+    async fn source_anchored_alias_selects_the_correct_repeated_part() {
+        let client = create_test_client_with_failing_http("anchored_alias_repeat").await;
+        let mut info = (*test_info("ANCHORED_ALIAS_REPEAT")).clone();
+        info.source.is_group = true;
+        let info = Arc::new(info);
+        let raw = [10, 1, b'a', 0xc0, 0x3e, 7];
+        let canonical =
+            encode_pending_sourced_parts(&[(&raw, Some([1; 32])), (&raw, Some([3; 32]))]);
+        let partial = encode_pending_sourced_parts(&[(&raw, Some([3; 32]))]);
+        let backend = client.persistence_manager.backend();
+        for (sender, row) in [
+            ("200@s.whatsapp.net", canonical),
+            ("200:1@s.whatsapp.net", partial),
+        ] {
+            backend
+                .store_pending_inbound("100@g.us", sender, &info.id, &row)
+                .await
+                .unwrap();
+        }
+        let replay = client.load_pending_inbound(&info).await.unwrap();
+        assert_eq!(replay.items.len(), 2);
+        assert!(replay.waiting.is_empty());
+        for (item, source) in replay.items.iter().zip([[1; 32], [3; 32]]) {
+            assert_eq!(
+                replay.sources[&(Arc::as_ptr(&item.message) as usize)].as_slice(),
+                &[source]
+            );
+            let mut encoded = Vec::new();
+            waproto::codec::message_encode_into(&item.message, &mut encoded);
+            assert_eq!(encoded, raw);
+        }
+        assert_eq!(replay.keys.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn equal_alias_rows_without_shared_source_remain_separate() {
+        disjoint_alias_rows(false).await;
+    }
+    #[tokio::test]
+    async fn ambiguous_alias_placement_keeps_source_and_unknown_bytes() {
+        disjoint_alias_rows(true).await;
+    }
+
     #[tokio::test]
     async fn compatible_partial_alias_preserves_unique_ciphertext_provenance() {
         partial_alias_sources(false).await;

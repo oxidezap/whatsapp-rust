@@ -596,6 +596,22 @@ impl Client {
             return;
         }
 
+        // Settle a complete older delivery before another encryption generation
+        // can enter its collection. The caller already owns the processing
+        // permit and chat lane; a failed hook leaves the old bytes and lease
+        // retained and prevents advancing this delivery's ratchet.
+        if was_draining
+            && self.inbound_durability_hook().is_some()
+            && self
+                .inbound_commit_batch
+                .retention
+                .has_batched_payload(&info)
+            && (!self.commit_inbound_batch_holding_permit().await
+                || self.inbound_commit_batch.retention.has_plaintext(&info))
+        {
+            return;
+        }
+
         let _collection;
         if self.inbound_durability_hook().is_some() {
             let fresh = self

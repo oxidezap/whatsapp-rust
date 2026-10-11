@@ -27,6 +27,23 @@ pub(super) fn remember_sources(sources: &mut PayloadSources, incoming: &[Payload
         }
     }
 }
+pub(super) fn sources_compatible(old: &[PayloadSource], new: &[PayloadSource]) -> bool {
+    old.is_empty() || new.is_empty() || old.iter().any(|source| new.contains(source))
+}
+fn same_retained_occurrence(
+    sources: &HashMap<usize, PayloadSources>,
+    retained: &InboundMessage,
+    candidate: &InboundMessage,
+) -> bool {
+    sources_compatible(
+        sources
+            .get(&part_key(retained))
+            .map_or(&[], |sources| sources.as_slice()),
+        sources
+            .get(&part_key(candidate))
+            .map_or(&[], |sources| sources.as_slice()),
+    )
+}
 fn part_key(item: &InboundMessage) -> usize {
     Arc::as_ptr(&item.message) as usize
 }
@@ -94,6 +111,8 @@ struct Stanza {
     receipt: bool,
     ticket: Option<InboundCommitTicket>,
     admissions: Vec<Arc<InboundAdmission>>,
+    collection_admission: Option<Arc<InboundAdmission>>,
+    collection_has_payload: bool,
     commit_waiters: Vec<futures::channel::oneshot::Sender<()>>,
 }
 // Match occurrences, not a set: [A,A] remains two parts, but another
@@ -209,6 +228,20 @@ fn order_sourced_parts(
     }
 }
 impl Stanza {
+    fn finish_collection(&mut self) {
+        if let Some(admission) = self.collection_admission.take() {
+            if self.collection_has_payload {
+                self.admissions.push(admission);
+            } else {
+                // A duplicate/failed frame introduced no payload. Its node
+                // stays charged by RetentionCollection until the producer exits;
+                // transient delivery hashes must not outlive that reservation.
+                self.delivery.clear();
+                self.current_source = None;
+            }
+        }
+        self.collection_has_payload = false;
+    }
     fn reconcile(&mut self) -> bool {
         let fresh_start = self.fresh_boundaries.last().copied().unwrap_or_default();
         order_sourced_parts(
@@ -326,7 +359,18 @@ impl Stanza {
                 for item in &self.fresh[start..end] {
                     let fingerprint =
                         MessageDispatch::fingerprint_into(&item.message, &mut scratch);
-                    let Some(offset) = fingerprints[next..].iter().position(|f| *f == fingerprint)
+                    let Some(offset) =
+                        fingerprints[next..]
+                            .iter()
+                            .enumerate()
+                            .position(|(offset, f)| {
+                                *f == fingerprint
+                                    && same_retained_occurrence(
+                                        &self.sources,
+                                        item,
+                                        &candidate[next + offset],
+                                    )
+                            })
                     else {
                         self.ordering_blocked = true;
                         return false;
@@ -339,7 +383,18 @@ impl Stanza {
             let mut next = 0;
             for item in &self.items {
                 let fingerprint = MessageDispatch::fingerprint_into(&item.message, &mut scratch);
-                let Some(offset) = fingerprints[next..].iter().position(|f| *f == fingerprint)
+                let Some(offset) =
+                    fingerprints[next..]
+                        .iter()
+                        .enumerate()
+                        .position(|(offset, f)| {
+                            *f == fingerprint
+                                && same_retained_occurrence(
+                                    &self.sources,
+                                    item,
+                                    &candidate[next + offset],
+                                )
+                        })
                 else {
                     self.ordering_blocked = true;
                     return false;
@@ -479,6 +534,7 @@ impl InboundRetention {
         if let Some(stanza) = stanzas.get_mut(&key(info)) {
             // The chat gate and processing permit exclude its commit. Preserve
             // prior parts while a re-encrypted resend is examined for new parts.
+            stanza.finish_collection();
             stanza.id = id;
             stanza.state = State::Collecting;
             stanza.order_retry_owner = None;
@@ -487,7 +543,7 @@ impl InboundRetention {
             }
             stanza.delivery.clear();
             stanza.current_source = None;
-            stanza.admissions.extend(admission.take().map(Arc::new));
+            stanza.collection_admission = admission.take().map(Arc::new);
             return Ok(false);
         }
         stanzas.insert(
@@ -508,7 +564,9 @@ impl InboundRetention {
                 state: State::Collecting,
                 receipt: false,
                 ticket: None,
-                admissions: admission.take().map(Arc::new).into_iter().collect(),
+                admissions: Vec::new(),
+                collection_admission: admission.take().map(Arc::new),
+                collection_has_payload: false,
                 commit_waiters: Vec::new(),
             },
         );
@@ -579,6 +637,7 @@ impl InboundRetention {
                     .insert(part_key(item), smallvec::smallvec![source]);
             }
         }
+        stanza.collection_has_payload = true;
         stanza.fresh.extend_from_slice(items);
         let ticket = track.then(|| {
             stanza
@@ -610,12 +669,19 @@ impl InboundRetention {
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
     ) -> RetentionCollection {
-        let id = lock(&self.stanzas)[&key(info)].id;
+        let stanzas = lock(&self.stanzas);
+        let stanza = &stanzas[&key(info)];
         RetentionCollection {
             retention: Arc::clone(self),
             info: Arc::clone(info),
-            id,
+            id: stanza.id,
+            _admission: stanza.collection_admission.clone(),
         }
+    }
+    pub(super) fn has_batched_payload(&self, info: &MessageInfo) -> bool {
+        lock(&self.stanzas)
+            .get(&key(info))
+            .is_some_and(|stanza| stanza.state == State::Batched && !stanza.items.is_empty())
     }
     pub(crate) fn replay_items(&self, info: &MessageInfo) -> Option<Arc<[InboundMessage]>> {
         let stanzas = lock(&self.stanzas);
@@ -707,13 +773,24 @@ impl InboundRetention {
         };
         let mut stanzas = lock(&self.stanzas);
         if let Some(stanza) = stanzas.get_mut(&key(&first.info)) {
+            stanza.collection_has_payload = true;
             let mut scratch = Vec::new();
-            if stanza.items.len() == replay.items.len()
+            let same_sequence = stanza.items.len() == replay.items.len()
                 && stanza.items.iter().zip(&replay.items).all(|(old, new)| {
-                    let old = MessageDispatch::fingerprint_into(&old.message, &mut scratch);
-                    old == MessageDispatch::fingerprint_into(&new.message, &mut scratch)
-                })
-            {
+                    MessageDispatch::fingerprint_into(&old.message, &mut scratch)
+                        == MessageDispatch::fingerprint_into(&new.message, &mut scratch)
+                        && sources_compatible(
+                            stanza
+                                .sources
+                                .get(&part_key(old))
+                                .map_or(&[], |sources| sources.as_slice()),
+                            replay
+                                .sources
+                                .get(&part_key(new))
+                                .map_or(&[], |sources| sources.as_slice()),
+                        )
+                });
+            if same_sequence {
                 for (old, new) in stanza.items.iter().zip(&replay.items) {
                     if let Some(incoming) = replay.sources.get(&part_key(new)) {
                         let sources = stanza.sources.entry(part_key(old)).or_default();
@@ -721,7 +798,19 @@ impl InboundRetention {
                     }
                 }
             }
-            merge_parts(&mut stanza.items, replay.items);
+            if stanza.items.is_empty() {
+                stanza.items = replay.items;
+            } else if same_sequence {
+                // The resident bytes win over a compatible stored copy.
+            } else if stanza.sources.is_empty() && replay.sources.is_empty() {
+                merge_parts(&mut stanza.items, replay.items);
+            } else if !replay.items.is_empty() {
+                // A stored group cannot manufacture plaintext aliases for
+                // resident ciphertexts. Let a later wire sequence prove order.
+                stanza.fresh.extend(replay.items);
+                stanza.fresh_boundaries.push(stanza.fresh.len());
+                stanza.ordering_blocked = true;
+            }
             for waiting in replay.waiting {
                 stanza.fresh.extend(waiting);
                 stanza.fresh_boundaries.push(stanza.fresh.len());
@@ -739,7 +828,9 @@ impl InboundRetention {
         let Some(stanza) = stanzas.get_mut(&key(info)) else {
             return (Arc::from([]), false);
         };
-        if !stanza.reconcile() {
+        let reconciled = stanza.reconcile();
+        stanza.finish_collection();
+        if !reconciled {
             stanza.state = State::AwaitingOrder;
             return (Arc::from([]), false);
         }
@@ -917,6 +1008,7 @@ pub(crate) struct RetentionCollection {
     retention: Arc<InboundRetention>,
     info: Arc<MessageInfo>,
     id: u64,
+    _admission: Option<Arc<InboundAdmission>>,
 }
 impl Drop for RetentionCollection {
     fn drop(&mut self) {
@@ -926,7 +1018,9 @@ impl Drop for RetentionCollection {
             && stanza.id == self.id
             && stanza.state == State::Collecting
         {
-            if !stanza.reconcile() {
+            let reconciled = stanza.reconcile();
+            stanza.finish_collection();
+            if !reconciled {
                 stanza.state = State::AwaitingOrder;
                 return;
             }
@@ -1314,6 +1408,37 @@ impl Client {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn unchanged_retry_keeps_only_the_payload_reservation() {
+        let retention = Arc::new(InboundRetention::default());
+        let first = item("empty-retry-budget", "A");
+        retention.begin(&first.info, retention.admit(100)).await;
+        retention.stage(std::slice::from_ref(&first), false);
+        retention.seal(&first.info, false);
+        for _ in 0..MAX_STANZAS + 1 {
+            retention.begin(&first.info, retention.admit(100)).await;
+            let collection = retention.collection_guard(&first.info);
+            assert_eq!(retention.seal(&first.info, false).0.len(), 1);
+            assert_eq!(retention.stats(), (2, 200), "producer still owns its frame");
+            drop(collection);
+            assert_eq!(retention.stats(), (1, 100));
+        }
+        assert!(retention.admit(100).is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_empty_retry_releases_only_its_own_reservation() {
+        let retention = Arc::new(InboundRetention::default());
+        let first = item("cancel-empty-budget", "A");
+        retention.begin(&first.info, retention.admit(100)).await;
+        retention.stage(std::slice::from_ref(&first), false);
+        retention.seal(&first.info, false);
+        retention.begin(&first.info, retention.admit(200)).await;
+        drop(retention.collection_guard(&first.info));
+        assert_eq!(retention.stats(), (1, 100));
+        assert_eq!(retention.replay_items(&first.info).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn canceled_partial_collection_keeps_fresh_for_order_recovery() {
         let retention = Arc::new(InboundRetention::default());
         let first = item("canceled-order", "A");
@@ -1517,6 +1642,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn equal_plaintext_without_ciphertext_anchor_keeps_both_occurrences() {
+        let retention = Arc::new(InboundRetention::default());
+        let old = item("unanchored-equal", "A");
+        retention.begin(&old.info, None).await;
+        {
+            let mut stanzas = lock(&retention.stanzas);
+            let stanza = stanzas.get_mut(&key(&old.info)).unwrap();
+            stanza.delivery = vec![(0, [1; 32])];
+            stanza.current_source = Some([1; 32]);
+        }
+        retention.stage(std::slice::from_ref(&old), false);
+        assert_eq!(retention.seal(&old.info, false).0.len(), 1);
+        let fresh = item("unanchored-equal", "A");
+        retention.begin(&old.info, None).await;
+        {
+            let mut stanzas = lock(&retention.stanzas);
+            let stanza = stanzas.get_mut(&key(&old.info)).unwrap();
+            stanza.delivery = vec![(0, [2; 32])];
+            stanza.current_source = Some([2; 32]);
+        }
+        retention.stage(std::slice::from_ref(&fresh), false);
+        assert!(
+            retention.seal(&old.info, false).0.is_empty(),
+            "equal plaintext alone cannot replace a retained occurrence"
+        );
+        assert!(retention.awaiting_order(&old.info));
+        {
+            let stanzas = lock(&retention.stanzas);
+            let stanza = stanzas.get(&key(&old.info)).unwrap();
+            assert!(Arc::ptr_eq(&stanza.items[0].message, &old.message));
+            assert!(Arc::ptr_eq(&stanza.fresh[0].message, &fresh.message));
+            assert_eq!(stanza.sources[&part_key(&old)].as_slice(), &[[1; 32]]);
+        }
+        retention.begin(&old.info, None).await;
+        lock(&retention.stanzas)
+            .get_mut(&key(&old.info))
+            .unwrap()
+            .delivery = vec![(0, [1; 32]), (1, [2; 32])];
+        let (items, _) = retention.seal(&old.info, false);
+        assert_eq!(
+            items.len(),
+            2,
+            "a frame containing both sources proves two occurrences"
+        );
+        assert!(Arc::ptr_eq(&items[0].message, &old.message));
+        assert!(Arc::ptr_eq(&items[1].message, &fresh.message));
+    }
+
+    #[tokio::test]
     async fn complete_retry_preserves_unknown_fields_in_waiting_fresh_parts() {
         fn marked(id: &str, marker: u8) -> InboundMessage {
             let message = waproto::codec::message_decode(&[10, 1, b'B', 192, 62, marker]).unwrap();
@@ -1577,9 +1751,9 @@ mod tests {
             frame(
                 &retention,
                 &first.info,
-                &[(0, [4; 32]), (1, [5; 32])],
+                &[(0, [1; 32]), (1, [5; 32])],
                 &[
-                    ([4; 32], item("waiting-fresh-unknown", "A")),
+                    ([1; 32], item("waiting-fresh-unknown", "A")),
                     ([5; 32], new.clone())
                 ]
             )
@@ -1590,11 +1764,11 @@ mod tests {
         let items = frame(
             &retention,
             &first.info,
-            &[(0, [6; 32]), (1, [7; 32]), (2, [8; 32])],
+            &[(0, [1; 32]), (1, [3; 32]), (2, [5; 32])],
             &[
-                ([6; 32], item("waiting-fresh-unknown", "A")),
-                ([7; 32], old.clone()),
-                ([8; 32], new.clone()),
+                ([1; 32], item("waiting-fresh-unknown", "A")),
+                ([3; 32], old.clone()),
+                ([5; 32], new.clone()),
             ],
         )
         .await;
@@ -1648,9 +1822,9 @@ mod tests {
         {
             let mut stanzas = lock(&retention.stanzas);
             let stanza = stanzas.get_mut(&key(&first.info)).unwrap();
-            stanza.delivery = vec![(0, [3; 32]), (1, [4; 32]), (2, [5; 32])];
+            stanza.delivery = vec![(0, [3; 32]), (1, [4; 32]), (2, [2; 32])];
         }
-        for (source, body) in [([3; 32], "A"), ([4; 32], "A"), ([5; 32], "B")] {
+        for (source, body) in [([3; 32], "A"), ([4; 32], "A"), ([2; 32], "B")] {
             lock(&retention.stanzas)
                 .get_mut(&key(&first.info))
                 .unwrap()
@@ -1741,8 +1915,8 @@ mod tests {
         {
             let mut stanzas = lock(&retention.stanzas);
             let stanza = stanzas.get_mut(&key(&first.info)).unwrap();
-            stanza.delivery = vec![(0, [254; 32]), (1, [255; 32])];
-            stanza.current_source = Some([254; 32]);
+            stanza.delivery = vec![(0, [0; 32]), (1, [255; 32])];
+            stanza.current_source = Some([0; 32]);
         }
         let fresh_first = item("saturated-source", "A");
         retention.stage(std::slice::from_ref(&fresh_first), false);

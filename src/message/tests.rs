@@ -20054,11 +20054,16 @@ async fn suppressed_resend_replays_to_a_durability_hook() {
     let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
 
     let id = "HOOK_REPLAY";
+    let ciphertext = encrypt_group_text(&mut alice, &group, "ping").await;
     for _ in 0..2 {
-        let ciphertext = encrypt_group_text(&mut alice, &group, "ping").await;
         client
             .clone()
-            .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, ciphertext))
+            .handle_incoming_message(group_skmsg_stanza(
+                &group,
+                &alice.jid,
+                id,
+                ciphertext.clone(),
+            ))
             .await;
     }
 

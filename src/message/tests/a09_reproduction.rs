@@ -856,12 +856,8 @@ async fn p1_group_spelling_drain(first_device: bool) {
     f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
     assert_eq!(f.info.source.sender, first);
     f.receive().await;
-    f.stanza = group_skmsg_stanza(
-        &group,
-        &second,
-        &f.info.id,
-        encrypt_group_text(&mut peer, &group, "one group body").await,
-    );
+    // Only the sender spelling changes; occurrence identity stays on wire.
+    f.stanza = with_participant(&f.stanza, &second);
     assert_eq!(
         f.client
             .parse_message_info(f.stanza.get())
@@ -947,6 +943,7 @@ async fn p1_restart_parts(bodies: &[&str]) {
     let group: Jid = "120363000000000021@g.us".parse().unwrap();
     let mut peer = joined_group_sender(&f.client, "100000000000021:75@lid", &group).await;
     f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, bodies).await;
+    let original_stanza = f.stanza.clone();
     f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
     f.hook.fail.store(true, Ordering::SeqCst);
     f.receive().await;
@@ -954,21 +951,52 @@ async fn p1_restart_parts(bodies: &[&str]) {
     let original = f.pending().await.unwrap();
     f.restart().await;
     f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, bodies).await;
+    let reencrypted = f.stanza.clone();
     f.receive().await;
     assert_eq!(
         f.hook.attempts.load(Ordering::SeqCst),
-        bodies.len(),
-        "a re-encrypted replay must retain original multiplicity"
+        0,
+        "equal reencrypted parts have no proven old occurrence identity"
     );
+    let waiting = f.pending().await.unwrap();
+    let deferred = durability::deferred_parts(&waiting).unwrap().unwrap();
+    assert_eq!(deferred.canonical, original);
+    assert_eq!(deferred.waiting.len(), 1);
     assert_eq!(
-        durability::pending_parts(&f.pending().await.unwrap()).unwrap(),
-        durability::pending_parts(&original).unwrap(),
-        "failed replay must preserve every original payload byte and occurrence"
+        durability::pending_parts(deferred.waiting[0]).unwrap(),
+        durability::pending_parts(&original).unwrap()
     );
     f.hook.fail.store(false, Ordering::SeqCst);
     f.receive().await;
-    assert_eq!(f.hook.committed.load(Ordering::SeqCst), bodies.len());
-    assert_eq!(f.published(), bodies);
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 0);
+    assert_eq!(f.receipts(), 0);
+    assert!(f.published().is_empty());
+    // After another restart, a frame containing both preserved sources proves
+    // both occurrences rather than declaring one generation a plaintext alias.
+    f.restart().await;
+    let children: Vec<_> = original_stanza
+        .get()
+        .children()
+        .unwrap()
+        .iter()
+        .chain(reencrypted.get().children().unwrap())
+        .map(|part| part.to_owned())
+        .collect();
+    f.stanza = node_to_arc(
+        NodeBuilder::new("message")
+            .attr("from", group.clone())
+            .attr("participant", peer.jid.clone())
+            .attr("id", &f.info.id)
+            .attr("t", wacore::time::now_secs().to_string())
+            .attr("type", "text")
+            .attr("addressing_mode", "lid")
+            .children(children)
+            .build(),
+    );
+    f.receive().await;
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), bodies.len() * 2);
+    let expected: Vec<_> = bodies.iter().chain(bodies).copied().collect();
+    assert_eq!(f.published(), expected);
     assert!(f.pending().await.is_none());
 }
 #[tokio::test]
@@ -1048,6 +1076,27 @@ async fn p1_two_reconnects_after_hook_failure_keep_retrying() {
 #[tokio::test]
 async fn p1_two_reconnects_after_hook_cancellation_keep_retrying() {
     p1_two_reconnects(true).await;
+}
+
+fn with_enc_children(
+    stanza: &OwnedNodeRef,
+    children: Vec<wacore_binary::Node>,
+) -> Arc<OwnedNodeRef> {
+    let mut node = stanza.to_owned_node();
+    node.content = Some(wacore_binary::node::NodeContent::Nodes(children));
+    node_to_arc(node)
+}
+
+fn combine_enc_frames(first: &OwnedNodeRef, second: &OwnedNodeRef) -> Arc<OwnedNodeRef> {
+    let children = first
+        .get()
+        .children()
+        .unwrap()
+        .iter()
+        .chain(second.get().children().unwrap().iter())
+        .map(|node| (*node).to_owned())
+        .collect();
+    with_enc_children(second, children)
 }
 
 fn with_participant(stanza: &OwnedNodeRef, participant: &Jid) -> Arc<OwnedNodeRef> {
@@ -1147,6 +1196,44 @@ async fn restart_participant_alias(first_device: bool, multiple_rows: bool) {
     );
     assert_eq!(f.client.inbound_commit_batch.retention.stats(), (0, 0));
 }
+#[tokio::test]
+async fn failed_prior_drain_commit_does_not_decrypt_the_next_generation() {
+    let mut f = Fixture::new("DRAIN_PRIOR_COMMIT", true).await;
+    let group: Jid = "120363000000000027@g.us".parse().unwrap();
+    let mut peer = joined_group_sender(&f.client, "100000000000027:75@lid", &group).await;
+    f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, &["A"]).await;
+    f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+    f.receive().await;
+    while f.events.try_recv().is_ok() {}
+    assert!(
+        f.client
+            .inbound_commit_batch
+            .retention
+            .has_batched_payload(&f.info)
+    );
+    let received = f.client.stats.snapshot().messages_received;
+    f.hook.fail.store(true, Ordering::SeqCst);
+    f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, &["B"]).await;
+    f.receive().await;
+    assert!(f.hook.attempts.load(Ordering::SeqCst) > 0);
+    assert_eq!(f.hook.committed.load(Ordering::SeqCst), 0);
+    assert_eq!(f.client.stats.snapshot().messages_received, received);
+    assert_eq!(f.receipts(), 0);
+    while let Ok(event) = f.events.try_recv() {
+        assert!(
+            !matches!(event.as_ref(), Event::DecryptedPayload(payload) if payload.info.id == f.info.id)
+        );
+        assert!(!matches!(event.as_ref(), Event::Messages(_)));
+    }
+    assert_eq!(f.client.inbound_commit_batch.retention.stats().0, 1);
+    f.hook.fail.store(false, Ordering::SeqCst);
+    f.receive().await;
+    let _permit = f.client.acquire_message_processing_permit().await;
+    assert!(f.client.commit_inbound_batch_holding_permit().await);
+    assert_eq!(f.published(), ["A", "B"]);
+    assert_eq!(f.client.inbound_commit_batch.retention.stats(), (0, 0));
+}
+
 #[tokio::test]
 async fn restart_alias_device_to_bare_replays_before_receipt() {
     restart_participant_alias(true, false).await;
@@ -1257,7 +1344,19 @@ async fn restart_alias_conflicting_part_order_preserves_both_records() {
             .unwrap(),
         reversed
     );
-    assert_eq!(f.client.inbound_commit_batch.retention.stats(), (0, 0));
+    let retention = &f.client.inbound_commit_batch.retention;
+    assert!(retention.awaiting_order(&f.info));
+    assert!(!retention.has_batched_payload(&f.info));
+    assert_eq!(retention.stats().0, 1);
+    assert!(retention.stats().1 > 0);
+    let replay = f
+        .client
+        .load_pending_inbound(&Arc::new(f.info.clone()))
+        .await
+        .unwrap();
+    assert_eq!(replay.items.len(), 2);
+    assert_eq!(replay.waiting.len(), 1);
+    assert_eq!(replay.waiting[0].len(), 2);
 }
 
 #[tokio::test]
@@ -1571,10 +1670,29 @@ async fn recovered_middle_part_uses_retry_order_including_repeated_occurrences()
         };
         f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, &retained).await;
         f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
+        let retained_frame = f.stanza.clone();
         f.hook.fail.store(true, Ordering::SeqCst);
         f.receive().await;
         assert_eq!(f.receipts(), 0);
         f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, &recovered).await;
+        // Retained ciphertexts prove their positions. Only B is new.
+        let mut retained_encs = retained_frame.get().children().unwrap().iter();
+        let children = f
+            .stanza
+            .get()
+            .children()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(index, node)| {
+                if index == 1 {
+                    (*node).to_owned()
+                } else {
+                    (*retained_encs.next().unwrap()).to_owned()
+                }
+            })
+            .collect();
+        f.stanza = with_enc_children(&f.stanza, children);
         f.hook.fail.store(false, Ordering::SeqCst);
         f.receive().await;
         assert_eq!(
@@ -1777,6 +1895,7 @@ async fn repeated_reencrypted_partial_retry(restart: bool, repeated: bool) {
         vec!["A", "B", "C"]
     };
     let mut original = p1_group_parts(&mut peer, &group, &f.info.id, &bodies).await;
+    let initial_frame = original.clone();
     // Corrupt only B on the first delivery. A and C advance the sender-key
     // ratchet, retaining B's skipped key. On the unchanged retry, A and C
     // are cryptographic duplicates and only the restored B decrypts.
@@ -1904,10 +2023,13 @@ async fn repeated_reencrypted_partial_retry(restart: bool, repeated: bool) {
     if restart {
         f.restart().await;
     }
+    // A complete second generation alone cannot cover the first one.
+    // Prove both generations in one ordered frame before consuming either.
+    let complete = combine_enc_frames(&initial_frame, &original);
     f.stanza = if repeated {
-        with_participant(&original, &peer.jid.to_non_ad())
+        with_participant(&complete, &peer.jid.to_non_ad())
     } else {
-        original
+        complete
     };
     f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
     f.hook.fail.store(false, Ordering::SeqCst);
@@ -1943,8 +2065,8 @@ async fn repeated_reencrypted_partial_retry(restart: bool, repeated: bool) {
     }
     assert_eq!(
         f.published(),
-        bodies,
-        "publish every retained occurrence in proven order"
+        bodies.iter().chain(&bodies).copied().collect::<Vec<_>>(),
+        "publish both encryption generations in proven order"
     );
     assert_eq!(f.receipts(), 1);
     assert!(f.pending().await.is_none());
@@ -2063,7 +2185,8 @@ async fn legacy_partial_ciphertext_order(
             .unwrap();
     }
     f.restart().await;
-    f.stanza = original;
+    f.stanza = original.clone();
+    let mut alias_frame = None;
     let deferred_sender: Jid = if complete_bare_alias {
         "100000000000032:76@lid".parse().unwrap()
     } else {
@@ -2139,6 +2262,7 @@ async fn legacy_partial_ciphertext_order(
             // Keep the original resident sender metadata, then write another
             // waiting delivery under a new device spelling without restarting.
             f.stanza = p1_group_parts(&mut peer, &group, &f.info.id, &["B"]).await;
+            alias_frame = Some(f.stanza.clone());
             f.stanza = with_participant(&f.stanza, &deferred_sender);
             f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
             f.receive().await;
@@ -2224,15 +2348,40 @@ async fn legacy_partial_ciphertext_order(
             );
         }
 
+        // Keep the recovered occurrence's actual ciphertext. Legacy chunks
+        // can then migrate by unique order without inventing a known alias.
+        let anchor_index = usize::from(!leading_repeat);
+        let carrier_offset = usize::from(carrier);
+        let mut children = f
+            .stanza
+            .get()
+            .children()
+            .unwrap()
+            .iter()
+            .map(|node| (*node).to_owned())
+            .collect::<Vec<_>>();
+        let mut anchors = vec![original.get().children().unwrap()[anchor_index].to_owned()];
+        if let Some(alias) = &alias_frame {
+            anchors.push(alias.get().children().unwrap()[0].to_owned());
+        }
+        children.splice(
+            carrier_offset + anchor_index..carrier_offset + anchor_index + 1,
+            anchors,
+        );
+        f.stanza = with_enc_children(&f.stanza, children);
         if complete_bare_alias {
             f.stanza = with_participant(&f.stanza, &peer.jid.to_non_ad());
         }
         f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
         f.receive().await;
     }
+    let mut expected = bodies.clone();
+    if alias_frame.is_some() {
+        expected.insert(2, "B");
+    }
     assert_eq!(
         f.published(),
-        bodies,
+        expected,
         "only B decrypts; ciphertext duplicates must anchor its wire position"
     );
     if complete_bare_alias {
@@ -2349,7 +2498,15 @@ async fn compatible_alias_rows_combine_ciphertext_histories() {
         (info.source.sender.to_string(), [1; 32]),
         (info.source.sender.to_non_ad().to_string(), [2; 32]),
     ] {
-        let row = durability::encode_pending_source_sets(&[(&bytes, smallvec::smallvec![source])]);
+        // The overlap is already known in the stored row; plaintext does not create it.
+        let row = durability::encode_pending_source_sets(&[(
+            &bytes,
+            if source == [1; 32] {
+                smallvec::smallvec![source]
+            } else {
+                smallvec::smallvec![[1; 32], source]
+            },
+        )]);
         f.client
             .persistence_manager
             .backend()
@@ -2428,10 +2585,20 @@ async fn reencrypted_partial_leading_repeat_preserves_all_occurrences() {
     f.stanza = partial(&second, &[1, 2], &group, &peer.jid, &f.info.id);
     f.info = f.client.parse_message_info(f.stanza.get()).await.unwrap();
     f.receive().await;
-    f.stanza = second;
+    f.stanza = second.clone();
     f.hook.fail.store(false, Ordering::SeqCst);
     f.receive().await;
-    assert_eq!(f.published(), bodies);
+    assert!(
+        f.published().is_empty(),
+        "a second generation alone cannot cover the first"
+    );
+    assert_eq!(f.receipts(), 0);
+    f.stanza = combine_enc_frames(&first, &second);
+    f.receive().await;
+    assert_eq!(
+        f.published(),
+        bodies.iter().chain(&bodies).copied().collect::<Vec<_>>()
+    );
     assert_eq!(f.receipts(), 1);
     assert!(f.pending().await.is_none());
 }
