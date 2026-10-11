@@ -34,19 +34,21 @@ impl From<&UploadResponse> for UploadedMediaParts {
 /// Helper: build an ImageMessage from an UploadResponse.
 fn build_image_message(upload: &UploadResponse, caption: Option<&str>) -> wa::Message {
     let upload = UploadedMediaParts::from(upload);
-    wa::Message {
-        image_message: buffa::MessageField::some(wa::message::ImageMessage {
-            url: Some(upload.url),
-            direct_path: Some(upload.direct_path),
-            media_key: Some(upload.media_key),
-            file_sha256: Some(upload.file_sha256),
-            file_enc_sha256: Some(upload.file_enc_sha256),
-            file_length: Some(upload.file_length),
-            mimetype: Some("image/jpeg".to_string()),
-            caption: caption.map(|c| c.to_string()),
-            ..Default::default()
-        }),
-        ..Default::default()
+    {
+        let mut proto_contract_fixture = wa::Message::default();
+        proto_contract_fixture.image_message = buffa::MessageField::some({
+            let mut proto_contract_fixture = wa::message::ImageMessage::default();
+            proto_contract_fixture.url = Some(upload.url);
+            proto_contract_fixture.direct_path = Some(upload.direct_path);
+            proto_contract_fixture.media_key = Some(upload.media_key);
+            proto_contract_fixture.file_sha256 = Some(upload.file_sha256);
+            proto_contract_fixture.file_enc_sha256 = Some(upload.file_enc_sha256);
+            proto_contract_fixture.file_length = Some(upload.file_length);
+            proto_contract_fixture.mimetype = Some("image/jpeg".to_string());
+            proto_contract_fixture.caption = caption.map(|c| c.to_string());
+            proto_contract_fixture
+        });
+        proto_contract_fixture
     }
 }
 
@@ -57,63 +59,69 @@ fn build_video_message(
     seconds: u32,
 ) -> wa::Message {
     let upload = UploadedMediaParts::from(upload);
-    wa::Message {
-        video_message: buffa::MessageField::some(wa::message::VideoMessage {
-            url: Some(upload.url),
-            direct_path: Some(upload.direct_path),
-            media_key: Some(upload.media_key),
-            file_sha256: Some(upload.file_sha256),
-            file_enc_sha256: Some(upload.file_enc_sha256),
-            file_length: Some(upload.file_length),
-            mimetype: Some("video/mp4".to_string()),
-            seconds: Some(seconds),
-            caption: caption.map(|c| c.to_string()),
-            ..Default::default()
-        }),
-        ..Default::default()
+    {
+        let mut proto_contract_fixture = wa::Message::default();
+        proto_contract_fixture.video_message = buffa::MessageField::some({
+            let mut proto_contract_fixture = wa::message::VideoMessage::default();
+            proto_contract_fixture.url = Some(upload.url);
+            proto_contract_fixture.direct_path = Some(upload.direct_path);
+            proto_contract_fixture.media_key = Some(upload.media_key);
+            proto_contract_fixture.file_sha256 = Some(upload.file_sha256);
+            proto_contract_fixture.file_enc_sha256 = Some(upload.file_enc_sha256);
+            proto_contract_fixture.file_length = Some(upload.file_length);
+            proto_contract_fixture.mimetype = Some("video/mp4".to_string());
+            proto_contract_fixture.seconds = Some(seconds);
+            proto_contract_fixture.caption = caption.map(|c| c.to_string());
+            proto_contract_fixture
+        });
+        proto_contract_fixture
     }
 }
 
 /// Helper: build a DocumentMessage from an UploadResponse.
 fn build_document_message(upload: &UploadResponse, filename: &str, mimetype: &str) -> wa::Message {
     let upload = UploadedMediaParts::from(upload);
-    wa::Message {
-        document_message: buffa::MessageField::some(wa::message::DocumentMessage {
-            url: Some(upload.url),
-            direct_path: Some(upload.direct_path),
-            media_key: Some(upload.media_key),
-            file_sha256: Some(upload.file_sha256),
-            file_enc_sha256: Some(upload.file_enc_sha256),
-            file_length: Some(upload.file_length),
-            mimetype: Some(mimetype.to_string()),
-            file_name: Some(filename.to_string()),
-            ..Default::default()
-        }),
-        ..Default::default()
+    {
+        let mut proto_contract_fixture = wa::Message::default();
+        proto_contract_fixture.document_message = buffa::MessageField::some({
+            let mut proto_contract_fixture = wa::message::DocumentMessage::default();
+            proto_contract_fixture.url = Some(upload.url);
+            proto_contract_fixture.direct_path = Some(upload.direct_path);
+            proto_contract_fixture.media_key = Some(upload.media_key);
+            proto_contract_fixture.file_sha256 = Some(upload.file_sha256);
+            proto_contract_fixture.file_enc_sha256 = Some(upload.file_enc_sha256);
+            proto_contract_fixture.file_length = Some(upload.file_length);
+            proto_contract_fixture.mimetype = Some(mimetype.to_string());
+            proto_contract_fixture.file_name = Some(filename.to_string());
+            proto_contract_fixture
+        });
+        proto_contract_fixture
     }
 }
 
 /// Helper: build an AudioMessage from an UploadResponse.
 fn build_audio_message(upload: &UploadResponse, ptt: bool, seconds: u32) -> wa::Message {
     let upload = UploadedMediaParts::from(upload);
-    wa::Message {
-        audio_message: buffa::MessageField::some(wa::message::AudioMessage {
-            url: Some(upload.url),
-            direct_path: Some(upload.direct_path),
-            media_key: Some(upload.media_key),
-            file_sha256: Some(upload.file_sha256),
-            file_enc_sha256: Some(upload.file_enc_sha256),
-            file_length: Some(upload.file_length),
-            mimetype: Some(if ptt {
+    {
+        let mut proto_contract_fixture = wa::Message::default();
+        proto_contract_fixture.audio_message = buffa::MessageField::some({
+            let mut proto_contract_fixture = wa::message::AudioMessage::default();
+            proto_contract_fixture.url = Some(upload.url);
+            proto_contract_fixture.direct_path = Some(upload.direct_path);
+            proto_contract_fixture.media_key = Some(upload.media_key);
+            proto_contract_fixture.file_sha256 = Some(upload.file_sha256);
+            proto_contract_fixture.file_enc_sha256 = Some(upload.file_enc_sha256);
+            proto_contract_fixture.file_length = Some(upload.file_length);
+            proto_contract_fixture.mimetype = Some(if ptt {
                 "audio/ogg; codecs=opus".to_string()
             } else {
                 "audio/mpeg".to_string()
-            }),
-            ptt: Some(ptt),
-            seconds: Some(seconds),
-            ..Default::default()
-        }),
-        ..Default::default()
+            });
+            proto_contract_fixture.ptt = Some(ptt);
+            proto_contract_fixture.seconds = Some(seconds);
+            proto_contract_fixture
+        });
+        proto_contract_fixture
     }
 }
 
@@ -328,15 +336,16 @@ async fn test_upload_then_download_via_downloadable_trait() -> anyhow::Result<()
         .await?;
 
     // Build an ImageMessage (which implements Downloadable)
-    let img_msg = wa::message::ImageMessage {
-        url: Some(upload.url.clone()),
-        direct_path: Some(upload.direct_path.clone()),
-        media_key: Some(upload.media_key.to_vec()),
-        file_sha256: Some(upload.file_sha256.to_vec()),
-        file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
-        file_length: Some(upload.file_length),
-        mimetype: Some("image/jpeg".to_string()),
-        ..Default::default()
+    let img_msg = {
+        let mut proto_contract_fixture = wa::message::ImageMessage::default();
+        proto_contract_fixture.url = Some(upload.url.clone());
+        proto_contract_fixture.direct_path = Some(upload.direct_path.clone());
+        proto_contract_fixture.media_key = Some(upload.media_key.to_vec());
+        proto_contract_fixture.file_sha256 = Some(upload.file_sha256.to_vec());
+        proto_contract_fixture.file_enc_sha256 = Some(upload.file_enc_sha256.to_vec());
+        proto_contract_fixture.file_length = Some(upload.file_length);
+        proto_contract_fixture.mimetype = Some("image/jpeg".to_string());
+        proto_contract_fixture
     };
 
     let downloaded = client

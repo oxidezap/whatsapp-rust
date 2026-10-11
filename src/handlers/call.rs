@@ -1825,13 +1825,15 @@ mod tests {
         // decryption and generation-scoped media mailbox. No live account is used.
         for transaction_id in [7, 8] {
             let key = vec![transaction_id as u8; 32];
-            let plaintext = MessageUtils::encode_and_pad(&waproto::whatsapp::Message {
-                call: Some(waproto::whatsapp::message::Call {
-                    call_key: Some(key.clone()),
-                    ..Default::default()
+            let plaintext = MessageUtils::encode_and_pad(&{
+                let mut proto_contract_fixture = waproto::whatsapp::Message::default();
+                proto_contract_fixture.call = Some({
+                    let mut proto_contract_fixture = waproto::whatsapp::message::Call::default();
+                    proto_contract_fixture.call_key = Some(key.clone());
+                    proto_contract_fixture
                 })
-                .into(),
-                ..Default::default()
+                .into();
+                proto_contract_fixture
             });
             let (enc_type, ciphertext) = sender_client
                 .signal()
