@@ -32,6 +32,23 @@ struct SentMessageEntry {
     timestamp: i64,
 }
 
+// Only this backend can write these bytes. Conditional writes retain their
+// payload revision; legacy writes replace the entire entry without a cache.
+struct PendingInboundEntry {
+    bytes: Vec<u8>,
+    inserted_at: i64,
+    revision: Option<PendingInboundRevision>,
+}
+
+impl PendingInboundEntry {
+    fn bounded_revision(&self, max_bytes: usize) -> Result<PendingInboundRevision> {
+        validate_pending_length(self.bytes.len(), max_bytes)?;
+        Ok(self
+            .revision
+            .unwrap_or_else(|| PendingInboundRevision::for_bytes(&self.bytes)))
+    }
+}
+
 /// Key for pre-keys: `id`.
 struct PreKeyEntry {
     record: Bytes,
@@ -179,8 +196,8 @@ struct InMemoryState {
     group_metadata: HashMap<String, Vec<u8>>,
     tc_tokens: HashMap<String, TcTokenEntry>,
     sent_messages: HashMap<SentMessageKey, SentMessageEntry>,
-    /// Pending inbound durability buffer: (chat, sender, id) -> (message, inserted_at).
-    pending_inbound: HashMap<(String, String, String), (Vec<u8>, i64)>,
+    /// Pending inbound durability buffer keyed by (chat, sender, id).
+    pending_inbound: HashMap<(String, String, String), PendingInboundEntry>,
 
     // --- MsgSecret ---
     /// `expires_at = 0` means never expire; `message_ts = 0` means the parent
@@ -1153,7 +1170,11 @@ impl ProtocolStore for InMemoryBackend {
         let now = crate::time::now_secs();
         self.state.lock().await.pending_inbound.insert(
             (chat.to_string(), sender.to_string(), id.to_string()),
-            (message.to_vec(), now),
+            PendingInboundEntry {
+                bytes: message.to_vec(),
+                inserted_at: now,
+                revision: None,
+            },
         );
         Ok(())
     }
@@ -1171,7 +1192,7 @@ impl ProtocolStore for InMemoryBackend {
             .await
             .pending_inbound
             .get(&key)
-            .map(|(bytes, _)| bytes.clone()))
+            .map(|entry| entry.bytes.clone()))
     }
 
     async fn delete_pending_inbound(&self, chat: &str, sender: &str, id: &str) -> Result<()> {
@@ -1195,9 +1216,9 @@ impl ProtocolStore for InMemoryBackend {
         state
             .pending_inbound
             .get(&key)
-            .map(|(bytes, _)| {
-                validate_pending_length(bytes.len(), max_bytes)?;
-                Ok(PendingInboundRecord::new(bytes.clone(), lease))
+            .map(|entry| {
+                validate_pending_length(entry.bytes.len(), max_bytes)?;
+                Ok(PendingInboundRecord::new(entry.bytes.clone(), lease))
             })
             .transpose()
     }
@@ -1217,10 +1238,7 @@ impl ProtocolStore for InMemoryBackend {
         );
         let mut state = self.state.lock().await;
         let revision = match state.pending_inbound.get(&key) {
-            Some((bytes, _)) => {
-                validate_pending_length(bytes.len(), max_bytes)?;
-                PendingInboundRevision::for_bytes(bytes)
-            }
+            Some(entry) => entry.bounded_revision(max_bytes)?,
             None => PendingInboundRevision::missing(),
         };
         let installed = replacement.revision();
@@ -1230,9 +1248,14 @@ impl ProtocolStore for InMemoryBackend {
         if revision != expected {
             return Ok(PendingInboundMutation::Conflict);
         }
-        state
-            .pending_inbound
-            .insert(key, (replacement.bytes().to_vec(), crate::time::now_secs()));
+        state.pending_inbound.insert(
+            key,
+            PendingInboundEntry {
+                bytes: replacement.bytes().to_vec(),
+                inserted_at: crate::time::now_secs(),
+                revision: Some(installed),
+            },
+        );
         Ok(PendingInboundMutation::Applied)
     }
 
@@ -1250,10 +1273,7 @@ impl ProtocolStore for InMemoryBackend {
         );
         let mut state = self.state.lock().await;
         let revision = match state.pending_inbound.get(&key) {
-            Some((bytes, _)) => {
-                validate_pending_length(bytes.len(), max_bytes)?;
-                PendingInboundRevision::for_bytes(bytes)
-            }
+            Some(entry) => entry.bounded_revision(max_bytes)?,
             None => PendingInboundRevision::missing(),
         };
         if revision != expected {
@@ -1267,7 +1287,7 @@ impl ProtocolStore for InMemoryBackend {
         let mut s = self.state.lock().await;
         let before = s.pending_inbound.len();
         s.pending_inbound
-            .retain(|_, (_, inserted_at)| *inserted_at >= cutoff_timestamp);
+            .retain(|_, entry| entry.inserted_at >= cutoff_timestamp);
         Ok((before - s.pending_inbound.len()) as u32)
     }
 }
@@ -1523,8 +1543,8 @@ impl DeviceStore for InMemoryBackend {
         );
         account!(
             state.pending_inbound,
-            |k: &(String, String, String), v: &(Vec<u8>, i64)| {
-                k.0.capacity() + k.1.capacity() + k.2.capacity() + v.0.capacity()
+            |k: &(String, String, String), v: &PendingInboundEntry| {
+                k.0.capacity() + k.1.capacity() + k.2.capacity() + v.bytes.capacity()
             }
         );
 
@@ -1818,6 +1838,69 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_bounded_memory_legacy_write_invalidates_cached_revision() {
+        let backend = InMemoryBackend::new();
+        let key = PendingInboundKey {
+            chat: "test-chat",
+            sender: "test-sender",
+            id: "legacy-overwrite",
+        };
+        let lease = || PendingInboundLease::new(Arc::new(()));
+        let payload = PendingInboundPayload::new(Bytes::from_static(b"old"), lease());
+        let old = payload.revision();
+        assert_eq!(
+            backend
+                .replace_pending_inbound_if(key, PendingInboundRevision::missing(), payload, 16)
+                .await
+                .unwrap(),
+            PendingInboundMutation::Applied
+        );
+        assert!(
+            backend
+                .delete_pending_inbound_if(key, old, 2, lease())
+                .await
+                .is_err()
+        );
+        backend
+            .store_pending_inbound(key.chat, key.sender, key.id, b"new")
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .delete_pending_inbound_if(key, old, 16, lease())
+                .await
+                .unwrap(),
+            PendingInboundMutation::Conflict
+        );
+        assert_eq!(
+            backend
+                .replace_pending_inbound_if(
+                    key,
+                    old,
+                    PendingInboundPayload::new(Bytes::from_static(b"third"), lease()),
+                    16,
+                )
+                .await
+                .unwrap(),
+            PendingInboundMutation::Conflict
+        );
+        let record = backend
+            .read_pending_inbound_bounded(key, 16, lease())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.bytes(), b"new");
+        assert_eq!(record.revision(), PendingInboundRevision::for_bytes(b"new"));
+        assert_eq!(
+            backend
+                .delete_pending_inbound_if(key, record.revision(), 16, lease())
+                .await
+                .unwrap(),
+            PendingInboundMutation::Applied
         );
     }
 
