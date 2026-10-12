@@ -1392,8 +1392,8 @@ impl PendingInboundRecord {
 /// Select a unique non-device group sender from bounded physical metadata.
 /// `None` marks metadata withheld by a backend's preallocation length check.
 #[inline(never)]
-pub fn pending_group_sender<'a>(
-    senders: &mut dyn Iterator<Item = Option<&'a str>>,
+pub fn pending_group_sender(
+    senders: &mut dyn Iterator<Item = Option<&str>>,
     sender: &str,
 ) -> Result<Option<String>> {
     let invalid = |message: &str| crate::store::error::StoreError::Validation(message.to_owned());
