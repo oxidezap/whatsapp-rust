@@ -3389,20 +3389,13 @@ fn read_pending_inbound_bounded_row(
 ) -> QueryResult<Result<Option<PendingInboundRecord>>> {
     // CASE keeps oversized blobs out of the Diesel value buffer. Both length
     // and payload come from one row snapshot, never separate racing queries.
-    let row: Option<BoundedPendingPayload> = diesel::sql_query(
-        "SELECT typeof(message) AS storage_type, \
-         CASE WHEN typeof(message) = 'blob' THEN length(message) ELSE NULL END AS byte_len, \
-         CASE WHEN typeof(message) = 'blob' THEN \
-           CASE WHEN length(message) <= ? THEN message ELSE NULL END \
-         ELSE NULL END AS payload \
-         FROM pending_inbound_messages \
-         WHERE device_id = ? AND chat = ? AND sender = ? AND id = ?",
-    )
-    .bind::<diesel::sql_types::BigInt, _>(i64::try_from(max_bytes).unwrap_or(i64::MAX))
-    .bind::<diesel::sql_types::Integer, _>(device_id)
-    .bind::<diesel::sql_types::Text, _>(chat)
-    .bind::<diesel::sql_types::Text, _>(sender)
-    .bind::<diesel::sql_types::Text, _>(id)
+    let row: Option<BoundedPendingPayload> = crate::bounded_pending_query::BoundedPendingQuery {
+        max_bytes: i64::try_from(max_bytes).unwrap_or(i64::MAX),
+        device_id,
+        chat,
+        sender,
+        id,
+    }
     .get_result(conn)
     .optional()?;
     Ok(match row {
@@ -5415,6 +5408,58 @@ mod tests {
                 .unwrap(),
             PendingInboundMutation::Conflict
         );
+    }
+
+    #[test]
+    fn pending_bounded_statement_reuses_cache_and_rebinds_all_parameters() {
+        use diesel::connection::{InstrumentationEvent, SimpleConnection};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        conn.batch_execute(
+            "CREATE TABLE pending_inbound_messages \
+             (device_id INTEGER, chat TEXT, sender TEXT, id TEXT, message BLOB); \
+             INSERT INTO pending_inbound_messages VALUES \
+             (1, 'chat-a', 'sender-a', 'id-a', x'616161'), \
+             (2, 'chat-a', 'sender-a', 'id-a', x'626262'), \
+             (1, 'chat-b', 'sender-a', 'id-a', x'636363'), \
+             (1, 'chat-a', 'sender-b', 'id-a', x'646464'), \
+             (1, 'chat-a', 'sender-a', 'id-b', x'656565');",
+        )
+        .unwrap();
+        let cached = Arc::new(AtomicUsize::new(0));
+        let observed = cached.clone();
+        conn.set_instrumentation(move |event: InstrumentationEvent<'_>| {
+            if let InstrumentationEvent::CacheQuery { .. } = event {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        for (max_bytes, device_id, chat, sender, id, expected) in [
+            (3, 1, "chat-a", "sender-a", "id-a", Some(b"aaa")),
+            (2, 1, "chat-a", "sender-a", "id-a", None),
+            (3, 2, "chat-a", "sender-a", "id-a", Some(b"bbb")),
+            (3, 1, "chat-b", "sender-a", "id-a", Some(b"ccc")),
+            (3, 1, "chat-a", "sender-b", "id-a", Some(b"ddd")),
+            (3, 1, "chat-a", "sender-a", "id-b", Some(b"eee")),
+            (3, 1, "chat-a", "sender-a", "id-a", Some(b"aaa")),
+        ] {
+            let row: BoundedPendingPayload = crate::bounded_pending_query::BoundedPendingQuery {
+                max_bytes,
+                device_id,
+                chat,
+                sender,
+                id,
+            }
+            .get_result(&mut conn)
+            .unwrap();
+            assert_eq!(row.storage_type, "blob");
+            assert_eq!(row.byte_len, Some(3));
+            assert_eq!(
+                row.payload.as_deref(),
+                expected.map(|value| value.as_slice())
+            );
+        }
+        assert_eq!(cached.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
