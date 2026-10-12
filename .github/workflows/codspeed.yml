@@ -397,7 +397,11 @@ jobs:
           set -euo pipefail
           git -C main-control rev-parse HEAD > reports/main-sha.txt
           codspeed --version > reports/main-tools.txt
-          cargo codspeed --version >> reports/main-tools.txt
+          cargo_version_status=0
+          cargo codspeed --version > reports/main-cargo-version.txt 2>&1 || cargo_version_status=$?
+          test "$cargo_version_status" -le 1
+          grep -Fx 'cargo-codspeed 5.0.1' reports/main-cargo-version.txt >> reports/main-tools.txt
+          printf '%s\n' "$cargo_version_status" > reports/main-cargo-version-exit.txt
           ldd --version > reports/main-libc.txt
           codspeed run --mode simulation,memory --working-directory main-control --profile-folder "$GITHUB_WORKSPACE/reports/main-profiles" -- cargo codspeed run -p whatsapp-rust --bench connected_idle 2>&1 | tee reports/main-run.log
           codspeed status >> reports/main-tools.txt
@@ -410,7 +414,10 @@ jobs:
           ldd --version > reports/before-candidate-libc.txt
           cmp reports/main-libc.txt reports/before-candidate-libc.txt
           codspeed --version
-          cargo codspeed --version
+          cargo_version_status=0
+          cargo codspeed --version > reports/before-candidate-cargo-version.txt 2>&1 || cargo_version_status=$?
+          test "$cargo_version_status" -le 1
+          grep -Fx 'cargo-codspeed 5.0.1' reports/before-candidate-cargo-version.txt
       - name: Build candidate on the same host and target
         working-directory: candidate
         run: cargo codspeed build --locked -p whatsapp-rust --features bench-harness --bench connected_idle -m simulation -m memory -j2
@@ -420,7 +427,11 @@ jobs:
           set -euo pipefail
           git -C candidate rev-parse HEAD > reports/candidate-sha.txt
           codspeed --version > reports/candidate-tools.txt
-          cargo codspeed --version >> reports/candidate-tools.txt
+          cargo_version_status=0
+          cargo codspeed --version > reports/candidate-cargo-version.txt 2>&1 || cargo_version_status=$?
+          test "$cargo_version_status" -le 1
+          grep -Fx 'cargo-codspeed 5.0.1' reports/candidate-cargo-version.txt >> reports/candidate-tools.txt
+          printf '%s\n' "$cargo_version_status" > reports/candidate-cargo-version-exit.txt
           ldd --version > reports/candidate-libc.txt
           codspeed run --mode simulation,memory --working-directory candidate --profile-folder "$GITHUB_WORKSPACE/reports/candidate-profiles" -- cargo codspeed run -p whatsapp-rust --bench connected_idle 2>&1 | tee reports/candidate-run.log
           codspeed status >> reports/candidate-tools.txt
