@@ -390,19 +390,6 @@ impl Client {
         }
     }
 
-    pub(super) fn pending_replay_info(
-        info: &Arc<MessageInfo>,
-        sender: String,
-    ) -> anyhow::Result<Arc<MessageInfo>> {
-        let sender = sender.parse::<Jid>()?;
-        if sender == info.source.sender {
-            return Ok(Arc::clone(info));
-        }
-        let mut stored_info = (**info).clone();
-        stored_info.source.sender = sender;
-        Ok(Arc::new(stored_info))
-    }
-
     pub(super) async fn read_pending_for_replay(
         &self,
         info: &MessageInfo,
@@ -447,9 +434,14 @@ impl Client {
         let mut groups: Vec<(String, String, String, Vec<&PendingDelivery>)> = Vec::new();
         for item in items {
             let chat = item.info.source.chat.to_string();
-            let incoming_sender = item.info.source.sender.to_string();
+            let incoming_sender = item.storage_sender.as_ref().map_or_else(
+                || item.info.source.sender.to_string(),
+                |sender| sender.to_string(),
+            );
             let canonical = Self::pending_sender(&item.info);
-            let sender = if canonical != incoming_sender
+            let sender = if item.storage_sender.is_some() {
+                incoming_sender
+            } else if canonical != incoming_sender
                 && backend
                     .read_pending_inbound_bounded(
                         PendingInboundKey {
@@ -626,18 +618,14 @@ impl Client {
         };
         let (bytes, read_lease) = record.into_bytes();
         let journal = PendingJournal::decode(bytes)?;
-        let stored_info = Self::pending_replay_info(info, sender)?;
+        let storage_sender: Arc<str> = sender.into();
         drop(read_lease);
         let mut predecessor = Vec::with_capacity(journal.occurrences.len());
         for (position, entry) in journal.occurrences.into_iter().enumerate() {
             let position = entry.index.map_or(position, |index| index as usize);
-            predecessor.push(PendingDelivery::from_occurrence(
-                entry,
-                position,
-                &stored_info,
-                None,
-                None,
-            )?);
+            let mut delivery = PendingDelivery::from_occurrence(entry, position, info, None, None)?;
+            delivery.storage_sender = Some(Arc::clone(&storage_sender));
+            predecessor.push(delivery);
         }
         // A hook can flush Signal itself. Recover the durable predecessor
         // before decrypt advances the incoming ratchet, without acknowledging
@@ -667,7 +655,7 @@ impl Client {
         let (bytes, read_lease) = record.into_bytes();
         let journal = PendingJournal::decode(bytes)?;
         drop(read_lease);
-        let stored_info = Self::pending_replay_info(&item.info, sender)?;
+        let storage_sender: Arc<str> = sender.into();
         let projection = waproto::codec::message_to_vec(&item.message);
         let index = u32::try_from(origin.position)?;
         if !journal.occurrences.iter().any(|entry| {
@@ -696,13 +684,15 @@ impl Client {
             let position = entry.index.map_or(position, |index| index as usize);
             let shared_message =
                 (entry.projection.as_ref() == projection).then(|| Arc::clone(&item.message));
-            retained.push(PendingDelivery::from_occurrence(
+            let mut delivery = PendingDelivery::from_occurrence(
                 entry,
                 position,
-                &stored_info,
+                &item.info,
                 shared_message,
                 None,
-            )?);
+            )?;
+            delivery.storage_sender = Some(Arc::clone(&storage_sender));
+            retained.push(delivery);
         }
         retained.push(item.clone());
         Ok(Some(retained))
@@ -1676,6 +1666,7 @@ mod tests {
 
                 retention: None,
                 receipt: None,
+                storage_sender: None,
                 consumer_claimed: false,
                 origin: Some(raw_pending::DeliveryOrigin {
                     stanza: origin,
@@ -1714,6 +1705,7 @@ mod tests {
             carrier: None,
             retention: None,
             receipt: None,
+            storage_sender: None,
             consumer_claimed: claimed,
             origin: None,
         };
@@ -2378,6 +2370,7 @@ mod tests {
             item: inbound.clone(),
             retention: None,
             receipt: None,
+            storage_sender: None,
             consumer_claimed: false,
             origin: Some(raw_pending::DeliveryOrigin {
                 stanza: raw_pending::StanzaOrigin::new(),

@@ -27,6 +27,9 @@ pub(super) struct PendingDelivery {
     pub origin: Option<DeliveryOrigin>,
     pub retention: Option<std::sync::Arc<super::live_retention::Charge>>,
     pub receipt: Option<std::sync::Arc<super::live_retention::ReceiptScope>>,
+    // The physical CAS key can differ from the arrival's sender spelling.
+    // Keep MessageInfo intact: its Arc identifies the whole-stanza receipt scope.
+    pub storage_sender: Option<std::sync::Arc<str>>,
     pub consumer_claimed: bool,
 }
 impl From<InboundMessage> for PendingDelivery {
@@ -37,6 +40,7 @@ impl From<InboundMessage> for PendingDelivery {
             origin: None,
             retention: None,
             receipt: None,
+            storage_sender: None,
             consumer_claimed: false,
         }
     }
@@ -73,6 +77,7 @@ impl PendingDelivery {
                 .map(|stanza| DeliveryOrigin { stanza, position }),
             retention: None,
             receipt,
+            storage_sender: None,
             consumer_claimed: false,
         })
     }

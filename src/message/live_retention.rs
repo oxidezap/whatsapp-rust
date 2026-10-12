@@ -399,6 +399,7 @@ fn same_message(first: &MessageInfo, second: &MessageInfo) -> bool {
 
 fn same_entry(first: &PendingDelivery, second: &PendingDelivery) -> bool {
     first.origin == second.origin
+        && first.storage_sender == second.storage_sender
         && same_message(&first.info, &second.info)
         && Arc::ptr_eq(&first.message, &second.message)
 }
@@ -430,6 +431,7 @@ mod tests {
             origin: Some(origin),
             retention: retention.charge_for_origin(Some(origin)),
             receipt: None,
+            storage_sender: None,
             consumer_claimed: false,
         };
         let worker = item.retention.clone().expect("existing live charge");

@@ -127,9 +127,7 @@ impl Client {
                     // before the batch's conditional write takes that owner.
                     let (bytes, read_lease) = record.into_bytes();
                     let decoded = raw_pending::PendingJournal::decode(bytes);
-                    let Ok(stored_info) = Self::pending_replay_info(info, sender) else {
-                        return false;
-                    };
+                    let storage_sender: Arc<str> = sender.into();
                     drop(read_lease);
                     let replay = match decoded.and_then(|journal| {
                         journal
@@ -139,12 +137,9 @@ impl Client {
                             .map(|(position, entry)| {
                                 // Preserve the replay position and producer absence of legacy rows.
                                 let mut delivery = raw_pending::PendingDelivery::from_occurrence(
-                                    entry,
-                                    position,
-                                    &stored_info,
-                                    None,
-                                    None,
+                                    entry, position, info, None, None,
                                 )?;
+                                delivery.storage_sender = Some(Arc::clone(&storage_sender));
                                 delivery.receipt =
                                     self.inbound_commit_batch.live_retention.receipt_for(info);
                                 Ok(delivery)

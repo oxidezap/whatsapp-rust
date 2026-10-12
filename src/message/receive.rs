@@ -2245,6 +2245,7 @@ impl Client {
                                         }),
                                         retention: None,
                                         receipt: None,
+                                        storage_sender: None,
                                         consumer_claimed: true,
                                     },
                                     app_state_key_share_job.is_some(),

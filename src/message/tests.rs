@@ -20116,6 +20116,72 @@ async fn suppressed_resend_replays_to_a_durability_hook() {
 }
 
 #[tokio::test]
+async fn raw_pending_legacy_alias_replay_keeps_failed_arrival_receipt_scope() {
+    use crate::types::durability_hook::InboundDurabilityHook;
+    use wacore::types::events::InboundMessage;
+    struct Hook;
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for Hook {
+        async fn on_messages(&self, _: Arc<Client>, _: &[InboundMessage]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    let (client, transport) = capturing_client("alias_failed_scope").await;
+    client
+        .inbound_durability_hook
+        .set(Arc::new(Hook))
+        .ok()
+        .unwrap();
+    let group: Jid = "120363000000000085@g.us".parse().unwrap();
+    let bare: Jid = "100000000000085@lid".parse().unwrap();
+    let physical = "100000000000085:75@lid";
+    let mut info =
+        create_test_message_info(&group.to_string(), "ALIAS_FAILED_SCOPE", &bare.to_string());
+    info.source.chat = group.clone();
+    info.source.sender = bare;
+    let info = Arc::new(info);
+    let mut message = wa::Message::default();
+    message.conversation = Some("legacy scoped predecessor".into());
+    let backend = client.persistence_manager.backend();
+    backend
+        .store_pending_inbound(
+            &group.to_string(),
+            physical,
+            &info.id,
+            &waproto::codec::message_to_vec(&message),
+        )
+        .await
+        .unwrap();
+    client.inbound_commit_batch.reset();
+    let producer = client
+        .inbound_commit_batch
+        .live_retention
+        .begin_receipts(&info)
+        .unwrap();
+    assert!(client.ack_or_replay_to_hook(&info).await);
+    // A sibling failed after the predecessor entered the drain batch.
+    client
+        .inbound_commit_batch
+        .live_retention
+        .fail_receipt(&info);
+    assert!(!producer.finish());
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(delivery_receipts_for(&transport.sent(), &info.id), 0);
+    assert!(
+        backend
+            .get_pending_inbound(&group.to_string(), physical, &info.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn raw_pending_real_stanza_failure_cannot_ack_successful_predecessor() {
     use crate::types::durability_hook::InboundDurabilityHook;
     use std::sync::atomic::AtomicUsize;
