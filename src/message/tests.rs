@@ -20114,3 +20114,670 @@ async fn suppressed_resend_replays_to_a_durability_hook() {
         "the replay is what delivers the message the failed commit owed the consumer"
     );
 }
+
+#[tokio::test]
+async fn raw_pending_real_stanza_failure_cannot_ack_successful_predecessor() {
+    use crate::types::durability_hook::InboundDurabilityHook;
+    use std::sync::atomic::AtomicUsize;
+    use wacore::types::events::InboundMessage;
+    struct Hook(AtomicUsize);
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            items: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            self.0.fetch_add(items.len(), Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let (client, transport) = capturing_client("raw_stanza_failure").await;
+    let hook = Arc::new(Hook(AtomicUsize::new(0)));
+    client
+        .inbound_durability_hook
+        .set(hook.clone())
+        .ok()
+        .unwrap();
+    let mut alice = AlicePeer::new("1111111111131@s.whatsapp.net").await;
+    let (bundle, receiver) = bobs_prekey_bundle(&client).await;
+    let receiver_address = receiver.to_protocol_address();
+    alice.install_bob_session(&receiver_address, &bundle).await;
+    let good = alice
+        .encrypt_text(&receiver_address, "retained predecessor")
+        .await;
+    let mut first = enc_payload_from_ciphertext(&good);
+    first.enc_index = 0;
+    let info = dm_info("RAW_COMPLETE_STANZA", &alice.jid);
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                info: info.clone(),
+                sender_encryption_jid: alice.jid.clone(),
+                session_payloads: vec![
+                    first,
+                    enc_payload_at("msg", UNPARSEABLE_ENVELOPE.to_vec(), 1),
+                ],
+                group_payloads: vec![],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: DecryptFailMode::Show,
+            },
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+    // A predecessor may stream to the hook before its successor finishes.
+    // The stanza-level positive receipt must still wait for every slot.
+    assert_eq!(hook.0.load(Ordering::SeqCst), 1);
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(
+        delivery_receipts_for(&transport.sent(), &info.id),
+        0,
+        "a failed successor cannot acknowledge the whole stanza"
+    );
+}
+
+#[tokio::test]
+async fn raw_pending_identical_ciphertext_after_live_storage_failure() {
+    live_storage_failure_retry(false).await;
+}
+#[tokio::test]
+async fn raw_pending_live_storage_failure_survives_reset_and_signal_flush() {
+    live_storage_failure_retry(true).await;
+}
+async fn live_storage_failure_retry(reset_and_flush: bool) {
+    use crate::types::durability_hook::InboundDurabilityHook;
+    use std::sync::atomic::AtomicUsize;
+    use wacore::types::events::InboundMessage;
+    struct Hook(AtomicUsize);
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            items: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            self.0.fetch_add(items.len(), Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let (client, _transport) = capturing_client("live_storage_ciphertext_retry").await;
+    let hook = Arc::new(Hook(AtomicUsize::new(0)));
+    client
+        .inbound_durability_hook
+        .set(hook.clone())
+        .ok()
+        .unwrap();
+    let group: Jid = "120363000000000008@g.us".parse().unwrap();
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+    let ciphertext = encrypt_group_text(&mut alice, &group, "retained after storage failure").await;
+    client
+        .inbound_commit_batch
+        .fail_commits
+        .store(true, Ordering::Release);
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(
+            &group,
+            &alice.jid,
+            "LIVE_STORAGE_RETRY",
+            ciphertext.clone(),
+        ))
+        .await;
+    assert_eq!(hook.0.load(Ordering::SeqCst), 0);
+    if reset_and_flush {
+        client.flush_signal_cache().await.unwrap();
+        client.inbound_commit_batch.reset();
+        client.enter_live_mode_for_tests();
+    }
+    client
+        .inbound_commit_batch
+        .fail_commits
+        .store(false, Ordering::Release);
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(
+            &group,
+            &alice.jid,
+            "LIVE_STORAGE_RETRY",
+            ciphertext,
+        ))
+        .await;
+    assert_eq!(
+        hook.0.load(Ordering::SeqCst),
+        1,
+        "duplicate ciphertext must recover plaintext lost by the failed write before ACK"
+    );
+}
+
+#[tokio::test]
+async fn raw_pending_cancelled_after_group_decrypt_replays_without_ratchet() {
+    cancelled_raw_replay(false).await;
+}
+
+#[tokio::test]
+async fn raw_pending_full_capacity_replays_existing_raw_before_admission() {
+    cancelled_raw_replay(true).await;
+}
+
+async fn cancelled_raw_replay(full_capacity: bool) {
+    use crate::types::durability_hook::InboundDurabilityHook;
+    use std::sync::atomic::AtomicUsize;
+    use wacore::types::events::InboundMessage;
+    struct Hook(AtomicUsize);
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            items: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            self.0.fetch_add(items.len(), Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let (client, transport) = capturing_client("raw_cancel_after_decrypt").await;
+    let hook = Arc::new(Hook(AtomicUsize::new(0)));
+    client
+        .inbound_durability_hook
+        .set(hook.clone())
+        .ok()
+        .unwrap();
+    let group: Jid = "120363000000000083@g.us".parse().unwrap();
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+    let ciphertext = encrypt_group_text(&mut alice, &group, "cancelled raw plaintext").await;
+    let first = group_skmsg_stanza(&group, &alice.jid, "RAW_CANCEL_REPLAY", ciphertext.clone());
+    client
+        .inbound_commit_batch
+        .live_retention
+        .pause_stage
+        .store(true, Ordering::Release);
+    let receiver = client.clone();
+    let worker = tokio::spawn(async move { receiver.handle_incoming_message(first).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client
+            .inbound_commit_batch
+            .live_retention
+            .stage_ready
+            .notified(),
+    )
+    .await
+    .unwrap();
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    assert_eq!(hook.0.load(Ordering::SeqCst), 0);
+    client
+        .inbound_commit_batch
+        .live_retention
+        .pause_stage
+        .store(false, Ordering::Release);
+    let _occupied = full_capacity.then(|| {
+        client
+            .inbound_commit_batch
+            .live_retention
+            .occupy_remaining_for_tests()
+    });
+    client.flush_signal_cache().await.unwrap();
+    client.inbound_commit_batch.reset();
+    client.enter_live_mode_for_tests();
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(
+            &group,
+            &alice.jid,
+            "RAW_CANCEL_REPLAY",
+            ciphertext,
+        ))
+        .await;
+    assert_eq!(hook.0.load(Ordering::SeqCst), 1);
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(
+        delivery_receipts_for(&transport.sent(), "RAW_CANCEL_REPLAY"),
+        1
+    );
+}
+
+/// A stored predecessor fills backing + metadata admission exactly. Its hook
+/// can flush Signal and then be cancelled before the incoming carrier commits.
+/// The invariant accepts either an untouched ratchet or a durable incoming
+/// carrier, rather than assuming a particular preflight implementation.
+#[tokio::test]
+async fn full_pending_journal_hook_flush_protects_retry_before_recreation() {
+    use super::raw_pending::{MAX_PENDING_BYTES, Occurrence, PendingJournal, StanzaOrigin};
+    use crate::types::durability_hook::InboundDurabilityHook;
+    use wacore::store::traits::PendingInboundRevision;
+    use wacore::types::events::InboundMessage;
+    struct FlushAndPause {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for FlushAndPause {
+        async fn on_messages(
+            &self,
+            client: Arc<Client>,
+            _: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            client.flush_signal_cache().await?;
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+    #[derive(Default)]
+    struct Accept(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for Accept {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            items: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            self.0.lock().unwrap().extend(
+                items
+                    .iter()
+                    .map(|item| item.message.conversation.clone().unwrap()),
+            );
+            Ok(())
+        }
+    }
+    const ID: &str = "FULL_JOURNAL_FLUSH_RECREATE";
+    let (client, transport) = capturing_client("full_journal_flush_recreate").await;
+    let group: Jid = "120363000000000086@g.us".parse().unwrap();
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+    client.flush_signal_cache().await.unwrap();
+    let backend = client.persistence_manager.backend();
+    let sender_key_name =
+        make_sender_key_name(&group, &alice.jid.to_non_ad().to_protocol_address());
+    let before_iteration = client
+        .persistence_manager
+        .get_device_snapshot()
+        .load_sender_key(&sender_key_name)
+        .await
+        .unwrap()
+        .unwrap()
+        .sender_key_state()
+        .unwrap()
+        .sender_chain_key()
+        .unwrap()
+        .iteration();
+
+    let mut plaintext = wa::Message::default();
+    plaintext.conversation = Some("full journal payload".into());
+    let projection: bytes::Bytes = waproto::codec::message_to_vec(&plaintext).into();
+    let mut wrapper = wa::Message::default();
+    let mut sent = wa::message::DeviceSentMessage::default();
+    sent.destination_jid = Some("15550000001@s.whatsapp.net".into());
+    sent.message = buffa::MessageField::some(plaintext);
+    wrapper.device_sent_message = buffa::MessageField::some(sent);
+    let mut original = waproto::codec::message_to_vec(&wrapper);
+    // Synthetic future bytes on the outer DSM, retained verbatim while the
+    // user projection is its small inner message. No production capture.
+    let fixed = 6 + 16 + 4 + 30 + size_of::<Occurrence>() + projection.len();
+    let original_len = MAX_PENDING_BYTES - fixed;
+    let filler_len = original_len - original.len() - 2 - 4;
+    original.extend_from_slice(&[0xba, 0x3e]); // field999, length-delimited
+    let mut length = u32::try_from(filler_len).unwrap();
+    while length >= 128 {
+        original.push((length as u8 & 0x7f) | 0x80);
+        length >>= 7;
+    }
+    original.push(length as u8);
+    original.resize(original.len() + filler_len, 0);
+    assert_eq!(original.len(), original_len);
+    let restored_wrapper = waproto::codec::message_decode(&original).unwrap();
+    assert_eq!(
+        restored_wrapper
+            .device_sent_message
+            .as_option()
+            .unwrap()
+            .message
+            .as_option()
+            .unwrap()
+            .conversation
+            .as_deref(),
+        Some("full journal payload")
+    );
+    drop(restored_wrapper);
+    let mut journal = PendingJournal::default();
+    journal
+        .merge(Occurrence {
+            producer: Some(StanzaOrigin::new()),
+            index: Some(0),
+            original: original.into(),
+            projection: projection.clone(),
+        })
+        .unwrap();
+    let row = journal.encode().unwrap();
+    assert_eq!(row.len() + size_of::<Occurrence>(), MAX_PENDING_BYTES);
+    assert!(!journal.fits_additional(0, 0));
+    let initial_revision = PendingInboundRevision::for_bytes(&row);
+    let chat = group.to_string();
+    let sender = alice.jid.to_string();
+    backend
+        .store_pending_inbound(&chat, &sender, ID, &row)
+        .await
+        .unwrap();
+    drop(journal);
+    drop(row);
+
+    let hook = Arc::new(FlushAndPause {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    client
+        .inbound_durability_hook
+        .set(hook.clone())
+        .ok()
+        .unwrap();
+    let ciphertext = encrypt_group_text(&mut alice, &group, "full journal payload").await;
+    let stanza = group_skmsg_stanza(&group, &alice.jid, ID, ciphertext);
+    let receiver = client.clone();
+    let first = stanza.clone();
+    let worker = tokio::spawn(async move { receiver.handle_incoming_message(first).await });
+    if tokio::time::timeout(std::time::Duration::from_secs(10), hook.entered.notified())
+        .await
+        .is_err()
+    {
+        worker.abort();
+        let _ = worker.await;
+        panic!("full-journal fixture never reached the flush hook; recovery hypothesis not tested");
+    }
+    let stored = backend
+        .get_pending_inbound(&chat, &sender, ID)
+        .await
+        .unwrap()
+        .unwrap();
+    let prior_row_unchanged = PendingInboundRevision::for_bytes(&stored) == initial_revision;
+    let incoming_carrier_stored = PendingJournal::decode(stored.into())
+        .unwrap()
+        .occurrences
+        .iter()
+        .any(|entry| entry.original == projection);
+    let flushed_iteration = client
+        .persistence_manager
+        .get_device_snapshot()
+        .load_sender_key(&sender_key_name)
+        .await
+        .unwrap()
+        .unwrap()
+        .sender_key_state()
+        .unwrap()
+        .sender_chain_key()
+        .unwrap()
+        .iteration();
+    let protected_before_cancel = flushed_iteration == before_iteration || incoming_carrier_stored;
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(delivery_receipts_for(&transport.sent(), ID), 0);
+    drop(client);
+
+    let restarted = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+    let accepted = Arc::new(Accept::default());
+    restarted
+        .inbound_durability_hook
+        .set(accepted.clone())
+        .ok()
+        .unwrap();
+    restarted.handle_incoming_message(stanza).await;
+    assert_eq!(*accepted.0.lock().unwrap(), vec!["full journal payload"]);
+    assert!(
+        backend
+            .get_pending_inbound(&chat, &sender, ID)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    eprintln!(
+        "full journal cancellation: prior_unchanged={prior_row_unchanged}, incoming_carrier_stored={incoming_carrier_stored}, before_iteration={before_iteration}, flushed_iteration={flushed_iteration}"
+    );
+    assert!(
+        protected_before_cancel,
+        "hook flush must not persist the retry ratchet while its distinct carrier is only volatile"
+    );
+}
+
+#[tokio::test]
+async fn raw_pending_hook_failure_survives_client_recreation() {
+    use crate::types::durability_hook::InboundDurabilityHook;
+    use std::sync::Mutex;
+    use wacore::types::events::InboundMessage;
+    struct Reject;
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for Reject {
+        async fn on_messages(&self, _: Arc<Client>, _: &[InboundMessage]) -> anyhow::Result<()> {
+            anyhow::bail!("consumer unavailable")
+        }
+    }
+    struct Accept(Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for Accept {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            items: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            self.0.lock().unwrap().extend(
+                items
+                    .iter()
+                    .map(|item| item.message.conversation.clone().unwrap()),
+            );
+            Ok(())
+        }
+    }
+    let (client, _) = capturing_client("raw_pending_recreated_client").await;
+    client
+        .inbound_durability_hook
+        .set(Arc::new(Reject))
+        .ok()
+        .unwrap();
+    let backend = client.persistence_manager.backend();
+    let group: Jid = "120363000000000008@g.us".parse().unwrap();
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+    let ciphertext = encrypt_group_text(&mut alice, &group, "durable before restart").await;
+    let stanza = group_skmsg_stanza(&group, &alice.jid, "RECREATED", ciphertext);
+    client.clone().handle_incoming_message(stanza.clone()).await;
+    assert!(
+        backend
+            .get_pending_inbound(&group.to_string(), &alice.jid.to_string(), "RECREATED")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    client.flush_signal_cache().await.unwrap();
+    drop(client);
+    let restarted = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+    let hook = Arc::new(Accept(Mutex::new(Vec::new())));
+    restarted
+        .inbound_durability_hook
+        .set(hook.clone())
+        .ok()
+        .unwrap();
+    restarted.handle_incoming_message(stanza).await;
+    assert_eq!(*hook.0.lock().unwrap(), vec!["durable before restart"]);
+    assert!(
+        backend
+            .get_pending_inbound(&group.to_string(), &alice.jid.to_string(), "RECREATED")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn malformed_msmsg_does_not_poison_a_valid_retry() {
+    use crate::store::commands::DeviceCommand;
+    use crate::types::durability_hook::InboundDurabilityHook;
+    use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+    use wacore::types::events::InboundMessage;
+    #[derive(Default)]
+    struct Hook(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            items: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            self.0.lock().unwrap().extend(
+                items
+                    .iter()
+                    .map(|item| item.message.conversation.clone().unwrap_or_default()),
+            );
+            Ok(())
+        }
+    }
+    let (client, _) = capturing_client("msmsg_invalid_then_valid").await;
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLid(Some(
+            "999888777666555:0@lid".parse().unwrap(),
+        )))
+        .await;
+    let hook = Arc::new(Hook::default());
+    client
+        .inbound_durability_hook
+        .set(hook.clone())
+        .ok()
+        .unwrap();
+    client.enter_live_mode_for_tests();
+    let chat = "867051314767696@bot";
+    let our_lid = "999888777666555@lid";
+    let outbound_id = "OUT_INVALID_RETRY";
+    let reply_id = "REPLY_INVALID_RETRY";
+    let secret = [0x55; 32];
+    client
+        .persistence_manager
+        .backend()
+        .put_msg_secret(chat, our_lid, outbound_id, &secret)
+        .await
+        .unwrap();
+    let ctx = BotMessageContext {
+        msg_id: reply_id,
+        target_sender_user_jid: our_lid,
+        bot_user_jid: chat,
+    };
+    let stanza = |plaintext: &[u8]| {
+        let (cipher, iv) = encrypt_bot_message(plaintext, &secret, &ctx).unwrap();
+        node_to_arc(
+            NodeBuilder::new("message")
+                .attr("from", chat)
+                .attr("id", reply_id)
+                .attr("type", "text")
+                .children([
+                    NodeBuilder::new("meta")
+                        .attr("target_id", outbound_id)
+                        .attr("target_sender_jid", our_lid)
+                        .build(),
+                    NodeBuilder::new("enc")
+                        .attr("type", "msmsg")
+                        .attr("v", "2")
+                        .bytes(encode_message_secret_message(&iv, &cipher))
+                        .build(),
+                ])
+                .build(),
+        )
+    };
+    client
+        .clone()
+        .handle_incoming_message(stanza(&[0x80]))
+        .await;
+    assert!(hook.0.lock().unwrap().is_empty());
+    let info = create_test_message_info(chat, reply_id, chat);
+    assert!(
+        !client
+            .inbound_commit_batch
+            .live_retention
+            .has_raw_for_message(&info)
+    );
+    let mut message = wa::Message::default();
+    message.conversation = Some("valid retry".into());
+    client
+        .clone()
+        .handle_incoming_message(stanza(&waproto::codec::message_to_vec(&message)))
+        .await;
+    assert_eq!(*hook.0.lock().unwrap(), vec!["valid retry"]);
+    assert!(
+        !client
+            .inbound_commit_batch
+            .live_retention
+            .has_raw_for_message(&info)
+    );
+    assert!(
+        client
+            .persistence_manager
+            .backend()
+            .get_pending_inbound(chat, chat, reply_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn malformed_signal_plaintext_does_not_poison_a_valid_retry() {
+    use crate::types::durability_hook::InboundDurabilityHook;
+    use wacore::types::events::InboundMessage;
+    #[derive(Default)]
+    struct Hook(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            items: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            self.0.lock().unwrap().extend(
+                items
+                    .iter()
+                    .map(|item| item.message.conversation.clone().unwrap_or_default()),
+            );
+            Ok(())
+        }
+    }
+    let (client, _) = capturing_client("signal_invalid_then_valid").await;
+    let hook = Arc::new(Hook::default());
+    client
+        .inbound_durability_hook
+        .set(hook.clone())
+        .ok()
+        .unwrap();
+    let group: Jid = "120363000000000008@g.us".parse().unwrap();
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+    let invalid = alice.encrypt_group_message(&group, &[0x80, 1]).await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(
+            &group,
+            &alice.jid,
+            "SIGNAL_VALID_RETRY",
+            invalid,
+        ))
+        .await;
+    assert!(hook.0.lock().unwrap().is_empty());
+    let info = create_test_message_info(
+        &group.to_string(),
+        "SIGNAL_VALID_RETRY",
+        &alice.jid.to_string(),
+    );
+    assert!(
+        !client
+            .inbound_commit_batch
+            .live_retention
+            .has_raw_for_message(&info)
+    );
+    let valid = encrypt_group_text(&mut alice, &group, "valid Signal retry").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(
+            &group,
+            &alice.jid,
+            "SIGNAL_VALID_RETRY",
+            valid,
+        ))
+        .await;
+    assert_eq!(*hook.0.lock().unwrap(), vec!["valid Signal retry"]);
+}

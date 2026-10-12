@@ -83,6 +83,7 @@ impl Client {
         enc_type: &'static str,
         reason: EncDecryptFailureReason,
     ) {
+        self.inbound_commit_batch.live_retention.fail_receipt(info);
         if !self.enc_decrypt_failed_forwarding_enabled() {
             return;
         }

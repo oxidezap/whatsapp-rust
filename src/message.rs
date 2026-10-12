@@ -209,6 +209,7 @@ enum MigrationDecryptResult {
 pub(crate) struct PlaintextHandleOutcome {
     dispatched: bool,
     skdm_only: bool,
+    delivered: bool,
 }
 
 #[cfg(feature = "bench-harness")]
@@ -572,6 +573,8 @@ impl InboundCommitTicket {
 
 pub(crate) enum InboundCommitState {
     Durable,
+    /// The row is stored, but the consumer hook has not accepted it yet.
+    Buffered,
     Deferred(Option<InboundCommitTicket>),
     Failed,
 }
@@ -722,6 +725,7 @@ pub(crate) use wacore::protocol::retry::RetryReason;
 pub(crate) mod commit_batch;
 mod dispatch;
 mod durability;
+mod live_retention;
 mod msg_secret;
 mod raw_pending;
 mod receive;

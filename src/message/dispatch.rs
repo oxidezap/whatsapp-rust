@@ -299,6 +299,9 @@ impl Client {
                 item,
                 carrier,
                 origin,
+                retention: None,
+                receipt: None,
+                consumer_claimed: false,
             },
             track_commit,
         )
@@ -353,6 +356,13 @@ impl Client {
     /// receipt for own-account self-fanouts), else a transport ack. status is
     /// acked by the `should_ack` gate, newsletters/empty ids need nothing here.
     pub(crate) fn ack_received_message(self: &Arc<Self>, info: &Arc<MessageInfo>) {
+        if self.inbound_commit_batch.live_retention.defer_receipt(info) {
+            return;
+        }
+        self.ack_received_message_unscoped(info);
+    }
+
+    pub(super) fn ack_received_message_unscoped(self: &Arc<Self>, info: &Arc<MessageInfo>) {
         if info.id.is_empty() || info.source.chat.is_newsletter() {
             return;
         }

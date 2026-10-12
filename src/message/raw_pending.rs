@@ -8,7 +8,7 @@ const LEGACY_MAGIC: &[u8; 6] = b"\0WRPD\x01";
 pub(super) const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
 
 /// Producer-local identity, never a ciphertext authentication claim.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct StanzaOrigin([u8; 16]);
 impl StanzaOrigin {
     pub fn new() -> Self {
@@ -25,6 +25,9 @@ pub(super) struct PendingDelivery {
     pub item: InboundMessage,
     pub carrier: Option<(Option<u32>, Bytes)>,
     pub origin: Option<DeliveryOrigin>,
+    pub retention: Option<std::sync::Arc<super::live_retention::Charge>>,
+    pub receipt: Option<std::sync::Arc<super::live_retention::ReceiptScope>>,
+    pub consumer_claimed: bool,
 }
 impl From<InboundMessage> for PendingDelivery {
     fn from(item: InboundMessage) -> Self {
@@ -32,6 +35,9 @@ impl From<InboundMessage> for PendingDelivery {
             item,
             carrier: None,
             origin: None,
+            retention: None,
+            receipt: None,
+            consumer_claimed: false,
         }
     }
 }
@@ -42,6 +48,34 @@ impl std::ops::Deref for PendingDelivery {
     }
 }
 impl PendingDelivery {
+    // Keep journal materialization out of each async replay frame. Callers
+    // retain their own position, receipt and byte-exact sharing policies.
+    #[inline(never)]
+    pub(super) fn from_occurrence(
+        entry: Occurrence,
+        position: usize,
+        info: &std::sync::Arc<wacore::types::message::MessageInfo>,
+        shared_message: Option<std::sync::Arc<waproto::whatsapp::Message>>,
+        receipt: Option<std::sync::Arc<super::live_retention::ReceiptScope>>,
+    ) -> anyhow::Result<Self> {
+        let message = match shared_message {
+            Some(message) => message,
+            None => std::sync::Arc::new(waproto::codec::message_decode(&entry.projection)?),
+        };
+        Ok(Self {
+            item: InboundMessage::builder()
+                .message(message)
+                .info(std::sync::Arc::clone(info))
+                .build(),
+            carrier: Some((entry.index, entry.original)),
+            origin: entry
+                .producer
+                .map(|stanza| DeliveryOrigin { stanza, position }),
+            retention: None,
+            receipt,
+            consumer_claimed: false,
+        })
+    }
     pub fn retained_wire_bytes(&self) -> usize {
         waproto::codec::message_encoded_len(&self.message)
             .saturating_add(self.carrier.as_ref().map_or(0, |(_, bytes)| bytes.len()))
@@ -59,12 +93,14 @@ pub(super) struct Occurrence {
 pub(super) struct PendingJournal {
     generation: [u8; 16],
     pub occurrences: Vec<Occurrence>,
+    backing: Option<Bytes>,
 }
 impl Default for PendingJournal {
     fn default() -> Self {
         Self {
             generation: rand::random(),
             occurrences: Vec::new(),
+            backing: None,
         }
     }
 }
@@ -87,6 +123,7 @@ impl PendingJournal {
                     original: bytes,
                     projection: waproto::codec::message_to_vec(&message).into(),
                 }],
+                backing: None,
             });
         }
         let grouped = bytes.starts_with(MAGIC);
@@ -145,6 +182,7 @@ impl PendingJournal {
         let journal = Self {
             generation,
             occurrences,
+            backing: grouped.then(|| cursor.bytes.clone()),
         };
         journal.validate()?;
         Ok(journal)
@@ -230,8 +268,62 @@ impl PendingJournal {
         Ok(())
     }
 
+    pub fn fits_additional(&self, original: usize, projection: usize) -> bool {
+        let current = self
+            .occurrences
+            .iter()
+            .try_fold(MAGIC.len() + 16 + 4, |size, entry| {
+                size.checked_add(30 + size_of::<Occurrence>())
+                    .and_then(|size| size.checked_add(entry.original.len()))
+                    .and_then(|size| size.checked_add(entry.projection.len()))
+            });
+        current
+            .and_then(|size| size.checked_add(30 + size_of::<Occurrence>()))
+            .and_then(|size| size.checked_add(original))
+            .and_then(|size| size.checked_add(projection))
+            .is_some_and(|size| size <= MAX_PENDING_BYTES)
+    }
+
+    fn matches_backing(&self, bytes: &Bytes) -> anyhow::Result<bool> {
+        let mut cursor = Cursor {
+            bytes: bytes.clone(),
+            offset: MAGIC.len(),
+        };
+        if cursor.take(16)?.as_ref() != self.generation
+            || cursor.number()? != self.occurrences.len()
+        {
+            return Ok(false);
+        }
+        for entry in &self.occurrences {
+            if cursor.take(1)?[0] != u8::from(entry.producer.is_some())
+                || cursor.take(16)?.as_ref() != entry.producer.map_or([0; 16], |id| id.0)
+                || cursor.take(1)?[0] != u8::from(entry.index.is_some())
+                || cursor.number()? != usize::try_from(entry.index.unwrap_or(0))?
+            {
+                return Ok(false);
+            }
+            for current in [&entry.original, &entry.projection] {
+                let saved = cursor.blob()?;
+                if saved.len() != current.len()
+                    || (saved.as_ptr() != current.as_ptr() && saved != *current)
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(cursor.remaining() == 0)
+    }
+
     pub fn encode(&self) -> anyhow::Result<Bytes> {
         self.validate()?;
+        // A retry of the same physical occurrences needs the existing bytes,
+        // not another row-sized allocation. Compare metadata and every slice
+        // so even an edited occurrence cannot reuse stale backing.
+        if let Some(backing) = &self.backing
+            && self.matches_backing(backing)?
+        {
+            return Ok(backing.clone());
+        }
         // Do the complete wire-bound check before allocating the replacement.
         let mut length = MAGIC.len() + 16 + 4;
         for occurrence in &self.occurrences {
@@ -428,5 +520,237 @@ mod tests {
         assert!(PendingJournal::decode(future.into()).is_err());
         journal.occurrences[0].original = vec![0; MAX_PENDING_BYTES].into();
         assert!(journal.encode().is_err());
+    }
+    #[test]
+    fn raw_pending_integral_retained_heap_sample() {
+        use crate::test_alloc::{current_heap_sample, heap_sample};
+        use std::sync::Arc;
+        use wacore::store::traits::{PendingInboundLease, PendingInboundRecord};
+        for payload in [128, 1800 * 1024] {
+            let (baseline, baseline_held) = heap_sample(|| {
+                let mut stages = [crate::test_alloc::HeapSample::default(); 6];
+                let mut message = waproto::whatsapp::Message::default();
+                message.conversation = Some("x".repeat(payload));
+                stages[0] = current_heap_sample();
+                let projection: Bytes = waproto::codec::message_to_vec(&message).into();
+                let mut journal = PendingJournal::default();
+                journal
+                    .merge(Occurrence {
+                        producer: Some(StanzaOrigin::new()),
+                        index: Some(0),
+                        original: projection.clone(),
+                        projection,
+                    })
+                    .unwrap();
+                stages[1] = current_heap_sample();
+                let row = journal.encode().unwrap();
+                stages[2] = current_heap_sample();
+                let copied = Bytes::copy_from_slice(&row);
+                let decoded = PendingJournal::decode(copied).unwrap();
+                stages[3] = current_heap_sample();
+                let graphs: Vec<_> = decoded
+                    .occurrences
+                    .iter()
+                    .map(|entry| waproto::codec::message_decode(&entry.projection).unwrap())
+                    .collect();
+                stages[4] = current_heap_sample();
+                // Reference the old copying handoff, including its newly
+                // allocated replacement even when the row was unchanged.
+                let replacement = Bytes::copy_from_slice(&decoded.encode().unwrap());
+                stages[5] = current_heap_sample();
+                (message, journal, row, decoded, graphs, replacement, stages)
+            });
+            eprintln!(
+                "copying reference payload={payload}: {baseline:?}, stages={:?}",
+                baseline_held.6
+            );
+            drop(baseline_held);
+            for (append, cold) in [(false, false), (true, false), (false, true), (true, true)] {
+                let (optimized, held) = heap_sample(|| {
+                    let mut stages = [crate::test_alloc::HeapSample::default(); 6];
+                    let mut message = waproto::whatsapp::Message::default();
+                    message.conversation = Some("x".repeat(payload));
+                    let message = Arc::new(message);
+                    stages[0] = current_heap_sample();
+                    let projection: Bytes = waproto::codec::message_to_vec(&message).into();
+                    let mut journal = PendingJournal::default();
+                    journal
+                        .merge(Occurrence {
+                            producer: Some(StanzaOrigin::new()),
+                            index: Some(0),
+                            original: projection.clone(),
+                            projection: projection.clone(),
+                        })
+                        .unwrap();
+                    stages[1] = current_heap_sample();
+                    let row = journal.encode().unwrap();
+                    let row_ptr = row.as_ptr();
+                    let owned_row = Vec::from(row);
+                    assert_eq!(
+                        owned_row.as_ptr(),
+                        row_ptr,
+                        "unique row transfers without copying"
+                    );
+                    let record = PendingInboundRecord::new(
+                        owned_row,
+                        PendingInboundLease::new(Arc::new(())),
+                    );
+                    drop(journal);
+                    stages[2] = current_heap_sample();
+                    let (backing, lease) = record.into_bytes();
+                    let mut decoded = PendingJournal::decode(backing).unwrap();
+                    stages[3] = current_heap_sample();
+                    assert_eq!(decoded.occurrences[0].projection, projection);
+                    // A cold client has only the stored row. Release fixture
+                    // setup objects before decoding; the peak still includes
+                    // their earlier transient coexistence during preparation.
+                    let (message, projection, replay_graph) = if cold {
+                        drop(message);
+                        drop(projection);
+                        let graph = Arc::new(
+                            waproto::codec::message_decode(&decoded.occurrences[0].projection)
+                                .unwrap(),
+                        );
+                        (None, None, graph)
+                    } else {
+                        let graph = Arc::clone(&message);
+                        (Some(message), Some(projection), graph)
+                    };
+                    stages[4] = current_heap_sample();
+                    if append {
+                        decoded
+                            .merge(Occurrence {
+                                producer: Some(StanzaOrigin::new()),
+                                index: Some(1),
+                                original: Bytes::from_static(b"\x0a\x83\x00new"),
+                                projection: Bytes::from_static(b"\x0a\x03new"),
+                            })
+                            .unwrap();
+                    }
+                    let replacement = decoded.encode().unwrap();
+                    stages[5] = current_heap_sample();
+                    (
+                        message,
+                        projection,
+                        decoded,
+                        replay_graph,
+                        replacement,
+                        lease,
+                        stages,
+                    )
+                });
+                eprintln!(
+                    "shared ownership payload={payload}, append={append}, cold={cold}: {optimized:?}, stages={:?}",
+                    held.6
+                );
+                // This flat conversation fixture accounts for current graph,
+                // projection, prior row and replacement. Three admission-sized
+                // buffers plus 64 KiB cover their transient bookkeeping. This
+                // is not a global heap limit for arbitrary protobuf graphs,
+                // concurrent receives or SQLite's own internal allocations.
+                let scenario_budget = 3 * MAX_PENDING_BYTES + 64 * 1024;
+                assert!(optimized.peak <= scenario_budget as i64);
+                assert!(optimized.retained <= optimized.peak);
+                // Only unchanged warm retry has the same work as the
+                // copying reference. Cold decode and append are separate
+                // peak scenarios, not equivalent allocation comparisons.
+                if !append && !cold {
+                    assert!(optimized.allocations < baseline.allocations);
+                }
+                if payload > 1024 && !append && !cold {
+                    assert!(
+                        optimized.peak * 4 <= baseline.peak * 3,
+                        "large payload must eliminate copies, not only raise a limit"
+                    );
+                }
+                drop(held);
+            }
+        }
+    }
+
+    #[test]
+    fn raw_pending_dense_graph_heap_sample() {
+        use crate::test_alloc::{current_heap_sample, heap_sample};
+        let (sample, held) = heap_sample(|| {
+            let mut message = waproto::whatsapp::Message::default();
+            let mut text = waproto::whatsapp::message::ExtendedTextMessage::default();
+            let mut context = waproto::whatsapp::ContextInfo::default();
+            context.mentioned_jid = vec![String::new(); 8192];
+            text.context_info = buffa::MessageField::some(context);
+            message.extended_text_message = buffa::MessageField::some(text);
+            let graph = current_heap_sample();
+            let projection: Bytes = waproto::codec::message_to_vec(&message).into();
+            let mut journal = PendingJournal::default();
+            journal
+                .merge(Occurrence {
+                    producer: Some(StanzaOrigin::new()),
+                    index: Some(0),
+                    original: projection.clone(),
+                    projection: projection.clone(),
+                })
+                .unwrap();
+            let row = journal.encode().unwrap();
+            let decoded = waproto::codec::message_decode(&projection).unwrap();
+            (message, projection, journal, row, decoded, graph)
+        });
+        eprintln!(
+            "dense graph: {sample:?}, graph={:?}, projection={}, row={}",
+            held.5,
+            held.1.len(),
+            held.3.len()
+        );
+        assert!(held.3.len() < MAX_PENDING_BYTES);
+        // Empty repeated strings still allocate a Vec of String headers.
+        // Wire admission alone therefore cannot bound the decoded graph.
+        assert!(held.5.retained > held.1.len() as i64);
+        assert_eq!(
+            held.4
+                .extended_text_message
+                .as_option()
+                .unwrap()
+                .context_info
+                .as_option()
+                .unwrap()
+                .mentioned_jid
+                .len(),
+            8192
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn raw_pending_backing_reuse_checks_direct_edits() {
+        let mut initial = PendingJournal::default();
+        initial.merge(occurrence(0, b"old")).unwrap();
+        let bytes = initial.encode().unwrap();
+        for edit in 0..4 {
+            let mut edited = PendingJournal::decode(bytes.clone()).unwrap();
+            match edit {
+                0 => edited.generation[0] ^= 1,
+                1 => edited.occurrences[0].producer = Some(StanzaOrigin::new()),
+                2 => edited.occurrences[0].index = Some(1),
+                _ => edited.occurrences[0].projection = Bytes::from_static(b"new projection"),
+            }
+            let replacement = edited.encode().unwrap();
+            assert_ne!(replacement.as_ptr(), bytes.as_ptr());
+            let restored = PendingJournal::decode(replacement).unwrap();
+            assert_eq!(restored.generation, edited.generation);
+            assert_eq!(
+                restored.occurrences[0].producer,
+                edited.occurrences[0].producer
+            );
+            assert_eq!(restored.occurrences[0].index, edited.occurrences[0].index);
+            assert_eq!(
+                restored.occurrences[0].projection,
+                edited.occurrences[0].projection
+            );
+        }
+        let mut decoded = PendingJournal::decode(bytes.clone()).unwrap();
+        assert_eq!(decoded.encode().unwrap().as_ptr(), bytes.as_ptr());
+        decoded.occurrences[0].original = Bytes::from_static(b"edited");
+        let replacement = decoded.encode().unwrap();
+        assert_ne!(replacement.as_ptr(), bytes.as_ptr());
+        let restored = PendingJournal::decode(replacement).unwrap();
+        assert_eq!(restored.occurrences[0].original.as_ref(), b"edited");
     }
 }

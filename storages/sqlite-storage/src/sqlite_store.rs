@@ -460,6 +460,38 @@ type BlockingJob<T> = Box<dyn FnOnce() -> Result<T> + Send>;
 
 type WriteJob<T> = Box<dyn FnOnce(&mut SqliteConnection) -> Result<T> + Send>;
 
+// Native retries cross blocking worker boundaries; the browser shim runs inline.
+#[derive(Clone)]
+enum OwnedPendingMutation {
+    Replace {
+        payload: Arc<PendingInboundPayload>,
+        revision: PendingInboundRevision,
+    },
+    Delete(PendingInboundLease),
+}
+
+impl OwnedPendingMutation {
+    fn operation(&self) -> &'static str {
+        match self {
+            Self::Replace { .. } => "replace_pending_inbound_if",
+            Self::Delete(_) => "delete_pending_inbound_if",
+        }
+    }
+
+    fn lease(&self) -> PendingInboundLease {
+        match self {
+            Self::Replace { payload, .. } => payload.lease(),
+            Self::Delete(lease) => lease.clone(),
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+type RetryQuery<T> =
+    Box<dyn FnOnce(&mut SqliteConnection) -> std::result::Result<T, DieselError> + Send>;
+#[cfg(target_family = "wasm")]
+type RetryQuery<T> = Box<dyn FnOnce(&mut SqliteConnection) -> std::result::Result<T, DieselError>>;
+
 /// Reader connections and the permits that bound how many run at once.
 #[derive(Clone)]
 pub(crate) struct ReadPool {
@@ -1432,25 +1464,92 @@ impl SqliteStore {
         Ok(result)
     }
 
+    // Share the mutation retry/transaction body while retaining owned leases
+    // in the worker, including when its awaiting caller is cancelled.
+    async fn mutate_pending_inbound_owned(
+        &self,
+        key: PendingInboundKey<'_>,
+        expected: PendingInboundRevision,
+        max_bytes: usize,
+        mutation: OwnedPendingMutation,
+    ) -> Result<PendingInboundMutation> {
+        let (chat, sender, id) = (
+            key.chat.to_owned(),
+            key.sender.to_owned(),
+            key.id.to_owned(),
+        );
+        let device_id = self.device_id;
+        self.with_retry(mutation.operation(), || {
+            let (chat, sender, id) = (chat.clone(), sender.clone(), id.clone());
+            let mutation = mutation.clone();
+            Box::new(move |conn| {
+                conn.immediate_transaction(|conn| {
+                    let current = match read_pending_inbound_bounded_row(
+                        conn,
+                        device_id,
+                        &chat,
+                        &sender,
+                        &id,
+                        max_bytes,
+                        mutation.lease(),
+                    )? {
+                        Ok(current) => current,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    let revision = current.as_ref().map_or(
+                        PendingInboundRevision::missing(),
+                        PendingInboundRecord::revision,
+                    );
+                    // Already-replaced is Applied even if the caller's expected
+                    // revision is stale. Delete has no such shortcut.
+                    if let OwnedPendingMutation::Replace {
+                        revision: replacement,
+                        ..
+                    } = &mutation
+                        && revision == *replacement
+                    {
+                        return Ok(Ok(PendingInboundMutation::Applied));
+                    }
+                    if revision != expected {
+                        return Ok(Ok(PendingInboundMutation::Conflict));
+                    }
+                    match &mutation {
+                        OwnedPendingMutation::Replace { payload, .. } => {
+                            insert_pending_inbound_row(
+                                conn,
+                                device_id,
+                                &chat,
+                                &sender,
+                                &id,
+                                payload.bytes(),
+                            )?;
+                        }
+                        OwnedPendingMutation::Delete(_) => {
+                            delete_pending_inbound_row(conn, device_id, &chat, &sender, &id)?;
+                        }
+                    }
+                    Ok(Ok(PendingInboundMutation::Applied))
+                })
+            })
+        })
+        .await?
+    }
+
     /// Execute a database operation with semaphore serialization and retry on
     /// transient SQLite lock/busy errors. Mirrors WhatsApp Web's PromiseQueue
     /// pattern that serializes database commits to avoid concurrent write contention.
     async fn with_retry<F, T>(&self, op_name: &str, make_op: F) -> Result<T>
     where
-        F: Fn() -> Box<
-            dyn FnOnce(&mut SqliteConnection) -> std::result::Result<T, DieselError> + Send,
-        >,
-        T: Send + 'static,
+        F: Fn() -> RetryQuery<T>,
+        T: wacore::sync_marker::MaybeSend + 'static,
     {
         self.with_retry_inner(op_name, make_op, true).await
     }
 
     async fn with_read_retry<F, T>(&self, op_name: &str, make_op: F) -> Result<T>
     where
-        F: Fn() -> Box<
-            dyn FnOnce(&mut SqliteConnection) -> std::result::Result<T, DieselError> + Send,
-        >,
-        T: Send + 'static,
+        F: Fn() -> RetryQuery<T>,
+        T: wacore::sync_marker::MaybeSend + 'static,
     {
         self.with_retry_inner(op_name, make_op, false).await
     }
@@ -1462,10 +1561,8 @@ impl SqliteStore {
         await_barrier: bool,
     ) -> Result<T>
     where
-        F: Fn() -> Box<
-            dyn FnOnce(&mut SqliteConnection) -> std::result::Result<T, DieselError> + Send,
-        >,
-        T: Send + 'static,
+        F: Fn() -> RetryQuery<T>,
+        T: wacore::sync_marker::MaybeSend + 'static,
     {
         const MAX_RETRIES: u32 = 5;
 
@@ -4400,54 +4497,17 @@ impl ProtocolStore for SqliteStore {
                 replacement.bytes().len(),
             )));
         }
-        let replacement_revision = PendingInboundRevision::for_bytes(replacement.bytes());
-        let replacement = Arc::new(replacement);
-        let (chat, sender, id) = (
-            key.chat.to_owned(),
-            key.sender.to_owned(),
-            key.id.to_owned(),
-        );
-        let device_id = self.device_id;
-        self.with_retry("replace_pending_inbound_if", || {
-            let (chat, sender, id) = (chat.clone(), sender.clone(), id.clone());
-            let replacement = Arc::clone(&replacement);
-            Box::new(move |conn| {
-                conn.immediate_transaction(|conn| {
-                    let current = match read_pending_inbound_bounded_row(
-                        conn,
-                        device_id,
-                        &chat,
-                        &sender,
-                        &id,
-                        max_bytes,
-                        replacement.lease(),
-                    )? {
-                        Ok(current) => current,
-                        Err(error) => return Ok(Err(error)),
-                    };
-                    let revision = current.as_ref().map_or(
-                        PendingInboundRevision::missing(),
-                        PendingInboundRecord::revision,
-                    );
-                    if revision == replacement_revision {
-                        return Ok(Ok(PendingInboundMutation::Applied));
-                    }
-                    if revision != expected {
-                        return Ok(Ok(PendingInboundMutation::Conflict));
-                    }
-                    insert_pending_inbound_row(
-                        conn,
-                        device_id,
-                        &chat,
-                        &sender,
-                        &id,
-                        replacement.bytes(),
-                    )?;
-                    Ok(Ok(PendingInboundMutation::Applied))
-                })
-            })
-        })
-        .await?
+        let revision = PendingInboundRevision::for_bytes(replacement.bytes());
+        self.mutate_pending_inbound_owned(
+            key,
+            expected,
+            max_bytes,
+            OwnedPendingMutation::Replace {
+                payload: Arc::new(replacement),
+                revision,
+            },
+        )
+        .await
     }
 
     async fn delete_pending_inbound_if(
@@ -4457,42 +4517,13 @@ impl ProtocolStore for SqliteStore {
         max_bytes: usize,
         lease: PendingInboundLease,
     ) -> Result<PendingInboundMutation> {
-        let (chat, sender, id) = (
-            key.chat.to_owned(),
-            key.sender.to_owned(),
-            key.id.to_owned(),
-        );
-        let device_id = self.device_id;
-        self.with_retry("delete_pending_inbound_if", || {
-            let lease = lease.clone();
-            let (chat, sender, id) = (chat.clone(), sender.clone(), id.clone());
-            Box::new(move |conn| {
-                conn.immediate_transaction(|conn| {
-                    let current = match read_pending_inbound_bounded_row(
-                        conn,
-                        device_id,
-                        &chat,
-                        &sender,
-                        &id,
-                        max_bytes,
-                        lease.clone(),
-                    )? {
-                        Ok(current) => current,
-                        Err(error) => return Ok(Err(error)),
-                    };
-                    let revision = current.as_ref().map_or(
-                        PendingInboundRevision::missing(),
-                        PendingInboundRecord::revision,
-                    );
-                    if revision != expected {
-                        return Ok(Ok(PendingInboundMutation::Conflict));
-                    }
-                    delete_pending_inbound_row(conn, device_id, &chat, &sender, &id)?;
-                    Ok(Ok(PendingInboundMutation::Applied))
-                })
-            })
-        })
-        .await?
+        self.mutate_pending_inbound_owned(
+            key,
+            expected,
+            max_bytes,
+            OwnedPendingMutation::Delete(lease),
+        )
+        .await
     }
 
     async fn delete_expired_pending_inbound(&self, cutoff_timestamp: i64) -> Result<u32> {

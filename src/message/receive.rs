@@ -495,20 +495,6 @@ impl Client {
             decrypt_fail_mode,
         } = msg;
 
-        let stanza_origin = raw_pending::StanzaOrigin::new();
-        if max_sender_retry_count > 0 {
-            let cache_key = self
-                .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
-                .await;
-            self.preseed_retry_count(&cache_key, max_sender_retry_count)
-                .await;
-            log::debug!(
-                "[msg:{}] Sender retry count {} pre-seeded into cache",
-                info.id,
-                max_sender_retry_count
-            );
-        }
-
         // Acquire the global processing permit (1 during offline sync, N after).
         // The helper re-acquires across a 1→N semaphore swap (offline→online):
         // without that, a task waiting on the old 1-permit semaphore would be
@@ -545,6 +531,96 @@ impl Client {
                 );
             }
             return;
+        }
+
+        let stanza_origin = raw_pending::StanzaOrigin::new();
+        let mut receipt_producer = None;
+        if self.inbound_durability_hook().is_some()
+            && !self.inbound_commit_batch.is_active()
+            && self
+                .inbound_commit_batch
+                .live_retention
+                .has_raw_for_message(&info)
+        {
+            // Resume the older plaintext using its existing charge. A full
+            // budget must not require a second admission to make progress.
+            // Its hook may stream, but this arrival cannot ACK by identity:
+            // the current ciphertext still has to finish below.
+            receipt_producer = match self
+                .inbound_commit_batch
+                .live_retention
+                .begin_receipts(&info)
+            {
+                Ok(producer) => Some(producer),
+                Err(error) => {
+                    log::warn!("Receipt admission refused before decrypt: {error:?}");
+                    return;
+                }
+            };
+            if !self.ack_or_replay_to_hook(&info).await {
+                return;
+            }
+        }
+        // Admission precedes every ratchet mutation. Refusal leaves ciphertext
+        // untouched for server redelivery; reset never evicts a retained live row.
+        let _live_admission = if self.inbound_durability_hook().is_some()
+            && !self.inbound_commit_batch.is_active()
+        {
+            if let Err(error) = self.persist_live_retained_before_decrypt(&info).await {
+                log::warn!(
+                    "Retained live write is still unavailable; leaving ciphertext untouched: {error:?}"
+                );
+                return;
+            }
+            let payloads = session_payloads
+                .iter()
+                .chain(&group_payloads)
+                .chain(&bot_payloads);
+            let (wire_bytes, slots) = payloads.fold((0usize, 0usize), |(bytes, count), payload| {
+                (
+                    bytes.saturating_add(payload.ciphertext.len()),
+                    count.saturating_add(1),
+                )
+            });
+            match self
+                .inbound_commit_batch
+                .live_retention
+                .reserve(stanza_origin, wire_bytes, slots)
+            {
+                Ok(admission) => Some(admission),
+                Err(error) => {
+                    log::warn!("Live pending capacity exhausted before decrypt: {error:?}");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        // Scope only receipts; predecessor hooks continue streaming.
+        if receipt_producer.is_none() && self.inbound_durability_hook().is_some() {
+            receipt_producer = match self
+                .inbound_commit_batch
+                .live_retention
+                .begin_receipts(&info)
+            {
+                Ok(producer) => Some(producer),
+                Err(error) => {
+                    log::warn!("Receipt admission refused before decrypt: {error:?}");
+                    return;
+                }
+            };
+        }
+        if max_sender_retry_count > 0 {
+            let cache_key = self
+                .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
+                .await;
+            self.preseed_retry_count(&cache_key, max_sender_retry_count)
+                .await;
+            log::debug!(
+                "[msg:{}] Sender retry count {} pre-seeded into cache",
+                info.id,
+                max_sender_retry_count
+            );
         }
 
         log::debug!(
@@ -587,6 +663,9 @@ impl Client {
             }
             SessionBatchOutcome::default()
         };
+        if session_outcome.had_failure {
+            self.inbound_commit_batch.live_retention.fail_receipt(&info);
+        }
         let session_decrypted_successfully = session_outcome.decrypted;
         let session_had_duplicates = session_outcome.duplicate;
         let session_dispatched_undecryptable = session_outcome.undecryptable;
@@ -743,8 +822,14 @@ impl Client {
         // with the session/group decrypt batches under the same global
         // permit + per-chat enqueue lock acquired upstream.
         for payload in bot_payloads {
-            self.handle_msmsg_payload_in_scope(&info, payload, stanza_origin)
-                .await;
+            // Keep the bot-only decrypt frame out of every chat lane future.
+            Box::pin(self.handle_msmsg_payload_in_scope(&info, payload, stanza_origin)).await;
+        }
+
+        if let Some(producer) = &receipt_producer
+            && producer.finish()
+        {
+            self.ack_received_message_unscoped(&info);
         }
 
         // Live: coalesce the receive-side flush. A lost advance re-derives
@@ -759,7 +844,7 @@ impl Client {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.session_decrypt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %sender_encryption_jid.observe(), msg_id = %info.id)))]
-    #[cfg(any(test, feature = "bench-harness"))]
+    #[cfg(test)]
     pub(crate) async fn process_session_enc_batch(
         self: Arc<Self>,
         payloads: Vec<EncPayload>,
@@ -934,6 +1019,17 @@ impl Client {
 
             match decrypt_res {
                 Ok(decrypted) => {
+                    self.inbound_commit_batch.live_retention.stage(
+                        info,
+                        stanza_origin,
+                        (enc_index, enc_type, padding_version),
+                        &decrypted.plaintext,
+                    );
+                    #[cfg(test)]
+                    self.inbound_commit_batch
+                        .live_retention
+                        .pause_after_stage()
+                        .await;
                     // Buffer the prekey this pkmsg consumed: message_decrypt promoted
                     // the session into the (volatile) cache but no longer deletes the
                     // prekey itself. The post-loop flush deletes it only once that
@@ -1054,6 +1150,12 @@ impl Client {
 
                         match retry_decrypt_res {
                             Ok(decrypted) => {
+                                self.inbound_commit_batch.live_retention.stage(
+                                    info,
+                                    stanza_origin,
+                                    (enc_index, enc_type, padding_version),
+                                    &decrypted.plaintext,
+                                );
                                 log::debug!(
                                     "[msg:{}] Successfully decrypted message from {} after handling untrusted identity",
                                     info.id,
@@ -1121,6 +1223,7 @@ impl Client {
                                             &session_mutex,
                                             &mut session_guard,
                                             &mut deferred,
+                                            stanza_origin,
                                         )
                                         .await
                                     {
@@ -1239,6 +1342,7 @@ impl Client {
                                 &session_mutex,
                                 &mut session_guard,
                                 &mut deferred,
+                                stanza_origin,
                             )
                             .await
                         {
@@ -1294,6 +1398,7 @@ impl Client {
                                 &session_mutex,
                                 &mut session_guard,
                                 &mut deferred,
+                                stanza_origin,
                             )
                             .await
                         {
@@ -1367,6 +1472,7 @@ impl Client {
                                 &session_mutex,
                                 &mut session_guard,
                                 &mut deferred,
+                                stanza_origin,
                             )
                             .await
                         {
@@ -1586,6 +1692,17 @@ impl Client {
 
             match decrypt_result {
                 Ok(padded_plaintext) => {
+                    self.inbound_commit_batch.live_retention.stage(
+                        info,
+                        stanza_origin,
+                        (enc_index, enc_type, padding_version),
+                        &padded_plaintext,
+                    );
+                    #[cfg(test)]
+                    self.inbound_commit_batch
+                        .live_retention
+                        .pause_after_stage()
+                        .await;
                     // Sync device list if sender is unknown, but still process
                     // the message. Signal decryption success already proves the
                     // sender holds the session key — discarding would only add
@@ -1841,12 +1958,47 @@ impl Client {
         slot: PlaintextSlot<'_>,
         info: &Arc<MessageInfo>,
     ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
+        let origin = raw_pending::DeliveryOrigin {
+            stanza: slot.producer,
+            position: slot.index,
+        };
+        let result = self
+            .handle_decrypted_plaintext_retained(
+                enc_type,
+                padded_plaintext,
+                padding_version,
+                slot,
+                info,
+            )
+            .await;
+        if result.as_ref().is_ok_and(|outcome| !outcome.dispatched) {
+            // Successful protocol-only processing has no consumer delivery.
+            // Recoverable errors and cancellation keep raw ownership; the
+            // terminal padding/decode checks release only their rejected slot.
+            self.inbound_commit_batch.live_retention.finish_raw(origin);
+        }
+        result
+    }
+
+    async fn handle_decrypted_plaintext_retained(
+        self: &Arc<Self>,
+        enc_type: &'static str,
+        padded_plaintext: Vec<u8>,
+        padding_version: u8,
+        slot: PlaintextSlot<'_>,
+        info: &Arc<MessageInfo>,
+    ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
         let PlaintextSlot {
             index: enc_index,
             annotations,
             producer: stanza_origin,
         } = slot;
-        let source = wacore::messages::unpad_plaintext(padded_plaintext, padding_version)?;
+        let origin = raw_pending::DeliveryOrigin {
+            stanza: stanza_origin,
+            position: enc_index,
+        };
+        let source = wacore::messages::unpad_plaintext(padded_plaintext, padding_version)
+            .inspect_err(|_| self.inbound_commit_batch.live_retention.finish_raw(origin))?;
 
         // Emitted before decoding, so a payload this build cannot decode still
         // reaches a consumer that wants it. Nothing is cloned while no lease is
@@ -1872,7 +2024,8 @@ impl Client {
             .then(|| u32::try_from(enc_index).map(|index| (Some(index), source.clone())))
             .transpose()?;
         let (original_msg, history_sync_taken) =
-            wacore::messages::decode_unpadded_detached_history_sync(source)?;
+            wacore::messages::decode_unpadded_detached_history_sync(source)
+                .inspect_err(|_| self.inbound_commit_batch.live_retention.finish_raw(origin))?;
         log::debug!(
             "[msg:{}] Successfully decrypted message from {}: type={} [batch path]",
             info.id,
@@ -2073,8 +2226,38 @@ impl Client {
                     // survived replays instead of being acked, which dispatches the
                     // message again: that is the documented at-least-once shape, not a
                     // suppression, so it is not counted as one.
-                    let replayed = !info.source.chat.is_status_broadcast()
-                        && self.ack_or_replay_to_hook(info).await;
+                    let (replayed, commit_state) =
+                        if self.inbound_durability_hook().is_some() && carrier.is_some() {
+                            // A consumer claim does not prove that this raw occurrence
+                            // is stored. Commit it directly instead of recursively
+                            // replaying the raw entry that is currently being prepared.
+                            let state = self
+                                .commit_or_batch_pending(
+                                    raw_pending::PendingDelivery {
+                                        item: wacore::types::events::InboundMessage::builder()
+                                            .message(Arc::new(msg))
+                                            .info(Arc::clone(info))
+                                            .build(),
+                                        carrier,
+                                        origin: Some(raw_pending::DeliveryOrigin {
+                                            stanza: stanza_origin,
+                                            position: enc_index,
+                                        }),
+                                        retention: None,
+                                        receipt: None,
+                                        consumer_claimed: true,
+                                    },
+                                    app_state_key_share_job.is_some(),
+                                )
+                                .await;
+                            (matches!(state, InboundCommitState::Durable), Some(state))
+                        } else {
+                            (
+                                !info.source.chat.is_status_broadcast()
+                                    && self.ack_or_replay_to_hook(info).await,
+                                None,
+                            )
+                        };
                     if !replayed {
                         self.duplicate_dispatch_suppressed
                             .fetch_add(1, Ordering::Relaxed);
@@ -2090,10 +2273,31 @@ impl Client {
                     // one. Sending them twice costs a stanza; not sending them leaves
                     // the requester without app-state keys until it changes request id.
                     if let Some((requester, request)) = app_state_key_share_job {
-                        self.schedule_app_state_sync_key_share(requester, request, None);
+                        match commit_state {
+                            Some(InboundCommitState::Durable | InboundCommitState::Buffered)
+                            | None => {
+                                self.schedule_app_state_sync_key_share(requester, request, None);
+                            }
+                            Some(InboundCommitState::Deferred(Some(ticket))) => {
+                                self.schedule_app_state_sync_key_share(
+                                    requester,
+                                    request,
+                                    Some(ticket),
+                                );
+                            }
+                            Some(
+                                InboundCommitState::Deferred(None) | InboundCommitState::Failed,
+                            ) => {
+                                warn!(
+                                    "[msg:{}] Deferring app-state key-share until durable retry",
+                                    info.id
+                                );
+                            }
+                        }
                     }
                     return Ok(PlaintextHandleOutcome {
                         dispatched: true,
+                        delivered: replayed,
                         ..Default::default()
                     });
                 }
@@ -2115,9 +2319,10 @@ impl Client {
                     }),
                 )
                 .await;
+            let delivered = matches!(commit_state, InboundCommitState::Durable);
             if let Some((requester, request)) = app_state_key_share_job {
                 match commit_state {
-                    InboundCommitState::Durable => {
+                    InboundCommitState::Durable | InboundCommitState::Buffered => {
                         self.schedule_app_state_sync_key_share(requester, request, None);
                     }
                     InboundCommitState::Deferred(Some(ticket)) => {
@@ -2133,6 +2338,7 @@ impl Client {
             }
             Ok(PlaintextHandleOutcome {
                 dispatched: true,
+                delivered,
                 ..Default::default()
             })
         }
@@ -2165,6 +2371,7 @@ impl Client {
         session_mutex: &Arc<async_lock::Mutex<()>>,
         session_guard: &mut Option<async_lock::MutexGuardArc<()>>,
         deferred: &mut Vec<DeferredPlaintext>,
+        stanza_origin: raw_pending::StanzaOrigin,
     ) -> MigrationDecryptResult {
         if !parsed_message.is_available() || !sender_jid.is_lid() {
             return MigrationDecryptResult::NotDecrypted(None);
@@ -2203,6 +2410,12 @@ impl Client {
             // the identity for the first time (NewOrUnchanged), so no local
             // identity-change reaction is warranted here.
             Ok(decrypted) => {
+                self.inbound_commit_batch.live_retention.stage(
+                    info,
+                    stanza_origin,
+                    (enc_index, enc_type, padding_version),
+                    &decrypted.plaintext,
+                );
                 log::info!(
                     "[msg:{}] Decrypted after PN→LID session migration for {}",
                     info.id,

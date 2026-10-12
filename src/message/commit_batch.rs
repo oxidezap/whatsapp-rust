@@ -59,6 +59,17 @@ impl PendingInboundBatch {
     }
 }
 
+pub(crate) struct PendingStorage {
+    arena: std::sync::Mutex<Vec<u8>>,
+}
+impl PendingStorage {
+    fn arena(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
+        self.arena
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
 pub(crate) struct InboundCommitBatcher {
     state: std::sync::Mutex<BatchState>,
     #[cfg(test)]
@@ -95,8 +106,8 @@ pub(crate) struct InboundCommitBatcher {
     /// commits use a local buffer instead: sharing it would serialize
     /// concurrent live-path hook calls that could previously overlap. Release
     /// this buffer when the drain finishes; live traffic cannot reuse it.
-    arena: async_lock::Mutex<Vec<u8>>,
-    pending_mutations: Arc<async_lock::Mutex<()>>,
+    pending_storage: Arc<async_lock::Mutex<PendingStorage>>,
+    pub(super) live_retention: live_retention::LiveRetention,
 }
 
 impl Default for InboundCommitBatcher {
@@ -108,8 +119,10 @@ impl Default for InboundCommitBatcher {
             active: std::sync::atomic::AtomicBool::new(true),
             pending_live: std::sync::atomic::AtomicBool::new(false),
             epoch: AtomicU64::new(0),
-            arena: async_lock::Mutex::new(Vec::new()),
-            pending_mutations: Arc::new(async_lock::Mutex::new(())),
+            pending_storage: Arc::new(async_lock::Mutex::new(PendingStorage {
+                arena: std::sync::Mutex::new(Vec::new()),
+            })),
+            live_retention: Default::default(),
             #[cfg(test)]
             fail_commits: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -119,6 +132,13 @@ impl Default for InboundCommitBatcher {
 }
 
 impl InboundCommitBatcher {
+    #[cfg(test)]
+    pub(crate) fn storage_layout_delta() -> isize {
+        (size_of::<Arc<async_lock::Mutex<PendingStorage>>>()
+            + size_of::<live_retention::LiveRetention>()) as isize
+            - size_of::<async_lock::Mutex<Vec<u8>>>() as isize
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, BatchState> {
         match self.state.lock() {
             Ok(guard) => guard,
@@ -187,14 +207,16 @@ impl InboundCommitBatcher {
         // Normal transitions hold the processing permit after the final
         // commit, so no encoder owns this lock. A forced exit may race a
         // stalled backend write: never block it or invalidate borrowed rows.
-        if let Some(mut arena) = self.arena.try_lock() {
-            *arena = Vec::new();
+        if let Some(storage) = self.pending_storage.try_lock() {
+            *storage.arena() = Vec::new();
         }
     }
 
     #[cfg(feature = "bench-harness")]
     pub(crate) fn encode_arena_capacity(&self) -> Option<usize> {
-        self.arena.try_lock().map(|arena| arena.capacity())
+        self.pending_storage
+            .try_lock()
+            .map(|storage| storage.arena().capacity())
     }
 
     /// Record that the end-of-drain flush failed before its durable point;
@@ -346,12 +368,22 @@ struct StoredPendingGroup {
     complete: bool,
 }
 
+// Keep one concrete commit poll body shared across drain and replay callers.
+// The future stays pinned on the caller's stack; this adds no heap owner.
+#[inline(never)]
+fn poll_pending_commit<F: Future<Output = PendingCommitOutcome>>(
+    future: std::pin::Pin<&mut F>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<PendingCommitOutcome> {
+    future.poll(cx)
+}
+
 impl Client {
     pub(super) async fn read_pending_for_replay(
         &self,
         info: &MessageInfo,
     ) -> anyhow::Result<Option<wacore::store::traits::PendingInboundRecord>> {
-        let owner = Arc::new(self.inbound_commit_batch.pending_mutations.lock_arc().await);
+        let owner = Arc::new(self.inbound_commit_batch.pending_storage.lock_arc().await);
         let lease = PendingInboundLease::new(owner);
         let chat = info.source.chat.to_string();
         let sender = info.source.sender.to_string();
@@ -377,8 +409,14 @@ impl Client {
     ) -> anyhow::Result<Vec<StoredPendingGroup>> {
         // Workers retain this mutation owner after receive cancellation. It
         // covers only storage; never hold it while invoking consumer code.
-        let owner = Arc::new(self.inbound_commit_batch.pending_mutations.lock_arc().await);
-        let lease = PendingInboundLease::new(owner);
+        let owner = Arc::new(self.inbound_commit_batch.pending_storage.lock_arc().await);
+        // The detached request retains both mutation exclusion and admission
+        // charges after the receive future is cancelled.
+        let charges: Vec<_> = items
+            .iter()
+            .filter_map(|item| item.retention.clone())
+            .collect();
+        let lease = PendingInboundLease::new(Arc::new((Arc::clone(&owner), charges)));
         let backend = self.persistence_manager.backend();
         let mut groups: Vec<(String, String, String, Vec<&PendingDelivery>)> = Vec::new();
         for item in items {
@@ -408,16 +446,17 @@ impl Client {
                 .map_or(PendingInboundRevision::missing(), |record| {
                     record.revision()
                 });
-            let mut journal = match record.as_ref() {
+            let mut journal = match record {
                 Some(record) => {
-                    PendingJournal::decode(bytes::Bytes::copy_from_slice(record.bytes()))?
+                    let (bytes, _read_lease) = record.into_bytes();
+                    PendingJournal::decode(bytes)?
                 }
                 None => PendingJournal::default(),
             };
             let mut covered = Vec::with_capacity(deliveries.len());
             for delivery in deliveries {
                 let projection = if is_drain {
-                    let mut arena = self.inbound_commit_batch.arena.lock().await;
+                    let mut arena = owner.arena();
                     arena.clear();
                     waproto::codec::message_encode_into(&delivery.message, &mut arena);
                     bytes::Bytes::copy_from_slice(&arena)
@@ -468,7 +507,7 @@ impl Client {
     }
 
     async fn cleanup_pending_group(&self, rows: &[StoredPendingGroup]) -> anyhow::Result<()> {
-        let owner = Arc::new(self.inbound_commit_batch.pending_mutations.lock_arc().await);
+        let owner = Arc::new(self.inbound_commit_batch.pending_storage.lock_arc().await);
         let lease = PendingInboundLease::new(owner);
         let backend = self.persistence_manager.backend();
         for row in rows {
@@ -514,8 +553,42 @@ impl Client {
         (epoch, ticket)
     }
 
+    pub(super) async fn persist_live_retained_before_decrypt(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+    ) -> anyhow::Result<()> {
+        let retained = self.inbound_commit_batch.live_retention.for_message(info);
+        if !retained.is_empty() {
+            self.persist_pending_group(&retained, false).await?;
+            self.inbound_commit_batch.live_retention.stored(&retained);
+        }
+        let Some(record) = self.read_pending_for_replay(info).await? else {
+            return Ok(());
+        };
+        let (bytes, read_lease) = record.into_bytes();
+        let journal = PendingJournal::decode(bytes)?;
+        drop(read_lease);
+        let mut predecessor = Vec::with_capacity(journal.occurrences.len());
+        for (position, entry) in journal.occurrences.into_iter().enumerate() {
+            let position = entry.index.map_or(position, |index| index as usize);
+            predecessor.push(PendingDelivery::from_occurrence(
+                entry, position, info, None, None,
+            )?);
+        }
+        // A hook can flush Signal itself. Recover the durable predecessor
+        // before decrypt advances the incoming ratchet, without acknowledging
+        // the incoming stanza. Refusal leaves its ciphertext untouched.
+        anyhow::ensure!(
+            self.commit_pending_batch_result(predecessor.into(), BatchOrigin::Live, None, false)
+                .await
+                .delivered,
+            "predecessor hook has not recovered before decrypt"
+        );
+        Ok(())
+    }
+
     async fn live_pending_retry_batch(
-        &self,
+        self: &Arc<Self>,
         item: &PendingDelivery,
     ) -> anyhow::Result<Option<Vec<PendingDelivery>>> {
         let Some(origin) = item
@@ -527,8 +600,9 @@ impl Client {
         let Some(record) = self.read_pending_for_replay(&item.info).await? else {
             return Ok(None);
         };
-        let journal = PendingJournal::decode(bytes::Bytes::copy_from_slice(record.bytes()))?;
-        drop(record);
+        let (bytes, read_lease) = record.into_bytes();
+        let journal = PendingJournal::decode(bytes)?;
+        drop(read_lease);
         let projection = waproto::codec::message_to_vec(&item.message);
         let index = u32::try_from(origin.position)?;
         if !journal.occurrences.iter().any(|entry| {
@@ -542,20 +616,28 @@ impl Client {
         }
         // Retry a failed hook with the actual retained occurrences, never
         // substitute projection equality for their storage ownership.
+        let original_len = item
+            .carrier
+            .as_ref()
+            .map_or(projection.len(), |(_, raw)| raw.len());
+        // Capacity recovery belongs before decrypt: invoking a predecessor
+        // hook here could flush the incoming ratchet without its carrier.
+        anyhow::ensure!(
+            journal.fits_additional(original_len, projection.len()),
+            "pending predecessor requires recovery before decrypt"
+        );
         let mut retained = Vec::with_capacity(journal.occurrences.len() + 1);
         for (position, entry) in journal.occurrences.into_iter().enumerate() {
-            let message = waproto::codec::message_decode(&entry.projection)?;
-            retained.push(PendingDelivery {
-                item: InboundMessage::builder()
-                    .message(Arc::new(message))
-                    .info(Arc::clone(&item.info))
-                    .build(),
-                carrier: Some((entry.index, entry.original)),
-                origin: entry.producer.map(|stanza| raw_pending::DeliveryOrigin {
-                    stanza,
-                    position: entry.index.map_or(position, |index| index as usize),
-                }),
-            });
+            let position = entry.index.map_or(position, |index| index as usize);
+            let shared_message =
+                (entry.projection.as_ref() == projection).then(|| Arc::clone(&item.message));
+            retained.push(PendingDelivery::from_occurrence(
+                entry,
+                position,
+                &item.info,
+                shared_message,
+                None,
+            )?);
         }
         retained.push(item.clone());
         Ok(Some(retained))
@@ -563,7 +645,7 @@ impl Client {
 
     /// Batch a message decrypted while the offline drain is active, or commit
     /// immediately (batch of one) on the live path.
-    #[cfg(any(test, feature = "bench-harness"))]
+    #[cfg(test)]
     pub(crate) async fn commit_or_batch_inbound(
         self: &Arc<Self>,
         item: InboundMessage,
@@ -575,10 +657,20 @@ impl Client {
 
     pub(super) async fn commit_or_batch_pending(
         self: &Arc<Self>,
-        item: PendingDelivery,
+        mut item: PendingDelivery,
         track_commit: bool,
     ) -> InboundCommitState {
+        item.receipt = self
+            .inbound_commit_batch
+            .live_retention
+            .receipt_for(&item.info);
         if !self.inbound_commit_batch.is_active() {
+            if self.inbound_durability_hook().is_some()
+                && let Err(error) = self.inbound_commit_batch.live_retention.retain(&mut item)
+            {
+                log::warn!("Live retention admission refused: {error:?}");
+                return InboundCommitState::Failed;
+            }
             let items: Arc<[PendingDelivery]> = match self.live_pending_retry_batch(&item).await {
                 Ok(Some(retained)) => retained.into(),
                 Ok(None) => Arc::from([item]),
@@ -587,11 +679,20 @@ impl Client {
                     return InboundCommitState::Failed;
                 }
             };
-            return if self
-                .commit_pending_batch(items, BatchOrigin::Live, None)
-                .await
-            {
+            let outcome = self
+                .commit_pending_batch_result(Arc::clone(&items), BatchOrigin::Live, None, true)
+                .await;
+            if !outcome.delivered {
+                for item in items.iter() {
+                    self.inbound_commit_batch
+                        .live_retention
+                        .fail_receipt(&item.info);
+                }
+            }
+            return if outcome.delivered {
                 InboundCommitState::Durable
+            } else if outcome.persisted {
+                InboundCommitState::Buffered
             } else {
                 InboundCommitState::Failed
             };
@@ -1117,7 +1218,7 @@ impl Client {
     /// committed — the gate for flushing buffered offline receipts. A hook
     /// failure still returns `true`: its rows are durable and the replay path
     /// retries it, so already-buffered receipts of other messages stay safe.
-    #[cfg(any(test, feature = "bench-harness"))]
+    #[cfg(test)]
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.commit_batch", level = "debug", skip_all, fields(count = items.len())))]
     pub(crate) async fn commit_inbound_batch(
         self: &Arc<Self>,
@@ -1136,7 +1237,7 @@ impl Client {
         origin: BatchOrigin,
         commit_ticket: Option<InboundCommitTicket>,
     ) -> bool {
-        self.commit_pending_batch_result(items, origin, commit_ticket)
+        self.commit_pending_batch_result(items, origin, commit_ticket, true)
             .await
             .persisted
     }
@@ -1145,7 +1246,7 @@ impl Client {
         self: &Arc<Self>,
         items: Arc<[PendingDelivery]>,
     ) -> bool {
-        self.commit_pending_batch_result(items, BatchOrigin::Live, None)
+        self.commit_pending_batch_result(items, BatchOrigin::Live, None, true)
             .await
             .delivered
     }
@@ -1155,6 +1256,20 @@ impl Client {
         items: Arc<[PendingDelivery]>,
         origin: BatchOrigin,
         commit_ticket: Option<InboundCommitTicket>,
+        acknowledge: bool,
+    ) -> PendingCommitOutcome {
+        let future =
+            self.commit_pending_batch_result_inner(items, origin, commit_ticket, acknowledge);
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(|cx| poll_pending_commit(future.as_mut(), cx)).await
+    }
+
+    async fn commit_pending_batch_result_inner(
+        self: &Arc<Self>,
+        items: Arc<[PendingDelivery]>,
+        origin: BatchOrigin,
+        commit_ticket: Option<InboundCommitTicket>,
+        acknowledge: bool,
     ) -> PendingCommitOutcome {
         let is_drain = matches!(origin, BatchOrigin::OfflineDrain);
         debug_assert!(is_drain || commit_ticket.is_none());
@@ -1168,6 +1283,17 @@ impl Client {
         // acked from `arrived`; only what the hook and the consumer see is
         // reduced to one copy.
         let arrived = Arc::clone(&items);
+        // Already delivered entries still need persistence and cleanup, but
+        // must not hide an equivalent entry that the consumer has not seen.
+        let items = if items.iter().any(|entry| entry.consumer_claimed) {
+            items
+                .iter()
+                .filter(|entry| !entry.consumer_claimed)
+                .cloned()
+                .collect()
+        } else {
+            items
+        };
         let items = if self.dispatch_gate_enabled() {
             self.dedup_batch_by_message(items)
         } else {
@@ -1235,6 +1361,7 @@ impl Client {
             // future must not restore the entries — redelivery replays from
             // the rows.
             reinsert.mark_durable();
+            self.inbound_commit_batch.live_retention.stored(&pending);
 
             if !items.is_empty()
                 && let Err(e) = hook.on_messages(self.clone(), &items).await
@@ -1302,11 +1429,15 @@ impl Client {
         let items = retained.map(Arc::from).unwrap_or(items);
         // Schedule receipts before synchronous consumer code can block or panic.
         let mut acknowledged = std::collections::HashSet::with_capacity(arrived.len());
-        for item in arrived.iter() {
-            // Replayed occurrences share the current stanza metadata. Retain
-            // every carrier, but emit one receipt for that physical arrival.
-            if acknowledged.insert(Arc::as_ptr(&item.info) as usize) {
-                self.ack_received_message(&item.info);
+        for item in pending.iter() {
+            // The scope belongs to this arrival, including after cancellation.
+            // Never redirect a late commit into another attempt's scope.
+            if acknowledge && acknowledged.insert(Arc::as_ptr(&item.info) as usize) {
+                match &item.receipt {
+                    Some(scope) if scope.defer() => {}
+                    Some(_) => self.ack_received_message_unscoped(&item.info),
+                    None => self.ack_received_message(&item.info),
+                }
             }
         }
         if is_drain {
@@ -1390,6 +1521,9 @@ mod tests {
                 )),
                 item: inbound,
 
+                retention: None,
+                receipt: None,
+                consumer_claimed: false,
                 origin: Some(raw_pending::DeliveryOrigin {
                     stanza: origin,
                     position,
@@ -1416,6 +1550,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_pending_claimed_entry_cannot_hide_unclaimed_delivery() {
+        let client = create_test_client_with_failing_http("claimed_dedup").await;
+        let hook = Arc::new(RecordingHook {
+            batches: Mutex::new(Vec::new()),
+        });
+        let _ = client.inbound_durability_hook.set(hook.clone());
+        let delivery = |claimed| PendingDelivery {
+            item: item("CLAIMED_FIRST"),
+            carrier: None,
+            retention: None,
+            receipt: None,
+            consumer_claimed: claimed,
+            origin: None,
+        };
+        let outcome = client
+            .commit_pending_batch_result(
+                vec![delivery(true), delivery(false)].into(),
+                BatchOrigin::Live,
+                None,
+                false,
+            )
+            .await;
+        assert!(outcome.delivered);
+        assert_eq!(
+            *hook.batches.lock().unwrap(),
+            vec![vec!["CLAIMED_FIRST".to_owned()]]
+        );
+    }
+
+    #[tokio::test]
     async fn drain_encode_arena_is_reused_then_released_in_live_mode() {
         let client = create_test_client_with_failing_http("drain_arena_lifetime").await;
         let hook = Arc::new(RecordingHook {
@@ -1438,7 +1602,8 @@ mod tests {
                     .flush_inbound_commits_under_permit(false, None, None)
                     .await
             );
-            let arena = client.inbound_commit_batch.arena.lock().await;
+            let storage = client.inbound_commit_batch.pending_storage.lock().await;
+            let arena = storage.arena();
             assert!(arena.capacity() >= 16 * 1024);
             if let Some(previous) = capacity {
                 assert_eq!(arena.capacity(), previous, "reuse between drain batches");
@@ -1453,14 +1618,24 @@ mod tests {
                 .await
         );
         assert!(!client.inbound_commit_batch.is_active());
-        assert_eq!(client.inbound_commit_batch.arena.lock().await.capacity(), 0);
+        assert_eq!(
+            client
+                .inbound_commit_batch
+                .pending_storage
+                .lock()
+                .await
+                .arena()
+                .capacity(),
+            0
+        );
     }
 
     #[tokio::test]
     async fn forced_live_transition_leaves_an_inflight_encoder_untouched() {
         let batcher = InboundCommitBatcher::default();
         batcher.reset();
-        let mut arena = batcher.arena.lock().await;
+        let storage = batcher.pending_storage.lock().await;
+        let mut arena = storage.arena();
         arena.extend_from_slice(b"pending durable row");
         batcher.force_live_dropping_entries();
         assert!(!batcher.is_active());
@@ -2011,5 +2186,67 @@ mod tests {
             guards.push(guard);
         }
         guards.len()
+    }
+    #[tokio::test]
+    async fn raw_pending_near_full_retry_must_reach_recovered_hook() {
+        use std::sync::atomic::AtomicUsize;
+        struct RecoveringHook(AtomicUsize);
+        #[async_trait::async_trait]
+        impl InboundDurabilityHook for RecoveringHook {
+            async fn on_messages(
+                &self,
+                _: Arc<Client>,
+                _: &[InboundMessage],
+            ) -> anyhow::Result<()> {
+                anyhow::ensure!(
+                    self.0.fetch_add(1, Ordering::SeqCst) != 0,
+                    "first hook fails"
+                );
+                Ok(())
+            }
+        }
+        let client = create_test_client_with_failing_http("near_full_retry_progress").await;
+        client.enter_live_mode_for_tests();
+        let hook = Arc::new(RecoveringHook(AtomicUsize::new(0)));
+        client
+            .inbound_durability_hook
+            .set(hook.clone())
+            .ok()
+            .unwrap();
+        let mut inbound = item("NEAR_FULL_RETRY");
+        let mut message = wa::Message::default();
+        message.conversation = Some("x".repeat(1800 * 1024));
+        inbound.message = Arc::new(message);
+        let make = || PendingDelivery {
+            carrier: Some((
+                Some(0),
+                waproto::codec::message_to_vec(&inbound.message).into(),
+            )),
+            item: inbound.clone(),
+            retention: None,
+            receipt: None,
+            consumer_claimed: false,
+            origin: Some(raw_pending::DeliveryOrigin {
+                stanza: raw_pending::StanzaOrigin::new(),
+                position: 0,
+            }),
+        };
+        client.commit_or_batch_pending(make(), false).await;
+        assert_eq!(
+            hook.0.load(Ordering::SeqCst),
+            1,
+            "first admitted row reaches failing hook"
+        );
+        // Production recovers the predecessor before the next decrypt.
+        client
+            .persist_live_retained_before_decrypt(&inbound.info)
+            .await
+            .unwrap();
+        client.commit_or_batch_pending(make(), false).await;
+        assert_eq!(
+            hook.0.load(Ordering::SeqCst),
+            3,
+            "recovery delivers the older row and then the new occurrence after the first failed hook"
+        );
     }
 }

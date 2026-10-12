@@ -9,6 +9,7 @@
 
 use super::*;
 use crate::types::durability_hook::InboundDurabilityHook;
+#[cfg(test)]
 use wacore::types::events::InboundMessage;
 
 impl Client {
@@ -16,6 +17,72 @@ impl Client {
     /// the at-most-once ack path with zero overhead.
     pub(crate) fn inbound_durability_hook(&self) -> Option<Arc<dyn InboundDurabilityHook>> {
         self.inbound_durability_hook.get().cloned()
+    }
+
+    // Recovery owns the retained entries in a cold frame; normal session
+    // processing does not need their iterator and plaintext buffers inline.
+    async fn replay_retained_raw(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+        raw: Vec<live_retention::RawRetained>,
+    ) -> bool {
+        for entry in raw {
+            // Do not redo Signal decryption: its ratchet already advanced.
+            // Raw staging has not yet prepared a consumer projection.
+            let _charge = Arc::clone(&entry.charge);
+            if entry.enc_type == "msmsg" {
+                if !Box::pin(self.replay_retained_bot(info, entry)).await {
+                    return false;
+                }
+                continue;
+            }
+            let outcome = Box::pin(self.handle_decrypted_plaintext_in_scope(
+                entry.enc_type,
+                entry.plaintext.to_vec(),
+                entry.padding_version,
+                receive::PlaintextSlot {
+                    index: entry.origin.position,
+                    annotations: EncNodeAnnotations {
+                        state: None,
+                        session_type: None,
+                    },
+                    producer: entry.origin.stanza,
+                },
+                info,
+            ))
+            .await;
+            if !outcome.is_ok_and(|outcome| outcome.delivered) {
+                return false;
+            }
+        }
+        true
+    }
+
+    // The decoded bot graph belongs to this cold replay frame, rather than
+    // enlarging the future retained by every chat lane.
+    async fn replay_retained_bot(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+        entry: live_retention::RawRetained,
+    ) -> bool {
+        let Ok(message) = waproto::codec::message_decode(&entry.plaintext) else {
+            return false;
+        };
+        let Ok(index) = u32::try_from(entry.origin.position) else {
+            return false;
+        };
+        matches!(
+            self.dispatch_shared_message_with_carrier(
+                Arc::new(message),
+                info,
+                false,
+                None,
+                Some((Some(index), entry.plaintext)),
+                Some(entry.origin),
+            )
+            .await,
+            InboundCommitState::Durable
+        )
     }
 
     /// Redelivery path: when the server replays an already-decrypted message
@@ -39,34 +106,41 @@ impl Client {
     /// failed returns `false`, because nothing reached a consumer.
     pub(crate) async fn ack_or_replay_to_hook(self: &Arc<Self>, info: &Arc<MessageInfo>) -> bool {
         if self.inbound_durability_hook().is_some() {
+            let raw = self
+                .inbound_commit_batch
+                .live_retention
+                .raw_for_message(info);
+            if !raw.is_empty() {
+                return Box::pin(self.replay_retained_raw(info, raw)).await;
+            }
+            let mut retained = self.inbound_commit_batch.live_retention.for_message(info);
+            if !retained.is_empty() {
+                for entry in &mut retained {
+                    entry.item.info = Arc::clone(info);
+                    entry.receipt = self.inbound_commit_batch.live_retention.receipt_for(info);
+                }
+                return self.replay_pending_batch(retained.into()).await;
+            }
             match self.read_pending_for_replay(info).await {
                 Ok(Some(record)) => {
                     // Decode before releasing the read owner, then release it
                     // before the batch's conditional write takes that owner.
-                    let decoded = raw_pending::PendingJournal::decode(
-                        bytes::Bytes::copy_from_slice(record.bytes()),
-                    );
-                    drop(record);
+                    let (bytes, read_lease) = record.into_bytes();
+                    let decoded = raw_pending::PendingJournal::decode(bytes);
+                    drop(read_lease);
                     let replay = match decoded.and_then(|journal| {
                         journal
                             .occurrences
                             .into_iter()
                             .enumerate()
                             .map(|(position, entry)| {
-                                let message = waproto::codec::message_decode(&entry.projection)?;
-                                Ok(raw_pending::PendingDelivery {
-                                    item: InboundMessage::builder()
-                                        .message(Arc::new(message))
-                                        .info(Arc::clone(info))
-                                        .build(),
-
-                                    carrier: Some((entry.index, entry.original)),
-                                    // A legacy row has no producer ownership. Inventing one
-                                    // on replay would leave its predecessor uncovered.
-                                    origin: entry.producer.map(|stanza| {
-                                        raw_pending::DeliveryOrigin { stanza, position }
-                                    }),
-                                })
+                                // Preserve the replay position and producer absence of legacy rows.
+                                let mut delivery = raw_pending::PendingDelivery::from_occurrence(
+                                    entry, position, info, None, None,
+                                )?;
+                                delivery.receipt =
+                                    self.inbound_commit_batch.live_retention.receipt_for(info);
+                                Ok(delivery)
                             })
                             .collect::<anyhow::Result<Vec<_>>>()
                     }) {

@@ -1348,6 +1348,12 @@ impl PendingInboundRecord {
         &self.bytes
     }
 
+    /// Transfer the owned backing without copying it. Keep the returned lease
+    /// through decoding, then release mutation exclusion before a new write.
+    pub fn into_bytes(self) -> (Bytes, PendingInboundLease) {
+        (Bytes::from(self.bytes), self.lease)
+    }
+
     pub const fn revision(&self) -> PendingInboundRevision {
         self.revision
     }
