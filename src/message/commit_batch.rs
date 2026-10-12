@@ -571,7 +571,7 @@ impl Client {
                 .await
             {
                 Ok(PendingInboundMutation::Applied) => {}
-                Ok(PendingInboundMutation::Conflict) => {
+                Ok(_) => {
                     anyhow::bail!("pending occurrence cleanup revision conflict");
                 }
                 Err(error) => {
