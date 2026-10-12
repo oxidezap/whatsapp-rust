@@ -382,6 +382,26 @@ jobs:
           cat "$RUNNER_TEMP/fullcycle.rs" >> candidate/benches/connected_idle.rs
           cmp main-control/benches/connected_idle.rs candidate/benches/connected_idle.rs
           mkdir -p reports
+          # Each workflow is one CodSpeed run; keep both sides' benchmark URIs unique.
+          for name in activity_peak cache_maintenance_after_activity complete_client_activity; do
+            sed -i "s/^fn ${name}(/fn base_3eeb8080_${name}(/" main-control/benches/connected_idle.rs
+            sed -i "s/^fn ${name}(/fn head_4ba95d7f_${name}(/" candidate/benches/connected_idle.rs
+          done
+          test "$(grep -c '^fn base_3eeb8080_' main-control/benches/connected_idle.rs)" -eq 3
+          test "$(grep -c '^fn head_4ba95d7f_' candidate/benches/connected_idle.rs)" -eq 3
+          sed 's/^fn base_3eeb8080_/fn /' main-control/benches/connected_idle.rs > reports/main-normalized-workload.rs
+          sed 's/^fn head_4ba95d7f_/fn /' candidate/benches/connected_idle.rs > reports/candidate-normalized-workload.rs
+          cmp reports/main-normalized-workload.rs reports/candidate-normalized-workload.rs
+          cat > reports/benchmark-sha-map.json <<'JSON'
+          {
+            "kind": "single paired qualification run; compare labels, not this run's aggregate commit",
+            "base_3eeb8080_": "3eeb80806ba456170018b114cd1fda66bc74329d",
+            "head_4ba95d7f_": "4ba95d7f16e565ca2b11046db32f2ae34eefb707",
+            "canonical_cases": ["activity_peak", "cache_maintenance_after_activity", "complete_client_activity"],
+            "arguments": [false, true],
+            "instruments": ["Simulation", "Memory"]
+          }
+          JSON
           {
             uname -a
             rustc -Vv
