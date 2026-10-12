@@ -390,6 +390,19 @@ impl Client {
         }
     }
 
+    pub(super) fn pending_replay_info(
+        info: &Arc<MessageInfo>,
+        sender: String,
+    ) -> anyhow::Result<Arc<MessageInfo>> {
+        let sender = sender.parse::<wacore_binary::Jid>()?;
+        if sender == info.source.sender {
+            return Ok(Arc::clone(info));
+        }
+        let mut stored_info = (**info).clone();
+        stored_info.source.sender = sender;
+        Ok(Arc::new(stored_info))
+    }
+
     pub(super) async fn read_pending_for_replay(
         &self,
         info: &MessageInfo,
@@ -618,9 +631,7 @@ impl Client {
         };
         let (bytes, read_lease) = record.into_bytes();
         let journal = PendingJournal::decode(bytes)?;
-        let mut stored_info = (**info).clone();
-        stored_info.source.sender = sender.parse()?;
-        let stored_info = Arc::new(stored_info);
+        let stored_info = Self::pending_replay_info(info, sender)?;
         drop(read_lease);
         let mut predecessor = Vec::with_capacity(journal.occurrences.len());
         for (position, entry) in journal.occurrences.into_iter().enumerate() {
@@ -661,9 +672,7 @@ impl Client {
         let (bytes, read_lease) = record.into_bytes();
         let journal = PendingJournal::decode(bytes)?;
         drop(read_lease);
-        let mut stored_info = (*item.info).clone();
-        stored_info.source.sender = sender.parse()?;
-        let stored_info = Arc::new(stored_info);
+        let stored_info = Self::pending_replay_info(&item.info, sender)?;
         let projection = waproto::codec::message_to_vec(&item.message);
         let index = u32::try_from(origin.position)?;
         if !journal.occurrences.iter().any(|entry| {
