@@ -18204,7 +18204,7 @@ async fn pdo_retry_durability_after_recovery(fail_first: bool) {
     let pending = || {
         backend.get_pending_inbound(
             "120363000000000071@g.us",
-            "777000000000001:2@lid",
+            "777000000000001@lid",
             PdoRetryFixture::ID,
         )
     };
@@ -20065,7 +20065,7 @@ async fn suppressed_resend_replays_to_a_durability_hook() {
     let pending = client
         .persistence_manager
         .backend()
-        .get_pending_inbound(&group.to_string(), &alice.jid.to_string(), id)
+        .get_pending_inbound(&group.to_string(), &alice.jid.to_non_ad_string(), id)
         .await
         .unwrap();
     if let Some(pending) = &pending {
