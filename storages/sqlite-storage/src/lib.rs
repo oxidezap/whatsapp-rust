@@ -30,13 +30,13 @@
 //! }
 //! ```
 
-pub(crate) mod bounded_pending_query;
+mod bounded_pending_query;
 mod database;
 mod pool;
 mod schema;
 mod shared;
 mod sqlite_store;
-mod upsert_queries;
+pub(crate) mod upsert_queries;
 mod wire;
 
 pub use database::SqliteDatabase;
