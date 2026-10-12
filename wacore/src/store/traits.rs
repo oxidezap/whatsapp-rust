@@ -1184,6 +1184,21 @@ pub trait ProtocolStore: Send + Sync {
         Err(unsupported_pending_inbound())
     }
 
+    /// Read the unique physical row for a group's non-device sender identity.
+    /// Return its actual sender spelling for subsequent CAS. Discover at most
+    /// 400 same-chat/id sender keys, each at most 128 bytes, before copying any
+    /// payload. Ambiguous aliases, invalid/oversized metadata and oversized
+    /// payloads are errors, never absence. Discovery and payload must share a
+    /// snapshot, and detached readers retain the supplied mutation-owner lease.
+    async fn read_pending_inbound_group_bounded(
+        &self,
+        _key: PendingInboundKey<'_>,
+        _max_bytes: usize,
+        _lease: PendingInboundLease,
+    ) -> Result<Option<(String, PendingInboundRecord)>> {
+        Err(unsupported_pending_inbound())
+    }
+
     /// Replace only the exact revision observed by the owner. Absence is an
     /// explicit expected revision. Backends must compare and write atomically,
     /// and reject oversized existing or replacement payloads before copying. An
@@ -1374,6 +1389,42 @@ impl PendingInboundRecord {
     }
 }
 
+/// Select a unique non-device group sender from bounded physical metadata.
+/// `None` marks metadata withheld by a backend's preallocation length check.
+#[inline(never)]
+pub fn pending_group_sender<'a>(
+    senders: &mut dyn Iterator<Item = Option<&'a str>>,
+    sender: &str,
+) -> Result<Option<String>> {
+    let invalid = |message: &str| crate::store::error::StoreError::Validation(message.to_owned());
+    if sender.len() > 128 {
+        return Err(invalid("group pending sender exceeds bound"));
+    }
+    let canonical = sender
+        .parse::<Jid>()
+        .map_err(|_| invalid("invalid group pending sender"))?
+        .to_non_ad();
+    let mut selected = None;
+    for (index, spelling) in senders.enumerate() {
+        if index >= 400 {
+            return Err(invalid("pending group sender count exceeds bound"));
+        }
+        let spelling = spelling
+            .filter(|value| value.len() <= 128)
+            .ok_or_else(|| invalid("pending group sender metadata exceeds bound"))?;
+        let physical = spelling
+            .parse::<Jid>()
+            .map_err(|_| invalid("invalid pending group sender metadata"))?;
+        if physical.to_non_ad() == canonical {
+            if selected.is_some() {
+                return Err(invalid("ambiguous pending group sender aliases"));
+            }
+            selected = Some(spelling);
+        }
+    }
+    Ok(selected.map(str::to_owned))
+}
+
 /// Result of an atomic conditional pending-row mutation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1547,4 +1598,40 @@ pub trait Backend:
 impl<T> Backend for T where
     T: SignalStore + AppSyncStore + ProtocolStore + MsgSecretStore + DeviceStore + Send + Sync
 {
+}
+
+#[cfg(test)]
+mod pending_group_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn pending_bounded_group_metadata_rejects_ambiguity_and_limits() {
+        assert_eq!(
+            pending_group_sender(
+                &mut [Some("200:75@lid"), Some("200:75@s.whatsapp.net")].into_iter(),
+                "200@lid"
+            )
+            .unwrap(),
+            Some("200:75@lid".into())
+        );
+        assert!(
+            pending_group_sender(
+                &mut [Some("200@lid"), Some("200:75@lid")].into_iter(),
+                "200@lid"
+            )
+            .is_err()
+        );
+        assert!(pending_group_sender(&mut [None].into_iter(), "200@lid").is_err());
+        let huge = format!("{}:75@lid", "2".repeat(129));
+        assert!(pending_group_sender(&mut [Some(huge.as_str())].into_iter(), "200@lid").is_err());
+        assert!(
+            pending_group_sender(&mut std::iter::repeat_n(Some("300@lid"), 401), "200@lid")
+                .is_err()
+        );
+        assert!(
+            pending_group_sender(&mut std::iter::repeat_n(Some("300@lid"), 400), "200@lid")
+                .unwrap()
+                .is_none()
+        );
+    }
 }

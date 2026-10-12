@@ -20604,17 +20604,22 @@ async fn full_pending_journal_flush_recreation(novel_payload: bool) {
 
 #[tokio::test]
 async fn raw_pending_hook_failure_survives_client_recreation() {
-    group_pending_recreation(None).await;
+    group_pending_recreation(None, false).await;
 }
 
 #[tokio::test]
 async fn raw_pending_group_sender_spelling_replays_after_recreation() {
     for first_device in [false, true] {
-        group_pending_recreation(Some(first_device)).await;
+        group_pending_recreation(Some(first_device), false).await;
     }
 }
 
-async fn group_pending_recreation(change_spelling: Option<bool>) {
+#[tokio::test]
+async fn raw_pending_group_legacy_device_row_replays_on_bare_sender() {
+    group_pending_recreation(Some(true), true).await;
+}
+
+async fn group_pending_recreation(change_spelling: Option<bool>, legacy_device_row: bool) {
     use crate::types::durability_hook::InboundDurabilityHook;
     use std::sync::Mutex;
     use wacore::types::events::InboundMessage;
@@ -20674,6 +20679,23 @@ async fn group_pending_recreation(change_spelling: Option<bool>) {
             .unwrap()
             .is_some()
     );
+    if legacy_device_row {
+        let chat = group.to_string();
+        let canonical = alice.jid.to_non_ad_string();
+        let bytes = backend
+            .get_pending_inbound(&chat, &canonical, "RECREATED")
+            .await
+            .unwrap()
+            .unwrap();
+        backend
+            .store_pending_inbound(&chat, &alice.jid.to_string(), "RECREATED", &bytes)
+            .await
+            .unwrap();
+        backend
+            .delete_pending_inbound(&chat, &canonical, "RECREATED")
+            .await
+            .unwrap();
+    }
     client.flush_signal_cache().await.unwrap();
     drop(client);
     let restarted = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
@@ -20702,6 +20724,14 @@ async fn group_pending_recreation(change_spelling: Option<bool>) {
             .await
             .unwrap()
             .is_none()
+    );
+    assert!(
+        backend
+            .get_pending_inbound(&group.to_string(), &alice.jid.to_string(), "RECREATED")
+            .await
+            .unwrap()
+            .is_none(),
+        "legacy physical spelling is conditionally cleaned up"
     );
 }
 

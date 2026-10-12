@@ -1236,6 +1236,37 @@ impl ProtocolStore for InMemoryBackend {
             .transpose()
     }
 
+    async fn read_pending_inbound_group_bounded(
+        &self,
+        key: PendingInboundKey<'_>,
+        max_bytes: usize,
+        lease: PendingInboundLease,
+    ) -> Result<Option<(String, PendingInboundRecord)>> {
+        let state = self.state.lock().await;
+        let mut metadata = state
+            .pending_inbound
+            .keys()
+            .filter(|(chat, _, id)| chat == key.chat && id == key.id)
+            .map(|(_, sender, _)| Some(sender.as_str()))
+            .take(401);
+        let Some(sender) = pending_group_sender(&mut metadata, key.sender)? else {
+            return Ok(None);
+        };
+        let entry = state
+            .pending_inbound
+            .get(&(key.chat.to_owned(), sender.clone(), key.id.to_owned()))
+            .ok_or_else(|| {
+                crate::store::error::StoreError::Validation(
+                    "pending group row disappeared under owner".into(),
+                )
+            })?;
+        validate_pending_length(entry.bytes.len(), max_bytes)?;
+        Ok(Some((
+            sender,
+            PendingInboundRecord::new(entry.bytes.clone(), lease),
+        )))
+    }
+
     async fn replace_pending_inbound_if(
         &self,
         key: PendingInboundKey<'_>,
@@ -1774,6 +1805,121 @@ mod tests {
     use super::*;
 
     fn is_backend<T: Backend>() {}
+
+    #[tokio::test]
+    async fn pending_bounded_group_legacy_alias_preserves_physical_cas_and_lease() {
+        let store = InMemoryBackend::new();
+        let chat = "120363000000000081@g.us";
+        let sender = "200:75@lid";
+        let key = PendingInboundKey {
+            chat,
+            sender,
+            id: "LEGACY_ALIAS",
+        };
+        let logical = PendingInboundKey {
+            sender: "200@lid",
+            ..key
+        };
+        store
+            .store_pending_inbound(chat, sender, key.id, b"old")
+            .await
+            .unwrap();
+        store
+            .store_pending_inbound(chat, "200:75@s.whatsapp.net", key.id, b"other")
+            .await
+            .unwrap();
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let (physical, record) = store
+            .read_pending_inbound_group_bounded(
+                logical,
+                16,
+                PendingInboundLease::new(owner.clone()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        drop(owner);
+        assert!(
+            weak.upgrade().is_some(),
+            "returned record retains the owner"
+        );
+        assert_eq!(physical, sender);
+        assert_eq!(record.bytes(), b"old");
+        let stale = record.revision();
+        drop(record);
+        assert!(weak.upgrade().is_none());
+        store
+            .store_pending_inbound(chat, sender, key.id, b"new")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .delete_pending_inbound_if(key, stale, 16, PendingInboundLease::new(Arc::new(())))
+                .await
+                .unwrap(),
+            PendingInboundMutation::Conflict
+        );
+        assert!(
+            store
+                .read_pending_inbound_group_bounded(
+                    logical,
+                    2,
+                    PendingInboundLease::new(Arc::new(()))
+                )
+                .await
+                .is_err()
+        );
+        store
+            .store_pending_inbound(chat, logical.sender, key.id, b"ambiguous")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .read_pending_inbound_group_bounded(
+                    logical,
+                    16,
+                    PendingInboundLease::new(Arc::new(()))
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_pending_inbound(chat, sender, key.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            b"new"
+        );
+        store
+            .delete_pending_inbound(chat, logical.sender, key.id)
+            .await
+            .unwrap();
+        let (_, record) = store
+            .read_pending_inbound_group_bounded(logical, 16, PendingInboundLease::new(Arc::new(())))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .delete_pending_inbound_if(key, record.revision(), 16, record.lease())
+                .await
+                .unwrap(),
+            PendingInboundMutation::Applied
+        );
+        assert!(
+            store
+                .read_pending_inbound_group_bounded(
+                    logical,
+                    16,
+                    PendingInboundLease::new(Arc::new(()))
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn pending_bounded_memory_preserves_revision_and_empty_presence() {

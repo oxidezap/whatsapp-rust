@@ -837,8 +837,8 @@ async fn probe_durability_backend(
         PendingInboundRevision,
     };
     let key = PendingInboundKey {
-        chat: PROBE_JID,
-        sender: PROBE_JID,
+        chat: "0@g.us",
+        sender: "0:1@s.whatsapp.net",
         id: &probe_id,
     };
     let lease = PendingInboundLease::new(Arc::new(()));
@@ -870,11 +870,27 @@ async fn probe_durability_backend(
     let stored = backend
         .read_pending_inbound_bounded(key, bound, lease.clone())
         .await;
+    let grouped = backend
+        .read_pending_inbound_group_bounded(
+            PendingInboundKey {
+                chat: key.chat,
+                sender: PROBE_JID,
+                id: key.id,
+            },
+            bound,
+            lease.clone(),
+        )
+        .await;
     let deleted = backend
         .delete_pending_inbound_if(key, revision, bound, lease.clone())
         .await;
     let stored = stored.map_err(map_err)?;
-    if stored.as_ref().map(|record| record.bytes()) != Some(PROBE_PAYLOAD)
+    let grouped = grouped.map_err(map_err)?;
+    if grouped
+        .as_ref()
+        .map(|(sender, record)| (sender.as_str(), record.bytes()))
+        != Some((key.sender, PROBE_PAYLOAD))
+        || stored.as_ref().map(|record| record.bytes()) != Some(PROBE_PAYLOAD)
         || stored.as_ref().map(|record| record.revision()) != Some(revision)
         || deleted.map_err(map_err)? != PendingInboundMutation::Applied
         || backend

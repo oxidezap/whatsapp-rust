@@ -53,3 +53,33 @@ impl QueryFragment<Sqlite> for BoundedPendingQuery<'_> {
         Ok(())
     }
 }
+
+#[derive(Debug)]
+pub(crate) struct BoundedPendingSendersId;
+
+pub(crate) struct BoundedPendingSenders<'a> {
+    pub device_id: i32,
+    pub chat: &'a str,
+    pub id: &'a str,
+}
+impl QueryId for BoundedPendingSenders<'_> {
+    type QueryId = BoundedPendingSendersId;
+    const HAS_STATIC_QUERY_ID: bool = true;
+}
+impl Query for BoundedPendingSenders<'_> {
+    type SqlType = Untyped;
+}
+impl<Conn> RunQueryDsl<Conn> for BoundedPendingSenders<'_> {}
+impl QueryFragment<Sqlite> for BoundedPendingSenders<'_> {
+    fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Sqlite>) -> QueryResult<()> {
+        // Never materialize an oversized TEXT key, even when the BLOB is tiny.
+        out.push_sql("SELECT CASE WHEN length(CAST(sender AS BLOB)) <= 128 THEN sender ELSE NULL END AS sender FROM pending_inbound_messages WHERE device_id = ");
+        out.push_bind_param::<Integer, _>(&self.device_id)?;
+        out.push_sql(" AND chat = ");
+        out.push_bind_param::<Text, _>(&self.chat)?;
+        out.push_sql(" AND id = ");
+        out.push_bind_param::<Text, _>(&self.id)?;
+        out.push_sql(" LIMIT 401");
+        Ok(())
+    }
+}

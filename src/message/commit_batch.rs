@@ -411,26 +411,21 @@ impl Client {
         let lease = PendingInboundLease::new(owner);
         let chat = info.source.chat.to_string();
         let sender = info.source.sender.to_string();
-        let canonical = Self::pending_sender(info);
         let backend = self.persistence_manager.backend();
-        for spelling in std::iter::once(&sender).chain((canonical != sender).then_some(&canonical))
-        {
-            if let Some(record) = backend
-                .read_pending_inbound_bounded(
-                    PendingInboundKey {
-                        chat: &chat,
-                        sender: spelling,
-                        id: &info.id,
-                    },
-                    MAX_PENDING_BYTES,
-                    lease.clone(),
-                )
-                .await?
-            {
-                return Ok(Some((spelling.clone(), record)));
-            }
+        let key = PendingInboundKey {
+            chat: &chat,
+            sender: &sender,
+            id: &info.id,
+        };
+        if info.source.chat.is_group() {
+            return Ok(backend
+                .read_pending_inbound_group_bounded(key, MAX_PENDING_BYTES, lease)
+                .await?);
         }
-        Ok(None)
+        Ok(backend
+            .read_pending_inbound_bounded(key, MAX_PENDING_BYTES, lease)
+            .await?
+            .map(|record| (sender, record)))
     }
 
     async fn persist_pending_group(

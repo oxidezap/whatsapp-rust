@@ -3378,6 +3378,12 @@ struct BoundedPendingPayload {
     payload: Option<Vec<u8>>,
 }
 
+#[derive(QueryableByName)]
+struct BoundedPendingSender {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    sender: Option<String>,
+}
+
 fn read_pending_inbound_bounded_row(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -4506,6 +4512,61 @@ impl ProtocolStore for SqliteStore {
         .await?
     }
 
+    async fn read_pending_inbound_group_bounded(
+        &self,
+        key: PendingInboundKey<'_>,
+        max_bytes: usize,
+        lease: PendingInboundLease,
+    ) -> Result<Option<(String, PendingInboundRecord)>> {
+        if key.sender.len() > 128 {
+            return Err(StoreError::Validation(
+                "group pending sender exceeds bound".into(),
+            ));
+        }
+        let (chat, sender, id) = (
+            key.chat.to_owned(),
+            key.sender.to_owned(),
+            key.id.to_owned(),
+        );
+        let device_id = self.device_id;
+        self.with_read_retry("read_pending_inbound_group_bounded", || {
+            let (chat, sender, id, lease) =
+                (chat.clone(), sender.clone(), id.clone(), lease.clone());
+            Box::new(move |conn| {
+                // One read transaction prevents alias discovery and payload
+                // from observing different external-writer snapshots.
+                conn.transaction(|conn| {
+                    let rows: Vec<BoundedPendingSender> =
+                        crate::bounded_pending_query::BoundedPendingSenders {
+                            device_id,
+                            chat: &chat,
+                            id: &id,
+                        }
+                        .load(conn)?;
+                    let physical = match pending_group_sender(
+                        &mut rows.iter().map(|row| row.sender.as_deref()),
+                        &sender,
+                    ) {
+                        Ok(Some(physical)) => physical,
+                        Ok(None) => return Ok(Ok(None)),
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    Ok(read_pending_inbound_bounded_row(
+                        conn,
+                        device_id,
+                        &chat,
+                        &physical,
+                        &id,
+                        max_bytes,
+                        lease.clone(),
+                    )?
+                    .map(|record| record.map(|record| (physical, record))))
+                })
+            })
+        })
+        .await?
+    }
+
     async fn replace_pending_inbound_if(
         &self,
         key: PendingInboundKey<'_>,
@@ -5340,6 +5401,121 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn pending_bounded_group_legacy_alias_preserves_physical_cas_and_lease() {
+        let store = create_test_store().await;
+        let chat = "120363000000000081@g.us";
+        let sender = "200:75@lid";
+        let key = PendingInboundKey {
+            chat,
+            sender,
+            id: "LEGACY_ALIAS",
+        };
+        let logical = PendingInboundKey {
+            sender: "200@lid",
+            ..key
+        };
+        store
+            .store_pending_inbound(chat, sender, key.id, b"old")
+            .await
+            .unwrap();
+        store
+            .store_pending_inbound(chat, "200:75@s.whatsapp.net", key.id, b"other")
+            .await
+            .unwrap();
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let (physical, record) = store
+            .read_pending_inbound_group_bounded(
+                logical,
+                16,
+                PendingInboundLease::new(owner.clone()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        drop(owner);
+        assert!(
+            weak.upgrade().is_some(),
+            "returned record retains the owner"
+        );
+        assert_eq!(physical, sender);
+        assert_eq!(record.bytes(), b"old");
+        let stale = record.revision();
+        drop(record);
+        assert!(weak.upgrade().is_none());
+        store
+            .store_pending_inbound(chat, sender, key.id, b"new")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .delete_pending_inbound_if(key, stale, 16, PendingInboundLease::new(Arc::new(())))
+                .await
+                .unwrap(),
+            PendingInboundMutation::Conflict
+        );
+        assert!(
+            store
+                .read_pending_inbound_group_bounded(
+                    logical,
+                    2,
+                    PendingInboundLease::new(Arc::new(()))
+                )
+                .await
+                .is_err()
+        );
+        store
+            .store_pending_inbound(chat, logical.sender, key.id, b"ambiguous")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .read_pending_inbound_group_bounded(
+                    logical,
+                    16,
+                    PendingInboundLease::new(Arc::new(()))
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_pending_inbound(chat, sender, key.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            b"new"
+        );
+        store
+            .delete_pending_inbound(chat, logical.sender, key.id)
+            .await
+            .unwrap();
+        let (_, record) = store
+            .read_pending_inbound_group_bounded(logical, 16, PendingInboundLease::new(Arc::new(())))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .delete_pending_inbound_if(key, record.revision(), 16, record.lease())
+                .await
+                .unwrap(),
+            PendingInboundMutation::Applied
+        );
+        assert!(
+            store
+                .read_pending_inbound_group_bounded(
+                    logical,
+                    16,
+                    PendingInboundLease::new(Arc::new(()))
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     fn pending_test_lease() -> PendingInboundLease {
         PendingInboundLease::new(Arc::new(()))
     }
@@ -5407,6 +5583,65 @@ mod tests {
                 .await
                 .unwrap(),
             PendingInboundMutation::Conflict
+        );
+    }
+
+    #[test]
+    fn pending_bounded_group_metadata_sql_limits_copying_and_rebinds_cache() {
+        use diesel::connection::{InstrumentationEvent, SimpleConnection};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        conn.batch_execute("CREATE TABLE pending_inbound_messages (device_id INTEGER, chat TEXT, sender TEXT, id TEXT, message BLOB);
+            INSERT INTO pending_inbound_messages VALUES
+            (1, 'chat-a', '200:75@lid', 'id-a', zeroblob(4194304)),
+            (2, 'chat-a', '300:76@lid', 'id-a', x'01'),
+            (1, 'chat-b', '400@lid', 'id-a', x'01'),
+            (1, 'chat-a', '500@lid', 'id-b', x'01');").unwrap();
+        diesel::sql_query(
+            "INSERT INTO pending_inbound_messages VALUES (1, 'huge', ?, 'id-a', x'01')",
+        )
+        .bind::<diesel::sql_types::Text, _>("2".repeat(4096))
+        .execute(&mut conn)
+        .unwrap();
+        let cached = Arc::new(AtomicUsize::new(0));
+        let observed = cached.clone();
+        conn.set_instrumentation(move |event: InstrumentationEvent<'_>| {
+            if let InstrumentationEvent::CacheQuery { .. } = event {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        for (device_id, chat, id, expected) in [
+            (1, "chat-a", "id-a", Some("200:75@lid")),
+            (2, "chat-a", "id-a", Some("300:76@lid")),
+            (1, "chat-b", "id-a", Some("400@lid")),
+            (1, "chat-a", "id-b", Some("500@lid")),
+            (1, "huge", "id-a", None),
+        ] {
+            let rows: Vec<BoundedPendingSender> =
+                crate::bounded_pending_query::BoundedPendingSenders {
+                    device_id,
+                    chat,
+                    id,
+                }
+                .load(&mut conn)
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].sender.as_deref(), expected);
+        }
+        assert_eq!(cached.load(Ordering::SeqCst), 1);
+        conn.batch_execute("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<402)
+            INSERT INTO pending_inbound_messages SELECT 1, 'many', x || '@lid', 'id-a', x'01' FROM n;").unwrap();
+        let rows: Vec<BoundedPendingSender> = crate::bounded_pending_query::BoundedPendingSenders {
+            device_id: 1,
+            chat: "many",
+            id: "id-a",
+        }
+        .load(&mut conn)
+        .unwrap();
+        assert_eq!(rows.len(), 401);
+        assert!(
+            pending_group_sender(&mut rows.iter().map(|row| row.sender.as_deref()), "1@lid")
+                .is_err()
         );
     }
 
