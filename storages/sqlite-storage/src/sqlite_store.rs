@@ -492,6 +492,20 @@ type RetryQuery<T> =
 #[cfg(target_family = "wasm")]
 type RetryQuery<T> = Box<dyn FnOnce(&mut SqliteConnection) -> std::result::Result<T, DieselError>>;
 
+#[cfg(not(target_family = "wasm"))]
+type RetryFactory<'a, T> = dyn FnMut() -> RetryQuery<T> + Send + 'a;
+#[cfg(target_family = "wasm")]
+type RetryFactory<'a, T> = dyn FnMut() -> RetryQuery<T> + 'a;
+
+// Keep the shared retry poll outside the per-factory caller without boxing.
+#[inline(never)]
+fn poll_retry_future<F: std::future::Future>(
+    future: std::pin::Pin<&mut F>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<F::Output> {
+    future.poll(cx)
+}
+
 /// Reader connections and the permits that bound how many run at once.
 #[derive(Clone)]
 pub(crate) struct ReadPool {
@@ -1540,7 +1554,7 @@ impl SqliteStore {
     /// pattern that serializes database commits to avoid concurrent write contention.
     async fn with_retry<F, T>(&self, op_name: &str, make_op: F) -> Result<T>
     where
-        F: Fn() -> RetryQuery<T>,
+        F: Fn() -> RetryQuery<T> + wacore::sync_marker::MaybeSend,
         T: wacore::sync_marker::MaybeSend + 'static,
     {
         self.with_retry_inner(op_name, make_op, true).await
@@ -1548,7 +1562,7 @@ impl SqliteStore {
 
     async fn with_read_retry<F, T>(&self, op_name: &str, make_op: F) -> Result<T>
     where
-        F: Fn() -> RetryQuery<T>,
+        F: Fn() -> RetryQuery<T> + wacore::sync_marker::MaybeSend,
         T: wacore::sync_marker::MaybeSend + 'static,
     {
         self.with_retry_inner(op_name, make_op, false).await
@@ -1561,7 +1575,22 @@ impl SqliteStore {
         await_barrier: bool,
     ) -> Result<T>
     where
-        F: Fn() -> RetryQuery<T>,
+        F: Fn() -> RetryQuery<T> + wacore::sync_marker::MaybeSend,
+        T: wacore::sync_marker::MaybeSend + 'static,
+    {
+        let mut make_op = make_op;
+        let future = self.with_retry_erased(op_name, &mut make_op, await_barrier);
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(|cx| poll_retry_future(future.as_mut(), cx)).await
+    }
+
+    async fn with_retry_erased<T>(
+        &self,
+        op_name: &str,
+        make_op: &mut RetryFactory<'_, T>,
+        await_barrier: bool,
+    ) -> Result<T>
+    where
         T: wacore::sync_marker::MaybeSend + 'static,
     {
         const MAX_RETRIES: u32 = 5;
@@ -5051,6 +5080,126 @@ mod tests {
         SqliteStore::open(&db_name)
             .await
             .expect("Failed to create test store")
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn shared_retry_accepts_send_only_factory_and_preserves_commit_barrier() {
+        use std::cell::Cell;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn assert_send<F: std::future::Future + Send>(future: F) -> F {
+            future
+        }
+
+        let mut store = create_test_store().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let barriers = Arc::new(AtomicUsize::new(0));
+        store.commit_barrier = Some({
+            let barriers = barriers.clone();
+            let semaphore = store.db_semaphore.clone();
+            Arc::new(move || {
+                let barriers = barriers.clone();
+                let semaphore = semaphore.clone();
+                Box::pin(async move {
+                    assert_eq!(semaphore.available_permits(), 0);
+                    barriers.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+        });
+        // Cell is Send but not Sync; sharing the factory must not add Sync.
+        let attempt = Cell::new(0usize);
+        let observed = attempts.clone();
+        let value = assert_send(store.with_retry("send_only_retry", move || {
+            let current = attempt.get();
+            attempt.set(current + 1);
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::new(move |_| {
+                if current < 2 {
+                    Err(DieselError::DatabaseError(
+                        DatabaseErrorKind::Unknown,
+                        Box::new("database is busy".to_string()),
+                    ))
+                } else {
+                    Ok(42u8)
+                }
+            })
+        }))
+        .await
+        .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(barriers.load(Ordering::SeqCst), 1);
+        assert_eq!(store.db_semaphore.available_permits(), 1);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn shared_retry_keeps_error_classification_and_attempt_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let store = create_test_store().await;
+        for (message, expected_attempts) in [("database is busy", 6), ("syntax error", 1)] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let observed = attempts.clone();
+            let result = store
+                .with_retry("bounded_retry", move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Box::new(move |_| -> std::result::Result<(), DieselError> {
+                        Err(DieselError::DatabaseError(
+                            DatabaseErrorKind::Unknown,
+                            Box::new(message.to_string()),
+                        ))
+                    })
+                })
+                .await;
+            assert!(result.is_err());
+            assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
+            assert_eq!(store.db_semaphore.available_permits(), 1);
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn shared_retry_cancellation_during_backoff_releases_permit_and_stops_attempts() {
+        use std::future::{Future, poll_fn};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Poll;
+
+        let store = create_test_store().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let mut operation = Box::pin(store.with_retry("cancelled_backoff", move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::new(|_| -> std::result::Result<(), DieselError> {
+                Err(DieselError::DatabaseError(
+                    DatabaseErrorKind::Unknown,
+                    Box::new("database is busy".to_string()),
+                ))
+            })
+        }));
+        poll_fn(|cx| {
+            assert!(operation.as_mut().poll(cx).is_pending());
+            if attempts.load(Ordering::SeqCst) == 1 && store.db_semaphore.available_permits() == 1 {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        drop(operation);
+        assert_eq!(store.db_semaphore.available_permits(), 1);
+        assert_eq!(
+            store
+                .with_retry("successor", || Box::new(|_| Ok(7u8)))
+                .await
+                .unwrap(),
+            7
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(store.db_semaphore.available_permits(), 1);
     }
 
     #[cfg(not(target_family = "wasm"))]
