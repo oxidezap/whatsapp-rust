@@ -499,8 +499,8 @@ type RetryFactory<'a, T> = dyn FnMut() -> RetryQuery<T> + 'a;
 
 // Keep the shared retry poll outside the per-factory caller without boxing.
 #[inline(never)]
-fn poll_retry_future<F: std::future::Future>(
-    future: std::pin::Pin<&mut F>,
+fn poll_retry_future<F: Future>(
+    future: Pin<&mut F>,
     cx: &mut std::task::Context<'_>,
 ) -> std::task::Poll<F::Output> {
     future.poll(cx)
@@ -5088,7 +5088,7 @@ mod tests {
         use std::cell::Cell;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        fn assert_send<F: std::future::Future + Send>(future: F) -> F {
+        fn assert_send<F: Future + Send>(future: F) -> F {
             future
         }
 
