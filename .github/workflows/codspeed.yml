@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       paired_once:
-        description: Run only the pinned main3eeb/candidate264f98a9 lifecycle comparison
+        description: Run only the pinned main3eeb/candidateeec34cbd lifecycle comparison
         type: boolean
         required: false
         default: false
@@ -297,7 +297,7 @@ jobs:
 
   paired:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.paired_once == true && github.ref == 'refs/heads/fix/a09-durable-recovery' }}
-    name: Paired main3eeb and candidate264f98a9 CPU and lifecycle memory
+    name: Paired main3eeb and candidateeec34cbd CPU and lifecycle memory
     env:
       CARGO_BUILD_JOBS: "2"
       CARGO_TERM_COLOR: never
@@ -322,7 +322,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 264f98a904d41b06fb2a2520748f985d375e060c
+          ref: eec34cbd999b5d4b0a0eb6738fc33fdb96318983
           path: candidate
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
@@ -350,7 +350,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git -C main-control rev-parse HEAD)" = 3eeb80806ba456170018b114cd1fda66bc74329d
-          test "$(git -C candidate rev-parse HEAD)" = 264f98a904d41b06fb2a2520748f985d375e060c
+          test "$(git -C candidate rev-parse HEAD)" = eec34cbd999b5d4b0a0eb6738fc33fdb96318983
           cmp main-control/Cargo.toml candidate/Cargo.toml
           cmp main-control/Cargo.lock candidate/Cargo.lock
           cmp main-control/rust-toolchain.toml candidate/rust-toolchain.toml
@@ -385,18 +385,18 @@ jobs:
           # Each workflow is one CodSpeed run; keep both sides' benchmark URIs unique.
           for name in activity_peak cache_maintenance_after_activity complete_client_activity; do
             sed -i "s/^fn ${name}(/fn base_3eeb8080_${name}(/" main-control/benches/connected_idle.rs
-            sed -i "s/^fn ${name}(/fn head_264f98a9_${name}(/" candidate/benches/connected_idle.rs
+            sed -i "s/^fn ${name}(/fn head_eec34cbd_${name}(/" candidate/benches/connected_idle.rs
           done
           test "$(grep -c '^fn base_3eeb8080_' main-control/benches/connected_idle.rs)" -eq 3
-          test "$(grep -c '^fn head_264f98a9_' candidate/benches/connected_idle.rs)" -eq 3
+          test "$(grep -c '^fn head_eec34cbd_' candidate/benches/connected_idle.rs)" -eq 3
           sed 's/^fn base_3eeb8080_/fn /' main-control/benches/connected_idle.rs > reports/main-normalized-workload.rs
-          sed 's/^fn head_264f98a9_/fn /' candidate/benches/connected_idle.rs > reports/candidate-normalized-workload.rs
+          sed 's/^fn head_eec34cbd_/fn /' candidate/benches/connected_idle.rs > reports/candidate-normalized-workload.rs
           cmp reports/main-normalized-workload.rs reports/candidate-normalized-workload.rs
           cat > reports/benchmark-sha-map.json <<'JSON'
           {
             "kind": "single paired qualification run; compare labels, not this run's aggregate commit",
             "base_3eeb8080_": "3eeb80806ba456170018b114cd1fda66bc74329d",
-            "head_264f98a9_": "264f98a904d41b06fb2a2520748f985d375e060c",
+            "head_eec34cbd_": "eec34cbd999b5d4b0a0eb6738fc33fdb96318983",
             "canonical_cases": ["activity_peak", "cache_maintenance_after_activity", "complete_client_activity"],
             "arguments": [false, true],
             "instruments": ["Simulation", "Memory"]
@@ -450,8 +450,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth=1 origin 264f98a904d41b06fb2a2520748f985d375e060c
-          git checkout --detach 264f98a904d41b06fb2a2520748f985d375e060c
+          git fetch --no-tags --depth=1 origin eec34cbd999b5d4b0a0eb6738fc33fdb96318983
+          git checkout --detach eec34cbd999b5d4b0a0eb6738fc33fdb96318983
           test "$(git rev-parse HEAD)" = "$(git -C candidate rev-parse HEAD)"
           cmp Cargo.toml candidate/Cargo.toml
           cmp Cargo.lock candidate/Cargo.lock
