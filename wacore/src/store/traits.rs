@@ -1307,13 +1307,24 @@ impl std::fmt::Debug for PendingInboundLease {
 #[derive(Debug)]
 pub struct PendingInboundPayload {
     bytes: Bytes,
+    revision: PendingInboundRevision,
     // Fields drop in declaration order: bytes must die before their charge.
     lease: PendingInboundLease,
 }
 
 impl PendingInboundPayload {
     pub fn new(bytes: Bytes, lease: PendingInboundLease) -> Self {
-        Self { bytes, lease }
+        let revision = PendingInboundRevision::for_bytes(&bytes);
+        Self {
+            bytes,
+            revision,
+            lease,
+        }
+    }
+
+    /// Revision computed once from the immutable replacement bytes.
+    pub const fn revision(&self) -> PendingInboundRevision {
+        self.revision
     }
 
     pub fn bytes(&self) -> &[u8] {

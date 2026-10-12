@@ -486,8 +486,8 @@ impl Client {
                 })
             });
             let encoded = journal.encode()?;
-            let revision = PendingInboundRevision::for_bytes(&encoded);
             let payload = PendingInboundPayload::new(encoded, lease.clone());
+            let revision = payload.revision();
             anyhow::ensure!(
                 backend
                     .replace_pending_inbound_if(key, expected, payload, MAX_PENDING_BYTES)

@@ -1223,7 +1223,7 @@ impl ProtocolStore for InMemoryBackend {
             }
             None => PendingInboundRevision::missing(),
         };
-        let installed = PendingInboundRevision::for_bytes(replacement.bytes());
+        let installed = replacement.revision();
         if revision == installed {
             return Ok(PendingInboundMutation::Applied);
         }
@@ -1759,9 +1759,11 @@ mod tests {
                 .unwrap(),
             PendingInboundMutation::Conflict
         );
+        let replacement = put(b"\x0a\x81\x00a");
+        let installed = replacement.revision();
         assert_eq!(
             backend
-                .replace_pending_inbound_if(key, empty.revision(), put(b"\x0a\x81\x00a"), 16)
+                .replace_pending_inbound_if(key, empty.revision(), replacement, 16)
                 .await
                 .unwrap(),
             PendingInboundMutation::Applied
@@ -1772,6 +1774,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(original.bytes(), b"\x0a\x81\x00a");
+        assert_eq!(original.revision(), installed);
+        assert_eq!(
+            backend
+                .replace_pending_inbound_if(key, empty.revision(), put(b"\x0a\x81\x00a"), 16)
+                .await
+                .unwrap(),
+            PendingInboundMutation::Applied
+        );
         assert_eq!(
             backend
                 .replace_pending_inbound_if(key, empty.revision(), put(b"\x0a\x01a"), 16)

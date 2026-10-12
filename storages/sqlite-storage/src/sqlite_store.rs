@@ -4497,7 +4497,7 @@ impl ProtocolStore for SqliteStore {
                 replacement.bytes().len(),
             )));
         }
-        let revision = PendingInboundRevision::for_bytes(replacement.bytes());
+        let revision = replacement.revision();
         self.mutate_pending_inbound_owned(
             key,
             expected,
@@ -5296,17 +5296,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(original.bytes(), compact);
+        let replacement =
+            PendingInboundPayload::new(Bytes::copy_from_slice(&extended), pending_test_lease());
+        let installed = replacement.revision();
         assert_eq!(
             store
-                .replace_pending_inbound_if(
-                    key,
-                    original.revision(),
-                    PendingInboundPayload::new(
-                        Bytes::copy_from_slice(&extended),
-                        pending_test_lease()
-                    ),
-                    16
-                )
+                .replace_pending_inbound_if(key, original.revision(), replacement, 16)
                 .await
                 .unwrap(),
             PendingInboundMutation::Applied
@@ -5317,6 +5312,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(successor.bytes(), extended);
+        assert_eq!(successor.revision(), installed);
         assert_ne!(successor.revision(), original.revision());
         assert_eq!(
             store
