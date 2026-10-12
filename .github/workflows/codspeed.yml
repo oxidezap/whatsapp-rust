@@ -309,6 +309,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
+      # CodSpeed's GitHub provider reads GITHUB_WORKSPACE for upload identity.
+      - name: Checkout the pinned baseline upload identity at workspace root
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: 3eeb80806ba456170018b114cd1fda66bc74329d
+          persist-credentials: false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: 3eeb80806ba456170018b114cd1fda66bc74329d
@@ -395,6 +401,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$(git -C main-control rev-parse HEAD)"
+          git rev-parse HEAD > reports/main-upload-sha.txt
           git -C main-control rev-parse HEAD > reports/main-sha.txt
           codspeed --version > reports/main-tools.txt
           cargo_version_status=0
@@ -418,6 +426,15 @@ jobs:
           cargo codspeed --version > reports/before-candidate-cargo-version.txt 2>&1 || cargo_version_status=$?
           test "$cargo_version_status" -le 1
           grep -Fx 'cargo-codspeed 5.0.1' reports/before-candidate-cargo-version.txt
+      - name: Align the root upload identity with the pinned candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin 4ba95d7f16e565ca2b11046db32f2ae34eefb707
+          git checkout --detach 4ba95d7f16e565ca2b11046db32f2ae34eefb707
+          test "$(git rev-parse HEAD)" = "$(git -C candidate rev-parse HEAD)"
+          cmp Cargo.toml candidate/Cargo.toml
+          cmp Cargo.lock candidate/Cargo.lock
       - name: Build candidate on the same host and target
         working-directory: candidate
         run: cargo codspeed build --locked -p whatsapp-rust --features bench-harness --bench connected_idle -m simulation -m memory -j2
@@ -425,6 +442,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$(git -C candidate rev-parse HEAD)"
+          git rev-parse HEAD > reports/candidate-upload-sha.txt
           git -C candidate rev-parse HEAD > reports/candidate-sha.txt
           codspeed --version > reports/candidate-tools.txt
           cargo_version_status=0
