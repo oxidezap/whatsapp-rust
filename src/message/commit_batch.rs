@@ -394,7 +394,7 @@ impl Client {
         info: &Arc<MessageInfo>,
         sender: String,
     ) -> anyhow::Result<Arc<MessageInfo>> {
-        let sender = sender.parse::<wacore_binary::Jid>()?;
+        let sender = sender.parse::<Jid>()?;
         if sender == info.source.sender {
             return Ok(Arc::clone(info));
         }
