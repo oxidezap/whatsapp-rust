@@ -20253,20 +20253,25 @@ async fn live_storage_failure_retry(reset_and_flush: bool) {
 
 #[tokio::test]
 async fn raw_pending_cancelled_after_group_decrypt_replays_without_ratchet() {
-    cancelled_raw_replay(false, false).await;
+    cancelled_raw_replay(false, false, false).await;
 }
 
 #[tokio::test]
 async fn raw_pending_full_capacity_replays_existing_raw_before_admission() {
-    cancelled_raw_replay(true, false).await;
+    cancelled_raw_replay(true, false, false).await;
 }
 
 #[tokio::test]
 async fn raw_pending_cancelled_after_decrypt_releases_retention_in_drain() {
-    cancelled_raw_replay(false, true).await;
+    cancelled_raw_replay(false, true, false).await;
 }
 
-async fn cancelled_raw_replay(full_capacity: bool, retry_in_drain: bool) {
+#[tokio::test]
+async fn raw_pending_group_sender_spelling_recovers_raw_at_full_capacity() {
+    cancelled_raw_replay(true, false, true).await;
+}
+
+async fn cancelled_raw_replay(full_capacity: bool, retry_in_drain: bool, change_sender: bool) {
     use crate::types::durability_hook::InboundDurabilityHook;
     use std::sync::atomic::AtomicUsize;
     use wacore::types::events::InboundMessage;
@@ -20329,11 +20334,16 @@ async fn cancelled_raw_replay(full_capacity: bool, retry_in_drain: bool) {
     if !retry_in_drain {
         client.enter_live_mode_for_tests();
     }
+    let retry_sender = if change_sender {
+        alice.jid.to_non_ad()
+    } else {
+        alice.jid.clone()
+    };
     client
         .clone()
         .handle_incoming_message(group_skmsg_stanza(
             &group,
-            &alice.jid,
+            &retry_sender,
             "RAW_CANCEL_REPLAY",
             ciphertext,
         ))
