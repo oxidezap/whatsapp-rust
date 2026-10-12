@@ -25,8 +25,8 @@ use waproto::whatsapp as wa;
 /// stanza ids are only unique within a `(chat, sender)`, so two chats can
 /// reuse the same id.
 ///
-/// The builder checks the backend's individual `ProtocolStore` pending-inbound
-/// store/read/delete operations and rejects unsupported backends with
+/// The builder checks the `ProtocolStore` bounded pending-inbound read and
+/// conditional replacement/deletion operations, and rejects unsupported backends with
 /// [`ClientBuilderError::UnsupportedDurabilityBackend`](crate::ClientBuilderError::UnsupportedDurabilityBackend).
 /// Custom batched overrides must preserve those operations' semantics; the
 /// construction probe does not certify an arbitrary batch implementation.

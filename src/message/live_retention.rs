@@ -363,6 +363,18 @@ impl LiveRetention {
             .cloned()
             .collect()
     }
+    pub fn charge_for_origin(
+        &self,
+        origin: Option<super::raw_pending::DeliveryOrigin>,
+    ) -> Option<Arc<Charge>> {
+        let origin = origin?;
+        lock(&self.state)
+            .reservations
+            .iter()
+            .find(|reservation| reservation.origin == origin.stanza)
+            .map(|reservation| Arc::clone(&reservation.charge))
+    }
+
     pub fn stored(&self, items: &[PendingDelivery]) {
         let mut state = lock(&self.state);
         for index in (0..state.reservations.len()).rev() {
@@ -370,6 +382,12 @@ impl LiveRetention {
             reservation
                 .entries
                 .retain(|entry| !items.iter().any(|item| same_entry(entry, item)));
+            // A replay queued during drain may still own its raw slot. Only
+            // release that exact slot after storage succeeded; detached workers
+            // retain the same charge through their delivery's storage lease.
+            reservation
+                .raw
+                .retain(|raw| !items.iter().any(|item| item.origin == Some(raw.origin)));
             if !reservation.receiving
                 && reservation.entries.is_empty()
                 && reservation.raw.is_empty()
@@ -390,6 +408,44 @@ fn same_entry(first: &PendingDelivery, second: &PendingDelivery) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_pending_drain_cleanup_keeps_detached_worker_charge() {
+        let retention = LiveRetention::default();
+        let info = Arc::new(MessageInfo::default());
+        let producer = StanzaOrigin::new();
+        let admission = retention.reserve(producer, 1024, 1).unwrap();
+        retention.stage(&info, producer, (0, "skmsg", 3), b"synthetic raw");
+        drop(admission);
+        let origin = super::super::raw_pending::DeliveryOrigin {
+            stanza: producer,
+            position: 0,
+        };
+        let mut message = waproto::whatsapp::Message::default();
+        message.conversation = Some("synthetic projection".into());
+        let item = PendingDelivery {
+            item: wacore::types::events::InboundMessage::builder()
+                .info(info.clone())
+                .message(Arc::new(message))
+                .build(),
+            carrier: Some((Some(0), bytes::Bytes::from_static(b"synthetic raw"))),
+            origin: Some(origin),
+            retention: retention.charge_for_origin(Some(origin)),
+            receipt: None,
+            consumer_claimed: false,
+        };
+        let worker = item.retention.clone().expect("existing live charge");
+        assert_eq!(lock(&retention.budget).admissions, 1);
+        assert!(!retention.raw_for_message(&info).is_empty());
+        retention.stored(std::slice::from_ref(&item));
+        assert!(retention.raw_for_message(&info).is_empty());
+        assert!(lock(&retention.state).reservations.is_empty());
+        drop(item);
+        assert_eq!(lock(&retention.budget).admissions, 1);
+        drop(worker);
+        assert_eq!(lock(&retention.budget).admissions, 0);
+        assert_eq!(lock(&retention.budget).bytes, 0);
+    }
 
     #[test]
     fn raw_pending_charge_survives_detached_owner_until_final_drop() {

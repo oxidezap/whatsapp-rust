@@ -832,22 +832,59 @@ async fn probe_durability_backend(
     let map_err =
         |error: StoreError| ClientBuilderError::UnsupportedDurabilityBackend(error.to_string());
 
-    backend
-        .store_pending_inbound(PROBE_JID, PROBE_JID, &probe_id, PROBE_PAYLOAD)
+    use wacore::store::traits::{
+        PendingInboundKey, PendingInboundLease, PendingInboundMutation, PendingInboundPayload,
+        PendingInboundRevision,
+    };
+    let key = PendingInboundKey {
+        chat: PROBE_JID,
+        sender: PROBE_JID,
+        id: &probe_id,
+    };
+    let lease = PendingInboundLease::new(Arc::new(()));
+    let bound = PROBE_PAYLOAD.len();
+    if backend
+        .read_pending_inbound_bounded(key, bound, lease.clone())
         .await
-        .map_err(map_err)?;
-    let stored = backend
-        .get_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
-        .await
-        .map_err(map_err)?;
-    backend
-        .delete_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
-        .await
-        .map_err(map_err)?;
-
-    if stored.as_deref() != Some(PROBE_PAYLOAD) {
+        .map_err(map_err)?
+        .is_some()
+    {
         return Err(ClientBuilderError::UnsupportedDurabilityBackend(
-            "pending-inbound buffer did not round-trip".to_string(),
+            "pending-inbound probe identity already exists".to_string(),
+        ));
+    }
+    let revision = PendingInboundRevision::for_bytes(PROBE_PAYLOAD);
+    let payload =
+        PendingInboundPayload::new(bytes::Bytes::from_static(PROBE_PAYLOAD), lease.clone());
+    let replaced = backend
+        .replace_pending_inbound_if(key, PendingInboundRevision::missing(), payload, bound)
+        .await
+        .map_err(map_err)?;
+    if replaced != PendingInboundMutation::Applied {
+        return Err(ClientBuilderError::UnsupportedDurabilityBackend(
+            "pending-inbound conditional insert did not apply".to_string(),
+        ));
+    }
+    // Attempt conditional cleanup even if the round-trip read fails. Never
+    // delete a replacement or an unrelated row through an unconditional path.
+    let stored = backend
+        .read_pending_inbound_bounded(key, bound, lease.clone())
+        .await;
+    let deleted = backend
+        .delete_pending_inbound_if(key, revision, bound, lease.clone())
+        .await;
+    let stored = stored.map_err(map_err)?;
+    if stored.as_ref().map(|record| record.bytes()) != Some(PROBE_PAYLOAD)
+        || stored.as_ref().map(|record| record.revision()) != Some(revision)
+        || deleted.map_err(map_err)? != PendingInboundMutation::Applied
+        || backend
+            .read_pending_inbound_bounded(key, bound, lease)
+            .await
+            .map_err(map_err)?
+            .is_some()
+    {
+        return Err(ClientBuilderError::UnsupportedDurabilityBackend(
+            "bounded pending-inbound CAS did not round-trip and clean up".to_string(),
         ));
     }
     Ok(())

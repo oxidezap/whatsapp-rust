@@ -670,8 +670,8 @@ fn a_newtype_or_alias_does_not_hide_its_collection() {
     );
     assert_eq!(
         path("InboundCommitBatcher").as_deref(),
-        Some("InboundCommitBatcher::Vec"),
-        "the offline-drain commit batch is a Vec behind a newtype"
+        Some("InboundCommitBatcher::BatchState::Vec"),
+        "the offline-drain Vec must remain visible through the batcher state"
     );
     assert!(
         path("SyncTtlCache").is_some(),

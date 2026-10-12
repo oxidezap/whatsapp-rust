@@ -20253,15 +20253,20 @@ async fn live_storage_failure_retry(reset_and_flush: bool) {
 
 #[tokio::test]
 async fn raw_pending_cancelled_after_group_decrypt_replays_without_ratchet() {
-    cancelled_raw_replay(false).await;
+    cancelled_raw_replay(false, false).await;
 }
 
 #[tokio::test]
 async fn raw_pending_full_capacity_replays_existing_raw_before_admission() {
-    cancelled_raw_replay(true).await;
+    cancelled_raw_replay(true, false).await;
 }
 
-async fn cancelled_raw_replay(full_capacity: bool) {
+#[tokio::test]
+async fn raw_pending_cancelled_after_decrypt_releases_retention_in_drain() {
+    cancelled_raw_replay(false, true).await;
+}
+
+async fn cancelled_raw_replay(full_capacity: bool, retry_in_drain: bool) {
     use crate::types::durability_hook::InboundDurabilityHook;
     use std::sync::atomic::AtomicUsize;
     use wacore::types::events::InboundMessage;
@@ -20321,7 +20326,9 @@ async fn cancelled_raw_replay(full_capacity: bool) {
     });
     client.flush_signal_cache().await.unwrap();
     client.inbound_commit_batch.reset();
-    client.enter_live_mode_for_tests();
+    if !retry_in_drain {
+        client.enter_live_mode_for_tests();
+    }
     client
         .clone()
         .handle_incoming_message(group_skmsg_stanza(
@@ -20331,6 +20338,25 @@ async fn cancelled_raw_replay(full_capacity: bool) {
             ciphertext,
         ))
         .await;
+    if retry_in_drain {
+        assert!(
+            client
+                .flush_inbound_commits_under_permit(true, None, None)
+                .await
+        );
+        let info = create_test_message_info(
+            &group.to_string(),
+            "RAW_CANCEL_REPLAY",
+            &alice.jid.to_string(),
+        );
+        assert!(
+            !client
+                .inbound_commit_batch
+                .live_retention
+                .has_raw_for_message(&info),
+            "a durably stored drain item must release its retained raw occurrence"
+        );
+    }
     assert_eq!(hook.0.load(Ordering::SeqCst), 1);
     crate::test_utils::wait_for_outbound_tasks(&client).await;
     assert_eq!(
@@ -20345,6 +20371,15 @@ async fn cancelled_raw_replay(full_capacity: bool) {
 /// carrier, rather than assuming a particular preflight implementation.
 #[tokio::test]
 async fn full_pending_journal_hook_flush_protects_retry_before_recreation() {
+    full_pending_journal_flush_recreation(false).await;
+}
+
+#[tokio::test]
+async fn full_pending_journal_hook_flush_protects_novel_payload_before_recreation() {
+    full_pending_journal_flush_recreation(true).await;
+}
+
+async fn full_pending_journal_flush_recreation(novel_payload: bool) {
     use super::raw_pending::{MAX_PENDING_BYTES, Occurrence, PendingJournal, StanzaOrigin};
     use crate::types::durability_hook::InboundDurabilityHook;
     use wacore::store::traits::PendingInboundRevision;
@@ -20472,7 +20507,19 @@ async fn full_pending_journal_hook_flush_protects_retry_before_recreation() {
         .set(hook.clone())
         .ok()
         .unwrap();
-    let ciphertext = encrypt_group_text(&mut alice, &group, "full journal payload").await;
+    let incoming_text = if novel_payload {
+        "distinct incoming payload"
+    } else {
+        "full journal payload"
+    };
+    let mut incoming_message = wa::Message::default();
+    incoming_message.conversation = Some(incoming_text.into());
+    let incoming_projection: bytes::Bytes =
+        waproto::codec::message_to_vec(&incoming_message).into();
+    if novel_payload {
+        assert_ne!(incoming_projection, projection);
+    }
+    let ciphertext = encrypt_group_text(&mut alice, &group, incoming_text).await;
     let stanza = group_skmsg_stanza(&group, &alice.jid, ID, ciphertext);
     let receiver = client.clone();
     let first = stanza.clone();
@@ -20495,7 +20542,7 @@ async fn full_pending_journal_hook_flush_protects_retry_before_recreation() {
         .unwrap()
         .occurrences
         .iter()
-        .any(|entry| entry.original == projection);
+        .any(|entry| entry.original == incoming_projection);
     let flushed_iteration = client
         .persistence_manager
         .get_device_snapshot()
@@ -20523,7 +20570,12 @@ async fn full_pending_journal_hook_flush_protects_retry_before_recreation() {
         .ok()
         .unwrap();
     restarted.handle_incoming_message(stanza).await;
-    assert_eq!(*accepted.0.lock().unwrap(), vec!["full journal payload"]);
+    let expected = if novel_payload {
+        vec!["full journal payload", "distinct incoming payload"]
+    } else {
+        vec!["full journal payload"]
+    };
+    assert_eq!(*accepted.0.lock().unwrap(), expected);
     assert!(
         backend
             .get_pending_inbound(&chat, &sender, ID)

@@ -5146,7 +5146,7 @@ mod tests {
             // No production hook or timing sleep changes the storage path.
             let (started, entered) = std::sync::mpsc::channel();
             let (unpark, parked) = std::sync::mpsc::channel();
-            let blocker = tokio::task::spawn_blocking(move || {
+            let blocker = crate::pool::spawn_blocking(move || {
                 started.send(()).unwrap();
                 parked.recv_timeout(Duration::from_secs(10)).unwrap();
             });

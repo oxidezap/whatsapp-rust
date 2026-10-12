@@ -697,6 +697,15 @@ impl Client {
                 InboundCommitState::Failed
             };
         }
+        // Raw replay can reenter while the offline batcher is active. Keep its
+        // existing admission alive in queued storage even after the raw slot
+        // is retired; ordinary drain arrivals do not create live reservations.
+        if item.retention.is_none() {
+            item.retention = self
+                .inbound_commit_batch
+                .live_retention
+                .charge_for_origin(item.origin);
+        }
         let (timer_epoch, ticket) = self.enqueue_inbound_commit(item, track_commit);
         if let Some(epoch) = timer_epoch {
             // Weak: a sleeper must not keep the whole Client graph alive for
