@@ -10,6 +10,12 @@ on:
   # Allows CodSpeed to trigger backtest performance analysis to generate
   # initial baseline data.
   workflow_dispatch:
+    inputs:
+      paired_once:
+        description: Run only the pinned main3eeb/candidate4ba95 lifecycle comparison
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -32,6 +38,7 @@ env:
 
 jobs:
   benchmarks:
+    if: ${{ inputs.paired_once != true }}
     name: Run CodSpeed benchmarks (${{ matrix.shard.name }})
     runs-on: ubuntu-24.04
     # The slowest shard finishes in ~13min. The cap exists because the CodSpeed
@@ -173,7 +180,7 @@ jobs:
     # `credentials.password` rejects the empty string while the job template is
     # being prepared, so the job fails before any step runs and a step-level
     # `if:` cannot save it — the guard has to sit here. Same condition as e2e.yml.
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    if: ${{ inputs.paired_once != true && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-24.04
     # These benches drive the real client (connect/reconnect handshakes) under
     # Valgrind, so they are slow; cap the job so a stuck run can't hang CI
@@ -287,3 +294,165 @@ jobs:
         with:
           mode: simulation
           run: cargo codspeed run -p bench-integration
+
+  paired:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.paired_once == true && github.ref == 'refs/heads/fix/a09-durable-recovery' }}
+    name: Paired main3eeb and candidate4ba95 CPU and lifecycle memory
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TERM_COLOR: never
+      CARGO_TARGET_DIR: ${{ github.workspace }}/paired-target
+      MALLOC_ARENA_MAX: "1"
+      MALLOC_MMAP_THRESHOLD_: "131072"
+      MALLOC_TRIM_THRESHOLD_: "131072"
+      MALLOC_TOP_PAD_: "131072"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: 3eeb80806ba456170018b114cd1fda66bc74329d
+          path: main-control
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: 4ba95d7f16e565ca2b11046db32f2ae34eefb707
+          path: candidate
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
+        with:
+          toolchain: nightly-2026-06-16
+      - name: Prepare pinned runner before either measurement
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/paired-codspeed" "$RUNNER_TEMP/paired-tools/bin"
+          curl --fail --location --retry 2 --max-time 120 -o "$RUNNER_TEMP/paired-tools/bin/cargo-codspeed" https://github.com/CodSpeedHQ/codspeed-rust/releases/download/v5.0.1/cargo-codspeed-x86_64-unknown-linux-musl
+          echo "df4b2618fda2aa19f8b92e8d745548a49d9ce20785472eeb584fdc2c99624395  $RUNNER_TEMP/paired-tools/bin/cargo-codspeed" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/paired-tools/bin/cargo-codspeed"
+          curl --fail --location --retry 2 --max-time 120 -o "$RUNNER_TEMP/paired-tools/protoc.zip" https://github.com/protocolbuffers/protobuf/releases/download/v25.3/protoc-25.3-linux-x86_64.zip
+          echo "f853e691868d0557425ea290bf7ba6384eef2fa9b04c323afab49a770ba9da80  $RUNNER_TEMP/paired-tools/protoc.zip" | sha256sum --check
+          unzip -q "$RUNNER_TEMP/paired-tools/protoc.zip" -d "$RUNNER_TEMP/paired-tools/protobuf"
+          echo "$RUNNER_TEMP/paired-tools/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/paired-tools/protobuf/bin" >> "$GITHUB_PATH"
+          curl --fail --location --retry 2 --max-time 120 -o "$RUNNER_TEMP/paired-codspeed/runner.tar.gz" https://github.com/CodSpeedHQ/codspeed/releases/download/v5.2.0/codspeed-runner-x86_64-unknown-linux-musl.tar.gz
+          echo "22919a3a9324eee016548cbe6f29b5665f8dec57091461f803c9a918533e375f  $RUNNER_TEMP/paired-codspeed/runner.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/paired-codspeed/runner.tar.gz" -C "$RUNNER_TEMP/paired-codspeed"
+          echo "$RUNNER_TEMP/paired-codspeed/codspeed-runner-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+      - name: Verify identities and add identical measured lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C main-control rev-parse HEAD)" = 3eeb80806ba456170018b114cd1fda66bc74329d
+          test "$(git -C candidate rev-parse HEAD)" = 4ba95d7f16e565ca2b11046db32f2ae34eefb707
+          cmp main-control/Cargo.toml candidate/Cargo.toml
+          cmp main-control/Cargo.lock candidate/Cargo.lock
+          cmp main-control/rust-toolchain.toml candidate/rust-toolchain.toml
+          cmp main-control/benches/connected_idle.rs candidate/benches/connected_idle.rs
+          cmp main-control/src/bench_support/connected_idle.rs candidate/src/bench_support/connected_idle.rs
+          cat > "$RUNNER_TEMP/fullcycle.rs" <<'RS'
+          // Paired control: retain the entire client lifecycle inside the measured region.
+          #[divan::bench(args = [false, true], sample_count = 1, sample_size = 1)]
+          fn complete_client_activity(bencher: divan::Bencher, sqlite: bool) {
+              bencher.bench_local(|| {
+                  let rt = runtime();
+                  rt.block_on(async {
+                      let backend = if sqlite {
+                          BackendFixture::sqlite().await.expect("real SQLite backend")
+                      } else {
+                          BackendFixture::memory()
+                      };
+                      let session = Session::connect(backend.backend()).await.expect("connect");
+                      let activity = session.prepare_activity().await.expect("prepare activity");
+                      session.receive_activity(activity).await.expect("activity");
+                      session.shutdown().await.expect("shutdown");
+                      backend.cleanup().expect("cleanup");
+                  });
+                  drop(rt);
+              });
+          }
+          RS
+          cat "$RUNNER_TEMP/fullcycle.rs" >> main-control/benches/connected_idle.rs
+          cat "$RUNNER_TEMP/fullcycle.rs" >> candidate/benches/connected_idle.rs
+          cmp main-control/benches/connected_idle.rs candidate/benches/connected_idle.rs
+          mkdir -p reports
+          {
+            uname -a
+            rustc -Vv
+            ldd --version
+            sha256sum main-control/rust-toolchain.toml candidate/rust-toolchain.toml main-control/Cargo.toml candidate/Cargo.toml main-control/Cargo.lock candidate/Cargo.lock main-control/benches/connected_idle.rs candidate/benches/connected_idle.rs
+          } > reports/environment.txt
+          printf 'RUSTFLAGS=%s\nCARGO_ENCODED_RUSTFLAGS=%s\n' "${RUSTFLAGS-}" "${CARGO_ENCODED_RUSTFLAGS-}" > reports/compiler-flags.txt
+          printf 'codspeed build injects --cfg=codspeed -Cdebuginfo=2 -Cstrip=none; bench profile inherited from identical manifests\n' >> reports/compiler-flags.txt
+      # Remote-only prerequisite, matching the existing CodSpeed CI instruments.
+      # This draft is not authorized to run on the laptop.
+      - name: Finish instrument setup on the disposable CI runner
+        run: codspeed setup --mode simulation,memory
+      - name: Build main control
+        working-directory: main-control
+        run: cargo codspeed build --locked -p whatsapp-rust --features bench-harness --bench connected_idle -m simulation -m memory -j2
+      - name: Measure main control with isolated raw profiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C main-control rev-parse HEAD > reports/main-sha.txt
+          codspeed --version > reports/main-tools.txt
+          cargo codspeed --version >> reports/main-tools.txt
+          ldd --version > reports/main-libc.txt
+          codspeed run --mode simulation,memory --working-directory main-control --profile-folder "$GITHUB_WORKSPACE/reports/main-profiles" -- cargo codspeed run -p whatsapp-rust --bench connected_idle 2>&1 | tee reports/main-run.log
+          codspeed status >> reports/main-tools.txt
+      - name: Preserve main build metadata
+        run: find paired-target -type f -name "connected_idle*" -print -exec sha256sum {} \; > reports/main-artifacts.txt
+      - name: Verify tool and libc state before candidate build
+        shell: bash
+        run: |
+          set -euo pipefail
+          ldd --version > reports/before-candidate-libc.txt
+          cmp reports/main-libc.txt reports/before-candidate-libc.txt
+          codspeed --version
+          cargo codspeed --version
+      - name: Build candidate on the same host and target
+        working-directory: candidate
+        run: cargo codspeed build --locked -p whatsapp-rust --features bench-harness --bench connected_idle -m simulation -m memory -j2
+      - name: Measure candidate with isolated raw profiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C candidate rev-parse HEAD > reports/candidate-sha.txt
+          codspeed --version > reports/candidate-tools.txt
+          cargo codspeed --version >> reports/candidate-tools.txt
+          ldd --version > reports/candidate-libc.txt
+          codspeed run --mode simulation,memory --working-directory candidate --profile-folder "$GITHUB_WORKSPACE/reports/candidate-profiles" -- cargo codspeed run -p whatsapp-rust --bench connected_idle 2>&1 | tee reports/candidate-run.log
+          codspeed status >> reports/candidate-tools.txt
+      - name: Check the same executor versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmp reports/main-tools.txt reports/candidate-tools.txt
+          cmp reports/main-libc.txt reports/candidate-libc.txt
+      - name: Preserve candidate build metadata
+        run: find paired-target -type f -name "connected_idle*" -print -exec sha256sum {} \; > reports/candidate-artifacts.txt
+      - name: Bound retained reports to 128 MiB
+        id: report-size
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          total=$(du -sb reports main-control/benches/connected_idle.rs candidate/benches/connected_idle.rs | awk '{sum += $1} END {print sum}')
+          if [ "$total" -gt 134217728 ]; then
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            echo "Report retention budget exceeded: $total bytes" >&2
+            exit 1
+          fi
+          echo "allowed=true" >> "$GITHUB_OUTPUT"
+      - name: Preserve measurement sources and environment
+        if: ${{ always() && steps.report-size.outputs.allowed == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: paired-connected-lifecycle-source-environment
+          retention-days: 3
+          if-no-files-found: error
+          path: |
+            reports
+            main-control/benches/connected_idle.rs
+            candidate/benches/connected_idle.rs
