@@ -20594,6 +20594,17 @@ async fn full_pending_journal_flush_recreation(novel_payload: bool) {
 
 #[tokio::test]
 async fn raw_pending_hook_failure_survives_client_recreation() {
+    group_pending_recreation(None).await;
+}
+
+#[tokio::test]
+async fn raw_pending_group_sender_spelling_replays_after_recreation() {
+    for first_device in [false, true] {
+        group_pending_recreation(Some(first_device)).await;
+    }
+}
+
+async fn group_pending_recreation(change_spelling: Option<bool>) {
     use crate::types::durability_hook::InboundDurabilityHook;
     use std::sync::Mutex;
     use wacore::types::events::InboundMessage;
@@ -20630,11 +20641,25 @@ async fn raw_pending_hook_failure_survives_client_recreation() {
     let group: Jid = "120363000000000008@g.us".parse().unwrap();
     let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
     let ciphertext = encrypt_group_text(&mut alice, &group, "durable before restart").await;
-    let stanza = group_skmsg_stanza(&group, &alice.jid, "RECREATED", ciphertext);
+    let first_sender = if change_spelling == Some(false) {
+        alice.jid.to_non_ad()
+    } else {
+        alice.jid.clone()
+    };
+    let retry_sender = if change_spelling == Some(true) {
+        alice.jid.to_non_ad()
+    } else {
+        alice.jid.clone()
+    };
+    let stanza = group_skmsg_stanza(&group, &first_sender, "RECREATED", ciphertext.clone());
     client.clone().handle_incoming_message(stanza.clone()).await;
     assert!(
         backend
-            .get_pending_inbound(&group.to_string(), &alice.jid.to_string(), "RECREATED")
+            .get_pending_inbound(
+                &group.to_string(),
+                &alice.jid.to_non_ad_string(),
+                "RECREATED"
+            )
             .await
             .unwrap()
             .is_some()
@@ -20648,11 +20673,22 @@ async fn raw_pending_hook_failure_survives_client_recreation() {
         .set(hook.clone())
         .ok()
         .unwrap();
-    restarted.handle_incoming_message(stanza).await;
+    restarted
+        .handle_incoming_message(group_skmsg_stanza(
+            &group,
+            &retry_sender,
+            "RECREATED",
+            ciphertext,
+        ))
+        .await;
     assert_eq!(*hook.0.lock().unwrap(), vec!["durable before restart"]);
     assert!(
         backend
-            .get_pending_inbound(&group.to_string(), &alice.jid.to_string(), "RECREATED")
+            .get_pending_inbound(
+                &group.to_string(),
+                &alice.jid.to_non_ad_string(),
+                "RECREATED"
+            )
             .await
             .unwrap()
             .is_none()

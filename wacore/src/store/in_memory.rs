@@ -244,6 +244,8 @@ const MAX_MSG_SECRETS: usize = 8192;
 pub struct InMemoryBackend {
     state: Mutex<InMemoryState>,
     next_device_id: AtomicI32,
+    #[cfg(any(test, feature = "test-util"))]
+    fail_pending_delete: AtomicU32,
     /// Count of `put_sessions_batch` calls. Test hook (see `test-util`): lets a
     /// harness prove receive-path flush coalescing (N receives collapse to fewer
     /// batch writes). Gated so normal builds carry neither the field nor the
@@ -276,10 +278,21 @@ pub struct InMemoryBackend {
 }
 
 impl InMemoryBackend {
+    /// Inject a conditional-delete error before or after applying it.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_fail_pending_delete(&self, after_commit: Option<bool>) {
+        self.fail_pending_delete.store(
+            after_commit.map_or(0, |after| if after { 2 } else { 1 }),
+            Ordering::Relaxed,
+        );
+    }
+
     /// Create a new, empty in-memory store.
     pub fn new() -> Self {
         Self {
             state: Mutex::new(InMemoryState::default()),
+            #[cfg(any(test, feature = "test-util"))]
+            fail_pending_delete: AtomicU32::new(0),
             next_device_id: AtomicI32::new(1),
             #[cfg(any(test, feature = "test-util"))]
             session_batch_writes: AtomicU32::new(0),
@@ -1279,7 +1292,19 @@ impl ProtocolStore for InMemoryBackend {
         if revision != expected {
             return Ok(PendingInboundMutation::Conflict);
         }
+        #[cfg(any(test, feature = "test-util"))]
+        if self.fail_pending_delete.load(Ordering::Relaxed) == 1 {
+            return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                "injected pending delete failure",
+            )));
+        }
         state.pending_inbound.remove(&key);
+        #[cfg(any(test, feature = "test-util"))]
+        if self.fail_pending_delete.load(Ordering::Relaxed) == 2 {
+            return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                "injected post-commit pending delete failure",
+            )));
+        }
         Ok(PendingInboundMutation::Applied)
     }
 

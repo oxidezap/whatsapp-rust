@@ -379,27 +379,45 @@ fn poll_pending_commit<F: Future<Output = PendingCommitOutcome>>(
 }
 
 impl Client {
+    // Group sender-key addresses ignore the device. New rows use that same
+    // identity; retain an existing physical spelling so legacy CAS cleanup
+    // still targets the row whose bytes were actually read.
+    fn pending_sender(info: &MessageInfo) -> String {
+        if info.source.chat.is_group() {
+            info.source.sender.to_non_ad_string()
+        } else {
+            info.source.sender.to_string()
+        }
+    }
+
     pub(super) async fn read_pending_for_replay(
         &self,
         info: &MessageInfo,
-    ) -> anyhow::Result<Option<wacore::store::traits::PendingInboundRecord>> {
+    ) -> anyhow::Result<Option<(String, wacore::store::traits::PendingInboundRecord)>> {
         let owner = Arc::new(self.inbound_commit_batch.pending_storage.lock_arc().await);
         let lease = PendingInboundLease::new(owner);
         let chat = info.source.chat.to_string();
         let sender = info.source.sender.to_string();
-        Ok(self
-            .persistence_manager
-            .backend()
-            .read_pending_inbound_bounded(
-                PendingInboundKey {
-                    chat: &chat,
-                    sender: &sender,
-                    id: &info.id,
-                },
-                MAX_PENDING_BYTES,
-                lease,
-            )
-            .await?)
+        let canonical = Self::pending_sender(info);
+        let backend = self.persistence_manager.backend();
+        for spelling in std::iter::once(&sender).chain((canonical != sender).then_some(&canonical))
+        {
+            if let Some(record) = backend
+                .read_pending_inbound_bounded(
+                    PendingInboundKey {
+                        chat: &chat,
+                        sender: spelling,
+                        id: &info.id,
+                    },
+                    MAX_PENDING_BYTES,
+                    lease.clone(),
+                )
+                .await?
+            {
+                return Ok(Some((spelling.clone(), record)));
+            }
+        }
+        Ok(None)
     }
 
     async fn persist_pending_group(
@@ -421,7 +439,26 @@ impl Client {
         let mut groups: Vec<(String, String, String, Vec<&PendingDelivery>)> = Vec::new();
         for item in items {
             let chat = item.info.source.chat.to_string();
-            let sender = item.info.source.sender.to_string();
+            let incoming_sender = item.info.source.sender.to_string();
+            let canonical = Self::pending_sender(&item.info);
+            let sender = if canonical != incoming_sender
+                && backend
+                    .read_pending_inbound_bounded(
+                        PendingInboundKey {
+                            chat: &chat,
+                            sender: &incoming_sender,
+                            id: &item.info.id,
+                        },
+                        MAX_PENDING_BYTES,
+                        lease.clone(),
+                    )
+                    .await?
+                    .is_some()
+            {
+                incoming_sender
+            } else {
+                canonical
+            };
             if let Some(group) = groups
                 .iter_mut()
                 .find(|group| group.0 == chat && group.1 == sender && group.2 == item.info.id)
@@ -516,13 +553,27 @@ impl Client {
                 sender: &row.sender,
                 id: &row.id,
             };
-            anyhow::ensure!(
-                backend
-                    .delete_pending_inbound_if(key, row.revision, MAX_PENDING_BYTES, lease.clone())
-                    .await?
-                    == PendingInboundMutation::Applied,
-                "pending occurrence cleanup revision conflict"
-            );
+            match backend
+                .delete_pending_inbound_if(key, row.revision, MAX_PENDING_BYTES, lease.clone())
+                .await
+            {
+                Ok(PendingInboundMutation::Applied) => {}
+                Ok(PendingInboundMutation::Conflict) => {
+                    anyhow::bail!("pending occurrence cleanup revision conflict");
+                }
+                Err(error) => {
+                    // The hook has committed. An error can follow an applied
+                    // deletion, so verify absence under the same mutation owner
+                    // before withholding its event. Never delete a successor.
+                    if backend
+                        .read_pending_inbound_bounded(key, MAX_PENDING_BYTES, lease.clone())
+                        .await?
+                        .is_some()
+                    {
+                        return Err(error.into());
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -562,17 +613,24 @@ impl Client {
             self.persist_pending_group(&retained, false).await?;
             self.inbound_commit_batch.live_retention.stored(&retained);
         }
-        let Some(record) = self.read_pending_for_replay(info).await? else {
+        let Some((sender, record)) = self.read_pending_for_replay(info).await? else {
             return Ok(());
         };
         let (bytes, read_lease) = record.into_bytes();
         let journal = PendingJournal::decode(bytes)?;
+        let mut stored_info = (**info).clone();
+        stored_info.source.sender = sender.parse()?;
+        let stored_info = Arc::new(stored_info);
         drop(read_lease);
         let mut predecessor = Vec::with_capacity(journal.occurrences.len());
         for (position, entry) in journal.occurrences.into_iter().enumerate() {
             let position = entry.index.map_or(position, |index| index as usize);
             predecessor.push(PendingDelivery::from_occurrence(
-                entry, position, info, None, None,
+                entry,
+                position,
+                &stored_info,
+                None,
+                None,
             )?);
         }
         // A hook can flush Signal itself. Recover the durable predecessor
@@ -597,12 +655,15 @@ impl Client {
         else {
             return Ok(None);
         };
-        let Some(record) = self.read_pending_for_replay(&item.info).await? else {
+        let Some((sender, record)) = self.read_pending_for_replay(&item.info).await? else {
             return Ok(None);
         };
         let (bytes, read_lease) = record.into_bytes();
         let journal = PendingJournal::decode(bytes)?;
         drop(read_lease);
+        let mut stored_info = (*item.info).clone();
+        stored_info.source.sender = sender.parse()?;
+        let stored_info = Arc::new(stored_info);
         let projection = waproto::codec::message_to_vec(&item.message);
         let index = u32::try_from(origin.position)?;
         if !journal.occurrences.iter().any(|entry| {
@@ -634,7 +695,7 @@ impl Client {
             retained.push(PendingDelivery::from_occurrence(
                 entry,
                 position,
-                &item.info,
+                &stored_info,
                 shared_message,
                 None,
             )?);
@@ -1511,6 +1572,85 @@ mod tests {
                 ..Default::default()
             }))
             .build()
+    }
+
+    #[tokio::test]
+    async fn raw_pending_cleanup_error_after_delete_still_publishes() {
+        use wacore::store::in_memory::InMemoryBackend;
+        use wacore::store::traits::ProtocolStore;
+        for after_commit in [false, true] {
+            let backend = Arc::new(InMemoryBackend::new());
+            let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+            let hook = Arc::new(RecordingHook {
+                batches: Mutex::new(Vec::new()),
+            });
+            client
+                .inbound_durability_hook
+                .set(hook.clone())
+                .ok()
+                .unwrap();
+            let (handler, rx) = ChannelEventHandler::new();
+            client.core.event_bus.subscribe_handler(handler).detach();
+            backend.set_fail_pending_delete(Some(after_commit));
+            let outcome = client
+                .commit_pending_batch_result(
+                    vec![PendingDelivery::from(item("AMBIGUOUS_DELETE"))].into(),
+                    BatchOrigin::Live,
+                    None,
+                    false,
+                )
+                .await;
+            assert!(outcome.persisted);
+            assert_eq!(outcome.delivered, after_commit);
+            assert_eq!(hook.batches.lock().unwrap().len(), 1);
+            assert_eq!(
+                rx.try_recv().is_ok(),
+                after_commit,
+                "only a committed hook with absent row publishes"
+            );
+            assert!(rx.try_recv().is_err());
+            assert_eq!(
+                backend
+                    .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "AMBIGUOUS_DELETE")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                after_commit
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_pending_group_spellings_share_one_new_row_and_cleanup() {
+        let client = create_test_client_with_failing_http("canonical_group_pending").await;
+        let hook = Arc::new(RecordingHook {
+            batches: Mutex::new(Vec::new()),
+        });
+        client.inbound_durability_hook.set(hook).ok().unwrap();
+        let bare = item("CANONICAL_GROUP");
+        let mut device = bare.clone();
+        let mut info = (*device.info).clone();
+        info.source.sender = "200:75@s.whatsapp.net".parse().unwrap();
+        device.info = Arc::new(info);
+        let outcome = client
+            .commit_pending_batch_result(
+                vec![PendingDelivery::from(bare), PendingDelivery::from(device)].into(),
+                BatchOrigin::Live,
+                None,
+                false,
+            )
+            .await;
+        assert!(outcome.delivered);
+        let backend = client.persistence_manager.backend();
+        for sender in ["200@s.whatsapp.net", "200:75@s.whatsapp.net"] {
+            assert!(
+                backend
+                    .get_pending_inbound("100@g.us", sender, "CANONICAL_GROUP")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]

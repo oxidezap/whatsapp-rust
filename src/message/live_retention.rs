@@ -3,6 +3,7 @@
 use super::raw_pending::{MAX_PENDING_BYTES, PendingDelivery, StanzaOrigin};
 use crate::types::message::MessageInfo;
 use std::sync::{Arc, Mutex};
+use wacore_binary::JidExt;
 
 #[derive(Default)]
 pub(super) struct LiveRetention {
@@ -330,11 +331,10 @@ impl LiveRetention {
     }
     pub fn has_raw_for_message(&self, info: &MessageInfo) -> bool {
         lock(&self.state).reservations.iter().any(|reservation| {
-            reservation.raw.iter().any(|entry| {
-                entry.info.source.chat == info.source.chat
-                    && entry.info.source.sender == info.source.sender
-                    && entry.info.id == info.id
-            })
+            reservation
+                .raw
+                .iter()
+                .any(|entry| same_message(&entry.info, info))
         })
     }
     pub fn raw_for_message(&self, info: &MessageInfo) -> Vec<RawRetained> {
@@ -342,11 +342,7 @@ impl LiveRetention {
             .reservations
             .iter()
             .flat_map(|reservation| &reservation.raw)
-            .filter(|entry| {
-                entry.info.source.chat == info.source.chat
-                    && entry.info.source.sender == info.source.sender
-                    && entry.info.id == info.id
-            })
+            .filter(|entry| same_message(&entry.info, info))
             .cloned()
             .collect()
     }
@@ -355,11 +351,7 @@ impl LiveRetention {
             .reservations
             .iter()
             .flat_map(|reservation| &reservation.entries)
-            .filter(|entry| {
-                entry.info.source.chat == info.source.chat
-                    && entry.info.source.sender == info.source.sender
-                    && entry.info.id == info.id
-            })
+            .filter(|entry| same_message(&entry.info, info))
             .cloned()
             .collect()
     }
@@ -397,11 +389,17 @@ impl LiveRetention {
         }
     }
 }
+fn same_message(first: &MessageInfo, second: &MessageInfo) -> bool {
+    first.source.chat == second.source.chat
+        && first.id == second.id
+        && (first.source.sender == second.source.sender
+            || (first.source.chat.is_group()
+                && first.source.sender.to_non_ad() == second.source.sender.to_non_ad()))
+}
+
 fn same_entry(first: &PendingDelivery, second: &PendingDelivery) -> bool {
     first.origin == second.origin
-        && first.info.source.chat == second.info.source.chat
-        && first.info.source.sender == second.info.source.sender
-        && first.info.id == second.info.id
+        && same_message(&first.info, &second.info)
         && Arc::ptr_eq(&first.message, &second.message)
 }
 
