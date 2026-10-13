@@ -302,16 +302,27 @@ mod tests {
     async fn business_pn_is_learned_through_public_contact_lookups() {
         use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
         use wacore_binary::builder::NodeBuilder;
-        for user_info in [false, true] {
+        for (user_info, known_pair) in [(false, false), (true, false), (false, true), (true, true)]
+        {
             let (client, transport) = create_iq_test_client().await;
             let lid = Jid::lid("100000001");
+            if known_pair {
+                client
+                    .add_lid_pn_mapping(
+                        "100000001",
+                        "12025550112",
+                        crate::lid_pn_cache::LearningSource::Other,
+                    )
+                    .await
+                    .unwrap();
+            }
             let caller = client.clone();
             let queried = lid.clone();
             let task = tokio::spawn(async move {
                 if user_info {
                     let info = caller
                         .contacts()
-                        .get_user_info(&[queried.clone()])
+                        .get_user_info(std::slice::from_ref(&queried))
                         .await
                         .unwrap();
                     assert_eq!(info[&queried].pn_jid, Some(Jid::pn("12025550111")));
@@ -321,6 +332,15 @@ mod tests {
                 }
             });
             let sent = decode_sent_iq(&transport, 0).await;
+            assert!(
+                sent.get()
+                    .get_optional_child("usync")
+                    .unwrap()
+                    .get_optional_child("query")
+                    .unwrap()
+                    .get_optional_child("business")
+                    .is_some()
+            );
             let id = sent
                 .get()
                 .attrs()
