@@ -960,8 +960,9 @@ impl Client {
 
         let (mutation, _) = encode_record(operation, index, value, &keys, &key_id, &iv, version);
 
-        self.send_app_state_patch(collection, vec![mutation])
-            .await?;
+        // This cold metadata transaction must not expose its recovery future's
+        // nested layout through every public action and downstream host.
+        Box::pin(self.send_app_state_patch(collection, vec![mutation])).await?;
         Ok(())
     }
 

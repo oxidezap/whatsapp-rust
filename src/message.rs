@@ -255,6 +255,7 @@ impl DispatchKey {
     /// Hashes an identity through the process key. Zero folds onto one so
     /// `Option<DispatchKey>` rides in 8 bytes: one extra colliding pair in
     /// 2^64, below the collision rate the identity already tolerates.
+    #[inline(never)]
     fn new(identity: impl std::hash::Hash) -> Self {
         use std::hash::BuildHasher;
         let digest = DISPATCH_IDENTITY.hash_one(identity);

@@ -13,12 +13,24 @@ fn delivery_receipt_burst_warning(
 }
 
 impl Client {
-    fn with_message_dispatch<R>(
+    fn with_message_dispatch(
         &self,
         info: &Arc<MessageInfo>,
         pdo: bool,
-        update: impl FnOnce(&mut DispatchClaim) -> R,
-    ) -> R {
+        mut update: impl FnMut(&mut DispatchClaim) -> bool,
+    ) -> bool {
+        self.with_message_dispatch_inner(info, pdo, &mut update)
+    }
+
+    // All callers return a claim decision. Erase only their stack callback,
+    // sharing the locked lookup without allocating or extending the guard.
+    #[inline(never)]
+    fn with_message_dispatch_inner(
+        &self,
+        info: &Arc<MessageInfo>,
+        pdo: bool,
+        update: &mut dyn FnMut(&mut DispatchClaim) -> bool,
+    ) -> bool {
         let key = Self::dispatch_key(info);
         self.dispatched_messages.with(|cache| {
             if cache.get(&key).is_some_and(|claim| {
