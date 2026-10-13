@@ -54,8 +54,8 @@ async fn test_expired_chatstate_not_delivered() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Confirms the server observed B going offline before queueing a fresh
-/// chatstate, then reconnects within its TTL (CHATSTATE_TTL_SECS=3).
+/// Holds B offline while a fresh chatstate is queued, then reconnects
+/// within its TTL (CHATSTATE_TTL_SECS=3).
 #[tokio::test]
 async fn test_fresh_chatstate_delivered_on_reconnect() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -67,9 +67,8 @@ async fn test_fresh_chatstate_delivered_on_reconnect() -> anyhow::Result<()> {
 
     info!("B={jid_b}");
 
-    // Establish a server-observed availability transition. `pause()` closes
-    // the local socket but does not await the peer's Close acknowledgement;
-    // its disconnected flag alone cannot prove the server retired B's route.
+    // Explicitly announce the availability transition: the mock does not
+    // broadcast unavailable presence when a companion socket closes.
     client_b.client.presence().set_available().await?;
     client_a.client.presence().subscribe(&jid_b).await?;
     client_a
@@ -80,7 +79,7 @@ async fn test_fresh_chatstate_delivered_on_reconnect() -> anyhow::Result<()> {
             )
         })
         .await?;
-    client_b.go_offline().await?;
+    client_b.client.presence().set_unavailable().await?;
     client_a
         .wait_for_event(5, |event| {
             matches!(event,
@@ -89,7 +88,16 @@ async fn test_fresh_chatstate_delivered_on_reconnect() -> anyhow::Result<()> {
             )
         })
         .await?;
-    info!("Server observed B offline before the chatstate send");
+    client_b.go_offline().await?;
+    // Await server traffic after the socket close before sending the fresh
+    // chatstate; the local disconnected flag alone is not a receive barrier.
+    client_a
+        .client
+        .execute(wacore::iq::keepalive::KeepaliveSpec::with_timeout(
+            std::time::Duration::from_secs(2),
+        ))
+        .await?;
+    info!("B remains paused during the chatstate send");
 
     client_a.client.chatstate().send_composing(&jid_b).await?;
     info!("A sent typing indicator to offline B");

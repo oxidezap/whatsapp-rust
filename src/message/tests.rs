@@ -11294,75 +11294,87 @@ async fn raw_pending_live_equal_parts_survive_prefix_cleanup_and_later_hook_fail
             Ok(())
         }
     }
-    for cleanup_failure in [false, true] {
-        for hook_failure in [false, true] {
-            let backend = Arc::new(InMemoryBackend::new());
-            let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
-            client.enter_live_mode_for_tests();
-            client
-                .inbound_durability_hook
-                .set(Arc::new(Hook {
-                    calls: AtomicUsize::new(0),
-                    fail_second: hook_failure,
-                }))
-                .ok()
-                .unwrap();
-            let (handler, rx) = wacore::types::events::ChannelEventHandler::new();
-            client.core.event_bus.subscribe_handler(handler).detach();
-            let info = Arc::new(create_test_message_info(
-                "100@g.us",
-                "LIVE_EQUAL_PARTS",
-                "200@s.whatsapp.net",
-            ));
-            let mut message = wa::Message::default();
-            message.conversation = Some("equal genuine parts".into());
-            let producer = raw_pending::StanzaOrigin::new();
-            let _admission = client
-                .inbound_commit_batch
-                .live_retention
-                .reserve(producer, 1024, 2)
-                .unwrap();
-            if cleanup_failure {
-                backend.fail_one_pending_delete(0, false);
-            }
-            for index in 0..2 {
+    for before_decrypt in [false, true] {
+        for cleanup_failure in [false, true] {
+            for hook_failure in [false, true] {
+                let backend = Arc::new(InMemoryBackend::new());
+                let client =
+                    crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+                client.enter_live_mode_for_tests();
                 client
-                    .handle_decrypted_plaintext_in_scope(
-                        "msg",
-                        MessageUtils::encode_and_pad(&message),
-                        2,
-                        receive::PlaintextSlot {
-                            index,
-                            annotations: Default::default(),
-                            producer,
-                        },
-                        &info,
-                    )
-                    .await
+                    .inbound_durability_hook
+                    .set(Arc::new(Hook {
+                        calls: AtomicUsize::new(0),
+                        fail_second: hook_failure,
+                    }))
+                    .ok()
                     .unwrap();
-            }
-            assert_eq!(
-                message_events_for_id(&rx, "LIVE_EQUAL_PARTS").0,
-                if hook_failure { 1 } else { 2 },
-                "completed claims must not suppress a fresh sibling slot"
-            );
-            if hook_failure {
-                let redelivery = Arc::new((*info).clone());
-                assert!(client.ack_or_replay_to_hook(&redelivery).await);
+                let (handler, rx) = wacore::types::events::ChannelEventHandler::new();
+                client.core.event_bus.subscribe_handler(handler).detach();
+                let info = Arc::new(create_test_message_info(
+                    "100@g.us",
+                    "LIVE_EQUAL_PARTS",
+                    "200@s.whatsapp.net",
+                ));
+                let mut message = wa::Message::default();
+                message.conversation = Some("equal genuine parts".into());
+                let producer = raw_pending::StanzaOrigin::new();
+                let _admission = client
+                    .inbound_commit_batch
+                    .live_retention
+                    .reserve(producer, 1024, 2)
+                    .unwrap();
+                if cleanup_failure {
+                    backend.fail_one_pending_delete(0, false);
+                }
+                for index in 0..2 {
+                    client
+                        .handle_decrypted_plaintext_in_scope(
+                            "msg",
+                            MessageUtils::encode_and_pad(&message),
+                            2,
+                            receive::PlaintextSlot {
+                                index,
+                                annotations: Default::default(),
+                                producer,
+                            },
+                            &info,
+                        )
+                        .await
+                        .unwrap();
+                }
                 assert_eq!(
                     message_events_for_id(&rx, "LIVE_EQUAL_PARTS").0,
-                    1,
-                    "recovery must publish only the still-unpublished equal part"
+                    if hook_failure { 1 } else { 2 },
+                    "completed claims must not suppress a fresh sibling slot"
                 );
+                if hook_failure {
+                    let redelivery = Arc::new((*info).clone());
+                    if before_decrypt {
+                        // Ordinary receive recovery must preserve the unclaimed
+                        // occurrence before decrypting the redelivered carrier.
+                        client
+                            .persist_live_retained_before_decrypt(&redelivery)
+                            .await
+                            .unwrap();
+                    } else {
+                        assert!(client.ack_or_replay_to_hook(&redelivery).await);
+                    }
+                    assert_eq!(
+                        message_events_for_id(&rx, "LIVE_EQUAL_PARTS").0,
+                        1,
+                        "recovery must publish only the still-unpublished equal part"
+                    );
+                }
+                assert!(
+                    backend
+                        .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "LIVE_EQUAL_PARTS")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(rx.try_recv().is_err());
             }
-            assert!(
-                backend
-                    .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "LIVE_EQUAL_PARTS")
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(rx.try_recv().is_err());
         }
     }
 }

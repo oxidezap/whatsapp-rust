@@ -386,6 +386,16 @@ fn poll_pending_commit<F: Future<Output = PendingCommitOutcome>>(
     future.poll(cx)
 }
 
+type PendingRecovery = anyhow::Result<Option<Vec<PendingDelivery>>>;
+
+#[inline(never)]
+fn poll_pending_recovery<F: Future<Output = PendingRecovery>>(
+    future: std::pin::Pin<&mut F>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<PendingRecovery> {
+    future.poll(cx)
+}
+
 type PendingLookup = anyhow::Result<Option<(String, wacore::store::traits::PendingInboundRecord)>>;
 
 #[inline(never)]
@@ -462,12 +472,60 @@ impl Client {
             .collect();
         let lease = PendingInboundLease::new(Arc::new((Arc::clone(&owner), charges)));
         let backend = self.persistence_manager.backend();
+        // A complete batch can carry both legacy physical spellings. Exact
+        // bounded reads establish which arrived keys already exist; a single
+        // unknown arrival must still use the ambiguity-rejecting group lookup.
+        let mut arrived_keys = Vec::new();
+        for item in items {
+            if item.storage_sender.is_some() || !item.info.source.chat.is_group() {
+                continue;
+            }
+            let info = &item.info;
+            let has_alias = items.iter().any(|other| {
+                other.info.id == info.id
+                    && other.info.source.chat == info.source.chat
+                    && other.info.source.sender != info.source.sender
+                    && other.info.source.sender.user == info.source.sender.user
+                    && other.info.source.sender.server == info.source.sender.server
+                    && other.info.source.sender.integrator == info.source.sender.integrator
+            });
+            if !has_alias {
+                continue;
+            }
+            let chat = info.source.chat.to_string();
+            let sender = info.source.sender.to_string();
+            if backend
+                .read_pending_inbound_bounded(
+                    PendingInboundKey {
+                        chat: &chat,
+                        sender: &sender,
+                        id: &info.id,
+                    },
+                    MAX_PENDING_BYTES,
+                    lease.clone(),
+                )
+                .await?
+                .is_some()
+            {
+                arrived_keys.push((chat, sender, info.id.to_string()));
+            }
+        }
         let mut groups: Vec<(String, String, String, Vec<&PendingDelivery>, bool)> = Vec::new();
         for item in items {
             let chat = item.info.source.chat.to_string();
-            let explicit = item.storage_sender.is_some();
+            let arrived = arrived_keys.iter().find(|(candidate_chat, sender, id)| {
+                candidate_chat == &chat
+                    && id == item.info.id
+                    && sender == &item.info.source.sender.to_string()
+            });
+            let explicit = item.storage_sender.is_some() || arrived.is_some();
             let sender = item.storage_sender.as_ref().map_or_else(
-                || Self::pending_sender(&item.info),
+                || {
+                    arrived.map_or_else(
+                        || Self::pending_sender(&item.info),
+                        |(_, sender, _)| sender.clone(),
+                    )
+                },
                 |sender| sender.to_string(),
             );
             let group = groups.iter_mut().find(|group| {
@@ -714,22 +772,16 @@ impl Client {
     ) -> anyhow::Result<()> {
         let retained = self.inbound_commit_batch.live_retention.for_message(info);
         if !retained.is_empty() {
-            let rows = self.persist_pending_group(&retained, false).await?;
-            if has_physical_aliases(&rows) {
-                anyhow::ensure!(
-                    self.commit_pending_batch_result(
-                        retained.into(),
-                        BatchOrigin::Live,
-                        None,
-                        false
-                    )
+            let retained = self
+                .live_pending_retry_batch(&retained, true)
+                .await?
+                .unwrap_or(retained);
+            anyhow::ensure!(
+                self.commit_pending_batch_result(retained.into(), BatchOrigin::Live, None, false)
                     .await
                     .delivered,
-                    "physical aliases have not recovered before decrypt"
-                );
-            } else {
-                self.inbound_commit_batch.live_retention.stored(&retained);
-            }
+                "retained producer has not recovered before decrypt"
+            );
         }
         let Some((sender, record)) = self.read_pending_for_replay(info).await? else {
             return Ok(());
@@ -761,7 +813,16 @@ impl Client {
         self: &Arc<Self>,
         owned: &[PendingDelivery],
         replay: bool,
-    ) -> anyhow::Result<Option<Vec<PendingDelivery>>> {
+    ) -> PendingRecovery {
+        let mut future = std::pin::pin!(self.live_pending_retry_batch_inner(owned, replay));
+        std::future::poll_fn(|cx| poll_pending_recovery(future.as_mut(), cx)).await
+    }
+
+    async fn live_pending_retry_batch_inner(
+        self: &Arc<Self>,
+        owned: &[PendingDelivery],
+        replay: bool,
+    ) -> PendingRecovery {
         let Some(first) = owned.first() else {
             return Ok(None);
         };
@@ -782,8 +843,12 @@ impl Client {
         let (bytes, read_lease) = record.into_bytes();
         let journal = PendingJournal::decode(bytes)?;
         drop(read_lease);
+        let projections: Vec<_> = owned
+            .iter()
+            .map(|item| waproto::codec::message_to_vec(&item.message))
+            .collect();
         if !replay
-            && !owned.iter().any(|item| {
+            && !owned.iter().zip(&projections).any(|(item, projection)| {
                 item.origin.is_some_and(|origin| {
                     self.hook_publication_from_producer(&item.info, origin.stanza)
                         || journal.occurrences.iter().any(|entry| {
@@ -791,18 +856,13 @@ impl Client {
                                 .producer
                                 .is_some_and(|producer| producer != origin.stanza)
                                 && entry.index == u32::try_from(origin.position).ok()
-                                && entry.projection.as_ref()
-                                    == waproto::codec::message_to_vec(&item.message)
+                                && entry.projection.as_ref() == projection.as_slice()
                         })
                 })
             })
         {
             return Ok(None);
         }
-        let projections: Vec<_> = owned
-            .iter()
-            .map(|item| waproto::codec::message_to_vec(&item.message))
-            .collect();
         let matches_owned =
             |entry: &Occurrence, position: usize, item: &PendingDelivery, projection: &[u8]| {
                 item.origin.is_some_and(|origin| {
