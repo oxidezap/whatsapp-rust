@@ -121,11 +121,30 @@ pub(super) struct PlaintextSlot<'a> {
 }
 
 #[inline(never)]
-fn poll_retained_plaintext<F: Future<Output = Result<PlaintextHandleOutcome, anyhow::Error>>>(
+fn poll_inbound_phase<F: Future>(
     future: std::pin::Pin<&mut F>,
     cx: &mut std::task::Context<'_>,
-) -> std::task::Poll<Result<PlaintextHandleOutcome, anyhow::Error>> {
+) -> std::task::Poll<F::Output> {
     future.poll(cx)
+}
+
+#[inline(never)]
+fn defer_plaintext(
+    deferred: &mut Vec<DeferredPlaintext>,
+    enc_type: &'static str,
+    plaintext: bytes::Bytes,
+    padding_version: u8,
+    enc_index: usize,
+    annotations: EncNodeAnnotations<'_>,
+) {
+    deferred.push(DeferredPlaintext {
+        enc_type,
+        plaintext,
+        padding_version,
+        enc_index,
+        state: annotations.state.map(str::to_owned),
+        session_type: annotations.session_type.map(str::to_owned),
+    });
 }
 
 impl Client {
@@ -701,16 +720,15 @@ impl Client {
         let session_payloads_empty = session_payloads.is_empty();
 
         let session_outcome = if !is_group_sender && !session_payloads_empty {
-            // Active decrypt work gets a transient frame; idle lanes do not
-            // reserve its crypto/recovery state for their whole lifetime.
-            Box::pin(self.clone().process_session_enc_batch_with_origin(
-                session_payloads,
-                &info,
-                &sender_encryption_jid,
-                decrypt_fail_mode,
-                stanza_origin,
-            ))
-            .await
+            self.clone()
+                .process_session_enc_batch_with_origin(
+                    session_payloads,
+                    &info,
+                    &sender_encryption_jid,
+                    decrypt_fail_mode,
+                    stanza_origin,
+                )
+                .await
         } else {
             if is_group_sender && !session_payloads_empty {
                 log::debug!(
@@ -936,8 +954,91 @@ impl Client {
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
         stanza_origin: raw_pending::StanzaOrigin,
     ) -> SessionBatchOutcome {
+        // Decrypt and projection are sequential phases. Keeping their state in
+        // separate futures lets idle lanes reuse the frame without a per-batch box.
+        let (mut outcome, deferred, _timer) = {
+            let mut future = std::pin::pin!(self.clone().decrypt_session_enc_batch_with_origin(
+                payloads,
+                info,
+                sender_encryption_jid,
+                decrypt_fail_mode,
+                stanza_origin,
+            ));
+            std::future::poll_fn(|cx| poll_inbound_phase(future.as_mut(), cx)).await
+        };
+
+        for DeferredPlaintext {
+            enc_type,
+            plaintext,
+            padding_version,
+            enc_index,
+            state,
+            session_type,
+        } in deferred
+        {
+            match self
+                .handle_decrypted_plaintext_in_scope(
+                    enc_type,
+                    plaintext,
+                    padding_version,
+                    PlaintextSlot {
+                        index: enc_index,
+                        annotations: EncNodeAnnotations {
+                            state: state.as_deref(),
+                            session_type: session_type.as_deref(),
+                        },
+                        producer: stanza_origin,
+                        receipt: None,
+                    },
+                    info,
+                )
+                .await
+            {
+                Ok(plaintext_outcome) => {
+                    outcome.dispatched |= plaintext_outcome.dispatched;
+                    outcome.skdm_only |= plaintext_outcome.skdm_only;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[msg:{}] Failed processing plaintext from {}: {e:?}",
+                        info.id,
+                        info.source.sender.observe()
+                    );
+                    outcome.plaintext_failed = true;
+                    outcome.had_failure = true;
+                    // The one report that can follow a DecryptedPayload for the
+                    // same enc: the bytes existed, they just could not be made
+                    // into a message. Unpadding fails ahead of that event, so
+                    // there this is the only signal.
+                    self.report_enc_decrypt_failure(
+                        info,
+                        enc_index,
+                        enc_type,
+                        EncDecryptFailureReason::PlaintextUnusable,
+                    );
+                    outcome.undecryptable |=
+                        self.handle_plaintext_failure(info, decrypt_fail_mode).await;
+                }
+            }
+        }
+
+        outcome
+    }
+
+    async fn decrypt_session_enc_batch_with_origin(
+        self: Arc<Self>,
+        payloads: Vec<EncPayload>,
+        info: &Arc<MessageInfo>,
+        sender_encryption_jid: &Jid,
+        decrypt_fail_mode: crate::types::events::DecryptFailMode,
+        stanza_origin: raw_pending::StanzaOrigin,
+    ) -> (
+        SessionBatchOutcome,
+        Vec<DeferredPlaintext>,
+        Option<wacore::telemetry::Timer>,
+    ) {
         if payloads.is_empty() {
-            return SessionBatchOutcome::default();
+            return (SessionBatchOutcome::default(), Vec::new(), None);
         }
 
         // Acquire a per-sender session lock to prevent race conditions when
@@ -955,7 +1056,7 @@ impl Client {
             Some(session_mutex.lock_arc().await);
 
         // Started after the lock so the histogram excludes lock/queue wait.
-        let _t = wacore::telemetry::timer(wacore::telemetry::DECRYPT_DURATION);
+        let timer = wacore::telemetry::timer(wacore::telemetry::DECRYPT_DURATION);
 
         let mut adapter = self.signal_adapter();
         let mut rng = LazyStdRng::default();
@@ -1115,14 +1216,17 @@ impl Client {
                     // Decrypt succeeded (the ratchet advanced); defer the
                     // plaintext handling until the lock is dropped.
                     outcome.decrypted = true;
-                    deferred.push(DeferredPlaintext {
+                    defer_plaintext(
+                        &mut deferred,
                         enc_type,
                         plaintext,
                         padding_version,
                         enc_index,
-                        state: state.clone(),
-                        session_type: session_type.clone(),
-                    });
+                        EncNodeAnnotations {
+                            state: state.as_deref(),
+                            session_type: session_type.as_deref(),
+                        },
+                    );
                 }
                 Err(e) => {
                     // Handle DuplicatedMessage: This is expected when messages are redelivered during reconnection
@@ -1247,14 +1351,17 @@ impl Client {
                                 // Decrypt succeeded after the identity retry;
                                 // defer plaintext handling until the lock drops.
                                 outcome.decrypted = true;
-                                deferred.push(DeferredPlaintext {
+                                defer_plaintext(
+                                    &mut deferred,
                                     enc_type,
                                     plaintext,
                                     padding_version,
                                     enc_index,
-                                    state: state.clone(),
-                                    session_type: session_type.clone(),
-                                });
+                                    EncNodeAnnotations {
+                                        state: state.as_deref(),
+                                        session_type: session_type.as_deref(),
+                                    },
+                                );
                             }
                             Err(retry_err) => {
                                 // Handle DuplicatedMessage in retry path: This commonly happens during reconnection
@@ -1275,28 +1382,33 @@ impl Client {
                                 } else if matches!(retry_err, SignalProtocolError::InvalidPreKeyId)
                                 {
                                     // Session may exist under PN address after identity change
-                                    match self
-                                        .try_pn_to_lid_migration_decrypt(
-                                            sender_encryption_jid,
-                                            &signal_address,
-                                            &mut parsed_message,
-                                            &mut adapter,
-                                            &mut rng,
-                                            enc_type,
-                                            padding_version,
-                                            enc_index,
-                                            EncNodeAnnotations {
-                                                state: state.as_deref(),
-                                                session_type: session_type.as_deref(),
-                                            },
-                                            info,
-                                            &session_mutex,
-                                            &mut session_guard,
-                                            &mut deferred,
-                                            stanza_origin,
-                                        )
+                                    let migration = {
+                                        let mut future =
+                                            std::pin::pin!(self.try_pn_to_lid_migration_decrypt(
+                                                sender_encryption_jid,
+                                                &signal_address,
+                                                &mut parsed_message,
+                                                &mut adapter,
+                                                &mut rng,
+                                                enc_type,
+                                                padding_version,
+                                                enc_index,
+                                                EncNodeAnnotations {
+                                                    state: state.as_deref(),
+                                                    session_type: session_type.as_deref(),
+                                                },
+                                                info,
+                                                &session_mutex,
+                                                &mut session_guard,
+                                                &mut deferred,
+                                                stanza_origin,
+                                            ));
+                                        std::future::poll_fn(|cx| {
+                                            poll_inbound_phase(future.as_mut(), cx)
+                                        })
                                         .await
-                                    {
+                                    };
+                                    match migration {
                                         MigrationDecryptResult::Decrypted => {
                                             outcome.decrypted = true;
                                         }
@@ -1397,8 +1509,8 @@ impl Client {
                         // `Some` only when a migration ran and its retry decrypt
                         // failed: then that failure is the terminal one, not the
                         // error that opened the migration.
-                        let terminal = match self
-                            .try_pn_to_lid_migration_decrypt(
+                        let migration = {
+                            let mut future = std::pin::pin!(self.try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
                                 &mut parsed_message,
@@ -1416,9 +1528,10 @@ impl Client {
                                 &mut session_guard,
                                 &mut deferred,
                                 stanza_origin,
-                            )
-                            .await
-                        {
+                            ));
+                            std::future::poll_fn(|cx| poll_inbound_phase(future.as_mut(), cx)).await
+                        };
+                        let terminal = match migration {
                             MigrationDecryptResult::Decrypted => {
                                 outcome.decrypted = true;
                                 continue;
@@ -1456,8 +1569,8 @@ impl Client {
                         // `Some` only when a migration ran and its retry decrypt
                         // failed: then that failure is the terminal one, not the
                         // error that opened the migration.
-                        let terminal = match self
-                            .try_pn_to_lid_migration_decrypt(
+                        let migration = {
+                            let mut future = std::pin::pin!(self.try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
                                 &mut parsed_message,
@@ -1475,9 +1588,10 @@ impl Client {
                                 &mut session_guard,
                                 &mut deferred,
                                 stanza_origin,
-                            )
-                            .await
-                        {
+                            ));
+                            std::future::poll_fn(|cx| poll_inbound_phase(future.as_mut(), cx)).await
+                        };
+                        let terminal = match migration {
                             MigrationDecryptResult::Decrypted => {
                                 outcome.decrypted = true;
                                 continue;
@@ -1533,8 +1647,8 @@ impl Client {
                         // `Some` only when a migration ran and its retry decrypt
                         // failed: then that failure is the terminal one, not the
                         // error that opened the migration.
-                        let terminal = match self
-                            .try_pn_to_lid_migration_decrypt(
+                        let migration = {
+                            let mut future = std::pin::pin!(self.try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
                                 &mut parsed_message,
@@ -1552,9 +1666,10 @@ impl Client {
                                 &mut session_guard,
                                 &mut deferred,
                                 stanza_origin,
-                            )
-                            .await
-                        {
+                            ));
+                            std::future::poll_fn(|cx| poll_inbound_phase(future.as_mut(), cx)).await
+                        };
+                        let terminal = match migration {
                             MigrationDecryptResult::Decrypted => {
                                 outcome.decrypted = true;
                                 continue;
@@ -1657,62 +1772,8 @@ impl Client {
         // serial chat-lane worker, not this guard. Matches whatsmeow.
         drop(session_guard);
 
-        for DeferredPlaintext {
-            enc_type,
-            plaintext,
-            padding_version,
-            enc_index,
-            state,
-            session_type,
-        } in deferred
-        {
-            match self
-                .handle_decrypted_plaintext_in_scope(
-                    enc_type,
-                    plaintext,
-                    padding_version,
-                    PlaintextSlot {
-                        index: enc_index,
-                        annotations: EncNodeAnnotations {
-                            state: state.as_deref(),
-                            session_type: session_type.as_deref(),
-                        },
-                        producer: stanza_origin,
-                        receipt: None,
-                    },
-                    info,
-                )
-                .await
-            {
-                Ok(plaintext_outcome) => {
-                    outcome.dispatched |= plaintext_outcome.dispatched;
-                    outcome.skdm_only |= plaintext_outcome.skdm_only;
-                }
-                Err(e) => {
-                    log::warn!(
-                        "[msg:{}] Failed processing plaintext from {}: {e:?}",
-                        info.id,
-                        info.source.sender.observe()
-                    );
-                    outcome.plaintext_failed = true;
-                    outcome.had_failure = true;
-                    // The one report that can follow a DecryptedPayload for the
-                    // same enc: the bytes existed, they just could not be made
-                    // into a message. Unpadding fails ahead of that event, so
-                    // there this is the only signal.
-                    self.report_enc_decrypt_failure(
-                        info,
-                        enc_index,
-                        enc_type,
-                        EncDecryptFailureReason::PlaintextUnusable,
-                    );
-                    outcome.undecryptable |=
-                        self.handle_plaintext_failure(info, decrypt_fail_mode).await;
-                }
-            }
-        }
-
-        outcome
+        // Keep the existing measurement boundary through plaintext projection.
+        (outcome, deferred, Some(timer))
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.group_decrypt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id), err(Debug)))]
@@ -2052,7 +2113,7 @@ impl Client {
             slot,
             info,
         ));
-        let result = std::future::poll_fn(|cx| poll_retained_plaintext(future.as_mut(), cx)).await;
+        let result = std::future::poll_fn(|cx| poll_inbound_phase(future.as_mut(), cx)).await;
         if result.as_ref().is_ok_and(|outcome| !outcome.dispatched) {
             // Successful protocol-only processing has no consumer delivery.
             // Recoverable errors and cancellation keep raw ownership; the
@@ -2543,14 +2604,14 @@ impl Client {
                 }
                 // Buffer for post-lock handling, keeping the same ordering as the
                 // batch's main path.
-                deferred.push(DeferredPlaintext {
+                defer_plaintext(
+                    deferred,
                     enc_type,
                     plaintext,
                     padding_version,
                     enc_index,
-                    state: annotations.state.map(str::to_owned),
-                    session_type: annotations.session_type.map(str::to_owned),
-                });
+                    annotations,
+                );
                 MigrationDecryptResult::Decrypted
             }
             Err(SignalProtocolError::DuplicatedMessage(chain, counter)) => {
