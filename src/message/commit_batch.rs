@@ -1623,7 +1623,7 @@ mod tests {
             };
             assert!(batch.hook_committed);
             assert_eq!(
-                batch.iter().map(|m| m.info.id.as_ref()).collect::<Vec<_>>(),
+                batch.iter().map(|m| m.info.id.as_str()).collect::<Vec<_>>(),
                 ids
             );
             assert!(rx.try_recv().is_err());
