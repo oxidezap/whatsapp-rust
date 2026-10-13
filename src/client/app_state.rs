@@ -814,6 +814,39 @@ fn unaccounted_for(
     }
 }
 
+// WAWebPnForLidChatSync uses createUserLidOrThrow/createUserWidOrThrow.
+// Reject other namespaces and device addresses rather than turning them into
+// a pair of bare user strings that the ledger would accept without validation.
+fn pn_for_lid_chat_pair(m: &crate::appstate_sync::Mutation) -> Option<(Jid, Jid)> {
+    let [command, lid] = m.index.as_slice() else {
+        return None;
+    };
+    if command != wacore::appstate::schemas::PN_FOR_LID_CHAT.name
+        || m.operation != wa::syncd_mutation::SyncdOperation::Set
+    {
+        return None;
+    }
+    let lid: Jid = lid.parse().ok()?;
+    let pn: Jid = m
+        .action_value
+        .as_ref()?
+        .pn_for_lid_chat_action
+        .as_option()?
+        .pn_jid
+        .as_ref()?
+        .parse()
+        .ok()?;
+    let valid_user = |jid: &Jid| {
+        !jid.user.is_empty()
+            && jid.user != "0"
+            && jid.user.bytes().all(|byte| byte.is_ascii_digit())
+            && jid.device == 0
+            && jid.agent == 0
+            && jid.integrator == 0
+    };
+    (lid.is_lid() && pn.is_pn() && valid_user(&lid) && valid_user(&pn)).then_some((lid, pn))
+}
+
 impl Client {
     pub(crate) fn get_app_state_processor(&self) -> &Arc<AppStateProcessor> {
         self.app_state_processor.get_or_init(|| {
@@ -2372,15 +2405,13 @@ impl Client {
                 // caller for a distinction the per-patch `Decoded … vN`
                 // lines already draw. The version below is therefore the
                 // page's end cursor, not each mutation's birth version.
-                let total = mutations.len();
-                for (position, mut m) in mutations.into_iter().enumerate() {
-                    self.dispatch_app_state_mutation(
-                        &mut m,
-                        full_sync,
-                        (name, new_state.version, position + 1, total),
-                    )
-                    .await;
-                }
+                self.dispatch_app_state_mutations(
+                    mutations,
+                    full_sync,
+                    full_sync,
+                    (name, new_state.version),
+                )
+                .await;
 
                 // No version write here. `process_one_patch_list` already
                 // persisted this exact state — alongside the mutation MACs it
@@ -2640,20 +2671,13 @@ impl Client {
                 .await;
 
             wacore::telemetry::appstate_mutations(mutations.len() as u64);
-            let total = mutations.len();
-            for (position, mut m) in mutations.into_iter().enumerate() {
-                // `new_state`, not `state`: the page just applied produced
-                // this version, and `state` still holds the pre-page cursor
-                // until the assignment below. Logging the old version would
-                // attribute the fresh mutations to the cursor they replaced —
-                // the batched path already reports `new_state.version`.
-                self.dispatch_app_state_mutation(
-                    &mut m,
-                    full_sync,
-                    (name, new_state.version, position + 1, total),
-                )
-                .await;
-            }
+            self.dispatch_app_state_mutations(
+                mutations,
+                full_sync,
+                full_sync,
+                (name, new_state.version),
+            )
+            .await;
 
             // A collection the server refused advances nothing: the processor
             // returns the state untouched for a list carrying an error
@@ -3254,16 +3278,13 @@ impl Client {
                     // `event_full_sync=false` (the base passed `false`
                     // here unconditionally), so the split args below must
                     // not be reunited into one `full_sync`.
-                    let total = mutations.len();
-                    for (position, mut m) in mutations.into_iter().enumerate() {
-                        self.dispatch_app_state_mutation_inner(
-                            &mut m,
-                            false, // event provenance: a conflict absorb is not a full sync
-                            replaying_snapshot, // logging mode: snapshot replays stay at TRACE
-                            Some((list.name, new_state.version, position + 1, total)),
-                        )
-                        .await;
-                    }
+                    self.dispatch_app_state_mutations(
+                        mutations,
+                        false,
+                        replaying_snapshot,
+                        (list.name, new_state.version),
+                    )
+                    .await;
                     if let Some(refused) = &list.error {
                         debug!(
                             target: "Client/AppState",
@@ -3552,15 +3573,13 @@ impl Client {
                 // for exactly the recovery path that exists to unstick a
                 // collection. `full_sync = true`: a recovery replaces the
                 // whole collection, so per-mutation lines stay at TRACE.
-                let total = mutations.len();
-                for (position, mut m) in mutations.into_iter().enumerate() {
-                    self.dispatch_app_state_mutation(
-                        &mut m,
-                        true,
-                        (patch_name, recovery_version, position + 1, total),
-                    )
-                    .await;
-                }
+                self.dispatch_app_state_mutations(
+                    mutations,
+                    true,
+                    true,
+                    (patch_name, recovery_version),
+                )
+                .await;
             }
             Ok(wacore::appstate_sync::RecoveryOutcome::Retired) => {
                 debug!(
@@ -4343,16 +4362,13 @@ impl Client {
         };
         let (mutations, state, collection, source) = committed.into_parts();
         wacore::telemetry::appstate_mutations(mutations.len() as u64);
-        let total = mutations.len();
-        for (position, mut mutation) in mutations.into_iter().enumerate() {
-            self.dispatch_app_state_mutation_inner(
-                &mut mutation,
-                event_full_sync,
-                log_full_sync,
-                Some((collection, state.version, position + 1, total)),
-            )
-            .await;
-        }
+        self.dispatch_app_state_mutations(
+            mutations,
+            event_full_sync,
+            log_full_sync,
+            (collection, state.version),
+        )
+        .await;
         source
     }
 
@@ -4372,6 +4388,7 @@ impl Client {
     /// conflict absorb is the exception — it replays a snapshot at TRACE
     /// while keeping `event_full_sync=false` — and calls
     /// `dispatch_app_state_mutation_inner` directly for that.
+    #[cfg(test)]
     pub(crate) async fn dispatch_app_state_mutation(
         &self,
         m: &mut crate::appstate_sync::Mutation,
@@ -4382,6 +4399,8 @@ impl Client {
             .await
     }
 
+    /// Single-mutation adapter for dispatcher regression tests.
+    ///
     /// Split dispatch: `event_full_sync` is public event provenance (lands
     /// on `*.from_full_sync` in every emitted event) while `log_full_sync`
     /// only selects the per-mutation log level (DEBUG vs TRACE). They agree
@@ -4390,12 +4409,55 @@ impl Client {
     /// events came from a full sync — the base passed `false` there, and
     /// this PR is observability-only, so the events must keep saying
     /// `false` too. Separate names so the two can never be confused again.
+    #[cfg(test)]
     async fn dispatch_app_state_mutation_inner(
         &self,
         m: &mut crate::appstate_sync::Mutation,
         event_full_sync: bool,
         log_full_sync: bool,
         ctx: Option<(WAPatchName, u64, usize, usize)>,
+    ) -> AppStateDispatchOutcome {
+        self.dispatch_app_state_mutation_with_mappings(m, event_full_sync, log_full_sync, ctx, None)
+            .await
+    }
+
+    async fn dispatch_app_state_mutations(
+        &self,
+        mutations: Vec<crate::appstate_sync::Mutation>,
+        event_full_sync: bool,
+        log_full_sync: bool,
+        cursor: (WAPatchName, u64),
+    ) {
+        let total = mutations.len();
+        // WAWebPnForLidChatSync flushes one batch. Use the existing ledger's
+        // default source policy, including conflict reconciliation and migrations.
+        let mut mappings = Vec::new();
+        for (position, mut mutation) in mutations.into_iter().enumerate() {
+            self.dispatch_app_state_mutation_with_mappings(
+                &mut mutation,
+                event_full_sync,
+                log_full_sync,
+                Some((cursor.0, cursor.1, position + 1, total)),
+                Some(&mut mappings),
+            )
+            .await;
+        }
+        if !mappings.is_empty()
+            && let Err(error) = self
+                .add_lid_pn_mappings(mappings, crate::lid_pn_cache::LearningSource::Other)
+                .await
+        {
+            warn!(target: "Client/AppState", "Failed to persist pnForLidChat mappings: {error}");
+        }
+    }
+
+    async fn dispatch_app_state_mutation_with_mappings(
+        &self,
+        m: &mut crate::appstate_sync::Mutation,
+        event_full_sync: bool,
+        log_full_sync: bool,
+        ctx: Option<(WAPatchName, u64, usize, usize)>,
+        mappings: Option<&mut Vec<(String, String)>>,
     ) -> AppStateDispatchOutcome {
         use crate::client::AppStateDispatchOutcome;
         use wacore::types::events::Event;
@@ -4537,6 +4599,30 @@ impl Client {
         // All remaining mutations only care about Set operations
         if m.operation != wa::syncd_mutation::SyncdOperation::Set {
             return report("none", m, AppStateDispatchOutcome::Unclaimed, effect_detail);
+        }
+
+        if m.index[0] == wacore::appstate::schemas::PN_FOR_LID_CHAT.name {
+            let outcome = if let Some((lid, pn)) = pn_for_lid_chat_pair(m) {
+                if let Some(mappings) = mappings {
+                    mappings.push((lid.user.to_string(), pn.user.to_string()));
+                    AppStateDispatchOutcome::Event("LidPnMappingQueued")
+                } else if self
+                    .add_lid_pn_mapping(
+                        &lid.user,
+                        &pn.user,
+                        crate::lid_pn_cache::LearningSource::Other,
+                    )
+                    .await
+                    .is_ok()
+                {
+                    AppStateDispatchOutcome::Event("LidPnMappingStored")
+                } else {
+                    AppStateDispatchOutcome::Skipped("lid-pn-persistence-failed")
+                }
+            } else {
+                AppStateDispatchOutcome::Malformed("LidPnMappingStored")
+            };
+            return report("pn_for_lid_chat", m, outcome, effect_detail);
         }
 
         // WA Web's WAWebStatusPrivacySettingSync (whatspec .wa-cache,
@@ -8784,6 +8870,189 @@ mod critical_bootstrap_tests {
             client.needs_initial_full_sync.is_armed(),
             "and the replacement inherits the work through the gate"
         );
+    }
+
+    fn pn_for_lid_mutation(lid: Option<&str>, pn: Option<&str>) -> crate::appstate_sync::Mutation {
+        let mut value = wa::SyncActionValue::default();
+        value.pn_for_lid_chat_action.get_or_insert_default().pn_jid = pn.map(str::to_owned);
+        let mut index = vec!["pnForLidChat".into()];
+        if let Some(lid) = lid {
+            index.push(lid.into());
+        }
+        crate::appstate_sync::Mutation {
+            index,
+            operation: wa::syncd_mutation::SyncdOperation::Set,
+            action_value: Some(value),
+        }
+    }
+
+    #[tokio::test]
+    async fn pn_for_lid_chat_rejects_malformed_and_non_set_mutations() {
+        let client = crate::test_utils::create_test_client().await;
+        for (lid, pn) in [
+            (None, Some("12025550111@s.whatsapp.net")),
+            (Some("100000001@lid"), None),
+            (Some("not a jid"), Some("12025550111@s.whatsapp.net")),
+            (
+                Some("12025550111@s.whatsapp.net"),
+                Some("12025550112@s.whatsapp.net"),
+            ),
+            (Some("100000001@lid"), Some("100000002@lid")),
+            (Some("100000001@lid"), Some("123-456@g.us")),
+            (Some("@lid"), Some("12025550111@s.whatsapp.net")),
+            (Some("100000001@lid"), Some("abc@s.whatsapp.net")),
+            (Some("100000001@lid"), Some("0@s.whatsapp.net")),
+            (Some("100000001:7@lid"), Some("12025550111@s.whatsapp.net")),
+            (Some("100000001@lid"), Some("12025550111:7@s.whatsapp.net")),
+            (Some("100000001@lid"), Some("12025550111.1@s.whatsapp.net")),
+        ] {
+            let mut mutation = pn_for_lid_mutation(lid, pn);
+            assert_eq!(
+                client
+                    .dispatch_app_state_mutation(
+                        &mut mutation,
+                        false,
+                        (WAPatchName::Regular, 8, 1, 1)
+                    )
+                    .await,
+                AppStateDispatchOutcome::Malformed("LidPnMappingStored")
+            );
+        }
+        let mut missing_action = pn_for_lid_mutation(Some("100000001@lid"), None);
+        missing_action.action_value = None;
+        assert_eq!(
+            client
+                .dispatch_app_state_mutation(
+                    &mut missing_action,
+                    false,
+                    (WAPatchName::Regular, 8, 1, 1)
+                )
+                .await,
+            AppStateDispatchOutcome::Malformed("LidPnMappingStored")
+        );
+        let mut mutation =
+            pn_for_lid_mutation(Some("100000001@lid"), Some("12025550111@s.whatsapp.net"));
+        mutation.operation = wa::syncd_mutation::SyncdOperation::Remove;
+        assert_eq!(
+            client
+                .dispatch_app_state_mutation(&mut mutation, false, (WAPatchName::Regular, 8, 1, 1))
+                .await,
+            AppStateDispatchOutcome::Unclaimed
+        );
+        assert!(
+            client
+                .get_lid_pn_entry(&Jid::lid("100000001"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn pn_for_lid_chat_page_reuses_the_observational_conflict_policy() {
+        use crate::lid_pn_cache::LearningSource;
+        let client = crate::test_utils::create_test_client().await;
+        client
+            .add_lid_pn_mapping("100000001", "12025550111", LearningSource::Usync)
+            .await
+            .unwrap();
+        let mutations = vec![
+            pn_for_lid_mutation(Some("100000001@lid"), Some("12025550112@s.whatsapp.net")),
+            pn_for_lid_mutation(Some("100000002@lid"), Some("12025550113@s.whatsapp.net")),
+            pn_for_lid_mutation(Some("100000002@lid"), Some("12025550113@s.whatsapp.net")),
+            pn_for_lid_mutation(Some("100000003@lid"), None),
+        ];
+        client
+            .dispatch_app_state_mutations(mutations, true, true, (WAPatchName::Regular, 8))
+            .await;
+        let known = client
+            .get_lid_pn_entry(&Jid::lid("100000001"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(known.phone_number.as_ref(), "12025550111");
+        let fresh = client
+            .get_lid_pn_entry(&Jid::lid("100000002"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.phone_number.as_ref(), "12025550113");
+        assert_eq!(fresh.learning_source, LearningSource::Other);
+        assert!(
+            client
+                .get_lid_pn_entry(&Jid::lid("100000003"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            client
+                .persistence_manager
+                .backend()
+                .get_lid_mapping("100000002")
+                .await
+                .unwrap()
+                .unwrap()
+                .phone_number,
+            "12025550113"
+        );
+    }
+
+    #[tokio::test]
+    async fn pn_for_lid_chat_learns_durable_public_mapping() {
+        let client = crate::test_utils::create_test_client().await;
+        let mut value = wa::SyncActionValue::default();
+        value.pn_for_lid_chat_action.get_or_insert_default().pn_jid =
+            Some("12025550111@s.whatsapp.net".into());
+        let mut mutation = crate::appstate_sync::Mutation {
+            index: vec!["pnForLidChat".into(), "100000001@lid".into()],
+            operation: wa::syncd_mutation::SyncdOperation::Set,
+            action_value: Some(value),
+        };
+        for full_sync in [true, false] {
+            assert_eq!(
+                client
+                    .dispatch_app_state_mutation(
+                        &mut mutation,
+                        full_sync,
+                        (WAPatchName::Regular, 8, 1, 1)
+                    )
+                    .await,
+                AppStateDispatchOutcome::Event("LidPnMappingStored")
+            );
+            let mapping = client
+                .get_lid_pn_entry(&"100000001@lid".parse().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(mapping.phone_number.as_ref(), "12025550111");
+            assert_eq!(
+                mapping.learning_source,
+                crate::lid_pn_cache::LearningSource::Other
+            );
+            client.lid_pn_cache.clear().await;
+            assert_eq!(
+                client
+                    .get_lid_pn_entry(&Jid::pn("12025550111"))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .lid
+                    .as_ref(),
+                "100000001"
+            );
+            assert_eq!(
+                client
+                    .persistence_manager
+                    .backend()
+                    .get_lid_mapping("100000001")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .phone_number,
+                "12025550111"
+            );
+        }
     }
 
     #[tokio::test]

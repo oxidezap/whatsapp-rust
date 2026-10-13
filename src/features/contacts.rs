@@ -77,6 +77,11 @@ fn user_info_lid_pair(entry: &UserInfo) -> (&Jid, Option<&Jid>) {
     (&entry.jid, entry.lid.as_ref())
 }
 
+fn user_info_reverse_lid_pair(entry: &UserInfo) -> Option<(&Jid, Option<&Jid>)> {
+    entry.jid.is_lid().then_some(())?;
+    entry.pn_jid.as_ref().map(|pn| (pn, Some(&entry.jid)))
+}
+
 pub struct Contacts<'a> {
     client: &'a Client,
 }
@@ -249,6 +254,8 @@ impl<'a> Contacts<'a> {
         let info = self.client.execute(spec).await?;
         self.persist_lid_mappings(info.values().map(user_info_lid_pair))
             .await;
+        self.persist_lid_mappings(info.values().filter_map(user_info_reverse_lid_pair))
+            .await;
         Ok(info)
     }
 
@@ -290,6 +297,84 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn business_pn_is_learned_through_public_contact_lookups() {
+        use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
+        use wacore_binary::builder::NodeBuilder;
+        for user_info in [false, true] {
+            let (client, transport) = create_iq_test_client().await;
+            let lid = Jid::lid("100000001");
+            let caller = client.clone();
+            let queried = lid.clone();
+            let task = tokio::spawn(async move {
+                if user_info {
+                    let info = caller
+                        .contacts()
+                        .get_user_info(&[queried.clone()])
+                        .await
+                        .unwrap();
+                    assert_eq!(info[&queried].pn_jid, Some(Jid::pn("12025550111")));
+                } else {
+                    let results = caller.contacts().is_on_whatsapp(&[queried]).await.unwrap();
+                    assert_eq!(results[0].pn_jid, Some(Jid::pn("12025550111")));
+                }
+            });
+            let sent = decode_sent_iq(&transport, 0).await;
+            let id = sent
+                .get()
+                .attrs()
+                .optional_string("id")
+                .unwrap()
+                .into_owned();
+            let response = NodeBuilder::new("iq")
+                .attr("type", "result")
+                .attr("id", &id)
+                .children([NodeBuilder::new("usync")
+                    .children([NodeBuilder::new("list")
+                        .children([NodeBuilder::new("user")
+                            .attr("jid", &lid)
+                            .children([NodeBuilder::new("business")
+                                .attr("pn_jid", "12025550111:7@s.whatsapp.net")
+                                .build()])
+                            .build()])
+                        .build()])
+                    .build()])
+                .build();
+            answer_iq(&client, &id, &response).await;
+            task.await.unwrap();
+            let by_lid = client.get_lid_pn_entry(&lid).await.unwrap().unwrap();
+            let by_pn = client
+                .get_lid_pn_entry(&Jid::pn("12025550111"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(by_lid.phone_number.as_ref(), "12025550111");
+            assert_eq!(by_pn.lid.as_ref(), "100000001");
+            assert_eq!(
+                by_lid.learning_source,
+                crate::lid_pn_cache::LearningSource::Usync
+            );
+            client.lid_pn_cache.clear().await;
+            assert_eq!(
+                client
+                    .get_lid_pn_entry(&lid)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .phone_number
+                    .as_ref(),
+                "12025550111"
+            );
+            let persisted = client
+                .persistence_manager
+                .backend()
+                .get_lid_mapping("100000001")
+                .await
+                .unwrap();
+            assert!(persisted.is_some());
+        }
+    }
 
     #[test]
     fn is_on_whatsapp_accepts_pn_and_lid_jids() {

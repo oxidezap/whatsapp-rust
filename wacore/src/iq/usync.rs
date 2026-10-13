@@ -155,7 +155,7 @@ fn usync_subprotocol_error_message(tag: &str, error: &UsyncSubprotocolError) -> 
 pub struct IsOnWhatsAppResult {
     pub jid: Jid,
     pub lid: Option<Jid>,
-    /// From `pn_jid` response attribute; present when server returns LID as primary JID.
+    /// PN disclosed on `<user>` or, for a LID result, on `<business>`.
     pub pn_jid: Option<Jid>,
     pub is_registered: bool,
     pub contact_error: Option<UsyncSubprotocolError>,
@@ -176,6 +176,8 @@ pub struct IsOnWhatsAppResult {
 #[non_exhaustive]
 pub struct UserInfo {
     pub jid: Jid,
+    /// PN disclosed on `<user>` or, for a LID result, on `<business>`.
+    pub pn_jid: Option<Jid>,
     pub lid: Option<Jid>,
     pub lid_error: Option<UsyncSubprotocolError>,
     pub status: Option<String>,
@@ -281,16 +283,49 @@ fn project_lid(user: &UsyncUserResult) -> (Option<Jid>, Option<UsyncSubprotocolE
 
 fn project_business(
     user: &UsyncUserResult,
-) -> (bool, Option<VerifiedName>, Option<UsyncSubprotocolError>) {
+) -> (
+    bool,
+    Option<VerifiedName>,
+    Option<UsyncSubprotocolError>,
+    Option<Jid>,
+) {
     match user.protocol(UsyncProtocolKind::Business) {
-        Some(UsyncProtocolResult::Business(UsyncOutcome::Value(business))) => {
-            (true, business.verified_name.clone(), None)
-        }
+        Some(UsyncProtocolResult::Business(UsyncOutcome::Value(business))) => (
+            true,
+            business.verified_name.clone(),
+            None,
+            business.pn_jid.clone(),
+        ),
         Some(UsyncProtocolResult::Business(UsyncOutcome::Error(error))) => {
-            (false, None, Some((**error).clone()))
+            (false, None, Some((**error).clone()), None)
         }
-        _ => (false, None, None),
+        _ => (false, None, None, None),
     }
+}
+
+// Only a LID-primary business answer discloses a reverse mapping. The user
+// attribute retains precedence; two conflicting disclosures are not aliases.
+fn project_pn(user: &UsyncUserResult, business_pn: Option<Jid>) -> Option<Jid> {
+    user.pn_jid
+        .clone()
+        .or_else(|| {
+            user.id
+                .as_ref()
+                .filter(|jid| {
+                    jid.is_lid()
+                        && !jid.user.is_empty()
+                        && jid.user.bytes().all(|b| b.is_ascii_digit())
+                })
+                .and(business_pn)
+        })
+        .filter(|pn| {
+            pn.user != "0"
+                && pn.is_pn()
+                && !pn.user.is_empty()
+                && pn.user.bytes().all(|byte| byte.is_ascii_digit())
+                && pn.agent == 0
+                && pn.integrator == 0
+        })
 }
 
 /// Username carried by a successful `<contact>` result, if any.
@@ -448,13 +483,14 @@ impl IqSpec for IsOnWhatsAppSpec {
                 _ => (jid.is_lid(), None),
             };
             let (lid, lid_error) = project_lid(&user);
-            let (is_business, verified_name, business_error) = project_business(&user);
+            let (is_business, verified_name, business_error, business_pn) = project_business(&user);
+            let pn_jid = project_pn(&user, business_pn);
             let (username, username_error) = project_username(&user);
 
             results.push(IsOnWhatsAppResult {
                 jid,
                 lid,
-                pn_jid: user.pn_jid,
+                pn_jid,
                 is_registered,
                 contact_error,
                 lid_error,
@@ -624,7 +660,7 @@ impl IqSpec for UsernameLookupSpec {
             .username
             .clone()
             .filter(|username| !username.is_empty());
-        let (is_business, verified_name, _) = project_business(&user);
+        let (is_business, verified_name, _, _) = project_business(&user);
         let pn_jid = match user.protocol(UsyncProtocolKind::Business) {
             Some(UsyncProtocolResult::Business(UsyncOutcome::Value(business))) => {
                 business.pn_jid.clone()
@@ -740,7 +776,8 @@ impl IqSpec for UserInfoSpec {
                 }
                 _ => (None, None),
             };
-            let (is_business, verified_name, business_error) = project_business(&user);
+            let (is_business, verified_name, business_error, business_pn) = project_business(&user);
+            let pn_jid = project_pn(&user, business_pn);
             let (username, username_error) = project_username(&user);
             let (devices, devices_error) = match user.protocol(UsyncProtocolKind::Devices) {
                 Some(UsyncProtocolResult::Devices(UsyncOutcome::Value(devices))) => (
@@ -761,6 +798,7 @@ impl IqSpec for UserInfoSpec {
                 jid.clone(),
                 UserInfo {
                     jid,
+                    pn_jid,
                     lid,
                     lid_error,
                     status,
@@ -2631,6 +2669,112 @@ mod tests {
             .to_string();
         assert!(error.contains("contact"), "{error}");
         assert!(error.contains("403"), "{error}");
+    }
+
+    #[test]
+    fn business_pn_projection_is_validated_and_scoped_to_the_returned_lid() {
+        let existence = IsOnWhatsAppSpec::new(vec![], "sid-1", IsOnWhatsAppQueryType::Lid);
+        let info = UserInfoSpec::new(vec![], "sid-1");
+        for (id, primary, business, expected) in [
+            (
+                "100000001@lid",
+                None,
+                Some("12025550111@s.whatsapp.net"),
+                Some("12025550111"),
+            ),
+            (
+                "100000001@lid",
+                None,
+                Some("12025550111:7@s.whatsapp.net"),
+                Some("12025550111"),
+            ),
+            ("100000001@lid", None, None, None),
+            ("100000001@lid", None, Some("not a jid"), None),
+            ("100000001@lid", None, Some("100000002@lid"), None),
+            ("100000001@lid", None, Some("123-456@g.us"), None),
+            ("100000001@lid", None, Some("@s.whatsapp.net"), None),
+            ("100000001@lid", None, Some("abc@s.whatsapp.net"), None),
+            ("100000001@lid", None, Some("0@s.whatsapp.net"), None),
+            (
+                "12025550111@s.whatsapp.net",
+                None,
+                Some("12025550112@s.whatsapp.net"),
+                None,
+            ),
+            (
+                "100000001@lid",
+                Some("12025550112@s.whatsapp.net"),
+                Some("12025550111@s.whatsapp.net"),
+                Some("12025550112"),
+            ),
+            (
+                "100000001@lid",
+                Some("100000002@lid"),
+                Some("12025550111@s.whatsapp.net"),
+                None,
+            ),
+        ] {
+            let mut business_node = NodeBuilder::new("business");
+            if let Some(pn) = business {
+                business_node = business_node.attr("pn_jid", pn);
+            }
+            let mut user = NodeBuilder::new("user").attr("jid", id);
+            if let Some(pn) = primary {
+                user = user.attr("pn_jid", pn);
+            }
+            let response = usync_result(vec![user.children([business_node.build()]).build()]);
+            let expected = expected.map(Jid::pn);
+            assert_eq!(
+                existence.parse_response(&response.as_node_ref()).unwrap()[0].pn_jid,
+                expected,
+                "existence id={id}, primary={primary:?}, business={business:?}"
+            );
+            let results = info.parse_response(&response.as_node_ref()).unwrap();
+            assert_eq!(
+                results.values().next().unwrap().pn_jid,
+                expected,
+                "info id={id}, primary={primary:?}, business={business:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_business_does_not_disclose_a_phone_number() {
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "100000001@lid")
+                .children([NodeBuilder::new("business")
+                    .attr("pn_jid", "12025550111@s.whatsapp.net")
+                    .children([NodeBuilder::new("error").attr("code", "403").build()])
+                    .build()])
+                .build(),
+        ]);
+        let spec = IsOnWhatsAppSpec::new(vec![], "sid-1", IsOnWhatsAppQueryType::Lid);
+        let results = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(results[0].pn_jid, None);
+        assert!(results[0].business_error.is_some());
+    }
+
+    #[test]
+    fn lid_existence_preserves_business_pn() {
+        let spec = IsOnWhatsAppSpec::new(
+            vec![IsOnWhatsAppUser {
+                jid: Jid::lid("100000001"),
+                known_lid: None,
+            }],
+            "sid-1",
+            IsOnWhatsAppQueryType::Lid,
+        );
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "100000001@lid")
+                .children([NodeBuilder::new("business")
+                    .attr("pn_jid", "12025550111:7@s.whatsapp.net")
+                    .build()])
+                .build(),
+        ]);
+        let results = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(results[0].pn_jid, Some(Jid::pn("12025550111")));
     }
 
     /// A `pn_jid` the server spelled wrong is one user's bonus field, not a
