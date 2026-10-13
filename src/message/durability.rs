@@ -88,8 +88,9 @@ impl Client {
         let Ok(index) = u32::try_from(entry.origin.position) else {
             return false;
         };
-        matches!(
-            self.dispatch_shared_message_with_carrier(
+        let origin = entry.origin;
+        let outcome = self
+            .dispatch_shared_message_with_carrier(
                 Arc::new(message),
                 &entry.info,
                 false,
@@ -97,12 +98,16 @@ impl Client {
                 Some((Some(index), entry.plaintext)),
                 (
                     Some(entry.origin),
-                    self.inbound_commit_batch.live_retention.receipt_for(info)
+                    self.inbound_commit_batch.live_retention.receipt_for(info),
                 ),
             )
-            .await,
-            InboundCommitState::Durable
-        )
+            .await;
+        matches!(outcome, InboundCommitState::Durable)
+            || matches!(outcome, InboundCommitState::Deferred(_))
+                && !self
+                    .inbound_commit_batch
+                    .live_retention
+                    .has_raw_origin(origin)
     }
 
     /// Redelivery path: when the server replays an already-decrypted message

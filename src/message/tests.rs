@@ -21134,6 +21134,200 @@ async fn raw_pending_capacity_refusal_preserves_ratchet_for_later_retry() {
 }
 
 #[tokio::test]
+async fn raw_pending_cancelled_bot_replay_preserves_live_and_drain_receipts() {
+    use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+    struct Hook {
+        fail: std::sync::atomic::AtomicBool,
+        delivered: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            items: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                !self.fail.load(Ordering::Acquire),
+                "injected bot hook failure"
+            );
+            self.delivered.lock().unwrap().extend(
+                items
+                    .iter()
+                    .map(|item| item.message.conversation.clone().unwrap()),
+            );
+            Ok(())
+        }
+    }
+    for drain in [true, false] {
+        for fail_hook in [false, true] {
+            let (client, transport) = capturing_client("cancelled_bot_replay").await;
+            if drain {
+                client.enter_drain_mode_for_tests();
+            }
+            let hook = Arc::new(Hook {
+                fail: std::sync::atomic::AtomicBool::new(fail_hook),
+                delivered: Default::default(),
+            });
+            client
+                .inbound_durability_hook
+                .set(hook.clone())
+                .ok()
+                .unwrap();
+            let (handler, events) = wacore::types::events::ChannelEventHandler::new();
+            client.core.event_bus.subscribe_handler(handler).detach();
+            let chat = "100000000000011@bot";
+            let target = "100000000000012@lid";
+            let outbound_id = "OUT_CANCELLED_BOT";
+            let id = "CANCELLED_BOT_REPLAY";
+            let secret = [0x71; 32];
+            client
+                .persistence_manager
+                .backend()
+                .put_msg_secret(chat, target, outbound_id, &secret)
+                .await
+                .unwrap();
+            let mut message = wa::Message::default();
+            message.conversation = Some("retained bot reply".into());
+            let plaintext = waproto::codec::message_to_vec(&message);
+            let context = BotMessageContext {
+                msg_id: id,
+                target_sender_user_jid: target,
+                bot_user_jid: chat,
+            };
+            let (ciphertext, iv) = encrypt_bot_message(&plaintext, &secret, &context).unwrap();
+            let encrypted = bytes::Bytes::from(encode_message_secret_message(&iv, &ciphertext));
+            let payload = || EncPayload {
+                ciphertext: encrypted.clone(),
+                enc_type: EncType::MessageSecret,
+                padding_version: 2,
+                enc_index: 0,
+                state: None,
+                session_type: None,
+            };
+            let mut info = create_test_message_info(chat, id, chat);
+            info.meta_info = Some(Box::new(wacore::types::message::MsgMetaInfo {
+                target_id: Some(outbound_id.into()),
+                target_sender: Some(target.parse().unwrap()),
+                ..Default::default()
+            }));
+            let info = Arc::new(info);
+            client
+                .inbound_commit_batch
+                .live_retention
+                .pause_stage
+                .store(true, Ordering::Release);
+            let receiver = client.clone();
+            let original = info.clone();
+            let sender = info.source.sender.clone();
+            let first_payload = payload();
+            let worker = tokio::spawn(async move {
+                process_group_classified_with_payloads(
+                    &receiver,
+                    original,
+                    &sender,
+                    vec![],
+                    vec![],
+                    vec![first_payload],
+                )
+                .await;
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client
+                    .inbound_commit_batch
+                    .live_retention
+                    .stage_ready
+                    .notified(),
+            )
+            .await
+            .unwrap();
+            worker.abort();
+            assert!(worker.await.unwrap_err().is_cancelled());
+            assert!(
+                client
+                    .inbound_commit_batch
+                    .live_retention
+                    .has_raw_for_message(&info)
+            );
+            if drain {
+                client.enter_drain_mode_for_tests();
+            }
+            client
+                .inbound_commit_batch
+                .live_retention
+                .release_stage_for_tests();
+            crate::test_utils::wait_for_outbound_tasks(&client).await;
+            assert_eq!(confirmations_for(&transport.sent(), id), 0);
+            for retry in 0..=usize::from(fail_hook) {
+                let arrival = Arc::new((*info).clone());
+                // Own the same receipt scope a receive caller holds while raw
+                // recovery transfers into queued storage, before fresh decrypt.
+                let producer = client
+                    .inbound_commit_batch
+                    .live_retention
+                    .begin_receipts(&arrival)
+                    .unwrap();
+                let progressed = client.ack_or_replay_to_hook(&arrival).await;
+                assert_eq!(
+                    progressed,
+                    drain || retry > 0 || !fail_hook,
+                    "an owned deferred projection is progress, not delivery"
+                );
+                crate::test_utils::wait_for_outbound_tasks(&client).await;
+                assert_eq!(
+                    confirmations_for(&transport.sent(), id),
+                    0,
+                    "replay cannot finish a receipt while its producer is open"
+                );
+                if client.inbound_commit_batch.is_active() {
+                    client
+                        .flush_inbound_commits_under_permit(false, None, None)
+                        .await;
+                }
+                if fail_hook && retry == 0 {
+                    drop(producer);
+                    crate::test_utils::wait_for_outbound_tasks(&client).await;
+                    assert_eq!(confirmations_for(&transport.sent(), id), 0);
+                    assert!(hook.delivered.lock().unwrap().is_empty());
+                    assert!(
+                        client
+                            .inbound_commit_batch
+                            .live_retention
+                            .has_owned_for_message(&info)
+                            || client
+                                .persistence_manager
+                                .backend()
+                                .get_pending_inbound(chat, chat, id)
+                                .await
+                                .unwrap()
+                                .is_some(),
+                        "failed hook delivery keeps resident or durable journal ownership"
+                    );
+                    hook.fail.store(false, Ordering::Release);
+                } else {
+                    assert!(
+                        producer.finish(),
+                        "completed bot replay requests its receipt"
+                    );
+                    client.ack_received_message_unscoped(producer.info());
+                }
+            }
+            assert_eq!(*hook.delivered.lock().unwrap(), ["retained bot reply"]);
+            assert_eq!(message_events_for_id(&events, id).0, 1);
+            assert!(
+                !client
+                    .inbound_commit_batch
+                    .live_retention
+                    .has_owned_for_message(&info)
+            );
+            assert_exactly_one_confirmation(&transport, id).await;
+            assert_eq!(delivery_receipts_for(&transport.sent(), id), 1);
+        }
+    }
+}
+
+#[tokio::test]
 async fn raw_pending_packed_image_growth_survives_live_and_drain_hook_errors() {
     struct Hook {
         fail: std::sync::atomic::AtomicBool,

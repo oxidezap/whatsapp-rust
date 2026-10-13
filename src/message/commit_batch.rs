@@ -59,14 +59,69 @@ impl PendingInboundBatch {
     }
 }
 
+#[derive(Default)]
+struct PendingEncodeArena {
+    bytes: std::sync::Mutex<Vec<u8>>,
+    release_requested: std::sync::atomic::AtomicBool,
+}
+impl PendingEncodeArena {
+    fn borrow(&self) -> PendingEncodeArenaGuard<'_> {
+        PendingEncodeArenaGuard {
+            arena: self,
+            guard: Some(
+                self.bytes
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()),
+            ),
+        }
+    }
+    fn try_buffer(&self) -> Option<std::sync::MutexGuard<'_, Vec<u8>>> {
+        match self.bytes.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poison)) => Some(poison.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+    #[inline(never)]
+    fn release_if_idle(&self) {
+        if self.release_requested.load(Ordering::Acquire)
+            && let Some(mut bytes) = self.try_buffer()
+        {
+            *bytes = Vec::new();
+        }
+    }
+}
+struct PendingEncodeArenaGuard<'a> {
+    arena: &'a PendingEncodeArena,
+    guard: Option<std::sync::MutexGuard<'a, Vec<u8>>>,
+}
+impl std::ops::Deref for PendingEncodeArenaGuard<'_> {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_deref().expect("encode arena guard is held")
+    }
+}
+impl std::ops::DerefMut for PendingEncodeArenaGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .as_deref_mut()
+            .expect("encode arena guard is held")
+    }
+}
+impl Drop for PendingEncodeArenaGuard<'_> {
+    fn drop(&mut self) {
+        // Unlock before observing the release request: either the transition
+        // clears an idle arena, or this last borrower completes its request.
+        drop(self.guard.take());
+        self.arena.release_if_idle();
+    }
+}
 pub(crate) struct PendingStorage {
-    arena: std::sync::Mutex<Vec<u8>>,
+    arena: Arc<PendingEncodeArena>,
 }
 impl PendingStorage {
-    fn arena(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
-        self.arena
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+    fn arena(&self) -> PendingEncodeArenaGuard<'_> {
+        self.arena.borrow()
     }
 }
 
@@ -107,11 +162,15 @@ pub(crate) struct InboundCommitBatcher {
     /// concurrent live-path hook calls that could previously overlap. Release
     /// this buffer when the drain finishes; live traffic cannot reuse it.
     pending_storage: Arc<async_lock::Mutex<PendingStorage>>,
+    // Scratch bytes have their own lock: a completed backend reply can leave
+    // its mutation lease alive briefly, after encoding has already finished.
+    encode_arena: Arc<PendingEncodeArena>,
     pub(super) live_retention: live_retention::LiveRetention,
 }
 
 impl Default for InboundCommitBatcher {
     fn default() -> Self {
+        let encode_arena = Arc::new(PendingEncodeArena::default());
         Self {
             state: std::sync::Mutex::new(BatchState::default()),
             #[cfg(test)]
@@ -120,8 +179,9 @@ impl Default for InboundCommitBatcher {
             pending_live: std::sync::atomic::AtomicBool::new(false),
             epoch: AtomicU64::new(0),
             pending_storage: Arc::new(async_lock::Mutex::new(PendingStorage {
-                arena: std::sync::Mutex::new(Vec::new()),
+                arena: Arc::clone(&encode_arena),
             })),
+            encode_arena,
             live_retention: Default::default(),
             #[cfg(test)]
             fail_commits: std::sync::atomic::AtomicBool::new(false),
@@ -135,6 +195,7 @@ impl InboundCommitBatcher {
     #[cfg(test)]
     pub(crate) fn storage_layout_delta() -> isize {
         (size_of::<Arc<async_lock::Mutex<PendingStorage>>>()
+            + size_of::<Arc<PendingEncodeArena>>()
             + size_of::<live_retention::LiveRetention>()) as isize
             - size_of::<async_lock::Mutex<Vec<u8>>>() as isize
     }
@@ -189,10 +250,9 @@ impl InboundCommitBatcher {
     ///   real work on the receive path to sharpen a report — so this reads
     ///   "waiting to be committed", not "resident". `has_entries` draws the
     ///   same line, for the same reason.
-    /// - **The reusable encode arena**, whose lock a drain commit holds across
-    ///   its backend write; a report must not queue behind one. Worth knowing
-    ///   that this hides real memory during the drain: the arena retains its
-    ///   capacity between batches, then releases it on the live transition.
+    /// - **The reusable encode arena.** Scratch capacity is reused between
+    ///   drain batches and released on the live transition; it is separate
+    ///   from the owned bytes and leases held by backend workers.
     pub(crate) fn pending_stats(&self) -> (usize, usize) {
         let state = self.lock();
         (state.entries.len(), state.bytes)
@@ -204,19 +264,18 @@ impl InboundCommitBatcher {
     fn deactivate(&self) {
         self.pending_live.store(false, Ordering::Release);
         self.active.store(false, Ordering::Release);
-        // Normal transitions hold the processing permit after the final
-        // commit, so no encoder owns this lock. A forced exit may race a
-        // stalled backend write: never block it or invalidate borrowed rows.
-        if let Some(storage) = self.pending_storage.try_lock() {
-            *storage.arena() = Vec::new();
-        }
+        // A backend reply may still own its mutation lease. Scratch uses an
+        // independent lock, and a forced exit defers clearing until an active
+        // encoder has copied its output and released the borrow.
+        self.encode_arena
+            .release_requested
+            .store(true, Ordering::Release);
+        self.encode_arena.release_if_idle();
     }
 
     #[cfg(feature = "bench-harness")]
     pub(crate) fn encode_arena_capacity(&self) -> Option<usize> {
-        self.pending_storage
-            .try_lock()
-            .map(|storage| storage.arena().capacity())
+        self.encode_arena.try_buffer().map(|arena| arena.capacity())
     }
 
     /// Record that the end-of-drain flush failed before its durable point;
@@ -252,6 +311,9 @@ impl InboundCommitBatcher {
     /// advances have no rows; flushing them later would make each redelivery
     /// an ackable duplicate).
     pub(crate) fn reset(&self) -> bool {
+        self.encode_arena
+            .release_requested
+            .store(false, Ordering::Release);
         let dropped = self.take().mark_dropped();
         if !dropped.is_empty() {
             log::debug!(
@@ -623,52 +685,15 @@ impl Client {
                 .map_or(PendingInboundRevision::missing(), |record| {
                     record.revision()
                 });
-            let mut journal = match record {
+            let journal = match record {
                 Some(record) => {
                     let (bytes, _read_lease) = record.into_bytes();
                     PendingJournal::decode(bytes)?
                 }
                 None => PendingJournal::default(),
             };
-            let mut covered = Vec::with_capacity(deliveries.len());
-            for delivery in deliveries {
-                let projection = if let Some(encoded) = self
-                    .inbound_commit_batch
-                    .live_retention
-                    .encoded_projection(delivery)
-                {
-                    encoded
-                } else if is_drain {
-                    let mut arena = owner.arena();
-                    arena.clear();
-                    waproto::codec::message_encode_into(&delivery.message, &mut arena);
-                    bytes::Bytes::copy_from_slice(&arena)
-                } else {
-                    bytes::Bytes::from(waproto::codec::message_to_vec(&delivery.message))
-                };
-                let (index, original) = match &delivery.carrier {
-                    Some((index, original)) => (*index, original.clone()),
-                    None => (None, projection.clone()),
-                };
-                let occurrence = Occurrence {
-                    producer: delivery.origin.map(|origin| origin.stanza),
-
-                    index,
-                    original,
-                    projection,
-                };
-                covered.push(occurrence.clone());
-                journal.merge(occurrence)?;
-            }
-            let complete = journal.occurrences.iter().all(|entry| {
-                covered.iter().any(|incoming| {
-                    incoming.producer == entry.producer
-                        && incoming.index == entry.index
-                        && incoming.original == entry.original
-                        && incoming.projection == entry.projection
-                })
-            });
-            let encoded = journal.encode()?;
+            let (encoded, complete) =
+                self.encode_pending_deliveries(journal, deliveries, is_drain, &owner)?;
             let payload = PendingInboundPayload::new(encoded, lease.clone());
             let revision = payload.revision();
             anyhow::ensure!(
@@ -687,6 +712,58 @@ impl Client {
             });
         }
         Ok(stored)
+    }
+
+    // Scratch journal/coverage vectors must finish before the detached backend
+    // mutation awaits. Keep their encoding and drop logic out of the commit poll.
+    #[inline(never)]
+    fn encode_pending_deliveries(
+        &self,
+        mut journal: PendingJournal,
+        deliveries: Vec<&PendingDelivery>,
+        is_drain: bool,
+        owner: &PendingStorage,
+    ) -> anyhow::Result<(bytes::Bytes, bool)> {
+        let mut covered = Vec::with_capacity(deliveries.len());
+        for delivery in deliveries {
+            let projection = if let Some(encoded) = self
+                .inbound_commit_batch
+                .live_retention
+                .encoded_projection(delivery)
+            {
+                encoded
+            } else if is_drain {
+                let mut arena = owner.arena();
+                arena.clear();
+                waproto::codec::message_encode_into(&delivery.message, &mut arena);
+                bytes::Bytes::copy_from_slice(&arena)
+            } else {
+                bytes::Bytes::from(waproto::codec::message_to_vec(&delivery.message))
+            };
+            let (index, original) = match &delivery.carrier {
+                Some((index, original)) => (*index, original.clone()),
+                None => (None, projection.clone()),
+            };
+            let occurrence = Occurrence {
+                producer: delivery.origin.map(|origin| origin.stanza),
+
+                index,
+                original,
+                projection,
+            };
+            covered.push(occurrence.clone());
+            journal.merge(occurrence)?;
+        }
+        let complete = journal.occurrences.iter().all(|entry| {
+            covered.iter().any(|incoming| {
+                incoming.producer == entry.producer
+                    && incoming.index == entry.index
+                    && incoming.original == entry.original
+                    && incoming.projection == entry.projection
+            })
+        });
+        let encoded = journal.encode()?;
+        Ok((encoded, complete))
     }
 
     async fn cleanup_pending_group(
@@ -975,27 +1052,11 @@ impl Client {
         track_commit: bool,
     ) -> InboundCommitState {
         let durable = self.inbound_durability_hook.get().is_some();
-        if durable && item.receipt.is_none() {
-            item.receipt = self
-                .inbound_commit_batch
-                .live_retention
-                .receipt_for(&item.info);
-        }
-        if durable && item.retention.is_none() {
-            item.retention = self
-                .inbound_commit_batch
-                .live_retention
-                .charge_for_origin(item.origin)
-                .or_else(|| item.receipt.as_ref().and_then(|scope| scope.admission()));
-        }
         if durable
-            && (!self.inbound_commit_batch.is_active()
-                || self
-                    .inbound_commit_batch
-                    .live_retention
-                    .charge_for_origin(item.origin)
-                    .is_some())
-            && let Err(error) = self.inbound_commit_batch.live_retention.retain(&mut item)
+            && let Err(error) = self
+                .inbound_commit_batch
+                .live_retention
+                .prepare_delivery(&mut item, self.inbound_commit_batch.is_active())
         {
             log::warn!("Retention admission refused: {error:?}");
             return InboundCommitState::Failed;
@@ -1042,14 +1103,6 @@ impl Client {
             } else {
                 InboundCommitState::Failed
             };
-        }
-        // Drain arrivals and replay keep their admission alive in queued
-        // storage, including after a raw slot retires.
-        if durable && item.retention.is_none() {
-            item.retention = self
-                .inbound_commit_batch
-                .live_retention
-                .charge_for_origin(item.origin);
         }
         let (timer_epoch, ticket) = self.enqueue_inbound_commit(item, track_commit);
         if let Some(epoch) = timer_epoch {
@@ -2949,6 +3002,12 @@ mod tests {
         batcher.force_live_dropping_entries();
         assert!(!batcher.is_active());
         assert_eq!(&*arena, b"pending durable row");
+        drop(arena);
+        assert_eq!(
+            storage.arena().capacity(),
+            0,
+            "the last encoder clears scratch even while its mutation owner lives"
+        );
     }
 
     // During the drain, messages accumulate and one flush commits them all in

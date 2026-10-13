@@ -576,7 +576,7 @@ impl Client {
                 .inbound_commit_batch
                 .live_retention
                 .has_owned_for_message(&info)
-            && !self.flush_inbound_commits_while_processing().await
+            && !Box::pin(self.flush_inbound_commits_while_processing()).await
         {
             return;
         }
@@ -606,7 +606,7 @@ impl Client {
             }
             if self.inbound_commit_batch.is_active()
                 && self.inbound_commit_batch.has_entries()
-                && !self.flush_inbound_commits_while_processing().await
+                && !Box::pin(self.flush_inbound_commits_while_processing()).await
             {
                 return;
             }
@@ -639,7 +639,7 @@ impl Client {
             if admission.is_err()
                 && self.inbound_commit_batch.is_active()
                 && self.inbound_commit_batch.has_entries()
-                && self.flush_inbound_commits_while_processing().await
+                && Box::pin(self.flush_inbound_commits_while_processing()).await
             {
                 admission = self.inbound_commit_batch.live_retention.reserve_with_info(
                     stanza_origin,
@@ -701,15 +701,16 @@ impl Client {
         let session_payloads_empty = session_payloads.is_empty();
 
         let session_outcome = if !is_group_sender && !session_payloads_empty {
-            self.clone()
-                .process_session_enc_batch_with_origin(
-                    session_payloads,
-                    &info,
-                    &sender_encryption_jid,
-                    decrypt_fail_mode,
-                    stanza_origin,
-                )
-                .await
+            // Active decrypt work gets a transient frame; idle lanes do not
+            // reserve its crypto/recovery state for their whole lifetime.
+            Box::pin(self.clone().process_session_enc_batch_with_origin(
+                session_payloads,
+                &info,
+                &sender_encryption_jid,
+                decrypt_fail_mode,
+                stanza_origin,
+            ))
+            .await
         } else {
             if is_group_sender && !session_payloads_empty {
                 log::debug!(
@@ -975,29 +976,28 @@ impl Client {
                 state,
                 session_type,
             } = payload;
-            let annotations = EncNodeAnnotations {
-                state: state.as_deref(),
-                session_type: session_type.as_deref(),
-            };
-            let enc_type_str = enc_type.as_wire_str();
+            let is_prekey = enc_type == EncType::PreKeyMessage;
+            let enc_type = enc_type.as_wire_str();
             #[cfg(feature = "tracing")]
             let ciphertext_len = ciphertext.len();
 
-            if enc_type == EncType::PreKeyMessage {
+            if is_prekey {
                 // Capture before parsing moves the wire buffer into the owned
                 // decrypt path; this feature exists to reproduce BadMac reports.
                 #[cfg(feature = "debug-snapshots")]
                 {
                     use base64::prelude::*;
-                    let payload = serde_json::json!({
-                        "id": info.id,
-                        "sender_jid": sender_encryption_jid.to_string(),
-                        "timestamp": info.timestamp,
-                        "enc_type": enc_type_str,
-                        "payload_base64": BASE64_STANDARD.encode(ciphertext.as_ref()),
-                    });
+                    let content_bytes = {
+                        let payload = serde_json::json!({
+                            "id": info.id,
+                            "sender_jid": sender_encryption_jid.to_string(),
+                            "timestamp": info.timestamp,
+                            "enc_type": enc_type,
+                            "payload_base64": BASE64_STANDARD.encode(ciphertext.as_ref()),
+                        });
 
-                    let content_bytes = serde_json::to_vec_pretty(&payload).unwrap_or_default();
+                        serde_json::to_vec_pretty(&payload).unwrap_or_default()
+                    };
 
                     if let Err(e) = self
                         .persistence_manager
@@ -1018,10 +1018,10 @@ impl Client {
                 let _parse_span = tracing::trace_span!(
                     "wa.recv.session_parse",
                     ciphertext_bytes = ciphertext_len as u64,
-                    enc_type = enc_type_str
+                    enc_type = enc_type
                 )
                 .entered();
-                if enc_type == EncType::PreKeyMessage {
+                if is_prekey {
                     PreKeySignalMessage::try_from(ciphertext)
                         .map(CiphertextMessage::PreKeySignalMessage)
                         .map(OwnedCiphertextMessage::from)
@@ -1036,7 +1036,7 @@ impl Client {
                 Ok(message) => message,
                 Err(e) => {
                     log::error!(
-                        "[msg:{}] Failed to parse {enc_type_str} Signal envelope from {}: {e:?}. Sending nack.",
+                        "[msg:{}] Failed to parse {enc_type} Signal envelope from {}: {e:?}. Sending nack.",
                         info.id,
                         info.source.sender.observe()
                     );
@@ -1046,7 +1046,7 @@ impl Client {
                     self.report_enc_decrypt_failure(
                         info,
                         enc_index,
-                        enc_type_str,
+                        enc_type,
                         EncDecryptFailureReason::MalformedCiphertext,
                     );
                     outcome.undecryptable |= self
@@ -1062,25 +1062,25 @@ impl Client {
                 }
             };
 
-            // Shadow with wire string for all downstream usage (logging, handlers)
-            let enc_type = enc_type_str;
-
-            let decrypt_res = decrypt_session_message(
-                &mut parsed_message,
-                &signal_address,
-                &mut adapter,
-                &mut rng,
-            );
-            #[cfg(feature = "tracing")]
-            let decrypt_res = tracing::Instrument::instrument(
-                decrypt_res,
-                tracing::trace_span!(
-                    "wa.recv.session_crypto",
-                    ciphertext_bytes = ciphertext_len as u64,
-                    enc_type = enc_type_str
-                ),
-            );
-            let decrypt_res = decrypt_res.await;
+            let decrypt_res = {
+                let decrypt_res = decrypt_session_message(
+                    &mut parsed_message,
+                    &signal_address,
+                    &mut adapter,
+                    &mut rng,
+                );
+                #[cfg(feature = "tracing")]
+                let decrypt_res = tracing::Instrument::instrument(
+                    decrypt_res,
+                    tracing::trace_span!(
+                        "wa.recv.session_crypto",
+                        ciphertext_bytes = ciphertext_len as u64,
+                        enc_type = enc_type
+                    ),
+                );
+                decrypt_res
+            }
+            .await;
 
             match decrypt_res {
                 Ok(decrypted) => {
@@ -1285,7 +1285,10 @@ impl Client {
                                             enc_type,
                                             padding_version,
                                             enc_index,
-                                            annotations,
+                                            EncNodeAnnotations {
+                                                state: state.as_deref(),
+                                                session_type: session_type.as_deref(),
+                                            },
                                             info,
                                             &session_mutex,
                                             &mut session_guard,
@@ -1404,7 +1407,10 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 enc_index,
-                                annotations,
+                                EncNodeAnnotations {
+                                    state: state.as_deref(),
+                                    session_type: session_type.as_deref(),
+                                },
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
@@ -1460,7 +1466,10 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 enc_index,
-                                annotations,
+                                EncNodeAnnotations {
+                                    state: state.as_deref(),
+                                    session_type: session_type.as_deref(),
+                                },
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
@@ -1534,7 +1543,10 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 enc_index,
-                                annotations,
+                                EncNodeAnnotations {
+                                    state: state.as_deref(),
+                                    session_type: session_type.as_deref(),
+                                },
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
@@ -2073,7 +2085,8 @@ impl Client {
             padding_version,
         )
         .inspect_err(|_| self.finish_retained_raw(origin))?;
-        let source = padded_plaintext.slice(..unpadded_len);
+        let mut source = padded_plaintext;
+        source.truncate(unpadded_len);
 
         // Emitted before decoding, so a payload this build cannot decode still
         // reaches a consumer that wants it. Nothing is cloned while no lease is

@@ -32,22 +32,24 @@ pub fn run(root: &Path, slow: bool) -> Result<()> {
             check: true,
         },
     )?;
-    for filter in ["voip::", "iq::"] {
-        xtask_support::run(
-            std::process::Command::new(&cargo)
-                .args([
-                    "test",
-                    "--locked",
-                    "-p",
-                    "wacore",
-                    "--features",
-                    "voip-mlow",
-                    "--lib",
-                    filter,
-                ])
-                .current_dir(root),
-        )?;
-    }
+    // One libtest invocation selects the same union of gates without a
+    // second Cargo/build-script pass over the large generated dependencies.
+    xtask_support::run(
+        std::process::Command::new(&cargo)
+            .args([
+                "test",
+                "--locked",
+                "-p",
+                "wacore",
+                "--features",
+                "voip-mlow",
+                "--lib",
+                "--",
+                "voip::",
+                "iq::",
+            ])
+            .current_dir(root),
+    )?;
     if slow {
         for target in ["signaling", "video_offer"] {
             xtask_support::run(

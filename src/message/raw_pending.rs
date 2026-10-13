@@ -242,6 +242,7 @@ impl PendingJournal {
         Ok(())
     }
 
+    #[inline(never)]
     pub fn merge(&mut self, occurrence: Occurrence) -> anyhow::Result<()> {
         // Slot identity is local to a producer group. An independent retry can
         // reuse its index while retaining a different SKDM carrier verbatim.
@@ -316,6 +317,7 @@ impl PendingJournal {
             .is_some_and(|size| size <= MAX_PENDING_BYTES)
     }
 
+    #[inline(never)]
     fn matches_backing(&self, bytes: &Bytes) -> anyhow::Result<bool> {
         let mut cursor = Cursor {
             bytes: bytes.clone(),
@@ -350,6 +352,7 @@ impl PendingJournal {
         Ok(cursor.remaining() == 0)
     }
 
+    #[inline(never)]
     pub fn encode(&self) -> anyhow::Result<Bytes> {
         self.validate()?;
         // A retry of the same physical occurrences needs the existing bytes,

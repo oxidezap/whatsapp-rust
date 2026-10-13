@@ -57,7 +57,6 @@ struct Reservation {
     raw: Vec<RawRetained>,
 }
 
-#[derive(Clone)]
 struct RetainedDelivery {
     info: Arc<MessageInfo>,
     projection: bytes::Bytes,
@@ -72,7 +71,28 @@ struct RetainedDelivery {
     consumer_claimed: bool,
 }
 
+impl Clone for RetainedDelivery {
+    // Share the resident ownership copy across replay iterator transitions.
+    #[inline(never)]
+    fn clone(&self) -> Self {
+        Self {
+            info: Arc::clone(&self.info),
+            projection: self.projection.clone(),
+            message: self.message.clone(),
+            ephemeral_expiration: self.ephemeral_expiration,
+            comment_target: self.comment_target.clone(),
+            carrier: self.carrier.clone(),
+            origin: self.origin,
+            retention: Arc::clone(&self.retention),
+            receipt: self.receipt.clone(),
+            storage_sender: self.storage_sender.clone(),
+            consumer_claimed: self.consumer_claimed,
+        }
+    }
+}
+
 impl RetainedDelivery {
+    #[inline(never)]
     fn new(item: &PendingDelivery, charge: &Arc<Charge>) -> Self {
         let encoded = waproto::codec::message_to_vec(&item.message);
         let projection = match &item.carrier {
@@ -148,7 +168,6 @@ pub(super) struct RawRetained {
 pub(super) struct Admission {
     state: Arc<Mutex<State>>,
     origin: StanzaOrigin,
-    _charge: Arc<Charge>,
 }
 #[inline(never)]
 fn lock<T>(state: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -176,7 +195,15 @@ impl Drop for Admission {
 }
 impl Admission {
     pub fn attach_receipts(&self, producer: &ReceiptProducer) {
-        lock(&producer.0.state).charge = Arc::downgrade(&self._charge);
+        // A receiving reservation cannot retire before this guard drops.
+        // It owns the charge; the guard needs no second strong reference.
+        let charge = lock(&self.state)
+            .reservations
+            .iter()
+            .find(|reservation| reservation.origin == self.origin)
+            .map(|reservation| Arc::downgrade(&reservation.charge))
+            .expect("active admission owns its reservation");
+        lock(&producer.0.state).charge = charge;
     }
 }
 
@@ -357,7 +384,7 @@ impl LiveRetention {
         let mut state = lock(&self.state);
         state.reservations.push(Reservation {
             origin,
-            charge: Arc::clone(&charge),
+            charge,
             receiving: true,
             entries: Vec::new(),
             raw: Vec::new(),
@@ -365,7 +392,6 @@ impl LiveRetention {
         Ok(Admission {
             state: Arc::clone(&self.state),
             origin,
-            _charge: charge,
         })
     }
     fn charge(&self, bytes: usize) -> anyhow::Result<Arc<Charge>> {
@@ -385,6 +411,29 @@ impl LiveRetention {
             bytes,
         }))
     }
+    // Capture the producer reservation once, before receipt fallback can attach
+    // the current arrival's charge to a replay from a different producer.
+    #[inline(never)]
+    pub fn prepare_delivery(
+        &self,
+        item: &mut PendingDelivery,
+        draining: bool,
+    ) -> anyhow::Result<()> {
+        if item.receipt.is_none() {
+            item.receipt = self.receipt_for(&item.info);
+        }
+        let origin_charge = self.charge_for_origin(item.origin);
+        let admitted_origin = origin_charge.is_some();
+        if item.retention.is_none() {
+            item.retention =
+                origin_charge.or_else(|| item.receipt.as_ref().and_then(|scope| scope.admission()));
+        }
+        if !draining || admitted_origin {
+            self.retain(item)?;
+        }
+        Ok(())
+    }
+
     pub fn retain(&self, item: &mut PendingDelivery) -> anyhow::Result<()> {
         let retained_bytes = item
             .retained_wire_bytes()
@@ -1000,6 +1049,9 @@ mod tests {
     fn raw_pending_cancelled_empty_admission_returns_capacity() {
         let retention = LiveRetention::default();
         let admission = retention.reserve(StanzaOrigin::new(), 1024, 1).unwrap();
+        // A completed cleanup sweep cannot retire an empty receiving producer.
+        retention.stored(&[]);
+        assert_eq!(lock(&retention.state).reservations.len(), 1);
         assert_eq!(lock(&retention.budget).admissions, 1);
         drop(admission);
         assert!(lock(&retention.state).reservations.is_empty());

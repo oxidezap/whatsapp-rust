@@ -804,6 +804,11 @@ impl Client {
         // `Bytes::from` takes the buffer over rather than copying it.
         let plaintext = bytes::Bytes::from(plaintext);
         self.stage_retained_plaintext(info, producer, (enc_index, "msmsg", 3), &plaintext);
+        #[cfg(test)]
+        self.inbound_commit_batch
+            .live_retention
+            .pause_after_stage()
+            .await;
         if self.decrypted_payload_forwarding_enabled() {
             self.core.event_bus.dispatch(Event::DecryptedPayload(
                 wacore::types::events::DecryptedPayload::builder()
