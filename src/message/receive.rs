@@ -2209,8 +2209,11 @@ impl Client {
             // The probe may have already materialized a secret envelope while
             // fingerprinting; hand it to dispatch instead of resolving the
             // parent secret a second time.
-            let pre_decrypted = match self.probe_message_dispatch(info, &msg).await {
-                ProbeOutcome::Suppress => {
+            let pre_decrypted = match self
+                .probe_message_dispatch(info, &msg, Some(DispatchKey::new(stanza_origin)))
+                .await
+            {
+                ProbeOutcome::Suppress { decrypted } => {
                     // The event is a duplicate; the message secret it carries may not
                     // be. Capture is write-behind and can drop an entry when its
                     // backend is down, and this branch skips `dispatch_parsed_message`,
@@ -2235,7 +2238,7 @@ impl Client {
                                 .commit_or_batch_pending(
                                     raw_pending::PendingDelivery {
                                         item: wacore::types::events::InboundMessage::builder()
-                                            .message(Arc::new(msg))
+                                            .message(decrypted.unwrap_or_else(|| Arc::new(msg)))
                                             .info(Arc::clone(info))
                                             .build(),
                                         carrier,

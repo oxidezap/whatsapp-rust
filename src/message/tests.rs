@@ -11271,6 +11271,194 @@ async fn secret_encrypted_resend_resolves_parent_secret_once() {
 }
 
 #[tokio::test]
+async fn raw_pending_live_equal_parts_survive_prefix_cleanup_and_later_hook_failure() {
+    use crate::InboundDurabilityHook;
+    use std::sync::atomic::AtomicUsize;
+    use wacore::messages::MessageUtils;
+    use wacore::store::in_memory::InMemoryBackend;
+    use wacore::store::traits::ProtocolStore;
+    struct Hook {
+        calls: AtomicUsize,
+        fail_second: bool,
+    }
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 1 && self.fail_second {
+                return Err(anyhow::anyhow!("injected second-part hook failure"));
+            }
+            Ok(())
+        }
+    }
+    for cleanup_failure in [false, true] {
+        for hook_failure in [false, true] {
+            let backend = Arc::new(InMemoryBackend::new());
+            let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+            client.enter_live_mode_for_tests();
+            client
+                .inbound_durability_hook
+                .set(Arc::new(Hook {
+                    calls: AtomicUsize::new(0),
+                    fail_second: hook_failure,
+                }))
+                .ok()
+                .unwrap();
+            let (handler, rx) = wacore::types::events::ChannelEventHandler::new();
+            client.core.event_bus.subscribe_handler(handler).detach();
+            let info = Arc::new(create_test_message_info(
+                "100@g.us",
+                "LIVE_EQUAL_PARTS",
+                "200@s.whatsapp.net",
+            ));
+            let mut message = wa::Message::default();
+            message.conversation = Some("equal genuine parts".into());
+            let producer = raw_pending::StanzaOrigin::new();
+            let _admission = client
+                .inbound_commit_batch
+                .live_retention
+                .reserve(producer, 1024, 2)
+                .unwrap();
+            if cleanup_failure {
+                backend.fail_one_pending_delete(0, false);
+            }
+            for index in 0..2 {
+                client
+                    .handle_decrypted_plaintext_in_scope(
+                        "msg",
+                        MessageUtils::encode_and_pad(&message),
+                        2,
+                        receive::PlaintextSlot {
+                            index,
+                            annotations: Default::default(),
+                            producer,
+                        },
+                        &info,
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                message_events_for_id(&rx, "LIVE_EQUAL_PARTS").0,
+                if hook_failure { 1 } else { 2 },
+                "completed claims must not suppress a fresh sibling slot"
+            );
+            if hook_failure {
+                let redelivery = Arc::new((*info).clone());
+                assert!(client.ack_or_replay_to_hook(&redelivery).await);
+                assert_eq!(
+                    message_events_for_id(&rx, "LIVE_EQUAL_PARTS").0,
+                    1,
+                    "recovery must publish only the still-unpublished equal part"
+                );
+            }
+            assert!(
+                backend
+                    .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "LIVE_EQUAL_PARTS")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(rx.try_recv().is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn claimed_secret_resend_retains_resolved_projection_after_cleanup_failure() {
+    use crate::InboundDurabilityHook;
+    use wacore::messages::MessageUtils;
+    use wacore::store::in_memory::InMemoryBackend;
+    use wacore::store::traits::{MsgSecretStore, ProtocolStore};
+    struct Hook(std::sync::Mutex<Vec<Arc<wa::Message>>>);
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            batch: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .extend(batch.iter().map(|m| m.message.clone()));
+            Ok(())
+        }
+    }
+    let backend = Arc::new(InMemoryBackend::new());
+    let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+    seed_test_pn(&client).await;
+    client.enter_live_mode_for_tests();
+    let hook = Arc::new(Hook(std::sync::Mutex::new(Vec::new())));
+    client
+        .inbound_durability_hook
+        .set(hook.clone())
+        .ok()
+        .unwrap();
+    let (handler, rx) = wacore::types::events::ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+    let chat = "5511777776666@s.whatsapp.net";
+    let secret = [0x42; 32];
+    backend
+        .put_msg_secret(chat, chat, "SECRET_PARENT", &secret)
+        .await
+        .unwrap();
+    let info = Arc::new(create_test_message_info(chat, "SECRET_RETRY", chat));
+    let mut target = wa::MessageKey::default();
+    target.remote_jid = Some(chat.into());
+    target.from_me = Some(false);
+    target.id = Some("SECRET_PARENT".into());
+    let msg = encrypted_message_edit(
+        target,
+        chat,
+        chat,
+        "SECRET_PARENT",
+        &secret,
+        "resolved edit",
+        None,
+    );
+    backend.set_fail_pending_delete(Some(false));
+    for _ in 0..2 {
+        let outcome = client
+            .handle_decrypted_plaintext(
+                "msg",
+                MessageUtils::encode_and_pad(&msg),
+                2,
+                0,
+                Default::default(),
+                &info,
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.delivered);
+    }
+    let bytes = backend
+        .get_pending_inbound(chat, chat, "SECRET_RETRY")
+        .await
+        .unwrap()
+        .unwrap();
+    let journal = raw_pending::PendingJournal::decode(bytes.into()).unwrap();
+    for occurrence in journal.occurrences {
+        let projection = waproto::codec::message_decode(&occurrence.projection).unwrap();
+        assert!(projection.secret_encrypted_message.is_unset());
+        assert_eq!(legacy_edit_text(&projection), Some("resolved edit"));
+    }
+    assert_eq!(message_events_for_id(&rx, "SECRET_RETRY").0, 1);
+    backend.set_fail_pending_delete(None);
+    client.cleanup_connection_state().await;
+    client.enter_live_mode_for_tests();
+    assert!(client.ack_or_replay_to_hook(&info).await);
+    assert_eq!(message_events_for_id(&rx, "SECRET_RETRY").0, 0);
+    for projection in hook.0.lock().unwrap().iter() {
+        assert!(projection.secret_encrypted_message.is_unset());
+        assert_eq!(legacy_edit_text(projection), Some("resolved edit"));
+    }
+}
+
+#[tokio::test]
 async fn decrypted_message_edit_recaptures_secret_for_next_edit() {
     let (client, _transport) = capturing_client("secret_edit_chain").await;
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
@@ -16476,11 +16664,11 @@ mod pdo_alias_tests {
         let fingerprint = [0xA5; size_of::<DispatchFingerprint>()];
         let mut claim = DispatchClaim::default();
         let mut interrupted = PublicationGuard::default();
-        assert!(!claim.admit(fingerprint, true, false, &mut interrupted));
+        assert!(!claim.admit(fingerprint, true, false, None, &mut interrupted));
         drop(interrupted);
         let mut live = PublicationGuard::default();
         assert!(
-            !claim.admit(fingerprint, true, false, &mut live),
+            !claim.admit(fingerprint, true, false, None, &mut live),
             "an interrupted PDO admission must not suppress redelivery"
         );
         live.complete();
@@ -16491,11 +16679,11 @@ mod pdo_alias_tests {
 
         let mut claim = DispatchClaim::default();
         let mut interrupted = PublicationGuard::default();
-        assert!(!claim.admit(fingerprint, true, false, &mut interrupted));
+        assert!(!claim.admit(fingerprint, true, false, None, &mut interrupted));
         drop(interrupted);
         let mut live = PublicationGuard::default();
         assert!(
-            !claim.admit(fingerprint, false, false, &mut live),
+            !claim.admit(fingerprint, false, false, None, &mut live),
             "an interrupted recovery must not suppress the ordinary retry"
         );
         live.complete();
@@ -16548,37 +16736,37 @@ mod pdo_alias_tests {
         let fingerprint = [0x3C; size_of::<DispatchFingerprint>()];
         let mut claim = DispatchClaim::default();
         let mut first = PublicationGuard::default();
-        assert!(!claim.admit(fingerprint, true, false, &mut first));
+        assert!(!claim.admit(fingerprint, true, false, None, &mut first));
         let mut concurrent = PublicationGuard::default();
         assert!(
-            claim.admit(fingerprint, true, false, &mut concurrent),
+            claim.admit(fingerprint, true, false, None, &mut concurrent),
             "a live recovery suppresses the concurrent redelivery"
         );
         drop(first);
         let mut after_rollback = PublicationGuard::default();
         assert!(
-            !claim.admit(fingerprint, true, false, &mut after_rollback),
+            !claim.admit(fingerprint, true, false, None, &mut after_rollback),
             "a rolled-back recovery must not suppress the next redelivery"
         );
         after_rollback.complete();
         let mut late = PublicationGuard::default();
         assert!(
-            claim.admit(fingerprint, true, false, &mut late),
+            claim.admit(fingerprint, true, false, None, &mut late),
             "a completed recovery suppresses the late redelivery"
         );
 
         let mut claim = DispatchClaim::default();
         let mut recovery = PublicationGuard::default();
-        assert!(!claim.admit(fingerprint, true, false, &mut recovery));
+        assert!(!claim.admit(fingerprint, true, false, None, &mut recovery));
         let mut retry = PublicationGuard::default();
         assert!(
-            claim.admit(fingerprint, false, false, &mut retry),
+            claim.admit(fingerprint, false, false, None, &mut retry),
             "a live recovery suppresses the concurrent retry"
         );
         drop(recovery);
         let mut after_rollback = PublicationGuard::default();
         assert!(
-            !claim.admit(fingerprint, false, false, &mut after_rollback),
+            !claim.admit(fingerprint, false, false, None, &mut after_rollback),
             "a rolled-back recovery must not suppress the next retry"
         );
     }

@@ -206,6 +206,23 @@ impl LiveRetention {
     }
     pub fn retain(&self, item: &mut PendingDelivery) -> anyhow::Result<()> {
         let mut state = lock(&self.state);
+        // Legacy replay has no producer origin. Reuse its existing charge
+        // instead of adding another reservation on each failed alias retry.
+        if let Some(reservation) = state.reservations.iter().find(|reservation| {
+            reservation
+                .entries
+                .iter()
+                .any(|entry| same_entry(entry, item))
+        }) {
+            anyhow::ensure!(
+                item.retention
+                    .as_ref()
+                    .is_none_or(|charge| Arc::ptr_eq(charge, &reservation.charge)),
+                "live delivery has a different reservation owner"
+            );
+            item.retention = Some(Arc::clone(&reservation.charge));
+            return Ok(());
+        }
         let index = item.origin.and_then(|origin| {
             state
                 .reservations
@@ -367,6 +384,16 @@ impl LiveRetention {
             .map(|reservation| Arc::clone(&reservation.charge))
     }
 
+    pub fn published(&self, items: &[PendingDelivery]) {
+        for reservation in &mut lock(&self.state).reservations {
+            for entry in &mut reservation.entries {
+                if items.iter().any(|item| same_entry(entry, item)) {
+                    entry.consumer_claimed = true;
+                }
+            }
+        }
+    }
+
     pub fn stored(&self, items: &[PendingDelivery]) {
         let mut state = lock(&self.state);
         for index in (0..state.reservations.len()).rev() {
@@ -400,13 +427,63 @@ fn same_message(first: &MessageInfo, second: &MessageInfo) -> bool {
 fn same_entry(first: &PendingDelivery, second: &PendingDelivery) -> bool {
     first.origin == second.origin
         && first.storage_sender == second.storage_sender
-        && same_message(&first.info, &second.info)
+        && Arc::ptr_eq(&first.info, &second.info)
         && Arc::ptr_eq(&first.message, &second.message)
+        && match (&first.carrier, &second.carrier) {
+            (None, None) => true,
+            (Some((first_index, first_bytes)), Some((second_index, second_bytes))) => {
+                first_index == second_index
+                    && (first_bytes.len() == second_bytes.len()
+                        && first_bytes.as_ptr() == second_bytes.as_ptr()
+                        || first_bytes == second_bytes)
+            }
+            _ => false,
+        }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_pending_legacy_alias_retry_reuses_its_reservation() {
+        let retention = LiveRetention::default();
+        let mut item = PendingDelivery::from(
+            wacore::types::events::InboundMessage::builder()
+                .info(Arc::new(MessageInfo::default()))
+                .message(Arc::new(waproto::whatsapp::Message::default()))
+                .build(),
+        );
+        for _ in 0..500 {
+            retention.retain(&mut item).unwrap();
+        }
+        assert_eq!(lock(&retention.state).reservations.len(), 1);
+        assert_eq!(lock(&retention.budget).admissions, 1);
+        retention.stored(std::slice::from_ref(&item));
+        assert!(lock(&retention.state).reservations.is_empty());
+    }
+
+    #[test]
+    fn raw_pending_legacy_shared_projection_keeps_distinct_carriers() {
+        let retention = LiveRetention::default();
+        let mut first = PendingDelivery::from(
+            wacore::types::events::InboundMessage::builder()
+                .info(Arc::new(MessageInfo::default()))
+                .message(Arc::new(waproto::whatsapp::Message::default()))
+                .build(),
+        );
+        first.carrier = Some((None, bytes::Bytes::from_static(b"first")));
+        let mut second = first.clone();
+        second.carrier = Some((None, bytes::Bytes::from_static(b"second")));
+        retention.retain(&mut first).unwrap();
+        retention.retain(&mut second).unwrap();
+        retention.stored(std::slice::from_ref(&first));
+        assert_eq!(retention.for_message(&second.info).len(), 1);
+        assert_eq!(
+            retention.for_message(&second.info)[0].carrier,
+            second.carrier
+        );
+    }
 
     #[test]
     fn raw_pending_drain_cleanup_keeps_detached_worker_charge() {

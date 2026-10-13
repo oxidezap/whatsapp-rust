@@ -247,6 +247,8 @@ pub struct InMemoryBackend {
     #[cfg(any(test, feature = "test-util"))]
     fail_pending_delete: AtomicU32,
     #[cfg(any(test, feature = "test-util"))]
+    fail_pending_replace_after_commit: AtomicBool,
+    #[cfg(any(test, feature = "test-util"))]
     skip_pending_delete_failures: AtomicU32,
     #[cfg(any(test, feature = "test-util"))]
     pending_delete_gate: std::sync::Mutex<Option<Arc<async_lock::Barrier>>>,
@@ -282,6 +284,12 @@ pub struct InMemoryBackend {
 }
 
 impl InMemoryBackend {
+    /// Report an error after the next conditional replacement became visible.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn fail_next_pending_replace_after_commit(&self) {
+        self.fail_pending_replace_after_commit
+            .store(true, Ordering::Relaxed);
+    }
     /// Inject a conditional-delete error before or after applying it.
     #[cfg(any(test, feature = "test-util"))]
     pub fn set_fail_pending_delete(&self, after_commit: Option<bool>) {
@@ -323,6 +331,8 @@ impl InMemoryBackend {
             state: Mutex::new(InMemoryState::default()),
             #[cfg(any(test, feature = "test-util"))]
             fail_pending_delete: AtomicU32::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            fail_pending_replace_after_commit: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-util"))]
             skip_pending_delete_failures: AtomicU32::new(0),
             #[cfg(any(test, feature = "test-util"))]
@@ -1334,6 +1344,15 @@ impl ProtocolStore for InMemoryBackend {
                 revision: Some(installed),
             },
         );
+        #[cfg(any(test, feature = "test-util"))]
+        if self
+            .fail_pending_replace_after_commit
+            .swap(false, Ordering::Relaxed)
+        {
+            return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                "injected post-commit pending replace failure",
+            )));
+        }
         Ok(PendingInboundMutation::Applied)
     }
 
@@ -1385,7 +1404,7 @@ impl ProtocolStore for InMemoryBackend {
                 .take();
             if let Some(gate) = gate {
                 gate.wait().await;
-                std::future::pending::<()>().await;
+                gate.wait().await;
             }
         }
         #[cfg(any(test, feature = "test-util"))]

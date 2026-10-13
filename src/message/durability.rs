@@ -92,10 +92,10 @@ impl Client {
     /// arrival order with the fresh stanzas around it; live it commits
     /// immediately as a batch of one. Either way the batch commit rewrites and
     /// then clears its pending row, and consumers observe the message there.
-    /// Usually its original batch never dispatched (the hook failed then); if
-    /// it did (post-commit row cleanup failed AND the ack was lost), event
-    /// consumers see it twice — the documented at-least-once shape of
-    /// `Event::Messages` with a hook registered. A plain ack is sent only for
+    /// Usually its original batch never dispatched because the hook failed.
+    /// A completed hook publication suppresses cleanup replay within this
+    /// Client's dispatch cache. Hooks and consumers still need idempotence
+    /// across cache expiry or process restart. A plain ack is sent only for
     /// a genuine duplicate (no buffered copy). A read failure fails closed
     /// (no ack) so a transient storage error cannot drop a message that still
     /// needs its hook to commit.
@@ -113,13 +113,21 @@ impl Client {
             if !raw.is_empty() {
                 return Box::pin(self.replay_retained_raw(info, raw)).await;
             }
-            let mut retained = self.inbound_commit_batch.live_retention.for_message(info);
+            let retained = self.inbound_commit_batch.live_retention.for_message(info);
             if !retained.is_empty() {
-                for entry in &mut retained {
-                    entry.item.info = Arc::clone(info);
-                    entry.receipt = self.inbound_commit_batch.live_retention.receipt_for(info);
+                let retained = match self.live_pending_retry_batch(&retained, true).await {
+                    Ok(Some(hydrated)) => hydrated,
+                    Ok(None) => retained,
+                    Err(error) => {
+                        log::warn!("Retained producer recovery failed: {error:?}");
+                        return false;
+                    }
+                };
+                let delivered = self.replay_pending_batch(retained.into(), false).await;
+                if delivered {
+                    self.ack_received_message(info);
                 }
-                return self.replay_pending_batch(retained.into()).await;
+                return delivered;
             }
             match self.read_pending_for_replay(info).await {
                 Ok(Some((sender, record))) => {
@@ -156,7 +164,7 @@ impl Client {
                         }
                     };
                     if !self.inbound_commit_batch.is_active() {
-                        return self.replay_pending_batch(replay.into()).await;
+                        return self.replay_pending_batch(replay.into(), true).await;
                     }
                     for item in replay {
                         if matches!(

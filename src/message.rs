@@ -283,6 +283,7 @@ struct DispatchPayload {
     fingerprint: DispatchFingerprint,
     state: MessageDispatch,
     hook_committed: bool,
+    producer: Option<DispatchKey>,
     publication: Arc<AtomicU8>,
 }
 
@@ -312,7 +313,7 @@ pub(crate) struct PublicationGuard {
 /// final event handle so the near-kilobyte message never moves through the
 /// receive/dispatch futures again.
 pub(crate) enum ProbeOutcome {
-    Suppress,
+    Suppress { decrypted: Option<Arc<wa::Message>> },
     Proceed { decrypted: Option<Arc<wa::Message>> },
 }
 
@@ -376,6 +377,7 @@ impl DispatchClaim {
         fingerprint: DispatchFingerprint,
         pdo: bool,
         hook_committed: bool,
+        producer: Option<DispatchKey>,
         publication: &mut PublicationGuard,
     ) -> bool {
         if let Some(payload) = self.payloads.iter_mut().find(|payload| {
@@ -402,6 +404,7 @@ impl DispatchClaim {
                 return true;
             }
             payload.hook_committed |= hook_committed;
+            payload.producer = producer.or(payload.producer);
             // Ordinary multipart dispatches still fan out. Retained-row cleanup
             // replay separately checks completed hook publication before admission.
             // Keep a completed claim, but let a new publisher own a pending one.
@@ -414,6 +417,7 @@ impl DispatchClaim {
             self.payloads.push(DispatchPayload {
                 fingerprint,
                 hook_committed,
+                producer,
                 state: if pdo {
                     MessageDispatch::Recovered
                 } else {

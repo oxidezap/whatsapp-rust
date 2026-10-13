@@ -54,31 +54,55 @@ async fn test_expired_chatstate_not_delivered() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Holds B offline only for as long as the send takes, so the window stays
-/// well under the TTL (3s with CHATSTATE_TTL_SECS=3).
+/// Confirms the server observed B going offline before queueing a fresh
+/// chatstate, then reconnects within its TTL (CHATSTATE_TTL_SECS=3).
 #[tokio::test]
 async fn test_fresh_chatstate_delivered_on_reconnect() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let client_a = TestClient::connect("e2e_off_chatstate_fresh_a").await?;
+    let mut client_a = TestClient::connect("e2e_off_chatstate_fresh_a").await?;
     let mut client_b = TestClient::connect("e2e_off_chatstate_fresh_b").await?;
 
     let jid_b = client_b.jid().await;
 
     info!("B={jid_b}");
 
-    // `go_offline` makes the offline window a fact, and closing it right after
-    // the send keeps the window well within the 3s TTL. `reconnect_immediately`
-    // could not: its teardown is awaited inside the call, so the run loop was
-    // often back online before the harness could observe the drop, and the
-    // chatstate then went through the ordinary online path instead of the
-    // offline queue this test is about.
+    // Establish a server-observed availability transition. `pause()` closes
+    // the local socket but does not await the peer's Close acknowledgement;
+    // its disconnected flag alone cannot prove the server retired B's route.
+    client_b.client.presence().set_available().await?;
+    client_a.client.presence().subscribe(&jid_b).await?;
+    client_a
+        .wait_for_event(5, |event| {
+            matches!(event,
+                Event::Presence(update) if update.from == jid_b
+                    && update.status == wacore::types::presence::PresenceStatus::Available
+            )
+        })
+        .await?;
     client_b.go_offline().await?;
-    info!("B disconnected (held offline until the chatstate is queued)");
+    client_a
+        .wait_for_event(5, |event| {
+            matches!(event,
+                Event::Presence(update) if update.from == jid_b
+                    && update.status == wacore::types::presence::PresenceStatus::Unavailable
+            )
+        })
+        .await?;
+    info!("Server observed B offline before the chatstate send");
 
     client_a.client.chatstate().send_composing(&jid_b).await?;
     info!("A sent typing indicator to offline B");
 
+    // Sending a chatstate only completes the local transport write. A reply
+    // to a following IQ establishes a receive barrier on A's connection
+    // before B reconnects and the server drains its offline queue.
+    client_a
+        .client
+        .execute(wacore::iq::keepalive::KeepaliveSpec::with_timeout(
+            std::time::Duration::from_secs(2),
+        ))
+        .await?;
     client_b.come_back_online();
 
     let event = client_b

@@ -842,30 +842,52 @@ mod racing_tests {
 
     #[tokio::test]
     async fn double_failure_returns_the_last_error() {
-        // WA Web rejects with the failure that completes the set.
-        let (primary, _) = scripted(Some(20), Some("boom-primary"));
-        let (secondary, _) = scripted(Some(5), Some("boom-secondary"));
-        let err = race(primary, secondary)
-            .create_transport()
-            .await
-            .err()
-            .expect("both dials fail");
-        assert!(
-            err.to_string().contains("boom-primary"),
-            "the last failure wins, got: {err}"
-        );
-
-        let (primary, _) = scripted(Some(5), Some("boom-primary"));
-        let (secondary, _) = scripted(Some(20), Some("boom-secondary"));
-        let err = race(primary, secondary)
-            .create_transport()
-            .await
-            .err()
-            .expect("both dials fail");
-        assert!(
-            err.to_string().contains("boom-secondary"),
-            "the last failure wins, got: {err}"
-        );
+        struct GatedFailure {
+            started: async_channel::Sender<()>,
+            release: async_channel::Receiver<&'static str>,
+        }
+        #[async_trait::async_trait]
+        impl TransportFactory for GatedFailure {
+            async fn create_transport(&self) -> TransportDial {
+                self.started.send(()).await.unwrap();
+                Err(anyhow::anyhow!(self.release.recv().await.unwrap()))
+            }
+        }
+        // Observe the first failure before releasing the second. Wall-clock
+        // sleeps can expire together if this task is descheduled under load,
+        // reversing what the old fixture assumed was completion order.
+        for last_primary in [true, false] {
+            let (started, observed) = async_channel::unbounded();
+            let (primary, primary_rx) = async_channel::bounded(1);
+            let (secondary, secondary_rx) = async_channel::bounded(1);
+            let racing = RacingTransportFactory::new(
+                Arc::new(GatedFailure {
+                    started: started.clone(),
+                    release: primary_rx,
+                }),
+                Arc::new(GatedFailure {
+                    started,
+                    release: secondary_rx,
+                }),
+                test_runtime(),
+            );
+            let mut dial = Box::pin(racing.create_transport());
+            assert!(futures::poll!(&mut dial).is_pending());
+            assert_eq!(observed.len(), 2, "both dials must have started");
+            let (first, last, expected) = if last_primary {
+                (&secondary, &primary, "boom-primary")
+            } else {
+                (&primary, &secondary, "boom-secondary")
+            };
+            first.send("first failure").await.unwrap();
+            assert!(
+                futures::poll!(&mut dial).is_pending(),
+                "one failure must wait for the surviving dial"
+            );
+            last.send(expected).await.unwrap();
+            let error = dial.await.err().expect("both dials fail");
+            assert_eq!(error.to_string(), expected, "the last failure wins");
+        }
     }
 
     #[tokio::test]

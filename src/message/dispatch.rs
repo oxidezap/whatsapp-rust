@@ -83,11 +83,23 @@ impl Client {
         hook_committed: bool,
         publication: &mut PublicationGuard,
     ) -> bool {
+        self.admit_producer_dispatch(info, pdo, fingerprint, hook_committed, None, publication)
+    }
+
+    pub(crate) fn admit_producer_dispatch(
+        &self,
+        info: &Arc<MessageInfo>,
+        pdo: bool,
+        fingerprint: Option<DispatchFingerprint>,
+        hook_committed: bool,
+        producer: Option<DispatchKey>,
+        publication: &mut PublicationGuard,
+    ) -> bool {
         let Some(fingerprint) = fingerprint else {
             return false;
         };
         self.with_message_dispatch(info, pdo, |claim| {
-            claim.admit(fingerprint, pdo, hook_committed, publication)
+            claim.admit(fingerprint, pdo, hook_committed, producer, publication)
         })
     }
 
@@ -105,10 +117,26 @@ impl Client {
         })
     }
 
+    pub(super) fn hook_publication_from_producer(
+        &self,
+        info: &Arc<MessageInfo>,
+        origin: raw_pending::StanzaOrigin,
+    ) -> bool {
+        let producer = Some(DispatchKey::new(origin));
+        self.with_message_dispatch(info, false, |claim| {
+            claim.payloads.iter().any(|payload| {
+                payload.producer == producer
+                    && payload.hook_committed
+                    && payload.publication.load(Ordering::Acquire) == PUBLICATION_COMPLETE
+            })
+        })
+    }
+
     pub(crate) async fn probe_message_dispatch(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
         message: &wa::Message,
+        producer: Option<DispatchKey>,
     ) -> ProbeOutcome {
         if !self.dispatch_gate_enabled()
             || !self.with_message_dispatch(info, false, |claim| claim.has_deliveries())
@@ -132,11 +160,20 @@ impl Client {
         let candidate = decrypted.as_ref().map_or(message, |inner| inner);
         let fingerprint = MessageDispatch::fingerprint(candidate);
         if self.with_message_dispatch(info, false, |claim| {
-            claim.state(&fingerprint).is_some_and(|state| {
-                state != MessageDispatch::Recovered || self.inbound_durability_hook.get().is_none()
-            })
+            let sibling = producer.is_some()
+                && claim.payloads.iter().any(|payload| {
+                    payload.fingerprint == fingerprint
+                        && payload.producer == producer
+                        && payload.state == MessageDispatch::Decrypted
+                        && payload.publication.load(Ordering::Acquire) == PUBLICATION_COMPLETE
+                });
+            !sibling
+                && claim.state(&fingerprint).is_some_and(|state| {
+                    state != MessageDispatch::Recovered
+                        || self.inbound_durability_hook.get().is_none()
+                })
         }) {
-            ProbeOutcome::Suppress
+            ProbeOutcome::Suppress { decrypted }
         } else {
             ProbeOutcome::Proceed { decrypted }
         }

@@ -360,12 +360,20 @@ impl PendingCommitOutcome {
     };
 }
 
+#[derive(Clone)]
 struct StoredPendingGroup {
     chat: String,
     sender: String,
     id: String,
     revision: PendingInboundRevision,
     complete: bool,
+}
+
+fn has_physical_aliases(rows: &[StoredPendingGroup]) -> bool {
+    rows.iter().any(|row| {
+        rows.iter()
+            .any(|other| row.chat == other.chat && row.id == other.id && row.sender != other.sender)
+    })
 }
 
 // Keep one concrete commit poll body shared across drain and replay callers.
@@ -376,6 +384,37 @@ fn poll_pending_commit<F: Future<Output = PendingCommitOutcome>>(
     cx: &mut std::task::Context<'_>,
 ) -> std::task::Poll<PendingCommitOutcome> {
     future.poll(cx)
+}
+
+type PendingLookup = anyhow::Result<Option<(String, wacore::store::traits::PendingInboundRecord)>>;
+
+#[inline(never)]
+fn poll_pending_lookup<F: Future<Output = PendingLookup>>(
+    future: std::pin::Pin<&mut F>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<PendingLookup> {
+    future.poll(cx)
+}
+
+async fn lookup_pending_record(
+    backend: &Arc<dyn crate::store::traits::Backend>,
+    key: PendingInboundKey<'_>,
+    group: bool,
+    lease: PendingInboundLease,
+) -> PendingLookup {
+    let future = async {
+        if group {
+            return Ok(backend
+                .read_pending_inbound_group_bounded(key, MAX_PENDING_BYTES, lease)
+                .await?);
+        }
+        Ok(backend
+            .read_pending_inbound_bounded(key, MAX_PENDING_BYTES, lease)
+            .await?
+            .map(|record| (key.sender.to_owned(), record)))
+    };
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| poll_pending_lookup(future.as_mut(), cx)).await
 }
 
 impl Client {
@@ -391,7 +430,7 @@ impl Client {
     }
 
     pub(super) async fn read_pending_for_replay(
-        &self,
+        self: &Arc<Self>,
         info: &MessageInfo,
     ) -> anyhow::Result<Option<(String, wacore::store::traits::PendingInboundRecord)>> {
         let owner = Arc::new(self.inbound_commit_batch.pending_storage.lock_arc().await);
@@ -404,15 +443,7 @@ impl Client {
             sender: &sender,
             id: &info.id,
         };
-        if info.source.chat.is_group() {
-            return Ok(backend
-                .read_pending_inbound_group_bounded(key, MAX_PENDING_BYTES, lease)
-                .await?);
-        }
-        Ok(backend
-            .read_pending_inbound_bounded(key, MAX_PENDING_BYTES, lease)
-            .await?
-            .map(|record| (sender, record)))
+        lookup_pending_record(&backend, key, info.source.chat.is_group(), lease).await
     }
 
     async fn persist_pending_group(
@@ -431,52 +462,96 @@ impl Client {
             .collect();
         let lease = PendingInboundLease::new(Arc::new((Arc::clone(&owner), charges)));
         let backend = self.persistence_manager.backend();
-        let mut groups: Vec<(String, String, String, Vec<&PendingDelivery>)> = Vec::new();
+        let mut groups: Vec<(String, String, String, Vec<&PendingDelivery>, bool)> = Vec::new();
         for item in items {
             let chat = item.info.source.chat.to_string();
-            let incoming_sender = item.storage_sender.as_ref().map_or_else(
-                || item.info.source.sender.to_string(),
+            let explicit = item.storage_sender.is_some();
+            let sender = item.storage_sender.as_ref().map_or_else(
+                || Self::pending_sender(&item.info),
                 |sender| sender.to_string(),
             );
-            let canonical = Self::pending_sender(&item.info);
-            let sender = if item.storage_sender.is_some()
-                || canonical != incoming_sender
-                    && backend
-                        .read_pending_inbound_bounded(
-                            PendingInboundKey {
-                                chat: &chat,
-                                sender: &incoming_sender,
-                                id: &item.info.id,
-                            },
-                            MAX_PENDING_BYTES,
-                            lease.clone(),
-                        )
-                        .await?
-                        .is_some()
-            {
-                incoming_sender
-            } else {
-                canonical
-            };
-            if let Some(group) = groups
-                .iter_mut()
-                .find(|group| group.0 == chat && group.1 == sender && group.2 == item.info.id)
-            {
+            let group = groups.iter_mut().find(|group| {
+                group.0 == chat
+                    && group.2 == item.info.id
+                    && (group.1 == sender
+                        || item.info.source.chat.is_group()
+                            && (!explicit || group.4)
+                            && group.3.first().is_some_and(|first| {
+                                let first = &first.info.source.sender;
+                                let next = &item.info.source.sender;
+                                first.user == next.user
+                                    && first.server == next.server
+                                    && first.integrator == next.integrator
+                            }))
+            });
+            if let Some(group) = group {
+                if explicit && group.4 {
+                    group.1 = sender;
+                    group.4 = false;
+                }
                 group.3.push(item);
             } else {
-                groups.push((chat, sender, item.info.id.to_string(), vec![item]));
+                groups.push((
+                    chat,
+                    sender,
+                    item.info.id.to_string(),
+                    vec![item],
+                    item.info.source.chat.is_group() && !explicit,
+                ));
             }
         }
+        // Known physical aliases cannot use the ambiguity-rejecting lookup
+        // after cancellation. Keep their original arrivals under the existing
+        // live admission budget before the first mutation, through hook and
+        // cleanup completion. Unknown on-disk alias pairs still fail closed.
+        let mut alias_charges = Vec::new();
+        for (chat, sender, id, deliveries, _) in &groups {
+            if groups
+                .iter()
+                .any(|other| other.0 == *chat && other.2 == *id && other.1 != *sender)
+            {
+                for delivery in deliveries {
+                    let mut retained = (**delivery).clone();
+                    self.inbound_commit_batch
+                        .live_retention
+                        .retain(&mut retained)?;
+                    alias_charges.extend(retained.retention);
+                }
+            }
+        }
+        let lease = if alias_charges.is_empty() {
+            lease
+        } else {
+            PendingInboundLease::new(Arc::new((lease, alias_charges)))
+        };
         let mut stored = Vec::with_capacity(groups.len());
-        for (chat, sender, id, deliveries) in groups {
+        for (chat, mut sender, id, deliveries, lookup) in groups {
             let key = PendingInboundKey {
                 chat: &chat,
                 sender: &sender,
                 id: &id,
             };
-            let record = backend
-                .read_pending_inbound_bounded(key, MAX_PENDING_BYTES, lease.clone())
-                .await?;
+            // Resolve a fresh group's unique legacy physical key through the
+            // same bounded lookup as replay. Reuse its backing here, and never
+            // create a bare sibling beside an existing device-qualified row.
+            let record = if lookup {
+                match lookup_pending_record(&backend, key, true, lease.clone()).await? {
+                    Some((physical, record)) => {
+                        sender = physical;
+                        Some(record)
+                    }
+                    None => None,
+                }
+            } else {
+                backend
+                    .read_pending_inbound_bounded(key, MAX_PENDING_BYTES, lease.clone())
+                    .await?
+            };
+            let key = PendingInboundKey {
+                chat: &chat,
+                sender: &sender,
+                id: &id,
+            };
             let expected = record
                 .as_ref()
                 .map_or(PendingInboundRevision::missing(), |record| {
@@ -542,9 +617,30 @@ impl Client {
         Ok(stored)
     }
 
-    async fn cleanup_pending_group(&self, rows: &[StoredPendingGroup]) -> anyhow::Result<()> {
+    async fn cleanup_pending_group(
+        self: &Arc<Self>,
+        rows: Vec<StoredPendingGroup>,
+        retained: Arc<[PendingDelivery]>,
+    ) -> anyhow::Result<()> {
+        let (send, receive) = futures::channel::oneshot::channel();
+        let client = Arc::clone(self);
+        // The complete physical-key list has one owner even if the receipt
+        // caller is cancelled between deletes. No worker sends an ACK.
+        self.runtime.spawn_detached(Box::pin(async move {
+            let result = client.cleanup_pending_group_owned(&rows).await;
+            if result.is_ok() {
+                client.inbound_commit_batch.live_retention.stored(&retained);
+            }
+            let _ = send.send(result);
+        }));
+        receive
+            .await
+            .map_err(|_| anyhow::anyhow!("pending cleanup worker stopped"))?
+    }
+
+    async fn cleanup_pending_group_owned(&self, rows: &[StoredPendingGroup]) -> anyhow::Result<()> {
         let owner = Arc::new(self.inbound_commit_batch.pending_storage.lock_arc().await);
-        let lease = PendingInboundLease::new(owner);
+        let lease = PendingInboundLease::new(owner.clone());
         let backend = self.persistence_manager.backend();
         let mut failure = None;
         for row in rows {
@@ -618,8 +714,22 @@ impl Client {
     ) -> anyhow::Result<()> {
         let retained = self.inbound_commit_batch.live_retention.for_message(info);
         if !retained.is_empty() {
-            self.persist_pending_group(&retained, false).await?;
-            self.inbound_commit_batch.live_retention.stored(&retained);
+            let rows = self.persist_pending_group(&retained, false).await?;
+            if has_physical_aliases(&rows) {
+                anyhow::ensure!(
+                    self.commit_pending_batch_result(
+                        retained.into(),
+                        BatchOrigin::Live,
+                        None,
+                        false
+                    )
+                    .await
+                    .delivered,
+                    "physical aliases have not recovered before decrypt"
+                );
+            } else {
+                self.inbound_commit_batch.live_retention.stored(&retained);
+            }
         }
         let Some((sender, record)) = self.read_pending_for_replay(info).await? else {
             return Ok(());
@@ -647,63 +757,114 @@ impl Client {
         Ok(())
     }
 
-    async fn live_pending_retry_batch(
+    pub(super) async fn live_pending_retry_batch(
         self: &Arc<Self>,
-        item: &PendingDelivery,
+        owned: &[PendingDelivery],
+        replay: bool,
     ) -> anyhow::Result<Option<Vec<PendingDelivery>>> {
-        let Some(origin) = item
-            .origin
-            .filter(|_| self.inbound_durability_hook().is_some())
-        else {
+        let Some(first) = owned.first() else {
             return Ok(None);
         };
-        let Some((sender, record)) = self.read_pending_for_replay(&item.info).await? else {
+        if self.inbound_durability_hook().is_none() || first.origin.is_none() {
             return Ok(None);
+        }
+        let mut physical = owned
+            .iter()
+            .filter_map(|entry| entry.storage_sender.as_deref());
+        if let Some(first_key) = physical.next()
+            && physical.any(|key| key != first_key)
+        {
+            return Ok(Some(owned.to_vec()));
+        }
+        let Some((sender, record)) = self.read_pending_for_replay(&first.info).await? else {
+            return Ok((owned.len() > 1).then(|| owned.to_vec()));
         };
         let (bytes, read_lease) = record.into_bytes();
         let journal = PendingJournal::decode(bytes)?;
         drop(read_lease);
-        let storage_sender: Arc<str> = sender.into();
-        let projection = waproto::codec::message_to_vec(&item.message);
-        let index = u32::try_from(origin.position)?;
-        if !journal.occurrences.iter().any(|entry| {
-            entry
-                .producer
-                .is_some_and(|producer| producer != origin.stanza)
-                && entry.index == Some(index)
-                && entry.projection.as_ref() == projection
-        }) {
+        if !replay
+            && !owned.iter().any(|item| {
+                item.origin.is_some_and(|origin| {
+                    self.hook_publication_from_producer(&item.info, origin.stanza)
+                        || journal.occurrences.iter().any(|entry| {
+                            entry
+                                .producer
+                                .is_some_and(|producer| producer != origin.stanza)
+                                && entry.index == u32::try_from(origin.position).ok()
+                                && entry.projection.as_ref()
+                                    == waproto::codec::message_to_vec(&item.message)
+                        })
+                })
+            })
+        {
             return Ok(None);
         }
-        // Retry a failed hook with the actual retained occurrences, never
-        // substitute projection equality for their storage ownership.
-        let original_len = item
-            .carrier
-            .as_ref()
-            .map_or(projection.len(), |(_, raw)| raw.len());
-        // Capacity recovery belongs before decrypt: invoking a predecessor
-        // hook here could flush the incoming ratchet without its carrier.
-        anyhow::ensure!(
-            journal.fits_additional(original_len, projection.len()),
-            "pending predecessor requires recovery before decrypt"
-        );
-        let mut retained = Vec::with_capacity(journal.occurrences.len() + 1);
-        for (position, entry) in journal.occurrences.into_iter().enumerate() {
-            let position = entry.index.map_or(position, |index| index as usize);
-            let shared_message =
-                (entry.projection.as_ref() == projection).then(|| Arc::clone(&item.message));
-            let mut delivery = PendingDelivery::from_occurrence(
-                entry,
-                position,
-                &item.info,
-                shared_message,
-                None,
-            )?;
-            delivery.storage_sender = Some(Arc::clone(&storage_sender));
-            retained.push(delivery);
+        let projections: Vec<_> = owned
+            .iter()
+            .map(|item| waproto::codec::message_to_vec(&item.message))
+            .collect();
+        let matches_owned =
+            |entry: &Occurrence, position: usize, item: &PendingDelivery, projection: &[u8]| {
+                item.origin.is_some_and(|origin| {
+                    entry.producer == Some(origin.stanza)
+                        && entry.index.map_or(position, |index| index as usize) == origin.position
+                }) && entry.projection.as_ref() == projection
+                    && item
+                        .carrier
+                        .as_ref()
+                        .map_or(projection, |(_, raw)| raw.as_ref())
+                        == entry.original.as_ref()
+            };
+        for (item, projection) in owned.iter().zip(&projections) {
+            if !journal
+                .occurrences
+                .iter()
+                .enumerate()
+                .any(|(position, entry)| matches_owned(entry, position, item, projection))
+            {
+                let original_len = item
+                    .carrier
+                    .as_ref()
+                    .map_or(projection.len(), |(_, raw)| raw.len());
+                anyhow::ensure!(
+                    journal.fits_additional(original_len, projection.len()),
+                    "pending predecessor requires recovery before decrypt"
+                );
+            }
         }
-        retained.push(item.clone());
-        Ok(Some(retained))
+        let storage_sender: Arc<str> = sender.into();
+        let mut seen = vec![false; owned.len()];
+        let mut hydrated = Vec::with_capacity(journal.occurrences.len() + owned.len());
+        for (position, entry) in journal.occurrences.into_iter().enumerate() {
+            if let Some(index) = owned
+                .iter()
+                .zip(&projections)
+                .position(|(item, projection)| matches_owned(&entry, position, item, projection))
+            {
+                hydrated.push(owned[index].clone());
+                seen[index] = true;
+                continue;
+            }
+            let position = entry.index.map_or(position, |index| index as usize);
+            let shared = owned
+                .iter()
+                .zip(&projections)
+                .find(|(_, projection)| entry.projection.as_ref() == projection.as_slice())
+                .map(|(item, _)| Arc::clone(&item.message));
+            let mut delivery =
+                PendingDelivery::from_occurrence(entry, position, &first.info, shared, None)?;
+            delivery.storage_sender = Some(Arc::clone(&storage_sender));
+            let fingerprint = MessageDispatch::fingerprint(&delivery.message);
+            delivery.consumer_claimed =
+                self.completed_hook_publication(&delivery.info, &fingerprint);
+            hydrated.push(delivery);
+        }
+        for (item, seen) in owned.iter().zip(seen) {
+            if !seen {
+                hydrated.push(item.clone());
+            }
+        }
+        Ok(Some(hydrated))
     }
 
     /// Batch a message decrypted while the offline drain is active, or commit
@@ -734,14 +895,19 @@ impl Client {
                 log::warn!("Live retention admission refused: {error:?}");
                 return InboundCommitState::Failed;
             }
-            let items: Arc<[PendingDelivery]> = match self.live_pending_retry_batch(&item).await {
-                Ok(Some(retained)) => retained.into(),
-                Ok(None) => Arc::from([item]),
-                Err(error) => {
-                    log::warn!("Failed to retain live pending retry: {error:?}");
-                    return InboundCommitState::Failed;
-                }
-            };
+            let owned = self
+                .inbound_commit_batch
+                .live_retention
+                .for_message(&item.info);
+            let items: Arc<[PendingDelivery]> =
+                match self.live_pending_retry_batch(&owned, false).await {
+                    Ok(Some(retained)) => retained.into(),
+                    Ok(None) => Arc::from([item]),
+                    Err(error) => {
+                        log::warn!("Failed to retain live pending retry: {error:?}");
+                        return InboundCommitState::Failed;
+                    }
+                };
             let outcome = self
                 .commit_pending_batch_result(Arc::clone(&items), BatchOrigin::Live, None, true)
                 .await;
@@ -1315,8 +1481,9 @@ impl Client {
     pub(super) async fn replay_pending_batch(
         self: &Arc<Self>,
         items: Arc<[PendingDelivery]>,
+        acknowledge: bool,
     ) -> bool {
-        self.commit_pending_batch_result(items, BatchOrigin::Live, None, true)
+        self.commit_pending_batch_result(items, BatchOrigin::Live, None, acknowledge)
             .await
             .delivered
     }
@@ -1353,6 +1520,23 @@ impl Client {
         // acked from `arrived`; only what the hook and the consumer see is
         // reduced to one copy.
         let arrived = Arc::clone(&items);
+        // A later part of a producer can share a completed payload fingerprint.
+        // Keep its original occurrence until publication, so a failed hook
+        // cannot turn its replay into cleanup of the earlier part.
+        let producer_recovery = items.iter().any(|entry| {
+            entry.origin.is_some_and(|origin| {
+                self.hook_publication_from_producer(&entry.info, origin.stanza)
+            })
+        });
+        if producer_recovery {
+            for entry in items.iter().filter(|entry| !entry.consumer_claimed) {
+                let mut entry = entry.clone();
+                if let Err(error) = self.inbound_commit_batch.live_retention.retain(&mut entry) {
+                    log::warn!("Producer recovery admission refused: {error:?}");
+                    return PendingCommitOutcome::FAILED;
+                }
+            }
+        }
         // Already delivered entries still need persistence and cleanup, but
         // must not hide an equivalent entry that the consumer has not seen.
         let items = if items.iter().any(|entry| entry.consumer_claimed) {
@@ -1388,6 +1572,15 @@ impl Client {
         // whose identical projection is represented by another hook item.
         let pending = Arc::clone(&arrived);
         let deliveries = items;
+        let producers: smallvec::SmallVec<[Option<DispatchKey>; 1]> =
+            if self.dispatch_gate_enabled() {
+                deliveries
+                    .iter()
+                    .map(|entry| entry.origin.map(|origin| DispatchKey::new(origin.stanza)))
+                    .collect()
+            } else {
+                smallvec::SmallVec::new()
+            };
         let items: Arc<[InboundMessage]> =
             deliveries.iter().map(|entry| entry.item.clone()).collect();
         let arrived: Arc<[InboundMessage]> =
@@ -1439,7 +1632,9 @@ impl Client {
             // future must not restore the entries — redelivery replays from
             // the rows.
             reinsert.mark_durable();
-            self.inbound_commit_batch.live_retention.stored(&pending);
+            if !producer_recovery && !has_physical_aliases(&stored) {
+                self.inbound_commit_batch.live_retention.stored(&pending);
+            }
 
             if !items.is_empty()
                 && let Err(e) = hook.on_messages(self.clone(), &items).await
@@ -1498,11 +1693,12 @@ impl Client {
             // Fresh multipart occurrences still use ordinary admission.
             let suppress = stored_replay
                 && fingerprint.is_some_and(|fp| self.completed_hook_publication(&item.info, &fp))
-                || self.admit_message_dispatch(
+                || self.admit_producer_dispatch(
                     &item.info,
                     false,
                     fingerprint,
                     hook_committed,
+                    producers.get(index).copied().flatten(),
                     &mut publication,
                 );
             if suppress {
@@ -1525,7 +1721,8 @@ impl Client {
                 self.publish_pending_messages(items, origin, hook_committed);
             }
             std::mem::take(&mut publication).complete();
-            if let Err(error) = self.cleanup_pending_group(&rows).await {
+            self.inbound_commit_batch.live_retention.published(&pending);
+            if let Err(error) = self.cleanup_pending_group(rows, Arc::clone(&pending)).await {
                 log::warn!("Pending occurrence cleanup conflict; suppressing ACK: {error:?}");
                 return PendingCommitOutcome::BUFFERED;
             }
@@ -1720,7 +1917,8 @@ mod tests {
                 .unwrap();
             let (handler, rx) = ChannelEventHandler::new();
             client.core.event_bus.subscribe_handler(handler).detach();
-            let bare = PendingDelivery::from(item("ALIAS_PARTIAL"));
+            let mut bare = PendingDelivery::from(item("ALIAS_PARTIAL"));
+            bare.storage_sender = Some(Arc::from("200@s.whatsapp.net"));
             let mut legacy = item("ALIAS_PARTIAL");
             let mut legacy_info = (*legacy.info).clone();
             legacy_info.source.sender = "200:75@s.whatsapp.net".parse().unwrap();
@@ -1801,6 +1999,234 @@ mod tests {
             assert_eq!(
                 super::super::tests::delivery_receipts_for(&transport.sent(), "ALIAS_PARTIAL"),
                 1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_pending_alias_recovery_survives_cancellation_and_storage_errors() {
+        use wacore::store::in_memory::InMemoryBackend;
+        use wacore::store::traits::ProtocolStore;
+        for boundary in ["cleanup", "cancel", "replace"] {
+            let cancel = boundary == "cancel";
+            let backend = Arc::new(InMemoryBackend::new());
+            let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+            client
+                .inbound_durability_hook
+                .set(Arc::new(RecordingHook {
+                    batches: Mutex::new(Vec::new()),
+                }))
+                .ok()
+                .unwrap();
+            let (handler, rx) = ChannelEventHandler::new();
+            client.core.event_bus.subscribe_handler(handler).detach();
+            let mut bare = PendingDelivery::from(item("ALIAS_BOUNDARY"));
+            bare.storage_sender = Some(Arc::from("200@s.whatsapp.net"));
+            let mut legacy_item = item("ALIAS_BOUNDARY");
+            let mut legacy_info = (*legacy_item.info).clone();
+            legacy_info.source.sender = "200:75@s.whatsapp.net".parse().unwrap();
+            legacy_item.info = Arc::new(legacy_info);
+            let mut legacy = PendingDelivery::from(legacy_item);
+            legacy.storage_sender = Some(Arc::from("200:75@s.whatsapp.net"));
+            let bare_receipts = client
+                .inbound_commit_batch
+                .live_retention
+                .begin_receipts(&bare.info)
+                .unwrap();
+            let legacy_receipts = client
+                .inbound_commit_batch
+                .live_retention
+                .begin_receipts(&legacy.info)
+                .unwrap();
+            bare.receipt = client
+                .inbound_commit_batch
+                .live_retention
+                .receipt_for(&bare.info);
+            legacy.receipt = client
+                .inbound_commit_batch
+                .live_retention
+                .receipt_for(&legacy.info);
+            for sender in ["200:75@s.whatsapp.net", "200@s.whatsapp.net"] {
+                backend
+                    .store_pending_inbound(
+                        "100@g.us",
+                        sender,
+                        "ALIAS_BOUNDARY",
+                        &waproto::codec::message_to_vec(&bare.message),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let gate = Arc::new(async_lock::Barrier::new(2));
+            if cancel {
+                backend.park_pending_delete(0, gate.clone());
+            } else if boundary == "replace" {
+                backend.fail_next_pending_replace_after_commit();
+            } else {
+                backend.set_fail_pending_delete(Some(false));
+            }
+            let worker = tokio::spawn({
+                let client = client.clone();
+                let bare = bare.clone();
+                async move {
+                    client
+                        .commit_pending_batch_result(
+                            vec![legacy, bare].into(),
+                            BatchOrigin::OfflineDrain,
+                            None,
+                            true,
+                        )
+                        .await
+                }
+            });
+            if cancel {
+                tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait())
+                    .await
+                    .unwrap();
+                worker.abort();
+                assert!(matches!(worker.await, Err(error) if error.is_cancelled()));
+                backend.set_fail_pending_delete(None);
+                gate.wait().await;
+                drop(client.inbound_commit_batch.pending_storage.lock().await);
+            } else {
+                let outcome = worker.await.unwrap();
+                assert!(!outcome.delivered);
+                assert_eq!(outcome.persisted, boundary != "replace");
+                // Both failures leave an ambiguous physical pair. Recovery must
+                // use the exact revisions it already owns, before alias lookup.
+                backend.set_fail_pending_delete(None);
+            }
+            // Failed or cancelled original producers cannot authorize receipts
+            // from teardown's recovery. The new arrival has its own identity.
+            drop(bare_receipts);
+            drop(legacy_receipts);
+            assert_eq!(rx.try_recv().is_ok(), boundary != "replace");
+            client.cleanup_connection_state().await;
+            client.enter_live_mode_for_tests();
+            let transport = capture_pending_receipts(&client).await;
+            let redelivery = Arc::new((*bare.info).clone());
+            client.ack_or_replay_to_hook(&redelivery).await;
+            crate::test_utils::wait_for_outbound_tasks(&client).await;
+            assert_eq!(
+                super::super::tests::delivery_receipts_for(&transport.sent(), "ALIAS_BOUNDARY"),
+                1
+            );
+            for sender in ["200:75@s.whatsapp.net", "200@s.whatsapp.net"] {
+                assert!(
+                    backend
+                        .get_pending_inbound("100@g.us", sender, "ALIAS_BOUNDARY")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert_eq!(rx.try_recv().is_ok(), boundary == "replace");
+            assert!(rx.try_recv().is_err(), "recovery must publish once");
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_pending_alias_hook_cancellation_keeps_original_arrivals_recoverable() {
+        use wacore::store::in_memory::InMemoryBackend;
+        use wacore::store::traits::ProtocolStore;
+        struct Hook {
+            pause: std::sync::atomic::AtomicBool,
+            entered: Arc<async_lock::Barrier>,
+        }
+        #[async_trait::async_trait]
+        impl InboundDurabilityHook for Hook {
+            async fn on_messages(
+                &self,
+                _: Arc<Client>,
+                _: &[InboundMessage],
+            ) -> anyhow::Result<()> {
+                if self.pause.load(Ordering::Acquire) {
+                    self.entered.wait().await;
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            }
+        }
+        let backend = Arc::new(InMemoryBackend::new());
+        let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+        let gate = Arc::new(async_lock::Barrier::new(2));
+        let hook = Arc::new(Hook {
+            pause: std::sync::atomic::AtomicBool::new(true),
+            entered: gate.clone(),
+        });
+        client
+            .inbound_durability_hook
+            .set(hook.clone())
+            .ok()
+            .unwrap();
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+        let mut bare = PendingDelivery::from(item("ALIAS_HOOK_CANCEL"));
+        bare.storage_sender = Some(Arc::from("200@s.whatsapp.net"));
+        let mut legacy_item = item("ALIAS_HOOK_CANCEL");
+        let mut info = (*legacy_item.info).clone();
+        info.source.sender = "200:75@s.whatsapp.net".parse().unwrap();
+        legacy_item.info = Arc::new(info);
+        let mut legacy = PendingDelivery::from(legacy_item);
+        legacy.storage_sender = Some(Arc::from("200:75@s.whatsapp.net"));
+        for sender in ["200:75@s.whatsapp.net", "200@s.whatsapp.net"] {
+            backend
+                .store_pending_inbound(
+                    "100@g.us",
+                    sender,
+                    "ALIAS_HOOK_CANCEL",
+                    &waproto::codec::message_to_vec(&bare.message),
+                )
+                .await
+                .unwrap();
+        }
+        let original = legacy.info.clone();
+        let worker = tokio::spawn({
+            let client = client.clone();
+            let bare = bare.clone();
+            async move {
+                client
+                    .commit_pending_batch_result(
+                        vec![legacy, bare].into(),
+                        BatchOrigin::OfflineDrain,
+                        None,
+                        true,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait())
+            .await
+            .unwrap();
+        worker.abort();
+        assert!(matches!(worker.await, Err(error) if error.is_cancelled()));
+        assert!(rx.try_recv().is_err());
+        hook.pause.store(false, Ordering::Release);
+        client.cleanup_connection_state().await;
+        client.enter_live_mode_for_tests();
+        let transport = capture_pending_receipts(&client).await;
+        assert!(client.ack_or_replay_to_hook(&bare.info).await);
+        let event = rx.try_recv().unwrap();
+        let Event::Messages(batch) = event.as_ref() else {
+            panic!("expected messages")
+        };
+        assert_eq!(batch.len(), 1);
+        assert!(
+            Arc::ptr_eq(&batch.iter().next().unwrap().info, &original),
+            "recovery must retain the original carrier's information"
+        );
+        assert!(rx.try_recv().is_err());
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        assert!(
+            super::super::tests::delivery_receipts_for(&transport.sent(), "ALIAS_HOOK_CANCEL") > 0
+        );
+        for sender in ["200:75@s.whatsapp.net", "200@s.whatsapp.net"] {
+            assert!(
+                backend
+                    .get_pending_inbound("100@g.us", sender, "ALIAS_HOOK_CANCEL")
+                    .await
+                    .unwrap()
+                    .is_none()
             );
         }
     }
@@ -1937,6 +2363,11 @@ mod tests {
                 .unwrap();
             worker.abort();
             assert!(matches!(worker.await, Err(error) if error.is_cancelled()));
+            backend.set_fail_pending_delete(None);
+            gate.wait().await;
+            // The detached cleanup still owns storage exclusion. Waiting for
+            // it is a completion barrier, not a timing assumption.
+            drop(client.inbound_commit_batch.pending_storage.lock().await);
             let event = rx
                 .try_recv()
                 .expect("cleanup cancellation must not erase committed publication");
@@ -1948,14 +2379,13 @@ mod tests {
                 ids
             );
             assert!(batch.hook_committed);
-            for (index, id) in ids.iter().enumerate() {
-                assert_eq!(
+            for id in ids {
+                assert!(
                     backend
                         .get_pending_inbound("100@g.us", "200@s.whatsapp.net", id)
                         .await
                         .unwrap()
-                        .is_none(),
-                    index < prefix as usize
+                        .is_none()
                 );
             }
             crate::test_utils::wait_for_outbound_tasks(&client).await;
@@ -2147,6 +2577,81 @@ mod tests {
                     .unwrap()
                     .is_none(),
                 after_commit
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_pending_fresh_bare_arrival_reuses_unique_legacy_key_after_hook_failure() {
+        use wacore::store::in_memory::InMemoryBackend;
+        use wacore::store::traits::ProtocolStore;
+        struct RefuseHook;
+        #[async_trait::async_trait]
+        impl InboundDurabilityHook for RefuseHook {
+            async fn on_messages(
+                &self,
+                _: Arc<Client>,
+                _: &[InboundMessage],
+            ) -> anyhow::Result<()> {
+                Err(anyhow::anyhow!("injected hook refusal"))
+            }
+        }
+        let backend = Arc::new(InMemoryBackend::new());
+        let first = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+        first
+            .inbound_durability_hook
+            .set(Arc::new(RefuseHook))
+            .ok()
+            .unwrap();
+        let inbound = item("LEGACY_REUSE");
+        backend
+            .store_pending_inbound(
+                "100@g.us",
+                "200:75@s.whatsapp.net",
+                "LEGACY_REUSE",
+                &waproto::codec::message_to_vec(&inbound.message),
+            )
+            .await
+            .unwrap();
+        let outcome = first
+            .commit_pending_batch_result(
+                vec![PendingDelivery::from(inbound.clone())].into(),
+                BatchOrigin::Live,
+                None,
+                false,
+            )
+            .await;
+        assert!(outcome.persisted && !outcome.delivered);
+        assert!(
+            backend
+                .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "LEGACY_REUSE")
+                .await
+                .unwrap()
+                .is_none(),
+            "a fresh bare arrival must not create a second physical alias"
+        );
+        drop(first);
+        let second = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+        second
+            .inbound_durability_hook
+            .set(Arc::new(RecordingHook {
+                batches: Mutex::new(Vec::new()),
+            }))
+            .ok()
+            .unwrap();
+        second.enter_live_mode_for_tests();
+        let (handler, rx) = ChannelEventHandler::new();
+        second.core.event_bus.subscribe_handler(handler).detach();
+        assert!(second.ack_or_replay_to_hook(&inbound.info).await);
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+        for sender in ["200@s.whatsapp.net", "200:75@s.whatsapp.net"] {
+            assert!(
+                backend
+                    .get_pending_inbound("100@g.us", sender, "LEGACY_REUSE")
+                    .await
+                    .unwrap()
+                    .is_none()
             );
         }
     }
