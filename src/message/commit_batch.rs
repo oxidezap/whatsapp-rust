@@ -1568,6 +1568,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_pending_partial_cleanup_keeps_whole_batch_published() {
+        use wacore::store::in_memory::InMemoryBackend;
+        use wacore::store::traits::ProtocolStore;
+        for failed_index in 0..3 {
+            let backend = Arc::new(InMemoryBackend::new());
+            let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+            let hook = Arc::new(RecordingHook {
+                batches: Mutex::new(Vec::new()),
+            });
+            client
+                .inbound_durability_hook
+                .set(hook.clone())
+                .ok()
+                .unwrap();
+            let (handler, rx) = ChannelEventHandler::new();
+            client.core.event_bus.subscribe_handler(handler).detach();
+            let ids = ["PARTIAL_FIRST", "PARTIAL_SECOND", "PARTIAL_THIRD"];
+            let entries: Arc<[PendingDelivery]> = ids
+                .iter()
+                .map(|id| PendingDelivery::from(item(id)))
+                .collect();
+            backend.set_fail_pending_delete(Some(false));
+            backend.skip_pending_delete_failures(failed_index);
+            let outcome = client
+                .commit_pending_batch_result(
+                    Arc::clone(&entries),
+                    BatchOrigin::OfflineDrain,
+                    None,
+                    false,
+                )
+                .await;
+            assert!(outcome.persisted);
+            assert!(
+                !outcome.delivered,
+                "unfinished cleanup must not authorize ACK"
+            );
+            assert_eq!(hook.batches.lock().unwrap()[0], ids);
+            for (index, id) in ids.iter().enumerate() {
+                assert_eq!(
+                    backend
+                        .get_pending_inbound("100@g.us", "200@s.whatsapp.net", id)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    index < failed_index as usize
+                );
+            }
+            let Event::Messages(batch) = rx
+                .try_recv()
+                .expect("a hook-committed batch must not lose its deleted prefix")
+            else {
+                panic!("expected message batch")
+            };
+            assert!(batch.hook_committed);
+            assert_eq!(
+                batch.iter().map(|m| m.info.id.as_ref()).collect::<Vec<_>>(),
+                ids
+            );
+            assert!(rx.try_recv().is_err());
+            backend.set_fail_pending_delete(None);
+            // A reconnect resets the accumulated drain, but retains completed
+            // publication claims. A retry must clean rows without another event.
+            client.inbound_commit_batch.reset();
+            let retry = client
+                .commit_pending_batch_result(entries, BatchOrigin::Live, None, false)
+                .await;
+            assert!(retry.delivered);
+            assert!(
+                rx.try_recv().is_err(),
+                "cleanup retry must not duplicate publication"
+            );
+            for id in ids {
+                assert!(
+                    backend
+                        .get_pending_inbound("100@g.us", "200@s.whatsapp.net", id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn raw_pending_cleanup_error_after_delete_still_publishes() {
         use wacore::store::in_memory::InMemoryBackend;
         use wacore::store::traits::ProtocolStore;

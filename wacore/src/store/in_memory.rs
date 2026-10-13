@@ -246,6 +246,8 @@ pub struct InMemoryBackend {
     next_device_id: AtomicI32,
     #[cfg(any(test, feature = "test-util"))]
     fail_pending_delete: AtomicU32,
+    #[cfg(any(test, feature = "test-util"))]
+    skip_pending_delete_failures: AtomicU32,
     /// Count of `put_sessions_batch` calls. Test hook (see `test-util`): lets a
     /// harness prove receive-path flush coalescing (N receives collapse to fewer
     /// batch writes). Gated so normal builds carry neither the field nor the
@@ -287,12 +289,21 @@ impl InMemoryBackend {
         );
     }
 
+    /// Allow a prefix of conditional deletes before injecting an error.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn skip_pending_delete_failures(&self, count: u32) {
+        self.skip_pending_delete_failures
+            .store(count, Ordering::Relaxed);
+    }
+
     /// Create a new, empty in-memory store.
     pub fn new() -> Self {
         Self {
             state: Mutex::new(InMemoryState::default()),
             #[cfg(any(test, feature = "test-util"))]
             fail_pending_delete: AtomicU32::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            skip_pending_delete_failures: AtomicU32::new(0),
             next_device_id: AtomicI32::new(1),
             #[cfg(any(test, feature = "test-util"))]
             session_batch_writes: AtomicU32::new(0),
@@ -1324,14 +1335,26 @@ impl ProtocolStore for InMemoryBackend {
             return Ok(PendingInboundMutation::Conflict);
         }
         #[cfg(any(test, feature = "test-util"))]
-        if self.fail_pending_delete.load(Ordering::Relaxed) == 1 {
+        let fail = if self
+            .skip_pending_delete_failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            0
+        } else {
+            self.fail_pending_delete.load(Ordering::Relaxed)
+        };
+        #[cfg(any(test, feature = "test-util"))]
+        if fail == 1 {
             return Err(crate::store::error::StoreError::Io(std::io::Error::other(
                 "injected pending delete failure",
             )));
         }
         state.pending_inbound.remove(&key);
         #[cfg(any(test, feature = "test-util"))]
-        if self.fail_pending_delete.load(Ordering::Relaxed) == 2 {
+        if fail == 2 {
             return Err(crate::store::error::StoreError::Io(std::io::Error::other(
                 "injected post-commit pending delete failure",
             )));
