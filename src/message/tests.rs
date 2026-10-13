@@ -5809,7 +5809,7 @@ fn test_undecryptable_event_has_no_pending_pdo_hint() {
 }
 
 /// Seed `device.pn` so `send_nack` clears its `pn()` guard.
-async fn seed_test_pn(client: &Arc<Client>) {
+pub(super) async fn seed_test_pn(client: &Arc<Client>) {
     use crate::store::commands::DeviceCommand;
     client
         .persistence_manager
@@ -7251,7 +7251,7 @@ fn find_message_ack_for(frames: &[bytes::Bytes], id: &str) -> Option<SentMessage
 }
 
 /// Count delivery `<receipt>` (anything but type="retry") on the wire for `id`.
-fn delivery_receipts_for(frames: &[bytes::Bytes], id: &str) -> usize {
+pub(super) fn delivery_receipts_for(frames: &[bytes::Bytes], id: &str) -> usize {
     let mut count = 0;
     for (i, frame) in frames.iter().enumerate() {
         let Some(buf) = decode_frame(i, frame) else {

@@ -248,6 +248,8 @@ pub struct InMemoryBackend {
     fail_pending_delete: AtomicU32,
     #[cfg(any(test, feature = "test-util"))]
     skip_pending_delete_failures: AtomicU32,
+    #[cfg(any(test, feature = "test-util"))]
+    pending_delete_gate: std::sync::Mutex<Option<Arc<async_lock::Barrier>>>,
     /// Count of `put_sessions_batch` calls. Test hook (see `test-util`): lets a
     /// harness prove receive-path flush coalescing (N receives collapse to fewer
     /// batch writes). Gated so normal builds carry neither the field nor the
@@ -296,6 +298,17 @@ impl InMemoryBackend {
             .store(count, Ordering::Relaxed);
     }
 
+    /// Park a conditional delete after allowing the specified prefix.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn park_pending_delete(&self, prefix: u32, gate: Arc<async_lock::Barrier>) {
+        *self
+            .pending_delete_gate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(gate);
+        self.skip_pending_delete_failures(prefix);
+        self.fail_pending_delete.store(3, Ordering::Relaxed);
+    }
+
     /// Create a new, empty in-memory store.
     pub fn new() -> Self {
         Self {
@@ -304,6 +317,8 @@ impl InMemoryBackend {
             fail_pending_delete: AtomicU32::new(0),
             #[cfg(any(test, feature = "test-util"))]
             skip_pending_delete_failures: AtomicU32::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            pending_delete_gate: std::sync::Mutex::new(None),
             next_device_id: AtomicI32::new(1),
             #[cfg(any(test, feature = "test-util"))]
             session_batch_writes: AtomicU32::new(0),
@@ -1335,17 +1350,33 @@ impl ProtocolStore for InMemoryBackend {
             return Ok(PendingInboundMutation::Conflict);
         }
         #[cfg(any(test, feature = "test-util"))]
-        let fail = if self
-            .skip_pending_delete_failures
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
-        {
-            0
-        } else {
-            self.fail_pending_delete.load(Ordering::Relaxed)
+        let fail = {
+            let injected = self.fail_pending_delete.load(Ordering::Relaxed);
+            if injected != 0
+                && self
+                    .skip_pending_delete_failures
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                0
+            } else {
+                injected
+            }
         };
+        #[cfg(any(test, feature = "test-util"))]
+        if fail == 3 {
+            let gate = self
+                .pending_delete_gate
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            if let Some(gate) = gate {
+                gate.wait().await;
+                std::future::pending::<()>().await;
+            }
+        }
         #[cfg(any(test, feature = "test-util"))]
         if fail == 1 {
             return Err(crate::store::error::StoreError::Io(std::io::Error::other(

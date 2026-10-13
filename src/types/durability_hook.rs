@@ -68,7 +68,13 @@ pub trait InboundDurabilityHook: wacore::sync_marker::MaybeSendSync {
     /// granularity), so one round-trip covers the lot.
     /// [`Event::Messages`](wacore::types::events::Event::Messages) then
     /// carries the exact same items: what this method committed is what event
-    /// consumers observe.
+    /// consumers observe. Publication precedes conditional pending-row cleanup
+    /// so a partial cleanup cannot discard part of this committed event. ACK
+    /// waits for the complete cleanup; an error or cancellation can therefore
+    /// leave rows to retry after the event has already been published. The
+    /// existing dispatch cache suppresses repeated events within its retention
+    /// window, including reconnects of the same Client. A process restart still
+    /// requires the idempotent durable consumer described above.
     async fn on_messages(&self, client: Arc<Client>, batch: &[InboundMessage]) -> Result<()>;
 }
 
