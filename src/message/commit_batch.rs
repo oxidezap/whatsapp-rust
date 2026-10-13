@@ -1551,6 +1551,7 @@ mod tests {
     use crate::types::durability_hook::InboundDurabilityHook;
     use crate::types::message::{MessageInfo, MessageSource};
     use std::sync::Mutex;
+    use std::time::Duration;
     use wacore::types::events::ChannelEventHandler;
 
     struct RecordingHook {
