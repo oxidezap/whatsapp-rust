@@ -8,7 +8,7 @@ use wacore::appstate_sync::AppStateMutationPersistence;
 
 struct AppStateClientPersistence {
     client: std::sync::Weak<Client>,
-    persistence: Arc<crate::store::persistence_manager::PersistenceManager>,
+    persistence: Arc<PersistenceManager>,
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -8919,7 +8919,7 @@ mod critical_bootstrap_tests {
             .add_lid_pn_mapping("100000001", "12025550111", LearningSource::Usync)
             .await
             .unwrap();
-        let mutations = vec![
+        let mutations = [
             pn_for_lid_mutation(Some("100000001@lid"), Some("12025550112@s.whatsapp.net")),
             pn_for_lid_mutation(Some("100000002@lid"), Some("12025550113@s.whatsapp.net")),
             pn_for_lid_mutation(Some("100000002@lid"), Some("12025550113@s.whatsapp.net")),

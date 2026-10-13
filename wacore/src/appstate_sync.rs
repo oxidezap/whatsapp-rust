@@ -108,7 +108,7 @@ fn committed_mutations_error(
 /// The processor calls this hook before committing the cursor for a patch,
 /// snapshot, or snapshot recovery. A hook error leaves that cursor unchanged
 /// so the mutation can be replayed.
-pub trait AppStateMutationPersistence: Send + Sync {
+pub trait AppStateMutationPersistence: crate::sync_marker::MaybeSendSync {
     /// Persist the complete status privacy action, including unknown modes.
     async fn persist_status_privacy(
         &self,
