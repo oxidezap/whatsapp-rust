@@ -51,7 +51,16 @@ impl Client {
                 info,
             ))
             .await;
-            if !outcome.is_ok_and(|outcome| outcome.delivered || !outcome.dispatched) {
+            let progressed = match outcome {
+                Ok(outcome) => outcome.delivered || !outcome.dispatched,
+                // Only an explicitly retired terminal rejection can unblock
+                // another carrier. Errors with owned raw remain retryable.
+                Err(_) => !self
+                    .inbound_commit_batch
+                    .live_retention
+                    .has_raw_origin(entry.origin),
+            };
+            if !progressed {
                 return false;
             }
         }

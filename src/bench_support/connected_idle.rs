@@ -279,7 +279,7 @@ impl Session {
                     &format!("idle-skdm-{i}"),
                     skdm.serialized(),
                 )
-                .await;
+                .await?;
             keys.push(key);
         }
         let text = "x".repeat(TEXT_BYTES);

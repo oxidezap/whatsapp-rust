@@ -604,11 +604,12 @@ impl Client {
                     count.saturating_add(1),
                 )
             });
-            match self
-                .inbound_commit_batch
-                .live_retention
-                .reserve(stanza_origin, wire_bytes, slots)
-            {
+            match self.inbound_commit_batch.live_retention.reserve_with_info(
+                stanza_origin,
+                wire_bytes,
+                slots,
+                &info,
+            ) {
                 Ok(admission) => Some(admission),
                 Err(error) => {
                     log::warn!("Live pending capacity exhausted before decrypt: {error:?}");
@@ -2133,7 +2134,12 @@ impl Client {
                 &info.id,
                 axolotl_bytes,
             )
-            .await?;
+            .await
+            .inspect_err(|error| {
+                if matches!(error, crate::features::SignalError::InvalidInput(_)) {
+                    self.finish_retained_raw(origin);
+                }
+            })?;
         }
 
         // A peer-provided key could forge app-state mutations, so match WA Web's

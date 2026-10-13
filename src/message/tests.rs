@@ -20706,6 +20706,130 @@ async fn raw_pending_protocol_only_backend_failure_keeps_replay_owned() {
 }
 
 #[tokio::test]
+async fn raw_pending_terminal_skdm_rejection_allows_corrected_resend() {
+    use wacore::messages::MessageUtils;
+    struct NoDelivery;
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for NoDelivery {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            panic!("protocol-only messages must not enter the hook")
+        }
+    }
+    for cancelled in [false, true] {
+        let (client, transport) = capturing_client("terminal_skdm_resend").await;
+        client
+            .inbound_durability_hook
+            .set(Arc::new(NoDelivery))
+            .ok()
+            .unwrap();
+        let (bundle, bob) = bobs_prekey_bundle(&client).await;
+        let address = bob.to_protocol_address();
+        let group: Jid = "120363000000000087@g.us".parse().unwrap();
+        let mut alice = AlicePeer::new("100000000000005@lid").await;
+        alice.install_bob_session(&address, &bundle).await;
+        let mut valid = wa::Message::default();
+        valid.sender_key_distribution_message =
+            buffa::MessageField::some(alice.create_group_skdm(&group).await);
+        let mut invalid = valid.clone();
+        invalid
+            .sender_key_distribution_message
+            .as_option_mut()
+            .unwrap()
+            .axolotl_sender_key_distribution_message = Some(vec![0; 8]);
+        let info = group_message_info("TERMINAL_SKDM_RESEND", &group, &alice.jid, false);
+        let ciphertext = alice
+            .encrypt(&address, &MessageUtils::encode_and_pad(&invalid))
+            .await;
+        let receiver = client.clone();
+        let first_info = Arc::clone(&info);
+        let sender = alice.jid.clone();
+        client
+            .inbound_commit_batch
+            .live_retention
+            .pause_stage
+            .store(cancelled, Ordering::Release);
+        let worker = tokio::spawn(async move {
+            process_group_classified(
+                &receiver,
+                first_info,
+                &sender,
+                enc_payload_from_ciphertext(&ciphertext),
+                vec![],
+            )
+            .await;
+        });
+        if cancelled {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client
+                    .inbound_commit_batch
+                    .live_retention
+                    .stage_ready
+                    .notified(),
+            )
+            .await
+            .unwrap();
+            worker.abort();
+            assert!(worker.await.unwrap_err().is_cancelled());
+            assert!(
+                client
+                    .inbound_commit_batch
+                    .live_retention
+                    .has_raw_for_message(&info)
+            );
+        } else {
+            worker.await.unwrap();
+            assert!(
+                !client
+                    .inbound_commit_batch
+                    .live_retention
+                    .has_raw_for_message(&info)
+            );
+        }
+        client
+            .inbound_commit_batch
+            .live_retention
+            .pause_stage
+            .store(false, Ordering::Release);
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        assert_eq!(message_acks_for(&transport.sent(), &info.id), 0);
+        assert_eq!(delivery_receipts_for(&transport.sent(), &info.id), 0);
+        let corrected = alice
+            .encrypt(&address, &MessageUtils::encode_and_pad(&valid))
+            .await;
+        process_group_classified(
+            &client,
+            Arc::new((*info).clone()),
+            &alice.jid,
+            enc_payload_from_ciphertext(&corrected),
+            vec![],
+        )
+        .await;
+        assert!(
+            !client
+                .inbound_commit_batch
+                .live_retention
+                .has_raw_for_message(&info)
+        );
+        let name = make_sender_key_name(&group, &alice.jid.to_non_ad().to_protocol_address());
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        assert!(
+            client
+                .signal_cache
+                .get_sender_key(&name, &*snapshot.backend)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_exactly_one_confirmation(&transport, &info.id).await;
+    }
+}
+
+#[tokio::test]
 async fn raw_pending_capacity_refusal_preserves_ratchet_for_later_retry() {
     struct Hook(std::sync::atomic::AtomicUsize);
     #[async_trait::async_trait]
