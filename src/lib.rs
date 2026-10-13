@@ -29,6 +29,7 @@ pub(crate) mod test_alloc {
         live: AtomicI64,
         allocs: AtomicU64,
         max: AtomicUsize,
+        peak: AtomicI64,
     }
 
     thread_local! {
@@ -94,9 +95,11 @@ pub(crate) mod test_alloc {
                 .flatten();
             if let Some(state) = owner {
                 with_registry(|owners| {
-                    state
+                    let live = state
                         .live
-                        .fetch_add(layout.size() as i64, Ordering::Relaxed);
+                        .fetch_add(layout.size() as i64, Ordering::Relaxed)
+                        + layout.size() as i64;
+                    state.peak.fetch_max(live, Ordering::Relaxed);
                     state.allocs.fetch_add(1, Ordering::Relaxed);
                     state.max.fetch_max(layout.size(), Ordering::Relaxed);
                     owners.insert(block.addr(), state);
@@ -156,6 +159,51 @@ pub(crate) mod test_alloc {
             }
         }
         min
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(crate) struct HeapSample {
+        pub retained: i64,
+        pub peak: i64,
+        pub allocations: u64,
+    }
+
+    pub(crate) fn current_heap_sample() -> HeapSample {
+        ACTIVE.with(|active| {
+            let active = active.borrow();
+            let state = active.as_ref().expect("allocation scope is active");
+            HeapSample {
+                retained: state.live.load(Ordering::Relaxed),
+                peak: state.peak.load(Ordering::Relaxed),
+                allocations: state.allocs.load(Ordering::Relaxed),
+            }
+        })
+    }
+
+    /// Requested heap attributed to this synchronous thread scope, including
+    /// freed transient buffers in the peak. Excludes allocator overhead and
+    /// spawned async workers; their charges require separate lifetime tests.
+    pub(crate) fn heap_sample<T>(op: impl FnOnce() -> T) -> (HeapSample, T) {
+        let scope = Scope::enter();
+        let held = std::hint::black_box(op());
+        let sample = current_heap_sample();
+        drop(scope);
+        (sample, held)
+    }
+
+    #[test]
+    fn heap_sample_includes_freed_transient_buffers() {
+        let (sample, held) = heap_sample(|| {
+            let transient = vec![0_u8; 4096];
+            let held = vec![0_u8; 1024];
+            std::hint::black_box(&transient);
+            drop(transient);
+            held
+        });
+        assert_eq!(sample.retained, 1024);
+        assert_eq!(sample.peak, 5120);
+        assert_eq!(sample.allocations, 2);
+        drop(held);
     }
 
     fn live_sample<T>(op: impl FnOnce() -> T) -> ((i64, u64), T) {

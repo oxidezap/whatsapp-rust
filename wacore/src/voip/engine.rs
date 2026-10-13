@@ -5140,8 +5140,38 @@ mod encoded_tests {
             "old-key inbound media must remain gated while the requested epoch is pending"
         );
 
+        // A mid-call rekey can omit the outer `t` (issue #1710). Exercise the
+        // real stanza parser before installing its transaction. Signal decryption
+        // is covered by the runtime handler test; `new_epoch` is its result here.
+        let stanza = wacore_binary::builder::NodeBuilder::new("call")
+            .attr("from", peer_jid.clone())
+            .attr("id", "REKEY-NO-T")
+            .children([wacore_binary::builder::NodeBuilder::new("enc_rekey")
+                .attr("call-id", call_id)
+                .attr("call-creator", rekey.call_creator.clone())
+                .attr("transaction-id", "8")
+                .children([
+                    wacore_binary::builder::NodeBuilder::new("encopt")
+                        .attr("keygen", "2")
+                        .build(),
+                    wacore_binary::builder::NodeBuilder::new("enc")
+                        .attr("type", "msg")
+                        .attr("v", "2")
+                        .bytes(vec![0xEE])
+                        .build(),
+                ])
+                .build()])
+            .build();
+        let parsed = crate::stanza::call::parse_call_stanza(&stanza.as_node_ref())
+            .expect("rekey without t must reach the engine")
+            .expect("known action");
+        let crate::types::call::CallAction::EncRekey { rekey } = parsed.action else {
+            panic!("expected rekey");
+        };
         assert_eq!(
-            engine.apply_group_raw_epoch(8, &new_epoch).unwrap(),
+            engine
+                .apply_group_raw_epoch(rekey.transaction_id, &new_epoch)
+                .unwrap(),
             GroupEpochApply::Installed
         );
         assert!(old_sender.rekey_send_from_raw(&new_epoch, &peer_jid.to_string()));

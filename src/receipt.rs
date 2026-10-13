@@ -25,6 +25,19 @@ fn is_peer_thread(chat: &Jid) -> bool {
     !chat.is_group() && !chat.is_status_broadcast() && !chat.is_newsletter()
 }
 
+fn is_receipt_user(jid: &Jid) -> bool {
+    !jid.user.is_empty() && (jid.server.is_pn_family() || jid.server.is_lid_family())
+}
+
+fn receipt_sender_alt(sender: &Jid, pn: Option<Jid>) -> Option<Jid> {
+    pn.filter(|pn| {
+        sender.server.is_lid_family()
+            && !sender.user.is_empty()
+            && pn.server.is_pn_family()
+            && !pn.user.is_empty()
+    })
+}
+
 /// How a simple `<receipt>` is addressed once the author is known.
 struct ReceiptAddressing {
     chat: Jid,
@@ -60,6 +73,26 @@ fn address_receipt(
     is_group: bool,
     author_is_own_account: bool,
 ) -> ReceiptAddressing {
+    // WAWebHandleStatusReceipt keeps the Status conversation and uses
+    // `recipient` as the post author. The participant is the receipt actor,
+    // including on own-device delivery receipts, not necessarily that author.
+    if from.is_status_broadcast() {
+        let receipt_type = if author_is_own_account {
+            match receipt_type {
+                ReceiptType::Read => ReceiptType::ReadSelf,
+                ReceiptType::Played => ReceiptType::PlayedSelf,
+                receipt_type => receipt_type,
+            }
+        } else {
+            receipt_type
+        };
+        return ReceiptAddressing {
+            chat: from,
+            recipient: recipient.filter(is_receipt_user),
+            is_from_me: author_is_own_account,
+            receipt_type,
+        };
+    }
     if !author_is_own_account {
         return ReceiptAddressing::as_received(from, receipt_type);
     }
@@ -617,7 +650,7 @@ impl Client {
         let from = attrs.jid("from");
         let participant = attrs.optional_jid("participant");
         let recipient = attrs.optional_jid("recipient");
-        // participant_pn -> sender_alt so the LID-PN cache warms from receipts too.
+        // Explicit alternate of the receipt actor; never infer a missing PN.
         let participant_pn = attrs.optional_jid("participant_pn");
         // Present when this receipt was drained from the offline queue on reconnect.
         let offline = attrs.optional_string("offline").is_some();
@@ -635,6 +668,10 @@ impl Client {
         let is_group = from.is_group();
         let default_sender = if is_group {
             participant.unwrap_or_else(|| from.clone())
+        } else if from.is_status_broadcast() {
+            participant
+                .filter(is_receipt_user)
+                .unwrap_or_else(|| from.clone())
         } else {
             from.clone()
         };
@@ -645,11 +682,9 @@ impl Client {
         // enc_rekey_retry never use the aggregated shape, so this short-circuits
         // before the retry pipeline below.
         //
-        // No own-account classification here: WA Web only aggregates group and
-        // broadcast receipts (`handleAggregateReceipt` rejects anything else) and
-        // never parses `recipient` in this shape, so a self fan-out cannot arrive
-        // aggregated — and each `<user>` names a different peer, which no single
-        // stanza-level `recipient` could re-address.
+        // Aggregate parsing never reads `recipient`. Status deaggregation still
+        // classifies each actor through the same Status handler; no stanza-level
+        // recipient may be assigned to those individual receipts.
         if let Some(part_node) = nr.get_optional_child("participants") {
             let (agg_msg_id, agg_key, users) =
                 wacore::stanza::receipt::parse_participants(part_node);
@@ -688,16 +723,29 @@ impl Client {
                     ),
                     None => receipt_type.clone(),
                 };
+                let addressing = if from.is_status_broadcast() {
+                    address_receipt(
+                        from.clone(),
+                        None,
+                        effective_type,
+                        false,
+                        self.is_own_jid(&user.jid),
+                    )
+                } else {
+                    ReceiptAddressing::as_received(from.clone(), effective_type)
+                };
+                let sender_alt = receipt_sender_alt(&user.jid, user.participant_pn);
                 let r = Receipt::builder()
                     .message_ids(vec![fan_out_id.clone()])
                     .source(crate::types::message::MessageSource {
-                        chat: from.clone(),
+                        chat: addressing.chat,
                         sender: user.jid,
-                        sender_alt: user.participant_pn,
+                        sender_alt,
+                        is_from_me: addressing.is_from_me,
                         ..Default::default()
                     })
                     .timestamp(user_ts)
-                    .r#type(effective_type)
+                    .r#type(addressing.receipt_type)
                     .offline(offline)
                     .build();
                 self.core.event_bus.dispatch(Event::Receipt(r));
@@ -717,7 +765,7 @@ impl Client {
         );
 
         // A chat read on another of our own devices comes back as a receipt our
-        // own account authored: `from` on a DM, the `participant` on a group —
+        // own account authored: `from` on a DM, `participant` on a group/Status —
         // which is exactly what `default_sender` already holds.
         let addressing = address_receipt(
             from,
@@ -727,6 +775,7 @@ impl Client {
             self.is_own_jid(&default_sender),
         );
 
+        let sender_alt = receipt_sender_alt(&default_sender, participant_pn);
         let receipt = Receipt::builder()
             .message_ids(message_ids)
             .source(crate::types::message::MessageSource {
@@ -734,7 +783,7 @@ impl Client {
                 sender: default_sender,
                 is_from_me: addressing.is_from_me,
                 recipient: addressing.recipient,
-                sender_alt: participant_pn,
+                sender_alt,
                 ..Default::default()
             })
             .timestamp(stanza_ts)
@@ -2966,6 +3015,214 @@ mod tests {
             "15557654321",
             "simple receipt must thread receipt-level participant_pn into sender_alt"
         );
+    }
+
+    #[tokio::test]
+    async fn status_receipt_names_actor_and_keeps_post_author_separate() {
+        for (participant, own, kind, normalized) in [
+            ("100000000000002@lid", false, "read", ReceiptType::Read),
+            (
+                "15550000002@s.whatsapp.net",
+                false,
+                "read",
+                ReceiptType::Read,
+            ),
+            ("100000000000001:2@lid", true, "read", ReceiptType::ReadSelf),
+            (
+                "5511000000001:2@s.whatsapp.net",
+                true,
+                "played",
+                ReceiptType::PlayedSelf,
+            ),
+            (
+                "100000000000001@lid",
+                true,
+                "delivery",
+                ReceiptType::Delivered,
+            ),
+        ] {
+            let (client, collector) = setup_client_with_identities().await;
+            client
+                .handle_receipt(node_to_arc(
+                    NodeBuilder::new("receipt")
+                        .attr("id", "STATUS-ACTOR")
+                        .attr("from", "status@broadcast")
+                        .attr("type", kind)
+                        .attr("participant", participant)
+                        .attr(
+                            "participant_pn",
+                            if own {
+                                "5511000000001@s.whatsapp.net"
+                            } else {
+                                "15550000002@s.whatsapp.net"
+                            },
+                        )
+                        .attr("participant_username", "synthetic_user")
+                        .attr("recipient", "100000000000003@lid")
+                        .attr("t", "1700000000")
+                        .build(),
+                ))
+                .await;
+            let events = collector.events();
+            let receipt = events
+                .iter()
+                .find_map(|e| match &**e {
+                    Event::Receipt(r) => Some(r),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(receipt.source.chat, jid("status@broadcast"));
+            assert_eq!(receipt.source.sender, jid(participant));
+            assert_eq!(receipt.source.is_from_me, own);
+            assert_eq!(receipt.source.recipient, Some(jid("100000000000003@lid")));
+            assert_eq!(receipt.r#type, normalized);
+            assert_eq!(
+                receipt.source.sender_alt.is_some(),
+                participant.contains("@lid")
+            );
+            assert!(
+                client
+                    .lid_pn_cache
+                    .get_phone_number("100000000000002")
+                    .await
+                    .is_none(),
+                "receipt identity does not add a learning policy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_receipt_missing_or_invalid_identity_never_binds_an_alias() {
+        for (participant, pn, recipient, has_actor, has_alias) in [
+            (None, Some("15550000002@s.whatsapp.net"), None, false, false),
+            (
+                Some("invalid"),
+                Some("15550000002@s.whatsapp.net"),
+                None,
+                false,
+                false,
+            ),
+            (
+                Some("120363000000001@g.us"),
+                Some("15550000002@s.whatsapp.net"),
+                None,
+                false,
+                false,
+            ),
+            (Some("100000000000002@lid"), None, None, true, false),
+            (
+                Some("100000000000002@lid"),
+                Some("invalid"),
+                None,
+                true,
+                false,
+            ),
+            (
+                Some("100000000000002@lid"),
+                Some("100000000000004@lid"),
+                Some("status@broadcast"),
+                true,
+                false,
+            ),
+            (
+                Some("100000000000002@lid"),
+                Some("@s.whatsapp.net"),
+                Some("invalid"),
+                true,
+                false,
+            ),
+            (
+                Some("100000000000002@lid"),
+                Some("15550000002@s.whatsapp.net"),
+                None,
+                true,
+                true,
+            ),
+        ] {
+            let (client, collector) = setup_client_with_collector().await;
+            let mut node = NodeBuilder::new("receipt")
+                .attr("id", "STATUS-OPTIONAL")
+                .attr("from", "status@broadcast")
+                .attr("type", "read")
+                .attr("t", "1700000000");
+            if let Some(p) = participant {
+                node = node.attr("participant", p);
+            }
+            if let Some(p) = pn {
+                node = node.attr("participant_pn", p);
+            }
+            if let Some(p) = recipient {
+                node = node.attr("recipient", p);
+            }
+            client.handle_receipt(node_to_arc(node.build())).await;
+            let events = collector.events();
+            let receipt = events
+                .iter()
+                .find_map(|e| match &**e {
+                    Event::Receipt(r) => Some(r),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                receipt.source.sender,
+                if has_actor {
+                    jid(participant.unwrap())
+                } else {
+                    jid("status@broadcast")
+                }
+            );
+            assert_eq!(receipt.source.sender_alt.is_some(), has_alias);
+            assert!(receipt.source.recipient.is_none());
+            assert!(!receipt.source.is_from_me);
+        }
+    }
+
+    #[tokio::test]
+    async fn status_receipt_aggregate_classifies_each_actor_without_stanza_recipient() {
+        let (client, collector) = setup_client_with_identities().await;
+        client
+            .handle_receipt(node_to_arc(
+                NodeBuilder::new("receipt")
+                    .attr("from", "status@broadcast")
+                    .attr("id", "STATUS-AGG")
+                    .attr("recipient", "100000000000099@lid")
+                    .attr("t", "1700000000")
+                    .children([NodeBuilder::new("participants")
+                        .attr("message_id", "STATUS-POST")
+                        .children(["100000000000001@lid", "100000000000002@lid"].map(|p| {
+                            NodeBuilder::new("user")
+                                .attr("jid", p)
+                                .attr("type", "read")
+                                .attr("t", "1700000001")
+                                .build()
+                        }))
+                        .build()])
+                    .build(),
+            ))
+            .await;
+        let events = collector.events();
+        let receipts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &**e {
+                Event::Receipt(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(receipts.len(), 2);
+        for (r, own) in receipts.iter().zip([true, false]) {
+            assert_eq!(r.source.chat, jid("status@broadcast"));
+            assert_eq!(r.source.is_from_me, own);
+            assert_eq!(
+                r.r#type,
+                if own {
+                    ReceiptType::ReadSelf
+                } else {
+                    ReceiptType::Read
+                }
+            );
+            assert!(r.source.recipient.is_none());
+            assert!(r.source.sender_alt.is_none());
+        }
     }
 
     #[tokio::test]

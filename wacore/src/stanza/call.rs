@@ -49,10 +49,19 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
     let version = attrs.optional_string("version").map(|s| s.into_owned());
     let participant = attrs.optional_jid("participant");
     let recipient = attrs.optional_jid("recipient");
-    let ts = attrs
-        .optional_unix_time("t")
-        .ok_or_else(|| anyhow!("<call> missing or invalid 't' attribute"))?;
-    let timestamp = from_secs(ts).ok_or_else(|| anyhow!("<call> 't'={ts} out of range"))?;
+    // WA Web's callParser accepts an absent `t`, including on enc_rekey. Rekey
+    // processing uses the transaction id, not wall time. Keep absence explicit
+    // instead of inventing a call-log date; retain the other actions' contract.
+    let timestamp = if node.get_attr("t").is_some() {
+        let ts = attrs
+            .optional_unix_time("t")
+            .ok_or_else(|| anyhow!("<call> invalid 't' attribute"))?;
+        Some(from_secs(ts).ok_or_else(|| anyhow!("<call> 't'={ts} out of range"))?)
+    } else if action_tag == CallActionTag::EncRekey {
+        None
+    } else {
+        return Err(anyhow!("<call> missing 't' attribute"));
+    };
     // Server-set presence flag marking an offline-queue replay (WA Web `hasAttr("offline")`), the
     // same idiom we already use for messages/receipts. NOT the `e` attr, which is an offer timestamp.
     let offline = attrs.optional_string("offline").is_some();
@@ -99,7 +108,7 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
         .maybe_version(version)
         .maybe_participant(participant)
         .maybe_recipient(recipient)
-        .timestamp(timestamp)
+        .maybe_timestamp(timestamp)
         .offline(offline)
         .action(action)
         .maybe_caller_username(caller_username)
@@ -1703,6 +1712,99 @@ mod tests {
         );
     }
 
+    fn rekey_call_node(timestamp: Option<&str>) -> Node {
+        let mut call = NodeBuilder::new("call")
+            .attr("from", fake_caller_lid())
+            .attr("id", "REKEY-STANZA");
+        if let Some(timestamp) = timestamp {
+            call = call.attr("t", timestamp.to_string());
+        }
+        call.children([NodeBuilder::new("enc_rekey")
+            .attr("call-id", "CID")
+            .attr("call-creator", fake_caller_lid())
+            .attr("transaction-id", "9")
+            .children([
+                NodeBuilder::new("encopt").attr("keygen", "2").build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msg")
+                    .attr("v", "2")
+                    .bytes(vec![1, 2, 3])
+                    .build(),
+            ])
+            .build()])
+            .build()
+    }
+
+    #[test]
+    fn enc_rekey_without_timestamp_reaches_action_parser() {
+        let node = rekey_call_node(None);
+        let call = parse_call_stanza(&node.as_node_ref()).unwrap().unwrap();
+        assert_eq!(call.timestamp, None);
+        let serialized = serde_json::to_value(&call).unwrap();
+        assert!(serialized.get("timestamp").is_none());
+        let CallAction::EncRekey { rekey } = call.action else {
+            panic!("expected enc_rekey");
+        };
+        assert_eq!(rekey.transaction_id, 9);
+        assert_eq!(rekey.ciphertext, [1, 2, 3]);
+    }
+
+    #[test]
+    fn rekey_timestamp_preserves_valid_values_and_rejects_invalid_values() {
+        for ts in ["0", "-1", "1766847151"] {
+            let node = rekey_call_node(Some(ts));
+            let call = parse_call_stanza(&node.as_node_ref()).unwrap().unwrap();
+            assert_eq!(
+                call.timestamp.unwrap().timestamp(),
+                ts.parse::<i64>().unwrap()
+            );
+            let serialized = serde_json::to_value(&call).unwrap();
+            assert_eq!(serialized["timestamp"], ts.parse::<i64>().unwrap());
+        }
+        for ts in [
+            "",
+            "garbage",
+            "1.5",
+            "123junk",
+            "9223372036854775808",
+            "9223372036854775807",
+        ] {
+            let node = rekey_call_node(Some(ts));
+            assert!(parse_call_stanza(&node.as_node_ref()).is_err(), "t={ts:?}");
+        }
+    }
+
+    #[test]
+    fn other_call_actions_still_require_timestamp() {
+        for tag in [
+            "offer",
+            "offer_notice",
+            "preaccept",
+            "accept",
+            "reject",
+            "terminate",
+            "transport",
+            "relaylatency",
+            "video",
+            "group_update",
+            "waiting_room_update",
+            "user_action",
+            "screen_share",
+        ] {
+            // The wrapper contract must fail before reading action-specific fields.
+            let node = NodeBuilder::new("call")
+                .attr("from", fake_caller_lid())
+                .children([NodeBuilder::new(tag).build()])
+                .build();
+            let error = parse_call_stanza(&node.as_node_ref()).unwrap_err();
+            assert!(error.to_string().contains("missing 't'"), "{tag}: {error}");
+        }
+        let unknown = NodeBuilder::new("call")
+            .children([NodeBuilder::new("future_action").build()])
+            .build();
+        assert!(parse_call_stanza(&unknown.as_node_ref()).unwrap().is_none());
+    }
+
     #[test]
     fn offer_audio_only() {
         let node = base_call_builder()
@@ -1727,7 +1829,7 @@ mod tests {
         let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
         assert_eq!(call.stanza_id, "STANZA-ID-0001");
         assert_eq!(call.from, fake_caller_lid());
-        assert_eq!(call.timestamp.timestamp(), 1766847151);
+        assert_eq!(call.timestamp.unwrap().timestamp(), 1766847151);
         assert!(!call.offline);
         assert_eq!(call.notify.as_deref(), Some("Test Caller"));
         assert_eq!(call.platform.as_deref(), Some("android"));

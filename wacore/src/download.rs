@@ -1129,12 +1129,14 @@ mod tests {
         let enc =
             crate::upload::encrypt_media_with_key(plaintext, MediaType::MusicArtwork, Some(&key))
                 .unwrap();
-        let metadata = wa::EmbeddedMusic {
-            artwork_direct_path: Some("/mms/music-artwork/synthetic".into()),
-            artwork_media_key: Some(key.to_vec()),
-            artwork_sha256: Some(enc.file_sha256.to_vec()),
-            artwork_enc_sha256: Some(enc.file_enc_sha256.to_vec()),
-            ..Default::default()
+        let metadata = {
+            let mut proto_contract_fixture = wa::EmbeddedMusic::default();
+            proto_contract_fixture.artwork_direct_path =
+                Some("/mms/music-artwork/synthetic".into());
+            proto_contract_fixture.artwork_media_key = Some(key.to_vec());
+            proto_contract_fixture.artwork_sha256 = Some(enc.file_sha256.to_vec());
+            proto_contract_fixture.artwork_enc_sha256 = Some(enc.file_enc_sha256.to_vec());
+            proto_contract_fixture
         };
         assert_eq!(metadata.app_info(), MediaType::MusicArtwork);
         assert_eq!(metadata.file_length(), None);
@@ -1184,11 +1186,13 @@ mod tests {
 
     #[test]
     fn music_artwork_missing_key_never_implies_plaintext() {
-        let mut metadata = wa::EmbeddedMusic {
-            artwork_direct_path: Some("/mms/music-artwork/synthetic".into()),
-            artwork_sha256: Some(vec![1; 32]),
-            artwork_enc_sha256: Some(vec![2; 32]),
-            ..Default::default()
+        let mut metadata = {
+            let mut proto_contract_fixture = wa::EmbeddedMusic::default();
+            proto_contract_fixture.artwork_direct_path =
+                Some("/mms/music-artwork/synthetic".into());
+            proto_contract_fixture.artwork_sha256 = Some(vec![1; 32]);
+            proto_contract_fixture.artwork_enc_sha256 = Some(vec![2; 32]);
+            proto_contract_fixture
         };
         let chat = "15551234567@s.whatsapp.net".parse().unwrap();
         let artwork = MusicArtwork::for_chat(&metadata, &chat);
@@ -1228,11 +1232,13 @@ mod tests {
         use sha2::Digest;
         let plaintext = b"synthetic newsletter artwork";
         let hash = Sha256::digest(plaintext);
-        let metadata = wa::EmbeddedMusic {
-            artwork_direct_path: Some("/mms/newsletter-music-artwork/synthetic".into()),
-            artwork_sha256: Some(hash.to_vec()),
-            artwork_media_key: Some(vec![7; 32]),
-            ..Default::default()
+        let metadata = {
+            let mut proto_contract_fixture = wa::EmbeddedMusic::default();
+            proto_contract_fixture.artwork_direct_path =
+                Some("/mms/newsletter-music-artwork/synthetic".into());
+            proto_contract_fixture.artwork_sha256 = Some(hash.to_vec());
+            proto_contract_fixture.artwork_media_key = Some(vec![7; 32]);
+            proto_contract_fixture
         };
         let chat = Jid::newsletter("42");
         let artwork = MusicArtwork::for_chat(&metadata, &chat);
@@ -1288,13 +1294,14 @@ mod tests {
         let plaintext = b"synthetic group history bundle bytes";
         let enc = crate::upload::encrypt_media(plaintext, MediaType::GroupHistory)
             .expect("encrypt group history fixture");
-        let bundle = wa::message::MessageHistoryBundle {
-            mimetype: Some("application/protobuf".into()),
-            file_sha256: Some(enc.file_sha256.to_vec()),
-            media_key: Some(enc.media_key.to_vec()),
-            file_enc_sha256: Some(enc.file_enc_sha256.to_vec()),
-            direct_path: Some("/v/synthetic-group-history.enc".into()),
-            ..Default::default()
+        let bundle = {
+            let mut proto_contract_fixture = wa::message::MessageHistoryBundle::default();
+            proto_contract_fixture.mimetype = Some("application/protobuf".into());
+            proto_contract_fixture.file_sha256 = Some(enc.file_sha256.to_vec());
+            proto_contract_fixture.media_key = Some(enc.media_key.to_vec());
+            proto_contract_fixture.file_enc_sha256 = Some(enc.file_enc_sha256.to_vec());
+            proto_contract_fixture.direct_path = Some("/v/synthetic-group-history.enc".into());
+            proto_contract_fixture
         };
         assert!(bundle.file_length().is_none());
         assert_eq!(bundle.app_info(), MediaType::GroupHistory);

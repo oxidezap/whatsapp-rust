@@ -1,10 +1,14 @@
 //! Auto-generated protobuf definitions for the WhatsApp wire format.
 //!
-//! The Rust source (`whatsapp.rs`) is produced by `build.rs` from the
-//! pre-compiled descriptor set `whatsapp.desc`, and written to `OUT_DIR` —
-//! not tracked in git. To regenerate the descriptor after editing
-//! `whatsapp.proto`, run `cargo xt proto-desc` (wraps `protoc`).
-
+//! Public messages, views, enums and oneofs are non-exhaustive. Construct owned
+//! messages with `Default` followed by public field assignments or generated
+//! `with_*` setters. Match enums and oneofs with a fallback. Destructure with
+//! `..` to allow additive protocol updates.
+//!
+//! This source compatibility policy does not freeze ABI or struct layout, and
+//! does not promise lossless editing of unknown future wire occurrences.
+//! Durable input bytes and replay semantics are defined by the receiving API.
+//!
 #![allow(clippy::large_enum_variant)]
 /// Re-exported because its types permeate the generated API; depending on it
 /// directly would require version-matching this crate exactly.
@@ -234,6 +238,22 @@ pub mod codec {
     #[inline(never)]
     pub fn message_decode(bytes: &[u8]) -> Result<whatsapp::Message, buffa::DecodeError> {
         whatsapp::Message::decode_from_slice(bytes)
+    }
+
+    /// Keep retained comment-key serialization in one codec instantiation.
+    #[inline(never)]
+    pub fn message_key_to_vec(key: &whatsapp::MessageKey) -> Vec<u8> {
+        key.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn message_key_encoded_len(key: &whatsapp::MessageKey) -> usize {
+        key.encoded_len() as usize
+    }
+
+    #[inline(never)]
+    pub fn message_key_decode(bytes: &[u8]) -> Result<whatsapp::MessageKey, buffa::DecodeError> {
+        whatsapp::MessageKey::decode_from_slice(bytes)
     }
 
     #[inline(never)]

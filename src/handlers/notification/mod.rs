@@ -31,9 +31,28 @@ impl StanzaHandler for NotificationHandler {
         node: Arc<OwnedNodeRef>,
         _cancelled: &mut bool,
     ) -> bool {
-        handle_notification_impl(&client, node).await;
+        let shutdown = client.connection_shutdown_signal();
+        Self::handle_scoped(&client, node, &shutdown).await;
         true
     }
+}
+
+impl NotificationHandler {
+    pub(crate) async fn handle_scoped(
+        client: &Arc<Client>,
+        node: Arc<OwnedNodeRef>,
+        shutdown: &wacore::runtime::ShutdownSignal,
+    ) {
+        if !shutdown.is_fired() {
+            handle_notification_scoped(client, node, shutdown).await;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
+    let shutdown = client.connection_shutdown_signal();
+    handle_notification_scoped(client, node, &shutdown).await;
 }
 
 /// Dispatch notification by type.
@@ -53,7 +72,11 @@ impl StanzaHandler for NotificationHandler {
     feature = "tracing",
     tracing::instrument(name = "wa.notif.dispatch", level = "debug", skip_all)
 )]
-async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
+async fn handle_notification_scoped(
+    client: &Arc<Client>,
+    node: Arc<OwnedNodeRef>,
+    shutdown: &wacore::runtime::ShutdownSignal,
+) {
     let nr = node.get();
     let notification_type = nr.attrs().optional_string("type");
 
@@ -69,7 +92,10 @@ async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>)
         }
         Some(NotificationType::Devices) => Box::pin(handle_devices_notification(client, nr)).await,
         Some(NotificationType::LinkCodeCompanionReg) => {
-            Box::pin(crate::pair_code::handle_pair_code_notification(client, nr)).await;
+            Box::pin(crate::pair_code::handle_pair_code_notification_scoped(
+                client, nr, shutdown,
+            ))
+            .await;
         }
         Some(NotificationType::CompanionRegRefresh) => {
             Box::pin(handle_companion_reg_refresh(client, nr)).await

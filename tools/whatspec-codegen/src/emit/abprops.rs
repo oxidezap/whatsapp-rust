@@ -42,6 +42,14 @@ pub struct AbProp {
 ";
 
 pub fn generate(ir: &AbPropsIr) -> Result<String> {
+    for name in RETAINED_WEB_PROPS {
+        ensure!(
+            !ir.configs
+                .iter()
+                .any(|c| c.module == "WAWebABPropsConfigs" && c.name == *name),
+            "upstream reclaimed {name}; reconcile props::stale before regenerating"
+        );
+    }
     let mut out = super::header("A/B-props registry", &ir.wa_version);
     out.push_str(HEADER);
 
@@ -88,6 +96,17 @@ fn render_module(ident: &str, wa_module: &str, group: &[AbPropConfig]) -> String
     // Ident scope is per module, so a flag carried by two registries keeps its
     // name in each.
     let mut used = HashSet::new();
+    if wa_module == "WAWebABPropsConfigs" {
+        out.push_str(
+            "    // Retained API constants, deliberately outside the current catalog's ALL.\n",
+        );
+        for name in RETAINED_WEB_PROPS {
+            out.push_str(&format!(
+                "    pub use crate::iq::props::stale::{};\n",
+                name.to_uppercase()
+            ));
+        }
+    }
     let names: Vec<String> = group
         .iter()
         .map(|c| unique_ident(&snake_case(&c.name).to_uppercase(), &mut used, "F"))
@@ -111,6 +130,15 @@ fn render_module(ident: &str, wa_module: &str, group: &[AbPropConfig]) -> String
     out.push_str("    ];\n}\n\n");
     out
 }
+
+const RETAINED_WEB_PROPS: &[&str] = &[
+    "ai_3p_agent_link_enabled",
+    "lists_smb_web_enabled",
+    "scheduled_companion_contact_refresh_days",
+    "scheduled_companion_contact_refresh_hours",
+    "smoothie_performance_msg_send",
+    "updated_harmful_document_dialog",
+];
 
 /// `WAWebHybridABPropsConfigs` into `hybrid`; the bare registry into `web`.
 fn module_ident(wa_module: &str) -> String {

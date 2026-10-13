@@ -877,14 +877,15 @@ mod tests {
     }
 
     fn admission_notification() -> DetachedHistorySyncNotification {
-        HistorySyncNotification {
-            file_length: Some(42),
-            sync_type: Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP),
-            chunk_order: Some(7),
-            progress: Some(55),
-            peer_data_request_session_id: Some("session-test".to_string()),
-            initial_hist_bootstrap_inline_payload: Some(vec![1, 2, 3]),
-            ..Default::default()
+        {
+            let mut proto_addition = HistorySyncNotification::default();
+            proto_addition.file_length = Some(42);
+            proto_addition.sync_type = Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP);
+            proto_addition.chunk_order = Some(7);
+            proto_addition.progress = Some(55);
+            proto_addition.peer_data_request_session_id = Some("session-test".to_string());
+            proto_addition.initial_hist_bootstrap_inline_payload = Some(vec![1, 2, 3]);
+            proto_addition
         }
         .into()
     }
@@ -1039,26 +1040,31 @@ mod tests {
         records: Vec<wa::CallLogRecord>,
         order: u32,
     ) {
-        let history = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            call_log_records: records,
-            nct_salt: Some(vec![17; 32]),
-            phone_number_to_lid_mappings: vec![wa::PhoneNumberToLIDMapping {
-                pn_jid: Some("15550000002@s.whatsapp.net".into()),
-                lid_jid: Some("100000000000002@lid".into()),
-            }],
-            conversations: vec![wa::Conversation {
-                id: "15550000002@s.whatsapp.net".into(),
-                ..Default::default()
-            }],
-            ..Default::default()
+        let history = {
+            let mut proto_value = wa::HistorySync::default();
+            proto_value.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto_value.call_log_records = records;
+            proto_value.nct_salt = Some(vec![17; 32]);
+            proto_value.phone_number_to_lid_mappings = vec![{
+                let mut proto_value = wa::PhoneNumberToLIDMapping::default();
+                proto_value.pn_jid = Some("15550000002@s.whatsapp.net".into());
+                proto_value.lid_jid = Some("100000000000002@lid".into());
+                proto_value
+            }];
+            proto_value.conversations = vec![{
+                let mut proto_value = wa::Conversation::default();
+                proto_value.id = "15550000002@s.whatsapp.net".into();
+                proto_value
+            }];
+            proto_value
         };
         let compressed = compress_history_sync(&history);
-        let notification = HistorySyncNotification {
-            sync_type: Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP),
-            chunk_order: Some(order),
-            initial_hist_bootstrap_inline_payload: Some(compressed),
-            ..Default::default()
+        let notification = {
+            let mut proto_addition = HistorySyncNotification::default();
+            proto_addition.sync_type = Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP);
+            proto_addition.chunk_order = Some(order);
+            proto_addition.initial_hist_bootstrap_inline_payload = Some(compressed);
+            proto_addition
         };
         client
             .process_history_sync_task("CALL-HISTORY".into(), notification.into())
@@ -1090,26 +1096,29 @@ mod tests {
             .detach();
         let receipt = client.wait_for_sent_node(crate::client::NodeFilter::tag("receipt"));
         let records = vec![
-            wa::CallLogRecord {
-                call_creator_jid: Some("15550000001@s.whatsapp.net".into()),
-                call_id: Some("placed".into()),
-                start_time: Some(1_700_000_000),
-                duration: Some(91),
-                is_incoming: Some(true), // Deliberately contradictory: never read for direction.
-                is_video: Some(true),
-                call_result: Some(wa::call_log_record::CallResult::CONNECTED),
-                ..Default::default()
+            {
+                let mut proto_value = wa::CallLogRecord::default();
+                proto_value.call_creator_jid = Some("15550000001@s.whatsapp.net".into());
+                proto_value.call_id = Some("placed".into());
+                proto_value.start_time = Some(1_700_000_000);
+                proto_value.duration = Some(91);
+                proto_value.is_incoming = Some(true);
+                proto_value.is_video = Some(true);
+                proto_value.call_result = Some(wa::call_log_record::CallResult::CONNECTED);
+                proto_value
             },
-            wa::CallLogRecord {
-                call_creator_jid: Some("15550000002@s.whatsapp.net".into()),
-                call_id: Some("received".into()),
-                start_time: Some(1_700_000_100),
-                is_incoming: Some(false),
-                participants: vec![wa::call_log_record::ParticipantInfo {
-                    user_jid: Some("15550000001@s.whatsapp.net".into()),
-                    ..Default::default()
-                }],
-                ..Default::default()
+            {
+                let mut proto_value = wa::CallLogRecord::default();
+                proto_value.call_creator_jid = Some("15550000002@s.whatsapp.net".into());
+                proto_value.call_id = Some("received".into());
+                proto_value.start_time = Some(1_700_000_100);
+                proto_value.is_incoming = Some(false);
+                proto_value.participants = vec![{
+                    let mut proto_value = wa::call_log_record::ParticipantInfo::default();
+                    proto_value.user_jid = Some("15550000001@s.whatsapp.net".into());
+                    proto_value
+                }];
+                proto_value
             },
         ];
         process_call_history_chunk(&client, records, 7).await;
@@ -1207,11 +1216,13 @@ mod tests {
             creators
                 .iter()
                 .enumerate()
-                .map(|(index, creator)| wa::CallLogRecord {
-                    call_creator_jid: creator.map(str::to_owned),
-                    start_time: [Some(0), Some(-1), Some(i64::MAX), None, Some(i64::MIN)][index],
-                    is_incoming: Some(false),
-                    ..Default::default()
+                .map(|(index, creator)| {
+                    let mut proto_value = wa::CallLogRecord::default();
+                    proto_value.call_creator_jid = creator.map(str::to_owned);
+                    proto_value.start_time =
+                        [Some(0), Some(-1), Some(i64::MAX), None, Some(i64::MIN)][index];
+                    proto_value.is_incoming = Some(false);
+                    proto_value
                 })
                 .collect()
         };
@@ -1269,9 +1280,10 @@ mod tests {
             client
                 .process_history_sync_task(
                     "CALL-CORRUPT".into(),
-                    HistorySyncNotification {
-                        initial_hist_bootstrap_inline_payload: Some(compressed),
-                        ..Default::default()
+                    {
+                        let mut proto_addition = HistorySyncNotification::default();
+                        proto_addition.initial_hist_bootstrap_inline_payload = Some(compressed);
+                        proto_addition
                     }
                     .into(),
                 )
@@ -1283,11 +1295,11 @@ mod tests {
         client
             .process_history_sync_task(
                 "CALL-FRAMED".into(),
-                HistorySyncNotification {
-                    initial_hist_bootstrap_inline_payload: Some(compress(&[
-                        0x6a, 3, 0x62, 2, b'x', 0x6a, 0,
-                    ])),
-                    ..Default::default()
+                {
+                    let mut proto_addition = HistorySyncNotification::default();
+                    proto_addition.initial_hist_bootstrap_inline_payload =
+                        Some(compress(&[0x6a, 3, 0x62, 2, b'x', 0x6a, 0]));
+                    proto_addition
                 }
                 .into(),
             )
@@ -1320,9 +1332,10 @@ mod tests {
         process_call_history_chunk(
             &client,
             (0..300)
-                .map(|n| wa::CallLogRecord {
-                    call_id: Some(format!("call-{n}")),
-                    ..Default::default()
+                .map(|n| {
+                    let mut proto_value = wa::CallLogRecord::default();
+                    proto_value.call_id = Some(format!("call-{n}"));
+                    proto_value
                 })
                 .collect(),
             4,
@@ -1399,9 +1412,10 @@ mod tests {
             .detach();
         process_call_history_chunk(
             &client,
-            vec![wa::CallLogRecord {
-                call_creator_jid: Some("15550000001@s.whatsapp.net".into()),
-                ..Default::default()
+            vec![{
+                let mut proto_value = wa::CallLogRecord::default();
+                proto_value.call_creator_jid = Some("15550000001@s.whatsapp.net".into());
+                proto_value
             }],
             6,
         )
@@ -1464,9 +1478,10 @@ mod tests {
         process_call_history_chunk(
             &client,
             vec![
-                wa::CallLogRecord {
-                    call_creator_jid: Some("15550000001:8@c.us".into()),
-                    ..Default::default()
+                {
+                    let mut proto_value = wa::CallLogRecord::default();
+                    proto_value.call_creator_jid = Some("15550000001:8@c.us".into());
+                    proto_value
                 };
                 2
             ],
@@ -1674,15 +1689,17 @@ mod tests {
     }
 
     fn recent_history_chunk() -> (Vec<u8>, HistorySyncNotification) {
-        let compressed = compress_history_sync(&wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::RECENT,
-            ..Default::default()
+        let compressed = compress_history_sync(&{
+            let mut proto_value = wa::HistorySync::default();
+            proto_value.sync_type = wa::history_sync::HistorySyncType::RECENT;
+            proto_value
         });
-        let notification = HistorySyncNotification {
-            file_length: Some(compressed.len() as u64),
-            sync_type: Some(wa::message::HistorySyncType::RECENT),
-            initial_hist_bootstrap_inline_payload: Some(compressed.clone()),
-            ..Default::default()
+        let notification = {
+            let mut proto_addition = HistorySyncNotification::default();
+            proto_addition.file_length = Some(compressed.len() as u64);
+            proto_addition.sync_type = Some(wa::message::HistorySyncType::RECENT);
+            proto_addition.initial_hist_bootstrap_inline_payload = Some(compressed.clone());
+            proto_addition
         };
         (compressed, notification)
     }
@@ -1830,9 +1847,10 @@ mod tests {
         hook.release.add_permits(1);
         let invalid = vec![0xff];
         for _ in 0..2 {
-            let notification = HistorySyncNotification {
-                initial_hist_bootstrap_inline_payload: Some(invalid.clone()),
-                ..Default::default()
+            let notification = {
+                let mut proto_addition = HistorySyncNotification::default();
+                proto_addition.initial_hist_bootstrap_inline_payload = Some(invalid.clone());
+                proto_addition
             };
             client
                 .process_history_sync_task("HIST_UNVALIDATED".to_owned(), notification.into())
@@ -2108,37 +2126,46 @@ mod tests {
         let chat = "5511777776666@s.whatsapp.net";
         let parent_id = "HIST_PARENT";
         let secret = vec![0x44u8; 32];
-        let history_sync = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            conversations: vec![wa::Conversation {
-                id: chat.into(),
-                messages: vec![wa::HistorySyncMsg {
-                    message: buffa::MessageField::some(wa::WebMessageInfo {
-                        key: buffa::MessageField::some(wa::MessageKey {
-                            remote_jid: Some(chat.to_string()),
-                            from_me: Some(false),
-                            id: Some(parent_id.to_string()),
-                            participant: None,
-                        }),
-                        message: buffa::MessageField::some(wa::Message {
-                            conversation: Some("historical".to_string()),
-                            ..Default::default()
-                        }),
-                        message_secret: Some(secret.clone()),
-                        ..Default::default()
-                    }),
-                    msg_order_id: Some(1),
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
+        let history_sync = {
+            let mut proto_value = wa::HistorySync::default();
+            proto_value.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto_value.conversations = vec![{
+                let mut proto_value = wa::Conversation::default();
+                proto_value.id = chat.into();
+                proto_value.messages = vec![{
+                    let mut proto_value = wa::HistorySyncMsg::default();
+                    proto_value.message = buffa::MessageField::some({
+                        let mut proto_value = wa::WebMessageInfo::default();
+                        proto_value.key = buffa::MessageField::some({
+                            let mut proto_value = wa::MessageKey::default();
+                            proto_value.remote_jid = Some(chat.to_string());
+                            proto_value.from_me = Some(false);
+                            proto_value.id = Some(parent_id.to_string());
+                            proto_value.participant = None;
+                            proto_value
+                        });
+                        proto_value.message = buffa::MessageField::some({
+                            let mut proto_value = wa::Message::default();
+                            proto_value.conversation = Some("historical".to_string());
+                            proto_value
+                        });
+                        proto_value.message_secret = Some(secret.clone());
+                        proto_value
+                    });
+                    proto_value.msg_order_id = Some(1);
+                    proto_value
+                }];
+                proto_value
+            }];
+            proto_value
         };
         let compressed = compress_history_sync(&history_sync);
-        let notification = HistorySyncNotification {
-            file_length: Some(compressed.len() as u64),
-            sync_type: Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP),
-            initial_hist_bootstrap_inline_payload: Some(compressed),
-            ..Default::default()
+        let notification = {
+            let mut proto_addition = HistorySyncNotification::default();
+            proto_addition.file_length = Some(compressed.len() as u64);
+            proto_addition.sync_type = Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP);
+            proto_addition.initial_hist_bootstrap_inline_payload = Some(compressed);
+            proto_addition
         };
 
         client
@@ -2159,20 +2186,24 @@ mod tests {
         let client = crate::test_utils::create_test_client_with_name("history_lid_mappings").await;
         client.is_running.store(true, Ordering::Relaxed);
 
-        let history_sync = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            phone_number_to_lid_mappings: vec![wa::PhoneNumberToLIDMapping {
-                pn_jid: Some("5511777776666@s.whatsapp.net".to_string()),
-                lid_jid: Some("111222333444555@lid".to_string()),
-            }],
-            ..Default::default()
+        let history_sync = {
+            let mut proto_value = wa::HistorySync::default();
+            proto_value.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto_value.phone_number_to_lid_mappings = vec![{
+                let mut proto_value = wa::PhoneNumberToLIDMapping::default();
+                proto_value.pn_jid = Some("5511777776666@s.whatsapp.net".to_string());
+                proto_value.lid_jid = Some("111222333444555@lid".to_string());
+                proto_value
+            }];
+            proto_value
         };
         let compressed = compress_history_sync(&history_sync);
-        let notification = HistorySyncNotification {
-            file_length: Some(compressed.len() as u64),
-            sync_type: Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP),
-            initial_hist_bootstrap_inline_payload: Some(compressed),
-            ..Default::default()
+        let notification = {
+            let mut proto_addition = HistorySyncNotification::default();
+            proto_addition.file_length = Some(compressed.len() as u64);
+            proto_addition.sync_type = Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP);
+            proto_addition.initial_hist_bootstrap_inline_payload = Some(compressed);
+            proto_addition
         };
 
         client
@@ -2196,22 +2227,25 @@ mod tests {
         client.is_running.store(true, Ordering::Relaxed);
 
         let chat = "5511777776666@s.whatsapp.net";
-        let history_sync = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            conversations: vec![wa::Conversation {
-                id: chat.into(),
-                ..Default::default()
-            }],
-            ..Default::default()
+        let history_sync = {
+            let mut proto_value = wa::HistorySync::default();
+            proto_value.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto_value.conversations = vec![{
+                let mut proto_value = wa::Conversation::default();
+                proto_value.id = chat.into();
+                proto_value
+            }];
+            proto_value
         };
         let raw_len = history_sync.encode_to_vec().len();
         let compressed = compress_history_sync(&history_sync);
         let compressed_copy = compressed.clone();
-        let notification = HistorySyncNotification {
-            file_length: Some(compressed.len() as u64),
-            sync_type: Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP),
-            initial_hist_bootstrap_inline_payload: Some(compressed),
-            ..Default::default()
+        let notification = {
+            let mut proto_addition = HistorySyncNotification::default();
+            proto_addition.file_length = Some(compressed.len() as u64);
+            proto_addition.sync_type = Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP);
+            proto_addition.initial_hist_bootstrap_inline_payload = Some(compressed);
+            proto_addition
         };
 
         // Register a handler BEFORE the task so retain_blob is true.
@@ -2256,37 +2290,46 @@ mod tests {
         let chat = "867051314767696@bot";
         let parent_id = "HIST_BOT_PARENT";
         let secret = vec![0x61u8; 32];
-        let history_sync = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            conversations: vec![wa::Conversation {
-                id: chat.into(),
-                messages: vec![wa::HistorySyncMsg {
-                    message: buffa::MessageField::some(wa::WebMessageInfo {
-                        key: buffa::MessageField::some(wa::MessageKey {
-                            remote_jid: Some(chat.to_string()),
-                            from_me: Some(false),
-                            id: Some(parent_id.to_string()),
-                            participant: None,
-                        }),
-                        message: buffa::MessageField::some(wa::Message {
-                            conversation: Some("bot historical".to_string()),
-                            ..Default::default()
-                        }),
-                        message_secret: Some(secret.clone()),
-                        ..Default::default()
-                    }),
-                    msg_order_id: Some(1),
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
+        let history_sync = {
+            let mut proto_value = wa::HistorySync::default();
+            proto_value.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto_value.conversations = vec![{
+                let mut proto_value = wa::Conversation::default();
+                proto_value.id = chat.into();
+                proto_value.messages = vec![{
+                    let mut proto_value = wa::HistorySyncMsg::default();
+                    proto_value.message = buffa::MessageField::some({
+                        let mut proto_value = wa::WebMessageInfo::default();
+                        proto_value.key = buffa::MessageField::some({
+                            let mut proto_value = wa::MessageKey::default();
+                            proto_value.remote_jid = Some(chat.to_string());
+                            proto_value.from_me = Some(false);
+                            proto_value.id = Some(parent_id.to_string());
+                            proto_value.participant = None;
+                            proto_value
+                        });
+                        proto_value.message = buffa::MessageField::some({
+                            let mut proto_value = wa::Message::default();
+                            proto_value.conversation = Some("bot historical".to_string());
+                            proto_value
+                        });
+                        proto_value.message_secret = Some(secret.clone());
+                        proto_value
+                    });
+                    proto_value.msg_order_id = Some(1);
+                    proto_value
+                }];
+                proto_value
+            }];
+            proto_value
         };
         let compressed = compress_history_sync(&history_sync);
-        let notification = HistorySyncNotification {
-            file_length: Some(compressed.len() as u64),
-            sync_type: Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP),
-            initial_hist_bootstrap_inline_payload: Some(compressed),
-            ..Default::default()
+        let notification = {
+            let mut proto_addition = HistorySyncNotification::default();
+            proto_addition.file_length = Some(compressed.len() as u64);
+            proto_addition.sync_type = Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP);
+            proto_addition.initial_hist_bootstrap_inline_payload = Some(compressed);
+            proto_addition
         };
 
         client
@@ -2314,32 +2357,38 @@ mod tests {
         is_poll: bool,
     ) -> wa::HistorySyncMsg {
         let message = if is_poll {
-            wa::Message {
-                poll_creation_message: buffa::MessageField::some(
-                    wa::message::PollCreationMessage::default(),
-                ),
-                ..Default::default()
+            {
+                let mut proto_value = wa::Message::default();
+                proto_value.poll_creation_message =
+                    buffa::MessageField::some(wa::message::PollCreationMessage::default());
+                proto_value
             }
         } else {
-            wa::Message {
-                conversation: Some("historical".to_string()),
-                ..Default::default()
+            {
+                let mut proto_value = wa::Message::default();
+                proto_value.conversation = Some("historical".to_string());
+                proto_value
             }
         };
-        wa::HistorySyncMsg {
-            message: buffa::MessageField::some(wa::WebMessageInfo {
-                key: buffa::MessageField::some(wa::MessageKey {
-                    remote_jid: Some(chat.to_string()),
-                    from_me: Some(false),
-                    id: Some(msg_id.to_string()),
-                    participant: None,
-                }),
-                message: buffa::MessageField::some(message),
-                message_secret: Some(secret.to_vec()),
-                message_timestamp: Some(ts_secs),
-                ..Default::default()
-            }),
-            msg_order_id: Some(1),
+        {
+            let mut proto_value = wa::HistorySyncMsg::default();
+            proto_value.message = buffa::MessageField::some({
+                let mut proto_value = wa::WebMessageInfo::default();
+                proto_value.key = buffa::MessageField::some({
+                    let mut proto_value = wa::MessageKey::default();
+                    proto_value.remote_jid = Some(chat.to_string());
+                    proto_value.from_me = Some(false);
+                    proto_value.id = Some(msg_id.to_string());
+                    proto_value.participant = None;
+                    proto_value
+                });
+                proto_value.message = buffa::MessageField::some(message);
+                proto_value.message_secret = Some(secret.to_vec());
+                proto_value.message_timestamp = Some(ts_secs);
+                proto_value
+            });
+            proto_value.msg_order_id = Some(1);
+            proto_value
         }
     }
 
@@ -2347,21 +2396,24 @@ mod tests {
         chat: &str,
         messages: Vec<wa::HistorySyncMsg>,
     ) -> HistorySyncNotification {
-        let history_sync = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
-            conversations: vec![wa::Conversation {
-                id: chat.into(),
-                messages,
-                ..Default::default()
-            }],
-            ..Default::default()
+        let history_sync = {
+            let mut proto_value = wa::HistorySync::default();
+            proto_value.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+            proto_value.conversations = vec![{
+                let mut proto_addition = wa::Conversation::default();
+                proto_addition.id = chat.into();
+                proto_addition.messages = messages;
+                proto_addition
+            }];
+            proto_value
         };
         let compressed = compress_history_sync(&history_sync);
-        HistorySyncNotification {
-            file_length: Some(compressed.len() as u64),
-            sync_type: Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP),
-            initial_hist_bootstrap_inline_payload: Some(compressed),
-            ..Default::default()
+        {
+            let mut proto_addition = HistorySyncNotification::default();
+            proto_addition.file_length = Some(compressed.len() as u64);
+            proto_addition.sync_type = Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP);
+            proto_addition.initial_hist_bootstrap_inline_payload = Some(compressed);
+            proto_addition
         }
     }
 
@@ -2606,36 +2658,43 @@ mod tests {
         ts_secs: u64,
         bot_prompt: bool,
     ) -> wa::HistorySyncMsg {
-        let message_context_info = bot_prompt.then(|| wa::MessageContextInfo {
-            bot_metadata: buffa::MessageField::some(wa::BotMetadata {
-                persona_id: Some("867051314767696".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let message_context_info = bot_prompt.then(|| {
+            let mut proto_value = wa::MessageContextInfo::default();
+            proto_value.bot_metadata = buffa::MessageField::some({
+                let mut proto_value = wa::BotMetadata::default();
+                proto_value.persona_id = Some("867051314767696".into());
+                proto_value
+            });
+            proto_value
         });
-        wa::HistorySyncMsg {
-            message: buffa::MessageField::some(wa::WebMessageInfo {
-                key: buffa::MessageField::some(wa::MessageKey {
-                    remote_jid: Some(chat.to_string()),
-                    from_me: Some(false),
-                    id: Some(msg_id.to_string()),
-                    participant: Some(participant.to_string()),
-                }),
-                message: buffa::MessageField::some(wa::Message {
-                    extended_text_message: buffa::MessageField::some(
-                        wa::message::ExtendedTextMessage {
-                            text: Some("hi".into()),
-                            ..Default::default()
-                        },
-                    ),
-                    message_context_info: message_context_info.into(),
-                    ..Default::default()
-                }),
-                message_secret: Some(secret.to_vec()),
-                message_timestamp: Some(ts_secs),
-                ..Default::default()
-            }),
-            msg_order_id: Some(1),
+        {
+            let mut proto_value = wa::HistorySyncMsg::default();
+            proto_value.message = buffa::MessageField::some({
+                let mut proto_value = wa::WebMessageInfo::default();
+                proto_value.key = buffa::MessageField::some({
+                    let mut proto_value = wa::MessageKey::default();
+                    proto_value.remote_jid = Some(chat.to_string());
+                    proto_value.from_me = Some(false);
+                    proto_value.id = Some(msg_id.to_string());
+                    proto_value.participant = Some(participant.to_string());
+                    proto_value
+                });
+                proto_value.message = buffa::MessageField::some({
+                    let mut proto_value = wa::Message::default();
+                    proto_value.extended_text_message = buffa::MessageField::some({
+                        let mut proto_value = wa::message::ExtendedTextMessage::default();
+                        proto_value.text = Some("hi".into());
+                        proto_value
+                    });
+                    proto_value.message_context_info = message_context_info.into();
+                    proto_value
+                });
+                proto_value.message_secret = Some(secret.to_vec());
+                proto_value.message_timestamp = Some(ts_secs);
+                proto_value
+            });
+            proto_value.msg_order_id = Some(1);
+            proto_value
         }
     }
 

@@ -17,10 +17,11 @@ async fn replacing_status_privacy_releases_the_assembled_copy() {
             .await
             .expect("persistence manager"),
     );
-    let first = wa::sync_action_value::StatusPrivacyAction {
-        mode: Some(buffa::EnumValue::Unknown(99)),
-        user_jid: vec!["120363000000000042@lid".into()],
-        ..Default::default()
+    let first = {
+        let mut proto = wa::sync_action_value::StatusPrivacyAction::default();
+        proto.mode = Some(buffa::EnumValue::Unknown(99));
+        proto.user_jid = vec!["120363000000000042@lid".into()];
+        proto
     };
     persistence_manager
         .persist_status_privacy(&first)
@@ -43,9 +44,10 @@ async fn replacing_status_privacy_releases_the_assembled_copy() {
         .expect("test client should build")
         .into_parts();
 
-    let second = wa::sync_action_value::StatusPrivacyAction {
-        mode: Some(buffa::EnumValue::Unknown(100)),
-        ..Default::default()
+    let second = {
+        let mut proto = wa::sync_action_value::StatusPrivacyAction::default();
+        proto.mode = Some(buffa::EnumValue::Unknown(100));
+        proto
     };
     persistence_manager
         .persist_status_privacy(&second)
@@ -3801,6 +3803,15 @@ fn client_size_pins_runtime_cache_config_saving() {
         expected += size_of::<Arc<bench_startup::StartupTasks>>();
     }
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::HistorySyncCaptureHook>>>();
+    // The detached storage owner now also owns the reusable arena, replacing
+    // its former inline async mutex. Account for the actual attachment rather
+    // than raising the fixed Client base; retention includes test-only gates.
+    expected = expected
+        .checked_add_signed(
+            crate::message::commit_batch::InboundCommitBatcher::storage_layout_delta(),
+        )
+        .unwrap();
+
     assert_eq!(
         size_of::<Client>(),
         expected,

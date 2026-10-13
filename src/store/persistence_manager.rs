@@ -607,10 +607,11 @@ mod tests {
     async fn status_privacy_persistence_survives_manager_restart() {
         let backend = Arc::new(wacore::store::in_memory::InMemoryBackend::new());
         let pm = PersistenceManager::new(backend.clone()).await.unwrap();
-        let action = waproto::whatsapp::sync_action_value::StatusPrivacyAction {
-            mode: Some(buffa::EnumValue::Unknown(99)),
-            user_jid: vec!["120363000000000042@lid".into()],
-            ..Default::default()
+        let action = {
+            let mut proto_ = waproto::whatsapp::sync_action_value::StatusPrivacyAction::default();
+            proto_.mode = Some(buffa::EnumValue::Unknown(99));
+            proto_.user_jid = vec!["120363000000000042@lid".into()];
+            proto_
         };
         pm.persist_status_privacy(&action).await.unwrap();
 

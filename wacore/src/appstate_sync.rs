@@ -109,12 +109,21 @@ fn committed_mutations_error(
 /// The processor calls this hook before committing the cursor for a patch,
 /// snapshot, or snapshot recovery. A hook error leaves that cursor unchanged
 /// so the mutation can be replayed.
-pub trait AppStateMutationPersistence: Send + Sync {
+pub trait AppStateMutationPersistence: crate::sync_marker::MaybeSendSync {
     /// Persist the complete status privacy action, including unknown modes.
     async fn persist_status_privacy(
         &self,
         action: &wa::sync_action_value::StatusPrivacyAction,
     ) -> crate::store::error::Result<()>;
+
+    /// Persist validated pnForLidChat pairs before advancing the collection cursor.
+    /// The default preserves compatibility with status-privacy-only adapters.
+    async fn persist_lid_pn_mappings(
+        &self,
+        _mappings: Vec<(String, String)>,
+    ) -> crate::store::error::Result<()> {
+        Ok(())
+    }
 }
 
 /// Return a complete `status_privacy` SET action with a mode.
@@ -134,6 +143,40 @@ pub fn status_privacy_action(
         .status_privacy
         .as_option()
         .filter(|action| action.mode.is_some())
+}
+
+/// A validated pnForLidChat SET pair, with user addresses in LID and PN namespaces.
+// WAWebPnForLidChatSync uses createUserLidOrThrow/createUserWidOrThrow.
+// Reject other namespaces and device addresses rather than turning them into
+// a pair of bare user strings that the ledger would accept without validation.
+pub fn pn_for_lid_chat_pair(m: &Mutation) -> Option<(wacore_binary::Jid, wacore_binary::Jid)> {
+    let [command, lid] = m.index.as_slice() else {
+        return None;
+    };
+    if command != crate::appstate::schemas::PN_FOR_LID_CHAT.name
+        || m.operation != wa::syncd_mutation::SyncdOperation::Set
+    {
+        return None;
+    }
+    let lid: wacore_binary::Jid = lid.parse().ok()?;
+    let pn: wacore_binary::Jid = m
+        .action_value
+        .as_ref()?
+        .pn_for_lid_chat_action
+        .as_option()?
+        .pn_jid
+        .as_ref()?
+        .parse()
+        .ok()?;
+    let valid_user = |jid: &wacore_binary::Jid| {
+        !jid.user.is_empty()
+            && jid.user != "0"
+            && jid.user.bytes().all(|byte| byte.is_ascii_digit())
+            && jid.device == 0
+            && jid.agent == 0
+            && jid.integrator == 0
+    };
+    (lid.is_lid() && pn.is_pn() && valid_user(&lid) && valid_user(&pn)).then_some((lid, pn))
 }
 
 /// Index MAC carried by a mutation's record, if present.
@@ -392,14 +435,21 @@ impl AppStateProcessor {
         self
     }
 
-    async fn persist_status_privacy(&self, mutations: &[Mutation]) -> Result<()> {
-        let Some(action) = mutations.iter().rev().find_map(status_privacy_action) else {
-            return Ok(());
-        };
+    async fn persist_mutation_effects(&self, mutations: &[Mutation]) -> Result<()> {
         let Some(persistence) = self.mutation_persistence.as_ref() else {
             return Ok(());
         };
-        persistence.persist_status_privacy(action).await?;
+        if let Some(action) = mutations.iter().rev().find_map(status_privacy_action) {
+            persistence.persist_status_privacy(action).await?;
+        }
+        let mappings: Vec<_> = mutations
+            .iter()
+            .filter_map(pn_for_lid_chat_pair)
+            .map(|(lid, pn)| (lid.user.to_string(), pn.user.to_string()))
+            .collect();
+        if !mappings.is_empty() {
+            persistence.persist_lid_pn_mappings(mappings).await?;
+        }
         Ok(())
     }
 
@@ -858,7 +908,7 @@ impl AppStateProcessor {
         if !macs.is_empty() {
             self.backend.put_mutation_macs(name, version, &macs).await?;
         }
-        self.persist_status_privacy(&mutations).await?;
+        self.persist_mutation_effects(&mutations).await?;
         self.backend
             .set_version(
                 name,
@@ -1112,7 +1162,7 @@ impl AppStateProcessor {
                     .await?;
             }
             state.bootstrapped |= !pl.has_more_patches;
-            self.persist_status_privacy(&snapshot_result.mutations)
+            self.persist_mutation_effects(&snapshot_result.mutations)
                 .await?;
             self.backend
                 .set_version(collection_name, state.clone())
@@ -1246,7 +1296,7 @@ impl AppStateProcessor {
             // transactional backend commits the version with the MACs it
             // pairs with instead of paying three round trips.
             state.bootstrapped |= !pl.has_more_patches;
-            if let Err(error) = self.persist_status_privacy(&result.mutations).await {
+            if let Err(error) = self.persist_mutation_effects(&result.mutations).await {
                 return Err(committed_mutations_error(
                     error,
                     new_mutations,
@@ -1392,13 +1442,16 @@ impl AppStateProcessor {
         let snapshot_mac = state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
 
         // Build the patch — matching whatsmeow: no Version or DeviceIndex fields
-        let mut patch = wa::SyncdPatch {
-            snapshot_mac: Some(snapshot_mac),
-            key_id: buffa::MessageField::some(wa::KeyId {
-                id: Some(key_id.clone()),
-            }),
-            mutations,
-            ..Default::default()
+        let mut patch = {
+            let mut proto = wa::SyncdPatch::default();
+            proto.snapshot_mac = Some(snapshot_mac);
+            proto.key_id = buffa::MessageField::some({
+                let mut proto = wa::KeyId::default();
+                proto.id = Some(key_id.clone());
+                proto
+            });
+            proto.mutations = mutations;
+            proto
         };
 
         // Generate and set patch MAC
@@ -1492,9 +1545,10 @@ mod external_blob_tests {
     fn external_snapshot_download_failure_propagates() {
         // A referenced blob that fails to download must error, not be swallowed
         // (which would apply an empty patch and advance the version).
-        let mut pl = pl_with_snapshot_ref(Some(wa::ExternalBlobReference {
-            direct_path: Some("/blob".into()),
-            ..Default::default()
+        let mut pl = pl_with_snapshot_ref(Some({
+            let mut proto = wa::ExternalBlobReference::default();
+            proto.direct_path = Some("/blob".into());
+            proto
         }));
         let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
             Err(anyhow!("simulated failure"))
@@ -1506,9 +1560,10 @@ mod external_blob_tests {
     fn external_snapshot_decode_failure_propagates() {
         // Download succeeds but the bytes aren't a valid SyncdSnapshot: the decode
         // error must propagate too, not just download errors.
-        let mut pl = pl_with_snapshot_ref(Some(wa::ExternalBlobReference {
-            direct_path: Some("/blob".into()),
-            ..Default::default()
+        let mut pl = pl_with_snapshot_ref(Some({
+            let mut proto = wa::ExternalBlobReference::default();
+            proto.direct_path = Some("/blob".into());
+            proto
         }));
         let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
             Ok(bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF]))
@@ -1522,12 +1577,14 @@ mod external_blob_tests {
         let mut pl = PatchList {
             name: WAPatchName::Regular,
             has_more_patches: false,
-            patches: vec![wa::SyncdPatch {
-                external_mutations: buffa::MessageField::some(wa::ExternalBlobReference {
-                    direct_path: Some("/mutations".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
+            patches: vec![{
+                let mut proto = wa::SyncdPatch::default();
+                proto.external_mutations = buffa::MessageField::some({
+                    let mut proto = wa::ExternalBlobReference::default();
+                    proto.direct_path = Some("/mutations".into());
+                    proto
+                });
+                proto
             }],
             snapshot: None,
             snapshot_ref: None,
@@ -1546,12 +1603,14 @@ mod external_blob_tests {
         let mut pl = PatchList {
             name: WAPatchName::Regular,
             has_more_patches: false,
-            patches: vec![wa::SyncdPatch {
-                external_mutations: buffa::MessageField::some(wa::ExternalBlobReference {
-                    direct_path: Some("/mutations".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
+            patches: vec![{
+                let mut proto = wa::SyncdPatch::default();
+                proto.external_mutations = buffa::MessageField::some({
+                    let mut proto = wa::ExternalBlobReference::default();
+                    proto.direct_path = Some("/mutations".into());
+                    proto
+                });
+                proto
             }],
             snapshot: None,
             snapshot_ref: None,
@@ -1583,14 +1642,18 @@ mod dedup_tests {
     use super::*;
 
     fn mutation(index_mac: &[u8]) -> wa::SyncdMutation {
-        wa::SyncdMutation {
-            record: buffa::MessageField::some(wa::SyncdRecord {
-                index: buffa::MessageField::some(wa::SyncdIndex {
-                    blob: Some(index_mac.to_vec()),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
+        {
+            let mut proto = wa::SyncdMutation::default();
+            proto.record = buffa::MessageField::some({
+                let mut proto = wa::SyncdRecord::default();
+                proto.index = buffa::MessageField::some({
+                    let mut proto = wa::SyncdIndex::default();
+                    proto.blob = Some(index_mac.to_vec());
+                    proto
+                });
+                proto
+            });
+            proto
         }
     }
 

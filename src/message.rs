@@ -209,6 +209,7 @@ enum MigrationDecryptResult {
 pub(crate) struct PlaintextHandleOutcome {
     dispatched: bool,
     skdm_only: bool,
+    delivered: bool,
 }
 
 #[cfg(feature = "bench-harness")]
@@ -254,6 +255,7 @@ impl DispatchKey {
     /// Hashes an identity through the process key. Zero folds onto one so
     /// `Option<DispatchKey>` rides in 8 bytes: one extra colliding pair in
     /// 2^64, below the collision rate the identity already tolerates.
+    #[inline(never)]
     fn new(identity: impl std::hash::Hash) -> Self {
         use std::hash::BuildHasher;
         let digest = DISPATCH_IDENTITY.hash_one(identity);
@@ -281,6 +283,8 @@ pub(crate) type DispatchFingerprint = [u8; 16];
 struct DispatchPayload {
     fingerprint: DispatchFingerprint,
     state: MessageDispatch,
+    hook_committed: bool,
+    producer: Option<DispatchKey>,
     publication: Arc<AtomicU8>,
 }
 
@@ -310,7 +314,7 @@ pub(crate) struct PublicationGuard {
 /// final event handle so the near-kilobyte message never moves through the
 /// receive/dispatch futures again.
 pub(crate) enum ProbeOutcome {
-    Suppress,
+    Suppress { decrypted: Option<Arc<wa::Message>> },
     Proceed { decrypted: Option<Arc<wa::Message>> },
 }
 
@@ -374,6 +378,7 @@ impl DispatchClaim {
         fingerprint: DispatchFingerprint,
         pdo: bool,
         hook_committed: bool,
+        producer: Option<DispatchKey>,
         publication: &mut PublicationGuard,
     ) -> bool {
         if let Some(payload) = self.payloads.iter_mut().find(|payload| {
@@ -399,7 +404,10 @@ impl DispatchClaim {
                 }
                 return true;
             }
-            // Ordinary multipart dispatches and hook replays still fan out.
+            payload.hook_committed |= hook_committed;
+            payload.producer = producer.or(payload.producer);
+            // Ordinary multipart dispatches still fan out. Retained-row cleanup
+            // replay separately checks completed hook publication before admission.
             // Keep a completed claim, but let a new publisher own a pending one.
             if payload.publication.load(Ordering::Acquire) != PUBLICATION_COMPLETE {
                 payload.publication = publication.owner();
@@ -409,6 +417,8 @@ impl DispatchClaim {
         if self.payloads.len() < MAX_DISPATCH_PAYLOADS {
             self.payloads.push(DispatchPayload {
                 fingerprint,
+                hook_committed,
+                producer,
                 state: if pdo {
                     MessageDispatch::Recovered
                 } else {
@@ -572,6 +582,8 @@ impl InboundCommitTicket {
 
 pub(crate) enum InboundCommitState {
     Durable,
+    /// The row is stored, but the consumer hook has not accepted it yet.
+    Buffered,
     Deferred(Option<InboundCommitTicket>),
     Failed,
 }
@@ -580,7 +592,7 @@ pub(crate) enum InboundCommitState {
 /// handled after the per-sender session lock is released.
 struct DeferredPlaintext {
     enc_type: &'static str,
-    plaintext: Vec<u8>,
+    plaintext: bytes::Bytes,
     padding_version: u8,
     /// Which `<enc>` in the stanza produced this — [`EncPayload::enc_index`],
     /// carried through because the buffer drains after the decrypt loop.
@@ -722,7 +734,9 @@ pub(crate) use wacore::protocol::retry::RetryReason;
 pub(crate) mod commit_batch;
 mod dispatch;
 mod durability;
+mod live_retention;
 mod msg_secret;
+mod raw_pending;
 mod receive;
 mod retry;
 mod special;

@@ -519,6 +519,101 @@
           "source": "src/peer_video/negative.rs",
           "error_code": "E0599"
         }
+      },
+      {
+        "lanes": [
+          "native",
+          "msrv"
+        ],
+        "mode": "check",
+        "features": [
+          "proto-owned-literal"
+        ],
+        "lib": true,
+        "expect_failure": {
+          "error_code": "E0639",
+          "contains": [
+            "non-exhaustive",
+            "Message"
+          ],
+          "source": "src/protobuf_contract.rs"
+        }
+      },
+      {
+        "lanes": [
+          "native",
+          "msrv"
+        ],
+        "mode": "check",
+        "features": [
+          "proto-view-literal"
+        ],
+        "lib": true,
+        "expect_failure": {
+          "error_code": "E0639",
+          "contains": [
+            "non-exhaustive",
+            "MessageView"
+          ],
+          "source": "src/protobuf_contract.rs"
+        }
+      },
+      {
+        "lanes": [
+          "native",
+          "msrv"
+        ],
+        "mode": "check",
+        "features": [
+          "proto-exhaustive-enum"
+        ],
+        "lib": true,
+        "expect_failure": {
+          "error_code": "E0004",
+          "contains": [
+            "non-exhaustive",
+            "ADVEncryptionType"
+          ],
+          "source": "src/protobuf_contract.rs"
+        }
+      },
+      {
+        "lanes": [
+          "native",
+          "msrv"
+        ],
+        "mode": "check",
+        "features": [
+          "proto-exhaustive-oneof"
+        ],
+        "lib": true,
+        "expect_failure": {
+          "error_code": "E0004",
+          "contains": [
+            "non-exhaustive",
+            "Operation"
+          ],
+          "source": "src/protobuf_contract.rs"
+        }
+      },
+      {
+        "lanes": [
+          "native",
+          "msrv"
+        ],
+        "mode": "check",
+        "features": [
+          "proto-exhaustive-view-oneof"
+        ],
+        "lib": true,
+        "expect_failure": {
+          "error_code": "E0004",
+          "contains": [
+            "non-exhaustive",
+            "OperationView"
+          ],
+          "source": "src/protobuf_contract.rs"
+        }
       }
     ]
   }

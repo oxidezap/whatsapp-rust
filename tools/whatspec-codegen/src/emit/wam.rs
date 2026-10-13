@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 
 use crate::ir::{WamCallSite, WamEventDef, WamFieldWrite, WamIr, WamValueKind};
 use crate::naming::{ensure_ident, rust_ident, rust_lit, snake_case, unique_type_ident};
@@ -75,6 +75,14 @@ pub struct Artifacts {
 }
 
 pub fn generate(ir: &WamIr, wa_version: &str) -> Result<Artifacts> {
+    ensure!(
+        !ir.events.iter().any(|event| event.name == "RingtoneScreen")
+            && !ir
+                .enums
+                .iter()
+                .any(|value| value.module == "WAWebWamEnumRingtoneEntryType"),
+        "upstream reclaimed retained ringtone contracts; reconcile wam-catalog/src/unlisted.rs"
+    );
     let enums = enum_names(ir)?;
     Ok(Artifacts {
         catalog: catalog(ir, wa_version, &enums)?,
@@ -206,7 +214,7 @@ fn enum_module(ir: &WamIr, names: &BTreeMap<String, String>) -> String {
          /// Each is closed: WA Web validates a field against the frozen member set\n\
          /// and throws otherwise, so a value outside it is not representable here\n\
          /// either. `wire()` is the integer that reaches the buffer.\n\
-         pub mod enums {\n",
+         pub mod enums {\n    pub use crate::unlisted::RingtoneEntryType;\n",
     );
     for e in &ir.enums {
         let rust = &names[&e.module];
@@ -321,7 +329,7 @@ fn events_module(ir: &WamIr, enums: &BTreeMap<String, String>) -> Result<String>
          /// Absence is the only way to say \"this client does not know\": there is no\n\
          /// zero or empty-string sentinel, because the buffer distinguishes a field\n\
          /// that was written from one that was not and so does the server.\n\
-         pub mod events {\n\
+         pub mod events {\n    pub use crate::unlisted::RingtoneScreen;\n\
          \x20   use super::enums;\n\
          \x20   use crate::{Channel, EventFields, WamEvent};\n\n",
     );

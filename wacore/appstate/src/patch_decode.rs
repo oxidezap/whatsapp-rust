@@ -400,20 +400,24 @@ mod tests {
     const TRUNCATED_PROTOBUF: [u8; 3] = [0x0A, 0x05, 0x01];
 
     fn patch_bytes(version: u64) -> Vec<u8> {
-        waproto::codec::syncd_patch_to_vec(&wa::SyncdPatch {
-            version: buffa::MessageField::some(wa::SyncdVersion {
-                version: Some(version),
-            }),
-            snapshot_mac: Some(vec![0xAB; 32]),
-            ..Default::default()
+        waproto::codec::syncd_patch_to_vec(&{
+            let mut proto = wa::SyncdPatch::default();
+            proto.version = buffa::MessageField::some({
+                let mut proto = wa::SyncdVersion::default();
+                proto.version = Some(version);
+                proto
+            });
+            proto.snapshot_mac = Some(vec![0xAB; 32]);
+            proto
         })
     }
 
     fn snapshot_ref_bytes(direct_path: &str) -> Vec<u8> {
-        wa::ExternalBlobReference {
-            direct_path: Some(direct_path.to_string()),
-            file_size_bytes: Some(4096),
-            ..Default::default()
+        {
+            let mut proto = wa::ExternalBlobReference::default();
+            proto.direct_path = Some(direct_path.to_string());
+            proto.file_size_bytes = Some(4096);
+            proto
         }
         .encode_to_vec()
     }

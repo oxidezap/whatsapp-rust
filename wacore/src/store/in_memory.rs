@@ -32,6 +32,23 @@ struct SentMessageEntry {
     timestamp: i64,
 }
 
+// Only this backend can write these bytes. Conditional writes retain their
+// payload revision; legacy writes replace the entire entry without a cache.
+struct PendingInboundEntry {
+    bytes: Vec<u8>,
+    inserted_at: i64,
+    revision: Option<PendingInboundRevision>,
+}
+
+impl PendingInboundEntry {
+    fn bounded_revision(&self, max_bytes: usize) -> Result<PendingInboundRevision> {
+        validate_pending_length(self.bytes.len(), max_bytes)?;
+        Ok(self
+            .revision
+            .unwrap_or_else(|| PendingInboundRevision::for_bytes(&self.bytes)))
+    }
+}
+
 /// Key for pre-keys: `id`.
 struct PreKeyEntry {
     record: Bytes,
@@ -179,8 +196,8 @@ struct InMemoryState {
     group_metadata: HashMap<String, Vec<u8>>,
     tc_tokens: HashMap<String, TcTokenEntry>,
     sent_messages: HashMap<SentMessageKey, SentMessageEntry>,
-    /// Pending inbound durability buffer: (chat, sender, id) -> (message, inserted_at).
-    pending_inbound: HashMap<(String, String, String), (Vec<u8>, i64)>,
+    /// Pending inbound durability buffer keyed by (chat, sender, id).
+    pending_inbound: HashMap<(String, String, String), PendingInboundEntry>,
 
     // --- MsgSecret ---
     /// `expires_at = 0` means never expire; `message_ts = 0` means the parent
@@ -227,6 +244,14 @@ const MAX_MSG_SECRETS: usize = 8192;
 pub struct InMemoryBackend {
     state: Mutex<InMemoryState>,
     next_device_id: AtomicI32,
+    #[cfg(any(test, feature = "test-util"))]
+    fail_pending_delete: AtomicU32,
+    #[cfg(any(test, feature = "test-util"))]
+    fail_pending_replace_after_commit: AtomicBool,
+    #[cfg(any(test, feature = "test-util"))]
+    skip_pending_delete_failures: AtomicU32,
+    #[cfg(any(test, feature = "test-util"))]
+    pending_delete_gate: std::sync::Mutex<Option<Arc<async_lock::Barrier>>>,
     /// Count of `put_sessions_batch` calls. Test hook (see `test-util`): lets a
     /// harness prove receive-path flush coalescing (N receives collapse to fewer
     /// batch writes). Gated so normal builds carry neither the field nor the
@@ -251,6 +276,8 @@ pub struct InMemoryBackend {
     /// flush).
     #[cfg(any(test, feature = "test-util"))]
     fail_sender_key_writes: AtomicBool,
+    #[cfg(any(test, feature = "test-util"))]
+    fail_sender_key_reads: AtomicBool,
     /// Parks the next `load_signed_prekey` on a barrier. Test hook: lets a
     /// harness promote a rotated key while a lookup is already in flight,
     /// which is the window a caller's re-read exists to close.
@@ -259,10 +286,59 @@ pub struct InMemoryBackend {
 }
 
 impl InMemoryBackend {
+    /// Report an error after the next conditional replacement became visible.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn fail_next_pending_replace_after_commit(&self) {
+        self.fail_pending_replace_after_commit
+            .store(true, Ordering::Relaxed);
+    }
+    /// Inject a conditional-delete error before or after applying it.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_fail_pending_delete(&self, after_commit: Option<bool>) {
+        self.fail_pending_delete.store(
+            after_commit.map_or(0, |after| if after { 2 } else { 1 }),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Allow a prefix of conditional deletes before injecting an error.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn skip_pending_delete_failures(&self, count: u32) {
+        self.skip_pending_delete_failures
+            .store(count, Ordering::Relaxed);
+    }
+
+    /// Fail one conditional delete, then allow the remaining batch to progress.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn fail_one_pending_delete(&self, prefix: u32, after_commit: bool) {
+        self.skip_pending_delete_failures(prefix);
+        self.fail_pending_delete
+            .store(if after_commit { 5 } else { 4 }, Ordering::Relaxed);
+    }
+
+    /// Park a conditional delete after allowing the specified prefix.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn park_pending_delete(&self, prefix: u32, gate: Arc<async_lock::Barrier>) {
+        *self
+            .pending_delete_gate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(gate);
+        self.skip_pending_delete_failures(prefix);
+        self.fail_pending_delete.store(3, Ordering::Relaxed);
+    }
+
     /// Create a new, empty in-memory store.
     pub fn new() -> Self {
         Self {
             state: Mutex::new(InMemoryState::default()),
+            #[cfg(any(test, feature = "test-util"))]
+            fail_pending_delete: AtomicU32::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            fail_pending_replace_after_commit: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-util"))]
+            skip_pending_delete_failures: AtomicU32::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            pending_delete_gate: std::sync::Mutex::new(None),
             next_device_id: AtomicI32::new(1),
             #[cfg(any(test, feature = "test-util"))]
             session_batch_writes: AtomicU32::new(0),
@@ -274,6 +350,8 @@ impl InMemoryBackend {
             fail_session_after: AtomicUsize::new(usize::MAX),
             #[cfg(any(test, feature = "test-util"))]
             fail_sender_key_writes: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-util"))]
+            fail_sender_key_reads: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-util"))]
             signed_prekey_read_gate: std::sync::Mutex::new(None),
         }
@@ -311,6 +389,12 @@ impl InMemoryBackend {
     #[cfg(any(test, feature = "test-util"))]
     pub fn set_fail_sender_key_writes(&self, fail: bool) {
         self.fail_sender_key_writes.store(fail, Ordering::Relaxed);
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    /// Inject errors in backend sender-key reads; cached keys are unaffected.
+    pub fn set_fail_sender_key_reads(&self, fail: bool) {
+        self.fail_sender_key_reads.store(fail, Ordering::Relaxed);
     }
 
     /// Park the next `load_signed_prekey` on `gate`, which it waits on twice:
@@ -627,6 +711,12 @@ impl SignalStore for InMemoryBackend {
     }
 
     async fn get_sender_key(&self, address: &str) -> Result<Option<Vec<u8>>> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.fail_sender_key_reads.load(Ordering::Relaxed) {
+            return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                "injected sender-key read failure",
+            )));
+        }
         Ok(self.state.lock().await.sender_keys.get(address).cloned())
     }
 
@@ -1153,7 +1243,11 @@ impl ProtocolStore for InMemoryBackend {
         let now = crate::time::now_secs();
         self.state.lock().await.pending_inbound.insert(
             (chat.to_string(), sender.to_string(), id.to_string()),
-            (message.to_vec(), now),
+            PendingInboundEntry {
+                bytes: message.to_vec(),
+                inserted_at: now,
+                revision: None,
+            },
         );
         Ok(())
     }
@@ -1171,7 +1265,7 @@ impl ProtocolStore for InMemoryBackend {
             .await
             .pending_inbound
             .get(&key)
-            .map(|(bytes, _)| bytes.clone()))
+            .map(|entry| entry.bytes.clone()))
     }
 
     async fn delete_pending_inbound(&self, chat: &str, sender: &str, id: &str) -> Result<()> {
@@ -1180,13 +1274,187 @@ impl ProtocolStore for InMemoryBackend {
         Ok(())
     }
 
+    async fn read_pending_inbound_bounded(
+        &self,
+        key: PendingInboundKey<'_>,
+        max_bytes: usize,
+        lease: PendingInboundLease,
+    ) -> Result<Option<PendingInboundRecord>> {
+        let key = (
+            key.chat.to_owned(),
+            key.sender.to_owned(),
+            key.id.to_owned(),
+        );
+        let state = self.state.lock().await;
+        state
+            .pending_inbound
+            .get(&key)
+            .map(|entry| {
+                validate_pending_length(entry.bytes.len(), max_bytes)?;
+                Ok(PendingInboundRecord::new(entry.bytes.clone(), lease))
+            })
+            .transpose()
+    }
+
+    async fn read_pending_inbound_group_bounded(
+        &self,
+        key: PendingInboundKey<'_>,
+        max_bytes: usize,
+        lease: PendingInboundLease,
+    ) -> Result<Option<(String, PendingInboundRecord)>> {
+        let state = self.state.lock().await;
+        let mut metadata = state
+            .pending_inbound
+            .keys()
+            .filter(|(chat, _, id)| chat == key.chat && id == key.id)
+            .map(|(_, sender, _)| Some(sender.as_str()))
+            .take(401);
+        let Some(sender) = pending_group_sender(&mut metadata, key.sender)? else {
+            return Ok(None);
+        };
+        let entry = state
+            .pending_inbound
+            .get(&(key.chat.to_owned(), sender.clone(), key.id.to_owned()))
+            .ok_or_else(|| {
+                crate::store::error::StoreError::Validation(
+                    "pending group row disappeared under owner".into(),
+                )
+            })?;
+        validate_pending_length(entry.bytes.len(), max_bytes)?;
+        Ok(Some((
+            sender,
+            PendingInboundRecord::new(entry.bytes.clone(), lease),
+        )))
+    }
+
+    async fn replace_pending_inbound_if(
+        &self,
+        key: PendingInboundKey<'_>,
+        expected: PendingInboundRevision,
+        replacement: PendingInboundPayload,
+        max_bytes: usize,
+    ) -> Result<PendingInboundMutation> {
+        validate_pending_length(replacement.bytes().len(), max_bytes)?;
+        let key = (
+            key.chat.to_owned(),
+            key.sender.to_owned(),
+            key.id.to_owned(),
+        );
+        let mut state = self.state.lock().await;
+        let revision = match state.pending_inbound.get(&key) {
+            Some(entry) => entry.bounded_revision(max_bytes)?,
+            None => PendingInboundRevision::missing(),
+        };
+        let installed = replacement.revision();
+        if revision == installed {
+            return Ok(PendingInboundMutation::Applied);
+        }
+        if revision != expected {
+            return Ok(PendingInboundMutation::Conflict);
+        }
+        state.pending_inbound.insert(
+            key,
+            PendingInboundEntry {
+                bytes: replacement.bytes().to_vec(),
+                inserted_at: crate::time::now_secs(),
+                revision: Some(installed),
+            },
+        );
+        #[cfg(any(test, feature = "test-util"))]
+        if self
+            .fail_pending_replace_after_commit
+            .swap(false, Ordering::Relaxed)
+        {
+            return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                "injected post-commit pending replace failure",
+            )));
+        }
+        Ok(PendingInboundMutation::Applied)
+    }
+
+    async fn delete_pending_inbound_if(
+        &self,
+        key: PendingInboundKey<'_>,
+        expected: PendingInboundRevision,
+        max_bytes: usize,
+        _lease: PendingInboundLease,
+    ) -> Result<PendingInboundMutation> {
+        let key = (
+            key.chat.to_owned(),
+            key.sender.to_owned(),
+            key.id.to_owned(),
+        );
+        let mut state = self.state.lock().await;
+        let revision = match state.pending_inbound.get(&key) {
+            Some(entry) => entry.bounded_revision(max_bytes)?,
+            None => PendingInboundRevision::missing(),
+        };
+        if revision != expected {
+            return Ok(PendingInboundMutation::Conflict);
+        }
+        #[cfg(any(test, feature = "test-util"))]
+        let fail = {
+            let injected = self.fail_pending_delete.load(Ordering::Relaxed);
+            if injected != 0
+                && self
+                    .skip_pending_delete_failures
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                0
+            } else if injected >= 4 {
+                self.fail_pending_delete.store(0, Ordering::Relaxed);
+                injected - 3
+            } else {
+                injected
+            }
+        };
+        #[cfg(any(test, feature = "test-util"))]
+        if fail == 3 {
+            let gate = self
+                .pending_delete_gate
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            if let Some(gate) = gate {
+                gate.wait().await;
+                gate.wait().await;
+            }
+        }
+        #[cfg(any(test, feature = "test-util"))]
+        if fail == 1 {
+            return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                "injected pending delete failure",
+            )));
+        }
+        state.pending_inbound.remove(&key);
+        #[cfg(any(test, feature = "test-util"))]
+        if fail == 2 {
+            return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                "injected post-commit pending delete failure",
+            )));
+        }
+        Ok(PendingInboundMutation::Applied)
+    }
+
     async fn delete_expired_pending_inbound(&self, cutoff_timestamp: i64) -> Result<u32> {
         let mut s = self.state.lock().await;
         let before = s.pending_inbound.len();
         s.pending_inbound
-            .retain(|_, (_, inserted_at)| *inserted_at >= cutoff_timestamp);
+            .retain(|_, entry| entry.inserted_at >= cutoff_timestamp);
         Ok((before - s.pending_inbound.len()) as u32)
     }
+}
+
+fn validate_pending_length(length: usize, max_bytes: usize) -> Result<()> {
+    if length > max_bytes {
+        return Err(crate::store::error::StoreError::Validation(format!(
+            "pending inbound length {length} exceeds limit {max_bytes}"
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1431,8 +1699,8 @@ impl DeviceStore for InMemoryBackend {
         );
         account!(
             state.pending_inbound,
-            |k: &(String, String, String), v: &(Vec<u8>, i64)| {
-                k.0.capacity() + k.1.capacity() + k.2.capacity() + v.0.capacity()
+            |k: &(String, String, String), v: &PendingInboundEntry| {
+                k.0.capacity() + k.1.capacity() + k.2.capacity() + v.bytes.capacity()
             }
         );
 
@@ -1637,6 +1905,343 @@ mod tests {
     use super::*;
 
     fn is_backend<T: Backend>() {}
+
+    #[tokio::test]
+    async fn pending_bounded_group_legacy_alias_preserves_physical_cas_and_lease() {
+        let store = InMemoryBackend::new();
+        let chat = "120363000000000081@g.us";
+        let sender = "200:75@lid";
+        let key = PendingInboundKey {
+            chat,
+            sender,
+            id: "LEGACY_ALIAS",
+        };
+        let logical = PendingInboundKey {
+            sender: "200@lid",
+            ..key
+        };
+        store
+            .store_pending_inbound(chat, sender, key.id, b"old")
+            .await
+            .unwrap();
+        store
+            .store_pending_inbound(chat, "200:75@s.whatsapp.net", key.id, b"other")
+            .await
+            .unwrap();
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let (physical, record) = store
+            .read_pending_inbound_group_bounded(
+                logical,
+                16,
+                PendingInboundLease::new(owner.clone()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        drop(owner);
+        assert!(
+            weak.upgrade().is_some(),
+            "returned record retains the owner"
+        );
+        assert_eq!(physical, sender);
+        assert_eq!(record.bytes(), b"old");
+        let stale = record.revision();
+        drop(record);
+        assert!(weak.upgrade().is_none());
+        store
+            .store_pending_inbound(chat, sender, key.id, b"new")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .delete_pending_inbound_if(key, stale, 16, PendingInboundLease::new(Arc::new(())))
+                .await
+                .unwrap(),
+            PendingInboundMutation::Conflict
+        );
+        assert!(
+            store
+                .read_pending_inbound_group_bounded(
+                    logical,
+                    2,
+                    PendingInboundLease::new(Arc::new(()))
+                )
+                .await
+                .is_err()
+        );
+        store
+            .store_pending_inbound(chat, logical.sender, key.id, b"ambiguous")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .read_pending_inbound_group_bounded(
+                    logical,
+                    16,
+                    PendingInboundLease::new(Arc::new(()))
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_pending_inbound(chat, sender, key.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            b"new"
+        );
+        store
+            .delete_pending_inbound(chat, logical.sender, key.id)
+            .await
+            .unwrap();
+        let (_, record) = store
+            .read_pending_inbound_group_bounded(logical, 16, PendingInboundLease::new(Arc::new(())))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .delete_pending_inbound_if(key, record.revision(), 16, record.lease())
+                .await
+                .unwrap(),
+            PendingInboundMutation::Applied
+        );
+        assert!(
+            store
+                .read_pending_inbound_group_bounded(
+                    logical,
+                    16,
+                    PendingInboundLease::new(Arc::new(()))
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_bounded_memory_preserves_revision_and_empty_presence() {
+        let backend = InMemoryBackend::new();
+        let key = PendingInboundKey {
+            chat: "test-chat",
+            sender: "test-sender",
+            id: "same-id",
+        };
+        let lease = || PendingInboundLease::new(Arc::new(()));
+        let put =
+            |bytes: &'static [u8]| PendingInboundPayload::new(Bytes::from_static(bytes), lease());
+        backend
+            .store_pending_inbound(key.chat, key.sender, key.id, &[])
+            .await
+            .unwrap();
+        let empty = backend
+            .read_pending_inbound_bounded(key, 16, lease())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(empty.bytes().is_empty());
+        assert_ne!(empty.revision(), PendingInboundRevision::missing());
+        assert_eq!(
+            backend
+                .delete_pending_inbound_if(key, PendingInboundRevision::missing(), 16, lease())
+                .await
+                .unwrap(),
+            PendingInboundMutation::Conflict
+        );
+        let replacement = put(b"\x0a\x81\x00a");
+        let installed = replacement.revision();
+        assert_eq!(
+            backend
+                .replace_pending_inbound_if(key, empty.revision(), replacement, 16)
+                .await
+                .unwrap(),
+            PendingInboundMutation::Applied
+        );
+        let original = backend
+            .read_pending_inbound_bounded(key, 16, lease())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.bytes(), b"\x0a\x81\x00a");
+        assert_eq!(original.revision(), installed);
+        assert_eq!(
+            backend
+                .replace_pending_inbound_if(key, empty.revision(), put(b"\x0a\x81\x00a"), 16)
+                .await
+                .unwrap(),
+            PendingInboundMutation::Applied
+        );
+        assert_eq!(
+            backend
+                .replace_pending_inbound_if(key, empty.revision(), put(b"\x0a\x01a"), 16)
+                .await
+                .unwrap(),
+            PendingInboundMutation::Conflict
+        );
+        assert_eq!(
+            backend
+                .delete_pending_inbound_if(key, empty.revision(), 16, lease())
+                .await
+                .unwrap(),
+            PendingInboundMutation::Conflict
+        );
+        assert_eq!(
+            backend
+                .read_pending_inbound_bounded(key, 16, lease())
+                .await
+                .unwrap()
+                .unwrap()
+                .bytes(),
+            original.bytes()
+        );
+        assert_eq!(
+            backend
+                .delete_pending_inbound_if(key, original.revision(), 16, lease())
+                .await
+                .unwrap(),
+            PendingInboundMutation::Applied
+        );
+        assert!(
+            backend
+                .read_pending_inbound_bounded(key, 16, lease())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_bounded_memory_legacy_write_invalidates_cached_revision() {
+        let backend = InMemoryBackend::new();
+        let key = PendingInboundKey {
+            chat: "test-chat",
+            sender: "test-sender",
+            id: "legacy-overwrite",
+        };
+        let lease = || PendingInboundLease::new(Arc::new(()));
+        let payload = PendingInboundPayload::new(Bytes::from_static(b"old"), lease());
+        let old = payload.revision();
+        assert_eq!(
+            backend
+                .replace_pending_inbound_if(key, PendingInboundRevision::missing(), payload, 16)
+                .await
+                .unwrap(),
+            PendingInboundMutation::Applied
+        );
+        assert!(
+            backend
+                .delete_pending_inbound_if(key, old, 2, lease())
+                .await
+                .is_err()
+        );
+        backend
+            .store_pending_inbound(key.chat, key.sender, key.id, b"new")
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .delete_pending_inbound_if(key, old, 16, lease())
+                .await
+                .unwrap(),
+            PendingInboundMutation::Conflict
+        );
+        assert_eq!(
+            backend
+                .replace_pending_inbound_if(
+                    key,
+                    old,
+                    PendingInboundPayload::new(Bytes::from_static(b"third"), lease()),
+                    16,
+                )
+                .await
+                .unwrap(),
+            PendingInboundMutation::Conflict
+        );
+        let record = backend
+            .read_pending_inbound_bounded(key, 16, lease())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.bytes(), b"new");
+        assert_eq!(record.revision(), PendingInboundRevision::for_bytes(b"new"));
+        assert_eq!(
+            backend
+                .delete_pending_inbound_if(key, record.revision(), 16, lease())
+                .await
+                .unwrap(),
+            PendingInboundMutation::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_bounded_memory_rejects_oversize_without_mutation() {
+        let backend = InMemoryBackend::new();
+        let key = PendingInboundKey {
+            chat: "test-chat",
+            sender: "test-sender",
+            id: "large",
+        };
+        let lease = || PendingInboundLease::new(Arc::new(()));
+        backend
+            .store_pending_inbound(key.chat, key.sender, key.id, &[1; 32])
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .read_pending_inbound_bounded(key, 16, lease())
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .replace_pending_inbound_if(
+                    key,
+                    PendingInboundRevision::missing(),
+                    PendingInboundPayload::new(Bytes::from_static(b"small"), lease()),
+                    16
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .delete_pending_inbound_if(key, PendingInboundRevision::missing(), 16, lease())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            backend
+                .get_pending_inbound(key.chat, key.sender, key.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            [1; 32]
+        );
+        backend
+            .delete_pending_inbound(key.chat, key.sender, key.id)
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .replace_pending_inbound_if(
+                    key,
+                    PendingInboundRevision::missing(),
+                    PendingInboundPayload::new(Bytes::from_static(&[2; 32]), lease()),
+                    16
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .get_pending_inbound(key.chat, key.sender, key.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn in_memory_backend_implements_backend() {

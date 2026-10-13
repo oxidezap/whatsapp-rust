@@ -1,4 +1,4 @@
-//! Auto-generated AppState (syncd) action schemas (WhatsApp 2.3000.1045368834). DO NOT EDIT.
+//! Auto-generated AppState (syncd) action schemas (WhatsApp 2.3000.1047483476). DO NOT EDIT.
 //!
 //! Typed registry of syncd actions: collection, version, scope, value proto type,
 //! enum fields, and the mutation-index parts. `const`/`&'static`, no deps.
@@ -454,7 +454,10 @@ pub const BUSINESS_BROADCAST_CAMPAIGN: Schema = Schema {
     scope: Scope::Account,
     value_field: Some("businessBroadcastCampaignAction"),
     value_proto_type: Some("SyncActionValue.BusinessBroadcastCampaignAction"),
-    value_enum_fields: &[("status", "BusinessBroadcastCampaignStatus")],
+    value_enum_fields: &[
+        ("bbProStatus", "BusinessBroadcastCampaignBBProStatus"),
+        ("status", "BusinessBroadcastCampaignStatus"),
+    ],
     chat_jid_index: None,
     index_parts: &[
         IndexPart::Literal {
@@ -1410,7 +1413,10 @@ pub const STATUS_PRIVACY: Schema = Schema {
     scope: Scope::Account,
     value_field: Some("statusPrivacy"),
     value_proto_type: Some("SyncActionValue.StatusPrivacyAction"),
-    value_enum_fields: &[],
+    value_enum_fields: &[
+        ("mode", "StatusPrivacyAction.StatusDistributionMode"),
+        ("modes", "StatusPrivacyAction.StatusDistributionMode"),
+    ],
     chat_jid_index: None,
     index_parts: &[IndexPart::Literal {
         value: "status_privacy",

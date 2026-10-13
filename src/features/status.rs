@@ -136,14 +136,16 @@ impl<'a> Status<'a> {
         recipients: &[Jid],
         options: StatusSendOptions,
     ) -> Result<SendResult, SendError> {
-        let message = wa::Message {
-            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
-                text: Some(text.to_string()),
-                background_argb: Some(background_argb),
-                font: Some(font),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let message = {
+            let mut proto = wa::Message::default();
+            proto.extended_text_message = buffa::MessageField::some({
+                let mut proto = wa::message::ExtendedTextMessage::default();
+                proto.text = Some(text.to_string());
+                proto.background_argb = Some(background_argb);
+                proto.font = Some(font);
+                proto
+            });
+            proto
         };
 
         self.client
@@ -234,18 +236,21 @@ impl<'a> Status<'a> {
     ) -> Result<SendResult, SendError> {
         let to = Jid::status_broadcast();
 
-        let revoke_message = wa::Message {
-            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
-                key: buffa::MessageField::some(wa::MessageKey {
-                    remote_jid: Some(to.to_string()),
-                    from_me: Some(true),
-                    id: Some(message_id.into_string()),
-                    ..Default::default()
-                }),
-                r#type: Some(wa::message::protocol_message::Type::REVOKE),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let revoke_message = {
+            let mut proto_ = wa::Message::default();
+            proto_.protocol_message = buffa::MessageField::some({
+                let mut proto_ = wa::message::ProtocolMessage::default();
+                proto_.key = buffa::MessageField::some({
+                    let mut proto = wa::MessageKey::default();
+                    proto.remote_jid = Some(to.to_string());
+                    proto.from_me = Some(true);
+                    proto.id = Some(message_id.into_string());
+                    proto
+                });
+                proto_.r#type = Some(wa::message::protocol_message::Type::REVOKE);
+                proto_
+            });
+            proto_
         };
 
         self.client
@@ -385,16 +390,16 @@ mod tests {
         let bg = 0xFF1E6E4F_u32;
         let font = FontType::FB_SCRIPT;
 
-        let message = waproto::whatsapp::Message {
-            extended_text_message: buffa::MessageField::some(
-                waproto::whatsapp::message::ExtendedTextMessage {
-                    text: Some(text.to_string()),
-                    background_argb: Some(bg),
-                    font: Some(font),
-                    ..Default::default()
-                },
-            ),
-            ..Default::default()
+        let message = {
+            let mut proto_ = waproto::whatsapp::Message::default();
+            proto_.extended_text_message = buffa::MessageField::some({
+                let mut proto_ = waproto::whatsapp::message::ExtendedTextMessage::default();
+                proto_.text = Some(text.to_string());
+                proto_.background_argb = Some(bg);
+                proto_.font = Some(font);
+                proto_
+            });
+            proto_
         };
 
         let ext = message.extended_text_message.as_option().unwrap();
@@ -410,19 +415,22 @@ mod tests {
         let original_id = "3EB06D00CAB92340790621";
         let to = Jid::status_broadcast();
 
-        let revoke_message = wa::Message {
-            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
-                key: wa::MessageKey {
-                    remote_jid: Some(to.to_string()),
-                    from_me: Some(true),
-                    id: Some(original_id.to_string()),
-                    ..Default::default()
+        let revoke_message = {
+            let mut proto_ = wa::Message::default();
+            proto_.protocol_message = buffa::MessageField::some({
+                let mut proto_ = wa::message::ProtocolMessage::default();
+                proto_.key = {
+                    let mut proto = wa::MessageKey::default();
+                    proto.remote_jid = Some(to.to_string());
+                    proto.from_me = Some(true);
+                    proto.id = Some(original_id.to_string());
+                    proto
                 }
-                .into(),
-                r#type: Some(wa::message::protocol_message::Type::REVOKE),
-                ..Default::default()
-            }),
-            ..Default::default()
+                .into();
+                proto_.r#type = Some(wa::message::protocol_message::Type::REVOKE);
+                proto_
+            });
+            proto_
         };
 
         let pm = revoke_message.protocol_message.as_option().unwrap();
@@ -438,12 +446,14 @@ mod tests {
         use waproto::whatsapp as wa;
 
         // Non-revoke message
-        let text_msg = wa::Message {
-            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
-                text: Some("hello".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let text_msg = {
+            let mut proto = wa::Message::default();
+            proto.extended_text_message = buffa::MessageField::some({
+                let mut proto = wa::message::ExtendedTextMessage::default();
+                proto.text = Some("hello".to_string());
+                proto
+            });
+            proto
         };
         let is_revoke = text_msg
             .protocol_message
@@ -452,12 +462,14 @@ mod tests {
         assert!(!is_revoke, "text message should not be detected as revoke");
 
         // Revoke message
-        let revoke_msg = wa::Message {
-            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
-                r#type: Some(wa::message::protocol_message::Type::REVOKE),
-                ..Default::default()
-            }),
-            ..Default::default()
+        let revoke_msg = {
+            let mut proto_ = wa::Message::default();
+            proto_.protocol_message = buffa::MessageField::some({
+                let mut proto_ = wa::message::ProtocolMessage::default();
+                proto_.r#type = Some(wa::message::protocol_message::Type::REVOKE);
+                proto_
+            });
+            proto_
         };
         let is_revoke = revoke_msg
             .protocol_message

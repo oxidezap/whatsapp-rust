@@ -159,6 +159,8 @@ jobs:
           NEXTEST_PROFILE: ci
           TEST_TIMINGS_DIR: ${{ runner.temp }}/test-timings
         run: cargo xt ci nextest-timed workspace -- --workspace --exclude e2e-tests
+      - name: Verify pending-row cache, CAS, retries and cancelled-worker ownership
+        run: cargo nextest run --locked --workspace --exclude e2e-tests --lib -E '(package(wacore) | package(whatsapp-rust-sqlite-storage)) & (test(pending_bounded_) | test(pending_conditional_) | test(pending_owned_cancelled_cas_) | test(pending_owned_read_result_) | test(shared_retry_) | test(native_retry_backoff_) | test(only_busy_and_locked_database_errors_are_retriable))'
       - name: Publish test timings
         if: always()
         uses: actions/upload-artifact@v7

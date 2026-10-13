@@ -1,4 +1,4 @@
-//! Auto-generated WAM catalog (WhatsApp 2.3000.1045368834). DO NOT EDIT.
+//! Auto-generated WAM catalog (WhatsApp 2.3000.1047483476). DO NOT EDIT.
 //!
 //! Regenerate with `cargo run -p whatspec-codegen`. Every event, enum,
 //! global and constant WA Web declares is here; which of them this client
@@ -84,6 +84,7 @@ pub const PRIVATE_STATS_IDS: &[PrivateStatsId] = &[
 /// and throws otherwise, so a value outside it is not representable here
 /// either. `wire()` is the integer that reaches the buffer.
 pub mod enums {
+    pub use crate::unlisted::RingtoneEntryType;
     /// `ABOUT_CONSUMPTION_SURFACE_TYPE` (`WAWebWamEnumAboutConsumptionSurfaceType`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum AboutConsumptionSurfaceType {
@@ -137,6 +138,8 @@ pub mod enums {
         DeepLink,
         /// `ONE_ON_ONE_CHAT` = 5.
         OneOnOneChat,
+        /// `CONTACTS_TAB` = 6.
+        ContactsTab,
     }
 
     impl AboutEntrypointType {
@@ -148,6 +151,7 @@ pub mod enums {
                 Self::MeTab => 3,
                 Self::DeepLink => 4,
                 Self::OneOnOneChat => 5,
+                Self::ContactsTab => 6,
             }
         }
     }
@@ -921,6 +925,10 @@ pub mod enums {
         CommunityEmptySubgroup,
         /// `GROUP_MEMBERS_LIST_ADD_BUTTON` = 16.
         GroupMembersListAddButton,
+        /// `ADD_CONTACT_TO_GROUPS_PICKER` = 17.
+        AddContactToGroupsPicker,
+        /// `MEMBERSHIP_APPROVAL_REQUESTS` = 18.
+        MembershipApprovalRequests,
     }
 
     impl AddMembersEntrypointType {
@@ -944,6 +952,8 @@ pub mod enums {
                 Self::CommunityContextCard => 14,
                 Self::CommunityEmptySubgroup => 15,
                 Self::GroupMembersListAddButton => 16,
+                Self::AddContactToGroupsPicker => 17,
+                Self::MembershipApprovalRequests => 18,
             }
         }
     }
@@ -1151,6 +1161,170 @@ pub mod enums {
                 Self::GridLowRes => 3,
                 Self::InlineHighRes => 4,
                 Self::InlineLowRes => 5,
+            }
+        }
+    }
+
+    /// `AI_QP_SURFACE_TYPE` (`WAWebWamEnumAiQpSurfaceType`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum AiQpSurfaceType {
+        /// `SUGGESTED_PROMPT` = 1.
+        SuggestedPrompt,
+        /// `HERO_CARD` = 2.
+        HeroCard,
+    }
+
+    impl AiQpSurfaceType {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::SuggestedPrompt => 1,
+                Self::HeroCard => 2,
+            }
+        }
+    }
+
+    /// `AI_SUB_COMPONENT` (`WAWebWamEnumAiSubComponent`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum AiSubComponent {
+        /// `UNIFIED_RESPONSE_UPSELL` = 1.
+        UnifiedResponseUpsell,
+        /// `CREDITS_EXHAUSTED_SNACKBAR` = 2.
+        CreditsExhaustedSnackbar,
+        /// `UPSELL_BANNER` = 3.
+        UpsellBanner,
+        /// `CONTACT_INFO_ROW` = 4.
+        ContactInfoRow,
+    }
+
+    impl AiSubComponent {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::UnifiedResponseUpsell => 1,
+                Self::CreditsExhaustedSnackbar => 2,
+                Self::UpsellBanner => 3,
+                Self::ContactInfoRow => 4,
+            }
+        }
+    }
+
+    /// `AI_SUB_ENTRYPOINT` (`WAWebWamEnumAiSubEntrypoint`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum AiSubEntrypoint {
+        /// `THINKING` = 1.
+        Thinking,
+        /// `IMAGINE` = 2.
+        Imagine,
+        /// `VIDEO` = 3.
+        Video,
+        /// `META_AI_SETTINGS` = 4.
+        MetaAiSettings,
+        /// `IMAGINE_INTENTS_BOTTOM_SHEET` = 5.
+        ImagineIntentsBottomSheet,
+        /// `IMAGINE_INTENTS_CREATE_IMAGE` = 6.
+        ImagineIntentsCreateImage,
+        /// `IMAGINE_INTENTS_EDIT_IMAGE` = 7.
+        ImagineIntentsEditImage,
+        /// `IMAGINE_INTENTS_PRESETS` = 8.
+        ImagineIntentsPresets,
+        /// `IMAGINE_INTENTS_RESTYLE` = 9.
+        ImagineIntentsRestyle,
+        /// `IMAGINE_INTENTS_ANIMATE` = 10.
+        ImagineIntentsAnimate,
+        /// `IMAGINE_INTENTS_REGENERATE` = 11.
+        ImagineIntentsRegenerate,
+        /// `MEDIA_EDITOR_BOTTOM_SHEET` = 12.
+        MediaEditorBottomSheet,
+        /// `MEDIA_EDITOR_RESTYLE` = 13.
+        MediaEditorRestyle,
+        /// `MEDIA_EDITOR_EDIT_OPTION` = 14.
+        MediaEditorEditOption,
+        /// `MEDIA_EDITOR_ANIMATE` = 15.
+        MediaEditorAnimate,
+        /// `MEDIA_EDITOR_VIDEO_RESTYLE` = 16.
+        MediaEditorVideoRestyle,
+        /// `MEDIA_EDITOR_REGENERATE` = 17.
+        MediaEditorRegenerate,
+    }
+
+    impl AiSubEntrypoint {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::Thinking => 1,
+                Self::Imagine => 2,
+                Self::Video => 3,
+                Self::MetaAiSettings => 4,
+                Self::ImagineIntentsBottomSheet => 5,
+                Self::ImagineIntentsCreateImage => 6,
+                Self::ImagineIntentsEditImage => 7,
+                Self::ImagineIntentsPresets => 8,
+                Self::ImagineIntentsRestyle => 9,
+                Self::ImagineIntentsAnimate => 10,
+                Self::ImagineIntentsRegenerate => 11,
+                Self::MediaEditorBottomSheet => 12,
+                Self::MediaEditorRestyle => 13,
+                Self::MediaEditorEditOption => 14,
+                Self::MediaEditorAnimate => 15,
+                Self::MediaEditorVideoRestyle => 16,
+                Self::MediaEditorRegenerate => 17,
+            }
+        }
+    }
+
+    /// `AI_SUB_SCREEN` (`WAWebWamEnumAiSubScreen`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum AiSubScreen {
+        /// `CHAT_THREAD_THINKING` = 1.
+        ChatThreadThinking,
+        /// `CHAT_THREAD_IMAGINE` = 2.
+        ChatThreadImagine,
+        /// `CHAT_THREAD_VIDEO` = 3.
+        ChatThreadVideo,
+        /// `META_AI_SETTINGS` = 4.
+        MetaAiSettings,
+        /// `AI_TAB_THINKING` = 5.
+        AiTabThinking,
+        /// `IMAGINE_INTENTS` = 6.
+        ImagineIntents,
+        /// `MEDIA_EDITOR` = 7.
+        MediaEditor,
+    }
+
+    impl AiSubScreen {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::ChatThreadThinking => 1,
+                Self::ChatThreadImagine => 2,
+                Self::ChatThreadVideo => 3,
+                Self::MetaAiSettings => 4,
+                Self::AiTabThinking => 5,
+                Self::ImagineIntents => 6,
+                Self::MediaEditor => 7,
+            }
+        }
+    }
+
+    /// `AI_SUB_USER_ACTION` (`WAWebWamEnumAiSubUserAction`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum AiSubUserAction {
+        /// `VIEW` = 1.
+        View,
+        /// `CLICK` = 2.
+        Click,
+        /// `DISMISS` = 3.
+        Dismiss,
+    }
+
+    impl AiSubUserAction {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::View => 1,
+                Self::Click => 2,
+                Self::Dismiss => 3,
             }
         }
     }
@@ -1580,6 +1754,8 @@ pub mod enums {
         AllContacts,
         /// `LABEL` = 6.
         Label,
+        /// `GROUP` = 7.
+        Group,
     }
 
     impl AudiencePredicateTypeEnum {
@@ -1593,6 +1769,7 @@ pub mod enums {
                 Self::LargestList => 4,
                 Self::AllContacts => 5,
                 Self::Label => 6,
+                Self::Group => 7,
             }
         }
     }
@@ -2267,6 +2444,10 @@ pub mod enums {
         BackupsAuthError,
         /// `META_AI_THREADING_WIND_DOWN` = 124.
         MetaAiThreadingWindDown,
+        /// `WEB_CALLING_ACTIVATION_BANNER` = 125.
+        WebCallingActivationBanner,
+        /// `STATUS_OPT_IN_UPSELL_BANNER` = 126.
+        StatusOptInUpsellBanner,
     }
 
     impl BannerTypes {
@@ -2385,6 +2566,8 @@ pub mod enums {
                 Self::ChannelAdminProfilesAdoption => 122,
                 Self::BackupsAuthError => 123,
                 Self::MetaAiThreadingWindDown => 124,
+                Self::WebCallingActivationBanner => 125,
+                Self::StatusOptInUpsellBanner => 126,
             }
         }
     }
@@ -3149,6 +3332,25 @@ pub mod enums {
         }
     }
 
+    /// `BOT_SESSION_TYPE` (`WAWebWamEnumBotSessionType`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum BotSessionType {
+        /// `TEXT` = 1.
+        Text,
+        /// `VOICE` = 2.
+        Voice,
+    }
+
+    impl BotSessionType {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::Text => 1,
+                Self::Voice => 2,
+            }
+        }
+    }
+
     /// `BOT_TYPE` (`WAWebWamEnumBotType`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum BotType {
@@ -3236,6 +3438,12 @@ pub mod enums {
         BugReportEntryPointBloks,
         /// `BUG_REPORT_ENTRY_POINT_SIDEBAR_BUGNUB` = 8.
         BugReportEntryPointSidebarBugnub,
+        /// `BUG_REPORT_ENTRY_POINT_RESTORE_TRANSFER_SELECTOR` = 9.
+        BugReportEntryPointRestoreTransferSelector,
+        /// `BUG_REPORT_ENTRY_POINT_RESTORE_FROM_BACKUP` = 10.
+        BugReportEntryPointRestoreFromBackup,
+        /// `BUG_REPORT_ENTRY_POINT_CHAT_TRANSFER` = 11.
+        BugReportEntryPointChatTransfer,
     }
 
     impl BugReportEntryPointName {
@@ -3250,6 +3458,9 @@ pub mod enums {
                 Self::BugReportEntryPointVoipCallMenu => 6,
                 Self::BugReportEntryPointBloks => 7,
                 Self::BugReportEntryPointSidebarBugnub => 8,
+                Self::BugReportEntryPointRestoreTransferSelector => 9,
+                Self::BugReportEntryPointRestoreFromBackup => 10,
+                Self::BugReportEntryPointChatTransfer => 11,
             }
         }
     }
@@ -4135,6 +4346,8 @@ pub mod enums {
         GroupInfoBottomSheetChatsTab,
         /// `GROUP_INFO_BOTTOM_SHEET_CALLS_TAB` = 89.
         GroupInfoBottomSheetCallsTab,
+        /// `CONTACTS_TAB` = 90.
+        ContactsTab,
     }
 
     impl CallFromUi {
@@ -4230,6 +4443,7 @@ pub mod enums {
                 Self::CallInfoCallLinkMiniContactSheet => 87,
                 Self::GroupInfoBottomSheetChatsTab => 88,
                 Self::GroupInfoBottomSheetCallsTab => 89,
+                Self::ContactsTab => 90,
             }
         }
     }
@@ -5235,6 +5449,8 @@ pub mod enums {
         CredRequestFailedTimeout,
         /// `CRED_REQUEST_FAILED_ERROR` = 12.
         CredRequestFailedError,
+        /// `LID_VALIDATION` = 13.
+        LidValidation,
     }
 
     impl CanonicalEntRecoveryCompanionEvent {
@@ -5254,6 +5470,7 @@ pub mod enums {
                 Self::CredRequestSucceededViaRecovery => 10,
                 Self::CredRequestFailedTimeout => 11,
                 Self::CredRequestFailedError => 12,
+                Self::LidValidation => 13,
             }
         }
     }
@@ -7417,6 +7634,10 @@ pub mod enums {
         AgentProfileView,
         /// `AGENT_REMOVE` = 284.
         AgentRemove,
+        /// `AI_QP_IMPRESSION` = 285.
+        AiQpImpression,
+        /// `AI_QP_TAP` = 286.
+        AiQpTap,
     }
 
     impl ChatFilterActionTypes {
@@ -7702,6 +7923,8 @@ pub mod enums {
                 Self::AgentCreateFail => 282,
                 Self::AgentProfileView => 283,
                 Self::AgentRemove => 284,
+                Self::AiQpImpression => 285,
+                Self::AiQpTap => 286,
             }
         }
     }
@@ -10557,6 +10780,12 @@ pub mod enums {
         DeepLinkSettingsAccountPassword,
         /// `DEEP_LINK_BUSINESS_FOLDER` = 256.
         DeepLinkBusinessFolder,
+        /// `DEEP_LINK_HATCH_INSTALL` = 257.
+        DeepLinkHatchInstall,
+        /// `DEEP_LINK_SETTINGS_SCAM_ALERT` = 258.
+        DeepLinkSettingsScamAlert,
+        /// `DEEP_LINK_PAYMENT_BR_ADD_PIX_KEY` = 261.
+        DeepLinkPaymentBrAddPixKey,
     }
 
     impl DeepLinkType {
@@ -10818,6 +11047,9 @@ pub mod enums {
                 Self::DeepLinkAgeCollection => 254,
                 Self::DeepLinkSettingsAccountPassword => 255,
                 Self::DeepLinkBusinessFolder => 256,
+                Self::DeepLinkHatchInstall => 257,
+                Self::DeepLinkSettingsScamAlert => 258,
+                Self::DeepLinkPaymentBrAddPixKey => 261,
             }
         }
     }
@@ -12409,6 +12641,10 @@ pub mod enums {
         RevokeStanzaProtobufMismatch,
         /// `WASS_INVALID_ATTESTATION` = 116.
         WassInvalidAttestation,
+        /// `ERROR_LEASE_FETCH` = 117.
+        ErrorLeaseFetch,
+        /// `ERROR_TEE_IDENTITY_TOKEN` = 118.
+        ErrorTeeIdentityToken,
     }
 
     impl E2eFailureReason {
@@ -12532,6 +12768,8 @@ pub mod enums {
                 Self::InvalidDsm => 114,
                 Self::RevokeStanzaProtobufMismatch => 115,
                 Self::WassInvalidAttestation => 116,
+                Self::ErrorLeaseFetch => 117,
+                Self::ErrorTeeIdentityToken => 118,
             }
         }
     }
@@ -14205,6 +14443,8 @@ pub mod enums {
         GetPublicKey,
         /// `VERIFY_POSTCODE` = 11.
         VerifyPostcode,
+        /// `GET_ORDER_INFO` = 12.
+        GetOrderInfo,
     }
 
     impl GraphqlCatalogEndpoint {
@@ -14222,6 +14462,7 @@ pub mod enums {
                 Self::CreateCollection => 9,
                 Self::GetPublicKey => 10,
                 Self::VerifyPostcode => 11,
+                Self::GetOrderInfo => 12,
             }
         }
     }
@@ -14586,6 +14827,18 @@ pub mod enums {
         GroupHistoryBottomsheetCancelButtonClicked,
         /// `GROUP_HISTORY_BOTTOMSHEET_DISMISSED` = 22.
         GroupHistoryBottomsheetDismissed,
+        /// `GROUP_HISTORY_FOOTER_DISPLAYED` = 23.
+        GroupHistoryFooterDisplayed,
+        /// `GROUP_HISTORY_TOGGLE_ON` = 24.
+        GroupHistoryToggleOn,
+        /// `GROUP_HISTORY_TOGGLE_OFF` = 25.
+        GroupHistoryToggleOff,
+        /// `GROUP_HISTORY_SPEED_BUMP_DIALOG_DISPLAYED` = 26.
+        GroupHistorySpeedBumpDialogDisplayed,
+        /// `GROUP_HISTORY_SPEED_BUMP_DIALOG_CONTINUED` = 27.
+        GroupHistorySpeedBumpDialogContinued,
+        /// `GROUP_HISTORY_SPEED_BUMP_DIALOG_CANCELED` = 28.
+        GroupHistorySpeedBumpDialogCanceled,
     }
 
     impl GroupHistorySenderActionType {
@@ -14615,6 +14868,12 @@ pub mod enums {
                 Self::GroupHistoryBottomsheetConfirmButtonClicked => 20,
                 Self::GroupHistoryBottomsheetCancelButtonClicked => 21,
                 Self::GroupHistoryBottomsheetDismissed => 22,
+                Self::GroupHistoryFooterDisplayed => 23,
+                Self::GroupHistoryToggleOn => 24,
+                Self::GroupHistoryToggleOff => 25,
+                Self::GroupHistorySpeedBumpDialogDisplayed => 26,
+                Self::GroupHistorySpeedBumpDialogContinued => 27,
+                Self::GroupHistorySpeedBumpDialogCanceled => 28,
             }
         }
     }
@@ -15355,6 +15614,34 @@ pub mod enums {
         }
     }
 
+    /// `HANDOFF_NOTIF_ACTION_TYPE` (`WAWebWamEnumHandoffNotifActionType`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum HandoffNotifActionType {
+        /// `NOTIF_DELIVERED` = 1.
+        NotifDelivered,
+        /// `NOTIF_SHOWN` = 2.
+        NotifShown,
+        /// `NOTIF_CLICKED_BODY` = 3.
+        NotifClickedBody,
+        /// `NOTIF_CLICKED_BUTTON_1` = 4.
+        NotifClickedButton1,
+        /// `NOTIF_CLICKED_BUTTON_2` = 5.
+        NotifClickedButton2,
+    }
+
+    impl HandoffNotifActionType {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::NotifDelivered => 1,
+                Self::NotifShown => 2,
+                Self::NotifClickedBody => 3,
+                Self::NotifClickedButton1 => 4,
+                Self::NotifClickedButton2 => 5,
+            }
+        }
+    }
+
     /// `HARMFUL_FILE_WARNING_CLICKTHROUGH_ACTION` (`WAWebWamEnumHarmfulFileWarningClickthroughAction`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum HarmfulFileWarningClickthroughAction {
@@ -16035,6 +16322,12 @@ pub mod enums {
         AiTab,
         /// `AI_SEASONAL_UPSELL` = 25.
         AiSeasonalUpsell,
+        /// `AI_FAB_QP` = 26.
+        AiFabQp,
+        /// `AI_TAB_QP` = 27.
+        AiTabQp,
+        /// `NONE` = 28.
+        None,
     }
 
     impl ImagineActionSource {
@@ -16067,6 +16360,9 @@ pub mod enums {
                 Self::DeepLink => 23,
                 Self::AiTab => 24,
                 Self::AiSeasonalUpsell => 25,
+                Self::AiFabQp => 26,
+                Self::AiTabQp => 27,
+                Self::None => 28,
             }
         }
     }
@@ -16829,6 +17125,10 @@ pub mod enums {
         CopyPixImpression,
         /// `PIX_INVITE_SHARE_KEY` = 105.
         PixInviteShareKey,
+        /// `CLICK_BUY_ON_WHATSAPP_TILE` = 106.
+        ClickBuyOnWhatsappTile,
+        /// `AUTOMATIC_START` = 107.
+        AutomaticStart,
     }
 
     impl InteractionType {
@@ -16941,6 +17241,8 @@ pub mod enums {
                 Self::PaymentTextDetectionClick => 103,
                 Self::CopyPixImpression => 104,
                 Self::PixInviteShareKey => 105,
+                Self::ClickBuyOnWhatsappTile => 106,
+                Self::AutomaticStart => 107,
             }
         }
     }
@@ -17889,6 +18191,8 @@ pub mod enums {
         GroupInfoBottomSheetChatsTab,
         /// `GROUP_INFO_BOTTOM_SHEET_CALLS_TAB` = 44.
         GroupInfoBottomSheetCallsTab,
+        /// `CALLS_TAB_EMPTY_STATE` = 45.
+        CallsTabEmptyState,
     }
 
     impl LobbyEntryPointType {
@@ -17940,6 +18244,7 @@ pub mod enums {
                 Self::ChatEmptyState => 42,
                 Self::GroupInfoBottomSheetChatsTab => 43,
                 Self::GroupInfoBottomSheetCallsTab => 44,
+                Self::CallsTabEmptyState => 45,
             }
         }
     }
@@ -18205,6 +18510,8 @@ pub mod enums {
         ServerPingKick,
         /// `CONNECTION_RESET` = 20.
         ConnectionReset,
+        /// `FULL_PROXY_AVAILABLE` = 21.
+        FullProxyAvailable,
     }
 
     impl LogoutReasonType {
@@ -18232,6 +18539,7 @@ pub mod enums {
                 Self::ServerAckKick => 18,
                 Self::ServerPingKick => 19,
                 Self::ConnectionReset => 20,
+                Self::FullProxyAvailable => 21,
             }
         }
     }
@@ -18862,6 +19170,8 @@ pub mod enums {
         SmbFbLinkingUpsell,
         /// `SMB_IG_LINKING_UPSELL` = 117.
         SmbIgLinkingUpsell,
+        /// `SMB_SELF_STATUS_BOOST_END_CARD` = 118.
+        SmbSelfStatusBoostEndCard,
     }
 
     impl LwiEntryPoint {
@@ -18968,6 +19278,7 @@ pub mod enums {
                 Self::SmbFab => 115,
                 Self::SmbFbLinkingUpsell => 116,
                 Self::SmbIgLinkingUpsell => 117,
+                Self::SmbSelfStatusBoostEndCard => 118,
             }
         }
     }
@@ -20076,6 +20387,8 @@ pub mod enums {
         LwiActionWinbackRecreateFlowStarted,
         /// `LWI_ACTION_LINKING_UPSELL_CHOOSE_OTHER_MEDIA_TAPPED` = 542.
         LwiActionLinkingUpsellChooseOtherMediaTapped,
+        /// `LWI_ACTION_WINBACK_AD_CREATION_PAC_CREATE_NEW_AD_CLICK` = 543.
+        LwiActionWinbackAdCreationPacCreateNewAdClick,
     }
 
     impl LwiScreenAction {
@@ -20617,6 +20930,7 @@ pub mod enums {
                 Self::LwiActionWinbackThresholdScaleClick => 540,
                 Self::LwiActionWinbackRecreateFlowStarted => 541,
                 Self::LwiActionLinkingUpsellChooseOtherMediaTapped => 542,
+                Self::LwiActionWinbackAdCreationPacCreateNewAdClick => 543,
             }
         }
     }
@@ -22349,6 +22663,8 @@ pub mod enums {
         ContactsTab,
         /// `GROUP_STATUS_REPLY_WITH_STATUS` = 133.
         GroupStatusReplyWithStatus,
+        /// `STATUS_PRIVACY_SETTINGS` = 134.
+        StatusPrivacySettings,
     }
 
     impl MediaPickerOriginType {
@@ -22488,6 +22804,7 @@ pub mod enums {
                 Self::AiImagineMessageQuickEdit => 131,
                 Self::ContactsTab => 132,
                 Self::GroupStatusReplyWithStatus => 133,
+                Self::StatusPrivacySettings => 134,
             }
         }
     }
@@ -22714,6 +23031,8 @@ pub mod enums {
         StickerReaction,
         /// `MUSIC` = 80.
         Music,
+        /// `POLL_ADD_OPTION` = 81.
+        PollAddOption,
     }
 
     impl MediaType {
@@ -22800,6 +23119,7 @@ pub mod enums {
                 Self::EventInvite => 78,
                 Self::StickerReaction => 79,
                 Self::Music => 80,
+                Self::PollAddOption => 81,
             }
         }
     }
@@ -23586,6 +23906,8 @@ pub mod enums {
         ErrorBoundedStanzaTooLarge,
         /// `AEA_SEND_RECONCILATION_FAILURE` = 21.
         AeaSendReconcilationFailure,
+        /// `ERROR_SEND_PRECONDITION_FAILED` = 22.
+        ErrorSendPreconditionFailed,
     }
 
     impl MessageSendResultType {
@@ -23612,6 +23934,7 @@ pub mod enums {
                 Self::ErrorUploadCancelledAutomatic => 19,
                 Self::ErrorBoundedStanzaTooLarge => 20,
                 Self::AeaSendReconcilationFailure => 21,
+                Self::ErrorSendPreconditionFailed => 22,
             }
         }
     }
@@ -25832,6 +26155,8 @@ pub mod enums {
         EventV2Suspended,
         /// `STATUS_GROUP_STATUS_REPLY` = 72.
         StatusGroupStatusReply,
+        /// `STICKER_ANNOTATION` = 73.
+        StickerAnnotation,
     }
 
     impl NotificationTypeEnum {
@@ -25909,6 +26234,7 @@ pub mod enums {
                 Self::EventV2Reminder => 70,
                 Self::EventV2Suspended => 71,
                 Self::StatusGroupStatusReply => 72,
+                Self::StickerAnnotation => 73,
             }
         }
     }
@@ -25988,6 +26314,16 @@ pub mod enums {
         ProcessComplete,
         /// `PROCESS_INTERRUPTED` = 6.
         ProcessInterrupted,
+        /// `BACKEND_START` = 7.
+        BackendStart,
+        /// `DB_INIT_FAILED` = 8.
+        DbInitFailed,
+        /// `SERVICE_WORKER_VERSION_INVALID` = 9.
+        ServiceWorkerVersionInvalid,
+        /// `OFFLINE_PUSH_LIMIT_EXCEEDED` = 10.
+        OfflinePushLimitExceeded,
+        /// `OFFLINE_PUSH_DISABLED` = 11.
+        OfflinePushDisabled,
     }
 
     impl OfflineProcessStages {
@@ -26000,6 +26336,11 @@ pub mod enums {
                 Self::Processing => 4,
                 Self::ProcessComplete => 5,
                 Self::ProcessInterrupted => 6,
+                Self::BackendStart => 7,
+                Self::DbInitFailed => 8,
+                Self::ServiceWorkerVersionInvalid => 9,
+                Self::OfflinePushLimitExceeded => 10,
+                Self::OfflinePushDisabled => 11,
             }
         }
     }
@@ -27894,6 +28235,32 @@ pub mod enums {
         PixInviteRequestPayment,
         /// `PIX_INVITE_GO_TO_PAYMENTS` = 378.
         PixInviteGoToPayments,
+        /// `BUY_ON_WHATSAPP` = 379.
+        BuyOnWhatsapp,
+        /// `BUY_ON_WHATSAPP_TILE` = 380.
+        BuyOnWhatsappTile,
+        /// `PIX_ICON_ATTACHMENT_TRAY` = 381.
+        PixIconAttachmentTray,
+        /// `YOU_REQUESTED_CHIP` = 382.
+        YouRequestedChip,
+        /// `OTHERS_REQUESTED_CHIP` = 383.
+        OthersRequestedChip,
+        /// `ALL_CHIP` = 384.
+        AllChip,
+        /// `PILL_BUTTON` = 385.
+        PillButton,
+        /// `ADD_AMOUNT_BUTTON` = 386.
+        AddAmountButton,
+        /// `REQUEST_PAYMENT` = 387.
+        RequestPayment,
+        /// `SEND_PAYMENT` = 388.
+        SendPayment,
+        /// `SEND_PIX_KEY` = 389.
+        SendPixKey,
+        /// `GO_TO_PAYMENTS` = 390.
+        GoToPayments,
+        /// `SPLIT_PAYMENT` = 391.
+        SplitPayment,
     }
 
     impl PaymentActionTargets {
@@ -28278,6 +28645,19 @@ pub mod enums {
                 Self::PixInviteAskToSharePixKey => 376,
                 Self::PixInviteRequestPayment => 377,
                 Self::PixInviteGoToPayments => 378,
+                Self::BuyOnWhatsapp => 379,
+                Self::BuyOnWhatsappTile => 380,
+                Self::PixIconAttachmentTray => 381,
+                Self::YouRequestedChip => 382,
+                Self::OthersRequestedChip => 383,
+                Self::AllChip => 384,
+                Self::PillButton => 385,
+                Self::AddAmountButton => 386,
+                Self::RequestPayment => 387,
+                Self::SendPayment => 388,
+                Self::SendPixKey => 389,
+                Self::GoToPayments => 390,
+                Self::SplitPayment => 391,
             }
         }
     }
@@ -29417,6 +29797,10 @@ pub mod enums {
         Bluevr,
         /// `WAIL` = 70.
         Wail,
+        /// `WORKA` = 71.
+        Worka,
+        /// `WORKI` = 72.
+        Worki,
         /// `TEST` = 9.
         Test,
         /// `UNKNOWN` = 10.
@@ -29489,6 +29873,8 @@ pub mod enums {
                 Self::Wasg => 68,
                 Self::Bluevr => 69,
                 Self::Wail => 70,
+                Self::Worka => 71,
+                Self::Worki => 72,
                 Self::Test => 9,
                 Self::Unknown => 10,
             }
@@ -29714,6 +30100,10 @@ pub mod enums {
         EditPollInitiated,
         /// `EDIT_POLL_COMPLETED` = 9.
         EditPollCompleted,
+        /// `ADD_OPTION_INITIATED` = 10.
+        AddOptionInitiated,
+        /// `ADD_OPTION_COMPLETED` = 11.
+        AddOptionCompleted,
     }
 
     impl PollActionType {
@@ -29728,6 +30118,8 @@ pub mod enums {
                 Self::ChangeVote => 7,
                 Self::EditPollInitiated => 8,
                 Self::EditPollCompleted => 9,
+                Self::AddOptionInitiated => 10,
+                Self::AddOptionCompleted => 11,
             }
         }
     }
@@ -30166,6 +30558,8 @@ pub mod enums {
         AeaConsumerBackfill,
         /// `AEA_GOSSIP_MISMATCH` = 17.
         AeaGossipMismatch,
+        /// `PQ_SESSION_UPGRADE` = 18.
+        PqSessionUpgrade,
     }
 
     impl PrekeysFetchContext {
@@ -30189,6 +30583,7 @@ pub mod enums {
                 Self::AeaSendTimeReconcilation => 15,
                 Self::AeaConsumerBackfill => 16,
                 Self::AeaGossipMismatch => 17,
+                Self::PqSessionUpgrade => 18,
             }
         }
     }
@@ -33180,27 +33575,52 @@ pub mod enums {
         }
     }
 
-    /// `RINGTONE_ENTRY_TYPE` (`WAWebWamEnumRingtoneEntryType`).
+    /// `SCHEDULED_MESSAGE_ACTION_TYPE` (`WAWebWamEnumScheduledMessageActionType`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub enum RingtoneEntryType {
-        /// `APP_WIDE` = 0.
-        AppWide,
-        /// `ONE_TO_ONE` = 1.
-        OneToOne,
-        /// `GROUP` = 2.
-        Group,
-        /// `LIST` = 3.
-        List,
+    pub enum ScheduledMessageActionType {
+        /// `OPEN_SCHEDULE_DATE_TIME_PICKER` = 1.
+        OpenScheduleDateTimePicker,
+        /// `SELECT_DATE_TIME` = 2.
+        SelectDateTime,
+        /// `TAP_SCHEDULE_BUTTON` = 3.
+        TapScheduleButton,
+        /// `TAP_UNSCHEDULE_BUTTON` = 4.
+        TapUnscheduleButton,
+        /// `VIEW_SCHEDULED_MESSAGE_LIST` = 5.
+        ViewScheduledMessageList,
     }
 
-    impl RingtoneEntryType {
+    impl ScheduledMessageActionType {
         /// The integer WA Web writes for this member.
         pub const fn wire(self) -> i64 {
             match self {
-                Self::AppWide => 0,
-                Self::OneToOne => 1,
-                Self::Group => 2,
-                Self::List => 3,
+                Self::OpenScheduleDateTimePicker => 1,
+                Self::SelectDateTime => 2,
+                Self::TapScheduleButton => 3,
+                Self::TapUnscheduleButton => 4,
+                Self::ViewScheduledMessageList => 5,
+            }
+        }
+    }
+
+    /// `SCHEDULED_MESSAGE_ENTRYPOINT` (`WAWebWamEnumScheduledMessageEntrypoint`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum ScheduledMessageEntrypoint {
+        /// `SYSTEM_MESSAGE` = 1.
+        SystemMessage,
+        /// `CHAT_INFO` = 2.
+        ChatInfo,
+        /// `CHAT_DELETE_DIALOG` = 3.
+        ChatDeleteDialog,
+    }
+
+    impl ScheduledMessageEntrypoint {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::SystemMessage => 1,
+                Self::ChatInfo => 2,
+                Self::ChatDeleteDialog => 3,
             }
         }
     }
@@ -35477,6 +35897,8 @@ pub mod enums {
         GroupInfoBottomSheetChatsTab,
         /// `GROUP_INFO_BOTTOM_SHEET_CALLS_TAB` = 64.
         GroupInfoBottomSheetCallsTab,
+        /// `STATUS_PRIVACY_SETTINGS` = 65.
+        StatusPrivacySettings,
     }
 
     impl StatusCreationEntryPoint {
@@ -35546,6 +35968,7 @@ pub mod enums {
                 Self::GroupStatusReplyWithStatus => 62,
                 Self::GroupInfoBottomSheetChatsTab => 63,
                 Self::GroupInfoBottomSheetCallsTab => 64,
+                Self::StatusPrivacySettings => 65,
             }
         }
     }
@@ -36502,6 +36925,8 @@ pub mod enums {
         GroupInfoBottomSheetChatsTab,
         /// `GROUP_INFO_BOTTOM_SHEET_CALLS_TAB` = 63.
         GroupInfoBottomSheetCallsTab,
+        /// `STATUS_PRIVACY_SETTINGS` = 64.
+        StatusPrivacySettings,
     }
 
     impl StatusPostOrigin {
@@ -36571,6 +36996,7 @@ pub mod enums {
                 Self::GroupChatAttachmentTray => 61,
                 Self::GroupInfoBottomSheetChatsTab => 62,
                 Self::GroupInfoBottomSheetCallsTab => 63,
+                Self::StatusPrivacySettings => 64,
             }
         }
     }
@@ -36882,6 +37308,8 @@ pub mod enums {
         GroupStatusPickerLaunched,
         /// `GROUP_STATUS_CLICKED` = 46.
         GroupStatusClicked,
+        /// `ADD_STATUS_CLICKED` = 47.
+        AddStatusClicked,
     }
 
     impl StatusPrivacySettingsAction {
@@ -36934,6 +37362,7 @@ pub mod enums {
                 Self::CustomAudienceContactPickerNextClicked => 44,
                 Self::GroupStatusPickerLaunched => 45,
                 Self::GroupStatusClicked => 46,
+                Self::AddStatusClicked => 47,
             }
         }
     }
@@ -36975,6 +37404,8 @@ pub mod enums {
         VoiceComposer,
         /// `STATUS_VIEWER_CLOSE_SHARING_MIMICRY` = 6.
         StatusViewerCloseSharingMimicry,
+        /// `UPDATES_TAB` = 7.
+        UpdatesTab,
     }
 
     impl StatusPrivacySurface {
@@ -36987,6 +37418,7 @@ pub mod enums {
                 Self::ContactPicker => 4,
                 Self::VoiceComposer => 5,
                 Self::StatusViewerCloseSharingMimicry => 6,
+                Self::UpdatesTab => 7,
             }
         }
     }
@@ -37136,6 +37568,28 @@ pub mod enums {
         }
     }
 
+    /// `STATUS_REVOKE_DECRYPTION_FAILURE_ACTION` (`WAWebWamEnumStatusRevokeDecryptionFailureAction`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum StatusRevokeDecryptionFailureAction {
+        /// `DELAY_ACK` = 1.
+        DelayAck,
+        /// `DROP_ACK` = 2.
+        DropAck,
+        /// `RETRY_RECEIPT` = 3.
+        RetryReceipt,
+    }
+
+    impl StatusRevokeDecryptionFailureAction {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::DelayAck => 1,
+                Self::DropAck => 2,
+                Self::RetryReceipt => 3,
+            }
+        }
+    }
+
     /// `STATUS_ROW_ENTRY_METHOD` (`WAWebWamEnumStatusRowEntryMethod`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum StatusRowEntryMethod {
@@ -37248,6 +37702,8 @@ pub mod enums {
         MeTab,
         /// `CHANNEL_INFO_SHEET` = 41.
         ChannelInfoSheet,
+        /// `CONTACTS_TAB` = 42.
+        ContactsTab,
     }
 
     impl StatusRowSection {
@@ -37293,6 +37749,7 @@ pub mod enums {
                 Self::ArchiveStorage => 39,
                 Self::MeTab => 40,
                 Self::ChannelInfoSheet => 41,
+                Self::ContactsTab => 42,
             }
         }
     }
@@ -38989,6 +39446,40 @@ pub mod enums {
         GenAiBookAppointmentsNux,
         /// `GEN_AI_BOOK_APPOINTMENTS_OUTLOOK_CONNECT` = 323.
         GenAiBookAppointmentsOutlookConnect,
+        /// `GEN_AI_BOOK_APPOINTMENTS_CONNECTOR_LIST` = 324.
+        GenAiBookAppointmentsConnectorList,
+        /// `GEN_AI_BOOK_APPOINTMENTS_CONNECTOR_CONNECT` = 325.
+        GenAiBookAppointmentsConnectorConnect,
+        /// `GEN_AI_BOOK_APPOINTMENTS_SETUP_NUX` = 326.
+        GenAiBookAppointmentsSetupNux,
+        /// `GEN_AI_1P_CALENDAR_LIST` = 327.
+        GenAi1PCalendarList,
+        /// `GEN_AI_1P_CALENDAR_DETAIL` = 328.
+        GenAi1PCalendarDetail,
+        /// `GEN_AI_1P_CALENDAR_DELETE_CONFIRM_DIALOG` = 329.
+        GenAi1PCalendarDeleteConfirmDialog,
+        /// `GEN_AI_1P_CALENDAR_ERROR_DIALOG` = 330.
+        GenAi1PCalendarErrorDialog,
+        /// `GEN_AI_DAILY_ACTION_DASHBOARD` = 331.
+        GenAiDailyActionDashboard,
+        /// `BB_GENAI_NUX` = 332.
+        BbGenaiNux,
+        /// `BB_GENAI_DESCRIBE` = 333.
+        BbGenaiDescribe,
+        /// `BB_GENAI_SUGGESTIONS` = 334.
+        BbGenaiSuggestions,
+        /// `BB_GENAI_EDIT` = 335.
+        BbGenaiEdit,
+        /// `GEN_AI_AI_HUB_ADD_CLABE_ACCOUNT` = 336.
+        GenAiAiHubAddClabeAccount,
+        /// `GEN_AI_AI_HUB_CLABE_SUCCESS` = 337.
+        GenAiAiHubClabeSuccess,
+        /// `GEN_AI_AI_HUB_MANAGE_CLABE_ACCOUNT` = 338.
+        GenAiAiHubManageClabeAccount,
+        /// `GEN_AI_AI_HUB_LIST_CLABE_ACCOUNTS` = 339.
+        GenAiAiHubListClabeAccounts,
+        /// `GEN_AI_AGENT_SMART_COMPOSER_REPLY_CARD` = 340.
+        GenAiAgentSmartComposerReplyCard,
     }
 
     impl SurfaceType {
@@ -39318,6 +39809,23 @@ pub mod enums {
                 Self::BbMessagePacksMetaOneTab => 321,
                 Self::GenAiBookAppointmentsNux => 322,
                 Self::GenAiBookAppointmentsOutlookConnect => 323,
+                Self::GenAiBookAppointmentsConnectorList => 324,
+                Self::GenAiBookAppointmentsConnectorConnect => 325,
+                Self::GenAiBookAppointmentsSetupNux => 326,
+                Self::GenAi1PCalendarList => 327,
+                Self::GenAi1PCalendarDetail => 328,
+                Self::GenAi1PCalendarDeleteConfirmDialog => 329,
+                Self::GenAi1PCalendarErrorDialog => 330,
+                Self::GenAiDailyActionDashboard => 331,
+                Self::BbGenaiNux => 332,
+                Self::BbGenaiDescribe => 333,
+                Self::BbGenaiSuggestions => 334,
+                Self::BbGenaiEdit => 335,
+                Self::GenAiAiHubAddClabeAccount => 336,
+                Self::GenAiAiHubClabeSuccess => 337,
+                Self::GenAiAiHubManageClabeAccount => 338,
+                Self::GenAiAiHubListClabeAccounts => 339,
+                Self::GenAiAgentSmartComposerReplyCard => 340,
             }
         }
     }
@@ -40438,6 +40946,14 @@ pub mod enums {
         EventV2ContactPicker,
         /// `EVENT_V2_GUEST_LIST` = 267.
         EventV2GuestList,
+        /// `CHANNEL_SCHEDULED_UPDATES` = 268.
+        ChannelScheduledUpdates,
+        /// `MEMBERSHIP_APPROVAL_REQUESTS` = 269.
+        MembershipApprovalRequests,
+        /// `ADD_CONTACT_TO_GROUPS_PICKER` = 270.
+        AddContactToGroupsPicker,
+        /// `CTWA_MIDSTAGE_COMPOSER` = 271.
+        CtwaMidstageComposer,
     }
 
     impl TsSurface {
@@ -40710,6 +41226,10 @@ pub mod enums {
                 Self::EventV2Details => 265,
                 Self::EventV2ContactPicker => 266,
                 Self::EventV2GuestList => 267,
+                Self::ChannelScheduledUpdates => 268,
+                Self::MembershipApprovalRequests => 269,
+                Self::AddContactToGroupsPicker => 270,
+                Self::CtwaMidstageComposer => 271,
             }
         }
     }
@@ -41077,6 +41597,28 @@ pub mod enums {
                 Self::SenderDeleteForEveryone => 3,
                 Self::AdminAndSenderDeleteForEveryone => 4,
                 Self::DeleteForEveryoneSelected => 5,
+            }
+        }
+    }
+
+    /// `UNKNOWN_USER_RECOVERY_PATH` (`WAWebWamEnumUnknownUserRecoveryPath`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum UnknownUserRecoveryPath {
+        /// `NONE` = 1.
+        None,
+        /// `LOCAL_HEAL` = 2.
+        LocalHeal,
+        /// `USYNC` = 3.
+        Usync,
+    }
+
+    impl UnknownUserRecoveryPath {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::None => 1,
+                Self::LocalHeal => 2,
+                Self::Usync => 3,
             }
         }
     }
@@ -41990,6 +42532,8 @@ pub mod enums {
         ActivationRequestJittered,
         /// `CLICK_NOT_YOU` = 93.
         ClickNotYou,
+        /// `VIEW_LINK_ERROR_UPSELL_USE_CONSUMER` = 94.
+        ViewLinkErrorUpsellUseConsumer,
     }
 
     impl UsernameCreationActionName {
@@ -42089,6 +42633,7 @@ pub mod enums {
                 Self::AppSwitchToIgKeyFlow => 91,
                 Self::ActivationRequestJittered => 92,
                 Self::ClickNotYou => 93,
+                Self::ViewLinkErrorUpsellUseConsumer => 94,
             }
         }
     }
@@ -42197,6 +42742,8 @@ pub mod enums {
         UsernameKeyUpsellPreactivationBannerWa,
         /// `ACCOUNT_SETTING` = 14.
         AccountSetting,
+        /// `SMB_ACCOUNT_LINKING` = 15.
+        SmbAccountLinking,
     }
 
     impl UsernameCreationEntrypoint {
@@ -42217,6 +42764,7 @@ pub mod enums {
                 Self::UsernameUpsellSysMsg => 12,
                 Self::UsernameKeyUpsellPreactivationBannerWa => 13,
                 Self::AccountSetting => 14,
+                Self::SmbAccountLinking => 15,
             }
         }
     }
@@ -42619,6 +43167,8 @@ pub mod enums {
         ActionClickCoverPhoto,
         /// `ACTION_CLICK_OFFERINGS` = 27.
         ActionClickOfferings,
+        /// `ACTION_CLICK_CTA` = 28.
+        ActionClickCta,
     }
 
     impl ViewBusinessProfileAction {
@@ -42652,6 +43202,7 @@ pub mod enums {
                 Self::ActionClickReport => 25,
                 Self::ActionClickCoverPhoto => 26,
                 Self::ActionClickOfferings => 27,
+                Self::ActionClickCta => 28,
             }
         }
     }
@@ -43516,6 +44067,50 @@ pub mod enums {
         }
     }
 
+    /// `WEBC_EMAIL_INVITE_ACTION_TYPE` (`WAWebWamEnumWebcEmailInviteActionType`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum WebcEmailInviteActionType {
+        /// `ENTRY_POINT_CLICK` = 1.
+        EntryPointClick,
+        /// `EMAIL_TYPING_START` = 2.
+        EmailTypingStart,
+        /// `GMAIL_CLICK` = 3.
+        GmailClick,
+        /// `MAILTO_CLICK` = 4.
+        MailtoClick,
+    }
+
+    impl WebcEmailInviteActionType {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::EntryPointClick => 1,
+                Self::EmailTypingStart => 2,
+                Self::GmailClick => 3,
+                Self::MailtoClick => 4,
+            }
+        }
+    }
+
+    /// `WEBC_EMAIL_INVITE_ENTRY_POINT_TYPE` (`WAWebWamEnumWebcEmailInviteEntryPointType`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum WebcEmailInviteEntryPointType {
+        /// `GROUP_INFO_EMAIL` = 1.
+        GroupInfoEmail,
+        /// `INTRO_PANEL_EMAIL` = 2.
+        IntroPanelEmail,
+    }
+
+    impl WebcEmailInviteEntryPointType {
+        /// The integer WA Web writes for this member.
+        pub const fn wire(self) -> i64 {
+            match self {
+                Self::GroupInfoEmail => 1,
+                Self::IntroPanelEmail => 2,
+            }
+        }
+    }
+
     /// `WEBC_ENV_CODE` (`WAWebWamEnumWebcEnvCode`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum WebcEnvCode {
@@ -44037,6 +44632,12 @@ pub mod enums {
         StartCall,
         /// `GO_TO_CALLS` = 14.
         GoToCalls,
+        /// `NEW_CALL_LINK` = 15.
+        NewCallLink,
+        /// `OPEN_DIALER` = 16.
+        OpenDialer,
+        /// `SCHEDULE_CALL` = 17.
+        ScheduleCall,
     }
 
     impl WebcQuickActionId {
@@ -44057,6 +44658,9 @@ pub mod enums {
                 Self::AskMetaAi => 12,
                 Self::StartCall => 13,
                 Self::GoToCalls => 14,
+                Self::NewCallLink => 15,
+                Self::OpenDialer => 16,
+                Self::ScheduleCall => 17,
             }
         }
     }
@@ -44074,6 +44678,8 @@ pub mod enums {
         Chats,
         /// `SETTINGS_ME` = 5.
         SettingsMe,
+        /// `CALLS` = 6.
+        Calls,
     }
 
     impl WebcQuickActionSurface {
@@ -44085,6 +44691,7 @@ pub mod enums {
                 Self::CommunityNavigation => 3,
                 Self::Chats => 4,
                 Self::SettingsMe => 5,
+                Self::Calls => 6,
             }
         }
     }
@@ -44621,6 +45228,8 @@ pub mod enums {
         NotApplicable,
         /// `CLOUD_STORAGE` = 8.
         CloudStorage,
+        /// `CUSTOM_REACTIONS` = 9.
+        CustomReactions,
     }
 
     impl WpbujBenefitType {
@@ -44635,6 +45244,7 @@ pub mod enums {
                 Self::Lists => 6,
                 Self::NotApplicable => 7,
                 Self::CloudStorage => 8,
+                Self::CustomReactions => 9,
             }
         }
     }
@@ -44742,6 +45352,12 @@ pub mod enums {
         BackupProviderSelection,
         /// `BACKUP_NEW_USER_SETUP` = 16.
         BackupNewUserSetup,
+        /// `CUSTOM_REACTIONS_SETTINGS` = 17.
+        CustomReactionsSettings,
+        /// `REACTION_TRAY` = 18.
+        ReactionTray,
+        /// `REACTION_KEYBOARD` = 19.
+        ReactionKeyboard,
     }
 
     impl WpbujSurface {
@@ -44764,6 +45380,9 @@ pub mod enums {
                 Self::StickerGeneric => 14,
                 Self::BackupProviderSelection => 15,
                 Self::BackupNewUserSetup => 16,
+                Self::CustomReactionsSettings => 17,
+                Self::ReactionTray => 18,
+                Self::ReactionKeyboard => 19,
             }
         }
     }
@@ -44871,6 +45490,14 @@ pub mod enums {
         MetaOneBusinessEntryPoint,
         /// `GET_META_ONE_BUSINESS` = 39.
         GetMetaOneBusiness,
+        /// `CUSTOM_REACTIONS_LIST_ITEM` = 40.
+        CustomReactionsListItem,
+        /// `EDIT_DEFAULT_REACTIONS` = 41.
+        EditDefaultReactions,
+        /// `DEFAULT_REACTION_SLOT` = 42.
+        DefaultReactionSlot,
+        /// `RESET_DEFAULT_REACTIONS` = 43.
+        ResetDefaultReactions,
     }
 
     impl WsuaActionTarget {
@@ -44916,6 +45543,10 @@ pub mod enums {
                 Self::UpsellCard => 37,
                 Self::MetaOneBusinessEntryPoint => 38,
                 Self::GetMetaOneBusiness => 39,
+                Self::CustomReactionsListItem => 40,
+                Self::EditDefaultReactions => 41,
+                Self::DefaultReactionSlot => 42,
+                Self::ResetDefaultReactions => 43,
             }
         }
     }
@@ -45022,6 +45653,12 @@ pub mod enums {
         BizAiThread,
         /// `BIZ_AI` = 34.
         BizAi,
+        /// `IMAGINE_INTENTS` = 35.
+        ImagineIntents,
+        /// `AI_MEDIA_EDITOR` = 36.
+        AiMediaEditor,
+        /// `CUSTOM_REACTIONS_SETTINGS` = 37.
+        CustomReactionsSettings,
     }
 
     impl WsuaReferral {
@@ -45062,6 +45699,9 @@ pub mod enums {
                 Self::ChatList => 32,
                 Self::BizAiThread => 33,
                 Self::BizAi => 34,
+                Self::ImagineIntents => 35,
+                Self::AiMediaEditor => 36,
+                Self::CustomReactionsSettings => 37,
             }
         }
     }
@@ -45177,6 +45817,48 @@ pub mod enums {
         PaymentCheckout,
         /// `AI_RESPONSES` = 54.
         AiResponses,
+        /// `IMAGINE_INTENTS_BOTTOM_SHEET` = 55.
+        ImagineIntentsBottomSheet,
+        /// `IMAGINE_INTENTS_CREATE_IMAGE` = 56.
+        ImagineIntentsCreateImage,
+        /// `IMAGINE_INTENTS_EDIT_IMAGE` = 57.
+        ImagineIntentsEditImage,
+        /// `IMAGINE_INTENTS_PRESETS` = 58.
+        ImagineIntentsPresets,
+        /// `IMAGINE_INTENTS_RESTYLE` = 59.
+        ImagineIntentsRestyle,
+        /// `IMAGINE_INTENTS_ANIMATE` = 60.
+        ImagineIntentsAnimate,
+        /// `MEDIA_EDITOR_BOTTOM_SHEET` = 61.
+        MediaEditorBottomSheet,
+        /// `MEDIA_EDITOR_RESTYLE` = 62.
+        MediaEditorRestyle,
+        /// `MEDIA_EDITOR_EDIT_OPTION` = 63.
+        MediaEditorEditOption,
+        /// `MEDIA_EDITOR_ANIMATE` = 64.
+        MediaEditorAnimate,
+        /// `MEDIA_EDITOR_VIDEO_RESTYLE` = 65.
+        MediaEditorVideoRestyle,
+        /// `IMAGINE_INTENTS_REGENERATE` = 66.
+        ImagineIntentsRegenerate,
+        /// `MEDIA_EDITOR_REGENERATE` = 67.
+        MediaEditorRegenerate,
+        /// `CHAT_SETTINGS` = 68.
+        ChatSettings,
+        /// `CUSTOM_REACTIONS_SETTINGS` = 69.
+        CustomReactionsSettings,
+        /// `REACTION_KEYBOARD` = 70.
+        ReactionKeyboard,
+        /// `WAPLUS_CONSUMER_WEB` = 71.
+        WaplusConsumerWeb,
+        /// `WAPLUS_CONSUMER_HOUSEAD` = 72.
+        WaplusConsumerHousead,
+        /// `META_SUBS_PRO_ACQ_WA_EMAIL` = 73.
+        MetaSubsProAcqWaEmail,
+        /// `META_SUBS_PRO_WABIZAI_EMAIL` = 74.
+        MetaSubsProWabizaiEmail,
+        /// `META_SUBS_PRO_WABIZAI_FBADS` = 75.
+        MetaSubsProWabizaiFbads,
     }
 
     impl WsuaScreen {
@@ -45237,6 +45919,27 @@ pub mod enums {
                 Self::ApptBooking => 52,
                 Self::PaymentCheckout => 53,
                 Self::AiResponses => 54,
+                Self::ImagineIntentsBottomSheet => 55,
+                Self::ImagineIntentsCreateImage => 56,
+                Self::ImagineIntentsEditImage => 57,
+                Self::ImagineIntentsPresets => 58,
+                Self::ImagineIntentsRestyle => 59,
+                Self::ImagineIntentsAnimate => 60,
+                Self::MediaEditorBottomSheet => 61,
+                Self::MediaEditorRestyle => 62,
+                Self::MediaEditorEditOption => 63,
+                Self::MediaEditorAnimate => 64,
+                Self::MediaEditorVideoRestyle => 65,
+                Self::ImagineIntentsRegenerate => 66,
+                Self::MediaEditorRegenerate => 67,
+                Self::ChatSettings => 68,
+                Self::CustomReactionsSettings => 69,
+                Self::ReactionKeyboard => 70,
+                Self::WaplusConsumerWeb => 71,
+                Self::WaplusConsumerHousead => 72,
+                Self::MetaSubsProAcqWaEmail => 73,
+                Self::MetaSubsProWabizaiEmail => 74,
+                Self::MetaSubsProWabizaiFbads => 75,
             }
         }
     }
@@ -45310,6 +46013,10 @@ pub mod enums {
         BizAiLimitReached,
         /// `BIZ_AI_META_ONE_ENTRYPOINT` = 33.
         BizAiMetaOneEntrypoint,
+        /// `CUSTOM_REACTIONS_LIST_ITEM` = 34.
+        CustomReactionsListItem,
+        /// `EDIT_DEFAULT_REACTIONS` = 35.
+        EditDefaultReactions,
     }
 
     impl WsuaScreenElement {
@@ -45349,6 +46056,8 @@ pub mod enums {
                 Self::BizAiNearingLimit => 31,
                 Self::BizAiLimitReached => 32,
                 Self::BizAiMetaOneEntrypoint => 33,
+                Self::CustomReactionsListItem => 34,
+                Self::EditDefaultReactions => 35,
             }
         }
     }
@@ -45836,6 +46545,7 @@ pub mod globals {
 /// that was written from one that was not and so does the server.
 pub mod events {
     use super::enums;
+    pub use crate::unlisted::RingtoneScreen;
     use crate::{Channel, EventFields, WamEvent};
 
     /// `GroupCreateC`: WAM event 156 on the `regular` channel.
@@ -45912,6 +46622,8 @@ pub mod events {
         pub ephemerality_initiator: Option<enums::EphemeralityInitiatorType>,
         /// `ephemeralityTriggerAction` (id 27).
         pub ephemerality_trigger_action: Option<enums::EphemeralityTriggerActionType>,
+        /// `experienceIds` (id 67).
+        pub experience_ids: Option<String>,
         /// `hasUsername` (id 39).
         pub has_username: Option<bool>,
         /// `hasUsernamePin` (id 45).
@@ -46037,6 +46749,7 @@ pub mod events {
             fields.integer(13, self.ephemerality_duration);
             fields.integer(26, self.ephemerality_initiator.map(|v| v.wire()));
             fields.integer(27, self.ephemerality_trigger_action.map(|v| v.wire()));
+            fields.string(67, self.experience_ids.as_deref());
             fields.boolean(39, self.has_username);
             fields.boolean(45, self.has_username_pin);
             fields.integer(41, self.invisible_message_category.map(|v| v.wire()));
@@ -46192,6 +46905,20 @@ pub mod events {
         pub ptt_stop_tap_cnt: Option<i64>,
         /// `pttWaveformResult` (id 51).
         pub ptt_waveform_result: Option<enums::PttWaveformResult>,
+        /// `pttWorkerClearedPartialTailSamples` (id 59).
+        pub ptt_worker_cleared_partial_tail_samples: Option<i64>,
+        /// `pttWorkerClockTickDrainedFrameCount` (id 60).
+        pub ptt_worker_clock_tick_drained_frame_count: Option<i64>,
+        /// `pttWorkerEnqueueFailureSamples` (id 61).
+        pub ptt_worker_enqueue_failure_samples: Option<i64>,
+        /// `pttWorkerEnqueuedSamples` (id 62).
+        pub ptt_worker_enqueued_samples: Option<i64>,
+        /// `pttWorkerModeStatus` (id 63).
+        pub ptt_worker_mode_status: Option<i64>,
+        /// `pttWorkerPostClockStopDrainedFrameCount` (id 64).
+        pub ptt_worker_post_clock_stop_drained_frame_count: Option<i64>,
+        /// `pttWorkerQueueHighWaterSamples` (id 65).
+        pub ptt_worker_queue_high_water_samples: Option<i64>,
     }
 
     impl WamEvent for Ptt {
@@ -46250,6 +46977,13 @@ pub mod events {
             fields.boolean(6, self.ptt_stop);
             fields.integer(10, self.ptt_stop_tap_cnt);
             fields.integer(51, self.ptt_waveform_result.map(|v| v.wire()));
+            fields.integer(59, self.ptt_worker_cleared_partial_tail_samples);
+            fields.integer(60, self.ptt_worker_clock_tick_drained_frame_count);
+            fields.integer(61, self.ptt_worker_enqueue_failure_samples);
+            fields.integer(62, self.ptt_worker_enqueued_samples);
+            fields.integer(63, self.ptt_worker_mode_status);
+            fields.integer(64, self.ptt_worker_post_clock_stop_drained_frame_count);
+            fields.integer(65, self.ptt_worker_queue_high_water_samples);
         }
     }
 
@@ -46711,12 +47445,20 @@ pub mod events {
         pub audio_tx_crest_factor_p50: Option<f64>,
         /// `audioTxCrestFactorP95` (id 2979).
         pub audio_tx_crest_factor_p95: Option<f64>,
+        /// `audioTxHardClippedFrameCount` (id 3151).
+        pub audio_tx_hard_clipped_frame_count: Option<i64>,
+        /// `audioTxHardClippingRate` (id 3152).
+        pub audio_tx_hard_clipping_rate: Option<f64>,
         /// `audioTxInbandFecBitrate` (id 1749).
         pub audio_tx_inband_fec_bitrate: Option<f64>,
+        /// `audioTxLongestHardClippedRun` (id 3153).
+        pub audio_tx_longest_hard_clipped_run: Option<i64>,
         /// `audioTxNonactiveBitrate` (id 1750).
         pub audio_tx_nonactive_bitrate: Option<f64>,
         /// `audioTxPktCount` (id 1751).
         pub audio_tx_pkt_count: Option<f64>,
+        /// `audioTxSii` (id 3154).
+        pub audio_tx_sii: Option<f64>,
         /// `audioTxSiiSnrAvg` (id 2980).
         pub audio_tx_sii_snr_avg: Option<f64>,
         /// `audioTxSiiSnrP5` (id 2981).
@@ -46749,6 +47491,8 @@ pub mod events {
         pub audio_tx_spectral_rolloff_p50: Option<f64>,
         /// `audioTxSpectralRolloffP95` (id 2995).
         pub audio_tx_spectral_rolloff_p95: Option<f64>,
+        /// `audioTxTotalFrameCount` (id 3155).
+        pub audio_tx_total_frame_count: Option<i64>,
         /// `audioTxUlpFecPkts` (id 1359).
         pub audio_tx_ulp_fec_pkts: Option<i64>,
         /// `audioUlpFecRecovered` (id 1360).
@@ -46987,6 +47731,10 @@ pub mod events {
         pub ca2d_avsync_abs_delta_ms_p95: Option<f64>,
         /// `ca2dAvsyncIn100msWindowPct` (id 3144).
         pub ca2d_avsync_in100ms_window_pct: Option<f64>,
+        /// `ca2dAvsyncIn300msWindowPct` (id 3159).
+        pub ca2d_avsync_in300ms_window_pct: Option<f64>,
+        /// `ca2dAvsyncIn600msWindowPct` (id 3160).
+        pub ca2d_avsync_in600ms_window_pct: Option<f64>,
         /// `ca2dE2eNetworkDelayMs` (id 3080).
         pub ca2d_e2e_network_delay_ms: Option<f64>,
         /// `ca2dEverConnected` (id 3077).
@@ -47161,6 +47909,8 @@ pub mod events {
         pub call_from_reminder: Option<bool>,
         /// `callFromUi` (id 2).
         pub call_from_ui: Option<enums::CallFromUi>,
+        /// `callHasGuest` (id 3156).
+        pub call_has_guest: Option<bool>,
         /// `callHasNoAudio` (id 2124).
         pub call_has_no_audio: Option<bool>,
         /// `callHeld` (id 2428).
@@ -48397,6 +49147,8 @@ pub mod events {
         pub is_from_call_link: Option<bool>,
         /// `isGcRekeyMaster` (id 2075).
         pub is_gc_rekey_master: Option<bool>,
+        /// `isGuestParticipant` (id 3157).
+        pub is_guest_participant: Option<bool>,
         /// `isInSymNat` (id 1921).
         pub is_in_sym_nat: Option<bool>,
         /// `isIpv6BehindNat` (id 2072).
@@ -49053,6 +49805,8 @@ pub mod events {
         pub num_aud_rc_dyn_cond_true: Option<i64>,
         /// `numConnectedExtensions` (id 3045).
         pub num_connected_extensions: Option<i64>,
+        /// `numConnectedGuestParticipants` (id 3158).
+        pub num_connected_guest_participants: Option<i64>,
         /// `numConnectedParticipants` (id 330).
         pub num_connected_participants: Option<i64>,
         /// `numConnectedPeers` (id 1052).
@@ -51819,6 +52573,8 @@ pub mod events {
         pub win_npu_name: Option<String>,
         /// `winNpuPresent` (id 3130).
         pub win_npu_present: Option<bool>,
+        /// `winVsrAvgFrameTimeMs` (id 3148).
+        pub win_vsr_avg_frame_time_ms: Option<f64>,
         /// `winVsrButtonClicks` (id 3131).
         pub win_vsr_button_clicks: Option<i64>,
         /// `winVsrEnabled` (id 3132).
@@ -51829,6 +52585,10 @@ pub mod events {
         pub win_vsr_frames_with: Option<i64>,
         /// `winVsrFramesWithout` (id 3135).
         pub win_vsr_frames_without: Option<i64>,
+        /// `winVsrMaxFrameTimeMs` (id 3149).
+        pub win_vsr_max_frame_time_ms: Option<f64>,
+        /// `winVsrMinFrameTimeMs` (id 3150).
+        pub win_vsr_min_frame_time_ms: Option<f64>,
         /// `winVsrOnTimeSec` (id 3136).
         pub win_vsr_on_time_sec: Option<i64>,
         /// `winVsrSupported` (id 3137).
@@ -52047,9 +52807,13 @@ pub mod events {
             fields.number(2977, self.audio_tx_crest_factor_p5);
             fields.number(2978, self.audio_tx_crest_factor_p50);
             fields.number(2979, self.audio_tx_crest_factor_p95);
+            fields.integer(3151, self.audio_tx_hard_clipped_frame_count);
+            fields.number(3152, self.audio_tx_hard_clipping_rate);
             fields.number(1749, self.audio_tx_inband_fec_bitrate);
+            fields.integer(3153, self.audio_tx_longest_hard_clipped_run);
             fields.number(1750, self.audio_tx_nonactive_bitrate);
             fields.number(1751, self.audio_tx_pkt_count);
+            fields.number(3154, self.audio_tx_sii);
             fields.number(2980, self.audio_tx_sii_snr_avg);
             fields.number(2981, self.audio_tx_sii_snr_p5);
             fields.number(2982, self.audio_tx_sii_snr_p50);
@@ -52066,6 +52830,7 @@ pub mod events {
             fields.number(2993, self.audio_tx_spectral_rolloff_p5);
             fields.number(2994, self.audio_tx_spectral_rolloff_p50);
             fields.number(2995, self.audio_tx_spectral_rolloff_p95);
+            fields.integer(3155, self.audio_tx_total_frame_count);
             fields.integer(1359, self.audio_tx_ulp_fec_pkts);
             fields.integer(1360, self.audio_ulp_fec_recovered);
             fields.integer(2268, self.audio_unit_setup_time);
@@ -52185,6 +52950,8 @@ pub mod events {
             fields.number(3142, self.ca2d_avsync_abs_delta_ms_p50);
             fields.number(3143, self.ca2d_avsync_abs_delta_ms_p95);
             fields.number(3144, self.ca2d_avsync_in100ms_window_pct);
+            fields.number(3159, self.ca2d_avsync_in300ms_window_pct);
+            fields.number(3160, self.ca2d_avsync_in600ms_window_pct);
             fields.number(3080, self.ca2d_e2e_network_delay_ms);
             fields.boolean(3077, self.ca2d_ever_connected);
             fields.integer(
@@ -52275,6 +53042,7 @@ pub mod events {
             fields.integer(626, self.call_enter_pip_mode_count);
             fields.boolean(2458, self.call_from_reminder);
             fields.integer(2, self.call_from_ui.map(|v| v.wire()));
+            fields.boolean(3156, self.call_has_guest);
             fields.boolean(2124, self.call_has_no_audio);
             fields.boolean(2428, self.call_held);
             fields.number(45, self.call_hist_echo_likelihood);
@@ -52917,6 +53685,7 @@ pub mod events {
             fields.boolean(3066, self.is_extension_creator);
             fields.boolean(1316, self.is_from_call_link);
             fields.boolean(2075, self.is_gc_rekey_master);
+            fields.boolean(3157, self.is_guest_participant);
             fields.boolean(1921, self.is_in_sym_nat);
             fields.boolean(2072, self.is_ipv6_behind_nat);
             fields.boolean(91, self.is_ipv6_capable);
@@ -53261,6 +54030,7 @@ pub mod events {
             fields.integer(933, self.num_asserts);
             fields.integer(1800, self.num_aud_rc_dyn_cond_true);
             fields.integer(3045, self.num_connected_extensions);
+            fields.integer(3158, self.num_connected_guest_participants);
             fields.integer(330, self.num_connected_participants);
             fields.integer(1052, self.num_connected_peers);
             fields.integer(2010, self.num_cpu_cores);
@@ -54790,11 +55560,14 @@ pub mod events {
             fields.integer(263, self.wifi_rssi_at_call_start);
             fields.string(3129, self.win_npu_name.as_deref());
             fields.boolean(3130, self.win_npu_present);
+            fields.number(3148, self.win_vsr_avg_frame_time_ms);
             fields.integer(3131, self.win_vsr_button_clicks);
             fields.boolean(3132, self.win_vsr_enabled);
             fields.integer(3133, self.win_vsr_ep_init_ms);
             fields.integer(3134, self.win_vsr_frames_with);
             fields.integer(3135, self.win_vsr_frames_without);
+            fields.number(3149, self.win_vsr_max_frame_time_ms);
+            fields.number(3150, self.win_vsr_min_frame_time_ms);
             fields.integer(3136, self.win_vsr_on_time_sec);
             fields.boolean(3137, self.win_vsr_supported);
             fields.integer(3138, self.win_vsr_video_scaler_init_ms);
@@ -55136,6 +55909,9 @@ pub mod events {
         pub session_scope: Option<enums::SessionScopeType>,
         /// `stanzaType` (id 14).
         pub stanza_type: Option<enums::StanzaType>,
+        /// `statusRevokeDecryptionFailureAction` (id 32).
+        pub status_revoke_decryption_failure_action:
+            Option<enums::StatusRevokeDecryptionFailureAction>,
         /// `traceIdInt` (id 31).
         pub trace_id_int: Option<i64>,
         /// `typeOfGroup` (id 12).
@@ -55178,6 +55954,11 @@ pub mod events {
             fields.integer(18, self.server_addressing_mode.map(|v| v.wire()));
             fields.integer(28, self.session_scope.map(|v| v.wire()));
             fields.integer(14, self.stanza_type.map(|v| v.wire()));
+            fields.integer(
+                32,
+                self.status_revoke_decryption_failure_action
+                    .map(|v| v.wire()),
+            );
             fields.integer(31, self.trace_id_int);
             fields.integer(12, self.type_of_group.map(|v| v.wire()));
         }
@@ -55523,6 +56304,8 @@ pub mod events {
         pub app_context: Option<String>,
         /// `appContextBitfield` (id 73).
         pub app_context_bitfield: Option<i64>,
+        /// `botSessionType` (id 97).
+        pub bot_session_type: Option<enums::BotSessionType>,
         /// `botType` (id 55).
         pub bot_type: Option<enums::BotType>,
         /// `chatOrigins` (id 58).
@@ -55719,6 +56502,7 @@ pub mod events {
             fields.integer(49, self.agent_engagement_type.map(|v| v.wire()));
             fields.string(72, self.app_context.as_deref());
             fields.integer(73, self.app_context_bitfield);
+            fields.integer(97, self.bot_session_type.map(|v| v.wire()));
             fields.integer(55, self.bot_type.map(|v| v.wire()));
             fields.integer(58, self.chat_origins.map(|v| v.wire()));
             fields.string(67, self.chat_session_id.as_deref());
@@ -56873,6 +57657,8 @@ pub mod events {
         pub profile_links_count: Option<i64>,
         /// `receiptsEnabled` (id 8).
         pub receipts_enabled: Option<bool>,
+        /// `receivedExperienceIds` (id 262).
+        pub received_experience_ids: Option<String>,
         /// `secretCodeActive` (id 172).
         pub secret_code_active: Option<bool>,
         /// `showMetaAiButtonSetting` (id 173).
@@ -57112,6 +57898,7 @@ pub mod events {
             );
             fields.integer(211, self.profile_links_count);
             fields.boolean(8, self.receipts_enabled);
+            fields.string(262, self.received_experience_ids.as_deref());
             fields.boolean(172, self.secret_code_active);
             fields.boolean(173, self.show_meta_ai_button_setting);
             fields.integer(2, self.sim_mcc);
@@ -58129,6 +58916,8 @@ pub mod events {
         pub bytes_transferred: Option<f64>,
         /// `didPlay` (id 15).
         pub did_play: Option<bool>,
+        /// `experienceIds` (id 19).
+        pub experience_ids: Option<String>,
         /// `forcedPlayCount` (id 12).
         pub forced_play_count: Option<i64>,
         /// `initialBufferingT` (id 7). A duration in milliseconds.
@@ -58172,6 +58961,7 @@ pub mod events {
             fields.number(4, self.bytes_downloaded_start);
             fields.number(5, self.bytes_transferred);
             fields.boolean(15, self.did_play);
+            fields.string(19, self.experience_ids.as_deref());
             fields.integer(12, self.forced_play_count);
             fields.integer(7, self.initial_buffering_t);
             fields.number(2, self.media_size);
@@ -58447,6 +59237,8 @@ pub mod events {
         pub estimated_bandwidth: Option<f64>,
         /// `estimatedBandwidthV2` (id 59).
         pub estimated_bandwidth_v2: Option<f64>,
+        /// `experienceIds` (id 71).
+        pub experience_ids: Option<String>,
         /// `expressPathBytesSaved` (id 42).
         pub express_path_bytes_saved: Option<f64>,
         /// `expressPathDownloadState` (id 56).
@@ -58531,6 +59323,8 @@ pub mod events {
         pub streaming_used_non_streaming_fallback: Option<bool>,
         /// `timeDelayed` (id 54). A duration in milliseconds.
         pub time_delayed: Option<i64>,
+        /// `traceIdInt` (id 72).
+        pub trace_id_int: Option<i64>,
         /// `usedFallbackHint` (id 40).
         pub used_fallback_hint: Option<String>,
     }
@@ -58566,6 +59360,7 @@ pub mod events {
             fields.integer(21, self.download_time_to_first_byte_t);
             fields.number(36, self.estimated_bandwidth);
             fields.number(59, self.estimated_bandwidth_v2);
+            fields.string(71, self.experience_ids.as_deref());
             fields.number(42, self.express_path_bytes_saved);
             fields.integer(56, self.express_path_download_state.map(|v| v.wire()));
             fields.integer(43, self.express_path_time_saved_ms);
@@ -58608,6 +59403,7 @@ pub mod events {
             fields.string(67, self.status_id.as_deref());
             fields.boolean(70, self.streaming_used_non_streaming_fallback);
             fields.integer(54, self.time_delayed);
+            fields.integer(72, self.trace_id_int);
             fields.string(40, self.used_fallback_hint.as_deref());
         }
     }
@@ -60902,6 +61698,8 @@ pub mod events {
     pub struct PttPlayback {
         /// `audioStreamType` (id 19).
         pub audio_stream_type: Option<enums::AudioStreamType>,
+        /// `messageKeyHash` (id 28).
+        pub message_key_hash: Option<String>,
         /// `pttAudioRouteBluetoothTime` (id 23). A duration in milliseconds.
         pub ptt_audio_route_bluetooth_time: Option<i64>,
         /// `pttAudioRouteChangeCount` (id 20).
@@ -60965,6 +61763,7 @@ pub mod events {
 
         fn encode(&self, fields: &mut EventFields<'_>) {
             fields.integer(19, self.audio_stream_type.map(|v| v.wire()));
+            fields.string(28, self.message_key_hash.as_deref());
             fields.integer(23, self.ptt_audio_route_bluetooth_time);
             fields.integer(20, self.ptt_audio_route_change_count);
             fields.integer(24, self.ptt_audio_route_earpiece_time);
@@ -61076,8 +61875,12 @@ pub mod events {
     pub struct PaymentsUserAction {
         /// `actionTarget` (id 4).
         pub action_target: Option<enums::PaymentActionTargets>,
+        /// `appSessionId` (id 50).
+        pub app_session_id: Option<String>,
         /// `customPaymentMethodsSyncStatus` (id 48).
         pub custom_payment_methods_sync_status: Option<enums::CustomPaymentMethodsSyncStatus>,
+        /// `eventTsMs` (id 51).
+        pub event_ts_ms: Option<i64>,
         /// `graphqlEndpointName` (id 49).
         pub graphql_endpoint_name: Option<String>,
         /// `merchantType` (id 43).
@@ -61171,6 +61974,8 @@ pub mod events {
         pub referral_context: Option<String>,
         /// `screen` (id 5).
         pub screen: Option<String>,
+        /// `unifiedSessionId` (id 52).
+        pub unified_session_id: Option<String>,
         /// `upiPaymentsPspId` (id 8).
         pub upi_payments_psp_id: Option<enums::UpiPaymentsPspIdType>,
     }
@@ -61184,10 +61989,12 @@ pub mod events {
 
         fn encode(&self, fields: &mut EventFields<'_>) {
             fields.integer(4, self.action_target.map(|v| v.wire()));
+            fields.string(50, self.app_session_id.as_deref());
             fields.integer(
                 48,
                 self.custom_payment_methods_sync_status.map(|v| v.wire()),
             );
+            fields.integer(51, self.event_ts_ms);
             fields.string(49, self.graphql_endpoint_name.as_deref());
             fields.integer(43, self.merchant_type.map(|v| v.wire()));
             fields.integer(44, self.p2m_type.map(|v| v.wire()));
@@ -61237,6 +62044,7 @@ pub mod events {
             fields.string(6, self.referral.as_deref());
             fields.string(37, self.referral_context.as_deref());
             fields.string(5, self.screen.as_deref());
+            fields.string(52, self.unified_session_id.as_deref());
             fields.integer(8, self.upi_payments_psp_id.map(|v| v.wire()));
         }
     }
@@ -66191,6 +66999,8 @@ pub mod events {
     /// the weight a buffer carries can be overridden at runtime.
     #[derive(Debug, Clone, Default, PartialEq)]
     pub struct PollsActions {
+        /// `allowAddOption` (id 11).
+        pub allow_add_option: Option<bool>,
         /// `chatType` (id 8).
         pub chat_type: Option<enums::MessageChatType>,
         /// `groupSizeBucket` (id 1).
@@ -66201,6 +67011,8 @@ pub mod events {
         pub is_a_group: Option<bool>,
         /// `isAdmin` (id 2).
         pub is_admin: Option<bool>,
+        /// `isPollCreator` (id 12).
+        pub is_poll_creator: Option<bool>,
         /// `pollAction` (id 3).
         pub poll_action: Option<enums::PollActionType>,
         /// `pollCreationDs` (id 4).
@@ -66221,11 +67033,13 @@ pub mod events {
         const PRIVATE_STATS_ID: Option<i64> = None;
 
         fn encode(&self, fields: &mut EventFields<'_>) {
+            fields.boolean(11, self.allow_add_option);
             fields.integer(8, self.chat_type.map(|v| v.wire()));
             fields.integer(1, self.group_size_bucket.map(|v| v.wire()));
             fields.boolean(9, self.hide_voter_name);
             fields.boolean(6, self.is_a_group);
             fields.boolean(2, self.is_admin);
+            fields.boolean(12, self.is_poll_creator);
             fields.integer(3, self.poll_action.map(|v| v.wire()));
             fields.integer(4, self.poll_creation_ds);
             fields.integer(10, self.poll_duration_ms);
@@ -66908,6 +67722,8 @@ pub mod events {
         pub message_id_hmac: Option<String>,
         /// `messageTypeStr` (id 7).
         pub message_type_str: Option<String>,
+        /// `mmThreadSessionId` (id 65).
+        pub mm_thread_session_id: Option<String>,
         /// `muted` (id 4).
         pub muted: Option<bool>,
         /// `notificationEnabled` (id 5).
@@ -66996,6 +67812,7 @@ pub mod events {
             fields.boolean(19, self.message_has_url);
             fields.string(17, self.message_id_hmac.as_deref());
             fields.string(7, self.message_type_str.as_deref());
+            fields.string(65, self.mm_thread_session_id.as_deref());
             fields.boolean(4, self.muted);
             fields.boolean(5, self.notification_enabled);
             fields.integer(64, self.pill_entry_point.map(|v| v.wire()));
@@ -67101,6 +67918,8 @@ pub mod events {
         pub message_id_hmac: Option<String>,
         /// `messageTypeStr` (id 6).
         pub message_type_str: Option<String>,
+        /// `mmThreadSessionId` (id 62).
+        pub mm_thread_session_id: Option<String>,
         /// `pillEntryPoint` (id 61).
         pub pill_entry_point: Option<enums::PillEntryPoint>,
         /// `qbmFlag` (id 4).
@@ -67186,6 +68005,7 @@ pub mod events {
             fields.boolean(17, self.message_has_url);
             fields.string(13, self.message_id_hmac.as_deref());
             fields.string(6, self.message_type_str.as_deref());
+            fields.string(62, self.mm_thread_session_id.as_deref());
             fields.integer(61, self.pill_entry_point.map(|v| v.wire()));
             fields.integer(4, self.qbm_flag.map(|v| v.wire()));
             fields.boolean(12, self.read_receipts_enabled);
@@ -69414,6 +70234,8 @@ pub mod events {
         pub ai_home_qp_promotion_id: Option<i64>,
         /// `aiQpPromotionId` (id 54).
         pub ai_qp_promotion_id: Option<String>,
+        /// `aiQpSurface` (id 55).
+        pub ai_qp_surface: Option<enums::AiQpSurfaceType>,
         /// `aiSessionId` (id 18).
         pub ai_session_id: Option<String>,
         /// `aiVoiceOnSelectionDefault` (id 24).
@@ -69472,6 +70294,8 @@ pub mod events {
         pub is_user_created_agent: Option<bool>,
         /// `metricCount` (id 17).
         pub metric_count: Option<i64>,
+        /// `newBadgeVisible` (id 56).
+        pub new_badge_visible: Option<bool>,
         /// `promptTriggerPoint` (id 50).
         pub prompt_trigger_point: Option<enums::PromptTriggerPoint>,
         /// `rawBotEntryPoint` (id 48).
@@ -69505,6 +70329,7 @@ pub mod events {
             fields.string(4, self.ai_discovery_tab.as_deref());
             fields.integer(53, self.ai_home_qp_promotion_id);
             fields.string(54, self.ai_qp_promotion_id.as_deref());
+            fields.integer(55, self.ai_qp_surface.map(|v| v.wire()));
             fields.string(18, self.ai_session_id.as_deref());
             fields.boolean(24, self.ai_voice_on_selection_default);
             fields.string(25, self.ai_voice_selection_enum.as_deref());
@@ -69534,6 +70359,7 @@ pub mod events {
             fields.boolean(9, self.is_meta_ai_character_bot_chat);
             fields.boolean(10, self.is_user_created_agent);
             fields.integer(17, self.metric_count);
+            fields.boolean(56, self.new_badge_visible);
             fields.integer(50, self.prompt_trigger_point.map(|v| v.wire()));
             fields.string(48, self.raw_bot_entry_point.as_deref());
             fields.integer(44, self.scroll_depth);
@@ -71027,6 +71853,8 @@ pub mod events {
         pub message_id_hmac: Option<String>,
         /// `messageTypeStr` (id 7).
         pub message_type_str: Option<String>,
+        /// `mmThreadSessionId` (id 38).
+        pub mm_thread_session_id: Option<String>,
         /// `pillEntryPoint` (id 37).
         pub pill_entry_point: Option<enums::PillEntryPoint>,
         /// `qbmFlag` (id 8).
@@ -71077,6 +71905,7 @@ pub mod events {
             fields.string(21, self.message_field_json_array.as_deref());
             fields.string(11, self.message_id_hmac.as_deref());
             fields.string(7, self.message_type_str.as_deref());
+            fields.string(38, self.mm_thread_session_id.as_deref());
             fields.integer(37, self.pill_entry_point.map(|v| v.wire()));
             fields.integer(8, self.qbm_flag.map(|v| v.wire()));
             fields.string(22, self.submessage_field_json_array.as_deref());
@@ -73248,6 +74077,8 @@ pub mod events {
         pub message_id_hmac: Option<String>,
         /// `messageLevelAction` (id 8).
         pub message_level_action: Option<enums::MessageLevelAction>,
+        /// `mmThreadSessionId` (id 34).
+        pub mm_thread_session_id: Option<String>,
         /// `pillEntryPoint` (id 33).
         pub pill_entry_point: Option<enums::PillEntryPoint>,
         /// `submessageFieldJsonArray` (id 18).
@@ -73292,6 +74123,7 @@ pub mod events {
             fields.boolean(6, self.message_has_url);
             fields.string(7, self.message_id_hmac.as_deref());
             fields.integer(8, self.message_level_action.map(|v| v.wire()));
+            fields.string(34, self.mm_thread_session_id.as_deref());
             fields.integer(33, self.pill_entry_point.map(|v| v.wire()));
             fields.string(18, self.submessage_field_json_array.as_deref());
             fields.string(9, self.thread_id_hmac.as_deref());
@@ -75474,6 +76306,40 @@ pub mod events {
         }
     }
 
+    /// `BizAiHandoffNotification`: WAM event 6528 on the `regular` channel.
+    ///
+    /// Declared in `WAWebBizAiHandoffNotificationWamEvent`. Sampling weights `[1, 1, 1]` as the catalog lists them;
+    /// the weight a buffer carries can be overridden at runtime.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct BizAiHandoffNotification {
+        /// `handoffNotifAction` (id 1).
+        pub handoff_notif_action: Option<enums::HandoffNotifActionType>,
+        /// `handoffNotifVersion` (id 2).
+        pub handoff_notif_version: Option<i64>,
+        /// `handoffReason` (id 3).
+        pub handoff_reason: Option<i64>,
+        /// `notificationId` (id 4).
+        pub notification_id: Option<String>,
+        /// `threadId` (id 5).
+        pub thread_id: Option<String>,
+    }
+
+    impl WamEvent for BizAiHandoffNotification {
+        const NAME: &'static str = "BizAiHandoffNotification";
+        const CODE: u32 = 6528;
+        const CHANNEL: Channel = Channel::Regular;
+        const WEIGHTS: [u32; 3] = [1, 1, 1];
+        const PRIVATE_STATS_ID: Option<i64> = None;
+
+        fn encode(&self, fields: &mut EventFields<'_>) {
+            fields.integer(1, self.handoff_notif_action.map(|v| v.wire()));
+            fields.integer(2, self.handoff_notif_version);
+            fields.integer(3, self.handoff_reason);
+            fields.string(4, self.notification_id.as_deref());
+            fields.string(5, self.thread_id.as_deref());
+        }
+    }
+
     /// `MetaAiUpsellCta`: WAM event 6532 on the `regular` channel.
     ///
     /// Declared in `WAWebMetaAiUpsellCtaWamEvent`. Sampling weights `[1, 1, 1]` as the catalog lists them;
@@ -76184,6 +77050,8 @@ pub mod events {
         pub status_interaction_result_type: Option<enums::StatusInteractionResultType>,
         /// `statusInteractionType` (id 2).
         pub status_interaction_type: Option<enums::StatusInteractionType>,
+        /// `statusInteractorHashId` (id 9).
+        pub status_interactor_hash_id: Option<String>,
         /// `unifiedSessionId` (id 3).
         pub unified_session_id: Option<String>,
     }
@@ -76203,6 +77071,7 @@ pub mod events {
             fields.integer(4, self.status_interaction_message_type.map(|v| v.wire()));
             fields.integer(5, self.status_interaction_result_type.map(|v| v.wire()));
             fields.integer(2, self.status_interaction_type.map(|v| v.wire()));
+            fields.string(9, self.status_interactor_hash_id.as_deref());
             fields.string(3, self.unified_session_id.as_deref());
         }
     }
@@ -77554,6 +78423,8 @@ pub mod events {
         pub wsua_benefit_group: Option<String>,
         /// `wsuaBenefitsShown` (id 9).
         pub wsua_benefits_shown: Option<String>,
+        /// `wsuaEligibleSubscriptions` (id 13).
+        pub wsua_eligible_subscriptions: Option<String>,
         /// `wsuaProductType` (id 3).
         pub wsua_product_type: Option<enums::WsuaProductType>,
         /// `wsuaQuickPromotionId` (id 4).
@@ -77583,6 +78454,7 @@ pub mod events {
             fields.string(10, self.wsua_active_subscriptions.as_deref());
             fields.string(11, self.wsua_benefit_group.as_deref());
             fields.string(9, self.wsua_benefits_shown.as_deref());
+            fields.string(13, self.wsua_eligible_subscriptions.as_deref());
             fields.integer(3, self.wsua_product_type.map(|v| v.wire()));
             fields.string(4, self.wsua_quick_promotion_id.as_deref());
             fields.integer(5, self.wsua_referral.map(|v| v.wire()));
@@ -77781,46 +78653,6 @@ pub mod events {
         }
     }
 
-    /// `RingtoneScreen`: WAM event 7608 on the `regular` channel.
-    ///
-    /// Declared in `WAWebRingtoneScreenWamEvent`. Sampling weights `[1, 1, 1]` as the catalog lists them;
-    /// the weight a buffer carries can be overridden at runtime.
-    #[derive(Debug, Clone, Default, PartialEq)]
-    pub struct RingtoneScreen {
-        /// `premiumRingtonesDownloadedCount` (id 1).
-        pub premium_ringtones_downloaded_count: Option<i64>,
-        /// `ringtoneChangeApplied` (id 2).
-        pub ringtone_change_applied: Option<bool>,
-        /// `ringtoneId` (id 3).
-        pub ringtone_id: Option<String>,
-        /// `ringtoneReset` (id 7).
-        pub ringtone_reset: Option<bool>,
-        /// `ringtoneSelectionCancelled` (id 4).
-        pub ringtone_selection_cancelled: Option<bool>,
-        /// `ringtoneSource` (id 5).
-        pub ringtone_source: Option<enums::RingtoneEntryType>,
-        /// `ringtoneSubscribeSelected` (id 6).
-        pub ringtone_subscribe_selected: Option<bool>,
-    }
-
-    impl WamEvent for RingtoneScreen {
-        const NAME: &'static str = "RingtoneScreen";
-        const CODE: u32 = 7608;
-        const CHANNEL: Channel = Channel::Regular;
-        const WEIGHTS: [u32; 3] = [1, 1, 1];
-        const PRIVATE_STATS_ID: Option<i64> = None;
-
-        fn encode(&self, fields: &mut EventFields<'_>) {
-            fields.integer(1, self.premium_ringtones_downloaded_count);
-            fields.boolean(2, self.ringtone_change_applied);
-            fields.string(3, self.ringtone_id.as_deref());
-            fields.boolean(7, self.ringtone_reset);
-            fields.boolean(4, self.ringtone_selection_cancelled);
-            fields.integer(5, self.ringtone_source.map(|v| v.wire()));
-            fields.boolean(6, self.ringtone_subscribe_selected);
-        }
-    }
-
     /// `UsernameExposed`: WAM event 7614 on the `regular` channel.
     ///
     /// Declared in `WAWebUsernameExposedWamEvent`. Sampling weights `[1, 1, 1]` as the catalog lists them;
@@ -78000,6 +78832,8 @@ pub mod events {
         pub message_id_hmac: Option<String>,
         /// `mmCarouselCardIndex` (id 26).
         pub mm_carousel_card_index: Option<i64>,
+        /// `mmThreadSessionId` (id 29).
+        pub mm_thread_session_id: Option<String>,
         /// `qbmFlag` (id 17).
         pub qbm_flag: Option<enums::QbmFlag>,
         /// `readReceiptsEnabled` (id 18).
@@ -78046,6 +78880,7 @@ pub mod events {
             fields.string(15, self.message_field_json_array.as_deref());
             fields.string(16, self.message_id_hmac.as_deref());
             fields.integer(26, self.mm_carousel_card_index);
+            fields.string(29, self.mm_thread_session_id.as_deref());
             fields.integer(17, self.qbm_flag.map(|v| v.wire()));
             fields.boolean(18, self.read_receipts_enabled);
             fields.string(19, self.submessage_field_json_array.as_deref());
@@ -78593,6 +79428,43 @@ pub mod events {
         }
     }
 
+    /// `AiSubsBenefitUj`: WAM event 8220 on the `regular` channel.
+    ///
+    /// Declared in `WAWebAiSubsBenefitUjWamEvent`. Sampling weights `[1, 1, 1]` as the catalog lists them;
+    /// the weight a buffer carries can be overridden at runtime.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct AiSubsBenefitUj {
+        /// `aiSubComponent` (id 1).
+        pub ai_sub_component: Option<enums::AiSubComponent>,
+        /// `aiSubEntrypoint` (id 2).
+        pub ai_sub_entrypoint: Option<enums::AiSubEntrypoint>,
+        /// `aiSubScreen` (id 3).
+        pub ai_sub_screen: Option<enums::AiSubScreen>,
+        /// `aiSubSessionId` (id 6).
+        pub ai_sub_session_id: Option<String>,
+        /// `aiSubUserAction` (id 4).
+        pub ai_sub_user_action: Option<enums::AiSubUserAction>,
+        /// `aiSubscriptionTier` (id 5).
+        pub ai_subscription_tier: Option<String>,
+    }
+
+    impl WamEvent for AiSubsBenefitUj {
+        const NAME: &'static str = "AiSubsBenefitUj";
+        const CODE: u32 = 8220;
+        const CHANNEL: Channel = Channel::Regular;
+        const WEIGHTS: [u32; 3] = [1, 1, 1];
+        const PRIVATE_STATS_ID: Option<i64> = None;
+
+        fn encode(&self, fields: &mut EventFields<'_>) {
+            fields.integer(1, self.ai_sub_component.map(|v| v.wire()));
+            fields.integer(2, self.ai_sub_entrypoint.map(|v| v.wire()));
+            fields.integer(3, self.ai_sub_screen.map(|v| v.wire()));
+            fields.string(6, self.ai_sub_session_id.as_deref());
+            fields.integer(4, self.ai_sub_user_action.map(|v| v.wire()));
+            fields.string(5, self.ai_subscription_tier.as_deref());
+        }
+    }
+
     /// `CompanionInviteContact`: WAM event 8230 on the `regular` channel.
     ///
     /// Declared in `WAWebCompanionInviteContactWamEvent`. Sampling weights `[1, 1, 1]` as the catalog lists them;
@@ -78835,8 +79707,14 @@ pub mod events {
     /// the weight a buffer carries can be overridden at runtime.
     #[derive(Debug, Clone, Default, PartialEq)]
     pub struct GroupHistorySenderUserJourney {
+        /// `appSessionId` (id 21).
+        pub app_session_id: Option<String>,
         /// `bundleSendSource` (id 1).
         pub bundle_send_source: Option<enums::BundleSendSource>,
+        /// `groupAddMemberEntryPoint` (id 17).
+        pub group_add_member_entry_point: Option<enums::AddMembersEntrypointType>,
+        /// `groupCreateEntryPoint` (id 20).
+        pub group_create_entry_point: Option<enums::GroupCreateEntryPoint>,
         /// `groupHistoryMessagesCount` (id 2).
         pub group_history_messages_count: Option<i64>,
         /// `groupHistoryOutWindowPinsCount` (id 3).
@@ -78853,6 +79731,8 @@ pub mod events {
         pub group_size: Option<i64>,
         /// `ineligibleReason` (id 9).
         pub ineligible_reason: Option<enums::GroupHistoryIneligibilityReason>,
+        /// `isAdmin` (id 18).
+        pub is_admin: Option<bool>,
         /// `isGroupHistoryToggledOn` (id 15).
         pub is_group_history_toggled_on: Option<bool>,
         /// `isTeeBotNoticeOnly` (id 14).
@@ -78863,6 +79743,8 @@ pub mod events {
         pub ui_surface: Option<enums::TsSurface>,
         /// `unifiedSessionId` (id 12).
         pub unified_session_id: Option<String>,
+        /// `userJourneyFunnelId` (id 19).
+        pub user_journey_funnel_id: Option<String>,
         /// `userJourneyTs` (id 13).
         pub user_journey_ts: Option<i64>,
         /// `xIneligibleReasons` (id 16).
@@ -78877,7 +79759,10 @@ pub mod events {
         const PRIVATE_STATS_ID: Option<i64> = None;
 
         fn encode(&self, fields: &mut EventFields<'_>) {
+            fields.string(21, self.app_session_id.as_deref());
             fields.integer(1, self.bundle_send_source.map(|v| v.wire()));
+            fields.integer(17, self.group_add_member_entry_point.map(|v| v.wire()));
+            fields.integer(20, self.group_create_entry_point.map(|v| v.wire()));
             fields.integer(2, self.group_history_messages_count);
             fields.integer(3, self.group_history_out_window_pins_count);
             fields.integer(4, self.group_history_pins_count);
@@ -78886,11 +79771,13 @@ pub mod events {
             fields.integer(7, self.group_history_uncounted_messages_count);
             fields.integer(8, self.group_size);
             fields.integer(9, self.ineligible_reason.map(|v| v.wire()));
+            fields.boolean(18, self.is_admin);
             fields.boolean(15, self.is_group_history_toggled_on);
             fields.boolean(14, self.is_tee_bot_notice_only);
             fields.integer(10, self.recipient_count);
             fields.integer(11, self.ui_surface.map(|v| v.wire()));
             fields.string(12, self.unified_session_id.as_deref());
+            fields.string(19, self.user_journey_funnel_id.as_deref());
             fields.integer(13, self.user_journey_ts);
             fields.string(16, self.x_ineligible_reasons.as_deref());
         }
@@ -78944,6 +79831,55 @@ pub mod events {
             fields.string(3, self.biz_ai_error_detail.as_deref());
             fields.string(8, self.biz_ai_message_uuid.as_deref());
             fields.integer(4, self.biz_ai_render_outcome.map(|v| v.wire()));
+        }
+    }
+
+    /// `ScheduledMessageAction`: WAM event 8502 on the `regular` channel.
+    ///
+    /// Declared in `WAWebScheduledMessageActionWamEvent`. Sampling weights `[1, 1, 1]` as the catalog lists them;
+    /// the weight a buffer carries can be overridden at runtime.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct ScheduledMessageAction {
+        /// `groupRole` (id 1).
+        pub group_role: Option<enums::GroupRoleType>,
+        /// `groupTypeClient` (id 2).
+        pub group_type_client: Option<enums::GroupTypeClient>,
+        /// `messageType` (id 3).
+        pub message_type: Option<enums::MessageType>,
+        /// `scheduledMessageActionType` (id 4).
+        pub scheduled_message_action_type: Option<enums::ScheduledMessageActionType>,
+        /// `scheduledMessageCount` (id 5).
+        pub scheduled_message_count: Option<i64>,
+        /// `scheduledMessageEntrypoint` (id 6).
+        pub scheduled_message_entrypoint: Option<enums::ScheduledMessageEntrypoint>,
+        /// `scheduledMessageFutureDurationSecs` (id 7).
+        pub scheduled_message_future_duration_secs: Option<i64>,
+        /// `scheduledMessageToScheduledCount` (id 9).
+        pub scheduled_message_to_scheduled_count: Option<i64>,
+        /// `scheduledMessageToUnscheduleCount` (id 10).
+        pub scheduled_message_to_unschedule_count: Option<i64>,
+        /// `unifiedSessionId` (id 8).
+        pub unified_session_id: Option<String>,
+    }
+
+    impl WamEvent for ScheduledMessageAction {
+        const NAME: &'static str = "ScheduledMessageAction";
+        const CODE: u32 = 8502;
+        const CHANNEL: Channel = Channel::Regular;
+        const WEIGHTS: [u32; 3] = [1, 1, 1];
+        const PRIVATE_STATS_ID: Option<i64> = None;
+
+        fn encode(&self, fields: &mut EventFields<'_>) {
+            fields.integer(1, self.group_role.map(|v| v.wire()));
+            fields.integer(2, self.group_type_client.map(|v| v.wire()));
+            fields.integer(3, self.message_type.map(|v| v.wire()));
+            fields.integer(4, self.scheduled_message_action_type.map(|v| v.wire()));
+            fields.integer(5, self.scheduled_message_count);
+            fields.integer(6, self.scheduled_message_entrypoint.map(|v| v.wire()));
+            fields.integer(7, self.scheduled_message_future_duration_secs);
+            fields.integer(9, self.scheduled_message_to_scheduled_count);
+            fields.integer(10, self.scheduled_message_to_unschedule_count);
+            fields.string(8, self.unified_session_id.as_deref());
         }
     }
 
@@ -79004,6 +79940,8 @@ pub mod events {
         pub unknown_user_display_context: Option<String>,
         /// `unknownUserDisplayLid` (id 9).
         pub unknown_user_display_lid: Option<String>,
+        /// `unknownUserRecoveryPath` (id 11).
+        pub unknown_user_recovery_path: Option<enums::UnknownUserRecoveryPath>,
     }
 
     impl WamEvent for UsernameUnknownUserDisplayed {
@@ -79024,6 +79962,35 @@ pub mod events {
             fields.string(8, self.jid_type.as_deref());
             fields.string(1, self.unknown_user_display_context.as_deref());
             fields.string(9, self.unknown_user_display_lid.as_deref());
+            fields.integer(11, self.unknown_user_recovery_path.map(|v| v.wire()));
+        }
+    }
+
+    /// `CompanionEmailInviteAction`: WAM event 8576 on the `regular` channel.
+    ///
+    /// Declared in `WAWebCompanionEmailInviteActionWamEvent`. Sampling weights `[1, 1, 1]` as the catalog lists them;
+    /// the weight a buffer carries can be overridden at runtime.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct CompanionEmailInviteAction {
+        /// `webcEmailInviteAction` (id 1).
+        pub webc_email_invite_action: Option<enums::WebcEmailInviteActionType>,
+        /// `webcEmailInviteCount` (id 2).
+        pub webc_email_invite_count: Option<i64>,
+        /// `webcEmailInviteEntryPoint` (id 3).
+        pub webc_email_invite_entry_point: Option<enums::WebcEmailInviteEntryPointType>,
+    }
+
+    impl WamEvent for CompanionEmailInviteAction {
+        const NAME: &'static str = "CompanionEmailInviteAction";
+        const CODE: u32 = 8576;
+        const CHANNEL: Channel = Channel::Regular;
+        const WEIGHTS: [u32; 3] = [1, 1, 1];
+        const PRIVATE_STATS_ID: Option<i64> = None;
+
+        fn encode(&self, fields: &mut EventFields<'_>) {
+            fields.integer(1, self.webc_email_invite_action.map(|v| v.wire()));
+            fields.integer(2, self.webc_email_invite_count);
+            fields.integer(3, self.webc_email_invite_entry_point.map(|v| v.wire()));
         }
     }
 }

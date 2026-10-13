@@ -804,9 +804,11 @@ mod tests {
         let primary_kp = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
         let primary_pub: [u8; 32] = primary_kp.public_key.public_key_bytes().try_into().unwrap();
         let primary_nonce = [0x77u8; 32];
-        let primary_bytes = wa::PrimaryEphemeralIdentity {
-            public_key: Some(primary_pub.to_vec()),
-            nonce: Some(primary_nonce.to_vec()),
+        let primary_bytes = {
+            let mut proto = wa::PrimaryEphemeralIdentity::default();
+            proto.public_key = Some(primary_pub.to_vec());
+            proto.nonce = Some(primary_nonce.to_vec());
+            proto
         }
         .encode_to_vec();
 
@@ -1027,9 +1029,11 @@ mod tests {
             .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
             .detach();
 
-        let primary = wa::PrimaryEphemeralIdentity {
-            public_key: Some(vec![0xAB; 32]),
-            nonce: Some(vec![0xCD; 32]),
+        let primary = {
+            let mut proto = wa::PrimaryEphemeralIdentity::default();
+            proto.public_key = Some(vec![0xAB; 32]);
+            proto.nonce = Some(vec![0xCD; 32]);
+            proto
         };
         let child = NodeBuilder::new(TAG_PRIMARY_EPHEMERAL_IDENTITY)
             .bytes(buffa::Message::encode_to_vec(&primary))

@@ -6,9 +6,10 @@
 use waproto::whatsapp as wa;
 
 fn set_mutation() -> wa::SyncdMutation {
-    wa::SyncdMutation {
-        operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
-        ..Default::default()
+    {
+        let mut proto = wa::SyncdMutation::default();
+        proto.operation = Some(wa::syncd_mutation::SyncdOperation::SET.into());
+        proto
     }
 }
 
@@ -33,9 +34,10 @@ fn open_field_serializes_like_a_closed_enum() {
 
 #[test]
 fn open_field_serializes_unknown_as_raw_integer() {
-    let mutation = wa::SyncdMutation {
-        operation: Some(buffa::EnumValue::Unknown(7)),
-        ..Default::default()
+    let mutation = {
+        let mut proto = wa::SyncdMutation::default();
+        proto.operation = Some(buffa::EnumValue::Unknown(7));
+        proto
     };
     let json = serde_json::to_value(mutation).unwrap();
     assert_eq!(json["operation"], serde_json::json!(7));
@@ -79,13 +81,14 @@ fn status_privacy_unknown_modes_survive_wire_roundtrip() {
 
 #[test]
 fn status_privacy_open_fields_keep_enum_serde_contract() {
-    let action = wa::sync_action_value::StatusPrivacyAction {
-        mode: Some(
+    let action = {
+        let mut proto = wa::sync_action_value::StatusPrivacyAction::default();
+        proto.mode = Some(
             wa::sync_action_value::status_privacy_action::StatusDistributionMode::CUSTOM_LIST
                 .into(),
-        ),
-        modes: vec![buffa::EnumValue::Unknown(99)],
-        ..Default::default()
+        );
+        proto.modes = vec![buffa::EnumValue::Unknown(99)];
+        proto
     };
     let json = serde_json::to_value(action).unwrap();
 

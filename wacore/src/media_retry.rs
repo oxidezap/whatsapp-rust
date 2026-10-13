@@ -66,8 +66,10 @@ pub fn encrypt_media_retry_receipt(
     let mut iv = [0u8; ENC_IV_SIZE];
     rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut iv);
 
-    let receipt = wa::ServerErrorReceipt {
-        stanza_id: Some(stanza_id.to_string()),
+    let receipt = {
+        let mut proto = wa::ServerErrorReceipt::default();
+        proto.stanza_id = Some(stanza_id.to_string());
+        proto
     };
     let plaintext = waproto::codec::server_error_receipt_to_vec(&receipt);
 
@@ -272,11 +274,12 @@ mod tests {
         use buffa::Message;
         let key = [42; 32];
         for id in [Some("MSG"), None, Some("OTHER")] {
-            let plaintext = wa::MediaRetryNotification {
-                stanza_id: id.map(str::to_owned),
-                direct_path: Some("/media/test.enc".into()),
-                result: Some(wa::media_retry_notification::ResultType::SUCCESS),
-                ..Default::default()
+            let plaintext = {
+                let mut proto = wa::MediaRetryNotification::default();
+                proto.stanza_id = id.map(str::to_owned);
+                proto.direct_path = Some("/media/test.enc".into());
+                proto.result = Some(wa::media_retry_notification::ResultType::SUCCESS);
+                proto
             }
             .encode_to_vec();
             let iv = [1; 12];

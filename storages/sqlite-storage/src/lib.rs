@@ -30,6 +30,7 @@
 //! }
 //! ```
 
+mod bounded_pending_query;
 mod database;
 mod pool;
 mod schema;

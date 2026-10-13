@@ -110,10 +110,11 @@ mod tests {
     #[tokio::test]
     async fn final_client_errors_are_public_and_preserve_typed_sources() {
         let client = client().await;
-        let message = proto::whatsapp::message::ImageMessage {
-            static_url: Some("https://cdn.example.com/static".into()),
-            file_sha256: Some(vec![0; 32]),
-            ..Default::default()
+        let message = {
+            let mut proto_ = proto::whatsapp::message::ImageMessage::default();
+            proto_.static_url = Some("https://cdn.example.com/static".into());
+            proto_.file_sha256 = Some(vec![0; 32]);
+            proto_
         };
         let error: ClientDownloadError = client.download(&message).await.unwrap_err();
         assert!(matches!(error, ClientDownloadError::ReferenceRejected(_)));
@@ -246,10 +247,11 @@ mod tests {
     async fn local_writer_failures_have_public_domain_types_and_original_io_sources() {
         let encrypted =
             wacore::upload::encrypt_media(b"external destination", MediaType::Image).unwrap();
-        let message = proto::whatsapp::message::ImageMessage {
-            static_url: Some("https://cdn.example.com/static".into()),
-            file_sha256: Some(encrypted.file_sha256.to_vec()),
-            ..Default::default()
+        let message = {
+            let mut proto_ = proto::whatsapp::message::ImageMessage::default();
+            proto_.static_url = Some("https://cdn.example.com/static".into());
+            proto_.file_sha256 = Some(encrypted.file_sha256.to_vec());
+            proto_
         };
         for streaming in [false, true] {
             for fail_write in [false, true] {

@@ -536,22 +536,34 @@ mod tests {
         });
 
         let value = if let Some(b) = value_blob {
-            buffa::MessageField::some(wa::SyncdValue { blob: Some(b) })
+            buffa::MessageField::some({
+                let mut proto = wa::SyncdValue::default();
+                proto.blob = Some(b);
+                proto
+            })
         } else {
             buffa::MessageField::none()
         };
 
-        wa::SyncdMutation {
-            operation: Some(operation.into()),
-            record: buffa::MessageField::some(wa::SyncdRecord {
-                index: buffa::MessageField::some(wa::SyncdIndex {
-                    blob: Some(index_mac),
-                }),
-                value,
-                key_id: buffa::MessageField::some(wa::KeyId {
-                    id: Some(b"test_key_id".to_vec()),
-                }),
-            }),
+        {
+            let mut proto = wa::SyncdMutation::default();
+            proto.operation = Some(operation.into());
+            proto.record = buffa::MessageField::some({
+                let mut proto = wa::SyncdRecord::default();
+                proto.index = buffa::MessageField::some({
+                    let mut proto = wa::SyncdIndex::default();
+                    proto.blob = Some(index_mac);
+                    proto
+                });
+                proto.value = value;
+                proto.key_id = buffa::MessageField::some({
+                    let mut proto = wa::KeyId::default();
+                    proto.id = Some(b"test_key_id".to_vec());
+                    proto
+                });
+                proto
+            });
+            proto
         }
     }
 
@@ -752,26 +764,37 @@ mod tests {
         snapshot_mac: &str,
         mutations: &[(wa::syncd_mutation::SyncdOperation, &str)],
     ) -> wa::SyncdPatch {
-        wa::SyncdPatch {
-            snapshot_mac: Some(hex::decode(snapshot_mac).expect("vector hex")),
-            mutations: mutations
+        {
+            let mut proto = wa::SyncdPatch::default();
+            proto.snapshot_mac = Some(hex::decode(snapshot_mac).expect("vector hex"));
+            proto.mutations = mutations
                 .iter()
-                .map(|(operation, blob)| wa::SyncdMutation {
-                    operation: Some((*operation).into()),
-                    record: buffa::MessageField::some(wa::SyncdRecord {
-                        index: buffa::MessageField::some(wa::SyncdIndex {
-                            blob: Some(vec![0u8; 32]),
-                        }),
-                        value: buffa::MessageField::some(wa::SyncdValue {
-                            blob: Some(hex::decode(blob).expect("vector hex")),
-                        }),
-                        key_id: buffa::MessageField::some(wa::KeyId {
-                            id: Some(b"test_key_id".to_vec()),
-                        }),
-                    }),
+                .map(|(operation, blob)| {
+                    let mut proto = wa::SyncdMutation::default();
+                    proto.operation = Some((*operation).into());
+                    proto.record = buffa::MessageField::some({
+                        let mut proto = wa::SyncdRecord::default();
+                        proto.index = buffa::MessageField::some({
+                            let mut proto = wa::SyncdIndex::default();
+                            proto.blob = Some(vec![0u8; 32]);
+                            proto
+                        });
+                        proto.value = buffa::MessageField::some({
+                            let mut proto = wa::SyncdValue::default();
+                            proto.blob = Some(hex::decode(blob).expect("vector hex"));
+                            proto
+                        });
+                        proto.key_id = buffa::MessageField::some({
+                            let mut proto = wa::KeyId::default();
+                            proto.id = Some(b"test_key_id".to_vec());
+                            proto
+                        });
+                        proto
+                    });
+                    proto
                 })
-                .collect(),
-            ..Default::default()
+                .collect();
+            proto
         }
     }
 
@@ -995,23 +1018,38 @@ mod tests {
     fn unkeyed_record(value_mac: &[u8]) -> wa::SyncdRecord {
         let mut blob = vec![0u8; 16];
         blob.extend_from_slice(value_mac);
-        wa::SyncdRecord {
-            value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) }),
-            ..Default::default()
+        {
+            let mut proto = wa::SyncdRecord::default();
+            proto.value = buffa::MessageField::some({
+                let mut proto = wa::SyncdValue::default();
+                proto.blob = Some(blob);
+                proto
+            });
+            proto
         }
     }
 
     fn record_with(index_mac: &[u8], value_mac: &[u8]) -> wa::SyncdRecord {
         let mut blob = vec![0u8; 16];
         blob.extend_from_slice(value_mac);
-        wa::SyncdRecord {
-            index: buffa::MessageField::some(wa::SyncdIndex {
-                blob: Some(index_mac.to_vec()),
-            }),
-            value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) }),
-            key_id: buffa::MessageField::some(wa::KeyId {
-                id: Some(b"test_key_id".to_vec()),
-            }),
+        {
+            let mut proto = wa::SyncdRecord::default();
+            proto.index = buffa::MessageField::some({
+                let mut proto = wa::SyncdIndex::default();
+                proto.blob = Some(index_mac.to_vec());
+                proto
+            });
+            proto.value = buffa::MessageField::some({
+                let mut proto = wa::SyncdValue::default();
+                proto.blob = Some(blob);
+                proto
+            });
+            proto.key_id = buffa::MessageField::some({
+                let mut proto = wa::KeyId::default();
+                proto.id = Some(b"test_key_id".to_vec());
+                proto
+            });
+            proto
         }
     }
 
@@ -1267,16 +1305,24 @@ mod tests {
     /// carrying no blob, `Some("")` is a blob that is present and empty, and
     /// the value is the whole blob rather than its MAC tail.
     fn vector_record(index: Option<&str>, value: &str) -> wa::SyncdRecord {
-        wa::SyncdRecord {
-            index: buffa::MessageField::some(wa::SyncdIndex {
-                blob: index.map(hex_to_bytes),
-            }),
-            value: buffa::MessageField::some(wa::SyncdValue {
-                blob: Some(hex_to_bytes(value)),
-            }),
-            key_id: buffa::MessageField::some(wa::KeyId {
-                id: Some(b"unit-3".to_vec()),
-            }),
+        {
+            let mut proto = wa::SyncdRecord::default();
+            proto.index = buffa::MessageField::some({
+                let mut proto = wa::SyncdIndex::default();
+                proto.blob = index.map(hex_to_bytes);
+                proto
+            });
+            proto.value = buffa::MessageField::some({
+                let mut proto = wa::SyncdValue::default();
+                proto.blob = Some(hex_to_bytes(value));
+                proto
+            });
+            proto.key_id = buffa::MessageField::some({
+                let mut proto = wa::KeyId::default();
+                proto.id = Some(b"unit-3".to_vec());
+                proto
+            });
+            proto
         }
     }
 
@@ -1586,23 +1632,34 @@ mod tests {
         const BLOB: &str = "03284d7297bce1062b50759abfe4092e092e53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6cbf0153a5f84";
 
         let key = hex_to_bytes(PATCH_MAC_KEY);
-        let patch = wa::SyncdPatch {
-            snapshot_mac: Some(hex_to_bytes(SNAPSHOT_MAC)),
-            mutations: vec![wa::SyncdMutation {
-                operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
-                record: buffa::MessageField::some(wa::SyncdRecord {
-                    index: buffa::MessageField::some(wa::SyncdIndex {
-                        blob: Some(vec![0u8; 32]),
-                    }),
-                    value: buffa::MessageField::some(wa::SyncdValue {
-                        blob: Some(hex_to_bytes(BLOB)),
-                    }),
-                    key_id: buffa::MessageField::some(wa::KeyId {
-                        id: Some(b"conformance".to_vec()),
-                    }),
-                }),
-            }],
-            ..Default::default()
+        let patch = {
+            let mut proto = wa::SyncdPatch::default();
+            proto.snapshot_mac = Some(hex_to_bytes(SNAPSHOT_MAC));
+            proto.mutations = vec![{
+                let mut proto = wa::SyncdMutation::default();
+                proto.operation = Some(wa::syncd_mutation::SyncdOperation::SET.into());
+                proto.record = buffa::MessageField::some({
+                    let mut proto = wa::SyncdRecord::default();
+                    proto.index = buffa::MessageField::some({
+                        let mut proto = wa::SyncdIndex::default();
+                        proto.blob = Some(vec![0u8; 32]);
+                        proto
+                    });
+                    proto.value = buffa::MessageField::some({
+                        let mut proto = wa::SyncdValue::default();
+                        proto.blob = Some(hex_to_bytes(BLOB));
+                        proto
+                    });
+                    proto.key_id = buffa::MessageField::some({
+                        let mut proto = wa::KeyId::default();
+                        proto.id = Some(b"conformance".to_vec());
+                        proto
+                    });
+                    proto
+                });
+                proto
+            }];
+            proto
         };
 
         for (version, expected) in [

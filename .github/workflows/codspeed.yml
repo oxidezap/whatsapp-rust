@@ -130,7 +130,7 @@ jobs:
       - name: Install tools (protoc, cargo-codspeed)
         uses: taiki-e/install-action@v2
         with:
-          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.1
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.2
 
       - name: Cache Rust registry
         uses: Swatinem/rust-cache@v2
@@ -157,11 +157,16 @@ jobs:
       # this action, and read the PR right after the bump against the new
       # baseline, not the old one. `cycle-estimation: false` reverts it.
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@v5
+        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369 # v5.4.2
         env:
           SHARD_PACKAGES: ${{ matrix.shard.packages }}
         with:
           mode: simulation,memory
+          runner-version: "5.4.2"
+          # v5.4 defaults; keep allocation stacks and RSS explicit. RSS requires
+          # Linux >= 6.8 and is distinct from peak allocated heap memory.
+          disable-memory-capture-stack: "false"
+          disable-memory-track-physical: "false"
           run: cargo codspeed run $SHARD_PACKAGES
 
   # Integration benches drive the real async client against the bartender mock
@@ -254,7 +259,7 @@ jobs:
       - name: Install tools (protoc, cargo-codspeed)
         uses: taiki-e/install-action@v2
         with:
-          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.1
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.2
 
       - name: Cache Rust registry
         uses: Swatinem/rust-cache@v2
@@ -280,10 +285,11 @@ jobs:
       # workspace default-member, so a bare `cargo codspeed run` discovers no
       # benchmarks for it ("No benchmarks found for the simulation mode").
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@v5
+        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369 # v5.4.2
         env:
           MOCK_SERVER_URL: "wss://127.0.0.1:8080/ws/chat"
           RUST_LOG: warn
         with:
           mode: simulation
+          runner-version: "5.4.2"
           run: cargo codspeed run -p bench-integration

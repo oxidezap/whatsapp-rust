@@ -270,11 +270,12 @@ impl Client {
                                     // Decrypt the frame synchronously (required for noise counter ordering)
                                     if let Some(node) = self.decrypt_frame(&noise_socket, encrypted_frame) {
                                         if self.processes_inline(node.get()) {
-                                            self.process_decrypted_node(node).await;
+                                            self.process_decrypted_node_scoped(node, &shutdown).await;
                                         } else {
                                             let client = self.clone();
+                                            let shutdown = shutdown.clone();
                                             self.runtime.spawn_detached(Box::pin(async move {
-                                                client.process_decrypted_node(node).await;
+                                                client.process_decrypted_node_scoped(node, &shutdown).await;
                                             }));
                                         }
                                     }
@@ -442,13 +443,27 @@ impl Client {
         }
     }
 
-    /// Process an already-decrypted node.
-    /// This can be spawned concurrently since it doesn't depend on noise protocol state.
-    /// The node is wrapped in Arc to avoid cloning when passing through handlers.
-    pub(crate) async fn process_decrypted_node(
+    #[cfg(test)]
+    pub(crate) fn process_decrypted_node(
         self: &Arc<Self>,
         node: wacore_binary::OwnedNodeRef,
+    ) -> impl Future<Output = ()> + '_ {
+        let shutdown = self.connection_shutdown_signal();
+        async move { self.process_decrypted_node_scoped(node, &shutdown).await }
+    }
+
+    /// Process an already-decrypted node under the read loop's original connection.
+    /// This can be spawned concurrently since it doesn't depend on noise protocol state.
+    /// The node is wrapped in Arc to avoid cloning when passing through handlers.
+    async fn process_decrypted_node_scoped(
+        self: &Arc<Self>,
+        node: wacore_binary::OwnedNodeRef,
+        shutdown: &wacore::runtime::ShutdownSignal,
     ) {
+        // A detached handler may first be polled after the next connection starts.
+        if shutdown.is_fired() {
+            return;
+        }
         // ACKs need shared ownership only for opt-in raw/node observers. The
         // usual response-waiter path borrows the node and can skip the Arc.
         if node.tag() == StanzaTag::Ack.as_str()
@@ -464,15 +479,25 @@ impl Client {
 
         // Wrap in Arc once - all handlers will share this same allocation
         let node_arc = Arc::new(node);
-        self.process_node(node_arc).await;
+        self.process_node_scoped(node_arc, shutdown).await;
     }
 
     /// Process a node wrapped in Arc. Handlers receive the Arc and can share/store it cheaply.
+    #[cfg(any(test, feature = "bench-harness", feature = "test-support"))]
+    pub(crate) async fn process_node(self: &Arc<Self>, node: Arc<wacore_binary::OwnedNodeRef>) {
+        let shutdown = self.connection_shutdown_signal();
+        self.process_node_scoped(node, &shutdown).await;
+    }
+
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.conn.node", level = "trace", skip_all, fields(tag = %node.get().tag.as_ref()))
     )]
-    pub(crate) async fn process_node(self: &Arc<Self>, node: Arc<wacore_binary::OwnedNodeRef>) {
+    async fn process_node_scoped(
+        self: &Arc<Self>,
+        node: Arc<wacore_binary::OwnedNodeRef>,
+        shutdown: &wacore::runtime::ShutdownSignal,
+    ) {
         use wacore::xml::DisplayableNodeRef;
         let nr = node.get();
         // Classified once; every gate below dispatches on the enum instead of
@@ -673,7 +698,9 @@ impl Client {
                     && nr.get_attr("from").is_some())
                 .then(|| Arc::clone(&node))
             });
-            if let Some(node) = ack {
+            if !shutdown.is_fired()
+                && let Some(node) = ack
+            {
                 self.maybe_deferred_ack(node).await;
             }
             return;
@@ -682,6 +709,20 @@ impl Client {
         // Bypass async_trait's boxed future for the hot built-in handlers while
         // retaining router registration for direct router callers.
         match tag {
+            Some(StanzaTag::Iq) => {
+                Box::pin(crate::handlers::iq::IqHandler::handle_scoped(
+                    self, &node, shutdown,
+                ))
+                .await;
+            }
+            Some(StanzaTag::Notification) => {
+                Box::pin(
+                    crate::handlers::notification::NotificationHandler::handle_scoped(
+                        self, node, shutdown,
+                    ),
+                )
+                .await;
+            }
             Some(StanzaTag::Ack) => {
                 self.handle_ack_response_arc(&node);
             }
@@ -722,7 +763,10 @@ impl Client {
             }
         }
 
-        if !cancelled && let Some(node) = deferred_ack_node {
+        if !cancelled
+            && !shutdown.is_fired()
+            && let Some(node) = deferred_ack_node
+        {
             self.maybe_deferred_ack(node).await;
         }
     }
@@ -2332,11 +2376,24 @@ impl Client {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn handle_iq(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) -> bool {
+        let shutdown = self.connection_shutdown_signal();
+        self.handle_iq_scoped(node, &shutdown).await
+    }
+
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.conn.iq_in", level = "debug", skip_all)
     )]
-    pub(crate) async fn handle_iq(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) -> bool {
+    pub(crate) async fn handle_iq_scoped(
+        self: &Arc<Self>,
+        node: &wacore_binary::NodeRef<'_>,
+        shutdown: &wacore::runtime::ShutdownSignal,
+    ) -> bool {
+        if shutdown.is_fired() {
+            return true;
+        }
         // Pong a server-initiated ping. The gate is shared with
         // `is_connection_critical`, which never offers one to an interceptor:
         // a claimed ping is a pong never sent, and the server drops the
@@ -2353,7 +2410,7 @@ impl Client {
             return true;
         }
 
-        if pair::handle_iq(self, node).await {
+        if pair::handle_iq_scoped(self, node, shutdown).await {
             return true;
         }
 
@@ -2367,6 +2424,40 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn delayed_pair_device_handler_cannot_adopt_a_replacement_connection() {
+        use crate::test_utils::{TestEventCollector, create_iq_test_client, node_to_owned_ref};
+        use wacore_binary::builder::NodeBuilder;
+        let (client, _transport) = create_iq_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        let node = NodeBuilder::new("iq")
+            .attrs([
+                ("from", "s.whatsapp.net"),
+                ("type", "set"),
+                ("id", "old-pair"),
+            ])
+            .children([NodeBuilder::new("pair-device")
+                .children([NodeBuilder::new("ref").bytes(b"2@old-ref".to_vec()).build()])
+                .build()])
+            .build();
+        let pending =
+            client.process_decrypted_node(Arc::try_unwrap(node_to_owned_ref(&node)).unwrap());
+        client.notify_connection_shutdown();
+        client.reset_connection_shutdown();
+        pending.await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            collector
+                .events()
+                .iter()
+                .all(|e| !matches!(&**e, Event::PairingQrCode(_)))
+        );
+        assert!(!client.shutdown_signal().is_fired());
+    }
+
     #[test]
     fn group_repair_deadline_includes_task_and_property_delay() {
         let ack = wacore::time::Instant::ZERO;

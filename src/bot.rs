@@ -229,12 +229,12 @@ impl MessageContext {
         use wacore_binary::JidExt;
         let needs_participant =
             self.info.source.is_group || self.info.source.chat.is_status_broadcast();
-        wa::MessageKey {
-            remote_jid: Some(self.info.source.chat.to_string()),
-            from_me: Some(self.info.source.is_from_me),
-            id: Some(self.info.id.to_string()),
-            participant: needs_participant.then(|| self.info.source.sender.to_string()),
-        }
+        let mut key = wa::MessageKey::default();
+        key.remote_jid = Some(self.info.source.chat.to_string());
+        key.from_me = Some(self.info.source.is_from_me);
+        key.id = Some(self.info.id.to_string());
+        key.participant = needs_participant.then(|| self.info.source.sender.to_string());
+        key
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.edit_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
@@ -2093,11 +2093,12 @@ mod tests {
         let http_client = MockHttpClient;
 
         let custom_os = "CustomOS".to_string();
-        let custom_version = wa::device_props::AppVersion {
-            primary: Some(99),
-            secondary: Some(88),
-            tertiary: Some(77),
-            ..Default::default()
+        let custom_version = {
+            let mut proto_fixture = wa::device_props::AppVersion::default();
+            proto_fixture.primary = Some(99);
+            proto_fixture.secondary = Some(88);
+            proto_fixture.tertiary = Some(77);
+            proto_fixture
         };
 
         let bot = Bot::builder()
@@ -2163,11 +2164,12 @@ mod tests {
         let transport = TokioWebSocketTransportFactory::new();
         let http_client = MockHttpClient;
 
-        let custom_version = wa::device_props::AppVersion {
-            primary: Some(99),
-            secondary: Some(88),
-            tertiary: Some(77),
-            ..Default::default()
+        let custom_version = {
+            let mut proto_fixture = wa::device_props::AppVersion::default();
+            proto_fixture.primary = Some(99);
+            proto_fixture.secondary = Some(88);
+            proto_fixture.tertiary = Some(77);
+            proto_fixture
         };
 
         let bot = Bot::builder()
@@ -2242,11 +2244,12 @@ mod tests {
         let http_client = MockHttpClient;
 
         let custom_os = "macOS".to_string();
-        let custom_version = wa::device_props::AppVersion {
-            primary: Some(2),
-            secondary: Some(0),
-            tertiary: Some(0),
-            ..Default::default()
+        let custom_version = {
+            let mut proto_fixture = wa::device_props::AppVersion::default();
+            proto_fixture.primary = Some(2);
+            proto_fixture.secondary = Some(0);
+            proto_fixture.tertiary = Some(0);
+            proto_fixture
         };
         let custom_platform = wa::device_props::PlatformType::SAFARI;
 
@@ -2515,9 +2518,10 @@ mod tests {
             .await
             .expect("Failed to build bot");
 
-        let original = Arc::new(wa::Message {
-            conversation: Some("ping".to_string()),
-            ..Default::default()
+        let original = Arc::new({
+            let mut proto_fixture = wa::Message::default();
+            proto_fixture.conversation = Some("ping".to_string());
+            proto_fixture
         });
         let original_ptr = Arc::as_ptr(&original);
 
@@ -2556,11 +2560,9 @@ mod tests {
         assert!(ctx.comment_target.is_none());
 
         // A newsletter comment: the parent post key rides the same way.
-        let parent = wa::MessageKey {
-            remote_jid: Some("120363000000000001@newsletter".to_string()),
-            id: Some("POSTID01".to_string()),
-            ..Default::default()
-        };
+        let mut parent = wa::MessageKey::default();
+        parent.remote_jid = Some("120363000000000001@newsletter".to_string());
+        parent.id = Some("POSTID01".to_string());
         let comment = wacore::types::events::InboundMessage::builder()
             .message(Arc::new(wa::Message::default()))
             .info(Arc::new(react_info(

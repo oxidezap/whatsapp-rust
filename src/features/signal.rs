@@ -1327,9 +1327,10 @@ mod tests {
         client
             .signal_flush_test_block
             .store(true, Ordering::Release);
-        let message = waproto::whatsapp::Message {
-            conversation: Some("fanout".into()),
-            ..Default::default()
+        let message = {
+            let mut proto_ = waproto::whatsapp::Message::default();
+            proto_.conversation = Some("fanout".into());
+            proto_
         };
         let (nodes, _) = client
             .signal()

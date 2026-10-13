@@ -1,7 +1,14 @@
 syntax = "proto2";
 package whatsapp;
 
-/// WhatsApp Version: 2.3000.1045368834
+/// WhatsApp Version: 2.3000.1047483476
+
+message ACP2Setting {
+  optional bool enabled = 1;
+  optional LimitSharing.TriggerType trigger = 2 [default = UNKNOWN];
+  optional int64 settingTimestamp = 3;
+  optional bool initiatedByMe = 4;
+}
 
 message ADVDeviceIdentity {
   optional uint32 rawId = 1;
@@ -80,6 +87,7 @@ message AIMediaCollectionMetadata {
 
 message AIMetadataOperation {
   optional HatchMetadataSync hatchMetadataSync = 1;
+  optional BizAIMetadataSync bizAiMetadataSync = 2;
 }
 
 message AIProvenance {
@@ -214,6 +222,7 @@ message AIRichResponseMessage {
   repeated AIRichResponseSubMessage submessages = 2;
   optional AIRichResponseUnifiedResponse unifiedResponse = 3;
   optional ContextInfo contextInfo = 4;
+  optional AIRichResponseUnifiedResponse originalRecipientMetadata = 5;
 }
 
 enum AIRichResponseMessageType {
@@ -318,10 +327,24 @@ message AvatarUserSettings {
   optional string password = 2;
 }
 
-message BackwardEdge {
-  optional bytes encryptedPrevEpochAnonId = 1;
-  optional bytes encryptedPrevEpochRootKey = 2;
-  optional bytes prevEpochRootKeyFingerprint = 3;
+message BizAIMetadataSync {
+  oneof operation {
+    BizAIMetadataSync.ServerEvent serverEvent = 1;
+  }
+  message ServerEvent {
+    oneof event {
+      BizAIMetadataSync.ServerEvent.ProtocolEvent protocolEvent = 1;
+      BizAIMetadataSync.ServerEvent.AgentOnboardingStarted agentOnboardingStarted = 2;
+    }
+    message AgentOnboardingStarted {
+      optional int64 composerBlockDurationSecs = 1;
+    }
+
+    enum ProtocolEvent {
+      UNSPECIFIED = 0;
+      AGENT_CHAT_READY = 1;
+    }
+  }
 }
 
 message BizAccountLinkInfo {
@@ -460,6 +483,8 @@ message BotCapabilityMetadata {
     AI_RICH_RESPONSE_ARTIFACTS_ENABLED = 67;
     AI_RICH_RESPONSE_EMAIL_CALENDAR_ENABLED = 68;
     AI_RICH_RESPONSE_REMINDERS_ENABLED = 69;
+    AI_STOP_GENERATION_ENABLED = 70;
+    AI_RICH_RESPONSE_3P_LINKING_CARD_ENABLED = 71;
   }
 }
 
@@ -705,6 +730,7 @@ message BotMetadata {
   optional AISubscriptionUpsellMetadata subscriptionUpsellMetadata = 41;
   optional BotPttPromptMetadata pttPromptMetadata = 42;
   optional BotHistoryShareMetadata botHistoryShareMetadata = 43;
+  optional bool responseStoppedByUser = 44;
   optional bytes internalMetadata = 999;
 }
 
@@ -758,6 +784,7 @@ enum BotMetricsEntryPoint {
   CHATLIST_SEARCH = 55;
   NEW_CHAT_LIST = 56;
   CONTACTS_TAB = 57;
+  NEW_3P_AGENT_CREATION = 58;
 }
 message BotMetricsMetadata {
   optional string destinationId = 1;
@@ -1031,25 +1058,6 @@ message BotUnifiedResponseMutation {
   }
 }
 
-enum COMMAND_COMMAND_TYPE {
-  EVERYONE = 1;
-  SILENT = 2;
-  AI = 3;
-  AI_IMAGINE = 4;
-}
-enum CONSUMER_APPLICATION_METADATA_SPECIAL_TEXT_SIZE {
-  SMALL = 1;
-  MEDIUM = 2;
-  LARGE = 3;
-}
-enum CONSUMER_APPLICATION_STATUS_TEXT_MESAGE_FONT_TYPE {
-  SANS_SERIF = 0;
-  SERIF = 1;
-  NORICAN_REGULAR = 2;
-  BRYNDAN_WRITE = 3;
-  BEBASNEUE_REGULAR = 4;
-  OSWALD_HEAVY = 5;
-}
 message CallLogRecord {
   optional CallResult callResult = 1;
   optional bool isDndMode = 2;
@@ -1168,6 +1176,7 @@ message ClientPairingProps {
   optional bool isSyncdSnapshotRecoveryEnabled = 3;
   optional bool isHsThumbnailSyncEnabled = 4;
   optional bytes subscriptionSyncPayload = 5;
+  optional bool isBotJidDbMigrated = 6;
 }
 
 message ClientPayload {
@@ -1364,6 +1373,8 @@ message ClientPayload {
       BLUE_VR = 36;
       AR_WRIST = 37;
       WAIL = 38;
+      WORK_ANDROID = 39;
+      WORK_IOS = 40;
     }
     enum ReleaseChannel {
       RELEASE = 0;
@@ -1433,13 +1444,6 @@ message CombinedFingerprint {
   optional FingerprintData remoteFingerprint = 3;
 }
 
-message Command {
-  optional COMMAND_COMMAND_TYPE commandType = 1;
-  optional uint32 offset = 2;
-  optional uint32 length = 3;
-  optional string validationToken = 4;
-}
-
 message CommentMetadata {
   optional MessageKey commentParentKey = 1;
   optional uint32 replyCount = 2;
@@ -1458,216 +1462,6 @@ message CompanionEphemeralIdentity {
 message Config {
   map<uint32, Field> field = 1;
   optional uint32 version = 2;
-}
-
-message ConsumerApplication {
-  optional Payload payload = 1;
-  optional Metadata metadata = 2;
-  message ApplicationData {
-    oneof applicationContent {
-      ConsumerApplication.RevokeMessage revoke = 1;
-    }
-  }
-
-  message AudioMessage {
-    optional SubProtocol audio = 1;
-    optional bool ptt = 2;
-  }
-
-  message ContactMessage {
-    optional SubProtocol contact = 1;
-  }
-
-  message ContactsArrayMessage {
-    optional string displayName = 1;
-    repeated ConsumerApplication.ContactMessage contacts = 2;
-  }
-
-  message Content {
-    oneof content {
-      MessageText messageText = 1;
-      ConsumerApplication.ImageMessage imageMessage = 2;
-      ConsumerApplication.ContactMessage contactMessage = 3;
-      ConsumerApplication.LocationMessage locationMessage = 4;
-      ConsumerApplication.ExtendedTextMessage extendedTextMessage = 5;
-      ConsumerApplication.StatusTextMesage statusTextMessage = 6;
-      ConsumerApplication.DocumentMessage documentMessage = 7;
-      ConsumerApplication.AudioMessage audioMessage = 8;
-      ConsumerApplication.VideoMessage videoMessage = 9;
-      ConsumerApplication.ContactsArrayMessage contactsArrayMessage = 10;
-      ConsumerApplication.LiveLocationMessage liveLocationMessage = 11;
-      ConsumerApplication.StickerMessage stickerMessage = 12;
-      ConsumerApplication.GroupInviteMessage groupInviteMessage = 13;
-      ConsumerApplication.ViewOnceMessage viewOnceMessage = 14;
-      ConsumerApplication.ReactionMessage reactionMessage = 16;
-      ConsumerApplication.PollCreationMessage pollCreationMessage = 17;
-      ConsumerApplication.PollUpdateMessage pollUpdateMessage = 18;
-      ConsumerApplication.EditMessage editMessage = 19;
-    }
-  }
-
-  message DocumentMessage {
-    optional SubProtocol document = 1;
-    optional string fileName = 2;
-  }
-
-  message EditMessage {
-    optional MessageKey key = 1;
-    optional MessageText message = 2;
-    optional int64 timestampMs = 3;
-  }
-
-  message ExtendedTextMessage {
-    optional MessageText text = 1;
-    optional string matchedText = 2;
-    optional string canonicalUrl = 3;
-    optional string description = 4;
-    optional string title = 5;
-    optional SubProtocol thumbnail = 6;
-    optional CONSUMER_APPLICATION_EXTENDED_TEXT_MESSAGE_PREVIEW_TYPE previewType = 7;
-  }
-
-  message GroupInviteMessage {
-    optional string groupJid = 1;
-    optional string inviteCode = 2;
-    optional int64 inviteExpiration = 3;
-    optional string groupName = 4;
-    optional bytes jpegThumbnail = 5;
-    optional MessageText caption = 6;
-  }
-
-  message ImageMessage {
-    optional SubProtocol image = 1;
-    optional MessageText caption = 2;
-  }
-
-  message InteractiveAnnotation {
-    repeated ConsumerApplication.Point polygonVertices = 1;
-    oneof action {
-      ConsumerApplication.Location location = 2;
-    }
-  }
-
-  message LiveLocationMessage {
-    optional ConsumerApplication.Location location = 1;
-    optional uint32 accuracyInMeters = 2;
-    optional float speedInMps = 3;
-    optional uint32 degreesClockwiseFromMagneticNorth = 4;
-    optional MessageText caption = 5;
-    optional int64 sequenceNumber = 6;
-    optional uint32 timeOffset = 7;
-  }
-
-  message Location {
-    optional double degreesLatitude = 1;
-    optional double degreesLongitude = 2;
-    optional string name = 3;
-  }
-
-  message LocationMessage {
-    optional ConsumerApplication.Location location = 1;
-    optional string address = 2;
-  }
-
-  message MediaPayload {
-    optional SubProtocol protocol = 1;
-  }
-
-  message Metadata {
-    optional CONSUMER_APPLICATION_METADATA_SPECIAL_TEXT_SIZE specialTextSize = 1;
-  }
-
-  message Option {
-    optional string optionName = 1;
-  }
-
-  message Payload {
-    oneof payload {
-      ConsumerApplication.Content content = 1;
-      ConsumerApplication.ApplicationData applicationData = 2;
-      ConsumerApplication.Signal signal = 3;
-      ConsumerApplication.SubProtocolPayload subProtocol = 4;
-    }
-  }
-
-  message Point {
-    optional double x = 1;
-    optional double y = 2;
-  }
-
-  message PollAddOptionMessage {
-    repeated ConsumerApplication.Option pollOption = 1;
-  }
-
-  message PollCreationMessage {
-    optional bytes encKey = 1;
-    optional string name = 2;
-    repeated ConsumerApplication.Option options = 3;
-    optional uint32 selectableOptionsCount = 4;
-  }
-
-  message PollEncValue {
-    optional bytes encPayload = 1;
-    optional bytes encIv = 2;
-  }
-
-  message PollUpdateMessage {
-    optional MessageKey pollCreationMessageKey = 1;
-    optional ConsumerApplication.PollEncValue vote = 2;
-    optional ConsumerApplication.PollEncValue addOption = 3;
-  }
-
-  message PollVoteMessage {
-    repeated bytes selectedOptions = 1;
-    optional int64 senderTimestampMs = 2;
-  }
-
-  message ReactionMessage {
-    optional MessageKey key = 1;
-    optional string text = 2;
-    optional string groupingKey = 3;
-    optional int64 senderTimestampMs = 4;
-    optional string reactionMetadataDataclassData = 5;
-    optional int32 style = 6;
-  }
-
-  message RevokeMessage {
-    optional MessageKey key = 1;
-  }
-
-  message Signal {}
-
-  message StatusTextMesage {
-    optional ConsumerApplication.ExtendedTextMessage text = 1;
-    optional fixed32 textArgb = 6;
-    optional fixed32 backgroundArgb = 7;
-    optional CONSUMER_APPLICATION_STATUS_TEXT_MESAGE_FONT_TYPE font = 8;
-  }
-
-  message StickerMessage {
-    optional SubProtocol sticker = 1;
-  }
-
-  message SubProtocolPayload {
-    optional FUTURE_PROOF_BEHAVIOR futureProof = 1;
-  }
-
-  message VideoMessage {
-    optional SubProtocol video = 1;
-    optional MessageText caption = 2;
-  }
-
-  message ViewOnceMessage {
-    oneof viewOnceContent {
-      ConsumerApplication.ImageMessage imageMessage = 1;
-      ConsumerApplication.VideoMessage videoMessage = 2;
-    }
-  }
-
-  enum CONSUMER_APPLICATION_EXTENDED_TEXT_MESSAGE_PREVIEW_TYPE {
-    NONE = 0;
-    VIDEO = 1;
-  }
 }
 
 message ContextInfo {
@@ -1735,6 +1529,8 @@ message ContextInfo {
   optional string posterStatusId = 79;
   optional InstagramThreadLink instagramThreadLink = 80;
   optional AIProvenance aiProvenance = 81;
+  repeated uint32 experienceIds = 82 [packed = true];
+  optional string partnerDeepLinkToken = 83;
   message AdReplyInfo {
     optional string advertiserName = 1;
     optional MediaType mediaType = 2;
@@ -1855,6 +1651,7 @@ message ContextInfo {
     optional int32 agmTitleStrategy = 30;
     optional int32 agmSubtitleStrategy = 31;
     optional int32 agmHeaderInteractionStrategy = 32;
+    optional bool containsCtwaFlowsAutoLabel = 33;
     enum AdType {
       CTWA = 0;
       CAWC = 1;
@@ -2020,6 +1817,7 @@ message Conversation {
   optional string authAgentParentCompanyName = 61;
   optional string authAgentObaPhoneNumber = 62;
   optional IdentityVerificationState identityVerification = 63;
+  optional ACP2Setting acp2Setting = 64;
   enum EndOfHistoryTransferType {
     COMPLETE_BUT_MORE_MESSAGES_REMAIN_ON_PRIMARY = 0;
     COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY = 1;
@@ -2034,190 +1832,6 @@ message Conversation {
   }
 }
 
-message CreateBackupInput {
-  required string recoveryCode = 1;
-  required uint64 userId = 2;
-}
-
-message CreateBackupOutput {
-  optional DeviceOutput device = 1;
-  optional VirtualDeviceOutput virtualDevice = 2;
-  optional Epoch0Output epoch0 = 3;
-  optional bytes mailboxRootKey = 4;
-  optional string error = 5;
-}
-
-message DecryptMekForDistributionFromTransportSenderInput {
-  required TransportSenderMEKDistributionSingleRecipient mekDistribution = 1;
-  required bytes mekId = 2;
-  required bytes rosterHash = 3;
-  required bytes recipientEncSk = 4;
-  required uint64 version = 5;
-  optional MinosClientConfig conf = 6;
-  message TransportSenderMEKDistributionSingleRecipient {
-    required bytes encryptedMek = 1;
-    required bytes ephemeralEncryptionPk = 2;
-    required bytes signingPk = 3;
-    required bytes signature = 4;
-    optional bytes recipientEpochHead = 5;
-  }
-}
-
-message DecryptMekForDistributionFromTransportSenderResult {
-  oneof result {
-    DecryptMekForDistributionFromTransportSenderSuccess success = 1;
-    string errorMessage = 2;
-  }
-}
-
-message DecryptMekForDistributionFromTransportSenderSuccess {
-  required bytes mek = 1;
-}
-
-message DecryptMekForDistributionInput {
-  required bytes toMailboxSk = 1;
-  required bytes fromPk = 2;
-  required bytes mekId = 3;
-  required bytes senderEpochHead = 4;
-  required bytes rosterHash = 5;
-  required bytes ciphertext = 6;
-  optional bytes toEpochHead = 7;
-  optional int32 mekEncryptionVersion = 8;
-  optional MinosClientConfig conf = 9;
-}
-
-message DecryptMekForDistributionResult {
-  oneof result {
-    DecryptMekForDistributionSuccess success = 1;
-    string errorMessage = 2;
-  }
-}
-
-message DecryptMekForDistributionSuccess {
-  required bytes mek = 1;
-}
-
-message DecryptMessageInput {
-  required bytes epochRootKey = 1;
-  required bytes epochAnonId = 2;
-  required string threadId = 3;
-  required int32 encryptionVersion = 4;
-  required bytes ciphertext = 5;
-}
-
-message DecryptMessageOutput {
-  optional bytes plaintextPayload = 1;
-  optional string error = 2;
-}
-
-message DecryptSelfMmkDistributionInput {
-  required bytes encryptedMmk = 1;
-  required bytes exportRootKey = 2;
-  required bytes mailboxHeadHash = 3;
-}
-
-message DecryptSelfMmkDistributionResult {
-  oneof result {
-    DecryptSelfMmkDistributionSuccess success = 1;
-    string errorMessage = 2;
-  }
-}
-
-message DecryptSelfMmkDistributionSuccess {
-  required bytes mmkSeed = 1;
-}
-
-message DeriveAttachmentAccessTokenSecretInput {
-  required bytes mediaKey = 1;
-}
-
-message DeriveAttachmentAccessTokenSecretResult {
-  required bytes attachmentAccessTokenSecret = 1;
-}
-
-message DeriveAttachmentPrimaryKeySecretInput {
-  required bytes mediaKey = 1;
-}
-
-message DeriveAttachmentPrimaryKeySecretResult {
-  required bytes attachmentPrimaryKeySecret = 1;
-}
-
-message DeriveMailboxAuthKeypairInput {
-  required bytes exportRootKey = 1;
-  required uint64 epochNumber = 2;
-}
-
-message DeriveMailboxAuthKeypairResult {
-  required bytes mailboxAuthPublicKey = 1;
-  required bytes mailboxAuthPrivateKey = 2;
-}
-
-message DeriveMailboxEncryptionKeypairInput {
-  required bytes exportRootKey = 1;
-  required uint64 epochNumber = 2;
-}
-
-message DeriveMailboxEncryptionKeypairResult {
-  required bytes mailboxEncryptionPublicKey = 1;
-  required bytes mailboxEncryptionPrivateKey = 2;
-}
-
-message DeriveMailboxSigningKeypairInput {
-  required bytes exportRootKey = 1;
-  required uint64 epochNumber = 2;
-}
-
-message DeriveMailboxSigningKeypairResult {
-  oneof result {
-    DeriveMailboxSigningKeypairSuccess success = 1;
-    string errorMessage = 2;
-  }
-}
-
-message DeriveMailboxSigningKeypairSuccess {
-  required bytes mailboxSigningPublicKey = 1;
-  required bytes mailboxSigningPrivateKey = 2;
-}
-
-message DeriveMessageKeyInput {
-  required bytes epochRootKey = 1;
-  required bytes epochAnonId = 2;
-  required string threadId = 3;
-}
-
-message DeriveMessageKeyOutput {
-  optional bytes messageKey = 1;
-  optional string error = 2;
-}
-
-message DeriveMessagingMailboxKeypairsInput {
-  required bytes mmkSeed = 1;
-}
-
-message DeriveMessagingMailboxKeypairsResult {
-  oneof result {
-    DeriveMessagingMailboxKeypairsSuccess success = 1;
-    string errorMessage = 2;
-  }
-}
-
-message DeriveMessagingMailboxKeypairsSuccess {
-  required bytes encSk = 1;
-  required bytes encPk = 2;
-  optional bytes authSk = 3;
-  optional bytes authPk = 4;
-}
-
-message DetachedDevicePublicData {
-  required uint64 deviceId = 1;
-  required bytes name = 2;
-  required bytes sigPk = 3;
-  required bytes authPk = 4;
-  required bytes encPk = 5;
-  required bytes signature = 6;
-}
-
 message DeviceCapabilities {
   optional ChatLockSupportLevel chatLockSupportLevel = 1;
   optional LIDMigration lidMigration = 2;
@@ -2230,6 +1844,7 @@ message DeviceCapabilities {
   optional ContactRefresh contactRefresh = 9;
   message AiFbidMigration {
     optional uint64 chatDbMigrationTimestamp = 1;
+    optional uint32 supportVersion = 2;
   }
 
   message AiThread {
@@ -2251,6 +1866,7 @@ message DeviceCapabilities {
     optional bool campaignSyncEnabled = 3;
     optional bool insightsSyncEnabled = 4;
     optional int32 recipientLimit = 5;
+    optional bool proCompanionSupportEnabled = 6;
   }
 
   enum ChatLockSupportLevel {
@@ -2290,19 +1906,6 @@ message DeviceListMetadata {
   optional bytes recipientKeyHash = 8;
   optional uint64 recipientTimestamp = 9;
   repeated uint32 recipientKeyIndexes = 10 [packed = true];
-}
-
-message DeviceOutput {
-  required bytes publicKey = 1;
-  required bytes epochAuthPublicKey = 2;
-  required bytes epochAuthPublicKeySig = 3;
-  required bytes epochStoragePublicKey = 4;
-  required bytes epochStoragePublicKeySig = 5;
-  repeated int32 supportedEncryptionVersions = 6;
-  required bytes encryptionVersionSignature = 7;
-  required int32 clientVersion = 8;
-  required bytes ocmfClientState = 9;
-  required bytes epochStoragePrivateKey = 10;
 }
 
 message DeviceProps {
@@ -2374,6 +1977,8 @@ message DeviceProps {
     CLOUD_API = 23;
     SMARTGLASSES = 24;
     WAIL = 25;
+    WASS = 26;
+    BUSINESS_BACK_OFFICE = 27;
   }
 }
 
@@ -2398,107 +2003,6 @@ message DisappearingMode {
   }
 }
 
-enum EXTENDED_CONTENT_MESSAGE_CTA_BUTTON_TYPE {
-  OPEN_NATIVE = 11;
-}
-enum EXTENDED_CONTENT_MESSAGE_EXTENDED_CONTENT_TYPE {
-  UNSUPPORTED = -1;
-  IG_STORY_PHOTO_MENTION = 4;
-  IG_SINGLE_IMAGE_POST_SHARE = 9;
-  IG_MULTIPOST_SHARE = 10;
-  IG_SINGLE_VIDEO_POST_SHARE = 11;
-  IG_STORY_PHOTO_SHARE = 12;
-  IG_STORY_VIDEO_SHARE = 13;
-  IG_CLIPS_SHARE = 14;
-  IG_IGTV_SHARE = 15;
-  IG_SHOP_SHARE = 16;
-  IG_PROFILE_SHARE = 19;
-  IG_STORY_PHOTO_HIGHLIGHT_SHARE = 20;
-  IG_STORY_VIDEO_HIGHLIGHT_SHARE = 21;
-  IG_STORY_REPLY = 22;
-  IG_STORY_REACTION = 23;
-  IG_STORY_VIDEO_MENTION = 24;
-  IG_STORY_HIGHLIGHT_REPLY = 25;
-  IG_STORY_HIGHLIGHT_REACTION = 26;
-  IG_EXTERNAL_LINK = 27;
-  IG_RECEIVER_FETCH = 28;
-  FB_FEED_SHARE = 1000;
-  FB_STORY_REPLY = 1001;
-  FB_STORY_SHARE = 1002;
-  FB_STORY_MENTION = 1003;
-  FB_FEED_VIDEO_SHARE = 1004;
-  FB_GAMING_CUSTOM_UPDATE = 1005;
-  FB_PRODUCER_STORY_REPLY = 1006;
-  FB_EVENT = 1007;
-  FB_FEED_POST_PRIVATE_REPLY = 1008;
-  FB_SHORT = 1009;
-  FB_COMMENT_MENTION_SHARE = 1010;
-  FB_POST_MENTION = 1011;
-  FB_PROFILE_DIRECTORY_ITEM = 1013;
-  FB_FEED_POST_REACTION_REPLY = 1014;
-  FB_QUICKSNAP_REPLY = 1015;
-  MSG_EXTERNAL_LINK_SHARE = 2000;
-  MSG_P2P_PAYMENT = 2001;
-  MSG_LOCATION_SHARING = 2002;
-  MSG_LOCATION_SHARING_V2 = 2003;
-  MSG_HIGHLIGHTS_TAB_FRIEND_UPDATES_REPLY = 2004;
-  MSG_HIGHLIGHTS_TAB_LOCAL_EVENT_REPLY = 2005;
-  MSG_RECEIVER_FETCH = 2006;
-  MSG_IG_MEDIA_SHARE = 2007;
-  MSG_GEN_AI_SEARCH_PLUGIN_RESPONSE = 2008;
-  MSG_REELS_LIST = 2009;
-  MSG_CONTACT = 2010;
-  MSG_THREADS_POST_SHARE = 2011;
-  MSG_FILE = 2012;
-  MSG_AVATAR_DETAILS = 2013;
-  MSG_AI_CONTACT = 2014;
-  MSG_MEMORIES_SHARE = 2015;
-  MSG_SHARED_ALBUM_REPLY = 2016;
-  MSG_SHARED_ALBUM = 2017;
-  MSG_OCCAMADILLO_XMA = 2018;
-  MSG_GEN_AI_SUBSCRIPTION = 2021;
-  MSG_GEN_AI_REMINDER = 2022;
-  MSG_GEN_AI_MEMU_ONBOARDING_RESPONSE = 2023;
-  MSG_NOTE_REPLY = 2024;
-  MSG_NOTE_MENTION = 2025;
-  GEN_AI_ENTITY = 2026;
-  MSG_OPG_P2P_PAYMENT = 2027;
-  GEN_AI_RICH_RESPONSE = 2028;
-  MSG_MUSIC_STICKER = 2029;
-  MSG_PHONE_NUMBER = 2030;
-  AI_ACTIVITY_SHARE = 2031;
-  MSG_PRIVATE_XMA = 2032;
-  MSG_SOCIAL_CUE_MEMORIES = 2033;
-  MSG_MANUS_GROWTH_REFERRAL = 2060;
-  MSG_MOMENT_LINK = 2061;
-  MSG_HORIZON_WEEL = 2062;
-  MSG_MOMENT_ADDED = 2063;
-  RTC_AUDIO_CALL = 3000;
-  RTC_VIDEO_CALL = 3001;
-  RTC_MISSED_AUDIO_CALL = 3002;
-  RTC_MISSED_VIDEO_CALL = 3003;
-  RTC_GROUP_AUDIO_CALL = 3004;
-  RTC_GROUP_VIDEO_CALL = 3005;
-  RTC_MISSED_GROUP_AUDIO_CALL = 3006;
-  RTC_MISSED_GROUP_VIDEO_CALL = 3007;
-  RTC_ONGOING_AUDIO_CALL = 3008;
-  RTC_ONGOING_VIDEO_CALL = 3009;
-  MSG_RECEIVER_FETCH_FALLBACK = 3025;
-  DATACLASS_SENDER_COPY = 4000;
-}
-enum EXTENDED_CONTENT_MESSAGE_XMA_DATACLASS_TYPE {
-  SENDER_COPY = 0;
-  SERVER = 1;
-  SIGNED_CLIENT = 2;
-}
-enum EXTENDED_CONTENT_MESSAGE_XMA_LAYOUT_TYPE {
-  SINGLE = 0;
-  HSCROLL = 1;
-  PORTRAIT = 3;
-  STANDARD_DXMA = 12;
-  LIST_DXMA = 15;
-  GRID = 16;
-}
 message EmbeddedContent {
   oneof content {
     EmbeddedMessage embeddedMessage = 1;
@@ -2528,110 +2032,14 @@ message EmbeddedMusic {
   optional int64 overlapDurationInMs = 14;
 }
 
-message EncryptMekForDistributionInput {
-  required bytes senderEpochHead = 1;
-  required bytes toMailboxPk = 2;
-  required MailboxAuthKP fromKeypair = 3;
-  required MekBundle mek = 4;
-  optional bytes toEpochHead = 5;
-  optional MinosClientConfig conf = 6;
-  message MailboxAuthKP {
-    required bytes sk = 1;
-    required bytes pk = 2;
-  }
-}
-
-message EncryptMekForDistributionResult {
-  required bytes ciphertext = 1;
-  required uint64 version = 2;
-}
-
-message EncryptMeksForDistributionFromTransportSenderInput {
-  required MekBundle mek = 1;
-  required TransportSigningKP transportSigningKp = 2;
-  repeated bytes recipientMailboxEncryptionPks = 3;
-  repeated bytes recipientEpochHeads = 4;
-  optional MinosClientConfig conf = 5;
-  message TransportSigningKP {
-    required bytes sk = 1;
-    required bytes pk = 2;
-  }
-}
-
-message EncryptMeksForDistributionFromTransportSenderResult {
-  repeated bytes encryptedMeks = 1;
-  required bytes ephemeralEncryptionPk = 2;
-  required bytes signingPk = 3;
-  required bytes signature = 4;
-  required uint64 version = 5;
-}
-
-message EncryptMessageInput {
-  required bytes epochRootKey = 1;
-  required bytes mailboxRootKey = 2;
-  required bytes orfClientState = 3;
-  required bytes epochAnonId = 4;
-  required uint64 epochId = 5;
-  required string threadId = 6;
-  required uint64 waCanonicalUserFbid = 7;
-  required uint64 timestampMs = 8;
-  required uint64 backupId = 9;
-  required bytes plaintextPayload = 10;
-  required string stanzaId = 11;
-}
-
-message EncryptMessageOutput {
-  optional bytes encryptedProtobuf = 1;
-  optional bytes orfThreadId = 2;
-  optional string valueSecretRef = 3;
-  optional uint64 offlineThreadingId = 4;
-  optional uint64 timestampMs = 5;
-  optional string error = 7;
-}
-
 message EncryptedPairingRequest {
   optional bytes encryptedPayload = 1;
   optional bytes iv = 2;
 }
 
-message EncryptedSecretValuesOutput {
-  required bytes encryptedDevicePrivateKey = 1;
-  required bytes encryptedObliviousValidationTokenBlob = 2;
-  required bytes encryptedEpochStoragePrivateKey = 3;
-  required bytes encryptedOcmfClientState = 4;
-  optional bytes encryptedOrfClientStateV2 = 5;
-  required bytes encryptedMailboxRootKeyBlob = 6;
-  required bytes encryptedEpochAnonId = 7;
-  required bytes encryptedEpochRootKey = 8;
-}
-
 message EphemeralSetting {
   optional sfixed32 duration = 1;
   optional sfixed64 timestamp = 2;
-}
-
-message Epoch0Output {
-  required uint64 epochFbid = 1;
-  required bytes epochAnonId = 2;
-  required bytes epochData = 3;
-  required bytes wrappedRootKeyForSelf = 4;
-  required bytes epochSignature = 5;
-  required bytes epochRootKeyFingerprint = 6;
-  optional bytes epochRootKey = 7;
-}
-
-message EpochPublicData {
-  required uint64 epochNumber = 1;
-  required string userFbid = 2;
-  required bytes mailboxSigningPk = 3;
-  required bytes mailboxEncryptionPk = 4;
-  required bytes mailboxAuthPk = 5;
-  optional bytes previousEpochHead = 6;
-}
-
-message EpochSignatures {
-  required bytes selfSignature = 1;
-  optional bytes prevSignature = 2;
 }
 
 message EventAdditionalMetadata {
@@ -2650,59 +2058,6 @@ message ExitCode {
   optional string text = 2;
 }
 
-message ExtendedContentMessage {
-  optional SubProtocol associatedMessage = 1;
-  optional EXTENDED_CONTENT_MESSAGE_EXTENDED_CONTENT_TYPE targetType = 2;
-  optional string targetUsername = 3;
-  optional string targetId = 4;
-  optional int64 targetExpiringAtSec = 5;
-  optional EXTENDED_CONTENT_MESSAGE_XMA_LAYOUT_TYPE xmaLayoutType = 6;
-  repeated CTA ctas = 7;
-  repeated SubProtocol previews = 8;
-  optional string titleText = 9;
-  optional string subtitleText = 10;
-  optional uint32 maxTitleNumOfLines = 11;
-  optional uint32 maxSubtitleNumOfLines = 12;
-  optional SubProtocol favicon = 13;
-  optional SubProtocol headerImage = 14;
-  optional string headerTitle = 15;
-  optional EXTENDED_CONTENT_MESSAGE_OVERLAY_ICON_GLYPH overlayIconGlyph = 16;
-  optional string overlayTitle = 17;
-  optional string overlayDescription = 18;
-  optional string sentWithMessageId = 19;
-  optional string messageText = 20;
-  optional string headerSubtitle = 21;
-  optional string xmaDataclass = 22;
-  optional string contentRef = 23;
-  repeated string mentionedJid = 24;
-  repeated Command commands = 25;
-  repeated Mention mentions = 26;
-  optional EXTENDED_CONTENT_MESSAGE_XMA_DATACLASS_TYPE xmaDataclassType = 27;
-  optional string signedXmaDataclassValidation = 28;
-  optional string featureSharedSessionId = 29;
-  message CTA {
-    optional EXTENDED_CONTENT_MESSAGE_CTA_BUTTON_TYPE buttonType = 1;
-    optional string title = 2;
-    optional string actionUrl = 3;
-    optional string nativeUrl = 4;
-    optional string ctaType = 5;
-    optional string actionContentBlob = 6;
-  }
-
-  enum EXTENDED_CONTENT_MESSAGE_OVERLAY_ICON_GLYPH {
-    INFO = 0;
-    EYE_OFF = 1;
-    NEWS_OFF = 2;
-    WARNING = 3;
-    PRIVATE = 4;
-    NONE = 5;
-    MEDIA_LABEL = 6;
-    POST_COVER = 7;
-    POST_LABEL = 8;
-    WARNING_SCREENS = 9;
-  }
-}
-
 message ExternalBlobReference {
   optional bytes mediaKey = 1;
   optional string directPath = 2;
@@ -2712,11 +2067,6 @@ message ExternalBlobReference {
   optional bytes fileEncSha256 = 6;
 }
 
-enum FUTURE_PROOF_BEHAVIOR {
-  PLACEHOLDER = 0;
-  NO_PLACEHOLDER = 1;
-  IGNORE = 2;
-}
 message Field {
   optional uint32 minVersion = 1 [default = 1];
   optional uint32 maxVersion = 2;
@@ -2742,22 +2092,6 @@ message ForwardedAIBotMessageInfo {
   optional string botName = 1;
   optional string botJid = 2;
   optional string creatorName = 3;
-}
-
-message GenerateMekInput {
-  repeated bytes epochHeads = 1;
-}
-
-message GenerateMekResult {
-  required MekBundle mek = 1;
-}
-
-message GenerateMekRosterHashInput {
-  repeated bytes epochHeads = 1;
-}
-
-message GenerateMekRosterHashResult {
-  required bytes rosterHash = 1;
 }
 
 message GlobalSettings {
@@ -3086,17 +2420,6 @@ message LIDMigrationMappingSyncPayload {
   optional uint64 chatDbMigrationTimestamp = 2;
 }
 
-message LabyrinthWaCommand {
-  oneof commandInput {
-    CreateBackupInput createBackupInput = 1;
-    EncryptMessageInput encryptMessageInput = 2;
-    DecryptMessageInput decryptMessageInput = 3;
-    OrfThreadIdInput orfThreadIdInput = 4;
-    DeriveMessageKeyInput deriveMessageKeyInput = 5;
-    RotateEpochInput rotateEpochInput = 6;
-  }
-}
-
 message LegacyMessage {
   optional Message.EventResponseMessage eventResponseMessage = 1;
   optional Message.PollVoteMessage pollVote = 2;
@@ -3125,157 +2448,6 @@ message Location {
   optional double degreesLatitude = 1;
   optional double degreesLongitude = 2;
   optional string name = 3;
-}
-
-enum MENTION_MENTION_TYPE {
-  PROFILE = 0;
-}
-message MandrakeDecryptMekInput {
-  required bytes encryptedMek = 1;
-  required bytes recipientsHash = 4;
-  required bytes recipientEncSk = 5;
-  optional uint64 mekEncryptionVersion = 6;
-  optional MinosClientConfig conf = 7;
-  required MessagingMailboxPublicData recipientMmk = 8;
-  optional bytes mekId = 9;
-  optional MerkleMembershipProof recipientMembershipProof = 10;
-  oneof senderPublicData {
-    MandrakeDecryptMekInput.MmkSenderPublicData mmkSender = 2;
-    MandrakeDecryptMekInput.EpochSenderPublicData epochSender = 3;
-    MandrakeDecryptMekInput.PrecomputedEpochSenderPublicData precomputedEpochSender = 11;
-  }
-  message EpochSenderPublicData {
-    required EpochPublicData epochPublicData = 1;
-  }
-
-  message MmkSenderPublicData {
-    required MessagingMailboxPublicData mmkPublicData = 1;
-  }
-
-  message PrecomputedEpochSenderPublicData {
-    required bytes authPk = 1;
-    required bytes epochHead = 2;
-  }
-}
-
-message MandrakeDecryptMekResult {
-  oneof result {
-    MandrakeDecryptMekSuccess success = 1;
-    string errorMessage = 2;
-  }
-}
-
-message MandrakeDecryptMekSuccess {
-  required bytes mek = 1;
-}
-
-message MandrakeEncryptMekInput {
-  required MandrakeMekBundle mek = 1;
-  repeated MessagingMailboxPublicData recipients = 2;
-  optional MinosClientConfig conf = 5;
-  oneof sender {
-    MandrakeEncryptMekInput.MmkSender mmkSender = 3;
-    MandrakeEncryptMekInput.EpochSender epochSender = 4;
-    MandrakeEncryptMekInput.DetachedDeviceSender detachedDeviceSender = 6;
-  }
-  message DetachedDeviceSender {
-    required DetachedDevicePublicData detachedDevicePublicData = 1;
-    required bytes authSk = 2;
-    required bytes authPk = 3;
-  }
-
-  message EpochSender {
-    required EpochPublicData epochPublicData = 1;
-    required bytes authSk = 2;
-    required bytes authPk = 3;
-  }
-
-  message MmkSender {
-    required MessagingMailboxPublicData mmkPublicData = 1;
-    required bytes authSk = 2;
-    required bytes authPk = 3;
-  }
-}
-
-message MandrakeEncryptMekResult {
-  oneof result {
-    MandrakeEncryptMekSuccess success = 1;
-    string errorMessage = 2;
-  }
-}
-
-message MandrakeEncryptMekSuccess {
-  repeated MekDistributionSingleRecipient distributions = 1;
-  required bytes recipientsHash = 2;
-  required uint64 version = 3;
-  message MekDistributionSingleRecipient {
-    required bytes encryptedMek = 1;
-    required MessagingMailboxPublicData toMmk = 2;
-    optional MerkleMembershipProof recipientMembershipProof = 3;
-  }
-}
-
-message MandrakeMekBundle {
-  required bytes key = 1;
-  required bytes mekId = 2;
-  required bytes mailboxHeadHash = 3;
-}
-
-message MandrakeOpenEpochInput {
-  required string userFbid = 1;
-  required uint64 epochNumber = 2;
-  required bytes exportRootKey = 3;
-  required bytes previousExportRootKey = 4;
-  required uint64 previousEpochNumber = 5;
-  required bytes previousEpochHead = 6;
-  optional MessagingMailboxPublicData previousMmk = 7;
-  repeated DetachedDevicePublicData detachedDevices = 8;
-}
-
-message MandrakeOpenEpochResult {
-  oneof result {
-    MandrakeOpenEpochSuccess success = 1;
-    string errorMessage = 2;
-  }
-}
-
-message MandrakeOpenEpochSuccess {
-  required MinosSignedEpoch minosSignedEpoch = 1;
-  required SignedMmkDistributionFromMailbox signedMmkDistribution = 2;
-}
-
-message MandrakeOpenInitialEpochInput {
-  required string userFbid = 1;
-  required uint64 epochNumber = 2;
-  required bytes exportRootKey = 3;
-  repeated DetachedDevicePublicData detachedDevices = 4;
-}
-
-message MandrakeOpenInitialEpochResult {
-  oneof result {
-    MandrakeOpenEpochSuccess success = 1;
-    string errorMessage = 2;
-  }
-}
-
-message MandrakeValidateNewMmkFromDetachedDeviceInput {
-  required MmkFromDetachedDevice mmkFromDevice = 1;
-  required bytes signature = 2;
-  required MessagingMailboxPublicData prevMmk = 3;
-}
-
-message MandrakeValidateNewMmkFromMailboxInput {
-  required MessagingMailboxPublicData newMmk = 1;
-  required bytes signature = 2;
-  optional MessagingMailboxPublicData prevMmk = 3;
-  required EpochPublicData epochPublicData = 4;
-}
-
-message MandrakeValidateNewMmkResult {
-  oneof result {
-    bool valid = 1;
-    string errorMessage = 2;
-  }
 }
 
 message MediaData {
@@ -3349,29 +2521,9 @@ enum MediaVisibility {
   OFF = 1;
   ON = 2;
 }
-message MekBundle {
-  required bytes key = 1;
-  required bytes mekId = 2;
-  required bytes rosterHash = 3;
-}
-
 message MemberLabel {
   optional string label = 1;
   optional int64 labelTimestamp = 2;
-}
-
-message Mention {
-  optional MENTION_MENTION_TYPE mentionType = 1;
-  optional string mentionedJid = 2;
-  optional uint32 offset = 3;
-  optional uint32 length = 4;
-}
-
-message MerkleMembershipProof {
-  required bytes proof = 1;
-  required bytes root = 2;
-  required uint64 leafIndex = 3;
-  required uint64 totalLeaves = 4;
 }
 
 message Message {
@@ -3471,7 +2623,6 @@ message Message {
   optional NewsletterFollowerInviteMessage newsletterFollowerInviteMessageV2 = 113;
   optional PollResultSnapshotMessage pollResultSnapshotMessageV3 = 115;
   optional FutureProofMessage newsletterAdminProfileMessage = 116;
-  optional FutureProofMessage newsletterAdminProfileMessageV2 = 117;
   optional FutureProofMessage spoilerMessage = 118;
   optional PollCreationMessage pollCreationMessageV6 = 119;
   optional ConditionalRevealMessage conditionalRevealMessage = 120;
@@ -3486,6 +2637,9 @@ message Message {
   optional MusicMessage musicMessage = 129;
   optional StatusLinkPreviewMetadata statusLinkPreviewMetadata = 130;
   optional FutureProofMessage botPlatformRegistrationSuccessMessage = 131;
+  optional FutureProofMessage newsletterScheduledMessage = 132;
+  optional FutureProofMessage acp2SettingMessage = 133;
+  optional FutureProofMessage audioStickerMessage = 134;
   message AlbumMessage {
     optional uint32 expectedImageCount = 2;
     optional uint32 expectedVideoCount = 3;
@@ -3673,6 +2827,11 @@ message Message {
     optional string id = 2;
   }
 
+  message ChatAnimatedWallpaper {
+    optional string animatedWallpaperId = 1;
+    optional float dimLevel = 2;
+  }
+
   message ChatCustomImageWallpaper {
     optional string directPath = 1;
     optional bytes mediaKey = 2;
@@ -3705,6 +2864,7 @@ message Message {
       Message.ChatSolidColorWallpaper solidColor = 11;
       Message.ChatStockImageWallpaper stockImage = 12;
       Message.ChatCustomImageWallpaper customImage = 13;
+      Message.ChatAnimatedWallpaper animatedWallpaper = 14;
     }
   }
 
@@ -4864,6 +4024,9 @@ message Message {
     optional AIMetadataOperation aiMetadataOperation = 31;
     optional Message.MarkAsVerifiedAction markAsVerifiedAction = 32;
     optional CoexStateSync coexStateSync = 33;
+    optional ACP2Setting acp2Setting = 35;
+    optional Message.SharedDeviceContactHashKeyShare sharedDeviceContactHashKeyShare = 36;
+    optional Message.SharedDeviceContactHashKeyRequest sharedDeviceContactHashKeyRequest = 37;
     enum Type {
       REVOKE = 0;
       EPHEMERAL_SETTING = 3;
@@ -4897,6 +4060,9 @@ message Message {
       AI_METADATA_OPERATION = 35;
       MARK_AS_VERIFIED_ACTION = 36;
       COEX_STATE_SYNC = 37;
+      ACP2_SETTING = 39;
+      SHARED_DEVICE_CONTACT_HASH_KEY_SHARE = 40;
+      SHARED_DEVICE_CONTACT_HASH_KEY_REQUEST = 41;
     }
   }
 
@@ -4990,6 +4156,25 @@ message Message {
   message SenderKeyDistributionMessage {
     optional string groupId = 1;
     optional bytes axolotlSenderKeyDistributionMessage = 2;
+  }
+
+  message SharedDeviceContactHashKey {
+    optional uint32 epoch = 1;
+    optional Kind kind = 2;
+    optional bytes keyData = 3;
+    enum Kind {
+      UNKNOWN = 0;
+      LID = 1;
+      PHONE_NUMBER = 2;
+    }
+  }
+
+  message SharedDeviceContactHashKeyRequest {
+    optional uint32 knownEpoch = 1;
+  }
+
+  message SharedDeviceContactHashKeyShare {
+    repeated Message.SharedDeviceContactHashKey keys = 1;
   }
 
   message SplitPaymentMessage {
@@ -5088,6 +4273,9 @@ message Message {
     optional string accessibilityLabel = 22;
     optional int32 premium = 24;
     optional string emojis = 25;
+    oneof audio {
+      Message.AudioMessage audioMessage = 26;
+    }
   }
 
   message StickerPackMessage {
@@ -5224,6 +4412,7 @@ message Message {
     optional uint64 motionPhotoPresentationOffsetMs = 29;
     optional string metadataUrl = 30;
     optional VideoSourceType videoSourceType = 31;
+    optional string dashManifestUrl = 33;
     enum Attribution {
       NONE = 0;
       GIPHY = 1;
@@ -5309,6 +4498,8 @@ message MessageContextInfo {
   optional bytes teeBotMetadata = 17;
   optional NonE2EEAttestation accountEncryptionAttestation = 18;
   optional bytes associatedPrimaryIdentityKey = 19;
+  optional string teeContextAnchorMessageId = 20;
+  optional ACP2Setting acp2Setting = 21;
   enum MessageAddonExpiryType {
     STATIC = 1;
     DEPENDENT_ON_PARENT = 2;
@@ -5326,194 +4517,6 @@ message MessageSecretMessage {
   optional sfixed32 version = 1;
   optional bytes encIv = 2;
   optional bytes encPayload = 3;
-}
-
-message MessageText {
-  optional string text = 1;
-  repeated string mentionedJid = 2;
-  repeated Command commands = 3;
-  repeated Mention mentions = 4;
-}
-
-message MessagingMailboxPublicData {
-  required bytes epochHead = 1;
-  required bytes deviceRosterHash = 2;
-  required uint64 sequenceNumber = 3;
-  required bytes sigPk = 4;
-  required bytes encPk = 5;
-  required bytes authPk = 6;
-}
-
-message MinosClientConfig {
-  required int32 preferredMessageEncryptionVersion = 1;
-  required int32 preferredMekEncryptionVersion = 2;
-}
-
-message MinosCommand {
-  oneof commandInput {
-    MinosEncryptAndSignMessageInput encryptAndSignMessage = 1;
-    MinosDecryptAndVerifyMessageInput decryptAndVerifyMessage = 2;
-    GenerateMekInput generateMek = 3;
-    GenerateMekRosterHashInput generateMekRosterHash = 4;
-    EncryptMekForDistributionInput encryptMekForDistribution = 5;
-    DecryptMekForDistributionInput decryptMekForDistribution = 6;
-    EncryptMeksForDistributionFromTransportSenderInput encryptMeksForDistributionFromTransportSender = 7;
-    DecryptMekForDistributionFromTransportSenderInput decryptMekForDistributionFromTransportSender = 8;
-    WrapTransportSigningPublicKeyInput wrapTransportSigningPublicKey = 9;
-    WrapTransportSigningSecretKeyInput wrapTransportSigningSecretKey = 10;
-    DeriveMailboxSigningKeypairInput deriveMailboxSigningKeypair = 11;
-    DeriveMailboxEncryptionKeypairInput deriveMailboxEncryptionKeypair = 12;
-    DeriveMailboxAuthKeypairInput deriveMailboxAuthKeypair = 13;
-    DeriveAttachmentAccessTokenSecretInput deriveAttachmentAccessTokenSecret = 14;
-    DeriveAttachmentPrimaryKeySecretInput deriveAttachmentPrimaryKeySecret = 15;
-    MinosOpenInitialEpochInput minosOpenInitialEpoch = 16;
-    MinosOpenEpochInput minosOpenEpoch = 17;
-    MinosValidateEpochInput minosValidateEpoch = 18;
-    MinosVerifySingleEpochInput minosVerifySingleEpoch = 19;
-    MinosThreadIdFromOneToOneThreadInput minosThreadIdFromOneToOneThread = 20;
-    MinosThreadIdFromActThreadIdInput minosThreadIdFromActThreadId = 21;
-    MandrakeOpenEpochInput mandrakeOpenEpoch = 22;
-    MandrakeEncryptMekInput mandrakeEncryptMek = 23;
-    MandrakeDecryptMekInput mandrakeDecryptMek = 24;
-    MandrakeOpenInitialEpochInput mandrakeOpenInitialEpoch = 25;
-    MandrakeValidateNewMmkFromMailboxInput mandrakeValidateNewMmkFromMailbox = 27;
-    MandrakeValidateNewMmkFromDetachedDeviceInput mandrakeValidateNewMmkFromDetachedDevice = 28;
-    DeriveMessagingMailboxKeypairsInput deriveMessagingMailboxKeypairs = 29;
-    DecryptSelfMmkDistributionInput decryptSelfMmkDistribution = 30;
-  }
-}
-
-message MinosDecryptAndVerifyMessageInput {
-  required bytes transportSigningPk = 1;
-  required bytes mek = 2;
-  required bytes encryptedMessageCiphertext = 3;
-  required bytes encryptedMessageSignature = 4;
-  required MinosMessageMetadata metadata = 5;
-  optional int32 messageEncryptionVersion = 6;
-  optional MinosClientConfig conf = 7;
-}
-
-message MinosDecryptAndVerifyMessageResult {
-  oneof result {
-    MinosDecryptAndVerifyMessageSuccess success = 1;
-    string errorMessage = 2;
-  }
-}
-
-message MinosDecryptAndVerifyMessageSuccess {
-  required bytes plaintext = 1;
-}
-
-message MinosEncryptAndSignMessageInput {
-  required bytes transportSigningSk = 1;
-  required bytes mek = 2;
-  required bytes plaintext = 3;
-  required MinosMessageMetadata metadata = 4;
-  optional bytes transportSigningPk = 5;
-  optional MinosClientConfig conf = 6;
-}
-
-message MinosEncryptAndSignMessageResult {
-  required bytes ciphertext = 1;
-  required bytes signature = 2;
-  required int32 version = 3;
-}
-
-message MinosMessageMetadata {
-  required bytes mekId = 1;
-  required uint64 timestamp = 2;
-  required string messageId = 3;
-  required bytes threadId = 4;
-}
-
-message MinosOpenEpochInput {
-  required string userFbid = 1;
-  required uint64 epochNumber = 2;
-  required bytes exportRootKey = 3;
-  required bytes previousExportRootKey = 4;
-  required uint64 previousEpochNumber = 5;
-  required bytes previousEpochHead = 6;
-}
-
-message MinosOpenEpochResult {
-  required MinosSignedEpoch minosSignedEpoch = 1;
-}
-
-message MinosOpenInitialEpochInput {
-  required string userFbid = 1;
-  required uint64 epochNumber = 2;
-  required bytes exportRootKey = 3;
-}
-
-message MinosOpenInitialEpochResult {
-  required MinosSignedEpoch minosSignedEpoch = 1;
-}
-
-message MinosSignedEpoch {
-  required EpochPublicData epochPublicData = 1;
-  required EpochSignatures signatures = 2;
-  required bytes epochHead = 3;
-}
-
-message MinosThreadIdFromActThreadIdInput {
-  required string actThreadId = 1;
-}
-
-message MinosThreadIdFromActThreadIdResult {
-  required bytes threadId = 1;
-}
-
-message MinosThreadIdFromOneToOneThreadInput {
-  required string actThreadId = 1;
-  required string selfFbid = 2;
-}
-
-message MinosThreadIdFromOneToOneThreadResult {
-  required bytes threadId = 1;
-}
-
-message MinosValidateEpochInput {
-  required EpochPublicData epochPublicData = 1;
-  required EpochPublicData previousEpochPublicData = 2;
-  required EpochSignatures signatures = 3;
-}
-
-message MinosValidateEpochResult {
-  oneof result {
-    bool valid = 1;
-    string errorMessage = 2;
-  }
-}
-
-message MinosVerifySingleEpochInput {
-  required EpochPublicData epochPublicData = 1;
-  required bytes signature = 2;
-}
-
-message MinosVerifySingleEpochResult {
-  required bool valid = 1;
-}
-
-message MmkDistribution {
-  repeated MmkDistributionToDetachedDevice toDetachedDevices = 1;
-  required MmkDistributionToMailbox toMailbox = 2;
-  required uint64 version = 3;
-}
-
-message MmkDistributionToDetachedDevice {
-  required bytes encryptedMmk = 1;
-  required bytes recipDeviceHash = 2;
-}
-
-message MmkDistributionToMailbox {
-  required bytes encryptedMmk = 1;
-  required bytes recipMailboxHeadHash = 2;
-}
-
-message MmkFromDetachedDevice {
-  required MessagingMailboxPublicData mmk = 1;
-  required DetachedDevicePublicData fromDetachedDevice = 2;
-  required MerkleMembershipProof membershipProof = 3;
 }
 
 message Money {
@@ -5578,6 +4581,8 @@ message MsgOpaqueData {
   optional bool sharableEventInviteIsCanceled = 58;
   optional bytes sharableEventInviteJpegThumbnail = 59;
   optional string sharableEventInviteCallLink = 60;
+  optional string mediaPngThumbnail = 61;
+  optional string qrUrl = 62;
   message EventLocation {
     optional double degreesLatitude = 1;
     optional double degreesLongitude = 2;
@@ -5595,6 +4600,7 @@ message MsgOpaqueData {
   message PollOption {
     optional string name = 1;
     optional string hash = 2;
+    optional string addOptionMsgKey = 3;
   }
 
   enum PollType {
@@ -5704,6 +4710,9 @@ enum MutationProps {
   LABEL_SUBLIST_ACTION = 91;
   DEVICE_CAPABILITIES_V2 = 92;
   CTWA_MESSAGE_RECEIVED_ACTION = 93;
+  SHARED_DEVICE_ALLOWLIST_ACTION = 94;
+  CONTACT_MANAGER_METADATA_ACTION = 95;
+  BUSINESS_FOLDER_ACTIVATION_ACTION = 96;
   SHARE_OWN_PN = 10001;
   BUSINESS_BROADCAST_ACTION = 10002;
   AI_THREAD_DELETE_ACTION = 10003;
@@ -5743,16 +4752,6 @@ message NotificationSettings {
   optional bool lowPriorityNotifications = 4;
   optional bool reactionsMuted = 5;
   optional string callVibrate = 6;
-}
-
-message OrfThreadIdInput {
-  required bytes orfClientState = 1;
-  required string threadId = 2;
-}
-
-message OrfThreadIdOutput {
-  optional bytes orfThreadId = 1;
-  optional string error = 2;
 }
 
 message PairingRequest {
@@ -6079,37 +5078,6 @@ message ReportingTokenInfo {
   optional uint64 reportingTagTimestamp = 2;
 }
 
-message RotateEpochInput {
-  required bytes currentEpochRootKey = 1;
-  required bytes currentEpochAnonId = 2;
-  required uint64 currentEpochFbid = 3;
-  required bytes epochStoragePrivateKey = 4;
-  repeated RotateEpochMemberInput members = 5;
-}
-
-message RotateEpochMemberEdge {
-  optional uint64 deviceId = 1;
-  optional bytes encryptedEpochKey = 2;
-  optional bytes deviceEpochHmac = 3;
-}
-
-message RotateEpochMemberInput {
-  required uint64 deviceId = 1;
-  required bytes epochStoragePublicKey = 2;
-  required bytes devicePublicKey = 3;
-}
-
-message RotateEpochOutput {
-  optional bytes newEpochRootKey = 1;
-  optional uint64 newEpochAnonId = 2;
-  optional uint64 newEpochFbid = 8;
-  optional bytes epochAnonId = 3;
-  optional BackwardEdge backwardEdge = 4;
-  repeated RotateEpochMemberEdge memberEdges = 5;
-  optional bytes epochRootKeyFingerprint = 6;
-  optional string error = 7;
-}
-
 message RoutingInfo {
   repeated int32 regionId = 1;
   repeated int32 clusterId = 2;
@@ -6233,12 +5201,6 @@ message SignalMessage {
   optional uint32 counter = 2;
   optional uint32 previousCounter = 3;
   optional bytes ciphertext = 4;
-}
-
-message SignedMmkDistributionFromMailbox {
-  required MmkDistribution mmkDistribution = 1;
-  required bytes signature = 2;
-  required MessagingMailboxPublicData fromMailbox = 3;
 }
 
 message SignedPreKeyRecordStructure {
@@ -6376,11 +5338,6 @@ message StickerMetadata {
   optional bool isAvatarSticker = 14;
 }
 
-message SubProtocol {
-  optional bytes payload = 1;
-  optional int32 version = 2;
-}
-
 message SyncActionData {
   optional bytes index = 1;
   optional SyncActionValue value = 2;
@@ -6473,6 +5430,9 @@ message SyncActionValue {
   optional LabelSublistAction labelSublistAction = 91;
   optional DeviceCapabilities deviceCapabilitiesV2 = 92;
   optional CtwaMessageReceivedAction ctwaMessageReceivedAction = 93;
+  optional SharedDeviceAllowlistAction sharedDeviceAllowlistAction = 94;
+  optional ContactManagerMetadataAction contactManagerMetadataAction = 95;
+  optional BusinessFolderActivationAction businessFolderActivationAction = 96;
   message AgentAction {
     optional string name = 1;
     optional int32 deviceId = 2;
@@ -6548,8 +5508,22 @@ message SyncActionValue {
     optional int64 scheduledTimestamp = 7;
     optional int64 createTimestamp = 8;
     optional SyncActionValue.BusinessBroadcastCampaignStatus status = 9;
+    optional SyncActionValue.BusinessBroadcastCampaignBBProStatus bbProStatus = 10;
+    optional string customAudienceFbid = 11;
   }
 
+  enum BusinessBroadcastCampaignBBProStatus {
+    BB_PRO_ACTIVE = 1;
+    BB_PRO_COMPLETED = 2;
+    BB_PRO_IN_DRAFT = 3;
+    BB_PRO_IN_REVIEW = 4;
+    BB_PRO_NOT_SENDING = 5;
+    BB_PRO_OFF = 6;
+    BB_PRO_REJECTED = 7;
+    BB_PRO_SCHEDULED = 8;
+    BB_PRO_SENDING_LIMITED = 9;
+    BB_PRO_PROCESSING = 10;
+  }
   enum BusinessBroadcastCampaignStatus {
     DRAFT = 1;
     SCHEDULED = 2;
@@ -6572,6 +5546,10 @@ message SyncActionValue {
     repeated string labelIds = 4;
     optional string audienceExpression = 5;
     optional string customAudienceFbid = 6;
+  }
+
+  message BusinessFolderActivationAction {
+    optional bool activated = 1;
   }
 
   message CallLogAction {
@@ -6601,6 +5579,10 @@ message SyncActionValue {
     optional bool saveOnPrimaryAddressbook = 4;
     optional string pnJid = 5;
     optional string username = 6;
+  }
+
+  message ContactManagerMetadataAction {
+    optional bool isHidden = 1;
   }
 
   message CtwaMessageReceivedAction {
@@ -6716,6 +5698,7 @@ message SyncActionValue {
       THIRD_PARTY = 15;
       LEAD = 16;
       MENTIONS_AND_REPLIES = 17;
+      REQUESTS = 18;
     }
   }
 
@@ -7000,6 +5983,10 @@ message SyncActionValue {
       WINDOWS = 3;
       MAC = 4;
     }
+  }
+
+  message SharedDeviceAllowlistAction {
+    optional bool allowed = 1;
   }
 
   message StarAction {
@@ -7313,16 +6300,6 @@ message VerifiedNameCertificate {
     repeated LocalizedName localizedNames = 8;
     optional uint64 issueTime = 10;
   }
-}
-
-message VirtualDeviceOutput {
-  required bytes vdId = 1;
-  required bytes vdPublicKey = 2;
-  required bytes vdEpochStoragePublicKey = 3;
-  required bytes vdEpochStoragePublicKeySig = 4;
-  required bytes ocmfRotationToken = 5;
-  required bytes deviceEpochHmac = 6;
-  required EncryptedSecretValuesOutput encryptedSecretValues = 7;
 }
 
 message WallpaperSettings {
@@ -7707,6 +6684,8 @@ message WebMessageInfo {
     IDENTITY_TRUST_UNMARKED = 227;
     IDENTITY_TRUST_REVOKED = 228;
     CTWA_CONSUMER_DISCLOSURE = 230;
+    CHANGE_ACP2_SETTING = 240;
+    EPHEMERAL_CHANGED_FOR_COEX = 248;
   }
 }
 
@@ -7720,6 +6699,1161 @@ message WebNotificationsInfo {
   optional uint32 unreadChats = 3;
   optional uint32 notifyMessageCount = 4;
   repeated WebMessageInfo notifyMessages = 5;
+}
+
+// Public declarations retained from whatspec 1a441f0329c941fcdb238490a6c604550d8a9939.
+// Absent from the 2.3000.1047483476 capture; absence does not establish protocol retirement.
+// Reconcile explicitly if an upstream snapshot declares these names again.
+
+message BackwardEdge {
+  optional bytes encryptedPrevEpochAnonId = 1;
+  optional bytes encryptedPrevEpochRootKey = 2;
+  optional bytes prevEpochRootKeyFingerprint = 3;
+}
+
+enum COMMAND_COMMAND_TYPE {
+  EVERYONE = 1;
+  SILENT = 2;
+  AI = 3;
+  AI_IMAGINE = 4;
+}
+
+enum CONSUMER_APPLICATION_METADATA_SPECIAL_TEXT_SIZE {
+  SMALL = 1;
+  MEDIUM = 2;
+  LARGE = 3;
+}
+
+enum CONSUMER_APPLICATION_STATUS_TEXT_MESAGE_FONT_TYPE {
+  SANS_SERIF = 0;
+  SERIF = 1;
+  NORICAN_REGULAR = 2;
+  BRYNDAN_WRITE = 3;
+  BEBASNEUE_REGULAR = 4;
+  OSWALD_HEAVY = 5;
+}
+
+message Command {
+  optional COMMAND_COMMAND_TYPE commandType = 1;
+  optional uint32 offset = 2;
+  optional uint32 length = 3;
+  optional string validationToken = 4;
+}
+
+message ConsumerApplication {
+  optional Payload payload = 1;
+  optional Metadata metadata = 2;
+  message ApplicationData {
+    oneof applicationContent {
+      ConsumerApplication.RevokeMessage revoke = 1;
+    }
+  }
+
+  message AudioMessage {
+    optional SubProtocol audio = 1;
+    optional bool ptt = 2;
+  }
+
+  message ContactMessage {
+    optional SubProtocol contact = 1;
+  }
+
+  message ContactsArrayMessage {
+    optional string displayName = 1;
+    repeated ConsumerApplication.ContactMessage contacts = 2;
+  }
+
+  message Content {
+    oneof content {
+      MessageText messageText = 1;
+      ConsumerApplication.ImageMessage imageMessage = 2;
+      ConsumerApplication.ContactMessage contactMessage = 3;
+      ConsumerApplication.LocationMessage locationMessage = 4;
+      ConsumerApplication.ExtendedTextMessage extendedTextMessage = 5;
+      ConsumerApplication.StatusTextMesage statusTextMessage = 6;
+      ConsumerApplication.DocumentMessage documentMessage = 7;
+      ConsumerApplication.AudioMessage audioMessage = 8;
+      ConsumerApplication.VideoMessage videoMessage = 9;
+      ConsumerApplication.ContactsArrayMessage contactsArrayMessage = 10;
+      ConsumerApplication.LiveLocationMessage liveLocationMessage = 11;
+      ConsumerApplication.StickerMessage stickerMessage = 12;
+      ConsumerApplication.GroupInviteMessage groupInviteMessage = 13;
+      ConsumerApplication.ViewOnceMessage viewOnceMessage = 14;
+      ConsumerApplication.ReactionMessage reactionMessage = 16;
+      ConsumerApplication.PollCreationMessage pollCreationMessage = 17;
+      ConsumerApplication.PollUpdateMessage pollUpdateMessage = 18;
+      ConsumerApplication.EditMessage editMessage = 19;
+    }
+  }
+
+  message DocumentMessage {
+    optional SubProtocol document = 1;
+    optional string fileName = 2;
+  }
+
+  message EditMessage {
+    optional MessageKey key = 1;
+    optional MessageText message = 2;
+    optional int64 timestampMs = 3;
+  }
+
+  message ExtendedTextMessage {
+    optional MessageText text = 1;
+    optional string matchedText = 2;
+    optional string canonicalUrl = 3;
+    optional string description = 4;
+    optional string title = 5;
+    optional SubProtocol thumbnail = 6;
+    optional CONSUMER_APPLICATION_EXTENDED_TEXT_MESSAGE_PREVIEW_TYPE previewType = 7;
+  }
+
+  message GroupInviteMessage {
+    optional string groupJid = 1;
+    optional string inviteCode = 2;
+    optional int64 inviteExpiration = 3;
+    optional string groupName = 4;
+    optional bytes jpegThumbnail = 5;
+    optional MessageText caption = 6;
+  }
+
+  message ImageMessage {
+    optional SubProtocol image = 1;
+    optional MessageText caption = 2;
+  }
+
+  message InteractiveAnnotation {
+    repeated ConsumerApplication.Point polygonVertices = 1;
+    oneof action {
+      ConsumerApplication.Location location = 2;
+    }
+  }
+
+  message LiveLocationMessage {
+    optional ConsumerApplication.Location location = 1;
+    optional uint32 accuracyInMeters = 2;
+    optional float speedInMps = 3;
+    optional uint32 degreesClockwiseFromMagneticNorth = 4;
+    optional MessageText caption = 5;
+    optional int64 sequenceNumber = 6;
+    optional uint32 timeOffset = 7;
+  }
+
+  message Location {
+    optional double degreesLatitude = 1;
+    optional double degreesLongitude = 2;
+    optional string name = 3;
+  }
+
+  message LocationMessage {
+    optional ConsumerApplication.Location location = 1;
+    optional string address = 2;
+  }
+
+  message MediaPayload {
+    optional SubProtocol protocol = 1;
+  }
+
+  message Metadata {
+    optional CONSUMER_APPLICATION_METADATA_SPECIAL_TEXT_SIZE specialTextSize = 1;
+  }
+
+  message Option {
+    optional string optionName = 1;
+  }
+
+  message Payload {
+    oneof payload {
+      ConsumerApplication.Content content = 1;
+      ConsumerApplication.ApplicationData applicationData = 2;
+      ConsumerApplication.Signal signal = 3;
+      ConsumerApplication.SubProtocolPayload subProtocol = 4;
+    }
+  }
+
+  message Point {
+    optional double x = 1;
+    optional double y = 2;
+  }
+
+  message PollAddOptionMessage {
+    repeated ConsumerApplication.Option pollOption = 1;
+  }
+
+  message PollCreationMessage {
+    optional bytes encKey = 1;
+    optional string name = 2;
+    repeated ConsumerApplication.Option options = 3;
+    optional uint32 selectableOptionsCount = 4;
+  }
+
+  message PollEncValue {
+    optional bytes encPayload = 1;
+    optional bytes encIv = 2;
+  }
+
+  message PollUpdateMessage {
+    optional MessageKey pollCreationMessageKey = 1;
+    optional ConsumerApplication.PollEncValue vote = 2;
+    optional ConsumerApplication.PollEncValue addOption = 3;
+  }
+
+  message PollVoteMessage {
+    repeated bytes selectedOptions = 1;
+    optional int64 senderTimestampMs = 2;
+  }
+
+  message ReactionMessage {
+    optional MessageKey key = 1;
+    optional string text = 2;
+    optional string groupingKey = 3;
+    optional int64 senderTimestampMs = 4;
+    optional string reactionMetadataDataclassData = 5;
+    optional int32 style = 6;
+  }
+
+  message RevokeMessage {
+    optional MessageKey key = 1;
+  }
+
+  message Signal {}
+
+  message StatusTextMesage {
+    optional ConsumerApplication.ExtendedTextMessage text = 1;
+    optional fixed32 textArgb = 6;
+    optional fixed32 backgroundArgb = 7;
+    optional CONSUMER_APPLICATION_STATUS_TEXT_MESAGE_FONT_TYPE font = 8;
+  }
+
+  message StickerMessage {
+    optional SubProtocol sticker = 1;
+  }
+
+  message SubProtocolPayload {
+    optional FUTURE_PROOF_BEHAVIOR futureProof = 1;
+  }
+
+  message VideoMessage {
+    optional SubProtocol video = 1;
+    optional MessageText caption = 2;
+  }
+
+  message ViewOnceMessage {
+    oneof viewOnceContent {
+      ConsumerApplication.ImageMessage imageMessage = 1;
+      ConsumerApplication.VideoMessage videoMessage = 2;
+    }
+  }
+
+  enum CONSUMER_APPLICATION_EXTENDED_TEXT_MESSAGE_PREVIEW_TYPE {
+    NONE = 0;
+    VIDEO = 1;
+  }
+}
+
+message CreateBackupInput {
+  required string recoveryCode = 1;
+  required uint64 userId = 2;
+}
+
+message CreateBackupOutput {
+  optional DeviceOutput device = 1;
+  optional VirtualDeviceOutput virtualDevice = 2;
+  optional Epoch0Output epoch0 = 3;
+  optional bytes mailboxRootKey = 4;
+  optional string error = 5;
+}
+
+message DecryptMekForDistributionFromTransportSenderInput {
+  required TransportSenderMEKDistributionSingleRecipient mekDistribution = 1;
+  required bytes mekId = 2;
+  required bytes rosterHash = 3;
+  required bytes recipientEncSk = 4;
+  required uint64 version = 5;
+  optional MinosClientConfig conf = 6;
+  message TransportSenderMEKDistributionSingleRecipient {
+    required bytes encryptedMek = 1;
+    required bytes ephemeralEncryptionPk = 2;
+    required bytes signingPk = 3;
+    required bytes signature = 4;
+    optional bytes recipientEpochHead = 5;
+  }
+}
+
+message DecryptMekForDistributionFromTransportSenderResult {
+  oneof result {
+    DecryptMekForDistributionFromTransportSenderSuccess success = 1;
+    string errorMessage = 2;
+  }
+}
+
+message DecryptMekForDistributionFromTransportSenderSuccess {
+  required bytes mek = 1;
+}
+
+message DecryptMekForDistributionInput {
+  required bytes toMailboxSk = 1;
+  required bytes fromPk = 2;
+  required bytes mekId = 3;
+  required bytes senderEpochHead = 4;
+  required bytes rosterHash = 5;
+  required bytes ciphertext = 6;
+  optional bytes toEpochHead = 7;
+  optional int32 mekEncryptionVersion = 8;
+  optional MinosClientConfig conf = 9;
+}
+
+message DecryptMekForDistributionResult {
+  oneof result {
+    DecryptMekForDistributionSuccess success = 1;
+    string errorMessage = 2;
+  }
+}
+
+message DecryptMekForDistributionSuccess {
+  required bytes mek = 1;
+}
+
+message DecryptMessageInput {
+  required bytes epochRootKey = 1;
+  required bytes epochAnonId = 2;
+  required string threadId = 3;
+  required int32 encryptionVersion = 4;
+  required bytes ciphertext = 5;
+}
+
+message DecryptMessageOutput {
+  optional bytes plaintextPayload = 1;
+  optional string error = 2;
+}
+
+message DecryptSelfMmkDistributionInput {
+  required bytes encryptedMmk = 1;
+  required bytes exportRootKey = 2;
+  required bytes mailboxHeadHash = 3;
+}
+
+message DecryptSelfMmkDistributionResult {
+  oneof result {
+    DecryptSelfMmkDistributionSuccess success = 1;
+    string errorMessage = 2;
+  }
+}
+
+message DecryptSelfMmkDistributionSuccess {
+  required bytes mmkSeed = 1;
+}
+
+message DeriveAttachmentAccessTokenSecretInput {
+  required bytes mediaKey = 1;
+}
+
+message DeriveAttachmentAccessTokenSecretResult {
+  required bytes attachmentAccessTokenSecret = 1;
+}
+
+message DeriveAttachmentPrimaryKeySecretInput {
+  required bytes mediaKey = 1;
+}
+
+message DeriveAttachmentPrimaryKeySecretResult {
+  required bytes attachmentPrimaryKeySecret = 1;
+}
+
+message DeriveMailboxAuthKeypairInput {
+  required bytes exportRootKey = 1;
+  required uint64 epochNumber = 2;
+}
+
+message DeriveMailboxAuthKeypairResult {
+  required bytes mailboxAuthPublicKey = 1;
+  required bytes mailboxAuthPrivateKey = 2;
+}
+
+message DeriveMailboxEncryptionKeypairInput {
+  required bytes exportRootKey = 1;
+  required uint64 epochNumber = 2;
+}
+
+message DeriveMailboxEncryptionKeypairResult {
+  required bytes mailboxEncryptionPublicKey = 1;
+  required bytes mailboxEncryptionPrivateKey = 2;
+}
+
+message DeriveMailboxSigningKeypairInput {
+  required bytes exportRootKey = 1;
+  required uint64 epochNumber = 2;
+}
+
+message DeriveMailboxSigningKeypairResult {
+  oneof result {
+    DeriveMailboxSigningKeypairSuccess success = 1;
+    string errorMessage = 2;
+  }
+}
+
+message DeriveMailboxSigningKeypairSuccess {
+  required bytes mailboxSigningPublicKey = 1;
+  required bytes mailboxSigningPrivateKey = 2;
+}
+
+message DeriveMessageKeyInput {
+  required bytes epochRootKey = 1;
+  required bytes epochAnonId = 2;
+  required string threadId = 3;
+}
+
+message DeriveMessageKeyOutput {
+  optional bytes messageKey = 1;
+  optional string error = 2;
+}
+
+message DeriveMessagingMailboxKeypairsInput {
+  required bytes mmkSeed = 1;
+}
+
+message DeriveMessagingMailboxKeypairsResult {
+  oneof result {
+    DeriveMessagingMailboxKeypairsSuccess success = 1;
+    string errorMessage = 2;
+  }
+}
+
+message DeriveMessagingMailboxKeypairsSuccess {
+  required bytes encSk = 1;
+  required bytes encPk = 2;
+  optional bytes authSk = 3;
+  optional bytes authPk = 4;
+}
+
+message DetachedDevicePublicData {
+  required uint64 deviceId = 1;
+  required bytes name = 2;
+  required bytes sigPk = 3;
+  required bytes authPk = 4;
+  required bytes encPk = 5;
+  required bytes signature = 6;
+}
+
+message DeviceOutput {
+  required bytes publicKey = 1;
+  required bytes epochAuthPublicKey = 2;
+  required bytes epochAuthPublicKeySig = 3;
+  required bytes epochStoragePublicKey = 4;
+  required bytes epochStoragePublicKeySig = 5;
+  repeated int32 supportedEncryptionVersions = 6;
+  required bytes encryptionVersionSignature = 7;
+  required int32 clientVersion = 8;
+  required bytes ocmfClientState = 9;
+  required bytes epochStoragePrivateKey = 10;
+}
+
+enum EXTENDED_CONTENT_MESSAGE_CTA_BUTTON_TYPE {
+  OPEN_NATIVE = 11;
+}
+
+enum EXTENDED_CONTENT_MESSAGE_EXTENDED_CONTENT_TYPE {
+  UNSUPPORTED = -1;
+  IG_STORY_PHOTO_MENTION = 4;
+  IG_SINGLE_IMAGE_POST_SHARE = 9;
+  IG_MULTIPOST_SHARE = 10;
+  IG_SINGLE_VIDEO_POST_SHARE = 11;
+  IG_STORY_PHOTO_SHARE = 12;
+  IG_STORY_VIDEO_SHARE = 13;
+  IG_CLIPS_SHARE = 14;
+  IG_IGTV_SHARE = 15;
+  IG_SHOP_SHARE = 16;
+  IG_PROFILE_SHARE = 19;
+  IG_STORY_PHOTO_HIGHLIGHT_SHARE = 20;
+  IG_STORY_VIDEO_HIGHLIGHT_SHARE = 21;
+  IG_STORY_REPLY = 22;
+  IG_STORY_REACTION = 23;
+  IG_STORY_VIDEO_MENTION = 24;
+  IG_STORY_HIGHLIGHT_REPLY = 25;
+  IG_STORY_HIGHLIGHT_REACTION = 26;
+  IG_EXTERNAL_LINK = 27;
+  IG_RECEIVER_FETCH = 28;
+  FB_FEED_SHARE = 1000;
+  FB_STORY_REPLY = 1001;
+  FB_STORY_SHARE = 1002;
+  FB_STORY_MENTION = 1003;
+  FB_FEED_VIDEO_SHARE = 1004;
+  FB_GAMING_CUSTOM_UPDATE = 1005;
+  FB_PRODUCER_STORY_REPLY = 1006;
+  FB_EVENT = 1007;
+  FB_FEED_POST_PRIVATE_REPLY = 1008;
+  FB_SHORT = 1009;
+  FB_COMMENT_MENTION_SHARE = 1010;
+  FB_POST_MENTION = 1011;
+  FB_PROFILE_DIRECTORY_ITEM = 1013;
+  FB_FEED_POST_REACTION_REPLY = 1014;
+  FB_QUICKSNAP_REPLY = 1015;
+  MSG_EXTERNAL_LINK_SHARE = 2000;
+  MSG_P2P_PAYMENT = 2001;
+  MSG_LOCATION_SHARING = 2002;
+  MSG_LOCATION_SHARING_V2 = 2003;
+  MSG_HIGHLIGHTS_TAB_FRIEND_UPDATES_REPLY = 2004;
+  MSG_HIGHLIGHTS_TAB_LOCAL_EVENT_REPLY = 2005;
+  MSG_RECEIVER_FETCH = 2006;
+  MSG_IG_MEDIA_SHARE = 2007;
+  MSG_GEN_AI_SEARCH_PLUGIN_RESPONSE = 2008;
+  MSG_REELS_LIST = 2009;
+  MSG_CONTACT = 2010;
+  MSG_THREADS_POST_SHARE = 2011;
+  MSG_FILE = 2012;
+  MSG_AVATAR_DETAILS = 2013;
+  MSG_AI_CONTACT = 2014;
+  MSG_MEMORIES_SHARE = 2015;
+  MSG_SHARED_ALBUM_REPLY = 2016;
+  MSG_SHARED_ALBUM = 2017;
+  MSG_OCCAMADILLO_XMA = 2018;
+  MSG_GEN_AI_SUBSCRIPTION = 2021;
+  MSG_GEN_AI_REMINDER = 2022;
+  MSG_GEN_AI_MEMU_ONBOARDING_RESPONSE = 2023;
+  MSG_NOTE_REPLY = 2024;
+  MSG_NOTE_MENTION = 2025;
+  GEN_AI_ENTITY = 2026;
+  MSG_OPG_P2P_PAYMENT = 2027;
+  GEN_AI_RICH_RESPONSE = 2028;
+  MSG_MUSIC_STICKER = 2029;
+  MSG_PHONE_NUMBER = 2030;
+  AI_ACTIVITY_SHARE = 2031;
+  MSG_PRIVATE_XMA = 2032;
+  MSG_SOCIAL_CUE_MEMORIES = 2033;
+  MSG_MANUS_GROWTH_REFERRAL = 2060;
+  MSG_MOMENT_LINK = 2061;
+  MSG_HORIZON_WEEL = 2062;
+  MSG_MOMENT_ADDED = 2063;
+  RTC_AUDIO_CALL = 3000;
+  RTC_VIDEO_CALL = 3001;
+  RTC_MISSED_AUDIO_CALL = 3002;
+  RTC_MISSED_VIDEO_CALL = 3003;
+  RTC_GROUP_AUDIO_CALL = 3004;
+  RTC_GROUP_VIDEO_CALL = 3005;
+  RTC_MISSED_GROUP_AUDIO_CALL = 3006;
+  RTC_MISSED_GROUP_VIDEO_CALL = 3007;
+  RTC_ONGOING_AUDIO_CALL = 3008;
+  RTC_ONGOING_VIDEO_CALL = 3009;
+  MSG_RECEIVER_FETCH_FALLBACK = 3025;
+  DATACLASS_SENDER_COPY = 4000;
+}
+
+enum EXTENDED_CONTENT_MESSAGE_XMA_DATACLASS_TYPE {
+  SENDER_COPY = 0;
+  SERVER = 1;
+  SIGNED_CLIENT = 2;
+}
+
+enum EXTENDED_CONTENT_MESSAGE_XMA_LAYOUT_TYPE {
+  SINGLE = 0;
+  HSCROLL = 1;
+  PORTRAIT = 3;
+  STANDARD_DXMA = 12;
+  LIST_DXMA = 15;
+  GRID = 16;
+}
+
+message EncryptMekForDistributionInput {
+  required bytes senderEpochHead = 1;
+  required bytes toMailboxPk = 2;
+  required MailboxAuthKP fromKeypair = 3;
+  required MekBundle mek = 4;
+  optional bytes toEpochHead = 5;
+  optional MinosClientConfig conf = 6;
+  message MailboxAuthKP {
+    required bytes sk = 1;
+    required bytes pk = 2;
+  }
+}
+
+message EncryptMekForDistributionResult {
+  required bytes ciphertext = 1;
+  required uint64 version = 2;
+}
+
+message EncryptMeksForDistributionFromTransportSenderInput {
+  required MekBundle mek = 1;
+  required TransportSigningKP transportSigningKp = 2;
+  repeated bytes recipientMailboxEncryptionPks = 3;
+  repeated bytes recipientEpochHeads = 4;
+  optional MinosClientConfig conf = 5;
+  message TransportSigningKP {
+    required bytes sk = 1;
+    required bytes pk = 2;
+  }
+}
+
+message EncryptMeksForDistributionFromTransportSenderResult {
+  repeated bytes encryptedMeks = 1;
+  required bytes ephemeralEncryptionPk = 2;
+  required bytes signingPk = 3;
+  required bytes signature = 4;
+  required uint64 version = 5;
+}
+
+message EncryptMessageInput {
+  required bytes epochRootKey = 1;
+  required bytes mailboxRootKey = 2;
+  required bytes orfClientState = 3;
+  required bytes epochAnonId = 4;
+  required uint64 epochId = 5;
+  required string threadId = 6;
+  required uint64 waCanonicalUserFbid = 7;
+  required uint64 timestampMs = 8;
+  required uint64 backupId = 9;
+  required bytes plaintextPayload = 10;
+  required string stanzaId = 11;
+}
+
+message EncryptMessageOutput {
+  optional bytes encryptedProtobuf = 1;
+  optional bytes orfThreadId = 2;
+  optional string valueSecretRef = 3;
+  optional uint64 offlineThreadingId = 4;
+  optional uint64 timestampMs = 5;
+  optional string error = 7;
+}
+
+message EncryptedSecretValuesOutput {
+  required bytes encryptedDevicePrivateKey = 1;
+  required bytes encryptedObliviousValidationTokenBlob = 2;
+  required bytes encryptedEpochStoragePrivateKey = 3;
+  required bytes encryptedOcmfClientState = 4;
+  optional bytes encryptedOrfClientStateV2 = 5;
+  required bytes encryptedMailboxRootKeyBlob = 6;
+  required bytes encryptedEpochAnonId = 7;
+  required bytes encryptedEpochRootKey = 8;
+}
+
+message Epoch0Output {
+  required uint64 epochFbid = 1;
+  required bytes epochAnonId = 2;
+  required bytes epochData = 3;
+  required bytes wrappedRootKeyForSelf = 4;
+  required bytes epochSignature = 5;
+  required bytes epochRootKeyFingerprint = 6;
+  optional bytes epochRootKey = 7;
+}
+
+message EpochPublicData {
+  required uint64 epochNumber = 1;
+  required string userFbid = 2;
+  required bytes mailboxSigningPk = 3;
+  required bytes mailboxEncryptionPk = 4;
+  required bytes mailboxAuthPk = 5;
+  optional bytes previousEpochHead = 6;
+}
+
+message EpochSignatures {
+  required bytes selfSignature = 1;
+  optional bytes prevSignature = 2;
+}
+
+message ExtendedContentMessage {
+  optional SubProtocol associatedMessage = 1;
+  optional EXTENDED_CONTENT_MESSAGE_EXTENDED_CONTENT_TYPE targetType = 2;
+  optional string targetUsername = 3;
+  optional string targetId = 4;
+  optional int64 targetExpiringAtSec = 5;
+  optional EXTENDED_CONTENT_MESSAGE_XMA_LAYOUT_TYPE xmaLayoutType = 6;
+  repeated CTA ctas = 7;
+  repeated SubProtocol previews = 8;
+  optional string titleText = 9;
+  optional string subtitleText = 10;
+  optional uint32 maxTitleNumOfLines = 11;
+  optional uint32 maxSubtitleNumOfLines = 12;
+  optional SubProtocol favicon = 13;
+  optional SubProtocol headerImage = 14;
+  optional string headerTitle = 15;
+  optional EXTENDED_CONTENT_MESSAGE_OVERLAY_ICON_GLYPH overlayIconGlyph = 16;
+  optional string overlayTitle = 17;
+  optional string overlayDescription = 18;
+  optional string sentWithMessageId = 19;
+  optional string messageText = 20;
+  optional string headerSubtitle = 21;
+  optional string xmaDataclass = 22;
+  optional string contentRef = 23;
+  repeated string mentionedJid = 24;
+  repeated Command commands = 25;
+  repeated Mention mentions = 26;
+  optional EXTENDED_CONTENT_MESSAGE_XMA_DATACLASS_TYPE xmaDataclassType = 27;
+  optional string signedXmaDataclassValidation = 28;
+  optional string featureSharedSessionId = 29;
+  message CTA {
+    optional EXTENDED_CONTENT_MESSAGE_CTA_BUTTON_TYPE buttonType = 1;
+    optional string title = 2;
+    optional string actionUrl = 3;
+    optional string nativeUrl = 4;
+    optional string ctaType = 5;
+    optional string actionContentBlob = 6;
+  }
+
+  enum EXTENDED_CONTENT_MESSAGE_OVERLAY_ICON_GLYPH {
+    INFO = 0;
+    EYE_OFF = 1;
+    NEWS_OFF = 2;
+    WARNING = 3;
+    PRIVATE = 4;
+    NONE = 5;
+    MEDIA_LABEL = 6;
+    POST_COVER = 7;
+    POST_LABEL = 8;
+    WARNING_SCREENS = 9;
+  }
+}
+
+enum FUTURE_PROOF_BEHAVIOR {
+  PLACEHOLDER = 0;
+  NO_PLACEHOLDER = 1;
+  IGNORE = 2;
+}
+
+message GenerateMekInput {
+  repeated bytes epochHeads = 1;
+}
+
+message GenerateMekResult {
+  required MekBundle mek = 1;
+}
+
+message GenerateMekRosterHashInput {
+  repeated bytes epochHeads = 1;
+}
+
+message GenerateMekRosterHashResult {
+  required bytes rosterHash = 1;
+}
+
+message LabyrinthWaCommand {
+  oneof commandInput {
+    CreateBackupInput createBackupInput = 1;
+    EncryptMessageInput encryptMessageInput = 2;
+    DecryptMessageInput decryptMessageInput = 3;
+    OrfThreadIdInput orfThreadIdInput = 4;
+    DeriveMessageKeyInput deriveMessageKeyInput = 5;
+    RotateEpochInput rotateEpochInput = 6;
+  }
+}
+
+enum MENTION_MENTION_TYPE {
+  PROFILE = 0;
+}
+
+message MandrakeDecryptMekInput {
+  required bytes encryptedMek = 1;
+  required bytes recipientsHash = 4;
+  required bytes recipientEncSk = 5;
+  optional uint64 mekEncryptionVersion = 6;
+  optional MinosClientConfig conf = 7;
+  required MessagingMailboxPublicData recipientMmk = 8;
+  optional bytes mekId = 9;
+  optional MerkleMembershipProof recipientMembershipProof = 10;
+  oneof senderPublicData {
+    MandrakeDecryptMekInput.MmkSenderPublicData mmkSender = 2;
+    MandrakeDecryptMekInput.EpochSenderPublicData epochSender = 3;
+    MandrakeDecryptMekInput.PrecomputedEpochSenderPublicData precomputedEpochSender = 11;
+  }
+  message EpochSenderPublicData {
+    required EpochPublicData epochPublicData = 1;
+  }
+
+  message MmkSenderPublicData {
+    required MessagingMailboxPublicData mmkPublicData = 1;
+  }
+
+  message PrecomputedEpochSenderPublicData {
+    required bytes authPk = 1;
+    required bytes epochHead = 2;
+  }
+}
+
+message MandrakeDecryptMekResult {
+  oneof result {
+    MandrakeDecryptMekSuccess success = 1;
+    string errorMessage = 2;
+  }
+}
+
+message MandrakeDecryptMekSuccess {
+  required bytes mek = 1;
+}
+
+message MandrakeEncryptMekInput {
+  required MandrakeMekBundle mek = 1;
+  repeated MessagingMailboxPublicData recipients = 2;
+  optional MinosClientConfig conf = 5;
+  oneof sender {
+    MandrakeEncryptMekInput.MmkSender mmkSender = 3;
+    MandrakeEncryptMekInput.EpochSender epochSender = 4;
+    MandrakeEncryptMekInput.DetachedDeviceSender detachedDeviceSender = 6;
+  }
+  message DetachedDeviceSender {
+    required DetachedDevicePublicData detachedDevicePublicData = 1;
+    required bytes authSk = 2;
+    required bytes authPk = 3;
+  }
+
+  message EpochSender {
+    required EpochPublicData epochPublicData = 1;
+    required bytes authSk = 2;
+    required bytes authPk = 3;
+  }
+
+  message MmkSender {
+    required MessagingMailboxPublicData mmkPublicData = 1;
+    required bytes authSk = 2;
+    required bytes authPk = 3;
+  }
+}
+
+message MandrakeEncryptMekResult {
+  oneof result {
+    MandrakeEncryptMekSuccess success = 1;
+    string errorMessage = 2;
+  }
+}
+
+message MandrakeEncryptMekSuccess {
+  repeated MekDistributionSingleRecipient distributions = 1;
+  required bytes recipientsHash = 2;
+  required uint64 version = 3;
+  message MekDistributionSingleRecipient {
+    required bytes encryptedMek = 1;
+    required MessagingMailboxPublicData toMmk = 2;
+    optional MerkleMembershipProof recipientMembershipProof = 3;
+  }
+}
+
+message MandrakeMekBundle {
+  required bytes key = 1;
+  required bytes mekId = 2;
+  required bytes mailboxHeadHash = 3;
+}
+
+message MandrakeOpenEpochInput {
+  required string userFbid = 1;
+  required uint64 epochNumber = 2;
+  required bytes exportRootKey = 3;
+  required bytes previousExportRootKey = 4;
+  required uint64 previousEpochNumber = 5;
+  required bytes previousEpochHead = 6;
+  optional MessagingMailboxPublicData previousMmk = 7;
+  repeated DetachedDevicePublicData detachedDevices = 8;
+}
+
+message MandrakeOpenEpochResult {
+  oneof result {
+    MandrakeOpenEpochSuccess success = 1;
+    string errorMessage = 2;
+  }
+}
+
+message MandrakeOpenEpochSuccess {
+  required MinosSignedEpoch minosSignedEpoch = 1;
+  required SignedMmkDistributionFromMailbox signedMmkDistribution = 2;
+}
+
+message MandrakeOpenInitialEpochInput {
+  required string userFbid = 1;
+  required uint64 epochNumber = 2;
+  required bytes exportRootKey = 3;
+  repeated DetachedDevicePublicData detachedDevices = 4;
+}
+
+message MandrakeOpenInitialEpochResult {
+  oneof result {
+    MandrakeOpenEpochSuccess success = 1;
+    string errorMessage = 2;
+  }
+}
+
+message MandrakeValidateNewMmkFromDetachedDeviceInput {
+  required MmkFromDetachedDevice mmkFromDevice = 1;
+  required bytes signature = 2;
+  required MessagingMailboxPublicData prevMmk = 3;
+}
+
+message MandrakeValidateNewMmkFromMailboxInput {
+  required MessagingMailboxPublicData newMmk = 1;
+  required bytes signature = 2;
+  optional MessagingMailboxPublicData prevMmk = 3;
+  required EpochPublicData epochPublicData = 4;
+}
+
+message MandrakeValidateNewMmkResult {
+  oneof result {
+    bool valid = 1;
+    string errorMessage = 2;
+  }
+}
+
+message MekBundle {
+  required bytes key = 1;
+  required bytes mekId = 2;
+  required bytes rosterHash = 3;
+}
+
+message Mention {
+  optional MENTION_MENTION_TYPE mentionType = 1;
+  optional string mentionedJid = 2;
+  optional uint32 offset = 3;
+  optional uint32 length = 4;
+}
+
+message MerkleMembershipProof {
+  required bytes proof = 1;
+  required bytes root = 2;
+  required uint64 leafIndex = 3;
+  required uint64 totalLeaves = 4;
+}
+
+message MessageText {
+  optional string text = 1;
+  repeated string mentionedJid = 2;
+  repeated Command commands = 3;
+  repeated Mention mentions = 4;
+}
+
+message MessagingMailboxPublicData {
+  required bytes epochHead = 1;
+  required bytes deviceRosterHash = 2;
+  required uint64 sequenceNumber = 3;
+  required bytes sigPk = 4;
+  required bytes encPk = 5;
+  required bytes authPk = 6;
+}
+
+message MinosClientConfig {
+  required int32 preferredMessageEncryptionVersion = 1;
+  required int32 preferredMekEncryptionVersion = 2;
+}
+
+message MinosCommand {
+  oneof commandInput {
+    MinosEncryptAndSignMessageInput encryptAndSignMessage = 1;
+    MinosDecryptAndVerifyMessageInput decryptAndVerifyMessage = 2;
+    GenerateMekInput generateMek = 3;
+    GenerateMekRosterHashInput generateMekRosterHash = 4;
+    EncryptMekForDistributionInput encryptMekForDistribution = 5;
+    DecryptMekForDistributionInput decryptMekForDistribution = 6;
+    EncryptMeksForDistributionFromTransportSenderInput encryptMeksForDistributionFromTransportSender = 7;
+    DecryptMekForDistributionFromTransportSenderInput decryptMekForDistributionFromTransportSender = 8;
+    WrapTransportSigningPublicKeyInput wrapTransportSigningPublicKey = 9;
+    WrapTransportSigningSecretKeyInput wrapTransportSigningSecretKey = 10;
+    DeriveMailboxSigningKeypairInput deriveMailboxSigningKeypair = 11;
+    DeriveMailboxEncryptionKeypairInput deriveMailboxEncryptionKeypair = 12;
+    DeriveMailboxAuthKeypairInput deriveMailboxAuthKeypair = 13;
+    DeriveAttachmentAccessTokenSecretInput deriveAttachmentAccessTokenSecret = 14;
+    DeriveAttachmentPrimaryKeySecretInput deriveAttachmentPrimaryKeySecret = 15;
+    MinosOpenInitialEpochInput minosOpenInitialEpoch = 16;
+    MinosOpenEpochInput minosOpenEpoch = 17;
+    MinosValidateEpochInput minosValidateEpoch = 18;
+    MinosVerifySingleEpochInput minosVerifySingleEpoch = 19;
+    MinosThreadIdFromOneToOneThreadInput minosThreadIdFromOneToOneThread = 20;
+    MinosThreadIdFromActThreadIdInput minosThreadIdFromActThreadId = 21;
+    MandrakeOpenEpochInput mandrakeOpenEpoch = 22;
+    MandrakeEncryptMekInput mandrakeEncryptMek = 23;
+    MandrakeDecryptMekInput mandrakeDecryptMek = 24;
+    MandrakeOpenInitialEpochInput mandrakeOpenInitialEpoch = 25;
+    MandrakeValidateNewMmkFromMailboxInput mandrakeValidateNewMmkFromMailbox = 27;
+    MandrakeValidateNewMmkFromDetachedDeviceInput mandrakeValidateNewMmkFromDetachedDevice = 28;
+    DeriveMessagingMailboxKeypairsInput deriveMessagingMailboxKeypairs = 29;
+    DecryptSelfMmkDistributionInput decryptSelfMmkDistribution = 30;
+  }
+}
+
+message MinosDecryptAndVerifyMessageInput {
+  required bytes transportSigningPk = 1;
+  required bytes mek = 2;
+  required bytes encryptedMessageCiphertext = 3;
+  required bytes encryptedMessageSignature = 4;
+  required MinosMessageMetadata metadata = 5;
+  optional int32 messageEncryptionVersion = 6;
+  optional MinosClientConfig conf = 7;
+}
+
+message MinosDecryptAndVerifyMessageResult {
+  oneof result {
+    MinosDecryptAndVerifyMessageSuccess success = 1;
+    string errorMessage = 2;
+  }
+}
+
+message MinosDecryptAndVerifyMessageSuccess {
+  required bytes plaintext = 1;
+}
+
+message MinosEncryptAndSignMessageInput {
+  required bytes transportSigningSk = 1;
+  required bytes mek = 2;
+  required bytes plaintext = 3;
+  required MinosMessageMetadata metadata = 4;
+  optional bytes transportSigningPk = 5;
+  optional MinosClientConfig conf = 6;
+}
+
+message MinosEncryptAndSignMessageResult {
+  required bytes ciphertext = 1;
+  required bytes signature = 2;
+  required int32 version = 3;
+}
+
+message MinosMessageMetadata {
+  required bytes mekId = 1;
+  required uint64 timestamp = 2;
+  required string messageId = 3;
+  required bytes threadId = 4;
+}
+
+message MinosOpenEpochInput {
+  required string userFbid = 1;
+  required uint64 epochNumber = 2;
+  required bytes exportRootKey = 3;
+  required bytes previousExportRootKey = 4;
+  required uint64 previousEpochNumber = 5;
+  required bytes previousEpochHead = 6;
+}
+
+message MinosOpenEpochResult {
+  required MinosSignedEpoch minosSignedEpoch = 1;
+}
+
+message MinosOpenInitialEpochInput {
+  required string userFbid = 1;
+  required uint64 epochNumber = 2;
+  required bytes exportRootKey = 3;
+}
+
+message MinosOpenInitialEpochResult {
+  required MinosSignedEpoch minosSignedEpoch = 1;
+}
+
+message MinosSignedEpoch {
+  required EpochPublicData epochPublicData = 1;
+  required EpochSignatures signatures = 2;
+  required bytes epochHead = 3;
+}
+
+message MinosThreadIdFromActThreadIdInput {
+  required string actThreadId = 1;
+}
+
+message MinosThreadIdFromActThreadIdResult {
+  required bytes threadId = 1;
+}
+
+message MinosThreadIdFromOneToOneThreadInput {
+  required string actThreadId = 1;
+  required string selfFbid = 2;
+}
+
+message MinosThreadIdFromOneToOneThreadResult {
+  required bytes threadId = 1;
+}
+
+message MinosValidateEpochInput {
+  required EpochPublicData epochPublicData = 1;
+  required EpochPublicData previousEpochPublicData = 2;
+  required EpochSignatures signatures = 3;
+}
+
+message MinosValidateEpochResult {
+  oneof result {
+    bool valid = 1;
+    string errorMessage = 2;
+  }
+}
+
+message MinosVerifySingleEpochInput {
+  required EpochPublicData epochPublicData = 1;
+  required bytes signature = 2;
+}
+
+message MinosVerifySingleEpochResult {
+  required bool valid = 1;
+}
+
+message MmkDistribution {
+  repeated MmkDistributionToDetachedDevice toDetachedDevices = 1;
+  required MmkDistributionToMailbox toMailbox = 2;
+  required uint64 version = 3;
+}
+
+message MmkDistributionToDetachedDevice {
+  required bytes encryptedMmk = 1;
+  required bytes recipDeviceHash = 2;
+}
+
+message MmkDistributionToMailbox {
+  required bytes encryptedMmk = 1;
+  required bytes recipMailboxHeadHash = 2;
+}
+
+message MmkFromDetachedDevice {
+  required MessagingMailboxPublicData mmk = 1;
+  required DetachedDevicePublicData fromDetachedDevice = 2;
+  required MerkleMembershipProof membershipProof = 3;
+}
+
+message OrfThreadIdInput {
+  required bytes orfClientState = 1;
+  required string threadId = 2;
+}
+
+message OrfThreadIdOutput {
+  optional bytes orfThreadId = 1;
+  optional string error = 2;
+}
+
+message RotateEpochInput {
+  required bytes currentEpochRootKey = 1;
+  required bytes currentEpochAnonId = 2;
+  required uint64 currentEpochFbid = 3;
+  required bytes epochStoragePrivateKey = 4;
+  repeated RotateEpochMemberInput members = 5;
+}
+
+message RotateEpochMemberEdge {
+  optional uint64 deviceId = 1;
+  optional bytes encryptedEpochKey = 2;
+  optional bytes deviceEpochHmac = 3;
+}
+
+message RotateEpochMemberInput {
+  required uint64 deviceId = 1;
+  required bytes epochStoragePublicKey = 2;
+  required bytes devicePublicKey = 3;
+}
+
+message RotateEpochOutput {
+  optional bytes newEpochRootKey = 1;
+  optional uint64 newEpochAnonId = 2;
+  optional uint64 newEpochFbid = 8;
+  optional bytes epochAnonId = 3;
+  optional BackwardEdge backwardEdge = 4;
+  repeated RotateEpochMemberEdge memberEdges = 5;
+  optional bytes epochRootKeyFingerprint = 6;
+  optional string error = 7;
+}
+
+message SignedMmkDistributionFromMailbox {
+  required MmkDistribution mmkDistribution = 1;
+  required bytes signature = 2;
+  required MessagingMailboxPublicData fromMailbox = 3;
+}
+
+message SubProtocol {
+  optional bytes payload = 1;
+  optional int32 version = 2;
+}
+
+message VirtualDeviceOutput {
+  required bytes vdId = 1;
+  required bytes vdPublicKey = 2;
+  required bytes vdEpochStoragePublicKey = 3;
+  required bytes vdEpochStoragePublicKeySig = 4;
+  required bytes ocmfRotationToken = 5;
+  required bytes deviceEpochHmac = 6;
+  required EncryptedSecretValuesOutput encryptedSecretValues = 7;
 }
 
 message WrapTransportSigningPublicKeyInput {

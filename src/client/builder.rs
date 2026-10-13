@@ -647,7 +647,7 @@ impl ClientBuilder {
             }
 
             if self.inbound_durability_hook.is_some() {
-                probe_durability_backend(&persistence_manager.backend()).await?;
+                probe_durability_backend(&persistence_manager.backend(), &runtime).await?;
             }
 
             self.finish(runtime, persistence_manager, transport_factory, http_client)
@@ -825,6 +825,25 @@ impl ClientBuilder {
 
 async fn probe_durability_backend(
     backend: &Arc<dyn crate::store::traits::Backend>,
+    runtime: &Arc<dyn Runtime>,
+) -> Result<(), ClientBuilderError> {
+    let backend = Arc::clone(backend);
+    let (send, receive) = futures::channel::oneshot::channel();
+    // Construction cancellation must not abandon a probe that a backend
+    // worker may already have inserted. The runtime owns its entire lifetime.
+    runtime.spawn_detached(Box::pin(async move {
+        let result = probe_durability_backend_owned(&backend).await;
+        let _ = send.send(result);
+    }));
+    receive.await.map_err(|_| {
+        ClientBuilderError::UnsupportedDurabilityBackend(
+            "pending-inbound probe worker stopped".to_string(),
+        )
+    })?
+}
+
+async fn probe_durability_backend_owned(
+    backend: &Arc<dyn crate::store::traits::Backend>,
 ) -> Result<(), ClientBuilderError> {
     const PROBE_JID: &str = "0@s.whatsapp.net";
     const PROBE_PAYLOAD: &[u8] = b"probe";
@@ -832,22 +851,94 @@ async fn probe_durability_backend(
     let map_err =
         |error: StoreError| ClientBuilderError::UnsupportedDurabilityBackend(error.to_string());
 
-    backend
-        .store_pending_inbound(PROBE_JID, PROBE_JID, &probe_id, PROBE_PAYLOAD)
+    use wacore::store::traits::{
+        PendingInboundKey, PendingInboundLease, PendingInboundMutation, PendingInboundPayload,
+        PendingInboundRevision,
+    };
+    let key = PendingInboundKey {
+        chat: "0@g.us",
+        sender: "0:1@s.whatsapp.net",
+        id: &probe_id,
+    };
+    let lease = PendingInboundLease::new(Arc::new(()));
+    let bound = PROBE_PAYLOAD.len();
+    if backend
+        .read_pending_inbound_bounded(key, bound, lease.clone())
         .await
-        .map_err(map_err)?;
-    let stored = backend
-        .get_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
-        .await
-        .map_err(map_err)?;
-    backend
-        .delete_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
-        .await
-        .map_err(map_err)?;
-
-    if stored.as_deref() != Some(PROBE_PAYLOAD) {
+        .map_err(map_err)?
+        .is_some()
+    {
         return Err(ClientBuilderError::UnsupportedDurabilityBackend(
-            "pending-inbound buffer did not round-trip".to_string(),
+            "pending-inbound probe identity already exists".to_string(),
+        ));
+    }
+    let revision = PendingInboundRevision::for_bytes(PROBE_PAYLOAD);
+    let payload =
+        PendingInboundPayload::new(bytes::Bytes::from_static(PROBE_PAYLOAD), lease.clone());
+    let replaced = backend
+        .replace_pending_inbound_if(key, PendingInboundRevision::missing(), payload, bound)
+        .await;
+    if replaced
+        .as_ref()
+        .is_ok_and(|mutation| *mutation != PendingInboundMutation::Applied)
+    {
+        return Err(ClientBuilderError::UnsupportedDurabilityBackend(
+            "pending-inbound conditional insert did not apply".to_string(),
+        ));
+    }
+    // Attempt conditional cleanup even if the round-trip read fails. Never
+    // delete a replacement or an unrelated row through an unconditional path.
+    let stored = backend
+        .read_pending_inbound_bounded(key, bound, lease.clone())
+        .await;
+    let grouped = if replaced.is_ok() {
+        backend
+            .read_pending_inbound_group_bounded(
+                PendingInboundKey {
+                    chat: key.chat,
+                    sender: PROBE_JID,
+                    id: key.id,
+                },
+                bound,
+                lease.clone(),
+            )
+            .await
+    } else {
+        Ok(None)
+    };
+    // A reported insertion error can follow a visible commit. Its cleanup
+    // shares the successful probe's conditional-delete path, but only after
+    // the exact probe revision became visible. Never delete a successor.
+    let deleted = if replaced.is_ok()
+        || stored.as_ref().is_ok_and(|record| {
+            record
+                .as_ref()
+                .is_some_and(|record| record.revision() == revision)
+        }) {
+        backend
+            .delete_pending_inbound_if(key, revision, bound, lease.clone())
+            .await
+    } else {
+        Ok(PendingInboundMutation::Conflict)
+    };
+    replaced.map_err(map_err)?;
+    let stored = stored.map_err(map_err)?;
+    let grouped = grouped.map_err(map_err)?;
+    if grouped
+        .as_ref()
+        .map(|(sender, record)| (sender.as_str(), record.bytes()))
+        != Some((key.sender, PROBE_PAYLOAD))
+        || stored.as_ref().map(|record| record.bytes()) != Some(PROBE_PAYLOAD)
+        || stored.as_ref().map(|record| record.revision()) != Some(revision)
+        || deleted.map_err(map_err)? != PendingInboundMutation::Applied
+        || backend
+            .read_pending_inbound_bounded(key, bound, lease)
+            .await
+            .map_err(map_err)?
+            .is_some()
+    {
+        return Err(ClientBuilderError::UnsupportedDurabilityBackend(
+            "bounded pending-inbound CAS did not round-trip and clean up".to_string(),
         ));
     }
     Ok(())
@@ -1129,9 +1220,10 @@ mod tests {
             .await
             .expect("seed unrelated row");
 
+        let runtime: Arc<dyn Runtime> = Arc::new(TokioRuntime);
         let (first, second) = futures::join!(
-            probe_durability_backend(&backend),
-            probe_durability_backend(&backend)
+            probe_durability_backend(&backend, &runtime),
+            probe_durability_backend(&backend, &runtime)
         );
         first.expect("first probe");
         second.expect("second probe");
@@ -1150,6 +1242,43 @@ mod tests {
             1,
             "only the unrelated row should remain"
         );
+    }
+
+    #[tokio::test]
+    async fn durability_probe_cleans_visible_insert_errors_and_cancelled_cleanup() {
+        use wacore::store::traits::ProtocolStore;
+        for cancel in [false, true] {
+            let backend = Arc::new(wacore::store::in_memory::InMemoryBackend::new());
+            let erased: Arc<dyn crate::store::traits::Backend> = backend.clone();
+            let runtime: Arc<dyn Runtime> = Arc::new(TokioRuntime);
+            let gate = Arc::new(async_lock::Barrier::new(2));
+            if cancel {
+                backend.park_pending_delete(0, gate.clone());
+            } else {
+                backend.fail_next_pending_replace_after_commit();
+            }
+            let worker =
+                tokio::spawn(async move { probe_durability_backend(&erased, &runtime).await });
+            if cancel {
+                tokio::time::timeout(Duration::from_secs(5), gate.wait())
+                    .await
+                    .unwrap();
+                worker.abort();
+                assert!(matches!(worker.await, Err(error) if error.is_cancelled()));
+                backend.set_fail_pending_delete(None);
+                gate.wait().await;
+            } else {
+                assert!(worker.await.unwrap().is_err());
+            }
+            assert_eq!(
+                backend
+                    .delete_expired_pending_inbound(i64::MAX)
+                    .await
+                    .unwrap(),
+                0,
+                "a failed or cancelled construction must not strand its probe"
+            );
+        }
     }
 
     struct CaptureOnly;

@@ -229,15 +229,15 @@ mod web {
 
     /// Run it here, because there is nowhere else to run it.
     ///
-    /// The signature is `spawn_blocking`'s, bounds included, so the call sites
-    /// do not change and the native build keeps every guarantee it had. What
+    /// The browser executes the closure inline, so it requires no `Send`.
+    /// The native re-export retains Tokio's worker-boundary guarantees. What
     /// is lost is real and worth naming: a long query blocks the page's only
     /// agent, which is why the session belongs in a worker rather than in the
     /// window.
     pub(crate) async fn spawn_blocking<F, T>(f: F) -> Result<T, JoinError>
     where
-        F: FnOnce() -> T + Send + 'static,
-        T: Send + 'static,
+        F: FnOnce() -> T + 'static,
+        T: 'static,
     {
         Ok(f())
     }

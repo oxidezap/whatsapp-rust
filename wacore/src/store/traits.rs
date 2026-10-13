@@ -1169,6 +1169,71 @@ pub trait ProtocolStore: Send + Sync {
         Ok(0)
     }
 
+    /// Read a pending row without allocating its payload above `max_bytes`.
+    /// Oversized or non-BLOB rows are errors, distinct from absence. Empty bytes
+    /// are a present row; envelope validation belongs to the decoder. The length
+    /// check and read must observe the same row. This optional contract has no
+    /// fallback to the unbounded getter. The supplied lease must cover the
+    /// maximum returned payload before this operation starts.
+    async fn read_pending_inbound_bounded(
+        &self,
+        _key: PendingInboundKey<'_>,
+        _max_bytes: usize,
+        _lease: PendingInboundLease,
+    ) -> Result<Option<PendingInboundRecord>> {
+        Err(unsupported_pending_inbound())
+    }
+
+    /// Read the unique physical row for a group's non-device sender identity.
+    /// Return its actual sender spelling for subsequent CAS. Discover at most
+    /// 400 same-chat/id sender keys, each at most 128 bytes, before copying any
+    /// payload. Ambiguous aliases, invalid/oversized metadata and oversized
+    /// payloads are errors, never absence. Discovery and payload must share a
+    /// snapshot, and detached readers retain the supplied mutation-owner lease.
+    async fn read_pending_inbound_group_bounded(
+        &self,
+        _key: PendingInboundKey<'_>,
+        _max_bytes: usize,
+        _lease: PendingInboundLease,
+    ) -> Result<Option<(String, PendingInboundRecord)>> {
+        Err(unsupported_pending_inbound())
+    }
+
+    /// Replace only the exact revision observed by the owner. Absence is an
+    /// explicit expected revision. Backends must compare and write atomically,
+    /// and reject oversized existing or replacement payloads before copying. An
+    /// already installed identical replacement is an idempotent success only
+    /// because each new envelope carries its unique operation identifier.
+    /// The owned payload and its lease stay alive through all detached workers.
+    ///
+    /// The caller must retain exclusive ownership until detached workers and
+    /// retries finish, including after cancellation. Revision checks alone do
+    /// not prevent an absent-row ABA after a successor creates and deletes it.
+    async fn replace_pending_inbound_if(
+        &self,
+        _key: PendingInboundKey<'_>,
+        _expected: PendingInboundRevision,
+        _replacement: PendingInboundPayload,
+        _max_bytes: usize,
+    ) -> Result<PendingInboundMutation> {
+        Err(unsupported_pending_inbound())
+    }
+
+    /// Delete only the exact stored bytes observed by the current owner, in one
+    /// atomic operation. Missing expected and stored revisions are a no-op
+    /// success; a present expected revision against absence is a conflict.
+    /// The same worker-terminal ownership rule as conditional
+    /// replacement applies. A conflicting revision must remain untouched.
+    async fn delete_pending_inbound_if(
+        &self,
+        _key: PendingInboundKey<'_>,
+        _expected: PendingInboundRevision,
+        _max_bytes: usize,
+        _lease: PendingInboundLease,
+    ) -> Result<PendingInboundMutation> {
+        Err(unsupported_pending_inbound())
+    }
+
     /// Batched [`store_pending_inbound`](Self::store_pending_inbound): the
     /// offline drain buffers one commit-batch of messages per call, so backends
     /// should override this with a single transaction (the bundled SqliteStore
@@ -1209,6 +1274,163 @@ pub struct PendingInboundKey<'a> {
     pub chat: &'a str,
     pub sender: &'a str,
     pub id: &'a str,
+}
+
+/// Revision of the exact stored bytes, including legacy encodings. New raw
+/// envelopes must include a distinct operation identifier so successive writes
+/// with equal plaintext still have different revisions. No decode or re-encode
+/// participates in this identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingInboundRevision(Option<[u8; 32]>);
+
+impl PendingInboundRevision {
+    pub const fn missing() -> Self {
+        Self(None)
+    }
+
+    pub fn for_bytes(bytes: &[u8]) -> Self {
+        use sha2::Digest;
+        Self(Some(sha2::Sha256::digest(bytes).into()))
+    }
+}
+
+/// Opaque ownership retained by every detached pending-row worker and result.
+/// The caller supplies its identity lock and byte-budget reservation together.
+/// Cloning this token must not reacquire the lock or release its reservation.
+/// Backends must capture a clone in every retry factory and detached worker.
+#[derive(Clone)]
+pub struct PendingInboundLease {
+    _keepalive: Arc<dyn crate::sync_marker::MaybeSendSync>,
+}
+
+impl PendingInboundLease {
+    pub fn new(owner: Arc<dyn crate::sync_marker::MaybeSendSync>) -> Self {
+        Self { _keepalive: owner }
+    }
+}
+
+impl std::fmt::Debug for PendingInboundLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingInboundLease")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Immutable replacement bytes and the ownership that accounts for them.
+/// The caller reserves before allocating; the lease must also cover bounded
+/// prior-row scratch. SQLite's internal copies need separate peak accounting.
+#[derive(Debug)]
+pub struct PendingInboundPayload {
+    bytes: Bytes,
+    revision: PendingInboundRevision,
+    // Fields drop in declaration order: bytes must die before their charge.
+    lease: PendingInboundLease,
+}
+
+impl PendingInboundPayload {
+    pub fn new(bytes: Bytes, lease: PendingInboundLease) -> Self {
+        let revision = PendingInboundRevision::for_bytes(&bytes);
+        Self {
+            bytes,
+            revision,
+            lease,
+        }
+    }
+
+    /// Revision computed once from the immutable replacement bytes.
+    pub const fn revision(&self) -> PendingInboundRevision {
+        self.revision
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn lease(&self) -> PendingInboundLease {
+        self.lease.clone()
+    }
+}
+
+/// One bounded pending row, with its revision computed from the original bytes.
+/// Keep this wrapper, or a clone of its lease, while decoded data remains live.
+#[derive(Debug)]
+pub struct PendingInboundRecord {
+    bytes: Vec<u8>,
+    revision: PendingInboundRevision,
+    lease: PendingInboundLease,
+}
+
+impl PendingInboundRecord {
+    pub fn new(bytes: Vec<u8>, lease: PendingInboundLease) -> Self {
+        let revision = PendingInboundRevision::for_bytes(&bytes);
+        Self {
+            bytes,
+            revision,
+            lease,
+        }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Transfer the owned backing without copying it. Keep the returned lease
+    /// through decoding, then release mutation exclusion before a new write.
+    pub fn into_bytes(self) -> (Bytes, PendingInboundLease) {
+        (Bytes::from(self.bytes), self.lease)
+    }
+
+    pub const fn revision(&self) -> PendingInboundRevision {
+        self.revision
+    }
+
+    pub fn lease(&self) -> PendingInboundLease {
+        self.lease.clone()
+    }
+}
+
+/// Select a unique non-device group sender from bounded physical metadata.
+/// `None` marks metadata withheld by a backend's preallocation length check.
+#[inline(never)]
+pub fn pending_group_sender(
+    senders: &mut dyn Iterator<Item = Option<&str>>,
+    sender: &str,
+) -> Result<Option<String>> {
+    let invalid = |message: &str| crate::store::error::StoreError::Validation(message.to_owned());
+    if sender.len() > 128 {
+        return Err(invalid("group pending sender exceeds bound"));
+    }
+    let canonical = sender
+        .parse::<Jid>()
+        .map_err(|_| invalid("invalid group pending sender"))?
+        .to_non_ad();
+    let mut selected = None;
+    for (index, spelling) in senders.enumerate() {
+        if index >= 400 {
+            return Err(invalid("pending group sender count exceeds bound"));
+        }
+        let spelling = spelling
+            .filter(|value| value.len() <= 128)
+            .ok_or_else(|| invalid("pending group sender metadata exceeds bound"))?;
+        let physical = spelling
+            .parse::<Jid>()
+            .map_err(|_| invalid("invalid pending group sender metadata"))?;
+        if physical.to_non_ad() == canonical {
+            if selected.is_some() {
+                return Err(invalid("ambiguous pending group sender aliases"));
+            }
+            selected = Some(spelling);
+        }
+    }
+    Ok(selected.map(str::to_owned))
+}
+
+/// Result of an atomic conditional pending-row mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PendingInboundMutation {
+    Applied,
+    Conflict,
 }
 
 /// Device data persistence operations.
@@ -1376,4 +1598,40 @@ pub trait Backend:
 impl<T> Backend for T where
     T: SignalStore + AppSyncStore + ProtocolStore + MsgSecretStore + DeviceStore + Send + Sync
 {
+}
+
+#[cfg(test)]
+mod pending_group_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn pending_bounded_group_metadata_rejects_ambiguity_and_limits() {
+        assert_eq!(
+            pending_group_sender(
+                &mut [Some("200:75@lid"), Some("200:75@s.whatsapp.net")].into_iter(),
+                "200@lid"
+            )
+            .unwrap(),
+            Some("200:75@lid".into())
+        );
+        assert!(
+            pending_group_sender(
+                &mut [Some("200@lid"), Some("200:75@lid")].into_iter(),
+                "200@lid"
+            )
+            .is_err()
+        );
+        assert!(pending_group_sender(&mut [None].into_iter(), "200@lid").is_err());
+        let huge = format!("{}:75@lid", "2".repeat(129));
+        assert!(pending_group_sender(&mut [Some(huge.as_str())].into_iter(), "200@lid").is_err());
+        assert!(
+            pending_group_sender(&mut std::iter::repeat_n(Some("300@lid"), 401), "200@lid")
+                .is_err()
+        );
+        assert!(
+            pending_group_sender(&mut std::iter::repeat_n(Some("300@lid"), 400), "200@lid")
+                .unwrap()
+                .is_none()
+        );
+    }
 }

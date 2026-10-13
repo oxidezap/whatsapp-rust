@@ -202,9 +202,10 @@ async fn test_newsletter_send_and_get_messages() -> anyhow::Result<()> {
     info!("Created newsletter: {}", created.jid);
 
     // Send a text message
-    let message = wa::Message {
-        conversation: Some("Hello from newsletter!".to_string()),
-        ..Default::default()
+    let message = {
+        let mut proto_contract_fixture = wa::Message::default();
+        proto_contract_fixture.conversation = Some("Hello from newsletter!".to_string());
+        proto_contract_fixture
     };
     let msg_id = client
         .client
@@ -273,19 +274,21 @@ async fn test_newsletter_send_media_message() -> anyhow::Result<()> {
         .await?;
 
     // Build and send an image message
-    let message = wa::Message {
-        image_message: buffa::MessageField::some(wa::message::ImageMessage {
-            url: Some(upload.url.clone()),
-            direct_path: Some(upload.direct_path.clone()),
-            media_key: Some(upload.media_key.to_vec()),
-            file_sha256: Some(upload.file_sha256.to_vec()),
-            file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
-            file_length: Some(upload.file_length),
-            mimetype: Some("image/jpeg".to_string()),
-            caption: Some("Newsletter image test".to_string()),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let message = {
+        let mut proto_contract_fixture = wa::Message::default();
+        proto_contract_fixture.image_message = buffa::MessageField::some({
+            let mut proto_contract_fixture = wa::message::ImageMessage::default();
+            proto_contract_fixture.url = Some(upload.url.clone());
+            proto_contract_fixture.direct_path = Some(upload.direct_path.clone());
+            proto_contract_fixture.media_key = Some(upload.media_key.to_vec());
+            proto_contract_fixture.file_sha256 = Some(upload.file_sha256.to_vec());
+            proto_contract_fixture.file_enc_sha256 = Some(upload.file_enc_sha256.to_vec());
+            proto_contract_fixture.file_length = Some(upload.file_length);
+            proto_contract_fixture.mimetype = Some("image/jpeg".to_string());
+            proto_contract_fixture.caption = Some("Newsletter image test".to_string());
+            proto_contract_fixture
+        });
+        proto_contract_fixture
     };
 
     let msg_id = client
@@ -337,9 +340,10 @@ async fn test_newsletter_message_pagination() -> anyhow::Result<()> {
 
     // Send multiple messages
     for i in 0..5 {
-        let msg = wa::Message {
-            conversation: Some(format!("Message {}", i)),
-            ..Default::default()
+        let msg = {
+            let mut proto_contract_fixture = wa::Message::default();
+            proto_contract_fixture.conversation = Some(format!("Message {}", i));
+            proto_contract_fixture
         };
         client.client.send_message(created.jid.clone(), msg).await?;
     }
@@ -416,9 +420,10 @@ async fn test_newsletter_reaction_live_update() -> anyhow::Result<()> {
         .create("Reaction Test", None)
         .await?;
 
-    let msg = wa::Message {
-        conversation: Some("React to me!".to_string()),
-        ..Default::default()
+    let msg = {
+        let mut proto_contract_fixture = wa::Message::default();
+        proto_contract_fixture.conversation = Some("React to me!".to_string());
+        proto_contract_fixture
     };
     client_a
         .client

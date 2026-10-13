@@ -2070,19 +2070,16 @@ impl IqSpec for SetGroupSubjectIq {
     type Response = ();
 
     fn build_iq(&self) -> InfoQuery<'static> {
-        InfoQuery::set_ref(
-            GROUP_IQ_NAMESPACE,
-            &self.group_jid,
-            Some(NodeContent::Nodes(vec![
-                NodeBuilder::new("subject")
-                    .string_content(self.subject.as_str())
-                    .build(),
-            ])),
-        )
+        super::pilots::build_set_subject(super::pilots::SetSubjectRequest {
+            iq_to: &self.group_jid,
+            subject_element_value: self.subject.as_str(),
+        })
     }
 
-    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
-        Ok(())
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+        match super::pilots::parse_set_subject_payload(response) {
+            super::pilots::SetSubjectSuccess::Success => Ok(()),
+        }
     }
 }
 
@@ -3268,17 +3265,6 @@ fn parse_join_group_response(response: &NodeRef<'_>) -> Result<JoinGroupResult> 
     ))
 }
 
-/// Parse a join response that may be a bare `<iq type="result">`: with no
-/// content at all the join succeeded and the group is the request's own
-/// addressee (`fallback`); anything present but unrecognized falls through to
-/// the strict parser and fails loudly instead of reporting `Joined`.
-fn parse_join_or_bare(response: &NodeRef<'_>, fallback: &Jid) -> Result<JoinGroupResult> {
-    if response.content.is_none() {
-        return Ok(JoinGroupResult::Joined(fallback.clone()));
-    }
-    parse_join_group_response(response)
-}
-
 /// ```xml
 /// <iq type="set" xmlns="w:g2" to="@g.us">
 ///   <invite code="{code}"/>
@@ -3342,24 +3328,31 @@ impl IqSpec for AcceptGroupInviteV4Iq {
     type Response = JoinGroupResult;
 
     fn build_iq(&self) -> InfoQuery<'static> {
-        InfoQuery::set_ref(
-            GROUP_IQ_NAMESPACE,
-            &self.group_jid,
-            Some(NodeContent::Nodes(vec![
-                NodeBuilder::new("accept")
-                    .attr("code", &self.code)
-                    .attr("expiration", self.expiration)
-                    .attr("admin", &self.admin_jid)
-                    .build(),
-            ])),
-        )
+        super::pilots::build_accept_group_add(super::pilots::AcceptGroupAddRequest {
+            iq_to: &self.group_jid,
+            accept_code: &self.code,
+            accept_expiration: self.expiration,
+            accept_admin: &self.admin_jid,
+        })
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
-        // Bare joins the request's own `to` (`AcceptGroupAddResponseSuccess`
-        // in the generated shapes); the code-based join keeps the strict
-        // parser, whose bare result carries no group identity.
-        parse_join_or_bare(response, &self.group_jid)
+        // Retain the SDK's explicit group/community result extension and its
+        // errors. The official V4 contract has no group payload in either
+        // success outcome; its approval child is only a presence gate.
+        if response.get_optional_child(JOIN_GROUP_CHILD).is_some()
+            || response.get_optional_child(JOIN_COMMUNITY_CHILD).is_some()
+        {
+            return parse_join_group_response(response);
+        }
+        match super::pilots::parse_accept_group_add_payload(response) {
+            super::pilots::AcceptGroupAddSuccess::GroupJoinRequestSuccess => {
+                Ok(JoinGroupResult::PendingApproval(self.group_jid.clone()))
+            }
+            super::pilots::AcceptGroupAddSuccess::Success => {
+                Ok(JoinGroupResult::Joined(self.group_jid.clone()))
+            }
+        }
     }
 }
 
@@ -6808,16 +6801,19 @@ mod tests {
         assert!(spec.parse_response(&iq.as_node_ref()).is_err());
     }
 
-    /// Reject scalar response content.
+    /// The official bare success does not inspect content after a failed gate.
     #[test]
-    fn test_accept_group_invite_v4_scalar_content_is_rejected() {
-        let (_, spec) = v4_spec();
+    fn test_accept_group_invite_v4_scalar_content_reaches_bare_success() {
+        let (group, spec) = v4_spec();
         let iq = NodeBuilder::new("iq")
             .attr("type", "result")
             .attr("from", TEST_GROUP_JID)
             .apply_content(Some(NodeContent::String("unexpected payload".into())))
             .build();
-        assert!(spec.parse_response(&iq.as_node_ref()).is_err());
+        assert_eq!(
+            spec.parse_response(&iq.as_node_ref()).unwrap(),
+            JoinGroupResult::Joined(group)
+        );
     }
 
     #[test]

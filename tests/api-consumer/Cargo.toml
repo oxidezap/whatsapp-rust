@@ -28,6 +28,12 @@ js = ["wacore/js"]
 sqlite = ["sdk", "whatsapp-rust/sqlite-storage", "dep:whatsapp-rust-sqlite-storage", "dep:tokio"]
 wasm-execution = ["sqlite", "js", "whatsapp-rust-sqlite-storage/test-util", "dep:getrandom", "dep:rand", "dep:portable-atomic", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-test"]
 
+proto-owned-literal = ["sdk"]
+proto-view-literal = ["sdk"]
+proto-exhaustive-enum = ["sdk"]
+proto-exhaustive-oneof = ["sdk"]
+proto-exhaustive-view-oneof = ["sdk"]
+
 removed-video-state = ["voip-control"]
 
 old-image-literal = ["sdk"]

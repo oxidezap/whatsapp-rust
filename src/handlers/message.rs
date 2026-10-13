@@ -635,10 +635,11 @@ mod tests {
         );
         println!(
             "probe_message_dispatch future: {} bytes",
-            size_of_val(
-                &client
-                    .probe_message_dispatch(&dummy_info, &waproto::whatsapp::Message::default(),)
-            )
+            size_of_val(&client.probe_message_dispatch(
+                &dummy_info,
+                &waproto::whatsapp::Message::default(),
+                None
+            ))
         );
         println!("=== END SIZEOF REPORT ===");
     }

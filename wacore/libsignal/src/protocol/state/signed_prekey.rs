@@ -81,12 +81,14 @@ pub trait GenericSignedPreKey {
         let public_key = key_pair.get_public().to_record_bytes();
         let private_key = key_pair.get_private().to_record_bytes();
         let signature = signature.to_vec();
-        Self::from_storage(SignedPreKeyRecordStructure {
-            id: Some(id.into()),
-            timestamp: Some(timestamp),
-            public_key: Some(public_key),
-            private_key: Some(private_key),
-            signature: Some(signature),
+        Self::from_storage({
+            let mut proto = SignedPreKeyRecordStructure::default();
+            proto.id = Some(id.into());
+            proto.timestamp = Some(timestamp);
+            proto.public_key = Some(public_key);
+            proto.private_key = Some(private_key);
+            proto.signature = Some(signature);
+            proto
         })
     }
 

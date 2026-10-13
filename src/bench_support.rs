@@ -1465,7 +1465,8 @@ async fn build_multilane_receive_fixture(
                 &format!("bench-skdm-{i}"),
                 skdm.serialized(),
             )
-            .await;
+            .await
+            .expect("fixture sender key must install");
 
         groups.push(group);
         group_sender_keys.push(group_sender_key);
@@ -1561,7 +1562,8 @@ async fn build_receive_fixture() -> ReceiveFixture {
     };
     client
         .handle_sender_key_distribution_message(&group, &peer_jid, "bench-skdm", skdm.serialized())
-        .await;
+        .await
+        .expect("fixture sender key must install");
 
     let counter = Arc::new(MessageCounter {
         delivered: portable_atomic::AtomicU64::new(0),

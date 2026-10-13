@@ -107,6 +107,12 @@ impl GroupRawEpoch {
         &self.raw_epoch
     }
 
+    /// Inspect synthetic key material delivered to a test media consumer.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn raw_epoch_for_test(&self) -> &[u8] {
+        &self.raw_epoch
+    }
+
     pub(crate) fn heap_bytes(&self) -> usize {
         self.raw_epoch.capacity()
     }

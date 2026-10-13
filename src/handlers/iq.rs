@@ -23,18 +23,30 @@ impl StanzaHandler for IqHandler {
         StanzaTag::Iq.as_str()
     }
 
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(name = "wa.recv.iq", level = "debug", skip_all)
-    )]
     async fn handle(
         &self,
         client: Arc<Client>,
         node: Arc<wacore_binary::OwnedNodeRef>,
         _cancelled: &mut bool,
     ) -> bool {
+        let shutdown = client.connection_shutdown_signal();
+        Self::handle_scoped(&client, &node, &shutdown).await;
+        true
+    }
+}
+
+impl IqHandler {
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.iq", level = "debug", skip_all)
+    )]
+    pub(crate) async fn handle_scoped(
+        client: &Arc<Client>,
+        node: &Arc<wacore_binary::OwnedNodeRef>,
+        shutdown: &wacore::runtime::ShutdownSignal,
+    ) {
         let nr = node.get();
-        if !client.handle_iq(nr).await {
+        if !client.handle_iq_scoped(nr, shutdown).await {
             if nr.get_attr("type").is_some_and(|s| s.as_str() == "result") {
                 debug!(
                     "Received late IQ response (waiter already removed): {}",
@@ -44,6 +56,5 @@ impl StanzaHandler for IqHandler {
                 warn!("Received unhandled IQ: {}", DisplayableNodeRef(nr));
             }
         }
-        true
     }
 }

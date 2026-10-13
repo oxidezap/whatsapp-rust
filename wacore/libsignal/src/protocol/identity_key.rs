@@ -122,9 +122,11 @@ impl IdentityKeyPair {
     // IdentityKeyPairStructure round-trips only here; no codec pin needed.
     #[allow(clippy::disallowed_methods)]
     pub fn serialize(&self) -> Box<[u8]> {
-        let structure = IdentityKeyPairStructure {
-            public_key: Some(self.identity_key.serialize().to_vec()),
-            private_key: Some(self.private_key.serialize().to_vec()),
+        let structure = {
+            let mut proto = IdentityKeyPairStructure::default();
+            proto.public_key = Some(self.identity_key.serialize().to_vec());
+            proto.private_key = Some(self.private_key.serialize().to_vec());
+            proto
         };
 
         let result = structure.encode_to_vec();

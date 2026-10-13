@@ -130,13 +130,16 @@ impl Client {
             target_key.participant = Some(author.to_non_ad_string());
         }
 
-        let message = wa::Message {
-            enc_reaction_message: MessageField::some(wa::message::EncReactionMessage {
-                target_message_key: MessageField::some(target_key),
-                enc_payload: Some(enc_payload),
-                enc_iv: Some(iv.to_vec()),
-            }),
-            ..Default::default()
+        let message = {
+            let mut proto = wa::Message::default();
+            proto.enc_reaction_message = MessageField::some({
+                let mut proto = wa::message::EncReactionMessage::default();
+                proto.target_message_key = MessageField::some(target_key);
+                proto.enc_payload = Some(enc_payload);
+                proto.enc_iv = Some(iv.to_vec());
+                proto
+            });
+            proto
         };
         self.send_message(chat, message).await
     }
