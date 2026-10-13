@@ -1618,14 +1618,18 @@ mod tests {
     }
 
     /// The marker keeps the generation it was asked on, so an answer that
-    /// outlives its connection can be refused the unverified fallback.
+    /// outlives its connection can be refused before changing the collection.
     #[tokio::test]
     async fn a_recovery_request_remembers_the_generation_it_was_asked_on() {
         let backend = Arc::new(MockBackend::default());
         let processor =
             AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
 
-        assert!(processor.mark_recovery_requested("regular_low", 7).await);
+        assert!(
+            processor
+                .mark_recovery_requested_on_generation("regular_low", 7)
+                .await
+        );
         processor
             .note_recovery_request_id("regular_low", "req-7")
             .await;
@@ -1657,11 +1661,15 @@ mod tests {
         );
 
         assert!(
-            processor.mark_recovery_requested("regular_low", 0).await,
+            processor
+                .mark_recovery_requested_on_generation("regular_low", 0)
+                .await,
             "the first ask is a new one"
         );
         assert!(
-            !processor.mark_recovery_requested("regular_low", 0).await,
+            !processor
+                .mark_recovery_requested_on_generation("regular_low", 0)
+                .await,
             "a second ask while one is outstanding is suppressed: the reply already coming answers it"
         );
         assert!(processor.take_recovery_request("regular_low").await);
@@ -1673,7 +1681,11 @@ mod tests {
         // And an answer is claimed, not merely recognised: a response repeating
         // its result, or a second copy of it, would otherwise each inflate and
         // decode a whole collection against the one ask.
-        assert!(processor.mark_recovery_requested("regular_low", 0).await);
+        assert!(
+            processor
+                .mark_recovery_requested_on_generation("regular_low", 0)
+                .await
+        );
         processor
             .note_recovery_request_id("regular_low", "req-1")
             .await;

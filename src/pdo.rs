@@ -811,7 +811,11 @@ impl Client {
 
         let proc = self.get_app_state_processor();
         if !proc
-            .mark_recovery_requested(collection, self.current_generation())
+            .mark_recovery_requested_on_generation(
+                collection,
+                self.connection_generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
             .await
         {
             // One is already outstanding, and the reply that is coming answers
@@ -954,23 +958,13 @@ impl Client {
             // end, or a usable recovery is dropped and the collection stays
             // behind the MAC failure it started at.
             let proc = self.get_app_state_processor();
-            if proc
-                .claim_recovery_request_by_id(request_id)
-                .await
-                .is_some()
-                && let Some((name, asked_on)) = proc
-                    .take_recovery_request_with_generation_by_id(request_id)
-                    .await
-            {
-                warn!("Snapshot recovery response for {name} carries no result");
-                self.fall_back_to_unverified_snapshot(&name, asked_on);
+            if let Some(name) = proc.claim_recovery_request_by_id(request_id).await {
+                proc.take_recovery_request_by_id(request_id).await;
+                warn!(
+                    "Snapshot recovery response for {name} carries no result; it may be asked for again"
+                );
             }
         }
-    }
-
-    fn current_generation(&self) -> u64 {
-        self.connection_generation
-            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Apply a collection the primary sent back after a snapshot we refused.
@@ -1002,23 +996,16 @@ impl Client {
             // one's decoder is still working against -- and that task, finding
             // no marker at the end, would drop a usable recovery.
             let proc = self.get_app_state_processor();
-            if proc
-                .claim_recovery_request_by_id(request_id)
-                .await
-                .is_none()
-            {
+            let Some(name) = proc.claim_recovery_request_by_id(request_id).await else {
                 warn!(
                     "Ignoring a snapshot recovery with no collection: nothing here is waiting on that ask"
                 );
                 return;
-            }
-            if let Some((name, asked_on)) = proc
-                .take_recovery_request_with_generation_by_id(request_id)
-                .await
-            {
-                warn!("Snapshot recovery response for {name} carries no collection");
-                self.fall_back_to_unverified_snapshot(&name, asked_on);
-            }
+            };
+            proc.take_recovery_request_by_id(request_id).await;
+            warn!(
+                "Snapshot recovery response for {name} carries no collection; it may be asked for again"
+            );
             return;
         };
 
@@ -1079,17 +1066,13 @@ impl Client {
             wacore::history_sync::MAX_DECOMPRESSED
         };
         if blob.len() as u64 > max_wire {
-            let taken = self
-                .get_app_state_processor()
-                .take_recovery_request_with_generation_by_id(request_id)
+            self.get_app_state_processor()
+                .take_recovery_request_by_id(request_id)
                 .await;
             warn!(
                 "Snapshot recovery for {asked} is {} bytes on the wire, over the {max_wire} this path allows; refusing it",
                 blob.len()
             );
-            if let Some((_, asked_on)) = taken {
-                self.fall_back_to_unverified_snapshot(&asked, asked_on);
-            }
             return;
         }
         let payload = blob.to_vec();
@@ -1103,26 +1086,10 @@ impl Client {
             // pins its instantiation: off the runtime's async workers either
             // way.
             let decoded = wacore::runtime::blocking(&*client.runtime, move || {
-                let bytes = if compressed {
-                    match inflate_zlib(&payload) {
-                        Ok(plain) => std::borrow::Cow::Owned(plain),
-                        Err(zlib) => match inflate_gzip(&payload) {
-                            Some(plain) => std::borrow::Cow::Owned(plain),
-                            None => {
-                                return Err(format!(
-                                    "{zlib} (header {:02x?}, not gzip either)",
-                                    &payload[..payload.len().min(4)]
-                                ));
-                            }
-                        },
-                    }
-                } else {
-                    std::borrow::Cow::Borrowed(&payload[..])
-                };
-                waproto::codec::syncd_snapshot_recovery_decode(&bytes)
-                    .map_err(|e| format!("failed to decode: {e}"))
+                decode_snapshot_recovery(&payload, compressed)
             })
             .await;
+
             let recovery = match decoded {
                 Ok(recovery) => recovery,
                 Err(e) => {
@@ -1132,14 +1099,10 @@ impl Client {
                     // -- and leaving the marker would suppress every retry for
                     // the rest of the window over a question already answered.
                     let proc = client.get_app_state_processor();
-                    match proc
-                        .take_recovery_request_with_generation_by_id(&request_id)
-                        .await
-                    {
-                        Some((name, asked_on)) => {
-                            warn!("Snapshot recovery response for {name} {e}");
-                            client.fall_back_to_unverified_snapshot(&name, asked_on);
-                        }
+                    match proc.take_recovery_request_by_id(&request_id).await {
+                        Some(name) => warn!(
+                            "Snapshot recovery response for {name} {e}; the collection may be asked for again"
+                        ),
                         None => warn!("Snapshot recovery response {e}"),
                     }
                     return;
@@ -1151,16 +1114,11 @@ impl Client {
             match recovery.collection_name.as_deref() {
                 Some(named) if named == asked => {}
                 other => {
-                    let taken = proc
-                        .take_recovery_request_with_generation_by_id(&request_id)
-                        .await;
+                    proc.take_recovery_request_by_id(&request_id).await;
                     warn!(
                         "Snapshot recovery answering the ask for {asked} names {}; refusing it",
                         other.unwrap_or("nothing")
                     );
-                    if let Some((_, asked_on)) = taken {
-                        client.fall_back_to_unverified_snapshot(&asked, asked_on);
-                    }
                     return;
                 }
             }
@@ -1169,10 +1127,7 @@ impl Client {
             // registry wholesale -- so a task that started before one and
             // applied after it would write beside the new connection's own sync
             // and dispatch events for a session that has since been replaced.
-            if client
-                .connection_generation
-                .load(std::sync::atomic::Ordering::Acquire)
-                != generation
+            if client.connection_generation.load(std::sync::atomic::Ordering::Acquire) != generation
             {
                 // Spent, like every other ending that is not an apply. The ask
                 // was answered; dropping the answer because the connection went
@@ -4107,6 +4062,25 @@ mod tests {
     }
 }
 
+/// Decode the complete bounded recovery before allowing any state changes.
+fn decode_snapshot_recovery(
+    payload: &[u8],
+    compressed: bool,
+) -> Result<wa::SyncdSnapshotRecovery, String> {
+    let bytes = if compressed {
+        match inflate_zlib(payload) {
+            Ok(plain) => std::borrow::Cow::Owned(plain),
+            Err(zlib) => match inflate_gzip(payload) {
+                Some(plain) => std::borrow::Cow::Owned(plain),
+                None => return Err(format!("{zlib}; not a complete gzip stream either")),
+            },
+        }
+    } else {
+        std::borrow::Cow::Borrowed(payload)
+    };
+    waproto::codec::syncd_snapshot_recovery_decode(&bytes)
+        .map_err(|e| format!("failed to decode: {e}"))
+}
 /// Inflates a zlib stream, refusing one that is cut short or followed by more
 /// bytes.
 fn inflate_zlib(payload: &[u8]) -> Result<Vec<u8>, String> {
@@ -4157,8 +4131,11 @@ fn inflate_zlib(payload: &[u8]) -> Result<Vec<u8>, String> {
 /// The primary's reply flagged compressed but sent as gzip (`1f 8b 08 00`),
 /// not zlib. Bounded like the zlib path, and whole or nothing like it too.
 fn inflate_gzip(payload: &[u8]) -> Option<Vec<u8>> {
+    inflate_gzip_bounded(payload, wacore::history_sync::MAX_DECOMPRESSED)
+}
+
+fn inflate_gzip_bounded(payload: &[u8], max: u64) -> Option<Vec<u8>> {
     use std::io::Read;
-    let max = wacore::history_sync::MAX_DECOMPRESSED;
     let mut decoder = flate2::bufread::GzDecoder::new(payload);
     let mut plain = Vec::new();
     (&mut decoder).take(max + 1).read_to_end(&mut plain).ok()?;
@@ -4190,12 +4167,64 @@ mod inflate_gzip_tests {
         e.finish().unwrap()
     }
 
+    fn recovery() -> super::wa::SyncdSnapshotRecovery {
+        let mut recovery = super::wa::SyncdSnapshotRecovery::default();
+        recovery.collection_name = Some("regular_low".to_string());
+        let mut version = super::wa::SyncdVersion::default();
+        version.version = Some(7);
+        recovery.version = buffa::MessageField::some(version);
+        recovery
+    }
+
+    #[test]
+    fn decodes_compressed_recovery_as_gzip_and_zlib() {
+        use buffa::Message;
+        let expected = recovery();
+        let raw = expected.encode_to_vec();
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(&raw).unwrap();
+        for payload in [gzip(&raw), z.finish().unwrap()] {
+            let decoded = super::decode_snapshot_recovery(&payload, true).unwrap();
+            assert_eq!(decoded, expected);
+        }
+        assert_eq!(
+            super::decode_snapshot_recovery(&raw, false).unwrap(),
+            expected
+        );
+        assert!(super::decode_snapshot_recovery(&gzip(&raw), false).is_err());
+    }
+
+    #[test]
+    fn decoder_rejects_incomplete_or_appended_recoveries() {
+        use buffa::Message;
+        let raw = recovery().encode_to_vec();
+        let payload = gzip(&raw);
+        assert!(super::decode_snapshot_recovery(&payload[..payload.len() - 4], true).is_err());
+        let mut members = payload.clone();
+        members.extend(gzip(&raw));
+        assert!(super::decode_snapshot_recovery(&members, true).is_err());
+        let mut corrupt = payload;
+        let n = corrupt.len();
+        corrupt[n - 8] ^= 1;
+        assert!(super::decode_snapshot_recovery(&corrupt, true).is_err());
+        assert!(super::decode_snapshot_recovery(&gzip(&[255]), true).is_err());
+    }
+
     #[test]
     fn inflates_a_whole_gzip_stream() {
         assert_eq!(
             inflate_gzip(&gzip(b"records")).as_deref(),
             Some(&b"records"[..])
         );
+    }
+
+    #[test]
+    fn gzip_limit_accepts_the_boundary_and_rejects_one_byte_more() {
+        assert_eq!(
+            super::inflate_gzip_bounded(&gzip(b"12345678"), 8),
+            Some(b"12345678".to_vec())
+        );
+        assert_eq!(super::inflate_gzip_bounded(&gzip(b"123456789"), 8), None);
     }
 
     #[test]

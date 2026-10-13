@@ -3433,20 +3433,14 @@ impl Client {
             .get_int(wacore::iq::abprops::web::SNAPSHOT_RECOVERY_MAX_MUTATIONS_COUNT_ALLOWED)
             .await;
         if allowed > 0 && recovery.mutation_records.len() as i64 > allowed {
-            let taken = self
-                .get_app_state_processor()
-                .take_recovery_request_with_generation_by_id(request_id)
+            self.get_app_state_processor()
+                .take_recovery_request_by_id(request_id)
                 .await;
             warn!(
                 target: "Client/AppState",
                 "Snapshot recovery for {name} carries {} records, over the {allowed} allowed; refusing it",
                 recovery.mutation_records.len()
             );
-            // Refused, so as unusable as one that would not decode: the
-            // snapshot still fails its MAC and no second answer is coming.
-            if let Some((_, asked_on)) = taken {
-                self.fall_back_to_unverified_snapshot(name, asked_on);
-            }
             return;
         }
 
@@ -3534,12 +3528,13 @@ impl Client {
             .take_recovery_request_with_generation_by_id(request_id)
             .await
         else {
-            debug!(
-                target: "Client/AppState",
-                "The recovery request for {name} is no longer outstanding; dropping this reply"
-            );
+            debug!(target: "Client/AppState", "The recovery request for {name} is no longer outstanding; dropping this reply");
             return;
         };
+        if asked_on != generation {
+            debug!(target: "Client/AppState", "Dropping the {name} recovery from a retired request generation");
+            return;
+        }
 
         // Rechecked after the waits above, not only before them. A disconnect
         // during the key share or the reservation clears the registry, so the
@@ -3564,7 +3559,7 @@ impl Client {
         // held across the awaits inside the apply, and `Client` carries trait
         // objects that are neither on wasm.
         let live = Arc::clone(&self.connection_generation);
-        let still_current = move || live.load(Ordering::Acquire) == generation;
+        let still_current = move || live.load(Ordering::Acquire) == asked_on;
         // The recovery's own version, read before `apply_snapshot_recovery`
         // moves `recovery`: it is the post-apply cursor for the semantic
         // context below. `apply_snapshot_recovery` refuses a version-less
@@ -3637,71 +3632,8 @@ impl Client {
                     target: "Client/AppState",
                     "Failed to apply the snapshot recovery for {name}: {e}"
                 );
-                self.fall_back_to_unverified_snapshot(name, asked_on);
             }
         }
-    }
-
-    /// Peer recovery failed for a collection whose snapshot does not validate:
-    /// take the server's snapshot after all, with each record still checked on
-    /// its own, rather than leave the collection empty for good.
-    ///
-    /// `generation` is the connection the failed recovery was asked on, as
-    /// recorded with its marker. An answer that outlived that connection is not
-    /// allowed to waive the aggregate MAC on the one that replaced it.
-    pub(crate) fn fall_back_to_unverified_snapshot(&self, name: &str, generation: u64) {
-        let Ok(patch) = name.parse::<WAPatchName>() else {
-            return;
-        };
-        if patch == WAPatchName::CriticalBlock {
-            return;
-        }
-        if self.connection_generation.load(Ordering::Acquire) != generation {
-            debug!(
-                target: "Client/AppState",
-                "Not falling back for {name}: the connection its recovery belongs to is gone"
-            );
-            return;
-        }
-        let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
-            return;
-        };
-        warn!(
-            target: "Client/AppState",
-            "Falling back to the server's {name} snapshot without its aggregate MAC"
-        );
-        let name = name.to_string();
-        self.runtime.spawn_detached(Box::pin(async move {
-            // Asked again inside the task: the check above is true only until
-            // the task runs, and the grant is an await of its own.
-            let current = || client.connection_generation.load(Ordering::Acquire) == generation;
-            let proc = client.get_app_state_processor();
-            if !current() {
-                return;
-            }
-            proc.tolerate_next_snapshot_mac_mismatch(&name).await;
-            if !current() {
-                proc.revoke_snapshot_mac_tolerance(&name).await;
-                debug!(
-                    target: "Client/AppState",
-                    "Not falling back for {name}: the connection its recovery belongs to is gone"
-                );
-                return;
-            }
-            let result = client.resync_app_state_collection(patch).await;
-            proc.revoke_snapshot_mac_tolerance(&name).await;
-            match result {
-                Ok(report) if report.all_synced() => {}
-                Ok(report) => warn!(
-                    target: "Client/AppState",
-                    "Fallback resync of {patch:?} left {:?} unsynced",
-                    report.unsynced().collect::<Vec<_>>()
-                ),
-                Err(e) => {
-                    warn!(target: "Client/AppState", "Fallback resync of {patch:?} failed: {e}")
-                }
-            }
-        }));
     }
 
     /// Ask the primary for a collection whose snapshot this side cannot validate.
@@ -4817,6 +4749,61 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recovery_from_retired_request_generation_does_not_advance_state() {
+        let client = crate::test_utils::create_test_client_with_name("retired-recovery").await;
+        client
+            .persistence_manager
+            .backend()
+            .set_version(
+                "regular_low",
+                wacore::appstate::hash::HashState {
+                    version: 7,
+                    bootstrapped: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        let proc = client.get_app_state_processor();
+        assert!(
+            proc.mark_recovery_requested_on_generation("regular_low", generation)
+                .await
+        );
+        proc.note_recovery_request_id("regular_low", "old-request")
+            .await;
+        client
+            .connection_generation
+            .store(generation + 1, Ordering::Release);
+        let mut recovery = wa::SyncdSnapshotRecovery::default();
+        recovery.collection_name = Some("regular_low".to_string());
+        let mut version = wa::SyncdVersion::default();
+        version.version = Some(8);
+        recovery.version = buffa::MessageField::some(version);
+        recovery.collection_lthash = Some(vec![0; 128]);
+        client
+            .apply_recovered_collection("regular_low", "old-request", generation + 1, recovery)
+            .await;
+        assert_eq!(
+            client
+                .persistence_manager
+                .backend()
+                .get_version("regular_low")
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            7
+        );
+        assert!(!proc.has_recovery_request("regular_low").await);
+        assert!(
+            proc.mark_recovery_requested_on_generation("regular_low", generation + 1)
+                .await,
+            "retired answer does not suppress retries"
+        );
+    }
 
     /// JID redaction keeps routing answerable without leaking accounts:
     /// a value that parses as a JID with a known server redacts to
