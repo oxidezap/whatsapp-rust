@@ -546,35 +546,44 @@ impl Client {
         let owner = Arc::new(self.inbound_commit_batch.pending_storage.lock_arc().await);
         let lease = PendingInboundLease::new(owner);
         let backend = self.persistence_manager.backend();
+        let mut failure = None;
         for row in rows {
             let key = PendingInboundKey {
                 chat: &row.chat,
                 sender: &row.sender,
                 id: &row.id,
             };
-            match backend
+            let result = match backend
                 .delete_pending_inbound_if(key, row.revision, MAX_PENDING_BYTES, lease.clone())
                 .await
             {
-                Ok(PendingInboundMutation::Applied) => {}
-                Ok(_) => {
-                    anyhow::bail!("pending occurrence cleanup revision conflict");
-                }
+                Ok(PendingInboundMutation::Applied) => Ok(()),
+                Ok(_) => Err(anyhow::anyhow!(
+                    "pending occurrence cleanup revision conflict"
+                )),
                 Err(error) => {
-                    // The hook has committed. An error can follow an applied
-                    // deletion, so verify absence under the same mutation owner
-                    // before withholding ACK. Never delete a successor.
-                    if backend
+                    // An error can follow an applied deletion. Verify absence
+                    // under the same owner, and never delete a successor.
+                    match backend
                         .read_pending_inbound_bounded(key, MAX_PENDING_BYTES, lease.clone())
-                        .await?
-                        .is_some()
+                        .await
                     {
-                        return Err(error.into());
+                        Ok(None) => Ok(()),
+                        Ok(Some(_)) => Err(error.into()),
+                        Err(error) => Err(error.into()),
                     }
                 }
+            };
+            if let Err(error) = result {
+                // Retain ACK failure, but clean other owned revisions: leaving
+                // both physical aliases would make bounded replay ambiguous.
+                failure.get_or_insert(error);
             }
         }
-        Ok(())
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1378,7 +1387,9 @@ impl Client {
         // Cleanup then compares each retained revision, including spellings
         // whose identical projection is represented by another hook item.
         let pending = Arc::clone(&arrived);
-        let items: Arc<[InboundMessage]> = items.iter().map(|entry| entry.item.clone()).collect();
+        let deliveries = items;
+        let items: Arc<[InboundMessage]> =
+            deliveries.iter().map(|entry| entry.item.clone()).collect();
         let arrived: Arc<[InboundMessage]> =
             arrived.iter().map(|entry| entry.item.clone()).collect();
 
@@ -1387,7 +1398,8 @@ impl Client {
         let mut hook_committed = false;
         let mut cleanup = None;
         let dispatch_gate = self.dispatch_gate_enabled();
-        let mut fingerprints = smallvec::SmallVec::<[Option<DispatchFingerprint>; 1]>::new();
+        let mut fingerprints =
+            smallvec::SmallVec::<[(Option<DispatchFingerprint>, bool); 1]>::new();
         if let Some(hook) = self.inbound_durability_hook() {
             if dispatch_gate {
                 fingerprints.reserve_exact(items.len());
@@ -1401,15 +1413,19 @@ impl Client {
             };
             if dispatch_gate {
                 let mut scratch = Vec::new();
-                for item in items.iter() {
-                    fingerprints.push(
-                        (!crate::features::message_edit::carries_secret_encrypted(&item.message))
-                            .then(|| {
-                                MessageDispatch::fingerprint_into(&item.message, &mut scratch)
-                            }),
-                    );
+                for delivery in deliveries.iter() {
+                    fingerprints.push((
+                        (!crate::features::message_edit::carries_secret_encrypted(
+                            &delivery.message,
+                        ))
+                        .then(|| {
+                            MessageDispatch::fingerprint_into(&delivery.message, &mut scratch)
+                        }),
+                        delivery.storage_sender.is_some(),
+                    ));
                 }
             }
+            drop(deliveries);
             // A failed flush reports not-durable so buffered receipts are held
             // back. The guard is still armed: the rows are in place and
             // re-storing them is idempotent (replace-into), so the restored
@@ -1443,6 +1459,7 @@ impl Client {
             }
             cleanup = Some(stored);
         } else {
+            drop(deliveries);
             // No hook = at-most-once: the flush is the durable point, so a
             // failure restores the entries (guard still armed) for a retry.
             if is_drain && !self.drain_signal_flush_reporting().await {
@@ -1464,18 +1481,30 @@ impl Client {
         for (index, item) in items.iter().enumerate() {
             // A later PDO may carry another part under this id. Comparing it
             // without retaining plaintext requires this ordinary digest now.
-            let fingerprint = fingerprints.get(index).copied().unwrap_or_else(|| {
-                (dispatch_gate
-                    && !crate::features::message_edit::carries_secret_encrypted(&item.message))
-                .then(|| MessageDispatch::fingerprint_into(&item.message, &mut encode_scratch))
-            });
-            let suppress = self.admit_message_dispatch(
-                &item.info,
-                false,
-                fingerprint,
-                hook_committed,
-                &mut publication,
-            );
+            let (fingerprint, stored_replay) =
+                fingerprints.get(index).copied().unwrap_or_else(|| {
+                    (
+                        (dispatch_gate
+                            && !crate::features::message_edit::carries_secret_encrypted(
+                                &item.message,
+                            ))
+                        .then(|| {
+                            MessageDispatch::fingerprint_into(&item.message, &mut encode_scratch)
+                        }),
+                        false,
+                    )
+                });
+            // Only retained-row replay skips a completed hook publication.
+            // Fresh multipart occurrences still use ordinary admission.
+            let suppress = stored_replay
+                && fingerprint.is_some_and(|fp| self.completed_hook_publication(&item.info, &fp))
+                || self.admit_message_dispatch(
+                    &item.info,
+                    false,
+                    fingerprint,
+                    hook_committed,
+                    &mut publication,
+                );
             if suppress {
                 retained.get_or_insert_with(|| items[..index].to_vec());
                 self.duplicate_dispatch_suppressed
@@ -1551,7 +1580,6 @@ mod tests {
     use crate::types::durability_hook::InboundDurabilityHook;
     use crate::types::message::{MessageInfo, MessageSource};
     use std::sync::Mutex;
-    use std::time::Duration;
     use wacore::types::events::ChannelEventHandler;
 
     struct RecordingHook {
@@ -1609,12 +1637,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_pending_partial_alias_cleanup_redelivery_does_not_republish() {
-        use wacore::store::in_memory::InMemoryBackend;
-        use wacore::store::traits::ProtocolStore;
-        let backend = Arc::new(InMemoryBackend::new());
-        let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
-        let transport = capture_pending_receipts(&client).await;
+    async fn raw_pending_completed_hook_claim_preserves_fresh_multipart() {
+        let backend = Arc::new(wacore::store::in_memory::InMemoryBackend::new());
+        let client = crate::test_utils::create_test_client_with_backend(backend).await;
         let hook = Arc::new(RecordingHook {
             batches: Mutex::new(Vec::new()),
         });
@@ -1625,80 +1650,159 @@ mod tests {
             .unwrap();
         let (handler, rx) = ChannelEventHandler::new();
         client.core.event_bus.subscribe_handler(handler).detach();
-        let bare = PendingDelivery::from(item("ALIAS_PARTIAL"));
-        let mut legacy = item("ALIAS_PARTIAL");
-        let mut legacy_info = (*legacy.info).clone();
-        legacy_info.source.sender = "200:75@s.whatsapp.net".parse().unwrap();
-        legacy.info = Arc::new(legacy_info);
-        let mut legacy = PendingDelivery::from(legacy);
-        legacy.storage_sender = Some(Arc::from("200:75@s.whatsapp.net"));
-        let payload = waproto::codec::message_to_vec(&bare.message);
-        for sender in ["200:75@s.whatsapp.net", "200@s.whatsapp.net"] {
-            backend
-                .store_pending_inbound("100@g.us", sender, "ALIAS_PARTIAL", &payload)
-                .await
-                .unwrap();
-        }
-        backend.set_fail_pending_delete(Some(false));
-        backend.skip_pending_delete_failures(1);
-        let outcome = client
-            .commit_pending_batch_result(
-                vec![legacy, bare.clone()].into(),
-                BatchOrigin::OfflineDrain,
-                None,
-                true,
-            )
-            .await;
-        assert!(outcome.persisted);
-        assert!(!outcome.delivered);
+        let original = item("FRESH_MULTIPART");
+        let producer = raw_pending::StanzaOrigin::new();
+        let bytes = bytes::Bytes::from(waproto::codec::message_to_vec(&original.message));
+        let part = |position| {
+            let mut delivery = PendingDelivery::from(original.clone());
+            delivery.origin = Some(raw_pending::DeliveryOrigin {
+                stanza: producer,
+                position,
+            });
+            delivery.carrier = Some((Some(position as u32), bytes.clone()));
+            delivery
+        };
         assert!(
-            backend
-                .get_pending_inbound("100@g.us", "200:75@s.whatsapp.net", "ALIAS_PARTIAL")
+            client
+                .commit_pending_batch_result(
+                    vec![part(0), part(1)].into(),
+                    BatchOrigin::OfflineDrain,
+                    None,
+                    false
+                )
                 .await
-                .unwrap()
-                .is_none()
+                .delivered
         );
-        assert!(
-            backend
-                .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "ALIAS_PARTIAL")
-                .await
-                .unwrap()
-                .is_some()
-        );
-        let event = rx
-            .try_recv()
-            .expect("deleted alias must not lose the consumer event");
+        let event = rx.try_recv().unwrap();
         let Event::Messages(batch) = event.as_ref() else {
             panic!("expected message batch")
         };
-        assert_eq!(batch.len(), 1, "physical aliases are one consumer message");
-        assert!(batch.hook_committed);
-        assert_eq!(hook.batches.lock().unwrap()[0].len(), 1);
-        crate::test_utils::wait_for_outbound_tasks(&client).await;
         assert_eq!(
-            super::super::tests::delivery_receipts_for(&transport.sent(), "ALIAS_PARTIAL"),
-            0
+            batch.len(),
+            2,
+            "equal parts within one producer are not repeats"
         );
-        backend.set_fail_pending_delete(None);
-        client.cleanup_connection_state().await;
-        client.enter_live_mode_for_tests();
-        let transport = capture_pending_receipts(&client).await;
-        // Use the retained-row redelivery path, not a synthetic re-commit of
-        // the deleted alias. Its new MessageInfo must find the completed claim.
-        assert!(client.ack_or_replay_to_hook(&bare.info).await);
+        assert_eq!(hook.batches.lock().unwrap()[0].len(), 2);
         assert!(
-            backend
-                .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "ALIAS_PARTIAL")
+            client
+                .commit_pending_batch_result(vec![part(2)].into(), BatchOrigin::Live, None, false)
                 .await
-                .unwrap()
-                .is_none()
+                .delivered
         );
-        assert!(rx.try_recv().is_err());
-        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        let event = rx.try_recv().unwrap();
+        let Event::Messages(batch) = event.as_ref() else {
+            panic!("expected message batch")
+        };
         assert_eq!(
-            super::super::tests::delivery_receipts_for(&transport.sent(), "ALIAS_PARTIAL"),
-            1
+            batch.len(),
+            1,
+            "a fresh later part must survive the completed hook claim"
         );
+        assert_eq!(hook.batches.lock().unwrap()[1].len(), 1);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn raw_pending_partial_alias_cleanup_redelivery_does_not_republish() {
+        for failed_index in [0, 1] {
+            use wacore::store::in_memory::InMemoryBackend;
+            use wacore::store::traits::ProtocolStore;
+            let backend = Arc::new(InMemoryBackend::new());
+            let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+            let transport = capture_pending_receipts(&client).await;
+            let hook = Arc::new(RecordingHook {
+                batches: Mutex::new(Vec::new()),
+            });
+            client
+                .inbound_durability_hook
+                .set(hook.clone())
+                .ok()
+                .unwrap();
+            let (handler, rx) = ChannelEventHandler::new();
+            client.core.event_bus.subscribe_handler(handler).detach();
+            let bare = PendingDelivery::from(item("ALIAS_PARTIAL"));
+            let mut legacy = item("ALIAS_PARTIAL");
+            let mut legacy_info = (*legacy.info).clone();
+            legacy_info.source.sender = "200:75@s.whatsapp.net".parse().unwrap();
+            legacy.info = Arc::new(legacy_info);
+            let mut legacy = PendingDelivery::from(legacy);
+            legacy.storage_sender = Some(Arc::from("200:75@s.whatsapp.net"));
+            let payload = waproto::codec::message_to_vec(&bare.message);
+            for sender in ["200:75@s.whatsapp.net", "200@s.whatsapp.net"] {
+                backend
+                    .store_pending_inbound("100@g.us", sender, "ALIAS_PARTIAL", &payload)
+                    .await
+                    .unwrap();
+            }
+            backend.fail_one_pending_delete(failed_index, false);
+            let outcome = client
+                .commit_pending_batch_result(
+                    vec![legacy, bare.clone()].into(),
+                    BatchOrigin::OfflineDrain,
+                    None,
+                    true,
+                )
+                .await;
+            assert!(outcome.persisted);
+            assert!(!outcome.delivered);
+            assert!(
+                backend
+                    .get_pending_inbound("100@g.us", "200:75@s.whatsapp.net", "ALIAS_PARTIAL")
+                    .await
+                    .unwrap()
+                    .is_none()
+                    == (failed_index != 0)
+            );
+            assert!(
+                backend
+                    .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "ALIAS_PARTIAL")
+                    .await
+                    .unwrap()
+                    .is_some()
+                    == (failed_index == 1)
+            );
+            let event = rx
+                .try_recv()
+                .expect("deleted alias must not lose the consumer event");
+            let Event::Messages(batch) = event.as_ref() else {
+                panic!("expected message batch")
+            };
+            assert_eq!(batch.len(), 1, "physical aliases are one consumer message");
+            assert!(batch.hook_committed);
+            assert_eq!(hook.batches.lock().unwrap()[0].len(), 1);
+            crate::test_utils::wait_for_outbound_tasks(&client).await;
+            assert_eq!(
+                super::super::tests::delivery_receipts_for(&transport.sent(), "ALIAS_PARTIAL"),
+                0
+            );
+            backend.set_fail_pending_delete(None);
+            client.cleanup_connection_state().await;
+            client.enter_live_mode_for_tests();
+            let transport = capture_pending_receipts(&client).await;
+            // Use the retained-row redelivery path, not a synthetic re-commit of
+            // the deleted alias. Its new MessageInfo must find the completed claim.
+            assert!(client.ack_or_replay_to_hook(&bare.info).await);
+            assert!(
+                backend
+                    .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "ALIAS_PARTIAL")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                backend
+                    .get_pending_inbound("100@g.us", "200:75@s.whatsapp.net", "ALIAS_PARTIAL")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(rx.try_recv().is_err());
+            crate::test_utils::wait_for_outbound_tasks(&client).await;
+            assert_eq!(
+                super::super::tests::delivery_receipts_for(&transport.sent(), "ALIAS_PARTIAL"),
+                1
+            );
+        }
     }
 
     #[tokio::test]
@@ -1768,7 +1872,7 @@ mod tests {
                     .get_pending_inbound("100@g.us", "200@s.whatsapp.net", id)
                     .await
                     .unwrap();
-                assert_eq!(stored.is_none(), index < failed_index);
+                assert_eq!(stored.is_none(), index != failed_index);
                 if index == failed_index {
                     assert_eq!(stored.unwrap(), [9]);
                 }
@@ -1828,7 +1932,7 @@ mod tests {
                         .await
                 }
             });
-            tokio::time::timeout(Duration::from_secs(5), gate.wait())
+            tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait())
                 .await
                 .unwrap();
             worker.abort();
@@ -1870,10 +1974,16 @@ mod tests {
             );
             client.enter_live_mode_for_tests();
             let transport = capture_pending_receipts(&client).await;
-            let retry = client
-                .commit_pending_batch_result(entries, BatchOrigin::Live, None, true)
-                .await;
-            assert!(retry.delivered);
+            for entry in entries.iter() {
+                client.ack_or_replay_to_hook(&entry.info).await;
+                assert!(
+                    backend
+                        .get_pending_inbound("100@g.us", "200@s.whatsapp.net", &entry.info.id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
             crate::test_utils::wait_for_outbound_tasks(&client).await;
             for id in ids {
                 assert_eq!(
@@ -1911,8 +2021,7 @@ mod tests {
                 .iter()
                 .map(|id| PendingDelivery::from(item(id)))
                 .collect();
-            backend.set_fail_pending_delete(Some(false));
-            backend.skip_pending_delete_failures(failed_index);
+            backend.fail_one_pending_delete(failed_index, false);
             let outcome = client
                 .commit_pending_batch_result(
                     Arc::clone(&entries),
@@ -1934,7 +2043,7 @@ mod tests {
                         .await
                         .unwrap()
                         .is_none(),
-                    index < failed_index as usize
+                    index != failed_index as usize
                 );
             }
             let event = rx
@@ -1967,10 +2076,16 @@ mod tests {
             );
             client.enter_live_mode_for_tests();
             let transport = capture_pending_receipts(&client).await;
-            let retry = client
-                .commit_pending_batch_result(entries, BatchOrigin::Live, None, true)
-                .await;
-            assert!(retry.delivered);
+            for entry in entries.iter() {
+                client.ack_or_replay_to_hook(&entry.info).await;
+                assert!(
+                    backend
+                        .get_pending_inbound("100@g.us", "200@s.whatsapp.net", &entry.info.id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
             crate::test_utils::wait_for_outbound_tasks(&client).await;
             for id in ids {
                 assert_eq!(

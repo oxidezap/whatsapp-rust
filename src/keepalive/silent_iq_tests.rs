@@ -313,6 +313,115 @@ async fn an_iq_whose_write_never_completes_times_out() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn failed_ping_does_not_authorize_teardown_of_a_new_deadline() {
+    if isolate(concat!(
+        module_path!(),
+        "::failed_ping_does_not_authorize_teardown_of_a_new_deadline"
+    )) {
+        return;
+    }
+    async fn wait_sent(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        count: usize,
+    ) {
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        while transport.sent_count() < count {
+            assert!(
+                tokio::time::Instant::now() < until,
+                "frame {count} must reach the transport"
+            );
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+    }
+    let logs = log_capture::session();
+    let (client, transport) = create_iq_test_client().await;
+    let generation = client.connection_generation.load(Ordering::Acquire);
+    let keepalive = start_keepalive(&client);
+    tokio::task::yield_now().await;
+    tokio::time::advance(KEEP_ALIVE_INTERVAL_MAX).await;
+    wait_sent(&transport, 1).await;
+    let first = decode_sent_iq(&transport, 0).await;
+    let first_id = first
+        .get()
+        .attrs()
+        .optional_string("id")
+        .unwrap()
+        .into_owned();
+    client.stats.mark_recv_activity();
+    client
+        .process_node(node_to_owned_ref(
+            &NodeBuilder::new("iq")
+                .attr("id", first_id.as_str())
+                .attr(
+                    "from",
+                    wacore_binary::Jid::new("", wacore_binary::Server::Pn),
+                )
+                .attr("type", "error")
+                .children([NodeBuilder::new("error")
+                    .attr("code", "500")
+                    .attr("type", "wait")
+                    .build()])
+                .build(),
+        ))
+        .await;
+    let until = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !logs
+        .records_for("Client/Keepalive")
+        .iter()
+        .any(|(_, line)| line.contains("Keepalive timeout, error count: 1"))
+    {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "the IQ error must register a failed probe"
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    assert!(
+        client.stats.first_send_since_recv().is_none(),
+        "inbound IQ error clears the tested deadline"
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let unrelated = request(&client, "NEW_DEADLINE", Some(Duration::from_secs(150)));
+    wait_sent(&transport, 2).await;
+    let new_deadline = client.stats.first_send_since_recv();
+    assert!(new_deadline.is_some());
+    tokio::time::advance(KEEP_ALIVE_INTERVAL_MAX).await;
+    assert!(is_dead_socket_at(
+        new_deadline,
+        client.stats.last_data_received(),
+        wacore::time::Instant::now()
+    ));
+    // The earlier error response proved the old deadline alive. A new expired
+    // application-IQ deadline must get its own bounded liveness probe.
+    wait_sent(&transport, 3).await;
+    let probe = decode_sent_iq(&transport, 2).await;
+    assert_eq!(
+        probe.get().attrs().optional_string("xmlns").as_deref(),
+        Some("w:p")
+    );
+    let id = probe
+        .get()
+        .attrs()
+        .optional_string("id")
+        .unwrap()
+        .into_owned();
+    receive_result(&client, &id).await;
+    receive_result(&client, "NEW_DEADLINE").await;
+    assert!(unrelated.await.unwrap().is_ok());
+    tokio::task::yield_now().await;
+    assert_eq!(
+        client.connection_generation.load(Ordering::Acquire),
+        generation
+    );
+    assert!(client.is_socket_connected());
+    assert!(!keepalive.is_finished());
+    client.notify_connection_shutdown();
+    keepalive.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn keepalive_reconnects_when_its_ping_write_never_completes() {
     if isolate(concat!(
         module_path!(),

@@ -268,6 +268,7 @@ impl Client {
         generation: u64,
     ) {
         let mut error_count = 0u32;
+        let mut failed_probe_deadline = None;
         let mut cleanup_counter = 0u32;
         let mut maintenance_counter = 0u32;
         let mut engine_maintenance_counter = 0u32;
@@ -357,15 +358,18 @@ impl Client {
                             client_log!(self, debug, target: "Client/Keepalive", "Keepalive restored (recent activity).");
                             error_count = 0;
                         }
+                        failed_probe_deadline = None;
                         continue;
                     }
 
                     // A failed bounded probe already gave the peer a chance to
                     // respond. WA Web's independent watchdog does not wait for
                     // another ping once that first-send deadline has expired.
+                    let first_send = self.stats.first_send_since_recv();
                     if error_count > 0
+                        && first_send == failed_probe_deadline
                         && is_dead_socket_at(
-                            self.stats.first_send_since_recv(),
+                            first_send,
                             self.stats.last_data_received(),
                             wacore::time::Instant::now(),
                         )
@@ -381,6 +385,7 @@ impl Client {
                     // connection.  WA Web uses a separate 20 s timer that is
                     // cancelled on any receive; our periodic loop needs to send the
                     // ping first to give the server a chance to prove it is alive.
+                    let receive_before_probe = self.stats.last_data_received();
                     match self.send_keepalive().await {
                         // A skipped ping neither restores health nor authorizes
                         // a teardown if the deadline crosses during this tick.
@@ -391,12 +396,18 @@ impl Client {
                                 client_log!(self, debug, target: "Client/Keepalive", "Keepalive restored after {error_count} failure(s).");
                             }
                             error_count = 0;
+                            failed_probe_deadline = None;
                         }
                         KeepaliveResult::FatalFailure => {
                             client_log!(self, debug, target: "Client/Keepalive", "Fatal keepalive failure, exiting loop.");
                             return;
                         }
                         KeepaliveResult::TransientFailure => {
+                            // An IQ error is inbound activity too: a failure may
+                            // only authorize skipping a later probe for the
+                            // same deadline, with no intervening receive.
+                            failed_probe_deadline = (self.stats.last_data_received() == receive_before_probe)
+                                .then(|| self.stats.first_send_since_recv()).flatten();
                             error_count += 1;
                             client_log!(self, warn, target: "Client/Keepalive", "Keepalive timeout, error count: {error_count}");
                             if keepalive_failures_are_terminal(error_count) {

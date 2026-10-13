@@ -298,6 +298,14 @@ impl InMemoryBackend {
             .store(count, Ordering::Relaxed);
     }
 
+    /// Fail one conditional delete, then allow the remaining batch to progress.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn fail_one_pending_delete(&self, prefix: u32, after_commit: bool) {
+        self.skip_pending_delete_failures(prefix);
+        self.fail_pending_delete
+            .store(if after_commit { 5 } else { 4 }, Ordering::Relaxed);
+    }
+
     /// Park a conditional delete after allowing the specified prefix.
     #[cfg(any(test, feature = "test-util"))]
     pub fn park_pending_delete(&self, prefix: u32, gate: Arc<async_lock::Barrier>) {
@@ -1361,6 +1369,9 @@ impl ProtocolStore for InMemoryBackend {
                     .is_ok()
             {
                 0
+            } else if injected >= 4 {
+                self.fail_pending_delete.store(0, Ordering::Relaxed);
+                injected - 3
             } else {
                 injected
             }

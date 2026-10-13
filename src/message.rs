@@ -282,6 +282,7 @@ pub(crate) type DispatchFingerprint = [u8; 16];
 struct DispatchPayload {
     fingerprint: DispatchFingerprint,
     state: MessageDispatch,
+    hook_committed: bool,
     publication: Arc<AtomicU8>,
 }
 
@@ -400,7 +401,9 @@ impl DispatchClaim {
                 }
                 return true;
             }
-            // Ordinary multipart dispatches and hook replays still fan out.
+            payload.hook_committed |= hook_committed;
+            // Ordinary multipart dispatches still fan out. Retained-row cleanup
+            // replay separately checks completed hook publication before admission.
             // Keep a completed claim, but let a new publisher own a pending one.
             if payload.publication.load(Ordering::Acquire) != PUBLICATION_COMPLETE {
                 payload.publication = publication.owner();
@@ -410,6 +413,7 @@ impl DispatchClaim {
         if self.payloads.len() < MAX_DISPATCH_PAYLOADS {
             self.payloads.push(DispatchPayload {
                 fingerprint,
+                hook_committed,
                 state: if pdo {
                     MessageDispatch::Recovered
                 } else {

@@ -91,6 +91,20 @@ impl Client {
         })
     }
 
+    pub(super) fn completed_hook_publication(
+        &self,
+        info: &Arc<MessageInfo>,
+        fingerprint: &DispatchFingerprint,
+    ) -> bool {
+        self.with_message_dispatch(info, false, |claim| {
+            claim.payloads.iter().any(|payload| {
+                payload.fingerprint == *fingerprint
+                    && payload.hook_committed
+                    && payload.publication.load(Ordering::Acquire) == PUBLICATION_COMPLETE
+            })
+        })
+    }
+
     pub(crate) async fn probe_message_dispatch(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
