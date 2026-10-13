@@ -312,7 +312,7 @@ fn project_pn(user: &UsyncUserResult, business_pn: Option<Jid>) -> Option<Jid> {
             user.id
                 .as_ref()
                 .filter(|jid| {
-                    jid.is_lid()
+                    jid.server.is_lid_family()
                         && !jid.user.is_empty()
                         && jid.user.bytes().all(|b| b.is_ascii_digit())
                 })
@@ -320,7 +320,7 @@ fn project_pn(user: &UsyncUserResult, business_pn: Option<Jid>) -> Option<Jid> {
         })
         .filter(|pn| {
             pn.user != "0"
-                && pn.is_pn()
+                && pn.server.is_pn_family()
                 && !pn.user.is_empty()
                 && pn.user.bytes().all(|byte| byte.is_ascii_digit())
                 && pn.agent == 0
@@ -480,7 +480,7 @@ impl IqSpec for IsOnWhatsAppSpec {
                 Some(UsyncProtocolResult::Contact(UsyncOutcome::Error(error))) => {
                     (false, Some((**error).clone()))
                 }
-                _ => (jid.is_lid(), None),
+                _ => (jid.server.is_lid_family(), None),
             };
             let (lid, lid_error) = project_lid(&user);
             let (is_business, verified_name, business_error, business_pn) = project_business(&user);
@@ -2753,6 +2753,32 @@ mod tests {
         let results = spec.parse_response(&response.as_node_ref()).unwrap();
         assert_eq!(results[0].pn_jid, None);
         assert!(results[0].business_error.is_some());
+    }
+
+    #[test]
+    fn hosted_business_pn_is_preserved() {
+        let info = UserInfoSpec::new(vec![], "hosted-green");
+        let existence = IsOnWhatsAppSpec::new(vec![], "hosted-green", IsOnWhatsAppQueryType::Lid);
+        for primary in [false, true] {
+            let mut user = NodeBuilder::new("user").attr("jid", "100000001:99@hosted.lid");
+            if primary {
+                user = user.attr("pn_jid", "12025550111:99@hosted");
+            }
+            let response = usync_result(vec![
+                user.children([NodeBuilder::new("business")
+                    .attr("pn_jid", "12025550111:99@hosted")
+                    .build()])
+                    .build(),
+            ]);
+            let results = info.parse_response(&response.as_node_ref()).unwrap();
+            let pn = results.values().next().unwrap().pn_jid.as_ref().unwrap();
+            assert_eq!(pn.user, "12025550111");
+            assert_eq!(pn.server, Server::Hosted);
+            assert_eq!(pn.device, 0);
+            let results = existence.parse_response(&response.as_node_ref()).unwrap();
+            assert_eq!(results[0].pn_jid.as_ref(), Some(pn));
+            assert!(results[0].is_registered);
+        }
     }
 
     #[test]

@@ -58,7 +58,7 @@ fn forward_lid_pair(r: &IsOnWhatsAppResult) -> (&Jid, Option<&Jid>) {
 
 /// LID-primary result inverted to (PN, LID); None when not LID-primary.
 fn reverse_lid_pair(r: &IsOnWhatsAppResult) -> Option<(&Jid, Option<&Jid>)> {
-    if r.jid.is_lid() {
+    if r.jid.server.is_lid_family() {
         r.pn_jid.as_ref().map(|pn| (pn, Some(&r.jid)))
     } else {
         None
@@ -85,7 +85,7 @@ fn user_info_lid_pair(entry: &UserInfo) -> (&Jid, Option<&Jid>) {
 }
 
 fn user_info_reverse_lid_pair(entry: &UserInfo) -> Option<(&Jid, Option<&Jid>)> {
-    entry.jid.is_lid().then_some(())?;
+    entry.jid.server.is_lid_family().then_some(())?;
     entry.pn_jid.as_ref().map(|pn| (pn, Some(&entry.jid)))
 }
 
@@ -110,7 +110,10 @@ impl<'a> Contacts<'a> {
             let Some(lid) = lid else {
                 continue;
             };
-            if !jid.is_pn() || !lid.is_lid() || !valid_mapping_user(jid) || !valid_mapping_user(lid)
+            if !jid.server.is_pn_family()
+                || !lid.server.is_lid_family()
+                || !valid_mapping_user(jid)
+                || !valid_mapping_user(lid)
             {
                 continue;
             }
@@ -310,10 +313,38 @@ mod tests {
     async fn business_pn_is_learned_through_public_contact_lookups() {
         use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
         use wacore_binary::builder::NodeBuilder;
-        for (user_info, known_pair) in [(false, false), (true, false), (false, true), (true, true)]
-        {
+        for (user_info, known_pair, hosted) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, false, true),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
             let (client, transport) = create_iq_test_client().await;
-            let lid = Jid::lid("100000001");
+            let lid = Jid::new(
+                "100000001",
+                if hosted {
+                    wacore_binary::Server::HostedLid
+                } else {
+                    wacore_binary::Server::Lid
+                },
+            );
+            let pn = Jid::new(
+                "12025550111",
+                if hosted {
+                    wacore_binary::Server::Hosted
+                } else {
+                    wacore_binary::Server::Pn
+                },
+            );
+            let wire_lid = if hosted {
+                lid.with_device(99)
+            } else {
+                lid.clone()
+            };
             if known_pair {
                 client
                     .add_lid_pn_mapping(
@@ -325,7 +356,13 @@ mod tests {
                     .unwrap();
             }
             let caller = client.clone();
-            let queried = lid.clone();
+            let queried = if user_info {
+                lid.clone()
+            } else {
+                Jid::lid("100000001")
+            };
+            let returned = lid.clone();
+            let expected_pn = pn.clone();
             let task = tokio::spawn(async move {
                 if user_info {
                     let info = caller
@@ -333,10 +370,11 @@ mod tests {
                         .get_user_info(std::slice::from_ref(&queried))
                         .await
                         .unwrap();
-                    assert_eq!(info[&queried].pn_jid, Some(Jid::pn("12025550111")));
+                    assert_eq!(info[&returned].pn_jid, Some(expected_pn));
                 } else {
                     let results = caller.contacts().is_on_whatsapp(&[queried]).await.unwrap();
-                    assert_eq!(results[0].pn_jid, Some(Jid::pn("12025550111")));
+                    assert_eq!(results[0].pn_jid, Some(expected_pn));
+                    assert!(results[0].is_registered);
                 }
             });
             let sent = decode_sent_iq(&transport, 0).await;
@@ -361,9 +399,16 @@ mod tests {
                 .children([NodeBuilder::new("usync")
                     .children([NodeBuilder::new("list")
                         .children([NodeBuilder::new("user")
-                            .attr("jid", &lid)
+                            .attr("jid", &wire_lid)
                             .children([NodeBuilder::new("business")
-                                .attr("pn_jid", "12025550111:7@s.whatsapp.net")
+                                .attr(
+                                    "pn_jid",
+                                    if hosted {
+                                        "12025550111:99@hosted"
+                                    } else {
+                                        "12025550111:7@s.whatsapp.net"
+                                    },
+                                )
                                 .build()])
                             .build()])
                         .build()])
@@ -372,11 +417,7 @@ mod tests {
             answer_iq(&client, &id, &response).await;
             task.await.unwrap();
             let by_lid = client.get_lid_pn_entry(&lid).await.unwrap().unwrap();
-            let by_pn = client
-                .get_lid_pn_entry(&Jid::pn("12025550111"))
-                .await
-                .unwrap()
-                .unwrap();
+            let by_pn = client.get_lid_pn_entry(&pn).await.unwrap().unwrap();
             assert_eq!(by_lid.phone_number.as_ref(), "12025550111");
             assert_eq!(by_pn.lid.as_ref(), "100000001");
             assert_eq!(

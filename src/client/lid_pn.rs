@@ -1150,9 +1150,9 @@ impl Client {
     /// (`Ok(None)`) from "lookup failed" (`Err(_)`).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.get_lid_pn_entry", level = "trace", skip_all, fields(peer = %jid.observe()), err(Debug)))]
     pub async fn get_lid_pn_entry(&self, jid: &Jid) -> Result<Option<LidPnEntry>> {
-        let is_lid = if jid.is_lid() {
+        let is_lid = if jid.server.is_lid_family() {
             true
-        } else if jid.is_pn() {
+        } else if jid.server.is_pn_family() {
             false
         } else {
             return Ok(None);
