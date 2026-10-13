@@ -360,6 +360,21 @@ impl Client {
                         continue;
                     }
 
+                    // A failed bounded probe already gave the peer a chance to
+                    // respond. WA Web's independent watchdog does not wait for
+                    // another ping once that first-send deadline has expired.
+                    if error_count > 0
+                        && is_dead_socket_at(
+                            self.stats.first_send_since_recv(),
+                            self.stats.last_data_received(),
+                            wacore::time::Instant::now(),
+                        )
+                    {
+                        client_log!(self, warn, target: "Client/Keepalive", "Watchdog expired after a failed keepalive attempt, forcing reconnect.");
+                        self.reconnect_immediately().await;
+                        return;
+                    }
+
                     // Probe the connection BEFORE checking dead-socket so that a
                     // successful pong updates last_received_ms and prevents a
                     // false-positive dead-socket trigger on an idle-but-healthy

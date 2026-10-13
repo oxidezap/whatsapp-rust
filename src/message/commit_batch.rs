@@ -439,21 +439,20 @@ impl Client {
                 |sender| sender.to_string(),
             );
             let canonical = Self::pending_sender(&item.info);
-            let sender = if item.storage_sender.is_some() {
-                incoming_sender
-            } else if canonical != incoming_sender
-                && backend
-                    .read_pending_inbound_bounded(
-                        PendingInboundKey {
-                            chat: &chat,
-                            sender: &incoming_sender,
-                            id: &item.info.id,
-                        },
-                        MAX_PENDING_BYTES,
-                        lease.clone(),
-                    )
-                    .await?
-                    .is_some()
+            let sender = if item.storage_sender.is_some()
+                || canonical != incoming_sender
+                    && backend
+                        .read_pending_inbound_bounded(
+                            PendingInboundKey {
+                                chat: &chat,
+                                sender: &incoming_sender,
+                                id: &item.info.id,
+                            },
+                            MAX_PENDING_BYTES,
+                            lease.clone(),
+                        )
+                        .await?
+                        .is_some()
             {
                 incoming_sender
             } else {
