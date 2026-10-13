@@ -4,6 +4,41 @@ use super::*;
 use crate::features::{AppStateError, AppStateResyncMode, AppStateResyncReport};
 use crate::request::DEFAULT_IQ_TIMEOUT;
 use std::borrow::Cow;
+use wacore::appstate_sync::AppStateMutationPersistence;
+
+struct AppStateClientPersistence {
+    client: std::sync::Weak<Client>,
+    persistence: Arc<crate::store::persistence_manager::PersistenceManager>,
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl AppStateMutationPersistence for AppStateClientPersistence {
+    async fn persist_status_privacy(
+        &self,
+        action: &wa::sync_action_value::StatusPrivacyAction,
+    ) -> wacore::store::error::Result<()> {
+        self.persistence.persist_status_privacy(action).await
+    }
+
+    async fn persist_lid_pn_mappings(
+        &self,
+        mappings: Vec<(String, String)>,
+    ) -> wacore::store::error::Result<()> {
+        let client = self.client.upgrade().ok_or_else(|| {
+            wacore::store::error::StoreError::Io(std::io::Error::other(
+                "app-state client dropped before mapping persistence",
+            ))
+        })?;
+        client
+            .add_lid_pn_mappings(mappings, crate::lid_pn_cache::LearningSource::Other)
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                wacore::store::error::StoreError::Io(std::io::Error::other(error.to_string()))
+            })
+    }
+}
 
 /// Concurrency cap for pre-downloading app-state external blobs (independent CDN
 /// GETs, keyed by directPath — LTHash ordering is in patch application, not blob
@@ -814,46 +849,16 @@ fn unaccounted_for(
     }
 }
 
-// WAWebPnForLidChatSync uses createUserLidOrThrow/createUserWidOrThrow.
-// Reject other namespaces and device addresses rather than turning them into
-// a pair of bare user strings that the ledger would accept without validation.
-fn pn_for_lid_chat_pair(m: &crate::appstate_sync::Mutation) -> Option<(Jid, Jid)> {
-    let [command, lid] = m.index.as_slice() else {
-        return None;
-    };
-    if command != wacore::appstate::schemas::PN_FOR_LID_CHAT.name
-        || m.operation != wa::syncd_mutation::SyncdOperation::Set
-    {
-        return None;
-    }
-    let lid: Jid = lid.parse().ok()?;
-    let pn: Jid = m
-        .action_value
-        .as_ref()?
-        .pn_for_lid_chat_action
-        .as_option()?
-        .pn_jid
-        .as_ref()?
-        .parse()
-        .ok()?;
-    let valid_user = |jid: &Jid| {
-        !jid.user.is_empty()
-            && jid.user != "0"
-            && jid.user.bytes().all(|byte| byte.is_ascii_digit())
-            && jid.device == 0
-            && jid.agent == 0
-            && jid.integrator == 0
-    };
-    (lid.is_lid() && pn.is_pn() && valid_user(&lid) && valid_user(&pn)).then_some((lid, pn))
-}
-
 impl Client {
     pub(crate) fn get_app_state_processor(&self) -> &Arc<AppStateProcessor> {
         self.app_state_processor.get_or_init(|| {
             debug!("Initializing AppStateProcessor for the first time.");
             Arc::new(
                 AppStateProcessor::new(self.persistence_manager.backend(), self.runtime.clone())
-                    .with_mutation_persistence(self.persistence_manager.clone()),
+                    .with_mutation_persistence(Arc::new(AppStateClientPersistence {
+                        client: self.self_weak.get().cloned().unwrap_or_default(),
+                        persistence: self.persistence_manager.clone(),
+                    })),
             )
         })
     }
@@ -2405,13 +2410,15 @@ impl Client {
                 // caller for a distinction the per-patch `Decoded … vN`
                 // lines already draw. The version below is therefore the
                 // page's end cursor, not each mutation's birth version.
-                self.dispatch_app_state_mutations(
-                    mutations,
-                    full_sync,
-                    full_sync,
-                    (name, new_state.version),
-                )
-                .await;
+                let total = mutations.len();
+                for (position, mut m) in mutations.into_iter().enumerate() {
+                    self.dispatch_app_state_mutation(
+                        &mut m,
+                        full_sync,
+                        (name, new_state.version, position + 1, total),
+                    )
+                    .await;
+                }
 
                 // No version write here. `process_one_patch_list` already
                 // persisted this exact state — alongside the mutation MACs it
@@ -2671,13 +2678,20 @@ impl Client {
                 .await;
 
             wacore::telemetry::appstate_mutations(mutations.len() as u64);
-            self.dispatch_app_state_mutations(
-                mutations,
-                full_sync,
-                full_sync,
-                (name, new_state.version),
-            )
-            .await;
+            let total = mutations.len();
+            for (position, mut m) in mutations.into_iter().enumerate() {
+                // `new_state`, not `state`: the page just applied produced
+                // this version, and `state` still holds the pre-page cursor
+                // until the assignment below. Logging the old version would
+                // attribute the fresh mutations to the cursor they replaced —
+                // the batched path already reports `new_state.version`.
+                self.dispatch_app_state_mutation(
+                    &mut m,
+                    full_sync,
+                    (name, new_state.version, position + 1, total),
+                )
+                .await;
+            }
 
             // A collection the server refused advances nothing: the processor
             // returns the state untouched for a list carrying an error
@@ -3278,13 +3292,16 @@ impl Client {
                     // `event_full_sync=false` (the base passed `false`
                     // here unconditionally), so the split args below must
                     // not be reunited into one `full_sync`.
-                    self.dispatch_app_state_mutations(
-                        mutations,
-                        false,
-                        replaying_snapshot,
-                        (list.name, new_state.version),
-                    )
-                    .await;
+                    let total = mutations.len();
+                    for (position, mut m) in mutations.into_iter().enumerate() {
+                        self.dispatch_app_state_mutation_inner(
+                            &mut m,
+                            false, // event provenance: a conflict absorb is not a full sync
+                            replaying_snapshot, // logging mode: snapshot replays stay at TRACE
+                            Some((list.name, new_state.version, position + 1, total)),
+                        )
+                        .await;
+                    }
                     if let Some(refused) = &list.error {
                         debug!(
                             target: "Client/AppState",
@@ -3573,13 +3590,15 @@ impl Client {
                 // for exactly the recovery path that exists to unstick a
                 // collection. `full_sync = true`: a recovery replaces the
                 // whole collection, so per-mutation lines stay at TRACE.
-                self.dispatch_app_state_mutations(
-                    mutations,
-                    true,
-                    true,
-                    (patch_name, recovery_version),
-                )
-                .await;
+                let total = mutations.len();
+                for (position, mut m) in mutations.into_iter().enumerate() {
+                    self.dispatch_app_state_mutation(
+                        &mut m,
+                        true,
+                        (patch_name, recovery_version, position + 1, total),
+                    )
+                    .await;
+                }
             }
             Ok(wacore::appstate_sync::RecoveryOutcome::Retired) => {
                 debug!(
@@ -4362,13 +4381,16 @@ impl Client {
         };
         let (mutations, state, collection, source) = committed.into_parts();
         wacore::telemetry::appstate_mutations(mutations.len() as u64);
-        self.dispatch_app_state_mutations(
-            mutations,
-            event_full_sync,
-            log_full_sync,
-            (collection, state.version),
-        )
-        .await;
+        let total = mutations.len();
+        for (position, mut mutation) in mutations.into_iter().enumerate() {
+            self.dispatch_app_state_mutation_inner(
+                &mut mutation,
+                event_full_sync,
+                log_full_sync,
+                Some((collection, state.version, position + 1, total)),
+            )
+            .await;
+        }
         source
     }
 
@@ -4388,7 +4410,6 @@ impl Client {
     /// conflict absorb is the exception — it replays a snapshot at TRACE
     /// while keeping `event_full_sync=false` — and calls
     /// `dispatch_app_state_mutation_inner` directly for that.
-    #[cfg(test)]
     pub(crate) async fn dispatch_app_state_mutation(
         &self,
         m: &mut crate::appstate_sync::Mutation,
@@ -4399,8 +4420,6 @@ impl Client {
             .await
     }
 
-    /// Single-mutation adapter for dispatcher regression tests.
-    ///
     /// Split dispatch: `event_full_sync` is public event provenance (lands
     /// on `*.from_full_sync` in every emitted event) while `log_full_sync`
     /// only selects the per-mutation log level (DEBUG vs TRACE). They agree
@@ -4409,55 +4428,12 @@ impl Client {
     /// events came from a full sync — the base passed `false` there, and
     /// this PR is observability-only, so the events must keep saying
     /// `false` too. Separate names so the two can never be confused again.
-    #[cfg(test)]
     async fn dispatch_app_state_mutation_inner(
         &self,
         m: &mut crate::appstate_sync::Mutation,
         event_full_sync: bool,
         log_full_sync: bool,
         ctx: Option<(WAPatchName, u64, usize, usize)>,
-    ) -> AppStateDispatchOutcome {
-        self.dispatch_app_state_mutation_with_mappings(m, event_full_sync, log_full_sync, ctx, None)
-            .await
-    }
-
-    async fn dispatch_app_state_mutations(
-        &self,
-        mutations: Vec<crate::appstate_sync::Mutation>,
-        event_full_sync: bool,
-        log_full_sync: bool,
-        cursor: (WAPatchName, u64),
-    ) {
-        let total = mutations.len();
-        // WAWebPnForLidChatSync flushes one batch. Use the existing ledger's
-        // default source policy, including conflict reconciliation and migrations.
-        let mut mappings = Vec::new();
-        for (position, mut mutation) in mutations.into_iter().enumerate() {
-            self.dispatch_app_state_mutation_with_mappings(
-                &mut mutation,
-                event_full_sync,
-                log_full_sync,
-                Some((cursor.0, cursor.1, position + 1, total)),
-                Some(&mut mappings),
-            )
-            .await;
-        }
-        if !mappings.is_empty()
-            && let Err(error) = self
-                .add_lid_pn_mappings(mappings, crate::lid_pn_cache::LearningSource::Other)
-                .await
-        {
-            warn!(target: "Client/AppState", "Failed to persist pnForLidChat mappings: {error}");
-        }
-    }
-
-    async fn dispatch_app_state_mutation_with_mappings(
-        &self,
-        m: &mut crate::appstate_sync::Mutation,
-        event_full_sync: bool,
-        log_full_sync: bool,
-        ctx: Option<(WAPatchName, u64, usize, usize)>,
-        mappings: Option<&mut Vec<(String, String)>>,
     ) -> AppStateDispatchOutcome {
         use crate::client::AppStateDispatchOutcome;
         use wacore::types::events::Event;
@@ -4602,23 +4578,10 @@ impl Client {
         }
 
         if m.index[0] == wacore::appstate::schemas::PN_FOR_LID_CHAT.name {
-            let outcome = if let Some((lid, pn)) = pn_for_lid_chat_pair(m) {
-                if let Some(mappings) = mappings {
-                    mappings.push((lid.user.to_string(), pn.user.to_string()));
-                    AppStateDispatchOutcome::Event("LidPnMappingQueued")
-                } else if self
-                    .add_lid_pn_mapping(
-                        &lid.user,
-                        &pn.user,
-                        crate::lid_pn_cache::LearningSource::Other,
-                    )
-                    .await
-                    .is_ok()
-                {
-                    AppStateDispatchOutcome::Event("LidPnMappingStored")
-                } else {
-                    AppStateDispatchOutcome::Skipped("lid-pn-persistence-failed")
-                }
+            // The processor's mutation hook already made these pairs durable
+            // before committing the cursor. Dispatch only reports their effect.
+            let outcome = if wacore::appstate_sync::pn_for_lid_chat_pair(m).is_some() {
+                AppStateDispatchOutcome::Event("LidPnMappingStored")
             } else {
                 AppStateDispatchOutcome::Malformed("LidPnMappingStored")
             };
@@ -8962,9 +8925,18 @@ mod critical_bootstrap_tests {
             pn_for_lid_mutation(Some("100000002@lid"), Some("12025550113@s.whatsapp.net")),
             pn_for_lid_mutation(Some("100000003@lid"), None),
         ];
-        client
-            .dispatch_app_state_mutations(mutations, true, true, (WAPatchName::Regular, 8))
-            .await;
+        let pairs = mutations
+            .iter()
+            .filter_map(wacore::appstate_sync::pn_for_lid_chat_pair)
+            .map(|(lid, pn)| (lid.user.to_string(), pn.user.to_string()))
+            .collect();
+        AppStateClientPersistence {
+            client: Arc::downgrade(&client),
+            persistence: client.persistence_manager.clone(),
+        }
+        .persist_lid_pn_mappings(pairs)
+        .await
+        .unwrap();
         let known = client
             .get_lid_pn_entry(&Jid::lid("100000001"))
             .await
@@ -9009,6 +8981,14 @@ mod critical_bootstrap_tests {
             operation: wa::syncd_mutation::SyncdOperation::Set,
             action_value: Some(value),
         };
+        let (lid, pn) = wacore::appstate_sync::pn_for_lid_chat_pair(&mutation).unwrap();
+        AppStateClientPersistence {
+            client: Arc::downgrade(&client),
+            persistence: client.persistence_manager.clone(),
+        }
+        .persist_lid_pn_mappings(vec![(lid.user.to_string(), pn.user.to_string())])
+        .await
+        .unwrap();
         for full_sync in [true, false] {
             assert_eq!(
                 client

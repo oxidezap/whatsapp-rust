@@ -65,6 +65,13 @@ fn reverse_lid_pair(r: &IsOnWhatsAppResult) -> Option<(&Jid, Option<&Jid>)> {
     }
 }
 
+fn valid_mapping_user(jid: &Jid) -> bool {
+    !jid.user.is_empty()
+        && jid.user != "0"
+        && jid.user.bytes().all(|byte| byte.is_ascii_digit())
+        && jid.integrator == 0
+}
+
 /// WhatsApp Web renders a username as `@handle` but never sends the `@`
 /// (`WAWebUsernameTypes.asUsername` strips one and logs it), so accept the
 /// display form callers will have copied out of a chat.
@@ -103,7 +110,8 @@ impl<'a> Contacts<'a> {
             let Some(lid) = lid else {
                 continue;
             };
-            if !jid.is_pn() || !lid.is_lid() {
+            if !jid.is_pn() || !lid.is_lid() || !valid_mapping_user(jid) || !valid_mapping_user(lid)
+            {
                 continue;
             }
             if let Err(err) = self

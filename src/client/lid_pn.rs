@@ -422,16 +422,20 @@ impl Client {
         guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
     ) -> BatchRecordOutcome {
         let cap = mappings.len();
-        let mut deduped: std::collections::HashMap<String, String> =
-            std::collections::HashMap::with_capacity(cap);
-        for (lid, phone_number) in mappings {
-            deduped.insert(phone_number, lid);
+        let mut deduped = std::collections::HashMap::with_capacity(cap);
+        for (position, (lid, phone_number)) in mappings.into_iter().enumerate() {
+            deduped.insert(phone_number, (position, lid));
         }
+        // Retain the existing last-LID-per-phone policy, but apply retained
+        // observations in their input order. Other must never choose a LID's
+        // first PN through randomized HashMap iteration.
+        let mut deduped: Vec<_> = deduped.into_iter().collect();
+        deduped.sort_unstable_by_key(|(_, (position, _))| *position);
 
         let mut entries: Vec<LidPnEntry> = Vec::with_capacity(deduped.len());
         let mut migration_flags: Vec<bool> = Vec::with_capacity(deduped.len());
         let mut usync_phones: Vec<String> = Vec::new();
-        for (phone_number, lid) in deduped {
+        for (phone_number, (_, lid)) in deduped {
             match self
                 .record_lid_pn_in_memory_guarded(&lid, &phone_number, source, guard)
                 .await
