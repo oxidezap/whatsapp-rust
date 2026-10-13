@@ -807,41 +807,61 @@ impl Client {
         // id, and a reply that beats the send's return would otherwise find the
         // request recorded with no id at all -- unrecognisable, and so unable to
         // free the ask it answers.
-        let request_id = self.generate_message_id_at(wacore::time::now_secs_u64());
-
         let proc = self.get_app_state_processor();
-        if !proc
-            .mark_recovery_requested_on_generation(
-                collection,
-                self.connection_generation
-                    .load(std::sync::atomic::Ordering::Acquire),
-            )
-            .await
-        {
-            // One is already outstanding, and the reply that is coming answers
-            // this ask too. Suppressing the duplicate is also what keeps the
-            // marker honest: a second send that failed would otherwise withdraw
-            // the first request's only record of itself.
-            debug!("A recovery for {collection} is already outstanding; not asking again");
-            return Ok(String::new());
-        }
-        proc.note_recovery_request_id(collection, &request_id).await;
-        match self
-            .send_peer_message_with_id(peer_target, &msg, &request_id)
-            .await
-        {
-            Ok(()) => Ok(request_id),
-            Err(e) => {
-                // By id, not by name. The window this marker holds is shorter
-                // than a send can take, so by now another ask for the same
-                // collection may have replaced this entry -- and withdrawing by
-                // name would take *its* marker, leaving a request that really is
-                // on the wire with nothing to recognise its answer. Taking by id
-                // withdraws this ask or nothing.
-                proc.take_recovery_request_by_id(&request_id).await;
-                Err(e)
+        // Retry one reconnect, with a fresh id and marker. Repeated connection
+        // churn is left to the app-state retry loop rather than an unbounded send.
+        for _ in 0..2 {
+            let generation = self
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            let socket = self.get_noise_socket()?;
+            let request_id = self.generate_message_id_at(wacore::time::now_secs_u64());
+            if !proc
+                .mark_recovery_requested_with_id(collection, generation, &request_id)
+                .await
+            {
+                if self
+                    .connection_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != generation
+                {
+                    continue;
+                }
+                debug!("A recovery for {collection} is already outstanding; not asking again");
+                return Ok(String::new());
             }
+            let result = self
+                .send_message_impl(
+                    peer_target.clone(),
+                    &msg,
+                    crate::send::SendPipelineOptions {
+                        request_id: Some(&request_id),
+                        peer: true,
+                        send_scope: Some((generation, socket)),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if self
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != generation
+            {
+                proc.take_recovery_request_by_id(&request_id).await;
+                continue;
+            }
+            return match result {
+                Ok(_) => Ok(request_id),
+                Err(e) => {
+                    // A replacement request must never lose its marker.
+                    proc.take_recovery_request_by_id(&request_id).await;
+                    Err(e)
+                }
+            };
         }
+        Err(anyhow::anyhow!(
+            "connection changed twice while sending snapshot recovery"
+        ))
     }
 
     /// Sends a peer message (message to our own devices).
@@ -1024,14 +1044,26 @@ impl Client {
         // about itself -- and with two recoveries outstanding, a reply carrying
         // A's id and B's name would select B's marker and be checked against its
         // own name, which always agrees. So the ask decides.
-        let Some(asked) = self
+        let Some((asked, generation)) = self
             .get_app_state_processor()
-            .claim_recovery_request_by_id(request_id)
+            .claim_recovery_request_with_generation_by_id(request_id)
             .await
         else {
             warn!("Ignoring a snapshot recovery nothing here asked for");
             return;
         };
+
+        if self
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            != generation
+        {
+            self.get_app_state_processor()
+                .take_recovery_request_by_id(request_id)
+                .await;
+            debug!("Dropping retired recovery for {asked} before decoding");
+            return;
+        }
 
         // The whole continuation is detached, not just the CPU inside it.
         // `receive.rs` awaits this handler inline and inbound processing is
@@ -1077,9 +1109,6 @@ impl Client {
         }
         let payload = blob.to_vec();
         let request_id = request_id.to_string();
-        let generation = self
-            .connection_generation
-            .load(std::sync::atomic::Ordering::Acquire);
 
         self.runtime.spawn_detached(Box::pin(async move {
             // Up to 64 MiB of inflate plus a decode wide enough that `waproto`
@@ -2670,6 +2699,127 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn recovery_send_stops_after_two_reconnects_and_releases_markers() {
+            let (client, _, _) = manual_retry_client().await;
+            let (first_entered, first_release) = failure_socket(&client);
+            let sender = Arc::clone(&client);
+            let job =
+                tokio::spawn(
+                    async move { sender.request_syncd_snapshot_recovery("regular_low").await },
+                );
+            tokio::time::timeout(std::time::Duration::from_secs(5), first_entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let (second_entered, second_release) = failure_socket(&client);
+            client
+                .connection_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            first_release.send(()).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), second_entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            client
+                .connection_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            second_release.send(()).await.unwrap();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), job)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+            assert!(
+                !client
+                    .get_app_state_processor()
+                    .has_recovery_request("regular_low")
+                    .await
+            );
+        }
+
+        #[tokio::test]
+        async fn retired_recovery_reply_is_released_before_decode_is_scheduled() {
+            let (client, _, _) = manual_retry_client().await;
+            let proc = client.get_app_state_processor();
+            let generation = client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            assert!(
+                proc.mark_recovery_requested_with_id("regular_low", generation, "retired")
+                    .await
+            );
+            client
+                .connection_generation
+                .store(generation + 1, std::sync::atomic::Ordering::Release);
+            let mut response = wa::message::peer_data_operation_request_response_message::peer_data_operation_result::SyncDSnapshotFatalRecoveryResponse::default();
+            response.collection_snapshot = Some(vec![255; 32]);
+            response.is_compressed = Some(true);
+            client
+                .handle_syncd_snapshot_recovery_response(&response, "retired")
+                .await;
+            assert!(
+                !proc.has_recovery_request("regular_low").await,
+                "retired reply is consumed synchronously, before a decode job can run"
+            );
+            assert!(
+                proc.mark_recovery_requested_with_id("regular_low", generation + 1, "replacement")
+                    .await
+            );
+        }
+
+        #[tokio::test]
+        async fn recovery_send_retries_on_reconnect_without_using_old_marker() {
+            let (client, old_transport, _) = manual_retry_client().await;
+            let peer: Jid = "12025550100@s.whatsapp.net".parse().unwrap();
+            let mutex = client
+                .session_lock_for(peer.to_protocol_address().as_str())
+                .await;
+            let held = mutex.lock().await;
+            let proc = client.get_app_state_processor();
+            let generation = client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            let sender = Arc::clone(&client);
+            let job =
+                tokio::spawn(
+                    async move { sender.request_syncd_snapshot_recovery("regular_low").await },
+                );
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !proc.has_recovery_request("regular_low").await {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let replacement = Arc::new(crate::transport::mock::CapturingMockTransport::new());
+            install_socket(&client, replacement.clone());
+            client
+                .connection_generation
+                .store(generation + 1, std::sync::atomic::Ordering::Release);
+            drop(held);
+            let id = tokio::time::timeout(std::time::Duration::from_secs(5), job)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(
+                old_transport.sent().is_empty(),
+                "retired send must not hit the old socket"
+            );
+            assert_eq!(
+                replacement.sent().len(),
+                1,
+                "only the freshly marked request goes out"
+            );
+            assert_eq!(
+                proc.take_recovery_request_with_generation_by_id(&id).await,
+                Some(("regular_low".to_string(), generation + 1))
+            );
+        }
+
+        #[tokio::test]
         async fn outgoing_lid_pdo_uses_recipient_alias_and_preserves_metadata() {
             use wacore::types::events::ChannelEventHandler;
             use wacore::types::message::{AddressingMode, MessageSource};
@@ -4157,6 +4307,7 @@ fn inflate_gzip_bounded(payload: &[u8], max: u64) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Synthetic protobuf fixtures, as permitted by clippy.toml.
 mod inflate_gzip_tests {
     use super::inflate_gzip;
     use std::io::Write;

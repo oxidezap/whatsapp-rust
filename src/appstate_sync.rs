@@ -1648,6 +1648,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_new_generation_replaces_unanswered_and_claimed_recovery_requests() {
+        for claimed in [false, true] {
+            let processor = AppStateProcessor::new(
+                Arc::new(MockBackend::default()),
+                Arc::new(crate::runtime_impl::TokioRuntime),
+            );
+            assert!(
+                processor
+                    .mark_recovery_requested_with_id("regular_low", 7, "old")
+                    .await
+            );
+            if claimed {
+                assert_eq!(
+                    processor
+                        .claim_recovery_request_with_generation_by_id("old")
+                        .await,
+                    Some(("regular_low".into(), 7))
+                );
+            }
+            assert!(
+                !processor
+                    .mark_recovery_requested_with_id("regular_low", 7, "duplicate")
+                    .await
+            );
+            assert!(
+                processor
+                    .mark_recovery_requested_with_id("regular_low", 8, "new")
+                    .await
+            );
+            assert!(
+                !processor
+                    .mark_recovery_requested_with_id("regular_low", 7, "stale-sender")
+                    .await
+            );
+            assert_eq!(processor.take_recovery_request_by_id("old").await, None);
+            assert_eq!(
+                processor
+                    .take_recovery_request_with_generation_by_id("new")
+                    .await,
+                Some(("regular_low".into(), 8))
+            );
+        }
+    }
+
     /// One reply per request, and none at all for a request nobody made.
     #[tokio::test]
     async fn a_recovery_request_is_taken_once() {

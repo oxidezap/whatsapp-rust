@@ -3402,6 +3402,12 @@ impl Client {
         generation: u64,
         recovery: waproto::whatsapp::SyncdSnapshotRecovery,
     ) {
+        if self.connection_generation.load(Ordering::Acquire) != generation {
+            self.get_app_state_processor()
+                .take_recovery_request_by_id(request_id)
+                .await;
+            return;
+        }
         // `WAPatchName::from_str` is infallible: every unrecognised name maps to
         // `Unknown`, which is one shared reservation slot and one collection
         // this side has no rules for. Rejecting it explicitly is the difference

@@ -922,6 +922,8 @@ pub(crate) struct SendPipelineOptions<'a> {
     /// instead of handing over a copy.
     pub(crate) request_id: Option<&'a str>,
     pub(crate) peer: bool,
+    /// A peer recovery must use the socket its request generation names.
+    pub(crate) send_scope: Option<(u64, Arc<crate::socket::NoiseSocket>)>,
     pub(crate) send_observer: Option<Box<dyn wacore::socket::noise_socket::SendObserver>>,
     pub(crate) edit: Option<EditAttribute>,
     pub(crate) extra_stanza_nodes: Vec<Node>,
@@ -2750,6 +2752,7 @@ impl Client {
             sent_at,
             request_id: request_id_override,
             peer,
+            send_scope,
             send_observer,
             edit,
             extra_stanza_nodes,
@@ -3022,7 +3025,13 @@ impl Client {
             stanza_to_send.attrs.insert("type", t.as_wire());
         }
 
-        let send = self.send_node_observed(stanza_to_send, send_observer).await;
+        let send = match send_scope {
+            Some((generation, socket)) => {
+                self.send_node_observed_in_scope(stanza_to_send, send_observer, generation, socket)
+                    .await
+            }
+            None => self.send_node_observed(stanza_to_send, send_observer).await,
+        };
         if let Err(e) = send {
             if let Some(msg_id) = ack_message_id {
                 self.response_waiters_guard().remove(msg_id);

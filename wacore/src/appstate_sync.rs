@@ -498,14 +498,37 @@ impl AppStateProcessor {
         collection: &str,
         generation: u64,
     ) -> bool {
+        self.mark_recovery_request(collection, generation, None)
+            .await
+    }
+
+    /// Records the id and generation atomically before a peer send.
+    pub async fn mark_recovery_requested_with_id(
+        &self,
+        collection: &str,
+        generation: u64,
+        request_id: &str,
+    ) -> bool {
+        self.mark_recovery_request(collection, generation, Some(request_id))
+            .await
+    }
+
+    async fn mark_recovery_request(
+        &self,
+        collection: &str,
+        generation: u64,
+        request_id: Option<&str>,
+    ) -> bool {
         let mut outstanding = self.recovery_requested.lock().await;
         if let Some(request) = outstanding.get(collection)
-            && request.asked_at.elapsed()
-                < if request.answering {
-                    Self::RECOVERY_ANSWER_TTL
-                } else {
-                    Self::RECOVERY_REQUEST_TTL
-                }
+            && (request.generation > generation
+                || (request.generation == generation
+                    && request.asked_at.elapsed()
+                        < if request.answering {
+                            Self::RECOVERY_ANSWER_TTL
+                        } else {
+                            Self::RECOVERY_REQUEST_TTL
+                        }))
         {
             return false;
         }
@@ -513,7 +536,7 @@ impl AppStateProcessor {
             collection.to_string(),
             RecoveryRequest {
                 asked_at: crate::time::Instant::now(),
-                request_id: None,
+                request_id: request_id.map(str::to_string),
                 answering: false,
                 generation,
             },
@@ -551,6 +574,16 @@ impl AppStateProcessor {
     /// against the same request. `None` once it is claimed, and every path that
     /// ends an answer removes the request outright.
     pub async fn claim_recovery_request_by_id(&self, request_id: &str) -> Option<String> {
+        self.claim_recovery_request_with_generation_by_id(request_id)
+            .await
+            .map(|(name, _)| name)
+    }
+
+    /// Claims a reply together with its request generation, before decoding.
+    pub async fn claim_recovery_request_with_generation_by_id(
+        &self,
+        request_id: &str,
+    ) -> Option<(String, u64)> {
         let mut outstanding = self.recovery_requested.lock().await;
         let (name, request) = outstanding
             .iter_mut()
@@ -563,7 +596,7 @@ impl AppStateProcessor {
         // handler rather than recording an unanswered ask -- and a reply can
         // arrive long after the ask's own window closed.
         request.asked_at = crate::time::Instant::now();
-        Some(name.clone())
+        Some((name.clone(), request.generation))
     }
 
     /// Takes the request an id answers, whatever its payload turned out to be.
