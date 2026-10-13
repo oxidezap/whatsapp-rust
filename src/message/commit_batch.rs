@@ -1615,10 +1615,10 @@ mod tests {
                     index < failed_index as usize
                 );
             }
-            let Event::Messages(batch) = rx
+            let event = rx
                 .try_recv()
-                .expect("a hook-committed batch must not lose its deleted prefix")
-            else {
+                .expect("a hook-committed batch must not lose its deleted prefix");
+            let Event::Messages(batch) = event.as_ref() else {
                 panic!("expected message batch")
             };
             assert!(batch.hook_committed);
