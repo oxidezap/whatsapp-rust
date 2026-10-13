@@ -10,6 +10,8 @@ use wacore::stats::HeapSize;
 const SLOT_BYTES: usize = 4
     * (size_of::<PendingDelivery>() + size_of::<RawRetained>() + size_of::<RetainedDelivery>())
     + size_of::<waproto::whatsapp::Message>()
+    + size_of::<MessageInfo>()
+    + size_of::<ReceiptScope>()
     + 2 * size_of::<usize>();
 use wacore_binary::JidExt;
 
@@ -143,6 +145,7 @@ pub(super) struct Admission {
     origin: StanzaOrigin,
     _charge: Arc<Charge>,
 }
+#[inline(never)]
 fn lock<T>(state: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     state.lock().unwrap_or_else(|poison| poison.into_inner())
 }
@@ -175,7 +178,7 @@ struct ReceiptState {
     sent: bool,
 }
 pub(super) struct ReceiptScope {
-    info: Arc<MessageInfo>,
+    arrival: std::sync::Weak<MessageInfo>,
     state: Mutex<ReceiptState>,
 }
 impl ReceiptScope {
@@ -189,8 +192,14 @@ impl ReceiptScope {
         false
     }
 }
-pub(super) struct ReceiptProducer(Arc<ReceiptScope>);
+// The active producer owns its receipt envelope. Detached/resident delivery
+// scopes keep only a weak arrival identity, so they cannot retain an uncharged
+// metadata graph after the last corresponding delivery is released.
+pub(super) struct ReceiptProducer(Arc<ReceiptScope>, Arc<MessageInfo>);
 impl ReceiptProducer {
+    pub fn info(&self) -> &Arc<MessageInfo> {
+        &self.1
+    }
     pub fn finish(&self) -> bool {
         let mut state = lock(&self.0.state);
         state.closed = true;
@@ -227,12 +236,19 @@ impl LiveRetention {
             state.receipts.len() < 400,
             "pending receipt capacity exhausted"
         );
+        let original = state
+            .reservations
+            .iter()
+            .flat_map(|entry| &entry.raw)
+            .find(|raw| same_message(&raw.info, info))
+            .map_or(info, |raw| &raw.info);
+        let original = Arc::clone(original);
         let scope = Arc::new(ReceiptScope {
-            info: Arc::clone(info),
+            arrival: Arc::downgrade(info),
             state: Mutex::new(ReceiptState::default()),
         });
         state.receipts.push(Arc::downgrade(&scope));
-        Ok(ReceiptProducer(scope))
+        Ok(ReceiptProducer(scope, original))
     }
     pub fn receipt_for(&self, info: &Arc<MessageInfo>) -> Option<Arc<ReceiptScope>> {
         #[cfg(test)]
@@ -241,7 +257,7 @@ impl LiveRetention {
             .receipts
             .iter()
             .filter_map(std::sync::Weak::upgrade)
-            .find(|scope| Arc::ptr_eq(&scope.info, info))
+            .find(|scope| scope.arrival.as_ptr() == Arc::as_ptr(info))
     }
     pub fn fail_receipt(&self, info: &Arc<MessageInfo>) {
         if let Some(scope) = self.receipt_for(info) {
@@ -403,8 +419,17 @@ impl LiveRetention {
             .iter()
             .map(RetainedDelivery::retained_wire_bytes)
             .sum::<usize>();
+        let remaining_raw = reservation
+            .raw
+            .iter()
+            .filter(|raw| Some(raw.origin) != item.origin);
+        let raw_bytes = remaining_raw
+            .clone()
+            .map(|raw| raw.plaintext.len())
+            .sum::<usize>();
+        let slots = reservation.entries.len() + remaining_raw.count() + 1;
         let mut metadata = 0usize;
-        let mut seen = Vec::new();
+        let mut seen: Vec<&Arc<MessageInfo>> = Vec::new();
         for info in reservation
             .entries
             .iter()
@@ -422,12 +447,18 @@ impl LiveRetention {
                 metadata = metadata
                     .checked_add(info_bytes(info))
                     .ok_or_else(|| anyhow::anyhow!("live metadata overflow"))?;
-                seen.push(Arc::clone(info));
+                seen.push(info);
             }
         }
+        drop(seen);
         anyhow::ensure!(
             used.checked_add(retained_bytes)
+                .and_then(|bytes| bytes.checked_add(raw_bytes))
                 .and_then(|bytes| bytes.checked_add(metadata))
+                .and_then(|bytes| slots
+                    .checked_mul(SLOT_BYTES)
+                    .and_then(|slots| bytes.checked_add(slots)))
+                .and_then(|bytes| bytes.checked_add(size_of::<Reservation>()))
                 .is_some_and(|bytes| bytes <= reservation.charge.bytes),
             "live projection exceeds admission"
         );
@@ -589,15 +620,21 @@ impl LiveRetention {
         }
     }
 }
+#[inline(never)]
 fn info_bytes(info: &MessageInfo) -> usize {
     size_of::<MessageInfo>() + 2 * size_of::<usize>() + info.heap_bytes()
 }
+#[inline(never)]
 fn same_message(first: &MessageInfo, second: &MessageInfo) -> bool {
     first.source.chat == second.source.chat
         && first.id == second.id
-        && (first.source.sender == second.source.sender
-            || (first.source.chat.is_group()
-                && first.source.sender.to_non_ad() == second.source.sender.to_non_ad()))
+        && if first.source.chat.is_group() {
+            first.source.sender.user == second.source.sender.user
+                && first.source.sender.server == second.source.sender.server
+                && first.source.sender.integrator == second.source.sender.integrator
+        } else {
+            first.source.sender == second.source.sender
+        }
 }
 
 #[inline(never)]
@@ -615,7 +652,7 @@ fn same_entry(first: &RetainedDelivery, second: &PendingDelivery) -> bool {
             }
             _ => false,
         }
-        && (first.message.ptr_eq(&Arc::downgrade(&second.message))
+        && (first.message.as_ptr() == Arc::as_ptr(&second.message)
             || second.retention.as_ref().is_some_and(|charge| {
                 Arc::ptr_eq(&first.retention, charge)
                     && first.projection.len()
@@ -627,6 +664,47 @@ fn same_entry(first: &RetainedDelivery, second: &PendingDelivery) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_pending_projection_preserves_other_slots_backing_budget() {
+        let retention = LiveRetention::default();
+        let info = Arc::new(MessageInfo::default());
+        let producer = StanzaOrigin::new();
+        let admission = retention
+            .reserve_with_info(producer, 1024, 2, &info)
+            .unwrap();
+        let plaintext = vec![0; 512];
+        retention.stage(&info, producer, (0, "msg", 3), &plaintext);
+        retention.stage(&info, producer, (1, "msg", 3), &plaintext);
+        let origin = super::super::raw_pending::DeliveryOrigin {
+            stanza: producer,
+            position: 0,
+        };
+        let make_item = |length| {
+            let mut message = waproto::whatsapp::Message::default();
+            message.conversation = Some("a".repeat(length));
+            let mut item = PendingDelivery::from(
+                wacore::types::events::InboundMessage::builder()
+                    .info(Arc::clone(&info))
+                    .message(Arc::new(message))
+                    .build(),
+            );
+            item.carrier = Some((Some(0), bytes::Bytes::copy_from_slice(&plaintext)));
+            item.origin = Some(origin);
+            item.retention = retention.charge_for_origin(Some(origin));
+            item
+        };
+        let mut oversized = make_item(1024);
+        assert!(retention.retain(&mut oversized).is_err());
+        assert_eq!(retention.raw_for_message(&info).len(), 2);
+        assert!(retention.for_message(&info).unwrap().is_empty());
+        let mut exact = make_item(1021);
+        assert_eq!(exact.retained_wire_bytes() + plaintext.len(), 2048);
+        retention.retain(&mut exact).unwrap();
+        assert_eq!(retention.raw_for_message(&info).len(), 1);
+        assert_eq!(retention.for_message(&info).unwrap().len(), 1);
+        drop(admission);
+    }
 
     #[test]
     fn raw_pending_admission_counts_shared_envelope_metadata_once() {

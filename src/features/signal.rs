@@ -17,14 +17,6 @@ use wacore_binary::Node;
 
 use crate::client::Client;
 
-#[inline(never)]
-fn poll_sender_key_distribution<F: Future<Output = Result<(), SignalError>>>(
-    future: std::pin::Pin<&mut F>,
-    cx: &mut std::task::Context<'_>,
-) -> std::task::Poll<Result<(), SignalError>> {
-    future.poll(cx)
-}
-
 /// Error returned by the low-level Signal protocol operations.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -313,19 +305,17 @@ impl<'a> Signal<'a> {
         sender_jid: &Jid,
         distribution: &[u8],
     ) -> Result<(), SignalError> {
-        let mut future = std::pin::pin!(async {
-            let distribution = decode_sender_key_distribution(distribution)?;
-            let sender_address = sender_jid.to_non_ad().to_protocol_address();
-            let sender_key_name = make_sender_key_name(group_jid, &sender_address);
-            let mut store = self.client.sender_key_adapter();
-            let chain_lock = store.sender_key_lock(&sender_key_name).await;
-            let chain_guard = chain_lock.lock().await;
-            process_sender_key_distribution_message(&sender_key_name, &distribution, &mut store)
-                .await?;
-            drop(chain_guard);
-            Ok(())
-        });
-        std::future::poll_fn(|cx| poll_sender_key_distribution(future.as_mut(), cx)).await
+        let distribution = decode_sender_key_distribution(distribution)?;
+        let sender_address = sender_jid.to_non_ad().to_protocol_address();
+        let sender_key_name = make_sender_key_name(group_jid, &sender_address);
+        let mut store = self.client.sender_key_adapter();
+        let chain_lock = store.sender_key_lock(&sender_key_name).await;
+        let chain_guard = chain_lock.lock().await;
+
+        process_sender_key_distribution_message(&sender_key_name, &distribution, &mut store)
+            .await?;
+        drop(chain_guard);
+        Ok(())
     }
 
     /// Create the current sender-key distribution for a group.

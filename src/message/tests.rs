@@ -11349,6 +11349,7 @@ async fn raw_pending_live_equal_parts_survive_prefix_cleanup_and_later_hook_fail
                                 index,
                                 annotations: Default::default(),
                                 producer,
+                                receipt: None,
                             },
                             &info,
                         )
@@ -20560,6 +20561,7 @@ async fn raw_pending_sibling_bypass_keeps_default_duplicate_suppression() {
                     index,
                     annotations: Default::default(),
                     producer,
+                    receipt: None,
                 },
                 &info,
             )
@@ -20827,6 +20829,243 @@ async fn raw_pending_terminal_skdm_rejection_allows_corrected_resend() {
         );
         assert_exactly_one_confirmation(&transport, &info.id).await;
     }
+}
+
+#[tokio::test]
+async fn raw_pending_mixed_skdm_failure_matrix_preserves_content() {
+    use std::sync::atomic::AtomicBool;
+    use wacore::messages::MessageUtils;
+    use wacore::store::in_memory::InMemoryBackend;
+    struct Hook {
+        fail: AtomicBool,
+        delivered: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            items: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(!self.fail.load(Ordering::Acquire), "injected hook failure");
+            self.delivered.lock().unwrap().extend(
+                items
+                    .iter()
+                    .map(|item| item.message.conversation.clone().unwrap()),
+            );
+            Ok(())
+        }
+    }
+    for terminal in [false, true] {
+        for cancelled in [false, true] {
+            for hook_failure in [false, true] {
+                let backend = Arc::new(InMemoryBackend::new());
+                let client =
+                    crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+                let factory = crate::transport::mock::CapturingMockTransportFactory::new();
+                let transport = factory.transport();
+                let socket = crate::socket::NoiseSocket::new(
+                    Arc::new(crate::runtime_impl::TokioRuntime),
+                    transport.clone(),
+                    wacore::handshake::NoiseCipher::new(&[0; 32]).unwrap(),
+                    wacore::handshake::NoiseCipher::new(&[0; 32]).unwrap(),
+                );
+                *client.noise_socket.lock().unwrap() = Some(Arc::new(socket));
+                seed_test_pn(&client).await;
+                let hook = Arc::new(Hook {
+                    fail: AtomicBool::new(hook_failure),
+                    delivered: Default::default(),
+                });
+                client
+                    .inbound_durability_hook
+                    .set(hook.clone())
+                    .ok()
+                    .unwrap();
+                let (handler, rx) = wacore::types::events::ChannelEventHandler::new();
+                client.core.event_bus.subscribe_handler(handler).detach();
+                let group: Jid = "120363000000000088@g.us".parse().unwrap();
+                let mut alice = AlicePeer::new("100000000000006@lid").await;
+                let (bundle, bob) = bobs_prekey_bundle(&client).await;
+                let address = bob.to_protocol_address();
+                alice.install_bob_session(&address, &bundle).await;
+                let mut message = wa::Message::default();
+                message.conversation = Some("content survives auxiliary failure".into());
+                message.sender_key_distribution_message =
+                    buffa::MessageField::some(alice.create_group_skdm(&group).await);
+                if terminal {
+                    message
+                        .sender_key_distribution_message
+                        .as_option_mut()
+                        .unwrap()
+                        .axolotl_sender_key_distribution_message = Some(vec![0; 8]);
+                }
+                let info = group_message_info("MIXED_SKDM_FAILURE", &group, &alice.jid, false);
+                let ciphertext = alice
+                    .encrypt(&address, &MessageUtils::encode_and_pad(&message))
+                    .await;
+                backend.set_fail_sender_key_reads(!terminal);
+                client
+                    .inbound_commit_batch
+                    .live_retention
+                    .pause_stage
+                    .store(cancelled, Ordering::Release);
+                let receiver = client.clone();
+                let first_info = Arc::clone(&info);
+                let sender = alice.jid.clone();
+                let payload = enc_payload_from_ciphertext(&ciphertext);
+                let worker = tokio::spawn(async move {
+                    process_group_classified(&receiver, first_info, &sender, payload, vec![]).await;
+                });
+                if cancelled {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        client
+                            .inbound_commit_batch
+                            .live_retention
+                            .stage_ready
+                            .notified(),
+                    )
+                    .await
+                    .unwrap();
+                    worker.abort();
+                    assert!(worker.await.unwrap_err().is_cancelled());
+                } else {
+                    worker.await.unwrap();
+                }
+                let first_completed = terminal && !cancelled && !hook_failure;
+                assert_eq!(
+                    hook.delivered.lock().unwrap().len(),
+                    usize::from(first_completed)
+                );
+                crate::test_utils::wait_for_outbound_tasks(&client).await;
+                if !first_completed {
+                    assert_eq!(message_acks_for(&transport.sent(), &info.id), 0);
+                    assert_eq!(delivery_receipts_for(&transport.sent(), &info.id), 0);
+                }
+                backend.set_fail_sender_key_reads(false);
+                hook.fail.store(false, Ordering::Release);
+                client
+                    .inbound_commit_batch
+                    .live_retention
+                    .pause_stage
+                    .store(false, Ordering::Release);
+                client.inbound_commit_batch.reset();
+                client.enter_live_mode_for_tests();
+                for _ in 0..2 {
+                    process_group_classified(
+                        &client,
+                        Arc::new((*info).clone()),
+                        &alice.jid,
+                        enc_payload_from_ciphertext(&ciphertext),
+                        vec![],
+                    )
+                    .await;
+                }
+                assert_eq!(
+                    *hook.delivered.lock().unwrap(),
+                    ["content survives auxiliary failure"]
+                );
+                assert_eq!(message_events_for_id(&rx, &info.id), (1, 1));
+                assert!(
+                    !client
+                        .inbound_commit_batch
+                        .live_retention
+                        .has_raw_for_message(&info)
+                );
+                assert!(
+                    client
+                        .inbound_commit_batch
+                        .live_retention
+                        .for_message(&info)
+                        .unwrap()
+                        .is_empty()
+                );
+                let name =
+                    make_sender_key_name(&group, &alice.jid.to_non_ad().to_protocol_address());
+                let snapshot = client.persistence_manager.get_device_snapshot();
+                assert_eq!(
+                    client
+                        .signal_cache
+                        .get_sender_key(&name, &*snapshot.backend)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    !terminal
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn raw_pending_multipart_replay_keeps_original_shared_metadata() {
+    use wacore::messages::MessageUtils;
+    struct Hook(std::sync::Mutex<Vec<Arc<MessageInfo>>>);
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            items: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .extend(items.iter().map(|item| Arc::clone(&item.info)));
+            Ok(())
+        }
+    }
+    let (client, _) = capturing_client("multipart_metadata_replay").await;
+    client.enter_live_mode_for_tests();
+    let hook = Arc::new(Hook(Default::default()));
+    client
+        .inbound_durability_hook
+        .set(hook.clone())
+        .ok()
+        .unwrap();
+    let mut info = create_test_message_info("100@g.us", "SHARED_RAW_METADATA", "200:4@lid");
+    info.push_name = "n".repeat(1024 * 1024).into();
+    let original = Arc::new(info);
+    let producer = raw_pending::StanzaOrigin::new();
+    let payloads: Vec<_> = ["A", "A", "B"]
+        .into_iter()
+        .map(|text| {
+            let mut message = wa::Message::default();
+            message.conversation = Some(text.into());
+            MessageUtils::encode_and_pad(&message)
+        })
+        .collect();
+    let retention = &client.inbound_commit_batch.live_retention;
+    let admission = retention
+        .reserve_with_info(
+            producer,
+            payloads.iter().map(Vec::len).sum(),
+            payloads.len(),
+            &original,
+        )
+        .unwrap();
+    for (index, payload) in payloads.iter().enumerate() {
+        retention.stage(&original, producer, (index, "msg", 2), payload);
+    }
+    drop(admission);
+    let redelivery = Arc::new((*original).clone());
+    let receipts = retention.begin_receipts(&redelivery).unwrap();
+    assert!(Arc::ptr_eq(receipts.info(), &original));
+    assert!(client.ack_or_replay_to_hook(&redelivery).await);
+    assert!(!retention.has_raw_for_message(&original));
+    assert!(retention.for_message(&original).unwrap().is_empty());
+    assert!(!hook.0.lock().unwrap().is_empty());
+    assert!(
+        hook.0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|info| Arc::ptr_eq(info, &original))
+    );
+    assert!(
+        receipts.finish(),
+        "the current receipt scope owns replay completion"
+    );
 }
 
 #[tokio::test]

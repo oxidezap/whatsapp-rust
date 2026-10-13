@@ -862,10 +862,13 @@ impl Client {
             self.inbound_durability_hook()
                 .is_some()
                 .then_some((Some(index), plaintext)),
-            Some(raw_pending::DeliveryOrigin {
-                stanza: producer,
-                position: enc_index,
-            }),
+            (
+                Some(raw_pending::DeliveryOrigin {
+                    stanza: producer,
+                    position: enc_index,
+                }),
+                None,
+            ),
         )
         .await;
     }

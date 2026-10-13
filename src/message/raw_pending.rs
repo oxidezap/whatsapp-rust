@@ -21,7 +21,6 @@ pub(super) struct DeliveryOrigin {
     pub stanza: StanzaOrigin,
     pub position: usize,
 }
-#[derive(Clone)]
 pub(super) struct PendingDelivery {
     pub item: InboundMessage,
     pub carrier: Option<(Option<u32>, Bytes)>,
@@ -32,6 +31,22 @@ pub(super) struct PendingDelivery {
     // Keep MessageInfo intact: its Arc identifies the whole-stanza receipt scope.
     pub storage_sender: Option<std::sync::Arc<str>>,
     pub consumer_claimed: bool,
+}
+impl Clone for PendingDelivery {
+    // Replay and cleanup share the same ownership copy rather than embedding
+    // its Arc/Bytes bookkeeping in each asynchronous transition.
+    #[inline(never)]
+    fn clone(&self) -> Self {
+        Self {
+            item: self.item.clone(),
+            carrier: self.carrier.clone(),
+            origin: self.origin,
+            retention: self.retention.clone(),
+            receipt: self.receipt.clone(),
+            storage_sender: self.storage_sender.clone(),
+            consumer_claimed: self.consumer_claimed,
+        }
+    }
 }
 impl From<InboundMessage> for PendingDelivery {
     fn from(item: InboundMessage) -> Self {
@@ -398,20 +413,27 @@ impl Cursor {
     fn remaining(&self) -> usize {
         self.bytes.len() - self.offset
     }
-    fn take(&mut self, count: usize) -> anyhow::Result<Bytes> {
-        let end = self
-            .offset
+    #[inline(never)]
+    fn end(&self, count: usize) -> anyhow::Result<usize> {
+        self.offset
             .checked_add(count)
             .filter(|end| *end <= self.bytes.len())
-            .ok_or_else(|| anyhow::anyhow!("truncated pending journal"))?;
+            .ok_or_else(|| anyhow::anyhow!("truncated pending journal"))
+    }
+    #[inline(never)]
+    fn take(&mut self, count: usize) -> anyhow::Result<Bytes> {
+        let end = self.end(count)?;
         let bytes = self.bytes.slice(self.offset..end);
         self.offset = end;
         Ok(bytes)
     }
+    #[inline(never)]
     fn number(&mut self) -> anyhow::Result<usize> {
-        Ok(usize::try_from(u32::from_le_bytes(
-            self.take(4)?.as_ref().try_into()?,
-        ))?)
+        let end = self.end(4)?;
+        // Fixed-width metadata needs no owned Bytes slice or refcount bump.
+        let number = u32::from_le_bytes(self.bytes[self.offset..end].try_into()?);
+        self.offset = end;
+        Ok(usize::try_from(number)?)
     }
     fn blob(&mut self) -> anyhow::Result<Bytes> {
         let length = self.number()?;

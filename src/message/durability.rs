@@ -47,8 +47,9 @@ impl Client {
                         session_type: None,
                     },
                     producer: entry.origin.stanza,
+                    receipt: self.inbound_commit_batch.live_retention.receipt_for(info),
                 },
-                info,
+                &entry.info,
             ))
             .await;
             let progressed = match outcome {
@@ -83,11 +84,14 @@ impl Client {
         matches!(
             self.dispatch_shared_message_with_carrier(
                 Arc::new(message),
-                info,
+                &entry.info,
                 false,
                 None,
                 Some((Some(index), entry.plaintext)),
-                Some(entry.origin),
+                (
+                    Some(entry.origin),
+                    self.inbound_commit_batch.live_retention.receipt_for(info)
+                ),
             )
             .await,
             InboundCommitState::Durable
@@ -667,6 +671,7 @@ mod tests {
                         index,
                         annotations: Default::default(),
                         producer: origin,
+                        receipt: None,
                     },
                     &info,
                 )

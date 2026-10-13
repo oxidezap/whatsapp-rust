@@ -945,7 +945,7 @@ impl Client {
         track_commit: bool,
     ) -> InboundCommitState {
         let durable = self.inbound_durability_hook.get().is_some();
-        if durable {
+        if durable && item.receipt.is_none() {
             item.receipt = self
                 .inbound_commit_batch
                 .live_retention

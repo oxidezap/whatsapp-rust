@@ -117,6 +117,15 @@ pub(super) struct PlaintextSlot<'a> {
     pub index: usize,
     pub annotations: EncNodeAnnotations<'a>,
     pub producer: raw_pending::StanzaOrigin,
+    pub receipt: Option<Arc<live_retention::ReceiptScope>>,
+}
+
+#[inline(never)]
+fn poll_retained_plaintext<F: Future<Output = Result<PlaintextHandleOutcome, anyhow::Error>>>(
+    future: std::pin::Pin<&mut F>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<Result<PlaintextHandleOutcome, anyhow::Error>> {
+    future.poll(cx)
 }
 
 impl Client {
@@ -852,7 +861,7 @@ impl Client {
         if let Some(producer) = &receipt_producer
             && producer.finish()
         {
-            self.ack_received_message_unscoped(&info);
+            self.ack_received_message_unscoped(producer.info());
         }
 
         // Live: coalesce the receive-side flush. A lost advance re-derives
@@ -1622,6 +1631,7 @@ impl Client {
                             session_type: session_type.as_deref(),
                         },
                         producer: stanza_origin,
+                        receipt: None,
                     },
                     info,
                 )
@@ -1748,6 +1758,7 @@ impl Client {
                                 index: enc_index,
                                 annotations: payload.annotations(),
                                 producer: stanza_origin,
+                                receipt: None,
                             },
                             info,
                         )
@@ -1967,6 +1978,7 @@ impl Client {
                 index: enc_index,
                 annotations,
                 producer: raw_pending::StanzaOrigin::new(),
+                receipt: None,
             },
             info,
         )
@@ -1985,15 +1997,14 @@ impl Client {
             stanza: slot.producer,
             position: slot.index,
         };
-        let result = self
-            .handle_decrypted_plaintext_retained(
-                enc_type,
-                padded_plaintext,
-                padding_version,
-                slot,
-                info,
-            )
-            .await;
+        let mut future = std::pin::pin!(self.handle_decrypted_plaintext_retained(
+            enc_type,
+            padded_plaintext,
+            padding_version,
+            slot,
+            info,
+        ));
+        let result = std::future::poll_fn(|cx| poll_retained_plaintext(future.as_mut(), cx)).await;
         if result.as_ref().is_ok_and(|outcome| !outcome.dispatched) {
             // Successful protocol-only processing has no consumer delivery.
             // Recoverable errors and cancellation keep raw ownership; the
@@ -2015,6 +2026,7 @@ impl Client {
             index: enc_index,
             annotations,
             producer: stanza_origin,
+            receipt,
         } = slot;
         let origin = raw_pending::DeliveryOrigin {
             stanza: stanza_origin,
@@ -2128,18 +2140,31 @@ impl Client {
         if let Some(skdm) = msg.sender_key_distribution_message.as_option()
             && let Some(axolotl_bytes) = &skdm.axolotl_sender_key_distribution_message
         {
-            self.handle_sender_key_distribution_message(
-                &info.source.chat,
-                &info.source.sender,
-                &info.id,
-                axolotl_bytes,
-            )
-            .await
-            .inspect_err(|error| {
+            let result = self
+                .handle_sender_key_distribution_message(
+                    &info.source.chat,
+                    &info.source.sender,
+                    &info.id,
+                    axolotl_bytes,
+                )
+                .await;
+            if let Err(error) = result {
                 if matches!(error, crate::features::SignalError::InvalidInput(_)) {
-                    self.finish_retained_raw(origin);
+                    if skdm_only {
+                        self.finish_retained_raw(origin);
+                        return Err(error.into());
+                    }
+                    // Renderable content has independent ownership from an
+                    // invalid auxiliary sender-key distribution. Its original
+                    // carrier remains retained until consumer commit succeeds.
+                    warn!(
+                        "[msg:{}] Ignoring malformed auxiliary SKDM: {error}",
+                        info.id
+                    );
+                } else {
+                    return Err(error.into());
                 }
-            })?;
+            }
         }
 
         // A peer-provided key could forge app-state mutations, so match WA Web's
@@ -2275,7 +2300,7 @@ impl Client {
                                             position: enc_index,
                                         }),
                                         retention: None,
-                                        receipt: None,
+                                        receipt: receipt.clone(),
                                         storage_sender: None,
                                         consumer_claimed: true,
                                     },
@@ -2345,10 +2370,13 @@ impl Client {
                     app_state_key_share_job.is_some(),
                     pre_decrypted,
                     carrier,
-                    Some(raw_pending::DeliveryOrigin {
-                        stanza: stanza_origin,
-                        position: enc_index,
-                    }),
+                    (
+                        Some(raw_pending::DeliveryOrigin {
+                            stanza: stanza_origin,
+                            position: enc_index,
+                        }),
+                        receipt,
+                    ),
                 )
                 .await;
             let delivered = matches!(commit_state, InboundCommitState::Durable);

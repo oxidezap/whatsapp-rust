@@ -331,7 +331,7 @@ impl Client {
             track_commit,
             pre_decrypted,
             None,
-            None,
+            (None, None),
         )
         .await
     }
@@ -343,7 +343,10 @@ impl Client {
         track_commit: bool,
         pre_decrypted: Option<Arc<wa::Message>>,
         carrier: Option<(Option<u32>, bytes::Bytes)>,
-        origin: Option<raw_pending::DeliveryOrigin>,
+        (origin, receipt): (
+            Option<raw_pending::DeliveryOrigin>,
+            Option<Arc<live_retention::ReceiptScope>>,
+        ),
     ) -> InboundCommitState {
         let item = self
             .prepare_shared_inbound_message(msg, info, pre_decrypted)
@@ -364,7 +367,7 @@ impl Client {
                 carrier,
                 origin,
                 retention: None,
-                receipt: None,
+                receipt,
                 storage_sender: None,
                 consumer_claimed: false,
             },
