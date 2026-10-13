@@ -923,7 +923,7 @@ pub(crate) struct SendPipelineOptions<'a> {
     pub(crate) request_id: Option<&'a str>,
     pub(crate) peer: bool,
     /// A peer recovery must use the socket its request generation names.
-    pub(crate) send_scope: Option<(u64, Arc<crate::socket::NoiseSocket>)>,
+    pub(crate) send_scope: Option<(u64, std::sync::Arc<crate::socket::NoiseSocket>)>,
     pub(crate) send_observer: Option<Box<dyn wacore::socket::noise_socket::SendObserver>>,
     pub(crate) edit: Option<EditAttribute>,
     pub(crate) extra_stanza_nodes: Vec<Node>,

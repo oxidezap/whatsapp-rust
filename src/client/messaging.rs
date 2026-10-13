@@ -141,7 +141,10 @@ impl Client {
         generation: u64,
         socket: Arc<NoiseSocket>,
     ) -> Result<(), ClientError> {
-        if self.connection_generation.load(Ordering::Acquire) != generation {
+        if self.connection_generation.load(Ordering::Acquire) != generation
+            || self.authenticated_generation.load(Ordering::SeqCst) != generation
+            || !self.can_reach_server()
+        {
             return Err(anyhow::anyhow!("connection changed before peer recovery send").into());
         }
         let plaintext = self.marshal_node_for_send(node)?;

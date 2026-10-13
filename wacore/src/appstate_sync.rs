@@ -313,9 +313,9 @@ struct RecoveryRequest {
     /// Set once an answer carrying this id has been taken up, so a repeat of
     /// that answer is refused before it costs a decode.
     answering: bool,
-    /// The caller's connection generation when the ask was made. Opaque here;
-    /// it lets an answer that outlived that connection be told apart from one
-    /// that did not, since the marker itself survives a reconnect.
+    /// The caller's monotonic connection generation when the ask was made.
+    /// It distinguishes retired replies and prevents an older sender from
+    /// replacing a newer request, since the marker survives a reconnect.
     generation: u64,
 }
 

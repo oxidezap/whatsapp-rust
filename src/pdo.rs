@@ -811,6 +811,18 @@ impl Client {
         // Retry one reconnect, with a fresh id and marker. Repeated connection
         // churn is left to the app-state retry loop rather than an unbounded send.
         for _ in 0..2 {
+            let reachable = wacore::runtime::timeout(
+                &*self.runtime,
+                std::time::Duration::from_secs(60),
+                self.wait_until_reachable(),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("timed out waiting for an authenticated recovery connection")
+            })?;
+            if reachable != crate::client::Reachability::Reachable {
+                anyhow::bail!("snapshot recovery connection is {reachable:?}");
+            }
             let generation = self
                 .connection_generation
                 .load(std::sync::atomic::Ordering::Acquire);
@@ -846,6 +858,7 @@ impl Client {
                 .connection_generation
                 .load(std::sync::atomic::Ordering::Acquire)
                 != generation
+                || !self.can_reach_server()
             {
                 proc.take_recovery_request_by_id(&request_id).await;
                 continue;
@@ -2698,9 +2711,101 @@ mod tests {
             (client, transport, info)
         }
 
+        fn authenticate_recovery_fixture(client: &Arc<Client>) {
+            client
+                .is_logged_in
+                .store(true, std::sync::atomic::Ordering::Release);
+            client.authenticated_generation.store(
+                client
+                    .connection_generation
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            client.session_state_notifier.notify(usize::MAX);
+        }
+
+        #[tokio::test]
+        async fn recovery_retry_waits_for_the_final_authenticated_generation() {
+            let (client, _, _) = manual_retry_client().await;
+            let generation = client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            client
+                .is_logged_in
+                .store(true, std::sync::atomic::Ordering::Release);
+            client
+                .authenticated_generation
+                .store(generation, std::sync::atomic::Ordering::SeqCst);
+            let peer: Jid = "12025550100@s.whatsapp.net".parse().unwrap();
+            let mutex = client
+                .session_lock_for(peer.to_protocol_address().as_str())
+                .await;
+            let held = mutex.lock().await;
+            let proc = client.get_app_state_processor();
+            let sender = Arc::clone(&client);
+            let job =
+                tokio::spawn(
+                    async move { sender.request_syncd_snapshot_recovery("regular_low").await },
+                );
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !proc.has_recovery_request("regular_low").await {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // Teardown increments first; connect publishes a socket; success
+            // authenticates and increments again only after the parked send resumes.
+            client
+                .connection_generation
+                .store(generation + 1, std::sync::atomic::Ordering::SeqCst);
+            client
+                .is_logged_in
+                .store(false, std::sync::atomic::Ordering::Release);
+            let replacement = Arc::new(crate::transport::mock::CapturingMockTransport::new());
+            install_socket(&client, replacement.clone());
+            let prior_listeners = client.session_state_notifier.total_listeners();
+            drop(held);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !job.is_finished()
+                    && client.session_state_notifier.total_listeners() <= prior_listeners
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                replacement.sent().is_empty(),
+                "an intermediate pre-login generation must send no recovery"
+            );
+            assert!(!job.is_finished(), "retry must await authentication");
+            client
+                .connection_generation
+                .store(generation + 2, std::sync::atomic::Ordering::SeqCst);
+            client
+                .authenticated_generation
+                .store(generation + 2, std::sync::atomic::Ordering::SeqCst);
+            client
+                .is_logged_in
+                .store(true, std::sync::atomic::Ordering::Release);
+            client.session_state_notifier.notify(usize::MAX);
+            let id = tokio::time::timeout(std::time::Duration::from_secs(5), job)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(replacement.sent().len(), 1);
+            assert_eq!(
+                proc.take_recovery_request_with_generation_by_id(&id).await,
+                Some(("regular_low".into(), generation + 2))
+            );
+        }
+
         #[tokio::test]
         async fn recovery_send_stops_after_two_reconnects_and_releases_markers() {
             let (client, _, _) = manual_retry_client().await;
+            authenticate_recovery_fixture(&client);
             let (first_entered, first_release) = failure_socket(&client);
             let sender = Arc::clone(&client);
             let job =
@@ -2715,6 +2820,7 @@ mod tests {
             client
                 .connection_generation
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            authenticate_recovery_fixture(&client);
             first_release.send(()).await.unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(5), second_entered.recv())
                 .await
@@ -2723,6 +2829,7 @@ mod tests {
             client
                 .connection_generation
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            authenticate_recovery_fixture(&client);
             second_release.send(()).await.unwrap();
             assert!(
                 tokio::time::timeout(std::time::Duration::from_secs(5), job)
@@ -2772,6 +2879,7 @@ mod tests {
         #[tokio::test]
         async fn recovery_send_retries_on_reconnect_without_using_old_marker() {
             let (client, old_transport, _) = manual_retry_client().await;
+            authenticate_recovery_fixture(&client);
             let peer: Jid = "12025550100@s.whatsapp.net".parse().unwrap();
             let mutex = client
                 .session_lock_for(peer.to_protocol_address().as_str())
@@ -2798,6 +2906,7 @@ mod tests {
             client
                 .connection_generation
                 .store(generation + 1, std::sync::atomic::Ordering::Release);
+            authenticate_recovery_fixture(&client);
             drop(held);
             let id = tokio::time::timeout(std::time::Duration::from_secs(5), job)
                 .await
