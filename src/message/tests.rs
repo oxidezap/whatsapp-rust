@@ -20518,6 +20518,153 @@ async fn live_storage_failure_retry(reset_and_flush: bool) {
 }
 
 #[tokio::test]
+async fn raw_pending_sibling_bypass_keeps_default_duplicate_suppression() {
+    use wacore::messages::MessageUtils;
+    let (client, _) = capturing_client("default_sibling_suppression").await;
+    let (handler, rx) = wacore::types::events::ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+    let info = Arc::new(create_test_message_info(
+        "100@g.us",
+        "DEFAULT_EQUAL_PARTS",
+        "200@s.whatsapp.net",
+    ));
+    let mut message = wa::Message::default();
+    message.conversation = Some("identical default delivery".into());
+    let producer = raw_pending::StanzaOrigin::new();
+    for index in 0..2 {
+        client
+            .handle_decrypted_plaintext_in_scope(
+                "msg",
+                MessageUtils::encode_and_pad(&message),
+                2,
+                receive::PlaintextSlot {
+                    index,
+                    annotations: Default::default(),
+                    producer,
+                },
+                &info,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(message_events_for_id(&rx, &info.id), (1, 1));
+}
+
+#[tokio::test]
+async fn raw_pending_protocol_only_replay_allows_progress_without_publication() {
+    use wacore::messages::MessageUtils;
+    struct NoDelivery;
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for NoDelivery {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            panic!("protocol-only recovery must not enter the consumer hook")
+        }
+    }
+    let (client, transport) = capturing_client("raw_protocol_only_replay").await;
+    client
+        .inbound_durability_hook
+        .set(Arc::new(NoDelivery))
+        .ok()
+        .unwrap();
+    let (handler, rx) = wacore::types::events::ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+    let group: Jid = "120363000000000084@g.us".parse().unwrap();
+    let mut alice = AlicePeer::new("100000000000002@lid").await;
+    let mut message = wa::Message::default();
+    message.sender_key_distribution_message =
+        buffa::MessageField::some(alice.create_group_skdm(&group).await);
+    let info = group_message_info("RAW_PROTOCOL_ONLY", &group, &alice.jid, false);
+    let producer = raw_pending::StanzaOrigin::new();
+    let retention = &client.inbound_commit_batch.live_retention;
+    let admission = retention.reserve(producer, 1024, 1).unwrap();
+    retention.stage(
+        &info,
+        producer,
+        (0, "msg", 2),
+        &MessageUtils::encode_and_pad(&message),
+    );
+    drop(admission);
+    assert!(retention.has_raw_for_message(&info));
+    assert!(
+        client.ack_or_replay_to_hook(&info).await,
+        "successful protocol-only recovery must unblock the current carrier"
+    );
+    assert!(!retention.has_raw_for_message(&info));
+    assert_eq!(message_events_for_id(&rx, &info.id), (0, 0));
+    assert_eq!(message_acks_for(&transport.sent(), &info.id), 0);
+    assert_eq!(delivery_receipts_for(&transport.sent(), &info.id), 0);
+}
+
+#[tokio::test]
+async fn raw_pending_capacity_refusal_preserves_ratchet_for_later_retry() {
+    struct Hook(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            messages: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            self.0.fetch_add(messages.len(), Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let (client, transport) = capturing_client("capacity_refusal_retry").await;
+    let hook = Arc::new(Hook(std::sync::atomic::AtomicUsize::new(0)));
+    client
+        .inbound_durability_hook
+        .set(hook.clone())
+        .ok()
+        .unwrap();
+    let group: Jid = "120363000000000085@g.us".parse().unwrap();
+    let mut alice = joined_group_sender(&client, "100000000000003:76@lid", &group).await;
+    let ciphertext = encrypt_group_text(&mut alice, &group, "retry after capacity returns").await;
+    let occupied = client
+        .inbound_commit_batch
+        .live_retention
+        .occupy_remaining_for_tests();
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(
+            &group,
+            &alice.jid,
+            "CAPACITY_RETRY",
+            ciphertext.clone(),
+        ))
+        .await;
+    assert_eq!(hook.0.load(Ordering::SeqCst), 0);
+    assert_eq!(message_acks_for(&transport.sent(), "CAPACITY_RETRY"), 0);
+    assert_eq!(
+        delivery_receipts_for(&transport.sent(), "CAPACITY_RETRY"),
+        0
+    );
+    drop(occupied);
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(
+            &group,
+            &alice.jid,
+            "CAPACITY_RETRY",
+            ciphertext,
+        ))
+        .await;
+    assert_eq!(
+        hook.0.load(Ordering::SeqCst),
+        1,
+        "refusal must not advance Signal"
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(
+        delivery_receipts_for(&transport.sent(), "CAPACITY_RETRY"),
+        1
+    );
+}
+
+#[tokio::test]
 async fn raw_pending_cancelled_after_group_decrypt_replays_without_ratchet() {
     cancelled_raw_replay(false, false, false).await;
 }

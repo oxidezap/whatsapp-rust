@@ -541,6 +541,39 @@ mod tests {
     }
 
     #[test]
+    fn raw_pending_direct_lookup_preserves_device_and_namespace_identity() {
+        let mut info = MessageInfo {
+            id: "DIRECT_RAW_IDENTITY".into(),
+            ..Default::default()
+        };
+        info.source.chat = "100@s.whatsapp.net".parse().unwrap();
+        info.source.sender = "100:7@s.whatsapp.net".parse().unwrap();
+        assert!(same_message(&info, &info.clone()));
+        let mut other = info.clone();
+        other.source.sender = "100:8@s.whatsapp.net".parse().unwrap();
+        assert!(!same_message(&info, &other));
+        other.source.sender = "100@s.whatsapp.net".parse().unwrap();
+        assert!(!same_message(&info, &other));
+        other.source.chat = "100@lid".parse().unwrap();
+        other.source.sender = "100:7@lid".parse().unwrap();
+        assert!(!same_message(&info, &other));
+    }
+
+    #[test]
+    fn raw_pending_oversized_admission_does_not_consume_capacity() {
+        let retention = LiveRetention::default();
+        assert!(
+            retention
+                .reserve(StanzaOrigin::new(), MAX_PENDING_BYTES, 1)
+                .is_err()
+        );
+        assert!(lock(&retention.state).reservations.is_empty());
+        assert_eq!(lock(&retention.budget).bytes, 0);
+        assert_eq!(lock(&retention.budget).admissions, 0);
+        assert!(retention.reserve(StanzaOrigin::new(), 1024, 1).is_ok());
+    }
+
+    #[test]
     fn raw_pending_cancelled_empty_admission_returns_capacity() {
         let retention = LiveRetention::default();
         let admission = retention.reserve(StanzaOrigin::new(), 1024, 1).unwrap();

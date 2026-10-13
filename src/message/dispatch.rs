@@ -172,7 +172,8 @@ impl Client {
         let candidate = decrypted.as_ref().map_or(message, |inner| inner);
         let fingerprint = MessageDispatch::fingerprint(candidate);
         if self.with_message_dispatch(info, false, |claim| {
-            let sibling = producer.is_some()
+            let sibling = self.inbound_durability_hook.get().is_some()
+                && producer.is_some()
                 && claim.payloads.iter().any(|payload| {
                     payload.fingerprint == fingerprint
                         && payload.producer == producer

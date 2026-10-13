@@ -51,7 +51,7 @@ impl Client {
                 info,
             ))
             .await;
-            if !outcome.is_ok_and(|outcome| outcome.delivered) {
+            if !outcome.is_ok_and(|outcome| outcome.delivered || !outcome.dispatched) {
                 return false;
             }
         }

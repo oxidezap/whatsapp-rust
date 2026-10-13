@@ -323,8 +323,9 @@ async fn failed_ping_does_not_authorize_teardown_of_a_new_deadline() {
     async fn wait_sent(
         transport: &Arc<crate::transport::mock::CapturingMockTransport>,
         count: usize,
+        budget: Duration,
     ) {
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + budget;
         while transport.sent_count() < count {
             assert!(
                 tokio::time::Instant::now() < until,
@@ -340,7 +341,7 @@ async fn failed_ping_does_not_authorize_teardown_of_a_new_deadline() {
     let keepalive = start_keepalive(&client);
     tokio::task::yield_now().await;
     tokio::time::advance(KEEP_ALIVE_INTERVAL_MAX).await;
-    wait_sent(&transport, 1).await;
+    wait_sent(&transport, 1, Duration::from_secs(5)).await;
     let first = decode_sent_iq(&transport, 0).await;
     let first_id = first
         .get()
@@ -384,7 +385,7 @@ async fn failed_ping_does_not_authorize_teardown_of_a_new_deadline() {
     );
     tokio::time::advance(Duration::from_secs(1)).await;
     let unrelated = request(&client, "NEW_DEADLINE", Some(Duration::from_secs(150)));
-    wait_sent(&transport, 2).await;
+    wait_sent(&transport, 2, Duration::from_secs(5)).await;
     let new_deadline = client.stats.first_send_since_recv();
     assert!(new_deadline.is_some());
     tokio::time::advance(KEEP_ALIVE_INTERVAL_MAX).await;
@@ -395,7 +396,15 @@ async fn failed_ping_does_not_authorize_teardown_of_a_new_deadline() {
     ));
     // The earlier error response proved the old deadline alive. A new expired
     // application-IQ deadline must get its own bounded liveness probe.
-    wait_sent(&transport, 3).await;
+    // An intermediate tick can skip the ping after recent receive activity.
+    // Allow the next randomized tick; the expired-deadline assertion above
+    // and generation assertion below still enforce the watchdog behavior.
+    wait_sent(
+        &transport,
+        3,
+        KEEP_ALIVE_INTERVAL_MAX + Duration::from_secs(5),
+    )
+    .await;
     let probe = decode_sent_iq(&transport, 2).await;
     assert_eq!(
         probe.get().attrs().optional_string("xmlns").as_deref(),

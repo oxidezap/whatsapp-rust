@@ -47,14 +47,21 @@ use waproto::whatsapp as wa;
 ///   hook does not gate them (they dispatch event-only). The same applies to PDO
 ///   placeholder recoveries (`info.unavailable_request_id` is set): their ack runs
 ///   on the PDO path, so the hook never sees them.
-/// - If the durable buffer write itself fails (e.g. disk full, after retries),
-///   the acks are suppressed, but if the process does not crash the Signal
-///   ratchet still advances and those messages degrade to at-most-once on their
-///   next redelivery (they can no longer be decrypted, and there is no buffered
-///   copy to replay). The guarantee holds whenever the buffer write succeeds.
+/// - Live plaintext backing is admitted before Signal decryption under a
+///   4 MiB budget and 400 reservations. Admission accounts for both the carrier
+///   and consumer projection plus metadata; the maximum ciphertext size is
+///   therefore smaller than 4 MiB. Capacity refusal leaves Signal untouched
+///   and sends no positive ACK. A later server redelivery can retry after
+///   capacity is released; an oversized stanza remains refused under this bound.
+/// - If a durable buffer write fails, plaintext remains owned by this Client
+///   across cancellation and reconnect, and redelivery retries storage without
+///   repeating Signal decryption. This resident copy cannot survive process
+///   termination. Crash recovery requires the pending row to have been stored
+///   durably before the process exits.
 /// - On a redelivery replay the `info` is re-parsed from the stanza, so a few
 ///   fields derived during the first dispatch (the ephemeral timer, encrypted
-///   comment threading) may be absent. The `message` body is always the original.
+///   comment threading) may be absent. The stored `message` is the consumer
+///   projection, including the resolved payload of secret messages.
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait InboundDurabilityHook: wacore::sync_marker::MaybeSendSync {
