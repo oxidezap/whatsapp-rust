@@ -396,6 +396,70 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn public_contact_lookups_never_learn_malformed_returned_lids() {
+        use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
+        use wacore_binary::builder::NodeBuilder;
+        for (user_info, returned) in [
+            (false, "abc@lid"),
+            (true, "abc@lid"),
+            (false, "@lid"),
+            (true, "@lid"),
+            (false, "0@lid"),
+            (true, "0@lid"),
+        ] {
+            let (client, transport) = create_iq_test_client().await;
+            let caller = client.clone();
+            let task = tokio::spawn(async move {
+                if user_info {
+                    caller
+                        .contacts()
+                        .get_user_info(&[Jid::lid("100000001")])
+                        .await
+                        .unwrap();
+                } else {
+                    caller
+                        .contacts()
+                        .is_on_whatsapp(&[Jid::lid("100000001")])
+                        .await
+                        .unwrap();
+                }
+            });
+            let sent = decode_sent_iq(&transport, 0).await;
+            let id = sent
+                .get()
+                .attrs()
+                .optional_string("id")
+                .unwrap()
+                .into_owned();
+            let response = NodeBuilder::new("iq")
+                .attr("type", "result")
+                .attr("id", &id)
+                .children([NodeBuilder::new("usync")
+                    .children([NodeBuilder::new("list")
+                        .children([NodeBuilder::new("user")
+                            .attr("jid", returned)
+                            .attr("pn_jid", "12025550111@s.whatsapp.net")
+                            .children([NodeBuilder::new("business")
+                                .attr("pn_jid", "12025550111@s.whatsapp.net")
+                                .build()])
+                            .build()])
+                        .build()])
+                    .build()])
+                .build();
+            answer_iq(&client, &id, &response).await;
+            task.await.unwrap();
+            assert!(
+                client
+                    .get_lid_pn_entry(&Jid::pn("12025550111"))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "user_info={user_info}, returned={returned}"
+            );
+        }
+    }
+
     #[test]
     fn is_on_whatsapp_accepts_pn_and_lid_jids() {
         ensure_is_on_whatsapp_jids_supported(&[Jid::pn("15550000001"), Jid::lid("100000001")])

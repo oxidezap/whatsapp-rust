@@ -1359,6 +1359,39 @@ mod tests {
     use wacore::store::traits::SignalStore;
     use wacore_binary::Server;
 
+    #[tokio::test]
+    async fn lid_pn_batch_preserves_observation_order_after_phone_deduplication() {
+        let client = create_test_client().await;
+        let mappings: Vec<_> = (1..=32)
+            .map(|n| (format!("100000{n:03}"), format!("1202555{n:04}")))
+            .collect();
+        let outcome = client
+            .record_lid_pn_batch_in_memory(mappings.clone(), LearningSource::Other)
+            .await;
+        let observed: Vec<_> = outcome
+            .entries
+            .iter()
+            .map(|e| (e.lid.to_string(), e.phone_number.to_string()))
+            .collect();
+        assert_eq!(observed, mappings);
+    }
+
+    #[tokio::test]
+    async fn lid_pn_batch_does_not_replace_the_first_observation_of_a_lid() {
+        let client = create_test_client().await;
+        let outcome = client
+            .record_lid_pn_batch_in_memory(
+                vec![
+                    ("100000001".into(), "12025550111".into()),
+                    ("100000001".into(), "12025550112".into()),
+                ],
+                LearningSource::Other,
+            )
+            .await;
+        assert_eq!(outcome.entries[0].phone_number.as_ref(), "12025550111");
+        assert_eq!(outcome.usync_phones, ["12025550112"]);
+    }
+
     /// Fixture: test client with one cached peer LID-PN mapping.
     async fn client_with_peer_mapping() -> (Arc<Client>, &'static str, &'static str) {
         let client = create_test_client().await;

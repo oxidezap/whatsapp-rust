@@ -51,6 +51,8 @@ mod tests {
         status_privacy: Arc<Mutex<Option<wa::sync_action_value::StatusPrivacyAction>>>,
         status_privacy_versions: Arc<Mutex<Vec<Option<u64>>>>,
         fail_status_privacy: Arc<Mutex<bool>>,
+        fail_lid_mappings: Arc<Mutex<bool>>,
+        lid_mapping_versions: Arc<Mutex<Vec<Option<u64>>>>,
     }
 
     // Implement SignalStore - Signal protocol cryptographic operations
@@ -242,17 +244,30 @@ mod tests {
         async fn delete_sender_key_device_rows(&self, _: &[&str]) -> StoreResult<()> {
             Ok(())
         }
-        async fn get_lid_mapping(&self, _: &str) -> StoreResult<Option<LidPnMappingEntry>> {
-            Ok(None)
+        async fn get_lid_mapping(&self, lid: &str) -> StoreResult<Option<LidPnMappingEntry>> {
+            self.token_store.get_lid_mapping(lid).await
         }
-        async fn get_pn_mapping(&self, _: &str) -> StoreResult<Option<LidPnMappingEntry>> {
-            Ok(None)
+        async fn get_pn_mapping(&self, pn: &str) -> StoreResult<Option<LidPnMappingEntry>> {
+            self.token_store.get_pn_mapping(pn).await
         }
-        async fn put_lid_mapping(&self, _: &LidPnMappingEntry) -> StoreResult<()> {
-            Ok(())
+        async fn put_lid_mapping(&self, mapping: &LidPnMappingEntry) -> StoreResult<()> {
+            self.put_lid_mappings(std::slice::from_ref(mapping)).await
+        }
+        async fn put_lid_mappings(&self, mappings: &[LidPnMappingEntry]) -> StoreResult<()> {
+            let version = self
+                .get_version(WAPatchName::Regular.as_str())
+                .await?
+                .map(|s| s.version);
+            self.lid_mapping_versions.lock().await.push(version);
+            if *self.fail_lid_mappings.lock().await {
+                return Err(wacore::store::error::StoreError::Io(std::io::Error::other(
+                    "injected LID mapping failure",
+                )));
+            }
+            self.token_store.put_lid_mappings(mappings).await
         }
         async fn get_all_lid_mappings(&self) -> StoreResult<Vec<LidPnMappingEntry>> {
-            Ok(vec![])
+            self.token_store.get_all_lid_mappings().await
         }
         async fn save_base_key(&self, _: &str, _: &str, _: &[u8]) -> StoreResult<()> {
             Ok(())
@@ -567,6 +582,190 @@ mod tests {
             }
         };
         (backend, processor, list, action)
+    }
+
+    async fn pn_for_lid_chat_patch_scenario(
+        snapshot: bool,
+        install_persistence: bool,
+    ) -> (
+        Arc<MockBackend>,
+        AppStateProcessor,
+        PatchList,
+        wa::SyncActionValue,
+    ) {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let processor = if install_persistence {
+            processor.with_mutation_persistence(backend.clone())
+        } else {
+            processor
+        };
+        let key_id = b"pn_for_lid_chat_key".to_vec();
+        let master_key = [21u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        backend
+            .set_sync_key(
+                &key_id,
+                AppStateSyncKey {
+                    key_data: master_key.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        if snapshot {
+            backend
+                .set_version(
+                    WAPatchName::Regular.as_str(),
+                    HashState {
+                        version: 1,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut action = wa::SyncActionValue::default();
+        action.pn_for_lid_chat_action.get_or_insert_default().pn_jid =
+            Some("12025550111@s.whatsapp.net".into());
+        let plaintext = {
+            let mut proto = wa::SyncActionData::default();
+            proto.index = Some(br#"["pnForLidChat","100000001@lid"]"#.to_vec());
+            proto.value = buffa::MessageField::some(action.clone());
+            proto
+        }
+        .encode_to_vec();
+        let mutation = create_encrypted_mutation(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &[0x31; 32],
+            &plaintext,
+            &keys,
+            &key_id,
+        );
+        let version = if snapshot { 2 } else { 1 };
+        let list = if snapshot {
+            PatchList {
+                name: WAPatchName::Regular,
+                has_more_patches: false,
+                patches: Vec::new(),
+                snapshot: Some({
+                    let mut proto = wa::SyncdSnapshot::default();
+                    proto.version = buffa::MessageField::some({
+                        let mut proto = wa::SyncdVersion::default();
+                        proto.version = Some(version);
+                        proto
+                    });
+                    proto.records = vec![mutation.record.expect("status record")];
+                    proto.key_id = buffa::MessageField::some({
+                        let mut proto = wa::KeyId::default();
+                        proto.id = Some(key_id);
+                        proto
+                    });
+                    proto
+                }),
+                snapshot_ref: None,
+                error: None,
+            }
+        } else {
+            PatchList {
+                name: WAPatchName::Regular,
+                has_more_patches: false,
+                patches: vec![{
+                    let mut proto = wa::SyncdPatch::default();
+                    proto.mutations = vec![mutation];
+                    proto.version = buffa::MessageField::some({
+                        let mut proto = wa::SyncdVersion::default();
+                        proto.version = Some(version);
+                        proto
+                    });
+                    proto.key_id = buffa::MessageField::some({
+                        let mut proto = wa::KeyId::default();
+                        proto.id = Some(key_id);
+                        proto
+                    });
+                    proto
+                }],
+                snapshot: None,
+                snapshot_ref: None,
+                error: None,
+            }
+        };
+        (backend, processor, list, action)
+    }
+
+    #[tokio::test]
+    async fn public_processor_learns_pn_for_lid_before_advancing_the_cursor() {
+        for snapshot in [false, true] {
+            let (backend, _, list, _) = pn_for_lid_chat_patch_scenario(snapshot, false).await;
+            let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+            let (_, state, _) = client
+                .get_app_state_processor()
+                .process_patch_list(list, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                backend.lid_mapping_versions.lock().await.as_slice(),
+                &[if snapshot { Some(1) } else { None }]
+            );
+            assert_eq!(
+                backend
+                    .get_version("regular")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .version,
+                state.version
+            );
+            client.lid_pn_cache.clear().await;
+            let mapping = client
+                .get_lid_pn_entry(&wacore_binary::Jid::lid("100000001"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(mapping.phone_number.as_ref(), "12025550111");
+        }
+    }
+
+    #[tokio::test]
+    async fn public_processor_retries_pn_for_lid_after_a_durable_write_failure() {
+        for snapshot in [false, true] {
+            let (backend, _, list, _) = pn_for_lid_chat_patch_scenario(snapshot, false).await;
+            let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+            *backend.fail_lid_mappings.lock().await = true;
+            let processor = client.get_app_state_processor();
+            assert!(
+                processor
+                    .process_patch_list(list.clone(), false)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                backend
+                    .get_version("regular")
+                    .await
+                    .unwrap()
+                    .map(|s| s.version),
+                if snapshot { Some(1) } else { None }
+            );
+            assert!(
+                backend
+                    .get_lid_mapping("100000001")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            *backend.fail_lid_mappings.lock().await = false;
+            processor.process_patch_list(list, false).await.unwrap();
+            client.lid_pn_cache.clear().await;
+            let mapping = client
+                .get_lid_pn_entry(&wacore_binary::Jid::lid("100000001"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(mapping.phone_number.as_ref(), "12025550111");
+        }
     }
 
     #[tokio::test]
