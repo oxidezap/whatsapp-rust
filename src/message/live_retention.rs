@@ -74,9 +74,14 @@ struct RetainedDelivery {
 
 impl RetainedDelivery {
     fn new(item: &PendingDelivery, charge: &Arc<Charge>) -> Self {
+        let encoded = waproto::codec::message_to_vec(&item.message);
+        let projection = match &item.carrier {
+            Some((_, original)) if original.as_ref() == encoded => original.clone(),
+            _ => encoded.into(),
+        };
         Self {
             info: Arc::clone(&item.info),
-            projection: waproto::codec::message_to_vec(&item.message).into(),
+            projection,
             message: Arc::downgrade(&item.message),
             ephemeral_expiration: item.ephemeral_expiration,
             comment_target: item
@@ -169,6 +174,11 @@ impl Drop for Admission {
         }
     }
 }
+impl Admission {
+    pub fn attach_receipts(&self, producer: &ReceiptProducer) {
+        lock(&producer.0.state).charge = Arc::downgrade(&self._charge);
+    }
+}
 
 #[derive(Default)]
 struct ReceiptState {
@@ -176,12 +186,19 @@ struct ReceiptState {
     failed: bool,
     requested: bool,
     sent: bool,
+    // A queued replay may use an older producer origin with this arrival's
+    // metadata. Capture its admission in the delivery before the producer
+    // releases it; a receipt scope alone does not own resident payload data.
+    charge: std::sync::Weak<Charge>,
 }
 pub(super) struct ReceiptScope {
     arrival: std::sync::Weak<MessageInfo>,
     state: Mutex<ReceiptState>,
 }
 impl ReceiptScope {
+    pub fn admission(&self) -> Option<Arc<Charge>> {
+        lock(&self.state).charge.upgrade()
+    }
     pub fn defer(&self) -> bool {
         let mut state = lock(&self.state);
         state.requested = true;
@@ -220,6 +237,33 @@ impl Drop for ReceiptProducer {
     }
 }
 impl LiveRetention {
+    #[inline(never)]
+    pub fn has_owned_for_message(&self, info: &MessageInfo) -> bool {
+        let state = lock(&self.state);
+        state.reservations.iter().any(|reservation| {
+            reservation
+                .raw
+                .iter()
+                .any(|entry| same_message(&entry.info, info))
+                || reservation
+                    .entries
+                    .iter()
+                    .any(|entry| same_message(&entry.info, info))
+        })
+    }
+
+    #[inline(never)]
+    pub fn encoded_projection(&self, item: &PendingDelivery) -> Option<bytes::Bytes> {
+        let state = lock(&self.state);
+        for reservation in &state.reservations {
+            for entry in &reservation.entries {
+                if entry.message.as_ptr() == Arc::as_ptr(&item.message) {
+                    return Some(entry.projection.clone());
+                }
+            }
+        }
+        None
+    }
     #[cfg(test)]
     fn assert_access_allowed(&self) {
         assert!(
@@ -277,6 +321,7 @@ impl LiveRetention {
         self.reserve_sized(origin, wire_bytes, slots, 0)
     }
 
+    #[inline(never)]
     pub fn reserve_with_info(
         &self,
         origin: StanzaOrigin,
@@ -294,10 +339,12 @@ impl LiveRetention {
         slots: usize,
         metadata: usize,
     ) -> anyhow::Result<Admission> {
-        // Reserve carrier + projection backing and per-slot bookkeeping, before
-        // decrypt. This accounting is separate from transient decoded heap.
+        // Canonical encoding may expand packed scalar fields to unpacked tags.
+        // Message's repeated scalar tags occupy at most two bytes, so a one-byte
+        // value can expand to three bytes. Reserve carrier + that projection
+        // before decrypt; this remains separate from transient decoded heap.
         let bytes = wire_bytes
-            .checked_mul(2)
+            .checked_mul(4)
             .and_then(|bytes| {
                 slots
                     .checked_mul(SLOT_BYTES)
@@ -482,12 +529,34 @@ impl LiveRetention {
             self.stage_release.notified().await;
         }
     }
+    #[cfg(test)]
+    pub fn release_stage_for_tests(&self) {
+        self.pause_stage
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.stage_release.notify_one();
+    }
+    #[cfg(test)]
     pub fn stage(
         &self,
         info: &Arc<MessageInfo>,
         producer: StanzaOrigin,
         slot: (usize, &'static str, u8),
         plaintext: &[u8],
+    ) {
+        self.stage_owned(
+            info,
+            producer,
+            slot,
+            bytes::Bytes::copy_from_slice(plaintext),
+        );
+    }
+
+    pub fn stage_owned(
+        &self,
+        info: &Arc<MessageInfo>,
+        producer: StanzaOrigin,
+        slot: (usize, &'static str, u8),
+        plaintext: bytes::Bytes,
     ) {
         #[cfg(test)]
         self.assert_access_allowed();
@@ -511,7 +580,7 @@ impl LiveRetention {
         reservation.raw.push(RawRetained {
             info: Arc::clone(info),
             origin,
-            plaintext: bytes::Bytes::copy_from_slice(plaintext),
+            plaintext,
             enc_type: slot.1,
             padding_version: slot.2,
             charge: Arc::clone(&reservation.charge),
@@ -532,6 +601,7 @@ impl LiveRetention {
             }
         }
     }
+    #[inline(never)]
     pub fn has_raw_for_message(&self, info: &MessageInfo) -> bool {
         lock(&self.state).reservations.iter().any(|reservation| {
             reservation
@@ -540,12 +610,14 @@ impl LiveRetention {
                 .any(|entry| same_message(&entry.info, info))
         })
     }
+    #[inline(never)]
     pub fn has_raw_origin(&self, origin: super::raw_pending::DeliveryOrigin) -> bool {
         lock(&self.state)
             .reservations
             .iter()
             .any(|reservation| reservation.raw.iter().any(|entry| entry.origin == origin))
     }
+    #[inline(never)]
     pub fn raw_for_message(&self, info: &MessageInfo) -> Vec<RawRetained> {
         lock(&self.state)
             .reservations
@@ -576,6 +648,7 @@ impl LiveRetention {
         }
         Ok(deliveries)
     }
+    #[inline(never)]
     pub fn charge_for_origin(
         &self,
         origin: Option<super::raw_pending::DeliveryOrigin>,
@@ -694,12 +767,12 @@ mod tests {
             item.retention = retention.charge_for_origin(Some(origin));
             item
         };
-        let mut oversized = make_item(1024);
+        let mut oversized = make_item(3072);
         assert!(retention.retain(&mut oversized).is_err());
         assert_eq!(retention.raw_for_message(&info).len(), 2);
         assert!(retention.for_message(&info).unwrap().is_empty());
-        let mut exact = make_item(1021);
-        assert_eq!(exact.retained_wire_bytes() + plaintext.len(), 2048);
+        let mut exact = make_item(3069);
+        assert_eq!(exact.retained_wire_bytes() + plaintext.len(), 4096);
         retention.retain(&mut exact).unwrap();
         assert_eq!(retention.raw_for_message(&info).len(), 1);
         assert_eq!(retention.for_message(&info).unwrap().len(), 1);

@@ -135,12 +135,15 @@ impl Client {
         info: &Arc<MessageInfo>,
         producer: raw_pending::StanzaOrigin,
         slot: (usize, &'static str, u8),
-        plaintext: &[u8],
+        plaintext: &bytes::Bytes,
     ) {
         if self.inbound_durability_hook.get().is_some() {
-            self.inbound_commit_batch
-                .live_retention
-                .stage(info, producer, slot, plaintext);
+            self.inbound_commit_batch.live_retention.stage_owned(
+                info,
+                producer,
+                slot,
+                plaintext.clone(),
+            );
         }
     }
 
@@ -567,7 +570,17 @@ impl Client {
         let stanza_origin = raw_pending::StanzaOrigin::new();
         let mut receipt_producer = None;
         if self.inbound_durability_hook().is_some()
-            && !self.inbound_commit_batch.is_active()
+            && self.inbound_commit_batch.is_active()
+            && self.inbound_commit_batch.has_entries()
+            && self
+                .inbound_commit_batch
+                .live_retention
+                .has_owned_for_message(&info)
+            && !self.flush_inbound_commits_while_processing().await
+        {
+            return;
+        }
+        if self.inbound_durability_hook().is_some()
             && self
                 .inbound_commit_batch
                 .live_retention
@@ -591,12 +604,16 @@ impl Client {
             if !self.ack_or_replay_to_hook(&info).await {
                 return;
             }
+            if self.inbound_commit_batch.is_active()
+                && self.inbound_commit_batch.has_entries()
+                && !self.flush_inbound_commits_while_processing().await
+            {
+                return;
+            }
         }
         // Admission precedes every ratchet mutation. Refusal leaves ciphertext
         // untouched for server redelivery; reset never evicts a retained live row.
-        let _live_admission = if self.inbound_durability_hook().is_some()
-            && !self.inbound_commit_batch.is_active()
-        {
+        let _live_admission = if self.inbound_durability_hook().is_some() {
             if let Err(error) = self.persist_live_retained_before_decrypt(&info).await {
                 log::warn!(
                     "Retained live write is still unavailable; leaving ciphertext untouched: {error:?}"
@@ -613,12 +630,25 @@ impl Client {
                     count.saturating_add(1),
                 )
             });
-            match self.inbound_commit_batch.live_retention.reserve_with_info(
+            let mut admission = self.inbound_commit_batch.live_retention.reserve_with_info(
                 stanza_origin,
                 wire_bytes,
                 slots,
                 &info,
-            ) {
+            );
+            if admission.is_err()
+                && self.inbound_commit_batch.is_active()
+                && self.inbound_commit_batch.has_entries()
+                && self.flush_inbound_commits_while_processing().await
+            {
+                admission = self.inbound_commit_batch.live_retention.reserve_with_info(
+                    stanza_origin,
+                    wire_bytes,
+                    slots,
+                    &info,
+                );
+            }
+            match admission {
                 Ok(admission) => Some(admission),
                 Err(error) => {
                     log::warn!("Live pending capacity exhausted before decrypt: {error:?}");
@@ -641,6 +671,9 @@ impl Client {
                     return;
                 }
             };
+        }
+        if let (Some(admission), Some(producer)) = (&_live_admission, &receipt_producer) {
+            admission.attach_receipts(producer);
         }
         if max_sender_retry_count > 0 {
             let cache_key = self
@@ -1051,11 +1084,12 @@ impl Client {
 
             match decrypt_res {
                 Ok(decrypted) => {
+                    let plaintext = bytes::Bytes::from(decrypted.plaintext);
                     self.stage_retained_plaintext(
                         info,
                         stanza_origin,
                         (enc_index, enc_type, padding_version),
-                        &decrypted.plaintext,
+                        &plaintext,
                     );
                     #[cfg(test)]
                     self.inbound_commit_batch
@@ -1083,7 +1117,7 @@ impl Client {
                     outcome.decrypted = true;
                     deferred.push(DeferredPlaintext {
                         enc_type,
-                        plaintext: decrypted.plaintext,
+                        plaintext,
                         padding_version,
                         enc_index,
                         state: state.clone(),
@@ -1182,11 +1216,12 @@ impl Client {
 
                         match retry_decrypt_res {
                             Ok(decrypted) => {
+                                let plaintext = bytes::Bytes::from(decrypted.plaintext);
                                 self.stage_retained_plaintext(
                                     info,
                                     stanza_origin,
                                     (enc_index, enc_type, padding_version),
-                                    &decrypted.plaintext,
+                                    &plaintext,
                                 );
                                 log::debug!(
                                     "[msg:{}] Successfully decrypted message from {} after handling untrusted identity",
@@ -1214,7 +1249,7 @@ impl Client {
                                 outcome.decrypted = true;
                                 deferred.push(DeferredPlaintext {
                                     enc_type,
-                                    plaintext: decrypted.plaintext,
+                                    plaintext,
                                     padding_version,
                                     enc_index,
                                     state: state.clone(),
@@ -1725,6 +1760,7 @@ impl Client {
 
             match decrypt_result {
                 Ok(padded_plaintext) => {
+                    let padded_plaintext = bytes::Bytes::from(padded_plaintext);
                     self.stage_retained_plaintext(
                         info,
                         stanza_origin,
@@ -1972,7 +2008,7 @@ impl Client {
     ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
         self.handle_decrypted_plaintext_in_scope(
             enc_type,
-            padded_plaintext,
+            padded_plaintext.into(),
             padding_version,
             PlaintextSlot {
                 index: enc_index,
@@ -1988,7 +2024,7 @@ impl Client {
     pub(super) async fn handle_decrypted_plaintext_in_scope(
         self: &Arc<Self>,
         enc_type: &'static str,
-        padded_plaintext: Vec<u8>,
+        padded_plaintext: bytes::Bytes,
         padding_version: u8,
         slot: PlaintextSlot<'_>,
         info: &Arc<MessageInfo>,
@@ -2017,7 +2053,7 @@ impl Client {
     async fn handle_decrypted_plaintext_retained(
         self: &Arc<Self>,
         enc_type: &'static str,
-        padded_plaintext: Vec<u8>,
+        padded_plaintext: bytes::Bytes,
         padding_version: u8,
         slot: PlaintextSlot<'_>,
         info: &Arc<MessageInfo>,
@@ -2032,8 +2068,12 @@ impl Client {
             stanza: stanza_origin,
             position: enc_index,
         };
-        let source = wacore::messages::unpad_plaintext(padded_plaintext, padding_version)
-            .inspect_err(|_| self.finish_retained_raw(origin))?;
+        let unpadded_len = wacore::messages::MessageUtils::unpadded_message_len(
+            &padded_plaintext,
+            padding_version,
+        )
+        .inspect_err(|_| self.finish_retained_raw(origin))?;
+        let source = padded_plaintext.slice(..unpadded_len);
 
         // Emitted before decoding, so a payload this build cannot decode still
         // reaches a consumer that wants it. Nothing is cloned while no lease is
@@ -2470,11 +2510,12 @@ impl Client {
             // the identity for the first time (NewOrUnchanged), so no local
             // identity-change reaction is warranted here.
             Ok(decrypted) => {
+                let plaintext = bytes::Bytes::from(decrypted.plaintext);
                 self.stage_retained_plaintext(
                     info,
                     stanza_origin,
                     (enc_index, enc_type, padding_version),
-                    &decrypted.plaintext,
+                    &plaintext,
                 );
                 log::info!(
                     "[msg:{}] Decrypted after PN→LID session migration for {}",
@@ -2491,7 +2532,7 @@ impl Client {
                 // batch's main path.
                 deferred.push(DeferredPlaintext {
                     enc_type,
-                    plaintext: decrypted.plaintext,
+                    plaintext,
                     padding_version,
                     enc_index,
                     state: annotations.state.map(str::to_owned),

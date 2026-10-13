@@ -267,6 +267,14 @@ impl InboundCommitBatcher {
 
 #[cfg(any(test, feature = "bench-harness"))]
 impl Client {
+    #[cfg(test)]
+    pub(crate) fn enter_drain_mode_for_tests(&self) {
+        self.offline_sync_completed.store(false, Ordering::Release);
+        self.offline_sync_finish_started.store(0, Ordering::Release);
+        self.swap_message_semaphore(1);
+        self.inbound_commit_batch.reset();
+    }
+
     /// Test/bench mirror of a completed offline sync: the flag, live permit
     /// count and batcher mode move together so a fixture can never run in a
     /// hybrid drain/live state production cannot reach. Kept next to the
@@ -624,7 +632,13 @@ impl Client {
             };
             let mut covered = Vec::with_capacity(deliveries.len());
             for delivery in deliveries {
-                let projection = if is_drain {
+                let projection = if let Some(encoded) = self
+                    .inbound_commit_batch
+                    .live_retention
+                    .encoded_projection(delivery)
+                {
+                    encoded
+                } else if is_drain {
                     let mut arena = owner.arena();
                     arena.clear();
                     waproto::codec::message_encode_into(&delivery.message, &mut arena);
@@ -749,6 +763,22 @@ impl Client {
     ) -> (Option<u64>, Option<InboundCommitTicket>) {
         let batcher = &self.inbound_commit_batch;
         let mut state = batcher.lock();
+        if let Some(existing) = state.entries.iter_mut().find(|existing| {
+            item.origin.is_some()
+                && existing.origin == item.origin
+                && Arc::ptr_eq(&existing.info, &item.info)
+                && Arc::ptr_eq(&existing.message, &item.message)
+                && existing.carrier == item.carrier
+        }) {
+            existing.consumer_claimed |= item.consumer_claimed;
+            let ticket = track_commit.then(|| {
+                state
+                    .commit_ticket
+                    .get_or_insert_with(InboundCommitTicket::new)
+                    .clone()
+            });
+            return (None, ticket);
+        }
         state.bytes += item.retained_wire_bytes();
         state.entries.push(item);
         let ticket = track_commit.then(|| {
@@ -951,13 +981,26 @@ impl Client {
                 .live_retention
                 .receipt_for(&item.info);
         }
+        if durable && item.retention.is_none() {
+            item.retention = self
+                .inbound_commit_batch
+                .live_retention
+                .charge_for_origin(item.origin)
+                .or_else(|| item.receipt.as_ref().and_then(|scope| scope.admission()));
+        }
+        if durable
+            && (!self.inbound_commit_batch.is_active()
+                || self
+                    .inbound_commit_batch
+                    .live_retention
+                    .charge_for_origin(item.origin)
+                    .is_some())
+            && let Err(error) = self.inbound_commit_batch.live_retention.retain(&mut item)
+        {
+            log::warn!("Retention admission refused: {error:?}");
+            return InboundCommitState::Failed;
+        }
         if !self.inbound_commit_batch.is_active() {
-            if self.inbound_durability_hook().is_some()
-                && let Err(error) = self.inbound_commit_batch.live_retention.retain(&mut item)
-            {
-                log::warn!("Live retention admission refused: {error:?}");
-                return InboundCommitState::Failed;
-            }
             let owned = if durable {
                 match self
                     .inbound_commit_batch
@@ -1000,9 +1043,8 @@ impl Client {
                 InboundCommitState::Failed
             };
         }
-        // Raw replay can reenter while the offline batcher is active. Keep its
-        // existing admission alive in queued storage even after the raw slot
-        // is retired; ordinary drain arrivals do not create live reservations.
+        // Drain arrivals and replay keep their admission alive in queued
+        // storage, including after a raw slot retires.
         if durable && item.retention.is_none() {
             item.retention = self
                 .inbound_commit_batch
@@ -1043,19 +1085,25 @@ impl Client {
             state.entries.len() >= MAX_BATCH_MESSAGES || state.bytes >= MAX_BATCH_BYTES
         };
         if over {
-            let PendingInboundBatch {
-                entries,
-                commit_ticket,
-            } = self.inbound_commit_batch.take();
-            let durable = self
-                .commit_pending_batch(entries.into(), BatchOrigin::OfflineDrain, commit_ticket)
-                .await;
-            // A durable commit may be the retry that clears a deferred
-            // drain→live transition (failed end-of-drain tail).
-            if durable && self.inbound_commit_batch.live_transition_pending() {
-                self.complete_deferred_live_transition();
-            }
+            self.flush_inbound_commits_while_processing().await;
         }
+    }
+
+    // The receive caller already owns the processing permit. Capacity pressure
+    // must flush queued predecessors without reacquiring that same permit or
+    // advancing the incoming ciphertext before admission succeeds.
+    pub(super) async fn flush_inbound_commits_while_processing(self: &Arc<Self>) -> bool {
+        let PendingInboundBatch {
+            entries,
+            commit_ticket,
+        } = self.inbound_commit_batch.take();
+        let durable = self
+            .commit_pending_batch(entries.into(), BatchOrigin::OfflineDrain, commit_ticket)
+            .await;
+        if durable && self.inbound_commit_batch.live_transition_pending() {
+            self.complete_deferred_live_transition();
+        }
+        durable
     }
 
     /// Flush after acquiring a global processing permit, so no stanza is

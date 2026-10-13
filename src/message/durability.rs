@@ -38,7 +38,7 @@ impl Client {
             }
             let outcome = Box::pin(self.handle_decrypted_plaintext_in_scope(
                 entry.enc_type,
-                entry.plaintext.to_vec(),
+                entry.plaintext.clone(),
                 entry.padding_version,
                 receive::PlaintextSlot {
                     index: entry.origin.position,
@@ -53,7 +53,14 @@ impl Client {
             ))
             .await;
             let progressed = match outcome {
-                Ok(outcome) => outcome.delivered || !outcome.dispatched,
+                Ok(outcome) => {
+                    outcome.delivered
+                        || !outcome.dispatched
+                        || !self
+                            .inbound_commit_batch
+                            .live_retention
+                            .has_raw_origin(entry.origin)
+                }
                 // Only an explicitly retired terminal rejection can unblock
                 // another carrier. Errors with owned raw remain retryable.
                 Err(_) => !self
@@ -665,7 +672,7 @@ mod tests {
             client
                 .handle_decrypted_plaintext_in_scope(
                     "msg",
-                    wacore::messages::MessageUtils::encode_and_pad(&message),
+                    wacore::messages::MessageUtils::encode_and_pad(&message).into(),
                     2,
                     receive::PlaintextSlot {
                         index,

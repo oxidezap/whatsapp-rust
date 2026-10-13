@@ -592,7 +592,7 @@ pub(crate) enum InboundCommitState {
 /// handled after the per-sender session lock is released.
 struct DeferredPlaintext {
     enc_type: &'static str,
-    plaintext: Vec<u8>,
+    plaintext: bytes::Bytes,
     padding_version: u8,
     /// Which `<enc>` in the stanza produced this — [`EncPayload::enc_index`],
     /// carried through because the buffer drains after the decrypt loop.

@@ -11343,7 +11343,7 @@ async fn raw_pending_live_equal_parts_survive_prefix_cleanup_and_later_hook_fail
                     client
                         .handle_decrypted_plaintext_in_scope(
                             "msg",
-                            MessageUtils::encode_and_pad(&message),
+                            MessageUtils::encode_and_pad(&message).into(),
                             2,
                             receive::PlaintextSlot {
                                 index,
@@ -20555,7 +20555,7 @@ async fn raw_pending_sibling_bypass_keeps_default_duplicate_suppression() {
         client
             .handle_decrypted_plaintext_in_scope(
                 "msg",
-                MessageUtils::encode_and_pad(&message),
+                MessageUtils::encode_and_pad(&message).into(),
                 2,
                 receive::PlaintextSlot {
                     index,
@@ -21131,6 +21131,506 @@ async fn raw_pending_capacity_refusal_preserves_ratchet_for_later_retry() {
         delivery_receipts_for(&transport.sent(), "CAPACITY_RETRY"),
         1
     );
+}
+
+#[tokio::test]
+async fn raw_pending_packed_image_growth_survives_live_and_drain_hook_errors() {
+    struct Hook {
+        fail: std::sync::atomic::AtomicBool,
+        scans: std::sync::Mutex<Vec<usize>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            items: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                !self.fail.load(Ordering::Acquire),
+                "injected image hook failure"
+            );
+            self.scans.lock().unwrap().extend(items.iter().map(|item| {
+                item.message
+                    .image_message
+                    .as_option()
+                    .unwrap()
+                    .scan_lengths
+                    .len()
+            }));
+            Ok(())
+        }
+    }
+    fn varint(mut value: usize, out: &mut Vec<u8>) {
+        while value >= 128 {
+            out.push((value as u8 & 127) | 128);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+    for scans in [512, 8192] {
+        for drain in [false, true] {
+            for fail_hook in [false, true] {
+                let (client, transport) = capturing_client("packed_image_growth").await;
+                if drain {
+                    client.enter_drain_mode_for_tests();
+                }
+                let hook = Arc::new(Hook {
+                    fail: std::sync::atomic::AtomicBool::new(fail_hook),
+                    scans: Default::default(),
+                });
+                client
+                    .inbound_durability_hook
+                    .set(hook.clone())
+                    .ok()
+                    .unwrap();
+                let (handler, rx) = wacore::types::events::ChannelEventHandler::new();
+                client.core.event_bus.subscribe_handler(handler).detach();
+                let (bundle, bob) = bobs_prekey_bundle(&client).await;
+                let address = bob.to_protocol_address();
+                let mut alice = AlicePeer::new("100000000000008@lid").await;
+                alice.install_bob_session(&address, &bundle).await;
+                // Message.imageMessage (3), ImageMessage.scanLengths (22),
+                // legally packed on input although canonical output is unpacked.
+                let mut image = vec![0xb2, 0x01];
+                varint(scans, &mut image);
+                image.resize(image.len() + scans, 0);
+                let mut packed = vec![0x1a];
+                varint(image.len(), &mut packed);
+                packed.extend_from_slice(&image);
+                let decoded = waproto::codec::message_decode(&packed).unwrap();
+                assert!(waproto::codec::message_encoded_len(&decoded) > 2 * packed.len());
+                packed.push(1);
+                let ciphertext = alice.encrypt(&address, &packed).await;
+                let group: Jid = "120363000000000090@g.us".parse().unwrap();
+                let info = group_message_info("PACKED_IMAGE_GROWTH", &group, &alice.jid, false);
+                process_group_classified(
+                    &client,
+                    Arc::clone(&info),
+                    &alice.jid,
+                    enc_payload_from_ciphertext(&ciphertext),
+                    vec![],
+                )
+                .await;
+                if drain {
+                    client
+                        .flush_inbound_commits_under_permit(true, None, None)
+                        .await;
+                }
+                if fail_hook {
+                    crate::test_utils::wait_for_outbound_tasks(&client).await;
+                    assert_eq!(message_acks_for(&transport.sent(), &info.id), 0);
+                    assert_eq!(delivery_receipts_for(&transport.sent(), &info.id), 0);
+                    hook.fail.store(false, Ordering::Release);
+                    process_group_classified(
+                        &client,
+                        Arc::new((*info).clone()),
+                        &alice.jid,
+                        enc_payload_from_ciphertext(&ciphertext),
+                        vec![],
+                    )
+                    .await;
+                    if client.inbound_commit_batch.is_active() {
+                        client
+                            .flush_inbound_commits_under_permit(true, None, None)
+                            .await;
+                    }
+                }
+                assert_eq!(*hook.scans.lock().unwrap(), [scans]);
+                assert_eq!(message_events_for_id(&rx, &info.id).0, 1);
+                assert!(
+                    !client
+                        .inbound_commit_batch
+                        .live_retention
+                        .has_owned_for_message(&info)
+                );
+                assert_exactly_one_confirmation(&transport, &info.id).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn raw_pending_fresh_drain_protocol_failure_retains_ratchet_advanced_plaintext() {
+    use wacore::messages::MessageUtils;
+    use wacore::store::in_memory::InMemoryBackend;
+    use wacore::store::traits::SignalStore;
+    struct NoDelivery;
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for NoDelivery {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            panic!("protocol-only replay must not publish consumer content")
+        }
+    }
+    for cancelled in [false, true] {
+        let backend = Arc::new(InMemoryBackend::new());
+        let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+        client.enter_drain_mode_for_tests();
+        client
+            .inbound_durability_hook
+            .set(Arc::new(NoDelivery))
+            .ok()
+            .unwrap();
+        let factory = crate::transport::mock::CapturingMockTransportFactory::new();
+        let transport = factory.transport();
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(crate::socket::NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            transport.clone(),
+            wacore::handshake::NoiseCipher::new(&[0; 32]).unwrap(),
+            wacore::handshake::NoiseCipher::new(&[0; 32]).unwrap(),
+        )));
+        seed_test_pn(&client).await;
+        let (bundle, bob) = bobs_prekey_bundle(&client).await;
+        let address = bob.to_protocol_address();
+        let mut alice = AlicePeer::new("100000000000009@lid").await;
+        alice.install_bob_session(&address, &bundle).await;
+        let group: Jid = "120363000000000091@g.us".parse().unwrap();
+        let mut message = wa::Message::default();
+        message.sender_key_distribution_message =
+            buffa::MessageField::some(alice.create_group_skdm(&group).await);
+        let info = group_message_info("FRESH_DRAIN_SKDM_FAILURE", &group, &alice.jid, false);
+        let ciphertext = alice
+            .encrypt(&address, &MessageUtils::encode_and_pad(&message))
+            .await;
+        backend.set_fail_sender_key_reads(true);
+        client
+            .inbound_commit_batch
+            .live_retention
+            .pause_stage
+            .store(cancelled, Ordering::Release);
+        let receiver = client.clone();
+        let original = Arc::clone(&info);
+        let sender = alice.jid.clone();
+        let payload = enc_payload_from_ciphertext(&ciphertext);
+        let worker = tokio::spawn(async move {
+            process_group_classified(&receiver, original, &sender, payload, vec![]).await;
+        });
+        if cancelled {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client
+                    .inbound_commit_batch
+                    .live_retention
+                    .stage_ready
+                    .notified(),
+            )
+            .await
+            .unwrap();
+            worker.abort();
+            assert!(worker.await.unwrap_err().is_cancelled());
+        } else {
+            worker.await.unwrap();
+        }
+        assert!(
+            client
+                .inbound_commit_batch
+                .live_retention
+                .has_raw_for_message(&info)
+        );
+        client.flush_signal_cache().await.unwrap();
+        client.enter_drain_mode_for_tests();
+        client
+            .inbound_commit_batch
+            .live_retention
+            .pause_stage
+            .store(false, Ordering::Release);
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        assert_eq!(message_acks_for(&transport.sent(), &info.id), 0);
+        assert_eq!(delivery_receipts_for(&transport.sent(), &info.id), 0);
+        backend.set_fail_sender_key_reads(false);
+        process_group_classified(
+            &client,
+            Arc::new((*info).clone()),
+            &alice.jid,
+            enc_payload_from_ciphertext(&ciphertext),
+            vec![],
+        )
+        .await;
+        assert!(
+            client
+                .flush_inbound_commits_under_permit(true, None, None)
+                .await
+        );
+        assert!(
+            !client
+                .inbound_commit_batch
+                .live_retention
+                .has_owned_for_message(&info)
+        );
+        let name = make_sender_key_name(&group, &alice.jid.to_non_ad().to_protocol_address());
+        assert!(
+            backend
+                .get_sender_key(name.cache_key())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_exactly_one_confirmation(&transport, &info.id).await;
+    }
+}
+
+#[tokio::test]
+async fn raw_pending_group_plaintext_failure_blocks_shared_receipt_without_forwarding() {
+    use std::sync::atomic::AtomicUsize;
+    use wacore::messages::MessageUtils;
+    use wacore::store::in_memory::InMemoryBackend;
+    struct Hook {
+        calls: AtomicUsize,
+        arm: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            client: Arc<Client>,
+            items: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            self.calls.fetch_add(items.len(), Ordering::Relaxed);
+            if self.arm.swap(false, Ordering::AcqRel) {
+                client
+                    .inbound_commit_batch
+                    .live_retention
+                    .pause_stage
+                    .store(true, Ordering::Release);
+            }
+            Ok(())
+        }
+    }
+    let backend = Arc::new(InMemoryBackend::new());
+    let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+    let factory = crate::transport::mock::CapturingMockTransportFactory::new();
+    let transport = factory.transport();
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(crate::socket::NoiseSocket::new(
+        Arc::new(crate::runtime_impl::TokioRuntime),
+        transport.clone(),
+        wacore::handshake::NoiseCipher::new(&[0; 32]).unwrap(),
+        wacore::handshake::NoiseCipher::new(&[0; 32]).unwrap(),
+    )));
+    seed_test_pn(&client).await;
+    let hook = Arc::new(Hook {
+        calls: AtomicUsize::new(0),
+        arm: std::sync::atomic::AtomicBool::new(true),
+    });
+    client
+        .inbound_durability_hook
+        .set(hook.clone())
+        .ok()
+        .unwrap();
+    assert!(!client.enc_decrypt_failed_forwarding_enabled());
+    let (handler, rx) = wacore::types::events::ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+    let group: Jid = "120363000000000092@g.us".parse().unwrap();
+    let mut alice = joined_group_sender(&client, "100000000000010@lid", &group).await;
+    let (bundle, bob) = bobs_prekey_bundle(&client).await;
+    let address = bob.to_protocol_address();
+    alice.install_bob_session(&address, &bundle).await;
+    let mut first = wa::Message::default();
+    first.conversation = Some("committed before group failure".into());
+    let session = alice
+        .encrypt(&address, &MessageUtils::encode_and_pad(&first))
+        .await;
+    let mut protocol = wa::Message::default();
+    protocol.sender_key_distribution_message =
+        buffa::MessageField::some(alice.create_group_skdm(&group).await);
+    let encrypted_group = alice
+        .encrypt_group_message(&group, &MessageUtils::encode_and_pad(&protocol))
+        .await;
+    let info = group_message_info("GROUP_PLAINTEXT_RECEIPT_FAILURE", &group, &alice.jid, false);
+    let receiver = client.clone();
+    let original = Arc::clone(&info);
+    let sender = alice.jid.clone();
+    let first_payload = enc_payload_from_ciphertext(&session);
+    let mut group_payload = skmsg_payload_from_bytes(encrypted_group.clone());
+    group_payload.enc_index = 1;
+    let worker = tokio::spawn(async move {
+        process_group_classified(
+            &receiver,
+            original,
+            &sender,
+            first_payload,
+            vec![group_payload],
+        )
+        .await;
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client
+            .inbound_commit_batch
+            .live_retention
+            .stage_ready
+            .notified(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(hook.calls.load(Ordering::Relaxed), 1);
+    client.flush_signal_cache().await.unwrap();
+    client.signal_cache.clear_after_flush().await;
+    backend.set_fail_sender_key_reads(true);
+    client
+        .inbound_commit_batch
+        .live_retention
+        .release_stage_for_tests();
+    worker.await.unwrap();
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(message_events_for_id(&rx, &info.id), (1, 1));
+    assert!(
+        client
+            .inbound_commit_batch
+            .live_retention
+            .has_raw_for_message(&info)
+    );
+    assert_eq!(message_acks_for(&transport.sent(), &info.id), 0);
+    assert_eq!(delivery_receipts_for(&transport.sent(), &info.id), 0);
+    backend.set_fail_sender_key_reads(false);
+    let mut group_payload = skmsg_payload_from_bytes(encrypted_group);
+    group_payload.enc_index = 1;
+    process_group_classified(
+        &client,
+        Arc::new((*info).clone()),
+        &alice.jid,
+        enc_payload_from_ciphertext(&session),
+        vec![group_payload],
+    )
+    .await;
+    assert_eq!(hook.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(message_events_for_id(&rx, &info.id), (0, 0));
+    assert!(
+        !client
+            .inbound_commit_batch
+            .live_retention
+            .has_owned_for_message(&info)
+    );
+    assert_exactly_one_confirmation(&transport, &info.id).await;
+}
+
+#[tokio::test]
+async fn raw_pending_drain_capacity_flush_preserves_queued_order_and_refusal_ratchet() {
+    use wacore::store::in_memory::InMemoryBackend;
+    struct Hook(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            items: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .extend(items.iter().map(|item| item.info.id.to_string()));
+            Ok(())
+        }
+    }
+    for storage_error in [false, true] {
+        let backend = Arc::new(InMemoryBackend::new());
+        let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+        client.enter_drain_mode_for_tests();
+        let hook = Arc::new(Hook(Default::default()));
+        client
+            .inbound_durability_hook
+            .set(hook.clone())
+            .ok()
+            .unwrap();
+        let group: Jid = "120363000000000093@g.us".parse().unwrap();
+        let mut alice = joined_group_sender(&client, "100000000000011@lid", &group).await;
+        let name = make_sender_key_name(&group, &alice.jid.to_non_ad().to_protocol_address());
+        let mut inputs = Vec::new();
+        for index in 0..4 {
+            let ciphertext = encrypt_group_text(&mut alice, &group, "bounded drain pressure").await;
+            let mut info = (*group_message_info(
+                &format!("DRAIN_PRESSURE_{index}"),
+                &group,
+                &alice.jid,
+                false,
+            ))
+            .clone();
+            info.push_name = "n".repeat(1024 * 1024).into();
+            inputs.push((Arc::new(info), ciphertext));
+        }
+        for (info, ciphertext) in &inputs[..3] {
+            process_group_classified_with_sessions(
+                &client,
+                Arc::clone(info),
+                &alice.jid,
+                vec![],
+                vec![skmsg_payload_from_bytes(ciphertext.clone())],
+            )
+            .await;
+        }
+        assert!(hook.0.lock().unwrap().is_empty());
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        let before = client
+            .signal_cache
+            .get_sender_key(&name, &*snapshot.backend)
+            .await
+            .unwrap()
+            .unwrap()
+            .serialize()
+            .unwrap();
+        if storage_error {
+            backend.fail_next_pending_replace_after_commit();
+        }
+        let (fourth, ciphertext) = &inputs[3];
+        process_group_classified_with_sessions(
+            &client,
+            Arc::clone(fourth),
+            &alice.jid,
+            vec![],
+            vec![skmsg_payload_from_bytes(ciphertext.clone())],
+        )
+        .await;
+        if storage_error {
+            let after = client
+                .signal_cache
+                .get_sender_key(&name, &*snapshot.backend)
+                .await
+                .unwrap()
+                .unwrap()
+                .serialize()
+                .unwrap();
+            assert_eq!(
+                before, after,
+                "pressure flush failure must leave fresh ciphertext untouched"
+            );
+            assert!(hook.0.lock().unwrap().is_empty());
+            process_group_classified_with_sessions(
+                &client,
+                Arc::clone(fourth),
+                &alice.jid,
+                vec![],
+                vec![skmsg_payload_from_bytes(ciphertext.clone())],
+            )
+            .await;
+        }
+        assert_eq!(
+            *hook.0.lock().unwrap(),
+            ["DRAIN_PRESSURE_0", "DRAIN_PRESSURE_1", "DRAIN_PRESSURE_2"]
+        );
+        assert!(
+            client
+                .flush_inbound_commits_under_permit(true, None, None)
+                .await
+        );
+        assert_eq!(
+            *hook.0.lock().unwrap(),
+            [
+                "DRAIN_PRESSURE_0",
+                "DRAIN_PRESSURE_1",
+                "DRAIN_PRESSURE_2",
+                "DRAIN_PRESSURE_3"
+            ]
+        );
+        assert!(inputs.iter().all(|(info, _)| {
+            !client
+                .inbound_commit_batch
+                .live_retention
+                .has_owned_for_message(info)
+        }));
+    }
 }
 
 #[tokio::test]
