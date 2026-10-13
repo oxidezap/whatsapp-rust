@@ -1571,7 +1571,7 @@ mod tests {
     async fn raw_pending_partial_cleanup_keeps_whole_batch_published() {
         use wacore::store::in_memory::InMemoryBackend;
         use wacore::store::traits::ProtocolStore;
-        for failed_index in 0..3 {
+        for failed_index in [1, 2, 0] {
             let backend = Arc::new(InMemoryBackend::new());
             let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
             let hook = Arc::new(RecordingHook {
